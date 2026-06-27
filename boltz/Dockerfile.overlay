@@ -1,0 +1,9 @@
+# boltz overlay image: layer this fork's changed runtime files onto the pinned
+# upstream skypilot-nightly base. The build context is assembled by
+# build-overlay.sh to contain ONLY the files that differ from the fork base
+# (git diff <fork-base> HEAD -- 'sky/**'), so a single recursive COPY overlays
+# exactly those files without shadowing base-image package files that must
+# match the installed wheel.
+ARG BASE_IMAGE=berkeleyskypilot/skypilot-nightly:1.0.0.dev20260620
+FROM ${BASE_IMAGE}
+COPY sky/ /usr/local/lib/python3.10/site-packages/sky/
