@@ -420,10 +420,14 @@ def _respawn_controller_if_dead(
     child respawn) and the LB targets a fixed `controller_host:controller_port`,
     the parent can simply restart the controller child IN PLACE on the SAME
     port. The new controller rebuilds its state from the DB exactly like a
-    fresh recovery; the DB row and the LB need no changes.
+    fresh recovery; the DB row and the LB need no changes. We reload the latest
+    version + spec from the DB rather than reusing the values `_start` captured
+    at boot, so a respawn AFTER a `/update_service` does not regress the
+    controller to the old spec/version.
 
-    Best-effort: a respawn that fails to bind is killed and retried on the next
-    tick. We never raise out of here -- that would hit `_start`'s finally and
+    Best-effort: any spawn / readiness failure is contained, the not-yet-ready
+    respawn is killed, and the dead handle is returned so the next tick
+    retries. We never raise out of here -- that would hit `_start`'s finally and
     trigger destructive `_cleanup`.
     """
     if controller_process is None or controller_process.is_alive():
@@ -439,18 +443,39 @@ def _respawn_controller_if_dead(
             parent_pids=[controller_process.pid], force=True)
     except Exception:  # pylint: disable=broad-except
         pass
-    new_process = _spawn_controller(service_name, service_spec, version,
-                                    controller_host, controller_port)
+    # Reload the latest version + spec from the DB so a respawn after a service
+    # update doesn't bring the controller back on the stale spec/version this
+    # _start captured at boot. Fall back to the captured values on any DB error.
+    try:
+        latest_version = serve_state.get_latest_version(service_name)
+        if latest_version is not None:
+            latest_spec = serve_state.get_spec(service_name, latest_version)
+            if latest_spec is not None:
+                version, service_spec = latest_version, latest_spec
+    except Exception as e:  # pylint: disable=broad-except
+        logger.warning(f'Could not reload latest version/spec for '
+                       f'{service_name} on respawn ({e}); using the captured '
+                       f'version {version}.')
+    # Spawn + readiness wait, fully contained: a failure here must NOT propagate
+    # (it would reach _start's finally -> destructive _cleanup).
+    try:
+        new_process = _spawn_controller(service_name, service_spec, version,
+                                        controller_host, controller_port)
+    except Exception as e:  # pylint: disable=broad-except
+        logger.error(f'Failed to spawn replacement controller for '
+                     f'{service_name}: {common_utils.format_exception(e)}; '
+                     f'will retry on the next tick.')
+        return controller_process
     try:
         _wait_for_controller_ready(
             controller_host, controller_port,
             timeout=constants.SERVICE_REGISTER_TIMEOUT_SECONDS)
-    except RuntimeError as e:
-        # Do NOT propagate: that would reach _start's finally -> destructive
-        # _cleanup. Kill the not-yet-bound respawn and keep the (dead) handle
-        # so the next tick retries cleanly.
-        logger.error(f'Respawned controller failed to bind for {service_name}: '
-                     f'{e}; will retry on the next tick.')
+    except Exception as e:  # pylint: disable=broad-except
+        # Kill the not-yet-ready respawn and keep the (dead) handle so the next
+        # tick retries cleanly.
+        logger.error(f'Respawned controller failed to become ready for '
+                     f'{service_name}: {common_utils.format_exception(e)}; '
+                     f'will retry on the next tick.')
         try:
             subprocess_utils.kill_children_processes(
                 parent_pids=[new_process.pid], force=True)
