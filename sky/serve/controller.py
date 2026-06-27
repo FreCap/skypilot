@@ -124,33 +124,22 @@ class SkyServeController:
             logger.info(f'Received {len(timestamps)} inflight requests.')
             self._autoscaler.collect_request_information(request_aggregator)
 
-            # Get replica information for instance-aware load balancing
-            replica_infos = serve_state.get_replica_infos(self._service_name)
             ready_replica_urls = self._replica_manager.get_active_replica_urls()
 
-            # Use URL-to-info mapping to avoid duplication
-            replica_info = {}
-            for info in replica_infos:
-                if info.url in ready_replica_urls:
-                    # Get GPU type from handle.launched_resources.accelerators
-                    gpu_type = 'unknown'
-                    handle = info.handle()
-                    if handle is not None:
-                        accelerators = handle.launched_resources.accelerators
-                        if accelerators and len(accelerators) > 0:
-                            # Get the first accelerator type
-                            gpu_type = list(accelerators.keys())[0]
-
-                    replica_info[info.url] = {'gpu_type': gpu_type}
-
-            # Check that all ready replica URLs are included in replica_info
-            missing_urls = set(ready_replica_urls) - set(replica_info.keys())
-            if missing_urls:
-                logger.warning(f'Ready replica URLs missing from replica_info: '
-                               f'{missing_urls}')
-                # fallback: add missing URLs with unknown GPU type
-                for url in missing_urls:
-                    replica_info[url] = {'gpu_type': 'unknown'}
+            # [boltz fork] Build replica_info directly from the already-resolved
+            # ready URLs. The previous version looped over ALL replica_infos
+            # (provisioning included) calling info.url (-> handle() +
+            # get_endpoints()) per replica AND info.handle() again for gpu_type.
+            # During a launch storm that is 150+ handle()/endpoint lookups per
+            # sync against a DB the launch threads are contending — it blows the
+            # load balancer's sync timeout, so the LB gets an empty ready-list
+            # and 503s every request despite dozens of READY replicas. gpu_type
+            # is only consumed by instance-aware LB policies (we use least_load,
+            # and instance_aware crashes on GCP replicas with location=None), so
+            # skip the per-replica handle() entirely.
+            replica_info = {
+                url: {'gpu_type': 'unknown'} for url in ready_replica_urls
+            }
 
             return responses.JSONResponse(
                 content={'replica_info': replica_info}, status_code=200)
