@@ -63,6 +63,15 @@ def _handle_signal(service_name: str) -> None:
                     logger.warning(
                         f'Unknown signal received: {user_signal}. Ignoring.')
                     user_signal = None
+            if user_signal is not None:
+                # Persist the teardown intent BEFORE consuming the signal so a
+                # crash in this window cannot resurrect the service: HA recovery
+                # then sees either SHUTTING_DOWN (and resumes teardown) or the
+                # still-present signal (and re-fires terminate) -- never a
+                # downed service that comes back up serving. (Only TERMINATE
+                # exists.)
+                serve_state.set_service_status_and_active_versions(
+                    service_name, serve_state.ServiceStatus.SHUTTING_DOWN)
             # Remove the signal file, after reading it.
             signal_file.unlink()
     if user_signal is None:
@@ -429,6 +438,16 @@ def _run_cleanup_and_finalize(service_name: str,
         with ux_utils.enable_traceback():
             logger.error(f'  Traceback: {traceback.format_exc()}')
         failed = True
+        # _cleanup raised before its own end-of-function script removal, so the
+        # HA recovery script is still present. Remove it here: FAILED_CLEANUP is
+        # a teardown status that _should_resume_teardown resumes, so leaving the
+        # script would make HA recovery re-run cleanup and hit the same error
+        # forever. (A PROCESS death before this handler never runs this line, so
+        # the script is preserved for that case -- which is what we want.)
+        try:
+            serve_state.remove_ha_recovery_script(service_name)
+        except Exception:  # pylint: disable=broad-except
+            pass
 
     if failed:
         serve_state.set_service_status_and_active_versions(

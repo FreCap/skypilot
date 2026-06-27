@@ -17,6 +17,9 @@ able to respawn the controller and re-run cleanup.
 import threading
 import types
 
+import pytest
+
+from sky import exceptions
 from sky.serve import replica_managers
 from sky.serve import serve_state
 from sky.serve import service
@@ -141,6 +144,8 @@ def _patch_finalize(monkeypatch, calls):
                         lambda *a, **k: calls.append(('failed_cleanup', a)))
     monkeypatch.setattr(serve_state, 'remove_service_completely',
                         lambda name: calls.append(('removed', name)))
+    monkeypatch.setattr(serve_state, 'remove_ha_recovery_script',
+                        lambda name: calls.append(('remove_script', name)))
     monkeypatch.setattr(service.shutil, 'rmtree', lambda *a, **k: None)
     monkeypatch.setattr(service, '_cleanup_task_run_script', lambda jid: None)
 
@@ -155,6 +160,8 @@ def test_finalize_removes_service_on_clean_teardown(monkeypatch):
 
     assert ('removed', 'svc') in calls
     assert not any(c[0] == 'failed_cleanup' for c in calls)
+    # _cleanup itself removed the script on its clean path; finalize must not.
+    assert not any(c[0] == 'remove_script' for c in calls)
 
 
 def test_finalize_marks_failed_cleanup_when_teardown_fails(monkeypatch):
@@ -167,11 +174,18 @@ def test_finalize_marks_failed_cleanup_when_teardown_fails(monkeypatch):
 
     assert any(c[0] == 'failed_cleanup' for c in calls)
     assert not any(c[0] == 'removed' for c in calls)
+    # _cleanup completed (returned True) and removed its own script; a normal
+    # failure must NOT be turned into a recovery loop -- but the explicit
+    # removal here is only for the EXCEPTION path, so finalize must not call it.
+    assert not any(c[0] == 'remove_script' for c in calls)
 
 
-def test_finalize_contains_cleanup_exception(monkeypatch):
-    """A _cleanup that raises must be contained and leave the service
-    FAILED_CLEANUP (not propagate and leave no process to retry)."""
+def test_finalize_contains_cleanup_exception_and_breaks_recovery_loop(
+        monkeypatch):
+    """A _cleanup that RAISES must be contained, leave the service
+    FAILED_CLEANUP, AND remove the HA recovery script -- otherwise a persistent
+    cleanup error loops forever (FAILED_CLEANUP is a resume status and the
+    script was never reached for removal inside _cleanup)."""
     calls = []
 
     def _boom(name, pool):
@@ -184,3 +198,35 @@ def test_finalize_contains_cleanup_exception(monkeypatch):
                                       '/tmp/svc', 1)
 
     assert any(c[0] == 'failed_cleanup' for c in calls)
+    assert ('remove_script', 'svc') in calls, (
+        'a caught cleanup exception must remove the HA script to avoid a '
+        'recovery loop')
+
+
+def test_handle_signal_persists_shutting_down_before_consuming_signal(
+        monkeypatch, tmp_path):
+    """The terminate signal must not be consumed before SHUTTING_DOWN is durably
+    set: otherwise a crash in that window loses the teardown intent and HA
+    recovery would bring the (user-downed) service back up serving."""
+    sig = tmp_path / 'svc.signal'
+    sig.write_text('terminate')
+    monkeypatch.setattr(service.constants, 'SIGNAL_FILE_PATH',
+                        str(tmp_path / '{}.signal'))
+    observed = []
+
+    def _record_status(name, status):
+        # The signal file must still exist when we persist SHUTTING_DOWN.
+        observed.append((status, sig.exists()))
+
+    monkeypatch.setattr(serve_state, 'set_service_status_and_active_versions',
+                        _record_status)
+
+    with pytest.raises(exceptions.ServeUserTerminatedError):
+        service._handle_signal('svc')
+
+    assert observed, 'SHUTTING_DOWN must be persisted on a terminate signal'
+    status, signal_existed_at_status_time = observed[0]
+    assert status == serve_state.ServiceStatus.SHUTTING_DOWN
+    assert signal_existed_at_status_time is True, (
+        'status must be set BEFORE the signal file is consumed')
+    assert not sig.exists(), 'signal file is consumed after status is persisted'
