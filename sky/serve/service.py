@@ -11,7 +11,7 @@ import socket
 import sys
 import time
 import traceback
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, TYPE_CHECKING
 
 import filelock
 
@@ -35,6 +35,9 @@ from sky.utils import controller_utils
 from sky.utils import subprocess_utils
 from sky.utils import thread_utils
 from sky.utils import ux_utils
+
+if TYPE_CHECKING:
+    from sky.serve import service_spec as service_spec_lib
 
 # Use the explicit logger name so that the logger is under the
 # `sky.serve.service` namespace when executed directly, so as
@@ -393,6 +396,57 @@ def _bail_on_boot_failure(service_name: str,
     os._exit(1)  # pylint: disable=protected-access
 
 
+def _should_resume_teardown(is_recovery: bool,
+                            service: Optional[Dict[str, Any]]) -> bool:
+    """Whether a recovery run should resume teardown instead of serving.
+
+    A controller that died mid-teardown left the service in a teardown status
+    (SHUTTING_DOWN from a user `down`, or FAILED_CLEANUP from a prior failed
+    attempt). Bringing it back up would resurrect a service the user tore down,
+    so recovery must instead finish the cleanup. A controller that died for any
+    other reason left a non-teardown status (e.g. READY) and is recovered
+    normally (brought back up).
+    """
+    return (is_recovery and service is not None and service['status'] in (
+        serve_state.ServiceStatus.SHUTTING_DOWN,
+        serve_state.ServiceStatus.FAILED_CLEANUP))
+
+
+def _run_cleanup_and_finalize(service_name: str,
+                              service_spec: 'service_spec_lib.SkyServiceSpec',
+                              service_dir: str, job_id: int) -> None:
+    """Run ``_cleanup`` and finalize the service's DB / dir state.
+
+    Shared by ``_start``'s teardown ``finally`` and the recovery-resume path (a
+    controller that died mid-teardown). On failure the service is left
+    FAILED_CLEANUP so an operator can ``--purge``; on success the service row
+    and working dir are removed.
+    """
+    try:
+        failed = _cleanup(service_name, service_spec.pool)
+    except Exception as e:  # pylint: disable=broad-except
+        logger.error(f'Failed to clean up service {service_name}: {e}')
+        with ux_utils.enable_traceback():
+            logger.error(f'  Traceback: {traceback.format_exc()}')
+        failed = True
+
+    if failed:
+        serve_state.set_service_status_and_active_versions(
+            service_name, serve_state.ServiceStatus.FAILED_CLEANUP)
+        logger.error(f'Service {service_name} failed to clean up.')
+    else:
+        serve_state.remove_service_completely(service_name)
+        try:
+            shutil.rmtree(service_dir)
+        except FileNotFoundError:
+            # The service_dir may already be gone (e.g. the controller's own
+            # success path raced with a purge).
+            pass
+        logger.info(f'Service {service_name} terminated successfully.')
+
+    _cleanup_task_run_script(job_id)
+
+
 def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
     """Starts the service.
     This including the controller and load balancer.
@@ -428,6 +482,19 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
 
     service_dir = os.path.expanduser(
         serve_utils.generate_remote_service_dir_name(service_name))
+
+    # If the previous controller died mid-teardown, its HA recovery script was
+    # preserved (see _cleanup, which now removes the script only AFTER
+    # teardown). Bringing the controller + LB back up here would resurrect a
+    # service the user tore down -- so resume the unfinished cleanup instead.
+    if _should_resume_teardown(is_recovery, service):
+        assert service is not None
+        logger.info(f'Recovering service {service_name} in status '
+                    f'{service["status"].value}: resuming teardown instead of '
+                    'serving.')
+        _run_cleanup_and_finalize(service_name, service_spec, service_dir,
+                                  job_id)
+        return
 
     # Pod IP for HA leader-aware routing.
     pod_ip: Optional[str] = os.environ.get('POD_IP')
@@ -697,34 +764,13 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
         for process in process_to_kill:
             process.join()
 
-        # Catch any exception here to avoid it kill the service monitoring
-        # process. In which case, the service will not only fail to clean
-        # up, but also cannot be terminated in the future as no process
-        # will handle the user signal anymore. Instead, we catch any error
-        # and set it to FAILED_CLEANUP instead.
-        try:
-            failed = _cleanup(service_name, service_spec.pool)
-        except Exception as e:  # pylint: disable=broad-except
-            logger.error(f'Failed to clean up service {service_name}: {e}')
-            with ux_utils.enable_traceback():
-                logger.error(f'  Traceback: {traceback.format_exc()}')
-            failed = True
-
-        if failed:
-            serve_state.set_service_status_and_active_versions(
-                service_name, serve_state.ServiceStatus.FAILED_CLEANUP)
-            logger.error(f'Service {service_name} failed to clean up.')
-        else:
-            serve_state.remove_service_completely(service_name)
-            try:
-                shutil.rmtree(service_dir)
-            except FileNotFoundError:
-                # The service_dir may already be gone (e.g. the controller's own
-                # success path raced with a purge).
-                pass
-            logger.info(f'Service {service_name} terminated successfully.')
-
-        _cleanup_task_run_script(job_id)
+        # Run cleanup + finalize. _run_cleanup_and_finalize catches any error
+        # from _cleanup and sets FAILED_CLEANUP instead, so the service can
+        # still be terminated later (a crash here would otherwise leave no
+        # process to handle the user signal). Shared with the recovery-resume
+        # path above.
+        _run_cleanup_and_finalize(service_name, service_spec, service_dir,
+                                  job_id)
 
 
 if __name__ == '__main__':

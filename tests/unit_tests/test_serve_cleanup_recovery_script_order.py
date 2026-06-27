@@ -15,6 +15,7 @@ script must outlive replica teardown so a crash partway through leaves recovery
 able to respawn the controller and re-run cleanup.
 """
 import threading
+import types
 
 from sky.serve import replica_managers
 from sky.serve import serve_state
@@ -101,3 +102,85 @@ def test_recovery_script_removed_once_on_clean_service(monkeypatch):
     service._cleanup('svc', pool=False)
 
     assert events == ['remove_recovery_script']
+
+
+# --- recovery must resume teardown, not resurrect a torn-down service ---
+
+
+def _svc(status):
+    return {'status': status}
+
+
+def test_resume_teardown_for_user_downed_service():
+    """A recovery of a SHUTTING_DOWN service must resume teardown (else the
+    preserved recovery script would resurrect a service the user `down`ed)."""
+    assert service._should_resume_teardown(
+        True, _svc(serve_state.ServiceStatus.SHUTTING_DOWN)) is True
+
+
+def test_resume_teardown_for_failed_cleanup_service():
+    assert service._should_resume_teardown(
+        True, _svc(serve_state.ServiceStatus.FAILED_CLEANUP)) is True
+
+
+def test_no_resume_for_ready_service():
+    """A controller that died while the service was healthy (READY) must be
+    recovered normally (brought back up), NOT torn down."""
+    assert service._should_resume_teardown(
+        True, _svc(serve_state.ServiceStatus.READY)) is False
+
+
+def test_no_resume_on_fresh_run():
+    assert service._should_resume_teardown(False, None) is False
+    assert service._should_resume_teardown(
+        False, _svc(serve_state.ServiceStatus.SHUTTING_DOWN)) is False
+
+
+def _patch_finalize(monkeypatch, calls):
+    monkeypatch.setattr(serve_state, 'set_service_status_and_active_versions',
+                        lambda *a, **k: calls.append(('failed_cleanup', a)))
+    monkeypatch.setattr(serve_state, 'remove_service_completely',
+                        lambda name: calls.append(('removed', name)))
+    monkeypatch.setattr(service.shutil, 'rmtree', lambda *a, **k: None)
+    monkeypatch.setattr(service, '_cleanup_task_run_script', lambda jid: None)
+
+
+def test_finalize_removes_service_on_clean_teardown(monkeypatch):
+    calls = []
+    monkeypatch.setattr(service, '_cleanup', lambda name, pool: False)
+    _patch_finalize(monkeypatch, calls)
+
+    service._run_cleanup_and_finalize('svc', types.SimpleNamespace(pool=False),
+                                      '/tmp/svc', 1)
+
+    assert ('removed', 'svc') in calls
+    assert not any(c[0] == 'failed_cleanup' for c in calls)
+
+
+def test_finalize_marks_failed_cleanup_when_teardown_fails(monkeypatch):
+    calls = []
+    monkeypatch.setattr(service, '_cleanup', lambda name, pool: True)
+    _patch_finalize(monkeypatch, calls)
+
+    service._run_cleanup_and_finalize('svc', types.SimpleNamespace(pool=False),
+                                      '/tmp/svc', 1)
+
+    assert any(c[0] == 'failed_cleanup' for c in calls)
+    assert not any(c[0] == 'removed' for c in calls)
+
+
+def test_finalize_contains_cleanup_exception(monkeypatch):
+    """A _cleanup that raises must be contained and leave the service
+    FAILED_CLEANUP (not propagate and leave no process to retry)."""
+    calls = []
+
+    def _boom(name, pool):
+        raise RuntimeError('cleanup blew up')
+
+    monkeypatch.setattr(service, '_cleanup', _boom)
+    _patch_finalize(monkeypatch, calls)
+
+    service._run_cleanup_and_finalize('svc', types.SimpleNamespace(pool=False),
+                                      '/tmp/svc', 1)
+
+    assert any(c[0] == 'failed_cleanup' for c in calls)
