@@ -1,0 +1,103 @@
+"""Regression test: _cleanup must remove the HA recovery script LAST.
+
+``sky/serve/service.py::_cleanup`` used to delete the
+``serve_ha_recovery_script`` row on its very first line, *before* the
+(seconds-to-minutes) replica teardown.
+If the controller pod was then killed mid-teardown (HA pod move / node drain),
+the durable service row survived but its recovery script was gone, so
+``ha_recovery_for_consolidation_mode`` logged 'recovery script does not exist.
+Skipping recovery' forever and stranded the service with replicas still
+consuming resources.
+
+The fix moves the ``remove_ha_recovery_script`` call to the END of ``_cleanup``,
+after all destructive teardown. These tests pin the ordering invariant: the
+script must outlive replica teardown so a crash partway through leaves recovery
+able to respawn the controller and re-run cleanup.
+"""
+import threading
+
+from sky.serve import replica_managers
+from sky.serve import serve_state
+from sky.serve import service
+from sky.utils import common_utils
+from sky.utils import controller_utils
+
+
+def _replica(replica_id: int) -> replica_managers.ReplicaInfo:
+    return replica_managers.ReplicaInfo(replica_id=replica_id,
+                                        cluster_name=f'c{replica_id}',
+                                        replica_port='8080',
+                                        is_spot=False,
+                                        location=None,
+                                        version=1,
+                                        resources_override=None)
+
+
+def _patch_common(monkeypatch, events, replicas):
+    """Wire up _cleanup's collaborators to record an ordered event log."""
+    monkeypatch.setattr(service.time, 'sleep', lambda *_a, **_k: None)
+    monkeypatch.setattr(serve_state, 'get_service_from_name', lambda svc: None)
+    monkeypatch.setattr(serve_state, 'get_replica_infos',
+                        lambda svc: list(replicas))
+    monkeypatch.setattr(service.global_user_state,
+                        'get_cluster_names_start_with',
+                        lambda prefix: [r.cluster_name for r in replicas])
+    monkeypatch.setattr(serve_state, 'add_or_update_replica',
+                        lambda *a, **k: None)
+    monkeypatch.setattr(serve_state, 'remove_replica', lambda *a, **k: None)
+    monkeypatch.setattr(serve_state, 'get_service_versions', lambda svc: [])
+    monkeypatch.setattr(controller_utils, 'can_terminate',
+                        lambda pool, in_flight=None: True)
+    monkeypatch.setattr(
+        serve_state, 'remove_ha_recovery_script',
+        lambda svc: events.append('remove_recovery_script'))
+
+
+def test_recovery_script_removed_after_replica_teardown(monkeypatch):
+    """The recovery script must be deleted only AFTER replica teardown runs."""
+    events = []
+
+    def _terminate(cluster_name, log_file_name):
+        events.append(f'teardown:{cluster_name}')
+
+    monkeypatch.setattr(replica_managers, 'terminate_cluster', _terminate)
+    _patch_common(monkeypatch, events, [_replica(1)])
+
+    failed = service._cleanup('svc', pool=False)
+
+    assert failed is False
+    assert events == ['teardown:c1', 'remove_recovery_script'], (
+        'recovery script must be removed only after replica teardown; '
+        f'got order {events}')
+
+
+def test_recovery_script_survives_until_all_replicas_torn_down(monkeypatch):
+    """With multiple replicas, the script removal must come after the LAST
+    teardown -- a crash before that point leaves recovery able to retry."""
+    events = []
+    lock = threading.Lock()
+
+    def _terminate(cluster_name, log_file_name):
+        with lock:
+            events.append(f'teardown:{cluster_name}')
+
+    monkeypatch.setattr(replica_managers, 'terminate_cluster', _terminate)
+    _patch_common(monkeypatch, events, [_replica(i) for i in range(3)])
+
+    service._cleanup('svc', pool=False)
+
+    assert events[-1] == 'remove_recovery_script', (
+        f'recovery script removed before all teardowns finished: {events}')
+    assert sorted(events[:-1]) == ['teardown:c0', 'teardown:c1', 'teardown:c2']
+
+
+def test_recovery_script_removed_once_on_clean_service(monkeypatch):
+    """No replicas: the script is still removed exactly once at the end."""
+    events = []
+    monkeypatch.setattr(replica_managers, 'terminate_cluster',
+                        lambda *a, **k: events.append('teardown'))
+    _patch_common(monkeypatch, events, [])
+
+    service._cleanup('svc', pool=False)
+
+    assert events == ['remove_recovery_script']

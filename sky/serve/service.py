@@ -142,9 +142,9 @@ def _cleanup(service_name: str, pool: bool) -> bool:
     """Clean up all service related resources, i.e. replicas and storage."""
     # Log who we are and what DB state we're cleaning up, so post-mortems
     # can correlate this with concurrent ha_recovery activity. _cleanup is
-    # destructive (it deletes the HA recovery script on the very next line
-    # and may delete the entire service row at the end), so an audit trail
-    # is worth a few WARN lines.
+    # destructive (it tears down replicas and, at the very end, deletes the
+    # HA recovery script and may delete the entire service row), so an audit
+    # trail is worth a few WARN lines.
     own_pid = os.getpid()
     try:
         svc_dbg = serve_state.get_service_from_name(service_name)
@@ -160,10 +160,14 @@ def _cleanup(service_name: str, pool: bool) -> bool:
         logger.warning(
             f'_cleanup entered for service {service_name} '
             f'(own_pid={own_pid}, db row not found — already removed?)')
-    # Cleanup the HA recovery script first as it is possible that some error
-    # was raised when we construct the task object (e.g.,
-    # sky.exceptions.ResourcesUnavailableError).
-    serve_state.remove_ha_recovery_script(service_name)
+    # NOTE: the HA recovery script is removed at the END of _cleanup (after
+    # replica teardown), NOT here. Removing it up-front opened a window where a
+    # controller-pod kill mid-teardown (HA pod move / node drain) left a durable
+    # service row with NO recovery script — ha_recovery_for_consolidation_mode
+    # then logs 'recovery script does not exist. Skipping recovery' forever and
+    # strands the service with replicas still consuming resources. Keeping the
+    # script until all destructive teardown finishes lets recovery re-run
+    # _cleanup if we die partway. See the removal at the end of this function.
     failed = False
     replica_infos = serve_state.get_replica_infos(service_name)
     info2thr: Dict[replica_managers.ReplicaInfo,
@@ -254,6 +258,15 @@ def _cleanup(service_name: str, pool: bool) -> bool:
     versions = serve_state.get_service_versions(service_name)
     if not all(map(cleanup_version_storage, versions)):
         failed = True
+
+    # All destructive teardown above is done; only now is it safe to drop the
+    # HA recovery script. If we had been killed partway through teardown the
+    # script would have survived, letting ha_recovery_for_consolidation_mode
+    # respawn the controller and re-run _cleanup instead of stranding the
+    # service. On the success path the caller's remove_service_completely also
+    # deletes it (idempotent); on the FAILED_CLEANUP path removing it here
+    # avoids a recovery loop on a cleanup that already ran to completion.
+    serve_state.remove_ha_recovery_script(service_name)
 
     # NOTE: do not delete version_specs here. The success path in `_start`
     # deletes them along with `remove_service`. Deleting them on failure
