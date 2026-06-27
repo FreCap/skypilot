@@ -11,7 +11,7 @@ import socket
 import sys
 import time
 import traceback
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, TYPE_CHECKING
 
 import filelock
 
@@ -35,6 +35,9 @@ from sky.utils import controller_utils
 from sky.utils import subprocess_utils
 from sky.utils import thread_utils
 from sky.utils import ux_utils
+
+if TYPE_CHECKING:
+    from sky.serve import service_spec as service_spec_lib
 
 # Use the explicit logger name so that the logger is under the
 # `sky.serve.service` namespace when executed directly, so as
@@ -380,6 +383,85 @@ def _bail_on_boot_failure(service_name: str,
     os._exit(1)  # pylint: disable=protected-access
 
 
+def _spawn_controller(
+        service_name: str, service_spec: 'service_spec_lib.SkyServiceSpec',
+        version: int, controller_host: str,
+        controller_port: int) -> multiprocessing.Process:
+    """Spawn (and start) the controller server subprocess for a service.
+
+    Factored out of `_start` so the supervision loop can respawn the
+    controller with identical arguments (same host/port) if it dies. See
+    `_respawn_controller_if_dead`.
+    """
+    process = multiprocessing.Process(target=controller.run_controller,
+                                      args=(service_name, service_spec, version,
+                                            controller_host, controller_port))
+    process.start()
+    return process
+
+
+def _respawn_controller_if_dead(
+        controller_process: Optional[multiprocessing.Process],
+        service_name: str, service_spec: 'service_spec_lib.SkyServiceSpec',
+        version: int, controller_host: str,
+        controller_port: int) -> Optional[multiprocessing.Process]:
+    """Respawn the controller server subprocess if it has exited.
+
+    The controller server (autoscaler + replica-manager threads + FastAPI app)
+    runs as a child of this `_start` parent. HA recovery only re-creates a
+    controller when the parent's `controller_pid` row disappears / a pod moves;
+    it does NOT cover the controller child dying (OOM, unhandled fault) while
+    the parent stays alive. In VM (non-consolidation) mode nothing covers that
+    at all -- the skylet event merely marks the service CONTROLLER_FAILED -- so
+    autoscaling, probing and replica reconciliation stop permanently until a
+    human re-ups.
+
+    Since this parent is alive and owns the DB `controller_pid` (unchanged by a
+    child respawn) and the LB targets a fixed `controller_host:controller_port`,
+    the parent can simply restart the controller child IN PLACE on the SAME
+    port. The new controller rebuilds its state from the DB exactly like a
+    fresh recovery; the DB row and the LB need no changes.
+
+    Best-effort: a respawn that fails to bind is killed and retried on the next
+    tick. We never raise out of here -- that would hit `_start`'s finally and
+    trigger destructive `_cleanup`.
+    """
+    if controller_process is None or controller_process.is_alive():
+        return controller_process
+    logger.error(
+        f'Serve controller subprocess (pid={controller_process.pid}) exited '
+        f'with exitcode {controller_process.exitcode}; respawning on '
+        f'{controller_host}:{controller_port}.')
+    # Reap any lingering grandchildren of the dead controller before reusing
+    # its port (best-effort; the dead pid may already be gone).
+    try:
+        subprocess_utils.kill_children_processes(
+            parent_pids=[controller_process.pid], force=True)
+    except Exception:  # pylint: disable=broad-except
+        pass
+    new_process = _spawn_controller(service_name, service_spec, version,
+                                    controller_host, controller_port)
+    try:
+        _wait_for_controller_ready(
+            controller_host, controller_port,
+            timeout=constants.SERVICE_REGISTER_TIMEOUT_SECONDS)
+    except RuntimeError as e:
+        # Do NOT propagate: that would reach _start's finally -> destructive
+        # _cleanup. Kill the not-yet-bound respawn and keep the (dead) handle
+        # so the next tick retries cleanly.
+        logger.error(f'Respawned controller failed to bind for {service_name}: '
+                     f'{e}; will retry on the next tick.')
+        try:
+            subprocess_utils.kill_children_processes(
+                parent_pids=[new_process.pid], force=True)
+        except Exception:  # pylint: disable=broad-except
+            pass
+        return controller_process
+    logger.info(f'Serve controller subprocess for {service_name} respawned '
+                'and ready.')
+    return new_process
+
+
 def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
     """Starts the service.
     This including the controller and load balancer.
@@ -515,11 +597,9 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
                 return '127.0.0.1'
 
             controller_host = _get_controller_host()
-            controller_process = multiprocessing.Process(
-                target=controller.run_controller,
-                args=(service_name, service_spec, version, controller_host,
-                      controller_port))
-            controller_process.start()
+            controller_process = _spawn_controller(service_name, service_spec,
+                                                   version, controller_host,
+                                                   controller_port)
             logger.debug(f'_start() spawned controller_process pid='
                          f'{controller_process.pid} host={controller_host} '
                          f'port={controller_port}')
@@ -605,6 +685,11 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
         # matters in HA deployments and is checked once per
         # interval to avoid DB load.
         orphan_check_interval_seconds = 30
+        # How often to check that the controller child is still alive and
+        # respawn it if it died (a cheap local is_alive() poll). Capped at this
+        # cadence so a controller that crash-loops on boot is respawned at most
+        # once per interval.
+        controller_respawn_check_interval_seconds = 5
         own_pid = os.getpid()
         loop_count = 0
         while True:
@@ -637,6 +722,16 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
                         f'{own_pid}; another instance has taken over. '
                         'Exiting as orphan without running cleanup.')
                     _orphan_exit(controller_process, load_balancer_process)
+            # Respawn the controller child if it died while we (the parent)
+            # are still alive and still own the DB row. HA recovery does not
+            # cover this case, and in VM mode nothing does -- the service would
+            # otherwise stop autoscaling / probing / reconciling permanently.
+            # Skipped if a respawn would race the orphan-exit above (handled
+            # first this tick).
+            if loop_count % controller_respawn_check_interval_seconds == 0:
+                controller_process = _respawn_controller_if_dead(
+                    controller_process, service_name, service_spec, version,
+                    controller_host, controller_port)
             time.sleep(1)
     except exceptions.ServeUserTerminatedError:
         logger.debug(f'Caught ServeUserTerminatedError for '
