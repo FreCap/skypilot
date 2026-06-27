@@ -456,31 +456,39 @@ def _respawn_controller_if_dead(
         logger.warning(f'Could not reload latest version/spec for '
                        f'{service_name} on respawn ({e}); using the captured '
                        f'version {version}.')
-    # Spawn + readiness wait, fully contained: a failure here must NOT propagate
-    # (it would reach _start's finally -> destructive _cleanup).
+    # Bring the replacement up under the same port-selection lock the initial
+    # startup uses, so a concurrent service sharing this controller pod cannot
+    # grab our port mid-respawn. Accept the respawn ONLY if our child is still
+    # alive after readiness: a child that lost the port race would have exited,
+    # and the readiness probe (a bare loopback TCP connect) would otherwise
+    # connect to whatever else now holds the port and falsely report success --
+    # cross-wiring this service's load balancer to another service's controller.
+    # The whole attempt is contained: any failure must NOT propagate (it would
+    # reach _start's finally -> destructive _cleanup); we kill the not-ready
+    # respawn and keep the dead handle so the next tick retries.
+    new_process = None
     try:
-        new_process = _spawn_controller(service_name, service_spec, version,
-                                        controller_host, controller_port)
+        with filelock.FileLock(
+                os.path.expanduser(constants.PORT_SELECTION_FILE_LOCK_PATH)):
+            new_process = _spawn_controller(service_name, service_spec, version,
+                                            controller_host, controller_port)
+            _wait_for_controller_ready(
+                controller_host, controller_port,
+                timeout=constants.SERVICE_REGISTER_TIMEOUT_SECONDS)
+            if not new_process.is_alive():
+                raise RuntimeError(
+                    'replacement controller exited during startup; its port '
+                    'may have been taken by another service on this pod')
     except Exception as e:  # pylint: disable=broad-except
-        logger.error(f'Failed to spawn replacement controller for '
-                     f'{service_name}: {common_utils.format_exception(e)}; '
-                     f'will retry on the next tick.')
-        return controller_process
-    try:
-        _wait_for_controller_ready(
-            controller_host, controller_port,
-            timeout=constants.SERVICE_REGISTER_TIMEOUT_SECONDS)
-    except Exception as e:  # pylint: disable=broad-except
-        # Kill the not-yet-ready respawn and keep the (dead) handle so the next
-        # tick retries cleanly.
-        logger.error(f'Respawned controller failed to become ready for '
-                     f'{service_name}: {common_utils.format_exception(e)}; '
-                     f'will retry on the next tick.')
-        try:
-            subprocess_utils.kill_children_processes(
-                parent_pids=[new_process.pid], force=True)
-        except Exception:  # pylint: disable=broad-except
-            pass
+        logger.error(f'Failed to respawn controller for {service_name}: '
+                     f'{common_utils.format_exception(e)}; will retry on the '
+                     f'next tick.')
+        if new_process is not None:
+            try:
+                subprocess_utils.kill_children_processes(
+                    parent_pids=[new_process.pid], force=True)
+            except Exception:  # pylint: disable=broad-except
+                pass
         return controller_process
     logger.info(f'Serve controller subprocess for {service_name} respawned '
                 'and ready.')

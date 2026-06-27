@@ -32,11 +32,24 @@ class _FakeProc:
         return self._alive
 
 
+class _DummyLock:
+
+    def __init__(self, *a, **k):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
 def _mute_db_reload(monkeypatch, version=None, spec=None):
-    """Make the latest-version/spec reload a no-op (keep captured values)
-    unless explicit version/spec are provided."""
+    """Make the latest-version/spec reload a no-op (keep captured values) and
+    stub the port-selection filelock so tests don't touch the filesystem."""
     monkeypatch.setattr(serve_state, 'get_latest_version', lambda name: version)
     monkeypatch.setattr(serve_state, 'get_spec', lambda name, ver: spec)
+    monkeypatch.setattr(service.filelock, 'FileLock', _DummyLock)
 
 
 def test_alive_controller_not_respawned(monkeypatch):
@@ -140,3 +153,26 @@ def test_readiness_failure_retries_without_raising(monkeypatch):
 
     assert out is dead, 'a not-ready respawn keeps the dead handle to retry'
     assert new.pid in killed, 'the not-ready respawn must be reaped'
+
+
+def test_rejects_respawn_that_exited_during_startup(monkeypatch):
+    """If readiness 'succeeds' but our replacement process has exited (e.g. it
+    lost the port race and the probe connected to another service's controller
+    on the reused port), the respawn must be rejected -- not returned as
+    healthy, which would cross-wire this service to another's controller."""
+    dead = _FakeProc(alive=False, pid=111, exitcode=1)
+    exited = _FakeProc(alive=False, pid=222, exitcode=1)  # lost the port race
+    killed = []
+    monkeypatch.setattr(service, '_spawn_controller', lambda *a, **k: exited)
+    monkeypatch.setattr(service, '_wait_for_controller_ready',
+                        lambda *a, **k: None)  # probe connects to *someone*
+    _mute_db_reload(monkeypatch)
+    monkeypatch.setattr(
+        subprocess_utils, 'kill_children_processes',
+        lambda parent_pids, force=False: killed.extend(parent_pids))
+
+    out = service._respawn_controller_if_dead(dead, 'svc', object(), 1,
+                                              '127.0.0.1', 20001)
+
+    assert out is dead, 'a replacement that exited during startup is rejected'
+    assert 222 in killed, 'the exited replacement must be reaped'
