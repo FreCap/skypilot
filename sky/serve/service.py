@@ -11,7 +11,7 @@ import socket
 import sys
 import time
 import traceback
-from typing import Any, Dict, Optional, TYPE_CHECKING
+from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
 
 import filelock
 
@@ -389,9 +389,8 @@ def _spawn_controller(
         controller_port: int) -> multiprocessing.Process:
     """Spawn (and start) the controller server subprocess for a service.
 
-    Factored out of `_start` so the supervision loop can respawn the
-    controller with identical arguments (same host/port) if it dies. See
-    `_respawn_controller_if_dead`.
+    Factored out of `_start` so the supervision loop can re-create the
+    controller (on a fresh port) if it dies. See `_respawn_controller_and_lb`.
     """
     process = multiprocessing.Process(target=controller.run_controller,
                                       args=(service_name, service_spec, version,
@@ -400,99 +399,140 @@ def _spawn_controller(
     return process
 
 
-def _respawn_controller_if_dead(
-        controller_process: Optional[multiprocessing.Process],
-        service_name: str, service_spec: 'service_spec_lib.SkyServiceSpec',
-        version: int, controller_host: str,
-        controller_port: int) -> Optional[multiprocessing.Process]:
-    """Respawn the controller server subprocess if it has exited.
+def _spawn_load_balancer(
+        controller_addr: str, load_balancer_port: int,
+        service_spec: 'service_spec_lib.SkyServiceSpec',
+        load_balancer_log_file: str) -> multiprocessing.Process:
+    """Spawn (and start) the load balancer subprocess.
 
-    The controller server (autoscaler + replica-manager threads + FastAPI app)
-    runs as a child of this `_start` parent. HA recovery only re-creates a
-    controller when the parent's `controller_pid` row disappears / a pod moves;
-    it does NOT cover the controller child dying (OOM, unhandled fault) while
-    the parent stays alive. In VM (non-consolidation) mode nothing covers that
-    at all -- the skylet event merely marks the service CONTROLLER_FAILED -- so
-    autoscaling, probing and replica reconciliation stop permanently until a
-    human re-ups.
-
-    Since this parent is alive and owns the DB `controller_pid` (unchanged by a
-    child respawn) and the LB targets a fixed `controller_host:controller_port`,
-    the parent can simply restart the controller child IN PLACE on the SAME
-    port. The new controller rebuilds its state from the DB exactly like a
-    fresh recovery; the DB row and the LB need no changes. We reload the latest
-    version + spec from the DB rather than reusing the values `_start` captured
-    at boot, so a respawn AFTER a `/update_service` does not regress the
-    controller to the old spec/version.
-
-    Best-effort: any spawn / readiness failure is contained, the not-yet-ready
-    respawn is killed, and the dead handle is returned so the next tick
-    retries. We never raise out of here -- that would hit `_start`'s finally and
-    trigger destructive `_cleanup`.
+    It serves the public `load_balancer_port` and syncs with the controller at
+    `controller_addr`. Factored out so the controller respawn can restart the
+    LB pointing at the new controller addr, and a dead LB can be restarted.
     """
-    if controller_process is None or controller_process.is_alive():
-        return controller_process
-    logger.error(
-        f'Serve controller subprocess (pid={controller_process.pid}) exited '
-        f'with exitcode {controller_process.exitcode}; respawning on '
-        f'{controller_host}:{controller_port}.')
-    # Reap any lingering grandchildren of the dead controller before reusing
-    # its port (best-effort; the dead pid may already be gone).
+    process = multiprocessing.Process(
+        target=ux_utils.RedirectOutputForProcess(
+            load_balancer.run_load_balancer, load_balancer_log_file).run,
+        args=(controller_addr, load_balancer_port,
+              service_spec.load_balancing_policy, service_spec.tls_credential,
+              service_spec.target_qps_per_replica,
+              service_spec.lb_stream_timeout_seconds))
+    process.start()
+    return process
+
+
+def _kill_process(process: Optional[multiprocessing.Process]) -> None:
+    """Best-effort SIGKILL of a subprocess and its children."""
+    if process is None:
+        return
     try:
-        subprocess_utils.kill_children_processes(
-            parent_pids=[controller_process.pid], force=True)
+        subprocess_utils.kill_children_processes(parent_pids=[process.pid],
+                                                 force=True)
     except Exception:  # pylint: disable=broad-except
         pass
-    # Reload the latest version + spec from the DB so a respawn after a service
-    # update doesn't bring the controller back on the stale spec/version this
-    # _start captured at boot. Fall back to the captured values on any DB error.
+
+
+def _ensure_load_balancer(
+        lb_process: Optional[multiprocessing.Process], controller_addr: str,
+        load_balancer_port: int,
+        service_spec: 'service_spec_lib.SkyServiceSpec',
+        load_balancer_log_file: str) -> Optional[multiprocessing.Process]:
+    """Ensure the load balancer is running for a non-pool service.
+
+    Restarts it -- on the same public `load_balancer_port`, pointing at
+    `controller_addr` -- if it is missing or dead. Pool services have no LB.
+    Contained: never raises into _start's destructive cleanup.
+    """
+    if service_spec.pool:
+        return lb_process
+    if lb_process is not None and lb_process.is_alive():
+        return lb_process
+    _kill_process(lb_process)
     try:
-        latest_version = serve_state.get_latest_version(service_name)
-        if latest_version is not None:
-            latest_spec = serve_state.get_spec(service_name, latest_version)
-            if latest_spec is not None:
-                version, service_spec = latest_version, latest_spec
+        return _spawn_load_balancer(controller_addr, load_balancer_port,
+                                    service_spec, load_balancer_log_file)
+    except Exception as e:  # pylint: disable=broad-except
+        logger.error(f'Failed to (re)start the load balancer: '
+                     f'{common_utils.format_exception(e)}; will retry.')
+        return None
+
+
+def _respawn_controller_and_lb(
+    service_name: str, service_spec: 'service_spec_lib.SkyServiceSpec',
+    version: int, controller_host: str, load_balancer_port: int,
+    load_balancer_log_file: str,
+    dead_controller: Optional[multiprocessing.Process],
+    old_lb: Optional[multiprocessing.Process]
+) -> Optional[Tuple[multiprocessing.Process,
+                    Optional[multiprocessing.Process], int]]:
+    """Re-create the controller (on a FRESH port) and restart the LB after the
+    controller child died while the _start parent is still alive.
+
+    HA recovery only re-creates a controller when the parent `controller_pid`
+    row disappears / a pod moves; it does NOT cover the controller child dying
+    while the parent stays alive, and in VM mode nothing does -- autoscaling,
+    probing and reconciliation would otherwise stop permanently.
+
+    A fresh controller port, chosen free under the port-selection lock, avoids
+    the cross-wiring a same-port reuse risks when services share a controller
+    pod: another service cannot already hold a port we just found free and hold
+    the lock for. The LB is restarted pointing at the new controller addr but on
+    the SAME public `load_balancer_port`, so the service endpoint is stable. The
+    DB controller_port is updated; controller_pid/ip (the live parent) and the
+    public load_balancer_port are unchanged.
+
+    Returns (controller_process, lb_process, controller_port) on success, or
+    None on failure (retry next tick). Never raises into _start's destructive
+    cleanup. The OLD load balancer is left running until the new controller is
+    confirmed, so the data plane is not dropped during retries.
+    """
+    # Reload the latest version + spec so a respawn after /update_service uses
+    # the current config (fall back to captured values on a DB error).
+    try:
+        latest = serve_state.get_latest_version(service_name)
+        if latest is not None:
+            spec = serve_state.get_spec(service_name, latest)
+            if spec is not None:
+                version, service_spec = latest, spec
     except Exception as e:  # pylint: disable=broad-except
         logger.warning(f'Could not reload latest version/spec for '
-                       f'{service_name} on respawn ({e}); using the captured '
+                       f'{service_name} on respawn ({e}); using captured '
                        f'version {version}.')
-    # Bring the replacement up under the same port-selection lock the initial
-    # startup uses, so a concurrent service sharing this controller pod cannot
-    # grab our port mid-respawn. Accept the respawn ONLY if our child is still
-    # alive after readiness: a child that lost the port race would have exited,
-    # and the readiness probe (a bare loopback TCP connect) would otherwise
-    # connect to whatever else now holds the port and falsely report success --
-    # cross-wiring this service's load balancer to another service's controller.
-    # The whole attempt is contained: any failure must NOT propagate (it would
-    # reach _start's finally -> destructive _cleanup); we kill the not-ready
-    # respawn and keep the dead handle so the next tick retries.
-    new_process = None
+
+    new_controller = None
     try:
         with filelock.FileLock(
                 os.path.expanduser(constants.PORT_SELECTION_FILE_LOCK_PATH)):
-            new_process = _spawn_controller(service_name, service_spec, version,
-                                            controller_host, controller_port)
+            controller_port = common_utils.find_free_port(
+                constants.CONTROLLER_PORT_START)
+            new_controller = _spawn_controller(service_name, service_spec,
+                                               version, controller_host,
+                                               controller_port)
             _wait_for_controller_ready(
                 controller_host, controller_port,
                 timeout=constants.SERVICE_REGISTER_TIMEOUT_SECONDS)
-            if not new_process.is_alive():
+            if not new_controller.is_alive():
                 raise RuntimeError(
-                    'replacement controller exited during startup; its port '
-                    'may have been taken by another service on this pod')
+                    'replacement controller exited during startup')
+            serve_state.set_service_controller_port(service_name,
+                                                    controller_port)
     except Exception as e:  # pylint: disable=broad-except
-        logger.error(f'Failed to respawn controller for {service_name}: '
-                     f'{common_utils.format_exception(e)}; will retry on the '
-                     f'next tick.')
-        if new_process is not None:
-            try:
-                subprocess_utils.kill_children_processes(
-                    parent_pids=[new_process.pid], force=True)
-            except Exception:  # pylint: disable=broad-except
-                pass
-        return controller_process
-    logger.info(f'Serve controller subprocess for {service_name} respawned '
-                'and ready.')
-    return new_process
+        logger.error(f'Failed to bring up a replacement controller for '
+                     f'{service_name}: {common_utils.format_exception(e)}; '
+                     f'will retry on the next tick.')
+        _kill_process(new_controller)
+        return None  # old LB left running -> data plane preserved during retry
+
+    # Controller is up on the new port. Reap the dead controller's leftovers,
+    # then restart the LB (it targeted the dead controller's addr) on the same
+    # public port. The brief LB gap is unavoidable for an addr change.
+    _kill_process(dead_controller)
+    _kill_process(old_lb)
+    controller_addr = f'http://{controller_host}:{controller_port}'
+    new_lb = _ensure_load_balancer(None, controller_addr, load_balancer_port,
+                                   service_spec, load_balancer_log_file)
+    logger.info(f'Controller for {service_name} respawned on fresh port '
+                f'{controller_port}; load balancer restarted.')
+    return new_controller, new_lb, controller_port
 
 
 def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
@@ -755,16 +795,30 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
                         f'{own_pid}; another instance has taken over. '
                         'Exiting as orphan without running cleanup.')
                     _orphan_exit(controller_process, load_balancer_process)
-            # Respawn the controller child if it died while we (the parent)
-            # are still alive and still own the DB row. HA recovery does not
-            # cover this case, and in VM mode nothing does -- the service would
+            # Keep the serve subprocesses alive while we (the parent) own the
+            # DB row. HA recovery does not cover a child dying while the parent
+            # stays alive, and in VM mode nothing does -- the service would
             # otherwise stop autoscaling / probing / reconciling permanently.
-            # Skipped if a respawn would race the orphan-exit above (handled
-            # first this tick).
+            # A dead controller is re-created on a FRESH port (avoiding cross-
+            # wiring) and the LB restarted to point at it; otherwise the LB is
+            # ensured up (it may have died on its own, or a prior respawn's LB
+            # restart may have failed). Runs after the orphan-exit above.
             if loop_count % controller_respawn_check_interval_seconds == 0:
-                controller_process = _respawn_controller_if_dead(
-                    controller_process, service_name, service_spec, version,
-                    controller_host, controller_port)
+                if (controller_process is not None and
+                        not controller_process.is_alive()):
+                    result = _respawn_controller_and_lb(
+                        service_name, service_spec, version, controller_host,
+                        load_balancer_port, load_balancer_log_file,
+                        controller_process, load_balancer_process)
+                    if result is not None:
+                        (controller_process, load_balancer_process,
+                         controller_port) = result
+                else:
+                    load_balancer_process = _ensure_load_balancer(
+                        load_balancer_process,
+                        f'http://{controller_host}:{controller_port}',
+                        load_balancer_port, service_spec,
+                        load_balancer_log_file)
             time.sleep(1)
     except exceptions.ServeUserTerminatedError:
         logger.debug(f'Caught ServeUserTerminatedError for '
