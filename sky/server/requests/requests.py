@@ -1640,10 +1640,21 @@ class SqliteRequestBackend(request_storage.RequestBackend):
     def get_shutdown_active_requests(self) -> List[Tuple[str, str]]:
         """Get (request_id, name) pairs to wait for during graceful shutdown."""
 
+        # WAITING is included alongside PENDING/RUNNING because it is a
+        # non-terminal status (see active_statuses): a request is parked in
+        # WAITING while it waits to resume -- a retry backoff or an external
+        # continue-condition -- with its resume timer living only in an
+        # in-memory monitor thread. If graceful shutdown skipped WAITING, that
+        # request would be neither waited for nor handed to
+        # interrupt_request_for_retry, so should_retry would never be set; the
+        # in-memory timer would die with the process and the row would be wiped
+        # by reset_db_and_logs on the next boot -- silently dropping the
+        # request on a clean restart with no retry signal to the client.
         tasks = self.query_requests(
             RequestTaskFilter(
                 status=[
                     RequestStatus.PENDING,
+                    RequestStatus.WAITING,
                     RequestStatus.RUNNING,
                 ],
                 fields=['request_id', 'name'],
