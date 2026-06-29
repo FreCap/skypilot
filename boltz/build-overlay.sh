@@ -2,9 +2,12 @@
 # Build (and optionally push) the boltz overlay image from THIS fork checkout.
 # Run from anywhere inside the repo; uses the current HEAD.
 #
-# Overlays only the fork's changed runtime files (git diff <FORK_BASE> HEAD --
-# 'sky/**', tests excluded) onto the pinned upstream nightly. Minimal on purpose:
-# we never shadow base-image package files that must match the installed wheel.
+# Overlays the fork's changed runtime files (git diff <FORK_BASE> HEAD --
+# 'sky/**', tests excluded) onto the pinned upstream nightly, PLUS any fork
+# sky/ module the base image is missing (a file present at the fork base but
+# dropped by the newer nightly that the fork still imports). We never shadow
+# base files the diff leaves unchanged — only changed files and base-missing
+# modules are copied, so the deployed sky/ stays consistent with the fork.
 #
 #   PUSH=true TAG=<ecr>/skypilot-nightly-boltz:<ver>-<n> ./boltz/build-overlay.sh
 #
@@ -34,6 +37,37 @@ while IFS= read -r f; do [ -n "$f" ] && files+=("$f"); done < <(
   git diff --name-only "$FORK_BASE" HEAD -- 'sky/**' | grep -vE '(^|/)tests?/')
 if [ "${#files[@]}" -eq 0 ]; then echo "  none — aborting" >&2; exit 1; fi
 printf '   %s\n' "${files[@]}"
+
+# The diff above is "changed vs the fork base", which deliberately leaves
+# unchanged files to the (newer) nightly wheel. But a module that exists at the
+# fork base and is still imported by the fork, yet was REMOVED in the newer
+# upstream nightly, is in neither set — so it vanishes from the image and the
+# server crashes at startup (e.g. sky/jobs/managed_job_refresh_thread.py ->
+# ImportError at boot). Detect and additionally carry those base-missing fork
+# modules. We add only files the base LACKS, never shadowing base files the diff
+# intentionally leaves to the newer wheel.
+echo ">> Checking for fork sky/ modules absent from the base image"
+base_sky_files="$(docker run --rm "$BASE_IMAGE" python - <<'PY'
+import os, sky
+root = os.path.dirname(sky.__file__)
+parent = os.path.dirname(root)
+for dirpath, _dirs, names in os.walk(root):
+    for name in names:
+        print(os.path.relpath(os.path.join(dirpath, name), parent))
+PY
+)"
+carried=()
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  case "$f" in */tests/*|*/test/*) continue ;; esac
+  printf '%s\n' "${files[@]}" | grep -qxF -- "$f" && continue  # already in diff set
+  grep -qxF -- "$f" <<<"$base_sky_files" && continue           # present in base
+  files+=("$f"); carried+=("$f")
+done < <(git ls-tree -r --name-only HEAD -- 'sky' | grep -E '\.py$')
+if [ "${#carried[@]}" -gt 0 ]; then
+  echo ">> Carrying ${#carried[@]} fork module(s) absent from the base image:"
+  printf '   + %s\n' "${carried[@]}"
+fi
 
 ctx="$(mktemp -d)"; trap 'rm -rf "$ctx"' EXIT
 for f in "${files[@]}"; do mkdir -p "$ctx/$(dirname "$f")"; cp "$f" "$ctx/$f"; done
