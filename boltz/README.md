@@ -5,7 +5,10 @@ live control plane as a thin **overlay image** — only this fork's changed `sky
 the pinned upstream `berkeleyskypilot/skypilot-nightly` base (so we never shadow base-image package
 files that must match the installed wheel).
 
-- **Build/verify locally:** `./boltz/build-overlay.sh` (add `PUSH=true TAG=<ref>` to push).
+- **Build/verify locally:** `./boltz/build-overlay.sh` (add `PUSH=true TAG=<ref>` to push). The
+  overlay baseline is derived as `git merge-base HEAD upstream/master`, so add the upstream remote
+  once: `git remote add upstream https://github.com/skypilot-org/skypilot.git && git fetch upstream
+  master` (or pass an explicit `FORK_BASE=<sha>`).
 - **Publish:** `.github/workflows/boltz-overlay-publish.yml` builds on every `improvements` push and
   pushes to `255203429798.dkr.ecr.us-east-1.amazonaws.com/skypilot-nightly-boltz`, tagged
   `<BASE_VER>-g<sha>` (immutable) and `<BASE_VER>-improvements` (moving).

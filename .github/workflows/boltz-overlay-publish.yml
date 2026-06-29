@@ -36,6 +36,14 @@ jobs:
         with:
           fetch-depth: 0   # need history for the overlay diff against the fork base
 
+      - name: Fetch upstream base ref
+        # build-overlay.sh derives the overlay baseline from
+        # `git merge-base HEAD upstream/master`, so make that ref resolvable.
+        # Objects are already in the fork's history, so this is a cheap ref sync.
+        run: |
+          git remote add upstream https://github.com/skypilot-org/skypilot.git 2>/dev/null || true
+          git fetch --no-tags upstream master
+
       - name: Resolve config
         id: cfg
         run: |
