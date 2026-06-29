@@ -1640,23 +1640,18 @@ class SqliteRequestBackend(request_storage.RequestBackend):
     def get_shutdown_active_requests(self) -> List[Tuple[str, str]]:
         """Get (request_id, name) pairs to wait for during graceful shutdown."""
 
-        # WAITING is included alongside PENDING/RUNNING because it is a
-        # non-terminal status (see active_statuses): a request is parked in
-        # WAITING while it waits to resume -- a retry backoff or an external
-        # continue-condition -- with its resume timer living only in an
-        # in-memory monitor thread. If graceful shutdown skipped WAITING, that
-        # request would be neither waited for nor handed to
-        # interrupt_request_for_retry, so should_retry would never be set; the
-        # in-memory timer would die with the process and the row would be wiped
-        # by reset_db_and_logs on the next boot -- silently dropping the
-        # request on a clean restart with no retry signal to the client.
+        # Wait on every non-terminal request. Use active_statuses() rather than
+        # re-hardcoding the list: this query was the lone outlier that drifted
+        # out of sync and silently dropped the (fork-added) WAITING status. A
+        # request parked in WAITING -- on a retry backoff or an external
+        # continue-condition, with its resume timer living only in an in-memory
+        # monitor thread -- would otherwise be neither waited for nor handed to
+        # interrupt_request_for_retry, so should_retry would never be set; its
+        # timer would die with the process and reset_db_and_logs would wipe the
+        # row on the next boot, silently dropping it on a clean restart.
         tasks = self.query_requests(
             RequestTaskFilter(
-                status=[
-                    RequestStatus.PENDING,
-                    RequestStatus.WAITING,
-                    RequestStatus.RUNNING,
-                ],
+                status=RequestStatus.active_statuses(),
                 fields=['request_id', 'name'],
             ))
         return [(t.request_id, t.name) for t in tasks]

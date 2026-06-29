@@ -76,10 +76,15 @@ async def test_shutdown_active_requests_matches_active_statuses(
     # The shutdown query must cover every non-terminal status, so no in-flight
     # request can slip past graceful shutdown unpreserved.
     backend = request_storage.get_request_backend()
+    expected_ids = set()
     for i, status in enumerate(RequestStatus.active_statuses()):
+        request_id = f'req-{i}'
         assert await requests.create_if_not_exists_async(
-            _make_request(f'req-{i}', status))
+            _make_request(request_id, status))
+        expected_ids.add(request_id)
 
     active_ids = {rid for rid, _ in backend.get_shutdown_active_requests()}
 
-    assert len(active_ids) == len(RequestStatus.active_statuses())
+    # Set equality, not just count: a query that swapped one active status for
+    # an equal number of others (the exact drift this guards) would still fail.
+    assert active_ids == expected_ids
