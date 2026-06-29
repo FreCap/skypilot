@@ -15,7 +15,11 @@
 #   BASE_VER   upstream nightly tag to base on (keep in sync with the platform
 #              chart_version, normalized "-dev." -> ".dev"). Default below.
 #   BASE_IMAGE override the full base image (default berkeleyskypilot/...:$BASE_VER)
-#   FORK_BASE  the upstream-import commit on this fork (overlay diff baseline)
+#   FORK_BASE  overlay diff baseline. Default: the fork's divergence point from
+#              upstream ("git merge-base HEAD $UPSTREAM_REF"), so it tracks the
+#              fork automatically across upstream syncs/rebases. Set to pin one.
+#   UPSTREAM_REF  ref used to derive FORK_BASE (default upstream/master). CI adds
+#              the skypilot-org remote and fetches it before building.
 #   TAG        full image ref to build/push (default builds a local dev tag)
 #   PUSH       "true" to docker push (default false)
 #   PLATFORM   docker build --platform (default linux/amd64 — control-plane arch)
@@ -26,10 +30,28 @@ cd "$repo_root"
 
 BASE_VER="${BASE_VER:-1.0.0.dev20260620}"
 BASE_IMAGE="${BASE_IMAGE:-berkeleyskypilot/skypilot-nightly:${BASE_VER}}"
-FORK_BASE="${FORK_BASE:-87aeb8a}"
 PLATFORM="${PLATFORM:-linux/amd64}"
 TAG="${TAG:-skypilot-nightly-boltz:${BASE_VER}-dev}"
 PUSH="${PUSH:-false}"
+UPSTREAM_REF="${UPSTREAM_REF:-upstream/master}"
+
+# Resolve the overlay baseline: the upstream commit the fork diverges from. Prefer
+# an explicit FORK_BASE; otherwise derive it as the merge-base of HEAD and the
+# upstream master ref. This tracks the fork across upstream syncs/rebases instead
+# of pinning a commit that vanishes when history is rewritten (the old hardcoded
+# import sha did exactly that, silently widening the overlay to upstream's delta).
+if [ -z "${FORK_BASE:-}" ]; then
+  if ! git rev-parse --verify --quiet "${UPSTREAM_REF}^{commit}" >/dev/null; then
+    echo "error: cannot resolve '${UPSTREAM_REF}' to derive the overlay baseline." >&2
+    echo "       In CI the workflow fetches it; locally run:" >&2
+    echo "         git remote add upstream https://github.com/skypilot-org/skypilot.git" >&2
+    echo "         git fetch upstream master" >&2
+    echo "       or pass an explicit FORK_BASE=<sha>." >&2
+    exit 1
+  fi
+  FORK_BASE="$(git merge-base HEAD "${UPSTREAM_REF}")"
+fi
+echo ">> Overlay baseline FORK_BASE=$(git rev-parse --short "$FORK_BASE") ($(git log -1 --format=%s "$FORK_BASE"))"
 
 echo ">> Overlay file set (git diff ${FORK_BASE}..HEAD -- 'sky/**'):"
 files=()
