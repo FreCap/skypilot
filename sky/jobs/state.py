@@ -1382,13 +1382,13 @@ def get_managed_job_tasks(job_id: int) -> List[Dict[str, Any]]:
     jobs = []
     for row in rows:
         job_dict = _get_jobs_dict(row._mapping)  # pylint: disable=protected-access
-        # LINT.IfChange(managed_job_row_decode)
+        # WARNING: Keep this decode (enum conversion + job_name fallback) in
+        # sync with get_jobs_status_check_info.
         job_dict['status'] = ManagedJobStatus(job_dict['status'])
         job_dict['schedule_state'] = ManagedJobScheduleState(
             job_dict['schedule_state'])
         if job_dict['job_name'] is None:
             job_dict['job_name'] = job_dict['task_name']
-        # LINT.ThenChange(:status_check_row_decode)
         job_dict['metadata'] = json.loads(job_dict['metadata'])
 
         # Add user YAML content for managed jobs.
@@ -1414,8 +1414,7 @@ def get_managed_job_tasks(job_id: int) -> List[Dict[str, Any]]:
 _STATUS_CHECK_JOB_ID_CHUNK = 500
 
 
-def get_jobs_status_check_info(
-        job_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+def get_jobs_status_check_info(job_ids: List[int]) -> Dict[int, Dict[str, Any]]:
     """Batched, slim fetch of the fields the status-refresh tick needs.
 
     ``update_managed_jobs_statuses`` only consumes a handful of small scalar
@@ -1468,11 +1467,12 @@ def get_jobs_status_check_info(
             mapping = row._mapping  # pylint: disable=protected-access
             job_id = mapping['spot_job_id']
             info = result.get(job_id)
+            # WARNING: Keep this decode (enum conversion + job_name fallback)
+            # in sync with get_managed_job_tasks.
             if info is None:
-                # LINT.IfChange(status_check_row_decode)
                 info = {
-                    'schedule_state':
-                        ManagedJobScheduleState(mapping['schedule_state']),
+                    'schedule_state': ManagedJobScheduleState(
+                        mapping['schedule_state']),
                     'controller_pid': mapping['controller_pid'],
                     'controller_pid_started_at':
                         mapping['controller_pid_started_at'],
@@ -1490,7 +1490,6 @@ def get_jobs_status_check_info(
                 'status': ManagedJobStatus(mapping['status']),
                 'job_name': job_name,
             })
-            # LINT.ThenChange(:managed_job_row_decode)
     return result
 
 
@@ -2209,9 +2208,10 @@ def get_pool_from_job_id(job_id: int) -> Optional[str]:
 def get_execution_from_job_id(job_id: int) -> Optional[str]:
     """Get the DAG execution mode ('parallel'/'serial') from the job id.
 
-    Returns None when the job is unknown or was created before the execution
-    column existed (legacy rows). Callers can use this to decide JobGroup-ness
-    without fetching and re-parsing the full DAG YAML.
+    Returns None when the job is unknown or its row has no recorded execution
+    mode (writers may store an explicit NULL, e.g. legacy code paths that
+    predate the column). Callers can use this to decide JobGroup-ness without
+    fetching and re-parsing the full DAG YAML.
     """
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
