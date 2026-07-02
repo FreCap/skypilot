@@ -68,7 +68,9 @@ def _setup(monkeypatch,
     monkeypatch.setattr(common_utils, 'find_free_port', lambda start: _PORT)
     monkeypatch.setattr(serve_state, 'set_service_controller_port_if_owner',
                         lambda name, pid, port: owns_row)
-    monkeypatch.setattr(serve_state, 'get_latest_version',
+    # The fork's respawn reload reads the latest COMMITTED version (see
+    # 94f8ef92b: skip NULL-yaml placeholder versions), not raw MAX(version).
+    monkeypatch.setattr(serve_state, 'get_latest_committed_version',
                         lambda name: latest_version)
     monkeypatch.setattr(serve_state, 'get_spec', lambda name, ver: latest_spec)
 
