@@ -155,8 +155,8 @@ class TestSkyPilotReplicaManagerInitOrdering:
 
 def _make_manager(service_name='svc', next_replica_id=1):
     """Build a bare SkyPilotReplicaManager with only the attributes the
-    recovery / scale-up id-allocator paths touch, skipping the heavy
-    __init__ (yaml parse, spot placer, daemon threads)."""
+    recovery / scale-up id-allocator and version-spec lookup paths touch,
+    skipping the heavy __init__ (yaml parse, spot placer, daemon threads)."""
     mgr = object.__new__(replica_managers.SkyPilotReplicaManager)
     mgr.lock = threading.RLock()
     mgr._service_name = service_name
