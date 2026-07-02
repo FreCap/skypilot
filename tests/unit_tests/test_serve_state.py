@@ -12,6 +12,7 @@ import sqlalchemy
 from sqlalchemy import create_engine
 from sqlalchemy import orm
 
+from sky.serve import constants as serve_constants
 from sky.serve import serve_state
 
 
@@ -54,8 +55,32 @@ def _add_minimal_service(name: str, controller_ip=None):
         pool=False,
         controller_pid=12345,
         entrypoint='entry',
+        # A None spec is stored as pickled None (like `add_version` does), so
+        # the read path (`_get_service_from_row`) skips the spec-dependent
+        # fields instead of calling SkyServiceSpec methods on it.
+        spec=None,
+        yaml_content='yaml: v1',
         controller_ip=controller_ip,
     )
+
+
+def _insert_orphan_service_row(engine, name: str, pool: bool = False):
+    """Insert a `services` row with no `version_specs` row.
+
+    Simulates the debris stranded by the pre-atomic registration path (or an
+    interrupted teardown) on an older controller; `add_service` can no longer
+    produce this state."""
+    with orm.Session(engine) as session:
+        session.execute(serve_state.services_table.insert().values(
+            name=name,
+            controller_job_id=1,
+            status=serve_state.ServiceStatus.CONTROLLER_INIT.value,
+            requested_resources_str='1x[CPU:1+]',
+            pool=int(pool),
+            controller_pid=12345,
+            hash='orphan',
+            entrypoint='entry'))
+        session.commit()
 
 
 class TestAddServiceWritesControllerIp:
@@ -89,15 +114,69 @@ class TestAddServiceWritesControllerIp:
         assert record['controller_ip'] == '10.0.0.7'
 
 
+class TestAddServiceAtomicRegistration:
+    """`add_service` must write the `services` row and its initial
+    `version_specs` row atomically. The two-write path (add_service then
+    add_or_update_version) had a crash window that stranded a `services` row
+    with no version row -- invisible to the latest-version INNER JOIN, so it
+    could never be recovered, removed, or have its name reused."""
+
+    def test_registration_is_visible_via_join(self, _mock_serve_db):
+        # The whole point: after the atomic write, the service is reachable
+        # through get_service_from_name (which INNER-JOINs version_specs),
+        # with its initial version row in place.
+        assert _add_minimal_service('svc-atomic') is True
+        assert serve_state.get_service_from_name('svc-atomic') is not None
+        assert (serve_state.get_latest_version('svc-atomic') ==
+                serve_constants.INITIAL_VERSION)
+        assert serve_state.get_yaml_content(
+            'svc-atomic', serve_constants.INITIAL_VERSION) == 'yaml: v1'
+
+    def test_duplicate_does_not_write_second_version_row(self, _mock_serve_db):
+        assert _add_minimal_service('svc-dup') is True
+        # A duplicate name returns False so up() can short-circuit, and must
+        # not write a second version row.
+        assert _add_minimal_service('svc-dup') is False
+        with orm.Session(_mock_serve_db) as session:
+            versions = session.execute(
+                sqlalchemy.select(
+                    serve_state.version_specs_table.c.version).where(
+                        serve_state.version_specs_table.c.service_name ==
+                        'svc-dup')).fetchall()
+        assert len(versions) == 1
+
+    def test_overwrites_stale_version_row(self, _mock_serve_db):
+        # A stale initial version row with no services row (left behind by an
+        # interrupted teardown on an older controller) must not block
+        # re-registration of the name: the initial version write is an upsert,
+        # matching the old add_or_update_version semantics.
+        serve_state.add_or_update_version('svc-stale',
+                                          serve_constants.INITIAL_VERSION, None,
+                                          'yaml: stale')
+        assert _read_row(_mock_serve_db, 'svc-stale') is None  # no svc row
+
+        assert _add_minimal_service('svc-stale') is True
+        assert serve_state.get_service_from_name('svc-stale') is not None
+        assert serve_state.get_yaml_content(
+            'svc-stale', serve_constants.INITIAL_VERSION) == 'yaml: v1'
+
+    def test_get_service_pool_from_db_sees_orphan_row(self, _mock_serve_db):
+        # The raw-pool accessor must read a version-less row (the orphan case)
+        # that get_service_from_name's inner join hides -- this is what gates
+        # the mode-scoped `down --purge` cleanup of such an orphan.
+        _insert_orphan_service_row(_mock_serve_db, 'svc-orphan')
+        assert serve_state.get_service_from_name('svc-orphan') is None
+        assert serve_state.get_service_pool_from_db('svc-orphan') is False
+        assert serve_state.get_service_pool_from_db('never-existed') is None
+
+
 class TestGetServiceFromNameReturnsControllerIp:
 
     def _add_with_version(self, service_name, controller_ip):
         # Reading via get_service_from_name requires a version_specs row
-        # (it's an INNER JOIN). Use the lightweight `add_version` helper,
-        # which inserts with spec=pickle.dumps(None) and yaml_content=NULL —
-        # enough for the JOIN to fire, no SkyServiceSpec wrangling needed.
+        # (it's an INNER JOIN); `add_service` writes the initial version row
+        # in the same transaction, so this is enough for the JOIN to fire.
         _add_minimal_service(service_name, controller_ip=controller_ip)
-        serve_state.add_version(service_name)
 
     def test_round_trips_controller_ip(self, _mock_serve_db):
         self._add_with_version('svc-rt', controller_ip='10.4.10.8')
@@ -209,6 +288,29 @@ class TestUpdateServiceControllerPidIpAndPort:
         assert record['controller_ip'] == '10.0.0.8'
         assert record['controller_port'] == 20007
         assert record['load_balancer_port'] == 30000  # untouched
+
+
+class TestSetServiceControllerPortIfOwner:
+    """Compare-and-swap port write for the in-place controller respawn: the
+    UPDATE must be filtered on controller_pid so a parent whose row was taken
+    over by HA recovery cannot clobber the new owner's port."""
+
+    def test_owner_updates_port(self, _mock_serve_db):
+        _add_minimal_service('svc')  # seeds controller_pid=12345
+        assert serve_state.set_service_controller_port_if_owner(
+            'svc', 12345, 20123) is True
+        assert _read_row(_mock_serve_db, 'svc')['controller_port'] == 20123
+
+    def test_non_owner_is_rejected(self, _mock_serve_db):
+        _add_minimal_service('svc')
+        serve_state.set_service_controller_port('svc', 20123)
+        assert serve_state.set_service_controller_port_if_owner(
+            'svc', 99999, 20999) is False
+        assert _read_row(_mock_serve_db, 'svc')['controller_port'] == 20123
+
+    def test_missing_service_returns_false(self, _mock_serve_db):
+        assert serve_state.set_service_controller_port_if_owner(
+            'never-existed', 12345, 20123) is False
 
 
 class TestSetServiceControllerIp:
@@ -330,71 +432,24 @@ class TestRemoveServiceCompletely:
 
 
 class TestRecoveryVersionSelection:
-    """`get_latest_committed_version` / `delete_uncommitted_versions` are the
-    core of the F4 fix: an interrupted `sky serve update` leaves a NULL-yaml
-    placeholder version (written by `add_version`) as MAX(version). Recovery
-    must resume the latest version whose yaml was actually committed, otherwise
-    the controller crash-loops asserting on the NULL yaml. These tests pin that
-    the placeholder is skipped and can be swept."""
+    """An interrupted `sky serve update` leaves a NULL-yaml placeholder
+    version (written by `add_version`) as MAX(version). Recovery must resume
+    the latest version whose yaml was actually committed, otherwise the
+    controller crash-loops asserting on the NULL yaml. These tests pin that
+    `get_latest_committed_version` skips the placeholder."""
 
     def test_committed_version_skips_placeholder(self, _mock_serve_db):
-        # v1 committed (yaml persisted), then an interrupted update creates a
-        # NULL-yaml placeholder v2 as the new MAX.
-        serve_state.add_or_update_version('svc', 1, 'spec-1', 'yaml: v1')
-        placeholder = serve_state.add_version('svc')
-        assert placeholder == 2
-        # Raw MAX points at the placeholder (the bug)...
-        assert serve_state.get_latest_version('svc') == 2
-        # ...but recovery must pick the last committed version.
-        assert serve_state.get_latest_committed_version('svc') == 1
-
-    def test_committed_version_is_latest_committed_not_first(
-            self, _mock_serve_db):
-        # Multiple committed updates then an interrupted one: recovery resumes
-        # the newest committed version, not the original.
+        # Two committed versions, then an interrupted update creates a
+        # NULL-yaml placeholder v3 as the new MAX.
         serve_state.add_or_update_version('svc', 1, 'spec-1', 'yaml: v1')
         serve_state.add_or_update_version('svc', 2, 'spec-2', 'yaml: v2')
-        serve_state.add_version('svc')  # placeholder v3
+        assert serve_state.add_version('svc') == 3  # placeholder
+        # Raw MAX points at the placeholder (the bug)...
+        assert serve_state.get_latest_version('svc') == 3
+        # ...but recovery must pick the newest committed version, not the
+        # placeholder and not the original.
         assert serve_state.get_latest_committed_version('svc') == 2
 
     def test_committed_version_none_when_only_placeholder(self, _mock_serve_db):
         serve_state.add_version('svc')  # placeholder v1, no committed yaml
         assert serve_state.get_latest_committed_version('svc') is None
-
-    def test_delete_uncommitted_removes_placeholder_keeps_committed(
-            self, _mock_serve_db):
-        serve_state.add_or_update_version('svc', 1, 'spec-1', 'yaml: v1')
-        serve_state.add_version('svc')  # placeholder v2
-        serve_state.delete_uncommitted_versions('svc', newer_than=1)
-        # Placeholder gone -> MAX is back to the committed version.
-        assert serve_state.get_latest_version('svc') == 1
-        assert serve_state.get_yaml_content('svc', 1) == 'yaml: v1'
-
-    def test_delete_uncommitted_preserves_old_null_yaml_rows(self,
-                                                             _mock_serve_db):
-        # A legitimate older record that predates yaml-in-DB (NULL yaml) sits
-        # BELOW the recovered committed version; the placeholder sits ABOVE it.
-        # Only the placeholder must be swept.
-        serve_state.add_version('svc')  # v1: old NULL-yaml record
-        serve_state.add_or_update_version('svc', 2, 'spec-2', 'yaml: v2')
-        serve_state.add_version('svc')  # v3: interrupted-update placeholder
-        serve_state.delete_uncommitted_versions('svc', newer_than=2)
-        # v3 (placeholder above committed) removed; v1 (old, below) preserved.
-        assert serve_state.get_yaml_content('svc', 2) == 'yaml: v2'
-        assert serve_state.get_latest_version('svc') == 2
-        with orm.Session(_mock_serve_db) as session:
-            remaining = session.execute(
-                sqlalchemy.select(serve_state.version_specs_table.c.version).
-                where(serve_state.version_specs_table.c.service_name == 'svc')
-            ).fetchall()
-        assert {r[0] for r in remaining} == {1, 2}
-
-    def test_delete_uncommitted_scoped_to_service(self, _mock_serve_db):
-        serve_state.add_or_update_version('keep', 1, 'spec-1', 'yaml: v1')
-        serve_state.add_version('keep')  # placeholder v2 for 'keep'
-        serve_state.add_or_update_version('drop', 1, 'spec-1', 'yaml: v1')
-        serve_state.add_version('drop')  # placeholder v2 for 'drop'
-        serve_state.delete_uncommitted_versions('drop', newer_than=1)
-        # 'drop' placeholder gone, 'keep' placeholder untouched.
-        assert serve_state.get_latest_version('drop') == 1
-        assert serve_state.get_latest_version('keep') == 2

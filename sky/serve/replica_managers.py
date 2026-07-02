@@ -49,8 +49,9 @@ logger = sky_logging.init_logger(__name__)
 _JOB_STATUS_FETCH_INTERVAL = 30
 _PROCESS_POOL_REFRESH_INTERVAL = 20
 _RETRY_INIT_GAP_SECONDS = 60
-# Default retries for launch_cluster. Spot replicas with a placer override this
-# to 1 so a capacity failure fails over to a new location immediately instead of
+# Default number of launch attempts for launch_cluster. Spot replicas with a
+# spot placer cap resource availability (capacity) failures at one attempt so
+# the placer can fail over to a different location immediately instead of
 # re-hammering the same exhausted zone (see _launch_replica).
 _DEFAULT_LAUNCH_MAX_RETRY = 3
 _DEFAULT_DRAIN_SECONDS = 120
@@ -84,16 +85,25 @@ def launch_cluster(replica_id: int,
                        int, bool],
                    resources_override: Optional[Dict[str, Any]] = None,
                    retry_until_up: bool = True,
-                   max_retry: int = _DEFAULT_LAUNCH_MAX_RETRY) -> None:
+                   max_retry: int = _DEFAULT_LAUNCH_MAX_RETRY,
+                   availability_max_retry: Optional[int] = None) -> None:
     """Launch a sky serve replica cluster.
 
     This function will not wait for the job starts running. It will return
     immediately after the job is submitted.
 
+    Launch failures are retried in place with backoff, up to max_retry
+    attempts. Failures caused by resource availability (capacity) are capped
+    separately by availability_max_retry, defaulting to max_retry. Spot
+    replicas with a spot placer pass availability_max_retry=1 so a capacity
+    failure at the placer-pinned location propagates immediately and the
+    placer fails over to a different location, while other (transient) errors
+    keep the max_retry in-place attempts.
+
     Raises:
-        RuntimeError: If failed to launch the cluster after max_retry retries,
-            or some error happened before provisioning and will happen again
-            if retry.
+        RuntimeError: If failed to launch the cluster after the allowed
+            attempts, or some error happened before provisioning and will
+            happen again if retry.
     """
     ctx = context.get()
     assert ctx is not None, 'Context is not initialized'
@@ -130,7 +140,10 @@ def launch_cluster(replica_id: int,
             replica_to_launch_cancelled.pop(replica_id)
         return is_cancelled
 
+    if availability_max_retry is None:
+        availability_max_retry = max_retry
     retry_cnt = 0
+    availability_retry_cnt = 0
     backoff = common_utils.Backoff(_RETRY_INIT_GAP_SECONDS)
     while True:
         retry_cnt += 1
@@ -160,6 +173,7 @@ def launch_cluster(replica_id: int,
                     for err in e.failover_history):
                 raise RuntimeError('Failed to launch the sky serve replica '
                                    f'cluster {cluster_name}.') from e
+            availability_retry_cnt += 1
             logger.info('Failed to launch the sky serve replica cluster with '
                         f'error: {common_utils.format_exception(e)})')
         except Exception as e:  # pylint: disable=broad-except
@@ -178,9 +192,10 @@ def launch_cluster(replica_id: int,
             return
         terminate_cluster(cluster_name, log_file=log_file)
 
-        if retry_cnt >= max_retry:
+        if (retry_cnt >= max_retry or
+                availability_retry_cnt >= availability_max_retry):
             raise RuntimeError('Failed to launch the sky serve replica cluster '
-                               f'{cluster_name} after {max_retry} retries.')
+                               f'{cluster_name} after {retry_cnt} attempt(s).')
 
         gap_seconds = backoff.current_backoff()
         logger.info('Retrying to launch the sky serve replica cluster '
@@ -806,8 +821,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         # per tick. Scoping it to a tick keeps it single-threaded (only the
         # prober thread touches it) and never reuses a spec across ticks, so it
         # cannot go stale even if a version's spec row is later rewritten.
-        self._tick_version_spec_cache: Dict[
-            int, 'service_spec.SkyServiceSpec'] = {}
+        self._tick_version_spec_cache: Dict[int,
+                                            'service_spec.SkyServiceSpec'] = {}
 
         # Run recovery synchronously before launching the daemon threads.
         #
@@ -944,22 +959,22 @@ class SkyPilotReplicaManager(ReplicaManager):
                 current_spot_locations)
             resources_override.update(location.to_dict())
         # When the spot placer owns failover (use_spot + placer above sets
-        # retry_until_up=False), the launch is pinned to ONE location. Retrying
-        # that same location with the default max_retry=3 + 60s exponential
-        # backoff burns minutes re-hammering an exhausted zone
-        # (ZONE_RESOURCE_POOL_EXHAUSTED / InsufficientInstanceCapacity) before
-        # the failure propagates to set_preemptive. Fail fast (one attempt) so
-        # the placer marks the location preemptive and the next launch picks a
-        # different location immediately — the failover the placer is meant to
-        # do, per the retry_until_up=False comment above.
-        launch_max_retry = (1 if use_spot and self._spot_placer is not None
-                            else _DEFAULT_LAUNCH_MAX_RETRY)
+        # retry_until_up=False), the launch is pinned to ONE location, so a
+        # capacity failure there must propagate immediately for the placer to
+        # mark the location preemptive and pick a different one on the next
+        # launch. Retrying the same exhausted zone in place with the default
+        # attempts + 60s exponential backoff burns minutes before failing
+        # over. Other (transient) launch errors say nothing about the
+        # location's capacity, so they keep the default in-place retries.
+        availability_max_retry = (1 if use_spot and
+                                  self._spot_placer is not None else None)
         t = thread_utils.SafeThread(
             target=launch_cluster,
             args=(replica_id, self.yaml_content, cluster_name, log_file_name,
                   self._replica_to_request_id,
                   self._replica_to_launch_cancelled, resources_override,
-                  retry_until_up, launch_max_retry),
+                  retry_until_up),
+            kwargs={'availability_max_retry': availability_max_retry},
         )
         replica_port = _get_resources_ports(self.yaml_content)
 
@@ -982,6 +997,9 @@ class SkyPilotReplicaManager(ReplicaManager):
         # against any drift so id allocation can never clobber a live replica.
         while serve_state.get_replica_info_from_id(
                 self._service_name, self._next_replica_id) is not None:
+            logger.warning(f'Replica id {self._next_replica_id} still has a '
+                           'durable replica row; skipping it to avoid '
+                           'clobbering a live replica.')
             self._next_replica_id += 1
         self._launch_replica(self._next_replica_id, resources_override)
         self._next_replica_id += 1
@@ -1252,81 +1270,76 @@ class SkyPilotReplicaManager(ReplicaManager):
         """
         # To avoid `dictionary changed size during iteration` error.
         launch_thread_pool_snapshot = list(self._launch_thread_pool.items())
-        # Read the launch budget ONCE per tick, under the cross-process
-        # resources lock held across the whole admission pass. Reading it
-        # outside the lock would let a concurrent service manager admit against
-        # the same stale count and oversubscribe the launch cap. Tracking the
-        # delta locally avoids the O(K*N) per-replica re-scan this read used to
-        # incur -- can_provision/can_terminate otherwise unpickle the ENTIRE
-        # replica table per launching/terminating replica (measured ~1.7s/tick
-        # at N=2000, K=140; grows with fleet size).
-        with filelock.FileLock(controller_utils.get_resources_lock_path()):
-            in_flight = controller_utils.in_flight_launch_count()
-            for replica_id, t in launch_thread_pool_snapshot:
-                if t.is_alive():
-                    continue
-                info = serve_state.get_replica_info_from_id(
-                    self._service_name, replica_id)
-                assert info is not None, replica_id
-                error_in_sky_launch = False
-                if info.status == serve_state.ReplicaStatus.PENDING:
-                    # sky.launch not started yet
-                    if controller_utils.can_provision(self._is_pool,
-                                                      in_flight=in_flight):
-                        t.start()
-                        # This replica is now provisioning; reflect it locally
-                        # instead of re-scanning the DB on the next replica.
-                        in_flight += 1
-                        info.status_property.sky_launch_status = (
-                            common_utils.ProcessStatus.RUNNING)
+        # Process finished launch threads BEFORE taking the cross-process
+        # resources lock: this pass performs per-replica DB writes and, for a
+        # failed launch, an inline log sync that may SSH into the replica.
+        # None of that needs the lock -- holding it here would stall every
+        # other service's admission pass (and `sky serve up`) for the whole
+        # walk. Only the admission pass below needs the lock.
+        launch_to_admit: List[Tuple[int, thread_utils.SafeThread,
+                                    ReplicaInfo]] = []
+        for replica_id, t in launch_thread_pool_snapshot:
+            if t.is_alive():
+                continue
+            info = serve_state.get_replica_info_from_id(self._service_name,
+                                                        replica_id)
+            assert info is not None, replica_id
+            if info.status == serve_state.ReplicaStatus.PENDING:
+                # sky.launch not started yet; admitted below under the
+                # resources lock.
+                launch_to_admit.append((replica_id, t, info))
+                continue
+            # sky.launch finished
+            # TODO(tian): Try-catch in thread, and have an enum return
+            # value to indicate which type of failure happened.
+            # Currently we only have user code failure since the
+            # retry_until_up flag is set to True, but it will be helpful
+            # when we enable user choose whether to retry or not.
+            logger.info(f'Launch thread for replica {replica_id} finished.')
+            self._launch_thread_pool.pop(replica_id)
+            self._replica_to_request_id.pop(replica_id)
+            error_in_sky_launch = False
+            if t.format_exc is not None:
+                logger.warning(f'Launch thread for replica {replica_id} '
+                               f'exited abnormally with exception '
+                               f'{t.format_exc}. Terminating...')
+                info.status_property.sky_launch_status = (
+                    common_utils.ProcessStatus.FAILED)
+                error_in_sky_launch = True
+            else:
+                info.status_property.sky_launch_status = (
+                    common_utils.ProcessStatus.SUCCEEDED)
+            if self._spot_placer is not None and info.is_spot:
+                # TODO(tian): Currently, we set the location to
+                # preemptive if the launch thread failed. This is
+                # because if the error is not related to the
+                # availability of the location, then all locations
+                # should failed for same reason. So it does not matter
+                # which location is preemptive or not, instead, all
+                # locations would fail. We should implement a log parser
+                # to detect if the error is actually related to the
+                # availability of the location later.
+                location = info.get_spot_location()
+                assert location is not None
+                if t.format_exc is not None:
+                    self._spot_placer.set_preemptive(location)
+                    info.status_property.failed_spot_availability = True
                 else:
-                    # sky.launch finished
-                    # TODO(tian): Try-catch in thread, and have an enum return
-                    # value to indicate which type of failure happened.
-                    # Currently we only have user code failure since the
-                    # retry_until_up flag is set to True, but it will be helpful
-                    # when we enable user choose whether to retry or not.
-                    logger.info(
-                        f'Launch thread for replica {replica_id} finished.')
-                    self._launch_thread_pool.pop(replica_id)
-                    self._replica_to_request_id.pop(replica_id)
-                    if t.format_exc is not None:
-                        logger.warning(
-                            f'Launch thread for replica {replica_id} '
-                            f'exited abnormally with exception '
-                            f'{t.format_exc}. Terminating...')
-                        info.status_property.sky_launch_status = (
-                            common_utils.ProcessStatus.FAILED)
-                        error_in_sky_launch = True
-                    else:
-                        info.status_property.sky_launch_status = (
-                            common_utils.ProcessStatus.SUCCEEDED)
-                    if self._spot_placer is not None and info.is_spot:
-                        # TODO(tian): Currently, we set the location to
-                        # preemptive if the launch thread failed. This is
-                        # because if the error is not related to the
-                        # availability of the location, then all locations
-                        # should failed for same reason. So it does not matter
-                        # which location is preemptive or not, instead, all
-                        # locations would fail. We should implement a log parser
-                        # to detect if the error is actually related to the
-                        # availability of the location later.
-                        location = info.get_spot_location()
-                        assert location is not None
-                        if t.format_exc is not None:
-                            self._spot_placer.set_preemptive(location)
-                            info.status_property.failed_spot_availability = True
-                        else:
-                            self._spot_placer.set_active(location)
-                serve_state.add_or_update_replica(self._service_name,
-                                                  replica_id, info)
-                if error_in_sky_launch:
-                    # Teardown after update replica info since
-                    # _terminate_replica will update the replica info too.
-                    self._terminate_replica(replica_id,
-                                            sync_down_logs=True,
-                                            replica_drain_delay_seconds=0)
+                    self._spot_placer.set_active(location)
+            serve_state.add_or_update_replica(self._service_name, replica_id,
+                                              info)
+            if error_in_sky_launch:
+                # Teardown after update replica info since
+                # _terminate_replica will update the replica info too.
+                self._terminate_replica(replica_id,
+                                        sync_down_logs=True,
+                                        replica_drain_delay_seconds=0)
+
+        # Snapshot AFTER the finished-launch pass so down threads it scheduled
+        # (via _terminate_replica for failed launches) are admitted this tick.
         down_thread_pool_snapshot = list(self._down_thread_pool.items())
+        down_to_admit: List[Tuple[int, thread_utils.SafeThread,
+                                  ReplicaInfo]] = []
         for replica_id, t in down_thread_pool_snapshot:
             if t.is_alive():
                 continue
@@ -1335,9 +1348,43 @@ class SkyPilotReplicaManager(ReplicaManager):
             assert info is not None, replica_id
             if (info.status_property.sky_down_status ==
                     common_utils.ProcessStatus.SCHEDULED):
-                # sky.down not started yet
-                if controller_utils.can_terminate(self._is_pool,
-                                                  in_flight=in_flight):
+                # sky.down not started yet; admitted below under the
+                # resources lock.
+                down_to_admit.append((replica_id, t, info))
+                continue
+            logger.info(f'Terminate thread for replica {replica_id} finished.')
+            self._down_thread_pool.pop(replica_id)
+            self._handle_sky_down_finish(info, format_exc=t.format_exc)
+
+        # Admission pass: read the launch budget ONCE per tick, under the
+        # cross-process resources lock held across ALL admission decisions
+        # (launch and down -- both draw on the same weighted budget). Reading
+        # it outside the lock would let a concurrent service manager admit
+        # against the same stale count and oversubscribe the launch cap.
+        # Tracking the delta locally avoids the O(K*N) per-replica re-scan
+        # this read used to incur -- can_provision/can_terminate otherwise
+        # unpickle the ENTIRE replica table per launching/terminating replica
+        # (measured ~1.7s/tick at N=2000, K=140; grows with fleet size). When
+        # there is nothing to admit, skip the lock and the scan entirely.
+        if launch_to_admit or down_to_admit:
+            with filelock.FileLock(controller_utils.get_resources_lock_path()):
+                in_flight = controller_utils.in_flight_launch_count()
+                for replica_id, t, info in launch_to_admit:
+                    if not controller_utils.can_provision(self._is_pool,
+                                                          in_flight=in_flight):
+                        continue
+                    t.start()
+                    # This replica is now provisioning; reflect it locally
+                    # instead of re-scanning the DB on the next replica.
+                    in_flight += 1
+                    info.status_property.sky_launch_status = (
+                        common_utils.ProcessStatus.RUNNING)
+                    serve_state.add_or_update_replica(self._service_name,
+                                                      replica_id, info)
+                for replica_id, t, info in down_to_admit:
+                    if not controller_utils.can_terminate(self._is_pool,
+                                                          in_flight=in_flight):
+                        continue
                     t.start()
                     # This replica is now terminating; reflect it locally
                     # (weighted like in_flight_launch_count) instead of
@@ -1347,11 +1394,6 @@ class SkyPilotReplicaManager(ReplicaManager):
                         common_utils.ProcessStatus.RUNNING)
                     serve_state.add_or_update_replica(self._service_name,
                                                       replica_id, info)
-            else:
-                logger.info(
-                    f'Terminate thread for replica {replica_id} finished.')
-                self._down_thread_pool.pop(replica_id)
-                self._handle_sky_down_finish(info, format_exc=t.format_exc)
 
         # Clean old version
         replica_infos = serve_state.get_replica_infos(self._service_name)
@@ -1407,7 +1449,9 @@ class SkyPilotReplicaManager(ReplicaManager):
         to minutes); holding the lock across the walk would block the
         refresher / prober / scaler -- which all take ``self.lock`` -- for the
         whole walk, stalling autoscaling exactly when the fleet is churning.
-        The lock is taken only for the brief state mutations.
+        The lock is re-acquired only on the failure-handling paths (preemption
+        and user-code failure); those paths may still run a cloud status
+        refresh or a log sync while holding it.
         """
         infos = serve_state.get_replica_infos(self._service_name)
         for info in infos:
@@ -1417,7 +1461,12 @@ class SkyPilotReplicaManager(ReplicaManager):
             # sdk.job_status.
             backend = backends.CloudVmRayBackend()
             handle = info.handle()
-            assert handle is not None, info
+            if handle is None:
+                # The walk runs lock-free, so the replica's cluster record can
+                # vanish mid-walk (a scale-down or preemption cleanup
+                # completing after the snapshot was taken). Skip it; the next
+                # round re-snapshots.
+                continue
             # Use None to fetch latest job, which stands for user task job
             job_ids = [1] if self._is_pool else None
             try:
@@ -1436,8 +1485,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                     # newer state or double-terminate.
                     fresh = serve_state.get_replica_info_from_id(
                         self._service_name, info.replica_id)
-                    if fresh is None or not (
-                            fresh.status_property.should_track_service_status()):
+                    if fresh is None:
+                        continue
+                    if not fresh.status_property.should_track_service_status():
                         continue
                     is_preempted = self._handle_preemption(fresh)
                 if is_preempted:
@@ -1454,6 +1504,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     fresh = serve_state.get_replica_info_from_id(
                         self._service_name, info.replica_id)
                     if fresh is None:
+                        continue
+                    if not fresh.status_property.should_track_service_status():
                         continue
                     fresh.status_property.user_app_failed = True
                     serve_state.add_or_update_replica(self._service_name,

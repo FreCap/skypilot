@@ -63,13 +63,12 @@ def _handle_signal(service_name: str) -> None:
                     logger.warning(
                         f'Unknown signal received: {user_signal}. Ignoring.')
                     user_signal = None
-            if user_signal is not None:
+            if user_signal is serve_utils.UserSignal.TERMINATE:
                 # Persist the teardown intent BEFORE consuming the signal so a
                 # crash in this window cannot resurrect the service: HA recovery
                 # then sees either SHUTTING_DOWN (and resumes teardown) or the
                 # still-present signal (and re-fires terminate) -- never a
-                # downed service that comes back up serving. (Only TERMINATE
-                # exists.)
+                # downed service that comes back up serving.
                 serve_state.set_service_status_and_active_versions(
                     service_name, serve_state.ServiceStatus.SHUTTING_DOWN)
             # Remove the signal file, after reading it.
@@ -304,17 +303,31 @@ def _cleanup_task_run_script(job_id: int) -> None:
             logger.warning(f'Task run script {this_task_run_script} not found')
 
 
-def _wait_for_controller_ready(host: str, port: int, timeout: int = 30) -> None:
+def _wait_for_controller_ready(
+        host: str,
+        port: int,
+        timeout: int = 30,
+        process: Optional[multiprocessing.Process] = None) -> None:
     """Block until the controller HTTP server is accepting connections.
 
     We must not flip DB `controller_pid`/`controller_ip` until the new
     subprocess is actually listening, otherwise clients routed by DB hit
     the new pod's IP before its uvicorn binds and get ECONNREFUSED.
+
+    If `process` is given, fail as soon as it is no longer alive instead of
+    burning the full timeout: this wait runs while holding the host-global
+    port-selection lock, so a controller child that dies at boot would
+    otherwise hold that lock for the entire timeout on every (5s-cadence)
+    respawn retry, starving other services' boot/recovery on the same host.
     """
     # When binding 0.0.0.0, probe via loopback.
     probe_host = '127.0.0.1' if host == '0.0.0.0' else host
     start = time.time()
     while time.time() - start < timeout:
+        if process is not None and not process.is_alive():
+            raise RuntimeError(
+                f'Controller process exited (exitcode={process.exitcode}) '
+                f'before becoming ready on {probe_host}:{port}')
         try:
             with socket.create_connection((probe_host, port), timeout=0.5):
                 return
@@ -405,10 +418,10 @@ def _bail_on_boot_failure(service_name: str,
     os._exit(1)  # pylint: disable=protected-access
 
 
-def _spawn_controller(
-        service_name: str, service_spec: 'service_spec_lib.SkyServiceSpec',
-        version: int, controller_host: str,
-        controller_port: int) -> multiprocessing.Process:
+def _spawn_controller(service_name: str,
+                      service_spec: 'service_spec_lib.SkyServiceSpec',
+                      version: int, controller_host: str,
+                      controller_port: int) -> multiprocessing.Process:
     """Spawn (and start) the controller server subprocess for a service.
 
     Factored out of `_start` so the supervision loop can re-create the
@@ -484,8 +497,8 @@ def _respawn_controller_and_lb(
     load_balancer_log_file: str,
     dead_controller: Optional[multiprocessing.Process],
     old_lb: Optional[multiprocessing.Process]
-) -> Optional[Tuple[multiprocessing.Process,
-                    Optional[multiprocessing.Process], int]]:
+) -> Optional[Tuple[multiprocessing.Process, Optional[multiprocessing.Process],
+                    int]]:
     """Re-create the controller (on a FRESH port) and restart the LB after the
     controller child died while the _start parent is still alive.
 
@@ -499,8 +512,12 @@ def _respawn_controller_and_lb(
     pod: another service cannot already hold a port we just found free and hold
     the lock for. The LB is restarted pointing at the new controller addr but on
     the SAME public `load_balancer_port`, so the service endpoint is stable. The
-    DB controller_port is updated; controller_pid/ip (the live parent) and the
-    public load_balancer_port are unchanged.
+    DB controller_port write is guarded by row ownership (compare-and-swap on
+    `controller_pid`): HA recovery on another pod may have taken the row over
+    since our last (30s-cadence) orphan check, and an unconditional write would
+    cross-wire the new owner's atomically-flipped pid/ip/port with our stale
+    port. controller_pid/ip (the live parent) and the public load_balancer_port
+    are unchanged.
 
     Returns (controller_process, lb_process, controller_port) on success, or
     None on failure (retry next tick). Never raises into _start's destructive
@@ -508,11 +525,14 @@ def _respawn_controller_and_lb(
     confirmed, so the data plane is not dropped during retries.
     """
     # Reload the latest COMMITTED version + spec so a respawn after
-    # /update_service uses the current config (fall back to captured values on a
-    # DB error). Use the committed version, not raw MAX(version): an interrupted
-    # `sky serve update` can leave a NULL-yaml placeholder as MAX whose spec is
-    # None, which would otherwise drop us back to the stale captured parent
-    # version/spec instead of the latest fully-committed version.
+    # /update_service uses the current config. Use the committed version, not
+    # raw MAX(version): an interrupted `sky serve update` can leave a NULL-yaml
+    # placeholder as MAX whose spec is None, which would otherwise drop us back
+    # to the stale captured parent version/spec instead of the latest
+    # fully-committed version. On a DB error, retry on the next tick instead of
+    # proceeding: the captured version/spec are stale after an in-place update,
+    # and a controller rebuilt from them would tear down every newer-version
+    # replica and relaunch old-version ones.
     try:
         latest = serve_state.get_latest_committed_version(service_name)
         if latest is not None:
@@ -520,9 +540,10 @@ def _respawn_controller_and_lb(
             if spec is not None:
                 version, service_spec = latest, spec
     except Exception as e:  # pylint: disable=broad-except
-        logger.warning(f'Could not reload latest version/spec for '
-                       f'{service_name} on respawn ({e}); using captured '
-                       f'version {version}.')
+        logger.error(f'Failed to reload the latest committed version/spec for '
+                     f'{service_name}: {common_utils.format_exception(e)}; '
+                     f'will retry on the next tick.')
+        return None  # old LB left running -> data plane preserved during retry
 
     new_controller = None
     try:
@@ -533,14 +554,29 @@ def _respawn_controller_and_lb(
             new_controller = _spawn_controller(service_name, service_spec,
                                                version, controller_host,
                                                controller_port)
+            # `process=` fails this wait fast if the replacement dies at boot,
+            # instead of holding the port-selection lock for the full timeout
+            # on every retry of a crash-looping controller.
             _wait_for_controller_ready(
-                controller_host, controller_port,
-                timeout=constants.SERVICE_REGISTER_TIMEOUT_SECONDS)
+                controller_host,
+                controller_port,
+                timeout=constants.SERVICE_REGISTER_TIMEOUT_SECONDS,
+                process=new_controller)
             if not new_controller.is_alive():
                 raise RuntimeError(
                     'replacement controller exited during startup')
-            serve_state.set_service_controller_port(service_name,
-                                                    controller_port)
+            if not serve_state.set_service_controller_port_if_owner(
+                    service_name, os.getpid(), controller_port):
+                # Another instance (HA recovery on a different pod) took over
+                # the row while we were bringing up the replacement. Discard it
+                # and keep the old LB; the orphan check in _start's loop will
+                # exit this parent shortly.
+                logger.warning(
+                    f'Lost ownership of service {service_name} during the '
+                    'controller respawn; discarding the replacement '
+                    'controller.')
+                _kill_process(new_controller)
+                return None
     except Exception as e:  # pylint: disable=broad-except
         logger.error(f'Failed to bring up a replacement controller for '
                      f'{service_name}: {common_utils.format_exception(e)}; '
@@ -572,9 +608,9 @@ def _should_resume_teardown(is_recovery: bool,
     other reason left a non-teardown status (e.g. READY) and is recovered
     normally (brought back up).
     """
-    return (is_recovery and service is not None and service['status'] in (
-        serve_state.ServiceStatus.SHUTTING_DOWN,
-        serve_state.ServiceStatus.FAILED_CLEANUP))
+    return (is_recovery and service is not None and
+            service['status'] in (serve_state.ServiceStatus.SHUTTING_DOWN,
+                                  serve_state.ServiceStatus.FAILED_CLEANUP))
 
 
 def _run_cleanup_and_finalize(service_name: str,
@@ -697,6 +733,15 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
                     raise RuntimeError(
                         controller_utils.get_max_services_error_message(
                             task.service.pool))
+            # Create the service working directory before the DB write so a
+            # crash here can at most leave a harmless empty dir. The service
+            # row and its initial version row are then written atomically
+            # below: writing them as two separate commits leaves a crash
+            # window that strands a `services` row with no `version_specs`
+            # row, which the latest-version inner join hides from status,
+            # recovery and teardown, and which blocks re-`up` of the name.
+            os.makedirs(service_dir, exist_ok=True)
+            version = constants.INITIAL_VERSION
             success = serve_state.add_service(
                 service_name,
                 controller_job_id=job_id,
@@ -709,6 +754,8 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
                 pool=service_spec.pool,
                 controller_pid=os.getpid(),
                 controller_ip=pod_ip,
+                spec=service_spec,
+                yaml_content=yaml_content,
                 entrypoint=entrypoint)
         # Directly throw an error here. See sky/serve/api.py::up
         # for more details.
@@ -716,39 +763,38 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
             cleanup_storage(yaml_content)
             with ux_utils.print_exception_no_traceback():
                 raise ValueError(f'Service {service_name} already exists.')
-
-        # Create the service working directory.
-        os.makedirs(service_dir, exist_ok=True)
-
-        version = constants.INITIAL_VERSION
-        # Add initial version information to the service state.
-        serve_state.add_or_update_version(service_name, version, service_spec,
-                                          yaml_content)
     else:
         # Use the latest COMMITTED version (computed above), not raw
         # MAX(version), so an interrupted-update NULL-yaml placeholder does not
         # wedge the controller on boot.
         if recovery_version is not None:
             version = recovery_version
-            # Drop orphan placeholder versions (NULL yaml) left ABOVE the
-            # committed version by an interrupted update, so a later
-            # `sky serve update` gets a clean MAX(version)+1 and recovery is
-            # never wedged by them again. Scoped to > version so it can never
-            # delete the version we are about to boot, nor legitimate older
-            # records that predate yaml-in-DB. Safe here: the API server just
-            # restarted, so no update is in flight.
-            serve_state.delete_uncommitted_versions(service_name,
-                                                    newer_than=version)
+            # An interrupted `sky serve update` may have left NULL-yaml
+            # placeholder versions above the committed version (add_version
+            # inserts the row before the yaml is persisted). Leave them in
+            # place: recovery can also run while the API server stays up and
+            # keeps serving updates (e.g. only the controller process died),
+            # so deleting them could race an in-flight update and re-open its
+            # version number for reuse by a concurrent update. They are
+            # otherwise inert -- recovery and respawn boot from the latest
+            # committed version, and a later update allocates MAX(version)+1
+            # above them. The interrupted update itself is unrecoverable (its
+            # yaml was never persisted), so warn instead of silently reverting
+            # it.
+            raw_latest = serve_state.get_latest_version(service_name)
+            if raw_latest is not None and raw_latest > version:
+                logger.warning(
+                    f'Service {service_name} has uncommitted version(s) up to '
+                    f'{raw_latest} left by an interrupted update; recovering '
+                    f'at the latest committed version {version}.')
         else:
             # Nothing committed yet (e.g. an old record that predates
             # yaml-in-DB, recovered via the tmp-yaml fallback above). Fall back
-            # to raw latest and do NOT sweep -- the version we boot has no
-            # committed yaml of its own, so deleting NULL-yaml rows could remove
-            # it.
-            version = serve_state.get_latest_version(service_name)
-            if version is None:
-                raise ValueError(
-                    f'No version found for service {service_name}')
+            # to raw latest.
+            latest_version = serve_state.get_latest_version(service_name)
+            if latest_version is None:
+                raise ValueError(f'No version found for service {service_name}')
+            version = latest_version
         # Pre-claim controller_pid immediately so the next
         # ha_recovery_for_consolidation_mode iteration sees our _start
         # process as the live controller and does NOT fire a duplicate
@@ -827,7 +873,8 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
                 _wait_for_controller_ready(
                     controller_host,
                     controller_port,
-                    timeout=constants.SERVICE_REGISTER_TIMEOUT_SECONDS)
+                    timeout=constants.SERVICE_REGISTER_TIMEOUT_SECONDS,
+                    process=controller_process)
             except RuntimeError as boot_err:
                 # Bail without falling through to the outer try/finally,
                 # which would call _cleanup → remove_ha_recovery_script
@@ -873,16 +920,9 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
             # NOTE(tian): We don't need the load balancer for pool.
             # Skip the load balancer process for pool.
             if not service_spec.pool:
-                load_balancer_process = multiprocessing.Process(
-                    target=ux_utils.RedirectOutputForProcess(
-                        load_balancer.run_load_balancer,
-                        load_balancer_log_file).run,
-                    args=(controller_addr, load_balancer_port,
-                          service_spec.load_balancing_policy,
-                          service_spec.tls_credential,
-                          service_spec.target_qps_per_replica,
-                          service_spec.lb_stream_timeout_seconds))
-                load_balancer_process.start()
+                load_balancer_process = _spawn_load_balancer(
+                    controller_addr, load_balancer_port, service_spec,
+                    load_balancer_log_file)
 
             if not is_recovery:
                 serve_state.set_service_load_balancer_port(

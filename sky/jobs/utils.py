@@ -778,6 +778,26 @@ def update_managed_jobs_statuses(job_id: Optional[int] = None):
 
         # At this point, either pid is None or process is dead.
 
+        # The judgment above was made from the batched snapshot taken before
+        # the loop, which can be minutes stale by now (each earlier iteration
+        # that reaches the destructive path synchronously terminates a
+        # cluster). In that window the job may have been reset for recovery
+        # (schedule_state=WAITING, pid cleared; see reset_jobs_for_recovery)
+        # or re-claimed by a new controller process. Only act if a fresh read
+        # confirms the exact values the judgment was based on; otherwise defer
+        # to the next status-update cycle, which will re-judge the job from
+        # fresh state.
+        fresh_infos = managed_job_state.get_jobs_status_check_info([job_id])
+        fresh_info = fresh_infos.get(job_id)
+        if (fresh_info is None or
+                fresh_info['schedule_state'] != schedule_state or
+                fresh_info['controller_pid'] != pid or
+                fresh_info['controller_pid_started_at'] != pid_started_at):
+            logger.info(f'Job {job_id} schedule state or controller pid '
+                        'changed since the status snapshot was taken; '
+                        'deferring to the next status update cycle.')
+            continue
+
         # The controller process for this managed job is not running: it must
         # have exited abnormally, and we should set the job status to
         # FAILED_CONTROLLER.
@@ -802,6 +822,17 @@ def update_managed_jobs_statuses(job_id: Optional[int] = None):
         cleanup_error_msg = ''
         if cleanup_error:
             cleanup_error_msg = f'Also, cleanup failed: {cleanup_error}. '
+
+        # Cluster teardown can take minutes, so a restart can begin while it
+        # runs. The cluster is gone either way, but the terminal set_failed
+        # below is what makes the job unrecoverable -- defer it so a restarted
+        # controller can resume the job (recovery relaunches the cluster).
+        if _controller_is_restarting():
+            logger.info(
+                f'Controller restart began during cluster cleanup; deferring '
+                f'FAILED_CONTROLLER for job {job_id} (will re-check on the '
+                f'next status update).')
+            continue
 
         # Set all tasks to FAILED_CONTROLLER, regardless of current status.
         # This may change a job from SUCCEEDED or another terminal state to

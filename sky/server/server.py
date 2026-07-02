@@ -186,9 +186,8 @@ async def _try_set_basic_auth_user(request: fastapi.Request):
             continue
         username_encoded = username.encode('utf8')
         db_username_encoded = user.name.encode('utf8')
-        if (username_encoded == db_username_encoded and
-                await asyncio.to_thread(common.crypt_ctx.verify, password,
-                                        user.password)):
+        if (username_encoded == db_username_encoded and await asyncio.to_thread(
+                common.crypt_ctx.verify, password, user.password)):
             request.state.auth_user = user
             break
 
@@ -2604,7 +2603,10 @@ async def api_status(
                 fields=fields,
                 sort=True,
             ))
-        return requests_lib.encode_requests(request_tasks)
+        # encode_requests does a sync get_all_users() DB read; offload it so
+        # the event loop is not blocked.
+        return await asyncio.to_thread(requests_lib.encode_requests,
+                                       request_tasks)
     else:
         matched_request_tasks = []
         for request_id in request_ids:
@@ -2613,10 +2615,11 @@ async def api_status(
             if request_tasks is None:
                 continue
             matched_request_tasks.extend(request_tasks)
-        # encode_requests batches the user lookup (one get_all_users instead of
-        # a per-row readable_encode -> get_user N+1) and produces the same
-        # display payload.
-        return requests_lib.encode_requests(matched_request_tasks)
+        # encode_requests resolves user names with a single batched
+        # get_all_users() lookup for all matched rows; offload the sync DB
+        # read so the event loop is not blocked.
+        return await asyncio.to_thread(requests_lib.encode_requests,
+                                       matched_request_tasks)
 
 
 @app.get('/dashboard_config')
