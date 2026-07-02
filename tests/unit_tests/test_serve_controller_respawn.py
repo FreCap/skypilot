@@ -158,8 +158,8 @@ def test_respawn_db_error_retries_instead_of_stale_spec(monkeypatch):
 
     result = service._respawn_controller_and_lb('svc', _spec(), 1, '127.0.0.1',
                                                 30001, '/tmp/lb.log',
-                                                _FakeProc(alive=False, pid=111),
-                                                old_lb)
+                                                _FakeProc(alive=False,
+                                                          pid=111), old_lb)
 
     assert result is None
     assert spawn_calls == []

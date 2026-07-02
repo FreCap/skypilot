@@ -788,10 +788,10 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
             # Nothing committed yet (e.g. an old record that predates
             # yaml-in-DB, recovered via the tmp-yaml fallback above). Fall back
             # to raw latest.
-            version = serve_state.get_latest_version(service_name)
-            if version is None:
-                raise ValueError(
-                    f'No version found for service {service_name}')
+            latest_version = serve_state.get_latest_version(service_name)
+            if latest_version is None:
+                raise ValueError(f'No version found for service {service_name}')
+            version = latest_version
         # Pre-claim controller_pid immediately so the next
         # ha_recovery_for_consolidation_mode iteration sees our _start
         # process as the live controller and does NOT fire a duplicate
