@@ -8,6 +8,7 @@ from sky.serve import constants
 from sky.serve import controller as serve_controller
 from sky.serve import replica_managers
 from sky.serve import serve_state
+from sky.utils import common_utils
 
 
 class TestSelectNonterminalReplicasToScaleDown(unittest.TestCase):
@@ -239,6 +240,50 @@ class TestAutoscalerVersionInitialization(unittest.TestCase):
         # version is the 3rd positional arg (service_name, service_spec,
         # version).
         self.assertEqual(mock_from_spec.call_args.args[2], 7)
+
+
+class TestInstanceAwareGpuTypeCache(unittest.TestCase):
+    """The GPU-type memo must only cache a post-launch resolution.
+
+    While a replica is provisioning, its cluster record is rewritten for every
+    failover attempt, so the accelerator resolved mid-launch can change until
+    the launch finishes.
+    """
+
+    def _make_autoscaler(self):
+        autoscaler = object.__new__(
+            autoscalers.InstanceAwareRequestRateAutoscaler)
+        autoscaler._gpu_type_cache = {}
+        return autoscaler
+
+    def _make_replica(self, gpu_type, launch_status):
+        info = mock.Mock()
+        info.replica_id = 1
+        info.status_property.sky_launch_status = launch_status
+        info.handle.return_value.launched_resources.accelerators = {
+            gpu_type: 1
+        }
+        return info
+
+    def test_provisioning_resolution_is_not_cached(self):
+        autoscaler = self._make_autoscaler()
+        info = self._make_replica('A100', common_utils.ProcessStatus.RUNNING)
+        self.assertEqual(autoscaler._get_gpu_type_from_replica_info(info),
+                         'A100')
+        # Failover rewrote the cluster record with a different accelerator
+        # while the replica was still provisioning: it must be re-resolved.
+        info.handle.return_value.launched_resources.accelerators = {'L4': 1}
+        self.assertEqual(autoscaler._get_gpu_type_from_replica_info(info),
+                         'L4')
+
+    def test_resolution_cached_once_launch_succeeds(self):
+        autoscaler = self._make_autoscaler()
+        info = self._make_replica('L4', common_utils.ProcessStatus.SUCCEEDED)
+        self.assertEqual(autoscaler._get_gpu_type_from_replica_info(info),
+                         'L4')
+        self.assertEqual(autoscaler._get_gpu_type_from_replica_info(info),
+                         'L4')
+        self.assertEqual(info.handle.call_count, 1)
 
 
 if __name__ == '__main__':
