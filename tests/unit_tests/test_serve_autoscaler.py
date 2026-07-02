@@ -5,8 +5,10 @@ from unittest import mock
 
 from sky.serve import autoscalers
 from sky.serve import constants
+from sky.serve import controller as serve_controller
 from sky.serve import replica_managers
 from sky.serve import serve_state
+from sky.utils import common_utils
 
 
 class TestSelectNonterminalReplicasToScaleDown(unittest.TestCase):
@@ -187,41 +189,31 @@ class TestAutoscalerVersionInitialization(unittest.TestCase):
         self.assertEqual(autoscaler.latest_version_ever_ready,
                          constants.INITIAL_VERSION - 1)
 
-    def _route_spec(self, pool=False, use_ondemand_fallback=False,
+    def _route_spec(self,
+                    pool=False,
+                    use_ondemand_fallback=False,
                     target_qps_per_replica=2.0):
         return types.SimpleNamespace(
             pool=pool,
             use_ondemand_fallback=use_ondemand_fallback,
             target_qps_per_replica=target_qps_per_replica)
 
-    def test_from_spec_forwards_version_request_rate(self):
-        spec = self._route_spec()
-        with mock.patch.object(autoscalers,
-                               'RequestRateAutoscaler') as mock_cls:
-            autoscalers.Autoscaler.from_spec('svc', spec, version=7)
-        mock_cls.assert_called_once_with('svc', spec, 7)
-
-    def test_from_spec_forwards_version_queue_length(self):
-        spec = self._route_spec(pool=True)
-        with mock.patch.object(autoscalers,
-                               'QueueLengthAutoscaler') as mock_cls:
-            autoscalers.Autoscaler.from_spec('svc', spec, version=7)
-        mock_cls.assert_called_once_with('svc', spec, 7)
-
-    def test_from_spec_forwards_version_fallback(self):
-        spec = self._route_spec(use_ondemand_fallback=True)
-        with mock.patch.object(autoscalers,
-                               'FallbackRequestRateAutoscaler') as mock_cls:
-            autoscalers.Autoscaler.from_spec('svc', spec, version=7)
-        mock_cls.assert_called_once_with('svc', spec, 7)
-
-    def test_from_spec_forwards_version_instance_aware(self):
-        spec = self._route_spec(target_qps_per_replica={'A100': 2.0})
-        with mock.patch.object(
-                autoscalers,
-                'InstanceAwareRequestRateAutoscaler') as mock_cls:
-            autoscalers.Autoscaler.from_spec('svc', spec, version=7)
-        mock_cls.assert_called_once_with('svc', spec, 7)
+    def test_from_spec_forwards_version_to_every_variant(self):
+        # Each `from_spec` dispatch branch is a separate call site that could
+        # individually drop the version argument.
+        cases = [
+            ('RequestRateAutoscaler', self._route_spec()),
+            ('QueueLengthAutoscaler', self._route_spec(pool=True)),
+            ('FallbackRequestRateAutoscaler',
+             self._route_spec(use_ondemand_fallback=True)),
+            ('InstanceAwareRequestRateAutoscaler',
+             self._route_spec(target_qps_per_replica={'A100': 2.0})),
+        ]
+        for cls_name, spec in cases:
+            with self.subTest(cls_name):
+                with mock.patch.object(autoscalers, cls_name) as mock_cls:
+                    autoscalers.Autoscaler.from_spec('svc', spec, version=7)
+                mock_cls.assert_called_once_with('svc', spec, 7)
 
     def test_from_spec_defaults_to_initial_version(self):
         spec = self._route_spec()
@@ -232,9 +224,9 @@ class TestAutoscalerVersionInitialization(unittest.TestCase):
 
     def test_controller_passes_recovered_version_to_autoscaler(self):
         # Regression for the actual bug boundary: SkyServeController must hand
-        # the recovered service version to the autoscaler factory (not drop it),
-        # so a controller rebuilt on restart at version >= 2 doesn't churn.
-        from sky.serve import controller as serve_controller
+        # the recovered service version to the autoscaler factory (not drop
+        # it), so a controller rebuilt on restart at version >= 2 doesn't
+        # churn.
         with mock.patch.object(serve_controller.replica_managers,
                                'SkyPilotReplicaManager'), \
              mock.patch.object(serve_controller.autoscalers.Autoscaler,
@@ -245,8 +237,48 @@ class TestAutoscalerVersionInitialization(unittest.TestCase):
                                                 host='localhost',
                                                 port=8000)
         mock_from_spec.assert_called_once()
-        # version is the 3rd positional arg (service_name, service_spec, version)
-        assert mock_from_spec.call_args.args[2] == 7
+        # version is the 3rd positional arg (service_name, service_spec,
+        # version).
+        self.assertEqual(mock_from_spec.call_args.args[2], 7)
+
+
+class TestInstanceAwareGpuTypeCache(unittest.TestCase):
+    """The GPU-type memo must only cache a post-launch resolution.
+
+    While a replica is provisioning, its cluster record is rewritten for every
+    failover attempt, so the accelerator resolved mid-launch can change until
+    the launch finishes.
+    """
+
+    def _make_autoscaler(self):
+        autoscaler = object.__new__(
+            autoscalers.InstanceAwareRequestRateAutoscaler)
+        autoscaler._gpu_type_cache = {}
+        return autoscaler
+
+    def _make_replica(self, gpu_type, launch_status):
+        info = mock.Mock()
+        info.replica_id = 1
+        info.status_property.sky_launch_status = launch_status
+        info.handle.return_value.launched_resources.accelerators = {gpu_type: 1}
+        return info
+
+    def test_provisioning_resolution_is_not_cached(self):
+        autoscaler = self._make_autoscaler()
+        info = self._make_replica('A100', common_utils.ProcessStatus.RUNNING)
+        self.assertEqual(autoscaler._get_gpu_type_from_replica_info(info),
+                         'A100')
+        # Failover rewrote the cluster record with a different accelerator
+        # while the replica was still provisioning: it must be re-resolved.
+        info.handle.return_value.launched_resources.accelerators = {'L4': 1}
+        self.assertEqual(autoscaler._get_gpu_type_from_replica_info(info), 'L4')
+
+    def test_resolution_cached_once_launch_succeeds(self):
+        autoscaler = self._make_autoscaler()
+        info = self._make_replica('L4', common_utils.ProcessStatus.SUCCEEDED)
+        self.assertEqual(autoscaler._get_gpu_type_from_replica_info(info), 'L4')
+        self.assertEqual(autoscaler._get_gpu_type_from_replica_info(info), 'L4')
+        self.assertEqual(info.handle.call_count, 1)
 
 
 if __name__ == '__main__':
