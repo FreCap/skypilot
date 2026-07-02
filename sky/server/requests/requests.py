@@ -282,29 +282,9 @@ class Request:
         sent to the client side, especially for the request table could include
         all the requests.
         """
-        assert isinstance(self.request_body,
-                          payloads.RequestBody), (self.name, self.request_body)
-        user = global_user_state.get_user(self.user_id)
-        user_name = user.name if user is not None else None
-        return payloads.RequestPayload(
-            request_id=self.request_id,
-            name=self.name,
-            entrypoint=self.entrypoint.__name__,
-            request_body=self.request_body.model_dump_json(),
-            status=_status_value_for_client(self.status.value),
-            return_value=orjson.dumps(None).decode('utf-8'),
-            error=orjson.dumps(None).decode('utf-8'),
-            pid=None,
-            created_at=self.created_at,
-            schedule_type=self.schedule_type.value,
-            user_id=self.user_id,
-            user_name=user_name,
-            cluster_name=self.cluster_name,
-            status_msg=self.status_msg,
-            should_retry=self.should_retry,
-            finished_at=self.finished_at,
-            file_mounts_blob_id=self.file_mounts_blob_id,
-        )
+        # Delegate to the batched encoder so the display field list lives in a
+        # single place and the two paths cannot drift apart.
+        return encode_requests([self])[0]
 
     def encode(self) -> payloads.RequestPayload:
         """Serialize the SkyPilot API request."""
@@ -448,9 +428,6 @@ def encode_requests(requests: List[Request]) -> List[payloads.RequestPayload]:
             status_msg=request.status_msg,
             should_retry=request.should_retry,
             finished_at=request.finished_at,
-            # Keep parity with Request.readable_encode (which sets this), so the
-            # by-id /api/status branch is field-identical after switching to the
-            # batched encoder.
             file_mounts_blob_id=request.file_mounts_blob_id,
         )
         encoded_requests.append(payload)
@@ -579,6 +556,22 @@ def _init_db_within_lock():
         _DB = db_utils.SQLiteConn(db_path, create_table)
 
 
+def _close_db_within_lock():
+    """Close the calling thread's DB connection and drop the handle.
+
+    The next DB access re-initializes the handle, re-creating the database
+    file and its tables if needed. ``_DB`` is thread-local, so only the
+    calling thread's connection can be closed here: this is only safe during
+    single-threaded startup, before any other thread or event loop has
+    touched the request DB.
+    """
+    global _DB
+    if _DB is None:
+        return
+    _DB.conn.close()
+    _DB = None
+
+
 def _ensure_db_initialized():
     """Ensure the database is initialized.
 
@@ -640,13 +633,25 @@ def _log_orphaned_inflight_requests() -> None:
     block startup.
     """
     try:
+        # Select only the plain columns needed for the log: the rows were
+        # written by the previous server version, and unpickling entrypoint
+        # or request_body can fail across an upgrade, which would silence
+        # the entire report.
         orphaned = request_storage.get_request_backend().query_requests(
             req_filter=RequestTaskFilter(
-                status=RequestStatus.active_statuses()))
+                status=RequestStatus.active_statuses(),
+                fields=['request_id', 'name', 'status', COL_CLUSTER_NAME]))
     except Exception as e:  # pylint: disable=broad-except
         logger.debug('Could not scan for orphaned in-flight requests during '
                      f'API server startup (continuing): {e}')
         return
+    # Internal daemon requests sit in RUNNING for the whole life of the
+    # server and are recreated on every startup, so their rows are not
+    # dropped work; skip them like the other kill paths do.
+    orphaned = [
+        req for req in orphaned
+        if not daemons.is_daemon_request_id(req.request_id)
+    ]
     if not orphaned:
         return
     logger.warning(
@@ -665,6 +670,13 @@ def reset_db_and_logs():
     # Surface any requests still in-flight when the server stopped BEFORE we
     # wipe them, so the drop is alertable rather than silent (see helper).
     _log_orphaned_inflight_requests()
+    # The scan may have initialized the module-level DB handle against the
+    # database file that is about to be removed. Drop the handle before the
+    # wipe so reset_on_startup() below re-creates the fresh database and its
+    # tables, instead of leaving this thread's connection bound to the
+    # unlinked file.
+    with _init_db_lock:
+        _close_db_within_lock()
     logger.debug('clearing local API server database')
     server_common.clear_local_api_server_database()
     logger.debug('clearing local API server logs directory at '
