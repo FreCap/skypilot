@@ -30,6 +30,8 @@ LONG_WORKER_MEM_GB = 0.4
 SHORT_WORKER_MEM_GB = 0.3
 # To control the number of long workers.
 _CPU_MULTIPLIER_FOR_LONG_WORKERS = 2
+# Env var to override _CPU_MULTIPLIER_FOR_LONG_WORKERS.
+LONG_WORKER_CPU_MULTIPLIER_ENV_VAR = 'SKYPILOT_LONG_WORKER_CPU_MULTIPLIER'
 # Limit the number of long workers of local API server, since local server is
 # typically:
 # 1. launched automatically in an environment with high resource contention
@@ -229,14 +231,18 @@ def _max_long_worker_parallism(cpu_count: int,
     # *request* * 2), which on a 16-CPU-request pod is only 32, leaving 100+
     # admitted replicas queued. Make the multiplier env-tunable so we can widen
     # provisioning concurrency without re-sizing the pod CPU (launches are
-    # I/O-bound — SSH/cloud-API — so heavy CPU oversubscription is fine).
+    # I/O-bound — SSH/cloud-API — so heavy CPU oversubscription is fine). An
+    # invalid value falls back to the default; the multiplier is floored at 1.
     cpu_multiplier = _CPU_MULTIPLIER_FOR_LONG_WORKERS
-    _mult_override = os.environ.get('SKYPILOT_LONG_WORKER_CPU_MULTIPLIER')
-    if _mult_override is not None:
+    multiplier_override = os.environ.get(LONG_WORKER_CPU_MULTIPLIER_ENV_VAR)
+    if multiplier_override is not None:
         try:
-            cpu_multiplier = max(1, int(_mult_override))
+            cpu_multiplier = max(1, int(multiplier_override))
         except ValueError:
-            pass
+            logger.warning(
+                f'Invalid {LONG_WORKER_CPU_MULTIPLIER_ENV_VAR} value '
+                f'{multiplier_override!r}, using the default multiplier '
+                f'{_CPU_MULTIPLIER_FOR_LONG_WORKERS}.')
     cpu_based_max_parallel = cpu_count * cpu_multiplier
     mem_based_max_parallel = int(available_mem * _MAX_MEM_PERCENT_FOR_BLOCKING /
                                  LONG_WORKER_MEM_GB)
