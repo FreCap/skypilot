@@ -53,13 +53,43 @@ class TestRefreshFaultIsolation:
                             'get_cluster_names',
                             lambda exclude_managed_clusters: cluster_names)
         monkeypatch.setattr(
-            backend_utils.global_user_state, 'get_clusters_from_names',
-            lambda names, **kwargs:
-            {name: _record(status_lib.ClusterStatus.UP, 1) for name in names})
+            backend_utils.global_user_state, 'get_cluster_status_fields',
+            lambda names:
+            {name: (status_lib.ClusterStatus.UP.value, 1) for name in names})
         monkeypatch.setattr(backend_utils.requests_lib, 'get_request_tasks',
                             lambda req_filter: [])
 
         # Must not raise, and every cluster must have been attempted.
+        backend_utils.refresh_cluster_records()
+        assert sorted(attempted) == sorted(cluster_names)
+
+    def test_sweep_covers_all_clusters_when_ordering_fails(self, monkeypatch):
+        """A failure in the best-effort ordering step must not abort the
+        sweep: all clusters are still refreshed, in some order."""
+        cluster_names = ['c-1', 'c-2', 'c-3']
+        attempted = []
+        attempted_lock = threading.Lock()
+
+        def _fake_refresh_cluster_record(cluster_name, **kwargs):
+            del kwargs
+            with attempted_lock:
+                attempted.append(cluster_name)
+            return _record(status_lib.ClusterStatus.UP, 1)
+
+        def _raise(names):
+            del names
+            raise RuntimeError('corrupt row')
+
+        monkeypatch.setattr(backend_utils, 'refresh_cluster_record',
+                            _fake_refresh_cluster_record)
+        monkeypatch.setattr(backend_utils.global_user_state,
+                            'get_cluster_names',
+                            lambda exclude_managed_clusters: cluster_names)
+        monkeypatch.setattr(backend_utils.global_user_state,
+                            'get_cluster_status_fields', _raise)
+        monkeypatch.setattr(backend_utils.requests_lib, 'get_request_tasks',
+                            lambda req_filter: [])
+
         backend_utils.refresh_cluster_records()
         assert sorted(attempted) == sorted(cluster_names)
 
@@ -108,16 +138,22 @@ class TestRefreshOrdering:
     """Clusters most in need of reconciliation are dispatched first."""
 
     def test_init_first_then_stalest(self, monkeypatch):
-        records = {
-            'up-stale': _record(status_lib.ClusterStatus.UP, 50),
-            'init-fresh': _record(status_lib.ClusterStatus.INIT, 200),
-            'stopped-fresh': _record(status_lib.ClusterStatus.STOPPED, 300),
-            'init-stale': _record(status_lib.ClusterStatus.INIT, 100),
-            'up-no-timestamp': _record(status_lib.ClusterStatus.UP, None),
+        # Raw (status, status_updated_at) column values, as returned by
+        # global_user_state.get_cluster_status_fields.
+        status_fields = {
+            'up-stale': (status_lib.ClusterStatus.UP.value, 50),
+            'init-fresh': (status_lib.ClusterStatus.INIT.value, 200),
+            'stopped-fresh': (status_lib.ClusterStatus.STOPPED.value, 300),
+            'init-stale': (status_lib.ClusterStatus.INIT.value, 100),
+            'up-no-timestamp': (status_lib.ClusterStatus.UP.value, None),
         }
         monkeypatch.setattr(
-            backend_utils.global_user_state, 'get_clusters_from_names',
-            lambda names, **kwargs: {name: records.get(name) for name in names})
+            backend_utils.global_user_state, 'get_cluster_status_fields',
+            lambda names: {
+                name: status_fields[name]
+                for name in names
+                if name in status_fields
+            })
 
         ordered = backend_utils._sort_clusters_for_refresh([
             'stopped-fresh', 'up-no-timestamp', 'up-stale', 'init-fresh',
@@ -128,3 +164,17 @@ class TestRefreshOrdering:
         assert ordered[:2] == ['init-stale', 'init-fresh']
         assert set(ordered[2:4]) == {'up-no-timestamp', 'deleted'}
         assert ordered[4:] == ['up-stale', 'stopped-fresh']
+
+    def test_ordering_failure_falls_back_to_original_order(self, monkeypatch):
+        """Ordering is best-effort: if its data source raises, the helper
+        returns the input list unchanged instead of raising."""
+
+        def _raise(names):
+            del names
+            raise RuntimeError('corrupt row')
+
+        monkeypatch.setattr(backend_utils.global_user_state,
+                            'get_cluster_status_fields', _raise)
+        cluster_names = ['c-2', 'c-1', 'c-3']
+        assert backend_utils._sort_clusters_for_refresh(
+            cluster_names) == cluster_names

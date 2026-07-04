@@ -3849,21 +3849,33 @@ def _sort_clusters_for_refresh(cluster_names: List[str]) -> List[str]:
     restart) come first, then the rest by ascending status_updated_at
     (stalest first), so a long sweep reconciles them right away instead of
     at a random point.
+
+    Ordering is a best-effort optimization that runs before the per-cluster
+    fault isolation in _refresh_cluster, so it must never be able to abort
+    the sweep: any failure falls back to the original, unsorted list.
     """
-    records = global_user_state.get_clusters_from_names(cluster_names)
+    try:
+        # Reads only plain columns (no handle unpickling or metadata
+        # parsing), so one corrupt row cannot fail the lookup for every
+        # cluster.
+        status_fields = global_user_state.get_cluster_status_fields(
+            cluster_names)
 
-    def _priority(cluster_name: str) -> Tuple[int, float]:
-        record = records.get(cluster_name)
-        if record is None:
-            # Deleted between listing and lookup; ordering is irrelevant.
-            return (1, 0)
-        is_init = record['status'] == status_lib.ClusterStatus.INIT
-        status_updated_at = record.get('status_updated_at')
-        if status_updated_at is None:
-            status_updated_at = 0
-        return (0 if is_init else 1, status_updated_at)
+        def _priority(cluster_name: str) -> Tuple[int, float]:
+            status, status_updated_at = status_fields.get(
+                cluster_name, (None, None))
+            if status_updated_at is None:
+                # Deleted rows and missing timestamps sort as stalest.
+                status_updated_at = 0
+            is_init = status == status_lib.ClusterStatus.INIT.value
+            return (0 if is_init else 1, status_updated_at)
 
-    return sorted(cluster_names, key=_priority)
+        return sorted(cluster_names, key=_priority)
+    except Exception as e:  # pylint: disable=broad-except
+        logger.debug('Failed to order clusters for refresh; refreshing in the '
+                     'original order: '
+                     f'{common_utils.format_exception(e, use_bracket=True)}')
+        return list(cluster_names)
 
 
 def refresh_cluster_records() -> None:
