@@ -70,6 +70,40 @@ class TestRecoveryScriptContent:
         assert ray_head_cmd in script
         assert instance_setup.MAYBE_SKYLET_RESTART_CMD in script
 
+    def test_head_script_restarts_skylet_before_ray(self):
+        # The ray head start command ends with an unbounded "wait until
+        # initialized" loop: skylet restart + autostop re-arm must come
+        # first so a wedged ray recovery cannot block autostop.
+        ray_head_cmd = instance_setup.ray_head_start_command(None, None)
+        script = instance_setup._runtime_recovery_head_script(ray_head_cmd)
+        skylet_pos = script.index(instance_setup.MAYBE_SKYLET_RESTART_CMD)
+        rearm_pos = script.index(instance_setup.MAYBE_REARM_AUTOSTOP_CMD)
+        ray_pos = script.index(ray_head_cmd)
+        assert skylet_pos < rearm_pos < ray_pos
+
+    def test_head_script_rearms_autostop(self):
+        script = instance_setup._runtime_recovery_head_script('true')
+        assert instance_setup.MAYBE_REARM_AUTOSTOP_CMD in script
+        # The embedded snippet must be valid Python and re-persist the
+        # config via set_autostop (which stamps the current boot_time,
+        # clearing the AutostopEvent boot_time skip).
+        compile(instance_setup._REARM_AUTOSTOP_PY, '<rearm>', 'exec')
+        assert 'set_autostop' in instance_setup._REARM_AUTOSTOP_PY
+        assert 'boot_time' in instance_setup._REARM_AUTOSTOP_PY
+
+    def test_scripts_replicate_command_runner_login_env(self):
+        # Provisioning ran the persisted commands with source_bashrc=True
+        # (`bash --login -i -c 'true && source ~/.bashrc && ...'`, see
+        # CommandRunner._get_command_to_run); the boot hook must re-exec
+        # through the same login+interactive invocation.
+        for script in (
+                instance_setup._runtime_recovery_head_script('true'),
+                instance_setup._runtime_recovery_worker_script('true'),
+        ):
+            assert '/bin/bash --login -i -c' in script
+            assert 'source ~/.bashrc' in script
+            assert 'OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore' in script
+
     def test_head_script_guards_ray_start_with_status_probe(self):
         ray_head_cmd = instance_setup.ray_head_start_command(None, None)
         script = instance_setup._runtime_recovery_head_script(ray_head_cmd)
