@@ -72,6 +72,10 @@ COL_FILE_MOUNTS_BLOB_ID = 'file_mounts_blob_id'
 LEGACY_REQUEST_LOG_PATH_PREFIX = '~/sky_logs/api_server/requests'
 
 DEFAULT_REQUESTS_RETENTION_HOURS = 24  # 1 day
+# Interval between requests GC runs. Retention only controls the age cutoff
+# of the rows being cleaned; the GC itself always runs at this cadence so
+# the table does not grow unboundedly between runs under high request rates.
+_GC_INTERVAL_SECONDS = 3600
 
 # TODO(zhwu): For scalability, there are several TODOs:
 # [x] Have a way to queue requests.
@@ -540,6 +544,11 @@ def create_table(cursor, conn):
     # Add an index on created_at to speed up queries that sort on this column.
     cursor.execute(f"""\
         CREATE INDEX IF NOT EXISTS created_at_idx ON {REQUEST_TABLE} (created_at);
+    """)
+    # Add an index on finished_at for terminal rows to speed up the requests
+    # GC, which repeatedly queries finished requests older than the retention.
+    cursor.execute(f"""\
+        CREATE INDEX IF NOT EXISTS finished_at_idx ON {REQUEST_TABLE} ({COL_FINISHED_AT}) WHERE status IN ('SUCCEEDED', 'FAILED', 'CANCELLED');
     """)
 
 
@@ -1278,6 +1287,14 @@ async def clean_finished_requests_with_retention(retention_seconds: int,
             futs.append(
                 asyncio.create_task(
                     anyio.Path(debug_log_path).unlink(missing_ok=True)))
+            # Delete the per-request lock file, which otherwise accumulates
+            # for the whole server uptime. Safe: the request finished longer
+            # ago than the retention, and the lock file is recreated
+            # harmlessly if a late reader locks this id again.
+            futs.append(
+                asyncio.create_task(
+                    anyio.Path(request_lock_path(
+                        req.request_id)).unlink(missing_ok=True)))
         await asyncio.gather(*futs)
 
         await _delete_requests([req.request_id for req in reqs])
@@ -1314,9 +1331,10 @@ async def requests_gc_daemon():
         except Exception as e:  # pylint: disable=broad-except
             logger.error(f'Error running requests GC daemon: {e}'
                          f'traceback: {traceback.format_exc()}')
-        # Run the daemon at most once every hour to avoid too frequent
-        # cleanup.
-        await asyncio.sleep(max(retention_seconds, 3600))
+        # Run the daemon hourly regardless of the retention period, so the
+        # table is trimmed continuously; retention only controls the age
+        # cutoff of the rows being cleaned.
+        await asyncio.sleep(_GC_INTERVAL_SECONDS)
 
 
 def _cleanup():
