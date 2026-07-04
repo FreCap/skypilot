@@ -239,6 +239,7 @@ class RequestWorker:
 
     def process_request(self, executor: process.BurstableExecutor,
                         queue: RequestQueue) -> None:
+        request_id: Optional[str] = None
         try:
             request_element = queue.get()
             if request_element is None:
@@ -247,7 +248,13 @@ class RequestWorker:
             request_id, ignore_return_value, _ = request_element
             request = api_requests.get_request(request_id,
                                                fields=['status', 'created_at'])
-            assert request is not None, f'Request with ID {request_id} is None'
+            if request is None:
+                # The record can be gone, e.g. wiped by a concurrent cleanup.
+                # Drop the element instead of raising: the queue element is
+                # already popped and there is no row to fail.
+                logger.warning(f'[{self}] Dropping queued request '
+                               f'{request_id}: no request record found')
+                return
             if request.status == api_requests.RequestStatus.CANCELLED:
                 return
             if metrics_utils.METRICS_ENABLED:
@@ -282,8 +289,31 @@ class RequestWorker:
             # Catch any other exceptions to avoid crashing the worker process.
             logger.error(
                 f'[{self}] Error processing request: '
-                f'{request_id if "request_id" in locals() else ""} '
+                f'{request_id if request_id is not None else ""} '
                 f'{common_utils.format_exception(e, use_bracket=True)}')
+            if request_id is not None:
+                # The element is already popped from the queue: without
+                # terminalizing the row here it would stay PENDING forever
+                # and clients polling /api/get would block indefinitely.
+                self._fail_stranded_request(request_id, e)
+
+    def _fail_stranded_request(self, request_id: str, e: BaseException) -> None:
+        """Best-effort: fail a dequeued request that never got submitted."""
+        try:
+            request = api_requests.get_request(request_id, fields=['status'])
+            if request is None:
+                return
+            if request.status > api_requests.RequestStatus.RUNNING:
+                # Already terminal, e.g. cancelled by a concurrent kill.
+                return
+            api_requests.set_request_failed(request_id, e)
+        except (Exception, SystemExit) as recovery_e:  # pylint: disable=broad-except
+            # Never let the recovery itself crash the dispatcher thread.
+            logger.error(
+                f'[{self}] Failed to mark stranded request {request_id} as '
+                f'failed: '
+                f'{common_utils.format_exception(recovery_e, use_bracket=True)}'
+            )
 
     def _mark_executor_free(self) -> None:
         """Increment the free-executor gauge for this worker's schedule type.
