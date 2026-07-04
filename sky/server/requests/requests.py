@@ -157,6 +157,37 @@ def _status_value_for_client(status_value: str) -> str:
     return status_value
 
 
+def _build_error_dict(error: BaseException) -> Dict[str, Any]:
+    """Build the serializable error payload persisted for a failed request."""
+    # TODO(zhwu): pickle.dump does not work well with custom exceptions if
+    # it has more than 1 arguments.
+    serialized = exceptions.serialize_exception(error)
+    return {
+        'object': encoders.pickle_and_encode(serialized),
+        'type': type(error).__name__,
+        'message': str(error),
+    }
+
+
+def _encoded_return_value(name: str, request_id: str, return_value: Any) -> Any:
+    """Encode a return value, dropping to None on encoder failure.
+
+    An exception here would escape the executor wrapper's else-block
+    (outside its try/except) and leave the row stuck in RUNNING with the
+    worker pid populated — enabling the SIGTERM-to-idle-worker pool break.
+    All return-value serializers already guard `if return_value is not
+    None`, so None persists as JSON `null`.
+    """
+    encoder = encoders.get_encoder(name)
+    try:
+        return encoder(return_value)
+    except Exception as e:  # pylint: disable=broad-except
+        logger.warning(f'Encoder for request {request_id} ({name}) '
+                       f'failed; storing None: '
+                       f'{common_utils.format_exception(e)}')
+        return None
+
+
 REQUEST_COLUMNS = [
     'request_id',
     'name',
@@ -229,14 +260,7 @@ class Request:
 
     def set_error(self, error: BaseException) -> None:
         """Set the error."""
-        # TODO(zhwu): pickle.dump does not work well with custom exceptions if
-        # it has more than 1 arguments.
-        serialized = exceptions.serialize_exception(error)
-        self.error = {
-            'object': encoders.pickle_and_encode(serialized),
-            'type': type(error).__name__,
-            'message': str(error),
-        }
+        self.error = _build_error_dict(error)
 
     def get_error(self) -> Optional[Dict[str, Any]]:
         """Get the error."""
@@ -253,21 +277,10 @@ class Request:
     def set_return_value(self, return_value: Any) -> None:
         """Set the encoded return value.
 
-        On encoder failure, drop to None. An exception here would escape the
-        wrapper's else-block (outside its try/except) and leave the row stuck
-        in RUNNING with the worker pid populated — enabling the
-        SIGTERM-to-idle-worker pool break. All return-value serializers
-        already guard `if return_value is not None`, so None persists as JSON
-        `null`.
+        On encoder failure, drop to None (see `_encoded_return_value`).
         """
-        encoder = encoders.get_encoder(self.name)
-        try:
-            self.return_value = encoder(return_value)
-        except Exception as e:  # pylint: disable=broad-except
-            logger.warning(
-                f'Encoder for request {self.request_id} ({self.name}) '
-                f'failed; storing None: {common_utils.format_exception(e)}')
-            self.return_value = None
+        self.return_value = _encoded_return_value(self.name, self.request_id,
+                                                  return_value)
 
     def get_return_value(self) -> Any:
         """Get the return value."""
@@ -530,6 +543,9 @@ def create_table(cursor, conn):
     if not common_utils.is_wsl():
         try:
             cursor.execute('PRAGMA journal_mode=WAL')
+            # Safe with WAL (no corruption on crash) and avoids an fsync on
+            # every commit.
+            cursor.execute('PRAGMA synchronous=NORMAL')
         except sqlite3.OperationalError as e:
             if 'database is locked' not in str(e):
                 raise
@@ -1003,6 +1019,19 @@ def update_request(request_id: str) -> Generator[Optional[Request], None, None]:
 
 
 @metrics_lib.time_me
+def try_mark_running(request_id: str, pid: Optional[int]) -> bool:
+    """Atomically flip a request to RUNNING if it is still executable.
+
+    Returns:
+        True iff the request was in an executable status (PENDING/WAITING)
+        and is now RUNNING with `pid` recorded and any stale retry-backoff
+        status_msg cleared.
+    """
+    return request_storage.get_request_backend().try_mark_running(
+        request_id, pid)
+
+
+@metrics_lib.time_me
 @asyncio_utils.shield
 async def update_status_async(request_id: str, status: RequestStatus) -> None:
     """Update the status of a request"""
@@ -1028,8 +1057,12 @@ def _get_request_no_lock(
         columns_str = ', '.join(fields)
     with _DB.conn:
         cursor = _DB.conn.cursor()
+        # Exact match on the primary key: LIKE-prefix matching would force a
+        # full table scan here (TEXT PK with default BINARY collation disables
+        # SQLite's LIKE-prefix index optimization). Prefix expansion is the
+        # caller's job via the *_with_prefix APIs.
         cursor.execute((f'SELECT {columns_str} FROM {REQUEST_TABLE} '
-                        'WHERE request_id LIKE ?'), (request_id + '%',))
+                        'WHERE request_id = ?'), (request_id,))
         row = cursor.fetchone()
         if row is None:
             return None
@@ -1046,9 +1079,10 @@ async def _get_request_no_lock_async(
     columns_str = ', '.join(REQUEST_COLUMNS)
     if fields:
         columns_str = ', '.join(fields)
+    # Exact match on the primary key; see _get_request_no_lock.
     async with _DB.execute_fetchall_async(
         (f'SELECT {columns_str} FROM {REQUEST_TABLE} '
-         'WHERE request_id LIKE ?'), (request_id + '%',)) as rows:
+         'WHERE request_id = ?'), (request_id,)) as rows:
         row = rows[0] if rows else None
         if row is None:
             return None
@@ -1315,6 +1349,48 @@ _add_or_update_request_sql = (f'INSERT OR REPLACE INTO {REQUEST_TABLE} '
                               f'({", ".join(REQUEST_COLUMNS)}) VALUES '
                               f'({", ".join(["?"] * len(REQUEST_COLUMNS))})')
 
+_EXECUTABLE_STATUS_VALUES = tuple(
+    s.value for s in RequestStatus.executable_statuses())
+_TERMINAL_STATUS_VALUES = tuple(
+    s.value for s in RequestStatus.finished_status())
+
+_try_mark_running_sql = (
+    f'UPDATE {REQUEST_TABLE} SET status = ?, pid = ?, '
+    f'{COL_STATUS_MSG} = NULL WHERE request_id = ? AND status IN '
+    f'({", ".join(["?"] * len(_EXECUTABLE_STATUS_VALUES))})')
+
+
+def _finish_request_update_sql(request_id: str, status: RequestStatus,
+                               name: Optional[str],
+                               error: Optional[BaseException],
+                               result: Optional[Any]) -> Tuple[str, List[Any]]:
+    """Build the targeted UPDATE that persists a terminal status.
+
+    Only the transitioned scalar columns are written; entrypoint and
+    request_body are never rewritten after insert. The NOT-IN guard makes
+    the terminal write and the shutdown sweep's CANCELLED+should_retry
+    marker (interrupt_request_for_retry) mutually exclusive: whichever
+    lands first wins, mirroring the terminal-status guard on the kill
+    paths.
+    """
+    set_clauses = ['status = ?', f'{COL_FINISHED_AT} = ?']
+    params: List[Any] = [status.value, time.time()]
+    if result is not None:
+        assert name is not None, request_id
+        serializer = return_value_serializers.get_serializer(name)
+        set_clauses.append('return_value = ?')
+        params.append(
+            serializer(_encoded_return_value(name, request_id, result)))
+    if error is not None:
+        set_clauses.append('error = ?')
+        params.append(orjson.dumps(_build_error_dict(error)).decode('utf-8'))
+    sql = (f'UPDATE {REQUEST_TABLE} SET {", ".join(set_clauses)} '
+           f'WHERE request_id = ? AND status NOT IN '
+           f'({", ".join(["?"] * len(_TERMINAL_STATUS_VALUES))})')
+    params.append(request_id)
+    params.extend(_TERMINAL_STATUS_VALUES)
+    return sql, params
+
 
 def _add_or_update_request_no_lock(request: Request):
     """Add or update a REST request into the database."""
@@ -1346,11 +1422,8 @@ def set_exception_stacktrace(e: BaseException) -> None:
 def set_request_failed(request_id: str, e: BaseException) -> None:
     """Set a request to failed and populate the error message."""
     set_exception_stacktrace(e)
-    with update_request(request_id) as request_task:
-        assert request_task is not None, request_id
-        request_task.status = RequestStatus.FAILED
-        request_task.finished_at = time.time()
-        request_task.set_error(e)
+    request_storage.get_request_backend().set_request_finished(
+        request_id, RequestStatus.FAILED, error=e)
 
 
 @metrics_lib.time_me_async
@@ -1358,22 +1431,14 @@ def set_request_failed(request_id: str, e: BaseException) -> None:
 async def set_request_failed_async(request_id: str, e: BaseException) -> None:
     """Set a request to failed and populate the error message."""
     set_exception_stacktrace(e)
-    storage = request_storage.get_request_backend()
-    async with storage.update_request_async(request_id) as request_task:
-        assert request_task is not None, request_id
-        request_task.status = RequestStatus.FAILED
-        request_task.finished_at = time.time()
-        request_task.set_error(e)
+    await request_storage.get_request_backend().set_request_finished_async(
+        request_id, RequestStatus.FAILED, error=e)
 
 
 def set_request_succeeded(request_id: str, result: Optional[Any]) -> None:
     """Set a request to succeeded and populate the result."""
-    with update_request(request_id) as request_task:
-        assert request_task is not None, request_id
-        request_task.status = RequestStatus.SUCCEEDED
-        request_task.finished_at = time.time()
-        if result is not None:
-            request_task.set_return_value(result)
+    request_storage.get_request_backend().set_request_finished(
+        request_id, RequestStatus.SUCCEEDED, result=result)
 
 
 @metrics_lib.time_me_async
@@ -1381,13 +1446,8 @@ def set_request_succeeded(request_id: str, result: Optional[Any]) -> None:
 async def set_request_succeeded_async(request_id: str,
                                       result: Optional[Any]) -> None:
     """Set a request to succeeded and populate the result."""
-    storage = request_storage.get_request_backend()
-    async with storage.update_request_async(request_id) as request_task:
-        assert request_task is not None, request_id
-        request_task.status = RequestStatus.SUCCEEDED
-        request_task.finished_at = time.time()
-        if result is not None:
-            request_task.set_return_value(result)
+    await request_storage.get_request_backend().set_request_finished_async(
+        request_id, RequestStatus.SUCCEEDED, result=result)
 
 
 @metrics_lib.time_me_async
@@ -1732,6 +1792,65 @@ class SqliteRequestBackend(request_storage.RequestBackend):
                 await _add_or_update_request_no_lock_async(request)
 
     @init_db
+    def try_mark_running(self, request_id: str, pid: Optional[int]) -> bool:
+        assert _DB is not None
+        # The status IN (...) guard makes the check-and-flip atomic in a
+        # single statement, so no per-request FileLock is needed.
+        with _DB.conn:
+            cursor = _DB.conn.cursor()
+            cursor.execute(_try_mark_running_sql,
+                           (RequestStatus.RUNNING.value, pid, request_id) +
+                           _EXECUTABLE_STATUS_VALUES)
+            return cursor.rowcount == 1
+
+    @init_db
+    def set_request_finished(self,
+                             request_id: str,
+                             status: RequestStatus,
+                             error: Optional[BaseException] = None,
+                             result: Optional[Any] = None) -> None:
+        assert _DB is not None
+        name = None
+        if result is not None:
+            # The return-value encoder is looked up by request name; a
+            # single-column primary-key read is far cheaper than the full
+            # row (which would unpickle entrypoint and request_body).
+            with _DB.conn:
+                cursor = _DB.conn.cursor()
+                cursor.execute(
+                    f'SELECT name FROM {REQUEST_TABLE} WHERE request_id = ?',
+                    (request_id,))
+                row = cursor.fetchone()
+            if row is None:
+                return
+            name = row[0]
+        sql, params = _finish_request_update_sql(request_id, status, name,
+                                                 error, result)
+        with _DB.conn:
+            cursor = _DB.conn.cursor()
+            cursor.execute(sql, params)
+
+    @init_db_async
+    @asyncio_utils.shield
+    async def set_request_finished_async(self,
+                                         request_id: str,
+                                         status: RequestStatus,
+                                         error: Optional[BaseException] = None,
+                                         result: Optional[Any] = None) -> None:
+        assert _DB is not None
+        name = None
+        if result is not None:
+            async with _DB.execute_fetchall_async(
+                    f'SELECT name FROM {REQUEST_TABLE} WHERE request_id = ?',
+                (request_id,)) as rows:
+                if not rows:
+                    return
+                name = rows[0][0]
+        sql, params = _finish_request_update_sql(request_id, status, name,
+                                                 error, result)
+        await _DB.execute_and_commit_async(sql, params)
+
+    @init_db
     def kill_requests(self,
                       request_ids: Optional[List[str]] = None,
                       user_id: Optional[str] = None) -> List[str]:
@@ -1836,9 +1955,12 @@ class SqliteRequestBackend(request_storage.RequestBackend):
         columns = 'status'
         if include_msg:
             columns += ', status_msg'
+        # Exact match on the primary key: this query runs in the /api/get
+        # poll loop every 10-100ms per waiting client, and LIKE-prefix
+        # matching would force a full table scan (see _get_request_no_lock).
         sql = (f'SELECT {columns} FROM {REQUEST_TABLE} '
-               f'WHERE request_id LIKE ?')
-        async with _DB.execute_fetchall_async(sql, (request_id + '%',)) as rows:
+               f'WHERE request_id = ?')
+        async with _DB.execute_fetchall_async(sql, (request_id,)) as rows:
             if rows is None or len(rows) == 0:
                 return None
             status = RequestStatus(rows[0][0])
