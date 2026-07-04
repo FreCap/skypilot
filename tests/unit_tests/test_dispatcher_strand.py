@@ -85,6 +85,18 @@ class _FailingExecutor:
         raise RuntimeError('worker pool broken')
 
 
+class _SucceedingExecutor:
+    """Executor whose submit succeeds, returning a fake future."""
+
+    def __init__(self):
+        self.submit_calls = 0
+
+    def submit_until_success(self, *args, **kwargs):
+        del args, kwargs
+        self.submit_calls += 1
+        return mock.MagicMock()
+
+
 @pytest.mark.asyncio
 async def test_submit_failure_fails_request(isolated_database, monkeypatch):
     monkeypatch.setattr(executor.time, 'sleep', lambda _: None)
@@ -127,6 +139,39 @@ async def test_concurrently_cancelled_request_left_untouched(
     # The terminal status set by the concurrent kill is not overwritten.
     record = requests_lib.get_request('req-cancelled')
     assert record.status == RequestStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_post_submit_failure_leaves_request_untouched(
+        isolated_database, monkeypatch):
+    """A failure AFTER a successful submit must not terminalize the row.
+
+    Once a future is obtained the request is executing (or about to); its
+    lifecycle belongs to ``handle_task_result``. Marking it FAILED from the
+    dispatcher would clobber a request that is running normally.
+    """
+    monkeypatch.setattr(executor.time, 'sleep', lambda _: None)
+    assert await requests_lib.create_if_not_exists_async(
+        _make_request('req-post-submit', RequestStatus.PENDING))
+
+    def _raise_on_thread(*args, **kwargs):
+        raise RuntimeError('post-submit bookkeeping broken')
+
+    # Inject a failure in the post-submit bookkeeping (the monitor thread
+    # creation), i.e. after submit_until_success returned a future.
+    monkeypatch.setattr(executor.threading, 'Thread', _raise_on_thread)
+
+    worker = _worker()
+    fake_executor = _SucceedingExecutor()
+    queue = _FakeQueue([('req-post-submit', True, False)])
+
+    # Must not raise despite the post-submit failure.
+    worker.process_request(fake_executor, queue)
+
+    assert fake_executor.submit_calls == 1
+    # The row is NOT terminalized: the request was successfully submitted.
+    record = requests_lib.get_request('req-post-submit')
+    assert record.status == RequestStatus.PENDING
 
 
 def test_missing_row_is_dropped(isolated_database, monkeypatch):

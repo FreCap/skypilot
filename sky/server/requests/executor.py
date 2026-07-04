@@ -240,6 +240,7 @@ class RequestWorker:
     def process_request(self, executor: process.BurstableExecutor,
                         queue: RequestQueue) -> None:
         request_id: Optional[str] = None
+        fut: Optional[concurrent.futures.Future] = None
         try:
             request_element = queue.get()
             if request_element is None:
@@ -291,22 +292,34 @@ class RequestWorker:
                 f'[{self}] Error processing request: '
                 f'{request_id if request_id is not None else ""} '
                 f'{common_utils.format_exception(e, use_bracket=True)}')
-            if request_id is not None:
-                # The element is already popped from the queue: without
-                # terminalizing the row here it would stay PENDING forever
-                # and clients polling /api/get would block indefinitely.
+            if request_id is not None and fut is None:
+                # The failure happened before a future was obtained, i.e. the
+                # request was never handed to the executor pool. The element
+                # is already popped from the queue: without terminalizing the
+                # row here it would stay PENDING forever and clients polling
+                # /api/get would block indefinitely.
+                # If a future exists, the request was submitted successfully
+                # and may already be RUNNING (or even finished); its lifecycle
+                # is owned by handle_task_result, so only log here.
                 self._fail_stranded_request(request_id, e)
 
     def _fail_stranded_request(self, request_id: str, e: BaseException) -> None:
         """Best-effort: fail a dequeued request that never got submitted."""
         try:
-            request = api_requests.get_request(request_id, fields=['status'])
-            if request is None:
-                return
-            if request.status > api_requests.RequestStatus.RUNNING:
-                # Already terminal, e.g. cancelled by a concurrent kill.
-                return
-            api_requests.set_request_failed(request_id, e)
+            api_requests.set_exception_stacktrace(e)
+            # Guard and write under a single update_request block (the lock
+            # is held across the read and the write), so a concurrent
+            # cancel/terminal write cannot land between the status check and
+            # the FAILED write and get clobbered.
+            with api_requests.update_request(request_id) as request_task:
+                if request_task is None:
+                    return
+                if request_task.status > api_requests.RequestStatus.RUNNING:
+                    # Already terminal, e.g. cancelled by a concurrent kill.
+                    return
+                request_task.status = api_requests.RequestStatus.FAILED
+                request_task.finished_at = time.time()
+                request_task.set_error(e)
         except (Exception, SystemExit) as recovery_e:  # pylint: disable=broad-except
             # Never let the recovery itself crash the dispatcher thread.
             logger.error(
