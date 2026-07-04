@@ -1371,7 +1371,10 @@ def _finish_request_update_sql(request_id: str, status: RequestStatus,
     the terminal write and the shutdown sweep's CANCELLED+should_retry
     marker (interrupt_request_for_retry) mutually exclusive: whichever
     lands first wins, mirroring the terminal-status guard on the kill
-    paths.
+    paths. The guard alone only protects UPDATE-vs-UPDATE ordering;
+    executing it must additionally hold the per-request FileLock so it
+    also serializes with full-row read-modify-write writers
+    (update_request / update_request_async).
     """
     set_clauses = ['status = ?', f'{COL_FINISHED_AT} = ?']
     params: List[Any] = [status.value, time.time()]
@@ -1794,14 +1797,19 @@ class SqliteRequestBackend(request_storage.RequestBackend):
     @init_db
     def try_mark_running(self, request_id: str, pid: Optional[int]) -> bool:
         assert _DB is not None
-        # The status IN (...) guard makes the check-and-flip atomic in a
-        # single statement, so no per-request FileLock is needed.
-        with _DB.conn:
-            cursor = _DB.conn.cursor()
-            cursor.execute(_try_mark_running_sql,
-                           (RequestStatus.RUNNING.value, pid, request_id) +
-                           _EXECUTABLE_STATUS_VALUES)
-            return cursor.rowcount == 1
+        # The per-request FileLock is required for composition with
+        # update_request()'s full-row read-modify-write writers (kill
+        # paths, interrupt_request_for_retry): the status IN (...) guard
+        # is atomic only at UPDATE time and cannot protect against a
+        # writer that read the row before this UPDATE and later REPLACEs
+        # the full (stale) row back.
+        with filelock.FileLock(request_lock_path(request_id)):
+            with _DB.conn:
+                cursor = _DB.conn.cursor()
+                cursor.execute(_try_mark_running_sql,
+                               (RequestStatus.RUNNING.value, pid, request_id) +
+                               _EXECUTABLE_STATUS_VALUES)
+                return cursor.rowcount == 1
 
     @init_db
     def set_request_finished(self,
@@ -1826,9 +1834,16 @@ class SqliteRequestBackend(request_storage.RequestBackend):
             name = row[0]
         sql, params = _finish_request_update_sql(request_id, status, name,
                                                  error, result)
-        with _DB.conn:
-            cursor = _DB.conn.cursor()
-            cursor.execute(sql, params)
+        # The per-request FileLock is required for composition with
+        # update_request()'s full-row read-modify-write writers (kill
+        # paths, interrupt_request_for_retry): the NOT IN (...) status
+        # guard alone is insufficient against a writer that read the row
+        # before this UPDATE and later REPLACEs the full (stale) row back,
+        # which would clobber the terminal result written here.
+        with filelock.FileLock(request_lock_path(request_id)):
+            with _DB.conn:
+                cursor = _DB.conn.cursor()
+                cursor.execute(sql, params)
 
     @init_db_async
     @asyncio_utils.shield
@@ -1848,7 +1863,12 @@ class SqliteRequestBackend(request_storage.RequestBackend):
                 name = rows[0][0]
         sql, params = _finish_request_update_sql(request_id, status, name,
                                                  error, result)
-        await _DB.execute_and_commit_async(sql, params)
+        # See set_request_finished(): the per-request FileLock is required
+        # for composition with update_request_async()'s full-row
+        # read-modify-write writers; the SQL status guard alone cannot
+        # prevent a stale full-row REPLACE from clobbering this write.
+        async with filelock.AsyncFileLock(request_lock_path(request_id)):
+            await _DB.execute_and_commit_async(sql, params)
 
     @init_db
     def kill_requests(self,

@@ -9,10 +9,16 @@ terminal setters) and the exact-match single-request lookups:
     (notably a CANCELLED + should_retry marker from the shutdown sweep).
   - Single-request getters match on the exact request id; prefix matching
     stays confined to the *_with_prefix APIs.
+  - The guarded UPDATE paths serialize with ``update_request``'s
+    FileLock-protected full-row read-modify-write, so a stale full-row
+    REPLACE can never clobber a terminal result (and vice versa).
 """
 # pylint: disable=protected-access
 # Pytest fixtures are injected by argument name.
 # pylint: disable=redefined-outer-name,unused-argument
+import asyncio
+import threading
+import time
 import unittest.mock as mock
 
 import pytest
@@ -243,3 +249,140 @@ async def test_transitions_preserve_entrypoint_and_body(isolated_database):
     assert record.entrypoint is _dummy
     assert record.request_body == original.request_body
     assert record.get_return_value() == 'ok'
+
+
+# --- Composition with update_request()'s full-row writers ---
+#
+# update_request() (used by the kill paths and by
+# interrupt_request_for_retry) does a FileLock-protected full-row
+# SELECT + INSERT OR REPLACE. The guarded UPDATE paths must hold the
+# same per-request lock: the SQL status guard alone cannot protect
+# against a writer that read the row before the guarded UPDATE landed
+# and later REPLACEs its full (stale) row back, clobbering the result.
+# These tests hold the lock via update_request() and assert the guarded
+# writers block until the context exits, and that no update is lost.
+
+_WAIT_TIMEOUT = 30.0
+# Long enough for a non-blocking (buggy) writer to finish many times
+# over; the assertion is on the event staying unset, so a correctly
+# blocking writer passes deterministically regardless of load.
+_BLOCKED_CHECK_TIMEOUT = 1.0
+
+
+@pytest.mark.asyncio
+async def test_set_request_finished_serializes_with_update_request(
+        isolated_database):
+    # Simulates interrupt_request_for_retry's read-modify-write racing
+    # with the worker's terminal write.
+    assert await requests.create_if_not_exists_async(
+        _make_request('req-compose-sync', RequestStatus.RUNNING, pid=4242))
+
+    started = threading.Event()
+    finished = threading.Event()
+
+    def _late_terminal_write():
+        started.set()
+        requests.set_request_succeeded('req-compose-sync', 'late-result')
+        finished.set()
+
+    writer = threading.Thread(target=_late_terminal_write, daemon=True)
+    with requests.update_request('req-compose-sync') as record:
+        assert record is not None
+        assert record.status == RequestStatus.RUNNING
+        writer.start()
+        assert started.wait(_WAIT_TIMEOUT)
+        # While the full-row writer holds the per-request lock, the
+        # guarded terminal UPDATE must not land.
+        assert not finished.wait(_BLOCKED_CHECK_TIMEOUT)
+        record.status = RequestStatus.CANCELLED
+        record.should_retry = True
+        record.finished_at = time.time()
+    # Lock released: the guarded write completes, and its terminal-status
+    # guard refuses to overwrite the CANCELLED marker written first.
+    assert finished.wait(_WAIT_TIMEOUT)
+    writer.join(_WAIT_TIMEOUT)
+    assert not writer.is_alive()
+
+    final = requests.get_request('req-compose-sync')
+    assert final is not None
+    assert final.status == RequestStatus.CANCELLED
+    assert final.should_retry is True
+    assert final.return_value is None
+
+
+@pytest.mark.asyncio
+async def test_try_mark_running_serializes_with_update_request(
+        isolated_database):
+    # Inverse race: a kill-path full-row writer vs the RUNNING flip.
+    assert await requests.create_if_not_exists_async(
+        _make_request('req-compose-flip', RequestStatus.PENDING))
+
+    started = threading.Event()
+    finished = threading.Event()
+    flip_result = {}
+
+    def _flip_to_running():
+        started.set()
+        flip_result['value'] = requests.try_mark_running('req-compose-flip',
+                                                         pid=777)
+        finished.set()
+
+    flipper = threading.Thread(target=_flip_to_running, daemon=True)
+    with requests.update_request('req-compose-flip') as record:
+        assert record is not None
+        flipper.start()
+        assert started.wait(_WAIT_TIMEOUT)
+        assert not finished.wait(_BLOCKED_CHECK_TIMEOUT)
+        # Simulate the kill path cancelling the request under the lock.
+        record.status = RequestStatus.CANCELLED
+        record.finished_at = time.time()
+    assert finished.wait(_WAIT_TIMEOUT)
+    flipper.join(_WAIT_TIMEOUT)
+    assert not flipper.is_alive()
+
+    # The flip observed the CANCELLED row and refused.
+    assert flip_result['value'] is False
+    final = requests.get_request('req-compose-flip')
+    assert final is not None
+    assert final.status == RequestStatus.CANCELLED
+    assert final.pid is None
+
+
+@pytest.mark.asyncio
+async def test_set_request_finished_async_serializes_with_update_request(
+        isolated_database):
+    assert await requests.create_if_not_exists_async(
+        _make_request('req-compose-async', RequestStatus.RUNNING, pid=4242))
+
+    lock_held = threading.Event()
+    release = threading.Event()
+
+    def _hold_lock_and_cancel():
+        with requests.update_request('req-compose-async') as record:
+            assert record is not None
+            record.status = RequestStatus.CANCELLED
+            record.should_retry = True
+            record.finished_at = time.time()
+            lock_held.set()
+            release.wait(_WAIT_TIMEOUT)
+
+    holder = threading.Thread(target=_hold_lock_and_cancel, daemon=True)
+    holder.start()
+    assert lock_held.wait(_WAIT_TIMEOUT)
+
+    task = asyncio.create_task(
+        requests.set_request_succeeded_async('req-compose-async',
+                                             'late-result'))
+    done, _ = await asyncio.wait({task}, timeout=_BLOCKED_CHECK_TIMEOUT)
+    # The async guarded write must stay blocked while the lock is held.
+    assert not done
+    release.set()
+    await asyncio.wait_for(task, timeout=_WAIT_TIMEOUT)
+    holder.join(_WAIT_TIMEOUT)
+    assert not holder.is_alive()
+
+    final = requests.get_request('req-compose-async')
+    assert final is not None
+    assert final.status == RequestStatus.CANCELLED
+    assert final.should_retry is True
+    assert final.return_value is None

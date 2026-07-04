@@ -775,9 +775,11 @@ def _request_execution_wrapper(request_id: str,
         # the try block to ensure we have the KeyboardInterrupt handling.
         # The guarded UPDATE atomically checks the executable-status
         # precondition (PENDING/WAITING) and flips the row to RUNNING with
-        # this worker's pid, clearing any leftover retry-backoff message, so
-        # the per-request FileLock previously used for this read-modify-write
-        # is not needed on this path.
+        # this worker's pid, clearing any leftover retry-backoff message,
+        # in a single statement without re-writing the full row. It still
+        # takes the per-request FileLock internally so it serializes with
+        # the remaining full-row read-modify-write writers (kill paths,
+        # interrupt_request_for_retry).
         if not api_requests.try_mark_running(request_id, pid):
             logger.warning(f'Request {request_id} is already finished or '
                            'cancelled, skipping execution')
