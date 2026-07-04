@@ -22,6 +22,7 @@ from sky import sky_logging
 from sky.server import daemons
 from sky.server import metrics as metrics_lib
 from sky.server import state
+from sky.server import watchdog
 from sky.server.requests import requests as requests_lib
 from sky.server.requests import storage as request_storage
 from sky.skylet import constants
@@ -240,6 +241,14 @@ class Server(uvicorn.Server):
 
     def run(self, *args, **kwargs):
         """Run the server process."""
+        # In multi-worker mode this runs in a spawned worker process. If the
+        # main server process dies abruptly (kill -9, OOM), exit with it
+        # instead of keeping the API port bound and health checks green while
+        # the dispatcher threads (which lived in the main process) are gone.
+        # In single-worker mode run() executes in the main process itself and
+        # the guard keeps the watchdog unarmed.
+        if watchdog.running_in_child_process():
+            watchdog.start_parent_death_watchdog()
         if self.max_db_connections is not None:
             db_utils.set_max_connections(self.max_db_connections)
         add_timestamp_prefix_for_server_logs()

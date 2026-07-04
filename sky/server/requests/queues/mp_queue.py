@@ -6,6 +6,7 @@ import time
 from typing import List
 
 from sky import sky_logging
+from sky.server import watchdog
 
 logger = sky_logging.init_logger(__name__)
 
@@ -22,6 +23,13 @@ class QueueManager(managers.BaseManager):
 
 def start_queue_manager(queue_names: List[str],
                         port: int = DEFAULT_QUEUE_MANAGER_PORT) -> None:
+    # This runs in a child process of the API server. If the main process
+    # dies abruptly (kill -9, OOM), exit with it instead of holding the
+    # queue manager port as an orphan, which would block a fresh
+    # `sky api start`.
+    if watchdog.running_in_child_process():
+        watchdog.start_parent_death_watchdog()
+
     # Defining a local function instead of a lambda function
     # (e.g. lambda: q) because the lambda function captures q by
     # reference, so by the time lambda is called, the loop has already
