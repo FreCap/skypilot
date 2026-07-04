@@ -3500,8 +3500,10 @@ if __name__ == '__main__':
     global_user_state.initialize_and_get_db()
     logger.info('Database engine initialized')
     # Initialize request db, recovering request state from the previous
-    # server run (or wiping it if recovery is disabled or fails).
-    requests_lib.recover_db_and_logs()
+    # server run (or wiping it if recovery is disabled or fails). Returns
+    # whether the recovery transitions actually ran and completed; only then
+    # is it safe to re-enqueue the surviving queued rows below.
+    requests_recovered = requests_lib.recover_db_and_logs()
     # Restore the server user hash
     logger.info('Initializing server user hash')
     _init_or_restore_server_user_hash()
@@ -3597,8 +3599,12 @@ if __name__ == '__main__':
         # Requeue requests that were still queued when the previous server
         # stopped. Must run after executor.start() (queue backend up) and
         # before serving traffic, so recovered work resumes ahead of new
-        # requests.
-        executor.reenqueue_recovered_requests()
+        # requests. Only safe when startup recovery actually reconciled the
+        # request rows; on any legacy wipe path (env-var reset, plugin
+        # request backend, recovery failure) surviving rows were never
+        # reconciled and must not be replayed.
+        if requests_recovered:
+            executor.reenqueue_recovered_requests()
 
         logger.info(f'Starting SkyPilot API server, workers={num_workers}')
         # We don't support reload for now, since it may cause leakage of request

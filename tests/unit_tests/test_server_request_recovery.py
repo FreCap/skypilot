@@ -107,7 +107,8 @@ async def test_recovery_reconciles_each_status(isolated_database,
             f'UPDATE {requests_lib.REQUEST_TABLE} SET retryable = NULL '
             'WHERE request_id = ?', ('req-waiting-legacy-null',))
 
-    requests_lib.recover_db_and_logs()
+    # Recovery ran and completed: the caller may re-enqueue queued rows.
+    assert requests_lib.recover_db_and_logs() is True
 
     # Stale daemon rows are deleted so the daemon is re-created and
     # re-enqueued on this boot.
@@ -191,25 +192,82 @@ async def test_reset_env_var_forces_full_wipe(isolated_database,
     assert await requests_lib.create_if_not_exists_async(
         _make_request('req-healthy', RequestStatus.PENDING))
 
-    requests_lib.recover_db_and_logs()
+    # The wipe path signals that recovery did NOT run, so the server must
+    # not re-enqueue anything.
+    assert requests_lib.recover_db_and_logs() is False
 
     assert requests_lib.get_request_tasks(
         requests_lib.RequestTaskFilter()) == []
 
 
-def test_plugin_request_backend_falls_back_to_wipe(monkeypatch):
+def test_plugin_request_backend_falls_back_to_wipe_without_reenqueue(
+        monkeypatch):
     # A plugin RequestBackend owns its own restart semantics via
-    # reset_on_startup(); the sqlite-level recovery would not see its rows,
-    # so the legacy reset path must be taken.
-    monkeypatch.setattr(
-        requests_lib.request_storage, '_storage_backend',
-        mock.Mock(spec=requests_lib.request_storage.RequestBackend))
+    # reset_on_startup() (a no-op by default); the sqlite-level recovery
+    # would not see its rows, so the legacy reset path must be taken AND the
+    # surviving, never-reconciled rows must not be replayed.
+    plugin_backend = mock.Mock(spec=requests_lib.request_storage.RequestBackend)
+    # The plugin backend still holds a queued row after the (no-op) wipe: if
+    # the server re-enqueued unconditionally, this row would be replayed.
+    plugin_backend.query_requests.return_value = [
+        _make_request('req-plugin-pending', RequestStatus.PENDING)
+    ]
+    monkeypatch.setattr(requests_lib.request_storage, '_storage_backend',
+                        plugin_backend)
     wipe = mock.Mock()
     monkeypatch.setattr(requests_lib, 'reset_db_and_logs', wipe)
+    puts = []
+    monkeypatch.setattr(
+        executor, '_get_queue',
+        lambda schedule_type: mock.Mock(put=lambda item: puts.append(
+            (schedule_type, item))))
 
-    requests_lib.recover_db_and_logs()
+    # Mirror the server startup sequence: re-enqueue only if recovery ran.
+    recovered = requests_lib.recover_db_and_logs()
+    if recovered:
+        executor.reenqueue_recovered_requests()
 
     wipe.assert_called_once()
+    assert recovered is False
+    # The queued plugin row was never reconciled by recovery, so nothing may
+    # be enqueued.
+    assert not puts
+
+
+@pytest.mark.asyncio
+async def test_reenqueue_skips_daemon_pattern_ids(isolated_database,
+                                                  monkeypatch):
+    # A daemon id that was removed from the current build is not deleted by
+    # startup recovery (it is no longer in INTERNAL_REQUEST_DAEMONS) and the
+    # lifespan orphan-daemon cleanup only runs later; the daemon-id naming
+    # pattern must keep its row out of the re-enqueue regardless of cleanup
+    # ordering.
+    removed_daemon_id = 'legacy-removed-status-refresh-daemon'
+    assert removed_daemon_id not in daemons._DAEMON_IDS
+    seed = [
+        _make_request(removed_daemon_id, RequestStatus.PENDING, created_at=1.0),
+        _make_request('req-user-pending', RequestStatus.PENDING,
+                      created_at=2.0),
+    ]
+    for request in seed:
+        assert await requests_lib.create_if_not_exists_async(request)
+
+    puts = []
+    monkeypatch.setattr(executor, '_get_queue',
+                        lambda schedule_type: mock.Mock(put=puts.append))
+
+    executor.reenqueue_recovered_requests()
+
+    assert [item[0] for item in puts] == ['req-user-pending']
+
+
+def test_registered_daemon_ids_follow_naming_pattern():
+    # The re-enqueue exclusion relies on daemon ids matching the naming
+    # pattern even after they are removed from a build; every registered id
+    # must therefore follow the naming convention (not just the exact-id
+    # set, which would no longer contain a removed daemon).
+    for daemon in daemons.INTERNAL_REQUEST_DAEMONS:
+        assert daemon.id.endswith(daemons._DAEMON_ID_SUFFIX), daemon.id
 
 
 @pytest.mark.asyncio
@@ -219,8 +277,9 @@ async def test_corrupted_db_falls_back_to_wipe(isolated_database,
     monkeypatch.setattr(requests_lib.bs, 'get_blob_storage', mock.Mock)
     isolated_database.write_bytes(b'this is not a sqlite database at all')
 
-    # Must not raise: a corrupted DB may never block startup.
-    requests_lib.recover_db_and_logs()
+    # Must not raise: a corrupted DB may never block startup. The fallback
+    # wipe signals that recovery did not run (no re-enqueue).
+    assert requests_lib.recover_db_and_logs() is False
 
     # The corrupted file was wiped and replaced with a fresh, empty DB that
     # accepts new writes.

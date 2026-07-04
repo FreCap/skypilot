@@ -841,7 +841,7 @@ def _recover_requests() -> Tuple[int, int]:
     return interrupted, replayable
 
 
-def recover_db_and_logs():
+def recover_db_and_logs() -> bool:
     """Initialize request state on startup, preserving prior requests.
 
     Replaces the legacy behavior of wiping the request DB and logs on every
@@ -850,10 +850,20 @@ def recover_db_and_logs():
     legacy wipe remains available via ``RESET_REQUESTS_ON_STARTUP_ENV_VAR``
     and as the fallback if recovery fails for any reason, so startup is
     never blocked.
+
+    Returns:
+        True if the recovery transitions ran and completed, i.e. every
+        remaining PENDING/WAITING row has been reconciled and it is safe
+        for the caller to re-enqueue them
+        (``executor.reenqueue_recovered_requests``). False whenever the
+        legacy wipe path was taken instead (explicit env-var reset, plugin
+        request backend, or recovery failure): rows that survive a wipe --
+        e.g. rows owned by a plugin backend whose ``reset_on_startup`` is a
+        no-op -- were never reconciled and must NOT be re-enqueued.
     """
     if os.environ.get(RESET_REQUESTS_ON_STARTUP_ENV_VAR) == '1':
         reset_db_and_logs()
-        return
+        return False
     if not isinstance(request_storage.get_request_backend(),
                       SqliteRequestBackend):
         # A plugin request backend owns its own restart semantics via
@@ -861,7 +871,7 @@ def recover_db_and_logs():
         # its rows (and reenqueue_recovered_requests would then replay rows
         # recovery never reconciled). Keep the legacy behavior for it.
         reset_db_and_logs()
-        return
+        return False
     try:
         interrupted, replayable = _recover_requests()
         if interrupted or replayable:
@@ -884,6 +894,7 @@ def recover_db_and_logs():
         shutil.rmtree(pathlib.Path(LEGACY_REQUEST_LOG_PATH_PREFIX).expanduser(),
                       ignore_errors=True)
         request_storage.get_request_backend().reset_on_startup()
+        return True
     except Exception as e:  # pylint: disable=broad-except
         # Recovery must never block startup (e.g. a corrupted DB file):
         # fall back to the legacy full wipe, which starts from a clean slate.
@@ -891,6 +902,7 @@ def recover_db_and_logs():
                        'API server run; falling back to a full reset: '
                        f'{common_utils.format_exception(e)}')
         reset_db_and_logs()
+        return False
 
 
 def request_lock_path(request_id: str) -> str:

@@ -1247,8 +1247,12 @@ def reenqueue_recovered_requests() -> None:
                                            api_requests.COL_RETRYABLE
                                        ]))
     # Daemon rows are deleted by startup recovery and re-created via
-    # schedule_internal_daemon_async; skip them defensively in case any
-    # slipped through (e.g. a daemon id removed from the current build).
+    # schedule_internal_daemon_async; skip anything matching the daemon-id
+    # pattern in case any slipped through. is_daemon_request_id matches by
+    # naming pattern, so this also covers a PENDING row of a daemon id that
+    # was removed from the current build -- which recovery keeps (its id is
+    # no longer in INTERNAL_REQUEST_DAEMONS) and the FastAPI-lifespan
+    # orphan-daemon cleanup only reaps after we run.
     # Likewise, only replay WAITING rows explicitly marked retryable:
     # recovery flips non-retryable WAITING rows to CANCELLED+should_retry,
     # but re-check here rather than trusting that recovery ran and agreed.
