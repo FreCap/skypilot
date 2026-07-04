@@ -9,11 +9,13 @@ exit when its parent dies; these tests pin the detection loop and the
 arm/no-arm guard with injected fakes (no real sleeping, no real processes).
 """
 # pylint: disable=protected-access
+import functools
 import threading
 
 import pytest
 
 from sky.server import watchdog
+from sky.server.requests import executor
 
 
 class _StopLoop(Exception):
@@ -97,3 +99,66 @@ def test_guard_arms_only_in_child_process():
                                             ) is True
     assert watchdog.running_in_child_process(
         parent_process=lambda: None) is False
+
+
+class _FakeThread:
+    """Records Thread(...) construction/start without spawning a thread."""
+
+    def __init__(self, *args, **kwargs):  # pylint: disable=unused-argument
+        self.daemon = kwargs.get('daemon', False)
+        self.started = False
+
+    def start(self):
+        self.started = True
+
+
+@pytest.mark.parametrize('has_parent', [True, False])
+def test_executor_initializer_arms_watchdog_only_in_child(
+        monkeypatch, has_parent):
+    """executor_initializer arms the watchdog iff a parent process exists.
+
+    Executor pool children (including lazily-spawned burst workers) must die
+    with the main API server process; otherwise an orphan keeps executing its
+    current request and its late terminal writes race the next server boot's
+    startup recovery. All side effects are faked: no real processes/threads.
+    """
+    armed = []
+    # Exercise the real guard logic with a fake parent_process instead of
+    # relying on multiprocessing.parent_process (bound at def-time).
+    monkeypatch.setattr(
+        watchdog, 'running_in_child_process',
+        functools.partial(watchdog.running_in_child_process,
+                          parent_process=lambda: object()
+                          if has_parent else None))
+    monkeypatch.setattr(watchdog, 'start_parent_death_watchdog',
+                        lambda *args, **kwargs: armed.append(True))
+
+    # Stub the initializer's other side effects and record they still run.
+    proctitles = []
+    monkeypatch.setattr(executor.setproctitle, 'setproctitle',
+                        proctitles.append)
+    plugins_loaded = []
+    monkeypatch.setattr(executor.plugins, 'load_plugins', plugins_loaded.append)
+    monkeypatch.setattr(executor.metrics_lib,
+                        'register_multiproc_cleanup_atexit', lambda: None)
+    clean_envs = []
+    monkeypatch.setattr(executor.clean_env_module, 'set_clean_server_env',
+                        clean_envs.append)
+    fake_threads = []
+
+    def _fake_thread(*args, **kwargs):
+        fake_thread = _FakeThread(*args, **kwargs)
+        fake_threads.append(fake_thread)
+        return fake_thread
+
+    monkeypatch.setattr(executor.threading, 'Thread', _fake_thread)
+
+    executor.executor_initializer('short', clean_env={'FOO': 'BAR'})
+
+    assert armed == ([True] if has_parent else [])
+    # Existing initializer behavior still runs regardless of the guard.
+    assert len(proctitles) == 1
+    assert len(plugins_loaded) == 1
+    assert clean_envs == [{'FOO': 'BAR'}]
+    assert len(fake_threads) == 1
+    assert fake_threads[0].daemon and fake_threads[0].started
