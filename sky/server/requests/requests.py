@@ -67,6 +67,11 @@ COL_STATUS_MSG = 'status_msg'
 COL_SHOULD_RETRY = 'should_retry'
 COL_FINISHED_AT = 'finished_at'
 COL_FILE_MOUNTS_BLOB_ID = 'file_mounts_blob_id'
+# Enqueue flags, persisted so that queued requests can be re-enqueued after
+# a server restart. Not part of RequestPayload: they are server-internal and
+# never sent to clients.
+COL_IGNORE_RETURN_VALUE = 'ignore_return_value'
+COL_RETRYABLE = 'retryable'
 # Legacy path for backward compatibility - GC will clean up logs from both
 # the new and legacy paths to handle server upgrades gracefully.
 LEGACY_REQUEST_LOG_PATH_PREFIX = '~/sky_logs/api_server/requests'
@@ -76,6 +81,10 @@ DEFAULT_REQUESTS_RETENTION_HOURS = 24  # 1 day
 # of the rows being cleaned; the GC itself always runs at this cadence so
 # the table does not grow unboundedly between runs under high request rates.
 _GC_INTERVAL_SECONDS = 3600
+
+# Escape hatch: set to '1' to restore the legacy behavior of wiping the
+# request DB and logs on API server startup instead of recovering them.
+RESET_REQUESTS_ON_STARTUP_ENV_VAR = 'SKYPILOT_RESET_REQUESTS_ON_STARTUP'
 
 # TODO(zhwu): For scalability, there are several TODOs:
 # [x] Have a way to queue requests.
@@ -165,6 +174,8 @@ REQUEST_COLUMNS = [
     COL_SHOULD_RETRY,
     COL_FINISHED_AT,
     COL_FILE_MOUNTS_BLOB_ID,
+    COL_IGNORE_RETURN_VALUE,
+    COL_RETRYABLE,
 ]
 
 
@@ -201,6 +212,12 @@ class Request:
     finished_at: Optional[float] = None
     # Blob ID of uploaded file mounts
     file_mounts_blob_id: Optional[str] = None
+    # Enqueue flags (see the queue tuple in executor.RequestQueue). Persisted
+    # so that queued requests survive a server restart and can be re-enqueued
+    # with the same dispatch semantics. Server-internal: not part of
+    # RequestPayload and never sent to clients.
+    ignore_return_value: bool = False
+    retryable: bool = False
 
     @property
     def log_path(self) -> pathlib.Path:
@@ -259,7 +276,15 @@ class Request:
     @classmethod
     def from_row(cls, row: Tuple[Any, ...]) -> 'Request':
         content = dict(zip(REQUEST_COLUMNS, row))
-        return cls.decode(payloads.RequestPayload(**content))
+        # The enqueue flags are server-internal DB columns that are not part
+        # of RequestPayload; pop them and set them on the decoded request.
+        # NULL (a row written by an older server) coerces to False.
+        ignore_return_value = bool(content.pop(COL_IGNORE_RETURN_VALUE, None))
+        retryable = bool(content.pop(COL_RETRYABLE, None))
+        request = cls.decode(payloads.RequestPayload(**content))
+        request.ignore_return_value = ignore_return_value
+        request.retryable = retryable
+        return request
 
     def to_row(self) -> Tuple[Any, ...]:
         payload = self.encode()
@@ -267,9 +292,14 @@ class Request:
         # version; that is a wire-only concern. to_row() feeds the database, so
         # always persist the true status regardless of the request context.
         payload.status = self.status.value
-        row = []
+        row: List[Any] = []
         for k in REQUEST_COLUMNS:
-            row.append(getattr(payload, k))
+            if k == COL_IGNORE_RETURN_VALUE:
+                row.append(int(self.ignore_return_value))
+            elif k == COL_RETRYABLE:
+                row.append(int(self.retryable))
+            else:
+                row.append(getattr(payload, k))
         return tuple(row)
 
     def readable_encode(self) -> payloads.RequestPayload:
@@ -482,6 +512,10 @@ def _update_request_row_fields(
         content['finished_at'] = None
     if COL_FILE_MOUNTS_BLOB_ID not in fields:
         content[COL_FILE_MOUNTS_BLOB_ID] = None
+    if COL_IGNORE_RETURN_VALUE not in fields:
+        content[COL_IGNORE_RETURN_VALUE] = False
+    if COL_RETRYABLE not in fields:
+        content[COL_RETRYABLE] = False
 
     # Convert back to tuple in the same order as REQUEST_COLUMNS
     return tuple(content[col] for col in REQUEST_COLUMNS)
@@ -519,7 +553,9 @@ def create_table(cursor, conn):
         {COL_USER_ID} TEXT,
         {COL_STATUS_MSG} TEXT,
         {COL_SHOULD_RETRY} INTEGER,
-        {COL_FINISHED_AT} REAL
+        {COL_FINISHED_AT} REAL,
+        {COL_IGNORE_RETURN_VALUE} INTEGER,
+        {COL_RETRYABLE} INTEGER
         )""")
 
     db_utils.add_column_to_table(cursor, conn, REQUEST_TABLE, COL_STATUS_MSG,
@@ -530,6 +566,10 @@ def create_table(cursor, conn):
                                  'REAL')
     db_utils.add_column_to_table(cursor, conn, REQUEST_TABLE,
                                  COL_FILE_MOUNTS_BLOB_ID, 'TEXT')
+    db_utils.add_column_to_table(cursor, conn, REQUEST_TABLE,
+                                 COL_IGNORE_RETURN_VALUE, 'INTEGER')
+    db_utils.add_column_to_table(cursor, conn, REQUEST_TABLE, COL_RETRYABLE,
+                                 'INTEGER')
 
     # Add an index on (status, name) to speed up queries
     # that filter on these columns.
@@ -627,8 +667,9 @@ def init_db_async(func):
 def _log_orphaned_inflight_requests() -> None:
     """Log any requests still in-flight when the API server last stopped.
 
-    ``reset_db_and_logs`` (run on every API-server startup) wipes the request DB
-    and its logs, and the executor child processes that ran those requests died
+    ``reset_db_and_logs`` (the legacy full-wipe path, run when startup
+    recovery is disabled or fails) wipes the request DB and its logs, and the
+    executor child processes that ran those requests died
     with the previous process. So a request that was still PENDING/WAITING/
     RUNNING -- notably a long provisioning launch held by a long worker -- is
     silently dropped: the caller (CLI, or a serve/jobs controller) awaiting it
@@ -674,6 +715,55 @@ def _log_orphaned_inflight_requests() -> None:
                        f'name={req.name!r} status={req.status.value}{cluster}')
 
 
+def _request_log_tombstones() -> List[pathlib.Path]:
+    """List request-log tombstone dirs left by this or a previous startup."""
+    log_dir = pathlib.Path(
+        server_constants.REQUEST_LOG_PATH_PREFIX).expanduser()
+    return list(log_dir.parent.glob(f'{log_dir.name}.deleting.*'))
+
+
+def _rmtree_in_background(
+        paths: List[pathlib.Path]) -> Optional[threading.Thread]:
+    """Delete directories in a background thread; returns it for tests."""
+    if not paths:
+        return None
+
+    def _rm():
+        for path in paths:
+            shutil.rmtree(path, ignore_errors=True)
+
+    thread = threading.Thread(target=_rm,
+                              name='request-logs-cleanup',
+                              daemon=True)
+    thread.start()
+    return thread
+
+
+def _clear_request_logs_in_background() -> Optional[threading.Thread]:
+    """Clear the request-logs dir without blocking startup.
+
+    The dir scales with the number of requests since the last wipe, so an
+    inline rmtree delays the port bind by O(requests). Rename it to a
+    tombstone (O(1), same filesystem) and delete the tombstone in a
+    background thread; also sweep tombstones left by a previous crash.
+    """
+    to_delete = _request_log_tombstones()
+    log_dir = pathlib.Path(
+        server_constants.REQUEST_LOG_PATH_PREFIX).expanduser()
+    if log_dir.exists():
+        tombstone = log_dir.parent / (f'{log_dir.name}.deleting.'
+                                      f'{os.getpid()}-{uuid.uuid4().hex[:8]}')
+        try:
+            log_dir.rename(tombstone)
+            to_delete.append(tombstone)
+        except OSError:
+            # Rename failed (e.g. concurrent removal); fall back to the
+            # legacy inline delete rather than deleting a live dir that new
+            # request logs may be written into.
+            shutil.rmtree(log_dir, ignore_errors=True)
+    return _rmtree_in_background(to_delete)
+
+
 def reset_db_and_logs():
     """Clear local state and re-initialize the request storage backend."""
     # Surface any requests still in-flight when the server stopped BEFORE we
@@ -690,9 +780,7 @@ def reset_db_and_logs():
     server_common.clear_local_api_server_database()
     logger.debug('clearing local API server logs directory at '
                  f'{server_constants.REQUEST_LOG_PATH_PREFIX}')
-    shutil.rmtree(pathlib.Path(
-        server_constants.REQUEST_LOG_PATH_PREFIX).expanduser(),
-                  ignore_errors=True)
+    _clear_request_logs_in_background()
     # Also clear legacy path for backward compatibility cleanup
     logger.debug('clearing legacy API server logs directory at '
                  f'{LEGACY_REQUEST_LOG_PATH_PREFIX}')
@@ -700,6 +788,109 @@ def reset_db_and_logs():
                   ignore_errors=True)
     bs.get_blob_storage().reset_on_startup()
     request_storage.get_request_backend().reset_on_startup()
+
+
+def _recover_requests() -> Tuple[int, int]:
+    """Reconcile request rows left over from the previous server process.
+
+    All executor processes died with the previous server, so no recovered
+    row has a live worker. Reconcile each non-terminal row:
+
+    - Internal daemon rows are deleted: a stale row would make
+      ``schedule_internal_daemon_async``'s create-or-refresh path skip the
+      enqueue and the daemon would never run this boot.
+    - RUNNING rows, and WAITING rows that are not retryable, are marked
+      CANCELLED with ``should_retry`` set so polling clients get the
+      retry signal (HTTP 503) instead of a 404.
+    - PENDING rows and retryable WAITING rows are left untouched for
+      re-enqueue (``executor.reenqueue_recovered_requests``): a PENDING row
+      never started executing (the execution wrapper flips it to RUNNING
+      before invoking the entrypoint) and retryable WAITING rows were
+      already parked for a full re-run.
+    - Terminal rows (and their logs) are preserved; the requests GC daemon
+      bounds their growth via the configured retention.
+
+    Returns:
+        A tuple of (number of rows marked for client retry, number of rows
+        left queued for re-enqueue).
+    """
+    with _init_db_lock:
+        _init_db_within_lock()
+    assert _DB is not None
+    daemon_ids = sorted(d.id for d in daemons.INTERNAL_REQUEST_DAEMONS)
+    with _DB.conn:
+        cursor = _DB.conn.cursor()
+        placeholders = ', '.join(['?'] * len(daemon_ids))
+        cursor.execute(
+            f'DELETE FROM {REQUEST_TABLE} '
+            f'WHERE request_id IN ({placeholders})', daemon_ids)
+        cursor.execute(
+            f'UPDATE {REQUEST_TABLE} '
+            f'SET status = ?, {COL_SHOULD_RETRY} = 1, {COL_FINISHED_AT} = ? '
+            f'WHERE status = ? '
+            f'OR (status = ? AND ({COL_RETRYABLE} IS NULL '
+            f'OR {COL_RETRYABLE} = 0))',
+            (RequestStatus.CANCELLED.value, time.time(),
+             RequestStatus.RUNNING.value, RequestStatus.WAITING.value))
+        interrupted = cursor.rowcount
+        cursor.execute(
+            f'SELECT COUNT(*) FROM {REQUEST_TABLE} '
+            'WHERE status IN (?, ?)',
+            (RequestStatus.PENDING.value, RequestStatus.WAITING.value))
+        replayable = cursor.fetchone()[0]
+    return interrupted, replayable
+
+
+def recover_db_and_logs():
+    """Initialize request state on startup, preserving prior requests.
+
+    Replaces the legacy behavior of wiping the request DB and logs on every
+    startup, which destroyed queued work and made clients polling in-flight
+    requests fail with 404 after any restart (hard crashes included). The
+    legacy wipe remains available via ``RESET_REQUESTS_ON_STARTUP_ENV_VAR``
+    and as the fallback if recovery fails for any reason, so startup is
+    never blocked.
+    """
+    if os.environ.get(RESET_REQUESTS_ON_STARTUP_ENV_VAR) == '1':
+        reset_db_and_logs()
+        return
+    if not isinstance(request_storage.get_request_backend(),
+                      SqliteRequestBackend):
+        # A plugin request backend owns its own restart semantics via
+        # reset_on_startup(); the sqlite-level recovery below would not see
+        # its rows (and reenqueue_recovered_requests would then replay rows
+        # recovery never reconciled). Keep the legacy behavior for it.
+        reset_db_and_logs()
+        return
+    try:
+        interrupted, replayable = _recover_requests()
+        if interrupted or replayable:
+            logger.warning(
+                'Recovered request state from the previous API server run: '
+                f'{interrupted} interrupted request(s) marked for client '
+                f'retry, {replayable} queued request(s) will be re-enqueued.')
+        # NOTE: bs.get_blob_storage().reset_on_startup() is intentionally not
+        # called on the recovery path: it wipes each client dir except
+        # file_mounts/blobs, and preserved PENDING/WAITING request bodies may
+        # reference legacy (non-blob) file-mount uploads under those client
+        # dirs (process_mounts_in_task_on_api_server resolves
+        # file_mounts_mapping against the client dir when file_mounts_blob_id
+        # is unset), which replay needs intact. The transient state stays
+        # bounded: the full wipe still runs whenever recovery is disabled or
+        # fails, and blob GC runs in the background.
+        # Sweep request-log tombstones left by a previous wipe that crashed
+        # mid-delete, and clear the legacy logs dir (cheap and one-time).
+        _rmtree_in_background(_request_log_tombstones())
+        shutil.rmtree(pathlib.Path(LEGACY_REQUEST_LOG_PATH_PREFIX).expanduser(),
+                      ignore_errors=True)
+        request_storage.get_request_backend().reset_on_startup()
+    except Exception as e:  # pylint: disable=broad-except
+        # Recovery must never block startup (e.g. a corrupted DB file):
+        # fall back to the legacy full wipe, which starts from a clean slate.
+        logger.warning('Failed to recover request state from the previous '
+                       'API server run; falling back to a full reset: '
+                       f'{common_utils.format_exception(e)}')
+        reset_db_and_logs()
 
 
 def request_lock_path(request_id: str) -> str:
@@ -951,6 +1142,9 @@ def build_internal_daemon_request(
         created_at=time.time(),
         schedule_type=ScheduleType.SHORT,
         user_id=skylet_constants.SKYPILOT_SYSTEM_USER_ID,
+        # Matches the retryable=True used when scheduling daemon requests
+        # (executor.schedule_internal_daemon_async).
+        retryable=True,
     )
 
 
