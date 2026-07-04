@@ -88,6 +88,21 @@ class TestRefreshParallelismKnob:
             monkeypatch.setenv(self._ENV_VAR, bad_value)
             assert backend_utils._get_cluster_refresh_parallelism() == 42
 
+    def test_invalid_override_warns_once(self, monkeypatch):
+        """The refresh daemon calls this every sweep; warn once, not always."""
+        monkeypatch.setattr(backend_utils.subprocess_utils,
+                            'get_parallel_threads',
+                            lambda cloud_str=None: 42)
+        monkeypatch.setattr(backend_utils,
+                            '_warned_invalid_refresh_parallelism', set())
+        warning_calls = []
+        monkeypatch.setattr(backend_utils.logger, 'warning',
+                            lambda *args, **kwargs: warning_calls.append(1))
+        monkeypatch.setenv(self._ENV_VAR, 'not-a-number')
+        assert backend_utils._get_cluster_refresh_parallelism() == 42
+        assert backend_utils._get_cluster_refresh_parallelism() == 42
+        assert len(warning_calls) == 1
+
 
 class TestRefreshOrdering:
     """Clusters most in need of reconciliation are dispatched first."""

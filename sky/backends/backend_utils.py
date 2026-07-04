@@ -3818,6 +3818,11 @@ def _refresh_cluster(
 # to the default.
 CLUSTER_REFRESH_PARALLELISM_ENV_VAR = 'SKYPILOT_CLUSTER_REFRESH_PARALLELISM'
 
+# Invalid values already warned about, so the refresh daemon (which calls
+# _get_cluster_refresh_parallelism every sweep) warns once per value instead
+# of every CLUSTER_REFRESH_DAEMON_INTERVAL_SECONDS.
+_warned_invalid_refresh_parallelism: Set[str] = set()
+
 
 def _get_cluster_refresh_parallelism() -> int:
     override = os.environ.get(CLUSTER_REFRESH_PARALLELISM_ENV_VAR)
@@ -3829,8 +3834,11 @@ def _get_cluster_refresh_parallelism() -> int:
             pass
         if parsed is not None and parsed > 0:
             return parsed
-        logger.warning(f'Invalid {CLUSTER_REFRESH_PARALLELISM_ENV_VAR} value '
-                       f'{override!r}, using the default parallelism.')
+        if override not in _warned_invalid_refresh_parallelism:
+            _warned_invalid_refresh_parallelism.add(override)
+            logger.warning(
+                f'Invalid {CLUSTER_REFRESH_PARALLELISM_ENV_VAR} value '
+                f'{override!r}, using the default parallelism.')
     return subprocess_utils.get_parallel_threads()
 
 
