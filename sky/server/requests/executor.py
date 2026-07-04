@@ -773,22 +773,24 @@ def _request_execution_wrapper(request_id: str,
         # As soon as the request is updated with the executor PID, we can
         # receive SIGTERM from cancellation. So, we update the request inside
         # the try block to ensure we have the KeyboardInterrupt handling.
-        with api_requests.update_request(request_id) as request_task:
-            assert request_task is not None, request_id
-            if (request_task.status
-                    not in api_requests.RequestStatus.executable_statuses()):
-                logger.warning(
-                    f'Request is already {request_task.status.value}, '
-                    f'skipping execution')
-                return
-            log_path = request_task.log_path
-            request_task.pid = pid
-            request_task.status = api_requests.RequestStatus.RUNNING
-            # Clear any leftover retry-backoff message now that we are running.
-            request_task.status_msg = None
-            func = request_task.entrypoint
-            request_body = request_task.request_body
-            request_name = request_task.name
+        # The guarded UPDATE atomically checks the executable-status
+        # precondition (PENDING/WAITING) and flips the row to RUNNING with
+        # this worker's pid, clearing any leftover retry-backoff message,
+        # in a single statement without re-writing the full row. It still
+        # takes the per-request FileLock internally so it serializes with
+        # the remaining full-row read-modify-write writers (kill paths,
+        # interrupt_request_for_retry).
+        if not api_requests.try_mark_running(request_id, pid):
+            logger.warning(f'Request {request_id} is already finished or '
+                           'cancelled, skipping execution')
+            return
+        request_task = api_requests.get_request(request_id)
+        assert request_task is not None, request_id
+        log_path = request_task.log_path
+        func = request_task.entrypoint
+        request_body = request_task.request_body
+        request_name = request_task.name
+        del request_task
 
         # Store copies of the original stdout and stderr file descriptors
         # We do this in two steps because we should make sure to restore the

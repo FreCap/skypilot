@@ -82,10 +82,11 @@ async def test_set_request_failed(isolated_database, test_async):
 
 
 def test_set_request_failed_nonexistent_request(isolated_database):
-    # Try to set a non-existent request as failed
-    with pytest.raises(AssertionError):
-        requests.set_request_failed('nonexistent-request',
-                                    ValueError('Test error'))
+    # Setting a non-existent request as failed is a no-op: the guarded
+    # UPDATE matches zero rows (a missing row is indistinguishable from an
+    # already-terminal one) and no row is created.
+    requests.set_request_failed('nonexistent-request', ValueError('Test error'))
+    assert requests.get_request('nonexistent-request') is None
 
 
 @pytest.mark.asyncio
@@ -124,9 +125,11 @@ async def test_set_request_succeeded(isolated_database, test_async):
 
 
 def test_set_request_succeeded_nonexistent_request(isolated_database):
-    # Try to set a non-existent request as succeeded
-    with pytest.raises(AssertionError):
-        requests.set_request_succeeded('nonexistent-request', {'result': 'ok'})
+    # Setting a non-existent request as succeeded is a no-op: the guarded
+    # UPDATE matches zero rows (a missing row is indistinguishable from an
+    # already-terminal one) and no row is created.
+    requests.set_request_succeeded('nonexistent-request', {'result': 'ok'})
+    assert requests.get_request('nonexistent-request') is None
 
 
 @pytest.mark.asyncio

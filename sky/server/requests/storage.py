@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import abc
 import contextlib
-from typing import (AsyncGenerator, Generator, List, Optional, Set, Tuple,
+import time
+from typing import (Any, AsyncGenerator, Generator, List, Optional, Set, Tuple,
                     TYPE_CHECKING)
 
 if TYPE_CHECKING:
@@ -126,6 +127,84 @@ class RequestBackend(abc.ABC):
                                       status_msg: str) -> None:
         """Update the status message of a request."""
         raise NotImplementedError
+
+    def try_mark_running(self, request_id: str, pid: Optional[int]) -> bool:
+        """Atomically flip a request to RUNNING if it is still executable.
+
+        Records `pid` and clears any stale retry-backoff status_msg. Non-
+        abstract with a read-modify-write default so existing plugin
+        backends stay source-compatible; backends may override with a
+        single guarded UPDATE.
+
+        Returns:
+            True iff the request was in an executable status and is now
+            RUNNING.
+        """
+        # Runtime import to avoid a circular import: the requests module
+        # imports this module at the top level.
+        # pylint: disable=import-outside-toplevel
+        from sky.server.requests import requests as requests_lib
+
+        with self.update_request(request_id) as request:
+            if request is None:
+                return False
+            if (request.status
+                    not in requests_lib.RequestStatus.executable_statuses()):
+                return False
+            request.status = requests_lib.RequestStatus.RUNNING
+            request.pid = pid
+            request.status_msg = None
+        return True
+
+    def set_request_finished(self,
+                             request_id: str,
+                             status: 'RequestStatus',
+                             error: Optional[BaseException] = None,
+                             result: Optional[Any] = None) -> None:
+        """Persist a terminal status (SUCCEEDED/FAILED) for a request.
+
+        Must not overwrite a status that is already terminal: a late
+        terminal write racing with a CANCELLED+should_retry marker from the
+        graceful-shutdown sweep (or a kill) loses, mirroring the terminal-
+        status guard on the kill paths. A `result` of None leaves the
+        stored return value untouched. Non-abstract with a read-modify-
+        write default so existing plugin backends stay source-compatible.
+        """
+        # pylint: disable=import-outside-toplevel
+        from sky.server.requests import requests as requests_lib
+
+        with self.update_request(request_id) as request:
+            if request is None:
+                return
+            if request.status in requests_lib.RequestStatus.finished_status():
+                return
+            request.status = status
+            request.finished_at = time.time()
+            if error is not None:
+                request.set_error(error)
+            if result is not None:
+                request.set_return_value(result)
+
+    async def set_request_finished_async(self,
+                                         request_id: str,
+                                         status: 'RequestStatus',
+                                         error: Optional[BaseException] = None,
+                                         result: Optional[Any] = None) -> None:
+        """Async version of set_request_finished."""
+        # pylint: disable=import-outside-toplevel
+        from sky.server.requests import requests as requests_lib
+
+        async with self.update_request_async(request_id) as request:
+            if request is None:
+                return
+            if request.status in requests_lib.RequestStatus.finished_status():
+                return
+            request.status = status
+            request.finished_at = time.time()
+            if error is not None:
+                request.set_error(error)
+            if result is not None:
+                request.set_return_value(result)
 
     @abc.abstractmethod
     def kill_requests(self,
