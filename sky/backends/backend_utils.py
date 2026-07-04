@@ -3798,7 +3798,84 @@ def _refresh_cluster(
         # handle the 'UNKNOWN' status, and collect the errors into
         # a table.
         record = {'status': 'UNKNOWN', 'error': e}
+    except Exception as e:  # pylint: disable=broad-except
+        # Any other failure on one cluster must not propagate: the sweep
+        # in refresh_cluster_records runs this via run_in_parallel, which
+        # re-raises the first exception and aborts the refresh of all
+        # remaining clusters.
+        logger.debug(f'Failed to refresh status of cluster {cluster_name!r}: '
+                     f'{common_utils.format_exception(e, use_bracket=True)}')
+        record = {'status': 'UNKNOWN', 'error': e}
     return record
+
+
+# Env var to override the number of worker threads used by the background
+# status refresh sweep (refresh_cluster_records). The default,
+# subprocess_utils.get_parallel_threads(), scales with the API server's CPU
+# count, but each per-cluster refresh can hold a thread for a long time
+# (cloud API query + SSH health probe), so deployments with many clusters can
+# raise this to shorten the sweep. Invalid or non-positive values fall back
+# to the default.
+CLUSTER_REFRESH_PARALLELISM_ENV_VAR = 'SKYPILOT_CLUSTER_REFRESH_PARALLELISM'
+
+# Invalid values already warned about, so the refresh daemon (which calls
+# _get_cluster_refresh_parallelism every sweep) warns once per value instead
+# of every CLUSTER_REFRESH_DAEMON_INTERVAL_SECONDS.
+_warned_invalid_refresh_parallelism: Set[str] = set()
+
+
+def _get_cluster_refresh_parallelism() -> int:
+    override = os.environ.get(CLUSTER_REFRESH_PARALLELISM_ENV_VAR)
+    if override is not None:
+        parsed: Optional[int] = None
+        try:
+            parsed = int(override)
+        except ValueError:
+            pass
+        if parsed is not None and parsed > 0:
+            return parsed
+        if override not in _warned_invalid_refresh_parallelism:
+            _warned_invalid_refresh_parallelism.add(override)
+            logger.warning(
+                f'Invalid {CLUSTER_REFRESH_PARALLELISM_ENV_VAR} value '
+                f'{override!r}, using the default parallelism.')
+    return subprocess_utils.get_parallel_threads()
+
+
+def _sort_clusters_for_refresh(cluster_names: List[str]) -> List[str]:
+    """Orders clusters so those most in need of reconciliation go first.
+
+    INIT clusters (e.g. half-provisioned clusters orphaned by an API server
+    restart) come first, then the rest by ascending status_updated_at
+    (stalest first), so a long sweep reconciles them right away instead of
+    at a random point.
+
+    Ordering is a best-effort optimization that runs before the per-cluster
+    fault isolation in _refresh_cluster, so it must never be able to abort
+    the sweep: any failure falls back to the original, unsorted list.
+    """
+    try:
+        # Reads only plain columns (no handle unpickling or metadata
+        # parsing), so one corrupt row cannot fail the lookup for every
+        # cluster.
+        status_fields = global_user_state.get_cluster_status_fields(
+            cluster_names)
+
+        def _priority(cluster_name: str) -> Tuple[int, float]:
+            status, status_updated_at = status_fields.get(
+                cluster_name, (None, None))
+            if status_updated_at is None:
+                # Deleted rows and missing timestamps sort as stalest.
+                status_updated_at = 0
+            is_init = status == status_lib.ClusterStatus.INIT.value
+            return (0 if is_init else 1, status_updated_at)
+
+        return sorted(cluster_names, key=_priority)
+    except Exception as e:  # pylint: disable=broad-except
+        logger.debug('Failed to order clusters for refresh; refreshing in the '
+                     'original order: '
+                     f'{common_utils.format_exception(e, use_bracket=True)}')
+        return list(cluster_names)
 
 
 def refresh_cluster_records() -> None:
@@ -3843,8 +3920,11 @@ def refresh_cluster_records() -> None:
 
     if len(cluster_names_without_launch_request) > 0:
         # Do not refresh the clusters that have an active launch request.
-        subprocess_utils.run_in_parallel(_refresh_cluster_record,
-                                         cluster_names_without_launch_request)
+        subprocess_utils.run_in_parallel(
+            _refresh_cluster_record,
+            _sort_clusters_for_refresh(
+                list(cluster_names_without_launch_request)),
+            num_threads=_get_cluster_refresh_parallelism())
 
 
 def _get_records_with_handle(

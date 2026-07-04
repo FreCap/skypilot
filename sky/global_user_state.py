@@ -2147,6 +2147,33 @@ def get_clusters_from_names(
 
 
 @metrics_lib.time_me
+def get_cluster_status_fields(
+    cluster_names: List[str],
+) -> Dict[str, Tuple[Optional[str], Optional[int]]]:
+    """Returns the raw (status, status_updated_at) columns for clusters.
+
+    Unlike ``get_clusters_from_names``, this reads only plain columns and
+    does no per-row deserialization (no handle unpickling, metadata parsing,
+    or enum conversion), so a corrupt row cannot make the lookup raise.
+    Names not present in the cluster table are omitted from the result.
+    """
+    result: Dict[str, Tuple[Optional[str], Optional[int]]] = {}
+    if not cluster_names:
+        return result
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        for offset in range(0, len(cluster_names),
+                            _CLUSTER_IN_QUERY_CHUNK_SIZE):
+            batch = cluster_names[offset:offset + _CLUSTER_IN_QUERY_CHUNK_SIZE]
+            rows = session.query(cluster_table.c.name, cluster_table.c.status,
+                                 cluster_table.c.status_updated_at).filter(
+                                     cluster_table.c.name.in_(batch)).all()
+            for row in rows:
+                result[row.name] = (row.status, row.status_updated_at)
+    return result
+
+
+@metrics_lib.time_me
 @context_utils.cancellation_guard
 def cluster_with_name_exists(cluster_name: str) -> bool:
     engine = _db_manager.get_engine()
