@@ -48,6 +48,7 @@ from sky.server import daemons
 from sky.server import metrics as metrics_lib
 from sky.server import plugins
 from sky.server import versions
+from sky.server import watchdog
 from sky.server.requests import payloads
 from sky.server.requests import preconditions
 from sky.server.requests import process
@@ -166,6 +167,13 @@ def executor_initializer(proc_group: str,
                          clean_env: Optional[Dict[str, str]] = None):
     setproctitle.setproctitle(f'SkyPilot:executor:{proc_group}:'
                               f'{multiprocessing.current_process().pid}')
+    # This runs in a child process of the API server. If the main process
+    # dies abruptly (kill -9, OOM), exit instead of keeping executing the
+    # current request as an orphan: its late terminal writes can race the
+    # next server boot's startup recovery (which may have already marked
+    # the request CANCELLED for retry), leading to double execution.
+    if watchdog.running_in_child_process():
+        watchdog.start_parent_death_watchdog()
     # Load plugins for executor process.
     plugins.load_plugins(
         plugins.ExtensionContext(context=plugins.PluginContext.EXECUTOR))
