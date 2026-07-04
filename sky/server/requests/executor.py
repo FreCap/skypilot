@@ -1046,8 +1046,16 @@ async def prepare_request_async(
     schedule_type: api_requests.ScheduleType = (api_requests.ScheduleType.LONG),
     is_skypilot_system: bool = False,
     auth_user: Optional[models.User] = None,
+    ignore_return_value: bool = False,
+    retryable: bool = False,
 ) -> api_requests.Request:
-    """Prepare a request for execution."""
+    """Prepare a request for execution.
+
+    The enqueue flags (ignore_return_value, retryable) are persisted with the
+    initial INSERT so a request still queued when the server restarts can be
+    re-enqueued with the same dispatch semantics
+    (see reenqueue_recovered_requests).
+    """
     if auth_user is not None:
         assert auth_user.name is not None
         # Use the authenticated user identity as the single source of truth
@@ -1087,6 +1095,8 @@ async def prepare_request_async(
         user_id=user_id,
         cluster_name=request_cluster_name,
         file_mounts_blob_id=getattr(request_body, 'file_mounts_blob_id', None),
+        ignore_return_value=ignore_return_value,
+        retryable=retryable,
     )
 
     if not await api_requests.create_if_not_exists_async(request):
@@ -1130,14 +1140,17 @@ async def schedule_request_async(
             The precondition is waited asynchronously and does not block the
             caller.
     """
-    request_task = await prepare_request_async(request_id,
-                                               request_name,
-                                               request_body,
-                                               func,
-                                               request_cluster_name,
-                                               schedule_type,
-                                               is_skypilot_system,
-                                               auth_user=auth_user)
+    request_task = await prepare_request_async(
+        request_id,
+        request_name,
+        request_body,
+        func,
+        request_cluster_name,
+        schedule_type,
+        is_skypilot_system,
+        auth_user=auth_user,
+        ignore_return_value=ignore_return_value,
+        retryable=retryable)
     await schedule_prepared_request(request_task, ignore_return_value,
                                     precondition, retryable)
 
@@ -1249,3 +1262,54 @@ def start(
     short_worker.run_in_background()
     workers.append(short_worker)
     return queue_server, workers
+
+
+def reenqueue_recovered_requests() -> None:
+    """Re-enqueue queued requests recovered from the previous server run.
+
+    Must be called after start() (the queue backend must be up). Startup
+    recovery (api_requests.recover_db_and_logs) left two kinds of rows
+    queued: PENDING rows, which never started executing
+    (_request_execution_wrapper flips a row to RUNNING before invoking the
+    entrypoint, so they are side-effect-free and replayable), and retryable
+    WAITING rows, which the executor monitor had already parked for a full
+    re-run. Requests originally gated on a precondition
+    (schedule_prepared_request) are re-enqueued without their gate and may
+    fail fast instead of waiting for it -- an accepted, client-visible
+    tradeoff vs. silently losing them on restart.
+    """
+    reqs = api_requests.get_request_tasks(
+        api_requests.RequestTaskFilter(status=[
+            api_requests.RequestStatus.PENDING,
+            api_requests.RequestStatus.WAITING,
+        ],
+                                       fields=[
+                                           'request_id', 'status',
+                                           'schedule_type', 'created_at',
+                                           api_requests.COL_IGNORE_RETURN_VALUE,
+                                           api_requests.COL_RETRYABLE
+                                       ]))
+    # Daemon rows are deleted by startup recovery and re-created via
+    # schedule_internal_daemon_async; skip anything matching the daemon-id
+    # pattern in case any slipped through. is_daemon_request_id matches by
+    # naming pattern, so this also covers a PENDING row of a daemon id that
+    # was removed from the current build -- which recovery keeps (its id is
+    # no longer in INTERNAL_REQUEST_DAEMONS) and the FastAPI-lifespan
+    # orphan-daemon cleanup only reaps after we run.
+    # Likewise, only replay WAITING rows explicitly marked retryable:
+    # recovery flips non-retryable WAITING rows to CANCELLED+should_retry,
+    # but re-check here rather than trusting that recovery ran and agreed.
+    reqs = [
+        req for req in reqs
+        if not daemons.is_daemon_request_id(req.request_id) and
+        (req.status == api_requests.RequestStatus.PENDING or req.retryable)
+    ]
+    if not reqs:
+        return
+    reqs.sort(key=lambda req: req.created_at)
+    for req in reqs:
+        _get_queue(req.schedule_type).put(
+            (req.request_id, bool(req.ignore_return_value),
+             bool(req.retryable)))
+    logger.info(f'Re-enqueued {len(reqs)} request(s) recovered from the '
+                'previous server run')

@@ -414,7 +414,20 @@ HIDDEN_REQUEST_NAMES = [
 
 _DAEMON_IDS = set(d.id for d in INTERNAL_REQUEST_DAEMONS)
 
+# Naming convention for internal daemon request ids. Matching on the suffix
+# (in addition to the exact id set of the current build) lets consumers
+# recognize daemon rows written by a previous server version whose daemon ids
+# no longer exist in this build -- e.g. startup re-enqueue must not replay a
+# PENDING row of a removed daemon. Regular request ids are uuid4 strings and
+# can never end with this suffix.
+_DAEMON_ID_SUFFIX = '-daemon'
+
 
 def is_daemon_request_id(request_id: str) -> bool:
-    """Returns whether a specific request_id is an internal daemon."""
-    return request_id in _DAEMON_IDS
+    """Returns whether a specific request_id is an internal daemon.
+
+    Pattern-based: also matches daemon ids from other server versions that
+    follow the ``*-daemon`` naming convention but are not registered in this
+    build.
+    """
+    return (request_id in _DAEMON_IDS or request_id.endswith(_DAEMON_ID_SUFFIX))
