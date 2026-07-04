@@ -319,6 +319,10 @@ spec:
         ports:
         - containerPort: 46580
         {{- if not .Values.apiService.devMode.enabled }}
+        {{- with .Values.apiService.startupProbe }}
+        startupProbe:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
         {{- with .Values.apiService.livenessProbe }}
         livenessProbe:
           {{- toYaml . | nindent 10 }}

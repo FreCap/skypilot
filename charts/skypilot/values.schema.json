@@ -242,6 +242,34 @@
                         "null"
                     ]
                 },
+                "startupProbe": {
+                    "type": [
+                        "object",
+                        "null"
+                    ],
+                    "properties": {
+                        "failureThreshold": {
+                            "type": "integer"
+                        },
+                        "httpGet": {
+                            "type": "object",
+                            "properties": {
+                                "path": {
+                                    "type": "string"
+                                },
+                                "port": {
+                                    "type": "integer"
+                                }
+                            }
+                        },
+                        "periodSeconds": {
+                            "type": "integer"
+                        },
+                        "timeoutSeconds": {
+                            "type": "integer"
+                        }
+                    }
+                },
                 "terminationGracePeriodSeconds": {
                     "type": "integer"
                 },

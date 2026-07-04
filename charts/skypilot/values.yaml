@@ -103,6 +103,20 @@ apiService:
     periodSeconds: 5
     initialDelaySeconds: 5
     timeoutSeconds: 1
+  # Startup probe for the API server container. Until it succeeds, liveness
+  # and readiness probes are suspended, giving the server a generous budget
+  # (10 minutes by default) for pre-bind initialization (database setup,
+  # migrations, state recovery) that grows with the amount of managed state.
+  # Without it, a slow restart on a large deployment gets killed by the
+  # liveness probe and the pod enters CrashLoopBackOff.
+  # @schema type: [object, null]
+  startupProbe:
+    httpGet:
+      path: /api/health
+      port: 46580
+    failureThreshold: 60
+    periodSeconds: 10
+    timeoutSeconds: 1
 
   # Set ~/.sky/config.yaml content on the API server
   # This value is IGNORED during an helm upgrade if there is an existing config
