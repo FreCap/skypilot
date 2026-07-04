@@ -1098,7 +1098,7 @@ tests:
           content:
             name: logrotate
 
-  # Tests for the apiService.livenessProbe / apiService.readinessProbe values
+  # Tests for the apiService.livenessProbe / readinessProbe / startupProbe values
   - it: should render the default probe specs that match the historical chart output
     asserts:
       # Liveness — historical defaults: httpGet only, periodSeconds 30,
@@ -1139,6 +1139,23 @@ tests:
           value: 5
       - equal:
           path: spec.template.spec.containers[0].readinessProbe.timeoutSeconds
+          value: 1
+      # Startup — suspends liveness/readiness until the first success,
+      # budgeting 60 * 10s = 10 minutes for pre-bind initialization.
+      - equal:
+          path: spec.template.spec.containers[0].startupProbe.httpGet.path
+          value: /api/health
+      - equal:
+          path: spec.template.spec.containers[0].startupProbe.httpGet.port
+          value: 46580
+      - equal:
+          path: spec.template.spec.containers[0].startupProbe.failureThreshold
+          value: 60
+      - equal:
+          path: spec.template.spec.containers[0].startupProbe.periodSeconds
+          value: 10
+      - equal:
+          path: spec.template.spec.containers[0].startupProbe.timeoutSeconds
           value: 1
 
   - it: should set readiness successThreshold to 1 under Recreate strategy
@@ -1241,15 +1258,44 @@ tests:
           path: spec.template.spec.containers[0].readinessProbe.tcpSocket.port
           value: 46580
 
+  - it: should render a user-provided startupProbe spec verbatim
+    set:
+      apiService.startupProbe:
+        httpGet:
+          path: /startz
+          port: 46581
+        failureThreshold: 120
+        periodSeconds: 15
+        timeoutSeconds: 5
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].startupProbe.httpGet.path
+          value: /startz
+      - equal:
+          path: spec.template.spec.containers[0].startupProbe.httpGet.port
+          value: 46581
+      - equal:
+          path: spec.template.spec.containers[0].startupProbe.failureThreshold
+          value: 120
+      - equal:
+          path: spec.template.spec.containers[0].startupProbe.periodSeconds
+          value: 15
+      - equal:
+          path: spec.template.spec.containers[0].startupProbe.timeoutSeconds
+          value: 5
+
   - it: should omit the probes entirely when set to null
     set:
       apiService.livenessProbe: null
       apiService.readinessProbe: null
+      apiService.startupProbe: null
     asserts:
       - notExists:
           path: spec.template.spec.containers[0].livenessProbe
       - notExists:
           path: spec.template.spec.containers[0].readinessProbe
+      - notExists:
+          path: spec.template.spec.containers[0].startupProbe
 
   - it: should inject POD_IP env from downward API
     asserts:
