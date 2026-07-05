@@ -144,3 +144,34 @@ class TestApplyRefusesTerminalStates:
                     p.stop()
         mock_up.assert_called_once()
         mock_update.assert_not_called()
+
+
+class TestHaRecoveryRestoreCmds:
+    """The stored HA recovery script must be able to recreate the
+    controller's file mounts on a replacement pod (fresh emptyDir): each
+    mount's content is embedded base64 with a dirname mkdir."""
+
+    def test_embeds_file_contents(self, tmp_path):
+        import base64 as b64
+        cfg = tmp_path / 'config.yaml'
+        cfg.write_bytes(b'active_workspace: mt_native\n')
+        cmds = impl._ha_recovery_restore_cmds(
+            {'~/.sky/serve/svc/config.yaml': str(cfg)})
+        assert len(cmds) == 1
+        expected = b64.b64encode(b'active_workspace: mt_native\n').decode()
+        assert expected in cmds[0]
+        assert 'mkdir -p $(dirname ~/.sky/serve/svc/config.yaml)' in cmds[0]
+        assert cmds[0].endswith('> ~/.sky/serve/svc/config.yaml')
+
+    def test_skips_unreadable_and_oversized(self, tmp_path):
+        big = tmp_path / 'big.bin'
+        big.write_bytes(b'x' * (1024 * 1024 + 1))
+        cmds = impl._ha_recovery_restore_cmds({
+            '~/x/missing.yaml': str(tmp_path / 'missing.yaml'),
+            '~/x/big.bin': str(big),
+        })
+        assert cmds == []
+
+    def test_empty_mounts(self):
+        assert impl._ha_recovery_restore_cmds(None) == []
+        assert impl._ha_recovery_restore_cmds({}) == []

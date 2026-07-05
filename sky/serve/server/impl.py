@@ -1,4 +1,5 @@
 """Implementation of the SkyServe core APIs."""
+import base64
 import os
 import pathlib
 import re
@@ -123,6 +124,40 @@ def _get_service_record(
     if not service_statuses:
         return None
     return service_statuses[0]
+
+
+def _ha_recovery_restore_cmds(
+        file_mounts: Optional[Dict[str, str]]) -> List[str]:
+    """Shell commands recreating the controller's file mounts from their
+    current local contents (base64-embedded).
+
+    Makes the stored HA recovery script self-contained across POD
+    REPLACEMENT: the mounts (the SKYPILOT_CONFIG config.yaml, the tmp task
+    yaml, modified catalogs) are synced onto pod-local storage (emptyDir),
+    but a replacement pod starts with a fresh filesystem while the recovery
+    script survives in the DB. Without these files the recovered controller
+    crash-loops (e.g. FileNotFoundError on SKYPILOT_CONFIG) — measured
+    live: a 224-replica fleet sat CONTROLLER_FAILED for hours after a
+    rolling update. Files are small yaml configs; anything unreadable or
+    over 1MiB is skipped (with a warning) rather than bloating the DB row.
+    """
+    restore_cmds = []
+    for remote_path, local_path in sorted((file_mounts or {}).items()):
+        try:
+            with open(os.path.expanduser(local_path), 'rb') as f:
+                content = f.read()
+        except OSError as e:
+            logger.warning(f'Skipping HA-recovery embed of {remote_path} '
+                           f'(unreadable local source {local_path}): {e}')
+            continue
+        if len(content) > 1024 * 1024:
+            logger.warning(f'Skipping HA-recovery embed of {remote_path}: '
+                           f'{len(content)} bytes exceeds the 1MiB cap.')
+            continue
+        content_b64 = base64.b64encode(content).decode('ascii')
+        restore_cmds.append(f'mkdir -p $(dirname {remote_path}) && '
+                            f'echo {content_b64} | base64 -d > {remote_path}')
+    return restore_cmds
 
 
 def _maybe_display_run_warning(task: 'task_lib.Task') -> None:
@@ -318,7 +353,12 @@ def up(
             env_cmds = [
                 f'export {k}={v!r}' for k, v in controller_task.envs.items()
             ]
-            run_script = '\n'.join(env_cmds + [run_script])
+            # See _ha_recovery_restore_cmds: embed the controller's file
+            # mounts so the stored recovery script is self-contained across
+            # pod replacement (fresh emptyDir).
+            restore_cmds = _ha_recovery_restore_cmds(
+                controller_task.file_mounts)
+            run_script = '\n'.join(env_cmds + restore_cmds + [run_script])
             # Dump script for high availability recovery.
             serve_state.set_ha_recovery_script(service_name, run_script)
             self_pod_ip_dbg = os.environ.get('POD_IP', '<unset>')
