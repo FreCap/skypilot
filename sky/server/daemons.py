@@ -244,6 +244,46 @@ def should_skip_managed_job_status_refresh():
     return True
 
 
+def _ensure_leader_lock(lock: Optional[locks.DistributedLock], lock_id: str,
+                        lock_label: str) -> locks.DistributedLock:
+    """Return the consolidation leader lock, held on a live session.
+
+    A PostgresLock is a session-scoped advisory lock: if the session that
+    holds it dies without this process noticing (RDS failover / maintenance
+    restart, LB idle timeout, pg_terminate_backend, network partition), the
+    server releases the lock while our local `is_locked()` flag stays True.
+    Another pod can then acquire it and run HA recovery concurrently with us
+    — split-brain, with two pods spawning controllers for the same services.
+    Probe the session each iteration (mirroring `_lock_still_held` in
+    sky/jobs/managed_job_refresh_thread.py) and, on loss, discard the stale
+    lock object and re-acquire on a fresh session. If another pod took the
+    lock in the meantime, the re-acquire blocks and this pod correctly stops
+    running recovery/refresh until leadership is regained.
+    """
+    if lock is None:
+        lock = locks.get_lock(lock_id)
+    if (lock.is_locked() and isinstance(lock, locks.PostgresLock) and
+            not lock.is_session_alive()):
+        logger.error(
+            f'The {lock_label} session is no longer alive; the advisory '
+            'lock was released server-side and another pod may hold it '
+            'now. Discarding the stale lock and re-acquiring on a fresh '
+            'session.')
+        try:
+            lock.release()
+        except Exception:  # pylint: disable=broad-except
+            # release() on a dead session is best-effort; the replacement
+            # lock object below owns a fresh connection either way.
+            logger.debug(f'Best-effort release of the stale {lock_label} '
+                         'failed; discarding it anyway.')
+        lock = locks.get_lock(lock_id)
+    if not lock.is_locked():
+        logger.info(f'Acquiring the {lock_label}: {lock}')
+        lock.acquire()
+        logger.info(f'{lock_label} acquired')
+    return lock
+
+
 def _serve_status_refresh_event(pool: bool):
     """Refresh the sky serve status for controller consolidation mode."""
     # pylint: disable=import-outside-toplevel
@@ -251,25 +291,20 @@ def _serve_status_refresh_event(pool: bool):
     from sky.serve import serve_utils
 
     # Acquire an advisory lock so that only one pod runs the recovery /
-    # controller-startup path at a time.
+    # controller-startup path at a time. Re-verified every iteration: a
+    # silently-dead PG session would otherwise leave two pods both believing
+    # they are the leader (see _ensure_leader_lock).
     global _pool_consolidation_mode_lock, _serve_consolidation_mode_lock
     if pool:
-        if _pool_consolidation_mode_lock is None:
-            _pool_consolidation_mode_lock = locks.get_lock(
-                serve_constants.POOL_CONSOLIDATION_MODE_LOCK_ID)
-        lock = _pool_consolidation_mode_lock
-        lock_label = 'pool consolidation mode lock'
+        _pool_consolidation_mode_lock = _ensure_leader_lock(
+            _pool_consolidation_mode_lock,
+            serve_constants.POOL_CONSOLIDATION_MODE_LOCK_ID,
+            'pool consolidation mode lock')
     else:
-        if _serve_consolidation_mode_lock is None:
-            _serve_consolidation_mode_lock = locks.get_lock(
-                serve_constants.SERVE_CONSOLIDATION_MODE_LOCK_ID)
-        lock = _serve_consolidation_mode_lock
-        lock_label = 'serve consolidation mode lock'
-
-    if not lock.is_locked():
-        logger.info(f'Acquiring the {lock_label}: {lock}')
-        lock.acquire()
-        logger.info(f'{lock_label} acquired')
+        _serve_consolidation_mode_lock = _ensure_leader_lock(
+            _serve_consolidation_mode_lock,
+            serve_constants.SERVE_CONSOLIDATION_MODE_LOCK_ID,
+            'serve consolidation mode lock')
 
     # We run the recovery logic before starting the event loop as those two are
     # conflicting. Check PERSISTENT_RUN_RESTARTING_SIGNAL_FILE for details.
