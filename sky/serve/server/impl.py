@@ -1,4 +1,5 @@
 """Implementation of the SkyServe core APIs."""
+import base64
 import os
 import pathlib
 import re
@@ -123,6 +124,107 @@ def _get_service_record(
     if not service_statuses:
         return None
     return service_statuses[0]
+
+
+# Config subtrees that may carry credentials in supported configurations
+# (free-form objects: arbitrary pod specs can hold plaintext env
+# credentials, create_instance_kwargs can hold registry credentials).
+# Stripped from the HA-recovery config embed so they never land in the
+# durable ha_recovery_script DB row; extend as new credential-capable
+# config keys appear. A '*' segment matches every child key (used for the
+# per-context config maps). The controller loses only these subtrees on a
+# pod-replacement recovery — the corresponding launch customizations, not
+# identity or workspace resolution.
+_EMBEDDED_CONFIG_CREDENTIAL_KEYS: List[Tuple[str, ...]] = [
+    ('vast', 'create_instance_kwargs'),
+    ('kubernetes', 'pod_config'),
+    ('kubernetes', 'context_configs', '*', 'pod_config'),
+    ('ssh', 'pod_config'),
+    ('ssh', 'context_configs', '*', 'pod_config'),
+]
+
+
+def _sanitized_config_bytes(local_path: str) -> Optional[bytes]:
+    """Read + sanitize the controller config yaml for the recovery embed.
+
+    Returns None (skip the embed; the recovery-side service-dir mkdir still
+    applies) when the file is unreadable or unparsable — a malformed embed
+    is worse than a missing one, since the restore would faithfully
+    recreate garbage.
+    """
+    try:
+        with open(os.path.expanduser(local_path), 'r', encoding='utf-8') as f:
+            config = yaml_utils.safe_load(f.read()) or {}
+    except Exception as e:  # pylint: disable=broad-except
+        logger.warning('Skipping HA-recovery config embed (unreadable or '
+                       f'unparsable {local_path}): {e}')
+        return None
+
+    def _strip(node: Any, key_path: Tuple[str, ...], trail: str) -> None:
+        if not isinstance(node, dict):
+            return
+        key, rest = key_path[0], key_path[1:]
+        if key == '*':
+            for child_key, child in list(node.items()):
+                _strip_or_pop(node, child_key, child, rest,
+                              f'{trail}.{child_key}')
+            return
+        if key in node:
+            _strip_or_pop(node, key, node[key], rest, f'{trail}.{key}')
+
+    def _strip_or_pop(parent: Dict[str, Any], key: str, child: Any,
+                      rest: Tuple[str, ...], trail: str) -> None:
+        if not rest:
+            parent.pop(key)
+            logger.info('Stripped credential-capable config subtree '
+                        f'{trail.lstrip(".")} from the HA-recovery embed.')
+        else:
+            _strip(child, rest, trail)
+
+    for credential_key_path in _EMBEDDED_CONFIG_CREDENTIAL_KEYS:
+        _strip(config, credential_key_path, '')
+    return yaml_utils.dump_yaml_str(config).encode('utf-8')
+
+
+def _ha_recovery_restore_cmds(files: Optional[Dict[str, bytes]]) -> List[str]:
+    """Shell commands recreating the given files from the given contents
+    (base64-embedded, shell-quoted paths).
+
+    Makes the stored HA recovery script self-contained across POD
+    REPLACEMENT: these files are synced onto pod-local storage (emptyDir),
+    but a replacement pod starts with a fresh filesystem while the recovery
+    script survives in the DB. Without them the recovered controller
+    crash-loops (e.g. FileNotFoundError on SKYPILOT_CONFIG) — measured
+    live: a 224-replica fleet sat CONTROLLER_FAILED for hours after a
+    rolling update.
+
+    Callers must pass an ALLOWLIST of infra files only — never the full
+    controller file_mounts: the mounts can include TLS private keys and
+    (in the two-hop path) arbitrary user files, and everything embedded
+    here lands in a durable DB row and in process command lines. Contents
+    are passed pre-read (and, for the config, pre-sanitized) as bytes;
+    anything over 1MiB is skipped with a warning rather than bloating the
+    DB row.
+    """
+    restore_cmds = []
+    for remote_path, content in sorted((files or {}).items()):
+        if len(content) > 1024 * 1024:
+            logger.warning(f'Skipping HA-recovery embed of {remote_path}: '
+                           f'{len(content)} bytes exceeds the 1MiB cap.')
+            continue
+        content_b64 = base64.b64encode(content).decode('ascii')
+        # shlex.quote treats `~` as unsafe and would quote it, which stops
+        # bash tilde expansion — so splice an explicit "$HOME" for
+        # home-relative paths and quote only the remainder. Hostile
+        # metacharacters in either form end up inside quotes and are inert.
+        if remote_path.startswith('~/'):
+            quoted_path = '"$HOME"' + shlex.quote(remote_path[1:])
+        else:
+            quoted_path = shlex.quote(remote_path)
+        restore_cmds.append(
+            f'mkdir -p -- "$(dirname -- {quoted_path})" && '
+            f'printf %s {content_b64} | base64 -d > {quoted_path}')
+    return restore_cmds
 
 
 def _maybe_display_run_warning(task: 'task_lib.Task') -> None:
@@ -318,7 +420,29 @@ def up(
             env_cmds = [
                 f'export {k}={v!r}' for k, v in controller_task.envs.items()
             ]
-            run_script = '\n'.join(env_cmds + [run_script])
+            # Embed ONLY the controller config yaml so the stored recovery
+            # script is self-contained across pod replacement (fresh
+            # emptyDir). The config is identity-critical: recovering with a
+            # partial config makes the controller activate the WRONG cloud
+            # identity (live incident: replica ops failed with
+            # ClusterOwnerIdentityMismatchError until the full merged config
+            # was restored). Deliberately NOT the full file_mounts: the task
+            # yaml carries the service's `secrets:` and TLS mounts carry
+            # private keys — none of which belong in a durable DB row. The
+            # remaining mounts stay a known pod-replacement gap (two-hop
+            # user mounts; tmp task yaml is only a legacy fallback, since
+            # recovery boots from the DB-committed yaml).
+            # The config is additionally sanitized of known
+            # credential-capable subtrees before the embed.
+            config_files: Dict[str, bytes] = {}
+            for remote, local in (controller_task.file_mounts or {}).items():
+                if remote != remote_config_yaml_path:
+                    continue
+                sanitized = _sanitized_config_bytes(local)
+                if sanitized is not None:
+                    config_files[remote] = sanitized
+            restore_cmds = _ha_recovery_restore_cmds(config_files)
+            run_script = '\n'.join(env_cmds + restore_cmds + [run_script])
             # Dump script for high availability recovery.
             serve_state.set_ha_recovery_script(service_name, run_script)
             self_pod_ip_dbg = os.environ.get('POD_IP', '<unset>')
