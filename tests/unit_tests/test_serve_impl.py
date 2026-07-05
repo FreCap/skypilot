@@ -217,3 +217,33 @@ class TestSanitizedConfigBytes:
         cfg = tmp_path / 'bad.yaml'
         cfg.write_text('{: not yaml :')
         assert impl._sanitized_config_bytes(str(cfg)) is None
+
+    def test_strips_pod_config_including_per_context(self, tmp_path):
+        import yaml
+        cfg = tmp_path / 'config.yaml'
+        cfg.write_text(
+            'active_workspace: mt_native\n'
+            'kubernetes:\n'
+            '  allowed_contexts: [ctx-a, ctx-b]\n'
+            '  pod_config:\n'
+            '    spec:\n'
+            '      containers:\n'
+            '        - env:\n'
+            '            - {name: REGISTRY_PASSWORD, value: hunter2}\n'
+            '  context_configs:\n'
+            '    ctx-a:\n'
+            '      provision_timeout: 10\n'
+            '      pod_config:\n'
+            '        spec: {imagePullSecrets: [{name: sekret}]}\n'
+            'ssh:\n'
+            '  pod_config: {spec: {x: topsecret}}\n')
+        out = impl._sanitized_config_bytes(str(cfg))
+        assert out is not None
+        assert b'hunter2' not in out
+        assert b'sekret' not in out
+        assert b'topsecret' not in out
+        parsed = yaml.safe_load(out)
+        # Non-credential neighbors survive.
+        assert parsed['kubernetes']['allowed_contexts'] == ['ctx-a', 'ctx-b']
+        assert parsed['kubernetes']['context_configs']['ctx-a'][
+            'provision_timeout'] == 10

@@ -127,13 +127,20 @@ def _get_service_record(
 
 
 # Config subtrees that may carry credentials in supported configurations
-# (free-form kwargs objects). Stripped from the HA-recovery config embed so
-# they never land in the durable ha_recovery_script DB row; extend as new
-# credential-capable config keys appear. The controller loses only those
-# subtrees on a pod-replacement recovery, which affects the corresponding
-# niche launch options, not identity or workspace resolution.
+# (free-form objects: arbitrary pod specs can hold plaintext env
+# credentials, create_instance_kwargs can hold registry credentials).
+# Stripped from the HA-recovery config embed so they never land in the
+# durable ha_recovery_script DB row; extend as new credential-capable
+# config keys appear. A '*' segment matches every child key (used for the
+# per-context config maps). The controller loses only these subtrees on a
+# pod-replacement recovery — the corresponding launch customizations, not
+# identity or workspace resolution.
 _EMBEDDED_CONFIG_CREDENTIAL_KEYS: List[Tuple[str, ...]] = [
     ('vast', 'create_instance_kwargs'),
+    ('kubernetes', 'pod_config'),
+    ('kubernetes', 'context_configs', '*', 'pod_config'),
+    ('ssh', 'pod_config'),
+    ('ssh', 'context_configs', '*', 'pod_config'),
 ]
 
 
@@ -152,16 +159,30 @@ def _sanitized_config_bytes(local_path: str) -> Optional[bytes]:
         logger.warning('Skipping HA-recovery config embed (unreadable or '
                        f'unparsable {local_path}): {e}')
         return None
-    for key_path in _EMBEDDED_CONFIG_CREDENTIAL_KEYS:
-        node = config
-        for key in key_path[:-1]:
-            node = node.get(key) if isinstance(node, dict) else None
-            if node is None:
-                break
-        if isinstance(node, dict) and key_path[-1] in node:
-            node.pop(key_path[-1])
+
+    def _strip(node: Any, key_path: Tuple[str, ...], trail: str) -> None:
+        if not isinstance(node, dict):
+            return
+        key, rest = key_path[0], key_path[1:]
+        if key == '*':
+            for child_key, child in list(node.items()):
+                _strip_or_pop(node, child_key, child, rest,
+                              f'{trail}.{child_key}')
+            return
+        if key in node:
+            _strip_or_pop(node, key, node[key], rest, f'{trail}.{key}')
+
+    def _strip_or_pop(parent: Dict[str, Any], key: str, child: Any,
+                      rest: Tuple[str, ...], trail: str) -> None:
+        if not rest:
+            parent.pop(key)
             logger.info('Stripped credential-capable config subtree '
-                        f'{".".join(key_path)} from the HA-recovery embed.')
+                        f'{trail.lstrip(".")} from the HA-recovery embed.')
+        else:
+            _strip(child, rest, trail)
+
+    for credential_key_path in _EMBEDDED_CONFIG_CREDENTIAL_KEYS:
+        _strip(config, credential_key_path, '')
     return yaml_utils.dump_yaml_str(config).encode('utf-8')
 
 
