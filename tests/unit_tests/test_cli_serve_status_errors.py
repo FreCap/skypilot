@@ -47,3 +47,40 @@ def test_up_controller_with_transport_error_raises():
         _run_handler(controller_records=[{
             'status': status_lib.ClusterStatus.UP
         }])
+
+
+def _run_handler_pool(controller_records):
+    captured = {}
+
+    def _status(cluster_names, all_users):
+        captured['cluster_names'] = cluster_names
+        del all_users
+        return 'req-ctrl'
+
+    with mock.patch.object(command.sdk, 'get',
+                           side_effect=[RuntimeError('504 gateway timeout'),
+                                        controller_records]), \
+         mock.patch.object(command.sdk, 'status', side_effect=_status):
+        result = command._handle_services_request('req-pool',
+                                                  service_names=None,
+                                                  show_all=False,
+                                                  show_endpoint=False,
+                                                  pool=True,
+                                                  is_called_by_user=True)
+    return result, captured
+
+
+def test_pool_fallback_probes_jobs_controller():
+    (num, msg), captured = _run_handler_pool(controller_records=[{
+        'status': status_lib.ClusterStatus.STOPPED
+    }])
+    # Pools run on the JOBS controller: the fallback must probe it, not
+    # the serve controller.
+    assert captured['cluster_names'] == ['sky-jobs-controller-*']
+    assert num is None
+    assert 'pool' in msg.lower() or 'job' in msg.lower()
+
+
+def test_pool_transport_error_with_no_record_raises():
+    with pytest.raises(RuntimeError):
+        _run_handler_pool(controller_records=[])
