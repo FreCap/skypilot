@@ -1870,15 +1870,32 @@ def _handle_services_request(
             # Since we are client-side, we may not know the exact name of the
             # controller, so use the prefix with a wildcard.
             # Query status of the controller cluster.
+            # Probe the controller matching the request: pools run on the
+            # JOBS controller, services on the serve controller.
+            controller_prefix = (common.JOB_CONTROLLER_PREFIX if pool else
+                                 common.SKY_SERVE_CONTROLLER_PREFIX)
             records = sdk.get(
-                sdk.status(
-                    cluster_names=[common.SKY_SERVE_CONTROLLER_PREFIX + '*'],
-                    all_users=True))
-            if (not records or
+                sdk.status(cluster_names=[controller_prefix + '*'],
+                           all_users=True))
+            # Only degrade to the "no live services/pools" hint when a
+            # controller cluster record EXISTS and is STOPPED (autostopped
+            # controller — the case this fallback was written for). `not
+            # records` must NOT take this path: in consolidation mode there
+            # is never a controller cluster, so an absent record is the
+            # steady HEALTHY state — and reaching this handler at all means
+            # the status request itself failed (e.g. an ingress 504 on a
+            # slow response). Rendering that as a normal-looking empty table
+            # silently misreports a live fleet as nonexistent (observed live
+            # against a 250-replica service); the connection error below is
+            # the truthful output. A truly never-launched controller
+            # surfaces as ClusterNotUpError, which is handled separately
+            # above.
+            if (records and
                     records[0]['status'] == status_lib.ClusterStatus.STOPPED):
-                controller = (
-                    controller_utils.Controllers.SKY_SERVE_CONTROLLER.value)
-                msg = controller.default_hint_if_non_existent
+                controller_type = (
+                    controller_utils.Controllers.JOBS_CONTROLLER if pool else
+                    controller_utils.Controllers.SKY_SERVE_CONTROLLER)
+                msg = controller_type.value.default_hint_if_non_existent
         except Exception:  # pylint: disable=broad-except
             # This is to an best effort to find the latest controller status to
             # print more helpful message, so we can ignore any exception to
