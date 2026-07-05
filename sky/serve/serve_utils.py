@@ -43,6 +43,7 @@ from sky.utils import log_utils
 from sky.utils import message_utils
 from sky.utils import resources_utils
 from sky.utils import status_lib
+from sky.utils import subprocess_utils
 from sky.utils import ux_utils
 from sky.utils import yaml_utils
 
@@ -1314,21 +1315,59 @@ def _terminate_failed_services(
 
     Services included in ServiceStatus.failed_statuses() do not have an
     active controller process, so we can't send a file terminate signal
-    to the controller. Instead, we manually cleanup database record for
-    the service and alert the user about a potential resource leak.
+    to the controller. Instead, terminate any replica clusters that still
+    exist, then clean up the database record for the service. Clusters
+    that fail to terminate are reported as a potential resource leak.
 
     Returns:
         A message indicating potential resource leak (if any). If no
         resource leak is detected, return None.
     """
     remaining_replica_clusters: List[str] = []
-    # The controller should have already attempted to terminate those
-    # replicas, so we don't need to try again here.
-    for replica_info in serve_state.get_replica_infos(service_name):
-        # TODO(tian): Refresh latest status of the cluster.
-        if global_user_state.cluster_with_name_exists(
-                replica_info.cluster_name):
-            remaining_replica_clusters.append(f'{replica_info.cluster_name!r}')
+    replica_infos = serve_state.get_replica_infos(service_name)
+    # The controller is dead (CONTROLLER_FAILED / FAILED_CLEANUP / zombie
+    # SHUTTING_DOWN), so no down thread will ever run for these replicas:
+    # terminate their clusters here, BEFORE dropping the DB rows. Deleting
+    # the rows first (the old behavior) permanently orphaned any cluster
+    # that still existed -- nothing referenced it anymore, so it kept
+    # billing until manually downed.
+    to_terminate = [
+        info for info in replica_infos
+        if global_user_state.cluster_with_name_exists(info.cluster_name)
+    ]
+    if to_terminate:
+        # Imported here to break the circular dependency: replica_managers
+        # imports serve_utils at module load.
+        # pylint: disable=import-outside-toplevel
+        from sky.serve import replica_managers
+
+        def _terminate_replica_cluster(
+                info: 'replica_managers.ReplicaInfo') -> Optional[str]:
+            # Reuse the normal replica down path (sdk.down with retries);
+            # logs go to the replica's log file like a regular teardown.
+            log_file_name = generate_replica_log_file_name(
+                service_name, info.replica_id)
+            try:
+                replica_managers.terminate_cluster(info.cluster_name,
+                                                   log_file_name)
+                return None
+            except Exception as e:  # pylint: disable=broad-except
+                logger.error(f'Failed to terminate replica cluster '
+                             f'{info.cluster_name} of failed service '
+                             f'{service_name!r}: '
+                             f'{common_utils.format_exception(e)}')
+                return info.cluster_name
+
+        termination_failures = subprocess_utils.run_in_parallel(
+            _terminate_replica_cluster, to_terminate)
+        remaining_replica_clusters = [
+            f'{name!r}' for name in termination_failures if name is not None
+        ]
+
+    # Purge semantics: clear every replica row even if its cluster failed to
+    # terminate -- the user explicitly traded a possible leak (reported
+    # below) for a clean record.
+    for replica_info in replica_infos:
         serve_state.remove_replica(service_name, replica_info.replica_id)
 
     service_dir = os.path.expanduser(
@@ -1346,12 +1385,12 @@ def _terminate_failed_services(
 
     if not remaining_replica_clusters:
         return None
-    # TODO(tian): Try to terminate those replica clusters.
     remaining_identity = ', '.join(remaining_replica_clusters)
     return (f'{colorama.Fore.YELLOW}terminate service {service_name!r} with '
-            f'failed status ({service_status}). This may indicate a resource '
-            'leak. Please check the following SkyPilot clusters on the '
-            f'controller: {remaining_identity}{colorama.Style.RESET_ALL}')
+            f'failed status ({service_status}). Some replica clusters could '
+            'not be terminated and may leak resources. Please check the '
+            'following SkyPilot clusters on the controller: '
+            f'{remaining_identity}{colorama.Style.RESET_ALL}')
 
 
 def terminate_services(service_names: Optional[List[str]], purge: bool,

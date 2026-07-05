@@ -1104,3 +1104,84 @@ def test_set_service_status_from_replica_active_versions_ready_only():
     set_st.assert_called_once()
     assert set_st.call_args.args[1] == serve_state.ServiceStatus.READY
     assert set_st.call_args.kwargs['active_versions'] == [2]
+
+
+class TestTerminateFailedServices:
+    """`_terminate_failed_services` must terminate replica clusters that
+    still exist BEFORE deleting their DB rows.
+
+    The controller of a failed service is dead, so no down thread will ever
+    run for its replicas. Deleting the rows without terminating the clusters
+    (the old behavior) permanently orphaned them: nothing referenced the
+    clusters anymore, so they kept billing until manually downed.
+    """
+
+    def _run(self, replica_infos, exists, terminate_side_effect=None):
+        terminated = []
+
+        def _terminate(cluster_name, _log_file):
+            terminated.append(cluster_name)
+            if terminate_side_effect is not None:
+                terminate_side_effect(cluster_name)
+
+        removed = []
+        with mock.patch(
+                'sky.serve.serve_utils.serve_state.get_replica_infos',
+                return_value=replica_infos), \
+             mock.patch(
+                 'sky.serve.serve_utils.global_user_state.'
+                 'cluster_with_name_exists',
+                 side_effect=exists), \
+             mock.patch('sky.serve.replica_managers.terminate_cluster',
+                        side_effect=_terminate), \
+             mock.patch('sky.serve.serve_utils.serve_state.remove_replica',
+                        side_effect=lambda _svc, rid: removed.append(rid)), \
+             mock.patch(
+                 'sky.serve.serve_utils.serve_state.'
+                 'remove_service_completely') as remove_service, \
+             mock.patch('sky.serve.serve_utils.shutil.rmtree'):
+            message = serve_utils._terminate_failed_services('svc', None)
+        return terminated, removed, remove_service, message
+
+    @staticmethod
+    def _replica(replica_id, cluster_name):
+        info = mock.Mock()
+        info.replica_id = replica_id
+        info.cluster_name = cluster_name
+        return info
+
+    def test_existing_clusters_are_terminated_before_row_removal(self):
+        infos = [self._replica(1, 'svc-1'), self._replica(2, 'svc-2')]
+        terminated, removed, remove_service, message = self._run(
+            infos, exists=lambda name: name == 'svc-1')
+        # Only the still-existing cluster is downed; both rows are removed
+        # and the service row is cleared.
+        assert terminated == ['svc-1']
+        assert removed == [1, 2]
+        remove_service.assert_called_once_with('svc')
+        assert message is None
+
+    def test_termination_failure_is_reported_and_rows_still_cleared(self):
+        infos = [self._replica(1, 'svc-1'), self._replica(2, 'svc-2')]
+
+        def _fail_svc_2(cluster_name):
+            if cluster_name == 'svc-2':
+                raise RuntimeError('down failed')
+
+        terminated, removed, remove_service, message = self._run(
+            infos, exists=lambda name: True, terminate_side_effect=_fail_svc_2)
+        assert sorted(terminated) == ['svc-1', 'svc-2']
+        # Purge semantics: rows cleared even for the failed termination,
+        # but the failure is surfaced to the user.
+        assert removed == [1, 2]
+        remove_service.assert_called_once_with('svc')
+        assert message is not None
+
+    def test_no_existing_clusters_skips_termination(self):
+        infos = [self._replica(1, 'svc-1')]
+        terminated, removed, remove_service, message = self._run(
+            infos, exists=lambda name: False)
+        assert not terminated
+        assert removed == [1]
+        remove_service.assert_called_once_with('svc')
+        assert message is None
