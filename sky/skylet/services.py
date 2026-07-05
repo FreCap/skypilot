@@ -2,6 +2,7 @@
 
 import json
 import os
+import subprocess
 from typing import List, Optional
 
 import grpc
@@ -12,6 +13,8 @@ from sky.jobs import state as managed_job_state
 from sky.jobs import utils as managed_job_utils
 from sky.schemas.generated import autostopv1_pb2
 from sky.schemas.generated import autostopv1_pb2_grpc
+from sky.schemas.generated import healthv1_pb2
+from sky.schemas.generated import healthv1_pb2_grpc
 from sky.schemas.generated import jobsv1_pb2
 from sky.schemas.generated import jobsv1_pb2_grpc
 from sky.schemas.generated import managed_jobsv1_pb2
@@ -25,6 +28,7 @@ from sky.skylet import autostop_lib
 from sky.skylet import constants
 from sky.skylet import job_lib
 from sky.skylet import log_lib
+from sky.skylet import runtime_utils
 
 logger = sky_logging.init_logger(__name__)
 
@@ -662,3 +666,73 @@ class ManagedJobsServiceImpl(managed_jobsv1_pb2_grpc.ManagedJobsServiceServicer
         # TODO(kevin): implement this
         context.abort(grpc.StatusCode.UNIMPLEMENTED,
                       'StreamLogs is not implemented')
+
+
+class HealthServiceImpl(healthv1_pb2_grpc.HealthServiceServicer):
+    """Implementation of the HealthService gRPC service.
+
+    Runs the cluster health check locally on the head node. The API
+    server's health probe historically SSH-exec'd `ray status` and parsed
+    its output; the SSH transport added a class of false positives
+    (transient transport failures flagging a healthy cluster as abnormal)
+    that matters at large node counts, where a spurious non-UP verdict can
+    trigger a whole-cluster recovery. Skylet is colocated with the ray
+    head, so it runs the exact same command locally and ships the raw
+    result back over the existing skylet gRPC channel; the caller keeps
+    using the same parser as the legacy SSH path, so the two transports
+    cannot drift semantically.
+    """
+
+    # Bounded so a wedged ray CLI cannot pin a gRPC worker thread; the
+    # client's deadline is shorter and falls back to the SSH probe, which
+    # would hit the same wedge — the timeout here is for skylet's own
+    # thread hygiene.
+    _RAY_STATUS_TIMEOUT_SECONDS = 30
+
+    def _get_ray_port(self) -> int:
+        """Port of the ray cluster SkyPilot launched.
+
+        Mirrors the legacy probe's port resolution (the _READ_RAY_PORT_PY
+        snippet in sky/provision/instance_setup.py): read the port file
+        written at provision time, falling back to the default port.
+        """
+        try:
+            port_path = runtime_utils.get_runtime_dir_path(
+                constants.SKY_REMOTE_RAY_PORT_FILE)
+            with open(port_path, 'r', encoding='utf-8') as f:
+                return int(json.load(f)['ray_port'])
+        except Exception:  # pylint: disable=broad-except
+            return constants.SKY_REMOTE_RAY_PORT
+
+    def GetRayStatus(  # type: ignore[return]
+            self, request: healthv1_pb2.GetRayStatusRequest,
+            context: grpc.ServicerContext) -> healthv1_pb2.GetRayStatusResponse:
+        del request  # Unused.
+        try:
+            env = dict(os.environ)
+            env['RAY_ADDRESS'] = f'127.0.0.1:{self._get_ray_port()}'
+            try:
+                # shell=True: SKY_RAY_CMD embeds shell substitutions.
+                proc = subprocess.run(f'{constants.SKY_RAY_CMD} status',
+                                      shell=True,
+                                      env=env,
+                                      capture_output=True,
+                                      text=True,
+                                      timeout=self._RAY_STATUS_TIMEOUT_SECONDS,
+                                      check=False)
+                returncode = proc.returncode
+                stdout, stderr = proc.stdout, proc.stderr
+            except subprocess.TimeoutExpired as e:
+                # Report as a failed ray status (the transport worked): the
+                # caller treats a non-zero returncode exactly like the
+                # legacy probe treats a failed SSH'd `ray status`.
+                returncode = 1
+                stdout = e.stdout if isinstance(e.stdout, str) else ''
+                stderr = (f'ray status timed out after '
+                          f'{self._RAY_STATUS_TIMEOUT_SECONDS}s on the head '
+                          'node.')
+            return healthv1_pb2.GetRayStatusResponse(returncode=returncode,
+                                                     stdout=stdout,
+                                                     stderr=stderr)
+        except Exception as e:  # pylint: disable=broad-except
+            context.abort(grpc.StatusCode.INTERNAL, str(e))

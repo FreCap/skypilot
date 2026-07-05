@@ -1490,6 +1490,59 @@ def _count_healthy_nodes_from_ray(output: str,
     return ready_head, ready_workers
 
 
+# Deadline for the single skylet gRPC ray-status attempt. Deliberately
+# tighter than SKYLET_GRPC_TIMEOUT_SECONDS: this is an opportunistic fast
+# path on the status-refresh hot path with the SSH probe as the always-
+# available fallback — it must fail fast, not thoroughly.
+_SKYLET_HEALTH_PROBE_TIMEOUT_SECONDS = 5.0
+
+
+def _ray_status_via_skylet_grpc(handle) -> Optional[Tuple[int, str, str]]:
+    """Run `ray status` on the head node via the skylet HealthService.
+
+    Returns the same (returncode, stdout, stderr) triple the SSH probe
+    produces, or None when the gRPC path is unavailable — flag off, an old
+    skylet without the RPC, or any transport failure — in which case the
+    caller falls back to the SSH probe. A non-zero returncode is NOT a
+    transport failure: skylet answered and ray itself is unhealthy on the
+    head, which must flow through the exact same code path as a failed
+    SSH'd `ray status`. The gRPC path must never make the health check
+    stricter than the SSH path, only cheaper and less flaky.
+
+    Deliberately a SINGLE attempt with a tight deadline — NOT
+    invoke_skylet_with_retries, whose up-to-5 UNAVAILABLE retries (each
+    paying the full gRPC deadline against a wedged channel, plus backoff)
+    would add on the order of a minute to the status-refresh hot path
+    before the SSH fallback runs. In the healthy case
+    handle.get_grpc_channel() reuses a cached tunnel and the call is one
+    cheap local round trip; in any unhealthy case we fall back immediately
+    and a stale tunnel gets repaired by a later get_grpc_channel call.
+    """
+    try:
+        if not handle.is_grpc_enabled_with_flag:
+            return None
+    except Exception:  # pylint: disable=broad-except
+        return None
+    # pylint: disable=import-outside-toplevel
+    # Circular import: cloud_vm_ray_backend imports backend_utils at module
+    # load, so the client/proto are imported at call time.
+    from sky import backends
+    from sky.schemas.generated import healthv1_pb2
+    try:
+        response = backends.SkyletClient(
+            handle.get_grpc_channel()).get_ray_status(
+                healthv1_pb2.GetRayStatusRequest(),
+                timeout=_SKYLET_HEALTH_PROBE_TIMEOUT_SECONDS)
+    except Exception as e:  # pylint: disable=broad-except
+        # UNIMPLEMENTED (old skylet), skylet down, tunnel/channel setup
+        # failures, deadline exceeded, ...: fall back to the SSH probe.
+        logger.debug('Skylet gRPC ray-status probe unavailable for '
+                     f'{handle.cluster_name!r}; falling back to the SSH '
+                     f'probe: {common_utils.format_exception(e)}')
+        return None
+    return response.returncode, response.stdout, response.stderr
+
+
 @timeline.event
 def _deterministic_cluster_yaml_hash(tmp_yaml_path: str) -> str:
     """Hash the cluster yaml and contents of file mounts to a unique string.
@@ -2611,13 +2664,32 @@ def _update_cluster_status(
                  f'{record["cluster_hash"]} has external cluster failures: '
                  f'{external_cluster_failures}')
 
+    # Once the skylet gRPC probe reports unavailable, skip it for the rest
+    # of this probe round (the retry loop below re-invokes the fetch up to
+    # 5 times) instead of paying the gRPC attempt before every SSH fallback.
+    skylet_grpc_unavailable = False
+
     def get_node_counts_from_ray_status(
             runner: command_runner.CommandRunner) -> Tuple[int, int, str, str]:
-        rc, output, stderr = runner.run(
-            instance_setup.RAY_STATUS_WITH_SKY_RAY_PORT_COMMAND,
-            stream_logs=False,
-            require_outputs=True,
-            separate_stderr=True)
+        nonlocal skylet_grpc_unavailable
+        # Prefer running `ray status` locally on the head via skylet gRPC:
+        # the SSH exec adds a class of transport false positives that, at
+        # large node counts, can flag a healthy cluster as abnormal (and,
+        # for managed jobs, trigger a whole-cluster recovery). The result
+        # triple and the parsing below are identical for both transports.
+        grpc_result = None
+        if not skylet_grpc_unavailable:
+            grpc_result = _ray_status_via_skylet_grpc(handle)
+            if grpc_result is None:
+                skylet_grpc_unavailable = True
+        if grpc_result is not None:
+            rc, output, stderr = grpc_result
+        else:
+            rc, output, stderr = runner.run(
+                instance_setup.RAY_STATUS_WITH_SKY_RAY_PORT_COMMAND,
+                stream_logs=False,
+                require_outputs=True,
+                separate_stderr=True)
         if rc:
             raise exceptions.CommandError(
                 rc, instance_setup.RAY_STATUS_WITH_SKY_RAY_PORT_COMMAND,

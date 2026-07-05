@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package health.v1;
+
+// Cluster runtime health, served by skylet on the head node.
+//
+// Rationale: the cluster health probe historically SSH-exec'd `ray status`
+// from the API server and parsed its text output. The SSH transport adds a
+// whole class of false positives (transient transport failures flagging a
+// healthy cluster) and is expensive at scale. Skylet is colocated with the
+// ray head, so it can run the same check locally and return the result over
+// the existing skylet gRPC channel.
+//
+// GetRayStatus deliberately returns the RAW `ray status` result
+// (returncode/stdout/stderr) rather than parsed counts: the caller keeps
+// using the exact same parser as the legacy SSH path, so the two transports
+// cannot drift semantically. Future RPCs on this service can add structured
+// per-node state (e.g. from ray.nodes()) for consumers that need node
+// identity.
+service HealthService {
+  // Run `ray status` locally on the head node against the ray port
+  // SkyPilot launched, and return its raw result.
+  rpc GetRayStatus(GetRayStatusRequest) returns (GetRayStatusResponse);
+}
+
+message GetRayStatusRequest {}
+
+message GetRayStatusResponse {
+  // Exit code of the local `ray status` invocation. Non-zero means ray
+  // itself is unhealthy on the head (the transport — this RPC — worked).
+  int32 returncode = 1;
+  string stdout = 2;
+  string stderr = 3;
+}

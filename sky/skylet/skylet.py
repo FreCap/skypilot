@@ -12,6 +12,7 @@ import grpc
 import sky
 from sky import sky_logging
 from sky.schemas.generated import autostopv1_pb2_grpc
+from sky.schemas.generated import healthv1_pb2_grpc
 from sky.schemas.generated import jobsv1_pb2_grpc
 from sky.schemas.generated import managed_jobsv1_pb2_grpc
 from sky.schemas.generated import servev1_pb2_grpc
@@ -67,6 +68,8 @@ def start_grpc_server(port: int = constants.SKYLET_GRPC_PORT) -> grpc.Server:
         services.ServeServiceImpl(), server)
     managed_jobsv1_pb2_grpc.add_ManagedJobsServiceServicer_to_server(
         services.ManagedJobsServiceImpl(), server)
+    healthv1_pb2_grpc.add_HealthServiceServicer_to_server(
+        services.HealthServiceImpl(), server)
 
     listen_addr = f'0.0.0.0:{port}'
     server.add_insecure_port(listen_addr)
