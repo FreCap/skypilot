@@ -116,10 +116,10 @@ class ServeServiceImpl(servev1_pb2_grpc.ServeServiceServicer):
     ) -> servev1_pb2.GetServiceStatusResponse:
         """Gets serve status."""
         try:
-            service_names, pool = (
+            service_names, pool, summary_only = (
                 serve_rpc_utils.GetServiceStatusRequestConverter.from_proto(request))  # pylint: disable=line-too-long
             statuses = serve_utils.get_service_status_pickled(
-                service_names, pool)
+                service_names, pool, summary_only=summary_only)
             return serve_rpc_utils.GetServiceStatusResponseConverter.to_proto(
                 statuses)
         except Exception as e:  # pylint: disable=broad-except

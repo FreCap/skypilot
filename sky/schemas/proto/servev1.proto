@@ -28,6 +28,10 @@ message ServiceStatus {
 message GetServiceStatusRequest {
     optional ServiceNames service_names = 1;
     bool pool = 2;
+    // Skip per-replica info; return replica_status_counts instead. Old
+    // skylets ignore this field and return the full payload (graceful
+    // degradation).
+    bool summary_only = 3;
 }
 
 message GetServiceStatusResponse {

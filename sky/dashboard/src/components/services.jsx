@@ -173,7 +173,12 @@ function ServicesTable({
     setLoading(true);
     setLocalLoading(true);
     try {
-      const servicesResponse = await dashboardCache.get(getServices);
+      // The list view only needs per-service aggregates: use the cheap
+      // summary query (the full one serializes every replica and takes
+      // tens of seconds at fleet scale).
+      const servicesResponse = await dashboardCache.get(getServices, [
+        { summaryOnly: true },
+      ]);
       setData(servicesResponse.services || []);
       setControllerStopped(servicesResponse.controllerStopped || false);
       if (onFetched) {

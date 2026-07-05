@@ -35,6 +35,7 @@ def _backend_mock():
 
 
 class TestRegistry:
+    """Runner registry: default construction and override."""
 
     def test_current_returns_default_when_unregistered(self):
         runner = serve_runner.current()
@@ -79,7 +80,7 @@ class TestDefaultRunnerRpcPath:
                                                service_names=['p1'],
                                                pool=True)
         assert result == expected
-        rpc.assert_called_once_with(handle, ['p1'], True)
+        rpc.assert_called_once_with(handle, ['p1'], True, summary_only=False)
         codegen.assert_not_called()
         # RPC path must not even materialize a backend.
         get_backend.assert_not_called()
@@ -110,7 +111,7 @@ class TestDefaultRunnerRpcPath:
                                                service_names=None,
                                                pool=False)
         assert result == legacy_records
-        codegen.assert_called_once_with(None, pool=False)
+        codegen.assert_called_once_with(None, pool=False, summary_only=False)
         backend.run_on_head.assert_called_once()
         load.assert_called_once_with(b'PAYLOAD')
 
@@ -192,10 +193,11 @@ class TestStatusDelegatesToRunner:
     def test_calls_registered_runner_with_normalized_args(self):
         captured = {}
 
-        def fake_get(*, handle, service_names, pool):
+        def fake_get(*, handle, service_names, pool, summary_only=False):
             captured['handle'] = handle
             captured['service_names'] = service_names
             captured['pool'] = pool
+            captured['summary_only'] = summary_only
             # Pool path: skip the endpoint-augmentation loop.
             return []
 
@@ -209,6 +211,7 @@ class TestStatusDelegatesToRunner:
         # service_names should be normalized from str -> [str].
         assert captured['service_names'] == ['single']
         assert captured['pool'] is True
+        assert captured['summary_only'] is False
 
     def test_rpc_then_legacy_fallback_end_to_end_via_status(self):
         """status() -> default runner -> RPC raises NotImplemented -> legacy.

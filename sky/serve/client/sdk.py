@@ -156,7 +156,8 @@ def terminate_replica(service_name: str, replica_id: int,
 @usage_lib.entrypoint
 @server_common.check_server_healthy_or_start
 def status(
-    service_names: Optional[Union[str, List[str]]]
+    service_names: Optional[Union[str, List[str]]],
+    summary_only: bool = False,
 ) -> server_common.RequestId[List[Dict[str, Any]]]:
     """Gets service statuses.
 
@@ -216,7 +217,7 @@ def status(
         RuntimeError: if failed to get the service status.
         exceptions.ClusterNotUpError: if the sky serve controller is not up.
     """
-    return impl.status(service_names, pool=False)
+    return impl.status(service_names, pool=False, summary_only=summary_only)
 
 
 @usage_lib.entrypoint
