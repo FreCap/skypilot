@@ -128,18 +128,23 @@ def _get_service_record(
 
 def _ha_recovery_restore_cmds(
         file_mounts: Optional[Dict[str, str]]) -> List[str]:
-    """Shell commands recreating the controller's file mounts from their
-    current local contents (base64-embedded).
+    """Shell commands recreating the given files from their current local
+    contents (base64-embedded, shell-quoted paths).
 
     Makes the stored HA recovery script self-contained across POD
-    REPLACEMENT: the mounts (the SKYPILOT_CONFIG config.yaml, the tmp task
-    yaml, modified catalogs) are synced onto pod-local storage (emptyDir),
+    REPLACEMENT: these files are synced onto pod-local storage (emptyDir),
     but a replacement pod starts with a fresh filesystem while the recovery
-    script survives in the DB. Without these files the recovered controller
+    script survives in the DB. Without them the recovered controller
     crash-loops (e.g. FileNotFoundError on SKYPILOT_CONFIG) — measured
     live: a 224-replica fleet sat CONTROLLER_FAILED for hours after a
-    rolling update. Files are small yaml configs; anything unreadable or
-    over 1MiB is skipped (with a warning) rather than bloating the DB row.
+    rolling update.
+
+    Callers must pass an ALLOWLIST of infra files only — never the full
+    controller file_mounts: the mounts can include TLS private keys and
+    (in the two-hop path) arbitrary user files, and everything embedded
+    here lands in a durable DB row and in process command lines. Anything
+    unreadable or over 1MiB is skipped with a warning rather than bloating
+    the DB row.
     """
     restore_cmds = []
     for remote_path, local_path in sorted((file_mounts or {}).items()):
@@ -155,8 +160,17 @@ def _ha_recovery_restore_cmds(
                            f'{len(content)} bytes exceeds the 1MiB cap.')
             continue
         content_b64 = base64.b64encode(content).decode('ascii')
-        restore_cmds.append(f'mkdir -p $(dirname {remote_path}) && '
-                            f'echo {content_b64} | base64 -d > {remote_path}')
+        # shlex.quote treats `~` as unsafe and would quote it, which stops
+        # bash tilde expansion — so splice an explicit "$HOME" for
+        # home-relative paths and quote only the remainder. Hostile
+        # metacharacters in either form end up inside quotes and are inert.
+        if remote_path.startswith('~/'):
+            quoted_path = '"$HOME"' + shlex.quote(remote_path[1:])
+        else:
+            quoted_path = shlex.quote(remote_path)
+        restore_cmds.append(
+            f'mkdir -p -- "$(dirname -- {quoted_path})" && '
+            f'printf %s {content_b64} | base64 -d > {quoted_path}')
     return restore_cmds
 
 
@@ -353,11 +367,25 @@ def up(
             env_cmds = [
                 f'export {k}={v!r}' for k, v in controller_task.envs.items()
             ]
-            # See _ha_recovery_restore_cmds: embed the controller's file
-            # mounts so the stored recovery script is self-contained across
-            # pod replacement (fresh emptyDir).
-            restore_cmds = _ha_recovery_restore_cmds(
-                controller_task.file_mounts)
+            # Embed ONLY the controller config yaml so the stored recovery
+            # script is self-contained across pod replacement (fresh
+            # emptyDir). The config is identity-critical: recovering with a
+            # partial config makes the controller activate the WRONG cloud
+            # identity (live incident: replica ops failed with
+            # ClusterOwnerIdentityMismatchError until the full merged config
+            # was restored). Deliberately NOT the full file_mounts: the task
+            # yaml carries the service's `secrets:` and TLS mounts carry
+            # private keys — none of which belong in a durable DB row. The
+            # remaining mounts stay a known pod-replacement gap (two-hop
+            # user mounts; tmp task yaml is only a legacy fallback, since
+            # recovery boots from the DB-committed yaml).
+            config_mount = {
+                remote: local
+                for remote, local in (
+                    controller_task.file_mounts or {}).items()
+                if remote == remote_config_yaml_path
+            }
+            restore_cmds = _ha_recovery_restore_cmds(config_mount)
             run_script = '\n'.join(env_cmds + restore_cmds + [run_script])
             # Dump script for high availability recovery.
             serve_state.set_ha_recovery_script(service_name, run_script)

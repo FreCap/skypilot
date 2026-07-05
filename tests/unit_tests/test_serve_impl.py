@@ -160,8 +160,25 @@ class TestHaRecoveryRestoreCmds:
         assert len(cmds) == 1
         expected = b64.b64encode(b'active_workspace: mt_native\n').decode()
         assert expected in cmds[0]
-        assert 'mkdir -p $(dirname ~/.sky/serve/svc/config.yaml)' in cmds[0]
-        assert cmds[0].endswith('> ~/.sky/serve/svc/config.yaml')
+        # Home-relative paths must expand at runtime: the leading ~ is
+        # spliced to an unquoted "$HOME" with only the remainder quoted
+        # (shlex leaves this metacharacter-free remainder unquoted).
+        import shlex as shlex_mod
+        expected_path = '"$HOME"' + shlex_mod.quote(
+            '/.sky/serve/svc/config.yaml')
+        assert f'mkdir -p -- "$(dirname -- {expected_path})"' in cmds[0]
+        assert cmds[0].endswith(f'> {expected_path}')
+
+    def test_hostile_paths_are_quoted_inert(self, tmp_path):
+        cfg = tmp_path / 'c.yaml'
+        cfg.write_bytes(b'x: 1\n')
+        hostile = '/tmp/a b; rm -rf $HOME/pwn'
+        cmds = impl._ha_recovery_restore_cmds({hostile: str(cfg)})
+        assert len(cmds) == 1
+        import shlex as shlex_mod
+        assert shlex_mod.quote(hostile) in cmds[0]
+        # The raw metacharacter sequence must not appear unquoted.
+        assert '; rm -rf' not in cmds[0].replace(shlex_mod.quote(hostile), '')
 
     def test_skips_unreadable_and_oversized(self, tmp_path):
         big = tmp_path / 'big.bin'
