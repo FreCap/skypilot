@@ -1,0 +1,437 @@
+'use client';
+
+import React, {
+  useState,
+  useEffect,
+  useMemo,
+  useCallback,
+  useRef,
+} from 'react';
+import PropTypes from 'prop-types';
+import { CircularProgress } from '@mui/material';
+import { Button } from '@/components/ui/button';
+import {
+  Table,
+  TableHeader,
+  TableRow,
+  TableHead,
+  TableBody,
+  TableCell,
+} from '@/components/ui/table';
+import { getServices } from '@/data/connectors/services';
+import { REFRESH_INTERVALS } from '@/lib/config';
+import { sortData } from '@/data/utils';
+import { RotateCwIcon, CopyIcon, CheckIcon } from 'lucide-react';
+import { useMobile } from '@/hooks/useMobile';
+import { Card } from '@/components/ui/card';
+import Link from 'next/link';
+import {
+  CustomTooltip as Tooltip,
+  LastUpdatedTimestamp,
+  formatDuration,
+} from '@/components/utils';
+import { StatusBadge } from '@/components/elements/StatusBadge';
+import dashboardCache from '@/lib/cache';
+
+const REFRESH_INTERVAL = REFRESH_INTERVALS.REFRESH_INTERVAL;
+
+export function formatUptime(uptime) {
+  // `uptime` is the epoch timestamp of when the service first became
+  // ready (see sky/serve/serve_state.py set_service_uptime).
+  if (!uptime || uptime <= 0) return '-';
+  return formatDuration(Math.max(0, Date.now() / 1000 - uptime));
+}
+
+export function EndpointCell({ endpoint }) {
+  const [isCopied, setIsCopied] = useState(false);
+
+  if (!endpoint) {
+    return <span>-</span>;
+  }
+
+  const copyEndpoint = async () => {
+    try {
+      await navigator.clipboard.writeText(endpoint);
+      setIsCopied(true);
+      setTimeout(() => setIsCopied(false), 2000);
+    } catch (err) {
+      console.error('Failed to copy endpoint to clipboard:', err);
+    }
+  };
+
+  return (
+    <span className="inline-flex items-center">
+      <a
+        href={endpoint}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="text-blue-600 hover:underline"
+      >
+        {endpoint}
+      </a>
+      <Tooltip
+        content={isCopied ? 'Copied!' : 'Copy endpoint'}
+        className="text-muted-foreground"
+      >
+        <button
+          onClick={copyEndpoint}
+          className="flex items-center text-gray-500 hover:text-gray-700 transition-colors duration-200 p-1 ml-1"
+        >
+          {isCopied ? (
+            <CheckIcon className="w-4 h-4 text-green-600" />
+          ) : (
+            <CopyIcon className="w-4 h-4" />
+          )}
+        </button>
+      </Tooltip>
+    </span>
+  );
+}
+
+EndpointCell.propTypes = {
+  endpoint: PropTypes.string,
+};
+
+export function Services() {
+  const [loading, setLoading] = useState(false);
+  const refreshDataRef = useRef(null);
+  const isMobile = useMobile();
+  const [lastFetchedTime, setLastFetchedTime] = useState(null);
+
+  const handleRefresh = () => {
+    dashboardCache.invalidate(getServices);
+    if (refreshDataRef.current) {
+      refreshDataRef.current();
+    }
+    setLastFetchedTime(new Date());
+  };
+
+  return (
+    <>
+      <div className="flex items-center justify-between mb-4 h-5">
+        <div className="text-base flex items-center">
+          <Link
+            href="/services"
+            className="text-sky-blue hover:underline leading-none"
+          >
+            Services
+          </Link>
+        </div>
+        <div className="flex items-center gap-3">
+          {loading && (
+            <div className="flex items-center">
+              <CircularProgress size={15} className="mt-0" />
+              <span className="ml-2 text-gray-500 text-sm">Loading...</span>
+            </div>
+          )}
+          {!loading && lastFetchedTime && (
+            <LastUpdatedTimestamp timestamp={lastFetchedTime} />
+          )}
+          <button
+            onClick={handleRefresh}
+            disabled={loading}
+            className="text-sky-blue hover:text-sky-blue-bright flex items-center"
+          >
+            <RotateCwIcon className="h-4 w-4 mr-1.5" />
+            {!isMobile && <span>Refresh</span>}
+          </button>
+        </div>
+      </div>
+
+      <ServicesTable
+        refreshInterval={REFRESH_INTERVAL}
+        setLoading={setLoading}
+        refreshDataRef={refreshDataRef}
+        onFetched={() => setLastFetchedTime(new Date())}
+      />
+    </>
+  );
+}
+
+function ServicesTable({
+  refreshInterval,
+  setLoading,
+  refreshDataRef,
+  onFetched,
+}) {
+  const [data, setData] = useState([]);
+  const [controllerStopped, setControllerStopped] = useState(false);
+  const [sortConfig, setSortConfig] = useState({
+    key: null,
+    direction: 'ascending',
+  });
+  const [loading, setLocalLoading] = useState(false);
+  const [isInitialLoad, setIsInitialLoad] = useState(true);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [pageSize, setPageSize] = useState(10);
+
+  const fetchData = useCallback(async () => {
+    setLoading(true);
+    setLocalLoading(true);
+    try {
+      const servicesResponse = await dashboardCache.get(getServices);
+      setData(servicesResponse.services || []);
+      setControllerStopped(servicesResponse.controllerStopped || false);
+      if (onFetched) {
+        onFetched();
+      }
+    } catch (error) {
+      console.error('Failed to fetch services:', error);
+      setData([]);
+    } finally {
+      setLoading(false);
+      setLocalLoading(false);
+      setIsInitialLoad(false);
+    }
+  }, [setLoading, onFetched]);
+
+  const sortedData = useMemo(() => {
+    return sortData(data, sortConfig.key, sortConfig.direction);
+  }, [data, sortConfig]);
+
+  // Expose fetchData to parent component
+  useEffect(() => {
+    if (refreshDataRef) {
+      refreshDataRef.current = fetchData;
+    }
+  }, [refreshDataRef, fetchData]);
+
+  useEffect(() => {
+    let isCurrent = true;
+
+    fetchData();
+
+    const interval = setInterval(() => {
+      if (isCurrent && window.document.visibilityState === 'visible') {
+        fetchData();
+      }
+    }, refreshInterval);
+
+    return () => {
+      isCurrent = false;
+      clearInterval(interval);
+    };
+  }, [refreshInterval, fetchData]);
+
+  // Reset to first page when data changes
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [data.length]);
+
+  const requestSort = (key) => {
+    let direction = 'ascending';
+    if (sortConfig.key === key && sortConfig.direction === 'ascending') {
+      direction = 'descending';
+    }
+    setSortConfig({ key, direction });
+  };
+
+  const getSortDirection = (key) => {
+    if (sortConfig.key === key) {
+      return sortConfig.direction === 'ascending' ? ' ↑' : ' ↓';
+    }
+    return '';
+  };
+
+  const totalPages = Math.ceil(sortedData.length / pageSize);
+  const startIndex = (currentPage - 1) * pageSize;
+  const endIndex = startIndex + pageSize;
+  const paginatedData = sortedData.slice(startIndex, endIndex);
+
+  const goToPreviousPage = () => {
+    setCurrentPage((page) => Math.max(page - 1, 1));
+  };
+
+  const goToNextPage = () => {
+    setCurrentPage((page) => Math.min(page + 1, totalPages));
+  };
+
+  const handlePageSizeChange = (e) => {
+    const newSize = parseInt(e.target.value, 10);
+    setPageSize(newSize);
+    setCurrentPage(1);
+  };
+
+  const sortableHeader = (label, sortKey) => (
+    <TableHead
+      className="sortable whitespace-nowrap cursor-pointer hover:bg-gray-50"
+      onClick={() => requestSort(sortKey)}
+    >
+      {label}
+      {getSortDirection(sortKey)}
+    </TableHead>
+  );
+
+  const totalColSpan = 7;
+
+  return (
+    <div>
+      <Card>
+        <div className="overflow-x-auto rounded-lg">
+          <Table className="min-w-full">
+            <TableHeader>
+              <TableRow>
+                {sortableHeader('Name', 'name')}
+                {sortableHeader('Status', 'status')}
+                {sortableHeader('Replicas', 'replicasReady')}
+                <TableHead className="whitespace-nowrap">Endpoint</TableHead>
+                {sortableHeader('Uptime', 'uptime')}
+                {sortableHeader('Policy', 'policy')}
+                {sortableHeader('Resources', 'requestedResources')}
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {loading && isInitialLoad ? (
+                <TableRow>
+                  <TableCell
+                    colSpan={totalColSpan}
+                    className="text-center py-6 text-gray-500"
+                  >
+                    <div className="flex justify-center items-center">
+                      <CircularProgress size={20} className="mr-2" />
+                      <span>Loading...</span>
+                    </div>
+                  </TableCell>
+                </TableRow>
+              ) : paginatedData.length > 0 ? (
+                paginatedData.map((service) => (
+                  <TableRow key={service.name}>
+                    <TableCell>
+                      <Link
+                        href={`/services/${encodeURIComponent(service.name)}`}
+                        className="text-blue-600"
+                      >
+                        {service.name}
+                      </Link>
+                    </TableCell>
+                    <TableCell>
+                      <StatusBadge status={service.status} />
+                    </TableCell>
+                    <TableCell>
+                      {service.replicasReady}/{service.replicasTotal}
+                    </TableCell>
+                    <TableCell>
+                      <EndpointCell endpoint={service.endpoint} />
+                    </TableCell>
+                    <TableCell>{formatUptime(service.uptime)}</TableCell>
+                    <TableCell>{service.policy || '-'}</TableCell>
+                    <TableCell>{service.requestedResources || '-'}</TableCell>
+                  </TableRow>
+                ))
+              ) : (
+                <TableRow>
+                  <TableCell
+                    colSpan={totalColSpan}
+                    className="text-center py-6 text-gray-500"
+                  >
+                    {controllerStopped
+                      ? 'No services (the SkyServe controller is not up).'
+                      : 'No services found. Launch one with `sky serve up`.'}
+                  </TableCell>
+                </TableRow>
+              )}
+            </TableBody>
+          </Table>
+        </div>
+      </Card>
+
+      {/* Pagination controls */}
+      {data.length > 0 && (
+        <div className="flex justify-end items-center py-2 px-4 text-sm text-gray-700">
+          <div className="flex items-center space-x-4">
+            <div className="flex items-center">
+              <span className="mr-2">Rows per page:</span>
+              <div className="relative inline-block">
+                <select
+                  value={pageSize}
+                  onChange={handlePageSizeChange}
+                  className="py-1 pl-2 pr-6 appearance-none outline-none cursor-pointer border-none bg-transparent"
+                  style={{ minWidth: '40px' }}
+                >
+                  <option value={10}>10</option>
+                  <option value={30}>30</option>
+                  <option value={50}>50</option>
+                  <option value={100}>100</option>
+                  <option value={200}>200</option>
+                </select>
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  className="h-4 w-4 text-gray-500 absolute right-0 top-1/2 transform -translate-y-1/2 pointer-events-none"
+                  fill="none"
+                  viewBox="0 0 24 24"
+                  stroke="currentColor"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={2}
+                    d="M19 9l-7 7-7-7"
+                  />
+                </svg>
+              </div>
+            </div>
+            <div>
+              {startIndex + 1} – {Math.min(endIndex, data.length)} of{' '}
+              {data.length}
+            </div>
+            <div className="flex items-center space-x-2">
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={goToPreviousPage}
+                disabled={currentPage === 1}
+                className="text-gray-500 h-8 w-8 p-0"
+              >
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  className="chevron-left"
+                >
+                  <path d="M15 18l-6-6 6-6" />
+                </svg>
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={goToNextPage}
+                disabled={currentPage === totalPages || totalPages === 0}
+                className="text-gray-500 h-8 w-8 p-0"
+              >
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  className="chevron-right"
+                >
+                  <path d="M9 18l6-6-6-6" />
+                </svg>
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+ServicesTable.propTypes = {
+  refreshInterval: PropTypes.number.isRequired,
+  setLoading: PropTypes.func.isRequired,
+  refreshDataRef: PropTypes.shape({
+    current: PropTypes.func,
+  }).isRequired,
+  onFetched: PropTypes.func,
+};

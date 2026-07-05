@@ -68,6 +68,10 @@ const clusterStatusMap = {
   UP: 'RUNNING',
   STOPPED: 'STOPPED',
   INIT: 'LAUNCHING',
+  // Cluster is executing pre-stop hooks and about to stop/tear down
+  // (sky/utils/status_lib.py ClusterStatus.AUTOSTOPPING). Without this
+  // entry the badge rendered with an undefined label (a bare dot).
+  AUTOSTOPPING: 'AUTOSTOPPING',
   PENDING: 'PENDING',
   null: 'TERMINATED',
 };
@@ -102,7 +106,9 @@ export async function getClusters({ clusterNames = null } = {}) {
         region_or_zone = truncateMiddle(region_or_zone, 25);
       }
       return {
-        status: clusterStatusMap[cluster.status],
+        // Fall back to the raw status so an unmapped enum value still
+        // renders a labeled badge instead of a bare dot.
+        status: clusterStatusMap[cluster.status] || cluster.status,
         cluster: cluster.name,
         user: cluster.user_name,
         user_hash: cluster.user_hash,
@@ -207,7 +213,7 @@ export async function getClusterHistory(
 
       return {
         status: cluster.status
-          ? clusterStatusMap[cluster.status]
+          ? clusterStatusMap[cluster.status] || cluster.status
           : 'TERMINATED',
         cluster: cluster.name,
         user: user_name,
