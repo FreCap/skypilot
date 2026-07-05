@@ -94,6 +94,8 @@ if typing.TYPE_CHECKING:
     from sky import dag
     from sky.schemas.generated import autostopv1_pb2
     from sky.schemas.generated import autostopv1_pb2_grpc
+    from sky.schemas.generated import healthv1_pb2
+    from sky.schemas.generated import healthv1_pb2_grpc
     from sky.schemas.generated import jobsv1_pb2
     from sky.schemas.generated import jobsv1_pb2_grpc
     from sky.schemas.generated import managed_jobsv1_pb2
@@ -111,6 +113,10 @@ else:
         'sky.schemas.generated.autostopv1_pb2')
     autostopv1_pb2_grpc = adaptors_common.LazyImport(
         'sky.schemas.generated.autostopv1_pb2_grpc')
+    healthv1_pb2 = adaptors_common.LazyImport(
+        'sky.schemas.generated.healthv1_pb2')
+    healthv1_pb2_grpc = adaptors_common.LazyImport(
+        'sky.schemas.generated.healthv1_pb2_grpc')
     jobsv1_pb2 = adaptors_common.LazyImport('sky.schemas.generated.jobsv1_pb2')
     jobsv1_pb2_grpc = adaptors_common.LazyImport(
         'sky.schemas.generated.jobsv1_pb2_grpc')
@@ -2898,6 +2904,8 @@ class SkyletClient:
             servev1_pb2_grpc.ServeServiceStub(channel))
         self._managed_jobs_stub = _CancelAwareStub(
             managed_jobsv1_pb2_grpc.ManagedJobsServiceStub(channel))
+        self._health_stub = _CancelAwareStub(
+            healthv1_pb2_grpc.HealthServiceStub(channel))
 
     def set_autostop(
         self,
@@ -3059,6 +3067,18 @@ class SkyletClient:
             timeout = max(timeout,
                           serve_constants.UPDATE_SERVICE_TIMEOUT_SECONDS + 10)
         return self._serve_stub.UpdateService(request, timeout=timeout)
+
+    def get_ray_status(
+        self,
+        request: 'healthv1_pb2.GetRayStatusRequest',
+        timeout: Optional[float] = constants.SKYLET_GRPC_TIMEOUT_SECONDS
+    ) -> 'healthv1_pb2.GetRayStatusResponse':
+        """Run `ray status` locally on the head node via skylet.
+
+        Replaces the SSH-exec'd ray status of the legacy health probe;
+        old skylets raise UNIMPLEMENTED and the caller falls back.
+        """
+        return self._health_stub.GetRayStatus(request, timeout=timeout)
 
     def get_managed_job_controller_version(
         self,
