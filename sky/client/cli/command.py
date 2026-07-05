@@ -5866,7 +5866,7 @@ def jobs_launch(
         dag.name = name
 
     dag_utils.maybe_infer_and_fill_dag_and_task_names(dag)
-    dag_utils.fill_default_config_in_dag_for_job_launch(dag)
+    dag_utils.fill_default_config_in_dag_for_job_launch(dag, pool=pool)
 
     common_utils.check_cluster_name_is_valid(name)
     _warn_if_name_looks_like_file_path(name, yes, 'Job name',

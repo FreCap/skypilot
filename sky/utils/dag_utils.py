@@ -356,12 +356,27 @@ def maybe_infer_and_fill_dag_and_task_names(dag: dag_lib.Dag) -> None:
                 task.name = f'{dag.name}-{task_id}'
 
 
-def fill_default_config_in_dag_for_job_launch(dag: dag_lib.Dag) -> None:
+def fill_default_config_in_dag_for_job_launch(dag: dag_lib.Dag,
+                                              pool: Optional[str] = None
+                                             ) -> None:
     for task_ in dag.tasks:
 
         new_resources_list = []
         default_strategy = registry.JOBS_RECOVERY_STRATEGY_REGISTRY.default
         assert default_strategy is not None
+        # When the user did not choose a strategy, default multi-node jobs to
+        # FAILOVER instead of the registry default (EAGER_NEXT_REGION). Eager
+        # recovery immediately terminates the WHOLE cluster and relaunches in
+        # a different region — sensible for a single spot VM, catastrophic
+        # for an N-node cluster where the common failure is losing one node:
+        # FAILOVER's first step relaunches on the SAME cluster, reusing the
+        # surviving nodes and re-provisioning only the missing ones. Pool
+        # jobs are excluded (their workers are managed by the pool, not by
+        # the recovery strategy). An explicit user strategy always wins (the
+        # str/dict handling below only falls back to `default_strategy` when
+        # none was specified).
+        if pool is None and task_.num_nodes > 1:
+            default_strategy = 'FAILOVER'
         for resources in list(task_.resources):
             original_job_recovery = resources.job_recovery
             job_recovery: Dict[str, Optional[Union[str, int]]] = {

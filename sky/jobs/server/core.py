@@ -842,7 +842,7 @@ def launch(
             f'Priority must be between {skylet_constants.MIN_PRIORITY}'
             f' and {skylet_constants.MAX_PRIORITY}, got {priority}')
 
-    dag_utils.fill_default_config_in_dag_for_job_launch(dag)
+    dag_utils.fill_default_config_in_dag_for_job_launch(dag, pool=pool)
 
     with rich_utils.safe_status(
             ux_utils.spinner_message('Initializing managed job')):
