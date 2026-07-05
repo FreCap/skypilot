@@ -369,8 +369,23 @@ def is_consolidation_mode(pool: bool = False) -> bool:
     return consolidation_mode
 
 
-def ha_recovery_for_consolidation_mode(pool: bool):
-    """Recovery logic for HA mode."""
+def ha_recovery_for_consolidation_mode(pool: bool,
+                                       still_leader: Optional[Callable[
+                                           [], bool]] = None):
+    """Recovery logic for HA mode.
+
+    Args:
+        pool: Whether to recover pools (True) or services (False).
+        still_leader: Optional probe returning whether this pod still holds
+            the consolidation leader lock. Re-checked before every recovery
+            launch: the leader lock is session-scoped (a PG advisory lock),
+            so it can be silently lost mid-sweep (RDS failover, idle
+            timeout), at which point another pod may already be running its
+            own recovery. Launching more controllers here without
+            leadership would split-brain, so the sweep aborts instead. None
+            means the caller has no revocable leadership concept (e.g. a
+            single-pod filelock deployment).
+    """
     # No setup recovery is needed in consolidation mode, as the API server
     # already has all runtime installed. Directly start jobs recovery here.
     # Refers to sky/templates/kubernetes-ray.yml.j2 for more details.
@@ -439,6 +454,17 @@ def ha_recovery_for_consolidation_mode(pool: bool):
                 f.write(f'{capnoun} {service_name}\'s recovery script does '
                         'not exist. Skipping recovery.\n')
                 continue
+            # Fence right before the launch: the leader-lock session may have
+            # died since the caller's top-of-iteration probe (this sweep can
+            # take a while with many services). Without leadership, another
+            # pod may already be recovering the same services — abort the
+            # sweep instead of racing it.
+            if still_leader is not None and not still_leader():
+                msg = ('Consolidation leader lock session lost mid-recovery; '
+                       'aborting the rest of this recovery sweep.')
+                f.write(msg + '\n')
+                logger.error(msg)
+                break
             rc, out, err = runner.run(script, require_outputs=True)
             if rc:
                 f.write(f'Recovery script returned {rc}. '

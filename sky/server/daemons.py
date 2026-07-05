@@ -244,6 +244,18 @@ def should_skip_managed_job_status_refresh():
     return True
 
 
+def _leader_session_alive(lock: locks.DistributedLock) -> bool:
+    """Whether the leader lock is still held on a live session.
+
+    Only PostgresLock has a revocable session; other lock types (single-pod
+    filelock) cannot be lost silently, so they always count as held. Mirrors
+    `_lock_still_held` in sky/jobs/managed_job_refresh_thread.py.
+    """
+    if isinstance(lock, locks.PostgresLock):
+        return lock.is_session_alive()
+    return True
+
+
 def _ensure_leader_lock(lock: Optional[locks.DistributedLock], lock_id: str,
                         lock_label: str) -> locks.DistributedLock:
     """Return the consolidation leader lock, held on a live session.
@@ -262,8 +274,7 @@ def _ensure_leader_lock(lock: Optional[locks.DistributedLock], lock_id: str,
     """
     if lock is None:
         lock = locks.get_lock(lock_id)
-    if (lock.is_locked() and isinstance(lock, locks.PostgresLock) and
-            not lock.is_session_alive()):
+    if lock.is_locked() and not _leader_session_alive(lock):
         logger.error(
             f'The {lock_label} session is no longer alive; the advisory '
             'lock was released server-side and another pod may hold it '
@@ -300,15 +311,32 @@ def _serve_status_refresh_event(pool: bool):
             _pool_consolidation_mode_lock,
             serve_constants.POOL_CONSOLIDATION_MODE_LOCK_ID,
             'pool consolidation mode lock')
+        lock = _pool_consolidation_mode_lock
     else:
         _serve_consolidation_mode_lock = _ensure_leader_lock(
             _serve_consolidation_mode_lock,
             serve_constants.SERVE_CONSOLIDATION_MODE_LOCK_ID,
             'serve consolidation mode lock')
+        lock = _serve_consolidation_mode_lock
+
+    def _still_leader() -> bool:
+        return _leader_session_alive(lock)
 
     # We run the recovery logic before starting the event loop as those two are
     # conflicting. Check PERSISTENT_RUN_RESTARTING_SIGNAL_FILE for details.
-    serve_utils.ha_recovery_for_consolidation_mode(pool=pool)
+    # `still_leader` re-fences every recovery launch: the sweep can take a
+    # while with many services, and the lock session can die mid-sweep.
+    serve_utils.ha_recovery_for_consolidation_mode(pool=pool,
+                                                   still_leader=_still_leader)
+
+    # Do not run the status-refresh event without leadership either: its
+    # controller-pid liveness checks are pod-local, so a non-leader pod
+    # would wrongly mark the (new) leader's controllers CONTROLLER_FAILED.
+    # The next iteration re-enters _ensure_leader_lock and blocks/re-acquires.
+    if not _still_leader():
+        logger.error('Consolidation leader lock session lost; skipping the '
+                     'status-refresh event this iteration.')
+        return
 
     # After recovery, we start the event loop. The event instance is
     # cached at module scope so its internal throttling counter
