@@ -1247,3 +1247,62 @@ class TestHaRecoveryFencesOnLeadershipLoss:
     def test_no_probe_runs_all(self, tmp_path, monkeypatch):
         run = self._run(None, tmp_path, monkeypatch)
         assert run.call_count == 2
+
+
+class TestHaRecoveryRecreatesServiceDir:
+    """HA recovery must recreate the service working directory before
+    running the recovery script.
+
+    The directory lives on pod-local storage (emptyDir): a pod replacement
+    wipes it while the durable service row and recovery script survive in
+    the DB. The stored script redirects output into that directory, so
+    without the mkdir it dies instantly and recovery retries forever while
+    the service stays headless with replicas still billing.
+    """
+
+    def test_service_dir_created_before_script_runs(self, tmp_path,
+                                                    monkeypatch):
+        monkeypatch.setenv('POD_IP', '10.4.0.1')
+        service_dir = tmp_path / 'servedir' / 'svc'
+        assert not service_dir.exists()
+        order = []
+
+        def _run(script, require_outputs):
+            del script, require_outputs
+            order.append(('run', service_dir.exists()))
+            return 0, '', ''
+
+        runner = mock.Mock()
+        runner.run.side_effect = _run
+        with mock.patch(
+                'sky.serve.serve_utils.serve_state.get_glob_service_names',
+                return_value=['svc']), \
+             mock.patch(
+                 'sky.serve.serve_utils._get_service_status',
+                 return_value={'controller_pid': 1234,
+                               'controller_ip': '10.4.0.1',
+                               'status': 'READY'}), \
+             mock.patch(
+                 'sky.serve.serve_utils._controller_process_alive',
+                 return_value=False), \
+             mock.patch(
+                 'sky.serve.serve_utils.'
+                 '_snapshot_in_flight_start_service_names',
+                 return_value=set()), \
+             mock.patch(
+                 'sky.serve.serve_utils.serve_state.get_ha_recovery_script',
+                 return_value='dummy script'), \
+             mock.patch(
+                 'sky.serve.serve_utils.generate_remote_service_dir_name',
+                 return_value=str(service_dir)), \
+             mock.patch(
+                 'sky.serve.serve_utils.command_runner.'
+                 'LocalProcessCommandRunner',
+                 return_value=runner), \
+             mock.patch(
+                 'sky.serve.serve_utils.skylet_constants.'
+                 'HA_PERSISTENT_RECOVERY_LOG_PATH',
+                 str(tmp_path / 'recovery_log_{}.log')):
+            serve_utils.ha_recovery_for_consolidation_mode(pool=True)
+        # The script ran exactly once, and the service dir existed by then.
+        assert order == [('run', True)]

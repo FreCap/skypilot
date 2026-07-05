@@ -465,6 +465,24 @@ def ha_recovery_for_consolidation_mode(pool: bool,
                 f.write(msg + '\n')
                 logger.error(msg)
                 break
+            # Recreate the service working directory before running the
+            # recovery script. It lives on pod-local storage (emptyDir), so a
+            # pod REPLACEMENT (rolling update, reschedule) wipes it while the
+            # durable service row and recovery script survive in the DB. The
+            # stored script redirects its output into this directory; without
+            # the mkdir the redirect fails and the script dies instantly —
+            # recovery then retries every ~20s forever and the service stays
+            # headless (measured live: a 224-replica spot fleet sat
+            # CONTROLLER_FAILED for hours while its replicas kept billing).
+            # _start itself re-derives everything else from the DB on
+            # recovery, so the empty directory is all that is needed.
+            try:
+                os.makedirs(os.path.expanduser(
+                    generate_remote_service_dir_name(service_name)),
+                            exist_ok=True)
+            except OSError as e:
+                f.write(f'Failed to recreate the service dir for '
+                        f'{service_name}: {e}\n')
             rc, out, err = runner.run(script, require_outputs=True)
             if rc:
                 f.write(f'Recovery script returned {rc}. '
