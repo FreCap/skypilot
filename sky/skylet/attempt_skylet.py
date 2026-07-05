@@ -3,8 +3,10 @@
 import os
 import signal
 import subprocess
+import sys
 from typing import List, Optional, Tuple
 
+import filelock
 import psutil
 
 from sky.skylet import constants
@@ -15,6 +17,21 @@ VERSION_FILE = runtime_utils.get_runtime_dir_path(constants.SKYLET_VERSION_FILE)
 SKYLET_LOG_FILE = runtime_utils.get_runtime_dir_path(constants.SKYLET_LOG_FILE)
 PID_FILE = runtime_utils.get_runtime_dir_path(constants.SKYLET_PID_FILE)
 PORT_FILE = runtime_utils.get_runtime_dir_path(constants.SKYLET_PORT_FILE)
+
+# Serializes the check-then-restart sequence across ALL invokers:
+# provisioning (`sky launch`/`sky start`), the reboot recovery hook, the
+# skylet watchdog, and any concurrent combination of them. Without it, two
+# concurrent runs can both observe "not running / stale", both kill and
+# start a skylet, and race on the pid/port files — leaving duplicate skylet
+# daemons on different ports or a pid file pointing at the losing child.
+# The kernel releases the flock if the holder dies, so it cannot orphan.
+LOCK_FILE = PID_FILE + '.restart.lock'
+# The critical section is bounded (process kills wait <=5s each plus a
+# nohup spawn), so a healthy holder finishes in seconds. If the lock cannot
+# be acquired within this window something is deeply wrong with the holder;
+# exit without touching skylet state — every caller retries naturally
+# (provisioning via its retry wrapper, the watchdog on its next tick).
+LOCK_TIMEOUT_SECONDS = 120
 
 
 def _is_running_skylet_process(pid: int) -> bool:
@@ -134,22 +151,47 @@ def restart_skylet():
         v_f.write(constants.SKYLET_VERSION)
 
 
-# Check if our skylet is running
-running = bool(_find_running_skylet_pids())
+def main():
+    # The aliveness/version CHECK must be inside the lock too: a caller
+    # that waited on the lock must re-observe the state left by the
+    # previous holder (typically "fresh skylet running") and no-op, not
+    # act on a pre-lock stale observation.
+    try:
+        lock = filelock.FileLock(LOCK_FILE)
+        with lock.acquire(timeout=LOCK_TIMEOUT_SECONDS):
+            _check_and_maybe_restart()
+    except filelock.Timeout:
+        print(f'Could not acquire the skylet restart lock ({LOCK_FILE}) '
+              f'within {LOCK_TIMEOUT_SECONDS}s; another restart is in '
+              'progress. Leaving skylet state untouched.')
+        # Exit non-zero: this run did NOT verify/restart skylet, and the
+        # caller must not believe it did. Provisioning treats the failure
+        # as fatal-after-retries (start_skylet_on_head_node is wrapped in
+        # _auto_retry) instead of silently proceeding without a verified
+        # skylet; the watchdog simply retries on its next tick.
+        sys.exit(1)
 
-version_match, found_version = _check_version_match()
 
-version_string = (f' (found version {found_version}, new version '
-                  f'{constants.SKYLET_VERSION})')
-if not running:
-    print('Skylet is not running. Starting (version '
-          f'{constants.SKYLET_VERSION})...')
-elif not version_match:
-    print(f'Skylet is stale{version_string}. Restarting...')
-else:
-    print(
-        f'Skylet is running with the latest version {constants.SKYLET_VERSION}.'
-    )
+def _check_and_maybe_restart():
+    # Check if our skylet is running
+    running = bool(_find_running_skylet_pids())
 
-if not running or not version_match:
-    restart_skylet()
+    version_match, found_version = _check_version_match()
+
+    version_string = (f' (found version {found_version}, new version '
+                      f'{constants.SKYLET_VERSION})')
+    if not running:
+        print('Skylet is not running. Starting (version '
+              f'{constants.SKYLET_VERSION})...')
+    elif not version_match:
+        print(f'Skylet is stale{version_string}. Restarting...')
+    else:
+        print(f'Skylet is running with the latest version '
+              f'{constants.SKYLET_VERSION}.')
+
+    if not running or not version_match:
+        restart_skylet()
+
+
+if __name__ == '__main__':
+    main()
