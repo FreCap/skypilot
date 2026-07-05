@@ -116,3 +116,73 @@ class TestWatchdogGating:
     def test_installed_on_vm_clouds(self):
         info = _make_cluster_info('aws')
         assert instance_setup._should_install_skylet_watchdog(info) is True
+
+
+class TestAttemptSkyletRestartLock:
+    """All attempt_skylet invokers (provisioning, reboot recovery, the
+    watchdog) must serialize on one inter-process lock: two concurrent runs
+    that both observe a dead/stale skylet would otherwise both kill and
+    start one, racing on the pid/port files (duplicate skylets, or a pid
+    file pointing at the losing child)."""
+
+    def _patched(self, tmp_path, monkeypatch):
+        from sky.skylet import attempt_skylet
+        lock_file = str(tmp_path / 'restart.lock')
+        monkeypatch.setattr(attempt_skylet, 'LOCK_FILE', lock_file)
+        return attempt_skylet, lock_file
+
+    def test_check_and_restart_runs_under_the_lock(self, tmp_path, monkeypatch):
+        import filelock
+        attempt_skylet, lock_file = self._patched(tmp_path, monkeypatch)
+        observed = {}
+
+        def _probe():
+            # While inside, the lock must be held: an independent
+            # non-blocking acquire has to fail.
+            probe = filelock.FileLock(lock_file)
+            try:
+                probe.acquire(timeout=0)
+                probe.release()
+                observed['locked'] = False
+            except filelock.Timeout:
+                observed['locked'] = True
+
+        monkeypatch.setattr(attempt_skylet, '_check_and_maybe_restart', _probe)
+        attempt_skylet.main()
+        assert observed['locked'] is True
+
+    def test_concurrent_mains_serialize(self, tmp_path, monkeypatch):
+        import threading
+        import time as time_mod
+        attempt_skylet, _ = self._patched(tmp_path, monkeypatch)
+        intervals = []
+
+        def _slow():
+            start = time_mod.monotonic()
+            time_mod.sleep(0.3)
+            intervals.append((start, time_mod.monotonic()))
+
+        monkeypatch.setattr(attempt_skylet, '_check_and_maybe_restart', _slow)
+        threads = [
+            threading.Thread(target=attempt_skylet.main) for _ in range(2)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+        assert len(intervals) == 2
+        (a_start, a_end), (b_start, b_end) = sorted(intervals)
+        # The critical sections must not overlap.
+        assert a_end <= b_start or b_end <= a_start
+
+    def test_lock_timeout_leaves_state_untouched(self, tmp_path, monkeypatch):
+        import filelock
+        attempt_skylet, lock_file = self._patched(tmp_path, monkeypatch)
+        monkeypatch.setattr(attempt_skylet, 'LOCK_TIMEOUT_SECONDS', 0.2)
+        called = []
+        monkeypatch.setattr(attempt_skylet, '_check_and_maybe_restart',
+                            lambda: called.append(True))
+        holder = filelock.FileLock(lock_file)
+        with holder.acquire(timeout=1):
+            attempt_skylet.main()  # must give up, not deadlock or raise
+        assert not called
