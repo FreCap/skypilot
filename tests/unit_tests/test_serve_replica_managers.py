@@ -17,6 +17,7 @@ import pytest
 
 from sky import exceptions
 from sky.serve import replica_managers
+from sky.serve import serve_utils
 from sky.utils import thread_utils
 
 
@@ -445,3 +446,37 @@ class TestLaunchReplicaAvailabilityMaxRetry:
         call = self._launch_replica(use_spot=False, with_placer=True)
         assert call.kwargs['kwargs'] == {'availability_max_retry': None}
         assert call.kwargs['args'][-1] is True
+
+
+class TestUpdateVersionHoldsManagerLock:
+    """`update_version` must serialize on the manager lock.
+
+    It runs on the controller's HTTP-handler thread while the autoscaler /
+    prober daemon threads hold `self.lock` for their own read-modify-write
+    cycles; without the lock a concurrent `scale_up` can read a torn
+    (latest_version, yaml_content) pair and replica-row upserts can be lost.
+    """
+
+    def test_update_version_blocks_until_lock_released(self):
+        mgr = _make_manager()
+        mgr.lock = threading.Lock()
+        mgr.latest_version = 5
+        entered = threading.Event()
+        done = threading.Event()
+
+        def _call():
+            entered.set()
+            # version <= latest_version returns right after the lock is
+            # acquired, so completion is a proxy for lock acquisition.
+            mgr.update_version(1,
+                               mock.Mock(),
+                               update_mode=serve_utils.UpdateMode.ROLLING)
+            done.set()
+
+        thread = threading.Thread(target=_call, daemon=True)
+        with mgr.lock:  # simulate a daemon thread mid read-modify-write
+            thread.start()
+            assert entered.wait(timeout=5)
+            assert not done.wait(timeout=0.5)
+        assert done.wait(timeout=5)
+        thread.join(timeout=5)

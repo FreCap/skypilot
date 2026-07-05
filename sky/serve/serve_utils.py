@@ -813,13 +813,20 @@ def update_service_encoded(service_name: str, version: int, mode: str,
         with ux_utils.print_exception_no_traceback():
             raise ValueError(f'{capnoun} {service_name!r} does not exist.')
     controller_port = service_status['controller_port']
-    resp = _post_to_controller_with_retry(service_name,
-                                          controller_port,
-                                          '/controller/update_service',
-                                          json={
-                                              'version': version,
-                                              'mode': mode,
-                                          })
+    resp = _post_to_controller_with_retry(
+        service_name,
+        controller_port,
+        '/controller/update_service',
+        json={
+            'version': version,
+            'mode': mode,
+        },
+        # See UPDATE_SERVICE_TIMEOUT_SECONDS: the handler may wait on the
+        # replica-manager lock behind a slow probe round, so the default 10s
+        # read timeout would spuriously fail the update. If even this
+        # expires, the update still applies server-side once the lock frees.
+        timeout=(_CONTROLLER_HTTP_TIMEOUT_SECONDS[0],
+                 constants.UPDATE_SERVICE_TIMEOUT_SECONDS))
     if resp.status_code == 404:
         with ux_utils.print_exception_no_traceback():
             # This only happens for services since pool is added after the

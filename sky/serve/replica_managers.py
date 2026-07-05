@@ -1694,6 +1694,15 @@ class SkyPilotReplicaManager(ReplicaManager):
     # SkyServe Update and replica versioning. #
     ###########################################
 
+    # Runs on the controller's HTTP-handler thread while the autoscaler /
+    # prober / refresher daemon threads hold `self.lock` for their own
+    # read-modify-write cycles. Without the lock, `scale_up` can read a torn
+    # (latest_version, yaml_content) pair — recording a replica at the new
+    # version but launching it with the old yaml, which a rolling update then
+    # never replaces — and the replica-row upsert below can clobber (or be
+    # clobbered by) a concurrent prober status write. See the with_lock
+    # invariant note above ReplicaStatusProperty.
+    @with_lock
     def update_version(self, version: int, spec: 'service_spec.SkyServiceSpec',
                        update_mode: serve_utils.UpdateMode) -> None:
         if version <= self.latest_version:
