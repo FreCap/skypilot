@@ -1223,6 +1223,13 @@ class SkyPilotReplicaManager(ReplicaManager):
         by design; the pre-filter confirms their instances are running and
         skips the expensive path for them.
 
+        Alive requires EVERY launched node to be reported UP, mirroring the
+        full refresh's partial-cluster semantics ("some nodes UP" is
+        abnormal: the cluster is partially preempted or terminated). Any
+        shortfall — fewer instances than launched_nodes, or any non-UP
+        instance — routes to the full path, which stays the authority on
+        classification.
+
         Errors count as alive: a transient provider/API error must not
         stampede a whole cold-starting fleet into forced refreshes — a
         genuinely dead instance keeps failing its probe and is re-checked
@@ -1236,7 +1243,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                 return False
             assert isinstance(handle, backends.CloudVmRayResourceHandle)
             statuses = backend_utils.query_cluster_instance_statuses(handle)
-            return any(status == status_lib.ClusterStatus.UP
+            if len(statuses) < handle.launched_nodes:
+                return False
+            return all(status == status_lib.ClusterStatus.UP
                        for status, _ in statuses.values())
         except Exception as e:  # pylint: disable=broad-except
             logger.debug(f'Preemption pre-filter failed for replica '
