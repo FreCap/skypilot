@@ -147,48 +147,73 @@ class TestApplyRefusesTerminalStates:
 
 
 class TestHaRecoveryRestoreCmds:
-    """The stored HA recovery script must be able to recreate the
-    controller's file mounts on a replacement pod (fresh emptyDir): each
-    mount's content is embedded base64 with a dirname mkdir."""
+    """The stored HA recovery script must recreate the controller config on
+    a replacement pod (fresh emptyDir): content embedded base64 with a
+    dirname mkdir, paths shell-quoted, and credential-capable config
+    subtrees stripped before the embed."""
 
-    def test_embeds_file_contents(self, tmp_path):
+    def test_embeds_contents_with_home_spliced_quoting(self):
         import base64 as b64
-        cfg = tmp_path / 'config.yaml'
-        cfg.write_bytes(b'active_workspace: mt_native\n')
+        import shlex as shlex_mod
+        content = b'active_workspace: mt_native\n'
         cmds = impl._ha_recovery_restore_cmds(
-            {'~/.sky/serve/svc/config.yaml': str(cfg)})
+            {'~/.sky/serve/svc/config.yaml': content})
         assert len(cmds) == 1
-        expected = b64.b64encode(b'active_workspace: mt_native\n').decode()
-        assert expected in cmds[0]
+        assert b64.b64encode(content).decode() in cmds[0]
         # Home-relative paths must expand at runtime: the leading ~ is
         # spliced to an unquoted "$HOME" with only the remainder quoted
         # (shlex leaves this metacharacter-free remainder unquoted).
-        import shlex as shlex_mod
         expected_path = '"$HOME"' + shlex_mod.quote(
             '/.sky/serve/svc/config.yaml')
         assert f'mkdir -p -- "$(dirname -- {expected_path})"' in cmds[0]
         assert cmds[0].endswith(f'> {expected_path}')
 
-    def test_hostile_paths_are_quoted_inert(self, tmp_path):
-        cfg = tmp_path / 'c.yaml'
-        cfg.write_bytes(b'x: 1\n')
-        hostile = '/tmp/a b; rm -rf $HOME/pwn'
-        cmds = impl._ha_recovery_restore_cmds({hostile: str(cfg)})
-        assert len(cmds) == 1
+    def test_hostile_paths_are_quoted_inert(self):
         import shlex as shlex_mod
+        hostile = '/tmp/a b; rm -rf $HOME/pwn'
+        cmds = impl._ha_recovery_restore_cmds({hostile: b'x: 1\n'})
+        assert len(cmds) == 1
         assert shlex_mod.quote(hostile) in cmds[0]
-        # The raw metacharacter sequence must not appear unquoted.
         assert '; rm -rf' not in cmds[0].replace(shlex_mod.quote(hostile), '')
 
-    def test_skips_unreadable_and_oversized(self, tmp_path):
-        big = tmp_path / 'big.bin'
-        big.write_bytes(b'x' * (1024 * 1024 + 1))
-        cmds = impl._ha_recovery_restore_cmds({
-            '~/x/missing.yaml': str(tmp_path / 'missing.yaml'),
-            '~/x/big.bin': str(big),
-        })
+    def test_oversized_content_skipped(self):
+        cmds = impl._ha_recovery_restore_cmds(
+            {'~/x/big.bin': b'x' * (1024 * 1024 + 1)})
         assert cmds == []
 
-    def test_empty_mounts(self):
+    def test_empty(self):
         assert impl._ha_recovery_restore_cmds(None) == []
         assert impl._ha_recovery_restore_cmds({}) == []
+
+
+class TestSanitizedConfigBytes:
+    """Credential-capable config subtrees must never reach the durable
+    ha_recovery_script DB row."""
+
+    def test_strips_vast_create_instance_kwargs(self, tmp_path):
+        import yaml
+        cfg = tmp_path / 'config.yaml'
+        cfg.write_text('active_workspace: mt_native\n'
+                       'workspaces:\n  mt_native: {}\n'
+                       'vast:\n'
+                       '  datacenter_only: true\n'
+                       '  create_instance_kwargs:\n'
+                       '    registry_password: hunter2\n')
+        out = impl._sanitized_config_bytes(str(cfg))
+        assert out is not None
+        parsed = yaml.safe_load(out)
+        assert b'hunter2' not in out
+        assert 'create_instance_kwargs' not in parsed.get('vast', {})
+        # Everything identity-relevant survives.
+        assert parsed['active_workspace'] == 'mt_native'
+        assert 'mt_native' in parsed['workspaces']
+        assert parsed['vast']['datacenter_only'] is True
+
+    def test_unreadable_returns_none(self, tmp_path):
+        assert impl._sanitized_config_bytes(str(
+            tmp_path / 'nope.yaml')) is (None)
+
+    def test_unparsable_returns_none(self, tmp_path):
+        cfg = tmp_path / 'bad.yaml'
+        cfg.write_text('{: not yaml :')
+        assert impl._sanitized_config_bytes(str(cfg)) is None
