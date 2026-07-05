@@ -1,9 +1,16 @@
-# boltz overlay image: layer this fork's changed runtime files onto the pinned
-# upstream skypilot-nightly base. The build context is assembled by
-# build-overlay.sh to contain the files that differ from the fork base
-# (git diff <fork-base> HEAD -- 'sky/**') PLUS any fork sky/ module the base
-# image is missing, so a single recursive COPY overlays exactly the files the
-# fork needs without shadowing base files the diff leaves to the newer wheel.
+# boltz overlay image: layer the FULL fork sky/ tree onto the pinned upstream
+# skypilot-nightly base. The build context is assembled by build-overlay.sh to
+# contain every tracked file under sky/** (tests excluded) PLUS a freshly
+# built dashboard static export at sky/dashboard/out (replacing the base
+# image's stale nightly bundle). Shadowing the whole wheel sky/ is deliberate:
+# the base is pinned to an older nightly than the fork's tree, so a partial
+# overlay would mix old-wheel modules with newer fork modules (version skew
+# inside one image); the full tree keeps sky/ internally consistent at the
+# fork's commit — the composition production has been validated on.
 ARG BASE_IMAGE=berkeleyskypilot/skypilot-nightly:1.0.0.dev20260620
 FROM ${BASE_IMAGE}
+# Drop the base image's dashboard bundle entirely: COPY overlays but never
+# deletes, so without this stale hashed chunks / removed routes from the
+# nightly's bundle would linger next to the fork's freshly built export.
+RUN rm -rf /usr/local/lib/python3.10/site-packages/sky/dashboard/out
 COPY sky/ /usr/local/lib/python3.10/site-packages/sky/

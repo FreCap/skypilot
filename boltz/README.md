@@ -1,14 +1,19 @@
 # boltz overlay image
 
 This fork (`improvements`) carries boltz's SkyPilot serve / control-plane fixes. They reach the
-live control plane as a thin **overlay image** — only this fork's changed `sky/` files layered onto
-the pinned upstream `berkeleyskypilot/skypilot-nightly` base (so we never shadow base-image package
-files that must match the installed wheel).
+live control plane as an **overlay image**: the **full fork `sky/` tree** (every tracked file under
+`sky/**`, tests excluded) layered onto the pinned upstream `berkeleyskypilot/skypilot-nightly` base,
+plus a **freshly built dashboard**. Shadowing the whole wheel `sky/` is deliberate — the base is
+pinned to an older nightly than the fork's tree (which rebases on upstream master), so a
+changed-files-only overlay would mix old-wheel modules with newer fork modules; the full tree keeps
+`sky/` internally consistent at the fork's commit, the composition production has been validated on.
+The dashboard: the base image's `sky/dashboard/out` bundle is baked at nightly-build time, so the
+script always rebuilds the static export from this fork's `sky/dashboard` source and ships it in the
+overlay (otherwise the deployed dashboard lags the fork's python and fork dashboard changes never
+deploy).
 
-- **Build/verify locally:** `./boltz/build-overlay.sh` (add `PUSH=true TAG=<ref>` to push). The
-  overlay baseline is derived as `git merge-base HEAD upstream/master`, so add the upstream remote
-  once: `git remote add upstream https://github.com/skypilot-org/skypilot.git && git fetch upstream
-  master` (or pass an explicit `FORK_BASE=<sha>`).
+- **Build/verify locally:** `./boltz/build-overlay.sh` (add `PUSH=true TAG=<ref>` to push). Requires
+  **node/npm (Node 20+)** for the dashboard build, e.g. `mise x node@24 -- ./boltz/build-overlay.sh`.
 - **Publish:** `.github/workflows/boltz-overlay-publish.yml` builds on every `improvements` push and
   pushes to `255203429798.dkr.ecr.us-east-1.amazonaws.com/skypilot-nightly-boltz`, tagged
   `<BASE_VER>-g<sha>` (immutable) and `<BASE_VER>-improvements` (moving).
