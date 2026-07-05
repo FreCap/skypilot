@@ -1228,6 +1228,30 @@ class SkyPilotReplicaManager(ReplicaManager):
                          'Skipping preemption handling.')
             return False
         assert isinstance(handle, backends.CloudVmRayResourceHandle)
+        # Cached-status fast path. This runs on EVERY failed readiness probe
+        # of a spot replica, inside the probe round, under the manager lock —
+        # and during a fleet cold start every not-yet-listening replica fails
+        # its probe. A forced cloud refresh here (cloud API plus an SSH ray-
+        # status probe against a still-booting VM) takes seconds to tens of
+        # seconds PER REPLICA, serially: measured on a 129-replica spot
+        # fleet, probe rounds stretched from the 10s cadence to minutes,
+        # which starves scale_up/_refresh_thread_pool (same lock) and leaves
+        # the service status and active_versions stale — the load balancer
+        # then 503s all traffic even with READY replicas. Trust the cached
+        # cluster status when it says the cluster is up: probes failing while
+        # the cluster is up is the NORMAL cold-start/warm-up state, not
+        # preemption. A genuine preemption flips the cached status via the
+        # API server's periodic cluster status refresh, after which the next
+        # failed probe escalates to the forced refresh below to confirm — the
+        # detection lag is bounded by the refresh daemon's cycle instead of
+        # blocking every probe round. Replicas that die without ever becoming
+        # ready are additionally bounded by the initial-delay teardown, and
+        # ready-then-dead replicas by the consecutive-failure threshold.
+        cached_status = global_user_state.get_status_from_cluster_name(
+            info.cluster_name)
+        if cached_status in (status_lib.ClusterStatus.UP,
+                             status_lib.ClusterStatus.AUTOSTOPPING):
+            return False
         # Pull the actual cluster status from the cloud provider to
         # determine whether the cluster is preempted.
         cluster_status, _ = backend_utils.refresh_cluster_status_handle(
