@@ -186,9 +186,14 @@ class SkyServeController:
                 content={'replica_info': self._get_lb_replica_info()},
                 status_code=200)
 
+        # Deliberately a sync handler: FastAPI runs it in the threadpool, so
+        # waiting on the replica-manager lock inside `update_version` (a probe
+        # round can hold it for tens of seconds when replicas are unreachable)
+        # never stalls the event loop — /controller/load_balancer_sync must
+        # keep serving while an update waits its turn.
         @self._app.post('/controller/update_service')
-        async def update_service(request: fastapi.Request) -> fastapi.Response:
-            request_data = await request.json()
+        def update_service(request_data: Dict[str, Any] = fastapi.Body(
+            ...)) -> fastapi.Response:
             try:
                 version = request_data.get('version', None)
                 if version is None:
