@@ -1874,7 +1874,19 @@ def _handle_services_request(
                 sdk.status(
                     cluster_names=[common.SKY_SERVE_CONTROLLER_PREFIX + '*'],
                     all_users=True))
-            if (not records or
+            # Only degrade to the "no live services" hint when a controller
+            # cluster record EXISTS and is STOPPED (autostopped controller —
+            # the case this fallback was written for). `not records` must NOT
+            # take this path: in consolidation mode there is never a
+            # controller cluster, so an absent record is the steady HEALTHY
+            # state — and reaching this handler at all means the status
+            # request itself failed (e.g. an ingress 504 on a slow response).
+            # Rendering that as a normal-looking empty table silently
+            # misreports a live fleet as nonexistent (observed live against
+            # a 250-replica service); the connection error below is the
+            # truthful output. A truly never-launched controller surfaces as
+            # ClusterNotUpError, which is handled separately above.
+            if (records and
                     records[0]['status'] == status_lib.ClusterStatus.STOPPED):
                 controller = (
                     controller_utils.Controllers.SKY_SERVE_CONTROLLER.value)
