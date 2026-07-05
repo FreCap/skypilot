@@ -68,6 +68,51 @@ logger = sky_logging.init_logger('sky.jobs.controller')
 _background_tasks: Set[asyncio.Task] = set()
 _background_tasks_lock: asyncio.Lock = asyncio.Lock()
 
+# How many consecutive monitor ticks must observe a non-UP cluster while the
+# job itself still reports a non-terminal status before recovery is triggered
+# for a multi-node job. The cluster health probe is all-or-nothing (every node
+# must appear in `ray status`), so at large node counts a single transiently
+# lagging raylet or a probe-timing hiccup flags the whole cluster while the
+# job is in fact still running — and recovery tears down and relaunches the
+# entire cluster. Requiring consecutive confirmations (~30s at the 15s tick)
+# eliminates single-tick false positives; genuine failures where the head is
+# unreachable fetch no job status at all and still recover immediately.
+_NOT_UP_CONFIRMATIONS_BEFORE_RECOVERY = 3
+
+
+class _ClusterNotUpDebouncer:
+    """Debounce non-UP cluster observations for a still-running job.
+
+    Only multi-node jobs debounce: single-node jobs skip the cluster status
+    check entirely while their job is running, and when the job is dead
+    there is nothing to protect from a spurious teardown.
+    """
+
+    def __init__(self, num_nodes: int) -> None:
+        self._threshold = (_NOT_UP_CONFIRMATIONS_BEFORE_RECOVERY
+                           if num_nodes > 1 else 1)
+        self._consecutive_not_up = 0
+
+    def should_recover_now(self) -> bool:
+        """Record a not-UP observation with the job still alive.
+
+        Returns True once enough consecutive observations accumulated for
+        recovery to proceed.
+        """
+        self._consecutive_not_up += 1
+        return self._consecutive_not_up >= self._threshold
+
+    @property
+    def observations(self) -> int:
+        return self._consecutive_not_up
+
+    @property
+    def threshold(self) -> int:
+        return self._threshold
+
+    def reset(self) -> None:
+        self._consecutive_not_up = 0
+
 
 async def create_background_task(coro: typing.Coroutine) -> None:
     """Create a background task and add it to the set of background tasks.
@@ -757,6 +802,7 @@ class JobController:
 
         transient_job_check_error_start_time = None
         job_check_backoff = None
+        not_up_debouncer = _ClusterNotUpDebouncer(task.num_nodes)
 
         while True:
             # Get job status (skip on first iteration if forcing recovery)
@@ -905,6 +951,22 @@ class JobController:
                 # code).
                 cluster_status_str = ('' if cluster_status is None else
                                       f' (status: {cluster_status.value})')
+                if (job_status is not None and not job_status.is_terminal() and
+                        not not_up_debouncer.should_recover_now()):
+                    # The job itself still reports running: the non-UP verdict
+                    # may be a transient probe false positive (the health
+                    # probe requires EVERY node in `ray status`). Confirm over
+                    # consecutive ticks before tearing the cluster down. A
+                    # genuinely dead head never reaches here (the job status
+                    # fetch fails and job_status is None).
+                    logger.info(
+                        f'Cluster is not UP{cluster_status_str} but the job '
+                        f'still reports {job_status.value}; waiting for '
+                        'confirmation before recovery '
+                        f'({not_up_debouncer.observations}/'
+                        f'{not_up_debouncer.threshold} consecutive '
+                        'observations).')
+                    continue
                 logger.info(
                     f'Cluster is preempted or failed{cluster_status_str}. '
                     'Recovering...')
@@ -948,6 +1010,7 @@ class JobController:
                                 cluster_failures))
             else:
                 # Cluster is UP
+                not_up_debouncer.reset()
                 if job_status is not None and not job_status.is_terminal():
                     # The multi-node job is still running, continue monitoring.
                     continue
@@ -1146,6 +1209,9 @@ class JobController:
 
             # Reset force flag after first recovery
             force_transit_to_recovering = False
+            # Observations accumulated against the old cluster must not count
+            # toward recovering the fresh one.
+            not_up_debouncer.reset()
 
     async def _prepare_job_group_task_for_launch(
         self, task: 'sky.Task', task_id: int, job_group_name: str,
