@@ -1185,3 +1185,65 @@ class TestTerminateFailedServices:
         assert removed == [1]
         remove_service.assert_called_once_with('svc')
         assert message is None
+
+
+class TestHaRecoveryFencesOnLeadershipLoss:
+    """`ha_recovery_for_consolidation_mode` must re-check `still_leader`
+    right before each recovery launch and abort the sweep on loss.
+
+    The consolidation leader lock is a session-scoped PG advisory lock; it
+    can die mid-sweep (RDS failover, idle timeout), at which point another
+    pod may already be running its own recovery. Launching more controllers
+    without leadership would split-brain.
+    """
+
+    def _run(self, still_leader, tmp_path, monkeypatch):
+        monkeypatch.setenv('POD_IP', '10.4.0.1')
+        with mock.patch(
+                'sky.serve.serve_utils.serve_state.get_glob_service_names',
+                return_value=['svc-a', 'svc-b']), \
+             mock.patch(
+                 'sky.serve.serve_utils._get_service_status',
+                 return_value={'controller_pid': 1234,
+                               'controller_ip': '10.4.0.1',
+                               'status': 'READY'}), \
+             mock.patch(
+                 'sky.serve.serve_utils._controller_process_alive',
+                 return_value=False), \
+             mock.patch(
+                 'sky.serve.serve_utils.'
+                 '_snapshot_in_flight_start_service_names',
+                 return_value=set()), \
+             mock.patch(
+                 'sky.serve.serve_utils.serve_state.get_ha_recovery_script',
+                 return_value='dummy script'), \
+             mock.patch(
+                 'sky.serve.serve_utils.command_runner.'
+                 'LocalProcessCommandRunner') as mock_runner_cls, \
+             mock.patch(
+                 'sky.serve.serve_utils.skylet_constants.'
+                 'HA_PERSISTENT_RECOVERY_LOG_PATH',
+                 str(tmp_path / 'recovery_log_{}.log')):
+            mock_runner_cls.return_value.run.return_value = (0, '', '')
+            serve_utils.ha_recovery_for_consolidation_mode(
+                pool=True, still_leader=still_leader)
+            return mock_runner_cls.return_value.run
+
+    def test_leadership_lost_aborts_sweep(self, tmp_path, monkeypatch):
+        run = self._run(lambda: False, tmp_path, monkeypatch)
+        run.assert_not_called()
+
+    def test_leadership_lost_midway_stops_remaining(self, tmp_path,
+                                                    monkeypatch):
+        # Leader for the first launch, lost before the second.
+        answers = iter([True, False])
+        run = self._run(lambda: next(answers), tmp_path, monkeypatch)
+        assert run.call_count == 1
+
+    def test_leadership_held_runs_all(self, tmp_path, monkeypatch):
+        run = self._run(lambda: True, tmp_path, monkeypatch)
+        assert run.call_count == 2
+
+    def test_no_probe_runs_all(self, tmp_path, monkeypatch):
+        run = self._run(None, tmp_path, monkeypatch)
+        assert run.call_count == 2
