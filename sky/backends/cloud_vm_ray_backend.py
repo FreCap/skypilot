@@ -3051,6 +3051,13 @@ class SkyletClient:
         request: 'servev1_pb2.UpdateServiceRequest',
         timeout: Optional[float] = constants.SKYLET_GRPC_TIMEOUT_SECONDS
     ) -> 'servev1_pb2.UpdateServiceResponse':
+        # The skylet-side handler waits on the controller's replica-manager
+        # lock for up to UPDATE_SERVICE_TIMEOUT_SECONDS (see
+        # sky/serve/constants.py); give the outer gRPC deadline margin over
+        # that, mirroring wait_service_registration above.
+        if timeout is not None:
+            timeout = max(timeout,
+                          serve_constants.UPDATE_SERVICE_TIMEOUT_SECONDS + 10)
         return self._serve_stub.UpdateService(request, timeout=timeout)
 
     def get_managed_job_controller_version(

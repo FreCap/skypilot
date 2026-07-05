@@ -31,6 +31,16 @@ CONTROLLER_SETUP_TIMEOUT_SECONDS = 300
 # Time to wait in seconds for service to register on the controller.
 SERVICE_REGISTER_TIMEOUT_SECONDS = 60
 
+# [boltz fork] Time budget in seconds for a service update to be accepted by
+# the controller. The /controller/update_service handler serializes on the
+# replica-manager lock, which a readiness-probe round can hold for tens of
+# seconds when replicas are unreachable (probe timeouts are user-configurable
+# with no hard cap, plus the inline preemption status refresh), so the
+# default 10s HTTP/gRPC timeouts would spuriously fail updates against a
+# busy-but-healthy controller. Used as the HTTP read timeout on the
+# controller POST and (plus margin) as the skylet gRPC deadline in VM mode.
+UPDATE_SERVICE_TIMEOUT_SECONDS = 120
+
 # The time interval in seconds for load balancer to sync with controller. Every
 # time the load balancer syncs with controller, it will update all available
 # replica ips for each service, also send the number of requests in last query

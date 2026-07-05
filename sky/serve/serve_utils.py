@@ -80,14 +80,6 @@ _CONTROLLER_HTTP_RETRY_BACKOFF_SECONDS = 0.5
 # appears to hang. Read timeout is generous because /autoscaler/info on a
 # busy controller can take a moment.
 _CONTROLLER_HTTP_TIMEOUT_SECONDS = (1.0, 10.0)
-# Read timeout for /controller/update_service specifically. The update
-# handler serializes on the replica-manager lock, which a readiness-probe
-# round can hold for tens of seconds when replicas are unreachable (probe
-# timeouts + preemption status refresh), so the default 10s read timeout
-# would spuriously fail updates against a busy-but-healthy controller.
-# The update still applies server-side if this expires; the longer wait
-# just keeps the common case a clean success.
-_UPDATE_SERVICE_READ_TIMEOUT_SECONDS = 120.0
 
 # Bound on the per-call thread pool used by `get_service_status_pickled` to
 # fan out across services/pools. The per-service work is dominated by I/O
@@ -795,10 +787,12 @@ def update_service_encoded(service_name: str, version: int, mode: str,
             'version': version,
             'mode': mode,
         },
-        # See _UPDATE_SERVICE_READ_TIMEOUT_SECONDS: the handler may wait on
-        # the replica-manager lock behind a slow probe round.
+        # See UPDATE_SERVICE_TIMEOUT_SECONDS: the handler may wait on the
+        # replica-manager lock behind a slow probe round, so the default 10s
+        # read timeout would spuriously fail the update. If even this
+        # expires, the update still applies server-side once the lock frees.
         timeout=(_CONTROLLER_HTTP_TIMEOUT_SECONDS[0],
-                 _UPDATE_SERVICE_READ_TIMEOUT_SECONDS))
+                 constants.UPDATE_SERVICE_TIMEOUT_SECONDS))
     if resp.status_code == 404:
         with ux_utils.print_exception_no_traceback():
             # This only happens for services since pool is added after the
