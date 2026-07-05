@@ -1,8 +1,9 @@
 name: Publish boltz overlay image
 
-# Builds the boltz overlay image (this fork's changed sky/ files layered on the
-# pinned upstream nightly) and pushes it to the gitops-hub ECR. The platform repo
-# consumes it via apiService.image in the skypilot-control-plane terragrunt.
+# Builds the boltz overlay image (the full fork sky/ tree plus a freshly built
+# dashboard, layered on the pinned upstream nightly) and pushes it to the
+# gitops-hub ECR. The platform repo consumes it via apiService.image in the
+# skypilot-control-plane terragrunt.
 #
 # One-time setup to enable pushes: create an OIDC role in the gitops-hub account
 # (255203429798) trusting this repo, with ECR push on `skypilot-nightly-boltz`,
@@ -33,16 +34,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0   # need history for the overlay diff against the fork base
+        # build-overlay.sh ships the full sky/ tree at HEAD (git ls-tree), so a
+        # shallow default checkout is enough — no history or upstream ref needed.
 
-      - name: Fetch upstream base ref
-        # build-overlay.sh derives the overlay baseline from
-        # `git merge-base HEAD upstream/master`, so make that ref resolvable.
-        # Objects are already in the fork's history, so this is a cheap ref sync.
-        run: |
-          git remote add upstream https://github.com/skypilot-org/skypilot.git 2>/dev/null || true
-          git fetch --no-tags upstream master
+      - uses: actions/setup-node@v4
+        # build-overlay.sh builds the dashboard (npm ci + npm run build in
+        # sky/dashboard) so the image ships a bundle matching the fork source.
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: sky/dashboard/package-lock.json
 
       - name: Resolve config
         id: cfg

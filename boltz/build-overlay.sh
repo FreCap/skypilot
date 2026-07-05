@@ -2,12 +2,25 @@
 # Build (and optionally push) the boltz overlay image from THIS fork checkout.
 # Run from anywhere inside the repo; uses the current HEAD.
 #
-# Overlays the fork's changed runtime files (git diff <FORK_BASE> HEAD --
-# 'sky/**', tests excluded) onto the pinned upstream nightly, PLUS any fork
-# sky/ module the base image is missing (a file present at the fork base but
-# dropped by the newer nightly that the fork still imports). We never shadow
-# base files the diff leaves unchanged — only changed files and base-missing
-# modules are copied, so the deployed sky/ stays consistent with the fork.
+# Policy: overlay the FULL fork sky/ tree (every tracked file under sky/**,
+# tests excluded) onto the pinned upstream nightly base. This is deliberate,
+# not an optimization opportunity:
+#
+#   The base image is pinned (BASE_VER, e.g. a June-20 nightly) while the fork
+#   tree tracks upstream master via rebases, so the fork's checkout is NEWER
+#   than the base wheel even for files the fork never touched. A partial
+#   overlay (changed-files-only) would mix old-wheel modules with fork modules
+#   that assume their newer counterparts — a version skew inside one image.
+#   Shipping the whole fork tree keeps sky/ internally consistent at exactly
+#   the fork's commit, and is the composition production has been validated
+#   on. Only files the base has but the fork tree lacks fall through to the
+#   wheel (COPY overlays; it never deletes).
+#
+# The dashboard is ALWAYS rebuilt from this fork's source (sky/dashboard ->
+# out/, requires node/npm) and shipped in the overlay: the base image's bundle
+# is baked at nightly-build time, so without this the deployed dashboard would
+# be older than the fork's python (stale enums render wrong) and fork dashboard
+# changes would never deploy. out/ is gitignored, hence built here, not tracked.
 #
 #   PUSH=true TAG=<ecr>/skypilot-nightly-boltz:<ver>-<n> ./boltz/build-overlay.sh
 #
@@ -15,11 +28,6 @@
 #   BASE_VER   upstream nightly tag to base on (keep in sync with the platform
 #              chart_version, normalized "-dev." -> ".dev"). Default below.
 #   BASE_IMAGE override the full base image (default berkeleyskypilot/...:$BASE_VER)
-#   FORK_BASE  overlay diff baseline. Default: the fork's divergence point from
-#              upstream ("git merge-base HEAD $UPSTREAM_REF"), so it tracks the
-#              fork automatically across upstream syncs/rebases. Set to pin one.
-#   UPSTREAM_REF  ref used to derive FORK_BASE (default upstream/master). CI adds
-#              the skypilot-org remote and fetches it before building.
 #   TAG        full image ref to build/push (default builds a local dev tag)
 #   PUSH       "true" to docker push (default false)
 #   PLATFORM   docker build --platform (default linux/amd64 — control-plane arch)
@@ -33,43 +41,22 @@ BASE_IMAGE="${BASE_IMAGE:-berkeleyskypilot/skypilot-nightly:${BASE_VER}}"
 PLATFORM="${PLATFORM:-linux/amd64}"
 TAG="${TAG:-skypilot-nightly-boltz:${BASE_VER}-dev}"
 PUSH="${PUSH:-false}"
-UPSTREAM_REF="${UPSTREAM_REF:-upstream/master}"
 
-# Resolve the overlay baseline: the upstream commit the fork diverges from. Prefer
-# an explicit FORK_BASE; otherwise derive it as the merge-base of HEAD and the
-# upstream master ref. This tracks the fork across upstream syncs/rebases instead
-# of pinning a commit that vanishes when history is rewritten (the old hardcoded
-# import sha did exactly that, silently widening the overlay to upstream's delta).
-if [ -z "${FORK_BASE:-}" ]; then
-  if ! git rev-parse --verify --quiet "${UPSTREAM_REF}^{commit}" >/dev/null; then
-    echo "error: cannot resolve '${UPSTREAM_REF}' to derive the overlay baseline." >&2
-    echo "       In CI the workflow fetches it; locally run:" >&2
-    echo "         git remote add upstream https://github.com/skypilot-org/skypilot.git" >&2
-    echo "         git fetch upstream master" >&2
-    echo "       or pass an explicit FORK_BASE=<sha>." >&2
-    exit 1
-  fi
-  FORK_BASE="$(git merge-base HEAD "${UPSTREAM_REF}")"
-fi
-echo ">> Overlay baseline FORK_BASE=$(git rev-parse --short "$FORK_BASE") ($(git log -1 --format=%s "$FORK_BASE"))"
-
-echo ">> Overlay file set (git diff ${FORK_BASE}..HEAD -- 'sky/**'):"
+echo ">> Overlay file set: full fork sky/ tree at HEAD (tests excluded)"
 files=()
 while IFS= read -r f; do [ -n "$f" ] && files+=("$f"); done < <(
-  git diff --name-only "$FORK_BASE" HEAD -- 'sky/**' | grep -vE '(^|/)tests?/')
+  git ls-tree -r --name-only HEAD -- 'sky' | grep -vE '(^|/)tests?/')
 if [ "${#files[@]}" -eq 0 ]; then echo "  none — aborting" >&2; exit 1; fi
-printf '   %s\n' "${files[@]}"
+echo "   ${#files[@]} tracked files under sky/"
 
-# The diff above is "changed vs the fork base", which deliberately leaves
-# unchanged files to the (newer) nightly wheel. But a module that exists at the
-# fork base and is still imported by the fork, yet was REMOVED in the newer
-# upstream nightly, is in neither set — so it vanishes from the image and the
-# server crashes at startup (e.g. sky/jobs/managed_job_refresh_thread.py ->
-# ImportError at boot). Detect and additionally carry those base-missing fork
-# modules. We add only files the base LACKS, never shadowing base files the diff
-# intentionally leaves to the newer wheel.
-echo ">> Checking for fork sky/ modules absent from the base image"
-base_sky_files="$(docker run --rm "$BASE_IMAGE" python - <<'PY'
+# Informational only (does NOT gate the file set): compare the fork tree
+# against the base image's installed sky/ files so the log shows how much of
+# the wheel we shadow and how much the fork adds. Doubles as a sanity check
+# that the base image is runnable before we spend time on npm + docker build.
+# -i is required to feed the heredoc to python's stdin: without it docker runs
+# `python -` against a closed stdin and the listing comes back EMPTY.
+echo ">> Comparing against base image sky/ contents (informational)"
+base_sky_files="$(docker run --rm -i --platform "$PLATFORM" "$BASE_IMAGE" python - <<'PY'
 import os, sky
 root = os.path.dirname(sky.__file__)
 parent = os.path.dirname(root)
@@ -78,34 +65,63 @@ for dirpath, _dirs, names in os.walk(root):
         print(os.path.relpath(os.path.join(dirpath, name), parent))
 PY
 )"
-carried=()
-while IFS= read -r f; do
-  [ -n "$f" ] || continue
-  case "$f" in */tests/*|*/test/*) continue ;; esac
-  printf '%s\n' "${files[@]}" | grep -qxF -- "$f" && continue  # already in diff set
-  grep -qxF -- "$f" <<<"$base_sky_files" && continue           # present in base
-  files+=("$f"); carried+=("$f")
-done < <(git ls-tree -r --name-only HEAD -- 'sky' | grep -E '\.py$')
-if [ "${#carried[@]}" -gt 0 ]; then
-  echo ">> Carrying ${#carried[@]} fork module(s) absent from the base image:"
-  printf '   + %s\n' "${carried[@]}"
+if [ -z "$base_sky_files" ]; then
+  echo "error: empty sky/ file listing from base image ${BASE_IMAGE} —" >&2
+  echo "       the base image is not runnable or the listing is broken." >&2
+  exit 1
+fi
+shadowed="$(comm -12 <(printf '%s\n' "${files[@]}" | sort) <(sort <<<"$base_sky_files") | wc -l | tr -d ' ')"
+added="$(( ${#files[@]} - shadowed ))"
+echo "   base image sky/ files: $(wc -l <<<"$base_sky_files" | tr -d ' ')"
+echo "   overlay shadows ${shadowed} base file(s); adds ${added} file(s) new vs base"
+
+# Build the dashboard from THIS fork's source, unconditionally: the base
+# image's bundle predates the fork's python (sky/dashboard/out is baked into
+# the nightly at build time and out/ is gitignored here), so shipping anything
+# but a fresh build reintroduces the stale-dashboard bug. Fail loudly —
+# set -e aborts the whole overlay build if npm install/build fails.
+echo ">> Building dashboard (sky/dashboard -> sky/dashboard/out)"
+if ! command -v npm >/dev/null 2>&1; then
+  echo "error: npm not found — the overlay build requires node/npm (Node 20+)" >&2
+  echo "       to build the dashboard. See boltz/README.md." >&2
+  exit 1
+fi
+if [ -f sky/dashboard/package-lock.json ]; then
+  npm --prefix sky/dashboard ci
+else
+  npm --prefix sky/dashboard install
+fi
+npm --prefix sky/dashboard run build
+if [ ! -f sky/dashboard/out/index.html ]; then
+  echo "error: dashboard build did not produce sky/dashboard/out/index.html" >&2
+  exit 1
 fi
 
 ctx="$(mktemp -d)"; trap 'rm -rf "$ctx"' EXIT
 for f in "${files[@]}"; do mkdir -p "$ctx/$(dirname "$f")"; cp "$f" "$ctx/$f"; done
+# Ship ONLY the static export (out/) — never node_modules/.next; the server
+# serves sky/dashboard/out directly (sky/server/constants.py: DASHBOARD_DIR),
+# so the recursive COPY sky/ in the Dockerfile lands it at
+# site-packages/sky/dashboard/out.
+mkdir -p "$ctx/sky/dashboard"
+cp -R sky/dashboard/out "$ctx/sky/dashboard/out"
+echo ">> Dashboard bundle added to context: $(du -sh "$ctx/sky/dashboard/out" | cut -f1)"
 cp boltz/Dockerfile.overlay "$ctx/Dockerfile"
 
 echo ">> Building ${TAG} (${PLATFORM}, base ${BASE_IMAGE})"
 docker build --platform "$PLATFORM" --build-arg "BASE_IMAGE=${BASE_IMAGE}" -t "$TAG" "$ctx"
 
-echo ">> Verifying overlaid modules import + control-loop API present"
+echo ">> Verifying overlaid modules import + control-loop API + dashboard present"
 docker run --rm --platform "$PLATFORM" "$TAG" python -c "
-import inspect
+import inspect, os
 import sky.serve.controller, sky.serve.replica_managers, sky.serve.load_balancer
 from sky.utils import controller_utils
 import sky.server.config
+from sky.server import constants as server_constants
 assert hasattr(controller_utils, 'in_flight_launch_count')
 assert 'in_flight' in inspect.signature(controller_utils.can_provision).parameters
+index = os.path.join(server_constants.DASHBOARD_DIR, 'index.html')
+assert os.path.isfile(index), f'dashboard missing from image: {index}'
 print('overlay verify OK')"
 
 if [ "$PUSH" = "true" ]; then echo ">> Pushing ${TAG}"; docker push "$TAG"; fi
