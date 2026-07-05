@@ -714,10 +714,17 @@ def set_service_status_and_active_versions_from_replica(
         chosen_version = get_latest_version_with_min_replicas(
             service_name, replica_infos)
         active_versions = [chosen_version] if chosen_version is not None else []
+    # Compute the service status from ALL replicas, not just the ready ones:
+    # `from_replica_statuses` needs the full set to ever return FAILED (some
+    # replica failed, none ready) or REPLICA_INIT (replicas exist, none ready
+    # or failed). Fed only ready replicas, it can only return READY or
+    # NO_REPLICA, so a service whose replicas all failed would show the
+    # benign-looking NO_REPLICA. `active_versions` above intentionally stays
+    # on the ready replicas (the versions actually serving traffic).
     serve_state.set_service_status_and_active_versions(
         service_name,
         serve_state.ServiceStatus.from_replica_statuses(
-            [info.status for info in ready_replicas]),
+            [info.status for info in replica_infos]),
         active_versions=active_versions)
 
 

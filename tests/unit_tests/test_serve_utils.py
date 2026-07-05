@@ -7,6 +7,7 @@ import requests.exceptions as requests_exceptions
 
 from sky import clouds
 from sky.resources import Resources
+from sky.serve import serve_state
 from sky.serve import serve_utils
 
 # String path for mock.patch — can't use the constant directly because
@@ -755,8 +756,6 @@ class TestTerminalStatuses:
     broken (CONTROLLER_FAILED / FAILED_CLEANUP / SHUTTING_DOWN)."""
 
     def test_includes_shutting_down(self):
-        # pylint: disable=import-outside-toplevel
-        from sky.serve import serve_state
         statuses = serve_state.ServiceStatus.terminal_statuses()
         assert serve_state.ServiceStatus.SHUTTING_DOWN in statuses
         assert serve_state.ServiceStatus.FAILED_CLEANUP in statuses
@@ -1031,3 +1030,77 @@ class TestHaRecoveryDefensiveOnAliveCheckException:
             # recovery script lookup or run must NOT happen — we skipped early
             mock_script.assert_not_called()
             mock_runner_cls.return_value.run.assert_not_called()
+
+
+class _FakeReplicaInfo:
+    """Minimal stand-in exposing the fields the status computation reads."""
+
+    def __init__(self, status, version):
+        self.status = status
+        self.version = version
+
+    @property
+    def is_ready(self):
+        return self.status == serve_state.ReplicaStatus.READY
+
+
+@pytest.mark.parametrize(
+    'replica_statuses,expected_service_status',
+    [
+        # Replicas exist but none ready/failed -> REPLICA_INIT.
+        ([
+            serve_state.ReplicaStatus.PROVISIONING,
+            serve_state.ReplicaStatus.STARTING
+        ], serve_state.ServiceStatus.REPLICA_INIT),
+        # Some replica failed, none ready -> FAILED.
+        ([
+            serve_state.ReplicaStatus.FAILED,
+            serve_state.ReplicaStatus.PROVISIONING
+        ], serve_state.ServiceStatus.FAILED),
+        # No replicas at all -> NO_REPLICA.
+        ([], serve_state.ServiceStatus.NO_REPLICA),
+        # A ready replica wins over a failed one -> READY.
+        ([serve_state.ReplicaStatus.FAILED, serve_state.ReplicaStatus.READY
+         ], serve_state.ServiceStatus.READY),
+    ])
+def test_set_service_status_from_replica_uses_all_replicas(
+        replica_statuses, expected_service_status):
+    """Service status must be derived from ALL replicas, not only READY ones.
+
+    Feeding only ready replicas into ServiceStatus.from_replica_statuses makes
+    FAILED and REPLICA_INIT unreachable (any non-empty input contains READY),
+    so a fully-failed or still-initializing service would misreport as
+    NO_REPLICA.
+    """
+    replica_infos = [
+        _FakeReplicaInfo(status, version=1) for status in replica_statuses
+    ]
+    record = {'status': serve_state.ServiceStatus.READY}
+    with mock.patch.object(serve_state,
+                           'get_service_from_name',
+                           return_value=record), \
+         mock.patch.object(serve_state,
+                           'set_service_status_and_active_versions') as set_st:
+        serve_utils.set_service_status_and_active_versions_from_replica(
+            'svc', replica_infos, serve_utils.UpdateMode.ROLLING)
+    set_st.assert_called_once()
+    assert set_st.call_args.args[1] == expected_service_status
+
+
+def test_set_service_status_from_replica_active_versions_ready_only():
+    """active_versions must still come from the READY replicas only."""
+    replica_infos = [
+        _FakeReplicaInfo(serve_state.ReplicaStatus.READY, version=2),
+        _FakeReplicaInfo(serve_state.ReplicaStatus.PROVISIONING, version=3),
+    ]
+    record = {'status': serve_state.ServiceStatus.READY}
+    with mock.patch.object(serve_state,
+                           'get_service_from_name',
+                           return_value=record), \
+         mock.patch.object(serve_state,
+                           'set_service_status_and_active_versions') as set_st:
+        serve_utils.set_service_status_and_active_versions_from_replica(
+            'svc', replica_infos, serve_utils.UpdateMode.ROLLING)
+    set_st.assert_called_once()
+    assert set_st.call_args.args[1] == serve_state.ServiceStatus.READY
+    assert set_st.call_args.kwargs['active_versions'] == [2]
