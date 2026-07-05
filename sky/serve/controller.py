@@ -7,7 +7,7 @@ import logging
 import os
 import time
 import traceback
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import colorama
 import fastapi
@@ -144,17 +144,38 @@ class SkyServeController:
                 # for better decoupling.
                 scaling_options = self._autoscaler.generate_scaling_decisions(
                     replica_infos, active_versions)
+                # Batch consecutive SCALE_UP decisions into ONE
+                # replica-manager call: each scale_up acquires the manager
+                # lock, which the readiness-probe round holds for tens of
+                # seconds per round on large fleets — per-decision calls
+                # trickle through the gaps between rounds (measured live: a
+                # 1000-target fleet enqueued only ~100 launches per several
+                # minutes while the launch budget sat idle). One lock
+                # acquisition per tick's upscale restores the launch budget
+                # as the intended pacing mechanism. Decision ORDER is
+                # preserved: scale-downs still execute at their original
+                # position relative to the upscale batches around them.
+                pending_scale_up: List[Optional[Dict[str, Any]]] = []
+
+                def _flush_scale_up() -> None:
+                    if pending_scale_up:
+                        self._replica_manager.scale_up_batch(
+                            list(pending_scale_up))
+                        pending_scale_up.clear()
+
                 for scaling_option in scaling_options:
                     logger.info(f'Scaling option received: {scaling_option}')
                     if (scaling_option.operator ==
                             autoscalers.AutoscalerDecisionOperator.SCALE_UP):
                         assert (scaling_option.target is None or isinstance(
                             scaling_option.target, dict)), scaling_option
-                        self._replica_manager.scale_up(scaling_option.target)
+                        pending_scale_up.append(scaling_option.target)
                     else:
                         assert isinstance(scaling_option.target,
                                           int), scaling_option
+                        _flush_scale_up()
                         self._replica_manager.scale_down(scaling_option.target)
+                _flush_scale_up()
             except Exception as e:  # pylint: disable=broad-except
                 # No matter what error happens, we should keep the
                 # monitor running.

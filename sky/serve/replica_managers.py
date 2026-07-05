@@ -767,6 +767,16 @@ class ReplicaManager:
         """
         raise NotImplementedError
 
+    def scale_up_batch(
+            self, resources_overrides: List[Optional[Dict[str, Any]]]) -> None:
+        """Scale up by len(resources_overrides) replicas in one batch.
+
+        Subclasses may override to amortize per-call synchronization; the
+        default just loops over `scale_up`.
+        """
+        for resources_override in resources_overrides:
+            self.scale_up(resources_override)
+
     def scale_down(self, replica_id: int, purge: bool = False) -> None:
         """Scale down replica with replica_id."""
         raise NotImplementedError
@@ -985,9 +995,9 @@ class SkyPilotReplicaManager(ReplicaManager):
         # to avoid too many sky.launch running at the same time.
         self._launch_thread_pool[replica_id] = t
 
-    @with_lock
-    def scale_up(self,
-                 resources_override: Optional[Dict[str, Any]] = None) -> None:
+    def _scale_up_one_locked(
+            self, resources_override: Optional[Dict[str, Any]]) -> None:
+        """Allocate an id and enqueue one replica launch. Lock must be held."""
         # Defensive: never hand `_launch_replica` an id that still has a
         # durable replica row. `add_or_update_replica` is an upsert keyed on
         # (service_name, replica_id), so reusing a live id would overwrite a
@@ -1003,6 +1013,29 @@ class SkyPilotReplicaManager(ReplicaManager):
             self._next_replica_id += 1
         self._launch_replica(self._next_replica_id, resources_override)
         self._next_replica_id += 1
+
+    @with_lock
+    def scale_up(self,
+                 resources_override: Optional[Dict[str, Any]] = None) -> None:
+        self._scale_up_one_locked(resources_override)
+
+    @with_lock
+    def scale_up_batch(
+            self, resources_overrides: List[Optional[Dict[str, Any]]]) -> None:
+        """Enqueue a batch of replica launches under ONE lock acquisition.
+
+        The manager lock is held by the readiness-probe round for tens of
+        seconds per round on large fleets, so per-replica `scale_up` calls
+        (one lock acquisition each) trickle through the short gaps between
+        rounds: measured live at a 1000-target / ~340-replica fleet, launch
+        enqueueing was the scaling bottleneck at ~100 replicas per several
+        minutes while the launch budget sat idle. Batching the whole
+        autoscaler tick into one acquisition makes the enqueue O(1) lock
+        waits per tick; the launch budget in `_refresh_thread_pool` then
+        paces actual `sky.launch` concurrency as intended.
+        """
+        for resources_override in resources_overrides:
+            self._scale_up_one_locked(resources_override)
 
     def _handle_sky_down_finish(self, info: ReplicaInfo,
                                 format_exc: Optional[str]) -> None:

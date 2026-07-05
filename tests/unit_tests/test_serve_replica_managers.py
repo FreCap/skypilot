@@ -570,3 +570,72 @@ class TestCloudInstanceLooksAlive:
         result, query = self._run(handle=None)
         assert result is False
         query.assert_not_called()
+
+
+class TestScaleUpBatch:
+    """A batch of scale-ups must run under ONE manager-lock acquisition:
+    the probe round holds the lock for tens of seconds per round on large
+    fleets, so per-replica acquisitions trickle through the gaps and
+    become the fleet-scale launch bottleneck (measured live at a
+    1000-target fleet)."""
+
+    class _CountingLock:
+
+        def __init__(self):
+            self.acquisitions = 0
+
+        def __enter__(self):
+            self.acquisitions += 1
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def test_batch_launches_all_with_one_lock_acquisition(self):
+        mgr = _make_manager(next_replica_id=1)
+        lock = self._CountingLock()
+        mgr.lock = lock
+        launched = []
+        with mock.patch(
+                'sky.serve.replica_managers.serve_state.'
+                'get_replica_info_from_id',
+                return_value=None), \
+             mock.patch.object(mgr, '_launch_replica',
+                               side_effect=_record_launch(launched)):
+            mgr.scale_up_batch([None, {'use_spot': True}, None])
+        assert launched == [1, 2, 3]
+        assert mgr._next_replica_id == 4
+        assert lock.acquisitions == 1
+
+    def test_single_scale_up_unchanged(self):
+        mgr = _make_manager(next_replica_id=7)
+        lock = self._CountingLock()
+        mgr.lock = lock
+        launched = []
+        with mock.patch(
+                'sky.serve.replica_managers.serve_state.'
+                'get_replica_info_from_id',
+                return_value=None), \
+             mock.patch.object(mgr, '_launch_replica',
+                               side_effect=_record_launch(launched)):
+            mgr.scale_up()
+        assert launched == [7]
+        assert lock.acquisitions == 1
+
+    def test_batch_skips_ids_with_existing_rows(self):
+        mgr = _make_manager(next_replica_id=1)
+        mgr.lock = self._CountingLock()
+        launched = []
+        existing = {2}
+
+        def _get(_service_name, replica_id):
+            return mock.Mock() if replica_id in existing else None
+
+        with mock.patch(
+                'sky.serve.replica_managers.serve_state.'
+                'get_replica_info_from_id',
+                side_effect=_get), \
+             mock.patch.object(mgr, '_launch_replica',
+                               side_effect=_record_launch(launched)):
+            mgr.scale_up_batch([None, None])
+        assert launched == [1, 3]
