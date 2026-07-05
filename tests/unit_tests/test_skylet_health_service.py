@@ -123,11 +123,16 @@ class TestRayStatusViaSkyletGrpc:
         handle.is_grpc_enabled_with_flag = True
         response = healthv1_pb2.GetRayStatusResponse(
             returncode=0, stdout='1 ray.head.default\n', stderr='')
-        with mock.patch.object(backend_utils,
-                               'invoke_skylet_with_retries',
-                               return_value=response):
+        client = mock.Mock()
+        client.get_ray_status.return_value = response
+        with mock.patch('sky.backends.SkyletClient', return_value=client):
             result = backend_utils._ray_status_via_skylet_grpc(handle)
         assert result == (0, '1 ray.head.default\n', '')
+        # Single bounded attempt on the hot path: a tight explicit deadline,
+        # no generic retry wrapper.
+        _, kwargs = client.get_ray_status.call_args
+        assert kwargs['timeout'] == (
+            backend_utils._SKYLET_HEALTH_PROBE_TIMEOUT_SECONDS)
 
     def test_unhealthy_ray_is_passed_through_not_swallowed(self):
         handle = mock.Mock()
@@ -135,9 +140,9 @@ class TestRayStatusViaSkyletGrpc:
         response = healthv1_pb2.GetRayStatusResponse(returncode=1,
                                                      stdout='',
                                                      stderr='no ray')
-        with mock.patch.object(backend_utils,
-                               'invoke_skylet_with_retries',
-                               return_value=response):
+        client = mock.Mock()
+        client.get_ray_status.return_value = response
+        with mock.patch('sky.backends.SkyletClient', return_value=client):
             result = backend_utils._ray_status_via_skylet_grpc(handle)
         # Non-zero rc flows to the caller (which raises CommandError like
         # the SSH path); it must NOT be treated as "gRPC unavailable".
@@ -146,7 +151,13 @@ class TestRayStatusViaSkyletGrpc:
     def test_any_rpc_failure_returns_none(self):
         handle = mock.Mock()
         handle.is_grpc_enabled_with_flag = True
-        with mock.patch.object(backend_utils,
-                               'invoke_skylet_with_retries',
-                               side_effect=RuntimeError('channel broke')):
+        client = mock.Mock()
+        client.get_ray_status.side_effect = RuntimeError('channel broke')
+        with mock.patch('sky.backends.SkyletClient', return_value=client):
             assert backend_utils._ray_status_via_skylet_grpc(handle) is None
+
+    def test_channel_setup_failure_returns_none(self):
+        handle = mock.Mock()
+        handle.is_grpc_enabled_with_flag = True
+        handle.get_grpc_channel.side_effect = RuntimeError('tunnel failed')
+        assert backend_utils._ray_status_via_skylet_grpc(handle) is None

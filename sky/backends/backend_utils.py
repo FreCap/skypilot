@@ -1490,6 +1490,13 @@ def _count_healthy_nodes_from_ray(output: str,
     return ready_head, ready_workers
 
 
+# Deadline for the single skylet gRPC ray-status attempt. Deliberately
+# tighter than SKYLET_GRPC_TIMEOUT_SECONDS: this is an opportunistic fast
+# path on the status-refresh hot path with the SSH probe as the always-
+# available fallback — it must fail fast, not thoroughly.
+_SKYLET_HEALTH_PROBE_TIMEOUT_SECONDS = 5.0
+
+
 def _ray_status_via_skylet_grpc(handle) -> Optional[Tuple[int, str, str]]:
     """Run `ray status` on the head node via the skylet HealthService.
 
@@ -1501,6 +1508,15 @@ def _ray_status_via_skylet_grpc(handle) -> Optional[Tuple[int, str, str]]:
     head, which must flow through the exact same code path as a failed
     SSH'd `ray status`. The gRPC path must never make the health check
     stricter than the SSH path, only cheaper and less flaky.
+
+    Deliberately a SINGLE attempt with a tight deadline — NOT
+    invoke_skylet_with_retries, whose up-to-5 UNAVAILABLE retries (each
+    paying the full gRPC deadline against a wedged channel, plus backoff)
+    would add on the order of a minute to the status-refresh hot path
+    before the SSH fallback runs. In the healthy case
+    handle.get_grpc_channel() reuses a cached tunnel and the call is one
+    cheap local round trip; in any unhealthy case we fall back immediately
+    and a stale tunnel gets repaired by a later get_grpc_channel call.
     """
     try:
         if not handle.is_grpc_enabled_with_flag:
@@ -1513,12 +1529,13 @@ def _ray_status_via_skylet_grpc(handle) -> Optional[Tuple[int, str, str]]:
     from sky import backends
     from sky.schemas.generated import healthv1_pb2
     try:
-        response = invoke_skylet_with_retries(
-            lambda: backends.SkyletClient(handle.get_grpc_channel(
-            )).get_ray_status(healthv1_pb2.GetRayStatusRequest()))
+        response = backends.SkyletClient(
+            handle.get_grpc_channel()).get_ray_status(
+                healthv1_pb2.GetRayStatusRequest(),
+                timeout=_SKYLET_HEALTH_PROBE_TIMEOUT_SECONDS)
     except Exception as e:  # pylint: disable=broad-except
-        # SkyletMethodNotImplementedError (old skylet), skylet down,
-        # tunnel/channel failures, deadline exceeded, ...: fall back.
+        # UNIMPLEMENTED (old skylet), skylet down, tunnel/channel setup
+        # failures, deadline exceeded, ...: fall back to the SSH probe.
         logger.debug('Skylet gRPC ray-status probe unavailable for '
                      f'{handle.cluster_name!r}; falling back to the SSH '
                      f'probe: {common_utils.format_exception(e)}')
