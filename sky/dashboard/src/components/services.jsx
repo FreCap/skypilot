@@ -103,7 +103,6 @@ export function Services() {
     if (refreshDataRef.current) {
       refreshDataRef.current();
     }
-    setLastFetchedTime(new Date());
   };
 
   return (
@@ -138,11 +137,16 @@ export function Services() {
         </div>
       </div>
 
+      {/* Pass the state setter itself (stable identity) rather than an
+          inline arrow: onFetched is a dependency of the table's fetchData
+          callback, and a per-render closure would recreate fetchData on
+          every parent render, re-triggering the fetch effect in a loop
+          outside the 30s interval/visibility gate. */}
       <ServicesTable
         refreshInterval={REFRESH_INTERVAL}
         setLoading={setLoading}
         refreshDataRef={refreshDataRef}
-        onFetched={() => setLastFetchedTime(new Date())}
+        onFetched={setLastFetchedTime}
       />
     </>
   );
@@ -173,7 +177,7 @@ function ServicesTable({
       setData(servicesResponse.services || []);
       setControllerStopped(servicesResponse.controllerStopped || false);
       if (onFetched) {
-        onFetched();
+        onFetched(new Date());
       }
     } catch (error) {
       console.error('Failed to fetch services:', error);
@@ -309,6 +313,12 @@ function ServicesTable({
                     </TableCell>
                     <TableCell>
                       {service.replicasReady}/{service.replicasTotal}
+                      {service.replicasFailed > 0 && (
+                        <span className="text-red-700">
+                          {' '}
+                          (+{service.replicasFailed} failed)
+                        </span>
+                      )}
                     </TableCell>
                     <TableCell>
                       <EndpointCell endpoint={service.endpoint} />

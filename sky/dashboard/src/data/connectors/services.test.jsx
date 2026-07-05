@@ -127,7 +127,10 @@ describe('getServices', () => {
     expect(result).toEqual({ services: [], controllerStopped: false });
   });
 
-  it('counts ready replicas with mixed replica statuses', async () => {
+  it('counts ready replicas with mixed replica statuses, excluding failed ones from the total like `sky serve status`', async () => {
+    // Mirrors _get_replicas in sky/serve/serve_utils.py: READY counts
+    // toward ready, and statuses in ReplicaStatus.failed_statuses()
+    // (here FAILED_PROBING) are excluded from the total.
     const record = rawServiceRecord({
       status: 'REPLICA_INIT',
       replica_info: [
@@ -144,8 +147,59 @@ describe('getServices', () => {
     const { services } = await getServices();
 
     expect(services[0].replicasReady).toBe(2);
-    expect(services[0].replicasTotal).toBe(5);
+    expect(services[0].replicasTotal).toBe(4);
+    expect(services[0].replicasFailed).toBe(1);
+    // The full replica list still contains every row, failed included.
     expect(services[0].replicas.map((r) => r.id)).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  it('shows 2/3 when one of four replicas is FAILED (CLI-consistent denominator)', async () => {
+    const record = rawServiceRecord({
+      replica_info: [
+        { replica_id: 1, status: 'READY' },
+        { replica_id: 2, status: 'READY' },
+        { replica_id: 3, status: 'NOT_READY' },
+        { replica_id: 4, status: 'FAILED' },
+      ],
+    });
+    apiClient.post.mockResolvedValue(mockDispatchResponse());
+    apiClient.get.mockResolvedValue(mockResultResponse([record]));
+
+    const { services } = await getServices();
+
+    expect(services[0].replicasReady).toBe(2);
+    expect(services[0].replicasTotal).toBe(3);
+    expect(services[0].replicasFailed).toBe(1);
+  });
+
+  it('excludes every failed-class replica status from the total', async () => {
+    // The full ReplicaStatus.failed_statuses() set from
+    // sky/serve/serve_state.py.
+    const failedStatuses = [
+      'FAILED',
+      'FAILED_CLEANUP',
+      'FAILED_INITIAL_DELAY',
+      'FAILED_PROBING',
+      'FAILED_PROVISION',
+      'UNKNOWN',
+    ];
+    const record = rawServiceRecord({
+      replica_info: [
+        { replica_id: 1, status: 'READY' },
+        ...failedStatuses.map((status, i) => ({
+          replica_id: i + 2,
+          status,
+        })),
+      ],
+    });
+    apiClient.post.mockResolvedValue(mockDispatchResponse());
+    apiClient.get.mockResolvedValue(mockResultResponse([record]));
+
+    const { services } = await getServices();
+
+    expect(services[0].replicasReady).toBe(1);
+    expect(services[0].replicasTotal).toBe(1);
+    expect(services[0].replicasFailed).toBe(failedStatuses.length);
   });
 
   it('reports controllerStopped when the serve controller is not up', async () => {

@@ -182,6 +182,12 @@ function ServiceDetailCard({ serviceData }) {
               </div>
               <div className="text-base mt-1">
                 {serviceData.replicasReady}/{serviceData.replicasTotal}
+                {serviceData.replicasFailed > 0 && (
+                  <span className="text-red-700">
+                    {' '}
+                    (+{serviceData.replicasFailed} failed)
+                  </span>
+                )}
                 {serviceData.targetReplicas != null && (
                   <span className="text-gray-500">
                     {' '}

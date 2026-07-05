@@ -22,6 +22,19 @@ export function normalizeReplica(replica) {
   };
 }
 
+// Replica statuses treated as failed, mirroring
+// sky/serve/serve_state.py ReplicaStatus.failed_statuses(). The CLI's
+// REPLICAS column (`_get_replicas` in sky/serve/serve_utils.py) excludes
+// these from the ready/total denominator; keep the dashboard consistent.
+const FAILED_REPLICA_STATUSES = new Set([
+  'FAILED',
+  'FAILED_CLEANUP',
+  'FAILED_INITIAL_DELAY',
+  'FAILED_PROBING',
+  'FAILED_PROVISION',
+  'UNKNOWN',
+]);
+
 // Normalize a raw service record from the /serve/status response into the
 // shape consumed by the services pages. Statuses arrive as plain strings
 // (sky/serve/serve_state.py ServiceStatus values).
@@ -31,6 +44,9 @@ export function normalizeService(record) {
     : [];
   const replicas = replicaInfo.map(normalizeReplica);
   const replicasReady = replicas.filter((r) => r.status === 'READY').length;
+  const replicasFailed = replicas.filter((r) =>
+    FAILED_REPLICA_STATUSES.has(r.status)
+  ).length;
 
   return {
     name: record.name,
@@ -40,7 +56,10 @@ export function normalizeService(record) {
     uptime: record.uptime ?? null,
     endpoint: record.endpoint || null,
     replicasReady,
-    replicasTotal: replicas.length,
+    // Match `sky serve status`: failed replicas are excluded from the
+    // total (see _get_replicas in sky/serve/serve_utils.py).
+    replicasTotal: replicas.length - replicasFailed,
+    replicasFailed,
     targetReplicas: record.target_num_replicas ?? null,
     policy: record.policy || null,
     loadBalancingPolicy: record.load_balancing_policy || null,
