@@ -3,6 +3,7 @@
 import os
 import signal
 import subprocess
+import sys
 from typing import List, Optional, Tuple
 
 import filelock
@@ -163,6 +164,12 @@ def main():
         print(f'Could not acquire the skylet restart lock ({LOCK_FILE}) '
               f'within {LOCK_TIMEOUT_SECONDS}s; another restart is in '
               'progress. Leaving skylet state untouched.')
+        # Exit non-zero: this run did NOT verify/restart skylet, and the
+        # caller must not believe it did. Provisioning treats the failure
+        # as fatal-after-retries (start_skylet_on_head_node is wrapped in
+        # _auto_retry) instead of silently proceeding without a verified
+        # skylet; the watchdog simply retries on its next tick.
+        sys.exit(1)
 
 
 def _check_and_maybe_restart():

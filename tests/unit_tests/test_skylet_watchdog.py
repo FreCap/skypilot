@@ -175,7 +175,8 @@ class TestAttemptSkyletRestartLock:
         # The critical sections must not overlap.
         assert a_end <= b_start or b_end <= a_start
 
-    def test_lock_timeout_leaves_state_untouched(self, tmp_path, monkeypatch):
+    def test_lock_timeout_exits_nonzero_without_touching_state(
+            self, tmp_path, monkeypatch):
         import filelock
         attempt_skylet, lock_file = self._patched(tmp_path, monkeypatch)
         monkeypatch.setattr(attempt_skylet, 'LOCK_TIMEOUT_SECONDS', 0.2)
@@ -184,5 +185,11 @@ class TestAttemptSkyletRestartLock:
                             lambda: called.append(True))
         holder = filelock.FileLock(lock_file)
         with holder.acquire(timeout=1):
-            attempt_skylet.main()  # must give up, not deadlock or raise
+            # Must give up without touching state, and exit NON-zero: the
+            # run did not verify/restart skylet, and provisioning (which
+            # treats attempt_skylet failure as fatal-after-retries) must
+            # not believe it did.
+            with pytest.raises(SystemExit) as exc_info:
+                attempt_skylet.main()
+        assert exc_info.value.code != 0
         assert not called
