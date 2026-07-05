@@ -8,7 +8,7 @@ import threading
 import time
 import traceback
 import typing
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import colorama
 import filelock
@@ -1208,6 +1208,51 @@ class SkyPilotReplicaManager(ReplicaManager):
 
     # We don't need to add lock here since every caller of this function
     # will acquire the lock.
+    # Thread-pool bound for the per-probe-round parallel cloud pre-filter
+    # over failed-probe spot replicas (see _cloud_instance_looks_alive).
+    _PREEMPTION_PREFILTER_PARALLELISM = 16
+
+    def _cloud_instance_looks_alive(self, info: ReplicaInfo) -> bool:
+        """Whether the cloud still reports this replica's instance(s) as UP.
+
+        Cloud-API-only (one provider call, no SSH probe, no status lock, no
+        DB writes): this is the cheap pre-filter that decides whether a
+        failed readiness probe warrants the full `_handle_preemption` path
+        (which does a forced, serial, lock-holding cluster refresh). During
+        a fleet cold start EVERY not-yet-listening replica fails its probe
+        by design; the pre-filter confirms their instances are running and
+        skips the expensive path for them.
+
+        Alive requires EVERY launched node to be reported UP, mirroring the
+        full refresh's partial-cluster semantics ("some nodes UP" is
+        abnormal: the cluster is partially preempted or terminated). Any
+        shortfall — fewer instances than launched_nodes, or any non-UP
+        instance — routes to the full path, which stays the authority on
+        classification.
+
+        Errors count as alive: a transient provider/API error must not
+        stampede a whole cold-starting fleet into forced refreshes — a
+        genuinely dead instance keeps failing its probe and is re-checked
+        next round. A missing handle counts as NOT alive so the full path
+        (which logs and handles that case) runs.
+        """
+        try:
+            handle = global_user_state.get_handle_from_cluster_name(
+                info.cluster_name)
+            if handle is None:
+                return False
+            assert isinstance(handle, backends.CloudVmRayResourceHandle)
+            statuses = backend_utils.query_cluster_instance_statuses(handle)
+            if len(statuses) < handle.launched_nodes:
+                return False
+            return all(status == status_lib.ClusterStatus.UP
+                       for status, _ in statuses.values())
+        except Exception as e:  # pylint: disable=broad-except
+            logger.debug(f'Preemption pre-filter failed for replica '
+                         f'{info.replica_id} ({info.cluster_name}); treating '
+                         f'as alive: {common_utils.format_exception(e)}')
+            return True
+
     def _handle_preemption(self, info: ReplicaInfo) -> bool:
         """Handle preemption of the replica if any error happened.
 
@@ -1576,8 +1621,40 @@ class SkyPilotReplicaManager(ReplicaManager):
             # completion, we need the info.probe function to return the info
             # object as well, so that we could update the info object in the
             # same order.
-            for future in probe_futures:
-                future_result: Tuple[ReplicaInfo, bool, float] = future.get()
+            probe_results: List[Tuple[ReplicaInfo, bool, float]] = [
+                future.get() for future in probe_futures
+            ]
+
+            # Parallel cloud-only pre-filter for preemption handling. The
+            # full _handle_preemption does a forced cluster refresh (cloud
+            # API + an SSH ray-status probe) serially under the manager
+            # lock; running it for every failed probe made cold-start probe
+            # rounds take minutes instead of the 10s cadence on a
+            # 129-replica spot fleet (starving scale-up on the same lock
+            # and leaving the LB's ready-set stale -> 503s with READY
+            # replicas). Instead, confirm instance liveness with one cheap
+            # provider call per failed spot replica, in parallel; only
+            # cloud-confirmed-dead (or handle-less) replicas take the full
+            # preemption path, which is rare and worth its cost. Detection
+            # latency is unchanged: every failed probe is still checked
+            # against the cloud every round.
+            failed_spot_infos = [
+                info for info, probe_succeeded, _ in probe_results
+                if not probe_succeeded and info.is_spot
+            ]
+            possibly_preempted_ids: Set[int] = set()
+            if failed_spot_infos:
+                num_workers = min(self._PREEMPTION_PREFILTER_PARALLELISM,
+                                  len(failed_spot_infos))
+                with mp_pool.ThreadPool(num_workers) as prefilter_pool:
+                    alive_flags = prefilter_pool.map(
+                        self._cloud_instance_looks_alive, failed_spot_infos)
+                possibly_preempted_ids = {
+                    failed_info.replica_id for failed_info, alive in zip(
+                        failed_spot_infos, alive_flags) if not alive
+                }
+
+            for future_result in probe_results:
                 info, probe_succeeded, probe_time = future_result
                 info.status_property.service_ready_now = probe_succeeded
                 should_teardown = False
@@ -1593,9 +1670,13 @@ class SkyPilotReplicaManager(ReplicaManager):
                     if info.status_property.first_ready_time is None:
                         info.status_property.first_ready_time = probe_time
                 else:
-                    # TODO(tian): This might take a lot of time. Shouldn't
-                    # blocking probe to other replicas.
-                    is_preempted = self._handle_preemption(info)
+                    is_preempted = False
+                    if info.replica_id in possibly_preempted_ids:
+                        # Cloud pre-filter above says the instance is gone:
+                        # run the full preemption path (forced refresh with
+                        # its record-cleanup side effects + spot placer
+                        # preemptive marking + teardown).
+                        is_preempted = self._handle_preemption(info)
                     if is_preempted:
                         continue
 

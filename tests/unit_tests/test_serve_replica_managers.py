@@ -480,3 +480,93 @@ class TestUpdateVersionHoldsManagerLock:
             assert not done.wait(timeout=0.5)
         assert done.wait(timeout=5)
         thread.join(timeout=5)
+
+
+class TestCloudInstanceLooksAlive:
+    """The spot-preemption pre-filter must be cloud-API-only and
+    conservative: it decides whether a failed readiness probe warrants the
+    expensive full `_handle_preemption` path (forced refresh under the
+    manager lock). During a fleet cold start every not-yet-listening spot
+    replica fails its probe, so the common case must be one cheap provider
+    call confirming the instance is up."""
+
+    @staticmethod
+    def _spot_info():
+        info = mock.Mock()
+        info.is_spot = True
+        info.cluster_name = 'svc-1'
+        info.replica_id = 1
+        return info
+
+    def _run(self, handle, statuses=None, side_effect=None):
+        mgr = _make_manager()
+        with mock.patch(
+                'sky.serve.replica_managers.global_user_state.'
+                'get_handle_from_cluster_name',
+                return_value=handle), \
+             mock.patch(
+                 'sky.serve.replica_managers.backend_utils.'
+                 'query_cluster_instance_statuses',
+                 return_value=statuses,
+                 side_effect=side_effect) as query:
+            result = mgr._cloud_instance_looks_alive(self._spot_info())
+        return result, query
+
+    @staticmethod
+    def _handle(launched_nodes=1):
+        handle = mock.Mock(
+            spec=replica_managers.backends.CloudVmRayResourceHandle)
+        handle.launched_nodes = launched_nodes
+        return handle
+
+    def test_running_instance_counts_as_alive(self):
+        from sky.utils import status_lib
+        result, query = self._run(
+            self._handle(),
+            statuses={'i-1': (status_lib.ClusterStatus.UP, None)})
+        assert result is True
+        query.assert_called_once()
+
+    def test_partially_up_multinode_counts_as_dead(self):
+        # Mirrors the full refresh's partial-cluster semantics: a 2-node
+        # replica with only 1 instance UP is abnormal, not alive.
+        from sky.utils import status_lib
+        result, _ = self._run(
+            self._handle(launched_nodes=2),
+            statuses={'i-1': (status_lib.ClusterStatus.UP, None)})
+        assert result is False
+
+    def test_multinode_with_stopped_member_counts_as_dead(self):
+        from sky.utils import status_lib
+        result, _ = self._run(self._handle(launched_nodes=2),
+                              statuses={
+                                  'i-1': (status_lib.ClusterStatus.UP, None),
+                                  'i-2': (status_lib.ClusterStatus.STOPPED,
+                                          'preempted'),
+                              })
+        assert result is False
+
+    def test_no_instances_counts_as_dead(self):
+        result, _ = self._run(self._handle(), statuses={})
+        assert result is False
+
+    def test_stopped_instance_counts_as_dead(self):
+        from sky.utils import status_lib
+        result, _ = self._run(
+            self._handle(),
+            statuses={'i-1': (status_lib.ClusterStatus.STOPPED, 'preempted')})
+        assert result is False
+
+    def test_provider_error_counts_as_alive(self):
+        # A transient provider error must not stampede a cold-starting
+        # fleet into forced refreshes.
+        result, _ = self._run(self._handle(),
+                              side_effect=RuntimeError('throttled'))
+        assert result is True
+
+    def test_missing_handle_routes_to_full_path(self):
+        # No handle -> NOT alive, so the full _handle_preemption (which
+        # logs and handles the missing-handle case) runs.
+        result, query = self._run(handle=None)
+        assert result is False
+        query.assert_not_called()

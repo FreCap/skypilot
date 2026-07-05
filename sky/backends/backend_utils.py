@@ -3459,6 +3459,29 @@ def refresh_cluster_status_handle(
     return record['status'], record['handle']
 
 
+def query_cluster_instance_statuses(
+    handle: 'cloud_vm_ray_backend.CloudVmRayResourceHandle',
+    retry_if_missing: bool = False,
+) -> Dict[str, Tuple[status_lib.ClusterStatus, Optional[str]]]:
+    """Cloud-provider-only view of a cluster's instance statuses.
+
+    A public thin wrapper over the cloud-API query used internally by the
+    status refresh: ONE provider call (e.g. describe-instances), no SSH
+    ray-status probe, no cluster status lock, and no writes to the cluster
+    table. Intended for cheap liveness pre-filters over many clusters (e.g.
+    SkyServe's spot-preemption pre-filter), where the full
+    refresh_cluster_status_handle — with its serial per-cluster lock and
+    on-node health probe — is orders of magnitude too expensive to run per
+    candidate. Safe to call concurrently for different clusters.
+
+    Raises:
+        exceptions.ClusterStatusFetchingError: the status cannot be fetched
+            from the cloud provider.
+    """
+    return _query_cluster_status_via_cloud_api(
+        handle, retry_if_missing=retry_if_missing)
+
+
 # =====================================
 
 
