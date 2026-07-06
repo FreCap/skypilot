@@ -691,3 +691,16 @@ def test_ssm_no_profile(monkeypatch):
     proxy_command = template_vars['ssh_proxy_command']
     assert 'aws ssm start-session' in proxy_command
     assert '--profile' not in proxy_command
+
+
+def test_ssm_adaptive_retry_exports(monkeypatch):
+    """The SSM proxy command self-throttles via the CLI's adaptive retry
+    mode, exported (not a VAR=x prefix) so the describe-instances command
+    substitution inherits it too."""
+    monkeypatch.delenv('AWS_PROFILE', raising=False)
+    template_vars = _write_cluster_config_with_ssm(monkeypatch,
+                                                   {'use_ssm': True})
+    proxy_command = template_vars['ssh_proxy_command']
+    assert proxy_command.startswith(
+        'export AWS_RETRY_MODE=adaptive AWS_MAX_ATTEMPTS=')
+    assert 'aws ssm start-session' in proxy_command

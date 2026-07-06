@@ -124,14 +124,16 @@ _SSH_CONNECTION_TIMED_OUT_PATTERN = re.compile(r'^ssh:.*timed out$',
                                                re.IGNORECASE)
 # Transport-level failures that do not indicate an unhealthy ray cluster: the
 # SSM agent momentarily dropping (TargetNotConnected), sshd not yet accepting
-# connections (kex_exchange_identification), or a reset mid-handshake. The ray
+# connections (kex_exchange_identification), a reset mid-handshake, or the
+# proxy command being throttled by the cloud API (SSM StartSession has a low
+# account-wide TPS quota; EC2 Describe* shares a throttle bucket). The ray
 # health probe retries these instead of immediately flagging the cluster
 # abnormal. Deliberately excludes "timed out", which signals a changed IP on
 # manually restarted clusters (see _SSH_CONNECTION_TIMED_OUT_PATTERN).
 _TRANSIENT_SSH_FAILURE_PATTERN = re.compile(
     r'(TargetNotConnected|kex_exchange_identification|'
-    r'Connection reset by peer|Connection closed by remote host|Broken pipe)',
-    re.IGNORECASE)
+    r'Connection reset by peer|Connection closed by remote host|Broken pipe|'
+    r'ThrottlingException|Rate exceeded|RequestLimitExceeded)', re.IGNORECASE)
 K8S_PODS_NOT_FOUND_PATTERN = re.compile(r'.*(NotFound|pods .* not found).*',
                                         re.IGNORECASE)
 _RAY_CLUSTER_NOT_FOUND_MESSAGE = 'Ray cluster is not found'
@@ -978,11 +980,22 @@ def write_cluster_config(
                 f'--region {region_name} --filters {ip_address_filter} ' + \
                 '--query \"Reservations[].Instances[].InstanceId\" ' + \
                 f'{profile_str} --output text'
-            ssm_proxy_command = 'aws ssm start-session --target ' + \
-                f'\"$({get_instance_id_command})\" ' + \
-                f'--region {region_name} {profile_str} ' + \
-                '--document-name AWS-StartSSHSession ' + \
-                '--parameters portNumber=%p'
+            # StartSession is throttled account-wide at a low TPS (default
+            # 3), and every SSH connection runs this proxy command, so a
+            # many-node provision bursts far past the quota and the default
+            # CLI retries give up while the burst is still colliding with
+            # itself. Adaptive retry mode rate-limits client-side and waits
+            # out ThrottlingException instead of failing the SSH handshake.
+            # 'export' (not a VAR=x command prefix) so the setting also
+            # reaches the describe-instances command substitution, which the
+            # shell expands before the outer command's environment applies.
+            ssm_proxy_command = (
+                'export AWS_RETRY_MODE=adaptive AWS_MAX_ATTEMPTS=12; '
+                'aws ssm start-session --target '
+                f'\"$({get_instance_id_command})\" '
+                f'--region {region_name} {profile_str} '
+                '--document-name AWS-StartSSHSession '
+                '--parameters portNumber=%p')
             ssh_proxy_command = ssm_proxy_command
             region_name = 'ssm-session'
     logger.debug(f'Using ssh_proxy_command: {ssh_proxy_command!r}')

@@ -49,3 +49,19 @@ class TestTransientSshFailurePattern:
     def test_permission_denied_is_not_transient(self):
         stderr = 'user@1.2.3.4: Permission denied (publickey).'
         assert _TRANSIENT_SSH_FAILURE_PATTERN.search(stderr) is None
+
+    def test_ssm_throttling_is_transient(self):
+        # StartSession has a low account-wide TPS quota; a throttled proxy
+        # command on a healthy running cluster must be retried, not treated
+        # as an abnormal cluster.
+        stderr = ('An error occurred (ThrottlingException) when calling the '
+                  'StartSession operation (reached max retries: 4): '
+                  'Rate exceeded')
+        assert _TRANSIENT_SSH_FAILURE_PATTERN.search(stderr) is not None
+
+    def test_ec2_request_limit_is_transient(self):
+        # The describe-instances embedded in the SSM proxy command shares
+        # the EC2 Describe* throttle bucket.
+        stderr = ('An error occurred (RequestLimitExceeded) when calling the '
+                  'DescribeInstances operation: Request limit exceeded.')
+        assert _TRANSIENT_SSH_FAILURE_PATTERN.search(stderr) is not None

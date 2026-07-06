@@ -420,23 +420,35 @@ def wait_for_ssh(cluster_info: provision_common.ClusterInfo,
     ips = collections.deque(ip_list)
     ssh_ports = collections.deque(port_list)
 
+    # Each SSM-proxied probe opens a session against the account-wide SSM
+    # StartSession TPS quota (default 3), so probing every node in parallel
+    # once per second saturates the quota for the whole account. Space the
+    # probes out with jittered backoff instead; the quota-free transports
+    # keep the tight 1s cadence.
+    is_ssm_proxy = 'ssm start-session' in (
+        ssh_credentials.get('ssh_proxy_command') or '')
+
     def _retry_ssh_thread(ip_ssh_port: Tuple[str, int]):
         ip, ssh_port = ip_ssh_port
         success = False
         ssh_probe_timeout = skypilot_config.get_nested(
             ('provision', 'ssh_timeout'), 10)
+        backoff = common_utils.Backoff(initial_backoff=2, max_backoff_factor=5)
         while not success:
             success, stderr = waiter(ip,
                                      ssh_port,
                                      **ssh_credentials,
                                      ssh_probe_timeout=ssh_probe_timeout)
-            if not success and time.time() - start > timeout:
+            if success:
+                break
+            if time.time() - start > timeout:
                 with ux_utils.print_exception_no_traceback():
                     raise RuntimeError(
                         f'Failed to SSH to {ip} after timeout {timeout}s, with '
                         f'{stderr}')
-            logger.debug('Retrying in 1 second...')
-            time.sleep(1)
+            sleep_secs = backoff.current_backoff() if is_ssm_proxy else 1
+            logger.debug(f'Retrying in {sleep_secs:.1f} seconds...')
+            time.sleep(sleep_secs)
 
     # try one node and multiprocess the rest
     if ips:
