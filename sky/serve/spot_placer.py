@@ -3,6 +3,8 @@
 import collections
 import dataclasses
 import enum
+import os
+import time
 import typing
 from typing import Any, Dict, List, Optional, Set
 
@@ -24,6 +26,30 @@ logger = sky_logging.init_logger(__name__)
 SPOT_PLACERS = {}
 DEFAULT_SPOT_PLACER = None
 SPOT_HEDGE_PLACER = 'dynamic_fallback'
+
+# How long a location stays benched after a failed launch or a preemption
+# before it becomes eligible for a retry. Without this, a location marked
+# PREEMPTED is NEVER selected again (selection only draws from ACTIVE
+# locations and reactivation only happened on a successful launch there —
+# which could never occur). Measured live (2026-07-06, 1000-replica L4
+# fleet): a region benched on a transient spot-vCPU-quota error stayed
+# excluded even after quota freed, permanently capping the fleet. Spot
+# capacity and quota recover on minute timescales, so retry each benched
+# location with one probe launch per TTL window.
+_PREEMPTION_RETRY_SECONDS_DEFAULT = 600
+_PREEMPTION_RETRY_SECONDS_ENV_VAR = 'SKYPILOT_SPOT_PLACER_RETRY_SECONDS'
+
+
+def _preemption_retry_seconds() -> float:
+    override = os.environ.get(_PREEMPTION_RETRY_SECONDS_ENV_VAR)
+    if override is not None:
+        try:
+            return max(0.0, float(override))
+        except ValueError:
+            logger.warning(f'Invalid {_PREEMPTION_RETRY_SECONDS_ENV_VAR} value '
+                           f'{override!r}, using default '
+                           f'{_PREEMPTION_RETRY_SECONDS_DEFAULT}s.')
+    return _PREEMPTION_RETRY_SECONDS_DEFAULT
 
 
 @dataclasses.dataclass
@@ -178,6 +204,8 @@ class SpotPlacer:
         self.location2status: Dict[Location, LocationStatus] = {
             location: LocationStatus.ACTIVE for location in possible_locations
         }
+        # When each PREEMPTED mark was set; drives the TTL retry.
+        self.location2preempted_at: Dict[Location, float] = {}
         self.location2cost: Dict[Location, float] = {}
         # Already checked there is only one resource in the task.
         self.resources = list(task.resources)[0]
@@ -199,14 +227,19 @@ class SpotPlacer:
     def set_active(self, location: Location) -> None:
         assert location in self.location2status, location
         self.location2status[location] = LocationStatus.ACTIVE
+        self.location2preempted_at.pop(location, None)
 
     def set_preemptive(self, location: Location) -> None:
         assert location in self.location2status, location
         self.location2status[location] = LocationStatus.PREEMPTED
+        # (Re)start the bench clock: a failed retry benches the location
+        # for another full TTL window.
+        self.location2preempted_at[location] = time.time()
 
     def clear_preemptive_locations(self) -> None:
         for location in self.location2status:
             self.location2status[location] = LocationStatus.ACTIVE
+        self.location2preempted_at.clear()
 
     def _min_cost_location(self, locations: List[Location]) -> Location:
 
@@ -230,12 +263,41 @@ class SpotPlacer:
 
         return min(locations, key=_get_cost_per_hour)
 
+    def _effective_status(self, location: Location) -> LocationStatus:
+        """Status with TTL decay: an expired PREEMPTED mark counts ACTIVE.
+
+        The stored status is left untouched — if the retry launch fails,
+        set_preemptive refreshes the timestamp (benched for another TTL);
+        if it succeeds, set_active clears the mark entirely.
+        """
+        status = self.location2status[location]
+        if status == LocationStatus.PREEMPTED:
+            preempted_at = self.location2preempted_at.get(location)
+            if (preempted_at is not None and
+                    time.time() - preempted_at >= _preemption_retry_seconds()):
+                return LocationStatus.ACTIVE
+        return status
+
     def _location_with_status(self, status: LocationStatus) -> List[Location]:
         return [
-            location
-            for location, location_type in self.location2status.items()
-            if location_type == status
+            location for location in self.location2status
+            if self._effective_status(location) == status
         ]
+
+    def _consume_retry_if_benched(self, location: Location) -> None:
+        """Consume the TTL retry budget of a benched location on selection.
+
+        An expired PREEMPTED mark makes the location selectable again, but
+        the retry must be consumed the moment it is selected — not when the
+        probe launch later fails. Otherwise a burst of scale-ups inside one
+        window would all pile onto the benched location (it looks like the
+        least-loaded ACTIVE candidate) before the first failure re-benches
+        it. Refreshing the timestamp here caps it to one probe launch per
+        TTL window regardless of batch size; a successful launch clears the
+        mark via set_active.
+        """
+        if self.location2status.get(location) == LocationStatus.PREEMPTED:
+            self.location2preempted_at[location] = time.time()
 
     def active_locations(self) -> List[Location]:
         return self._location_with_status(LocationStatus.ACTIVE)
@@ -279,6 +341,7 @@ class DynamicFallbackSpotPlacer(SpotPlacer,
         if not candidate_locations:
             candidate_locations = active_locations
         res = self._min_cost_location(candidate_locations)
+        self._consume_retry_if_benched(res)
         logger.info(f'Active locations: {active_locations}\n'
                     f'Current locations: {current_locations}\n'
                     f'Candidate locations: {candidate_locations}\n'
