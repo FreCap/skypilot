@@ -284,6 +284,21 @@ class SpotPlacer:
             if self._effective_status(location) == status
         ]
 
+    def _consume_retry_if_benched(self, location: Location) -> None:
+        """Consume the TTL retry budget of a benched location on selection.
+
+        An expired PREEMPTED mark makes the location selectable again, but
+        the retry must be consumed the moment it is selected — not when the
+        probe launch later fails. Otherwise a burst of scale-ups inside one
+        window would all pile onto the benched location (it looks like the
+        least-loaded ACTIVE candidate) before the first failure re-benches
+        it. Refreshing the timestamp here caps it to one probe launch per
+        TTL window regardless of batch size; a successful launch clears the
+        mark via set_active.
+        """
+        if self.location2status.get(location) == LocationStatus.PREEMPTED:
+            self.location2preempted_at[location] = time.time()
+
     def active_locations(self) -> List[Location]:
         return self._location_with_status(LocationStatus.ACTIVE)
 
@@ -326,6 +341,7 @@ class DynamicFallbackSpotPlacer(SpotPlacer,
         if not candidate_locations:
             candidate_locations = active_locations
         res = self._min_cost_location(candidate_locations)
+        self._consume_retry_if_benched(res)
         logger.info(f'Active locations: {active_locations}\n'
                     f'Current locations: {current_locations}\n'
                     f'Candidate locations: {candidate_locations}\n'

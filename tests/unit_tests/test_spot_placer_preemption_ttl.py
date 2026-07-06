@@ -105,6 +105,26 @@ class TestPreemptionTtlRetry:
         assert len(placer.active_locations()) == 3
         assert not placer.location2preempted_at
 
+    def test_selection_consumes_the_retry_budget(self, placer_and_locations,
+                                                 monkeypatch):
+        """A burst of selections within one window must send exactly ONE
+        probe launch to a benched location, not pile onto it."""
+        placer, cheap, other, third = placer_and_locations
+        now = [1000.0]
+        monkeypatch.setattr(spot_placer.time, 'time', lambda: now[0])
+        placer.set_preemptive(cheap)
+        now[0] += spot_placer._PREEMPTION_RETRY_SECONDS_DEFAULT + 1
+        # First selection picks the expired-benched cheapest location...
+        assert placer.select_next_location([]) == cheap
+        # ...and consumes its retry: subsequent selections in the same
+        # burst must go elsewhere until the next window.
+        assert cheap not in placer.active_locations()
+        assert placer.select_next_location([]) == other
+        assert placer.select_next_location([]) == other
+        # Next window: retryable again.
+        now[0] += spot_placer._PREEMPTION_RETRY_SECONDS_DEFAULT + 1
+        assert placer.select_next_location([]) == cheap
+
     def test_env_override_ttl(self, placer_and_locations, monkeypatch):
         placer, cheap, other, third = placer_and_locations
         now = [1000.0]
