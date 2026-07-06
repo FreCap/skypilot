@@ -993,12 +993,14 @@ class SSHCommandRunner(CommandRunner):
         # Opportunistic direct SSH: drop a SkyPilot-generated SSM proxy for
         # targets already verified directly reachable by a full proxy-less
         # handshake (recorded by wait_for_ssh; see sky/utils/ssm_direct.py).
-        # Cache-only, never blocks. Decided before the docker branch below
-        # so the inner (host-VM) hop inherits the decision. Kept as
-        # _ssm_bypassed_proxy_command so a transport failure can restore it.
+        # Cache-only, never blocks. Kept as _ssm_bypassed_proxy_command so a
+        # transport failure can restore it. Docker runners are excluded: the
+        # docker branch below bakes the (possibly bypassed) proxy into the
+        # inner-hop command at construction, which would make the bypass
+        # irreversible for this runner's lifetime.
         self._ssm_bypassed_proxy_command: Optional[str] = None
         self._ssm_bypass_key = (ip, port or 22)
-        if ssh_proxy_command is not None:
+        if ssh_proxy_command is not None and docker_user is None:
             bypassed = ssm_direct.maybe_bypass_proxy(ip, port or 22,
                                                      ssh_proxy_command)
             if bypassed is None:
@@ -1384,7 +1386,7 @@ class SSHCommandRunner(CommandRunner):
                                           **kwargs)
             transport_returncode = result[0] if require_outputs else result
             if isinstance(transport_returncode, int):
-                self._maybe_revert_ssm_bypass(transport_returncode)
+                self.note_transport_failure(transport_returncode)
             if not self.enable_interactive_auth:
                 return result
 
@@ -1466,61 +1468,69 @@ class SSHCommandRunner(CommandRunner):
         Raises:
             exceptions.CommandError: rsync command failed.
         """
-        if self._docker_ssh_proxy_command is not None:
-            docker_ssh_proxy_command = self._docker_ssh_proxy_command(['ssh'])
-        else:
-            docker_ssh_proxy_command = None
-        ssh_options = ' '.join(
-            ssh_options_list(
-                self.ssh_private_key,
-                self.ssh_control_name,
-                ssh_proxy_command=self._ssh_proxy_command,
-                ssh_proxy_jump=self._ssh_proxy_jump,
-                docker_ssh_proxy_command=docker_ssh_proxy_command,
-                port=self.port,
-                disable_control_master=self.disable_control_master,
-                disable_identities_only=self.disable_identities_only))
-        rsh_option = f'ssh {ssh_options}'
-        try:
+
+        def _do_rsync():
+            if self._docker_ssh_proxy_command is not None:
+                docker_ssh_proxy_command = self._docker_ssh_proxy_command(
+                    ['ssh'])
+            else:
+                docker_ssh_proxy_command = None
+            # Rebuilt on every attempt so a reverted SSM bypass (see below)
+            # takes effect.
+            ssh_options = ' '.join(
+                ssh_options_list(
+                    self.ssh_private_key,
+                    self.ssh_control_name,
+                    ssh_proxy_command=self._ssh_proxy_command,
+                    ssh_proxy_jump=self._ssh_proxy_jump,
+                    docker_ssh_proxy_command=docker_ssh_proxy_command,
+                    port=self.port,
+                    disable_control_master=self.disable_control_master,
+                    disable_identities_only=self.disable_identities_only))
             self._rsync(source,
                         target,
                         node_destination=f'{self.ssh_user}@{self.ip}',
                         up=up,
-                        rsh_option=rsh_option,
+                        rsh_option=f'ssh {ssh_options}',
                         log_path=log_path,
                         stream_logs=stream_logs,
                         max_retry=max_retry,
                         get_remote_home_dir=get_remote_home_dir,
                         timeout=timeout)
-        except exceptions.CommandError as e:
-            # rsync exits 255 when the underlying ssh transport failed;
-            # restore a bypassed SSM proxy before the caller's retry.
-            self._maybe_revert_ssm_bypass(e.returncode)
-            raise
 
-    def _maybe_revert_ssm_bypass(self, returncode: int) -> None:
-        """Restore the SSM proxy after a direct-transport failure.
+        try:
+            _do_rsync()
+        except exceptions.CommandError as e:
+            # rsync exits 255 when the underlying ssh transport failed. If
+            # this runner was bypassing an SSM proxy, restore it and salvage
+            # the operation over the proxy instead of failing the caller.
+            if not self.note_transport_failure(e.returncode):
+                raise
+            _do_rsync()
+
+    def note_transport_failure(self, returncode: int) -> bool:
+        """Restore a bypassed SSM proxy after a direct-transport failure.
 
         A bypassed runner talks directly to a target that once passed a
         proxy-less SSH handshake. If the transport now fails (exit 255:
         instance replaced behind the same IP, security group tightened),
-        put the proxy back for this runner's subsequent attempts -- both
-        run() and rsync() rebuild their ssh options from
-        self._ssh_proxy_command on every call -- and poison the cache so
-        other runners stop bypassing this target.
+        put the proxy back for this runner's subsequent attempts -- run()
+        and rsync() rebuild their ssh options from self._ssh_proxy_command
+        on every attempt -- and poison the cache so other runners stop
+        bypassing this target. Also for callers that execute ssh commands
+        built from this runner without going through run()/rsync() (e.g.
+        tunnels via port_forward_command()).
+
+        Returns True if a bypass was actually reverted.
         """
         if returncode != 255 or self._ssm_bypassed_proxy_command is None:
-            return
+            return False
         logger.debug(f'Direct SSH to {self._ssm_bypass_key} failed (exit 255); '
                      'reverting the SSM proxy bypass.')
-        if self._docker_ssh_proxy_command is None:
-            self._ssh_proxy_command = self._ssm_bypassed_proxy_command
-        # In docker mode the (bypassed) proxy was baked into the inner-hop
-        # command at construction; an in-place restore would wrongly attach
-        # it to the outer localhost hop, so only poison the cache and let
-        # the next runner construction pick the proxy back up.
+        self._ssh_proxy_command = self._ssm_bypassed_proxy_command
         self._ssm_bypassed_proxy_command = None
         ssm_direct.mark_direct_failed(*self._ssm_bypass_key)
+        return True
 
 
 class KubernetesCommandRunner(CommandRunner):

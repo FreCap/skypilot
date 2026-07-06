@@ -1,6 +1,7 @@
 """Tests for the opportunistic direct-SSH bypass of SSM proxy commands."""
 import pytest
 
+from sky import exceptions
 from sky.utils import command_runner
 from sky.utils import ssm_direct
 
@@ -112,7 +113,7 @@ class TestRunnerBypass:
     def test_transport_failure_reverts_and_poisons(self):
         ssm_direct.mark_direct_ok('1.2.3.4', 22)
         runner = self._runner(CURRENT_SSM_CMD)
-        runner._maybe_revert_ssm_bypass(255)  # pylint: disable=protected-access
+        assert runner.note_transport_failure(255) is True
         assert runner._ssh_proxy_command == CURRENT_SSM_CMD  # pylint: disable=protected-access
         assert runner._ssm_bypassed_proxy_command is None  # pylint: disable=protected-access
         # Cache poisoned: new runners keep the proxy.
@@ -122,10 +123,61 @@ class TestRunnerBypass:
     def test_success_does_not_revert(self):
         ssm_direct.mark_direct_ok('1.2.3.4', 22)
         runner = self._runner(CURRENT_SSM_CMD)
-        runner._maybe_revert_ssm_bypass(0)  # pylint: disable=protected-access
+        assert runner.note_transport_failure(0) is False
         assert runner._ssh_proxy_command is None  # pylint: disable=protected-access
 
     def test_custom_proxy_runner_untouched(self):
         ssm_direct.mark_direct_ok('1.2.3.4', 22)
         runner = self._runner(CUSTOM_PROXY_CMD)
         assert runner._ssh_proxy_command == CUSTOM_PROXY_CMD  # pylint: disable=protected-access
+
+    def test_docker_runner_never_bypasses(self):
+        # The docker branch bakes the proxy into the inner-hop command at
+        # construction, which would make a bypass irreversible: excluded.
+        ssm_direct.mark_direct_ok('1.2.3.4', 22)
+        runner = command_runner.SSHCommandRunner(
+            ('1.2.3.4', 22),
+            'ubuntu',
+            None,
+            ssh_proxy_command=CURRENT_SSM_CMD,
+            docker_user='docker-user')
+        assert runner._ssm_bypassed_proxy_command is None  # pylint: disable=protected-access
+
+    def test_rsync_salvages_over_ssm_after_direct_failure(self, monkeypatch):
+        ssm_direct.mark_direct_ok('1.2.3.4', 22)
+        runner = self._runner(CURRENT_SSM_CMD)
+        rsh_options = []
+
+        def fake_rsync(source, target, **kwargs):
+            del source, target
+            rsh_options.append(kwargs['rsh_option'])
+            if len(rsh_options) == 1:
+                raise exceptions.CommandError(returncode=255,
+                                              command='rsync',
+                                              error_msg='transport failed',
+                                              detailed_reason=None)
+
+        monkeypatch.setattr(runner, '_rsync', fake_rsync)
+        runner.rsync('/src', '/dst', up=True)
+        assert len(rsh_options) == 2
+        # First attempt ran direct (bypassed proxy), the salvage attempt
+        # rebuilt options with the restored SSM proxy.
+        assert 'ssm start-session' not in rsh_options[0]
+        assert 'ssm start-session' in rsh_options[1]
+
+    def test_rsync_non_transport_failure_raises(self, monkeypatch):
+        ssm_direct.mark_direct_ok('1.2.3.4', 22)
+        runner = self._runner(CURRENT_SSM_CMD)
+
+        def fake_rsync(source, target, **kwargs):
+            del source, target, kwargs
+            raise exceptions.CommandError(returncode=23,
+                                          command='rsync',
+                                          error_msg='partial transfer',
+                                          detailed_reason=None)
+
+        monkeypatch.setattr(runner, '_rsync', fake_rsync)
+        with pytest.raises(exceptions.CommandError):
+            runner.rsync('/src', '/dst', up=True)
+        # Not a transport failure: the bypass stays in place.
+        assert runner._ssh_proxy_command is None  # pylint: disable=protected-access

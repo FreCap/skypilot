@@ -4823,6 +4823,11 @@ def open_ssh_tunnel(head_runner: Union[command_runner.SSHCommandRunner,
         error_msg = 'Port forward failed'
         if stdout:
             error_msg += f'\n-- stdout --\n{stdout}\n'
+        # The tunnel executes ssh directly (not via runner.run()), so report
+        # the transport failure back to the runner: a bypassed SSM proxy is
+        # restored before the caller's retry reuses this runner.
+        if isinstance(head_runner, command_runner.SSHCommandRunner):
+            head_runner.note_transport_failure(ssh_tunnel_proc.returncode)
         raise exceptions.CommandError(returncode=ssh_tunnel_proc.returncode,
                                       command=cmd_str,
                                       error_msg=error_msg,
