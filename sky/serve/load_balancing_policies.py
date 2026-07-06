@@ -197,47 +197,73 @@ class InstanceAwareLeastLoadPolicy(LeastLoadPolicy,
             self.target_qps_per_accelerator = target_qps_per_accelerator
 
     def _get_normalized_load(self, replica_url: str) -> float:
-        """Get normalized load for a replica based on its accelerator type."""
+        """Get normalized load for a replica based on its GPU shape."""
         current_load = self.load_map.get(replica_url, 0)
 
-        # Get accelerator type for this replica
+        # Get accelerator shape for this replica
         replica_data = self.replica_info.get(replica_url, {})
         accelerator_type = replica_data.get('gpu_type', 'unknown')
+        try:
+            accelerator_count = max(1, int(replica_data.get('gpu_count', '1')))
+        except (TypeError, ValueError):
+            accelerator_count = 1
 
-        # Get target QPS for this accelerator type with flexible matching
-        target_qps = self._get_target_qps_for_accelerator(accelerator_type)
+        # Get per-replica target QPS with flexible matching, weighted by
+        # GPU count: a 4-GPU replica absorbs 4x the load of a 1-GPU one
+        # before looking equally loaded.
+        target_qps = self._get_target_qps_for_accelerator(
+            accelerator_type, accelerator_count)
         if target_qps <= 0:
             logger.warning(
-                'Non-positive target QPS (%s) for accelerator type %s; '
+                'Non-positive target QPS (%s) for accelerator shape %s:%s; '
                 'using default value 1.0 to avoid division by zero.',
-                target_qps, accelerator_type)
+                target_qps, accelerator_type, accelerator_count)
             target_qps = 1.0
 
         # Load is normalized by target QPS
         normalized_load = current_load / target_qps
 
         logger.debug(
-            'InstanceAwareLeastLoadPolicy: Replica %s - GPU type: %s, '
+            'InstanceAwareLeastLoadPolicy: Replica %s - GPU shape: %s:%s, '
             'current load: %s, target QPS: %s, normalized load: %s',
-            replica_url, accelerator_type, current_load, target_qps,
-            normalized_load)
+            replica_url, accelerator_type, accelerator_count, current_load,
+            target_qps, normalized_load)
 
         return normalized_load
 
-    def _get_target_qps_for_accelerator(self, accelerator_type: str) -> float:
-        """Get target QPS for accelerator type with flexible matching."""
-        # Direct match first
+    def _get_target_qps_for_accelerator(self,
+                                        accelerator_type: str,
+                                        accelerator_count: int = 1) -> float:
+        """Per-replica target QPS with flexible matching.
+
+        Same key semantics as the instance-aware autoscaler (kept inline —
+        this module runs in the load balancer process and must not pull in
+        serve_utils' import graph):
+          1. exact shape key ('L4:4') -> per-replica value, as-is;
+          2. bare type key ('L4') -> per-GPU value, x count;
+          3. other count-suffixed key of the same type ('L4:1') ->
+             normalized to per-GPU (value / key count), x count.
+        Per-GPU semantics assume one model instance per GPU; models
+        needing k GPUs per instance must use exact shape keys.
+        """
+        # Exact shape match first
+        exact_key = f'{accelerator_type}:{accelerator_count}'
+        if exact_key in self.target_qps_per_accelerator:
+            return self.target_qps_per_accelerator[exact_key]
+
+        # Bare type key is a per-GPU value
         if accelerator_type in self.target_qps_per_accelerator:
-            return self.target_qps_per_accelerator[accelerator_type]
+            return (self.target_qps_per_accelerator[accelerator_type] *
+                    accelerator_count)
 
-        # Try matching by base name (e.g., 'A100' matches 'A100:1')
-        for config_key in self.target_qps_per_accelerator.keys():
-            # Remove count suffix (e.g., 'A100:1' -> 'A100')
-            base_name = config_key.split(':')[0]
-            if accelerator_type == base_name:
-                return self.target_qps_per_accelerator[config_key]
+        # Count-suffixed key of the same type, normalized to per-GPU
+        for config_key, value in self.target_qps_per_accelerator.items():
+            base_name, _, count_str = config_key.partition(':')
+            if (base_name == accelerator_type and count_str.isdigit() and
+                    int(count_str) > 0):
+                return value / int(count_str) * accelerator_count
 
-        # Fallback to minimum QPS
+        # Fallback
         logger.warning(
             f'No matching QPS found for accelerator type: {accelerator_type}. '
             f'Available types: {list(self.target_qps_per_accelerator.keys())}. '

@@ -62,7 +62,8 @@ class SkyServeController:
                                              version))
         self._host = host
         self._port = port
-        # [boltz fork] Cache of replica_id -> (url, gpu_type) for the
+        # [boltz fork] Cache of replica_id -> (url, gpu_type, gpu_count)
+        # for the
         # load_balancer_sync response. Both fields require a cluster handle
         # fetch (and, for the url, an endpoint query) and are fixed for a
         # replica's lifetime once it is READY, so they are resolved at most
@@ -70,7 +71,7 @@ class SkyServeController:
         # replicas on every sync, which prunes replicas that are no longer
         # READY; a replica that recovers with a new endpoint is thus
         # re-resolved.
-        self._lb_replica_cache: Dict[int, Tuple[str, str]] = {}
+        self._lb_replica_cache: Dict[int, Tuple[str, str, int]] = {}
         self._app = fastapi.FastAPI(lifespan=self.lifespan)
 
     @contextlib.asynccontextmanager
@@ -96,7 +97,7 @@ class SkyServeController:
         assert record is not None, ('No service record found for '
                                     f'{self._service_name}')
         active_versions = set(record['active_versions'])
-        replica_cache: Dict[int, Tuple[str, str]] = {}
+        replica_cache: Dict[int, Tuple[str, str, int]] = {}
         replica_info: Dict[str, Dict[str, str]] = {}
         for info in serve_state.get_replica_infos(self._service_name):
             if (info.status != serve_state.ReplicaStatus.READY or
@@ -105,20 +106,39 @@ class SkyServeController:
             cached = self._lb_replica_cache.get(info.replica_id)
             if cached is None:
                 url = info.url
-                assert url is not None, info
-                # gpu_type is used by instance-aware load balancing policies.
-                # It derives from the replica's launched accelerators, which
-                # are fixed for the replica's lifetime.
+                if url is None:
+                    # A replica can be READY while its endpoint is briefly
+                    # unresolvable (e.g. the cluster record has no head IP
+                    # mid-recovery). Skip it for this sync instead of
+                    # crashing the whole load_balancer_sync — it is simply
+                    # not routable this round and will be re-resolved on
+                    # the next sync.
+                    logger.warning(f'Replica {info.replica_id} is READY but '
+                                   'its endpoint is not resolvable yet; '
+                                   'skipping for this sync.')
+                    continue
+                # gpu_type/gpu_count are used by instance-aware load
+                # balancing policies. They derive from the replica's
+                # launched accelerators, which are fixed for the replica's
+                # lifetime.
                 gpu_type = 'unknown'
+                gpu_count = 1
                 handle = info.handle()
                 if handle is not None:
                     accelerators = handle.launched_resources.accelerators
                     if accelerators:
                         gpu_type = list(accelerators.keys())[0]
-                cached = (url, gpu_type)
+                        try:
+                            gpu_count = max(1, int(accelerators[gpu_type]))
+                        except (TypeError, ValueError):
+                            gpu_count = 1
+                cached = (url, gpu_type, gpu_count)
             replica_cache[info.replica_id] = cached
-            url, gpu_type = cached
-            replica_info[url] = {'gpu_type': gpu_type}
+            url, gpu_type, gpu_count = cached
+            replica_info[url] = {
+                'gpu_type': gpu_type,
+                'gpu_count': str(gpu_count),
+            }
         # Replacing the cache with this sync's active replicas prunes the
         # replicas that are no longer READY.
         self._lb_replica_cache = replica_cache

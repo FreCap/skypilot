@@ -1,4 +1,5 @@
 """Unit tests for sky.serve.autoscalers."""
+# pylint: disable=protected-access
 import types
 import unittest
 from unittest import mock
@@ -242,8 +243,8 @@ class TestAutoscalerVersionInitialization(unittest.TestCase):
         self.assertEqual(mock_from_spec.call_args.args[2], 7)
 
 
-class TestInstanceAwareGpuTypeCache(unittest.TestCase):
-    """The GPU-type memo must only cache a post-launch resolution.
+class TestInstanceAwareGpuShapeCache(unittest.TestCase):
+    """The GPU-shape memo must only cache a post-launch resolution.
 
     While a replica is provisioning, its cluster record is rewritten for every
     failover attempt, so the accelerator resolved mid-launch can change until
@@ -253,32 +254,128 @@ class TestInstanceAwareGpuTypeCache(unittest.TestCase):
     def _make_autoscaler(self):
         autoscaler = object.__new__(
             autoscalers.InstanceAwareRequestRateAutoscaler)
-        autoscaler._gpu_type_cache = {}
+        autoscaler._gpu_shape_cache = {}
         return autoscaler
 
-    def _make_replica(self, gpu_type, launch_status):
+    def _make_replica(self, gpu_type, launch_status, count=1):
         info = mock.Mock()
         info.replica_id = 1
         info.status_property.sky_launch_status = launch_status
-        info.handle.return_value.launched_resources.accelerators = {gpu_type: 1}
+        info.handle.return_value.launched_resources.accelerators = {
+            gpu_type: count
+        }
         return info
 
     def test_provisioning_resolution_is_not_cached(self):
         autoscaler = self._make_autoscaler()
         info = self._make_replica('A100', common_utils.ProcessStatus.RUNNING)
-        self.assertEqual(autoscaler._get_gpu_type_from_replica_info(info),
-                         'A100')
+        self.assertEqual(autoscaler._get_gpu_shape_from_replica_info(info),
+                         ('A100', 1))
         # Failover rewrote the cluster record with a different accelerator
         # while the replica was still provisioning: it must be re-resolved.
-        info.handle.return_value.launched_resources.accelerators = {'L4': 1}
-        self.assertEqual(autoscaler._get_gpu_type_from_replica_info(info), 'L4')
+        info.handle.return_value.launched_resources.accelerators = {'L4': 4}
+        self.assertEqual(autoscaler._get_gpu_shape_from_replica_info(info),
+                         ('L4', 4))
 
     def test_resolution_cached_once_launch_succeeds(self):
         autoscaler = self._make_autoscaler()
-        info = self._make_replica('L4', common_utils.ProcessStatus.SUCCEEDED)
-        self.assertEqual(autoscaler._get_gpu_type_from_replica_info(info), 'L4')
-        self.assertEqual(autoscaler._get_gpu_type_from_replica_info(info), 'L4')
+        info = self._make_replica('L4',
+                                  common_utils.ProcessStatus.SUCCEEDED,
+                                  count=4)
+        self.assertEqual(autoscaler._get_gpu_shape_from_replica_info(info),
+                         ('L4', 4))
+        self.assertEqual(autoscaler._get_gpu_shape_from_replica_info(info),
+                         ('L4', 4))
         self.assertEqual(info.handle.call_count, 1)
+
+    def test_upscale_uses_observed_replica_capacity(self):
+        """Excess QPS equal to one 4-GPU replica's capacity must add ONE
+        replica, not four (per-GPU key + count-weighted fleet)."""
+        autoscaler = self._make_autoscaler()
+        autoscaler.target_qps_per_replica = {'L4': 0.1}
+        autoscaler.qps_window_size = 10
+        # Two READY 4-GPU replicas -> capacity 0.8 qps.
+        infos = []
+        for rid in (1, 2):
+            info = self._make_replica('L4',
+                                      common_utils.ProcessStatus.SUCCEEDED,
+                                      count=4)
+            info.replica_id = rid
+            info.status = serve_state.ReplicaStatus.READY
+            info.is_terminal = False
+            infos.append(info)
+        # 12 requests in a 10s window = 1.2 qps: 0.4 excess = exactly one
+        # more 4-GPU replica.
+        autoscaler.request_timestamps = [0.0] * 12
+        autoscaler.target_num_replicas = 2
+        autoscaler.upscale_counter = 0
+        autoscaler.downscale_counter = 0
+        autoscaler.scale_up_threshold = 1
+        autoscaler.scale_down_threshold = 1
+        autoscaler.min_replicas = 1
+        autoscaler.max_replicas = 20
+        autoscaler.num_overprovision = None
+        autoscaler._set_target_num_replicas_with_instance_aware_logic(infos)
+        self.assertEqual(autoscaler.target_num_replicas, 3)
+
+    def test_scale_from_zero_with_pending_traffic(self):
+        """min_replicas=0 + traffic + empty fleet must scale up, not
+        stay pinned at zero."""
+        autoscaler = self._make_autoscaler()
+        autoscaler.target_qps_per_replica = {'L4': 0.1}
+        autoscaler.qps_window_size = 10
+        # 2 requests in a 10s window = 0.2 qps -> 2 replicas at 0.1 each.
+        autoscaler.request_timestamps = [0.0] * 2
+        autoscaler.target_num_replicas = 0
+        autoscaler.upscale_counter = 0
+        autoscaler.downscale_counter = 0
+        autoscaler.scale_up_threshold = 1
+        autoscaler.scale_down_threshold = 1
+        autoscaler.min_replicas = 0
+        autoscaler.max_replicas = 20
+        autoscaler.num_overprovision = None
+        autoscaler._set_target_num_replicas_with_instance_aware_logic([])
+        self.assertEqual(autoscaler.target_num_replicas, 2)
+
+    def test_scale_down_prefers_earlier_lifecycle_status(self):
+        """A PROVISIONING replica must be selected before a READY one
+        even when the READY replica has lower weighted capacity."""
+        autoscaler = self._make_autoscaler()
+        autoscaler.target_qps_per_replica = {'L4': 0.1}
+        ready_small = self._make_replica('L4',
+                                         common_utils.ProcessStatus.SUCCEEDED,
+                                         count=1)
+        ready_small.replica_id = 1
+        ready_small.status = serve_state.ReplicaStatus.READY
+        ready_small.is_terminal = False
+        ready_small.version = 1
+        provisioning_big = self._make_replica(
+            'L4', common_utils.ProcessStatus.RUNNING, count=4)
+        provisioning_big.replica_id = 2
+        provisioning_big.status = serve_state.ReplicaStatus.PROVISIONING
+        provisioning_big.is_terminal = False
+        provisioning_big.version = 1
+        selected = autoscaler._select_replicas_to_scale_down_by_qps(
+            1, [ready_small, provisioning_big])
+        self.assertEqual(selected, [2])
+
+    def test_gpu_count_weights_capacity(self):
+        """A 4-GPU replica contributes 4x per-GPU capacity; an exact
+        shape key overrides with a per-replica value."""
+        autoscaler = self._make_autoscaler()
+        autoscaler.target_qps_per_replica = {'L4': 0.1}
+        self.assertAlmostEqual(
+            autoscaler._get_target_qps_for_gpu_shape('L4', 1), 0.1)
+        self.assertAlmostEqual(
+            autoscaler._get_target_qps_for_gpu_shape('L4', 4), 0.4)
+        # Exact shape key wins as a per-replica value (no multiplication).
+        autoscaler.target_qps_per_replica = {'L4': 0.1, 'L4:4': 0.3}
+        self.assertAlmostEqual(
+            autoscaler._get_target_qps_for_gpu_shape('L4', 4), 0.3)
+        # Count-suffixed key of a different count is normalized to per-GPU.
+        autoscaler.target_qps_per_replica = {'L4:2': 0.2}
+        self.assertAlmostEqual(
+            autoscaler._get_target_qps_for_gpu_shape('L4', 4), 0.4)
 
 
 if __name__ == '__main__':
