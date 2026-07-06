@@ -28,10 +28,6 @@ SPOT_PLACERS = {}
 DEFAULT_SPOT_PLACER = None
 SPOT_HEDGE_PLACER = 'dynamic_fallback'
 
-# SkyPilot's default kubernetes provision timeout (schemas.py default),
-# used only for the bench-TTL invariant warning below.
-_DEFAULT_K8S_PROVISION_TIMEOUT_SECONDS = 600
-
 # How long a location stays benched after a failed launch or a preemption
 # before it becomes eligible for a retry. Without this, a location marked
 # PREEMPTED is NEVER selected again (selection only draws from ACTIVE
@@ -460,11 +456,16 @@ class DynamicFallbackSpotPlacer(SpotPlacer,
             if str(location.cloud).lower() == 'kubernetes'
         })
         for context in k8s_contexts:
+            # Only an EXPLICITLY configured provision_timeout can violate
+            # the invariant: the built-in kubernetes default is dynamic
+            # (10s, capped at 60s) — far below any sane TTL.
             timeout = skypilot_config.get_effective_region_config(
                 cloud='kubernetes',
                 region=context,
                 keys=('provision_timeout',),
-                default_value=_DEFAULT_K8S_PROVISION_TIMEOUT_SECONDS)
+                default_value=None)
+            if timeout is None:
+                continue
             try:
                 timeout = float(timeout)
             except (TypeError, ValueError):

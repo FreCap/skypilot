@@ -362,8 +362,36 @@ class TestInstanceAwareGpuShapeCache(unittest.TestCase):
         cheap_spot = _replica(3, 0.11)
         selected = autoscaler._select_replicas_to_scale_down_by_qps(
             2, [free_k8s, paid_spot, cheap_spot])
-        # Most expensive first, zero-cost survives.
+        # Equal capacity (same type/qps): most expensive first, the
+        # zero-cost replica survives. Cost breaks ties AFTER qps so a
+        # high-capacity paid replica is never shed ahead of low-capacity
+        # free ones (the downscale target assumes top-capacity retention).
         assert selected == [2, 3]
+
+    def test_capacity_outranks_cost(self):
+        """A high-capacity paid replica outlives low-capacity free ones:
+        qps ranks before cost."""
+        autoscaler = self._make_autoscaler()
+        autoscaler._replica_cost_cache = {}
+        autoscaler.target_qps_per_replica = {'L4': 0.1, 'A100': 0.4}
+
+        def _replica(rid, gpu, cost):
+            info = self._make_replica(gpu, common_utils.ProcessStatus.SUCCEEDED)
+            info.replica_id = rid
+            info.status = serve_state.ReplicaStatus.READY
+            info.is_terminal = False
+            info.version = 1
+            info.handle.return_value.launched_resources.get_cost.return_value \
+                = cost
+            return info
+
+        big_paid = _replica(1, 'A100', 2.0)  # qps 0.4, expensive
+        small_free = _replica(2, 'L4', 0.0)  # qps 0.1, free
+        small_free2 = _replica(3, 'L4', 0.0)
+        selected = autoscaler._select_replicas_to_scale_down_by_qps(
+            1, [big_paid, small_free, small_free2])
+        # Lowest capacity goes first despite being free.
+        assert selected == [3]
 
     def test_scale_down_uniform_cost_order_unchanged(self):
         """Uniform-cost fleets keep the pre-change ordering exactly."""

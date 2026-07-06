@@ -1038,16 +1038,20 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
             except ValueError:
                 return len(status_order)
 
-        # Cost ranks IMMEDIATELY after lifecycle status: among equals,
-        # shed the most expensive replicas first (cloud spot before a
-        # zero-cost reserved pool). Uniform-cost fleets sort identically
-        # to before (the term is constant).
+        # Cost breaks ties AFTER capacity (qps): among replicas of equal
+        # serving capacity, shed the most expensive first (cloud spot
+        # before a zero-cost reserved pool). Cost must NOT outrank qps —
+        # the downscale target is computed assuming the highest-capacity
+        # replicas are kept, so shedding a high-capacity paid replica
+        # ahead of low-capacity free ones could leave less capacity than
+        # the target assumed. Uniform-capacity fleets (all per-type qps
+        # equal) get full cost-priority within each status tier.
         sorted_replicas = sorted(
             replica_infos,
             key=lambda info: (
                 _status_rank(info),
-                -self._get_hourly_cost_from_replica_info(info),
                 replica_qps_map.get(info.replica_id, float('inf')),
+                -self._get_hourly_cost_from_replica_info(info),
                 info.version,
                 -info.replica_id,
             ))
