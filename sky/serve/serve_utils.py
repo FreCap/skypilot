@@ -1045,6 +1045,13 @@ def resolve_target_qps_for_gpu_shape(
          ('L4:1' for an L4:8 replica) is normalized to per-GPU
          (value / key count) and multiplied by the replica's count.
     Returns None when nothing matches (caller picks its fallback).
+
+    NOTE: the per-GPU semantics of (2) and (3) assume ONE model instance
+    per GPU (each server pinned to a distinct device). For a model that
+    needs k GPUs per instance, per-GPU scaling would overcount capacity
+    by k: declare an exact per-replica shape key instead, e.g. a 2-GPU
+    model on L4:8 machines serving 4 instances at 0.1 qps each ->
+    {'L4:8': 0.4}.
     """
     exact_key = f'{gpu_type}:{gpu_count}'
     if exact_key in target_qps_per_replica:

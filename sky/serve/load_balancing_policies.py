@@ -243,6 +243,8 @@ class InstanceAwareLeastLoadPolicy(LeastLoadPolicy,
           2. bare type key ('L4') -> per-GPU value, x count;
           3. other count-suffixed key of the same type ('L4:1') ->
              normalized to per-GPU (value / key count), x count.
+        Per-GPU semantics assume one model instance per GPU; models
+        needing k GPUs per instance must use exact shape keys.
         """
         # Exact shape match first
         exact_key = f'{accelerator_type}:{accelerator_count}'
