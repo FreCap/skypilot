@@ -41,3 +41,45 @@ def test_no_token_no_auth_header(monkeypatch):
                        'https://raw.githubusercontent.com/example/cat/master')
     monkeypatch.delenv('SKYPILOT_HOSTED_CATALOG_TOKEN', raising=False)
     assert 'Authorization' not in common.hosted_catalog_request_headers()
+
+
+class _FakeResponse:
+
+    def __init__(self, text):
+        self.text = text
+        self.status_code = 200
+
+    def raise_for_status(self):
+        pass
+
+
+def test_source_change_invalidates_fresh_cache(monkeypatch, tmp_path):
+    """Switching catalog source must refetch immediately, not serve the old
+    source's data until the pull interval expires."""
+    monkeypatch.setattr(common, '_ABSOLUTE_VERSIONED_CATALOG_DIR',
+                        str(tmp_path))
+    monkeypatch.delenv('SKYPILOT_HOSTED_CATALOG_DIR_URL', raising=False)
+    requested_urls = []
+
+    def fake_get(url, headers=None):
+        del headers
+        requested_urls.append(url)
+        return _FakeResponse('InstanceType,Region\nx1,us-east-1\n')
+
+    monkeypatch.setattr(common.requests, 'get', fake_get)
+
+    # First read downloads from the default source and records it.
+    common.read_catalog('do/test-vms.csv', pull_frequency_hours=7).columns  # pylint: disable=expression-not-assigned
+    assert len(requested_urls) == 1
+    assert requested_urls[0].startswith(constants.HOSTED_CATALOG_DIR_URL)
+
+    # Second read within the pull interval: cache hit, no request.
+    common.read_catalog('do/test-vms.csv', pull_frequency_hours=7).columns  # pylint: disable=expression-not-assigned
+    assert len(requested_urls) == 1
+
+    # Source switch: the still-fresh cache must be invalidated.
+    monkeypatch.setenv('SKYPILOT_HOSTED_CATALOG_DIR_URL',
+                       'https://mirror.example.com/catalogs')
+    common.read_catalog('do/test-vms.csv', pull_frequency_hours=7).columns  # pylint: disable=expression-not-assigned
+    assert len(requested_urls) == 2
+    assert requested_urls[1].startswith('https://mirror.example.com/catalogs')
