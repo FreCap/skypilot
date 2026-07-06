@@ -597,6 +597,103 @@ class TestScaleUpBatch:
         assert launched == [1, 3]
 
 
+class TestLaunchReplicaSnapshotAccumulation:
+    """Bulk launches sharing one snapshot must see in-wave placements.
+
+    Recovery re-drive passes a single existing_replica_infos snapshot
+    across a whole wave of launches; without appending each newly placed
+    replica, every launch in the wave computes identical load counts and
+    the spot placer pins the entire wave to one location.
+    """
+
+    def _make_manager(self, placer):
+        # pylint: disable=protected-access
+        manager = replica_managers.SkyPilotReplicaManager.__new__(
+            replica_managers.SkyPilotReplicaManager)
+        manager._service_name = 'svc'
+        manager.yaml_content = 'dummy: yaml'
+        manager.latest_version = 1
+        manager._launch_thread_pool = thread_utils.ThreadSafeDict()
+        manager._replica_to_request_id = thread_utils.ThreadSafeDict()
+        manager._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
+        manager._spot_placer = placer
+        return manager
+
+    def test_wave_launches_see_prior_in_wave_placements(self):
+        # pylint: disable=protected-access
+        placer = mock.Mock()
+        seen_current_locations = []
+
+        def _select(current_locations):
+            seen_current_locations.append(list(current_locations))
+            location = mock.Mock()
+            location.to_dict.return_value = {'zone': 'z'}
+            return location
+
+        placer.select_next_location.side_effect = _select
+        manager = self._make_manager(placer)
+        shared_snapshot = []
+
+        def _fake_replica_info_ctor(replica_id, *_args, **_kwargs):
+            info = mock.Mock()
+            info.replica_id = replica_id
+            info.is_spot = True
+            return info
+
+        with mock.patch('sky.serve.replica_managers._should_use_spot',
+                        return_value=True), \
+             mock.patch('sky.serve.replica_managers.ReplicaInfo',
+                        side_effect=_fake_replica_info_ctor), \
+             mock.patch(
+                 'sky.serve.replica_managers.serve_state'
+                 '.add_or_update_replica'), \
+             mock.patch(
+                 'sky.serve.replica_managers.serve_utils'
+                 '.generate_replica_launch_log_file_name',
+                 return_value='/tmp/launch.log'), \
+             mock.patch('sky.serve.replica_managers._get_resources_ports',
+                        return_value='8080'), \
+             mock.patch('sky.serve.replica_managers.thread_utils.SafeThread'):
+            manager._launch_replica(replica_id=1,
+                                    existing_replica_infos=shared_snapshot)
+            manager._launch_replica(replica_id=2,
+                                    existing_replica_infos=shared_snapshot)
+
+        # The snapshot accumulated both newly placed replicas...
+        assert len(shared_snapshot) == 2
+        assert [info.replica_id for info in shared_snapshot] == [1, 2]
+        # ...and the second placement saw the first replica's location.
+        assert seen_current_locations[0] == []
+        assert len(seen_current_locations[1]) == 1
+
+    def test_fresh_scan_path_does_not_leak_appends(self):
+        # pylint: disable=protected-access
+        placer = mock.Mock()
+        location = mock.Mock()
+        location.to_dict.return_value = {'zone': 'z'}
+        placer.select_next_location.return_value = location
+        manager = self._make_manager(placer)
+
+        with mock.patch('sky.serve.replica_managers._should_use_spot',
+                        return_value=True), \
+             mock.patch(
+                 'sky.serve.replica_managers.serve_state.get_replica_infos',
+                 return_value=[]) as mock_scan, \
+             mock.patch(
+                 'sky.serve.replica_managers.serve_state'
+                 '.add_or_update_replica'), \
+             mock.patch(
+                 'sky.serve.replica_managers.serve_utils'
+                 '.generate_replica_launch_log_file_name',
+                 return_value='/tmp/launch.log'), \
+             mock.patch('sky.serve.replica_managers._get_resources_ports',
+                        return_value='8080'), \
+             mock.patch('sky.serve.replica_managers.thread_utils.SafeThread'):
+            manager._launch_replica(replica_id=1)
+        # Without a caller-provided snapshot each launch scans fresh state.
+        assert mock_scan.call_count == 1
+
+
 class TestRecoveryRetryAndIsolation:
     """A failed recovery pass must retry (previously a recovery exception
     failed the boot and the HA daemon retried via respawn; the recovery

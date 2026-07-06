@@ -1058,6 +1058,13 @@ class SkyPilotReplicaManager(ReplicaManager):
         info = ReplicaInfo(replica_id, cluster_name, replica_port, use_spot,
                            location, self.latest_version, resources_override)
         serve_state.add_or_update_replica(self._service_name, replica_id, info)
+        if existing_replica_infos is not None:
+            # Bulk callers (recovery re-drive) reuse one snapshot across a
+            # whole wave of launches. Append the replica we just placed so
+            # the spot placer sees in-wave assignments and spreads the wave
+            # across locations instead of pinning every launch to the
+            # least-loaded location of the frozen snapshot.
+            existing_replica_infos.append(info)
         # Don't start right now; we will start it later in _refresh_thread_pool
         # to avoid too many sky.launch running at the same time.
         self._launch_thread_pool[replica_id] = t
