@@ -39,6 +39,12 @@ POLL_INTERVAL_SECONDS = 2
 # Default KillWait is 30 seconds, so we add some buffer time here.
 _JOB_TERMINATION_TIMEOUT_SECONDS = 60
 
+# Grace period given to in-job processes to exit after the initial TERM
+# signal during termination, before termination is enforced with a plain
+# scancel.
+_TERMINATION_POLL_INTERVAL_SECONDS = 5
+_TERMINATION_GRACE_POLLS = 3
+
 # sbatch options that SkyPilot controls and must not be overridden by users.
 # These are either set dynamically based on the resource spec, or are required
 # for SkyPilot's job lifecycle management.
@@ -1023,10 +1029,29 @@ def terminate_instances(
             f'Job for cluster {cluster_name_on_cloud} is already completing. '
             'No action needed.')
     else:
-        # For other states (e.g., RUNNING, SUSPENDED), send a TERM signal.
+        # For other states (e.g., RUNNING, SUSPENDED), send a TERM signal
+        # first so in-job processes can shut down gracefully.
         client.cancel_jobs_by_name(cluster_name_on_cloud,
                                    signal='TERM',
                                    full=True)
+        # `scancel --signal=TERM` only delivers the signal; it does NOT
+        # mark the job for termination. If any process in the batch step
+        # survives TERM (e.g., a user-launched server), the batch script
+        # never exits and the allocation leaks indefinitely. Wait briefly
+        # for a graceful exit, then enforce termination with a plain
+        # scancel (Slurm escalates TERM -> KillWait -> KILL).
+        for _ in range(_TERMINATION_GRACE_POLLS):
+            time.sleep(_TERMINATION_POLL_INTERVAL_SECONDS)
+            jobs_state = client.get_jobs_state_by_name(cluster_name_on_cloud)
+            if not jobs_state:
+                return
+            state = jobs_state[0].strip()
+            if state in terminal_states or state == 'COMPLETING':
+                return
+        logger.info(f'Job for cluster {cluster_name_on_cloud} is still '
+                    'running after the TERM grace period; enforcing '
+                    'termination with scancel.')
+        client.cancel_jobs_by_name(cluster_name_on_cloud, signal=None)
 
 
 def open_ports(

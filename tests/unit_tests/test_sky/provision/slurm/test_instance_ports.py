@@ -50,5 +50,51 @@ class TestQueryPorts(unittest.TestCase):
         self.assertEqual(endpoints, {})
 
 
+class TestTerminateEscalation(unittest.TestCase):
+    """terminate_instances must enforce termination if TERM is survived."""
+
+    def _run_terminate(self, states_after_term):
+        """Run terminate_instances against a fake client.
+
+        states_after_term: sequence of job-state lists returned by
+        successive get_jobs_state_by_name calls after the initial
+        RUNNING answer.
+        """
+        client = mock.Mock()
+        client.get_jobs_state_by_name.side_effect = (
+            [['RUNNING']] + list(states_after_term))
+        with mock.patch.object(slurm_instance.slurm,
+                               'SlurmClient',
+                               return_value=client), \
+             mock.patch.object(slurm_instance.slurm_utils,
+                               'is_inside_slurm_cluster',
+                               return_value=False), \
+             mock.patch.object(slurm_instance.time, 'sleep'):
+            slurm_instance.terminate_instances(
+                'cluster-abc',
+                provider_config={
+                    'ssh': {
+                        'hostname': 'login',
+                        'port': 22,
+                        'user': 'u',
+                    }
+                })
+        return client
+
+    def test_graceful_exit_needs_no_escalation(self):
+        client = self._run_terminate([[]])
+        client.cancel_jobs_by_name.assert_called_once_with('cluster-abc',
+                                                           signal='TERM',
+                                                           full=True)
+
+    def test_surviving_job_gets_enforced_scancel(self):
+        polls = slurm_instance._TERMINATION_GRACE_POLLS
+        client = self._run_terminate([['RUNNING']] * polls)
+        self.assertEqual(client.cancel_jobs_by_name.call_args_list, [
+            mock.call('cluster-abc', signal='TERM', full=True),
+            mock.call('cluster-abc', signal=None),
+        ])
+
+
 if __name__ == '__main__':
     unittest.main()
