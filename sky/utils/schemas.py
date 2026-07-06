@@ -1005,9 +1005,12 @@ def get_service_schema():
                             {
                                 'type': 'object',
                                 'patternProperties': {
-                                    # Pattern for accelerator types like
-                                    # "H100:1", "A100:1", "H100", "A100"
-                                    '^[A-Z0-9]+(?::[0-9]+)?$': {
+                                    # Accelerator types with optional count:
+                                    # "H100:1", "A100", and hyphenated
+                                    # variants like "A100-80GB:1" or
+                                    # "H100-MEGA-80GB" (real catalog names
+                                    # include hyphens).
+                                    '^[A-Za-z0-9-]+(?::[0-9]+)?$': {
                                         'type': 'number',
                                         'minimum': 0,
                                     }
