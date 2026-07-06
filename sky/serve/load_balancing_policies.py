@@ -134,8 +134,17 @@ class LeastLoadPolicy(LoadBalancingPolicy, name='least_load', default=True):
         if not self.ready_replicas:
             return None
         with self.lock:
-            return min(self.ready_replicas,
-                       key=lambda replica: self.load_map.get(replica, 0))
+            min_load = min(
+                self.load_map.get(replica, 0)
+                for replica in self.ready_replicas)
+            # Random tie-break: deterministic min() over URL order biases
+            # cold starts (all-zero loads) onto the same replica wave
+            # after wave.
+            candidates = [
+                replica for replica in self.ready_replicas
+                if self.load_map.get(replica, 0) == min_load
+            ]
+            return random.choice(candidates)
 
     def pre_execute_hook(self, replica_url: str,
                          request: 'fastapi.Request') -> None:
@@ -147,7 +156,12 @@ class LeastLoadPolicy(LoadBalancingPolicy, name='least_load', default=True):
                           request: 'fastapi.Request') -> None:
         del request  # Unused.
         with self.lock:
-            self.load_map[replica_url] -= 1
+            # Only decrement live keys, clamped at zero: a replica pruned
+            # from the ready set mid-stream must not be recreated at -1
+            # (phantom capacity that would attract traffic on re-add).
+            if replica_url in self.load_map:
+                self.load_map[replica_url] = max(0,
+                                                 self.load_map[replica_url] - 1)
 
 
 class InstanceAwareLeastLoadPolicy(LeastLoadPolicy,
@@ -281,8 +295,14 @@ class InstanceAwareLeastLoadPolicy(LeastLoadPolicy,
                 normalized_load = self._get_normalized_load(replica)
                 replica_loads.append((replica, normalized_load))
 
-            # Select replica with minimum normalized load
-            selected_replica = min(replica_loads, key=lambda x: x[1])[0]
+            # Select among the (near-)minimum normalized loads at random:
+            # deterministic min() over URL order biases cold starts.
+            min_load = min(load for _, load in replica_loads)
+            candidates = [
+                replica for replica, load in replica_loads
+                if load - min_load <= 1e-9
+            ]
+            selected_replica = random.choice(candidates)
             logger.debug('Available replicas and loads: %s', replica_loads)
             logger.debug('Selected replica: %s', selected_replica)
             return selected_replica
