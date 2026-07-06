@@ -380,6 +380,17 @@ class SkyServiceSpec:
                         'When using dict type target_qps_per_replica, '
                         'load_balancing_policy must be '
                         '"instance_aware_least_load".')
+            # On-demand fallback routes to FallbackRequestRateAutoscaler,
+            # which sizes with the float-only request-rate math and rejects
+            # dict targets at runtime (after the service is already up).
+            if (service_config.get('dynamic_ondemand_fallback') or
+                    service_config.get('base_ondemand_fallback_replicas')):
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        'Dict type target_qps_per_replica is not supported '
+                        'with on-demand fallback '
+                        '(dynamic_ondemand_fallback / '
+                        'base_ondemand_fallback_replicas).')
 
         if load_balancing_policy == 'instance_aware_least_load':
             if not isinstance(target_qps_per_replica, dict):

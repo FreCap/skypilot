@@ -33,3 +33,17 @@ def test_plain_and_counted_keys_still_accepted():
 def test_garbage_keys_still_rejected():
     with pytest.raises(jsonschema.ValidationError):
         _validate({'not a gpu name!': 0.1})
+
+
+def test_empty_dict_rejected():
+    # An empty dict has no sizing signal and feeds max() on an empty
+    # sequence in the instance-aware autoscaler.
+    with pytest.raises(jsonschema.ValidationError):
+        _validate({})
+
+
+def test_zero_value_rejected():
+    # A zero value gives that shape zero capacity and feeds divisions in
+    # the instance-aware autoscaler and load balancer.
+    with pytest.raises(jsonschema.ValidationError):
+        _validate({'L4': 0})
