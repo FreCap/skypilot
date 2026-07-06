@@ -70,6 +70,12 @@ LB_MAX_RETRY = 3
 # https://github.com/lm-sys/FastChat/blob/f2e6ca964af7ad0585cadcf16ab98e57297e2133/fastchat/constants.py#L39 # pylint: disable=line-too-long
 DEFAULT_LB_STREAM_TIMEOUT = 120
 
+# Connect timeout for the LB -> replica hop, independent of the stream
+# (read) timeout above: connections to a preempted-but-still-routed
+# replica must fail fast into the retry loop even when the stream
+# timeout is sized for hour-long synchronous predictions.
+LB_CONNECT_TIMEOUT_SECONDS = 10
+
 # Default interval in seconds to probe replica endpoint.
 DEFAULT_ENDPOINT_PROBE_INTERVAL_SECONDS = 10
 # Backward compatibility alias.
