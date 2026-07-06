@@ -2115,7 +2115,12 @@ def provision_logs(provision_logs_body: payloads.ProvisionLogsBody,
         if not log_path.exists():
             raise fastapi.HTTPException(
                 status_code=404,
-                detail=f'Provision log path does not exist: {str(log_path)}')
+                detail=(f'Provision log path does not exist: {str(log_path)}. '
+                        'The API server has likely restarted since this '
+                        'cluster was launched, and provision logs are stored '
+                        'on the API server\'s local disk, so the log did not '
+                        'survive the restart. Relaunch the cluster to '
+                        'generate fresh provisioning logs.'))
 
     # stream worker node logs
     else:
@@ -3504,6 +3509,13 @@ if __name__ == '__main__':
     # whether the recovery transitions actually ran and completed; only then
     # is it safe to re-enqueue the surviving queued rows below.
     requests_recovered = requests_lib.recover_db_and_logs()
+    # Surface clusters wedged in INIT by work that died with the previous
+    # server run (or with the pod's disk on a redeploy): record a cluster
+    # event explaining the interruption. Must run after request rows are
+    # reconciled above (so re-enqueueable requests are excluded) and before
+    # the server accepts traffic (so no new launch is mistaken for a dead
+    # one). Best effort; never blocks startup.
+    requests_lib.surface_interrupted_cluster_launches()
     # Restore the server user hash
     logger.info('Initializing server user hash')
     _init_or_restore_server_user_hash()

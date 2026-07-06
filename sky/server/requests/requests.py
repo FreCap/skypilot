@@ -40,6 +40,7 @@ from sky.server.requests.serializers import return_value_serializers
 from sky.skylet import constants as skylet_constants
 from sky.utils import asyncio_utils
 from sky.utils import common_utils
+from sky.utils import status_lib
 from sky.utils import ux_utils
 from sky.utils.db import db_utils
 
@@ -919,6 +920,54 @@ def recover_db_and_logs() -> bool:
                        f'{common_utils.format_exception(e)}')
         reset_db_and_logs()
         return False
+
+
+def surface_interrupted_cluster_launches() -> None:
+    """Record a cluster event for INIT clusters whose in-flight work died.
+
+    Runs once at startup, after the request rows from the previous server run
+    have been reconciled (``recover_db_and_logs``) and before the server
+    accepts traffic. A cluster is left in INIT by a launch (or restart) that
+    did not complete; if the request driving it died with the previous server
+    process -- or its request row died with the pod's ephemeral disk on a
+    redeploy, in which case recovery finds nothing to reconcile -- the cluster
+    wedges in INIT with no user-visible explanation: ``sky status`` shows INIT
+    indefinitely and the provision-log endpoint 404s (the log file lived on
+    the old server's disk). We cannot resume the work, but we can record why
+    the cluster is stuck.
+
+    Clusters that still have an active request row are skipped: those rows
+    survived reconciliation (PENDING/WAITING) and will be re-enqueued, so
+    their work resumes. Best effort -- a failure here must never block
+    startup.
+    """
+    try:
+        init_clusters = global_user_state.get_cluster_names_by_status(
+            status_lib.ClusterStatus.INIT)
+        if not init_clusters:
+            return
+        active = request_storage.get_request_backend().query_requests(
+            req_filter=RequestTaskFilter(
+                status=RequestStatus.active_statuses(),
+                cluster_names=init_clusters,
+                fields=['request_id', COL_CLUSTER_NAME]))
+        clusters_with_active_request = {req.cluster_name for req in active}
+        for cluster_name in init_clusters:
+            if cluster_name in clusters_with_active_request:
+                continue
+            global_user_state.add_cluster_event(
+                cluster_name,
+                None,
+                'API server restarted while this cluster was in INIT with no '
+                'live request operating on it; any in-flight launch was '
+                'interrupted and its provision logs may be lost. Re-run '
+                '`sky launch` to recover the cluster, or `sky down` to '
+                'release its resources.',
+                global_user_state.ClusterEventType.STATUS_CHANGE,
+                nop_if_duplicate=True)
+    except Exception as e:  # pylint: disable=broad-except
+        logger.debug('Could not surface interrupted cluster launches during '
+                     f'API server startup (continuing): {e}')
 
 
 def request_lock_path(request_id: str) -> str:
