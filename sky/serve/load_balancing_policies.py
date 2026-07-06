@@ -231,9 +231,12 @@ class InstanceAwareLeastLoadPolicy(LeastLoadPolicy,
             for r in list(self.load_map.keys()):
                 if r not in ready_replicas:
                     del self.load_map[r]
-            # Initialize load for new replicas
+            # Initialize load for new replicas. Same generation bump as
+            # the base class: releases from before a prune must not
+            # decrement a re-added key's fresh counter (ABA).
             for replica in ready_replicas:
                 if replica not in self.load_map:
+                    self._generation[replica] += 1
                     self.load_map[replica] = 0
 
     def set_replica_info(self, replica_info: Dict[str, Dict[str, Any]]) -> None:

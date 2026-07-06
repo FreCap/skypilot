@@ -61,6 +61,18 @@ class TestLoadMapPairing:
         policy.post_execute_hook('http://a:8080', None, token_old)
         assert policy.load_map['http://a:8080'] == 1
 
+    def test_stale_generation_ignored_instance_aware_policy(self):
+        """The instance-aware subclass overrides set_ready_replicas and
+        must apply the same generation bump (codex round-3 catch)."""
+        policy = lb_policies.InstanceAwareLeastLoadPolicy()
+        policy.set_ready_replicas(['http://a:8080', 'http://b:8080'])
+        token_old = policy.pre_execute_hook('http://a:8080', None)
+        policy.set_ready_replicas(['http://b:8080'])
+        policy.set_ready_replicas(['http://a:8080', 'http://b:8080'])
+        policy.pre_execute_hook('http://a:8080', None)
+        policy.post_execute_hook('http://a:8080', None, token_old)
+        assert policy.load_map['http://a:8080'] == 1
+
     def test_post_clamps_at_zero(self):
         policy = _make_least_load()
         policy.post_execute_hook('http://b:8080', None)
