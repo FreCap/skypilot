@@ -1049,18 +1049,22 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
         #
         # PER-MACHINE vs PER-GPU: the cost used here is the replica's
         # whole-machine hourly cost, and that is deliberate. Because cost
-        # only compares replicas of EQUAL weighted capacity, machine cost
-        # ranks identically to cost-per-unit-of-serving-capacity (same
-        # denominator) — the economically correct metric. It is strictly
-        # better than per-GPU price, which would misrank GPU types with
-        # different throughput (an A100:1 at \$2/hr serving 0.4 qps beats
-        # an L4:4 at \$2.40/hr serving the same 0.4 qps, despite the L4s'
-        # lower per-GPU price).
+        # only compares replicas of equal RESOLVED qps (the configured
+        # per-type targets, count-weighted — for unresolved shapes the
+        # min-qps fallback applies, so this is not a guarantee about TRUE
+        # capacity), machine cost ranks identically to cost-per-unit-of-
+        # serving-capacity (same denominator) — the economically correct
+        # metric. It is strictly better than per-GPU price, which would
+        # misrank GPU types with different throughput (an A100:1 at
+        # \$2/hr serving 0.4 qps beats an L4:4 at \$2.40/hr serving the
+        # same 0.4 qps, despite the L4s' lower per-GPU price). The qps
+        # key is quantized so float noise (3 * 0.1 != 0.3) cannot split
+        # mathematically equal capacities away from the cost tie-break.
         sorted_replicas = sorted(
             replica_infos,
             key=lambda info: (
                 _status_rank(info),
-                replica_qps_map.get(info.replica_id, float('inf')),
+                round(replica_qps_map.get(info.replica_id, float('inf')), 9),
                 -self._get_hourly_cost_from_replica_info(info),
                 info.version,
                 -info.replica_id,

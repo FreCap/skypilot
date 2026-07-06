@@ -396,6 +396,32 @@ class TestInstanceAwareGpuShapeCache(unittest.TestCase):
             1, [a100, l4x4])
         assert selected == [2]
 
+    def test_float_noise_does_not_split_equal_capacity_ties(self):
+        """3 * 0.1 != 0.3 in floats: quantization must keep the
+        mathematically equal capacities in one cost tie-break bucket."""
+        autoscaler = self._make_autoscaler()
+        autoscaler._replica_cost_cache = {}
+        autoscaler.target_qps_per_replica = {'A100': 0.3, 'L4': 0.1}
+
+        def _replica(rid, gpu, count, cost):
+            info = self._make_replica(gpu,
+                                      common_utils.ProcessStatus.SUCCEEDED,
+                                      count=count)
+            info.replica_id = rid
+            info.status = serve_state.ReplicaStatus.READY
+            info.is_terminal = False
+            info.version = 1
+            info.handle.return_value.launched_resources.get_cost.return_value \
+                = cost
+            return info
+
+        a100 = _replica(1, 'A100', 1, 1.5)  # 0.3 qps
+        l4x3 = _replica(2, 'L4', 3, 1.8)  # 3 * 0.1 qps (float-noisy)
+        selected = autoscaler._select_replicas_to_scale_down_by_qps(
+            1, [a100, l4x3])
+        # Same capacity bucket after quantization -> pricier machine goes.
+        assert selected == [2]
+
     def test_capacity_outranks_cost(self):
         """A high-capacity paid replica outlives low-capacity free ones:
         qps ranks before cost."""
