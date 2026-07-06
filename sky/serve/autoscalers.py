@@ -1109,9 +1109,13 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
         # an optimistic estimate self-corrects instead of over-launching.
         assert isinstance(self.target_qps_per_replica, dict), \
             'InstanceAware Autoscaler requires dict type target_qps_per_replica'
+        max_target_qps = max(self.target_qps_per_replica.values())
+        # The schema allows 0 values; an all-zero dict means no rate-based
+        # sizing signal, same as target_qps_per_replica=None.
+        if max_target_qps <= 0:
+            return self.min_replicas
         num_requests_per_second = len(
             self.request_timestamps) / self.qps_window_size
-        max_target_qps = max(self.target_qps_per_replica.values())
         return self._clip_target_num_replicas(
             math.ceil(num_requests_per_second / max_target_qps))
 

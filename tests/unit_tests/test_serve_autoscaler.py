@@ -567,3 +567,9 @@ class TestInstanceAwareUpdateVersion(unittest.TestCase):
         autoscaler.update_version(2, self._spec({'L4': 0.5}),
                                   serve_utils.DEFAULT_UPDATE_MODE)
         self.assertEqual(autoscaler.target_num_replicas, 2)
+
+    def test_all_zero_dict_falls_back_to_min_replicas(self):
+        autoscaler = self._make_autoscaler({'L4': 0.0})
+        autoscaler.request_timestamps = [0.0] * autoscaler.qps_window_size
+        self.assertEqual(autoscaler._calculate_target_num_replicas(),
+                         autoscaler.min_replicas)
