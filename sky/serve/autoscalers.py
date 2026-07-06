@@ -648,6 +648,9 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
         # ticks. After launch the shape is fixed for the replica's lifetime.
         # Pruned to the live replica set each tick.
         self._gpu_shape_cache: Dict[int, Tuple[str, int]] = {}
+        # replica_id -> hourly cost of launched resources (same lifecycle
+        # rules as the shape cache).
+        self._replica_cost_cache: Dict[int, float] = {}
 
     def _generate_scaling_decisions(
         self,
@@ -660,6 +663,9 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
         for replica_id in list(self._gpu_shape_cache):
             if replica_id not in live_replica_ids:
                 del self._gpu_shape_cache[replica_id]
+        for replica_id in list(self._replica_cost_cache):
+            if replica_id not in live_replica_ids:
+                del self._replica_cost_cache[replica_id]
 
         # Always use instance-aware logic
         # since target_qps_per_replica is guaranteed to be dict
@@ -896,6 +902,34 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
                        f'Using minimum QPS as fallback.')
         return min(target_qps_dict.values())
 
+    def _get_hourly_cost_from_replica_info(
+            self, replica_info: 'replica_managers.ReplicaInfo') -> float:
+        """Hourly cost of a replica's launched resources (0.0 = reserved).
+
+        Used to prefer scaling down PAID replicas before zero-cost ones
+        (e.g. cloud spot before a reserved Kubernetes pool) — without
+        this, shedding the expensive replica first is luck, not policy.
+        Unknown costs resolve to 0.0 (treated like reserved capacity, so
+        they are shed last — the conservative direction for cost).
+        """
+        cached = self._replica_cost_cache.get(replica_info.replica_id)
+        if cached is not None:
+            return cached
+        cost = 0.0
+        try:
+            handle = replica_info.handle()
+            if handle is not None:
+                # Coerce: anything non-numeric degrades to 0.0 (shed last).
+                cost = float(handle.launched_resources.get_cost(seconds=3600))
+        except Exception:  # pylint: disable=broad-except
+            cost = 0.0
+        # Same post-launch-only cache rule as the shape memo: while the
+        # replica is provisioning the record may be rewritten by failover.
+        if (replica_info.status_property.sky_launch_status ==
+                common_utils.ProcessStatus.SUCCEEDED):
+            self._replica_cost_cache[replica_info.replica_id] = cost
+        return cost
+
     def _get_gpu_shape_from_replica_info(
             self,
             replica_info: 'replica_managers.ReplicaInfo') -> Tuple[str, int]:
@@ -1004,11 +1038,20 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
             except ValueError:
                 return len(status_order)
 
+        # Cost breaks ties AFTER capacity (qps): among replicas of equal
+        # serving capacity, shed the most expensive first (cloud spot
+        # before a zero-cost reserved pool). Cost must NOT outrank qps —
+        # the downscale target is computed assuming the highest-capacity
+        # replicas are kept, so shedding a high-capacity paid replica
+        # ahead of low-capacity free ones could leave less capacity than
+        # the target assumed. Uniform-capacity fleets (all per-type qps
+        # equal) get full cost-priority within each status tier.
         sorted_replicas = sorted(
             replica_infos,
             key=lambda info: (
                 _status_rank(info),
                 replica_qps_map.get(info.replica_id, float('inf')),
+                -self._get_hourly_cost_from_replica_info(info),
                 info.version,
                 -info.replica_id,
             ))
