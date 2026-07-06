@@ -103,6 +103,11 @@ class TestHeterogeneousLocations:
         # VM-selected launch clearing the k8s entry's docker image.
         assert 'image_id' in d and d['image_id'] is None
         assert 'disk_tier' in d and d['disk_tier'] is None
+        # accelerators likewise unconditional: a CPU-only location must
+        # strip GPU entries' accelerators from its copies.
+        cpu_only = _make_location('cpu-region', accelerators=None)
+        d_cpu = cpu_only.to_dict()
+        assert 'accelerators' in d_cpu and d_cpu['accelerators'] is None
 
     def test_pickleable_roundtrip_and_backcompat(self):
         with mock.patch.object(spot_placer.registry.CLOUD_REGISTRY,

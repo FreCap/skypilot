@@ -141,9 +141,13 @@ class Location:
             'region': self.region,
             'zone': self.zone,
             'use_spot': self.use_spot,
+            # Unconditional (None clears), like image_id/disk_tier below:
+            # a CPU-only location must strip GPU entries' accelerators
+            # from its copies. Safe for legacy shape-less pickled rows —
+            # to_dict is only called on enumerated locations (selection
+            # draws from location2status), never on deserialized rows.
+            'accelerators': self.accelerators,
         }
-        if self.accelerators is not None:
-            d['accelerators'] = self.accelerators
         # image_id and disk_tier are ALWAYS included (None clears): the
         # override is applied to every any_of entry, so a location without
         # the attribute must strip it from entries that carry it — a
