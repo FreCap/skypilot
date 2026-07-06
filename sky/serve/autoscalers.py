@@ -937,7 +937,7 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
         # across ticks.
         ready_old.sort(key=lambda pair: (-pair[0], pair[1].replica_id))
 
-        keep_ids = set()
+        keep_ids: Set[int] = set()
         covered_qps = 0.0
         for capacity, info in ready_old:
             if covered_qps >= shortfall and len(keep_ids) >= keep_count_floor:
