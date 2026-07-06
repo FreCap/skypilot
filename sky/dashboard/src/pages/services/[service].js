@@ -34,22 +34,21 @@ function useServiceDetails({ serviceName }) {
   //   1. summary_only — near-instant; renders the header/summary card.
   //   2. full — per-replica table; takes tens of seconds at fleet scale,
   //      fills in when it lands.
-  const summaryArgs = [{ serviceNames: [serviceName], summaryOnly: true }];
-  const fullArgs = [{ serviceNames: [serviceName] }];
-
   const fetchData = useCallback(async () => {
     if (!serviceName) return;
     setLoading(true);
     setReplicasLoading(true);
+    // Ordering within THIS invocation only: once the full result has
+    // landed, a later-resolving summary must not overwrite it — but a
+    // fresh summary must still replace whatever an earlier invocation
+    // left behind.
+    let fullLanded = false;
     const summaryPromise = dashboardCache
       .get(getServices, [{ serviceNames: [serviceName], summaryOnly: true }])
       .then(({ services }) => {
+        if (fullLanded) return;
         const found = (services || []).find((s) => s.name === serviceName);
-        // Never regress the view: the full record may have landed first
-        // (e.g. from cache); only show the summary while we have nothing.
-        setServiceData((prev) =>
-          prev && !prev.summaryOnly ? prev : found || null
-        );
+        setServiceData(found || null);
       })
       .catch((error) => {
         console.error('Failed to fetch service summary:', error);
@@ -60,6 +59,7 @@ function useServiceDetails({ serviceName }) {
       .then(({ services }) => {
         const found = (services || []).find((s) => s.name === serviceName);
         if (found) {
+          fullLanded = true;
           setServiceData(found);
         }
       })
@@ -75,11 +75,10 @@ function useServiceDetails({ serviceName }) {
   }, [fetchData]);
 
   const refreshData = useCallback(async () => {
-    dashboardCache.invalidate(getServices, summaryArgs);
-    dashboardCache.invalidate(getServices, fullArgs);
+    // Drop every args-keyed getServices variant (summary and full).
+    dashboardCache.invalidateFunction(getServices);
     await fetchData();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fetchData, serviceName]);
+  }, [fetchData]);
 
   return { serviceData, loading, replicasLoading, refreshData };
 }

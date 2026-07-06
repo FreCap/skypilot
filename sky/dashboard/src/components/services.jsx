@@ -99,7 +99,9 @@ export function Services() {
   const [lastFetchedTime, setLastFetchedTime] = useState(null);
 
   const handleRefresh = () => {
-    dashboardCache.invalidate(getServices);
+    // The cache is args-keyed; drop every getServices variant
+    // (summary and full) so refresh always refetches.
+    dashboardCache.invalidateFunction(getServices);
     if (refreshDataRef.current) {
       refreshDataRef.current();
     }
