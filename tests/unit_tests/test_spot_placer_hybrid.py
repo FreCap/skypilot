@@ -98,6 +98,11 @@ class TestHeterogeneousLocations:
         d = k8s.to_dict()
         assert d['accelerators'] == {'A100': 1}
         assert d['use_spot'] is False
+        # image_id/disk_tier are always present (None clears): a location
+        # without them must strip them from every copied entry — e.g. a
+        # VM-selected launch clearing the k8s entry's docker image.
+        assert 'image_id' in d and d['image_id'] is None
+        assert 'disk_tier' in d and d['disk_tier'] is None
 
     def test_pickleable_roundtrip_and_backcompat(self):
         with mock.patch.object(spot_placer.registry.CLOUD_REGISTRY,

@@ -144,12 +144,15 @@ class Location:
         }
         if self.accelerators is not None:
             d['accelerators'] = self.accelerators
-        if self.image_id is not None:
-            d['image_id'] = self.image_id
-        # ALWAYS included (None clears): the override is applied to every
-        # any_of entry, so a tier-less location (e.g. Kubernetes, which
-        # rejects disk_tier) must strip the tier from VM-originated
-        # entries or their copies fail validation before optimization.
+        # image_id and disk_tier are ALWAYS included (None clears): the
+        # override is applied to every any_of entry, so a location without
+        # the attribute must strip it from entries that carry it — a
+        # VM-selected launch must clear the Kubernetes entry's
+        # context-keyed docker image (invalid on AWS/GCP), and a
+        # k8s-selected launch must clear the VM entries' disk_tier
+        # (rejected by Kubernetes). Either leftover fails resource
+        # validation before optimization.
+        d['image_id'] = self.image_id
         d['disk_tier'] = self.disk_tier
         return d
 
