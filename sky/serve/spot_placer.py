@@ -90,6 +90,9 @@ class Location:
     # Kubernetes pool entry whose replicas run inside the model image).
     # Normalized SkyPilot form: {region_or_None: image_ref}.
     image_id: Optional[Dict[Optional[str], str]] = None
+    # Per-entry disk tier (e.g. 'high' on VM entries for docker-load
+    # throughput; unset on Kubernetes entries, which reject the field).
+    disk_tier: Optional[str] = None
 
     def _accel_key(self) -> str:
         parts = []
@@ -99,6 +102,8 @@ class Location:
         if self.image_id:
             parts.append(','.join(f'{k}={v}' for k, v in sorted(
                 self.image_id.items(), key=lambda kv: str(kv[0]))))
+        if self.disk_tier:
+            parts.append(f'disk_tier={self.disk_tier}')
         return '|'.join(parts)
 
     def __eq__(self, other) -> bool:
@@ -120,12 +125,15 @@ class Location:
         assert resources.cloud is not None, 'Cloud must be specified'
         assert resources.region is not None, 'Region must be specified'
         image_id = _normalize_image_id(resources.image_id)
+        disk_tier = (resources.disk_tier.value
+                     if resources.disk_tier is not None else None)
         return cls(resources.cloud,
                    resources.region,
                    resources.zone,
                    accelerators=resources.accelerators,
                    use_spot=resources.use_spot,
-                   image_id=image_id)
+                   image_id=image_id,
+                   disk_tier=disk_tier)
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {
@@ -133,11 +141,23 @@ class Location:
             'region': self.region,
             'zone': self.zone,
             'use_spot': self.use_spot,
+            # Unconditional (None clears), like image_id/disk_tier below:
+            # a CPU-only location must strip GPU entries' accelerators
+            # from its copies. Safe for legacy shape-less pickled rows —
+            # to_dict is only called on enumerated locations (selection
+            # draws from location2status), never on deserialized rows.
+            'accelerators': self.accelerators,
         }
-        if self.accelerators is not None:
-            d['accelerators'] = self.accelerators
-        if self.image_id is not None:
-            d['image_id'] = self.image_id
+        # image_id and disk_tier are ALWAYS included (None clears): the
+        # override is applied to every any_of entry, so a location without
+        # the attribute must strip it from entries that carry it — a
+        # VM-selected launch must clear the Kubernetes entry's
+        # context-keyed docker image (invalid on AWS/GCP), and a
+        # k8s-selected launch must clear the VM entries' disk_tier
+        # (rejected by Kubernetes). Either leftover fails resource
+        # validation before optimization.
+        d['image_id'] = self.image_id
+        d['disk_tier'] = self.disk_tier
         return d
 
     @classmethod
@@ -160,6 +180,7 @@ class Location:
             accelerators=data.get('accelerators'),
             use_spot=data.get('use_spot', True),
             image_id=data.get('image_id'),
+            disk_tier=data.get('disk_tier'),
         )
 
     def to_pickleable(self) -> Dict[str, Any]:
@@ -170,6 +191,7 @@ class Location:
             'accelerators': self.accelerators,
             'use_spot': self.use_spot,
             'image_id': self.image_id,
+            'disk_tier': self.disk_tier,
         }
 
 
@@ -192,7 +214,8 @@ def _get_possible_location_from_task(task: 'task_lib.Task') -> List[Location]:
         # 'clear this field' contract.
         config = resources.copy(cloud=None, region=None,
                                 zone=None).to_yaml_config()
-        for key in ('accelerators', 'use_spot', 'spot_recovery', 'image_id'):
+        for key in ('accelerators', 'use_spot', 'spot_recovery', 'image_id',
+                    'disk_tier'):
             config.pop(key, None)
         return config
 
@@ -248,6 +271,8 @@ def _get_possible_location_from_task(task: 'task_lib.Task') -> List[Location]:
         }
         if r.image_id is not None:
             shape_kwargs['image_id'] = r.image_id
+        if r.disk_tier is not None:
+            shape_kwargs['disk_tier'] = r.disk_tier
         shape_resources = empty_location_resources.copy(**shape_kwargs)
         for cloud in clouds_list:
             feasible_resources: resources_utils.FeasibleResources = (
@@ -283,6 +308,8 @@ def _get_possible_location_from_task(task: 'task_lib.Task') -> List[Location]:
                     loc.accelerators = r.accelerators
                     loc.use_spot = r.use_spot
                     loc.image_id = _normalize_image_id(r.image_id)
+                    loc.disk_tier = (r.disk_tier.value
+                                     if r.disk_tier is not None else None)
                     possible_locations.add(loc)
 
     return list(possible_locations)

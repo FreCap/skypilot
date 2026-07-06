@@ -98,6 +98,16 @@ class TestHeterogeneousLocations:
         d = k8s.to_dict()
         assert d['accelerators'] == {'A100': 1}
         assert d['use_spot'] is False
+        # image_id/disk_tier are always present (None clears): a location
+        # without them must strip them from every copied entry — e.g. a
+        # VM-selected launch clearing the k8s entry's docker image.
+        assert 'image_id' in d and d['image_id'] is None
+        assert 'disk_tier' in d and d['disk_tier'] is None
+        # accelerators likewise unconditional: a CPU-only location must
+        # strip GPU entries' accelerators from its copies.
+        cpu_only = _make_location('cpu-region', accelerators=None)
+        d_cpu = cpu_only.to_dict()
+        assert 'accelerators' in d_cpu and d_cpu['accelerators'] is None
 
     def test_pickleable_roundtrip_and_backcompat(self):
         with mock.patch.object(spot_placer.registry.CLOUD_REGISTRY,
@@ -276,3 +286,55 @@ run: echo hi
         assert locs, 'expected at least one location'
         for loc in locs:
             assert loc.image_id == {None: 'docker:myrepo/model:v1'}, loc
+
+
+class TestDiskTierPerLocation:
+    """disk_tier is a per-location attribute: VM entries keep 'high'
+    without breaking uniformity against k8s entries that reject it."""
+
+    def test_mixed_disk_tier_enumerates(self):
+        # pylint: disable=import-outside-toplevel
+        import sky
+        t = sky.Task.from_yaml_str("""
+resources:
+  cpus: 4+
+  ports: 8080
+  any_of:
+    - infra: aws/us-east-1
+      accelerators: L4:1
+      use_spot: true
+      disk_tier: high
+    - infra: aws/us-east-2
+      accelerators: A10G:1
+      use_spot: false
+run: echo hi
+""")
+        locs = spot_placer._get_possible_location_from_task(t)
+        l4 = [l for l in locs if 'L4' in (l.accelerators or {})]
+        a10g = [l for l in locs if 'A10G' in (l.accelerators or {})]
+        assert l4 and all(l.disk_tier == 'high' for l in l4)
+        assert a10g and all(l.disk_tier is None for l in a10g)
+        # The launch override pins OR CLEARS the tier: a tier-less
+        # location must strip disk_tier from VM-originated entries when
+        # the override is applied across the whole any_of set (a
+        # Kubernetes copy with disk_tier=high fails validation).
+        assert l4[0].to_dict()['disk_tier'] == 'high'
+        assert a10g[0].to_dict()['disk_tier'] is None
+
+    def test_pickle_roundtrip_and_backcompat(self):
+        with mock.patch.object(spot_placer.registry.CLOUD_REGISTRY,
+                               'from_str',
+                               return_value=mock.MagicMock()):
+            loc = spot_placer.Location.from_pickleable({
+                'cloud': 'AWS',
+                'region': 'us-east-1',
+                'zone': None,
+                'disk_tier': 'high',
+            })
+            assert loc.disk_tier == 'high'
+            old = spot_placer.Location.from_pickleable({
+                'cloud': 'AWS',
+                'region': 'us-east-1',
+                'zone': None,
+            })
+            assert old.disk_tier is None
