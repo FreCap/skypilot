@@ -9,6 +9,7 @@ from sky.serve import constants
 from sky.serve import controller as serve_controller
 from sky.serve import replica_managers
 from sky.serve import serve_state
+from sky.serve import serve_utils
 from sky.utils import common_utils
 
 
@@ -513,3 +514,56 @@ class TestInstanceAwareGpuShapeCache(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestInstanceAwareUpdateVersion(unittest.TestCase):
+    """`sky serve update` on a dict-QPS service must not crash.
+
+    The base update_version snaps target_num_replicas via
+    _calculate_target_num_replicas; without an instance-aware override that
+    hook resolved to RequestRateAutoscaler's, which raises on dict
+    target_qps_per_replica — so every update of an instance-aware service
+    failed after the version was already persisted (partial update).
+    """
+
+    def _spec(self, qps_dict, min_replicas=1, max_replicas=20):
+        return types.SimpleNamespace(min_replicas=min_replicas,
+                                     max_replicas=max_replicas,
+                                     num_overprovision=None,
+                                     target_qps_per_replica=qps_dict,
+                                     upscale_delay_seconds=None,
+                                     downscale_delay_seconds=None)
+
+    def _make_autoscaler(self, qps_dict):
+        return autoscalers.InstanceAwareRequestRateAutoscaler(
+            'svc', self._spec(qps_dict), version=1)
+
+    def test_update_version_does_not_raise_on_dict_qps(self):
+        autoscaler = self._make_autoscaler({'L4': 0.1, 'A100': 0.1})
+        autoscaler.update_version(2, self._spec({
+            'L4': 0.1,
+            'A100': 0.2
+        }), serve_utils.DEFAULT_UPDATE_MODE)
+        self.assertEqual(autoscaler.latest_version, 2)
+        # The new version's dict must be live (assigned before the base
+        # recompute, not after).
+        self.assertEqual(autoscaler.target_qps_per_replica, {
+            'L4': 0.1,
+            'A100': 0.2
+        })
+
+    def test_calculate_target_uses_max_capacity_estimate(self):
+        autoscaler = self._make_autoscaler({'L4': 0.1, 'A100:8': 0.8})
+        # 8 requests in the window -> qps = 8 / window; with max per-replica
+        # capacity 0.8 the estimate is ceil(qps / 0.8), clipped to min 1.
+        autoscaler.request_timestamps = [0.0] * (8 * autoscaler.qps_window_size)
+        self.assertEqual(autoscaler._calculate_target_num_replicas(),
+                         min(10, autoscaler.max_replicas))
+
+    def test_update_version_recomputes_target_with_new_dict(self):
+        autoscaler = self._make_autoscaler({'L4': 0.1})
+        autoscaler.request_timestamps = [0.0] * autoscaler.qps_window_size
+        # qps = 1; old capacity 0.1 -> 10 replicas; new capacity 0.5 -> 2.
+        autoscaler.update_version(2, self._spec({'L4': 0.5}),
+                                  serve_utils.DEFAULT_UPDATE_MODE)
+        self.assertEqual(autoscaler.target_num_replicas, 2)

@@ -1100,14 +1100,32 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
             f'{selected_replica_ids}')
         return selected_replica_ids
 
+    def _calculate_target_num_replicas(self) -> int:
+        # Shape-aware sizing needs replica_infos, which this hook (invoked
+        # by the base update_version to snap the target after an update)
+        # does not receive. Estimate with the largest configured per-replica
+        # capacity; the next decision tick recomputes from live replica
+        # shapes via _set_target_num_replicas_with_instance_aware_logic, so
+        # an optimistic estimate self-corrects instead of over-launching.
+        assert isinstance(self.target_qps_per_replica, dict), \
+            'InstanceAware Autoscaler requires dict type target_qps_per_replica'
+        num_requests_per_second = len(
+            self.request_timestamps) / self.qps_window_size
+        max_target_qps = max(self.target_qps_per_replica.values())
+        return self._clip_target_num_replicas(
+            math.ceil(num_requests_per_second / max_target_qps))
+
     def update_version(self, version: int, spec: 'service_spec.SkyServiceSpec',
                        update_mode: serve_utils.UpdateMode) -> None:
-        super(RequestRateAutoscaler,
-              self).update_version(version, spec, update_mode)
-        # Ensure it's a dict and re-assign using setattr to avoid typing
+        # Ensure it's a dict and re-assign using setattr to avoid typing.
+        # Must happen BEFORE super().update_version: the base class
+        # recomputes target_num_replicas via _calculate_target_num_replicas,
+        # which must see the new version's dict.
         assert isinstance(spec.target_qps_per_replica, dict), \
             'InstanceAware Autoscaler requires dict type target_qps_per_replica'
         self.target_qps_per_replica = spec.target_qps_per_replica
+        super(RequestRateAutoscaler,
+              self).update_version(version, spec, update_mode)
 
 
 class FallbackRequestRateAutoscaler(RequestRateAutoscaler):
