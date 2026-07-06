@@ -4583,6 +4583,19 @@ def get_endpoints(cluster: str,
                              f'for cluster {cluster!r} with backend '
                              f'{get_backend_from_handle(handle).NAME}.')
 
+    if handle.head_ip is None:
+        # The cluster record can transiently be UP with no head IP yet
+        # (mid-provision, or a recovered controller re-driving a
+        # launch). query_ports would assert on head_ip=None; surface it
+        # as the not-up condition it is so callers that tolerate
+        # ClusterNotUpError (e.g. serve status endpoint resolution)
+        # degrade gracefully instead of crashing the whole query.
+        with ux_utils.print_exception_no_traceback():
+            raise exceptions.ClusterNotUpError(
+                f'Cluster {cluster!r} has no known head IP yet.',
+                cluster_status=cluster_record['status'],
+                handle=handle)
+
     launched_resources = handle.launched_resources.assert_launchable()
     cloud = launched_resources.cloud
     try:
