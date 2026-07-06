@@ -93,16 +93,25 @@ class DashboardCache {
       return this.pendingRequests.get(key);
     }
 
-    // If data is stale or doesn't exist, fetch fresh data
-    // Create a promise for this request and store it
-    // Declared (not const-in-TDZ) before the IIFE runs: if
-    // fetchFunction throws synchronously, the catch/finally below
-    // execute during the IIFE call itself, before the assignment —
-    // the guards must then see `undefined`, not a TDZ ReferenceError.
-    let requestPromise;
-    requestPromise = (async () => {
+    // If data is stale or doesn't exist, fetch fresh data.
+    // Start the fetch eagerly, but normalize a synchronous throw into
+    // a rejected promise. The rejection is then handled inside the
+    // async IIFE, which only resumes after `requestPromise` is
+    // assigned and stored in pendingRequests below. If catch/finally
+    // could run during the IIFE call itself (as with a bare
+    // `await fetchFunction(...)` and a sync throw), the cleanup would
+    // no-op and pendingRequests would then permanently hold an
+    // already-settled promise, poisoning the key for every later call
+    // until an invalidate.
+    let fetchResultPromise;
+    try {
+      fetchResultPromise = Promise.resolve(fetchFunction(...args));
+    } catch (error) {
+      fetchResultPromise = Promise.reject(error);
+    }
+    const requestPromise = (async () => {
       try {
-        const freshData = await fetchFunction(...args);
+        const freshData = await fetchResultPromise;
 
         // If the fetch function indicates the result should not be cached
         // (e.g., transient error fallback), then skip cache update and
@@ -122,10 +131,7 @@ class DashboardCache {
         // invalidateFunction() ran while we were in flight, a newer
         // request may already be pending (or resolved); writing our
         // result would resurrect pre-invalidate data.
-        if (
-          requestPromise !== undefined &&
-          this.pendingRequests.get(key) === requestPromise
-        ) {
+        if (this.pendingRequests.get(key) === requestPromise) {
           this.cache.set(key, {
             data: freshData,
             lastUpdated: Date.now(),
@@ -148,13 +154,10 @@ class DashboardCache {
       } finally {
         // Remove the pending request marker — only our own. After an
         // invalidate, a newer request may occupy this key; deleting it
-        // would break that request's deduplication. (The extra
-        // undefined check covers the synchronous-throw path, where
-        // this runs before `requestPromise` is assigned.)
-        if (
-          requestPromise !== undefined &&
-          this.pendingRequests.get(key) === requestPromise
-        ) {
+        // would break that request's deduplication. (The deferred
+        // fetch above guarantees this never runs before the marker is
+        // set, so no TDZ/undefined handling is needed.)
+        if (this.pendingRequests.get(key) === requestPromise) {
           this.pendingRequests.delete(key);
         }
       }

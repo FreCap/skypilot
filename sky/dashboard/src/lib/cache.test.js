@@ -198,6 +198,33 @@ describe('DashboardCache', () => {
       shouldThrow = true;
       const result = await cache.get(mockFetch, ['x']);
       expect(result).toEqual({ data: 'seeded' });
+
+      // The failed request must not poison the key: once the fetch
+      // works again, a stale get() must retry it (a leftover settled
+      // promise in pendingRequests would short-circuit it forever).
+      shouldThrow = false;
+      jest.advanceTimersByTime(6 * 60 * 1000);
+      const recovered = await cache.get(mockFetch, ['x']);
+      expect(recovered).toEqual({ data: 'seeded' });
+      expect(mockFetch).toHaveBeenCalledTimes(3);
+    });
+
+    test('sync-throw with no cached fallback rejects with the original error and does not poison the key', async () => {
+      let shouldThrow = true;
+      const mockFetch = jest.fn((...args) => {
+        if (shouldThrow) {
+          throw new Error('sync boom');
+        }
+        return Promise.resolve({ data: 'ok' });
+      });
+
+      await expect(cache.get(mockFetch, ['y'])).rejects.toThrow('sync boom');
+
+      // Next call must retry the fetch, not reuse the rejected promise.
+      shouldThrow = false;
+      const result = await cache.get(mockFetch, ['y']);
+      expect(result).toEqual({ data: 'ok' });
+      expect(mockFetch).toHaveBeenCalledTimes(2);
     });
 
     test('drops every args variant of the function', async () => {
