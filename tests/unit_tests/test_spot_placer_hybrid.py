@@ -304,9 +304,12 @@ run: echo hi
         a10g = [l for l in locs if 'A10G' in (l.accelerators or {})]
         assert l4 and all(l.disk_tier == 'high' for l in l4)
         assert a10g and all(l.disk_tier is None for l in a10g)
-        # The launch override pins the tier.
+        # The launch override pins OR CLEARS the tier: a tier-less
+        # location must strip disk_tier from VM-originated entries when
+        # the override is applied across the whole any_of set (a
+        # Kubernetes copy with disk_tier=high fails validation).
         assert l4[0].to_dict()['disk_tier'] == 'high'
-        assert 'disk_tier' not in a10g[0].to_dict()
+        assert a10g[0].to_dict()['disk_tier'] is None
 
     def test_pickle_roundtrip_and_backcompat(self):
         with mock.patch.object(spot_placer.registry.CLOUD_REGISTRY,

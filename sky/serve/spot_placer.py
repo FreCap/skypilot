@@ -146,8 +146,11 @@ class Location:
             d['accelerators'] = self.accelerators
         if self.image_id is not None:
             d['image_id'] = self.image_id
-        if self.disk_tier is not None:
-            d['disk_tier'] = self.disk_tier
+        # ALWAYS included (None clears): the override is applied to every
+        # any_of entry, so a tier-less location (e.g. Kubernetes, which
+        # rejects disk_tier) must strip the tier from VM-originated
+        # entries or their copies fail validation before optimization.
+        d['disk_tier'] = self.disk_tier
         return d
 
     @classmethod
