@@ -95,7 +95,12 @@ class DashboardCache {
 
     // If data is stale or doesn't exist, fetch fresh data
     // Create a promise for this request and store it
-    const requestPromise = (async () => {
+    // Declared (not const-in-TDZ) before the IIFE runs: if
+    // fetchFunction throws synchronously, the catch/finally below
+    // execute during the IIFE call itself, before the assignment —
+    // the guards must then see `undefined`, not a TDZ ReferenceError.
+    let requestPromise;
+    requestPromise = (async () => {
       try {
         const freshData = await fetchFunction(...args);
 
@@ -117,7 +122,10 @@ class DashboardCache {
         // invalidateFunction() ran while we were in flight, a newer
         // request may already be pending (or resolved); writing our
         // result would resurrect pre-invalidate data.
-        if (this.pendingRequests.get(key) === requestPromise) {
+        if (
+          requestPromise !== undefined &&
+          this.pendingRequests.get(key) === requestPromise
+        ) {
           this.cache.set(key, {
             data: freshData,
             lastUpdated: Date.now(),
@@ -140,8 +148,13 @@ class DashboardCache {
       } finally {
         // Remove the pending request marker — only our own. After an
         // invalidate, a newer request may occupy this key; deleting it
-        // would break that request's deduplication.
-        if (this.pendingRequests.get(key) === requestPromise) {
+        // would break that request's deduplication. (The extra
+        // undefined check covers the synchronous-throw path, where
+        // this runs before `requestPromise` is assigned.)
+        if (
+          requestPromise !== undefined &&
+          this.pendingRequests.get(key) === requestPromise
+        ) {
           this.pendingRequests.delete(key);
         }
       }

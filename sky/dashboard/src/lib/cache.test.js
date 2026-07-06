@@ -178,6 +178,28 @@ describe('DashboardCache', () => {
       expect(cache.getCached(mockFetch, ['x'])).toEqual({ data: 'fresh' });
     });
 
+    test('synchronously-throwing fetch still falls back to stale cache', async () => {
+      // Seed the cache, expire it, then use a fetchFunction that
+      // throws BEFORE returning a promise: the catch/finally in get()
+      // run during the call itself and must not hit a TDZ on the
+      // pending-promise guard.
+      let shouldThrow = false;
+      const mockFetch = jest.fn((...args) => {
+        if (shouldThrow) {
+          throw new Error('sync boom');
+        }
+        return Promise.resolve({ data: 'seeded' });
+      });
+
+      await cache.get(mockFetch, ['x']);
+      // Age the entry past the TTL so the next get() refetches.
+      jest.advanceTimersByTime(6 * 60 * 1000);
+
+      shouldThrow = true;
+      const result = await cache.get(mockFetch, ['x']);
+      expect(result).toEqual({ data: 'seeded' });
+    });
+
     test('drops every args variant of the function', async () => {
       const mockFetch = createMockFetch({ data: 'v1' }, 10);
 
