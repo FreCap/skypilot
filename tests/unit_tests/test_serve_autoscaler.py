@@ -258,6 +258,7 @@ class TestInstanceAwareGpuShapeCache(unittest.TestCase):
         autoscaler._gpu_shape_cache = {}
         autoscaler._replica_cost_cache = {}
         autoscaler._bare_key_warned = set()
+        autoscaler._snap_target_on_next_recompute = False
         return autoscaler
 
     def _make_replica(self, gpu_type, launch_status, count=1):
@@ -569,3 +570,85 @@ class TestInstanceAwareUpdateVersion(unittest.TestCase):
         autoscaler.update_version(2, self._spec({'L4': 0.1}, max_replicas=5),
                                   serve_utils.DEFAULT_UPDATE_MODE)
         self.assertEqual(autoscaler.target_num_replicas, 5)
+
+
+class TestInstanceAwareUpdateRolloutSafety(unittest.TestCase):
+    """After an update, the drain must never act on a stale target.
+
+    The base generate_scaling_decisions drains outdated replicas by
+    comparing ready new-version replicas against target_num_replicas
+    BEFORE the subclass recomputes. If an update lowered per-replica
+    capacity (raising the replica need), a stale target lets the drain
+    scale down every old replica with only a fraction of the required
+    new capacity ready — and hysteresis would delay the corrective
+    upscale by the full upscale delay.
+    """
+
+    def _spec(self, qps_dict, min_replicas=1, max_replicas=20):
+        return types.SimpleNamespace(min_replicas=min_replicas,
+                                     max_replicas=max_replicas,
+                                     num_overprovision=None,
+                                     target_qps_per_replica=qps_dict,
+                                     upscale_delay_seconds=None,
+                                     downscale_delay_seconds=None)
+
+    def _make_autoscaler(self, qps_dict):
+        return autoscalers.InstanceAwareRequestRateAutoscaler(
+            'svc', self._spec(qps_dict), version=1)
+
+    def test_recompute_runs_before_outdated_drain(self):
+        autoscaler = self._make_autoscaler({'L4': 0.1})
+        calls = []
+        with mock.patch.object(
+                autoscaler,
+                '_set_target_num_replicas_with_instance_aware_logic',
+                side_effect=lambda infos: calls.append('recompute')), \
+             mock.patch.object(
+                autoscaler,
+                '_select_outdated_replicas_to_scale_down',
+                side_effect=lambda infos, versions:
+                    (calls.append('drain'), [])[1]), \
+             mock.patch.object(
+                autoscaler,
+                '_generate_scaling_decisions',
+                return_value=[]):
+            autoscaler.generate_scaling_decisions([], [1])
+        self.assertEqual(calls, ['recompute', 'drain'])
+
+    def test_single_recompute_per_tick(self):
+        autoscaler = self._make_autoscaler({'L4': 0.1})
+        with mock.patch.object(
+                autoscaler,
+                '_set_target_num_replicas_with_instance_aware_logic'
+        ) as mock_set, \
+             mock.patch.object(
+                autoscaler,
+                '_select_outdated_replicas_to_scale_down',
+                return_value=[]):
+            autoscaler.generate_scaling_decisions([], [1])
+        self.assertEqual(mock_set.call_count, 1)
+
+    def test_post_update_recompute_bypasses_hysteresis_once(self):
+        # Update lowers per-replica capacity 10 -> 1 with 20 rps: the
+        # first recompute after the update must snap the target to 20
+        # immediately, not wait out the upscale delay counters.
+        autoscaler = self._make_autoscaler({'A100': 10.0})
+        autoscaler.target_num_replicas = 2
+        autoscaler.update_version(2, self._spec({'A100': 1.0}),
+                                  serve_utils.DEFAULT_UPDATE_MODE)
+        autoscaler.request_timestamps = [0.0
+                                        ] * (20 * autoscaler.qps_window_size)
+        autoscaler._set_target_num_replicas_with_instance_aware_logic([])
+        self.assertEqual(autoscaler.target_num_replicas, 20)
+        # The bypass is one-shot: a subsequent noisy recompute is gated
+        # by hysteresis again.
+        autoscaler.request_timestamps = []
+        autoscaler._set_target_num_replicas_with_instance_aware_logic([])
+        self.assertEqual(autoscaler.target_num_replicas, 20)
+
+    def test_stale_version_update_does_not_mutate_state(self):
+        autoscaler = self._make_autoscaler({'A100': 10.0})
+        autoscaler.update_version(1, self._spec({'A100': 1.0}),
+                                  serve_utils.DEFAULT_UPDATE_MODE)
+        self.assertEqual(autoscaler.target_qps_per_replica, {'A100': 10.0})
+        self.assertFalse(autoscaler._snap_target_on_next_recompute)

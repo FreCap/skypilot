@@ -653,14 +653,31 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
         self._replica_cost_cache: Dict[int, float] = {}
         # Shapes already warned about bare-key per-GPU scaling.
         self._bare_key_warned: Set[Tuple[str, int]] = set()
+        # One-shot hysteresis bypass, armed by update_version: the base
+        # class snaps target_num_replicas directly after an update so the
+        # service scales quickly; the instance-aware equivalent must wait
+        # for the next tick's shape-aware recompute, which must then apply
+        # its result immediately instead of being gated behind the upscale/
+        # downscale delay counters. Transient by design: if the controller
+        # restarts before the next tick, convergence just falls back to the
+        # normal hysteresis path.
+        self._snap_target_on_next_recompute: bool = False
 
-    def _generate_scaling_decisions(
+    def generate_scaling_decisions(
         self,
         replica_infos: List['replica_managers.ReplicaInfo'],
+        active_versions: List[int],
     ) -> List[AutoscalerDecision]:
-        """Generate autoscaling decisions with instance-aware logic."""
-        # Drop cached GPU types for replicas that no longer exist so the cache
-        # stays bounded to the live replica set.
+        # Recompute the shape-aware target BEFORE the base class runs the
+        # outdated-replica drain: the drain compares ready new-version
+        # replicas against target_num_replicas, and a stale target (e.g.
+        # right after an update that lowered per-replica capacity) would
+        # scale down every old replica while only a fraction of the
+        # required new capacity exists. This is the single recompute for
+        # the tick; _generate_scaling_decisions must not recompute again
+        # or the hysteresis counters would double-increment.
+        # Drop cached GPU types for replicas that no longer exist so the
+        # cache stays bounded to the live replica set.
         live_replica_ids = {info.replica_id for info in replica_infos}
         for replica_id in list(self._gpu_shape_cache):
             if replica_id not in live_replica_ids:
@@ -668,11 +685,19 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
         for replica_id in list(self._replica_cost_cache):
             if replica_id not in live_replica_ids:
                 del self._replica_cost_cache[replica_id]
-
-        # Always use instance-aware logic
-        # since target_qps_per_replica is guaranteed to be dict
         self._set_target_num_replicas_with_instance_aware_logic(replica_infos)
+        return super().generate_scaling_decisions(replica_infos,
+                                                  active_versions)
 
+    def _generate_scaling_decisions(
+        self,
+        replica_infos: List['replica_managers.ReplicaInfo'],
+    ) -> List[AutoscalerDecision]:
+        """Generate autoscaling decisions with instance-aware logic.
+
+        The shape-aware target was already recomputed for this tick in
+        generate_scaling_decisions (before the outdated-replica drain).
+        """
         latest_nonterminal_replicas: List['replica_managers.ReplicaInfo'] = []
 
         for info in replica_infos:
@@ -817,8 +842,15 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
         # Apply hysteresis logic
         old_target_num_replicas = self.target_num_replicas
 
+        if self._snap_target_on_next_recompute:
+            # First recompute after an update: apply directly (the base
+            # class's post-update snap semantics, but shape-aware).
+            self._snap_target_on_next_recompute = False
+            self.upscale_counter = 0
+            self.downscale_counter = 0
+            self.target_num_replicas = target_num_replicas
         # Faster scale up when there is no replica.
-        if self.target_num_replicas == 0:
+        elif self.target_num_replicas == 0:
             self.target_num_replicas = target_num_replicas
         elif target_num_replicas > self.target_num_replicas:
             self.upscale_counter += 1
@@ -1119,11 +1151,20 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
         # Must happen BEFORE super().update_version: the base class
         # recomputes target_num_replicas via _calculate_target_num_replicas,
         # which must see the new version's dict.
+        if version <= self.latest_version:
+            # The base class rejects stale versions; don't mutate the qps
+            # dict or arm the post-update snap for a rejected call either.
+            super(RequestRateAutoscaler,
+                  self).update_version(version, spec, update_mode)
+            return
         assert isinstance(spec.target_qps_per_replica, dict), \
             'InstanceAware Autoscaler requires dict type target_qps_per_replica'
+        # Assign BEFORE the base update runs so any recompute it triggers
+        # sees the new version's dict.
         self.target_qps_per_replica = spec.target_qps_per_replica
         super(RequestRateAutoscaler,
               self).update_version(version, spec, update_mode)
+        self._snap_target_on_next_recompute = True
 
 
 class FallbackRequestRateAutoscaler(RequestRateAutoscaler):
