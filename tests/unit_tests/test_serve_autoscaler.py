@@ -256,6 +256,7 @@ class TestInstanceAwareGpuShapeCache(unittest.TestCase):
             autoscalers.InstanceAwareRequestRateAutoscaler)
         autoscaler._gpu_shape_cache = {}
         autoscaler._replica_cost_cache = {}
+        autoscaler._bare_key_warned = set()
         return autoscaler
 
     def _make_replica(self, gpu_type, launch_status, count=1):

@@ -6,7 +6,7 @@ import enum
 import math
 import time
 import typing
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 from sky import sky_logging
 from sky.jobs import state as managed_job_state
@@ -651,6 +651,8 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
         # replica_id -> hourly cost of launched resources (same lifecycle
         # rules as the shape cache).
         self._replica_cost_cache: Dict[int, float] = {}
+        # Shapes already warned about bare-key per-GPU scaling.
+        self._bare_key_warned: Set[Tuple[str, int]] = set()
 
     def _generate_scaling_decisions(
         self,
@@ -893,6 +895,21 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
         resolved = serve_utils.resolve_target_qps_for_gpu_shape(
             gpu_type, gpu_count, target_qps_dict)
         if resolved is not None:
+            if (gpu_count > 1 and
+                    f'{gpu_type}:{gpu_count}' not in target_qps_dict and
+                (gpu_type, gpu_count) not in self._bare_key_warned):
+                # Per-GPU scaling of a bare type key assumes ONE model
+                # instance per GPU. A replica serving K-GPU model
+                # instances is over-counted by K unless an exact shape
+                # key pins its per-replica capacity. Warn once per shape.
+                self._bare_key_warned.add((gpu_type, gpu_count))
+                logger.warning(
+                    f'Multi-GPU replica shape {gpu_type}:{gpu_count} is '
+                    'scaled from a bare per-GPU QPS key. This is correct '
+                    'ONLY if each GPU hosts one model instance; for '
+                    'k-GPU-per-instance models declare an exact shape '
+                    f'key (e.g. "{gpu_type}:{gpu_count}": '
+                    '<instances_per_replica * qps_per_instance>).')
             return resolved
 
         # Fallback to minimum QPS

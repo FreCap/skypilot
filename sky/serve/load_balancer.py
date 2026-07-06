@@ -173,7 +173,14 @@ class SkyServeLoadBalancer:
             encountered if anything goes wrong.
         """
         logger.info(f'Proxy request to {url}')
-        self._load_balancing_policy.pre_execute_hook(url, request)
+        # The token ties this request's release to the exact accounting
+        # generation it incremented (see LoadBalancingPolicy hooks).
+        slot_token = self._load_balancing_policy.pre_execute_hook(url, request)
+        # Every exit that does NOT hand a streaming response to the client
+        # must release the in-flight slot itself, or failed/aborted attempts
+        # permanently inflate this replica's load and skew routing away
+        # from it (each retry then leaks another slot on another replica).
+        released = False
         try:
             # We defer the get of the client here on purpose, for case when the
             # replica is ready in `_proxy_with_retries` but refreshed before
@@ -194,20 +201,50 @@ class SkyServeLoadBalancer:
                 timeout=self._stream_timeout_seconds)
             proxy_response = await client.send(proxy_request, stream=True)
 
-            async def background_func():
-                await proxy_response.aclose()
-                self._load_balancing_policy.post_execute_hook(url, request)
+            # The slot is owned by the stream now. Starlette runs
+            # BackgroundTasks strictly AFTER a successful stream — a
+            # mid-stream failure (client disconnect, upstream reset)
+            # skips them — so the release lives in the ITERATOR's
+            # finally (generator close on any exit runs it) with the
+            # background task as a second, idempotent safety net for
+            # the stream-never-started edge.
+            release_state = {'done': False}
 
-            return fastapi.responses.StreamingResponse(
-                content=proxy_response.aiter_raw(),
+            async def _release_slot():
+                if release_state['done']:
+                    return
+                release_state['done'] = True
+                try:
+                    await proxy_response.aclose()
+                finally:
+                    self._load_balancing_policy.post_execute_hook(
+                        url, request, slot_token)
+
+            async def _stream_with_release():
+                try:
+                    async for chunk in proxy_response.aiter_raw():
+                        yield chunk
+                finally:
+                    await _release_slot()
+
+            response = fastapi.responses.StreamingResponse(
+                content=_stream_with_release(),
                 status_code=proxy_response.status_code,
                 headers=proxy_response.headers,
-                background=background.BackgroundTask(background_func))
+                background=background.BackgroundTask(_release_slot))
+            # Ownership of the slot transfers to the stream/background pair
+            # only once the response object exists and will be returned.
+            released = True
+            return response
         except (httpx.RequestError, httpx.HTTPStatusError) as e:
             logger.error(f'Error when proxy request to {url}: '
                          f'{common_utils.format_exception(e)}'
                          f'\nTraceback: {traceback.format_exc()}')
             return e
+        finally:
+            if not released:
+                self._load_balancing_policy.post_execute_hook(
+                    url, request, slot_token)
 
     async def _proxy_with_retries(
             self, request: fastapi.Request) -> fastapi.responses.Response:

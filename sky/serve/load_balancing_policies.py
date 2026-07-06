@@ -76,12 +76,19 @@ class LoadBalancingPolicy:
         raise NotImplementedError
 
     def pre_execute_hook(self, replica_url: str,
-                         request: 'fastapi.Request') -> None:
-        pass
+                         request: 'fastapi.Request') -> Optional[Any]:
+        """Account an in-flight request. Returns an opaque token that the
+        caller must hand back to post_execute_hook, so a release is tied
+        to the exact accounting generation it incremented (a replica URL
+        pruned and re-added between the two must not absorb a stale
+        release — the ABA problem)."""
+        return None
 
-    def post_execute_hook(self, replica_url: str,
-                          request: 'fastapi.Request') -> None:
-        pass
+    def post_execute_hook(self,
+                          replica_url: str,
+                          request: 'fastapi.Request',
+                          token: Optional[Any] = None) -> None:
+        del replica_url, request, token
 
 
 class RoundRobinPolicy(LoadBalancingPolicy, name='round_robin'):
@@ -116,6 +123,9 @@ class LeastLoadPolicy(LoadBalancingPolicy, name='least_load', default=True):
     def __init__(self) -> None:
         super().__init__()
         self.load_map: Dict[str, int] = collections.defaultdict(int)
+        # url -> accounting generation; bumped whenever a key is (re)added
+        # so stale releases from before a prune are ignored (ABA).
+        self._generation: Dict[str, int] = collections.defaultdict(int)
         self.lock = threading.Lock()
 
     def set_ready_replicas(self, ready_replicas: List[str]) -> None:
@@ -127,26 +137,73 @@ class LeastLoadPolicy(LoadBalancingPolicy, name='least_load', default=True):
                 if r not in ready_replicas:
                     del self.load_map[r]
             for replica in ready_replicas:
-                self.load_map[replica] = self.load_map.get(replica, 0)
+                if replica not in self.load_map:
+                    # New (or re-added) key: bump its generation so
+                    # releases from streams counted BEFORE a prune cannot
+                    # decrement the fresh counter (ABA).
+                    self._generation[replica] += 1
+                    self.load_map[replica] = 0
 
     def _select_replica(self, request: 'fastapi.Request') -> Optional[str]:
         del request  # Unused.
         if not self.ready_replicas:
             return None
         with self.lock:
-            return min(self.ready_replicas,
-                       key=lambda replica: self.load_map.get(replica, 0))
+            min_load = min(
+                self.load_map.get(replica, 0)
+                for replica in self.ready_replicas)
+            # Random tie-break: deterministic min() over URL order biases
+            # cold starts (all-zero loads) onto the same replica wave
+            # after wave.
+            candidates = [
+                replica for replica in self.ready_replicas
+                if self.load_map.get(replica, 0) == min_load
+            ]
+            return random.choice(candidates)
 
     def pre_execute_hook(self, replica_url: str,
-                         request: 'fastapi.Request') -> None:
+                         request: 'fastapi.Request') -> Optional[Any]:
         del request  # Unused.
         with self.lock:
-            self.load_map[replica_url] += 1
+            # Live keys only: a replica pruned between selection and this
+            # hook must not be recreated (its paired post is skipped the
+            # same way, so accounting stays consistent).
+            if replica_url in self.load_map:
+                self.load_map[replica_url] += 1
+                return self._generation[replica_url]
+            logger.debug(
+                'pre_execute_hook: %s not in load map (pruned '
+                'between selection and dispatch); not counted.', replica_url)
+            return None
 
-    def post_execute_hook(self, replica_url: str,
-                          request: 'fastapi.Request') -> None:
+    def post_execute_hook(self,
+                          replica_url: str,
+                          request: 'fastapi.Request',
+                          token: Optional[Any] = None) -> None:
         del request  # Unused.
         with self.lock:
+            # Only decrement live keys, clamped at zero: a replica pruned
+            # from the ready set mid-stream must not be recreated at -1
+            # (phantom capacity that would attract traffic on re-add).
+            if replica_url not in self.load_map:
+                return
+            if (token is not None and token != self._generation[replica_url]):
+                # The increment belonged to a PREVIOUS generation of this
+                # URL (pruned and re-added since): releasing here would
+                # steal a slot from the new generation's streams (ABA).
+                logger.debug(
+                    'post_execute_hook: stale-generation release for %s '
+                    'ignored.', replica_url)
+                return
+            if self.load_map[replica_url] <= 0:
+                # A live key at zero receiving a release means a double
+                # release or a missed increment upstream — clamp, but do
+                # not hide it.
+                logger.warning(
+                    'post_execute_hook: load underflow for %s; clamping '
+                    'at 0 (possible double release).', replica_url)
+                self.load_map[replica_url] = 0
+                return
             self.load_map[replica_url] -= 1
 
 
@@ -174,9 +231,12 @@ class InstanceAwareLeastLoadPolicy(LeastLoadPolicy,
             for r in list(self.load_map.keys()):
                 if r not in ready_replicas:
                     del self.load_map[r]
-            # Initialize load for new replicas
+            # Initialize load for new replicas. Same generation bump as
+            # the base class: releases from before a prune must not
+            # decrement a re-added key's fresh counter (ABA).
             for replica in ready_replicas:
                 if replica not in self.load_map:
+                    self._generation[replica] += 1
                     self.load_map[replica] = 0
 
     def set_replica_info(self, replica_info: Dict[str, Dict[str, Any]]) -> None:
@@ -281,8 +341,14 @@ class InstanceAwareLeastLoadPolicy(LeastLoadPolicy,
                 normalized_load = self._get_normalized_load(replica)
                 replica_loads.append((replica, normalized_load))
 
-            # Select replica with minimum normalized load
-            selected_replica = min(replica_loads, key=lambda x: x[1])[0]
+            # Select among the (near-)minimum normalized loads at random:
+            # deterministic min() over URL order biases cold starts.
+            min_load = min(load for _, load in replica_loads)
+            candidates = [
+                replica for replica, load in replica_loads
+                if load - min_load <= 1e-9
+            ]
+            selected_replica = random.choice(candidates)
             logger.debug('Available replicas and loads: %s', replica_loads)
             logger.debug('Selected replica: %s', selected_replica)
             return selected_replica
