@@ -859,7 +859,31 @@ class SkyPilotReplicaManager(ReplicaManager):
             try:
                 with self.lock:
                     recovery_lock_acquired.set()
-                    self._recover_replica_operations()
+                    # Retry a failed recovery pass instead of dying silently:
+                    # in the previous synchronous design a recovery exception
+                    # failed the controller boot and the HA daemon retried
+                    # via respawn; a thread that just died would instead
+                    # leave interrupted replicas un-redriven forever while
+                    # the controller kept serving. Re-running is idempotent:
+                    # _launch_replica/_terminate_replica skip replicas whose
+                    # threads are already enqueued. The lock is deliberately
+                    # held across the backoff — until recovery completes the
+                    # daemons must not act on half-redriven state (matching
+                    # the pre-existing recovery-holds-lock-first semantics).
+                    backoff_seconds = 30
+                    while True:
+                        try:
+                            self._recover_replica_operations()
+                            break
+                        except Exception as e:  # pylint: disable=broad-except
+                            logger.error(
+                                'Replica recovery pass failed; retrying in '
+                                f'{backoff_seconds}s: '
+                                f'{common_utils.format_exception(e)}')
+                            with ux_utils.enable_traceback():
+                                logger.error(
+                                    f'  Traceback: {traceback.format_exc()}')
+                            time.sleep(backoff_seconds)
             finally:
                 # Failsafe: never leave __init__ waiting if this thread dies
                 # before signaling (nothing before the `with` can normally
@@ -889,8 +913,14 @@ class SkyPilotReplicaManager(ReplicaManager):
         Runs in the dedicated recovery thread started by __init__, which
         holds the manager lock for the whole pass (see __init__ for the
         lock-ordering handshake with the daemon threads)."""
-        assert (not self._launch_thread_pool and not self._down_thread_pool
-               ), 'We should not have any running threads in a recovery run'
+        if self._launch_thread_pool or self._down_thread_pool:
+            # Only possible on a RETRY of a partially-completed recovery
+            # pass: the per-replica enqueues below skip anything already in
+            # the pools, so re-running is safe.
+            logger.warning('Recovery pass re-entered with '
+                           f'{len(self._launch_thread_pool)} launch / '
+                           f'{len(self._down_thread_pool)} down threads '
+                           'already enqueued; continuing idempotently.')
 
         # Seed the replica-id allocator from durable state. A fresh
         # ReplicaManager initializes `self._next_replica_id` to 1 (see
@@ -929,19 +959,31 @@ class SkyPilotReplicaManager(ReplicaManager):
             # including SkyServeController._run_autoscaler.
             # One shared snapshot: per-launch fresh scans made recovery
             # O(pending x total rows) — tens of minutes at fleet scale.
-            self._launch_replica(
-                replica_info.replica_id,
-                resources_override=replica_info.resources_override,
-                existing_replica_infos=all_replica_infos)
+            # Per-replica isolation: one bad row must not strand the rest
+            # un-redriven.
+            try:
+                self._launch_replica(
+                    replica_info.replica_id,
+                    resources_override=replica_info.resources_override,
+                    existing_replica_infos=all_replica_infos)
+            except Exception as e:  # pylint: disable=broad-except
+                logger.error('Failed to re-drive launch of replica '
+                             f'{replica_info.replica_id}: '
+                             f'{common_utils.format_exception(e)}')
 
         for replica_info in serve_state.get_replicas_at_status(
                 self._service_name, serve_state.ReplicaStatus.SHUTTING_DOWN):
-            self._terminate_replica(
-                replica_info.replica_id,
-                sync_down_logs=False,
-                replica_drain_delay_seconds=0,
-                purge=replica_info.status_property.purged,
-                is_scale_down=replica_info.status_property.is_scale_down)
+            try:
+                self._terminate_replica(
+                    replica_info.replica_id,
+                    sync_down_logs=False,
+                    replica_drain_delay_seconds=0,
+                    purge=replica_info.status_property.purged,
+                    is_scale_down=replica_info.status_property.is_scale_down)
+            except Exception as e:  # pylint: disable=broad-except
+                logger.error('Failed to re-drive termination of replica '
+                             f'{replica_info.replica_id}: '
+                             f'{common_utils.format_exception(e)}')
 
     ################################
     # Replica management functions #

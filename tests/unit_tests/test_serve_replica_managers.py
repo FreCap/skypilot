@@ -595,3 +595,50 @@ class TestScaleUpBatch:
                                side_effect=_record_launch(launched)):
             mgr.scale_up_batch([None, None])
         assert launched == [1, 3]
+
+
+class TestRecoveryRetryAndIsolation:
+    """A failed recovery pass must retry (previously a recovery exception
+    failed the boot and the HA daemon retried via respawn; the recovery
+    thread must not die silently and strand un-redriven replicas), and one
+    bad replica must not abort re-driving the rest."""
+
+    def test_one_bad_launch_does_not_strand_the_rest(self):
+        mgr = _make_manager(next_replica_id=1)
+        launched = []
+
+        def _launch(replica_id,
+                    resources_override=None,
+                    existing_replica_infos=None):
+            del resources_override, existing_replica_infos
+            if replica_id == 2:
+                raise RuntimeError('boom')
+            launched.append(replica_id)
+
+        infos = [_fake_replica_info(i) for i in (1, 2, 3)]
+        for info in infos:
+            info.resources_override = None
+        with mock.patch(
+                'sky.serve.replica_managers.serve_state.get_replica_infos',
+                return_value=infos), \
+             mock.patch(
+                 'sky.serve.replica_managers.serve_state.'
+                 'get_replicas_at_status',
+                 side_effect=[infos, [], []]), \
+             mock.patch.object(mgr, '_launch_replica', side_effect=_launch):
+            mgr._recover_replica_operations()
+        # Replica 2 failed; 1 and 3 still re-driven.
+        assert launched == [1, 3]
+
+    def test_reentry_with_enqueued_threads_is_tolerated(self):
+        mgr = _make_manager(next_replica_id=1)
+        mgr._launch_thread_pool = {7: mock.Mock()}
+        with mock.patch(
+                'sky.serve.replica_managers.serve_state.get_replica_infos',
+                return_value=[]), \
+             mock.patch(
+                 'sky.serve.replica_managers.serve_state.'
+                 'get_replicas_at_status',
+                 return_value=[]):
+            # Previously an assert; on a retry pass this must not raise.
+            mgr._recover_replica_operations()
