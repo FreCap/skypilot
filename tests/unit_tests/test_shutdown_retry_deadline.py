@@ -88,3 +88,37 @@ def test_non_retriable_not_interrupted_before_deadline(monkeypatch):
 
     assert interrupted == []  # not swept before the deadline
     assert slept == [uvicorn_module._WAIT_REQUESTS_INTERVAL_SECONDS]
+
+
+def test_replayable_launch_neither_blocks_shutdown_nor_interrupted(monkeypatch):
+    # A RUNNING launch (a replayable request) must not hold shutdown open --
+    # provisioning outlives any realistic grace -- and must not be flagged
+    # should_retry: its row is left RUNNING so startup recovery requeues and
+    # re-executes it (sky/server/requests/requests.py,
+    # _requeue_interrupted_launches).
+    launch_name = uvicorn_module.requests_lib.REPLAYABLE_REQUEST_NAMES[0]
+    # now = 101 is well before the deadline (150): the early exit must come
+    # from the replayable filter, not the timeout sweep.
+    server, slept, interrupted = _server_at_shutdown(monkeypatch, now=101.0)
+    _patch_backend(monkeypatch,
+                   side_effect=lambda: [('req-launch', launch_name)])
+
+    server._wait_requests()
+
+    assert interrupted == []
+    assert slept == []
+
+
+def test_replayable_filter_leaves_other_requests_to_the_sweep(monkeypatch):
+    # Past the deadline, non-replayable requests are still interrupted for
+    # client retry; the replayable launch alone is exempt.
+    launch_name = uvicorn_module.requests_lib.REPLAYABLE_REQUEST_NAMES[0]
+    server, slept, interrupted = _server_at_shutdown(monkeypatch, now=151.0)
+    _patch_backend(monkeypatch,
+                   side_effect=lambda: [('req-launch', launch_name),
+                                        ('req-exec', 'sky.exec')])
+
+    server._wait_requests()
+
+    assert interrupted == ['req-exec']
+    assert slept == []

@@ -287,3 +287,115 @@ async def test_corrupted_db_falls_back_to_wipe(isolated_database,
         requests_lib.RequestTaskFilter()) == []
     assert await requests_lib.create_if_not_exists_async(
         _make_request('req-new', RequestStatus.PENDING))
+
+
+# ---------------------------------------------------------------------------
+# Interrupted-launch replay: launches are re-runnable by construction until
+# their cluster reaches UP (the run section is only submitted after the UP
+# row write), so recovery requeues them instead of cancelling, and graceful
+# shutdown leaves them RUNNING for recovery instead of waiting/cancelling.
+# ---------------------------------------------------------------------------
+
+from sky.utils import status_lib  # pylint: disable=wrong-import-position
+
+_LAUNCH_NAME = requests_lib.REPLAYABLE_REQUEST_NAMES[0]
+
+
+def _make_launch_request(request_id: str,
+                         status: RequestStatus,
+                         cluster_name: str,
+                         retryable: bool = False) -> requests_lib.Request:
+    req = _make_request(request_id, status, retryable=retryable)
+    req.name = _LAUNCH_NAME
+    req.cluster_name = cluster_name
+    return req
+
+
+def _patch_cluster_statuses(monkeypatch, statuses):
+
+    def _get_status(cluster_name):
+        return statuses[cluster_name]
+
+    monkeypatch.setattr(requests_lib.global_user_state,
+                        'get_status_from_cluster_name', _get_status)
+
+
+@pytest.mark.asyncio
+async def test_recovery_requeues_interrupted_launches(isolated_database,
+                                                      isolated_legacy_logs,
+                                                      monkeypatch):
+    seed = [
+        # Interrupted mid-provision: cluster still INIT -> requeue.
+        _make_launch_request('req-launch-init', RequestStatus.RUNNING,
+                             'cluster-init'),
+        # Died before the cluster row was written -> requeue from scratch.
+        _make_launch_request('req-launch-no-row', RequestStatus.RUNNING,
+                             'cluster-missing'),
+        # Cluster reached UP: job submission may have happened -> the
+        # generic CANCELLED + should_retry path, never a replay.
+        _make_launch_request('req-launch-up', RequestStatus.RUNNING,
+                             'cluster-up'),
+        # Non-retryable WAITING launch never started this attempt -> requeue.
+        _make_launch_request('req-launch-waiting', RequestStatus.WAITING,
+                             'cluster-init'),
+        # Retryable WAITING launch is already queued for a full re-run;
+        # recovery must leave it to the normal re-enqueue path.
+        _make_launch_request('req-launch-waiting-retryable',
+                             RequestStatus.WAITING,
+                             'cluster-init',
+                             retryable=True),
+    ]
+    for request in seed:
+        assert await requests_lib.create_if_not_exists_async(request)
+    _patch_cluster_statuses(
+        monkeypatch, {
+            'cluster-init': status_lib.ClusterStatus.INIT,
+            'cluster-missing': None,
+            'cluster-up': status_lib.ClusterStatus.UP,
+        })
+
+    assert requests_lib.recover_db_and_logs() is True
+
+    for request_id in ('req-launch-init', 'req-launch-no-row',
+                       'req-launch-waiting'):
+        record = requests_lib.get_request(request_id)
+        assert record.status == RequestStatus.PENDING, request_id
+        assert record.should_retry is False, request_id
+        assert record.pid is None, request_id
+        assert record.finished_at is None, request_id
+    record = requests_lib.get_request('req-launch-up')
+    assert record.status == RequestStatus.CANCELLED
+    assert record.should_retry is True
+    record = requests_lib.get_request('req-launch-waiting-retryable')
+    assert record.status == RequestStatus.WAITING
+    assert record.should_retry is False
+
+
+@pytest.mark.asyncio
+async def test_requeued_launch_is_reenqueued(isolated_database,
+                                             isolated_legacy_logs, monkeypatch):
+    # End-to-end at the recovery layer: a requeued launch must be picked up
+    # by the executor re-enqueue pass like any PENDING row.
+    assert await requests_lib.create_if_not_exists_async(
+        _make_launch_request('req-launch-init', RequestStatus.RUNNING,
+                             'cluster-init'))
+    _patch_cluster_statuses(monkeypatch,
+                            {'cluster-init': status_lib.ClusterStatus.INIT})
+    assert requests_lib.recover_db_and_logs() is True
+
+    puts = []
+
+    class _StubQueue:
+
+        def __init__(self, schedule_type):
+            self._schedule_type = schedule_type
+
+        def put(self, item):
+            puts.append((self._schedule_type, item))
+
+    monkeypatch.setattr(executor, '_get_queue', _StubQueue)
+
+    executor.reenqueue_recovered_requests()
+
+    assert puts == [(requests_lib.ScheduleType.LONG, ('req-launch-init', False,
+                                                      False))]

@@ -3510,12 +3510,21 @@ if __name__ == '__main__':
     # is it safe to re-enqueue the surviving queued rows below.
     requests_recovered = requests_lib.recover_db_and_logs()
     # Surface clusters wedged in INIT by work that died with the previous
-    # server run (or with the pod's disk on a redeploy): record a cluster
-    # event explaining the interruption. Must run after request rows are
-    # reconciled above (so re-enqueueable requests are excluded) and before
-    # the server accepts traffic (so no new launch is mistaken for a dead
-    # one). Best effort; never blocks startup.
-    requests_lib.surface_interrupted_cluster_launches()
+    # server run (or with the pod's disk on a redeploy) and could not be
+    # requeued: record a cluster event explaining the interruption. Runs in
+    # the background so a large INIT backlog cannot delay readiness, delayed
+    # past the previous replica's shutdown grace so a launch still finishing
+    # on an overlapping old replica is not misread as interrupted. Best
+    # effort; never affects the server.
+    try:
+        scan_delay = float(
+            os.environ.get(constants.GRACE_PERIOD_SECONDS_ENV_VAR, '60'))
+    except ValueError:
+        scan_delay = 60
+    threading.Thread(target=requests_lib.surface_interrupted_cluster_launches,
+                     args=(scan_delay,),
+                     name='surface-interrupted-launches',
+                     daemon=True).start()
     # Restore the server user hash
     logger.info('Initializing server user hash')
     _init_or_restore_server_user_hash()
