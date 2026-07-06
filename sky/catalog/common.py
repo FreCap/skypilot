@@ -87,6 +87,24 @@ def get_catalog_path(filename: str) -> str:
     return os.path.join(_ABSOLUTE_VERSIONED_CATALOG_DIR, filename)
 
 
+def hosted_catalog_base_urls() -> Tuple[str, str]:
+    """Primary and fallback base URLs for the hosted catalog.
+
+    SKYPILOT_HOSTED_CATALOG_DIR_URL overrides both (a self-hosted mirror,
+    e.g. when the upstream catalog feed is stale): with an override there
+    is deliberately no fallback to the upstream mirrors, otherwise a
+    transient error on the override would silently serve stale upstream
+    data. Read at call time so a server picks up the setting without a
+    code change.
+    """
+    override = os.environ.get('SKYPILOT_HOSTED_CATALOG_DIR_URL')
+    if override:
+        override = override.rstrip('/')
+        return override, override
+    return (constants.HOSTED_CATALOG_DIR_URL,
+            constants.HOSTED_CATALOG_DIR_URL_S3_MIRROR)
+
+
 def is_catalog_modified(filename: str) -> bool:
     # Check the md5 of the file to see if it has changed.
     catalog_path = get_catalog_path(filename)
@@ -242,8 +260,9 @@ def read_catalog(filename: str,
             if not _need_update():
                 return False
 
-            url = f'{constants.HOSTED_CATALOG_DIR_URL}/{constants.CATALOG_SCHEMA_VERSION}/{filename}'  # pylint: disable=line-too-long
-            url_fallback = f'{constants.HOSTED_CATALOG_DIR_URL_S3_MIRROR}/{constants.CATALOG_SCHEMA_VERSION}/{filename}'  # pylint: disable=line-too-long
+            base_url, base_url_fallback = hosted_catalog_base_urls()
+            url = f'{base_url}/{constants.CATALOG_SCHEMA_VERSION}/{filename}'
+            url_fallback = f'{base_url_fallback}/{constants.CATALOG_SCHEMA_VERSION}/{filename}'  # pylint: disable=line-too-long
             headers = {'User-Agent': 'SkyPilot/0.7'}
             update_frequency_str = ''
             if pull_frequency_hours is not None:
