@@ -638,15 +638,16 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
             'InstanceAware Autoscaler requires dict type target_qps_per_replica'
         # Re-assign with correct type using setattr to avoid typing issues
         self.target_qps_per_replica = spec.target_qps_per_replica
-        # Memoizes a replica's resolved GPU type (replica_id -> gpu_type) so
-        # the blocking handle() DB read + unpickle is not repeated for the same
-        # replica across the 2-3 passes per decision tick. A type is cached
-        # only once the replica's launch has finished: while it is still
-        # provisioning, the cluster record is rewritten for every failover
-        # attempt and its accelerators can change, so a mid-launch resolution
-        # must be re-resolved on later ticks. After launch the type is fixed
-        # for the replica's lifetime. Pruned to the live replica set each tick.
-        self._gpu_type_cache: Dict[int, str] = {}
+        # Memoizes a replica's resolved GPU shape (replica_id ->
+        # (gpu_type, gpu_count)) so the blocking handle() DB read + unpickle
+        # is not repeated for the same replica across the 2-3 passes per
+        # decision tick. A shape is cached only once the replica's launch has
+        # finished: while it is still provisioning, the cluster record is
+        # rewritten for every failover attempt and its accelerators can
+        # change, so a mid-launch resolution must be re-resolved on later
+        # ticks. After launch the shape is fixed for the replica's lifetime.
+        # Pruned to the live replica set each tick.
+        self._gpu_shape_cache: Dict[int, Tuple[str, int]] = {}
 
     def _generate_scaling_decisions(
         self,
@@ -656,9 +657,9 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
         # Drop cached GPU types for replicas that no longer exist so the cache
         # stays bounded to the live replica set.
         live_replica_ids = {info.replica_id for info in replica_infos}
-        for replica_id in list(self._gpu_type_cache):
+        for replica_id in list(self._gpu_shape_cache):
             if replica_id not in live_replica_ids:
-                del self._gpu_type_cache[replica_id]
+                del self._gpu_shape_cache[replica_id]
 
         # Always use instance-aware logic
         # since target_qps_per_replica is guaranteed to be dict
@@ -825,55 +826,66 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
                             f'with status: {replica_info.status}')
                 continue
 
-            gpu_type = self._get_gpu_type_from_replica_info(replica_info)
+            gpu_type, gpu_count = self._get_gpu_shape_from_replica_info(
+                replica_info)
             logger.info(f'Processing replica {replica_info.replica_id} '
-                        f'with GPU type: {gpu_type}')
+                        f'with GPU shape: {gpu_type}:{gpu_count}')
 
-            # Use flexible matching logic
-            qps_for_this_gpu = self._get_target_qps_for_gpu_type(gpu_type)
-            total_qps += qps_for_this_gpu
-            logger.info(f'GPU type {gpu_type} -> {qps_for_this_gpu} QPS')
+            # Use flexible matching logic, weighted by GPU count: a 4-GPU
+            # replica contributes 4x the per-GPU capacity of a 1-GPU one.
+            qps_for_this_replica = self._get_target_qps_for_gpu_shape(
+                gpu_type, gpu_count)
+            total_qps += qps_for_this_replica
+            logger.info(f'GPU shape {gpu_type}:{gpu_count} -> '
+                        f'{qps_for_this_replica} QPS')
 
         logger.info(f'Calculated total QPS: {total_qps}')
         return total_qps
 
-    def _get_target_qps_for_gpu_type(self, gpu_type: str) -> float:
-        """Get target QPS for a specific GPU type with flexible matching."""
+    def _get_target_qps_for_gpu_shape(self, gpu_type: str,
+                                      gpu_count: int) -> float:
+        """Per-replica target QPS for a `gpu_count` x `gpu_type` replica.
+
+        Resolution (see serve_utils.resolve_target_qps_for_gpu_shape):
+        exact shape key is a per-replica value; a bare type key is
+        per-GPU and is multiplied by the replica's GPU count.
+        """
         assert isinstance(self.target_qps_per_replica,
                           dict), 'Expected dict for instance-aware logic'
         target_qps_dict = self.target_qps_per_replica
 
-        # Direct match first
-        if gpu_type in target_qps_dict:
-            return target_qps_dict[gpu_type]
-
-        # Try matching by base name (e.g., 'A100' matches 'A100:1')
-        for config_key in target_qps_dict.keys():
-            # Remove count suffix (e.g., 'A100:1' -> 'A100')
-            base_name = config_key.split(':')[0]
-            if gpu_type == base_name:
-                return target_qps_dict[config_key]
+        resolved = serve_utils.resolve_target_qps_for_gpu_shape(
+            gpu_type, gpu_count, target_qps_dict)
+        if resolved is not None:
+            return resolved
 
         # Fallback to minimum QPS
-        logger.warning(f'No matching QPS found for GPU type: {gpu_type}. '
+        logger.warning(f'No matching QPS found for GPU shape: '
+                       f'{gpu_type}:{gpu_count}. '
                        f'Available types: {list(target_qps_dict.keys())}. '
                        f'Using minimum QPS as fallback.')
         return min(target_qps_dict.values())
 
-    def _get_gpu_type_from_replica_info(
-            self, replica_info: 'replica_managers.ReplicaInfo') -> str:
-        """Extract GPU type from ReplicaInfo object."""
-        cached = self._gpu_type_cache.get(replica_info.replica_id)
+    def _get_gpu_shape_from_replica_info(
+            self,
+            replica_info: 'replica_managers.ReplicaInfo') -> Tuple[str, int]:
+        """Extract (GPU type, GPU count) from ReplicaInfo object."""
+        cached = self._gpu_shape_cache.get(replica_info.replica_id)
         if cached is not None:
             return cached
         gpu_type = 'unknown'
+        gpu_count = 1
         handle = replica_info.handle()
         if handle is not None:
             accelerators = handle.launched_resources.accelerators
             if accelerators and len(accelerators) > 0:
-                # Get the first accelerator type
+                # Get the first accelerator entry.
                 gpu_type = list(accelerators.keys())[0]
-        # Cache only a resolved type of a replica whose launch has finished.
+                try:
+                    gpu_count = max(1, int(accelerators[gpu_type]))
+                except (TypeError, ValueError):
+                    gpu_count = 1
+        # Cache only a resolved shape of a replica whose launch has finished.
         # While the replica is still provisioning, the cluster record (and
         # thus launched_resources) is rewritten for every failover attempt, so
         # the accelerator resolved mid-launch may not be the one the launch
@@ -881,8 +893,9 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
         if (gpu_type != 'unknown' and
                 replica_info.status_property.sky_launch_status
                 == common_utils.ProcessStatus.SUCCEEDED):
-            self._gpu_type_cache[replica_info.replica_id] = gpu_type
-        return gpu_type
+            self._gpu_shape_cache[replica_info.replica_id] = (gpu_type,
+                                                              gpu_count)
+        return gpu_type, gpu_count
 
     def _extract_target_qps_list_from_ready_replicas(
             self,
@@ -898,13 +911,16 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
                     f'not ready (status: {replica_info.status}), skipping')
                 continue
 
-            gpu_type = self._get_gpu_type_from_replica_info(replica_info)
+            gpu_type, gpu_count = self._get_gpu_shape_from_replica_info(
+                replica_info)
 
-            # Use flexible matching logic
-            qps_for_this_gpu = self._get_target_qps_for_gpu_type(gpu_type)
-            ready_replica_qps.append(qps_for_this_gpu)
+            # Use flexible matching logic, weighted by GPU count.
+            qps_for_this_replica = self._get_target_qps_for_gpu_shape(
+                gpu_type, gpu_count)
+            ready_replica_qps.append(qps_for_this_replica)
             logger.info(f'Ready replica {replica_info.replica_id} '
-                        f'with GPU {gpu_type}: {qps_for_this_gpu} QPS')
+                        f'with GPU {gpu_type}:{gpu_count}: '
+                        f'{qps_for_this_replica} QPS')
 
         if ready_replica_qps:
             logger.info(
@@ -927,15 +943,16 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
             if info.is_terminal:
                 continue
 
-            # Get GPU type directly from replica info
-            gpu_type = self._get_gpu_type_from_replica_info(info)
+            # Get GPU shape directly from replica info
+            gpu_type, gpu_count = self._get_gpu_shape_from_replica_info(info)
 
-            # Use flexible matching logic
-            target_qps = self._get_target_qps_for_gpu_type(gpu_type)
+            # Use flexible matching logic, weighted by GPU count so
+            # smaller-capacity replicas are preferred for scale-down.
+            target_qps = self._get_target_qps_for_gpu_shape(gpu_type, gpu_count)
 
             replica_qps_pairs.append((info, float(target_qps)))
             logger.info(f'Replica {info.replica_id} '
-                        f'with GPU {gpu_type}: {target_qps} QPS')
+                        f'with GPU {gpu_type}:{gpu_count}: {target_qps} QPS')
 
         # Create a mapping from replica_id to target_qps for sorting
         replica_qps_map = {

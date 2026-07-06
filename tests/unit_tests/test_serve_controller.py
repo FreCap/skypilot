@@ -73,8 +73,8 @@ def _sync(ctrl: controller.SkyServeController, infos,
 
 
 class TestGetLbReplicaInfo:
-    """Tests for the (url, gpu_type) per-replica cache behind the
-    /controller/load_balancer_sync response."""
+    """Tests for the (url, gpu_type, gpu_count) per-replica cache behind
+    the /controller/load_balancer_sync response."""
 
     def test_resolves_url_and_gpu_type_for_ready_replicas(self):
         ctrl = _make_controller()
@@ -90,10 +90,12 @@ class TestGetLbReplicaInfo:
         ]
         assert _sync(ctrl, infos) == {
             'http://1.1.1.1:8080': {
-                'gpu_type': 'L4'
+                'gpu_type': 'L4',
+                'gpu_count': '1'
             },
             'http://2.2.2.2:8080': {
-                'gpu_type': 'A100'
+                'gpu_type': 'A100',
+                'gpu_count': '8'
             },
         }
 
@@ -119,7 +121,12 @@ class TestGetLbReplicaInfo:
                                  url='http://2.2.2.2:8080',
                                  accelerators={'L4': 1})
         result = _sync(ctrl, [provisioning, ready])
-        assert result == {'http://2.2.2.2:8080': {'gpu_type': 'L4'}}
+        assert result == {
+            'http://2.2.2.2:8080': {
+                'gpu_type': 'L4',
+                'gpu_count': '1'
+            }
+        }
         assert provisioning.url_resolutions == 0
         assert provisioning.handle_resolutions == 0
 
@@ -136,7 +143,12 @@ class TestGetLbReplicaInfo:
                                    url='http://2.2.2.2:8080',
                                    accelerators={'L4': 1})
         result = _sync(ctrl, [outdated, current], active_versions=(2,))
-        assert result == {'http://2.2.2.2:8080': {'gpu_type': 'L4'}}
+        assert result == {
+            'http://2.2.2.2:8080': {
+                'gpu_type': 'L4',
+                'gpu_count': '1'
+            }
+        }
         assert outdated.url_resolutions == 0
 
     def test_unknown_gpu_type_when_unresolvable(self):
@@ -153,12 +165,36 @@ class TestGetLbReplicaInfo:
                                            accelerators=None)
         assert _sync(ctrl, [no_handle, no_accelerators]) == {
             'http://1.1.1.1:8080': {
-                'gpu_type': 'unknown'
+                'gpu_type': 'unknown',
+                'gpu_count': '1'
             },
             'http://2.2.2.2:8080': {
-                'gpu_type': 'unknown'
+                'gpu_type': 'unknown',
+                'gpu_count': '1'
             },
         }
+
+    def test_ready_replica_without_url_is_skipped_not_crashed(self):
+        """A READY replica whose endpoint is briefly unresolvable (e.g.
+        no head IP mid-recovery) must be skipped for the sync round,
+        not crash load_balancer_sync (this was an assert)."""
+        ctrl = _make_controller()
+        no_url = _FakeReplicaInfo(1,
+                                  serve_state.ReplicaStatus.READY,
+                                  url=None,
+                                  accelerators={'L4': 1})
+        ok = _FakeReplicaInfo(2,
+                              serve_state.ReplicaStatus.READY,
+                              url='http://2.2.2.2:8080',
+                              accelerators={'L4': 1})
+        assert _sync(ctrl, [no_url, ok]) == {
+            'http://2.2.2.2:8080': {
+                'gpu_type': 'L4',
+                'gpu_count': '1'
+            }
+        }
+        # Not cached: it must be re-resolved on the next sync.
+        assert 1 not in ctrl._lb_replica_cache  # pylint: disable=protected-access
 
     def test_cache_pruned_when_replica_leaves_ready_set(self):
         ctrl = _make_controller()
@@ -183,7 +219,8 @@ class TestGetLbReplicaInfo:
                                      accelerators={'L4': 1})
         assert _sync(ctrl, [recovered]) == {
             'http://3.3.3.3:8080': {
-                'gpu_type': 'L4'
+                'gpu_type': 'L4',
+                'gpu_count': '1'
             }
         }
         assert recovered.url_resolutions == 1

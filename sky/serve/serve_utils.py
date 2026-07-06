@@ -1032,6 +1032,32 @@ def _get_service_status(
     return record
 
 
+def resolve_target_qps_for_gpu_shape(
+        gpu_type: str, gpu_count: int,
+        target_qps_per_replica: Dict[str, float]) -> Optional[float]:
+    """Per-REPLICA target QPS for a replica with `gpu_count` x `gpu_type`.
+
+    Key semantics (backward compatible with the count-blind matcher):
+      1. An exact shape key ('L4:4') is a per-replica value, used as-is.
+      2. A bare type key ('L4') is a per-GPU value, multiplied by the
+         replica's GPU count.
+      3. A count-suffixed key of the same type but different count
+         ('L4:1' for an L4:8 replica) is normalized to per-GPU
+         (value / key count) and multiplied by the replica's count.
+    Returns None when nothing matches (caller picks its fallback).
+    """
+    exact_key = f'{gpu_type}:{gpu_count}'
+    if exact_key in target_qps_per_replica:
+        return target_qps_per_replica[exact_key]
+    if gpu_type in target_qps_per_replica:
+        return target_qps_per_replica[gpu_type] * gpu_count
+    for key, value in target_qps_per_replica.items():
+        base, _, count_str = key.partition(':')
+        if base == gpu_type and count_str.isdigit() and int(count_str) > 0:
+            return value / int(count_str) * gpu_count
+    return None
+
+
 def get_service_status_pickled(
         service_names: Optional[List[str]],
         pool: bool,
