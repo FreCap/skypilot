@@ -43,10 +43,29 @@ export function normalizeService(record) {
     ? record.replica_info
     : [];
   const replicas = replicaInfo.map(normalizeReplica);
-  const replicasReady = replicas.filter((r) => r.status === 'READY').length;
-  const replicasFailed = replicas.filter((r) =>
-    FAILED_REPLICA_STATUSES.has(r.status)
-  ).length;
+  // Summary responses (summary_only=true) carry a cheap status histogram
+  // instead of per-replica entries; compute the same aggregates from it so
+  // list/header views render identically on either response shape.
+  const counts =
+    !replicaInfo.length && record.replica_status_counts
+      ? record.replica_status_counts
+      : null;
+  let replicasReady;
+  let replicasFailed;
+  let replicasTotalRaw;
+  if (counts) {
+    replicasReady = counts['READY'] || 0;
+    replicasFailed = Object.entries(counts)
+      .filter(([status]) => FAILED_REPLICA_STATUSES.has(status))
+      .reduce((acc, [, n]) => acc + n, 0);
+    replicasTotalRaw = Object.values(counts).reduce((acc, n) => acc + n, 0);
+  } else {
+    replicasReady = replicas.filter((r) => r.status === 'READY').length;
+    replicasFailed = replicas.filter((r) =>
+      FAILED_REPLICA_STATUSES.has(r.status)
+    ).length;
+    replicasTotalRaw = replicas.length;
+  }
 
   return {
     name: record.name,
@@ -58,8 +77,11 @@ export function normalizeService(record) {
     replicasReady,
     // Match `sky serve status`: failed replicas are excluded from the
     // total (see _get_replicas in sky/serve/serve_utils.py).
-    replicasTotal: replicas.length - replicasFailed,
+    replicasTotal: replicasTotalRaw - replicasFailed,
     replicasFailed,
+    // True when this record came from a summary_only response: the
+    // per-replica list is intentionally absent, not empty.
+    summaryOnly: Boolean(counts),
     targetReplicas: record.target_num_replicas ?? null,
     policy: record.policy || null,
     loadBalancingPolicy: record.load_balancing_policy || null,
@@ -71,10 +93,17 @@ export function normalizeService(record) {
   };
 }
 
-export async function getServices() {
+export async function getServices(options = {}) {
+  // summaryOnly asks the server to skip per-replica serialization and
+  // return a status histogram instead — at fleet scale (hundreds of
+  // replicas) the full query takes tens of seconds while the summary is
+  // near-instant, so list views and page headers should always use it.
+  // serviceNames narrows the query to specific services (null = all).
+  const { serviceNames = null, summaryOnly = false } = options;
   try {
     const response = await apiClient.post(`/serve/status`, {
-      service_names: null, // null means get all services
+      service_names: serviceNames,
+      summary_only: summaryOnly,
     });
     if (!response.ok) {
       const msg = `Initial API request to get services failed with status ${response.status}`;

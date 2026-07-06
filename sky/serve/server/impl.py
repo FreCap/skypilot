@@ -953,6 +953,7 @@ class _DefaultServiceStatusRunner:
         handle: 'backends.CloudVmRayResourceHandle',
         service_names: Optional[List[str]],
         pool: bool,
+        summary_only: bool = False,
     ) -> List[Dict[str, Any]]:
         noun = 'pool' if pool else 'service'
         use_legacy = not handle.is_grpc_enabled_with_flag
@@ -961,7 +962,7 @@ class _DefaultServiceStatusRunner:
         if not use_legacy:
             try:
                 service_records = serve_rpc_utils.RpcRunner.get_service_status(
-                    handle, service_names, pool)
+                    handle, service_names, pool, summary_only=summary_only)
             except exceptions.SkyletMethodNotImplementedError:
                 use_legacy = True
 
@@ -969,8 +970,8 @@ class _DefaultServiceStatusRunner:
             backend = backend_utils.get_backend_from_handle(handle)
             assert isinstance(backend, backends.CloudVmRayBackend)
 
-            code = serve_utils.ServeCodeGen.get_service_status(service_names,
-                                                               pool=pool)
+            code = serve_utils.ServeCodeGen.get_service_status(
+                service_names, pool=pool, summary_only=summary_only)
             returncode, serve_status_payload, stderr = backend.run_on_head(
                 handle,
                 code,
@@ -996,8 +997,14 @@ class _DefaultServiceStatusRunner:
 def status(
     service_names: Optional[Union[str, List[str]]] = None,
     pool: bool = False,
+    summary_only: bool = False,
 ) -> List[Dict[str, Any]]:
-    """Gets statuses of services or pools."""
+    """Gets statuses of services or pools.
+
+    summary_only skips per-replica info (returns replica_status_counts
+    instead) — the cheap path for dashboard list/header rendering at
+    fleet scale.
+    """
     noun = 'pool' if pool else 'service'
     if service_names is not None:
         if isinstance(service_names, str):
@@ -1019,7 +1026,10 @@ def status(
     assert isinstance(handle, backends.CloudVmRayResourceHandle)
 
     service_records = serve_runner.current().get_service_status(
-        handle=handle, service_names=service_names, pool=pool)
+        handle=handle,
+        service_names=service_names,
+        pool=pool,
+        summary_only=summary_only)
 
     # Get the endpoint for each service
     for service_record in service_records:

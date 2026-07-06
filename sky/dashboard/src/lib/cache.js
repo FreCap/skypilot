@@ -93,11 +93,25 @@ class DashboardCache {
       return this.pendingRequests.get(key);
     }
 
-    // If data is stale or doesn't exist, fetch fresh data
-    // Create a promise for this request and store it
+    // If data is stale or doesn't exist, fetch fresh data.
+    // Start the fetch eagerly, but normalize a synchronous throw into
+    // a rejected promise. The rejection is then handled inside the
+    // async IIFE, which only resumes after `requestPromise` is
+    // assigned and stored in pendingRequests below. If catch/finally
+    // could run during the IIFE call itself (as with a bare
+    // `await fetchFunction(...)` and a sync throw), the cleanup would
+    // no-op and pendingRequests would then permanently hold an
+    // already-settled promise, poisoning the key for every later call
+    // until an invalidate.
+    let fetchResultPromise;
+    try {
+      fetchResultPromise = Promise.resolve(fetchFunction(...args));
+    } catch (error) {
+      fetchResultPromise = Promise.reject(error);
+    }
     const requestPromise = (async () => {
       try {
-        const freshData = await fetchFunction(...args);
+        const freshData = await fetchResultPromise;
 
         // If the fetch function indicates the result should not be cached
         // (e.g., transient error fallback), then skip cache update and
@@ -112,11 +126,17 @@ class DashboardCache {
           return freshData;
         }
 
-        // Update cache with fresh data
-        this.cache.set(key, {
-          data: freshData,
-          lastUpdated: Date.now(),
-        });
+        // Update cache with fresh data — but only if this request is
+        // still the current one for the key. If invalidate()/
+        // invalidateFunction() ran while we were in flight, a newer
+        // request may already be pending (or resolved); writing our
+        // result would resurrect pre-invalidate data.
+        if (this.pendingRequests.get(key) === requestPromise) {
+          this.cache.set(key, {
+            data: freshData,
+            lastUpdated: Date.now(),
+          });
+        }
 
         return freshData;
       } catch (error) {
@@ -132,8 +152,14 @@ class DashboardCache {
         // If no cached data and fetch fails, re-throw the error
         throw error;
       } finally {
-        // Remove the pending request marker
-        this.pendingRequests.delete(key);
+        // Remove the pending request marker — only our own. After an
+        // invalidate, a newer request may occupy this key; deleting it
+        // would break that request's deduplication. (The deferred
+        // fetch above guarantees this never runs before the marker is
+        // set, so no TDZ/undefined handling is needed.)
+        if (this.pendingRequests.get(key) === requestPromise) {
+          this.pendingRequests.delete(key);
+        }
       }
     })();
 
@@ -164,12 +190,18 @@ class DashboardCache {
   invalidateFunction(fetchFunction) {
     const functionString = fetchFunction.toString();
     const functionHash = simpleHash(functionString);
-    const keysToDelete = [];
+    const keysToDelete = new Set();
 
-    // Find all keys that start with the function hash
-    for (const key of this.cache.keys()) {
-      if (key.startsWith(`${functionHash}_`)) {
-        keysToDelete.push(key);
+    // Find all keys that start with the function hash. Sweep the
+    // pending/background maps too: an in-flight first fetch has no
+    // cache entry yet, and leaving its pendingRequests entry behind
+    // would let a post-invalidate get() reuse the pre-invalidate
+    // request instead of refetching.
+    for (const map of [this.cache, this.pendingRequests, this.backgroundJobs]) {
+      for (const key of map.keys()) {
+        if (key.startsWith(`${functionHash}_`)) {
+          keysToDelete.add(key);
+        }
       }
     }
 
@@ -269,12 +301,19 @@ class DashboardCache {
    * @private
    */
   _refreshInBackground(fetchFunction, args, key) {
-    // Mark that we have a background job running for this key
-    this.backgroundJobs.set(key, true);
+    // Mark that we have a background job running for this key. The
+    // token identifies THIS job: if invalidate()/invalidateFunction()
+    // removes it mid-flight, the stale result must neither be written
+    // to the cache nor clobber a newer job's marker.
+    const jobToken = {};
+    this.backgroundJobs.set(key, jobToken);
 
     // Execute the refresh asynchronously
     fetchFunction(...args)
       .then((freshData) => {
+        if (this.backgroundJobs.get(key) !== jobToken) {
+          return; // invalidated while in flight
+        }
         // Respect __skipCache signal from fetch function
         if (freshData && freshData.__skipCache) {
           return; // do not update cache
@@ -289,8 +328,10 @@ class DashboardCache {
         console.warn(`Background refresh failed for ${key}:`, error);
       })
       .finally(() => {
-        // Remove the background job marker
-        this.backgroundJobs.delete(key);
+        // Remove the background job marker — only our own.
+        if (this.backgroundJobs.get(key) === jobToken) {
+          this.backgroundJobs.delete(key);
+        }
       });
   }
 

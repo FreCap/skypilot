@@ -99,7 +99,9 @@ export function Services() {
   const [lastFetchedTime, setLastFetchedTime] = useState(null);
 
   const handleRefresh = () => {
-    dashboardCache.invalidate(getServices);
+    // The cache is args-keyed; drop every getServices variant
+    // (summary and full) so refresh always refetches.
+    dashboardCache.invalidateFunction(getServices);
     if (refreshDataRef.current) {
       refreshDataRef.current();
     }
@@ -173,7 +175,12 @@ function ServicesTable({
     setLoading(true);
     setLocalLoading(true);
     try {
-      const servicesResponse = await dashboardCache.get(getServices);
+      // The list view only needs per-service aggregates: use the cheap
+      // summary query (the full one serializes every replica and takes
+      // tens of seconds at fleet scale).
+      const servicesResponse = await dashboardCache.get(getServices, [
+        { summaryOnly: true },
+      ]);
       setData(servicesResponse.services || []);
       setControllerStopped(servicesResponse.controllerStopped || false);
       if (onFetched) {

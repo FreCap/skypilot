@@ -82,6 +82,7 @@ describe('getServices', () => {
 
     expect(apiClient.post).toHaveBeenCalledWith('/serve/status', {
       service_names: null,
+      summary_only: false,
     });
     expect(apiClient.get).toHaveBeenCalledWith(
       `/api/get?request_id=${REQUEST_ID}`
@@ -200,6 +201,38 @@ describe('getServices', () => {
     expect(services[0].replicasReady).toBe(1);
     expect(services[0].replicasTotal).toBe(1);
     expect(services[0].replicasFailed).toBe(failedStatuses.length);
+  });
+
+  it('passes service_names and summary_only through to /serve/status', async () => {
+    // Summary responses have no replica_info; the server sends
+    // replica_status_counts instead (SERVE_VERSION >= 6).
+    const record = rawServiceRecord({
+      replica_info: undefined,
+      replica_status_counts: {
+        READY: 3,
+        PROVISIONING: 2,
+        FAILED_PROBING: 1,
+      },
+    });
+    apiClient.post.mockResolvedValue(mockDispatchResponse());
+    apiClient.get.mockResolvedValue(mockResultResponse([record]));
+
+    const { services } = await getServices({
+      serviceNames: ['boltz-l4-fleet'],
+      summaryOnly: true,
+    });
+
+    expect(apiClient.post).toHaveBeenCalledWith('/serve/status', {
+      service_names: ['boltz-l4-fleet'],
+      summary_only: true,
+    });
+    expect(services[0].summaryOnly).toBe(true);
+    expect(services[0].replicas).toEqual([]);
+    expect(services[0].replicasReady).toBe(3);
+    // Failed-class statuses are excluded from the total, matching the
+    // replica_info-based computation.
+    expect(services[0].replicasTotal).toBe(5);
+    expect(services[0].replicasFailed).toBe(1);
   });
 
   it('reports controllerStopped when the serve controller is not up', async () => {

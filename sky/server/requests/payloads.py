@@ -771,6 +771,9 @@ class ServeDownloadLogsBody(RequestBody):
 class ServeStatusBody(RequestBody):
     """The request body for the serve status endpoint."""
     service_names: Optional[Union[str, List[str]]]
+    # Skip per-replica info; return cheap replica_status_counts instead.
+    # Used by the dashboard for fast list/header rendering at fleet scale.
+    summary_only: bool = False
 
 
 class RealtimeGpuAvailabilityRequestBody(RequestBody):

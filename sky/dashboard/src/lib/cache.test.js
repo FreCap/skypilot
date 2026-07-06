@@ -126,6 +126,126 @@ describe('DashboardCache', () => {
     });
   });
 
+  describe('invalidateFunction', () => {
+    test('drops in-flight pending requests, not just cached entries', async () => {
+      const mockFetch = createMockFetch({ data: 'v1' }, 100);
+
+      // Start a first fetch; it is in pendingRequests but NOT yet in
+      // the cache map.
+      const inflight = cache.get(mockFetch, [{ summaryOnly: false }]);
+
+      // Invalidate mid-flight: a subsequent get() must start a fresh
+      // request instead of reusing the pre-invalidate one.
+      cache.invalidateFunction(mockFetch);
+      const fresh = cache.get(mockFetch, [{ summaryOnly: false }]);
+
+      jest.advanceTimersByTime(100);
+      await Promise.all([inflight, fresh]);
+
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+
+    test('an invalidated in-flight request cannot write stale data to the cache', async () => {
+      let firstResolve;
+      const slowFirst = new Promise((resolve) => {
+        firstResolve = resolve;
+      });
+      let call = 0;
+      const mockFetch = jest.fn(async () => {
+        call += 1;
+        if (call === 1) {
+          await slowFirst;
+          return { data: 'stale' };
+        }
+        return { data: 'fresh' };
+      });
+
+      // Request A in flight (slow), then invalidate, then request B
+      // completes with fresh data.
+      const a = cache.get(mockFetch, ['x']);
+      cache.invalidateFunction(mockFetch);
+      const b = cache.get(mockFetch, ['x']);
+      await b;
+
+      // A resolves last — it must NOT overwrite B's fresh cache entry
+      // nor delete B's bookkeeping.
+      firstResolve();
+      await a;
+
+      // A resolved after the invalidate: it must not have overwritten
+      // B's fresh entry (getCached is side-effect free — no background
+      // refresh).
+      expect(cache.getCached(mockFetch, ['x'])).toEqual({ data: 'fresh' });
+    });
+
+    test('synchronously-throwing fetch still falls back to stale cache', async () => {
+      // Seed the cache, expire it, then use a fetchFunction that
+      // throws BEFORE returning a promise: the catch/finally in get()
+      // run during the call itself and must not hit a TDZ on the
+      // pending-promise guard.
+      let shouldThrow = false;
+      const mockFetch = jest.fn((...args) => {
+        if (shouldThrow) {
+          throw new Error('sync boom');
+        }
+        return Promise.resolve({ data: 'seeded' });
+      });
+
+      await cache.get(mockFetch, ['x']);
+      // Age the entry past the TTL so the next get() refetches.
+      jest.advanceTimersByTime(6 * 60 * 1000);
+
+      shouldThrow = true;
+      const result = await cache.get(mockFetch, ['x']);
+      expect(result).toEqual({ data: 'seeded' });
+
+      // The failed request must not poison the key: once the fetch
+      // works again, a stale get() must retry it (a leftover settled
+      // promise in pendingRequests would short-circuit it forever).
+      shouldThrow = false;
+      jest.advanceTimersByTime(6 * 60 * 1000);
+      const recovered = await cache.get(mockFetch, ['x']);
+      expect(recovered).toEqual({ data: 'seeded' });
+      expect(mockFetch).toHaveBeenCalledTimes(3);
+    });
+
+    test('sync-throw with no cached fallback rejects with the original error and does not poison the key', async () => {
+      let shouldThrow = true;
+      const mockFetch = jest.fn((...args) => {
+        if (shouldThrow) {
+          throw new Error('sync boom');
+        }
+        return Promise.resolve({ data: 'ok' });
+      });
+
+      await expect(cache.get(mockFetch, ['y'])).rejects.toThrow('sync boom');
+
+      // Next call must retry the fetch, not reuse the rejected promise.
+      shouldThrow = false;
+      const result = await cache.get(mockFetch, ['y']);
+      expect(result).toEqual({ data: 'ok' });
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+
+    test('drops every args variant of the function', async () => {
+      const mockFetch = createMockFetch({ data: 'v1' }, 10);
+
+      const p1 = cache.get(mockFetch, [{ summaryOnly: true }]);
+      const p2 = cache.get(mockFetch, [{ summaryOnly: false }]);
+      jest.advanceTimersByTime(10);
+      await Promise.all([p1, p2]);
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+
+      cache.invalidateFunction(mockFetch);
+
+      const p3 = cache.get(mockFetch, [{ summaryOnly: true }]);
+      const p4 = cache.get(mockFetch, [{ summaryOnly: false }]);
+      jest.advanceTimersByTime(10);
+      await Promise.all([p3, p4]);
+      expect(mockFetch).toHaveBeenCalledTimes(4);
+    });
+  });
+
   describe('Cache Behavior', () => {
     test('should return cached data when available and fresh', async () => {
       jest.useRealTimers(); // Use real timers for this test

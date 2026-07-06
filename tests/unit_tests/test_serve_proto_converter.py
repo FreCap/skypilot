@@ -1,3 +1,4 @@
+"""Tests for serve gRPC request/response proto converters."""
 from sky.serve import serve_rpc_utils as utils
 
 # pylint: disable=line-too-long
@@ -6,27 +7,42 @@ from sky.serve import serve_rpc_utils as utils
 def test_get_service_status_request_converter():
     # list
     proto = utils.GetServiceStatusRequestConverter.to_proto(['test'], True)
-    service_names, pool = utils.GetServiceStatusRequestConverter.from_proto(
-        proto)
+    (service_names, pool,
+     summary_only) = utils.GetServiceStatusRequestConverter.from_proto(proto)
     assert service_names is not None
     assert len(service_names) == 1
     assert service_names[0] == 'test'
     assert pool
+    # Default: full replica info (backward compatible with old clients
+    # whose requests never set the field).
+    assert not summary_only
 
     # empty list
     proto = utils.GetServiceStatusRequestConverter.to_proto([], False)
-    service_names, pool = utils.GetServiceStatusRequestConverter.from_proto(
-        proto)
+    (service_names, pool,
+     summary_only) = utils.GetServiceStatusRequestConverter.from_proto(proto)
     assert service_names is not None
     assert len(service_names) == 0
     assert not pool
+    assert not summary_only
 
     # none
     proto = utils.GetServiceStatusRequestConverter.to_proto(None, True)
-    service_names, pool = utils.GetServiceStatusRequestConverter.from_proto(
-        proto)
+    (service_names, pool,
+     summary_only) = utils.GetServiceStatusRequestConverter.from_proto(proto)
     assert service_names is None
     assert pool
+    assert not summary_only
+
+    # summary_only round-trips
+    proto = utils.GetServiceStatusRequestConverter.to_proto(['svc'],
+                                                            False,
+                                                            summary_only=True)
+    (service_names, pool,
+     summary_only) = utils.GetServiceStatusRequestConverter.from_proto(proto)
+    assert service_names == ['svc']
+    assert not pool
+    assert summary_only
 
 
 def test_get_service_status_response_converter():

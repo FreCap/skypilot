@@ -27,20 +27,47 @@ import { useMobile } from '@/hooks/useMobile';
 function useServiceDetails({ serviceName }) {
   const [serviceData, setServiceData] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [replicasLoading, setReplicasLoading] = useState(true);
 
+  // Two-phase load, both scoped to THIS service (the old implementation
+  // fetched every service with full replica info just to display one):
+  //   1. summary_only — near-instant; renders the header/summary card.
+  //   2. full — per-replica table; takes tens of seconds at fleet scale,
+  //      fills in when it lands.
   const fetchData = useCallback(async () => {
     if (!serviceName) return;
     setLoading(true);
-    try {
-      const { services } = await dashboardCache.get(getServices);
-      const found = (services || []).find((s) => s.name === serviceName);
-      setServiceData(found || null);
-    } catch (error) {
-      console.error('Failed to fetch service details:', error);
-      setServiceData(null);
-    } finally {
-      setLoading(false);
-    }
+    setReplicasLoading(true);
+    // Ordering within THIS invocation only: once the full result has
+    // landed, a later-resolving summary must not overwrite it — but a
+    // fresh summary must still replace whatever an earlier invocation
+    // left behind.
+    let fullLanded = false;
+    const summaryPromise = dashboardCache
+      .get(getServices, [{ serviceNames: [serviceName], summaryOnly: true }])
+      .then(({ services }) => {
+        if (fullLanded) return;
+        const found = (services || []).find((s) => s.name === serviceName);
+        setServiceData(found || null);
+      })
+      .catch((error) => {
+        console.error('Failed to fetch service summary:', error);
+      })
+      .finally(() => setLoading(false));
+    const fullPromise = dashboardCache
+      .get(getServices, [{ serviceNames: [serviceName] }])
+      .then(({ services }) => {
+        const found = (services || []).find((s) => s.name === serviceName);
+        if (found) {
+          fullLanded = true;
+          setServiceData(found);
+        }
+      })
+      .catch((error) => {
+        console.error('Failed to fetch service replicas:', error);
+      })
+      .finally(() => setReplicasLoading(false));
+    await Promise.allSettled([summaryPromise, fullPromise]);
   }, [serviceName]);
 
   useEffect(() => {
@@ -48,11 +75,12 @@ function useServiceDetails({ serviceName }) {
   }, [fetchData]);
 
   const refreshData = useCallback(async () => {
-    dashboardCache.invalidate(getServices);
+    // Drop every args-keyed getServices variant (summary and full).
+    dashboardCache.invalidateFunction(getServices);
     await fetchData();
   }, [fetchData]);
 
-  return { serviceData, loading, refreshData };
+  return { serviceData, loading, replicasLoading, refreshData };
 }
 
 function ServiceDetails() {
@@ -62,9 +90,10 @@ function ServiceDetails() {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isInitialLoad, setIsInitialLoad] = useState(true);
   const isMobile = useMobile();
-  const { serviceData, loading, refreshData } = useServiceDetails({
-    serviceName,
-  });
+  const { serviceData, loading, replicasLoading, refreshData } =
+    useServiceDetails({
+      serviceName,
+    });
 
   useEffect(() => {
     if (!loading && isInitialLoad) {
@@ -139,7 +168,10 @@ function ServiceDetails() {
         ) : serviceData ? (
           <>
             <ServiceDetailCard serviceData={serviceData} />
-            <ReplicasCard replicas={serviceData.replicas} />
+            <ReplicasCard
+              replicas={serviceData.replicas}
+              loading={replicasLoading && serviceData.summaryOnly}
+            />
           </>
         ) : (
           <div className="flex justify-center items-center py-12">
@@ -242,13 +274,19 @@ function ServiceDetailCard({ serviceData }) {
   );
 }
 
-function ReplicasCard({ replicas }) {
+function ReplicasCard({ replicas, loading }) {
   const replicaList = Array.isArray(replicas) ? replicas : [];
 
   return (
     <div className="mb-6">
       <div className="flex items-center justify-between mb-2">
         <h3 className="text-lg font-semibold">Replicas</h3>
+        {loading && (
+          <span className="text-sm text-gray-500">
+            <CircularProgress size={14} className="mr-2" />
+            Loading replicas…
+          </span>
+        )}
       </div>
       <Card>
         <div className="overflow-x-auto rounded-lg">

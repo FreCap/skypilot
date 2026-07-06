@@ -217,11 +217,13 @@ def down(
 def status(
     service_names: Optional[Union[str, List[str]]],
     pool: bool = False,
+    summary_only: bool = False,
 ) -> server_common.RequestId[List[Dict[str, Any]]]:
     if pool:
         body = payloads.JobsPoolStatusBody(pool_names=service_names)
     else:
-        body = payloads.ServeStatusBody(service_names=service_names)
+        body = payloads.ServeStatusBody(service_names=service_names,
+                                        summary_only=summary_only)
     response = server_common.make_authenticated_request(
         'POST',
         '/jobs/pool_status' if pool else '/serve/status',

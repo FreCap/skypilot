@@ -49,6 +49,7 @@ class ServiceStatusRunner(Protocol):
         handle: 'backends.CloudVmRayResourceHandle',
         service_names: Optional[List[str]],
         pool: bool,
+        summary_only: bool = False,
     ) -> List[Dict[str, Any]]:
         ...
 

@@ -151,8 +151,9 @@ def terminate_replica(service_name: str, replica_id: int, purge: bool) -> None:
 
 @usage_lib.entrypoint
 def status(
-    service_names: Optional[Union[str,
-                                  List[str]]] = None) -> List[Dict[str, Any]]:
+    service_names: Optional[Union[str, List[str]]] = None,
+    summary_only: bool = False,
+) -> List[Dict[str, Any]]:
     """Gets service statuses.
 
     If service_names is given, return those services. Otherwise, return all
@@ -220,7 +221,7 @@ def status(
         RuntimeError: if failed to get the service status.
         exceptions.ClusterNotUpError: if the sky serve controller is not up.
     """
-    return impl.status(service_names, pool=False)
+    return impl.status(service_names, pool=False, summary_only=summary_only)
 
 
 ServiceComponentOrStr = Union[str, serve_utils.ServiceComponent]

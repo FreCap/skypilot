@@ -914,12 +914,18 @@ def get_yaml_content(service_name: str, version: int) -> str:
 def _get_service_status(
         service_name: str,
         pool: bool,
-        with_replica_info: bool = True) -> Optional[Dict[str, Any]]:
+        with_replica_info: bool = True,
+        with_replica_counts: bool = False) -> Optional[Dict[str, Any]]:
     """Get the status dict of the service.
 
     Args:
         service_name: The name of the service.
         with_replica_info: Whether to include the information of all replicas.
+        with_replica_counts: Whether to include a per-status replica count
+            histogram (``replica_status_counts``). Cheaper than
+            ``with_replica_info`` but not free (one pass over the replica
+            rows), so internal callers that only need the service row
+            should leave both off.
 
     Returns:
         A dictionary describing the status of the service if the service exists.
@@ -971,6 +977,18 @@ def _get_service_status(
                      f'{common_utils.format_exception(e)}\n'
                      f'Traceback: {traceback.format_exc()}')
 
+    if with_replica_counts and not with_replica_info:
+        # Summary mode: give callers (the dashboard header, list views)
+        # enough to render without the expensive per-replica
+        # `to_info_dict` serialization below — a status histogram costs
+        # one unpickle pass over the rows, no cluster-record joins, no
+        # URL resolution. At fleet scale (hundreds of replicas) this is
+        # the difference between a snappy summary and a 30s+ full query.
+        status_counts: DefaultDict[str, int] = collections.defaultdict(int)
+        for info in serve_state.get_replica_infos(service_name):
+            status_counts[info.status.value] += 1
+        record['replica_status_counts'] = dict(status_counts)
+
     if with_replica_info:
         replica_infos = serve_state.get_replica_infos(service_name)
         # Pre-fetch cluster records in one batched DB query instead of
@@ -1014,8 +1032,10 @@ def _get_service_status(
     return record
 
 
-def get_service_status_pickled(service_names: Optional[List[str]],
-                               pool: bool) -> List[Dict[str, str]]:
+def get_service_status_pickled(
+        service_names: Optional[List[str]],
+        pool: bool,
+        summary_only: bool = False) -> List[Dict[str, str]]:
     if service_names is None:
         # Get all service names
         service_names = serve_state.get_glob_service_names(None)
@@ -1033,7 +1053,11 @@ def get_service_status_pickled(service_names: Optional[List[str]],
     parent_ctx = contextvars.copy_context()
 
     def _run_in_context(name: str) -> Optional[Dict[str, Any]]:
-        return parent_ctx.copy().run(_get_service_status, name, pool=pool)
+        return parent_ctx.copy().run(_get_service_status,
+                                     name,
+                                     pool=pool,
+                                     with_replica_info=not summary_only,
+                                     with_replica_counts=summary_only)
 
     max_workers = min(len(service_names), _STATUS_FANOUT_MAX_WORKERS)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -1049,11 +1073,14 @@ def get_service_status_pickled(service_names: Optional[List[str]],
 
 # TODO (kyuds): remove when serve codegen is removed
 def get_service_status_encoded(service_names: Optional[List[str]],
-                               pool: bool) -> str:
+                               pool: bool,
+                               summary_only: bool = False) -> str:
     # We have to use payload_type here to avoid the issue of
     # message_utils.decode_payload() not being able to correctly decode the
     # message with <sky-payload> tags.
-    service_statuses = get_service_status_pickled(service_names, pool)
+    service_statuses = get_service_status_pickled(service_names,
+                                                  pool,
+                                                  summary_only=summary_only)
     return message_utils.encode_payload(service_statuses,
                                         payload_type='service_status')
 
@@ -2211,10 +2238,17 @@ class ServeCodeGen:
     ]
 
     @classmethod
-    def get_service_status(cls, service_names: Optional[List[str]],
-                           pool: bool) -> str:
+    def get_service_status(cls,
+                           service_names: Optional[List[str]],
+                           pool: bool,
+                           summary_only: bool = False) -> str:
+        # summary_only is only forwarded to controllers whose lib version
+        # understands it (v6+); older controllers just return the full
+        # payload — a graceful degradation, never an error.
         code = [
             f'kwargs={{}} if serve_version < 3 else {{"pool": {pool}}}',
+            ('kwargs.update({"summary_only": '
+             f'{summary_only}}}) if serve_version >= 6 else None'),
             f'msg = serve_utils.get_service_status_encoded({service_names!r}, '
             '**kwargs)', 'print(msg, end="", flush=True)'
         ]
