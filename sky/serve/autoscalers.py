@@ -735,7 +735,11 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
                 # ceil(0.4/0.1) = 4 replicas instead of 1. If the estimate
                 # is optimistic (the next launch lands a smaller shape),
                 # the next tick simply adds more — brief under-provision
-                # beats a 4x over-launch.
+                # beats a 4x over-launch. The dict-max default only covers
+                # the degenerate case of nonterminal replicas whose shapes
+                # all resolve to non-positive capacity; the truly empty
+                # fleet (total_qps == 0) is handled in the else branch
+                # below.
                 observed_capacities = [
                     self._get_target_qps_for_gpu_shape(
                         *self._get_gpu_shape_from_replica_info(info))
@@ -785,10 +789,21 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
                     f'{ready_target_qps_list}, '
                     f'target replicas: {target_num_replicas}')
         else:
-            # no replica is ready; use the normal min_replicas
-            target_num_replicas = self._clip_target_num_replicas(
-                self.min_replicas)
+            # No replica capacity at all (empty or entirely unresolved
+            # fleet). If traffic is already arriving, size from the config
+            # dict directly — pinning to min_replicas here left
+            # scale-to-zero services (min_replicas=0) stuck at zero with
+            # requests pending.
+            if num_requests_per_second > 0:
+                estimated_qps = max(target_qps_dict.values())
+                raw_target_num = max(
+                    self.min_replicas,
+                    math.ceil(num_requests_per_second / estimated_qps))
+            else:
+                raw_target_num = self.min_replicas
+            target_num_replicas = self._clip_target_num_replicas(raw_target_num)
             logger.info(f'Instance-aware autoscaling: no replica QPS available,'
+                        f' requests/s: {num_requests_per_second},'
                         f' target replicas: {target_num_replicas}')
 
         # Apply hysteresis logic

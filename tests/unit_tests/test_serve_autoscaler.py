@@ -318,6 +318,25 @@ class TestInstanceAwareGpuShapeCache(unittest.TestCase):
         autoscaler._set_target_num_replicas_with_instance_aware_logic(infos)
         self.assertEqual(autoscaler.target_num_replicas, 3)
 
+    def test_scale_from_zero_with_pending_traffic(self):
+        """min_replicas=0 + traffic + empty fleet must scale up, not
+        stay pinned at zero."""
+        autoscaler = self._make_autoscaler()
+        autoscaler.target_qps_per_replica = {'L4': 0.1}
+        autoscaler.qps_window_size = 10
+        # 2 requests in a 10s window = 0.2 qps -> 2 replicas at 0.1 each.
+        autoscaler.request_timestamps = [0.0] * 2
+        autoscaler.target_num_replicas = 0
+        autoscaler.upscale_counter = 0
+        autoscaler.downscale_counter = 0
+        autoscaler.scale_up_threshold = 1
+        autoscaler.scale_down_threshold = 1
+        autoscaler.min_replicas = 0
+        autoscaler.max_replicas = 20
+        autoscaler.num_overprovision = None
+        autoscaler._set_target_num_replicas_with_instance_aware_logic([])
+        self.assertEqual(autoscaler.target_num_replicas, 2)
+
     def test_scale_down_prefers_earlier_lifecycle_status(self):
         """A PROVISIONING replica must be selected before a READY one
         even when the READY replica has lower weighted capacity."""
