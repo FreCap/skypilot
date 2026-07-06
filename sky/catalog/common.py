@@ -269,6 +269,13 @@ def read_catalog(filename: str,
                 cached_source = f.read().strip()
             if cached_source != hosted_catalog_base_urls()[0]:
                 return True
+        elif (hosted_catalog_base_urls()[0] !=
+              constants.HOSTED_CATALOG_DIR_URL):
+            # Catalog predates source tracking (no .source recorded). With a
+            # mirror override configured we cannot prove the cached file came
+            # from the mirror, so refetch once; the download records .source
+            # and settles the question permanently.
+            return True
 
         last_update = os.path.getmtime(catalog_path)
         return last_update + pull_frequency_hours * 3600 < time.time()
