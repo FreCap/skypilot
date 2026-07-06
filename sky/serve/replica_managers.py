@@ -277,9 +277,12 @@ def _should_use_spot(yaml_content: str,
     spot_use_resources = [
         resources for resources in task.resources if resources.use_spot
     ]
-    # Either resources all use spot or none use spot.
-    assert len(spot_use_resources) in [0, len(task.resources)]
-    return len(spot_use_resources) == len(task.resources)
+    # Heterogeneous any_of sets may mix spot cloud entries with
+    # non-spot reserved-capacity entries (e.g. a Kubernetes pool, which
+    # cannot use spot). The task counts as spot-managed when ANY entry
+    # is spot; the placer then pins each launch's actual use_spot via
+    # its location's resources_override.
+    return len(spot_use_resources) > 0
 
 
 # Every function that calls serve_state.add_or_update_replica should acquire
@@ -1009,7 +1012,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         use_spot = _should_use_spot(self.yaml_content, resources_override)
         retry_until_up = True
         location = None
-        if use_spot and self._spot_placer is not None:
+        if self._spot_placer is not None and use_spot:
             # For spot placer, we don't retry until up so any launch failed
             # due to availability issue will be handled by the placer.
             retry_until_up = False
@@ -1028,13 +1031,18 @@ class SkyPilotReplicaManager(ReplicaManager):
                 existing_replica_infos = serve_state.get_replica_infos(
                     self._service_name)
             for info in existing_replica_infos:
-                if info.is_spot:
-                    spot_location = info.get_spot_location()
-                    if spot_location is not None:
-                        current_spot_locations.append(spot_location)
+                # Every placer-placed replica counts toward location load,
+                # including non-spot reserved-capacity ones.
+                spot_location = info.get_spot_location()
+                if spot_location is not None:
+                    current_spot_locations.append(spot_location)
             location = self._spot_placer.select_next_location(
                 current_spot_locations)
             resources_override.update(location.to_dict())
+            # The location dictates the actual spot-ness of THIS launch
+            # (a zero-cost reserved location is non-spot even though the
+            # task as a whole is spot-managed).
+            use_spot = location.use_spot
         # When the spot placer owns failover (use_spot + placer above sets
         # retry_until_up=False), the launch is pinned to ONE location, so a
         # capacity failure there must propagate immediately for the placer to
@@ -1043,8 +1051,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         # attempts + 60s exponential backoff burns minutes before failing
         # over. Other (transient) launch errors say nothing about the
         # location's capacity, so they keep the default in-place retries.
-        availability_max_retry = (1 if use_spot and
-                                  self._spot_placer is not None else None)
+        availability_max_retry = (1 if location is not None else None)
         t = thread_utils.SafeThread(
             target=launch_cluster,
             args=(replica_id, self.yaml_content, cluster_name, log_file_name,
@@ -1461,7 +1468,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             else:
                 info.status_property.sky_launch_status = (
                     common_utils.ProcessStatus.SUCCEEDED)
-            if self._spot_placer is not None and info.is_spot:
+            if (self._spot_placer is not None and
+                    info.get_spot_location() is not None):
                 # TODO(tian): Currently, we set the location to
                 # preemptive if the launch thread failed. This is
                 # because if the error is not related to the
