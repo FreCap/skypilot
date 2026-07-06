@@ -3,6 +3,7 @@ import collections
 import dataclasses
 import json
 import os
+import random
 import shlex
 import socket
 import subprocess
@@ -434,6 +435,11 @@ def wait_for_ssh(cluster_info: provision_common.ClusterInfo,
         ssh_probe_timeout = skypilot_config.get_nested(
             ('provision', 'ssh_timeout'), 10)
         backoff = common_utils.Backoff(initial_backoff=2, max_backoff_factor=5)
+        if is_ssm_proxy:
+            # Backoff only paces retries; without this the first probe of
+            # every worker fires simultaneously once the head is up, which
+            # is itself a StartSession burst. Spread the first wave out.
+            time.sleep(random.uniform(0, 5))
         while not success:
             success, stderr = waiter(ip,
                                      ssh_port,

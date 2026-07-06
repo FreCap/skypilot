@@ -65,3 +65,10 @@ class TestTransientSshFailurePattern:
         stderr = ('An error occurred (RequestLimitExceeded) when calling the '
                   'DescribeInstances operation: Request limit exceeded.')
         assert _TRANSIENT_SSH_FAILURE_PATTERN.search(stderr) is not None
+
+    def test_bare_rate_exceeded_is_not_transient(self):
+        # Without an AWS error code, "Rate exceeded" is too generic to
+        # attribute to cloud API throttling (e.g. an sshd/bastion rate
+        # limiter) and must not be swallowed by the retry loop.
+        stderr = 'ssh_exchange_identification: Rate exceeded, try later'
+        assert _TRANSIENT_SSH_FAILURE_PATTERN.search(stderr) is None

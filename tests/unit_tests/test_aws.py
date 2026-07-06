@@ -1,4 +1,5 @@
 import pathlib
+import shlex
 import typing
 from unittest.mock import MagicMock
 from unittest.mock import patch
@@ -704,3 +705,57 @@ def test_ssm_adaptive_retry_exports(monkeypatch):
     assert proxy_command.startswith(
         'export AWS_RETRY_MODE=adaptive AWS_MAX_ATTEMPTS=')
     assert 'aws ssm start-session' in proxy_command
+
+
+def test_ssm_profile_with_shell_metacharacters_is_quoted(monkeypatch):
+    """The profile is spliced into a shell-executed ProxyCommand; a value
+    with metacharacters must stay data, not become shell syntax."""
+    profile = 'pro file;touch /tmp/pwned'
+    template_vars = _write_cluster_config_with_ssm(monkeypatch, {
+        'use_ssm': True,
+        'ssm_profile': profile,
+    })
+    proxy_command = template_vars['ssh_proxy_command']
+    assert f'--profile {shlex.quote(profile)}' in proxy_command
+    assert f'--profile {profile}' not in proxy_command
+
+
+def _ssh_credentials_for_proxy_command(monkeypatch, proxy_command):
+    monkeypatch.setattr(
+        backend_utils.global_user_state, 'get_cluster_yaml_dict', lambda _: {
+            'cluster_name': 'fake-cluster',
+            'auth': {
+                'ssh_user': 'ubuntu',
+                'ssh_proxy_command': proxy_command,
+            },
+            'provider': {
+                'module': 'sky.provision.aws'
+            },
+        })
+    return backend_utils.ssh_credential_from_yaml('/fake/cluster.yaml')
+
+
+def test_legacy_ssm_proxy_command_upgraded_on_read(monkeypatch):
+    """Pre-adaptive-retry cluster YAMLs keep their old SSM proxy command
+    forever (auth is restored verbatim on re-provision), so the export is
+    prepended at read time."""
+    legacy = ('aws ssm start-session --target "$(aws ec2 describe-instances '
+              '--output text)" --region us-east-1 '
+              '--document-name AWS-StartSSHSession --parameters portNumber=%p')
+    credentials = _ssh_credentials_for_proxy_command(monkeypatch, legacy)
+    upgraded = credentials['ssh_proxy_command']
+    assert upgraded.startswith('export AWS_RETRY_MODE=adaptive')
+    assert upgraded.endswith(legacy)
+
+
+def test_current_ssm_proxy_command_not_double_prefixed(monkeypatch):
+    current = ('export AWS_RETRY_MODE=adaptive AWS_MAX_ATTEMPTS=12; '
+               'aws ssm start-session --target "i-123"')
+    credentials = _ssh_credentials_for_proxy_command(monkeypatch, current)
+    assert credentials['ssh_proxy_command'] == current
+
+
+def test_custom_proxy_command_left_untouched(monkeypatch):
+    custom = 'ssh -W %h:%p bastion.example.com'
+    credentials = _ssh_credentials_for_proxy_command(monkeypatch, custom)
+    assert credentials['ssh_proxy_command'] == custom

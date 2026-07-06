@@ -48,11 +48,14 @@ def test_ssm_proxy_probes_back_off(monkeypatch):
     sleeps = _run_wait_for_ssh(monkeypatch,
                                ssh_proxy_command=proxy,
                                failures_before_success=4)
-    assert len(sleeps) == 4
-    # Jittered exponential backoff: intervals trend upward and are not the
-    # fixed 1s cadence.
-    assert all(s > 1 for s in sleeps)
-    assert sleeps[-1] > sleeps[0]
+    # A bounded initial jitter staggers the first probe wave, then jittered
+    # exponential backoff paces the retries: intervals trend upward and are
+    # not the fixed 1s cadence.
+    assert len(sleeps) == 5
+    first_wave_jitter, *retry_backoffs = sleeps
+    assert 0 <= first_wave_jitter <= 5
+    assert all(s > 1 for s in retry_backoffs)
+    assert retry_backoffs[-1] > retry_backoffs[0]
 
 
 def test_non_ssm_probes_keep_fixed_cadence(monkeypatch):
