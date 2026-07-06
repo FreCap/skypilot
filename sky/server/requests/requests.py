@@ -33,6 +33,7 @@ from sky.server import daemons
 from sky.server import versions
 from sky.server.blob import blob_storage as bs
 from sky.server.requests import payloads
+from sky.server.requests import request_names
 from sky.server.requests import storage as request_storage
 from sky.server.requests.serializers import decoders
 from sky.server.requests.serializers import encoders
@@ -40,6 +41,7 @@ from sky.server.requests.serializers import return_value_serializers
 from sky.skylet import constants as skylet_constants
 from sky.utils import asyncio_utils
 from sky.utils import common_utils
+from sky.utils import status_lib
 from sky.utils import ux_utils
 from sky.utils.db import db_utils
 
@@ -85,6 +87,17 @@ _GC_INTERVAL_SECONDS = 3600
 # Escape hatch: set to '1' to restore the legacy behavior of wiping the
 # request DB and logs on API server startup instead of recovering them.
 RESET_REQUESTS_ON_STARTUP_ENV_VAR = 'SKYPILOT_RESET_REQUESTS_ON_STARTUP'
+
+# Request names whose entrypoints are safe to re-execute from scratch after a
+# server restart, provided their cluster is still INIT (see
+# _find_interrupted_launches_to_requeue). Graceful shutdown leaves these rows
+# RUNNING instead of cancelling them, and startup recovery requeues them, so
+# a server redeploy completes an in-flight provisioning instead of dropping
+# it.
+# Request rows persist the prefixed name (executor stamps
+# REQUEST_NAME_PREFIX + request_name at creation), so match that form.
+REPLAYABLE_REQUEST_NAMES = (server_constants.REQUEST_NAME_PREFIX +
+                            request_names.RequestName.CLUSTER_LAUNCH.value,)
 
 # TODO(zhwu): For scalability, there are several TODOs:
 # [x] Have a way to queue requests.
@@ -806,6 +819,62 @@ def reset_db_and_logs():
     request_storage.get_request_backend().reset_on_startup()
 
 
+def _find_interrupted_launches_to_requeue() -> List[str]:
+    """List interrupted launch rows that are safe to re-execute.
+
+    A launch whose executor died mid-provision leaves its cluster in INIT.
+    The launch entrypoint is re-runnable by construction up to the point the
+    cluster reaches UP: re-executing it resumes provisioning on the existing
+    cluster record (the same thing a manual relaunch does), and the task's
+    run section is only submitted after the cluster row is marked UP, so a
+    cluster still in INIT cannot have started user work.
+
+    Any other case falls to the generic CANCELLED + ``should_retry`` path:
+    past UP the remaining launch work has client-visible side effects (job
+    submission) that must not be silently repeated, and a launch with no
+    cluster record yet may have pre-provision side effects (e.g. storage
+    creation) whose re-run semantics are not established. A failed cluster
+    status lookup likewise disqualifies just that row -- it must not abort
+    recovery of everything else.
+
+    Runs outside the recovery transaction: the per-cluster status lookups hit
+    the (possibly remote) cluster-state database and must not extend the
+    request-DB transaction. Safe because startup is single-threaded -- no
+    executor is running yet to change the rows in between.
+    """
+    assert _DB is not None
+    replayable_names = ', '.join(['?'] * len(REPLAYABLE_REQUEST_NAMES))
+    cursor = _DB.conn.cursor()
+    cursor.execute(
+        f'SELECT request_id, {COL_CLUSTER_NAME} FROM {REQUEST_TABLE} '
+        f'WHERE name IN ({replayable_names}) '
+        f'AND (status = ? '
+        f'OR (status = ? AND ({COL_RETRYABLE} IS NULL '
+        f'OR {COL_RETRYABLE} = 0)))',
+        (*REPLAYABLE_REQUEST_NAMES, RequestStatus.RUNNING.value,
+         RequestStatus.WAITING.value))
+    rows = cursor.fetchall()
+    requeue_ids = []
+    cluster_status_cache: Dict[str, Optional[status_lib.ClusterStatus]] = {}
+    for request_id, cluster_name in rows:
+        if cluster_name is None:
+            continue
+        if cluster_name not in cluster_status_cache:
+            try:
+                cluster_status_cache[cluster_name] = (
+                    global_user_state.get_status_from_cluster_name(cluster_name)
+                )
+            except Exception as e:  # pylint: disable=broad-except
+                logger.warning(
+                    f'Could not check status of cluster {cluster_name!r} '
+                    f'while recovering launch request {request_id}; leaving '
+                    f'the request to the client-retry path: {e}')
+                cluster_status_cache[cluster_name] = None
+        if cluster_status_cache[cluster_name] == status_lib.ClusterStatus.INIT:
+            requeue_ids.append(request_id)
+    return requeue_ids
+
+
 def _recover_requests() -> Tuple[int, int]:
     """Reconcile request rows left over from the previous server process.
 
@@ -815,8 +884,14 @@ def _recover_requests() -> Tuple[int, int]:
     - Internal daemon rows are deleted: a stale row would make
       ``schedule_internal_daemon_async``'s create-or-refresh path skip the
       enqueue and the daemon would never run this boot.
-    - RUNNING rows, and WAITING rows that are not retryable, are marked
-      CANCELLED with ``should_retry`` set so polling clients get the
+    - Interrupted launch rows whose cluster is still INIT are flipped back
+      to PENDING for re-execution
+      (``_find_interrupted_launches_to_requeue``): re-running a launch is
+      safe until the cluster is UP, and this is what lets a server redeploy
+      complete an in-flight provisioning instead of wedging the cluster in
+      INIT.
+    - Other RUNNING rows, and WAITING rows that are not retryable, are
+      marked CANCELLED with ``should_retry`` set so polling clients get the
       retry signal (HTTP 503) instead of a 404.
     - PENDING rows and retryable WAITING rows are left untouched for
       re-enqueue (``executor.reenqueue_recovered_requests``): a PENDING row
@@ -834,12 +909,23 @@ def _recover_requests() -> Tuple[int, int]:
         _init_db_within_lock()
     assert _DB is not None
     daemon_ids = sorted(d.id for d in daemons.INTERNAL_REQUEST_DAEMONS)
+    # Resolved before the transaction: the cluster-status lookups may be
+    # remote and must not extend it (see the helper's docstring).
+    requeue_ids = _find_interrupted_launches_to_requeue()
     with _DB.conn:
         cursor = _DB.conn.cursor()
         placeholders = ', '.join(['?'] * len(daemon_ids))
         cursor.execute(
             f'DELETE FROM {REQUEST_TABLE} '
             f'WHERE request_id IN ({placeholders})', daemon_ids)
+        if requeue_ids:
+            placeholders = ', '.join(['?'] * len(requeue_ids))
+            cursor.execute(
+                f'UPDATE {REQUEST_TABLE} '
+                f'SET status = ?, pid = NULL, {COL_SHOULD_RETRY} = 0, '
+                f'{COL_FINISHED_AT} = NULL '
+                f'WHERE request_id IN ({placeholders})',
+                (RequestStatus.PENDING.value, *requeue_ids))
         cursor.execute(
             f'UPDATE {REQUEST_TABLE} '
             f'SET status = ?, {COL_SHOULD_RETRY} = 1, {COL_FINISHED_AT} = ? '
@@ -849,6 +935,10 @@ def _recover_requests() -> Tuple[int, int]:
             (RequestStatus.CANCELLED.value, time.time(),
              RequestStatus.RUNNING.value, RequestStatus.WAITING.value))
         interrupted = cursor.rowcount
+        if requeue_ids:
+            logger.info(f'Re-queued {len(requeue_ids)} interrupted launch '
+                        'request(s) whose clusters are still INIT; they will '
+                        'be re-executed to complete provisioning.')
         cursor.execute(
             f'SELECT COUNT(*) FROM {REQUEST_TABLE} '
             'WHERE status IN (?, ?)',
@@ -919,6 +1009,61 @@ def recover_db_and_logs() -> bool:
                        f'{common_utils.format_exception(e)}')
         reset_db_and_logs()
         return False
+
+
+def surface_interrupted_cluster_launches(delay_seconds: float = 0) -> None:
+    """Record a cluster event for INIT clusters whose in-flight work died.
+
+    Runs once per startup, after the request rows from the previous server
+    run have been reconciled (``recover_db_and_logs``). A cluster is left in
+    INIT by a launch (or restart) that did not complete; if the request
+    driving it died with the previous server process -- or its request row
+    died with the pod's ephemeral disk on a redeploy, in which case recovery
+    finds nothing to reconcile or requeue -- the cluster wedges in INIT with
+    no user-visible explanation: ``sky status`` shows INIT indefinitely and
+    the provision-log endpoint 404s (the log file lived on the old server's
+    disk). We cannot resume that work, so we record why the cluster is stuck.
+
+    Clusters that have an active request row at scan time are skipped: those
+    are either recovered rows about to be re-executed or new work submitted
+    after startup (a launch creates its request row before its cluster row
+    turns INIT, so a fresh launch cannot be misread as a dead one). This
+    makes the scan safe to run in the background after the server starts
+    serving; ``delay_seconds`` additionally postpones it past the previous
+    replica's shutdown grace, so a launch still finishing on an overlapping
+    old replica (whose request rows this instance cannot see) is not misread
+    as interrupted. Best effort -- a failure here must never affect the
+    server.
+    """
+    try:
+        if delay_seconds > 0:
+            time.sleep(delay_seconds)
+        init_clusters = global_user_state.get_cluster_names_by_status(
+            status_lib.ClusterStatus.INIT)
+        if not init_clusters:
+            return
+        active = request_storage.get_request_backend().query_requests(
+            req_filter=RequestTaskFilter(
+                status=RequestStatus.active_statuses(),
+                cluster_names=init_clusters,
+                fields=['request_id', COL_CLUSTER_NAME]))
+        clusters_with_active_request = {req.cluster_name for req in active}
+        for cluster_name in init_clusters:
+            if cluster_name in clusters_with_active_request:
+                continue
+            global_user_state.add_cluster_event(
+                cluster_name,
+                None,
+                'API server restarted while this cluster was in INIT with no '
+                'live request operating on it; an in-flight launch appears '
+                'to have been interrupted and its provision logs may be '
+                'lost. Re-run `sky launch` to recover the cluster, or '
+                '`sky down` to release its resources.',
+                global_user_state.ClusterEventType.STATUS_CHANGE,
+                nop_if_duplicate=True)
+    except Exception as e:  # pylint: disable=broad-except
+        logger.debug('Could not surface interrupted cluster launches during '
+                     f'API server startup (continuing): {e}')
 
 
 def request_lock_path(request_id: str) -> str:

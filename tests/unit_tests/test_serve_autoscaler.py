@@ -9,6 +9,7 @@ from sky.serve import constants
 from sky.serve import controller as serve_controller
 from sky.serve import replica_managers
 from sky.serve import serve_state
+from sky.serve import serve_utils
 from sky.utils import common_utils
 
 
@@ -257,11 +258,15 @@ class TestInstanceAwareGpuShapeCache(unittest.TestCase):
         autoscaler._gpu_shape_cache = {}
         autoscaler._replica_cost_cache = {}
         autoscaler._bare_key_warned = set()
+        autoscaler._snap_target_on_next_recompute = False
+        autoscaler._qps_dict_by_version = {}
+        autoscaler.latest_version = 1
         return autoscaler
 
     def _make_replica(self, gpu_type, launch_status, count=1):
         info = mock.Mock()
         info.replica_id = 1
+        info.version = 1
         info.status_property.sky_launch_status = launch_status
         info.handle.return_value.launched_resources.accelerators = {
             gpu_type: count
@@ -513,3 +518,319 @@ class TestInstanceAwareGpuShapeCache(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestInstanceAwareUpdateVersion(unittest.TestCase):
+    """`sky serve update` on a dict-QPS service must not crash.
+
+    The base update_version snaps target_num_replicas via
+    _calculate_target_num_replicas; without an instance-aware override that
+    hook resolved to RequestRateAutoscaler's, which raises on dict
+    target_qps_per_replica — so every update of an instance-aware service
+    failed after the version was already persisted (partial update).
+    """
+
+    def _spec(self, qps_dict, min_replicas=1, max_replicas=20):
+        return types.SimpleNamespace(min_replicas=min_replicas,
+                                     max_replicas=max_replicas,
+                                     num_overprovision=None,
+                                     target_qps_per_replica=qps_dict,
+                                     upscale_delay_seconds=None,
+                                     downscale_delay_seconds=None)
+
+    def _make_autoscaler(self, qps_dict):
+        return autoscalers.InstanceAwareRequestRateAutoscaler(
+            'svc', self._spec(qps_dict), version=1)
+
+    def test_update_version_does_not_raise_on_dict_qps(self):
+        autoscaler = self._make_autoscaler({'L4': 0.1, 'A100': 0.1})
+        autoscaler.update_version(2, self._spec({
+            'L4': 0.1,
+            'A100': 0.2
+        }), serve_utils.DEFAULT_UPDATE_MODE)
+        self.assertEqual(autoscaler.latest_version, 2)
+        # The new version's dict must be live (assigned before the base
+        # recompute, not after).
+        self.assertEqual(autoscaler.target_qps_per_replica, {
+            'L4': 0.1,
+            'A100': 0.2
+        })
+
+    def test_update_version_keeps_current_target(self):
+        # The outdated-replica drain consumes the target before the
+        # instance-aware recompute runs; a shape-blind snap here could
+        # scale down all old replicas mid-rolling-update.
+        autoscaler = self._make_autoscaler({'L4': 0.1})
+        autoscaler.target_num_replicas = 12
+        autoscaler.request_timestamps = [0.0] * autoscaler.qps_window_size
+        autoscaler.update_version(2, self._spec({'L4': 0.8}),
+                                  serve_utils.DEFAULT_UPDATE_MODE)
+        self.assertEqual(autoscaler.target_num_replicas, 12)
+
+    def test_update_version_reclips_target_to_new_max(self):
+        autoscaler = self._make_autoscaler({'L4': 0.1})
+        autoscaler.target_num_replicas = 12
+        autoscaler.update_version(2, self._spec({'L4': 0.1}, max_replicas=5),
+                                  serve_utils.DEFAULT_UPDATE_MODE)
+        self.assertEqual(autoscaler.target_num_replicas, 5)
+
+
+class TestInstanceAwareUpdateRolloutSafety(unittest.TestCase):
+    """After an update, the drain must never act on a stale target.
+
+    The base generate_scaling_decisions drains outdated replicas by
+    comparing ready new-version replicas against target_num_replicas
+    BEFORE the subclass recomputes. If an update lowered per-replica
+    capacity (raising the replica need), a stale target lets the drain
+    scale down every old replica with only a fraction of the required
+    new capacity ready — and hysteresis would delay the corrective
+    upscale by the full upscale delay.
+    """
+
+    def _spec(self, qps_dict, min_replicas=1, max_replicas=20):
+        return types.SimpleNamespace(min_replicas=min_replicas,
+                                     max_replicas=max_replicas,
+                                     num_overprovision=None,
+                                     target_qps_per_replica=qps_dict,
+                                     upscale_delay_seconds=None,
+                                     downscale_delay_seconds=None)
+
+    def _make_autoscaler(self, qps_dict):
+        return autoscalers.InstanceAwareRequestRateAutoscaler(
+            'svc', self._spec(qps_dict), version=1)
+
+    def test_recompute_runs_before_outdated_drain(self):
+        autoscaler = self._make_autoscaler({'L4': 0.1})
+        calls = []
+        with mock.patch.object(
+                autoscaler,
+                '_set_target_num_replicas_with_instance_aware_logic',
+                side_effect=lambda infos: calls.append('recompute')), \
+             mock.patch.object(
+                autoscaler,
+                '_select_outdated_replicas_to_scale_down',
+                side_effect=lambda infos, versions:
+                    (calls.append('drain'), [])[1]), \
+             mock.patch.object(
+                autoscaler,
+                '_generate_scaling_decisions',
+                return_value=[]):
+            autoscaler.generate_scaling_decisions([], [1])
+        self.assertEqual(calls, ['recompute', 'drain'])
+
+    def test_single_recompute_per_tick(self):
+        autoscaler = self._make_autoscaler({'L4': 0.1})
+        with mock.patch.object(
+                autoscaler,
+                '_set_target_num_replicas_with_instance_aware_logic'
+        ) as mock_set, \
+             mock.patch.object(
+                autoscaler,
+                '_select_outdated_replicas_to_scale_down',
+                return_value=[]):
+            autoscaler.generate_scaling_decisions([], [1])
+        self.assertEqual(mock_set.call_count, 1)
+
+    def test_post_update_recompute_bypasses_hysteresis_once(self):
+        # Update lowers per-replica capacity 10 -> 1 with 20 rps: the
+        # first recompute after the update must snap the target to 20
+        # immediately, not wait out the upscale delay counters.
+        autoscaler = self._make_autoscaler({'A100': 10.0})
+        autoscaler.target_num_replicas = 2
+        autoscaler.update_version(2, self._spec({'A100': 1.0}),
+                                  serve_utils.DEFAULT_UPDATE_MODE)
+        autoscaler.request_timestamps = [0.0
+                                        ] * (20 * autoscaler.qps_window_size)
+        autoscaler._set_target_num_replicas_with_instance_aware_logic([])
+        self.assertEqual(autoscaler.target_num_replicas, 20)
+        # The bypass is one-shot: a subsequent noisy recompute is gated
+        # by hysteresis again.
+        autoscaler.request_timestamps = []
+        autoscaler._set_target_num_replicas_with_instance_aware_logic([])
+        self.assertEqual(autoscaler.target_num_replicas, 20)
+
+    def test_stale_version_update_does_not_mutate_state(self):
+        autoscaler = self._make_autoscaler({'A100': 10.0})
+        # Consume the construction-armed snap so the assertion isolates
+        # the stale update's (non-)effect.
+        autoscaler._snap_target_on_next_recompute = False
+        autoscaler.update_version(1, self._spec({'A100': 1.0}),
+                                  serve_utils.DEFAULT_UPDATE_MODE)
+        self.assertEqual(autoscaler.target_qps_per_replica, {'A100': 10.0})
+        self.assertFalse(autoscaler._snap_target_on_next_recompute)
+
+    def test_old_replicas_resolve_capacity_from_their_own_version_dict(self):
+        # Shape-changing update {'L4': 0.1} -> {'A100': 10.0}: live L4
+        # replicas launched under v1 must keep 0.1 capacity, not resolve
+        # via the new dict's min-value fallback (10.0 — a 100x
+        # overestimate that collapses the computed target and lets the
+        # drain kill the old fleet before new capacity exists).
+        autoscaler = self._make_autoscaler({'L4': 0.1})
+        autoscaler.update_version(2, self._spec({'A100': 10.0}),
+                                  serve_utils.DEFAULT_UPDATE_MODE)
+        self.assertEqual(
+            autoscaler._get_target_qps_for_gpu_shape('L4', 1, version=1), 0.1)
+        self.assertEqual(
+            autoscaler._get_target_qps_for_gpu_shape('A100', 1, version=2),
+            10.0)
+        # Unknown version (e.g. controller restarted and only knows the
+        # latest dict) falls back to the latest dict.
+        self.assertEqual(
+            autoscaler._get_target_qps_for_gpu_shape('A100', 1, version=99),
+            10.0)
+
+    def test_version_dicts_pruned_to_live_versions(self):
+        autoscaler = self._make_autoscaler({'L4': 0.1})
+        autoscaler.update_version(2, self._spec({'A100': 10.0}),
+                                  serve_utils.DEFAULT_UPDATE_MODE)
+        self.assertIn(1, autoscaler._qps_dict_by_version)
+        info = mock.Mock()
+        info.replica_id = 1
+        info.version = 2
+        info.is_terminal = False
+        with mock.patch.object(
+                autoscaler,
+                '_set_target_num_replicas_with_instance_aware_logic'), \
+             mock.patch.object(
+                autoscaler,
+                '_select_outdated_replicas_to_scale_down',
+                return_value=[]), \
+             mock.patch.object(
+                autoscaler, '_generate_scaling_decisions', return_value=[]):
+            autoscaler.generate_scaling_decisions([info], [2])
+        # No live replica on v1 anymore: its dict is dropped; v2 kept.
+        self.assertNotIn(1, autoscaler._qps_dict_by_version)
+        self.assertIn(2, autoscaler._qps_dict_by_version)
+
+    def test_stale_version_update_does_not_reset_hysteresis(self):
+        autoscaler = self._make_autoscaler({'A100': 10.0})
+        autoscaler.upscale_counter = 7
+        autoscaler.update_version(1, self._spec({'A100': 1.0}),
+                                  serve_utils.DEFAULT_UPDATE_MODE)
+        self.assertEqual(autoscaler.upscale_counter, 7)
+
+
+class TestInstanceAwareMixedVersionArithmetic(unittest.TestCase):
+    """Target and drain must agree on what a 'replica' is mid-update.
+
+    Scenario from review: 100 old L4 (0.1 qps each, v1) + 1 ready new
+    A100 (10 qps, v2) at 20 rps. A whole-fleet count target (102) made
+    _generate_scaling_decisions enqueue 101 new A100s (it compares the
+    target against latest-version replicas only); a count-based drain
+    (target 2, 1 ready new) retired 99 old replicas while their capacity
+    was still needed.
+    """
+
+    def _spec(self, qps_dict, min_replicas=1, max_replicas=200):
+        return types.SimpleNamespace(min_replicas=min_replicas,
+                                     max_replicas=max_replicas,
+                                     num_overprovision=None,
+                                     target_qps_per_replica=qps_dict,
+                                     upscale_delay_seconds=None,
+                                     downscale_delay_seconds=None)
+
+    def _replica(self, replica_id, gpu_type, version, is_ready=True):
+        info = mock.Mock()
+        info.replica_id = replica_id
+        info.version = version
+        info.is_terminal = False
+        info.is_ready = is_ready
+        info.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.SUCCEEDED)
+        info.handle.return_value.launched_resources.accelerators = {gpu_type: 1}
+        return info
+
+    def _mid_update_fleet(self):
+        autoscaler = autoscalers.InstanceAwareRequestRateAutoscaler(
+            'svc', self._spec({'L4': 0.1}), version=1)
+        autoscaler.update_version(2, self._spec({'A100': 10.0}),
+                                  serve_utils.DEFAULT_UPDATE_MODE)
+        replicas = [self._replica(i, 'L4', version=1) for i in range(1, 101)]
+        replicas.append(self._replica(101, 'A100', version=2))
+        # 20 rps over the window.
+        autoscaler.request_timestamps = [0.0
+                                        ] * (20 * autoscaler.qps_window_size)
+        return autoscaler, replicas
+
+    def test_target_counts_latest_version_replicas_only(self):
+        autoscaler, replicas = self._mid_update_fleet()
+        autoscaler._set_target_num_replicas_with_instance_aware_logic(replicas)
+        # Demand 20, one ready A100 covers 10, one more A100 covers the
+        # rest: the target is 2 latest-version replicas — not 102.
+        self.assertEqual(autoscaler.target_num_replicas, 2)
+
+    def test_drain_keeps_old_capacity_covering_shortfall(self):
+        autoscaler, replicas = self._mid_update_fleet()
+        autoscaler._set_target_num_replicas_with_instance_aware_logic(replicas)
+        # Ready new capacity 10 of demand 20: all 100 old L4s (10 qps
+        # total) are needed to cover the shortfall — none drained.
+        self.assertEqual(
+            autoscaler._select_outdated_replicas_to_scale_down(
+                replicas, [1, 2]), [])
+
+    def test_drain_retires_all_old_once_target_ready(self):
+        autoscaler, replicas = self._mid_update_fleet()
+        autoscaler._set_target_num_replicas_with_instance_aware_logic(replicas)
+        replicas.append(self._replica(102, 'A100', version=2))
+        drained = autoscaler._select_outdated_replicas_to_scale_down(
+            replicas, [1, 2])
+        self.assertEqual(sorted(drained), list(range(1, 101)))
+
+    def test_drain_low_traffic_keeps_base_count_floor(self):
+        autoscaler = autoscalers.InstanceAwareRequestRateAutoscaler(
+            'svc', self._spec({'L4': 0.1}), version=1)
+        autoscaler.update_version(2, self._spec({'A100': 10.0}),
+                                  serve_utils.DEFAULT_UPDATE_MODE)
+        autoscaler.target_num_replicas = 1
+        autoscaler.request_timestamps = []
+        replicas = [self._replica(1, 'L4', version=1)]
+        # No traffic and no ready new replica: zero shortfall, but the
+        # base-class count floor (target 1 - ready 0) keeps the standby.
+        self.assertEqual(
+            autoscaler._select_outdated_replicas_to_scale_down(replicas, [1]),
+            [])
+
+    def test_unknown_version_rehydrates_from_serve_state(self):
+        autoscaler = autoscalers.InstanceAwareRequestRateAutoscaler(
+            'svc', self._spec({'A100': 10.0}), version=3)
+        old_spec = mock.Mock()
+        old_spec.target_qps_per_replica = {'L4': 0.1}
+        with mock.patch.object(autoscalers.serve_state,
+                               'get_spec',
+                               return_value=old_spec) as mock_get:
+            self.assertEqual(
+                autoscaler._get_target_qps_for_gpu_shape('L4', 1, version=1),
+                0.1)
+            # Memoized: the second resolution must not hit the DB again.
+            autoscaler._get_target_qps_for_gpu_shape('L4', 1, version=1)
+        mock_get.assert_called_once_with('svc', 1)
+
+    def test_unknown_version_db_miss_falls_back_to_latest(self):
+        autoscaler = autoscalers.InstanceAwareRequestRateAutoscaler(
+            'svc', self._spec({'A100': 10.0}), version=3)
+        with mock.patch.object(autoscalers.serve_state,
+                               'get_spec',
+                               return_value=None):
+            # Falls back to the latest dict's min-value fallback.
+            self.assertEqual(
+                autoscaler._get_target_qps_for_gpu_shape('L4', 1, version=1),
+                10.0)
+
+    def test_rebuilt_autoscaler_first_tick_snaps_before_drain(self):
+        # Controller restart mid-rolling-update: the fresh autoscaler
+        # starts at target=min_replicas (1). Its first recompute must
+        # apply the real target directly — with hysteresis gating it for
+        # the upscale delay, the drain's 'ready latest >= target' cutoff
+        # would retire all 100 old L4s against the stale minimum.
+        autoscaler = autoscalers.InstanceAwareRequestRateAutoscaler(
+            'svc', self._spec({'A100': 10.0}), version=2)
+        autoscaler._qps_dict_by_version[1] = {'L4': 0.1}
+        replicas = [self._replica(i, 'L4', version=1) for i in range(1, 101)]
+        replicas.append(self._replica(101, 'A100', version=2))
+        autoscaler.request_timestamps = [0.0
+                                        ] * (20 * autoscaler.qps_window_size)
+        autoscaler._set_target_num_replicas_with_instance_aware_logic(replicas)
+        self.assertEqual(autoscaler.target_num_replicas, 2)
+        self.assertEqual(
+            autoscaler._select_outdated_replicas_to_scale_down(
+                replicas, [1, 2]), [])

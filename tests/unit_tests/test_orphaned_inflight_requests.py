@@ -167,3 +167,120 @@ async def test_reset_db_and_logs_reinitializes_backend(isolated_database,
     assert requests_lib.get_request_tasks(filt) == []
     assert await requests_lib.create_if_not_exists_async(
         _make_request('req-new', requests_lib.RequestStatus.PENDING))
+
+
+# ---------------------------------------------------------------------------
+# surface_interrupted_cluster_launches: INIT clusters whose in-flight work
+# died with the previous server run (or with the pod's disk on a redeploy)
+# get a cluster event, so the wedge is explained instead of silent.
+# ---------------------------------------------------------------------------
+
+
+def _patch_init_clusters(monkeypatch, names):
+    monkeypatch.setattr(requests_lib.global_user_state,
+                        'get_cluster_names_by_status', lambda status: names)
+
+
+def _capture_cluster_events(monkeypatch):
+    events = []
+
+    def _add_event(cluster_name, new_status, reason, event_type, **kwargs):
+        events.append({
+            'cluster_name': cluster_name,
+            'new_status': new_status,
+            'event_type': event_type,
+            'kwargs': kwargs,
+        })
+
+    monkeypatch.setattr(requests_lib.global_user_state, 'add_cluster_event',
+                        _add_event)
+    return events
+
+
+def test_surface_flags_init_clusters_without_active_request(monkeypatch):
+    _patch_init_clusters(monkeypatch, ['wedged-a', 'resuming-b'])
+    # 'resuming-b' still has a surviving active request row (it will be
+    # re-enqueued), so only 'wedged-a' must be flagged.
+    backend = _FakeBackend(
+        [_FakeReq('req-1', 'sky.launch', 'PENDING', 'resuming-b')])
+    monkeypatch.setattr(request_storage, 'get_request_backend', lambda: backend)
+    events = _capture_cluster_events(monkeypatch)
+
+    requests_lib.surface_interrupted_cluster_launches()
+
+    assert [e['cluster_name'] for e in events] == ['wedged-a']
+    event = events[0]
+    # The event must not change the cluster status, must be deduplicated
+    # across restart storms, and must surface on the status page (only
+    # TERMINAL/STATUS_CHANGE events are shown there).
+    assert event['new_status'] is None
+    assert event['event_type'] == (
+        requests_lib.global_user_state.ClusterEventType.STATUS_CHANGE)
+    assert event['kwargs'].get('nop_if_duplicate') is True
+    # The request scan must be scoped to the INIT clusters and to in-flight
+    # statuses, and must avoid the pickled columns (their decode can fail
+    # across an upgrade).
+    req_filter = backend.filters[0]
+    assert req_filter.status == requests_lib.RequestStatus.active_statuses()
+    assert req_filter.cluster_names == ['wedged-a', 'resuming-b']
+    assert set(req_filter.fields) == {'request_id', 'cluster_name'}
+
+
+def test_surface_no_init_clusters_skips_request_scan(monkeypatch):
+    _patch_init_clusters(monkeypatch, [])
+    scanned = []
+    monkeypatch.setattr(request_storage, 'get_request_backend',
+                        lambda: scanned.append(True))
+    events = _capture_cluster_events(monkeypatch)
+
+    requests_lib.surface_interrupted_cluster_launches()
+
+    assert not scanned
+    assert not events
+
+
+def test_surface_failure_does_not_block_startup(monkeypatch):
+    _patch_init_clusters(monkeypatch, ['wedged-a'])
+
+    def _boom():
+        raise RuntimeError('request DB schema incompatible')
+
+    monkeypatch.setattr(request_storage, 'get_request_backend', _boom)
+    events = _capture_cluster_events(monkeypatch)
+
+    # Must not raise -- surfacing is best effort.
+    requests_lib.surface_interrupted_cluster_launches()
+
+    assert not events
+
+
+def test_surface_event_write_failure_does_not_block_startup(monkeypatch):
+    _patch_init_clusters(monkeypatch, ['wedged-a'])
+    monkeypatch.setattr(request_storage, 'get_request_backend',
+                        lambda: _FakeBackend([]))
+
+    def _add_event(*args, **kwargs):
+        raise RuntimeError('database is locked')
+
+    monkeypatch.setattr(requests_lib.global_user_state, 'add_cluster_event',
+                        _add_event)
+
+    # Must not raise -- surfacing is best effort.
+    requests_lib.surface_interrupted_cluster_launches()
+
+
+@pytest.mark.asyncio
+async def test_surface_scan_against_real_backend(isolated_database,
+                                                 monkeypatch):
+    # Exercise the real sqlite query path (cluster_names filter combined with
+    # a fields projection), which the fake-backend tests above bypass.
+    req = _make_request('req-live', requests_lib.RequestStatus.PENDING)
+    req.cluster_name = 'resuming-b'
+    assert await requests_lib.create_if_not_exists_async(req)
+
+    _patch_init_clusters(monkeypatch, ['wedged-a', 'resuming-b'])
+    events = _capture_cluster_events(monkeypatch)
+
+    requests_lib.surface_interrupted_cluster_launches()
+
+    assert [e['cluster_name'] for e in events] == ['wedged-a']
