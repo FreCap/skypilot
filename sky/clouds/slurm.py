@@ -33,6 +33,11 @@ class Slurm(clouds.Cloud):
     """Slurm."""
 
     _REPR = 'Slurm'
+    # OPEN_PORTS is supported as a no-op: Slurm has no firewall API, so
+    # SkyPilot cannot manage reachability. Ports bound on compute nodes are
+    # reachable if the surrounding network allows it (e.g., intra-VPC
+    # traffic on cloud-hosted clusters); query_ports resolves endpoints to
+    # the compute node's IP.
     _CLOUD_UNSUPPORTED_FEATURES = {
         clouds.CloudImplementationFeatures.AUTOSTOP: 'Slurm does not '
                                                      'support autostop.',
@@ -44,8 +49,6 @@ class Slurm(clouds.Cloud):
         clouds.CloudImplementationFeatures.CUSTOM_MULTI_NETWORK:
             'Customized multiple network interfaces are not supported in '
             'Slurm.',
-        clouds.CloudImplementationFeatures.OPEN_PORTS: 'Opening ports is not '
-                                                       'supported in Slurm.',
         clouds.CloudImplementationFeatures.HOST_CONTROLLERS:
             'Running '
             'controllers is not '

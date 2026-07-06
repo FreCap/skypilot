@@ -1049,6 +1049,29 @@ def cleanup_ports(
     pass
 
 
+def query_ports(
+    cluster_name_on_cloud: str,
+    ports: List[str],
+    head_ip: Optional[str] = None,
+    provider_config: Optional[Dict[str, Any]] = None,
+) -> Dict[int, List[common.Endpoint]]:
+    """See sky/provision/__init__.py
+
+    The head_ip recorded for Slurm clusters is the login node (the SSH
+    entrypoint), but ports are bound by processes on the allocated compute
+    node. Resolve endpoints to the head compute node's IP instead. Slurm
+    manages no firewall, so reachability of that IP is determined by the
+    surrounding network (e.g., VPC routing and security groups).
+    """
+    del head_ip  # Login node address; not where ports are bound.
+    cluster_info = get_cluster_info('', cluster_name_on_cloud, provider_config)
+    head_instance = cluster_info.get_head_instance()
+    if head_instance is None:
+        # No running allocation yet; no endpoints to report.
+        return {}
+    return common.query_ports_passthrough(ports, head_instance.internal_ip)
+
+
 def _build_pyxis_args(cluster_name_on_cloud: str) -> str:
     """Build pyxis/enroot container args for srun.
 
