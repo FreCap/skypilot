@@ -368,6 +368,34 @@ class TestInstanceAwareGpuShapeCache(unittest.TestCase):
         # free ones (the downscale target assumes top-capacity retention).
         assert selected == [2, 3]
 
+    def test_equal_capacity_tie_ranks_by_cost_per_capacity(self):
+        """Among EQUAL-capacity replicas of different shapes, the
+        machine-cost tie-break equals cost-per-unit-capacity: the
+        pricier-for-the-same-throughput machine is shed first, even if
+        its per-GPU price is lower."""
+        autoscaler = self._make_autoscaler()
+        autoscaler._replica_cost_cache = {}
+        # A100 serves 0.4 qps on 1 GPU; L4 serves 0.1/GPU so L4:4 also 0.4.
+        autoscaler.target_qps_per_replica = {'A100': 0.4, 'L4': 0.1}
+
+        def _replica(rid, gpu, count, cost):
+            info = self._make_replica(gpu,
+                                      common_utils.ProcessStatus.SUCCEEDED,
+                                      count=count)
+            info.replica_id = rid
+            info.status = serve_state.ReplicaStatus.READY
+            info.is_terminal = False
+            info.version = 1
+            info.handle.return_value.launched_resources.get_cost.return_value \
+                = cost
+            return info
+
+        a100 = _replica(1, 'A100', 1, 2.0)  # $5.0 per qps
+        l4x4 = _replica(2, 'L4', 4, 2.4)  # $6.0 per qps (lower per-GPU!)
+        selected = autoscaler._select_replicas_to_scale_down_by_qps(
+            1, [a100, l4x4])
+        assert selected == [2]
+
     def test_capacity_outranks_cost(self):
         """A high-capacity paid replica outlives low-capacity free ones:
         qps ranks before cost."""

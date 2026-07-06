@@ -1046,6 +1046,16 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
         # ahead of low-capacity free ones could leave less capacity than
         # the target assumed. Uniform-capacity fleets (all per-type qps
         # equal) get full cost-priority within each status tier.
+        #
+        # PER-MACHINE vs PER-GPU: the cost used here is the replica's
+        # whole-machine hourly cost, and that is deliberate. Because cost
+        # only compares replicas of EQUAL weighted capacity, machine cost
+        # ranks identically to cost-per-unit-of-serving-capacity (same
+        # denominator) — the economically correct metric. It is strictly
+        # better than per-GPU price, which would misrank GPU types with
+        # different throughput (an A100:1 at \$2/hr serving 0.4 qps beats
+        # an L4:4 at \$2.40/hr serving the same 0.4 qps, despite the L4s'
+        # lower per-GPU price).
         sorted_replicas = sorted(
             replica_infos,
             key=lambda info: (
