@@ -105,6 +105,21 @@ def hosted_catalog_base_urls() -> Tuple[str, str]:
             constants.HOSTED_CATALOG_DIR_URL_S3_MIRROR)
 
 
+def hosted_catalog_request_headers() -> Dict[str, str]:
+    """HTTP headers for hosted-catalog fetches.
+
+    SKYPILOT_HOSTED_CATALOG_TOKEN authenticates against a private mirror
+    (e.g. a private GitHub repo's raw URL, which accepts a fine-grained
+    PAT as a bearer token). Never sent to the default public catalog
+    hosts, so a misconfigured token cannot leak to third parties.
+    """
+    headers = {'User-Agent': 'SkyPilot/0.7'}
+    token = os.environ.get('SKYPILOT_HOSTED_CATALOG_TOKEN')
+    if token and os.environ.get('SKYPILOT_HOSTED_CATALOG_DIR_URL'):
+        headers['Authorization'] = f'Bearer {token}'
+    return headers
+
+
 def is_catalog_modified(filename: str) -> bool:
     # Check the md5 of the file to see if it has changed.
     catalog_path = get_catalog_path(filename)
@@ -263,7 +278,7 @@ def read_catalog(filename: str,
             base_url, base_url_fallback = hosted_catalog_base_urls()
             url = f'{base_url}/{constants.CATALOG_SCHEMA_VERSION}/{filename}'
             url_fallback = f'{base_url_fallback}/{constants.CATALOG_SCHEMA_VERSION}/{filename}'  # pylint: disable=line-too-long
-            headers = {'User-Agent': 'SkyPilot/0.7'}
+            headers = hosted_catalog_request_headers()
             update_frequency_str = ''
             if pull_frequency_hours is not None:
                 update_frequency_str = (
