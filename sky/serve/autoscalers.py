@@ -959,40 +959,6 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
             if info.replica_id not in keep_ids
         ]
 
-    def _calculate_total_qps_from_replicas(
-            self, replica_infos: List['replica_managers.ReplicaInfo']) -> float:
-        """Calculate total QPS based on current replica GPU types."""
-        total_qps = 0.0
-        logger.info(f'Calculating total QPS from {len(replica_infos)} replicas')
-
-        for replica_info in replica_infos:
-            # Skip non-valid replicas
-            valid_statuses = [
-                serve_state.ReplicaStatus.READY,
-                serve_state.ReplicaStatus.STARTING,
-                serve_state.ReplicaStatus.PROVISIONING
-            ]
-            if replica_info.status not in valid_statuses:
-                logger.info(f'Skipping replica {replica_info.replica_id} '
-                            f'with status: {replica_info.status}')
-                continue
-
-            gpu_type, gpu_count = self._get_gpu_shape_from_replica_info(
-                replica_info)
-            logger.info(f'Processing replica {replica_info.replica_id} '
-                        f'with GPU shape: {gpu_type}:{gpu_count}')
-
-            # Use flexible matching logic, weighted by GPU count: a 4-GPU
-            # replica contributes 4x the per-GPU capacity of a 1-GPU one.
-            qps_for_this_replica = self._get_target_qps_for_gpu_shape(
-                gpu_type, gpu_count, version=replica_info.version)
-            total_qps += qps_for_this_replica
-            logger.info(f'GPU shape {gpu_type}:{gpu_count} -> '
-                        f'{qps_for_this_replica} QPS')
-
-        logger.info(f'Calculated total QPS: {total_qps}')
-        return total_qps
-
     def _get_qps_dict_for_version(self, version: int) -> Dict[str, float]:
         """The qps dict a given service version was launched under.
 
@@ -1127,38 +1093,6 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
             self._gpu_shape_cache[replica_info.replica_id] = (gpu_type,
                                                               gpu_count)
         return gpu_type, gpu_count
-
-    def _extract_target_qps_list_from_ready_replicas(
-            self,
-            replica_infos: List['replica_managers.ReplicaInfo']) -> List[float]:
-        """Extract target QPS list from current READY replicas."""
-        ready_replica_qps = []
-
-        for replica_info in replica_infos:
-            # Check if replica is READY
-            if replica_info.status != serve_state.ReplicaStatus.READY:
-                logger.info(
-                    f'Replica {replica_info.replica_id} '
-                    f'not ready (status: {replica_info.status}), skipping')
-                continue
-
-            gpu_type, gpu_count = self._get_gpu_shape_from_replica_info(
-                replica_info)
-
-            # Use flexible matching logic, weighted by GPU count.
-            qps_for_this_replica = self._get_target_qps_for_gpu_shape(
-                gpu_type, gpu_count, version=replica_info.version)
-            ready_replica_qps.append(qps_for_this_replica)
-            logger.info(f'Ready replica {replica_info.replica_id} '
-                        f'with GPU {gpu_type}:{gpu_count}: '
-                        f'{qps_for_this_replica} QPS')
-
-        if ready_replica_qps:
-            logger.info(
-                f'Target QPS list from ready replicas: {ready_replica_qps}')
-            return ready_replica_qps
-
-        return []
 
     def _select_replicas_to_scale_down_by_qps(
             self, num_replicas_to_scale_down: int,
