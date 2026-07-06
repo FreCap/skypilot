@@ -276,3 +276,52 @@ run: echo hi
         assert locs, 'expected at least one location'
         for loc in locs:
             assert loc.image_id == {None: 'docker:myrepo/model:v1'}, loc
+
+
+class TestDiskTierPerLocation:
+    """disk_tier is a per-location attribute: VM entries keep 'high'
+    without breaking uniformity against k8s entries that reject it."""
+
+    def test_mixed_disk_tier_enumerates(self):
+        # pylint: disable=import-outside-toplevel
+        import sky
+        t = sky.Task.from_yaml_str("""
+resources:
+  cpus: 4+
+  ports: 8080
+  any_of:
+    - infra: aws/us-east-1
+      accelerators: L4:1
+      use_spot: true
+      disk_tier: high
+    - infra: aws/us-east-2
+      accelerators: A10G:1
+      use_spot: false
+run: echo hi
+""")
+        locs = spot_placer._get_possible_location_from_task(t)
+        l4 = [l for l in locs if 'L4' in (l.accelerators or {})]
+        a10g = [l for l in locs if 'A10G' in (l.accelerators or {})]
+        assert l4 and all(l.disk_tier == 'high' for l in l4)
+        assert a10g and all(l.disk_tier is None for l in a10g)
+        # The launch override pins the tier.
+        assert l4[0].to_dict()['disk_tier'] == 'high'
+        assert 'disk_tier' not in a10g[0].to_dict()
+
+    def test_pickle_roundtrip_and_backcompat(self):
+        with mock.patch.object(spot_placer.registry.CLOUD_REGISTRY,
+                               'from_str',
+                               return_value=mock.MagicMock()):
+            loc = spot_placer.Location.from_pickleable({
+                'cloud': 'AWS',
+                'region': 'us-east-1',
+                'zone': None,
+                'disk_tier': 'high',
+            })
+            assert loc.disk_tier == 'high'
+            old = spot_placer.Location.from_pickleable({
+                'cloud': 'AWS',
+                'region': 'us-east-1',
+                'zone': None,
+            })
+            assert old.disk_tier is None
