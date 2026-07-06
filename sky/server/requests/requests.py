@@ -90,9 +90,10 @@ RESET_REQUESTS_ON_STARTUP_ENV_VAR = 'SKYPILOT_RESET_REQUESTS_ON_STARTUP'
 
 # Request names whose entrypoints are safe to re-execute from scratch after a
 # server restart, provided their cluster is still INIT (see
-# _requeue_interrupted_launches). Graceful shutdown leaves these rows RUNNING
-# instead of cancelling them, and startup recovery requeues them, so a server
-# redeploy completes an in-flight provisioning instead of dropping it.
+# _find_interrupted_launches_to_requeue). Graceful shutdown leaves these rows
+# RUNNING instead of cancelling them, and startup recovery requeues them, so
+# a server redeploy completes an in-flight provisioning instead of dropping
+# it.
 # Request rows persist the prefixed name (executor stamps
 # REQUEST_NAME_PREFIX + request_name at creation), so match that form.
 REPLAYABLE_REQUEST_NAMES = (server_constants.REQUEST_NAME_PREFIX +
