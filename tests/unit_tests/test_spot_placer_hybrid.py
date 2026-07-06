@@ -253,3 +253,26 @@ class TestMixedValidation:
         with pytest.raises(ValueError, match='at least one spot'):
             serve_utils.validate_service_task(sky.Task.from_yaml_str(yaml_str),
                                               pool=False)
+
+
+class TestImageIdNormalizationEndToEnd:
+    """Enumerated locations must carry region-independent image dicts."""
+
+    def test_enumeration_normalizes_image_id(self):
+        # pylint: disable=import-outside-toplevel
+        import sky
+        t = sky.Task.from_yaml_str("""
+resources:
+  cpus: 4+
+  ports: 8080
+  any_of:
+    - infra: aws/us-east-1
+      accelerators: L4:1
+      use_spot: true
+      image_id: docker:myrepo/model:v1
+run: echo hi
+""")
+        locs = spot_placer._get_possible_location_from_task(t)
+        assert locs, 'expected at least one location'
+        for loc in locs:
+            assert loc.image_id == {None: 'docker:myrepo/model:v1'}, loc

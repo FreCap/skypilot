@@ -40,6 +40,24 @@ _PREEMPTION_RETRY_SECONDS_DEFAULT = 600
 _PREEMPTION_RETRY_SECONDS_ENV_VAR = 'SKYPILOT_SPOT_PLACER_RETRY_SECONDS'
 
 
+def _normalize_image_id(
+    image_id: Optional[Dict[Optional[str], str]]
+) -> Optional[Dict[Optional[str], str]]:
+    """Region-independent form of a single-image dict.
+
+    Parsed YAML keys single-value image dicts by the entry's
+    region/context (e.g. {'research-ctx': 'docker:...'}); applying that
+    as a cross-region resources_override silently drops the image
+    because copy() only honors a key matching the target region.
+    """
+    if not image_id:
+        return image_id
+    values = list(image_id.values())
+    if len(set(values)) == 1:
+        return {None: values[0]}
+    return image_id
+
+
 def _preemption_retry_seconds() -> float:
     override = os.environ.get(_PREEMPTION_RETRY_SECONDS_ENV_VAR)
     if override is not None:
@@ -100,15 +118,7 @@ class Location:
     def from_resources(cls, resources: 'resources_lib.Resources') -> 'Location':
         assert resources.cloud is not None, 'Cloud must be specified'
         assert resources.region is not None, 'Region must be specified'
-        image_id = resources.image_id
-        if image_id:
-            # Normalize to a region-independent form: the location may be
-            # applied to entries whose region differs from the one the
-            # image dict was keyed under, and copy() only applies an
-            # image whose key matches the target region.
-            values = list(image_id.values())
-            if len(set(values)) == 1:
-                image_id = {None: values[0]}
+        image_id = _normalize_image_id(resources.image_id)
         return cls(resources.cloud,
                    resources.region,
                    resources.zone,
@@ -271,7 +281,7 @@ def _get_possible_location_from_task(task: 'task_lib.Task') -> List[Location]:
                     # (make_launchables may resolve counts differently).
                     loc.accelerators = r.accelerators
                     loc.use_spot = r.use_spot
-                    loc.image_id = r.image_id
+                    loc.image_id = _normalize_image_id(r.image_id)
                     possible_locations.add(loc)
 
     return list(possible_locations)
