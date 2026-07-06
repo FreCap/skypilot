@@ -259,10 +259,21 @@ class DynamicFallbackSpotPlacer(SpotPlacer,
     def select_next_location(self,
                              current_locations: List[Location]) -> Location:
         active_locations = self.active_locations()
-        # Prioritize locations that are not currently used.
+        # Prioritize the least-loaded locations (unused ones have load 0,
+        # so this preserves the original prefer-unused behavior while any
+        # location is still free). Without the load tiebreak, once every
+        # location hosts at least one replica the min-cost rule pins
+        # EVERY subsequent launch to the single cheapest active location:
+        # at fleet scale this serially hammers one spot-exhausted zone
+        # (observed live: >1000 consecutive failed attempts in one zone
+        # while other zones and clouds sat idle) instead of spreading.
+        location_load = collections.Counter(current_locations)
+        min_load = min(
+            (location_load[location] for location in active_locations),
+            default=0)
         candidate_locations: List[Location] = [
             location for location in active_locations
-            if location not in current_locations
+            if location_load[location] == min_load
         ]
         # If no candidate locations, use all active locations.
         if not candidate_locations:
