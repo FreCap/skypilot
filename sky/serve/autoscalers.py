@@ -727,8 +727,23 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
         total_qps = self._calculate_total_qps_from_replicas(replica_infos)
         if total_qps > 0:
             if num_requests_per_second >= total_qps:
-                # for upscaling, max_target_qps is the standard qps
-                max_target_qps = max(target_qps_dict.values())
+                # For upscaling, estimate a NEW replica's capacity as the
+                # largest per-replica capacity observed in the current
+                # fleet (count-weighted). Raw max(dict values) undercounts
+                # multi-GPU replicas declared via per-GPU keys: with
+                # {'L4': 0.1} and L4:4 replicas, 0.4 excess QPS would add
+                # ceil(0.4/0.1) = 4 replicas instead of 1. If the estimate
+                # is optimistic (the next launch lands a smaller shape),
+                # the next tick simply adds more — brief under-provision
+                # beats a 4x over-launch.
+                observed_capacities = [
+                    self._get_target_qps_for_gpu_shape(
+                        *self._get_gpu_shape_from_replica_info(info))
+                    for info in replica_infos
+                    if not info.is_terminal
+                ]
+                max_target_qps = max([c for c in observed_capacities if c > 0],
+                                     default=max(target_qps_dict.values()))
                 over_request_num = num_requests_per_second - total_qps
                 current_num_replicas = len(replica_infos)
                 raw_target_num = current_num_replicas + math.ceil(
@@ -961,11 +976,23 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
         }
 
         # Sort replicas by: 1. status order, 2. target_qps (asc),
-        # 3. version (asc), 4. replica_id (desc)
+        # 3. version (asc), 4. replica_id (desc).
+        # scale_down_decision_order() is a classmethod returning the
+        # static ordering list; the sort key needs this replica's INDEX
+        # in it (the list itself is identical for every replica and
+        # would let weighted QPS outrank status).
+        status_order = serve_state.ReplicaStatus.scale_down_decision_order()
+
+        def _status_rank(info: 'replica_managers.ReplicaInfo') -> int:
+            try:
+                return status_order.index(info.status)
+            except ValueError:
+                return len(status_order)
+
         sorted_replicas = sorted(
             replica_infos,
             key=lambda info: (
-                info.status.scale_down_decision_order(),
+                _status_rank(info),
                 replica_qps_map.get(info.replica_id, float('inf')),
                 info.version,
                 -info.replica_id,

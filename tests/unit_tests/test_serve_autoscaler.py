@@ -288,6 +288,58 @@ class TestInstanceAwareGpuShapeCache(unittest.TestCase):
                          ('L4', 4))
         self.assertEqual(info.handle.call_count, 1)
 
+    def test_upscale_uses_observed_replica_capacity(self):
+        """Excess QPS equal to one 4-GPU replica's capacity must add ONE
+        replica, not four (per-GPU key + count-weighted fleet)."""
+        autoscaler = self._make_autoscaler()
+        autoscaler.target_qps_per_replica = {'L4': 0.1}
+        autoscaler.qps_window_size = 10
+        # Two READY 4-GPU replicas -> capacity 0.8 qps.
+        infos = []
+        for rid in (1, 2):
+            info = self._make_replica('L4',
+                                      common_utils.ProcessStatus.SUCCEEDED,
+                                      count=4)
+            info.replica_id = rid
+            info.status = serve_state.ReplicaStatus.READY
+            info.is_terminal = False
+            infos.append(info)
+        # 12 requests in a 10s window = 1.2 qps: 0.4 excess = exactly one
+        # more 4-GPU replica.
+        autoscaler.request_timestamps = [0.0] * 12
+        autoscaler.target_num_replicas = 2
+        autoscaler.upscale_counter = 0
+        autoscaler.downscale_counter = 0
+        autoscaler.scale_up_threshold = 1
+        autoscaler.scale_down_threshold = 1
+        autoscaler.min_replicas = 1
+        autoscaler.max_replicas = 20
+        autoscaler.num_overprovision = None
+        autoscaler._set_target_num_replicas_with_instance_aware_logic(infos)
+        self.assertEqual(autoscaler.target_num_replicas, 3)
+
+    def test_scale_down_prefers_earlier_lifecycle_status(self):
+        """A PROVISIONING replica must be selected before a READY one
+        even when the READY replica has lower weighted capacity."""
+        autoscaler = self._make_autoscaler()
+        autoscaler.target_qps_per_replica = {'L4': 0.1}
+        ready_small = self._make_replica('L4',
+                                         common_utils.ProcessStatus.SUCCEEDED,
+                                         count=1)
+        ready_small.replica_id = 1
+        ready_small.status = serve_state.ReplicaStatus.READY
+        ready_small.is_terminal = False
+        ready_small.version = 1
+        provisioning_big = self._make_replica(
+            'L4', common_utils.ProcessStatus.RUNNING, count=4)
+        provisioning_big.replica_id = 2
+        provisioning_big.status = serve_state.ReplicaStatus.PROVISIONING
+        provisioning_big.is_terminal = False
+        provisioning_big.version = 1
+        selected = autoscaler._select_replicas_to_scale_down_by_qps(
+            1, [ready_small, provisioning_big])
+        self.assertEqual(selected, [2])
+
     def test_gpu_count_weights_capacity(self):
         """A 4-GPU replica contributes 4x per-GPU capacity; an exact
         shape key overrides with a per-replica value."""
