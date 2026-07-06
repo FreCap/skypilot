@@ -260,11 +260,13 @@ class TestInstanceAwareGpuShapeCache(unittest.TestCase):
         autoscaler._bare_key_warned = set()
         autoscaler._snap_target_on_next_recompute = False
         autoscaler._qps_dict_by_version = {}
+        autoscaler.latest_version = 1
         return autoscaler
 
     def _make_replica(self, gpu_type, launch_status, count=1):
         info = mock.Mock()
         info.replica_id = 1
+        info.version = 1
         info.status_property.sky_launch_status = launch_status
         info.handle.return_value.launched_resources.accelerators = {
             gpu_type: count
@@ -703,3 +705,110 @@ class TestInstanceAwareUpdateRolloutSafety(unittest.TestCase):
         autoscaler.update_version(1, self._spec({'A100': 1.0}),
                                   serve_utils.DEFAULT_UPDATE_MODE)
         self.assertEqual(autoscaler.upscale_counter, 7)
+
+
+class TestInstanceAwareMixedVersionArithmetic(unittest.TestCase):
+    """Target and drain must agree on what a 'replica' is mid-update.
+
+    Scenario from review: 100 old L4 (0.1 qps each, v1) + 1 ready new
+    A100 (10 qps, v2) at 20 rps. A whole-fleet count target (102) made
+    _generate_scaling_decisions enqueue 101 new A100s (it compares the
+    target against latest-version replicas only); a count-based drain
+    (target 2, 1 ready new) retired 99 old replicas while their capacity
+    was still needed.
+    """
+
+    def _spec(self, qps_dict, min_replicas=1, max_replicas=200):
+        return types.SimpleNamespace(min_replicas=min_replicas,
+                                     max_replicas=max_replicas,
+                                     num_overprovision=None,
+                                     target_qps_per_replica=qps_dict,
+                                     upscale_delay_seconds=None,
+                                     downscale_delay_seconds=None)
+
+    def _replica(self, replica_id, gpu_type, version, is_ready=True):
+        info = mock.Mock()
+        info.replica_id = replica_id
+        info.version = version
+        info.is_terminal = False
+        info.is_ready = is_ready
+        info.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.SUCCEEDED)
+        info.handle.return_value.launched_resources.accelerators = {gpu_type: 1}
+        return info
+
+    def _mid_update_fleet(self):
+        autoscaler = autoscalers.InstanceAwareRequestRateAutoscaler(
+            'svc', self._spec({'L4': 0.1}), version=1)
+        autoscaler.update_version(2, self._spec({'A100': 10.0}),
+                                  serve_utils.DEFAULT_UPDATE_MODE)
+        replicas = [self._replica(i, 'L4', version=1) for i in range(1, 101)]
+        replicas.append(self._replica(101, 'A100', version=2))
+        # 20 rps over the window.
+        autoscaler.request_timestamps = [0.0
+                                        ] * (20 * autoscaler.qps_window_size)
+        return autoscaler, replicas
+
+    def test_target_counts_latest_version_replicas_only(self):
+        autoscaler, replicas = self._mid_update_fleet()
+        autoscaler._set_target_num_replicas_with_instance_aware_logic(replicas)
+        # Demand 20, one ready A100 covers 10, one more A100 covers the
+        # rest: the target is 2 latest-version replicas — not 102.
+        self.assertEqual(autoscaler.target_num_replicas, 2)
+
+    def test_drain_keeps_old_capacity_covering_shortfall(self):
+        autoscaler, replicas = self._mid_update_fleet()
+        autoscaler._set_target_num_replicas_with_instance_aware_logic(replicas)
+        # Ready new capacity 10 of demand 20: all 100 old L4s (10 qps
+        # total) are needed to cover the shortfall — none drained.
+        self.assertEqual(
+            autoscaler._select_outdated_replicas_to_scale_down(
+                replicas, [1, 2]), [])
+
+    def test_drain_retires_all_old_once_target_ready(self):
+        autoscaler, replicas = self._mid_update_fleet()
+        autoscaler._set_target_num_replicas_with_instance_aware_logic(replicas)
+        replicas.append(self._replica(102, 'A100', version=2))
+        drained = autoscaler._select_outdated_replicas_to_scale_down(
+            replicas, [1, 2])
+        self.assertEqual(sorted(drained), list(range(1, 101)))
+
+    def test_drain_low_traffic_keeps_base_count_floor(self):
+        autoscaler = autoscalers.InstanceAwareRequestRateAutoscaler(
+            'svc', self._spec({'L4': 0.1}), version=1)
+        autoscaler.update_version(2, self._spec({'A100': 10.0}),
+                                  serve_utils.DEFAULT_UPDATE_MODE)
+        autoscaler.target_num_replicas = 1
+        autoscaler.request_timestamps = []
+        replicas = [self._replica(1, 'L4', version=1)]
+        # No traffic and no ready new replica: zero shortfall, but the
+        # base-class count floor (target 1 - ready 0) keeps the standby.
+        self.assertEqual(
+            autoscaler._select_outdated_replicas_to_scale_down(replicas, [1]),
+            [])
+
+    def test_unknown_version_rehydrates_from_serve_state(self):
+        autoscaler = autoscalers.InstanceAwareRequestRateAutoscaler(
+            'svc', self._spec({'A100': 10.0}), version=3)
+        old_spec = mock.Mock()
+        old_spec.target_qps_per_replica = {'L4': 0.1}
+        with mock.patch.object(autoscalers.serve_state,
+                               'get_spec',
+                               return_value=old_spec) as mock_get:
+            self.assertEqual(
+                autoscaler._get_target_qps_for_gpu_shape('L4', 1, version=1),
+                0.1)
+            # Memoized: the second resolution must not hit the DB again.
+            autoscaler._get_target_qps_for_gpu_shape('L4', 1, version=1)
+        mock_get.assert_called_once_with('svc', 1)
+
+    def test_unknown_version_db_miss_falls_back_to_latest(self):
+        autoscaler = autoscalers.InstanceAwareRequestRateAutoscaler(
+            'svc', self._spec({'A100': 10.0}), version=3)
+        with mock.patch.object(autoscalers.serve_state,
+                               'get_spec',
+                               return_value=None):
+            # Falls back to the latest dict's min-value fallback.
+            self.assertEqual(
+                autoscaler._get_target_qps_for_gpu_shape('L4', 1, version=1),
+                10.0)

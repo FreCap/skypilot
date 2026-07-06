@@ -543,6 +543,11 @@ class RequestRateAutoscaler(_AutoscalerWithHysteresis):
 
     def update_version(self, version: int, spec: 'service_spec.SkyServiceSpec',
                        update_mode: serve_utils.UpdateMode) -> None:
+        if version <= self.latest_version:
+            # The base class rejects stale versions; don't overwrite the
+            # live qps target from a stale spec either.
+            super().update_version(version, spec, update_mode)
+            return
         super().update_version(version, spec, update_mode)
         self.target_qps_per_replica = spec.target_qps_per_replica
 
@@ -779,88 +784,56 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
         num_requests_per_second = len(
             self.request_timestamps) / self.qps_window_size
 
-        total_qps = self._calculate_total_qps_from_replicas(replica_infos)
-        if total_qps > 0:
-            if num_requests_per_second >= total_qps:
-                # For upscaling, estimate a NEW replica's capacity as the
-                # largest per-replica capacity observed in the current
-                # fleet (count-weighted). Raw max(dict values) undercounts
-                # multi-GPU replicas declared via per-GPU keys: with
-                # {'L4': 0.1} and L4:4 replicas, 0.4 excess QPS would add
-                # ceil(0.4/0.1) = 4 replicas instead of 1. If the estimate
-                # is optimistic (the next launch lands a smaller shape),
-                # the next tick simply adds more — brief under-provision
-                # beats a 4x over-launch. The dict-max default only covers
-                # the degenerate case of nonterminal replicas whose shapes
-                # all resolve to non-positive capacity; the truly empty
-                # fleet (total_qps == 0) is handled in the else branch
-                # below.
-                observed_capacities = [
-                    self._get_target_qps_for_gpu_shape(
-                        *self._get_gpu_shape_from_replica_info(info),
-                        version=info.version)
-                    for info in replica_infos
-                    if not info.is_terminal
-                ]
-                max_target_qps = max([c for c in observed_capacities if c > 0],
-                                     default=max(target_qps_dict.values()))
-                over_request_num = num_requests_per_second - total_qps
-                current_num_replicas = len(replica_infos)
-                raw_target_num = current_num_replicas + math.ceil(
-                    over_request_num / max_target_qps)
-                target_num_replicas = self._clip_target_num_replicas(
-                    raw_target_num)
-                logger.info(
-                    f'Instance-aware autoscaling: total QPS {total_qps}, '
-                    f'num_requests_per_second: {num_requests_per_second}, '
-                    f'upscaling, using maximum QPS {max_target_qps} '
-                    f'from {target_qps_dict}, '
-                    f'target replicas: {target_num_replicas}')
-            else:
-                # for downscaling, use qps for every ready_target_qps_list
-                # to calculate target_num_replicas
-                ready_target_qps_list = \
-                    self._extract_target_qps_list_from_ready_replicas(
-                        replica_infos)
-                ready_target_qps_list = sorted(ready_target_qps_list,
-                                               reverse=True)
-                if not ready_target_qps_list:
-                    # Fallback to maximum QPS from config if no ready replicas
-                    ready_target_qps_list = [max(target_qps_dict.values())]
+        # target_num_replicas counts LATEST-version replicas only: the
+        # scale-up/down decisions in _generate_scaling_decisions compare
+        # it against the latest-version population, and during a rolling
+        # update old-version replicas are transitional capacity handled
+        # by the capacity-aware outdated drain. Counting them here made
+        # the two consumers disagree — 100 old + 1 new replica with a
+        # whole-fleet count target of 102 enqueued 101 new launches.
+        latest_capacities = []
+        for info in replica_infos:
+            if info.is_terminal or info.version != self.latest_version:
+                continue
+            capacity = self._get_target_qps_for_gpu_shape(
+                *self._get_gpu_shape_from_replica_info(info),
+                version=info.version)
+            if capacity > 0:
+                latest_capacities.append(capacity)
+        latest_capacities.sort(reverse=True)
 
-                raw_target_num = 0
-                qps_sum = 0.0
-                for qps in ready_target_qps_list:
-                    raw_target_num += 1
-                    qps_sum += qps
-                    if qps_sum > num_requests_per_second:
-                        break
-
-                target_num_replicas = self._clip_target_num_replicas(
-                    raw_target_num)
-                logger.info(
-                    f'Instance-aware autoscaling: total QPS {total_qps}, '
-                    f'num_requests_per_second: {num_requests_per_second}, '
-                    f'downscaling, using ready QPS list '
-                    f'{ready_target_qps_list}, '
-                    f'target replicas: {target_num_replicas}')
-        else:
-            # No replica capacity at all (empty or entirely unresolved
-            # fleet). If traffic is already arriving, size from the config
-            # dict directly — pinning to min_replicas here left
-            # scale-to-zero services (min_replicas=0) stuck at zero with
-            # requests pending.
-            if num_requests_per_second > 0:
+        # Pack demand onto the existing latest replicas (largest first),
+        # then size any remaining demand with the best capacity estimate:
+        # the largest LIVE capacity when available — raw max(dict values)
+        # undercounts multi-GPU replicas declared via per-GPU keys (with
+        # {'L4': 0.1} and L4:4 replicas, 0.4 excess QPS would add 4
+        # replicas instead of 1) — falling back to the dict max for an
+        # empty or unresolvable latest fleet so scale-from-zero services
+        # (min_replicas=0) are not stuck at zero with requests pending.
+        # If the estimate is optimistic (the next launch lands a smaller
+        # shape), the next tick simply adds more — brief under-provision
+        # beats a multiple-x over-launch.
+        raw_target_num = 0
+        covered_qps = 0.0
+        for capacity in latest_capacities:
+            raw_target_num += 1
+            covered_qps += capacity
+            if covered_qps > num_requests_per_second:
+                break
+        if covered_qps <= num_requests_per_second:
+            remaining_qps = num_requests_per_second - covered_qps
+            estimated_qps = (latest_capacities[0] if latest_capacities else 0.0)
+            if estimated_qps <= 0:
                 estimated_qps = max(target_qps_dict.values())
-                raw_target_num = max(
-                    self.min_replicas,
-                    math.ceil(num_requests_per_second / estimated_qps))
-            else:
-                raw_target_num = self.min_replicas
-            target_num_replicas = self._clip_target_num_replicas(raw_target_num)
-            logger.info(f'Instance-aware autoscaling: no replica QPS available,'
-                        f' requests/s: {num_requests_per_second},'
-                        f' target replicas: {target_num_replicas}')
+            if estimated_qps > 0 and remaining_qps > 0:
+                raw_target_num += math.ceil(remaining_qps / estimated_qps)
+
+        target_num_replicas = self._clip_target_num_replicas(raw_target_num)
+        logger.info(f'Instance-aware autoscaling: '
+                    f'requests/s: {num_requests_per_second}, '
+                    f'latest-version capacities: {latest_capacities}, '
+                    f'target replicas (latest version): '
+                    f'{target_num_replicas}')
 
         # Apply hysteresis logic
         old_target_num_replicas = self.target_num_replicas
@@ -901,6 +874,91 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
             f'Downscale counter: {self.downscale_counter}/'
             f'{self.scale_down_threshold}. ')
 
+    def _select_outdated_replicas_to_scale_down(
+        self,
+        replica_infos: List['replica_managers.ReplicaInfo'],
+        active_versions: List[int],
+    ) -> List[int]:
+        """Capacity-aware rolling drain of old-version replicas.
+
+        The base class keeps (target - ready_new) OLD replicas — a count
+        that treats every replica as interchangeable. With per-shape
+        capacities that can retire 99% of the serving capacity while one
+        big new replica is still alone. Keep old replicas by CAPACITY:
+        enough READY old ones to cover the demand the ready latest
+        replicas cannot yet serve, never fewer than the base class would
+        have kept.
+        """
+        if self.update_mode != serve_utils.UpdateMode.ROLLING:
+            return super()._select_outdated_replicas_to_scale_down(
+                replica_infos, active_versions)
+        old_nonterminal = [
+            info for info in replica_infos
+            if info.version < self.latest_version and not info.is_terminal
+        ]
+        if not old_nonterminal:
+            return []
+        num_ready_latest = 0
+        ready_latest_capacity = 0.0
+        for info in replica_infos:
+            if info.version == self.latest_version and info.is_ready:
+                num_ready_latest += 1
+                ready_latest_capacity += self._get_target_qps_for_gpu_shape(
+                    *self._get_gpu_shape_from_replica_info(info),
+                    version=info.version)
+        if num_ready_latest >= self.get_final_target_num_replicas():
+            # Enough latest-version replicas: retire all old ones (same
+            # terminal condition as the base class).
+            return [info.replica_id for info in old_nonterminal]
+
+        demand = len(self.request_timestamps) / self.qps_window_size
+        shortfall = demand - ready_latest_capacity
+        # Never keep fewer old replicas than the base class's count rule
+        # (target - ready_new): capacity packing with a few big old
+        # replicas could otherwise drain the standby pool a low-traffic
+        # service relies on for its next request.
+        keep_count_floor = min(
+            len(old_nonterminal),
+            max(0,
+                self.get_final_target_num_replicas() - num_ready_latest))
+
+        ready_old = []
+        nonready_old = []
+        for info in old_nonterminal:
+            capacity = self._get_target_qps_for_gpu_shape(
+                *self._get_gpu_shape_from_replica_info(info),
+                version=info.version)
+            if info.is_ready:
+                ready_old.append((capacity, info))
+            else:
+                nonready_old.append((capacity, info))
+        # Largest capacity first: fewest old replicas kept, fastest
+        # rollout. Replica id tie-break keeps the selection stable
+        # across ticks.
+        ready_old.sort(key=lambda pair: (-pair[0], pair[1].replica_id))
+
+        keep_ids = set()
+        covered_qps = 0.0
+        for capacity, info in ready_old:
+            if covered_qps >= shortfall and len(keep_ids) >= keep_count_floor:
+                break
+            keep_ids.add(info.replica_id)
+            if capacity > 0:
+                covered_qps += capacity
+        # Not-yet-ready old replicas add no serving capacity; they only
+        # count toward the base-class floor (the base helper likewise
+        # prefers draining initializing replicas first).
+        for _, info in nonready_old:
+            if len(keep_ids) >= keep_count_floor:
+                break
+            keep_ids.add(info.replica_id)
+
+        return [
+            info.replica_id
+            for info in old_nonterminal
+            if info.replica_id not in keep_ids
+        ]
+
     def _calculate_total_qps_from_replicas(
             self, replica_infos: List['replica_managers.ReplicaInfo']) -> float:
         """Calculate total QPS based on current replica GPU types."""
@@ -935,6 +993,34 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
         logger.info(f'Calculated total QPS: {total_qps}')
         return total_qps
 
+    def _get_qps_dict_for_version(self, version: int) -> Dict[str, float]:
+        """The qps dict a given service version was launched under.
+
+        Unknown versions (the autoscaler was rebuilt after the update
+        that created them, e.g. a controller restart mid-rolling-update)
+        rehydrate from the durable per-version spec so old-version
+        replicas keep their real capacity. Falls back to the latest dict
+        when the version's spec is unavailable; misses are not memoized
+        so a transient DB error can heal on the next tick.
+        """
+        cached = self._qps_dict_by_version.get(version)
+        if cached is not None:
+            return cached
+        qps_dict = None
+        try:
+            spec = serve_state.get_spec(self._service_name, version)
+            if spec is not None:
+                qps_dict = spec.target_qps_per_replica
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning('Failed to load spec for version '
+                           f'{version}: {common_utils.format_exception(e)}')
+        if not isinstance(qps_dict, dict):
+            assert isinstance(self.target_qps_per_replica, dict), \
+                'Expected dict for instance-aware logic'
+            return self.target_qps_per_replica
+        self._qps_dict_by_version[version] = qps_dict
+        return qps_dict
+
     def _get_target_qps_for_gpu_shape(self,
                                       gpu_type: str,
                                       gpu_count: int,
@@ -953,9 +1039,8 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
         assert isinstance(self.target_qps_per_replica,
                           dict), 'Expected dict for instance-aware logic'
         target_qps_dict = self.target_qps_per_replica
-        if version is not None:
-            target_qps_dict = self._qps_dict_by_version.get(
-                version, target_qps_dict)
+        if version is not None and version != self.latest_version:
+            target_qps_dict = self._get_qps_dict_for_version(version)
 
         resolved = serve_utils.resolve_target_qps_for_gpu_shape(
             gpu_type, gpu_count, target_qps_dict)
@@ -1250,6 +1335,11 @@ class FallbackRequestRateAutoscaler(RequestRateAutoscaler):
 
     def update_version(self, version: int, spec: 'service_spec.SkyServiceSpec',
                        update_mode: serve_utils.UpdateMode) -> None:
+        if version <= self.latest_version:
+            # The base class rejects stale versions; don't reset fallback
+            # options from a stale spec either.
+            super().update_version(version, spec, update_mode=update_mode)
+            return
         super().update_version(version, spec, update_mode=update_mode)
         self._setup_fallback_options(spec)
 
@@ -1453,6 +1543,11 @@ class QueueLengthAutoscaler(_AutoscalerWithHysteresis):
 
     def update_version(self, version: int, spec: 'service_spec.SkyServiceSpec',
                        update_mode: serve_utils.UpdateMode) -> None:
+        if version <= self.latest_version:
+            # The base class rejects stale versions; don't update the
+            # queue threshold from a stale spec either.
+            super().update_version(version, spec, update_mode)
+            return
         super().update_version(version, spec, update_mode)
         # Update threshold.
         if isinstance(spec.queue_length_threshold, int):
