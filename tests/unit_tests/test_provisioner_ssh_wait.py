@@ -16,7 +16,7 @@ from sky.utils import ssm_direct
 
 # Matches ssm_direct.is_skypilot_ssm_proxy (bypass-eligible).
 FULL_SSM_PROXY = (
-    'export AWS_RETRY_MODE=adaptive AWS_MAX_ATTEMPTS=12; '
+    'env AWS_RETRY_MODE=adaptive AWS_MAX_ATTEMPTS=12 /bin/sh -c '
     'aws ssm start-session --target "$(aws ec2 describe-instances)" '
     '--region us-east-1 --document-name AWS-StartSSHSession '
     '--parameters portNumber=%p')

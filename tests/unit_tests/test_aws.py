@@ -694,16 +694,17 @@ def test_ssm_no_profile(monkeypatch):
     assert '--profile' not in proxy_command
 
 
-def test_ssm_adaptive_retry_exports(monkeypatch):
+def test_ssm_adaptive_retry_exec_safe_wrapper(monkeypatch):
     """The SSM proxy command self-throttles via the CLI's adaptive retry
-    mode, exported (not a VAR=x prefix) so the describe-instances command
-    substitution inherits it too."""
+    mode using an env wrapper that stays a single exec-able command:
+    OpenSSH runs ProxyCommand as `$SHELL -c "exec <cmd>"`, so an
+    `export ...;` prefix kills every proxied SSH."""
     monkeypatch.delenv('AWS_PROFILE', raising=False)
     template_vars = _write_cluster_config_with_ssm(monkeypatch,
                                                    {'use_ssm': True})
     proxy_command = template_vars['ssh_proxy_command']
     assert proxy_command.startswith(
-        'export AWS_RETRY_MODE=adaptive AWS_MAX_ATTEMPTS=')
+        'env AWS_RETRY_MODE=adaptive AWS_MAX_ATTEMPTS=')
     assert 'aws ssm start-session' in proxy_command
 
 
@@ -716,8 +717,12 @@ def test_ssm_profile_with_shell_metacharacters_is_quoted(monkeypatch):
         'ssm_profile': profile,
     })
     proxy_command = template_vars['ssh_proxy_command']
-    assert f'--profile {shlex.quote(profile)}' in proxy_command
-    assert f'--profile {profile}' not in proxy_command
+    # The command is now wrapped as `env ... /bin/sh -c '<inner>'`; the
+    # profile quoting must hold in the INNER command the shell actually
+    # runs (one unquoting level down).
+    inner = shlex.split(proxy_command)[-1]
+    assert f'--profile {shlex.quote(profile)}' in inner
+    assert f'--profile {profile}' not in inner
 
 
 def _ssh_credentials_for_proxy_command(monkeypatch, proxy_command):
@@ -744,15 +749,28 @@ def test_legacy_ssm_proxy_command_upgraded_on_read(monkeypatch):
               '--document-name AWS-StartSSHSession --parameters portNumber=%p')
     credentials = _ssh_credentials_for_proxy_command(monkeypatch, legacy)
     upgraded = credentials['ssh_proxy_command']
-    assert upgraded.startswith('export AWS_RETRY_MODE=adaptive')
-    assert upgraded.endswith(legacy)
+    assert upgraded.startswith('env AWS_RETRY_MODE=adaptive')
+    assert shlex.quote(legacy) in upgraded
 
 
 def test_current_ssm_proxy_command_not_double_prefixed(monkeypatch):
-    current = ('export AWS_RETRY_MODE=adaptive AWS_MAX_ATTEMPTS=12; '
-               'aws ssm start-session --target "i-123"')
+    inner = 'aws ssm start-session --target "i-123"'
+    current = ('env AWS_RETRY_MODE=adaptive AWS_MAX_ATTEMPTS=12 '
+               f'/bin/sh -c {shlex.quote(inner)}')
     credentials = _ssh_credentials_for_proxy_command(monkeypatch, current)
     assert credentials['ssh_proxy_command'] == current
+
+
+def test_broken_export_prefixed_form_repaired(monkeypatch):
+    # The prefix form shipped briefly and may be persisted in cluster
+    # YAMLs; it dies under OpenSSH's exec wrapping and must be rewritten,
+    # not passed through.
+    inner = 'aws ssm start-session --target "i-123"'
+    broken = f'export AWS_RETRY_MODE=adaptive AWS_MAX_ATTEMPTS=12; {inner}'
+    credentials = _ssh_credentials_for_proxy_command(monkeypatch, broken)
+    repaired = credentials['ssh_proxy_command']
+    assert repaired.startswith('env AWS_RETRY_MODE=adaptive')
+    assert shlex.quote(inner) in repaired
 
 
 def test_custom_proxy_command_left_untouched(monkeypatch):
@@ -785,5 +803,5 @@ def test_legacy_ssm_upgraded_in_credentials_from_handles(monkeypatch):
     handle.docker_user = None
     credentials, = backend_utils.ssh_credentials_from_handles([handle])
     upgraded = credentials['ssh_proxy_command']
-    assert upgraded.startswith('export AWS_RETRY_MODE=adaptive')
-    assert upgraded.endswith(legacy)
+    assert upgraded.startswith('env AWS_RETRY_MODE=adaptive')
+    assert shlex.quote(legacy) in upgraded
