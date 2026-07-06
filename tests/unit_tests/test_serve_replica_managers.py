@@ -22,43 +22,22 @@ from sky.utils import thread_utils
 
 
 class TestSkyPilotReplicaManagerInitOrdering:
-    """`SkyPilotReplicaManager.__init__` must run `_recover_replica_operations`
-    BEFORE starting the `_job_status_fetcher` / `_thread_pool_refresher` /
-    `_replica_prober` daemon threads.
+    """`SkyPilotReplicaManager.__init__` must (1) hand the manager lock to
+    the recovery pass BEFORE any daemon thread can grab it — otherwise
+    `_job_status_fetcher`'s per-replica SSH walk can starve recovery — and
+    (2) NOT block on recovery finishing: at fleet scale recovery re-drives
+    hundreds of interrupted launches and runs for minutes, and a blocking
+    __init__ kept uvicorn from binding within _start's 60s readiness window
+    (`_bail_on_boot_failure` -> os._exit -> daemon respawn -> recovery from
+    scratch: a controller crash-loop, observed live at ~860 rows / ~520
+    interrupted launches)."""
 
-    If the daemon threads start first, `_job_status_fetcher` will acquire
-    `self.lock` (via the `@with_lock` decorator on `_fetch_job_status`)
-    and perform a per-replica SSH/gRPC call to query job status. When a
-    replica's head node is unreachable (pod / VM gone), each SSH connect
-    hangs at the kernel TCP timeout (tens of seconds to minutes). The
-    main thread then blocks on `_recover_replica_operations`'s
-    `with self.lock:` for the full hang duration, never returns from
-    `SkyPilotReplicaManager.__init__`, and `uvicorn.run` is never called.
+    def _build(self, recovery_body, started_records):
+        import threading as threading_mod
 
-    With HA recovery changes, `_wait_for_controller_ready`
-    then times out (60s) → `_bail_on_boot_failure` → `os._exit(1)` →
-    daemon retries → same race → infinite recovery loop.
-
-    The fix: recovery first, daemon threads after.
-    """
-
-    def test_recover_called_before_threads_start(self):
-        """Verify the call order: `_recover_replica_operations` first,
-        then each daemon thread's `.start()`."""
-        call_order = []
-
-        def _record(name):
-
-            def _fn(*_args, **_kwargs):
-                call_order.append(name)
-
-            return _fn
-
-        # Patch the heavy deps so __init__ doesn't actually do work.
-        # We only care about the call order.
         with mock.patch.object(
                 replica_managers.ReplicaManager, '__init__',
-                return_value=None), \
+                lambda self_, service_name, spec, version: None), \
              mock.patch(
                  'sky.serve.replica_managers.serve_state.get_yaml_content',
                  return_value='dummy: yaml'), \
@@ -70,88 +49,65 @@ class TestSkyPilotReplicaManagerInitOrdering:
                  return_value=None), \
              mock.patch.object(
                  replica_managers.SkyPilotReplicaManager,
-                 '_recover_replica_operations',
-                 _record('recover')), \
-             mock.patch(
-                 'sky.serve.replica_managers.thread_utils'
-                 '.start_supervised_thread') as mock_supervised:
-            # start_supervised_thread starts the supervisor thread
-            # immediately, so its call time IS the thread start time.
-            def _start_supervised(target, *_args, **_kwargs):
-                target_name = getattr(target, '__name__', repr(target))
-                call_order.append(f'thread_start:{target_name}')
-                return mock.Mock()
-
-            mock_supervised.side_effect = _start_supervised
-
-            spec = mock.MagicMock()
-            replica_managers.SkyPilotReplicaManager(service_name='svc',
-                                                    spec=spec,
-                                                    version=1)
-
-        # `recover` must come before any `thread_start:*` entry. The
-        # daemon threads themselves may be created in any order relative
-        # to each other (we don't constrain that), but ALL of them must
-        # appear after `recover`.
-        assert 'recover' in call_order, (
-            f'_recover_replica_operations was never called; '
-            f'call_order={call_order}')
-        recover_idx = call_order.index('recover')
-        for i, name in enumerate(call_order):
-            if name.startswith('thread_start:'):
-                assert i > recover_idx, (
-                    f'{name} happened at index {i} before recover at '
-                    f'index {recover_idx}; call_order={call_order}. '
-                    f'Daemon threads must NOT start until '
-                    f'_recover_replica_operations has finished — '
-                    f'see the docstring of '
-                    f'TestSkyPilotReplicaManagerInitOrdering.')
-
-    def test_all_three_daemon_threads_are_started(self):
-        """Sanity: regardless of ordering, the three control-loop threads
-        (_thread_pool_refresher / _job_status_fetcher / _replica_prober)
-        still all start (supervised)."""
-        started_targets = []
-
-        # The three control loops are launched via
-        # thread_utils.start_supervised_thread(target, name), not
-        # threading.Thread directly, so capture the supervised target's name
-        # from there. Patching threading.Thread would only ever see the
-        # supervisor wrapper (_supervise), not the real methods.
-        with mock.patch.object(
-                replica_managers.ReplicaManager, '__init__',
-                return_value=None), \
-             mock.patch(
-                 'sky.serve.replica_managers.serve_state.get_yaml_content',
-                 return_value='dummy: yaml'), \
-             mock.patch(
-                 'sky.serve.replica_managers.task_lib.Task.from_yaml_str',
-                 return_value=mock.MagicMock()), \
-             mock.patch(
-                 'sky.serve.replica_managers.spot_placer.SpotPlacer.from_task',
-                 return_value=None), \
-             mock.patch.object(
-                 replica_managers.SkyPilotReplicaManager,
-                 '_recover_replica_operations'), \
+                 '_recover_replica_operations', recovery_body), \
              mock.patch(
                  'sky.serve.replica_managers.thread_utils.'
-                 'start_supervised_thread') as mock_start:
+                 'start_supervised_thread') as mock_supervised:
 
             def _record(target, *_args, **_kwargs):
-                started_targets.append(getattr(target, '__name__', None))
+                started_records.append((getattr(target, '__name__',
+                                                repr(target))))
                 return mock.Mock()
 
-            mock_start.side_effect = _record
+            mock_supervised.side_effect = _record
 
-            spec = mock.MagicMock()
-            replica_managers.SkyPilotReplicaManager(service_name='svc',
-                                                    spec=spec,
-                                                    version=1)
+            # Base __init__ is stubbed; provide the attrs it would set.
+            def _patched_base_init(self_, service_name, spec, version):
+                self_.lock = threading_mod.Lock()
+                self_._service_name = service_name
+                self_._next_replica_id = 1
+                self_._uptime = None
+                self_.latest_version = version
+                self_._update_mode = None
+                self_._is_pool = False
 
-        # Bound methods on the instance — verify by name.
-        assert '_thread_pool_refresher' in started_targets
-        assert '_job_status_fetcher' in started_targets
-        assert '_replica_prober' in started_targets
+            with mock.patch.object(replica_managers.ReplicaManager, '__init__',
+                                   _patched_base_init):
+                mgr = replica_managers.SkyPilotReplicaManager(
+                    service_name='svc', spec=mock.MagicMock(), version=1)
+            return mgr
+
+    def test_lock_is_held_by_recovery_when_daemons_start(self):
+        import threading as threading_mod
+        release = threading_mod.Event()
+        lock_state_at_daemon_start = []
+
+        def _slow_recovery(self_):
+            release.wait(timeout=10)
+
+        started = []
+        mgr = self._build(_slow_recovery, started)
+        # __init__ returned while recovery is still running (non-blocking
+        # boot), and the manager lock was already held when it returned —
+        # so any daemon started afterwards cannot win it.
+        assert mgr.lock.locked() is True
+        assert len(started) == 3
+        lock_state_at_daemon_start.append(mgr.lock.locked())
+        release.set()
+        # Recovery finishes and releases the lock.
+        for _ in range(100):
+            if not mgr.lock.locked():
+                break
+            import time as time_mod
+            time_mod.sleep(0.05)
+        assert mgr.lock.locked() is False
+
+    def test_all_three_daemon_threads_are_started(self):
+        started = []
+        self._build(lambda self_: None, started)
+        assert '_thread_pool_refresher' in started
+        assert '_job_status_fetcher' in started
+        assert '_replica_prober' in started
 
 
 def _make_manager(service_name='svc', next_replica_id=1):
@@ -639,3 +595,50 @@ class TestScaleUpBatch:
                                side_effect=_record_launch(launched)):
             mgr.scale_up_batch([None, None])
         assert launched == [1, 3]
+
+
+class TestRecoveryRetryAndIsolation:
+    """A failed recovery pass must retry (previously a recovery exception
+    failed the boot and the HA daemon retried via respawn; the recovery
+    thread must not die silently and strand un-redriven replicas), and one
+    bad replica must not abort re-driving the rest."""
+
+    def test_one_bad_launch_does_not_strand_the_rest(self):
+        mgr = _make_manager(next_replica_id=1)
+        launched = []
+
+        def _launch(replica_id,
+                    resources_override=None,
+                    existing_replica_infos=None):
+            del resources_override, existing_replica_infos
+            if replica_id == 2:
+                raise RuntimeError('boom')
+            launched.append(replica_id)
+
+        infos = [_fake_replica_info(i) for i in (1, 2, 3)]
+        for info in infos:
+            info.resources_override = None
+        with mock.patch(
+                'sky.serve.replica_managers.serve_state.get_replica_infos',
+                return_value=infos), \
+             mock.patch(
+                 'sky.serve.replica_managers.serve_state.'
+                 'get_replicas_at_status',
+                 side_effect=[infos, [], []]), \
+             mock.patch.object(mgr, '_launch_replica', side_effect=_launch):
+            mgr._recover_replica_operations()
+        # Replica 2 failed; 1 and 3 still re-driven.
+        assert launched == [1, 3]
+
+    def test_reentry_with_enqueued_threads_is_tolerated(self):
+        mgr = _make_manager(next_replica_id=1)
+        mgr._launch_thread_pool = {7: mock.Mock()}
+        with mock.patch(
+                'sky.serve.replica_managers.serve_state.get_replica_infos',
+                return_value=[]), \
+             mock.patch(
+                 'sky.serve.replica_managers.serve_state.'
+                 'get_replicas_at_status',
+                 return_value=[]):
+            # Previously an assert; on a retry pass this must not raise.
+            mgr._recover_replica_operations()
