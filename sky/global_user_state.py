@@ -2359,6 +2359,15 @@ def get_cluster_names(exclude_managed_clusters: bool = False,) -> List[str]:
 
 
 @metrics_lib.time_me
+def get_cluster_names_by_status(status: status_lib.ClusterStatus) -> List[str]:
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        rows = session.query(cluster_table.c.name).filter(
+            cluster_table.c.status == status.value).all()
+    return [row[0] for row in rows]
+
+
+@metrics_lib.time_me
 def get_clusters_from_history(
         days: Optional[int] = None,
         abbreviate_response: bool = False,

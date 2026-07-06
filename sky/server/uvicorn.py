@@ -182,6 +182,18 @@ class Server(uvicorn.Server):
         while True:
             requests = (request_storage.get_request_backend().
                         get_shutdown_active_requests())
+            # Replayable requests (launches) neither block shutdown nor get
+            # cancelled: their rows are left as-is so startup recovery can
+            # requeue and re-execute them (safe until their cluster reaches
+            # UP, see requests_lib._find_interrupted_launches_to_requeue).
+            # Waiting
+            # for them here is pointless -- a provisioning launch outlives
+            # any realistic shutdown grace -- and cancelling them would wedge
+            # the half-provisioned cluster in INIT with only a client-side
+            # retry signal that a disconnected client never sees.
+            requests = [(request_id, name)
+                        for request_id, name in requests
+                        if name not in requests_lib.REPLAYABLE_REQUEST_NAMES]
             if not requests:
                 break
             logger.info(f'{len(requests)} on-going requests '
