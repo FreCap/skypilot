@@ -1004,6 +1004,11 @@ def get_service_schema():
                             },
                             {
                                 'type': 'object',
+                                # An empty dict has no sizing signal, and a
+                                # zero value gives that shape zero capacity:
+                                # both feed divisions in the instance-aware
+                                # autoscaler and load balancer.
+                                'minProperties': 1,
                                 'patternProperties': {
                                     # Accelerator types with optional count:
                                     # "H100:1", "A100", and hyphenated
@@ -1012,7 +1017,7 @@ def get_service_schema():
                                     # include hyphens).
                                     '^[A-Za-z0-9-]+(?::[0-9]+)?$': {
                                         'type': 'number',
-                                        'minimum': 0,
+                                        'exclusiveMinimum': 0,
                                     }
                                 },
                                 'additionalProperties': False,

@@ -1103,21 +1103,15 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
     def _calculate_target_num_replicas(self) -> int:
         # Shape-aware sizing needs replica_infos, which this hook (invoked
         # by the base update_version to snap the target after an update)
-        # does not receive. Estimate with the largest configured per-replica
-        # capacity; the next decision tick recomputes from live replica
-        # shapes via _set_target_num_replicas_with_instance_aware_logic, so
-        # an optimistic estimate self-corrects instead of over-launching.
-        assert isinstance(self.target_qps_per_replica, dict), \
-            'InstanceAware Autoscaler requires dict type target_qps_per_replica'
-        max_target_qps = max(self.target_qps_per_replica.values())
-        # The schema allows 0 values; an all-zero dict means no rate-based
-        # sizing signal, same as target_qps_per_replica=None.
-        if max_target_qps <= 0:
-            return self.min_replicas
-        num_requests_per_second = len(
-            self.request_timestamps) / self.qps_window_size
-        return self._clip_target_num_replicas(
-            math.ceil(num_requests_per_second / max_target_qps))
+        # does not receive. Keep the current target instead of snapping to
+        # a shape-blind estimate: the outdated-replica drain in
+        # generate_scaling_decisions consumes the target BEFORE the
+        # instance-aware recompute runs, so an underestimate here could
+        # scale down all old replicas mid-rolling-update with only a
+        # fraction of the new capacity ready. The next decision tick
+        # recomputes from live replica shapes via
+        # _set_target_num_replicas_with_instance_aware_logic.
+        return self._clip_target_num_replicas(self.target_num_replicas)
 
     def update_version(self, version: int, spec: 'service_spec.SkyServiceSpec',
                        update_mode: serve_utils.UpdateMode) -> None:

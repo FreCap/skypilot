@@ -552,24 +552,20 @@ class TestInstanceAwareUpdateVersion(unittest.TestCase):
             'A100': 0.2
         })
 
-    def test_calculate_target_uses_max_capacity_estimate(self):
-        autoscaler = self._make_autoscaler({'L4': 0.1, 'A100:8': 0.8})
-        # 8 requests in the window -> qps = 8 / window; with max per-replica
-        # capacity 0.8 the estimate is ceil(qps / 0.8), clipped to min 1.
-        autoscaler.request_timestamps = [0.0] * (8 * autoscaler.qps_window_size)
-        self.assertEqual(autoscaler._calculate_target_num_replicas(),
-                         min(10, autoscaler.max_replicas))
-
-    def test_update_version_recomputes_target_with_new_dict(self):
+    def test_update_version_keeps_current_target(self):
+        # The outdated-replica drain consumes the target before the
+        # instance-aware recompute runs; a shape-blind snap here could
+        # scale down all old replicas mid-rolling-update.
         autoscaler = self._make_autoscaler({'L4': 0.1})
+        autoscaler.target_num_replicas = 12
         autoscaler.request_timestamps = [0.0] * autoscaler.qps_window_size
-        # qps = 1; old capacity 0.1 -> 10 replicas; new capacity 0.5 -> 2.
-        autoscaler.update_version(2, self._spec({'L4': 0.5}),
+        autoscaler.update_version(2, self._spec({'L4': 0.8}),
                                   serve_utils.DEFAULT_UPDATE_MODE)
-        self.assertEqual(autoscaler.target_num_replicas, 2)
+        self.assertEqual(autoscaler.target_num_replicas, 12)
 
-    def test_all_zero_dict_falls_back_to_min_replicas(self):
-        autoscaler = self._make_autoscaler({'L4': 0.0})
-        autoscaler.request_timestamps = [0.0] * autoscaler.qps_window_size
-        self.assertEqual(autoscaler._calculate_target_num_replicas(),
-                         autoscaler.min_replicas)
+    def test_update_version_reclips_target_to_new_max(self):
+        autoscaler = self._make_autoscaler({'L4': 0.1})
+        autoscaler.target_num_replicas = 12
+        autoscaler.update_version(2, self._spec({'L4': 0.1}, max_replicas=5),
+                                  serve_utils.DEFAULT_UPDATE_MODE)
+        self.assertEqual(autoscaler.target_num_replicas, 5)
