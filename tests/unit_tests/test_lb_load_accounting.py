@@ -247,3 +247,25 @@ class TestProxySlotRelease:
 
         asyncio.run(_run())
         policy.post_execute_hook.assert_called_once()
+
+    def test_proxy_uses_split_connect_read_timeout(self):
+        """The proxy must pass a split httpx.Timeout: long read (sync
+        predictions send no bytes until done) but SHORT connect, so a
+        preempted-but-routed replica fails fast into the retry loop."""
+        policy = mock.MagicMock()
+        client = mock.MagicMock()
+        captured = {}
+
+        def _build_request(*args, **kwargs):
+            captured['timeout'] = kwargs.get('timeout')
+            raise httpx.RequestError('stop here')
+
+        client.build_request = _build_request
+        balancer = _make_lb(policy, client_pool={'http://a:8080': client})
+        balancer._stream_timeout_seconds = 3700
+        asyncio.run(balancer._proxy_request_to('http://a:8080',
+                                               self._request()))
+        t = captured['timeout']
+        assert isinstance(t, httpx.Timeout)
+        assert t.connect == 10
+        assert t.read == 3700

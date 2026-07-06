@@ -198,7 +198,15 @@ class SkyServeLoadBalancer:
                 worker_url,
                 headers=request.headers.raw,
                 content=await request.body(),
-                timeout=self._stream_timeout_seconds)
+                # A scalar here would ALSO set the connect timeout: with a
+                # long stream timeout (sync model servers send no bytes
+                # until compute completes, so read must cover the whole
+                # prediction), a dead-but-still-routed replica would hang
+                # requests for the full value during the un-route window
+                # instead of failing fast into the retry loop.
+                timeout=httpx.Timeout(
+                    self._stream_timeout_seconds,
+                    connect=constants.LB_CONNECT_TIMEOUT_SECONDS))
             proxy_response = await client.send(proxy_request, stream=True)
 
             # The slot is owned by the stream now. Starlette runs
