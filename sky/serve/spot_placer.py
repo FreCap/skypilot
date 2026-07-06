@@ -100,12 +100,21 @@ class Location:
     def from_resources(cls, resources: 'resources_lib.Resources') -> 'Location':
         assert resources.cloud is not None, 'Cloud must be specified'
         assert resources.region is not None, 'Region must be specified'
+        image_id = resources.image_id
+        if image_id:
+            # Normalize to a region-independent form: the location may be
+            # applied to entries whose region differs from the one the
+            # image dict was keyed under, and copy() only applies an
+            # image whose key matches the target region.
+            values = list(image_id.values())
+            if len(set(values)) == 1:
+                image_id = {None: values[0]}
         return cls(resources.cloud,
                    resources.region,
                    resources.zone,
                    accelerators=resources.accelerators,
                    use_spot=resources.use_spot,
-                   image_id=resources.image_id)
+                   image_id=image_id)
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {
@@ -299,17 +308,45 @@ class SpotPlacer:
         """Select next location to place spot instance."""
         raise NotImplementedError
 
+    def resolve_location(self, location: Location) -> Optional[Location]:
+        """Map a possibly-legacy location onto this placer's key set.
+
+        Replica rows pickled before locations carried
+        (accelerators, use_spot, image_id) deserialize shape-less and no
+        longer hash-match the shape-bearing keys. Fall back to matching
+        on (cloud, region, zone) when that is unambiguous; return None
+        (callers skip, never assert) when nothing matches.
+        """
+        if location in self.location2status:
+            return location
+        matches = [
+            key for key in self.location2status
+            if str(key.cloud) == str(location.cloud) and
+            key.region == location.region and key.zone == location.zone
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
     def set_active(self, location: Location) -> None:
-        assert location in self.location2status, location
-        self.location2status[location] = LocationStatus.ACTIVE
-        self.location2preempted_at.pop(location, None)
+        resolved = self.resolve_location(location)
+        if resolved is None:
+            logger.warning(f'set_active: unknown location {location}; '
+                           'ignoring (likely a pre-upgrade replica row).')
+            return
+        self.location2status[resolved] = LocationStatus.ACTIVE
+        self.location2preempted_at.pop(resolved, None)
 
     def set_preemptive(self, location: Location) -> None:
-        assert location in self.location2status, location
-        self.location2status[location] = LocationStatus.PREEMPTED
+        resolved = self.resolve_location(location)
+        if resolved is None:
+            logger.warning(f'set_preemptive: unknown location {location}; '
+                           'ignoring (likely a pre-upgrade replica row).')
+            return
+        self.location2status[resolved] = LocationStatus.PREEMPTED
         # (Re)start the bench clock: a failed retry benches the location
         # for another full TTL window.
-        self.location2preempted_at[location] = time.time()
+        self.location2preempted_at[resolved] = time.time()
 
     def clear_preemptive_locations(self) -> None:
         for location in self.location2status:
@@ -414,7 +451,11 @@ class DynamicFallbackSpotPlacer(SpotPlacer,
         # at fleet scale this serially hammers one spot-exhausted zone
         # (observed live: >1000 consecutive failed attempts in one zone
         # while other zones and clouds sat idle) instead of spreading.
-        location_load = collections.Counter(current_locations)
+        # Pre-upgrade replica rows carry shape-less locations; resolve
+        # them onto the current key set so they still count as load.
+        location_load = collections.Counter(resolved for resolved in (
+            self.resolve_location(loc) for loc in current_locations)
+                                            if resolved is not None)
         min_load = min(
             (location_load[location] for location in active_locations),
             default=0)
@@ -435,6 +476,11 @@ class DynamicFallbackSpotPlacer(SpotPlacer,
 
     def set_preemptive(self, location: Location) -> None:
         super().set_preemptive(location)
-        # Prevent the case with only one active location.
-        if len(self.active_locations()) < 2:
+        # Reset only on TOTAL exhaustion (nothing selectable at all). The
+        # old <2 threshold defeated small mixed sets: benching a full
+        # zero-cost pool with a single paid fallback left active==1,
+        # which reset the bench and re-selected the full pool forever
+        # instead of spilling over. The TTL decay now guarantees benched
+        # locations come back on their own.
+        if not self.active_locations():
             self.clear_preemptive_locations()

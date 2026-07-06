@@ -150,3 +150,106 @@ run: echo hi
         # Override still wins.
         assert replica_managers._should_use_spot(yaml_none,
                                                  {'use_spot': True}) is True
+
+
+class TestLegacyLocationResolution:
+    """Pre-upgrade shape-less locations resolve onto shape-bearing keys."""
+
+    def test_set_preemptive_resolves_by_region(self, monkeypatch):
+        monkeypatch.setattr(spot_placer.time, 'time', lambda: 1000.0)
+        keyed = _make_location('us-east-1', accelerators={'L4': 1})
+        other = _make_location('us-east-2', accelerators={'L4': 1})
+        placer = _make_placer([keyed, other], {keyed: 0.2, other: 0.2})
+        # Shape-less location, as deserialized from a pre-upgrade row.
+        placer.set_preemptive(
+            spot_placer.Location(cloud=keyed.cloud,
+                                 region='us-east-1',
+                                 zone=None))
+        assert keyed in placer.preemptive_locations()
+
+    def test_unknown_location_is_ignored_not_asserted(self):
+        keyed = _make_location('us-east-1', accelerators={'L4': 1})
+        placer = _make_placer([keyed], {keyed: 0.2})
+        stranger = _make_location('mars-central-1')
+        # Must not raise.
+        placer.set_preemptive(stranger)
+        placer.set_active(stranger)
+        assert keyed in placer.active_locations()
+
+    def test_load_counting_resolves_legacy_rows(self):
+        keyed = _make_location('us-east-1', accelerators={'L4': 1})
+        other = _make_location('us-east-2', accelerators={'L4': 1})
+        placer = _make_placer([keyed, other], {keyed: 0.2, other: 0.2})
+        legacy = spot_placer.Location(cloud=keyed.cloud,
+                                      region='us-east-1',
+                                      zone=None)
+        # One legacy replica in us-east-1: the next launch must go to
+        # the (unloaded) other region, proving the legacy row counted.
+        assert placer.select_next_location([legacy]) == other
+
+
+class TestMixedValidation:
+    """validate_service_task accepts placer-managed mixed sets only."""
+
+    def _task(self, spot_placer_value, k8s_spot):
+        import textwrap
+
+        import sky
+        yaml_str = textwrap.dedent(f"""
+            resources:
+              cpus: 2+
+              ports: 8080
+              any_of:
+                - infra: aws/us-east-1
+                  accelerators: L4:1
+                  use_spot: true
+                - infra: aws/us-east-2
+                  accelerators: A10G:1
+                  use_spot: {str(k8s_spot).lower()}
+            service:
+              readiness_probe: /health
+              replica_policy:
+                min_replicas: 1
+                max_replicas: 2
+                target_qps_per_replica: 0.1
+                {'spot_placer: ' + spot_placer_value if spot_placer_value else ''}
+            run: echo hi
+            """)
+        return sky.Task.from_yaml_str(yaml_str)
+
+    def test_mixed_with_placer_accepted(self):
+        from sky.serve import serve_utils
+        serve_utils.validate_service_task(self._task('dynamic_fallback',
+                                                     k8s_spot=False),
+                                          pool=False)
+
+    def test_mixed_without_placer_rejected(self):
+        from sky.serve import serve_utils
+        with pytest.raises(ValueError, match='all use spot'):
+            serve_utils.validate_service_task(self._task(None, k8s_spot=False),
+                                              pool=False)
+
+    def test_placer_with_no_spot_at_all_rejected(self):
+        import textwrap
+
+        import sky
+        from sky.serve import serve_utils
+        yaml_str = textwrap.dedent("""
+            resources:
+              cpus: 2+
+              ports: 8080
+              accelerators: L4:1
+              use_spot: false
+              infra: aws/us-east-1
+            service:
+              readiness_probe: /health
+              replica_policy:
+                min_replicas: 1
+                max_replicas: 2
+                target_qps_per_replica: 0.1
+                spot_placer: dynamic_fallback
+            run: echo hi
+            """)
+        with pytest.raises(ValueError, match='at least one spot'):
+            serve_utils.validate_service_task(sky.Task.from_yaml_str(yaml_str),
+                                              pool=False)
