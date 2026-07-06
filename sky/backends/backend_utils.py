@@ -124,14 +124,47 @@ _SSH_CONNECTION_TIMED_OUT_PATTERN = re.compile(r'^ssh:.*timed out$',
                                                re.IGNORECASE)
 # Transport-level failures that do not indicate an unhealthy ray cluster: the
 # SSM agent momentarily dropping (TargetNotConnected), sshd not yet accepting
-# connections (kex_exchange_identification), or a reset mid-handshake. The ray
+# connections (kex_exchange_identification), a reset mid-handshake, or the
+# proxy command being throttled by the cloud API (SSM StartSession has a low
+# account-wide TPS quota; EC2 Describe* shares a throttle bucket). The ray
 # health probe retries these instead of immediately flagging the cluster
 # abnormal. Deliberately excludes "timed out", which signals a changed IP on
-# manually restarted clusters (see _SSH_CONNECTION_TIMED_OUT_PATTERN).
+# manually restarted clusters (see _SSH_CONNECTION_TIMED_OUT_PATTERN), and
+# the bare "Rate exceeded" message text, which without an AWS error code is
+# too generic to attribute to cloud API throttling.
 _TRANSIENT_SSH_FAILURE_PATTERN = re.compile(
     r'(TargetNotConnected|kex_exchange_identification|'
-    r'Connection reset by peer|Connection closed by remote host|Broken pipe)',
-    re.IGNORECASE)
+    r'Connection reset by peer|Connection closed by remote host|Broken pipe|'
+    r'ThrottlingException|RequestLimitExceeded)', re.IGNORECASE)
+
+# Prefix for the generated SSM ProxyCommand: makes the AWS CLI wait out
+# StartSession throttling (low account-wide TPS quota) with client-side rate
+# limiting instead of failing the SSH connection. Also prepended at read time
+# to SSM proxy commands from cluster YAMLs written before this prefix existed
+# (the auth section is restored verbatim on re-provision, so old clusters
+# never regenerate it).
+_SSM_ADAPTIVE_RETRY_EXPORT = ('export AWS_RETRY_MODE=adaptive '
+                              'AWS_MAX_ATTEMPTS=12;')
+
+
+def _upgrade_legacy_ssm_proxy_command(
+        ssh_proxy_command: Optional[str]) -> Optional[str]:
+    """Prepend the adaptive-retry export to pre-fix SSM proxy commands.
+
+    Clusters launched before the prefix existed carry an SSM proxy command
+    without it, and keep it forever: on re-provision the auth section is
+    restored verbatim from the old YAML (see
+    _RAY_YAML_KEYS_TO_RESTORE_FOR_BACK_COMPATIBILITY). Applied in every
+    credential read path so existing clusters also wait out StartSession
+    throttling.
+    """
+    if (ssh_proxy_command is not None and
+            ssh_proxy_command.startswith('aws ssm start-session') and
+            'AWS_RETRY_MODE' not in ssh_proxy_command):
+        return f'{_SSM_ADAPTIVE_RETRY_EXPORT} {ssh_proxy_command}'
+    return ssh_proxy_command
+
+
 K8S_PODS_NOT_FOUND_PATTERN = re.compile(r'.*(NotFound|pods .* not found).*',
                                         re.IGNORECASE)
 _RAY_CLUSTER_NOT_FOUND_MESSAGE = 'Ray cluster is not found'
@@ -970,7 +1003,11 @@ def write_cluster_config(
                 default_value=None)
             if aws_profile is None:
                 aws_profile = os.environ.get('AWS_PROFILE', None)
-            profile_str = f'--profile {aws_profile}' if aws_profile else ''
+            # Quoted: the profile name is spliced into a shell-executed
+            # ProxyCommand (twice: outer command and the describe-instances
+            # command substitution), so metacharacters in it must stay data.
+            profile_str = (f'--profile {shlex.quote(aws_profile)}'
+                           if aws_profile else '')
             ip_address_filter = ('Name=private-ip-address,Values=%h'
                                  if use_internal_ips else
                                  'Name=ip-address,Values=%h')
@@ -978,11 +1015,21 @@ def write_cluster_config(
                 f'--region {region_name} --filters {ip_address_filter} ' + \
                 '--query \"Reservations[].Instances[].InstanceId\" ' + \
                 f'{profile_str} --output text'
-            ssm_proxy_command = 'aws ssm start-session --target ' + \
-                f'\"$({get_instance_id_command})\" ' + \
-                f'--region {region_name} {profile_str} ' + \
-                '--document-name AWS-StartSSHSession ' + \
-                '--parameters portNumber=%p'
+            # StartSession is throttled account-wide at a low TPS (default
+            # 3), and every SSH connection runs this proxy command, so a
+            # many-node provision bursts far past the quota and the default
+            # CLI retries give up while the burst is still colliding with
+            # itself. Adaptive retry mode rate-limits client-side and waits
+            # out ThrottlingException instead of failing the SSH handshake.
+            # 'export' (not a VAR=x command prefix) so the setting also
+            # reaches the describe-instances command substitution, which the
+            # shell expands before the outer command's environment applies.
+            ssm_proxy_command = (f'{_SSM_ADAPTIVE_RETRY_EXPORT} '
+                                 'aws ssm start-session --target '
+                                 f'\"$({get_instance_id_command})\" '
+                                 f'--region {region_name} {profile_str} '
+                                 '--document-name AWS-StartSSHSession '
+                                 '--parameters portNumber=%p')
             ssh_proxy_command = ssm_proxy_command
             region_name = 'ssm-session'
     logger.debug(f'Using ssh_proxy_command: {ssh_proxy_command!r}')
@@ -1833,6 +1880,8 @@ def ssh_credential_from_yaml(
         ssh_proxy_command = ssh_proxy_command.replace(
             constants.SKY_SSH_USER_PLACEHOLDER, ssh_user)
 
+    ssh_proxy_command = _upgrade_legacy_ssm_proxy_command(ssh_proxy_command)
+
     credentials = {
         'ssh_user': ssh_user,
         'ssh_private_key': ssh_private_key_path,
@@ -1886,6 +1935,7 @@ def ssh_credentials_from_handles(
                 constants.SKY_SSH_USER_PLACEHOLDER in ssh_proxy_command):
             ssh_proxy_command = ssh_proxy_command.replace(
                 constants.SKY_SSH_USER_PLACEHOLDER, ssh_user)
+        ssh_proxy_command = _upgrade_legacy_ssm_proxy_command(ssh_proxy_command)
 
         credentials = {
             'ssh_user': ssh_user,
@@ -4773,6 +4823,11 @@ def open_ssh_tunnel(head_runner: Union[command_runner.SSHCommandRunner,
         error_msg = 'Port forward failed'
         if stdout:
             error_msg += f'\n-- stdout --\n{stdout}\n'
+        # The tunnel executes ssh directly (not via runner.run()), so report
+        # the transport failure back to the runner: a bypassed SSM proxy is
+        # restored before the caller's retry reuses this runner.
+        if isinstance(head_runner, command_runner.SSHCommandRunner):
+            head_runner.note_transport_failure(ssh_tunnel_proc.returncode)
         raise exceptions.CommandError(returncode=ssh_tunnel_proc.returncode,
                                       command=cmd_str,
                                       error_msg=error_msg,
