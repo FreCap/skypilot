@@ -664,15 +664,19 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
         self._replica_cost_cache: Dict[int, float] = {}
         # Shapes already warned about bare-key per-GPU scaling.
         self._bare_key_warned: Set[Tuple[str, int]] = set()
-        # One-shot hysteresis bypass, armed by update_version: the base
-        # class snaps target_num_replicas directly after an update so the
-        # service scales quickly; the instance-aware equivalent must wait
-        # for the next tick's shape-aware recompute, which must then apply
-        # its result immediately instead of being gated behind the upscale/
-        # downscale delay counters. Transient by design: if the controller
-        # restarts before the next tick, convergence just falls back to the
-        # normal hysteresis path.
-        self._snap_target_on_next_recompute: bool = False
+        # One-shot hysteresis bypass, armed by update_version AND at
+        # construction: the base class snaps target_num_replicas directly
+        # after an update so the service scales quickly; the instance-
+        # aware equivalent must wait for the next tick's shape-aware
+        # recompute, which must then apply its result immediately instead
+        # of being gated behind the upscale/downscale delay counters.
+        # Armed at construction because a rebuilt autoscaler (controller
+        # restart) starts at target=min_replicas with no hysteresis
+        # history worth protecting: mid-rolling-update, letting that
+        # stale minimum stand for the upscale delay would satisfy the
+        # drain's 'ready latest >= target' cutoff and retire all old
+        # capacity while the real target is still counters away.
+        self._snap_target_on_next_recompute: bool = True
         # version -> that version's qps dict. A live replica's capacity is
         # a property of the spec it was launched under: after a
         # shape-changing update (e.g. {'L4': 0.1} -> {'A100': 10.0}) the

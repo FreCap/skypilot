@@ -651,6 +651,9 @@ class TestInstanceAwareUpdateRolloutSafety(unittest.TestCase):
 
     def test_stale_version_update_does_not_mutate_state(self):
         autoscaler = self._make_autoscaler({'A100': 10.0})
+        # Consume the construction-armed snap so the assertion isolates
+        # the stale update's (non-)effect.
+        autoscaler._snap_target_on_next_recompute = False
         autoscaler.update_version(1, self._spec({'A100': 1.0}),
                                   serve_utils.DEFAULT_UPDATE_MODE)
         self.assertEqual(autoscaler.target_qps_per_replica, {'A100': 10.0})
@@ -812,3 +815,22 @@ class TestInstanceAwareMixedVersionArithmetic(unittest.TestCase):
             self.assertEqual(
                 autoscaler._get_target_qps_for_gpu_shape('L4', 1, version=1),
                 10.0)
+
+    def test_rebuilt_autoscaler_first_tick_snaps_before_drain(self):
+        # Controller restart mid-rolling-update: the fresh autoscaler
+        # starts at target=min_replicas (1). Its first recompute must
+        # apply the real target directly — with hysteresis gating it for
+        # the upscale delay, the drain's 'ready latest >= target' cutoff
+        # would retire all 100 old L4s against the stale minimum.
+        autoscaler = autoscalers.InstanceAwareRequestRateAutoscaler(
+            'svc', self._spec({'A100': 10.0}), version=2)
+        autoscaler._qps_dict_by_version[1] = {'L4': 0.1}
+        replicas = [self._replica(i, 'L4', version=1) for i in range(1, 101)]
+        replicas.append(self._replica(101, 'A100', version=2))
+        autoscaler.request_timestamps = [0.0
+                                        ] * (20 * autoscaler.qps_window_size)
+        autoscaler._set_target_num_replicas_with_instance_aware_logic(replicas)
+        self.assertEqual(autoscaler.target_num_replicas, 2)
+        self.assertEqual(
+            autoscaler._select_outdated_replicas_to_scale_down(
+                replicas, [1, 2]), [])
