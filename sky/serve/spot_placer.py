@@ -40,6 +40,24 @@ _PREEMPTION_RETRY_SECONDS_DEFAULT = 600
 _PREEMPTION_RETRY_SECONDS_ENV_VAR = 'SKYPILOT_SPOT_PLACER_RETRY_SECONDS'
 
 
+def _normalize_image_id(
+    image_id: Optional[Dict[Optional[str], str]]
+) -> Optional[Dict[Optional[str], str]]:
+    """Region-independent form of a single-image dict.
+
+    Parsed YAML keys single-value image dicts by the entry's
+    region/context (e.g. {'research-ctx': 'docker:...'}); applying that
+    as a cross-region resources_override silently drops the image
+    because copy() only honors a key matching the target region.
+    """
+    if not image_id:
+        return image_id
+    values = list(image_id.values())
+    if len(set(values)) == 1:
+        return {None: values[0]}
+    return image_id
+
+
 def _preemption_retry_seconds() -> float:
     override = os.environ.get(_PREEMPTION_RETRY_SECONDS_ENV_VAR)
     if override is not None:
@@ -54,35 +72,77 @@ def _preemption_retry_seconds() -> float:
 
 @dataclasses.dataclass
 class Location:
-    """Location class of a spot instance."""
+    """Location of a placer-managed instance.
+
+    Besides cloud/region/zone, a location carries the accelerator shape
+    and spot-ness of the resource entry it came from, so heterogeneous
+    any_of sets (e.g. cloud L4 spot + reserved-cluster A100 on-demand)
+    can be placed by one placer and each launch is pinned to the right
+    shape via resources_override.
+    """
     cloud: 'sky_clouds.Cloud'
     region: str
     zone: Optional[str]
+    accelerators: Optional[Dict[str, int]] = None
+    use_spot: bool = True
+    # The image the shape entry pins (e.g. a docker: reference for a
+    # Kubernetes pool entry whose replicas run inside the model image).
+    # Normalized SkyPilot form: {region_or_None: image_ref}.
+    image_id: Optional[Dict[Optional[str], str]] = None
+
+    def _accel_key(self) -> str:
+        parts = []
+        if self.accelerators:
+            parts.append(','.join(
+                f'{k}:{v}' for k, v in sorted(self.accelerators.items())))
+        if self.image_id:
+            parts.append(','.join(f'{k}={v}' for k, v in sorted(
+                self.image_id.items(), key=lambda kv: str(kv[0]))))
+        return '|'.join(parts)
 
     def __eq__(self, other) -> bool:
         if isinstance(other, Location):
             return (self.cloud.is_same_cloud(other.cloud) and
-                    self.region == other.region and self.zone == other.zone)
+                    self.region == other.region and self.zone == other.zone and
+                    self._accel_key() == other._accel_key() and
+                    self.use_spot == other.use_spot)
         return False
 
     def __hash__(self) -> int:
         return hash(
             str(self.cloud) + self.region +
-            (self.zone if self.zone is not None else ''))
+            (self.zone if self.zone is not None else '') + self._accel_key() +
+            str(self.use_spot))
 
     @classmethod
     def from_resources(cls, resources: 'resources_lib.Resources') -> 'Location':
         assert resources.cloud is not None, 'Cloud must be specified'
         assert resources.region is not None, 'Region must be specified'
-        return cls(resources.cloud, resources.region, resources.zone)
+        image_id = _normalize_image_id(resources.image_id)
+        return cls(resources.cloud,
+                   resources.region,
+                   resources.zone,
+                   accelerators=resources.accelerators,
+                   use_spot=resources.use_spot,
+                   image_id=image_id)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {'cloud': self.cloud, 'region': self.region, 'zone': self.zone}
+        d: Dict[str, Any] = {
+            'cloud': self.cloud,
+            'region': self.region,
+            'zone': self.zone,
+            'use_spot': self.use_spot,
+        }
+        if self.accelerators is not None:
+            d['accelerators'] = self.accelerators
+        if self.image_id is not None:
+            d['image_id'] = self.image_id
+        return d
 
     @classmethod
     def from_pickleable(
         cls,
-        data: Optional[Dict[str, Optional[str]]],
+        data: Optional[Dict[str, Any]],
     ) -> Optional['Location']:
         if data is None:
             return None
@@ -93,13 +153,22 @@ class Location:
             cloud=cloud,
             region=data['region'],
             zone=data['zone'],
+            # Rows pickled before the heterogeneous-placer change carry
+            # neither key; default to the old semantics (spot, shape from
+            # the task).
+            accelerators=data.get('accelerators'),
+            use_spot=data.get('use_spot', True),
+            image_id=data.get('image_id'),
         )
 
-    def to_pickleable(self) -> Dict[str, Optional[str]]:
+    def to_pickleable(self) -> Dict[str, Any]:
         return {
             'cloud': str(self.cloud),
             'region': self.region,
             'zone': self.zone,
+            'accelerators': self.accelerators,
+            'use_spot': self.use_spot,
+            'image_id': self.image_id,
         }
 
 
@@ -111,84 +180,109 @@ class LocationStatus(enum.Enum):
 
 def _get_possible_location_from_task(task: 'task_lib.Task') -> List[Location]:
 
-    def _without_location(
-            resources: 'resources_lib.Resources') -> 'resources_lib.Resources':
-        return resources.copy(cloud=None, region=None, zone=None)
+    def _shape_free_config(
+            resources: 'resources_lib.Resources') -> Dict[str, Any]:
+        # Accelerators and spot-ness are per-location attributes (a
+        # heterogeneous any_of mixes e.g. cloud L4 spot with
+        # reserved-cluster A100 on-demand); everything else must be
+        # uniform across entries. Compare yaml configs with the
+        # per-location keys stripped instead of round-tripping through
+        # Resources.copy(use_spot=None), whose None handling is not a
+        # 'clear this field' contract.
+        config = resources.copy(cloud=None, region=None,
+                                zone=None).to_yaml_config()
+        for key in ('accelerators', 'use_spot', 'spot_recovery', 'image_id'):
+            config.pop(key, None)
+        return config
 
     assert task.resources  # Guaranteed in task constructor
-    empty_location_resources = _without_location(list(task.resources)[0])
-    empty_location_resources_config = empty_location_resources.to_yaml_config()
+    resources_list = list(task.resources)
+    empty_location_resources = resources_list[0].copy(cloud=None,
+                                                      region=None,
+                                                      zone=None)
+    empty_location_resources_config = _shape_free_config(resources_list[0])
 
-    location_requirements: Dict[str, Dict[str, Set[str]]] = (
-        collections.defaultdict(lambda: collections.defaultdict(set)))
-
-    for r in task.resources:
-        if (_without_location(r).to_yaml_config() !=
-                empty_location_resources_config):
+    for r in resources_list:
+        if _shape_free_config(r) != empty_location_resources_config:
             with ux_utils.print_exception_no_traceback():
                 raise ValueError(
                     'Different resource configurations are not supported '
                     'for spot placement. All resources must have the same '
-                    'configuration except for cloud/region/zone.')
-        if r.cloud is None:
-            continue
-        cloud_str = str(r.cloud)
-        if r.region is None:
-            # Access defaultdict to create empty entry if it doesn't exist.
-            _ = location_requirements[cloud_str]
-            continue
-        if r.zone is None:
-            # Same as above.
-            _ = location_requirements[cloud_str][r.region]
-            continue
-        location_requirements[cloud_str][r.region].add(r.zone)
+                    'configuration except for cloud/region/zone/'
+                    'accelerators/use_spot.')
 
-    clouds_list: List[sky_clouds.Cloud] = []
-    for c in location_requirements.keys():
-        cloud_obj = registry.CLOUD_REGISTRY.from_str(c)
-        assert cloud_obj is not None
-        clouds_list.append(cloud_obj)
-    if not clouds_list:
-        # If the cloud list is empty, that means the user has no location
-        # related requirements. Then we start with all enabled clouds and
-        # all possible regions and zones.
-        clouds_list = sky_check.get_cached_enabled_clouds_or_refresh(
-            capability=sky_cloud.CloudCapability.COMPUTE,
-            raise_if_no_cloud_access=False)
-        for cloud in clouds_list:
-            # Create empty entry for each cloud.
-            _ = location_requirements[str(cloud)]
-
+    # Group entries by (accelerators, use_spot) shape: locations are
+    # enumerated per shape so each candidate location knows exactly what
+    # to launch there.
     possible_locations = set()
-    for cloud in clouds_list:
-        feasible_resources: resources_utils.FeasibleResources = (
-            cloud.get_feasible_launchable_resources(empty_location_resources,
-                                                    num_nodes=task.num_nodes))
-        for feasible in feasible_resources.resources_list:
-            # We set override_optimize_by_zone=True to force the provisioner
-            # to use zone-level provisioning. This is to get accurate location
-            # information.
-            launchables: List['resources_lib.Resources'] = (
-                resources_utils.make_launchables_for_valid_region_zones(
-                    feasible, override_optimize_by_zone=True))
-            for launchable in launchables:
-                cloud_str = str(launchable.cloud)
-                region = launchable.region
-                zone = launchable.zone
-                assert region is not None, 'Region must be specified'
-                if (cloud_str not in location_requirements and
-                        location_requirements):
-                    continue
-                # We need to use .get() here to avoid creating extra entries in
-                # location_requirements, and being treated as user's requirement
-                # in the following regions.
-                cloud_reqs = location_requirements.get(cloud_str, {})
-                if region not in cloud_reqs and cloud_reqs:
-                    continue
-                region_reqs = cloud_reqs.get(region, set())
-                if zone not in region_reqs and region_reqs:
-                    continue
-                possible_locations.add(Location.from_resources(launchable))
+    for shape_entry in resources_list:
+        location_requirements: Dict[str, Dict[str, Set[str]]] = (
+            collections.defaultdict(lambda: collections.defaultdict(set)))
+        r = shape_entry
+        if r.cloud is not None:
+            cloud_str = str(r.cloud)
+            if r.region is None:
+                _ = location_requirements[cloud_str]
+            elif r.zone is None:
+                _ = location_requirements[cloud_str][r.region]
+            else:
+                location_requirements[cloud_str][r.region].add(r.zone)
+
+        clouds_list: List[sky_clouds.Cloud] = []
+        for c in location_requirements.keys():
+            cloud_obj = registry.CLOUD_REGISTRY.from_str(c)
+            assert cloud_obj is not None
+            clouds_list.append(cloud_obj)
+        if not clouds_list:
+            # No location requirement on this entry: all enabled clouds.
+            clouds_list = sky_check.get_cached_enabled_clouds_or_refresh(
+                capability=sky_cloud.CloudCapability.COMPUTE,
+                raise_if_no_cloud_access=False)
+            for cloud in clouds_list:
+                _ = location_requirements[str(cloud)]
+
+        shape_kwargs: Dict[str, Any] = {
+            'accelerators': r.accelerators,
+            'use_spot': r.use_spot,
+        }
+        if r.image_id is not None:
+            shape_kwargs['image_id'] = r.image_id
+        shape_resources = empty_location_resources.copy(**shape_kwargs)
+        for cloud in clouds_list:
+            feasible_resources: resources_utils.FeasibleResources = (
+                cloud.get_feasible_launchable_resources(
+                    shape_resources, num_nodes=task.num_nodes))
+            for feasible in feasible_resources.resources_list:
+                # We set override_optimize_by_zone=True to force the
+                # provisioner to use zone-level provisioning. This is to get
+                # accurate location information.
+                launchables: List['resources_lib.Resources'] = (
+                    resources_utils.make_launchables_for_valid_region_zones(
+                        feasible, override_optimize_by_zone=True))
+                for launchable in launchables:
+                    cloud_str = str(launchable.cloud)
+                    region = launchable.region
+                    zone = launchable.zone
+                    assert region is not None, 'Region must be specified'
+                    if (cloud_str not in location_requirements and
+                            location_requirements):
+                        continue
+                    # .get() avoids creating extra entries in
+                    # location_requirements that would then be treated as
+                    # user requirements for the following regions.
+                    cloud_reqs = location_requirements.get(cloud_str, {})
+                    if region not in cloud_reqs and cloud_reqs:
+                        continue
+                    region_reqs = cloud_reqs.get(region, set())
+                    if zone not in region_reqs and region_reqs:
+                        continue
+                    loc = Location.from_resources(launchable)
+                    # Pin the shape from the any_of entry, not the launchable
+                    # (make_launchables may resolve counts differently).
+                    loc.accelerators = r.accelerators
+                    loc.use_spot = r.use_spot
+                    loc.image_id = _normalize_image_id(r.image_id)
+                    possible_locations.add(loc)
 
     return list(possible_locations)
 
@@ -224,44 +318,70 @@ class SpotPlacer:
         """Select next location to place spot instance."""
         raise NotImplementedError
 
+    def resolve_location(self, location: Location) -> Optional[Location]:
+        """Map a possibly-legacy location onto this placer's key set.
+
+        Replica rows pickled before locations carried
+        (accelerators, use_spot, image_id) deserialize shape-less and no
+        longer hash-match the shape-bearing keys. Fall back to matching
+        on (cloud, region, zone) when that is unambiguous; return None
+        (callers skip, never assert) when nothing matches.
+        """
+        if location in self.location2status:
+            return location
+        matches = [
+            key for key in self.location2status
+            if str(key.cloud) == str(location.cloud) and
+            key.region == location.region and key.zone == location.zone
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
     def set_active(self, location: Location) -> None:
-        assert location in self.location2status, location
-        self.location2status[location] = LocationStatus.ACTIVE
-        self.location2preempted_at.pop(location, None)
+        resolved = self.resolve_location(location)
+        if resolved is None:
+            logger.warning(f'set_active: unknown location {location}; '
+                           'ignoring (likely a pre-upgrade replica row).')
+            return
+        self.location2status[resolved] = LocationStatus.ACTIVE
+        self.location2preempted_at.pop(resolved, None)
 
     def set_preemptive(self, location: Location) -> None:
-        assert location in self.location2status, location
-        self.location2status[location] = LocationStatus.PREEMPTED
+        resolved = self.resolve_location(location)
+        if resolved is None:
+            logger.warning(f'set_preemptive: unknown location {location}; '
+                           'ignoring (likely a pre-upgrade replica row).')
+            return
+        self.location2status[resolved] = LocationStatus.PREEMPTED
         # (Re)start the bench clock: a failed retry benches the location
         # for another full TTL window.
-        self.location2preempted_at[location] = time.time()
+        self.location2preempted_at[resolved] = time.time()
 
     def clear_preemptive_locations(self) -> None:
         for location in self.location2status:
             self.location2status[location] = LocationStatus.ACTIVE
         self.location2preempted_at.clear()
 
+    def _get_cost_per_hour_cached(self, location: Location) -> float:
+        if location in self.location2cost:
+            return self.location2cost[location]
+        # TODO(tian): Is there a better way to do this? This is for filling
+        # instance type so the get_cost() can operate normally.
+        r: 'resources_lib.Resources' = self.resources.copy(**location.to_dict())
+        assert r.cloud is not None
+        rs = r.cloud.get_feasible_launchable_resources(
+            r, num_nodes=self.num_nodes).resources_list
+        # For some clouds, there might have multiple instance types
+        # satisfying the resource request. In such case we choose the
+        # cheapest one, as the optimizer does. Reference:
+        # sky/optimizer.py::Optimizer::_print_candidates
+        cost = min(res.get_cost(seconds=3600) for res in rs)
+        self.location2cost[location] = cost
+        return cost
+
     def _min_cost_location(self, locations: List[Location]) -> Location:
-
-        def _get_cost_per_hour(location: Location) -> float:
-            if location in self.location2cost:
-                return self.location2cost[location]
-            # TODO(tian): Is there a better way to do this? This is for filling
-            # instance type so the get_cost() can operate normally.
-            r: 'resources_lib.Resources' = self.resources.copy(
-                **location.to_dict())
-            assert r.cloud is not None
-            rs = r.cloud.get_feasible_launchable_resources(
-                r, num_nodes=self.num_nodes).resources_list
-            # For some clouds, there might have multiple instance types
-            # satisfying the resource request. In such case we choose the
-            # cheapest one, as the optimizer does. Reference:
-            # sky/optimizer.py::Optimizer::_print_candidates
-            cost = min(r.get_cost(seconds=3600) for r in rs)
-            self.location2cost[location] = cost
-            return cost
-
-        return min(locations, key=_get_cost_per_hour)
+        return min(locations, key=self._get_cost_per_hour_cached)
 
     def _effective_status(self, location: Location) -> LocationStatus:
         """Status with TTL decay: an expired PREEMPTED mark counts ACTIVE.
@@ -321,6 +441,18 @@ class DynamicFallbackSpotPlacer(SpotPlacer,
     def select_next_location(self,
                              current_locations: List[Location]) -> Location:
         active_locations = self.active_locations()
+        # Zero-cost tier first: locations that cost nothing (reserved /
+        # already-paid capacity, e.g. a Kubernetes pool) are filled
+        # COMPLETELY before any paid location is considered, regardless
+        # of load. When such a location is full, its launches fail fast,
+        # it gets benched, and the TTL retry re-probes it as capacity
+        # frees — so load drifts back automatically.
+        zero_cost = [
+            location for location in active_locations
+            if self._get_cost_per_hour_cached(location) == 0
+        ]
+        if zero_cost:
+            active_locations = zero_cost
         # Prioritize the least-loaded locations (unused ones have load 0,
         # so this preserves the original prefer-unused behavior while any
         # location is still free). Without the load tiebreak, once every
@@ -329,7 +461,11 @@ class DynamicFallbackSpotPlacer(SpotPlacer,
         # at fleet scale this serially hammers one spot-exhausted zone
         # (observed live: >1000 consecutive failed attempts in one zone
         # while other zones and clouds sat idle) instead of spreading.
-        location_load = collections.Counter(current_locations)
+        # Pre-upgrade replica rows carry shape-less locations; resolve
+        # them onto the current key set so they still count as load.
+        location_load = collections.Counter(resolved for resolved in (
+            self.resolve_location(loc) for loc in current_locations)
+                                            if resolved is not None)
         min_load = min(
             (location_load[location] for location in active_locations),
             default=0)
@@ -350,6 +486,11 @@ class DynamicFallbackSpotPlacer(SpotPlacer,
 
     def set_preemptive(self, location: Location) -> None:
         super().set_preemptive(location)
-        # Prevent the case with only one active location.
-        if len(self.active_locations()) < 2:
+        # Reset only on TOTAL exhaustion (nothing selectable at all). The
+        # old <2 threshold defeated small mixed sets: benching a full
+        # zero-cost pool with a single paid fallback left active==1,
+        # which reset the bench and re-selected the full pool forever
+        # instead of spilling over. The TTL decay now guarantees benched
+        # locations come back on their own.
+        if not self.active_locations():
             self.clear_preemptive_locations()

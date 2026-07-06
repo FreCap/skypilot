@@ -569,15 +569,21 @@ def validate_service_task(task: 'sky.Task', pool: bool) -> None:
     spot_resources: List['sky.Resources'] = [
         resource for resource in task.resources if resource.use_spot
     ]
-    # TODO(MaoZiming): Allow mixed on-demand and spot specification in resources
-    # On-demand fallback should go to the resources specified as on-demand.
-    if len(spot_resources) not in [0, len(task.resources)]:
+    has_spot_placer = (task.service is not None and
+                       task.service.spot_placer is not None)
+    # A spot placer may manage a heterogeneous set that mixes spot cloud
+    # entries with non-spot reserved-capacity entries (e.g. a zero-cost
+    # Kubernetes pool): each launch is pinned to its location's spot-ness.
+    # Without a placer, mixing stays unsupported.
+    if (len(spot_resources) not in [0, len(task.resources)] and
+            not has_spot_placer):
         with ux_utils.print_exception_no_traceback():
             raise ValueError(
                 'Resources must either all use spot or none use spot. '
                 'To use on-demand and spot instances together, '
-                'use `dynamic_ondemand_fallback` or set '
-                'base_ondemand_fallback_replicas.')
+                'use `dynamic_ondemand_fallback`, set '
+                'base_ondemand_fallback_replicas, or configure a '
+                '`spot_placer` to manage a mixed set.')
 
     field_name = 'service' if not pool else 'pool'
     if task.service is None:
@@ -622,11 +628,14 @@ def validate_service_task(task: 'sky.Task', pool: bool) -> None:
                     'for spot resources. Please explicitly specify '
                     '`use_spot: true` in resources for on-demand fallback.')
         if (task.service.spot_placer is not None and
-                not requested_resources.use_spot):
+                not requested_resources.use_spot and not spot_resources):
+            # Non-spot entries are fine under a placer as the reserved
+            # zero-cost tier of a mixed set — but a placer over a set with
+            # NO spot entry at all is a misconfiguration.
             with ux_utils.print_exception_no_traceback():
                 raise ValueError(
-                    '`spot_placer` is only supported for spot resources. '
-                    'Please explicitly specify `use_spot: true` in resources.')
+                    '`spot_placer` requires at least one spot resource. '
+                    'Please specify `use_spot: true` on the cloud entries.')
         if not pool and task.service.ports is None:
             requested_ports = list(
                 resources_utils.port_ranges_to_set(requested_resources.ports))

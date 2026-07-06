@@ -8,7 +8,7 @@ there, which could never happen. Freed quota or recovered capacity was
 therefore never picked up. The TTL decay retries each benched location
 with one probe launch per window.
 """
-# pylint: disable=redefined-outer-name,protected-access
+# pylint: disable=redefined-outer-name,protected-access,unused-variable
 from unittest import mock
 
 import pytest
@@ -95,13 +95,19 @@ class TestPreemptionTtlRetry:
         assert cheap in placer.active_locations()
         assert cheap not in placer.location2preempted_at
 
-    def test_fewer_than_two_active_reset_still_works(self, placer_and_locations,
-                                                     monkeypatch):
+    def test_total_exhaustion_reset(self, placer_and_locations, monkeypatch):
+        """The global reset fires only when NOTHING is selectable —
+        a single remaining active location must stay the fallback
+        (the old <2 threshold un-benched a full zero-cost pool and
+        re-selected it forever instead of spilling to the paid tier)."""
         placer, cheap, other, third = placer_and_locations
         monkeypatch.setattr(spot_placer.time, 'time', lambda: 1000.0)
         placer.set_preemptive(cheap)
-        # Benching the second leaves <2 active -> global reset fires.
         placer.set_preemptive(other)
+        # One active location left: NO reset — it serves as fallback.
+        assert placer.active_locations() == [third]
+        # Benching the last one leaves nothing selectable -> reset.
+        placer.set_preemptive(third)
         assert len(placer.active_locations()) == 3
         assert not placer.location2preempted_at
 
