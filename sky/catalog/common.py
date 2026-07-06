@@ -87,6 +87,39 @@ def get_catalog_path(filename: str) -> str:
     return os.path.join(_ABSOLUTE_VERSIONED_CATALOG_DIR, filename)
 
 
+def hosted_catalog_base_urls() -> Tuple[str, str]:
+    """Primary and fallback base URLs for the hosted catalog.
+
+    SKYPILOT_HOSTED_CATALOG_DIR_URL overrides both (a self-hosted mirror,
+    e.g. when the upstream catalog feed is stale): with an override there
+    is deliberately no fallback to the upstream mirrors, otherwise a
+    transient error on the override would silently serve stale upstream
+    data. Read at call time so a server picks up the setting without a
+    code change.
+    """
+    override = os.environ.get('SKYPILOT_HOSTED_CATALOG_DIR_URL')
+    if override:
+        override = override.rstrip('/')
+        return override, override
+    return (constants.HOSTED_CATALOG_DIR_URL,
+            constants.HOSTED_CATALOG_DIR_URL_S3_MIRROR)
+
+
+def hosted_catalog_request_headers() -> Dict[str, str]:
+    """HTTP headers for hosted-catalog fetches.
+
+    SKYPILOT_HOSTED_CATALOG_TOKEN authenticates against a private mirror
+    (e.g. a private GitHub repo's raw URL, which accepts a fine-grained
+    PAT as a bearer token). Never sent to the default public catalog
+    hosts, so a misconfigured token cannot leak to third parties.
+    """
+    headers = {'User-Agent': 'SkyPilot/0.7'}
+    token = os.environ.get('SKYPILOT_HOSTED_CATALOG_TOKEN')
+    if token and os.environ.get('SKYPILOT_HOSTED_CATALOG_DIR_URL'):
+        headers['Authorization'] = f'Bearer {token}'
+    return headers
+
+
 def is_catalog_modified(filename: str) -> bool:
     # Check the md5 of the file to see if it has changed.
     catalog_path = get_catalog_path(filename)
@@ -224,6 +257,19 @@ def read_catalog(filename: str,
             # avoid overwriting the catalog by fetching from GitHub.
             return False
 
+        # A change of catalog source (e.g. SKYPILOT_HOSTED_CATALOG_DIR_URL
+        # now points at a self-hosted mirror) invalidates the cache: the
+        # point of switching sources is usually that the old source's data
+        # is stale, so waiting out the pull interval defeats it. Catalogs
+        # with pull_frequency_hours=None never re-download from any source
+        # by design and are deliberately not affected (handled above).
+        source_path = meta_path + '.source'
+        if os.path.exists(source_path):
+            with open(source_path, 'r', encoding='utf-8') as f:
+                cached_source = f.read().strip()
+            if cached_source != hosted_catalog_base_urls()[0]:
+                return True
+
         last_update = os.path.getmtime(catalog_path)
         return last_update + pull_frequency_hours * 3600 < time.time()
 
@@ -242,9 +288,10 @@ def read_catalog(filename: str,
             if not _need_update():
                 return False
 
-            url = f'{constants.HOSTED_CATALOG_DIR_URL}/{constants.CATALOG_SCHEMA_VERSION}/{filename}'  # pylint: disable=line-too-long
-            url_fallback = f'{constants.HOSTED_CATALOG_DIR_URL_S3_MIRROR}/{constants.CATALOG_SCHEMA_VERSION}/{filename}'  # pylint: disable=line-too-long
-            headers = {'User-Agent': 'SkyPilot/0.7'}
+            base_url, base_url_fallback = hosted_catalog_base_urls()
+            url = f'{base_url}/{constants.CATALOG_SCHEMA_VERSION}/{filename}'
+            url_fallback = f'{base_url_fallback}/{constants.CATALOG_SCHEMA_VERSION}/{filename}'  # pylint: disable=line-too-long
+            headers = hosted_catalog_request_headers()
             update_frequency_str = ''
             if pull_frequency_hours is not None:
                 update_frequency_str = (
@@ -255,11 +302,13 @@ def read_catalog(filename: str,
                     f'{update_frequency_str}'):
                 try:
                     r = requests.get(url=url, headers=headers)
-                    if r.status_code == 429:
+                    if r.status_code == 429 and url_fallback != url:
                         # fallback to s3 mirror, github introduced rate
                         # limit after 2025-05, see
                         # https://github.com/skypilot-org/skypilot/issues/5438
-                        # for more details
+                        # for more details. With a self-hosted mirror the
+                        # fallback equals the primary; retrying the same URL
+                        # on 429 would only worsen the throttling.
                         r = requests.get(url=url_fallback, headers=headers)
                     r.raise_for_status()
                 except requests.exceptions.RequestException as e:
@@ -294,6 +343,14 @@ def read_catalog(filename: str,
                         f.write(
                             hashlib.md5(r.text.encode(),
                                         usedforsecurity=False).hexdigest())
+                    # Record which base URL this catalog came from, so a
+                    # later change of catalog source (e.g. pointing
+                    # SKYPILOT_HOSTED_CATALOG_DIR_URL at a self-hosted
+                    # mirror) invalidates the cache instead of serving the
+                    # old source's data until the pull interval expires.
+                    with open(meta_path + '.source', 'w',
+                              encoding='utf-8') as f:
+                        f.write(base_url)
             logger.debug(f'Updated {cloud} catalog {filename}.')
         return True
 
