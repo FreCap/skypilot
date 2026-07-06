@@ -145,6 +145,39 @@ describe('DashboardCache', () => {
       expect(mockFetch).toHaveBeenCalledTimes(2);
     });
 
+    test('an invalidated in-flight request cannot write stale data to the cache', async () => {
+      let firstResolve;
+      const slowFirst = new Promise((resolve) => {
+        firstResolve = resolve;
+      });
+      let call = 0;
+      const mockFetch = jest.fn(async () => {
+        call += 1;
+        if (call === 1) {
+          await slowFirst;
+          return { data: 'stale' };
+        }
+        return { data: 'fresh' };
+      });
+
+      // Request A in flight (slow), then invalidate, then request B
+      // completes with fresh data.
+      const a = cache.get(mockFetch, ['x']);
+      cache.invalidateFunction(mockFetch);
+      const b = cache.get(mockFetch, ['x']);
+      await b;
+
+      // A resolves last — it must NOT overwrite B's fresh cache entry
+      // nor delete B's bookkeeping.
+      firstResolve();
+      await a;
+
+      // A resolved after the invalidate: it must not have overwritten
+      // B's fresh entry (getCached is side-effect free — no background
+      // refresh).
+      expect(cache.getCached(mockFetch, ['x'])).toEqual({ data: 'fresh' });
+    });
+
     test('drops every args variant of the function', async () => {
       const mockFetch = createMockFetch({ data: 'v1' }, 10);
 
