@@ -164,12 +164,18 @@ class DashboardCache {
   invalidateFunction(fetchFunction) {
     const functionString = fetchFunction.toString();
     const functionHash = simpleHash(functionString);
-    const keysToDelete = [];
+    const keysToDelete = new Set();
 
-    // Find all keys that start with the function hash
-    for (const key of this.cache.keys()) {
-      if (key.startsWith(`${functionHash}_`)) {
-        keysToDelete.push(key);
+    // Find all keys that start with the function hash. Sweep the
+    // pending/background maps too: an in-flight first fetch has no
+    // cache entry yet, and leaving its pendingRequests entry behind
+    // would let a post-invalidate get() reuse the pre-invalidate
+    // request instead of refetching.
+    for (const map of [this.cache, this.pendingRequests, this.backgroundJobs]) {
+      for (const key of map.keys()) {
+        if (key.startsWith(`${functionHash}_`)) {
+          keysToDelete.add(key);
+        }
       }
     }
 

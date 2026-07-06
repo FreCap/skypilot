@@ -126,6 +126,44 @@ describe('DashboardCache', () => {
     });
   });
 
+  describe('invalidateFunction', () => {
+    test('drops in-flight pending requests, not just cached entries', async () => {
+      const mockFetch = createMockFetch({ data: 'v1' }, 100);
+
+      // Start a first fetch; it is in pendingRequests but NOT yet in
+      // the cache map.
+      const inflight = cache.get(mockFetch, [{ summaryOnly: false }]);
+
+      // Invalidate mid-flight: a subsequent get() must start a fresh
+      // request instead of reusing the pre-invalidate one.
+      cache.invalidateFunction(mockFetch);
+      const fresh = cache.get(mockFetch, [{ summaryOnly: false }]);
+
+      jest.advanceTimersByTime(100);
+      await Promise.all([inflight, fresh]);
+
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+
+    test('drops every args variant of the function', async () => {
+      const mockFetch = createMockFetch({ data: 'v1' }, 10);
+
+      const p1 = cache.get(mockFetch, [{ summaryOnly: true }]);
+      const p2 = cache.get(mockFetch, [{ summaryOnly: false }]);
+      jest.advanceTimersByTime(10);
+      await Promise.all([p1, p2]);
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+
+      cache.invalidateFunction(mockFetch);
+
+      const p3 = cache.get(mockFetch, [{ summaryOnly: true }]);
+      const p4 = cache.get(mockFetch, [{ summaryOnly: false }]);
+      jest.advanceTimersByTime(10);
+      await Promise.all([p3, p4]);
+      expect(mockFetch).toHaveBeenCalledTimes(4);
+    });
+  });
+
   describe('Cache Behavior', () => {
     test('should return cached data when available and fresh', async () => {
       jest.useRealTimers(); // Use real timers for this test
