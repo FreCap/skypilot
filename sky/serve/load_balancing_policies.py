@@ -150,7 +150,16 @@ class LeastLoadPolicy(LoadBalancingPolicy, name='least_load', default=True):
                          request: 'fastapi.Request') -> None:
         del request  # Unused.
         with self.lock:
-            self.load_map[replica_url] += 1
+            # Live keys only: a replica pruned between selection and this
+            # hook must not be recreated (its paired post is skipped the
+            # same way, so accounting stays consistent).
+            if replica_url in self.load_map:
+                self.load_map[replica_url] += 1
+            else:
+                logger.debug(
+                    'pre_execute_hook: %s not in load map (pruned '
+                    'between selection and dispatch); not counted.',
+                    replica_url)
 
     def post_execute_hook(self, replica_url: str,
                           request: 'fastapi.Request') -> None:
@@ -159,9 +168,18 @@ class LeastLoadPolicy(LoadBalancingPolicy, name='least_load', default=True):
             # Only decrement live keys, clamped at zero: a replica pruned
             # from the ready set mid-stream must not be recreated at -1
             # (phantom capacity that would attract traffic on re-add).
-            if replica_url in self.load_map:
-                self.load_map[replica_url] = max(0,
-                                                 self.load_map[replica_url] - 1)
+            if replica_url not in self.load_map:
+                return
+            if self.load_map[replica_url] <= 0:
+                # A live key at zero receiving a release means a double
+                # release or a missed increment upstream — clamp, but do
+                # not hide it.
+                logger.warning(
+                    'post_execute_hook: load underflow for %s; clamping '
+                    'at 0 (possible double release).', replica_url)
+                self.load_map[replica_url] = 0
+                return
+            self.load_map[replica_url] -= 1
 
 
 class InstanceAwareLeastLoadPolicy(LeastLoadPolicy,

@@ -199,21 +199,38 @@ class SkyServeLoadBalancer:
                 timeout=self._stream_timeout_seconds)
             proxy_response = await client.send(proxy_request, stream=True)
 
-            async def background_func():
-                # The slot is owned by the stream now; release it however
-                # the stream ends (aclose raising must not leak it).
+            # The slot is owned by the stream now. Starlette runs
+            # BackgroundTasks strictly AFTER a successful stream — a
+            # mid-stream failure (client disconnect, upstream reset)
+            # skips them — so the release lives in the ITERATOR's
+            # finally (generator close on any exit runs it) with the
+            # background task as a second, idempotent safety net for
+            # the stream-never-started edge.
+            release_state = {'done': False}
+
+            async def _release_slot():
+                if release_state['done']:
+                    return
+                release_state['done'] = True
                 try:
                     await proxy_response.aclose()
                 finally:
                     self._load_balancing_policy.post_execute_hook(url, request)
 
+            async def _stream_with_release():
+                try:
+                    async for chunk in proxy_response.aiter_raw():
+                        yield chunk
+                finally:
+                    await _release_slot()
+
             response = fastapi.responses.StreamingResponse(
-                content=proxy_response.aiter_raw(),
+                content=_stream_with_release(),
                 status_code=proxy_response.status_code,
                 headers=proxy_response.headers,
-                background=background.BackgroundTask(background_func))
-            # Ownership of the slot transfers to background_func only once
-            # the response object exists and will be returned.
+                background=background.BackgroundTask(_release_slot))
+            # Ownership of the slot transfers to the stream/background pair
+            # only once the response object exists and will be returned.
             released = True
             return response
         except (httpx.RequestError, httpx.HTTPStatusError) as e:

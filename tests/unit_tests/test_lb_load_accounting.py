@@ -138,3 +138,84 @@ class TestProxySlotRelease:
         # Slot NOT released synchronously: it belongs to the stream's
         # background task now.
         policy.post_execute_hook.assert_not_called()
+
+    def test_midstream_failure_releases_slot_via_iterator_finally(self):
+        """Starlette runs background tasks only AFTER a successful
+        stream: a mid-stream failure must release via the iterator's
+        finally instead (and exactly once)."""
+        policy = mock.MagicMock()
+        client = mock.MagicMock()
+        send_response = mock.MagicMock()
+        send_response.status_code = 200
+        send_response.headers = {}
+
+        async def _aiter_raw():
+            yield b'chunk-1'
+            raise httpx.ReadError('upstream reset mid-stream')
+
+        send_response.aiter_raw = _aiter_raw
+
+        async def _aclose():
+            return None
+
+        send_response.aclose = _aclose
+
+        async def _send(*args, **kwargs):
+            return send_response
+
+        client.send = _send
+        balancer = _make_lb(policy, client_pool={'http://a:8080': client})
+
+        async def _run():
+            response = await balancer._proxy_request_to('http://a:8080',
+                                                        self._request())
+            assert not isinstance(response, Exception)
+            # Drain the wrapped iterator like the server would; the
+            # failure mid-stream must trigger the finally-release.
+            chunks = []
+            try:
+                async for chunk in response.body_iterator:
+                    chunks.append(chunk)
+            except httpx.ReadError:
+                pass
+            return chunks
+
+        chunks = asyncio.run(_run())
+        assert chunks == [b'chunk-1']
+        policy.post_execute_hook.assert_called_once()
+
+    def test_release_is_idempotent_across_iterator_and_background(self):
+        """Normal completion: iterator finally AND the background task
+        both fire — the slot must be released exactly once."""
+        policy = mock.MagicMock()
+        client = mock.MagicMock()
+        send_response = mock.MagicMock()
+        send_response.status_code = 200
+        send_response.headers = {}
+
+        async def _aiter_raw():
+            yield b'done'
+
+        send_response.aiter_raw = _aiter_raw
+
+        async def _aclose():
+            return None
+
+        send_response.aclose = _aclose
+
+        async def _send(*args, **kwargs):
+            return send_response
+
+        client.send = _send
+        balancer = _make_lb(policy, client_pool={'http://a:8080': client})
+
+        async def _run():
+            response = await balancer._proxy_request_to('http://a:8080',
+                                                        self._request())
+            async for _ in response.body_iterator:
+                pass
+            # Simulate Starlette running the background task afterwards.
+            await response.background()
+
+        asyncio.run(_run())
+        policy.post_execute_hook.assert_called_once()
