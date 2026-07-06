@@ -759,3 +759,31 @@ def test_custom_proxy_command_left_untouched(monkeypatch):
     custom = 'ssh -W %h:%p bastion.example.com'
     credentials = _ssh_credentials_for_proxy_command(monkeypatch, custom)
     assert credentials['ssh_proxy_command'] == custom
+
+
+def test_legacy_ssm_upgraded_in_credentials_from_handles(monkeypatch):
+    """ssh_credentials_from_handles reads the auth section on its own path
+    (not via ssh_credential_from_yaml) and must apply the same upgrade."""
+    legacy = ('aws ssm start-session --target "i-123" --region us-east-1 '
+              '--document-name AWS-StartSSHSession --parameters portNumber=%p')
+    config = {
+        'cluster_name': 'fake-cluster',
+        'auth': {
+            'ssh_user': 'ubuntu',
+            'ssh_proxy_command': legacy,
+        },
+        'provider': {
+            'module': 'sky.provision.aws'
+        },
+    }
+    monkeypatch.setattr(backend_utils.global_user_state,
+                        'get_cluster_yaml_dict_multiple',
+                        lambda paths: [config for _ in paths])
+    handle = MagicMock()
+    handle.cluster_yaml = '/fake/cluster.yaml'
+    handle.ssh_user = None
+    handle.docker_user = None
+    credentials, = backend_utils.ssh_credentials_from_handles([handle])
+    upgraded = credentials['ssh_proxy_command']
+    assert upgraded.startswith('export AWS_RETRY_MODE=adaptive')
+    assert upgraded.endswith(legacy)

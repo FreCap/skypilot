@@ -37,6 +37,7 @@ from sky.utils import common_utils
 from sky.utils import message_utils
 from sky.utils import resources_utils
 from sky.utils import rich_utils
+from sky.utils import ssm_direct
 from sky.utils import status_lib
 from sky.utils import subprocess_utils
 from sky.utils import timeline
@@ -426,8 +427,20 @@ def wait_for_ssh(cluster_info: provision_common.ClusterInfo,
     # once per second saturates the quota for the whole account. Space the
     # probes out with jittered backoff instead; the quota-free transports
     # keep the tight 1s cadence.
-    is_ssm_proxy = 'ssm start-session' in (
-        ssh_credentials.get('ssh_proxy_command') or '')
+    proxy_command = ssh_credentials.get('ssh_proxy_command')
+    is_ssm_proxy = 'ssm start-session' in (proxy_command or '')
+    # Prefer proxy-less probes when the target is directly reachable: the
+    # successful direct handshake is what authorizes SSHCommandRunner to
+    # bypass the SSM proxy for the rest of provisioning (ssm_direct.py).
+    # skypilot_config is thread-local, so read the kill-switch here in the
+    # parent thread, not in the probe threads.
+    try_direct = (ssm_direct.is_skypilot_ssm_proxy(proxy_command) and
+                  ssm_direct.is_enabled())
+    # After this many failed direct probes, alternate direct/proxied
+    # attempts: during boot a not-yet-ready sshd fails both transports
+    # alike, but a TCP-open-yet-SSH-broken direct path must not be able to
+    # stall the wait when only SSM works.
+    max_exclusive_direct_failures = 5
 
     def _retry_ssh_thread(ip_ssh_port: Tuple[str, int]):
         ip, ssh_port = ip_ssh_port
@@ -440,13 +453,33 @@ def wait_for_ssh(cluster_info: provision_common.ClusterInfo,
             # every worker fires simultaneously once the head is up, which
             # is itself a StartSession burst. Spread the first wave out.
             time.sleep(random.uniform(0, 5))
+        attempt = 0
+        direct_failures = 0
         while not success:
+            attempted_direct = (try_direct and
+                                (direct_failures < max_exclusive_direct_failures
+                                 or attempt % 2 == 0) and
+                                ssm_direct.tcp_reachable(ip, ssh_port))
+            attempt += 1
+            credentials = ssh_credentials
+            if attempted_direct:
+                credentials = dict(ssh_credentials)
+                credentials['ssh_proxy_command'] = None
             success, stderr = waiter(ip,
                                      ssh_port,
-                                     **ssh_credentials,
+                                     **credentials,
                                      ssh_probe_timeout=ssh_probe_timeout)
             if success:
+                if attempted_direct:
+                    ssm_direct.mark_direct_ok(ip, ssh_port)
+                elif (try_direct and
+                      direct_failures >= max_exclusive_direct_failures):
+                    # Only SSM worked while the direct path kept failing
+                    # past the boot window: stop runners from bypassing.
+                    ssm_direct.mark_direct_failed(ip, ssh_port)
                 break
+            if attempted_direct:
+                direct_failures += 1
             if time.time() - start > timeout:
                 with ux_utils.print_exception_no_traceback():
                     raise RuntimeError(

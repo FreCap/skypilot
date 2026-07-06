@@ -145,6 +145,26 @@ _TRANSIENT_SSH_FAILURE_PATTERN = re.compile(
 # never regenerate it).
 _SSM_ADAPTIVE_RETRY_EXPORT = ('export AWS_RETRY_MODE=adaptive '
                               'AWS_MAX_ATTEMPTS=12;')
+
+
+def _upgrade_legacy_ssm_proxy_command(
+        ssh_proxy_command: Optional[str]) -> Optional[str]:
+    """Prepend the adaptive-retry export to pre-fix SSM proxy commands.
+
+    Clusters launched before the prefix existed carry an SSM proxy command
+    without it, and keep it forever: on re-provision the auth section is
+    restored verbatim from the old YAML (see
+    _RAY_YAML_KEYS_TO_RESTORE_FOR_BACK_COMPATIBILITY). Applied in every
+    credential read path so existing clusters also wait out StartSession
+    throttling.
+    """
+    if (ssh_proxy_command is not None and
+            ssh_proxy_command.startswith('aws ssm start-session') and
+            'AWS_RETRY_MODE' not in ssh_proxy_command):
+        return f'{_SSM_ADAPTIVE_RETRY_EXPORT} {ssh_proxy_command}'
+    return ssh_proxy_command
+
+
 K8S_PODS_NOT_FOUND_PATTERN = re.compile(r'.*(NotFound|pods .* not found).*',
                                         re.IGNORECASE)
 _RAY_CLUSTER_NOT_FOUND_MESSAGE = 'Ray cluster is not found'
@@ -1860,15 +1880,7 @@ def ssh_credential_from_yaml(
         ssh_proxy_command = ssh_proxy_command.replace(
             constants.SKY_SSH_USER_PLACEHOLDER, ssh_user)
 
-    # Clusters launched before the adaptive-retry prefix existed carry an SSM
-    # proxy command without it, and keep it forever: on re-provision the auth
-    # section is restored verbatim from the old YAML (see
-    # _RAY_YAML_KEYS_TO_RESTORE_FOR_BACK_COMPATIBILITY). Upgrade at read time
-    # so existing clusters also wait out StartSession throttling.
-    if (ssh_proxy_command is not None and
-            ssh_proxy_command.startswith('aws ssm start-session') and
-            'AWS_RETRY_MODE' not in ssh_proxy_command):
-        ssh_proxy_command = f'{_SSM_ADAPTIVE_RETRY_EXPORT} {ssh_proxy_command}'
+    ssh_proxy_command = _upgrade_legacy_ssm_proxy_command(ssh_proxy_command)
 
     credentials = {
         'ssh_user': ssh_user,
@@ -1923,6 +1935,7 @@ def ssh_credentials_from_handles(
                 constants.SKY_SSH_USER_PLACEHOLDER in ssh_proxy_command):
             ssh_proxy_command = ssh_proxy_command.replace(
                 constants.SKY_SSH_USER_PLACEHOLDER, ssh_user)
+        ssh_proxy_command = _upgrade_legacy_ssm_proxy_command(ssh_proxy_command)
 
         credentials = {
             'ssh_user': ssh_user,

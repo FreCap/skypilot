@@ -1850,6 +1850,9 @@ def get_config_schema():
                 'ssm_profile': {
                     'type': 'string',
                 },
+                'ssm_direct_fallback': {
+                    'type': 'boolean',
+                },
                 'post_provision_runcmd': {
                     'type': 'array',
                     'items': {
