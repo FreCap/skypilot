@@ -39,7 +39,11 @@ SERVICE_REGISTER_TIMEOUT_SECONDS = 60
 # default 10s HTTP/gRPC timeouts would spuriously fail updates against a
 # busy-but-healthy controller. Used as the HTTP read timeout on the
 # controller POST and (plus margin) as the skylet gRPC deadline in VM mode.
-UPDATE_SERVICE_TIMEOUT_SECONDS = 120
+# 600: at fleet scale the lock wait is minutes, not tens of seconds
+# (measured live 2026-07-06: >120s at ~900 replicas made the CLI report a
+# false failure while the update actually landed). The wait is genuine
+# work, not a hang; budget generously.
+UPDATE_SERVICE_TIMEOUT_SECONDS = 600
 
 # The time interval in seconds for load balancer to sync with controller. Every
 # time the load balancer syncs with controller, it will update all available

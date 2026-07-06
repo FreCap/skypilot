@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Set
 from sky import check as sky_check
 from sky import clouds as sky_clouds
 from sky import sky_logging
+from sky import skypilot_config
 from sky.clouds import cloud as sky_cloud
 from sky.utils import registry
 from sky.utils import resources_utils
@@ -26,6 +27,10 @@ logger = sky_logging.init_logger(__name__)
 SPOT_PLACERS = {}
 DEFAULT_SPOT_PLACER = None
 SPOT_HEDGE_PLACER = 'dynamic_fallback'
+
+# SkyPilot's default kubernetes provision timeout (schemas.py default),
+# used only for the bench-TTL invariant warning below.
+_DEFAULT_K8S_PROVISION_TIMEOUT_SECONDS = 600
 
 # How long a location stays benched after a failed launch or a preemption
 # before it becomes eligible for a retry. Without this, a location marked
@@ -437,6 +442,42 @@ class DynamicFallbackSpotPlacer(SpotPlacer,
                                 name=SPOT_HEDGE_PLACER,
                                 default=True):
     """Dynamic Fallback Placer."""
+
+    def __init__(self, task: 'task_lib.Task') -> None:
+        super().__init__(task)
+        # INVARIANT: the bench TTL must exceed the worst-case launch
+        # FAILURE latency of every managed location, or a full location
+        # ping-pongs (its bench expires exactly as a sibling's launch
+        # times out) and the service never falls through to the next
+        # cost tier. Observed live 2026-07-06 with two Kubernetes shape
+        # locations: provision_timeout (600s default) == TTL (600s) ->
+        # the service never spilled to cloud. Warn loudly; the fix is
+        # kubernetes.provision_timeout << SKYPILOT_SPOT_PLACER_RETRY_SECONDS.
+        ttl = _preemption_retry_seconds()
+        k8s_contexts = sorted({
+            location.region
+            for location in self.location2status
+            if str(location.cloud).lower() == 'kubernetes'
+        })
+        for context in k8s_contexts:
+            timeout = skypilot_config.get_effective_region_config(
+                cloud='kubernetes',
+                region=context,
+                keys=('provision_timeout',),
+                default_value=_DEFAULT_K8S_PROVISION_TIMEOUT_SECONDS)
+            try:
+                timeout = float(timeout)
+            except (TypeError, ValueError):
+                continue
+            if timeout >= ttl:
+                logger.warning(
+                    f'Kubernetes context {context!r} has '
+                    f'provision_timeout={timeout:.0f}s >= the spot placer '
+                    f'bench TTL ({ttl:.0f}s). A full cluster will ping-pong '
+                    'between its locations instead of spilling to the next '
+                    'cost tier. Set kubernetes.provision_timeout well below '
+                    f'{_PREEMPTION_RETRY_SECONDS_ENV_VAR} (or raise the '
+                    'TTL).')
 
     def select_next_location(self,
                              current_locations: List[Location]) -> Location:

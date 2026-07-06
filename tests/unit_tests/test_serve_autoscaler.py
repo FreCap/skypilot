@@ -255,6 +255,7 @@ class TestInstanceAwareGpuShapeCache(unittest.TestCase):
         autoscaler = object.__new__(
             autoscalers.InstanceAwareRequestRateAutoscaler)
         autoscaler._gpu_shape_cache = {}
+        autoscaler._replica_cost_cache = {}
         return autoscaler
 
     def _make_replica(self, gpu_type, launch_status, count=1):
@@ -336,6 +337,55 @@ class TestInstanceAwareGpuShapeCache(unittest.TestCase):
         autoscaler.num_overprovision = None
         autoscaler._set_target_num_replicas_with_instance_aware_logic([])
         self.assertEqual(autoscaler.target_num_replicas, 2)
+
+    def test_scale_down_sheds_expensive_replicas_first(self):
+        """Among same-status replicas, paid cloud replicas are scaled
+        down before zero-cost reserved ones (drill 2026-07-06 showed the
+        old order shed the paid GCP replica only by luck)."""
+        autoscaler = self._make_autoscaler()
+        autoscaler._replica_cost_cache = {}
+        autoscaler.target_qps_per_replica = {'L4': 0.1, 'A100': 0.1}
+
+        def _replica(rid, cost):
+            info = self._make_replica('L4',
+                                      common_utils.ProcessStatus.SUCCEEDED)
+            info.replica_id = rid
+            info.status = serve_state.ReplicaStatus.READY
+            info.is_terminal = False
+            info.version = 1
+            info.handle.return_value.launched_resources.get_cost.return_value \
+                = cost
+            return info
+
+        free_k8s = _replica(1, 0.0)
+        paid_spot = _replica(2, 0.21)
+        cheap_spot = _replica(3, 0.11)
+        selected = autoscaler._select_replicas_to_scale_down_by_qps(
+            2, [free_k8s, paid_spot, cheap_spot])
+        # Most expensive first, zero-cost survives.
+        assert selected == [2, 3]
+
+    def test_scale_down_uniform_cost_order_unchanged(self):
+        """Uniform-cost fleets keep the pre-change ordering exactly."""
+        autoscaler = self._make_autoscaler()
+        autoscaler._replica_cost_cache = {}
+        autoscaler.target_qps_per_replica = {'L4': 0.1}
+
+        def _replica(rid):
+            info = self._make_replica('L4',
+                                      common_utils.ProcessStatus.SUCCEEDED)
+            info.replica_id = rid
+            info.status = serve_state.ReplicaStatus.READY
+            info.is_terminal = False
+            info.version = 1
+            info.handle.return_value.launched_resources.get_cost.return_value \
+                = 0.11
+            return info
+
+        infos = [_replica(1), _replica(2), _replica(3)]
+        selected = autoscaler._select_replicas_to_scale_down_by_qps(1, infos)
+        # Tie on status/cost/qps/version -> highest replica_id first.
+        assert selected == [3]
 
     def test_scale_down_prefers_earlier_lifecycle_status(self):
         """A PROVISIONING replica must be selected before a READY one
