@@ -834,28 +834,43 @@ class SkyPilotReplicaManager(ReplicaManager):
         self._tick_version_spec_cache: Dict[int,
                                             'service_spec.SkyServiceSpec'] = {}
 
-        # Run recovery synchronously before launching the daemon threads.
+        # Run recovery in its own thread, but only start the daemon threads
+        # once recovery HOLDS the manager lock. Two hazards shaped this:
         #
-        # If any daemon (especially `_job_status_fetcher`, which SSHes /
-        # gRPC-calls into each replica's head node to query job status)
-        # wins the race for `self.lock`, the main thread blocks on
-        # `_recover_replica_operations`'s `with self.lock:` until that
-        # daemon's per-replica SSH walk completes. With unreachable
-        # replicas (pod / VM gone), each SSH connect hangs at the kernel
-        # TCP timeout (tens of seconds to minutes), so the main thread
-        # never returns from `SkyPilotReplicaManager.__init__` →
-        # `SkyServeController.__init__` → never reaches `uvicorn.run`,
-        # and `_wait_for_controller_ready` times out (60s) in the parent
-        # `_start` process. With HA recovery changes, that
-        # timeout now triggers `os._exit(1)` → daemon retries → same
-        # race → infinite loop.
-        #
-        # Doing recovery first guarantees the main thread has the lock
-        # for the brief window it needs (and `_launch_replica` itself
-        # just queues a SafeThread, no SSH inline). The daemons can
-        # safely start after — they'll wait for the lock only when
-        # `_recover_replica_operations` has already released it.
-        self._recover_replica_operations()
+        # 1. (original) If a daemon grabs `self.lock` before recovery —
+        #    `_job_status_fetcher` SSHes every replica under it — recovery
+        #    (and formerly __init__) blocks for the daemon's full walk.
+        #    The lock-acquired handshake below preserves the guarantee that
+        #    recovery gets the lock FIRST, without recovery having to finish
+        #    before __init__ returns.
+        # 2. (fleet-scale) Recovery itself is O(interrupted operations): at
+        #    a measured ~860-row fleet with ~520 interrupted launches it
+        #    runs for minutes. When it ran synchronously here, uvicorn never
+        #    bound within _start's 60s readiness window
+        #    (SERVICE_REGISTER_TIMEOUT_SECONDS) → _bail_on_boot_failure →
+        #    os._exit(1) → daemon respawn → recovery restarted from scratch,
+        #    forever: a controller crash-loop that froze the whole service.
+        #    With the thread, uvicorn binds within seconds while recovery
+        #    proceeds under the lock; probes/scaling naturally wait on the
+        #    lock exactly as they would during any long locked operation.
+        recovery_lock_acquired = threading.Event()
+
+        def _recover_with_lock() -> None:
+            try:
+                with self.lock:
+                    recovery_lock_acquired.set()
+                    self._recover_replica_operations()
+            finally:
+                # Failsafe: never leave __init__ waiting if this thread dies
+                # before signaling (nothing before the `with` can normally
+                # raise, but a stuck boot here would resurrect the exact
+                # crash-loop this design removes).
+                recovery_lock_acquired.set()
+
+        threading.Thread(target=_recover_with_lock,
+                         name='replica-recovery',
+                         daemon=True).start()
+        recovery_lock_acquired.wait()
 
         # Supervised so a BaseException escaping any of these loops (or the
         # loop returning) does not silently freeze replica reconciliation /
@@ -868,10 +883,12 @@ class SkyPilotReplicaManager(ReplicaManager):
         thread_utils.start_supervised_thread(self._replica_prober,
                                              'replica-prober')
 
-    @with_lock
     def _recover_replica_operations(self):
-        """Let's see are there something to do for ReplicaManager in a
-        recovery run"""
+        """Re-drive interrupted replica operations from durable state.
+
+        Runs in the dedicated recovery thread started by __init__, which
+        holds the manager lock for the whole pass (see __init__ for the
+        lock-ordering handshake with the daemon threads)."""
         assert (not self._launch_thread_pool and not self._down_thread_pool
                ), 'We should not have any running threads in a recovery run'
 
@@ -889,10 +906,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         # `sky.launch` against its live serving cluster. Advance the allocator
         # past every persisted id so new replicas always get a fresh id. On a
         # first run there are no replicas, so this stays at 1 (no-op).
-        existing_replica_ids = [
-            info.replica_id
-            for info in serve_state.get_replica_infos(self._service_name)
-        ]
+        all_replica_infos = serve_state.get_replica_infos(self._service_name)
+        existing_replica_ids = [info.replica_id for info in all_replica_infos]
         self._next_replica_id = max(existing_replica_ids, default=0) + 1
 
         # There is a FIFO queue with capacity _MAX_NUM_LAUNCH for
@@ -912,9 +927,12 @@ class SkyPilotReplicaManager(ReplicaManager):
             # where the provisioning is partially done.
             # So we mock the original request based on all call sites,
             # including SkyServeController._run_autoscaler.
+            # One shared snapshot: per-launch fresh scans made recovery
+            # O(pending x total rows) — tens of minutes at fleet scale.
             self._launch_replica(
                 replica_info.replica_id,
-                resources_override=replica_info.resources_override)
+                resources_override=replica_info.resources_override,
+                existing_replica_infos=all_replica_infos)
 
         for replica_info in serve_state.get_replicas_at_status(
                 self._service_name, serve_state.ReplicaStatus.SHUTTING_DOWN):
@@ -935,6 +953,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         self,
         replica_id: int,
         resources_override: Optional[Dict[str, Any]] = None,
+        existing_replica_infos: Optional[List['ReplicaInfo']] = None,
     ) -> None:
         if replica_id in self._launch_thread_pool:
             logger.warning(f'Launch thread for replica {replica_id} '
@@ -960,7 +979,13 @@ class SkyPilotReplicaManager(ReplicaManager):
             if resources_override is None:
                 resources_override = {}
             current_spot_locations: List[spot_placer.Location] = []
-            for info in serve_state.get_replica_infos(self._service_name):
+            # The per-launch replica scan is O(total rows) of unpickling;
+            # bulk callers (recovery re-enqueueing hundreds of launches)
+            # pass one snapshot instead of paying it per launch.
+            if existing_replica_infos is None:
+                existing_replica_infos = serve_state.get_replica_infos(
+                    self._service_name)
+            for info in existing_replica_infos:
                 if info.is_spot:
                     spot_location = info.get_spot_location()
                     if spot_location is not None:
