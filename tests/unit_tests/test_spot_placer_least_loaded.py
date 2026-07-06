@@ -30,6 +30,7 @@ def _make_placer(locations, costs):
     placer.location2status = {
         loc: spot_placer.LocationStatus.ACTIVE for loc in locations
     }
+    placer.location2preempted_at = {}
     placer.location2cost = dict(costs)
     return placer
 
