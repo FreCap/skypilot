@@ -45,6 +45,22 @@ class TestLoadMapPairing:
         policy.post_execute_hook('http://a:8080', None)
         assert 'http://a:8080' not in policy.load_map
 
+    def test_stale_generation_release_ignored_after_prune_readd(self):
+        """ABA: a release from before a prune must not decrement the
+        re-added generation's counter (old-A release stealing new-A's
+        in-flight slot)."""
+        policy = _make_least_load()
+        token_old = policy.pre_execute_hook('http://a:8080', None)
+        # A pruned, then re-added (new generation).
+        policy.set_ready_replicas(['http://b:8080'])
+        policy.set_ready_replicas(['http://a:8080', 'http://b:8080'])
+        # New stream on new-A.
+        policy.pre_execute_hook('http://a:8080', None)
+        assert policy.load_map['http://a:8080'] == 1
+        # Old stream finally ends: stale-generation release ignored.
+        policy.post_execute_hook('http://a:8080', None, token_old)
+        assert policy.load_map['http://a:8080'] == 1
+
     def test_post_clamps_at_zero(self):
         policy = _make_least_load()
         policy.post_execute_hook('http://b:8080', None)

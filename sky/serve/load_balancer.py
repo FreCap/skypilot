@@ -173,7 +173,9 @@ class SkyServeLoadBalancer:
             encountered if anything goes wrong.
         """
         logger.info(f'Proxy request to {url}')
-        self._load_balancing_policy.pre_execute_hook(url, request)
+        # The token ties this request's release to the exact accounting
+        # generation it incremented (see LoadBalancingPolicy hooks).
+        slot_token = self._load_balancing_policy.pre_execute_hook(url, request)
         # Every exit that does NOT hand a streaming response to the client
         # must release the in-flight slot itself, or failed/aborted attempts
         # permanently inflate this replica's load and skew routing away
@@ -215,7 +217,8 @@ class SkyServeLoadBalancer:
                 try:
                     await proxy_response.aclose()
                 finally:
-                    self._load_balancing_policy.post_execute_hook(url, request)
+                    self._load_balancing_policy.post_execute_hook(
+                        url, request, slot_token)
 
             async def _stream_with_release():
                 try:
@@ -240,7 +243,8 @@ class SkyServeLoadBalancer:
             return e
         finally:
             if not released:
-                self._load_balancing_policy.post_execute_hook(url, request)
+                self._load_balancing_policy.post_execute_hook(
+                    url, request, slot_token)
 
     async def _proxy_with_retries(
             self, request: fastapi.Request) -> fastapi.responses.Response:
