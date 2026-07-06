@@ -328,7 +328,9 @@ async def test_recovery_requeues_interrupted_launches(isolated_database,
         # Interrupted mid-provision: cluster still INIT -> requeue.
         _make_launch_request('req-launch-init', RequestStatus.RUNNING,
                              'cluster-init'),
-        # Died before the cluster row was written -> requeue from scratch.
+        # Died before the cluster row was written: pre-provision side
+        # effects (e.g. storage creation) have no established re-run
+        # semantics -> client-retry path, not a replay.
         _make_launch_request('req-launch-no-row', RequestStatus.RUNNING,
                              'cluster-missing'),
         # Cluster reached UP: job submission may have happened -> the
@@ -356,16 +358,16 @@ async def test_recovery_requeues_interrupted_launches(isolated_database,
 
     assert requests_lib.recover_db_and_logs() is True
 
-    for request_id in ('req-launch-init', 'req-launch-no-row',
-                       'req-launch-waiting'):
+    for request_id in ('req-launch-init', 'req-launch-waiting'):
         record = requests_lib.get_request(request_id)
         assert record.status == RequestStatus.PENDING, request_id
         assert record.should_retry is False, request_id
         assert record.pid is None, request_id
         assert record.finished_at is None, request_id
-    record = requests_lib.get_request('req-launch-up')
-    assert record.status == RequestStatus.CANCELLED
-    assert record.should_retry is True
+    for request_id in ('req-launch-up', 'req-launch-no-row'):
+        record = requests_lib.get_request(request_id)
+        assert record.status == RequestStatus.CANCELLED, request_id
+        assert record.should_retry is True, request_id
     record = requests_lib.get_request('req-launch-waiting-retryable')
     assert record.status == RequestStatus.WAITING
     assert record.should_retry is False
@@ -399,3 +401,45 @@ async def test_requeued_launch_is_reenqueued(isolated_database,
 
     assert puts == [(requests_lib.ScheduleType.LONG, ('req-launch-init', False,
                                                       False))]
+
+
+def test_replayable_names_match_persisted_request_names():
+    # Request rows persist REQUEST_NAME_PREFIX + RequestName (see
+    # executor request creation); a bare enum value here would silently
+    # disable replay for every real launch row.
+    from sky.server import constants as server_constants
+    from sky.server.requests import request_names
+    valid_names = {n.value for n in request_names.RequestName}
+    for name in requests_lib.REPLAYABLE_REQUEST_NAMES:
+        assert name.startswith(server_constants.REQUEST_NAME_PREFIX), name
+        assert name[len(server_constants.REQUEST_NAME_PREFIX):] in \
+            valid_names, name
+
+
+@pytest.mark.asyncio
+async def test_cluster_status_lookup_failure_disqualifies_only_that_row(
+        isolated_database, isolated_legacy_logs, monkeypatch):
+    # A failing cluster-status lookup must fall back to the client-retry
+    # path for that launch only -- never abort recovery into the full-wipe
+    # fallback, which would discard unrelated queued rows.
+    seed = [
+        _make_launch_request('req-launch-bad-lookup', RequestStatus.RUNNING,
+                             'cluster-boom'),
+        _make_request('req-pending', RequestStatus.PENDING),
+    ]
+    for request in seed:
+        assert await requests_lib.create_if_not_exists_async(request)
+
+    def _boom(cluster_name):
+        raise RuntimeError('cluster-state DB unavailable')
+
+    monkeypatch.setattr(requests_lib.global_user_state,
+                        'get_status_from_cluster_name', _boom)
+
+    assert requests_lib.recover_db_and_logs() is True
+
+    record = requests_lib.get_request('req-launch-bad-lookup')
+    assert record.status == RequestStatus.CANCELLED
+    assert record.should_retry is True
+    record = requests_lib.get_request('req-pending')
+    assert record.status == RequestStatus.PENDING

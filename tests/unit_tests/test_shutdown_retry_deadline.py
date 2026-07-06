@@ -1,7 +1,7 @@
 """Regression test: the graceful-shutdown retry sweep must run before SIGKILL.
 
-The only path that flags a non-retriable request (sky.launch / sky.exec /
-sky.jobs.launch / ...) with ``should_retry`` is the timeout branch of
+The only path that flags a non-retriable request (sky.exec / sky.jobs.launch
+/ ...) with ``should_retry`` is the timeout branch of
 ``_wait_requests``, which interrupts the whole snapshot. The Helm chart wires
 ``terminationGracePeriodSeconds`` (the k8s SIGKILL deadline) to the same value
 as ``_WAIT_REQUESTS_TIMEOUT_SECONDS``. The old code started its timeout clock at
@@ -44,14 +44,13 @@ def _patch_backend(monkeypatch, side_effect):
 def test_sweep_fires_once_budgeted_deadline_passes(monkeypatch):
     # deadline = 100 + (60 - 10) = 150; now = 151 is past it.
     server, slept, interrupted = _server_at_shutdown(monkeypatch, now=151.0)
-    _patch_backend(monkeypatch,
-                   side_effect=lambda: [('req-launch', 'sky.launch')])
+    _patch_backend(monkeypatch, side_effect=lambda: [('req-exec', 'sky.exec')])
 
     server._wait_requests()
 
     # The non-retriable launch request is interrupted-for-retry by the sweep,
     # and we do NOT keep sleeping past the SIGKILL deadline.
-    assert interrupted == ['req-launch']
+    assert interrupted == ['req-exec']
     assert slept == []
 
 
@@ -81,8 +80,7 @@ def test_non_retriable_not_interrupted_before_deadline(monkeypatch):
     # now = 120 is before the deadline (150): the per-iteration branch must
     # leave the non-retriable request alone (wait for it), not retry-cancel it.
     server, slept, interrupted = _server_at_shutdown(monkeypatch, now=120.0)
-    _patch_backend(monkeypatch,
-                   side_effect=[[('req-launch', 'sky.launch')], []])
+    _patch_backend(monkeypatch, side_effect=[[('req-exec', 'sky.exec')], []])
 
     server._wait_requests()
 
@@ -95,7 +93,7 @@ def test_replayable_launch_neither_blocks_shutdown_nor_interrupted(monkeypatch):
     # provisioning outlives any realistic grace -- and must not be flagged
     # should_retry: its row is left RUNNING so startup recovery requeues and
     # re-executes it (sky/server/requests/requests.py,
-    # _requeue_interrupted_launches).
+    # _find_interrupted_launches_to_requeue).
     launch_name = uvicorn_module.requests_lib.REPLAYABLE_REQUEST_NAMES[0]
     # now = 101 is well before the deadline (150): the early exit must come
     # from the replayable filter, not the timeout sweep.

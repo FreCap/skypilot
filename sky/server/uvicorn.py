@@ -185,7 +185,8 @@ class Server(uvicorn.Server):
             # Replayable requests (launches) neither block shutdown nor get
             # cancelled: their rows are left as-is so startup recovery can
             # requeue and re-execute them (safe until their cluster reaches
-            # UP, see requests_lib._requeue_interrupted_launches). Waiting
+            # UP, see requests_lib._find_interrupted_launches_to_requeue).
+            # Waiting
             # for them here is pointless -- a provisioning launch outlives
             # any realistic shutdown grace -- and cancelling them would wedge
             # the half-provisioned cluster in INIT with only a client-side

@@ -89,11 +89,14 @@ _GC_INTERVAL_SECONDS = 3600
 RESET_REQUESTS_ON_STARTUP_ENV_VAR = 'SKYPILOT_RESET_REQUESTS_ON_STARTUP'
 
 # Request names whose entrypoints are safe to re-execute from scratch after a
-# server restart, provided their cluster has not reached UP (see
+# server restart, provided their cluster is still INIT (see
 # _requeue_interrupted_launches). Graceful shutdown leaves these rows RUNNING
 # instead of cancelling them, and startup recovery requeues them, so a server
 # redeploy completes an in-flight provisioning instead of dropping it.
-REPLAYABLE_REQUEST_NAMES = (request_names.RequestName.CLUSTER_LAUNCH.value,)
+# Request rows persist the prefixed name (executor stamps
+# REQUEST_NAME_PREFIX + request_name at creation), so match that form.
+REPLAYABLE_REQUEST_NAMES = (server_constants.REQUEST_NAME_PREFIX +
+                            request_names.RequestName.CLUSTER_LAUNCH.value,)
 
 # TODO(zhwu): For scalability, there are several TODOs:
 # [x] Have a way to queue requests.
@@ -815,29 +818,32 @@ def reset_db_and_logs():
     request_storage.get_request_backend().reset_on_startup()
 
 
-def _requeue_interrupted_launches(cursor: 'sqlite3.Cursor') -> int:
-    """Flip interrupted, safely-replayable launch rows back to PENDING.
+def _find_interrupted_launches_to_requeue() -> List[str]:
+    """List interrupted launch rows that are safe to re-execute.
 
     A launch whose executor died mid-provision leaves its cluster in INIT.
     The launch entrypoint is re-runnable by construction up to the point the
     cluster reaches UP: re-executing it resumes provisioning on the existing
     cluster record (the same thing a manual relaunch does), and the task's
     run section is only submitted after the cluster row is marked UP, so a
-    cluster still in INIT cannot have started user work. Requeue those rows
-    as PENDING so ``executor.reenqueue_recovered_requests`` re-executes them
-    and the original request id completes for any polling client.
+    cluster still in INIT cannot have started user work.
 
-    Rows whose cluster already reached UP (or any other non-INIT status) are
-    left for the generic CANCELLED + ``should_retry`` path: past UP the
-    remaining launch work has client-visible side effects (job submission)
-    that must not be silently repeated. Rows with no cluster record are
-    requeued: the launch died before provisioning was recorded, so a re-run
-    starts from scratch.
+    Any other case falls to the generic CANCELLED + ``should_retry`` path:
+    past UP the remaining launch work has client-visible side effects (job
+    submission) that must not be silently repeated, and a launch with no
+    cluster record yet may have pre-provision side effects (e.g. storage
+    creation) whose re-run semantics are not established. A failed cluster
+    status lookup likewise disqualifies just that row -- it must not abort
+    recovery of everything else.
 
-    Must run inside the recovery transaction, before the generic
-    interrupted-row sweep (which would otherwise cancel these rows).
+    Runs outside the recovery transaction: the per-cluster status lookups hit
+    the (possibly remote) cluster-state database and must not extend the
+    request-DB transaction. Safe because startup is single-threaded -- no
+    executor is running yet to change the rows in between.
     """
+    assert _DB is not None
     replayable_names = ', '.join(['?'] * len(REPLAYABLE_REQUEST_NAMES))
+    cursor = _DB.conn.cursor()
     cursor.execute(
         f'SELECT request_id, {COL_CLUSTER_NAME} FROM {REQUEST_TABLE} '
         f'WHERE name IN ({replayable_names}) '
@@ -846,24 +852,26 @@ def _requeue_interrupted_launches(cursor: 'sqlite3.Cursor') -> int:
         f'OR {COL_RETRYABLE} = 0)))',
         (*REPLAYABLE_REQUEST_NAMES, RequestStatus.RUNNING.value,
          RequestStatus.WAITING.value))
+    rows = cursor.fetchall()
     requeue_ids = []
-    for request_id, cluster_name in cursor.fetchall():
-        cluster_status = None
-        if cluster_name is not None:
-            cluster_status = global_user_state.get_status_from_cluster_name(
-                cluster_name)
-        if (cluster_status is None or
-                cluster_status == status_lib.ClusterStatus.INIT):
+    cluster_status_cache: Dict[str, Optional[status_lib.ClusterStatus]] = {}
+    for request_id, cluster_name in rows:
+        if cluster_name is None:
+            continue
+        if cluster_name not in cluster_status_cache:
+            try:
+                cluster_status_cache[cluster_name] = (
+                    global_user_state.get_status_from_cluster_name(cluster_name)
+                )
+            except Exception as e:  # pylint: disable=broad-except
+                logger.warning(
+                    f'Could not check status of cluster {cluster_name!r} '
+                    f'while recovering launch request {request_id}; leaving '
+                    f'the request to the client-retry path: {e}')
+                cluster_status_cache[cluster_name] = None
+        if cluster_status_cache[cluster_name] == status_lib.ClusterStatus.INIT:
             requeue_ids.append(request_id)
-    if requeue_ids:
-        placeholders = ', '.join(['?'] * len(requeue_ids))
-        cursor.execute(
-            f'UPDATE {REQUEST_TABLE} '
-            f'SET status = ?, pid = NULL, {COL_SHOULD_RETRY} = 0, '
-            f'{COL_FINISHED_AT} = NULL '
-            f'WHERE request_id IN ({placeholders})',
-            (RequestStatus.PENDING.value, *requeue_ids))
-    return len(requeue_ids)
+    return requeue_ids
 
 
 def _recover_requests() -> Tuple[int, int]:
@@ -875,11 +883,12 @@ def _recover_requests() -> Tuple[int, int]:
     - Internal daemon rows are deleted: a stale row would make
       ``schedule_internal_daemon_async``'s create-or-refresh path skip the
       enqueue and the daemon would never run this boot.
-    - Interrupted launch rows whose cluster has not reached UP are flipped
-      back to PENDING for re-execution (``_requeue_interrupted_launches``):
-      re-running a launch is safe until the cluster is UP, and this is what
-      lets a server redeploy complete an in-flight provisioning instead of
-      wedging the cluster in INIT.
+    - Interrupted launch rows whose cluster is still INIT are flipped back
+      to PENDING for re-execution
+      (``_find_interrupted_launches_to_requeue``): re-running a launch is
+      safe until the cluster is UP, and this is what lets a server redeploy
+      complete an in-flight provisioning instead of wedging the cluster in
+      INIT.
     - Other RUNNING rows, and WAITING rows that are not retryable, are
       marked CANCELLED with ``should_retry`` set so polling clients get the
       retry signal (HTTP 503) instead of a 404.
@@ -899,13 +908,23 @@ def _recover_requests() -> Tuple[int, int]:
         _init_db_within_lock()
     assert _DB is not None
     daemon_ids = sorted(d.id for d in daemons.INTERNAL_REQUEST_DAEMONS)
+    # Resolved before the transaction: the cluster-status lookups may be
+    # remote and must not extend it (see the helper's docstring).
+    requeue_ids = _find_interrupted_launches_to_requeue()
     with _DB.conn:
         cursor = _DB.conn.cursor()
         placeholders = ', '.join(['?'] * len(daemon_ids))
         cursor.execute(
             f'DELETE FROM {REQUEST_TABLE} '
             f'WHERE request_id IN ({placeholders})', daemon_ids)
-        replayed = _requeue_interrupted_launches(cursor)
+        if requeue_ids:
+            placeholders = ', '.join(['?'] * len(requeue_ids))
+            cursor.execute(
+                f'UPDATE {REQUEST_TABLE} '
+                f'SET status = ?, pid = NULL, {COL_SHOULD_RETRY} = 0, '
+                f'{COL_FINISHED_AT} = NULL '
+                f'WHERE request_id IN ({placeholders})',
+                (RequestStatus.PENDING.value, *requeue_ids))
         cursor.execute(
             f'UPDATE {REQUEST_TABLE} '
             f'SET status = ?, {COL_SHOULD_RETRY} = 1, {COL_FINISHED_AT} = ? '
@@ -915,10 +934,10 @@ def _recover_requests() -> Tuple[int, int]:
             (RequestStatus.CANCELLED.value, time.time(),
              RequestStatus.RUNNING.value, RequestStatus.WAITING.value))
         interrupted = cursor.rowcount
-        if replayed:
-            logger.info(f'Re-queued {replayed} interrupted launch request(s) '
-                        'whose clusters have not reached UP; they will be '
-                        're-executed to complete provisioning.')
+        if requeue_ids:
+            logger.info(f'Re-queued {len(requeue_ids)} interrupted launch '
+                        'request(s) whose clusters are still INIT; they will '
+                        'be re-executed to complete provisioning.')
         cursor.execute(
             f'SELECT COUNT(*) FROM {REQUEST_TABLE} '
             'WHERE status IN (?, ?)',
