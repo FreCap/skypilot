@@ -259,6 +259,7 @@ class TestInstanceAwareGpuShapeCache(unittest.TestCase):
         autoscaler._replica_cost_cache = {}
         autoscaler._bare_key_warned = set()
         autoscaler._snap_target_on_next_recompute = False
+        autoscaler._qps_dict_by_version = {}
         return autoscaler
 
     def _make_replica(self, gpu_type, launch_status, count=1):
@@ -652,3 +653,53 @@ class TestInstanceAwareUpdateRolloutSafety(unittest.TestCase):
                                   serve_utils.DEFAULT_UPDATE_MODE)
         self.assertEqual(autoscaler.target_qps_per_replica, {'A100': 10.0})
         self.assertFalse(autoscaler._snap_target_on_next_recompute)
+
+    def test_old_replicas_resolve_capacity_from_their_own_version_dict(self):
+        # Shape-changing update {'L4': 0.1} -> {'A100': 10.0}: live L4
+        # replicas launched under v1 must keep 0.1 capacity, not resolve
+        # via the new dict's min-value fallback (10.0 — a 100x
+        # overestimate that collapses the computed target and lets the
+        # drain kill the old fleet before new capacity exists).
+        autoscaler = self._make_autoscaler({'L4': 0.1})
+        autoscaler.update_version(2, self._spec({'A100': 10.0}),
+                                  serve_utils.DEFAULT_UPDATE_MODE)
+        self.assertEqual(
+            autoscaler._get_target_qps_for_gpu_shape('L4', 1, version=1), 0.1)
+        self.assertEqual(
+            autoscaler._get_target_qps_for_gpu_shape('A100', 1, version=2),
+            10.0)
+        # Unknown version (e.g. controller restarted and only knows the
+        # latest dict) falls back to the latest dict.
+        self.assertEqual(
+            autoscaler._get_target_qps_for_gpu_shape('A100', 1, version=99),
+            10.0)
+
+    def test_version_dicts_pruned_to_live_versions(self):
+        autoscaler = self._make_autoscaler({'L4': 0.1})
+        autoscaler.update_version(2, self._spec({'A100': 10.0}),
+                                  serve_utils.DEFAULT_UPDATE_MODE)
+        self.assertIn(1, autoscaler._qps_dict_by_version)
+        info = mock.Mock()
+        info.replica_id = 1
+        info.version = 2
+        info.is_terminal = False
+        with mock.patch.object(
+                autoscaler,
+                '_set_target_num_replicas_with_instance_aware_logic'), \
+             mock.patch.object(
+                autoscaler,
+                '_select_outdated_replicas_to_scale_down',
+                return_value=[]), \
+             mock.patch.object(
+                autoscaler, '_generate_scaling_decisions', return_value=[]):
+            autoscaler.generate_scaling_decisions([info], [2])
+        # No live replica on v1 anymore: its dict is dropped; v2 kept.
+        self.assertNotIn(1, autoscaler._qps_dict_by_version)
+        self.assertIn(2, autoscaler._qps_dict_by_version)
+
+    def test_stale_version_update_does_not_reset_hysteresis(self):
+        autoscaler = self._make_autoscaler({'A100': 10.0})
+        autoscaler.upscale_counter = 7
+        autoscaler.update_version(1, self._spec({'A100': 1.0}),
+                                  serve_utils.DEFAULT_UPDATE_MODE)
+        self.assertEqual(autoscaler.upscale_counter, 7)

@@ -445,6 +445,12 @@ class _AutoscalerWithHysteresis(Autoscaler):
 
     def update_version(self, version: int, spec: 'service_spec.SkyServiceSpec',
                        update_mode: serve_utils.UpdateMode) -> None:
+        if version <= self.latest_version:
+            # The base class rejects stale versions but returns normally;
+            # without this guard we would still reset the hysteresis
+            # counters and thresholds from the stale spec below.
+            super().update_version(version, spec, update_mode)
+            return
         super().update_version(version, spec, update_mode)
         # We directly set the target_num_replicas here instead of calling
         # `_set_target_num_replicas_with_hysteresis` to have the replicas
@@ -662,6 +668,17 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
         # restarts before the next tick, convergence just falls back to the
         # normal hysteresis path.
         self._snap_target_on_next_recompute: bool = False
+        # version -> that version's qps dict. A live replica's capacity is
+        # a property of the spec it was launched under: after a
+        # shape-changing update (e.g. {'L4': 0.1} -> {'A100': 10.0}) the
+        # old shape is missing from the new dict and would resolve via the
+        # min-value fallback — overestimating 100 old L4s by 100x, which
+        # collapses the computed target and lets the rolling drain kill
+        # them before the new capacity exists. Pruned each tick to the
+        # live replica versions (+ latest).
+        self._qps_dict_by_version: Dict[int, Dict[str, float]] = {
+            version: spec.target_qps_per_replica
+        }
 
     def generate_scaling_decisions(
         self,
@@ -685,6 +702,11 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
         for replica_id in list(self._replica_cost_cache):
             if replica_id not in live_replica_ids:
                 del self._replica_cost_cache[replica_id]
+        keep_versions = {info.version for info in replica_infos}
+        keep_versions.add(self.latest_version)
+        for version in list(self._qps_dict_by_version):
+            if version not in keep_versions:
+                del self._qps_dict_by_version[version]
         self._set_target_num_replicas_with_instance_aware_logic(replica_infos)
         return super().generate_scaling_decisions(replica_infos,
                                                   active_versions)
@@ -775,7 +797,8 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
                 # below.
                 observed_capacities = [
                     self._get_target_qps_for_gpu_shape(
-                        *self._get_gpu_shape_from_replica_info(info))
+                        *self._get_gpu_shape_from_replica_info(info),
+                        version=info.version)
                     for info in replica_infos
                     if not info.is_terminal
                 ]
@@ -904,7 +927,7 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
             # Use flexible matching logic, weighted by GPU count: a 4-GPU
             # replica contributes 4x the per-GPU capacity of a 1-GPU one.
             qps_for_this_replica = self._get_target_qps_for_gpu_shape(
-                gpu_type, gpu_count)
+                gpu_type, gpu_count, version=replica_info.version)
             total_qps += qps_for_this_replica
             logger.info(f'GPU shape {gpu_type}:{gpu_count} -> '
                         f'{qps_for_this_replica} QPS')
@@ -912,17 +935,27 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
         logger.info(f'Calculated total QPS: {total_qps}')
         return total_qps
 
-    def _get_target_qps_for_gpu_shape(self, gpu_type: str,
-                                      gpu_count: int) -> float:
+    def _get_target_qps_for_gpu_shape(self,
+                                      gpu_type: str,
+                                      gpu_count: int,
+                                      version: Optional[int] = None) -> float:
         """Per-replica target QPS for a `gpu_count` x `gpu_type` replica.
 
         Resolution (see serve_utils.resolve_target_qps_for_gpu_shape):
         exact shape key is a per-replica value; a bare type key is
         per-GPU and is multiplied by the replica's GPU count.
+
+        `version` selects the qps dict the replica was launched under, so
+        old-version replicas keep their real capacity across a
+        shape-changing update (falls back to the latest dict when the
+        version's dict is unknown, e.g. after a controller restart).
         """
         assert isinstance(self.target_qps_per_replica,
                           dict), 'Expected dict for instance-aware logic'
         target_qps_dict = self.target_qps_per_replica
+        if version is not None:
+            target_qps_dict = self._qps_dict_by_version.get(
+                version, target_qps_dict)
 
         resolved = serve_utils.resolve_target_qps_for_gpu_shape(
             gpu_type, gpu_count, target_qps_dict)
@@ -1029,7 +1062,7 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
 
             # Use flexible matching logic, weighted by GPU count.
             qps_for_this_replica = self._get_target_qps_for_gpu_shape(
-                gpu_type, gpu_count)
+                gpu_type, gpu_count, version=replica_info.version)
             ready_replica_qps.append(qps_for_this_replica)
             logger.info(f'Ready replica {replica_info.replica_id} '
                         f'with GPU {gpu_type}:{gpu_count}: '
@@ -1061,7 +1094,8 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
 
             # Use flexible matching logic, weighted by GPU count so
             # smaller-capacity replicas are preferred for scale-down.
-            target_qps = self._get_target_qps_for_gpu_shape(gpu_type, gpu_count)
+            target_qps = self._get_target_qps_for_gpu_shape(
+                gpu_type, gpu_count, version=info.version)
 
             replica_qps_pairs.append((info, float(target_qps)))
             logger.info(f'Replica {info.replica_id} '
@@ -1162,6 +1196,7 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
         # Assign BEFORE the base update runs so any recompute it triggers
         # sees the new version's dict.
         self.target_qps_per_replica = spec.target_qps_per_replica
+        self._qps_dict_by_version[version] = spec.target_qps_per_replica
         super(RequestRateAutoscaler,
               self).update_version(version, spec, update_mode)
         self._snap_target_on_next_recompute = True
