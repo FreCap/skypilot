@@ -168,6 +168,36 @@ class SkyServeController:
         self._lb_replica_cache = replica_cache
         return replica_info
 
+    def _get_routing_spec(self) -> Optional[Dict[str, Any]]:
+        """Build the routing spec for the load_balancer_sync response.
+
+        [boltz fork] The external load balancer fetches its routing
+        configuration -- load-balancing policy, per-replica target QPS, and
+        stream timeout -- over the sync channel instead of static launch
+        args, so a `sky serve update` that only changes these fields reaches
+        a running LB without re-rolling it. Sourced from the latest service
+        version's spec (the same version the replica manager/autoscaler are
+        advanced to on update). TLS is deliberately NOT synced -- it is
+        bound to uvicorn at launch and a private key must not stream over
+        this channel -- so it stays a launch/mounted-secret concern.
+        Returns None when the spec cannot be loaded yet (mid-init); the LB
+        tolerates a missing routing_spec and keeps its default policy until
+        the next sync.
+        """
+        record = serve_state.get_service_from_name(self._service_name)
+        if record is None:
+            return None
+        spec = serve_state.get_spec(self._service_name, record['version'])
+        if spec is None:
+            return None
+        return {
+            # `load_balancing_policy` resolves None to the default policy
+            # name, so the LB always receives a concrete policy to build.
+            'load_balancing_policy_name': spec.load_balancing_policy,
+            'target_qps_per_replica': spec.target_qps_per_replica,
+            'stream_timeout_seconds': spec.lb_stream_timeout_seconds,
+        }
+
     def _run_autoscaler(self):
         logger.info('Starting autoscaler.')
         while True:
@@ -259,9 +289,11 @@ class SkyServeController:
             logger.info(f'Received {len(timestamps)} inflight requests.')
             self._autoscaler.collect_request_information(request_aggregator)
 
-            return responses.JSONResponse(
-                content={'replica_info': self._get_lb_replica_info()},
-                status_code=200)
+            return responses.JSONResponse(content={
+                'replica_info': self._get_lb_replica_info(),
+                'routing_spec': self._get_routing_spec(),
+            },
+                                          status_code=200)
 
         # Deliberately a sync handler: FastAPI runs it in the threadpool, so
         # waiting on the replica-manager lock inside `update_version` (a probe

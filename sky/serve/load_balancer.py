@@ -2,7 +2,6 @@
 import argparse
 import asyncio
 import contextlib
-import json
 import logging
 import os
 import signal
@@ -106,28 +105,45 @@ class SkyServeLoadBalancer:
         load_balancing_policy_name: Optional[str] = None,
         tls_credential: Optional[serve_utils.TLSCredential] = None,
         target_qps_per_replica: Optional[Union[float, Dict[str, float]]] = None,
-        stream_timeout_seconds: int = constants.DEFAULT_LB_STREAM_TIMEOUT,
+        stream_timeout_seconds: Optional[int] = None,
     ) -> None:
         """Initialize the load balancer.
+
+        The routing spec -- load-balancing policy, per-replica target QPS, and
+        stream timeout -- is fetched from the controller over the
+        load_balancer_sync channel (see `_apply_routing_spec`), so `sky serve
+        update` changes to those fields reach a running LB without re-rolling
+        it. The corresponding constructor args are only a bootstrap seed (used
+        by the in-pod caller, which already has the spec): until the first sync
+        lands, the LB serves with whatever policy is built here, and the
+        readiness gate keeps traffic away until that first sync arrives. A
+        standalone LB passes None for all three and picks them up from sync.
 
         Args:
             controller_url: The URL of the controller.
             load_balancer_port: The port where the load balancer listens to.
-            load_balancing_policy_name: The name of the load balancing policy
-                to use. Defaults to None.
+            load_balancing_policy_name: Seed load balancing policy name.
+                Defaults to None (the default policy until the first sync).
             tls_credentials: The TLS credentials for HTTPS endpoint. Defaults
                 to None.
-            target_qps_per_replica: Target QPS per replica for instance-aware
-                load balancing. Can be a float or dict mapping GPU types to QPS.
-                Defaults to None.
-            stream_timeout_seconds: Timeout in seconds for proxied responses.
+            target_qps_per_replica: Seed target QPS per replica for
+                instance-aware load balancing. Can be a float or dict mapping
+                GPU types to QPS. Defaults to None.
+            stream_timeout_seconds: Seed timeout in seconds for proxied
+                responses. Defaults to None (the built-in default until synced).
         """
         self._app = fastapi.FastAPI()
         self._controller_url: str = controller_url
         self._load_balancer_port: int = load_balancer_port
-        # Use the registry to create the load balancing policy
+        # Use the registry to create the load balancing policy. Track the
+        # resolved policy name so a sync only rebuilds the policy object when
+        # the name actually changes (a policy swap is rare -- only on an
+        # update that changes the policy).
+        self._load_balancing_policy_name: str = (
+            lb_policies.LoadBalancingPolicy.make_policy_name(
+                load_balancing_policy_name))
         self._load_balancing_policy = lb_policies.LoadBalancingPolicy.make(
-            load_balancing_policy_name)
+            self._load_balancing_policy_name)
 
         # Set accelerator QPS for instance-aware policies
         if (target_qps_per_replica and
@@ -138,12 +154,14 @@ class SkyServeLoadBalancer:
                 target_qps_per_replica)
 
         logger.info('Starting load balancer with policy '
-                    f'{load_balancing_policy_name}.')
+                    f'{self._load_balancing_policy_name}.')
         self._request_aggregator: serve_utils.RequestsAggregator = (
             serve_utils.RequestTimestamp())
         self._tls_credential: Optional[serve_utils.TLSCredential] = (
             tls_credential)
-        self._stream_timeout_seconds: int = stream_timeout_seconds
+        self._stream_timeout_seconds: int = (
+            stream_timeout_seconds if stream_timeout_seconds is not None else
+            constants.DEFAULT_LB_STREAM_TIMEOUT)
         # TODO(tian): httpx.Client has a resource limit of 100 max connections
         # for each client. We should wait for feedback on the best max
         # connections.
@@ -231,6 +249,42 @@ class SkyServeLoadBalancer:
                 self._replica_dead_failures.pop(url, None)
                 self._replica_quarantine_until.pop(url, None)
 
+    def _apply_routing_spec(self, routing_spec: Dict[str, Any]) -> None:
+        """Apply a routing spec fetched from the controller.
+
+        Must be called while holding `_client_pool_lock` (it mutates the
+        policy object the routing hot path reads under that lock). The three
+        routing fields arrive over the sync channel so `sky serve update` can
+        change them on a running LB without a re-roll:
+
+        - policy: rebuild + swap the policy object ONLY when the resolved
+          name changes (cheap + idempotent otherwise). The fresh policy is
+          left empty; the caller's immediately-following `set_ready_replicas`
+          re-populates it from this same sync, which is why we do not copy
+          the old ready set over (that would short-circuit set_ready_replicas
+          and skip load-map initialization).
+        - target_qps_per_replica: applied to the active policy when it is
+          instance-aware and the value is a per-accelerator dict.
+        - stream_timeout_seconds: stored into the per-request instance var so
+          it takes effect on subsequent proxied requests.
+        """
+        policy_name = routing_spec.get('load_balancing_policy_name')
+        if (policy_name is not None and
+                policy_name != self._load_balancing_policy_name):
+            self._load_balancing_policy = lb_policies.LoadBalancingPolicy.make(
+                policy_name)
+            self._load_balancing_policy_name = (
+                lb_policies.LoadBalancingPolicy.make_policy_name(policy_name))
+        target_qps_per_replica = routing_spec.get('target_qps_per_replica')
+        if (isinstance(target_qps_per_replica, dict) and
+                isinstance(self._load_balancing_policy,
+                           lb_policies.InstanceAwareLeastLoadPolicy)):
+            self._load_balancing_policy.set_target_qps_per_accelerator(
+                target_qps_per_replica)
+        stream_timeout_seconds = routing_spec.get('stream_timeout_seconds')
+        if stream_timeout_seconds is not None:
+            self._stream_timeout_seconds = stream_timeout_seconds
+
     def _is_ready_to_serve(self) -> bool:
         """Readiness: true only once synced at least once and not draining."""
         return self._ready and not self._draining
@@ -252,6 +306,7 @@ class SkyServeLoadBalancer:
         close_client_tasks = []
         ready_replica_urls = []
         replica_info = {}
+        routing_spec = None
 
         async with aiohttp.ClientSession() as session:
             try:
@@ -270,6 +325,12 @@ class SkyServeLoadBalancer:
                     response.raise_for_status()
                     response_json = await response.json()
                     replica_info = response_json.get('replica_info', {})
+                    # [boltz fork] The controller ships the routing config
+                    # (policy/target-qps/stream-timeout) alongside replica_info
+                    # so `sky serve update` changes reach this LB without a
+                    # re-roll. Older controllers omit the key -> None -> the LB
+                    # keeps its launch-seeded policy.
+                    routing_spec = response_json.get('routing_spec')
                     ready_replica_urls = list(replica_info.keys())
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 logger.error(f'An error occurred when syncing with '
@@ -278,6 +339,12 @@ class SkyServeLoadBalancer:
             else:
                 logger.info(f'Available Replica URLs: {ready_replica_urls}')
                 with self._client_pool_lock:
+                    # Apply the fetched routing spec BEFORE (re)setting the
+                    # ready replicas: if the policy object was swapped, the
+                    # set_ready_replicas below re-populates the fresh policy
+                    # from this same sync.
+                    if routing_spec:
+                        self._apply_routing_spec(routing_spec)
                     # Keep quarantined (locally-evicted) replicas out of
                     # routing even if the controller still lists them as
                     # ready, until their TTL expires -- otherwise a dead
@@ -548,21 +615,27 @@ def run_load_balancer(
     load_balancing_policy_name: Optional[str] = None,
     tls_credential: Optional[serve_utils.TLSCredential] = None,
     target_qps_per_replica: Optional[Union[float, Dict[str, float]]] = None,
-    stream_timeout_seconds: int = constants.DEFAULT_LB_STREAM_TIMEOUT,
+    stream_timeout_seconds: Optional[int] = None,
 ) -> None:
     """Run the load balancer.
+
+    The routing spec (policy / target QPS / stream timeout) is fetched from the
+    controller over the sync channel; the corresponding args here are only a
+    bootstrap seed for the in-pod caller and default to None for the standalone
+    launcher (see `SkyServeLoadBalancer.__init__`).
 
     Args:
         controller_addr: The address of the controller.
         load_balancer_port: The port where the load balancer listens to.
-        policy_name: The name of the load balancing policy to use.
-        Defaults to None.
+        load_balancing_policy_name: Seed load balancing policy name.
+            Defaults to None.
         tls_credential:
             The TLS credentials for HTTPS endpoint. Defaults to None.
-        target_qps_per_replica: Target QPS per replica for instance-aware
+        target_qps_per_replica: Seed target QPS per replica for instance-aware
             load balancing. Can be a float or dict mapping GPU types to QPS.
             Defaults to None.
-        stream_timeout_seconds: Timeout in seconds for proxied responses.
+        stream_timeout_seconds: Seed timeout in seconds for proxied responses.
+            Defaults to None.
     """
     load_balancer = SkyServeLoadBalancer(
         controller_url=controller_addr,
@@ -577,13 +650,14 @@ def run_load_balancer(
 def _build_argument_parser() -> argparse.ArgumentParser:
     """Build the standalone (external) load balancer CLI parser.
 
-    The in-pod load balancer is spawned by the controller with the full
-    service spec (`service.py::_spawn_load_balancer`). A standalone load
-    balancer running outside the controller pod has no such spec object, so
-    every field the routing policy needs must be passed explicitly here --
-    otherwise `target_qps_per_replica` / `tls_credential` default to None and
-    `InstanceAwareLeastLoadPolicy` silently falls back to a uniform QPS of 1.0,
-    breaking accelerator-aware routing.
+    The routing spec -- load-balancing policy, per-replica target QPS, and
+    stream timeout -- is NOT a launch arg: the LB fetches it from the
+    controller over the load_balancer_sync channel (see
+    `SkyServeLoadBalancer._apply_routing_spec`), so `sky serve update` changes
+    reach a running LB without a re-roll. Only the controller address, the
+    listen port, and the TLS material stay CLI args: TLS is bound to uvicorn at
+    launch and a private key must never stream over the sync channel, so it
+    remains a launch/mounted-secret concern.
     """
     parser = argparse.ArgumentParser()
     parser.add_argument('--controller-addr',
@@ -593,23 +667,6 @@ def _build_argument_parser() -> argparse.ArgumentParser:
                         type=int,
                         required=True,
                         help='The port where the load balancer listens to.')
-    available_policies = list(lb_policies.LB_POLICIES.keys())
-    parser.add_argument(
-        '--load-balancing-policy',
-        choices=available_policies,
-        default=lb_policies.DEFAULT_LB_POLICY,
-        help=f'The load balancing policy to use. Available policies: '
-        f'{", ".join(available_policies)}.')
-    parser.add_argument(
-        '--target-qps-per-replica',
-        type=str,
-        default=None,
-        help='Target QPS per replica, as JSON. Instance-aware load balancing '
-        'consumes the OBJECT form mapping accelerator type to QPS (e.g. '
-        '\'{"H100": 2.5, "A100": 1.0}\'), which must match the service spec; a '
-        'bare number (e.g. "2.5") is accepted for compatibility but is not used '
-        'by the instance-aware policy. When unset, instance-aware routing falls '
-        'back to a uniform QPS of 1.0.')
     parser.add_argument(
         '--tls-keyfile',
         type=str,
@@ -622,11 +679,6 @@ def _build_argument_parser() -> argparse.ArgumentParser:
         default=None,
         help='Path to the TLS certificate file for the HTTPS endpoint. Must '
         'be given together with --tls-keyfile.')
-    parser.add_argument(
-        '--stream-timeout-seconds',
-        type=int,
-        default=constants.DEFAULT_LB_STREAM_TIMEOUT,
-        help='Timeout in seconds for proxied (possibly streaming) responses.')
     return parser
 
 
@@ -635,26 +687,11 @@ def _resolve_launch_kwargs(parser: argparse.ArgumentParser,
     """Coerce parsed CLI args into `run_load_balancer` kwargs.
 
     Invalid combinations exit via `parser.error()`. Factored out of __main__
-    so the JSON/TLS coercion is unit-testable without starting a server.
+    so the TLS coercion is unit-testable without starting a server. The
+    routing spec (policy / target QPS / stream timeout) is sync-fetched, so it
+    is not resolved here -- the standalone launcher passes None and the values
+    arrive on the first controller sync.
     """
-    target_qps_per_replica: Optional[Union[float, Dict[str, float]]] = None
-    if args.target_qps_per_replica is not None:
-        try:
-            target_qps_per_replica = json.loads(args.target_qps_per_replica)
-        except json.JSONDecodeError as e:
-            parser.error(f'--target-qps-per-replica must be valid JSON (a '
-                         f'number or an object): {e}')
-        # bool is a subclass of int, so guard it explicitly ("true"/"false"
-        # must not be accepted as a QPS).
-        if isinstance(target_qps_per_replica,
-                      bool) or not isinstance(target_qps_per_replica,
-                                              (int, float, dict)):
-            parser.error('--target-qps-per-replica must be a number or a JSON '
-                         'object mapping accelerator type to QPS.')
-        if isinstance(target_qps_per_replica,
-                      (int, float)) and target_qps_per_replica <= 0:
-            parser.error('--target-qps-per-replica must be positive.')
-
     if (args.tls_keyfile is None) != (args.tls_certfile is None):
         parser.error('--tls-keyfile and --tls-certfile must be given together.')
     tls_credential: Optional[serve_utils.TLSCredential] = None
@@ -665,10 +702,7 @@ def _resolve_launch_kwargs(parser: argparse.ArgumentParser,
     return dict(
         controller_addr=args.controller_addr,
         load_balancer_port=args.load_balancer_port,
-        load_balancing_policy_name=args.load_balancing_policy,
         tls_credential=tls_credential,
-        target_qps_per_replica=target_qps_per_replica,
-        stream_timeout_seconds=args.stream_timeout_seconds,
     )
 
 
