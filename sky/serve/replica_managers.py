@@ -1325,6 +1325,7 @@ class SkyPilotReplicaManager(ReplicaManager):
     # Thread-pool bound for the per-probe-round parallel cloud pre-filter
     # over failed-probe spot replicas (see _cloud_instance_looks_alive).
     _PREEMPTION_PREFILTER_PARALLELISM = 16
+    _PROBE_ROUND_MAX_PARALLELISM = 256
 
     def _cloud_instance_looks_alive(self, info: ReplicaInfo) -> bool:
         """Whether the cloud still reports this replica's instance(s) as UP.
@@ -1707,8 +1708,14 @@ class SkyPilotReplicaManager(ReplicaManager):
         self._tick_version_spec_cache = {}
         probe_futures = []
         replica_to_probe = []
-        with mp_pool.ThreadPool() as pool:
-            infos = serve_state.get_replica_infos(self._service_name)
+        infos = serve_state.get_replica_infos(self._service_name)
+        # Probes are pure I/O (HTTP GET/POST with a several-second timeout):
+        # the default ThreadPool size (cpu_count) turns a large fleet into
+        # dozens of sequential probe waves and the round overruns its 10s
+        # period. Size the pool to the fleet, capped to bound thread cost.
+        num_probe_threads = min(max(len(infos), 1),
+                                self._PROBE_ROUND_MAX_PARALLELISM)
+        with mp_pool.ThreadPool(num_probe_threads) as pool:
             for info in infos:
                 if not info.status_property.should_track_service_status():
                     continue
@@ -1769,6 +1776,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                         failed_spot_infos, alive_flags) if not alive
                 }
 
+            pending_writes: List[Tuple[int, ReplicaInfo]] = []
+            replicas_to_teardown: List[int] = []
             for future_result in probe_results:
                 info, probe_succeeded, probe_time = future_result
                 info.status_property.service_ready_now = probe_succeeded
@@ -1835,12 +1844,23 @@ class SkyPilotReplicaManager(ReplicaManager):
                                         f'seconds ({current_delay_seconds}s '
                                         f'/ {initial_delay_seconds}s). '
                                         'Skipping.')
-                serve_state.add_or_update_replica(self._service_name,
-                                                  info.replica_id, info)
+                pending_writes.append((info.replica_id, info))
                 if should_teardown:
-                    self._terminate_replica(info.replica_id,
-                                            sync_down_logs=True,
-                                            replica_drain_delay_seconds=0)
+                    replicas_to_teardown.append(info.replica_id)
+
+            # One multi-row upsert for the whole round's bookkeeping instead
+            # of a DB round-trip per replica (all under the manager lock
+            # either way, so batching changes no interleaving — it only
+            # shortens how long the round holds the lock). Flushed BEFORE
+            # the teardowns: _terminate_replica re-reads the replica row,
+            # and the probe mutations (e.g. first_ready_time=-1.0, which
+            # drives the failure classification) must be visible to it.
+            serve_state.add_or_update_replicas(self._service_name,
+                                               pending_writes)
+            for replica_id in replicas_to_teardown:
+                self._terminate_replica(replica_id,
+                                        sync_down_logs=True,
+                                        replica_drain_delay_seconds=0)
 
     def _replica_prober(self) -> None:
         """Periodically probe replicas."""

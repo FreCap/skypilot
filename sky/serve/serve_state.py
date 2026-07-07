@@ -4,7 +4,7 @@ import enum
 import json
 import pickle
 import typing
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import uuid
 
 import colorama
@@ -723,6 +723,44 @@ def add_or_update_replica(service_name: str, replica_id: int,
             service_name=service_name,
             replica_id=replica_id,
             replica_info=pickle.dumps(replica_info))
+
+        insert_stmt = insert_stmt.on_conflict_do_update(
+            index_elements=['service_name', 'replica_id'],
+            set_={'replica_info': insert_stmt.excluded.replica_info})
+
+        session.execute(insert_stmt)
+        session.commit()
+
+
+def add_or_update_replicas(
+        service_name: str,
+        replica_infos: List[Tuple[int,
+                                  'replica_managers.ReplicaInfo']]) -> None:
+    """Upserts a batch of replicas in one statement/transaction.
+
+    The probe round persists per-replica bookkeeping for every probed
+    replica; issuing those as individual upserts serializes one DB
+    round-trip per replica under the replica-manager lock (at ~1k replicas
+    on Postgres that alone exceeds the probe period). Multi-row
+    ON CONFLICT upsert keeps the round O(1) in round-trips.
+    """
+    if not replica_infos:
+        return
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
+            insert_func = sqlite.insert
+        elif (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value
+             ):
+            insert_func = postgresql.insert
+        else:
+            raise ValueError('Unsupported database dialect')
+
+        insert_stmt = insert_func(replicas_table).values([{
+            'service_name': service_name,
+            'replica_id': replica_id,
+            'replica_info': pickle.dumps(replica_info),
+        } for replica_id, replica_info in replica_infos])
 
         insert_stmt = insert_stmt.on_conflict_do_update(
             index_elements=['service_name', 'replica_id'],
