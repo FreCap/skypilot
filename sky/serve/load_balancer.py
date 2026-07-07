@@ -1,10 +1,12 @@
 """LoadBalancer: Distribute any incoming request to all ready replicas."""
+import argparse
 import asyncio
+import json
 import logging
 import os
 import threading
 import traceback
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import aiohttp
 import fastapi
@@ -367,17 +369,24 @@ def run_load_balancer(
     load_balancer.run()
 
 
-if __name__ == '__main__':
-    import argparse
+def _build_argument_parser() -> argparse.ArgumentParser:
+    """Build the standalone (external) load balancer CLI parser.
+
+    The in-pod load balancer is spawned by the controller with the full
+    service spec (`service.py::_spawn_load_balancer`). A standalone load
+    balancer running outside the controller pod has no such spec object, so
+    every field the routing policy needs must be passed explicitly here --
+    otherwise `target_qps_per_replica` / `tls_credential` default to None and
+    `InstanceAwareLeastLoadPolicy` silently falls back to a uniform QPS of 1.0,
+    breaking accelerator-aware routing.
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument('--controller-addr',
                         required=True,
-                        default='127.0.0.1',
                         help='The address of the controller.')
     parser.add_argument('--load-balancer-port',
                         type=int,
                         required=True,
-                        default=8890,
                         help='The port where the load balancer listens to.')
     available_policies = list(lb_policies.LB_POLICIES.keys())
     parser.add_argument(
@@ -386,9 +395,70 @@ if __name__ == '__main__':
         default=lb_policies.DEFAULT_LB_POLICY,
         help=f'The load balancing policy to use. Available policies: '
         f'{", ".join(available_policies)}.')
-    args = parser.parse_args()
-    run_load_balancer(args.controller_addr,
-                      args.load_balancer_port,
-                      args.load_balancing_policy,
-                      tls_credential=None,
-                      target_qps_per_replica=None)
+    parser.add_argument(
+        '--target-qps-per-replica',
+        type=str,
+        default=None,
+        help='Target QPS per replica for instance-aware load balancing, as '
+        'JSON: either a number (e.g. "2.5") or an object mapping accelerator '
+        'type to QPS (e.g. \'{"H100": 2.5, "A100": 1.0}\'). Must match the '
+        'service spec; when unset, instance-aware routing falls back to a '
+        'uniform QPS of 1.0.')
+    parser.add_argument(
+        '--tls-keyfile',
+        type=str,
+        default=None,
+        help='Path to the TLS private key file for the HTTPS endpoint. Must '
+        'be given together with --tls-certfile.')
+    parser.add_argument(
+        '--tls-certfile',
+        type=str,
+        default=None,
+        help='Path to the TLS certificate file for the HTTPS endpoint. Must '
+        'be given together with --tls-keyfile.')
+    parser.add_argument(
+        '--stream-timeout-seconds',
+        type=int,
+        default=constants.DEFAULT_LB_STREAM_TIMEOUT,
+        help='Timeout in seconds for proxied (possibly streaming) responses.')
+    return parser
+
+
+def _resolve_launch_kwargs(parser: argparse.ArgumentParser,
+                           args: argparse.Namespace) -> Dict[str, Any]:
+    """Coerce parsed CLI args into `run_load_balancer` kwargs.
+
+    Invalid combinations exit via `parser.error()`. Factored out of __main__
+    so the JSON/TLS coercion is unit-testable without starting a server.
+    """
+    target_qps_per_replica: Optional[Union[float, Dict[str, float]]] = None
+    if args.target_qps_per_replica is not None:
+        try:
+            target_qps_per_replica = json.loads(args.target_qps_per_replica)
+        except json.JSONDecodeError as e:
+            parser.error(f'--target-qps-per-replica must be valid JSON (a '
+                         f'number or an object): {e}')
+        if not isinstance(target_qps_per_replica, (int, float, dict)):
+            parser.error('--target-qps-per-replica must be a number or a JSON '
+                         'object mapping accelerator type to QPS.')
+
+    if (args.tls_keyfile is None) != (args.tls_certfile is None):
+        parser.error('--tls-keyfile and --tls-certfile must be given together.')
+    tls_credential: Optional[serve_utils.TLSCredential] = None
+    if args.tls_keyfile is not None:
+        tls_credential = serve_utils.TLSCredential(keyfile=args.tls_keyfile,
+                                                   certfile=args.tls_certfile)
+
+    return dict(
+        controller_addr=args.controller_addr,
+        load_balancer_port=args.load_balancer_port,
+        load_balancing_policy_name=args.load_balancing_policy,
+        tls_credential=tls_credential,
+        target_qps_per_replica=target_qps_per_replica,
+        stream_timeout_seconds=args.stream_timeout_seconds,
+    )
+
+
+if __name__ == '__main__':
+    _parser = _build_argument_parser()
+    run_load_balancer(**_resolve_launch_kwargs(_parser, _parser.parse_args()))
