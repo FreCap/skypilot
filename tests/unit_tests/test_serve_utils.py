@@ -1349,33 +1349,3 @@ def test_external_lb_socket_endpoint_substitutes_and_strips_protocol():
         # Protocol is stripped; callers re-add http/https based on TLS.
         assert serve_utils.external_lb_socket_endpoint(
             'mysvc', 30001) == 'serve-mysvc.serve.svc:30001'
-
-
-# ---------------------------------------------------------------------------
-# validate_external_load_balancer_config (H3): external mode without an
-# endpoint template must fail early with a clear error, not crash up() later.
-# ---------------------------------------------------------------------------
-
-
-def test_validate_external_lb_config_off_is_noop():
-    with mock.patch.object(serve_utils,
-                           'is_external_load_balancer_mode',
-                           return_value=False):
-        serve_utils.validate_external_load_balancer_config()  # no raise
-
-
-def test_validate_external_lb_config_ok_when_template_set():
-    with mock.patch.object(serve_utils,
-                           'is_external_load_balancer_mode',
-                           return_value=True), \
-         _patch_endpoint_template('serve-{service_name}.svc:{load_balancer_port}'):
-        serve_utils.validate_external_load_balancer_config()  # no raise
-
-
-def test_validate_external_lb_config_raises_when_template_missing():
-    with mock.patch.object(serve_utils,
-                           'is_external_load_balancer_mode',
-                           return_value=True), \
-         _patch_endpoint_template(None):
-        with pytest.raises(ValueError):
-            serve_utils.validate_external_load_balancer_config()

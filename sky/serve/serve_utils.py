@@ -398,29 +398,6 @@ def get_controller_auth_token() -> Optional[str]:
     return os.environ.get(constants.CONTROLLER_AUTH_TOKEN_ENV_VAR) or None
 
 
-def validate_external_load_balancer_config() -> None:
-    """Fail early if external LB mode lacks an endpoint template.
-
-    With `external_load_balancer` on but `external_load_balancer_endpoint`
-    unset, the service endpoint cannot be synthesized: `up()` would report a
-    dead `localhost:{port}` (consolidation) or trip the `socket_endpoint is not
-    None` assertion (non-consolidation). Raise a clear config error instead.
-    """
-    if not is_external_load_balancer_mode():
-        return
-    template = skypilot_config.get_nested(
-        ('serve', 'controller', 'external_load_balancer_endpoint'),
-        default_value=None)
-    if not template:
-        with ux_utils.print_exception_no_traceback():
-            raise ValueError(
-                'serve.controller.external_load_balancer is enabled but '
-                'serve.controller.external_load_balancer_endpoint is not set. '
-                'Configure the endpoint template (with {service_name} and '
-                '{load_balancer_port} placeholders) so the service endpoint '
-                'can be reported.')
-
-
 def external_lb_socket_endpoint(
         service_name: str, load_balancer_port: Optional[int]) -> Optional[str]:
     """The external load balancer's socket endpoint (host:port), or None.
