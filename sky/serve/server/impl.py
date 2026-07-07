@@ -45,6 +45,8 @@ from sky.utils import yaml_utils
 
 if typing.TYPE_CHECKING:
     import grpc
+
+    from sky.utils import config_utils
 else:
     grpc = adaptors_common.LazyImport('grpc')
 
@@ -606,6 +608,35 @@ def up(
         return service_name, endpoint
 
 
+def _reject_external_lb_mode_flip(
+        mutated_config: 'config_utils.Config') -> None:
+    """Reject an update that would flip a service's external_load_balancer mode.
+
+    ``external_load_balancer`` selects between an in-pod load balancer and an
+    out-of-pod (external) one. The two topologies have no supported live
+    migration -- switching binds/unbinds the stable controller port and
+    starts/stops the in-pod LB -- so it is an up/down-only choice.
+
+    The mode is a global ``serve.controller`` setting (see
+    ``serve_utils.is_external_load_balancer_mode``); the running service uses
+    the server's current effective mode, while an admin policy applied to this
+    update may rewrite it for the new version. We compare the two and reject
+    only an actual change; a same-mode update proceeds. (A change made by
+    editing the server config between ``up`` and ``update`` is not caught here,
+    because the mode is not persisted per service -- that would need a schema
+    migration, out of scope for this guard.)
+    """
+    existing_external = serve_utils.is_external_load_balancer_mode()
+    with skypilot_config.replace_skypilot_config(mutated_config):
+        new_external = serve_utils.is_external_load_balancer_mode()
+    if existing_external != new_external:
+        with ux_utils.print_exception_no_traceback():
+            raise ValueError(
+                'Cannot change the external_load_balancer mode of a running '
+                'service via update; this switch has no live migration. Tear '
+                'down the service and spin up a new one instead.')
+
+
 def update(
     task: Optional['task_lib.Task'],
     service_name: str,
@@ -679,9 +710,13 @@ def update(
     # and get the mutated config.
     # TODO(cblmemo,zhwu): If a user sets a new skypilot_config, the update
     # will not apply the config.
-    dag, _ = admin_policy_utils.apply(
+    dag, mutated_config = admin_policy_utils.apply(
         task, request_name=request_names.AdminPolicyRequestName.SERVE_UPDATE)
     task = dag.tasks[0]
+    # Pools have no load balancer, so the external_load_balancer mode does not
+    # apply to them; only guard real services.
+    if not pool:
+        _reject_external_lb_mode_flip(mutated_config)
     if pool:
         _maybe_display_run_warning(task)
         # Use dummy run script for pool.

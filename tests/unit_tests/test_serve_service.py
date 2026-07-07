@@ -632,6 +632,56 @@ def test_select_controller_port_range_exhausted_raises():
             service._select_controller_port('svc')
 
 
+def test_select_controller_port_reclaims_terminal_service_port():
+    # A terminal (dying/broken) service still holds a row with its stable port,
+    # but under churn that port must be reclaimable -- otherwise the range leaks
+    # one port per dead service. base is occupied only by a terminal service, so
+    # the new service should be assigned base, not base+1.
+    base = service.constants.CONTROLLER_PORT_START
+    others = [{
+        'name': 'dead',
+        'controller_port': base,
+        'status': service.serve_state.ServiceStatus.FAILED_CLEANUP,
+    }, {
+        'name': 'live',
+        'controller_port': base + 1,
+        'status': service.serve_state.ServiceStatus.READY,
+    }]
+    with _external_lb_mode(), \
+         mock.patch.object(service.serve_state,
+                           'get_service_controller_port',
+                           return_value=None), \
+         mock.patch.object(service.serve_state,
+                           'get_services',
+                           return_value=others), \
+         mock.patch.object(service.serve_state,
+                           'set_service_controller_port') as setter:
+        assert service._select_controller_port('svc') == base
+        setter.assert_called_once_with('svc', base)
+
+
+def test_select_controller_port_live_service_port_not_reclaimed():
+    # A live (non-terminal) service's port must stay reserved; the new service
+    # skips base and takes base+1.
+    base = service.constants.CONTROLLER_PORT_START
+    others = [{
+        'name': 'live',
+        'controller_port': base,
+        'status': service.serve_state.ServiceStatus.READY,
+    }]
+    with _external_lb_mode(), \
+         mock.patch.object(service.serve_state,
+                           'get_service_controller_port',
+                           return_value=None), \
+         mock.patch.object(service.serve_state,
+                           'get_services',
+                           return_value=others), \
+         mock.patch.object(service.serve_state,
+                           'set_service_controller_port') as setter:
+        assert service._select_controller_port('svc') == base + 1
+        setter.assert_called_once_with('svc', base + 1)
+
+
 # ---------------------------------------------------------------------------
 # _ensure_load_balancer: in external load balancer mode (W3) the controller
 # must NOT spawn or supervise an in-pod load balancer (the LB is a separate

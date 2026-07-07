@@ -473,9 +473,15 @@ def _select_controller_port(service_name: str) -> int:
         assigned = serve_state.get_service_controller_port(service_name)
         if assigned is not None and base <= assigned < end:
             return assigned
+        # Terminal services (dying or already broken) no longer hold their
+        # controller port -- excluding them lets the stable-port range be
+        # reclaimed under churn instead of leaking one port per dead service.
+        terminal = serve_state.ServiceStatus.terminal_statuses()
         in_use = {
-            svc['controller_port'] for svc in serve_state.get_services() if
-            svc['name'] != service_name and svc['controller_port'] is not None
+            svc['controller_port']
+            for svc in serve_state.get_services()
+            if svc['name'] != service_name and svc['controller_port']
+            is not None and svc.get('status') not in terminal
         }
         for port in range(base, end):
             if port not in in_use:

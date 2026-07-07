@@ -31,19 +31,23 @@ from sky.utils import ux_utils
 logger = sky_logging.init_logger(__name__)
 
 
-def _make_auth_dependency(expected_token: Optional[str]) -> Callable:
+def _make_auth_dependency() -> Callable:
     """Build a FastAPI dependency that enforces a shared bearer token.
 
-    When `expected_token` is None (auth disabled), the dependency is a no-op so
-    in-pod / localhost-only deployments are unchanged. Otherwise it requires an
-    `Authorization: Bearer <token>` header matching in constant time; a missing
-    or wrong token yields 401. Applied only to the destructive endpoints -- the
-    read-only load_balancer_sync path stays open for the credential-free LB.
+    The expected token is read fresh from `serve_utils.get_controller_auth_token()`
+    on every request, so a token rotated after the controller boots is honored
+    without a respawn. When the token is None/empty (auth disabled), the
+    dependency is a no-op so in-pod / localhost-only deployments are unchanged.
+    Otherwise it requires an `Authorization: Bearer <token>` header matching in
+    constant time; a missing or wrong token yields 401. Applied only to the
+    destructive endpoints -- the read-only load_balancer_sync path stays open
+    for the credential-free LB.
     """
 
     async def _verify(authorization: Optional[str] = fastapi.Header(
         None)) -> None:
-        if expected_token is None:
+        expected_token = serve_utils.get_controller_auth_token()
+        if not expected_token:
             return
         expected = f'Bearer {expected_token}'
         if authorization is None or not hmac.compare_digest(
@@ -270,8 +274,7 @@ class SkyServeController:
         # Guard the destructive endpoints with a shared bearer token (no-op
         # when unset). The read-only load_balancer_sync path is intentionally
         # left open so the credential-free external LB can sync.
-        auth_dependency = fastapi.Depends(
-            _make_auth_dependency(serve_utils.get_controller_auth_token()))
+        auth_dependency = fastapi.Depends(_make_auth_dependency())
 
         @self._app.get('/autoscaler/info')
         async def get_autoscaler_info() -> fastapi.Response:
