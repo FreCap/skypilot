@@ -70,6 +70,11 @@ LB_MAX_RETRY = 3
 # https://github.com/lm-sys/FastChat/blob/f2e6ca964af7ad0585cadcf16ab98e57297e2133/fastchat/constants.py#L39 # pylint: disable=line-too-long
 DEFAULT_LB_STREAM_TIMEOUT = 120
 
+# Extra margin past the stream timeout before a pruned replica's drained
+# httpx client is force-closed even with requests still counted in flight
+# (guards against a stuck counter leaking connections forever).
+LB_DRAIN_CLOSE_GRACE_SECONDS = 60
+
 # Connect timeout for the LB -> replica hop, independent of the stream
 # (read) timeout above: connections to a preempted-but-still-routed
 # replica must fail fast into the retry loop even when the stream

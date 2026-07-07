@@ -4,7 +4,7 @@ import logging
 import os
 import threading
 import traceback
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Set, Union
 
 import aiohttp
 import fastapi
@@ -19,6 +19,12 @@ from sky.serve import serve_utils
 from sky.utils import common_utils
 
 logger = sky_logging.init_logger(__name__)
+
+# Per-client in-flight request counter attribute. Attached to the
+# httpx.AsyncClient OBJECT (not keyed by URL): a URL pruned and re-added
+# gets a fresh client while the old one is still draining, and the two
+# must not share a counter.
+_INFLIGHT_ATTR = '_sky_inflight_requests'
 
 
 class SkyServeLoadBalancer:
@@ -87,6 +93,9 @@ class SkyServeLoadBalancer:
         # We need this lock to avoid getting from the client pool while
         # updating it from _sync_with_controller.
         self._client_pool_lock: threading.Lock = threading.Lock()
+        # Strong refs to in-progress drain-close tasks (see
+        # _drain_and_close_client); a bare create_task result can be GCed.
+        self._client_close_tasks: Set[asyncio.Task] = set()
 
     async def _sync_with_controller_once(self) -> List[asyncio.Task]:
         close_client_tasks = []
@@ -134,10 +143,42 @@ class SkyServeLoadBalancer:
                     client_to_close = []
                     for replica_url in urls_to_close:
                         client_to_close.append(
-                            self._client_pool.pop(replica_url))
-                for client in client_to_close:
-                    close_client_tasks.append(client.aclose())
+                            (replica_url, self._client_pool.pop(replica_url)))
+                for replica_url, client in client_to_close:
+                    # Fire-and-forget: a drain can legitimately take as long
+                    # as the longest in-flight prediction; the sync loop must
+                    # never wait on it. Strong refs held in the task set (a
+                    # bare create_task result can be garbage collected).
+                    task = asyncio.create_task(
+                        self._drain_and_close_client(replica_url, client))
+                    self._client_close_tasks.add(task)
+                    task.add_done_callback(self._client_close_tasks.discard)
         return close_client_tasks
+
+    async def _drain_and_close_client(self, url: str,
+                                      client: httpx.AsyncClient) -> None:
+        """Close a pruned replica's client once its in-flight work drains.
+
+        aclose() cancels every request still running on the client, so
+        closing at prune time turned every graceful replica removal
+        (spot drain, rolling update, transient NOT_READY) into aborted
+        in-flight predictions. Wait for the per-client in-flight counter
+        (maintained by _proxy_request_to) to reach zero; the deadline
+        (stream timeout + margin) bounds leaked connections if a counter
+        is ever stuck.
+        """
+        deadline = (asyncio.get_event_loop().time() +
+                    self._stream_timeout_seconds +
+                    constants.LB_DRAIN_CLOSE_GRACE_SECONDS)
+        while (getattr(client, _INFLIGHT_ATTR, 0) > 0 and
+               asyncio.get_event_loop().time() < deadline):
+            await asyncio.sleep(1)
+        inflight = getattr(client, _INFLIGHT_ATTR, 0)
+        if inflight > 0:
+            logger.warning(f'Closing drained client for {url} with '
+                           f'{inflight} request(s) still in flight '
+                           '(drain deadline exceeded).')
+        await client.aclose()
 
     async def _sync_with_controller(self):
         """Sync with controller periodically.
@@ -191,6 +232,22 @@ class SkyServeLoadBalancer:
                 client = self._client_pool.get(url, None)
             if client is None:
                 return RuntimeError(f'Client for {url} not found.')
+            # Counted on the CLIENT object so a pruned client is closed
+            # only after its in-flight work drains (a re-added URL gets a
+            # fresh client with its own counter). Decremented exactly once
+            # per request alongside the slot release below.
+            setattr(client, _INFLIGHT_ATTR,
+                    getattr(client, _INFLIGHT_ATTR, 0) + 1)
+            client_refcount_dropped = False
+
+            def _drop_client_refcount():
+                nonlocal client_refcount_dropped
+                if client_refcount_dropped:
+                    return
+                client_refcount_dropped = True
+                setattr(client, _INFLIGHT_ATTR,
+                        getattr(client, _INFLIGHT_ATTR, 1) - 1)
+
             worker_url = httpx.URL(path=request.url.path,
                                    query=request.url.query.encode('utf-8'))
             proxy_request = client.build_request(
@@ -227,6 +284,7 @@ class SkyServeLoadBalancer:
                 finally:
                     self._load_balancing_policy.post_execute_hook(
                         url, request, slot_token)
+                    _drop_client_refcount()
 
             async def _stream_with_release():
                 try:
@@ -253,6 +311,10 @@ class SkyServeLoadBalancer:
             if not released:
                 self._load_balancing_policy.post_execute_hook(
                     url, request, slot_token)
+                # Only defined once the client was checked out; exits
+                # before that (no client) have nothing to drop.
+                if 'client' in locals() and client is not None:
+                    _drop_client_refcount()
 
     async def _proxy_with_retries(
             self, request: fastapi.Request) -> fastapi.responses.Response:
