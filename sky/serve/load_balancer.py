@@ -326,6 +326,19 @@ class SkyServeLoadBalancer:
         stream_timeout_seconds = routing_spec.get('stream_timeout_seconds')
         if stream_timeout_seconds is not None:
             self._stream_timeout_seconds = stream_timeout_seconds
+        # Retry tuning rides the same channel so `sky serve update` (and
+        # external LBs, which never see the spawn args) picks it up live.
+        # `None` means "not set in the spec": fall back to the defaults
+        # rather than keeping a stale override from a previous version.
+        retriable = routing_spec.get('retriable_status_codes')
+        self._retriable_status_codes = frozenset(retriable or ())
+        max_retries = routing_spec.get('max_retries')
+        self._max_retries = (max_retries if max_retries is not None else
+                             constants.LB_MAX_RETRY)
+        backoff_seconds = routing_spec.get('retry_initial_backoff_seconds')
+        self._retry_initial_backoff_seconds = (
+            backoff_seconds if backoff_seconds is not None else
+            constants.LB_RETRY_INITIAL_BACKOFF_SECONDS)
 
     def _is_ready_to_serve(self) -> bool:
         """Readiness: true only once synced at least once and not draining."""

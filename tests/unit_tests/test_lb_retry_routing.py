@@ -215,3 +215,54 @@ class TestRetryTuning(unittest.TestCase):
                                side_effect=_spy):
             self._run_all_failing(balancer)
         self.assertEqual(captured['initial'], 0.25)
+
+
+class TestRoutingSpecSync(unittest.TestCase):
+    """Retry tuning must ride the live routing-spec sync: external LBs
+    never see the spawn args, and `sky serve update` must apply without
+    an LB respawn."""
+
+    def _balancer(self):
+        balancer = object.__new__(lb_module.SkyServeLoadBalancer)
+        balancer._load_balancing_policy = lb_policies.LeastLoadPolicy()
+        balancer._load_balancing_policy_name = 'least_load'
+        balancer._client_pool_lock = threading.Lock()
+        balancer._stream_timeout_seconds = 120
+        balancer._retriable_status_codes = frozenset()
+        balancer._max_retries = lb_module.constants.LB_MAX_RETRY
+        balancer._retry_initial_backoff_seconds = (
+            lb_module.constants.LB_RETRY_INITIAL_BACKOFF_SECONDS)
+        return balancer
+
+    def test_sync_applies_retry_tuning(self):
+        balancer = self._balancer()
+        balancer._apply_routing_spec({
+            'load_balancing_policy_name': 'least_load',
+            'stream_timeout_seconds': 3700,
+            'retriable_status_codes': [503, 429],
+            'max_retries': 5,
+            'retry_initial_backoff_seconds': 0.5,
+        })
+        self.assertEqual(balancer._retriable_status_codes, frozenset({503,
+                                                                      429}))
+        self.assertEqual(balancer._max_retries, 5)
+        self.assertEqual(balancer._retry_initial_backoff_seconds, 0.5)
+
+    def test_sync_unset_fields_reset_to_defaults(self):
+        # A new service version that REMOVED the overrides must not leave
+        # stale values behind.
+        balancer = self._balancer()
+        balancer._retriable_status_codes = frozenset({503})
+        balancer._max_retries = 9
+        balancer._retry_initial_backoff_seconds = 9.0
+        balancer._apply_routing_spec({
+            'load_balancing_policy_name': 'least_load',
+            'retriable_status_codes': None,
+            'max_retries': None,
+            'retry_initial_backoff_seconds': None,
+        })
+        self.assertEqual(balancer._retriable_status_codes, frozenset())
+        self.assertEqual(balancer._max_retries,
+                         lb_module.constants.LB_MAX_RETRY)
+        self.assertEqual(balancer._retry_initial_backoff_seconds,
+                         lb_module.constants.LB_RETRY_INITIAL_BACKOFF_SECONDS)

@@ -200,6 +200,10 @@ class SkyServeController:
             'load_balancing_policy_name': spec.load_balancing_policy,
             'target_qps_per_replica': spec.target_qps_per_replica,
             'stream_timeout_seconds': spec.lb_stream_timeout_seconds,
+            'retriable_status_codes': spec.lb_retriable_status_codes,
+            'max_retries': spec.lb_max_retries,
+            'retry_initial_backoff_seconds':
+                (spec.lb_retry_initial_backoff_seconds),
         }
 
     def _run_autoscaler(self):
