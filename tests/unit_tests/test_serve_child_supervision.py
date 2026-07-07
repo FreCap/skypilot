@@ -104,11 +104,11 @@ class TestDegradedHeal:
              mock.patch.object(
                  service.serve_state,
                  'set_service_status_and_active_versions') as set_status:
-            service._heal_service_degraded('svc')
+            assert service._heal_service_degraded('svc')
         set_status.assert_called_once_with(
             'svc', serve_state.ServiceStatus.REPLICA_INIT)
 
-    def test_noop_for_other_statuses(self):
+    def test_noop_for_other_statuses_reports_complete(self):
         for status in (serve_state.ServiceStatus.READY,
                        serve_state.ServiceStatus.SHUTTING_DOWN,
                        serve_state.ServiceStatus.NO_REPLICA):
@@ -118,8 +118,27 @@ class TestDegradedHeal:
                  mock.patch.object(
                      service.serve_state,
                      'set_service_status_and_active_versions') as set_status:
-                service._heal_service_degraded('svc')
+                assert service._heal_service_degraded('svc')
             set_status.assert_not_called()
+
+    def test_db_failure_reports_incomplete_for_retry(self):
+        # The caller must keep retrying the heal on subsequent healthy
+        # ticks; giving up would leave the service stuck CONTROLLER_FAILED
+        # (the replica-driven writer never overwrites that status).
+        with mock.patch.object(service.serve_state,
+                               'get_service_from_name',
+                               side_effect=RuntimeError('db down')):
+            assert not service._heal_service_degraded('svc')
+        with mock.patch.object(
+                service.serve_state,
+                'get_service_from_name',
+                return_value=_record(
+                    serve_state.ServiceStatus.CONTROLLER_FAILED)), \
+             mock.patch.object(
+                 service.serve_state,
+                 'set_service_status_and_active_versions',
+                 side_effect=RuntimeError('db down')):
+            assert not service._heal_service_degraded('svc')
 
 
 class TestReplicaWriterGuard:

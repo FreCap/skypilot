@@ -523,14 +523,20 @@ def _flag_service_degraded(service_name: str) -> None:
                      f'{common_utils.format_exception(e)}')
 
 
-def _heal_service_degraded(service_name: str) -> None:
+def _heal_service_degraded(service_name: str) -> bool:
     """Clear CONTROLLER_FAILED once the children are confirmed healthy.
 
     Resets to REPLICA_INIT; the controller's next probe round recomputes the
     real status from replica states (the replica-driven writer never
     overwrites CONTROLLER_FAILED itself, so this reset is the only way back).
     Also heals services HA-recovered from a dead parent, whose status was set
-    to CONTROLLER_FAILED by the status refresh daemon. Best-effort.
+    to CONTROLLER_FAILED by the status refresh daemon.
+
+    Returns whether the heal is complete (status confirmed cleared or not
+    set). On a DB failure returns False so the caller retries on the next
+    healthy tick: giving up would leave the service stuck CONTROLLER_FAILED
+    forever, since the replica-driven writer is blocked on that status and
+    HA recovery does not replace a live parent.
     """
     try:
         record = serve_state.get_service_from_name(service_name)
@@ -540,9 +546,11 @@ def _heal_service_degraded(service_name: str) -> None:
                         'recovered; clearing CONTROLLER_FAILED.')
             serve_state.set_service_status_and_active_versions(
                 service_name, serve_state.ServiceStatus.REPLICA_INIT)
+        return True
     except Exception as e:  # pylint: disable=broad-except
         logger.error(f'Failed to heal degraded service {service_name}: '
                      f'{common_utils.format_exception(e)}')
+        return False
 
 
 def _ensure_load_balancer(
@@ -1084,10 +1092,13 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
                             (controller_process, load_balancer_process,
                              controller_port) = result
                             lb_spawned_at = now
-                            # Health (and any status heal) is confirmed on the
-                            # next check, once the fresh LB has bound.
-                            child_failures = 0
-                            child_retry_at = 0.0
+                            # Do NOT reset the failure streak here: the
+                            # replacement's LB is not proven yet (it may have
+                            # failed to spawn or may never bind). Only the
+                            # `healthy` branch below resets, so a mixed
+                            # controller/LB crash loop cannot dodge the
+                            # CONTROLLER_FAILED flag by alternating failure
+                            # modes.
                         else:
                             child_failures += 1
                             child_retry_at = now + _child_respawn_backoff_seconds(
@@ -1128,8 +1139,12 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
                 if healthy:
                     child_failures = 0
                     child_retry_at = 0.0
-                    if needs_status_heal:
-                        _heal_service_degraded(service_name)
+                    if needs_status_heal and _heal_service_degraded(
+                            service_name):
+                        # Only stop retrying once the heal is confirmed; a
+                        # transient DB failure during the heal would
+                        # otherwise leave the service stuck CONTROLLER_FAILED
+                        # (the replica-driven writer is blocked on it).
                         needs_status_heal = False
                 elif child_failures >= _CHILD_FAILURES_BEFORE_FLAG:
                     _flag_service_degraded(service_name)
