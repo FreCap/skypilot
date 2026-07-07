@@ -74,6 +74,11 @@ LB_CONTROLLER_SYNC_TIMEOUT_SECONDS = 30
 # TODO(tian): Expose this option to users in yaml file.
 LB_MAX_RETRY = 3
 
+# Default first-retry backoff for the LB proxy retry loop
+# (exponential with jitter after that). Service-overridable via
+# load_balancer.retry_initial_backoff_seconds.
+LB_RETRY_INITIAL_BACKOFF_SECONDS = 1
+
 # The timeout in seconds for load balancer to wait for a response from replica.
 # Large LLMs like Llama2-70b is able to process the request within ~30 seconds.
 # We set the timeout to 120s to be safe. For reference, FastChat uses 100s:

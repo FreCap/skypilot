@@ -958,6 +958,18 @@ def get_service_schema():
                             'maximum': 599,
                         },
                     },
+                    # Attempts before the client sees the error (with
+                    # failed-URL exclusion each attempt tries a distinct
+                    # replica while any remain).
+                    'max_retries': {
+                        'type': 'integer',
+                        'minimum': 1,
+                    },
+                    # First-retry backoff; exponential with jitter after.
+                    'retry_initial_backoff_seconds': {
+                        'type': 'number',
+                        'exclusiveMinimum': 0,
+                    },
                 },
             },
             'pool': {

@@ -129,6 +129,8 @@ class SkyServeLoadBalancer:
         target_qps_per_replica: Optional[Union[float, Dict[str, float]]] = None,
         stream_timeout_seconds: Optional[int] = None,
         retriable_status_codes: Optional[List[int]] = None,
+        max_retries: Optional[int] = None,
+        retry_initial_backoff_seconds: Optional[float] = None,
     ) -> None:
         """Initialize the load balancer.
 
@@ -190,6 +192,15 @@ class SkyServeLoadBalancer:
         # idempotent workloads and "not now" statuses (503/429): the body
         # is discarded before any byte reaches the client.
         self._retriable_status_codes = frozenset(retriable_status_codes or ())
+        # Retry-loop tuning (service YAML load_balancer.max_retries /
+        # retry_initial_backoff_seconds). With failed-URL exclusion, more
+        # retries = more distinct replicas tried before the client sees an
+        # error; the backoff prices how fast we fail over.
+        self._max_retries: int = (max_retries if max_retries is not None else
+                                  constants.LB_MAX_RETRY)
+        self._retry_initial_backoff_seconds: float = (
+            retry_initial_backoff_seconds if retry_initial_backoff_seconds
+            is not None else constants.LB_RETRY_INITIAL_BACKOFF_SECONDS)
         # TODO(tian): httpx.Client has a resource limit of 100 max connections
         # for each client. We should wait for feedback on the best max
         # connections.
@@ -315,6 +326,19 @@ class SkyServeLoadBalancer:
         stream_timeout_seconds = routing_spec.get('stream_timeout_seconds')
         if stream_timeout_seconds is not None:
             self._stream_timeout_seconds = stream_timeout_seconds
+        # Retry tuning rides the same channel so `sky serve update` (and
+        # external LBs, which never see the spawn args) picks it up live.
+        # `None` means "not set in the spec": fall back to the defaults
+        # rather than keeping a stale override from a previous version.
+        retriable = routing_spec.get('retriable_status_codes')
+        self._retriable_status_codes = frozenset(retriable or ())
+        max_retries = routing_spec.get('max_retries')
+        self._max_retries = (max_retries if max_retries is not None else
+                             constants.LB_MAX_RETRY)
+        backoff_seconds = routing_spec.get('retry_initial_backoff_seconds')
+        self._retry_initial_backoff_seconds = (
+            backoff_seconds if backoff_seconds is not None else
+            constants.LB_RETRY_INITIAL_BACKOFF_SECONDS)
 
     def _is_ready_to_serve(self) -> bool:
         """Readiness: true only once synced at least once and not draining."""
@@ -608,7 +632,8 @@ class SkyServeLoadBalancer:
         """Try to proxy the request to the endpoint replica with retries."""
         self._request_aggregator.add(request)
         # TODO(tian): Finetune backoff parameters.
-        backoff = common_utils.Backoff(initial_backoff=1)
+        backoff = common_utils.Backoff(
+            initial_backoff=self._retry_initial_backoff_seconds)
         # SkyServe supports serving on Spot Instances. To avoid preemptions
         # during request handling, we add a retry here.
         retry_cnt = 0
@@ -648,7 +673,7 @@ class SkyServeLoadBalancer:
                 # before the server is able to respond.
                 return fastapi.responses.Response(status_code=499)
             # TODO(tian): Fail fast for errors like 404 not found.
-            if retry_cnt == constants.LB_MAX_RETRY:
+            if retry_cnt >= self._max_retries:
                 if isinstance(response_or_exception, fastapi.HTTPException):
                     raise response_or_exception
                 exception = common_utils.remove_color(
@@ -657,7 +682,7 @@ class SkyServeLoadBalancer:
                 raise fastapi.HTTPException(
                     # 500 means internal server error.
                     status_code=500,
-                    detail=f'Max retries {constants.LB_MAX_RETRY} exceeded. '
+                    detail=f'Max retries {self._max_retries} exceeded. '
                     f'Last error encountered: {exception}. Please use '
                     '"sky serve logs [SERVICE_NAME] --load-balancer" '
                     'for more information.')
@@ -713,6 +738,8 @@ def run_load_balancer(
     target_qps_per_replica: Optional[Union[float, Dict[str, float]]] = None,
     stream_timeout_seconds: Optional[int] = None,
     retriable_status_codes: Optional[List[int]] = None,
+    max_retries: Optional[int] = None,
+    retry_initial_backoff_seconds: Optional[float] = None,
 ) -> None:
     """Run the load balancer.
 
@@ -741,7 +768,9 @@ def run_load_balancer(
         tls_credential=tls_credential,
         target_qps_per_replica=target_qps_per_replica,
         stream_timeout_seconds=stream_timeout_seconds,
-        retriable_status_codes=retriable_status_codes)
+        retriable_status_codes=retriable_status_codes,
+        max_retries=max_retries,
+        retry_initial_backoff_seconds=retry_initial_backoff_seconds)
     load_balancer.run()
 
 
