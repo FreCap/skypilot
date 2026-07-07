@@ -29,6 +29,7 @@ class SkyServiceSpec:
         endpoint_probe_interval_seconds: int,
         lb_stream_timeout_seconds: int,
         min_replicas: int,
+        lb_retriable_status_codes: Optional[List[int]] = None,
         max_replicas: Optional[int] = None,
         num_overprovision: Optional[int] = None,
         ports: Optional[str] = None,
@@ -134,6 +135,8 @@ class SkyServiceSpec:
         self._endpoint_probe_interval_seconds: int = (
             endpoint_probe_interval_seconds)
         self._lb_stream_timeout_seconds: int = lb_stream_timeout_seconds
+        self._lb_retriable_status_codes: Optional[List[int]] = (
+            lb_retriable_status_codes)
         self._min_replicas: int = min_replicas
         self._max_replicas: Optional[int] = max_replicas
         self._num_overprovision: Optional[int] = num_overprovision
@@ -171,6 +174,7 @@ class SkyServiceSpec:
                          constants.DEFAULT_ENDPOINT_PROBE_INTERVAL_SECONDS)
         state.setdefault('_lb_stream_timeout_seconds',
                          constants.DEFAULT_LB_STREAM_TIMEOUT)
+        state.setdefault('_lb_retriable_status_codes', None)
         state.setdefault('_consecutive_failure_threshold_timeout', None)
         self.__dict__.update(state)
 
@@ -229,6 +233,11 @@ class SkyServiceSpec:
         if lb_stream_timeout_seconds is None:
             lb_stream_timeout_seconds = constants.DEFAULT_LB_STREAM_TIMEOUT
         service_config['lb_stream_timeout_seconds'] = lb_stream_timeout_seconds
+        lb_retriable_status_codes = None
+        if load_balancer_section is not None:
+            lb_retriable_status_codes = load_balancer_section.get(
+                'retriable_status_codes', None)
+        service_config['lb_retriable_status_codes'] = lb_retriable_status_codes
         if isinstance(post_data, str):
             try:
                 post_data = json.loads(post_data)
@@ -487,6 +496,8 @@ class SkyServiceSpec:
                 constants.DEFAULT_LB_STREAM_TIMEOUT):
             add_if_not_none('load_balancer', 'stream_timeout_seconds',
                             self.lb_stream_timeout_seconds)
+        add_if_not_none('load_balancer', 'retriable_status_codes',
+                        self.lb_retriable_status_codes)
         add_if_not_none('readiness_probe', 'headers', self._readiness_headers)
         add_if_not_none('replica_policy', 'min_replicas', self.min_replicas)
         add_if_not_none('replica_policy', 'max_replicas', self.max_replicas)
@@ -620,6 +631,10 @@ class SkyServiceSpec:
         return self._lb_stream_timeout_seconds
 
     @property
+    def lb_retriable_status_codes(self) -> Optional[List[int]]:
+        return self._lb_retriable_status_codes
+
+    @property
     def min_replicas(self) -> int:
         return self._min_replicas
 
@@ -714,6 +729,8 @@ class SkyServiceSpec:
                 self._endpoint_probe_interval_seconds),
             lb_stream_timeout_seconds=override.pop(
                 'lb_stream_timeout_seconds', self._lb_stream_timeout_seconds),
+            lb_retriable_status_codes=override.pop(
+                'lb_retriable_status_codes', self._lb_retriable_status_codes),
             min_replicas=override.pop('min_replicas', self._min_replicas),
             max_replicas=override.pop('max_replicas', self._max_replicas),
             num_overprovision=override.pop('num_overprovision',

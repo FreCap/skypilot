@@ -946,6 +946,18 @@ def get_service_schema():
                     'stream_timeout_seconds': {
                         'type': 'number',
                     },
+                    # Replica responses with these statuses are re-routed
+                    # to another replica like transport failures. Only
+                    # sensible for idempotent services and "not now"
+                    # statuses (503 while warming, 429 shedding).
+                    'retriable_status_codes': {
+                        'type': 'array',
+                        'items': {
+                            'type': 'integer',
+                            'minimum': 100,
+                            'maximum': 599,
+                        },
+                    },
                 },
             },
             'pool': {

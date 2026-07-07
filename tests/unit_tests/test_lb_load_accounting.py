@@ -85,7 +85,10 @@ class TestTieBreakRandomization:
 
     def test_least_load_zero_ties_spread(self):
         policy = _make_least_load()
-        seen = {policy._select_replica(None) for _ in range(100)}
+        seen = {
+            policy._select_replica(None, policy.ready_replicas)
+            for _ in range(100)
+        }
         assert seen == {'http://a:8080', 'http://b:8080'}
 
     def test_instance_aware_zero_ties_spread(self):
@@ -102,7 +105,10 @@ class TestTieBreakRandomization:
             },
         })
         policy.set_target_qps_per_accelerator({'L4': 0.1})
-        seen = {policy._select_replica(None) for _ in range(100)}
+        seen = {
+            policy._select_replica(None, policy.ready_replicas)
+            for _ in range(100)
+        }
         assert seen == {'http://a:8080', 'http://b:8080'}
 
 
@@ -113,6 +119,7 @@ def _make_lb(policy, client_pool):
     balancer._client_pool_lock = threading.Lock()
     balancer._stream_timeout_seconds = 5
     balancer._client_close_tasks = set()
+    balancer._retriable_status_codes = frozenset()
     return balancer
 
 
