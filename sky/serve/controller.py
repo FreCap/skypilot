@@ -18,6 +18,7 @@ import uvicorn
 from sky import serve
 from sky import sky_logging
 from sky.serve import autoscalers
+from sky.serve import lb_rbac_preflight
 from sky.serve import replica_managers
 from sky.serve import serve_state
 from sky.serve import serve_utils
@@ -229,6 +230,12 @@ class SkyServeController:
             time.sleep(self._autoscaler.get_decision_interval())
 
     def run(self) -> None:
+
+        # Fail fast at boot if the in-cluster ServiceAccount lacks the RBAC
+        # needed to manage the external load balancer objects. No-op outside
+        # external-LB / in-cluster mode; degrades gracefully if the access
+        # review itself cannot be issued.
+        lb_rbac_preflight.check_lb_rbac_preflight()
 
         # Guard the destructive endpoints with a shared bearer token (no-op
         # when unset). The read-only load_balancer_sync path is intentionally
