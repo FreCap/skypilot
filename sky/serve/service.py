@@ -24,6 +24,7 @@ from sky.backends import cloud_vm_ray_backend
 from sky.data import data_utils
 from sky.serve import constants
 from sky.serve import controller
+from sky.serve import lb_k8s
 from sky.serve import load_balancer
 from sky.serve import replica_managers
 from sky.serve import serve_state
@@ -713,6 +714,12 @@ def _run_cleanup_and_finalize(service_name: str,
         logger.error(f'Service {service_name} failed to clean up.')
     else:
         serve_state.remove_service_completely(service_name)
+        # Real teardown: the service row is gone for good. Delete the
+        # controller-owned external LB objects (no-op outside external-LB +
+        # in-cluster mode). This runs only on the success/removal path -- the
+        # FAILED_CLEANUP branch above keeps the row (and its LB) for --purge,
+        # and orphan-exit/respawn bypass this function entirely via os._exit.
+        lb_k8s.delete_lb_objects(service_name)
         try:
             shutil.rmtree(service_dir)
         except FileNotFoundError:
@@ -1005,6 +1012,16 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
             if not is_recovery:
                 serve_state.set_service_load_balancer_port(
                     service_name, load_balancer_port)
+
+        # In external load balancer mode, ensure the controller-owned per-
+        # service LB Deployment + Service exist before up() reports the
+        # endpoint. Idempotent (409 == already exists), so it is safe on the
+        # recovery path too. No-op outside external-LB + in-cluster mode. Done
+        # outside the port-selection filelock to avoid holding a host-global
+        # lock across k8s API calls; controller_port is already recorded in DB.
+        if external_lb:
+            lb_k8s.create_lb_deployment_and_service(service_name,
+                                                    controller_port)
 
         # Self-check cadence (seconds): how often we re-read DB to confirm
         # we're still the authoritative controller. Ghost detection only

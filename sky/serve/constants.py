@@ -186,6 +186,14 @@ INITIAL_VERSION = 1
 # Replica ID environment variable name that can be accessed on the replica.
 REPLICA_ID_ENV_VAR = 'SKYPILOT_SERVE_REPLICA_ID'
 
+# Name of the environment variable holding the controller pod's own name.
+# In external load balancer mode the controller (running in the api-server pod)
+# reads its own pod spec to mirror its container image onto the LB Deployment
+# it creates. The platform must inject this via the downward API
+# (metadata.name). It is a hard contract: without it the controller cannot
+# resolve the LB image.
+POD_NAME_ENV_VAR = 'SKYPILOT_POD_NAME'
+
 # The version of the lib files that serve use. Whenever there is an API
 # change for the serve_utils.ServeCodeGen, we need to bump this version, so that
 # the user can be notified to update their SkyPilot serve version on the remote

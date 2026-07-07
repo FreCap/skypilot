@@ -1,3 +1,4 @@
+import contextlib
 import pathlib
 import tempfile
 from unittest import mock
@@ -1309,43 +1310,50 @@ class TestHaRecoveryRecreatesServiceDir:
 
 
 # ---------------------------------------------------------------------------
-# external_lb_socket_endpoint (W4): synthesize the public endpoint of an
-# external load balancer from a config template, instead of localhost:{port}.
+# external_lb_socket_endpoint (W4): in external-LB mode the endpoint is the
+# controller-owned LB Service's in-cluster DNS host:port, instead of
+# localhost:{port}. Delegates to lb_k8s.lb_service_endpoint_or_none.
 # ---------------------------------------------------------------------------
 
 
-def _patch_endpoint_template(template):
-    """Patch is_external_load_balancer_mode(True) + the template lookup."""
-    return mock.patch.object(
-        serve_utils.skypilot_config,
-        'get_nested',
-        side_effect=lambda keys, default_value=None:
-        (template
-         if keys == ('serve', 'controller', 'external_load_balancer_endpoint')
-         else default_value))
+def _patch_lb_mode(external, incluster=True, namespace='skypilot'):
+    """Patch the external-LB + in-cluster guards that lb_k8s consults."""
+    from sky.serve import lb_k8s
+    return [
+        mock.patch.object(serve_utils,
+                          'is_external_load_balancer_mode',
+                          return_value=external),
+        mock.patch.object(lb_k8s.kubernetes_utils,
+                          'is_incluster_config_available',
+                          return_value=incluster),
+        mock.patch.object(lb_k8s.kubernetes_utils,
+                          'get_kube_config_context_namespace',
+                          return_value=namespace),
+        mock.patch.object(lb_k8s.kubernetes,
+                          'in_cluster_context_name',
+                          return_value='in-cluster'),
+    ]
 
 
 def test_external_lb_socket_endpoint_off_when_mode_disabled():
-    with mock.patch.object(serve_utils,
-                           'is_external_load_balancer_mode',
-                           return_value=False):
+    with contextlib.ExitStack() as stack:
+        for patcher in _patch_lb_mode(external=False):
+            stack.enter_context(patcher)
         assert serve_utils.external_lb_socket_endpoint('svc', 30001) is None
 
 
-def test_external_lb_socket_endpoint_none_when_template_unset():
-    with mock.patch.object(serve_utils,
-                           'is_external_load_balancer_mode',
-                           return_value=True), \
-         _patch_endpoint_template(None):
+def test_external_lb_socket_endpoint_none_when_not_in_cluster():
+    with contextlib.ExitStack() as stack:
+        for patcher in _patch_lb_mode(external=True, incluster=False):
+            stack.enter_context(patcher)
         assert serve_utils.external_lb_socket_endpoint('svc', 30001) is None
 
 
-def test_external_lb_socket_endpoint_substitutes_and_strips_protocol():
-    template = 'http://serve-{service_name}.serve.svc:{load_balancer_port}'
-    with mock.patch.object(serve_utils,
-                           'is_external_load_balancer_mode',
-                           return_value=True), \
-         _patch_endpoint_template(template):
-        # Protocol is stripped; callers re-add http/https based on TLS.
+def test_external_lb_socket_endpoint_returns_service_dns():
+    from sky.serve import lb_k8s
+    with contextlib.ExitStack() as stack:
+        for patcher in _patch_lb_mode(external=True, namespace='skypilot'):
+            stack.enter_context(patcher)
+        # No scheme; callers re-add http/https based on TLS.
         assert serve_utils.external_lb_socket_endpoint(
-            'mysvc', 30001) == 'serve-mysvc.serve.svc:30001'
+            'mysvc', 30001) == lb_k8s.lb_service_endpoint('mysvc', 'skypilot')

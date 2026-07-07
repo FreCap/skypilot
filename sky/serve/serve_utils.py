@@ -402,23 +402,20 @@ def external_lb_socket_endpoint(
         service_name: str, load_balancer_port: Optional[int]) -> Optional[str]:
     """The external load balancer's socket endpoint (host:port), or None.
 
+    In external load balancer mode the controller owns a per-service LB
+    Service; this returns that Service's in-cluster DNS ``host:port`` (no
+    scheme -- callers add http/https based on the service's TLS config).
     Returns None (so callers keep the in-pod ``localhost:{port}`` / controller
-    cluster behavior) unless external load balancer mode is on AND a
-    ``serve.controller.external_load_balancer_endpoint`` template is
-    configured. The template is a str.format string with ``{service_name}``
-    and ``{load_balancer_port}`` placeholders; any protocol prefix is stripped
-    because callers add http/https based on the service's TLS config.
+    cluster behavior) unless external-LB mode is on AND we have in-cluster
+    config.
     """
-    if not is_external_load_balancer_mode():
-        return None
-    template = skypilot_config.get_nested(
-        ('serve', 'controller', 'external_load_balancer_endpoint'),
-        default_value=None)
-    if not template:
-        return None
-    endpoint = template.format(service_name=service_name,
-                               load_balancer_port=load_balancer_port)
-    return endpoint.replace('https://', '').replace('http://', '')
+    # The LB Service always exposes the fixed LOAD_BALANCER_PORT_START, so the
+    # caller-provided port is not used for the endpoint host:port.
+    del load_balancer_port
+    # Lazy import: lb_k8s imports serve_utils at module level, so a top-level
+    # import here would be circular.
+    from sky.serve import lb_k8s  # pylint: disable=import-outside-toplevel
+    return lb_k8s.lb_service_endpoint_or_none(service_name)
 
 
 def ha_recovery_for_consolidation_mode(pool: bool,
@@ -455,7 +452,13 @@ def ha_recovery_for_consolidation_mode(pool: bool,
               encoding='utf-8') as f:
         start = time.time()
         f.write(f'Starting HA recovery at {datetime.datetime.now()}\n')
-        for service_name in serve_state.get_glob_service_names(None):
+        # Snapshot every service name known to the DB. In external-LB mode this
+        # is the set of live services used below to reap orphaned LB objects
+        # (LBs whose owning service row is gone). It is a superset (also
+        # includes pools), which is safe: reconcile only deletes LBs NOT in the
+        # set, and pools own no LB.
+        all_service_names = serve_state.get_glob_service_names(None)
+        for service_name in all_service_names:
             svc = _get_service_status(service_name,
                                       pool=pool,
                                       with_replica_info=False)
@@ -541,6 +544,18 @@ def ha_recovery_for_consolidation_mode(pool: bool,
                         f'Output: {out}\nError: {err}\n')
             f.write(f'{capnoun} {service_name} completed recovery at '
                     f'{datetime.datetime.now()}\n')
+        # Reap external LB objects whose owning service no longer exists. Only
+        # for services (pools have no LB). No-op outside external-LB +
+        # in-cluster mode. Lazy import: lb_k8s imports serve_utils at module
+        # level, so a top-level import here would be circular.
+        if not pool:
+            from sky.serve import (  # pylint: disable=import-outside-toplevel  # noqa: E501
+                lb_k8s)
+            try:
+                lb_k8s.reconcile_lb_objects(set(all_service_names))
+            except Exception as e:  # pylint: disable=broad-except
+                # Reconcile is best-effort cleanup; never let it abort recovery.
+                f.write(f'Failed to reconcile external LB objects: {e}\n')
         f.write(f'HA recovery completed at {datetime.datetime.now()}\n')
         f.write(f'Total recovery time: {time.time() - start} seconds\n')
 
