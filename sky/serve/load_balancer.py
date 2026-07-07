@@ -27,6 +27,22 @@ logger = sky_logging.init_logger(__name__)
 _INFLIGHT_ATTR = '_sky_inflight_requests'
 
 
+class _RetriableStatusError(Exception):
+    """A replica answered with a status the service marked retriable.
+
+    Returned from _proxy_request_to like transport errors so
+    _proxy_with_retries re-routes the (idempotent) request to another
+    replica. Only statuses listed in the service's
+    load_balancer.retriable_status_codes take this path — everything
+    else streams to the client verbatim.
+    """
+
+    def __init__(self, status_code: int, url: str) -> None:
+        super().__init__(
+            f'replica {url} answered retriable status {status_code}')
+        self.status_code = status_code
+
+
 class SkyServeLoadBalancer:
     """SkyServeLoadBalancer: distribute incoming traffic with proxy.
 
@@ -43,6 +59,7 @@ class SkyServeLoadBalancer:
         tls_credential: Optional[serve_utils.TLSCredential] = None,
         target_qps_per_replica: Optional[Union[float, Dict[str, float]]] = None,
         stream_timeout_seconds: int = constants.DEFAULT_LB_STREAM_TIMEOUT,
+        retriable_status_codes: Optional[List[int]] = None,
     ) -> None:
         """Initialize the load balancer.
 
@@ -80,6 +97,11 @@ class SkyServeLoadBalancer:
         self._tls_credential: Optional[serve_utils.TLSCredential] = (
             tls_credential)
         self._stream_timeout_seconds: int = stream_timeout_seconds
+        # Replica responses with these statuses are re-routed like
+        # transport failures (empty = never, the default). Safe only for
+        # idempotent workloads and "not now" statuses (503/429): the body
+        # is discarded before any byte reaches the client.
+        self._retriable_status_codes = frozenset(retriable_status_codes or ())
         # TODO(tian): httpx.Client has a resource limit of 100 max connections
         # for each client. We should wait for feedback on the best max
         # connections.
@@ -262,6 +284,15 @@ class SkyServeLoadBalancer:
                     connect=constants.LB_CONNECT_TIMEOUT_SECONDS))
             proxy_response = await client.send(proxy_request, stream=True)
 
+            if proxy_response.status_code in self._retriable_status_codes:
+                # "Not now" from the replica (e.g. 503 while the model
+                # warms, 429 shedding): discard and re-route. No byte has
+                # reached the client — send() returns at headers with
+                # stream=True. Slot + client refcount release via the
+                # not-released finally below.
+                await proxy_response.aclose()
+                return _RetriableStatusError(proxy_response.status_code, url)
+
             # The slot is owned by the stream now. Starlette runs
             # BackgroundTasks strictly AFTER a successful stream — a
             # mid-stream failure (client disconnect, upstream reset)
@@ -321,11 +352,16 @@ class SkyServeLoadBalancer:
         # SkyServe supports serving on Spot Instances. To avoid preemptions
         # during request handling, we add a retry here.
         retry_cnt = 0
+        # URLs that already failed THIS request: without exclusion,
+        # least-load retries deterministically re-select a
+        # dead-but-not-yet-pruned replica on a busy fleet (it sits at
+        # load 0 while every healthy replica carries traffic).
+        failed_urls: Set[str] = set()
         while True:
             retry_cnt += 1
             with self._client_pool_lock:
                 ready_replica_url = self._load_balancing_policy.select_replica(
-                    request)
+                    request, exclude=failed_urls)
             if ready_replica_url is None:
                 response_or_exception = fastapi.HTTPException(
                     # 503 means that the server is currently
@@ -339,6 +375,8 @@ class SkyServeLoadBalancer:
                     ready_replica_url, request)
             if not isinstance(response_or_exception, Exception):
                 return response_or_exception
+            if ready_replica_url is not None:
+                failed_urls.add(ready_replica_url)
             # When the user aborts the request during streaming, the request
             # will be disconnected. We do not need to retry for this case.
             if await request.is_disconnected():
@@ -400,6 +438,7 @@ def run_load_balancer(
     tls_credential: Optional[serve_utils.TLSCredential] = None,
     target_qps_per_replica: Optional[Union[float, Dict[str, float]]] = None,
     stream_timeout_seconds: int = constants.DEFAULT_LB_STREAM_TIMEOUT,
+    retriable_status_codes: Optional[List[int]] = None,
 ) -> None:
     """Run the load balancer.
 
@@ -421,7 +460,8 @@ def run_load_balancer(
         load_balancing_policy_name=load_balancing_policy_name,
         tls_credential=tls_credential,
         target_qps_per_replica=target_qps_per_replica,
-        stream_timeout_seconds=stream_timeout_seconds)
+        stream_timeout_seconds=stream_timeout_seconds,
+        retriable_status_codes=retriable_status_codes)
     load_balancer.run()
 
 

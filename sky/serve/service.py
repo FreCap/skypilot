@@ -450,7 +450,8 @@ def _spawn_load_balancer(
         args=(controller_addr, load_balancer_port,
               service_spec.load_balancing_policy, service_spec.tls_credential,
               service_spec.target_qps_per_replica,
-              service_spec.lb_stream_timeout_seconds))
+              service_spec.lb_stream_timeout_seconds,
+              service_spec.lb_retriable_status_codes))
     process.start()
     return process
 
