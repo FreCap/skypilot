@@ -59,7 +59,7 @@ class TestApplyRefusesTerminalStates:
 
     def _run_apply_with_status(self, status, pool):
         patches = self._common_patches(status)
-        with mock.patch('sky.serve.server.impl.update') as mock_update, \
+        with mock.patch('sky.serve.server.impl._update_impl') as mock_update, \
              mock.patch('sky.serve.server.impl.up') as mock_up:
             for p in patches:
                 p.start()
@@ -130,7 +130,7 @@ class TestApplyRefusesTerminalStates:
             mock.patch('sky.serve.server.impl._get_service_record',
                        return_value=None),
         ]
-        with mock.patch('sky.serve.server.impl.update') as mock_update, \
+        with mock.patch('sky.serve.server.impl._update_impl') as mock_update, \
              mock.patch('sky.serve.server.impl.up') as mock_up:
             for p in patches:
                 p.start()
@@ -247,3 +247,64 @@ class TestSanitizedConfigBytes:
         assert parsed['kubernetes']['allowed_contexts'] == ['ctx-a', 'ctx-b']
         assert parsed['kubernetes']['context_configs']['ctx-a'][
             'provision_timeout'] == 10
+
+
+class TestLifecycleLocking:
+    """update()/down() must serialize on the same per-service filelock as
+    apply(): an update racing a down on the same service can launch
+    replicas mid-teardown, leaving orphaned (billable) clusters."""
+
+    def test_update_locks_before_impl(self):
+        calls = []
+        lock = mock.MagicMock()
+        lock.__enter__ = mock.Mock(side_effect=lambda *a: calls.append('lock'))
+        lock.__exit__ = mock.Mock(side_effect=lambda *a: calls.append('unlock'))
+        with mock.patch('sky.serve.server.impl.filelock.FileLock',
+                        return_value=lock) as mock_lock_cls, \
+             mock.patch('sky.serve.server.impl.serve_utils.'
+                        'get_service_filelock_path',
+                        return_value='/tmp/svc.lock'), \
+             mock.patch('sky.serve.server.impl._update_impl',
+                        side_effect=lambda *a, **k: calls.append('impl')):
+            impl.update(task=mock.Mock(), service_name='svc')
+        mock_lock_cls.assert_called_once_with('/tmp/svc.lock')
+        assert calls == ['lock', 'impl', 'unlock']
+
+    def _run_down(self, service_names, all=False):  # pylint: disable=redefined-builtin
+        locked = []
+        lock = mock.MagicMock()
+        lock.__enter__ = mock.Mock()
+        lock.__exit__ = mock.Mock()
+
+        def _lock_path(name):
+            return f'/tmp/{name}.lock'
+
+        def _make_lock(path):
+            locked.append(path)
+            return lock
+
+        handle = mock.MagicMock(spec=backends.CloudVmRayResourceHandle)
+        with mock.patch('sky.serve.server.impl.filelock.FileLock',
+                        side_effect=_make_lock), \
+             mock.patch('sky.serve.server.impl.serve_utils.'
+                        'get_service_filelock_path',
+                        side_effect=_lock_path), \
+             mock.patch('sky.serve.server.impl.controller_utils.'
+                        'get_controller_for_pool'), \
+             mock.patch('sky.serve.server.impl.backend_utils.'
+                        'is_controller_accessible',
+                        return_value=handle), \
+             mock.patch('sky.serve.server.impl._terminate_services',
+                        return_value='done') as mock_term:
+            impl.down(service_names=service_names, all=all)
+        return locked, mock_term
+
+    def test_down_locks_each_named_service_sorted(self):
+        locked, mock_term = self._run_down(['svc-b', 'svc-a'])
+        assert locked == ['/tmp/svc-a.lock', '/tmp/svc-b.lock']
+        mock_term.assert_called_once()
+
+    def test_down_all_takes_no_per_service_locks(self):
+        locked, mock_term = self._run_down(None, all=True)
+        assert locked == []
+        mock_term.assert_called_once()
