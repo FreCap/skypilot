@@ -76,6 +76,18 @@ DEFAULT_LB_STREAM_TIMEOUT = 120
 # timeout is sized for hour-long synchronous predictions.
 LB_CONNECT_TIMEOUT_SECONDS = 10
 
+# Passive LB-side replica eviction, for the window where the controller is
+# paused (e.g. during a control-plane roll) and cannot update the ready set.
+# After this many CONSECUTIVE dead-connection failures (refused/reset -- NOT
+# connect timeouts, which indicate a merely-saturated but healthy replica) the
+# LB quarantines a replica: removed from routing and kept out even if the
+# controller's next sync still lists it as ready, until the TTL expires. This
+# stops InstanceAwareLeastLoadPolicy from preferentially routing to a dead
+# replica whose drained in-flight slots read as least-loaded, and avoids
+# evict/re-add oscillation on every sync once the controller recovers.
+LB_EVICTION_CONSECUTIVE_FAILURES = 3
+LB_EVICTION_QUARANTINE_SECONDS = 30
+
 # Default interval in seconds to probe replica endpoint.
 DEFAULT_ENDPOINT_PROBE_INTERVAL_SECONDS = 10
 # Backward compatibility alias.

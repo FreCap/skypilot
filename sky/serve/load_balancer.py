@@ -5,8 +5,9 @@ import json
 import logging
 import os
 import threading
+import time
 import traceback
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Set, Union
 
 import aiohttp
 import fastapi
@@ -21,6 +22,20 @@ from sky.serve import serve_utils
 from sky.utils import common_utils
 
 logger = sky_logging.init_logger(__name__)
+
+
+def _is_dead_connection_error(exc: Exception) -> bool:
+    """Whether a proxy failure indicates a DEAD replica vs a saturated one.
+
+    A healthy replica overloaded at high RPS trips the connect/read timeout
+    (httpx.TimeoutException), so timeouts must NOT count toward eviction --
+    evicting a merely-saturated replica shrinks capacity under load and
+    cascades. Only genuine connection failures (refused/reset: NetworkError,
+    ProtocolError) indicate a dead replica worth evicting.
+    """
+    if isinstance(exc, httpx.TimeoutException):
+        return False
+    return isinstance(exc, (httpx.NetworkError, httpx.ProtocolError))
 
 
 class SkyServeLoadBalancer:
@@ -89,6 +104,67 @@ class SkyServeLoadBalancer:
         # We need this lock to avoid getting from the client pool while
         # updating it from _sync_with_controller.
         self._client_pool_lock: threading.Lock = threading.Lock()
+        # Passive replica eviction state, guarded by _client_pool_lock (the
+        # same lock that guards the policy's ready set). _replica_dead_failures
+        # counts consecutive dead-connection failures per replica;
+        # _replica_quarantine_until maps a replica URL to the wall-clock time
+        # until which it stays out of routing.
+        self._replica_dead_failures: Dict[str, int] = dict()
+        self._replica_quarantine_until: Dict[str, float] = dict()
+
+    def _quarantined_replicas(self) -> Set[str]:
+        """Replica URLs currently quarantined (TTL not yet expired).
+
+        Must be called while holding `_client_pool_lock`.
+        """
+        now = time.time()
+        return {
+            url for url, until in self._replica_quarantine_until.items()
+            if until > now
+        }
+
+    def _quarantine_replica(self, url: str) -> None:
+        """Remove a dead replica from routing for the quarantine TTL.
+
+        Must be called while holding `_client_pool_lock`. Drops the replica
+        from the policy's ready set immediately so in-flight routing stops
+        selecting it; the sync loop keeps it out (even if the controller still
+        lists it as ready) until the TTL expires.
+        """
+        self._replica_quarantine_until[url] = (
+            time.time() + constants.LB_EVICTION_QUARANTINE_SECONDS)
+        self._replica_dead_failures.pop(url, None)
+        remaining = [
+            u for u in self._load_balancing_policy.ready_replicas if u != url
+        ]
+        self._load_balancing_policy.set_ready_replicas(remaining)
+        logger.warning(
+            f'Evicted replica {url} after '
+            f'{constants.LB_EVICTION_CONSECUTIVE_FAILURES} consecutive '
+            f'dead-connection failures; quarantined for '
+            f'{constants.LB_EVICTION_QUARANTINE_SECONDS}s.')
+
+    def _record_proxy_outcome(
+        self, url: str,
+        response_or_exception: Union['fastapi.responses.Response', Exception]
+    ) -> None:
+        """Update per-replica eviction bookkeeping after a proxy attempt.
+
+        A successful attempt clears the replica's failure state and any
+        quarantine; a dead-connection failure increments its consecutive
+        count and quarantines it once the threshold is reached. Saturation
+        (timeouts) and other non-dead errors are ignored for eviction.
+        """
+        with self._client_pool_lock:
+            if isinstance(response_or_exception, Exception):
+                if _is_dead_connection_error(response_or_exception):
+                    count = self._replica_dead_failures.get(url, 0) + 1
+                    self._replica_dead_failures[url] = count
+                    if count >= constants.LB_EVICTION_CONSECUTIVE_FAILURES:
+                        self._quarantine_replica(url)
+            else:
+                self._replica_dead_failures.pop(url, None)
+                self._replica_quarantine_until.pop(url, None)
 
     async def _sync_with_controller_once(self) -> List[asyncio.Task]:
         close_client_tasks = []
@@ -120,13 +196,38 @@ class SkyServeLoadBalancer:
             else:
                 logger.info(f'Available Replica URLs: {ready_replica_urls}')
                 with self._client_pool_lock:
-                    self._load_balancing_policy.set_ready_replicas(
-                        ready_replica_urls)
+                    # Keep quarantined (locally-evicted) replicas out of
+                    # routing even if the controller still lists them as
+                    # ready, until their TTL expires -- otherwise a dead
+                    # replica would be re-added on every sync and eviction
+                    # would oscillate.
+                    quarantined = self._quarantined_replicas()
+                    routable = [
+                        url for url in ready_replica_urls
+                        if url not in quarantined
+                    ]
+                    self._load_balancing_policy.set_ready_replicas(routable)
                     # Set replica info for instance-aware policies
                     if isinstance(self._load_balancing_policy,
                                   lb_policies.InstanceAwareLeastLoadPolicy):
                         self._load_balancing_policy.set_replica_info(
                             replica_info)
+                    # Drop eviction bookkeeping for replicas the controller no
+                    # longer lists, and for expired quarantines, so the maps
+                    # do not grow unbounded.
+                    ready_set = set(ready_replica_urls)
+                    now = time.time()
+                    self._replica_dead_failures = {
+                        url: count
+                        for url, count in self._replica_dead_failures.items()
+                        if url in ready_set
+                    }
+                    self._replica_quarantine_until = {
+                        url: until
+                        for url, until in
+                        self._replica_quarantine_until.items()
+                        if url in ready_set and until > now
+                    }
                     for replica_url in ready_replica_urls:
                         if replica_url not in self._client_pool:
                             self._client_pool[replica_url] = httpx.AsyncClient(
@@ -281,6 +382,10 @@ class SkyServeLoadBalancer:
             else:
                 response_or_exception = await self._proxy_request_to(
                     ready_replica_url, request)
+                # Passively evict a replica that keeps failing with dead
+                # connections during the controller-pause window.
+                self._record_proxy_outcome(ready_replica_url,
+                                           response_or_exception)
             if not isinstance(response_or_exception, Exception):
                 return response_or_exception
             # When the user aborts the request during streaming, the request
