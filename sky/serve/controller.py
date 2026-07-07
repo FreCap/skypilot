@@ -3,11 +3,12 @@
 Responsible for autoscaling and replica management.
 """
 import contextlib
+import hmac
 import logging
 import os
 import time
 import traceback
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import colorama
 import fastapi
@@ -27,6 +28,28 @@ from sky.utils import thread_utils
 from sky.utils import ux_utils
 
 logger = sky_logging.init_logger(__name__)
+
+
+def _make_auth_dependency(expected_token: Optional[str]) -> Callable:
+    """Build a FastAPI dependency that enforces a shared bearer token.
+
+    When `expected_token` is None (auth disabled), the dependency is a no-op so
+    in-pod / localhost-only deployments are unchanged. Otherwise it requires an
+    `Authorization: Bearer <token>` header matching in constant time; a missing
+    or wrong token yields 401. Applied only to the destructive endpoints -- the
+    read-only load_balancer_sync path stays open for the credential-free LB.
+    """
+
+    async def _verify(authorization: Optional[str] = fastapi.Header(
+        None)) -> None:
+        if expected_token is None:
+            return
+        expected = f'Bearer {expected_token}'
+        if authorization is None or not hmac.compare_digest(
+                authorization, expected):
+            raise fastapi.HTTPException(status_code=401, detail='Unauthorized.')
+
+    return _verify
 
 
 class AutoscalerInfoFilter(logging.Filter):
@@ -207,6 +230,12 @@ class SkyServeController:
 
     def run(self) -> None:
 
+        # Guard the destructive endpoints with a shared bearer token (no-op
+        # when unset). The read-only load_balancer_sync path is intentionally
+        # left open so the credential-free external LB can sync.
+        auth_dependency = fastapi.Depends(
+            _make_auth_dependency(serve_utils.get_controller_auth_token()))
+
         @self._app.get('/autoscaler/info')
         async def get_autoscaler_info() -> fastapi.Response:
             return responses.JSONResponse(content=self._autoscaler.info(),
@@ -232,7 +261,8 @@ class SkyServeController:
         # round can hold it for tens of seconds when replicas are unreachable)
         # never stalls the event loop — /controller/load_balancer_sync must
         # keep serving while an update waits its turn.
-        @self._app.post('/controller/update_service')
+        @self._app.post('/controller/update_service',
+                        dependencies=[auth_dependency])
         def update_service(request_data: Dict[str, Any] = fastapi.Body(
             ...)) -> fastapi.Response:
             try:
@@ -293,7 +323,8 @@ class SkyServeController:
                 },
                                               status_code=500)
 
-        @self._app.post('/controller/terminate_replica')
+        @self._app.post('/controller/terminate_replica',
+                        dependencies=[auth_dependency])
         async def terminate_replica(
                 request: fastapi.Request) -> fastapi.Response:
             request_data = await request.json()

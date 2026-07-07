@@ -119,6 +119,13 @@ def _request_to_controller_with_retry(method: str, service_name: str,
     # Force a bounded timeout.
     if 'timeout' not in kwargs:
         kwargs['timeout'] = _CONTROLLER_HTTP_TIMEOUT_SECONDS
+    # Attach the shared bearer token so the controller's authenticated
+    # (destructive) endpoints accept this trusted caller. Harmless on the
+    # unauthenticated read paths. No-op when auth is disabled (token unset).
+    auth_token = get_controller_auth_token()
+    if auth_token is not None:
+        headers = kwargs.setdefault('headers', {})
+        headers.setdefault('Authorization', f'Bearer {auth_token}')
     for attempt in range(_CONTROLLER_HTTP_RETRY_ATTEMPTS):
         url = _get_controller_url(service_name, controller_port) + path
         try:
@@ -380,6 +387,15 @@ def is_external_load_balancer_mode() -> bool:
     """
     return skypilot_config.get_nested(
         ('serve', 'controller', 'external_load_balancer'), default_value=False)
+
+
+def get_controller_auth_token() -> Optional[str]:
+    """Shared bearer token guarding the controller's destructive endpoints.
+
+    Read from ``CONTROLLER_AUTH_TOKEN_ENV_VAR``; None (auth disabled) when
+    unset. See the constant for the security rationale.
+    """
+    return os.environ.get(constants.CONTROLLER_AUTH_TOKEN_ENV_VAR) or None
 
 
 def external_lb_socket_endpoint(

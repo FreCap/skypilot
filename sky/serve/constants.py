@@ -31,6 +31,16 @@ CONTROLLER_SETUP_TIMEOUT_SECONDS = 300
 # Time to wait in seconds for service to register on the controller.
 SERVICE_REGISTER_TIMEOUT_SECONDS = 60
 
+# Env var holding a shared bearer token that guards the controller's
+# DESTRUCTIVE endpoints (/controller/update_service, terminate_replica). In
+# external load balancer mode the controller port is reachable on the pod
+# network from the credential-free LB pod, so NetworkPolicy alone is
+# insufficient; the platform sets this (from a k8s secret) on both the
+# controller and its trusted callers. The read-only /load_balancer_sync path
+# stays unauthenticated so the LB can sync. When unset (in-pod localhost-only
+# default) auth is disabled and behavior is unchanged.
+CONTROLLER_AUTH_TOKEN_ENV_VAR = 'SKYPILOT_SERVE_CONTROLLER_AUTH_TOKEN'
+
 # [boltz fork] Time budget in seconds for a service update to be accepted by
 # the controller. The /controller/update_service handler serializes on the
 # replica-manager lock, which a readiness-probe round can hold for tens of
