@@ -517,8 +517,12 @@ def _ensure_load_balancer(
     Restarts it -- on the same public `load_balancer_port`, pointing at
     `controller_addr` -- if it is missing or dead. Pool services have no LB.
     Contained: never raises into _start's destructive cleanup.
+
+    In external load balancer mode the load balancer runs as a separate
+    Deployment outside this pod, so the controller neither spawns nor
+    supervises an in-pod one.
     """
-    if service_spec.pool:
+    if service_spec.pool or serve_utils.is_external_load_balancer_mode():
         return lb_process
     if lb_process is not None and lb_process.is_alive():
         return lb_process
@@ -951,11 +955,21 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
 
             controller_addr = f'http://{controller_host}:{controller_port}'
 
-            # Start the load balancer.
-            load_balancer_port = (
-                common_utils.find_free_port(constants.LOAD_BALANCER_PORT_START)
-                if not is_recovery else
-                serve_state.get_service_load_balancer_port(service_name))
+            # Start the load balancer. In external load balancer mode the LB
+            # runs as a separate Deployment (not in this pod), so we bind the
+            # port that the external LB listens on -- fixed and known so the
+            # platform can configure the LB Deployment/Service consistently --
+            # and still record it in DB so up()'s registration wait completes
+            # and the endpoint is reported, but we do not spawn an in-pod LB.
+            external_lb = serve_utils.is_external_load_balancer_mode()
+            if external_lb:
+                load_balancer_port = constants.LOAD_BALANCER_PORT_START
+            elif not is_recovery:
+                load_balancer_port = common_utils.find_free_port(
+                    constants.LOAD_BALANCER_PORT_START)
+            else:
+                load_balancer_port = serve_state.get_service_load_balancer_port(
+                    service_name)
             load_balancer_log_file = os.path.expanduser(
                 serve_utils.generate_remote_load_balancer_log_file_name(
                     service_name))
@@ -964,8 +978,8 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
             # service spec and we could start multiple load balancers.
             # After that, we will have a mapping from replica port to endpoint.
             # NOTE(tian): We don't need the load balancer for pool.
-            # Skip the load balancer process for pool.
-            if not service_spec.pool:
+            # Skip the load balancer process for pool, and in external LB mode.
+            if not service_spec.pool and not external_lb:
                 load_balancer_process = _spawn_load_balancer(
                     controller_addr, load_balancer_port, service_spec,
                     load_balancer_log_file)

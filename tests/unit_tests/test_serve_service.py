@@ -630,3 +630,38 @@ def test_select_controller_port_range_exhausted_raises():
          mock.patch.object(service.serve_state, 'set_service_controller_port'):
         with pytest.raises(RuntimeError):
             service._select_controller_port('svc')
+
+
+# ---------------------------------------------------------------------------
+# _ensure_load_balancer: in external load balancer mode (W3) the controller
+# must NOT spawn or supervise an in-pod load balancer (the LB is a separate
+# Deployment). Default mode still spawns.
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_load_balancer_skipped_in_external_mode():
+    spec = mock.Mock()
+    spec.pool = False
+    with mock.patch.object(service.serve_utils,
+                           'is_external_load_balancer_mode',
+                           return_value=True), \
+         mock.patch.object(service, '_spawn_load_balancer') as spawn:
+        result = service._ensure_load_balancer(None, 'http://c:1', 30001, spec,
+                                               '/tmp/lb.log')
+        assert result is None
+        spawn.assert_not_called()
+
+
+def test_ensure_load_balancer_spawns_when_not_external():
+    spec = mock.Mock()
+    spec.pool = False
+    sentinel = mock.Mock()
+    with mock.patch.object(service.serve_utils,
+                           'is_external_load_balancer_mode',
+                           return_value=False), \
+         mock.patch.object(service, '_spawn_load_balancer',
+                           return_value=sentinel) as spawn:
+        result = service._ensure_load_balancer(None, 'http://c:1', 30001, spec,
+                                               '/tmp/lb.log')
+        assert result is sentinel
+        spawn.assert_called_once()
