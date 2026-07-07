@@ -466,6 +466,85 @@ def _kill_process(process: Optional[multiprocessing.Process]) -> None:
         pass
 
 
+# Supervision of the controller/LB children in _start's keep-alive loop:
+# after this many consecutive failed respawn/bind attempts, the service is
+# flagged CONTROLLER_FAILED in the DB so `sky serve status` stops advertising
+# a dead endpoint as healthy. Respawn attempts continue with exponential
+# backoff, and the flag is cleared if the children recover.
+_CHILD_FAILURES_BEFORE_FLAG = 3
+_CHILD_RESPAWN_BACKOFF_BASE_SECONDS = 5
+_CHILD_RESPAWN_BACKOFF_CAP_SECONDS = 300
+# Time allowed for a freshly spawned load balancer child to bind its port
+# before the spawn is considered failed. The bind happens inside the child
+# (uvicorn), so a child that is alive but never binds (e.g., the port is held
+# by another process) would otherwise look healthy forever.
+_LB_BIND_TIMEOUT_SECONDS = 30
+
+
+def _child_respawn_backoff_seconds(consecutive_failures: int) -> float:
+    """Exponential backoff for child respawn attempts, capped."""
+    return min(
+        _CHILD_RESPAWN_BACKOFF_BASE_SECONDS *
+        (2**max(consecutive_failures - 1, 0)),
+        _CHILD_RESPAWN_BACKOFF_CAP_SECONDS)
+
+
+def _lb_port_is_bound(port: int) -> bool:
+    """Whether something accepts TCP connections on the LB port locally."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(1)
+        try:
+            s.connect(('127.0.0.1', port))
+            return True
+        except OSError:
+            return False
+
+
+def _flag_service_degraded(service_name: str) -> None:
+    """Mark the service CONTROLLER_FAILED after repeated child failures.
+
+    Never overrides a teardown in progress. Best-effort: a DB failure here
+    must not break the supervision loop.
+    """
+    try:
+        record = serve_state.get_service_from_name(service_name)
+        if record is None or record['status'] in (
+                serve_state.ServiceStatus.SHUTTING_DOWN,
+                serve_state.ServiceStatus.FAILED_CLEANUP):
+            return
+        if record['status'] != serve_state.ServiceStatus.CONTROLLER_FAILED:
+            logger.error(f'Flagging service {service_name} as '
+                         'CONTROLLER_FAILED after repeated controller/load '
+                         'balancer failures.')
+            serve_state.set_service_status_and_active_versions(
+                service_name, serve_state.ServiceStatus.CONTROLLER_FAILED)
+    except Exception as e:  # pylint: disable=broad-except
+        logger.error(f'Failed to flag service {service_name} as degraded: '
+                     f'{common_utils.format_exception(e)}')
+
+
+def _heal_service_degraded(service_name: str) -> None:
+    """Clear CONTROLLER_FAILED once the children are confirmed healthy.
+
+    Resets to REPLICA_INIT; the controller's next probe round recomputes the
+    real status from replica states (the replica-driven writer never
+    overwrites CONTROLLER_FAILED itself, so this reset is the only way back).
+    Also heals services HA-recovered from a dead parent, whose status was set
+    to CONTROLLER_FAILED by the status refresh daemon. Best-effort.
+    """
+    try:
+        record = serve_state.get_service_from_name(service_name)
+        if (record is not None and record['status']
+                == serve_state.ServiceStatus.CONTROLLER_FAILED):
+            logger.info(f'Service {service_name} controller/load balancer '
+                        'recovered; clearing CONTROLLER_FAILED.')
+            serve_state.set_service_status_and_active_versions(
+                service_name, serve_state.ServiceStatus.REPLICA_INIT)
+    except Exception as e:  # pylint: disable=broad-except
+        logger.error(f'Failed to heal degraded service {service_name}: '
+                     f'{common_utils.format_exception(e)}')
+
+
 def _ensure_load_balancer(
         lb_process: Optional[multiprocessing.Process], controller_addr: str,
         load_balancer_port: int,
@@ -936,10 +1015,22 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
         # How often to check that the controller child is still alive and
         # respawn it if it died (a cheap local is_alive() poll). Capped at this
         # cadence so a controller that crash-loops on boot is respawned at most
-        # once per interval.
+        # once per interval; actual respawns additionally honor the
+        # exponential backoff below.
         controller_respawn_check_interval_seconds = 5
         own_pid = os.getpid()
         loop_count = 0
+        # Consecutive controller-respawn/LB-bind failures (shared counter: one
+        # degradation flag), the earliest time the next respawn may run, and
+        # when the current LB child was spawned (for the bind grace period).
+        child_failures = 0
+        child_retry_at = 0.0
+        lb_spawned_at = time.time()
+        # Whether the DB status may need healing on the next confirmed-healthy
+        # check. Starts True: an HA-recovered service may carry
+        # CONTROLLER_FAILED from the status refresh daemon (set while the old
+        # parent was dead), which the replica-driven writer never clears.
+        needs_status_heal = True
         while True:
             _handle_signal(service_name)
             loop_count += 1
@@ -979,21 +1070,70 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
             # ensured up (it may have died on its own, or a prior respawn's LB
             # restart may have failed). Runs after the orphan-exit above.
             if loop_count % controller_respawn_check_interval_seconds == 0:
+                now = time.time()
+                healthy = False
                 if (controller_process is not None and
                         not controller_process.is_alive()):
-                    result = _respawn_controller_and_lb(
-                        service_name, service_spec, version, controller_host,
-                        load_balancer_port, load_balancer_log_file,
-                        controller_process, load_balancer_process)
-                    if result is not None:
-                        (controller_process, load_balancer_process,
-                         controller_port) = result
+                    if now >= child_retry_at:
+                        result = _respawn_controller_and_lb(
+                            service_name, service_spec, version,
+                            controller_host, load_balancer_port,
+                            load_balancer_log_file, controller_process,
+                            load_balancer_process)
+                        if result is not None:
+                            (controller_process, load_balancer_process,
+                             controller_port) = result
+                            lb_spawned_at = now
+                            # Health (and any status heal) is confirmed on the
+                            # next check, once the fresh LB has bound.
+                            child_failures = 0
+                            child_retry_at = 0.0
+                        else:
+                            child_failures += 1
+                            child_retry_at = now + _child_respawn_backoff_seconds(
+                                child_failures)
+                elif service_spec.pool:
+                    # Pool services have no LB; a live controller is healthy.
+                    healthy = True
                 else:
-                    load_balancer_process = _ensure_load_balancer(
-                        load_balancer_process,
-                        f'http://{controller_host}:{controller_port}',
-                        load_balancer_port, service_spec,
-                        load_balancer_log_file)
+                    lb_alive = (load_balancer_process is not None and
+                                load_balancer_process.is_alive())
+                    if lb_alive and _lb_port_is_bound(load_balancer_port):
+                        healthy = True
+                    elif (lb_alive and
+                          now - lb_spawned_at < _LB_BIND_TIMEOUT_SECONDS):
+                        # Fresh child still starting up; not a failure yet.
+                        pass
+                    elif now >= child_retry_at:
+                        # Dead, or alive without ever binding its port (e.g.,
+                        # the port is held by another process): kill and
+                        # respawn with backoff. A never-bound LB serves no
+                        # traffic even though the child looks alive.
+                        if lb_alive:
+                            logger.error(
+                                f'Load balancer for {service_name} did not '
+                                f'bind port {load_balancer_port} within '
+                                f'{_LB_BIND_TIMEOUT_SECONDS}s; restarting.')
+                            _kill_process(load_balancer_process)
+                            load_balancer_process = None
+                        load_balancer_process = _ensure_load_balancer(
+                            load_balancer_process,
+                            f'http://{controller_host}:{controller_port}',
+                            load_balancer_port, service_spec,
+                            load_balancer_log_file)
+                        lb_spawned_at = now
+                        child_failures += 1
+                        child_retry_at = now + _child_respawn_backoff_seconds(
+                            child_failures)
+                if healthy:
+                    child_failures = 0
+                    child_retry_at = 0.0
+                    if needs_status_heal:
+                        _heal_service_degraded(service_name)
+                        needs_status_heal = False
+                elif child_failures >= _CHILD_FAILURES_BEFORE_FLAG:
+                    _flag_service_degraded(service_name)
+                    needs_status_heal = True
             time.sleep(1)
     except exceptions.ServeUserTerminatedError:
         logger.debug(f'Caught ServeUserTerminatedError for '

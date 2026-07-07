@@ -759,6 +759,14 @@ def set_service_status_and_active_versions_from_replica(
         # terminated, the service status will still be READY, but we don't want
         # change service status to READY.
         return
+    if record['status'] == serve_state.ServiceStatus.CONTROLLER_FAILED:
+        # The _start supervisor flagged a dead or unbound controller/load
+        # balancer. The controller child may still be alive and probing
+        # replicas (e.g., only the LB failed to bind its port), and must not
+        # flap the status back to READY while the endpoint is down. The
+        # supervisor clears the flag itself once the children are confirmed
+        # healthy (see service.py `_heal_service_degraded`).
+        return
 
     ready_replicas = list(filter(lambda info: info.is_ready, replica_infos))
     if update_mode == UpdateMode.ROLLING:
