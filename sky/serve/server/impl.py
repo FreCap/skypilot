@@ -528,7 +528,11 @@ def up(
                         'Failed to spin up the service. Please '
                         'check the logs above for more details.') from None
         else:
-            if not serve_utils.is_consolidation_mode(pool) and not pool:
+            external_endpoint = serve_utils.external_lb_socket_endpoint(
+                service_name, lb_port)
+            if external_endpoint is not None:
+                socket_endpoint = external_endpoint
+            elif not serve_utils.is_consolidation_mode(pool) and not pool:
                 socket_endpoint = backend_utils.get_endpoints(
                     controller_handle.cluster_name,
                     lb_port,
@@ -1040,7 +1044,11 @@ def status(
         if service_record['load_balancer_port'] is not None:
             try:
                 lb_port = service_record['load_balancer_port']
-                if not serve_utils.is_consolidation_mode(pool):
+                external_endpoint = serve_utils.external_lb_socket_endpoint(
+                    service_record['name'], lb_port)
+                if external_endpoint is not None:
+                    endpoint = external_endpoint
+                elif not serve_utils.is_consolidation_mode(pool):
                     endpoint = backend_utils.get_endpoints(
                         cluster=common.SKY_SERVE_CONTROLLER_NAME,
                         port=lb_port).get(lb_port, None)

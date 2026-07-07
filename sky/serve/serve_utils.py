@@ -382,6 +382,29 @@ def is_external_load_balancer_mode() -> bool:
         ('serve', 'controller', 'external_load_balancer'), default_value=False)
 
 
+def external_lb_socket_endpoint(
+        service_name: str, load_balancer_port: Optional[int]) -> Optional[str]:
+    """The external load balancer's socket endpoint (host:port), or None.
+
+    Returns None (so callers keep the in-pod ``localhost:{port}`` / controller
+    cluster behavior) unless external load balancer mode is on AND a
+    ``serve.controller.external_load_balancer_endpoint`` template is
+    configured. The template is a str.format string with ``{service_name}``
+    and ``{load_balancer_port}`` placeholders; any protocol prefix is stripped
+    because callers add http/https based on the service's TLS config.
+    """
+    if not is_external_load_balancer_mode():
+        return None
+    template = skypilot_config.get_nested(
+        ('serve', 'controller', 'external_load_balancer_endpoint'),
+        default_value=None)
+    if not template:
+        return None
+    endpoint = template.format(service_name=service_name,
+                               load_balancer_port=load_balancer_port)
+    return endpoint.replace('https://', '').replace('http://', '')
+
+
 def ha_recovery_for_consolidation_mode(pool: bool,
                                        still_leader: Optional[Callable[
                                            [], bool]] = None):

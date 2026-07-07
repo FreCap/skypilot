@@ -1306,3 +1306,46 @@ class TestHaRecoveryRecreatesServiceDir:
             serve_utils.ha_recovery_for_consolidation_mode(pool=True)
         # The script ran exactly once, and the service dir existed by then.
         assert order == [('run', True)]
+
+
+# ---------------------------------------------------------------------------
+# external_lb_socket_endpoint (W4): synthesize the public endpoint of an
+# external load balancer from a config template, instead of localhost:{port}.
+# ---------------------------------------------------------------------------
+
+
+def _patch_endpoint_template(template):
+    """Patch is_external_load_balancer_mode(True) + the template lookup."""
+    return mock.patch.object(
+        serve_utils.skypilot_config,
+        'get_nested',
+        side_effect=lambda keys, default_value=None:
+        (template
+         if keys == ('serve', 'controller', 'external_load_balancer_endpoint')
+         else default_value))
+
+
+def test_external_lb_socket_endpoint_off_when_mode_disabled():
+    with mock.patch.object(serve_utils,
+                           'is_external_load_balancer_mode',
+                           return_value=False):
+        assert serve_utils.external_lb_socket_endpoint('svc', 30001) is None
+
+
+def test_external_lb_socket_endpoint_none_when_template_unset():
+    with mock.patch.object(serve_utils,
+                           'is_external_load_balancer_mode',
+                           return_value=True), \
+         _patch_endpoint_template(None):
+        assert serve_utils.external_lb_socket_endpoint('svc', 30001) is None
+
+
+def test_external_lb_socket_endpoint_substitutes_and_strips_protocol():
+    template = 'http://serve-{service_name}.serve.svc:{load_balancer_port}'
+    with mock.patch.object(serve_utils,
+                           'is_external_load_balancer_mode',
+                           return_value=True), \
+         _patch_endpoint_template(template):
+        # Protocol is stripped; callers re-add http/https based on TLS.
+        assert serve_utils.external_lb_socket_endpoint(
+            'mysvc', 30001) == 'serve-mysvc.serve.svc:30001'

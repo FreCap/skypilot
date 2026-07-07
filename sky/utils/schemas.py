@@ -1781,6 +1781,17 @@ def get_config_schema():
                         # the controller does not spawn an in-pod load
                         # balancer.
                     },
+                    'external_load_balancer_endpoint': {
+                        'type': 'string',
+                        # A str.format template for the public endpoint of the
+                        # external load balancer, with {service_name} and
+                        # {load_balancer_port} placeholders, e.g.
+                        # "serve-{service_name}.serve.svc:{load_balancer_port}".
+                        # Used to report the service endpoint when
+                        # external_load_balancer is true, instead of the
+                        # in-pod localhost:{port}. The platform sets this to
+                        # match the load balancer Service it provisions.
+                    },
                     'controller_logs_gc_retention_hours': {
                         'type': 'integer',
                     },
