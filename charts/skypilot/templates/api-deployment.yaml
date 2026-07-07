@@ -196,6 +196,18 @@ spec:
             fieldRef:
               fieldPath: status.podIP
         {{- end }}
+        {{- if .Values.serve.externalLoadBalancer.enabled }}
+        # The controller reads SKYPILOT_POD_NAME to mirror its own image onto
+        # the external LB it spawns (matches sky/serve/constants.py POD_NAME_ENV_VAR).
+        - name: SKYPILOT_POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: SKYPILOT_POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        {{- end }}
         # Use tini as the init process
         command: ["tini", "--"]
         # Start API server in foreground (if supported) to:
