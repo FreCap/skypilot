@@ -453,3 +453,42 @@ class TestRecoveryVersionSelection:
     def test_committed_version_none_when_only_placeholder(self, _mock_serve_db):
         serve_state.add_version('svc')  # placeholder v1, no committed yaml
         assert serve_state.get_latest_committed_version('svc') is None
+
+
+class TestBatchReplicaUpsert:
+    """add_or_update_replicas: one statement for a probe round's writes."""
+
+    def test_batch_insert_then_batch_update(self, _mock_serve_db):
+        import types
+
+        infos = [(i, types.SimpleNamespace(replica_id=i, tag='v1'))
+                 for i in range(1, 4)]
+        serve_state.add_or_update_replicas('svc', infos)
+        rows = {
+            i: serve_state.get_replica_info_from_id('svc', i)
+            for i in range(1, 4)
+        }
+        assert all(rows[i].tag == 'v1' for i in range(1, 4))
+
+        # Conflict path: same keys must update in place, not duplicate.
+        updated = [(i, types.SimpleNamespace(replica_id=i, tag='v2'))
+                   for i in range(1, 4)]
+        serve_state.add_or_update_replicas('svc', updated)
+        assert all(
+            serve_state.get_replica_info_from_id('svc', i).tag == 'v2'
+            for i in range(1, 4))
+        assert len(serve_state.get_replica_infos('svc')) == 3
+
+    def test_empty_batch_is_noop(self, _mock_serve_db):
+        serve_state.add_or_update_replicas('svc', [])
+        assert not serve_state.get_replica_infos('svc')
+
+    def test_batch_larger_than_chunk_size(self, _mock_serve_db):
+        import types
+
+        n = serve_state._REPLICA_UPSERT_CHUNK_SIZE * 2 + 17
+        infos = [
+            (i, types.SimpleNamespace(replica_id=i)) for i in range(1, n + 1)
+        ]
+        serve_state.add_or_update_replicas('svc', infos)
+        assert len(serve_state.get_replica_infos('svc')) == n

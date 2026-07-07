@@ -137,31 +137,54 @@ _TRANSIENT_SSH_FAILURE_PATTERN = re.compile(
     r'Connection reset by peer|Connection closed by remote host|Broken pipe|'
     r'ThrottlingException|RequestLimitExceeded)', re.IGNORECASE)
 
-# Prefix for the generated SSM ProxyCommand: makes the AWS CLI wait out
-# StartSession throttling (low account-wide TPS quota) with client-side rate
-# limiting instead of failing the SSH connection. Also prepended at read time
-# to SSM proxy commands from cluster YAMLs written before this prefix existed
-# (the auth section is restored verbatim on re-provision, so old clusters
-# never regenerate it).
-_SSM_ADAPTIVE_RETRY_EXPORT = ('export AWS_RETRY_MODE=adaptive '
-                              'AWS_MAX_ATTEMPTS=12;')
+# Adaptive-retry settings for the SSM ProxyCommand: make the AWS CLI wait
+# out StartSession throttling (low account-wide TPS quota) with client-side
+# rate limiting instead of failing the SSH connection.
+_SSM_ADAPTIVE_RETRY_ENV = 'AWS_RETRY_MODE=adaptive AWS_MAX_ATTEMPTS=12'
+# The broken prefix form shipped briefly: OpenSSH executes ProxyCommand as
+# `$SHELL -c "exec <command>"`, so a multi-command string starting with
+# `export ...;` makes the shell try to exec the `export` builtin and fail
+# hard (`/bin/sh: 1: exec: export: not found`) — EVERY proxied SSH dies,
+# and the serve controller then classifies healthy just-launched replicas
+# as preempted (job-status walk + forced refresh both SSH). Kept only to
+# recognize and repair commands persisted in that form.
+_SSM_LEGACY_BROKEN_EXPORT_PREFIX = ('export AWS_RETRY_MODE=adaptive '
+                                    'AWS_MAX_ATTEMPTS=12;')
+
+
+def _wrap_ssm_proxy_command_with_adaptive_retry(ssm_proxy_command: str) -> str:
+    """exec-safe adaptive-retry wrapper for an SSM ProxyCommand.
+
+    `env VAR=... /bin/sh -c '<cmd>'` stays a single exec-able command under
+    OpenSSH's `exec` wrapping, and the variables still reach the
+    describe-instances $() command substitution because the inner shell
+    inherits them (verified live; an `export ...;` prefix instead kills the
+    connection before any handshake).
+    """
+    return (f'env {_SSM_ADAPTIVE_RETRY_ENV} '
+            f'/bin/sh -c {shlex.quote(ssm_proxy_command)}')
 
 
 def _upgrade_legacy_ssm_proxy_command(
         ssh_proxy_command: Optional[str]) -> Optional[str]:
-    """Prepend the adaptive-retry export to pre-fix SSM proxy commands.
+    """Normalize persisted SSM proxy commands to the adaptive-retry form.
 
-    Clusters launched before the prefix existed carry an SSM proxy command
-    without it, and keep it forever: on re-provision the auth section is
-    restored verbatim from the old YAML (see
+    Clusters keep their originally-written auth section forever: on
+    re-provision it is restored verbatim from the old YAML (see
     _RAY_YAML_KEYS_TO_RESTORE_FOR_BACK_COMPATIBILITY). Applied in every
-    credential read path so existing clusters also wait out StartSession
-    throttling.
+    credential read path so (1) pre-retry-prefix clusters also wait out
+    StartSession throttling and (2) commands persisted with the broken
+    `export ...;` prefix are repaired instead of failing every SSH.
     """
-    if (ssh_proxy_command is not None and
-            ssh_proxy_command.startswith('aws ssm start-session') and
+    if ssh_proxy_command is None:
+        return None
+    if ssh_proxy_command.startswith(_SSM_LEGACY_BROKEN_EXPORT_PREFIX):
+        stripped = ssh_proxy_command[len(_SSM_LEGACY_BROKEN_EXPORT_PREFIX
+                                        ):].lstrip()
+        return _wrap_ssm_proxy_command_with_adaptive_retry(stripped)
+    if (ssh_proxy_command.startswith('aws ssm start-session') and
             'AWS_RETRY_MODE' not in ssh_proxy_command):
-        return f'{_SSM_ADAPTIVE_RETRY_EXPORT} {ssh_proxy_command}'
+        return _wrap_ssm_proxy_command_with_adaptive_retry(ssh_proxy_command)
     return ssh_proxy_command
 
 
@@ -1021,16 +1044,13 @@ def write_cluster_config(
             # CLI retries give up while the burst is still colliding with
             # itself. Adaptive retry mode rate-limits client-side and waits
             # out ThrottlingException instead of failing the SSH handshake.
-            # 'export' (not a VAR=x command prefix) so the setting also
-            # reaches the describe-instances command substitution, which the
-            # shell expands before the outer command's environment applies.
-            ssm_proxy_command = (f'{_SSM_ADAPTIVE_RETRY_EXPORT} '
-                                 'aws ssm start-session --target '
+            ssm_proxy_command = ('aws ssm start-session --target '
                                  f'\"$({get_instance_id_command})\" '
                                  f'--region {region_name} {profile_str} '
                                  '--document-name AWS-StartSSHSession '
                                  '--parameters portNumber=%p')
-            ssh_proxy_command = ssm_proxy_command
+            ssh_proxy_command = _wrap_ssm_proxy_command_with_adaptive_retry(
+                ssm_proxy_command)
             region_name = 'ssm-session'
     logger.debug(f'Using ssh_proxy_command: {ssh_proxy_command!r}')
 

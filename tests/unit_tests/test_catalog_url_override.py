@@ -83,3 +83,38 @@ def test_source_change_invalidates_fresh_cache(monkeypatch, tmp_path):
     common.read_catalog('do/test-vms.csv', pull_frequency_hours=7).columns  # pylint: disable=expression-not-assigned
     assert len(requested_urls) == 2
     assert requested_urls[1].startswith('https://mirror.example.com/catalogs')
+
+
+def test_pre_tracking_cache_refetched_under_override(monkeypatch, tmp_path):
+    """A catalog cached before source tracking existed (no .source meta)
+    must refetch once when a mirror override is configured — otherwise
+    long-lived machines serve the old source's data until the TTL."""
+    monkeypatch.setattr(common, '_ABSOLUTE_VERSIONED_CATALOG_DIR',
+                        str(tmp_path))
+    requested = []
+
+    def fake_get(url, headers=None):
+        del headers
+        requested.append(url)
+        return _FakeResponse('InstanceType,Region\nx1,us-east-1\n')
+
+    monkeypatch.setattr(common.requests, 'get', fake_get)
+    # Simulate a pre-tracking cache: downloaded catalog (file + .md5 meta,
+    # as pre-#82 downloads wrote) but no .source meta.
+    import hashlib
+    content = 'InstanceType,Region\n'
+    (tmp_path / 'do').mkdir(parents=True)
+    (tmp_path / 'do' / 'gap-vms.csv').write_text(content)
+    (tmp_path / '.meta' / 'do').mkdir(parents=True)
+    (tmp_path / '.meta' / 'do' / 'gap-vms.csv.md5').write_text(
+        hashlib.md5(content.encode(), usedforsecurity=False).hexdigest())
+
+    monkeypatch.delenv('SKYPILOT_HOSTED_CATALOG_DIR_URL', raising=False)
+    common.read_catalog('do/gap-vms.csv', pull_frequency_hours=7).columns  # pylint: disable=expression-not-assigned
+    assert not requested  # fresh by mtime, no override: cache honored
+
+    monkeypatch.setenv('SKYPILOT_HOSTED_CATALOG_DIR_URL',
+                       'https://mirror.example.com/catalogs')
+    common.read_catalog('do/gap-vms.csv', pull_frequency_hours=7).columns  # pylint: disable=expression-not-assigned
+    assert len(requested) == 1
+    assert requested[0].startswith('https://mirror.example.com/catalogs')
