@@ -706,6 +706,12 @@ def get_service_pool_from_db(service_name: str) -> Optional[bool]:
 
 
 # === Replica functions ===
+
+# 999 (the oldest SQLITE_MAX_VARIABLE_NUMBER default) // 3 params per row,
+# rounded down for headroom.
+_REPLICA_UPSERT_CHUNK_SIZE = 300
+
+
 def add_or_update_replica(service_name: str, replica_id: int,
                           replica_info: 'replica_managers.ReplicaInfo') -> None:
     """Adds a replica to the database."""
@@ -756,17 +762,23 @@ def add_or_update_replicas(
         else:
             raise ValueError('Unsupported database dialect')
 
-        insert_stmt = insert_func(replicas_table).values([{
-            'service_name': service_name,
-            'replica_id': replica_id,
-            'replica_info': pickle.dumps(replica_info),
-        } for replica_id, replica_info in replica_infos])
+        # Chunked: 3 bind params per row, and older SQLite builds cap
+        # SQLITE_MAX_VARIABLE_NUMBER at 999 — an unchunked 1k-replica round
+        # would fail exactly on the deployments this batching targets.
+        # 300 rows/chunk keeps a 1k-replica round at ~4 round-trips.
+        for start in range(0, len(replica_infos), _REPLICA_UPSERT_CHUNK_SIZE):
+            chunk = replica_infos[start:start + _REPLICA_UPSERT_CHUNK_SIZE]
+            insert_stmt = insert_func(replicas_table).values([{
+                'service_name': service_name,
+                'replica_id': replica_id,
+                'replica_info': pickle.dumps(replica_info),
+            } for replica_id, replica_info in chunk])
 
-        insert_stmt = insert_stmt.on_conflict_do_update(
-            index_elements=['service_name', 'replica_id'],
-            set_={'replica_info': insert_stmt.excluded.replica_info})
+            insert_stmt = insert_stmt.on_conflict_do_update(
+                index_elements=['service_name', 'replica_id'],
+                set_={'replica_info': insert_stmt.excluded.replica_info})
 
-        session.execute(insert_stmt)
+            session.execute(insert_stmt)
         session.commit()
 
 

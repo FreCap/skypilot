@@ -482,3 +482,13 @@ class TestBatchReplicaUpsert:
     def test_empty_batch_is_noop(self, _mock_serve_db):
         serve_state.add_or_update_replicas('svc', [])
         assert not serve_state.get_replica_infos('svc')
+
+    def test_batch_larger_than_chunk_size(self, _mock_serve_db):
+        import types
+
+        n = serve_state._REPLICA_UPSERT_CHUNK_SIZE * 2 + 17
+        infos = [
+            (i, types.SimpleNamespace(replica_id=i)) for i in range(1, n + 1)
+        ]
+        serve_state.add_or_update_replicas('svc', infos)
+        assert len(serve_state.get_replica_infos('svc')) == n
