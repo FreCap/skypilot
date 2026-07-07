@@ -235,7 +235,11 @@ class SlurmClient:
         guaranteed even if the calling process dies immediately after,
         and no in-process waiting is needed.
         """
-        cmd = (f'scancel --name {job_name} --signal TERM --full; '
+        # `;` (not `&&`) so the enforcing plain scancel always runs; the
+        # graceful scancel's failure is surfaced on stderr since only the
+        # last command's return code is observable.
+        cmd = (f'scancel --name {job_name} --signal TERM --full '
+               f'|| echo "graceful scancel returned $?" >&2; '
                f'scancel --name {job_name}')
         rc, stdout, stderr = self._run_slurm_cmd(cmd)
         subprocess_utils.handle_returncode(
@@ -244,6 +248,8 @@ class SlurmClient:
             f'Failed to terminate job {job_name}.',
             stderr=f'{stdout}\n{stderr}',
             stream_logs=False)
+        if stderr.strip():
+            logger.debug(f'Termination of job {job_name} reported: {stderr}')
         logger.debug(f'Successfully terminated job {job_name}: {stdout}')
 
     def info(self) -> str:

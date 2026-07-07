@@ -1038,10 +1038,12 @@ def terminate_instances(
             # The job may have exited concurrently (e.g., finished or was
             # cancelled elsewhere). Only propagate if it is actually still
             # alive; a vanished job means termination already succeeded.
+            # COMPLETING counts as alive here: since the cancel command
+            # itself failed, we cannot assume Slurm is driving the job to
+            # completion, and a stalled COMPLETING job would leak.
             jobs_state = client.get_jobs_state_by_name(cluster_name_on_cloud)
             still_alive = any(
-                s.strip() not in terminal_states and s.strip() != 'COMPLETING'
-                for s in jobs_state)
+                s.strip() not in terminal_states for s in jobs_state)
             if still_alive:
                 raise
             logger.debug(f'Termination of cluster {cluster_name_on_cloud} '

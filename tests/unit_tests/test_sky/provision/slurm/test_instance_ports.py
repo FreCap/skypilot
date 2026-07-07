@@ -143,12 +143,36 @@ class TestTerminateDurability(unittest.TestCase):
             terminate_side_effect=RuntimeError('no matching job'))
         client.terminate_jobs_by_name.assert_called_once_with('cluster-abc')
 
+    def test_termination_failure_with_completing_job_propagates(self):
+        # COMPLETING after a FAILED cancel command must count as alive:
+        # Slurm may not be driving the job to completion, and a stalled
+        # COMPLETING job would leak.
+        with self.assertRaises(RuntimeError):
+            self._run_terminate(
+                ['RUNNING'],
+                later_states=[['COMPLETING']],
+                terminate_side_effect=RuntimeError('scancel failed'))
+
     def test_termination_failure_with_live_job_propagates(self):
         with self.assertRaises(RuntimeError):
             self._run_terminate(
                 ['RUNNING'],
                 later_states=[['RUNNING']],
                 terminate_side_effect=RuntimeError('scancel failed'))
+
+    def test_terminate_jobs_by_name_is_single_invocation(self):
+        from sky.adaptors import slurm as slurm_adaptor
+        client = slurm_adaptor.SlurmClient.__new__(slurm_adaptor.SlurmClient)
+        with mock.patch.object(client,
+                               '_run_slurm_cmd',
+                               return_value=(0, '', '')) as run_cmd:
+            client.terminate_jobs_by_name('cluster-abc')
+        run_cmd.assert_called_once()
+        cmd = run_cmd.call_args[0][0]
+        # Graceful full-job TERM plus enforcing plain scancel, both against
+        # the same job name, in one remote command.
+        self.assertEqual(cmd.count('scancel --name cluster-abc'), 2)
+        self.assertIn('--signal TERM --full', cmd)
 
     def test_terminate_invalidates_query_ports_cache(self):
         slurm_instance._query_ports_cache['cluster-abc'] = (0.0, '10.0.0.42')
