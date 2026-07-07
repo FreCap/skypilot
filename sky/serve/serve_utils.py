@@ -1563,6 +1563,18 @@ def _terminate_failed_services(
     # DB state in one transaction so an interrupted purge doesn't leave
     # stragglers.
     serve_state.remove_service_completely(service_name)
+    # Delete the controller-owned external LB objects too (no-op outside
+    # external-LB + in-cluster mode). The failed-service controller never ran
+    # its own success-path teardown, so the LB Deployment + Service would
+    # otherwise leak. Best-effort: a purge must still complete even if the k8s
+    # delete fails. Lazy import: lb_k8s imports serve_utils at module level, so
+    # a top-level import here would be circular.
+    from sky.serve import lb_k8s  # pylint: disable=import-outside-toplevel
+    try:
+        lb_k8s.delete_lb_objects(service_name)
+    except Exception as e:  # pylint: disable=broad-except
+        logger.error(f'Failed to delete external LB objects for failed service '
+                     f'{service_name!r}: {common_utils.format_exception(e)}')
     try:
         shutil.rmtree(service_dir)
     except FileNotFoundError:

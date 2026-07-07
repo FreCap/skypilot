@@ -712,6 +712,19 @@ def _run_cleanup_and_finalize(service_name: str,
         serve_state.set_service_status_and_active_versions(
             service_name, serve_state.ServiceStatus.FAILED_CLEANUP)
         logger.error(f'Service {service_name} failed to clean up.')
+        # A FAILED_CLEANUP service is no longer serving, and its controller
+        # port is reclaimable by a new service (FAILED_CLEANUP is a terminal
+        # status excluded from `_select_controller_port`'s in-use set). If we
+        # kept the dead service's LB, a new service reusing that port would
+        # receive the dead LB's traffic -- so tear the data-plane LB down here.
+        # The DB row is intentionally kept for `--purge`; if the service is
+        # ever retried, up() recreates the LB idempotently. Best-effort so a
+        # delete failure does not worsen cleanup.
+        try:
+            lb_k8s.delete_lb_objects(service_name)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.error(f'Failed to delete external LB objects for '
+                         f'{service_name} during failed cleanup: {e}')
     else:
         serve_state.remove_service_completely(service_name)
         # Real teardown: the service row is gone for good. Delete the
@@ -1009,19 +1022,26 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
                     controller_addr, load_balancer_port, service_spec,
                     load_balancer_log_file)
 
-            if not is_recovery:
-                serve_state.set_service_load_balancer_port(
-                    service_name, load_balancer_port)
-
         # In external load balancer mode, ensure the controller-owned per-
-        # service LB Deployment + Service exist before up() reports the
-        # endpoint. Idempotent (409 == already exists), so it is safe on the
-        # recovery path too. No-op outside external-LB + in-cluster mode. Done
-        # outside the port-selection filelock to avoid holding a host-global
-        # lock across k8s API calls; controller_port is already recorded in DB.
+        # service LB Deployment + Service exist BEFORE the load_balancer_port
+        # DB write below. wait_service_registration returns as soon as
+        # load_balancer_port is non-null, so writing it first would let
+        # `sky serve up` report the endpoint before the LB Service exists.
+        # Creating the LB objects first closes that window. Idempotent (409 ==
+        # already exists), so it is safe on the recovery path too. No-op outside
+        # external-LB + in-cluster mode. Done outside the port-selection
+        # filelock to avoid holding a host-global lock across k8s API calls;
+        # controller_port is already recorded in DB.
         if external_lb:
             lb_k8s.create_lb_deployment_and_service(service_name,
                                                     controller_port)
+
+        # Publish load_balancer_port only now -- after the LB objects exist (in
+        # external mode) or the in-pod LB has been spawned -- so registration
+        # unblocks once the data plane is actually reachable.
+        if not is_recovery:
+            serve_state.set_service_load_balancer_port(service_name,
+                                                       load_balancer_port)
 
         # Self-check cadence (seconds): how often we re-read DB to confirm
         # we're still the authoritative controller. Ghost detection only

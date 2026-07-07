@@ -33,10 +33,18 @@ def _install(monkeypatch,
              namespace='skypilot',
              token=None,
              pod_name='controller-pod-0',
-             image='my-repo/skypilot:v1'):
+             image='my-repo/skypilot:v1',
+             db_service_names=None):
     """Patch environment probes + the k8s adaptor for lb_k8s."""
     monkeypatch.setattr(lb_k8s.serve_utils, 'is_external_load_balancer_mode',
                         lambda: external)
+    # reconcile re-checks the DB before reaping an orphan; by default every
+    # service is treated as absent (truly gone). Tests can pass a set of names
+    # the DB should still report as live.
+    live_in_db = set(db_service_names or ())
+    monkeypatch.setattr(
+        lb_k8s.serve_state, 'get_service_from_name',
+        lambda name: {'name': name} if name in live_in_db else None)
     monkeypatch.setattr(lb_k8s.kubernetes_utils,
                         'is_incluster_config_available', lambda: incluster)
     monkeypatch.setattr(lb_k8s.kubernetes_utils,
@@ -103,6 +111,18 @@ def test_long_name_gets_hash_suffix_and_is_unique():
     a = lb_k8s.lb_deployment_name('x' * 100 + '-alpha')
     b = lb_k8s.lb_deployment_name('x' * 100 + '-beta')
     assert a != b
+    assert len(a) <= 63 and len(b) <= 63
+
+
+def test_sanitize_collision_gets_distinct_names():
+    # Distinct originals that sanitize to the same string ('svc-a') must NOT
+    # collide: the hash of the ORIGINAL name keeps them apart.
+    a = lb_k8s.lb_deployment_name('svc_a')
+    b = lb_k8s.lb_deployment_name('svc-a')
+    assert a != b
+    # Deterministic + RFC1123 for both.
+    assert a == lb_k8s.lb_deployment_name('svc_a')
+    assert _RFC1123.match(a) and _RFC1123.match(b)
     assert len(a) <= 63 and len(b) <= 63
 
 
@@ -175,6 +195,37 @@ def test_create_swallows_409(monkeypatch):
     lb_k8s.create_lb_deployment_and_service('svc-a', 20005)
     apps.create_namespaced_deployment.assert_called_once()
     core.create_namespaced_service.assert_called_once()
+
+
+def test_create_409_patches_deployment(monkeypatch):
+    apps = mock.MagicMock()
+    core = mock.MagicMock()
+    apps.create_namespaced_deployment.side_effect = _ApiException(409)
+    _install(monkeypatch, apps_api=apps, core_api=core)
+
+    # 409 on create -> patch the existing Deployment to the desired spec so
+    # image/arg bumps roll out. Must not raise.
+    lb_k8s.create_lb_deployment_and_service('svc-a', 20005)
+    apps.patch_namespaced_deployment.assert_called_once()
+    name_arg, ns_arg, body = apps.patch_namespaced_deployment.call_args.args
+    assert name_arg == lb_k8s.lb_deployment_name('svc-a')
+    assert ns_arg == 'skypilot'
+    assert body['metadata']['name'] == lb_k8s.lb_deployment_name('svc-a')
+
+
+def test_deployment_has_readiness_probe_and_rolling_update(monkeypatch):
+    apps, _ = _install(monkeypatch)
+    lb_k8s.create_lb_deployment_and_service('svc-a', 20005)
+    _, dep = apps.create_namespaced_deployment.call_args.args
+    container = dep['spec']['template']['spec']['containers'][0]
+    # Readiness gated on the LB's drain-aware health route.
+    probe = container['readinessProbe']
+    assert probe['httpGet']['path'] == '/_lb/health'
+    assert probe['httpGet']['port'] == constants.LOAD_BALANCER_PORT_START
+    # Rolling update keeps the old pod until the new one is Ready (no gap).
+    strategy = dep['spec']['strategy']
+    assert strategy['type'] == 'RollingUpdate'
+    assert strategy['rollingUpdate']['maxUnavailable'] == 0
 
 
 def test_create_reraises_non_409(monkeypatch):
@@ -265,6 +316,37 @@ def test_reconcile_no_orphans_deletes_nothing(monkeypatch):
 
     lb_k8s.reconcile_lb_objects({'A', 'B'})
     apps.delete_namespaced_deployment.assert_not_called()
+
+
+def test_reconcile_rechecks_db_before_deleting(monkeypatch):
+    apps = mock.MagicMock()
+    listed = mock.MagicMock()
+    listed.items = [
+        _deployment_with_service_label('A'),
+        _deployment_with_service_label('B'),
+    ]
+    apps.list_namespaced_deployment.return_value = listed
+    # B is absent from the stale snapshot but STILL present in the DB (created
+    # after the snapshot was taken) -> must NOT be reaped. A is in the snapshot.
+    _install(monkeypatch, apps_api=apps, db_service_names={'B'})
+
+    lb_k8s.reconcile_lb_objects({'A'})
+    apps.delete_namespaced_deployment.assert_not_called()
+
+
+def test_reconcile_deletes_when_db_confirms_gone(monkeypatch):
+    apps = mock.MagicMock()
+    listed = mock.MagicMock()
+    listed.items = [_deployment_with_service_label('B')]
+    apps.list_namespaced_deployment.return_value = listed
+    # B absent from both the snapshot and the DB -> genuinely gone -> reaped.
+    _install(monkeypatch, apps_api=apps, db_service_names=set())
+
+    lb_k8s.reconcile_lb_objects({'A'})
+    deleted = [
+        c.args[0] for c in apps.delete_namespaced_deployment.call_args_list
+    ]
+    assert deleted == [lb_k8s.lb_deployment_name('B')]
 
 
 # --------------------------------------------------------------------------- #

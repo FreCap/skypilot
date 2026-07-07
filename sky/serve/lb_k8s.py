@@ -30,6 +30,7 @@ from sky import sky_logging
 from sky.adaptors import kubernetes
 from sky.provision.kubernetes import utils as kubernetes_utils
 from sky.serve import constants
+from sky.serve import serve_state
 from sky.serve import serve_utils
 
 logger = sky_logging.init_logger(__name__)
@@ -55,6 +56,12 @@ _MAX_NAME_LEN = 63
 _LB_NAME_PREFIX = 'skypilot-lb-'
 _HASH_LEN = 8
 
+# Readiness route served by the load balancer (see sky/serve/load_balancer.py).
+# It returns 503 while the LB is draining (SIGTERM / rolling update), so a
+# readinessProbe on it pulls a draining pod out of the Service endpoints before
+# the pod terminates -- no traffic to a pod that is going away.
+_LB_HEALTH_PATH = '/_lb/health'
+
 
 def _sanitize(service_name: str) -> str:
     """Lowercase and collapse non-[a-z0-9-] runs into single dashes."""
@@ -64,21 +71,21 @@ def _sanitize(service_name: str) -> str:
 def lb_base_name(service_name: str) -> str:
     """Deterministic RFC1123-compliant base name for the LB objects.
 
-    Lowercase, only ``[a-z0-9-]``, starts/ends alphanumeric, <=63 chars. If the
-    prefixed sanitized name would exceed 63 chars (or sanitizes to empty), a
-    short stable hash of the original service name is appended for uniqueness.
-    The Deployment and its Service share this base name.
+    Lowercase, only ``[a-z0-9-]``, starts/ends alphanumeric, <=63 chars. A short
+    stable hash of the ORIGINAL service name is ALWAYS appended: sanitizing is
+    lossy (e.g. ``svc_a`` and ``svc-a`` both sanitize to ``svc-a``), so without
+    the hash two distinct services could collide on the same object name and one
+    would receive the other's LB traffic. The Deployment and its Service share
+    this base name.
     """
     sanitized = _sanitize(service_name)
     digest = hashlib.sha1(service_name.encode()).hexdigest()[:_HASH_LEN]
-    if not sanitized:
-        sanitized = digest
-    candidate = f'{_LB_NAME_PREFIX}{sanitized}'
-    if len(candidate) <= _MAX_NAME_LEN:
-        return candidate
-    # Truncate and append the hash to stay unique within the length budget.
+    # Reserve room for the '-<digest>' suffix within the 63-char budget.
     budget = _MAX_NAME_LEN - len(_LB_NAME_PREFIX) - 1 - len(digest)
     truncated = sanitized[:budget].strip('-')
+    if not truncated:
+        # Sanitized to empty: the hash alone keeps the name valid and unique.
+        return f'{_LB_NAME_PREFIX}{digest}'
     return f'{_LB_NAME_PREFIX}{truncated}-{digest}'
 
 
@@ -170,6 +177,17 @@ def _build_deployment_dict(service_name: str, deployment_name: str, image: str,
         'ports': [{
             'containerPort': constants.LOAD_BALANCER_PORT_START
         }],
+        # Gate the Service endpoints on the LB's drain-aware health route: on
+        # SIGTERM / rolling update the route flips to 503, so k8s removes the
+        # draining pod from the endpoints before it exits.
+        'readinessProbe': {
+            'httpGet': {
+                'path': _LB_HEALTH_PATH,
+                'port': constants.LOAD_BALANCER_PORT_START,
+            },
+            'periodSeconds': 2,
+            'failureThreshold': 1,
+        },
     }
     # TODO(fcapponi): prod should mount the controller auth token from a
     # Secret rather than an inline env value. For this iteration we pass it
@@ -192,6 +210,16 @@ def _build_deployment_dict(service_name: str, deployment_name: str, image: str,
         },
         'spec': {
             'replicas': 1,
+            # Roll the new LB pod up (Ready via the readinessProbe) before the
+            # old one is torn down, so an image/arg bump never leaves a gap with
+            # no LB pod backing the Service.
+            'strategy': {
+                'type': 'RollingUpdate',
+                'rollingUpdate': {
+                    'maxSurge': 1,
+                    'maxUnavailable': 0,
+                },
+            },
             'selector': {
                 'matchLabels': {
                     APP_LABEL_KEY: deployment_name
@@ -258,13 +286,23 @@ def create_lb_deployment_and_service(service_name: str,
     except kubernetes.api_exception() as e:
         if getattr(e, 'status', None) != 409:
             raise
-        logger.debug(f'LB Deployment {deployment_name} already exists.')
+        # Already exists: patch it to the desired spec so image/arg bumps (e.g.
+        # a service update or a controller image roll) actually roll out. The
+        # RollingUpdate strategy keeps the old LB pod serving until the new one
+        # is Ready.
+        logger.debug(f'LB Deployment {deployment_name} already exists; '
+                     'patching it to the desired spec.')
+        kubernetes.apps_api(context).patch_namespaced_deployment(
+            deployment_name, namespace, deployment_dict)
     try:
         kubernetes.core_api(context).create_namespaced_service(
             namespace, service_dict)
     except kubernetes.api_exception() as e:
         if getattr(e, 'status', None) != 409:
             raise
+        # Leave an existing Service as-is: its spec (selector + ports) is stable
+        # across respawns, and patching it risks disturbing the allocated
+        # clusterIP for no benefit. Only the Deployment carries mutable spec.
         logger.debug(f'LB Service {service_name_k8s} already exists.')
 
 
@@ -305,6 +343,11 @@ def reconcile_lb_objects(live_service_names: Set[str]) -> None:
     and deletes any whose service is not in ``live_service_names``. Only
     deletes orphans -- create-if-missing for live services is handled by the
     up()/recovery path.
+
+    ``live_service_names`` is a stale snapshot (taken before the recovery
+    sweep), so a service created after the snapshot would look absent here. To
+    avoid deleting a live service's LB, re-check the DB at delete time and only
+    reap an LB whose owning service is genuinely gone.
     """
     if not _lb_mode_active():
         return
@@ -318,5 +361,11 @@ def reconcile_lb_objects(live_service_names: Set[str]) -> None:
         owning_service = labels.get(SERVE_LB_LABEL_KEY)
         if owning_service is None:
             continue
-        if owning_service not in live_service_names:
-            delete_lb_objects(owning_service)
+        if owning_service in live_service_names:
+            continue
+        # Not in the stale snapshot -- confirm the service is truly gone at
+        # delete time before reaping its LB (the snapshot predates any service
+        # created during recovery).
+        if serve_state.get_service_from_name(owning_service) is not None:
+            continue
+        delete_lb_objects(owning_service)

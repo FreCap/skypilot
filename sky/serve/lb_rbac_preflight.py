@@ -20,14 +20,17 @@ from sky.serve import serve_utils
 
 logger = sky_logging.init_logger(__name__)
 
-# (group, resource) pairs the controller must be able to manage for the load
-# balancer. Empty group is the core API group (services live there).
-_REQUIRED_RESOURCES: List[Tuple[str, str]] = [
-    ('apps', 'deployments'),
-    ('', 'services'),
+# (group, resource, verbs) the controller must be able to exercise for the load
+# balancer. Empty group is the core API group (services and pods live there).
+# Deployments/services span the full create/reconcile/teardown lifecycle; pods
+# only need `get`, because image resolution reads the controller pod
+# (read_namespaced_pod) to mirror its image onto the LB Deployment.
+_LIFECYCLE_VERBS: List[str] = ['create', 'get', 'list', 'delete']
+_REQUIRED_CHECKS: List[Tuple[str, str, List[str]]] = [
+    ('apps', 'deployments', _LIFECYCLE_VERBS),
+    ('', 'services', _LIFECYCLE_VERBS),
+    ('', 'pods', ['get']),
 ]
-# Verbs the controller exercises across create/reconcile/teardown.
-_REQUIRED_VERBS: List[str] = ['create', 'get', 'list', 'delete']
 
 
 def check_lb_rbac_preflight() -> None:
@@ -56,8 +59,8 @@ def check_lb_rbac_preflight() -> None:
     namespace = kubernetes_utils.get_kube_config_context_namespace(context)
 
     missing: List[Tuple[str, str]] = []
-    for group, resource in _REQUIRED_RESOURCES:
-        for verb in _REQUIRED_VERBS:
+    for group, resource, verbs in _REQUIRED_CHECKS:
+        for verb in verbs:
             resource_attributes = kubernetes.kubernetes.client.\
                 V1ResourceAttributes(namespace=namespace,
                                      verb=verb,
@@ -89,5 +92,5 @@ def check_lb_rbac_preflight() -> None:
             'External load balancer RBAC preflight failed: the in-cluster '
             f'ServiceAccount is missing the following permissions in namespace '
             f'{namespace!r}: {missing_str}. Grant these verbs on '
-            "'apps/deployments' and 'services' via the helm chart "
+            "'apps/deployments', 'services' and 'pods' via the helm chart "
             "'namespaceRules' and redeploy.")

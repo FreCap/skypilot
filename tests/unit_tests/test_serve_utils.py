@@ -1187,6 +1187,25 @@ class TestTerminateFailedServices:
         remove_service.assert_called_once_with('svc')
         assert message is None
 
+    def test_deletes_external_lb_objects(self):
+        # The failed-service purge path must also reap the controller-owned
+        # external LB (Deployment + Service); otherwise it leaks.
+        infos = [self._replica(1, 'svc-1')]
+        with mock.patch(
+                'sky.serve.serve_utils.serve_state.get_replica_infos',
+                return_value=infos), \
+             mock.patch(
+                 'sky.serve.serve_utils.global_user_state.'
+                 'cluster_with_name_exists', return_value=False), \
+             mock.patch('sky.serve.serve_utils.serve_state.remove_replica'), \
+             mock.patch('sky.serve.serve_utils.serve_state.'
+                        'remove_service_completely'), \
+             mock.patch('sky.serve.serve_utils.shutil.rmtree'), \
+             mock.patch('sky.serve.lb_k8s.delete_lb_objects'
+                       ) as mock_delete_lb:
+            serve_utils._terminate_failed_services('svc', None)
+        mock_delete_lb.assert_called_once_with('svc')
+
 
 class TestHaRecoveryFencesOnLeadershipLoss:
     """`ha_recovery_for_consolidation_mode` must re-check `still_leader`

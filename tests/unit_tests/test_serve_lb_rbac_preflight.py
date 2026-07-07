@@ -41,8 +41,8 @@ def _install(monkeypatch,
                         lambda ctx=None: authz_client)
 
 
-# 2 resources (deployments, services) x 4 verbs (create/get/list/delete).
-_EXPECTED_REVIEW_CALLS = 8
+# deployments x 4 verbs + services x 4 verbs + pods x 1 verb (get) = 9.
+_EXPECTED_REVIEW_CALLS = 9
 
 
 def test_all_allowed_does_not_raise(monkeypatch):
@@ -63,6 +63,7 @@ def test_one_verb_denied_raises(monkeypatch):
     authz.create_self_subject_access_review.side_effect = [
         _make_review(True),
         _make_review(False),
+        _make_review(True),
         _make_review(True),
         _make_review(True),
         _make_review(True),

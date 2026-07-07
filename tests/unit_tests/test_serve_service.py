@@ -386,6 +386,68 @@ class TestCleanupBlocksHaRecoveryButKeepsVersionSpecs:
             mock_remove_recovery.assert_called_once_with('svc')
 
 
+class TestRunCleanupAndFinalizeDeletesLb:
+    """`_run_cleanup_and_finalize` must delete the controller-owned external LB
+    on BOTH branches:
+
+    - success (row removed): the service is gone for good.
+    - FAILED_CLEANUP (row kept for --purge): the service no longer serves and
+      its controller port is reclaimable by a new service, so the dead LB must
+      go to keep the port safe to reclaim.
+    """
+
+    @staticmethod
+    def _spec():
+        spec = mock.MagicMock()
+        spec.pool = False
+        return spec
+
+    def test_deletes_lb_on_failed_cleanup(self):
+        with mock.patch('sky.serve.service._cleanup', return_value=True), \
+             mock.patch('sky.serve.service.serve_state.'
+                        'set_service_status_and_active_versions'), \
+             mock.patch('sky.serve.service.serve_state.'
+                        'remove_service_completely') as mock_remove, \
+             mock.patch('sky.serve.service.lb_k8s.delete_lb_objects'
+                       ) as mock_delete_lb, \
+             mock.patch('sky.serve.service._cleanup_task_run_script'):
+            service._run_cleanup_and_finalize('svc',
+                                              self._spec(),
+                                              '/tmp/svc',
+                                              job_id=1)
+        # FAILED_CLEANUP keeps the DB row but tears down the LB.
+        mock_remove.assert_not_called()
+        mock_delete_lb.assert_called_once_with('svc')
+
+    def test_failed_cleanup_lb_delete_error_is_swallowed(self):
+        with mock.patch('sky.serve.service._cleanup', return_value=True), \
+             mock.patch('sky.serve.service.serve_state.'
+                        'set_service_status_and_active_versions'), \
+             mock.patch('sky.serve.service.lb_k8s.delete_lb_objects',
+                        side_effect=RuntimeError('boom')), \
+             mock.patch('sky.serve.service._cleanup_task_run_script'):
+            # A best-effort LB delete failure must not propagate.
+            service._run_cleanup_and_finalize('svc',
+                                              self._spec(),
+                                              '/tmp/svc',
+                                              job_id=1)
+
+    def test_deletes_lb_on_success(self):
+        with mock.patch('sky.serve.service._cleanup', return_value=False), \
+             mock.patch('sky.serve.service.serve_state.'
+                        'remove_service_completely') as mock_remove, \
+             mock.patch('sky.serve.service.lb_k8s.delete_lb_objects'
+                       ) as mock_delete_lb, \
+             mock.patch('sky.serve.service.shutil.rmtree'), \
+             mock.patch('sky.serve.service._cleanup_task_run_script'):
+            service._run_cleanup_and_finalize('svc',
+                                              self._spec(),
+                                              '/tmp/svc',
+                                              job_id=1)
+        mock_remove.assert_called_once_with('svc')
+        mock_delete_lb.assert_called_once_with('svc')
+
+
 class TestCleanupAuditLog:
     """`_cleanup` logs a WARN with the current DB controller_pid / ip /
     status before deleting anything. _cleanup is destructive (deletes
