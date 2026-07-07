@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import threading
 import time
 import traceback
@@ -111,6 +112,12 @@ class SkyServeLoadBalancer:
         # until which it stays out of routing.
         self._replica_dead_failures: Dict[str, int] = dict()
         self._replica_quarantine_until: Dict[str, float] = dict()
+        # Rollout state. `_ready` flips true after the first successful
+        # controller sync, so k8s never routes to a cold LB. `_draining` flips
+        # true on SIGTERM, which fails readiness and stops the controller sync
+        # (deregister-before-drain).
+        self._ready: bool = False
+        self._draining: bool = False
 
     def _quarantined_replicas(self) -> Set[str]:
         """Replica URLs currently quarantined (TTL not yet expired).
@@ -165,6 +172,23 @@ class SkyServeLoadBalancer:
             else:
                 self._replica_dead_failures.pop(url, None)
                 self._replica_quarantine_until.pop(url, None)
+
+    def _is_ready_to_serve(self) -> bool:
+        """Readiness: true only once synced at least once and not draining."""
+        return self._ready and not self._draining
+
+    def _begin_draining(self) -> None:
+        """Start draining (idempotent): fail readiness + stop syncing."""
+        if not self._draining:
+            logger.info('Draining load balancer: failing readiness and '
+                        'deregistering from the controller sync.')
+        self._draining = True
+
+    async def _health(self,
+                      request: fastapi.Request) -> fastapi.responses.Response:
+        del request  # Unused.
+        return fastapi.responses.Response(
+            status_code=200 if self._is_ready_to_serve() else 503)
 
     async def _sync_with_controller_once(self) -> List[asyncio.Task]:
         close_client_tasks = []
@@ -240,6 +264,8 @@ class SkyServeLoadBalancer:
                             self._client_pool.pop(replica_url))
                 for client in client_to_close:
                     close_client_tasks.append(client.aclose())
+                # First successful sync -> ready to serve (readiness gate).
+                self._ready = True
         return close_client_tasks
 
     async def _sync_with_controller(self):
@@ -255,6 +281,12 @@ class SkyServeLoadBalancer:
         await asyncio.sleep(5)
 
         while True:
+            # Once draining, stop POSTing load_balancer_sync so the controller
+            # stops counting this LB's request timestamps -- otherwise it would
+            # double-count with the maxSurge replacement during a roll.
+            if self._draining:
+                logger.info('Draining: stopped syncing with the controller.')
+                return
             try:
                 close_client_tasks = await self._sync_with_controller_once()
                 await asyncio.sleep(
@@ -413,6 +445,10 @@ class SkyServeLoadBalancer:
             await asyncio.sleep(current_backoff)
 
     def run(self):
+        # Register the readiness route BEFORE the catch-all proxy route so it
+        # is matched first (Starlette matches in registration order) instead of
+        # being proxied to a replica.
+        self._app.add_api_route('/_lb/health', self._health, methods=['GET'])
         self._app.add_api_route('/{path:path}',
                                 self._proxy_with_retries,
                                 methods=['GET', 'POST', 'PUT', 'DELETE'])
@@ -436,10 +472,34 @@ class SkyServeLoadBalancer:
                     f'{protocol}://0.0.0.0:{self._load_balancer_port}. '
                     f'PID: {os.getpid()}')
 
-        uvicorn.run(self._app,
-                    host='0.0.0.0',
-                    port=self._load_balancer_port,
-                    **uvicorn_tls_kwargs)
+        # Manage SIGTERM ourselves (install_signal_handlers=False) so a rolling
+        # update drains gracefully: on SIGTERM we deregister + fail readiness
+        # immediately, then let the server exit only after a grace period so
+        # in-flight requests finish and k8s has pulled us from the Service.
+        config = uvicorn.Config(self._app,
+                                host='0.0.0.0',
+                                port=self._load_balancer_port,
+                                **uvicorn_tls_kwargs)
+        config.install_signal_handlers = False
+        server = uvicorn.Server(config)
+
+        async def _serve() -> None:
+            loop = asyncio.get_running_loop()
+
+            def _on_sigterm() -> None:
+                self._begin_draining()
+                loop.call_later(constants.LB_DRAIN_GRACE_SECONDS,
+                                lambda: setattr(server, 'should_exit', True))
+
+            try:
+                loop.add_signal_handler(signal.SIGTERM, _on_sigterm)
+            except NotImplementedError:
+                # add_signal_handler is unavailable on some platforms
+                # (e.g. Windows); fall back to uvicorn's own handling.
+                server.install_signal_handlers = True
+            await server.serve()
+
+        asyncio.run(_serve())
 
 
 def run_load_balancer(

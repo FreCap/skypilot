@@ -88,6 +88,13 @@ LB_CONNECT_TIMEOUT_SECONDS = 10
 LB_EVICTION_CONSECUTIVE_FAILURES = 3
 LB_EVICTION_QUARANTINE_SECONDS = 30
 
+# On SIGTERM the external LB first deregisters (stops POSTing
+# load_balancer_sync so the controller stops counting it -- avoiding a
+# double-count with the maxSurge replacement) and fails readiness (so k8s
+# pulls it from the Service endpoints), then waits this long for in-flight
+# requests to drain before letting the server exit.
+LB_DRAIN_GRACE_SECONDS = 15
+
 # Default interval in seconds to probe replica endpoint.
 DEFAULT_ENDPOINT_PROBE_INTERVAL_SECONDS = 10
 # Backward compatibility alias.
