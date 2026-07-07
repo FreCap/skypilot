@@ -1,6 +1,7 @@
 """LoadBalancer: Distribute any incoming request to all ready replicas."""
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -37,6 +38,57 @@ def _is_dead_connection_error(exc: Exception) -> bool:
     if isinstance(exc, httpx.TimeoutException):
         return False
     return isinstance(exc, (httpx.NetworkError, httpx.ProtocolError))
+
+
+class _DrainableServer(uvicorn.Server):
+    """A uvicorn Server that drains gracefully on SIGTERM.
+
+    uvicorn installs its own SIGTERM/SIGINT handlers inside
+    ``Server.serve()`` via ``capture_signals()`` (there is no
+    ``install_signal_handlers`` config knob in modern uvicorn), and its default
+    handler sets ``should_exit`` immediately -- which would kill in-flight
+    requests and skip the deregister step. We instead install our own
+    event-loop signal handlers (asyncio-safe) and suppress uvicorn's, so
+    SIGTERM begins draining (fail readiness + stop the controller sync) and the
+    server only exits after ``LB_DRAIN_GRACE_SECONDS`` -- long enough for k8s to
+    pull the pod from the Service and for in-flight requests to finish. A
+    second signal / SIGINT exits promptly.
+    """
+
+    def __init__(self, config: 'uvicorn.Config', on_drain: 'Any') -> None:
+        super().__init__(config)
+        self._on_drain = on_drain
+        self._own_signals = False
+
+    @contextlib.contextmanager
+    def capture_signals(self):
+        # Suppress uvicorn's own signal handlers when we installed ours;
+        # otherwise fall back to uvicorn's handling (e.g. platforms without
+        # loop.add_signal_handler).
+        if self._own_signals:
+            yield
+        else:
+            with super().capture_signals():
+                yield
+
+    async def serve_with_drain(self) -> None:
+        loop = asyncio.get_running_loop()
+
+        def _on_sigterm() -> None:
+            self._on_drain()
+            loop.call_later(constants.LB_DRAIN_GRACE_SECONDS,
+                            lambda: setattr(self, 'should_exit', True))
+
+        try:
+            loop.add_signal_handler(signal.SIGTERM, _on_sigterm)
+            loop.add_signal_handler(signal.SIGINT,
+                                    lambda: setattr(self, 'should_exit', True))
+            self._own_signals = True
+        except NotImplementedError:
+            # add_signal_handler is unavailable (e.g. Windows); let uvicorn
+            # manage signals (no graceful drain, but a correct shutdown).
+            self._own_signals = False
+        await self.serve()
 
 
 class SkyServeLoadBalancer:
@@ -157,10 +209,16 @@ class SkyServeLoadBalancer:
     ) -> None:
         """Update per-replica eviction bookkeeping after a proxy attempt.
 
-        A successful attempt clears the replica's failure state and any
-        quarantine; a dead-connection failure increments its consecutive
-        count and quarantines it once the threshold is reached. Saturation
-        (timeouts) and other non-dead errors are ignored for eviction.
+        Eviction is deliberately scoped to TCP-dead replicas (connection
+        refused/reset before headers): those are the ones whose drained
+        in-flight slots read as least-loaded and attract preferential routing.
+        A dead-connection failure increments the consecutive count and
+        quarantines once the threshold is reached. Everything else -- a
+        response of any status (incl. 5xx: the replica is reachable and
+        releasing its slot), a saturation timeout, or a mid-stream failure
+        after headers -- counts as a completed attempt and clears the streak.
+        Application errors and saturation are intentionally NOT eviction
+        signals (evicting a reachable-but-slow replica shrinks capacity).
         """
         with self._client_pool_lock:
             if isinstance(response_or_exception, Exception):
@@ -472,34 +530,16 @@ class SkyServeLoadBalancer:
                     f'{protocol}://0.0.0.0:{self._load_balancer_port}. '
                     f'PID: {os.getpid()}')
 
-        # Manage SIGTERM ourselves (install_signal_handlers=False) so a rolling
-        # update drains gracefully: on SIGTERM we deregister + fail readiness
-        # immediately, then let the server exit only after a grace period so
-        # in-flight requests finish and k8s has pulled us from the Service.
+        # Drain gracefully on SIGTERM (rolling update): _DrainableServer
+        # deregisters + fails readiness immediately, then exits only after a
+        # grace period so in-flight requests finish and k8s has pulled us from
+        # the Service.
         config = uvicorn.Config(self._app,
                                 host='0.0.0.0',
                                 port=self._load_balancer_port,
                                 **uvicorn_tls_kwargs)
-        config.install_signal_handlers = False
-        server = uvicorn.Server(config)
-
-        async def _serve() -> None:
-            loop = asyncio.get_running_loop()
-
-            def _on_sigterm() -> None:
-                self._begin_draining()
-                loop.call_later(constants.LB_DRAIN_GRACE_SECONDS,
-                                lambda: setattr(server, 'should_exit', True))
-
-            try:
-                loop.add_signal_handler(signal.SIGTERM, _on_sigterm)
-            except NotImplementedError:
-                # add_signal_handler is unavailable on some platforms
-                # (e.g. Windows); fall back to uvicorn's own handling.
-                server.install_signal_handlers = True
-            await server.serve()
-
-        asyncio.run(_serve())
+        server = _DrainableServer(config, on_drain=self._begin_draining)
+        asyncio.run(server.serve_with_drain())
 
 
 def run_load_balancer(
@@ -564,11 +604,12 @@ def _build_argument_parser() -> argparse.ArgumentParser:
         '--target-qps-per-replica',
         type=str,
         default=None,
-        help='Target QPS per replica for instance-aware load balancing, as '
-        'JSON: either a number (e.g. "2.5") or an object mapping accelerator '
-        'type to QPS (e.g. \'{"H100": 2.5, "A100": 1.0}\'). Must match the '
-        'service spec; when unset, instance-aware routing falls back to a '
-        'uniform QPS of 1.0.')
+        help='Target QPS per replica, as JSON. Instance-aware load balancing '
+        'consumes the OBJECT form mapping accelerator type to QPS (e.g. '
+        '\'{"H100": 2.5, "A100": 1.0}\'), which must match the service spec; a '
+        'bare number (e.g. "2.5") is accepted for compatibility but is not used '
+        'by the instance-aware policy. When unset, instance-aware routing falls '
+        'back to a uniform QPS of 1.0.')
     parser.add_argument(
         '--tls-keyfile',
         type=str,
@@ -603,9 +644,16 @@ def _resolve_launch_kwargs(parser: argparse.ArgumentParser,
         except json.JSONDecodeError as e:
             parser.error(f'--target-qps-per-replica must be valid JSON (a '
                          f'number or an object): {e}')
-        if not isinstance(target_qps_per_replica, (int, float, dict)):
+        # bool is a subclass of int, so guard it explicitly ("true"/"false"
+        # must not be accepted as a QPS).
+        if isinstance(target_qps_per_replica,
+                      bool) or not isinstance(target_qps_per_replica,
+                                              (int, float, dict)):
             parser.error('--target-qps-per-replica must be a number or a JSON '
                          'object mapping accelerator type to QPS.')
+        if isinstance(target_qps_per_replica,
+                      (int, float)) and target_qps_per_replica <= 0:
+            parser.error('--target-qps-per-replica must be positive.')
 
     if (args.tls_keyfile is None) != (args.tls_certfile is None):
         parser.error('--tls-keyfile and --tls-certfile must be given together.')

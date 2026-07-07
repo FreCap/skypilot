@@ -52,3 +52,41 @@ def test_health_endpoint_status_codes():
     # Draining -> 503 so k8s pulls it from the Service endpoints.
     lb._begin_draining()
     assert asyncio.run(lb._health(None)).status_code == 503
+
+
+# --- H1 fix: _DrainableServer must suppress uvicorn's own signal handlers when
+# we manage them, so the graceful-drain sequence actually runs on SIGTERM
+# (uvicorn's default handler would set should_exit immediately). ---
+
+import signal as _signal  # noqa: E402
+
+import uvicorn  # noqa: E402
+
+
+def _make_server(own_signals):
+    lb = _make_lb()
+    server = load_balancer._DrainableServer(uvicorn.Config(lb._app),
+                                            on_drain=lambda: None)
+    server._own_signals = own_signals
+    return server
+
+
+def test_drainable_server_suppresses_uvicorn_signals_when_owned():
+    server = _make_server(own_signals=True)
+    before = _signal.getsignal(_signal.SIGTERM)
+    with server.capture_signals():
+        during = _signal.getsignal(_signal.SIGTERM)
+    # uvicorn's handler must NOT have been installed -- we own signals.
+    assert during == before
+
+
+def test_drainable_server_delegates_to_uvicorn_when_not_owned():
+    server = _make_server(own_signals=False)
+    before = _signal.getsignal(_signal.SIGTERM)
+    with server.capture_signals():
+        during = _signal.getsignal(_signal.SIGTERM)
+    after = _signal.getsignal(_signal.SIGTERM)
+    # Fallback path: uvicorn installs its handler inside the context and
+    # restores it on exit.
+    assert during != before
+    assert after == before

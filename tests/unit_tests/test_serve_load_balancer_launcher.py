@@ -78,3 +78,15 @@ def test_tls_one_file_exits(partial):
 def test_stream_timeout_threaded():
     _, kwargs = _resolve(_BASE + ['--stream-timeout-seconds', '45'])
     assert kwargs['stream_timeout_seconds'] == 45
+
+
+def test_target_qps_bool_rejected():
+    # bool is a subclass of int; "true"/"false" must not slip through as a QPS.
+    with pytest.raises(SystemExit):
+        _resolve(_BASE + ['--target-qps-per-replica', 'true'])
+
+
+@pytest.mark.parametrize('value', ['0', '-1', '-2.5'])
+def test_target_qps_nonpositive_rejected(value):
+    with pytest.raises(SystemExit):
+        _resolve(_BASE + ['--target-qps-per-replica', value])
