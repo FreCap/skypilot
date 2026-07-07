@@ -97,8 +97,7 @@ class SkyServeLoadBalancer:
         # _drain_and_close_client); a bare create_task result can be GCed.
         self._client_close_tasks: Set[asyncio.Task] = set()
 
-    async def _sync_with_controller_once(self) -> List[asyncio.Task]:
-        close_client_tasks = []
+    async def _sync_with_controller_once(self) -> None:
         ready_replica_urls = []
         replica_info = {}
 
@@ -153,7 +152,6 @@ class SkyServeLoadBalancer:
                         self._drain_and_close_client(replica_url, client))
                     self._client_close_tasks.add(task)
                     task.add_done_callback(self._client_close_tasks.discard)
-        return close_client_tasks
 
     async def _drain_and_close_client(self, url: str,
                                       client: httpx.AsyncClient) -> None:
@@ -194,11 +192,9 @@ class SkyServeLoadBalancer:
 
         while True:
             try:
-                close_client_tasks = await self._sync_with_controller_once()
+                await self._sync_with_controller_once()
                 await asyncio.sleep(
                     constants.LB_CONTROLLER_SYNC_INTERVAL_SECONDS)
-                # Await those tasks after the interval to avoid blocking.
-                await asyncio.gather(*close_client_tasks)
             except Exception as e:  # pylint: disable=broad-except
                 logger.error(f'An error occurred when syncing with '
                              f'the controller: {e}'
