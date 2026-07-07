@@ -285,12 +285,12 @@ class TestTerminateInstances:
             ('NODE_FAIL', False, False),
             ('PREEMPTED', False, False),
             ('SPECIAL_EXIT', False, False),
-            # COMPLETING - already terminating
-            ('COMPLETING', False, False),
+            # COMPLETING - can stall; enforced termination
+            ('COMPLETING', True, True),
             # PENDING and CONFIGURING - cancel without signal
             ('PENDING', True, False),
             ('CONFIGURING', True, False),
-            # Other states - cancel with TERM signal
+            # Other states - crash-durable termination
             ('RUNNING', True, True),
             ('SUSPENDED', True, True),
             ('STAGING_OUT', True, True),
@@ -329,18 +329,18 @@ class TestTerminateInstances:
 
         if should_cancel:
             if should_signal:
-                mock_client.cancel_jobs_by_name.assert_called_once_with(
-                    cluster_name,
-                    signal='TERM',
-                    full=True,
-                )
+                mock_client.terminate_jobs_by_name.assert_called_once_with(
+                    cluster_name)
+                mock_client.cancel_jobs_by_name.assert_not_called()
             else:
                 mock_client.cancel_jobs_by_name.assert_called_once_with(
                     cluster_name,
                     signal=None,
                 )
+                mock_client.terminate_jobs_by_name.assert_not_called()
         else:
             mock_client.cancel_jobs_by_name.assert_not_called()
+            mock_client.terminate_jobs_by_name.assert_not_called()
 
     @patch('sky.provision.slurm.instance.slurm_utils.is_inside_slurm_cluster')
     @patch('sky.provision.slurm.instance.slurm.SlurmClient')

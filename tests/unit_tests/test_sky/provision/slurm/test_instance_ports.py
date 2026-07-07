@@ -88,28 +88,24 @@ class TestQueryPorts(unittest.TestCase):
         self.assertEqual(second[8080][0].url(), '10.0.0.42:8080')
 
 
-class TestTerminateEscalation(unittest.TestCase):
-    """terminate_instances must enforce termination if TERM is survived."""
+class TestTerminateDurability(unittest.TestCase):
+    """terminate_instances must be crash-durable and idempotent."""
 
-    def _run_terminate(self, states_after_term, cancel_side_effect=None):
-        """Run terminate_instances against a fake client.
-
-        states_after_term: sequence of job-state lists returned by
-        successive get_jobs_state_by_name calls after the initial
-        RUNNING answer.
-        """
+    def _run_terminate(self,
+                       initial_state,
+                       later_states=(),
+                       terminate_side_effect=None):
         client = mock.Mock()
-        client.get_jobs_state_by_name.side_effect = ([['RUNNING']] +
-                                                     list(states_after_term))
-        if cancel_side_effect is not None:
-            client.cancel_jobs_by_name.side_effect = cancel_side_effect
+        client.get_jobs_state_by_name.side_effect = ([initial_state] +
+                                                     list(later_states))
+        if terminate_side_effect is not None:
+            client.terminate_jobs_by_name.side_effect = terminate_side_effect
         with mock.patch.object(slurm_instance.slurm,
                                'SlurmClient',
                                return_value=client), \
              mock.patch.object(slurm_instance.slurm_utils,
                                'is_inside_slurm_cluster',
-                               return_value=False), \
-             mock.patch.object(slurm_instance.time, 'sleep'):
+                               return_value=False):
             slurm_instance.terminate_instances('cluster-abc',
                                                provider_config={
                                                    'ssh': {
@@ -120,42 +116,44 @@ class TestTerminateEscalation(unittest.TestCase):
                                                })
         return client
 
-    def test_graceful_exit_needs_no_escalation(self):
-        client = self._run_terminate([[]])
+    def test_running_job_is_terminated_in_one_call(self):
+        client = self._run_terminate(['RUNNING'])
+        client.terminate_jobs_by_name.assert_called_once_with('cluster-abc')
+        client.cancel_jobs_by_name.assert_not_called()
+
+    def test_completing_job_is_still_enforced(self):
+        client = self._run_terminate(['COMPLETING'])
+        client.terminate_jobs_by_name.assert_called_once_with('cluster-abc')
+
+    def test_pending_job_cancelled_without_signal(self):
+        client = self._run_terminate(['PENDING'])
         client.cancel_jobs_by_name.assert_called_once_with('cluster-abc',
-                                                           signal='TERM',
-                                                           full=True)
+                                                           signal=None)
+        client.terminate_jobs_by_name.assert_not_called()
 
-    def test_completing_after_term_needs_no_escalation(self):
-        client = self._run_terminate([['COMPLETING']])
-        client.cancel_jobs_by_name.assert_called_once_with('cluster-abc',
-                                                           signal='TERM',
-                                                           full=True)
+    def test_terminal_state_needs_no_action(self):
+        client = self._run_terminate(['COMPLETED'])
+        client.terminate_jobs_by_name.assert_not_called()
+        client.cancel_jobs_by_name.assert_not_called()
 
-    def test_surviving_job_gets_enforced_scancel(self):
-        polls = slurm_instance._TERMINATION_GRACE_POLLS
-        client = self._run_terminate([['RUNNING']] * polls)
-        self.assertEqual(client.cancel_jobs_by_name.call_args_list, [
-            mock.call('cluster-abc', signal='TERM', full=True),
-            mock.call('cluster-abc', signal=None),
-        ])
-
-    def test_enforced_scancel_racing_job_exit_is_tolerated(self):
-        # Job stays RUNNING through all polls, then exits right before the
-        # enforced scancel: the scancel failure must not propagate because
-        # a final state check shows the job is gone.
-        polls = slurm_instance._TERMINATION_GRACE_POLLS
+    def test_termination_racing_job_exit_is_tolerated(self):
         client = self._run_terminate(
-            [['RUNNING']] * polls + [[]],
-            cancel_side_effect=[None, RuntimeError('no matching job')])
-        self.assertEqual(client.cancel_jobs_by_name.call_count, 2)
+            ['RUNNING'],
+            later_states=[[]],
+            terminate_side_effect=RuntimeError('no matching job'))
+        client.terminate_jobs_by_name.assert_called_once_with('cluster-abc')
 
-    def test_enforced_scancel_failure_with_live_job_propagates(self):
-        polls = slurm_instance._TERMINATION_GRACE_POLLS
+    def test_termination_failure_with_live_job_propagates(self):
         with self.assertRaises(RuntimeError):
             self._run_terminate(
-                [['RUNNING']] * (polls + 1),
-                cancel_side_effect=[None, RuntimeError('scancel failed')])
+                ['RUNNING'],
+                later_states=[['RUNNING']],
+                terminate_side_effect=RuntimeError('scancel failed'))
+
+    def test_terminate_invalidates_query_ports_cache(self):
+        slurm_instance._query_ports_cache['cluster-abc'] = (0.0, '10.0.0.42')
+        self._run_terminate(['RUNNING'])
+        self.assertNotIn('cluster-abc', slurm_instance._query_ports_cache)
 
 
 if __name__ == '__main__':

@@ -39,12 +39,6 @@ POLL_INTERVAL_SECONDS = 2
 # Default KillWait is 30 seconds, so we add some buffer time here.
 _JOB_TERMINATION_TIMEOUT_SECONDS = 60
 
-# Grace period given to in-job processes to exit after the initial TERM
-# signal during termination, before termination is enforced with a plain
-# scancel.
-_TERMINATION_POLL_INTERVAL_SECONDS = 5
-_TERMINATION_GRACE_POLLS = 3
-
 # sbatch options that SkyPilot controls and must not be overridden by users.
 # These are either set dynamically based on the resource spec, or are required
 # for SkyPilot's job lifecycle management.
@@ -999,6 +993,12 @@ def terminate_instances(
             ssh_proxy_jump=ssh_proxy_jump,
             identities_only=identities_only,
         )
+    # Endpoints of this cluster are about to become invalid; drop any
+    # cached resolution so a re-provisioned allocation cannot be served a
+    # stale compute-node IP.
+    with _query_ports_cache_lock:
+        _query_ports_cache.pop(cluster_name_on_cloud, None)
+
     jobs_state = client.get_jobs_state_by_name(cluster_name_on_cloud)
     if not jobs_state:
         logger.debug(f'Job for cluster {cluster_name_on_cloud} not found, '
@@ -1023,39 +1023,20 @@ def terminate_instances(
     if job_state in ('PENDING', 'CONFIGURING'):
         # For pending/configuring jobs, cancel without signal to avoid hangs.
         client.cancel_jobs_by_name(cluster_name_on_cloud, signal=None)
-    elif job_state == 'COMPLETING':
-        # Job is already being terminated. No action needed.
-        logger.debug(
-            f'Job for cluster {cluster_name_on_cloud} is already completing. '
-            'No action needed.')
     else:
-        # For other states (e.g., RUNNING, SUSPENDED), send a TERM signal
-        # first so in-job processes can shut down gracefully.
-        client.cancel_jobs_by_name(cluster_name_on_cloud,
-                                   signal='TERM',
-                                   full=True)
-        # `scancel --signal=TERM` only delivers the signal; it does NOT
-        # mark the job for termination. If any process in the batch step
-        # survives TERM (e.g., a user-launched server), the batch script
-        # never exits and the allocation leaks indefinitely. Wait briefly
-        # for a graceful exit, then enforce termination with a plain
-        # scancel (Slurm escalates TERM -> KillWait -> KILL).
-        for _ in range(_TERMINATION_GRACE_POLLS):
-            time.sleep(_TERMINATION_POLL_INTERVAL_SECONDS)
-            jobs_state = client.get_jobs_state_by_name(cluster_name_on_cloud)
-            if not jobs_state:
-                return
-            state = jobs_state[0].strip()
-            if state in terminal_states or state == 'COMPLETING':
-                return
-        logger.info(f'Job for cluster {cluster_name_on_cloud} is still '
-                    'running after the TERM grace period; enforcing '
-                    'termination with scancel.')
+        # For all other states (RUNNING, SUSPENDED, and also COMPLETING,
+        # which can stall indefinitely if a process ignores signals),
+        # terminate crash-durably: a graceful TERM to the full job plus a
+        # plain scancel in one remote invocation, so Slurm itself enforces
+        # TERM -> KillWait -> KILL even if this process dies right after
+        # issuing the command. No in-process grace polling: relying on
+        # this worker surviving a wait window would leak the allocation on
+        # an API server crash, with no state left to reconcile it.
         try:
-            client.cancel_jobs_by_name(cluster_name_on_cloud, signal=None)
+            client.terminate_jobs_by_name(cluster_name_on_cloud)
         except Exception:  # pylint: disable=broad-except
-            # The job may have exited between the last poll and the
-            # enforced scancel. Only propagate if it is actually still
+            # The job may have exited concurrently (e.g., finished or was
+            # cancelled elsewhere). Only propagate if it is actually still
             # alive; a vanished job means termination already succeeded.
             jobs_state = client.get_jobs_state_by_name(cluster_name_on_cloud)
             still_alive = any(
@@ -1063,9 +1044,8 @@ def terminate_instances(
                 for s in jobs_state)
             if still_alive:
                 raise
-            logger.debug(f'Enforced scancel for cluster '
-                         f'{cluster_name_on_cloud} raced with job exit; '
-                         'job already terminated.')
+            logger.debug(f'Termination of cluster {cluster_name_on_cloud} '
+                         'raced with job exit; job already terminated.')
 
 
 def open_ports(

@@ -224,6 +224,28 @@ class SlurmClient:
                                            stream_logs=False)
         logger.debug(f'Successfully cancelled job {job_name}: {stdout}')
 
+    def terminate_jobs_by_name(self, job_name: str) -> None:
+        """Terminate job(s) by name, crash-durably.
+
+        Sends TERM to the full job (including the batch script, which traps
+        it for a graceful shutdown), then immediately marks the job for
+        termination with a plain scancel so that Slurm itself enforces
+        TERM -> KillWait -> KILL. Both commands run in a single remote
+        invocation: once it reaches the login node, termination is
+        guaranteed even if the calling process dies immediately after,
+        and no in-process waiting is needed.
+        """
+        cmd = (f'scancel --name {job_name} --signal TERM --full; '
+               f'scancel --name {job_name}')
+        rc, stdout, stderr = self._run_slurm_cmd(cmd)
+        subprocess_utils.handle_returncode(
+            rc,
+            cmd,
+            f'Failed to terminate job {job_name}.',
+            stderr=f'{stdout}\n{stderr}',
+            stream_logs=False)
+        logger.debug(f'Successfully terminated job {job_name}: {stdout}')
+
     def info(self) -> str:
         """Get Slurm cluster information.
 
