@@ -2,11 +2,13 @@ name: Helm Chart Values Schema
 
 on:
   push:
-    branches: [ main, master ]
+    # `improvements` is the boltz fork's integration branch — include it so the
+    # fork's chart schema drift (e.g. serve.externalLoadBalancer) is caught here.
+    branches: [ main, master, improvements ]
     paths:
       - 'charts/**'
   pull_request:
-    branches: [ main, master ]
+    branches: [ main, master, improvements ]
     paths:
       - 'charts/**'
   workflow_dispatch:

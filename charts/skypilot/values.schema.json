@@ -844,6 +844,25 @@
                 }
             }
         },
+        "serve": {
+            "type": "object",
+            "properties": {
+                "externalLoadBalancer": {
+                    "type": "object",
+                    "properties": {
+                        "controllerPortRangeSize": {
+                            "type": "integer"
+                        },
+                        "controllerPortRangeStart": {
+                            "type": "integer"
+                        },
+                        "enabled": {
+                            "type": "boolean"
+                        }
+                    }
+                }
+            }
+        },
         "slurmCredentials": {
             "type": "object",
             "properties": {
