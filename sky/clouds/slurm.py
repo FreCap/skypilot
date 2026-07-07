@@ -33,12 +33,16 @@ class Slurm(clouds.Cloud):
     """Slurm."""
 
     _REPR = 'Slurm'
-    # OPEN_PORTS is supported as a no-op: Slurm has no firewall API, so
-    # SkyPilot cannot manage reachability. Ports bound on compute nodes are
-    # reachable if the surrounding network allows it (e.g., intra-VPC
-    # traffic on cloud-hosted clusters); query_ports resolves endpoints to
-    # the compute node's IP.
     _CLOUD_UNSUPPORTED_FEATURES = {
+        clouds.CloudImplementationFeatures.OPEN_PORTS:
+            'Opening ports is disabled on this Slurm cluster. Slurm has no '
+            'firewall API, so SkyPilot cannot manage reachability; ports '
+            'bound on compute nodes are only reachable if the surrounding '
+            'network already routes to them (e.g., intra-VPC traffic on '
+            'cloud-hosted clusters). If that is the case, opt in with '
+            'slurm.enable_ports: true (or per cluster via '
+            'slurm.cluster_configs.<cluster>.enable_ports) in '
+            '~/.sky/config.yaml.',
         clouds.CloudImplementationFeatures.AUTOSTOP: 'Slurm does not '
                                                      'support autostop.',
         clouds.CloudImplementationFeatures.STOP: 'Slurm does not support '
@@ -71,6 +75,7 @@ class Slurm(clouds.Cloud):
     _DYNAMICALLY_CHECKED_FEATURES = {
         clouds.CloudImplementationFeatures.DOCKER_IMAGE,
         clouds.CloudImplementationFeatures.STORAGE_MOUNTING,
+        clouds.CloudImplementationFeatures.OPEN_PORTS,
     }
     _MAX_CLUSTER_NAME_LEN_LIMIT = 120
     _regions: List[clouds.Region] = []
@@ -120,6 +125,16 @@ class Slurm(clouds.Cloud):
         else:
             clusters = [cluster]
         for c in clusters:
+            # Ports are opt-in per cluster: the deployer asserts that the
+            # network already routes to compute nodes (Slurm itself has no
+            # firewall API for SkyPilot to manage).
+            if skypilot_config.get_effective_region_config(
+                    cloud='slurm',
+                    region=c,
+                    keys=('enable_ports',),
+                    default_value=False):
+                unsupported.pop(clouds.CloudImplementationFeatures.OPEN_PORTS,
+                                None)
             try:
                 # Docker image support requires the Pyxis SPANK plugin.
                 if slurm_utils.check_pyxis_enabled(c):

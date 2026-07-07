@@ -316,13 +316,16 @@ class TestTerminateInstances:
             }
         }
 
-        # Mock the job state query
-        mock_client.get_jobs_state_by_name.return_value = [job_state]
+        # Mock the job state query. After a TERM signal, the job exits
+        # gracefully (subsequent polls see no job).
+        mock_client.get_jobs_state_by_name.side_effect = ([[job_state]] +
+                                                          [[]] * 10)
 
-        slurm_instance.terminate_instances(
-            cluster_name_on_cloud=cluster_name,
-            provider_config=provider_config,
-        )
+        with patch('sky.provision.slurm.instance.time.sleep'):
+            slurm_instance.terminate_instances(
+                cluster_name_on_cloud=cluster_name,
+                provider_config=provider_config,
+            )
 
         if should_cancel:
             if should_signal:
@@ -1375,3 +1378,39 @@ class TestExpandPathVars:
         result = slurm_utils.expand_path_vars('/home/; rm -rf /',
                                               self.REMOTE_ENV)
         assert result == '/home/; rm -rf /'
+
+
+class TestOpenPortsGate:
+    """OPEN_PORTS must stay unsupported unless slurm.enable_ports is set."""
+
+    def _open_ports_unsupported(self, enable_ports: bool) -> bool:
+        from sky import clouds as sky_clouds
+
+        def fake_config(cloud, region, keys, default_value=None):
+            del cloud, region
+            if keys == ('enable_ports',):
+                return enable_ports
+            return default_value
+
+        resources = mock.MagicMock()
+        resources.region = 'mycluster'
+        with mock.patch.object(slurm_cloud.skypilot_config,
+                               'get_effective_region_config',
+                               side_effect=fake_config), \
+             mock.patch.object(slurm_cloud.slurm_utils,
+                               'check_pyxis_enabled',
+                               return_value=False), \
+             mock.patch.object(slurm_cloud.slurm_utils,
+                               'check_fuse_enabled',
+                               return_value=False):
+            unsupported = (
+                slurm_cloud.Slurm._unsupported_features_for_resources(
+                    resources, region='mycluster'))
+        return (sky_clouds.CloudImplementationFeatures.OPEN_PORTS
+                in unsupported)
+
+    def test_ports_unsupported_by_default(self):
+        assert self._open_ports_unsupported(enable_ports=False)
+
+    def test_ports_supported_when_enabled(self):
+        assert not self._open_ports_unsupported(enable_ports=True)

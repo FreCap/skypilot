@@ -1051,7 +1051,21 @@ def terminate_instances(
         logger.info(f'Job for cluster {cluster_name_on_cloud} is still '
                     'running after the TERM grace period; enforcing '
                     'termination with scancel.')
-        client.cancel_jobs_by_name(cluster_name_on_cloud, signal=None)
+        try:
+            client.cancel_jobs_by_name(cluster_name_on_cloud, signal=None)
+        except Exception:  # pylint: disable=broad-except
+            # The job may have exited between the last poll and the
+            # enforced scancel. Only propagate if it is actually still
+            # alive; a vanished job means termination already succeeded.
+            jobs_state = client.get_jobs_state_by_name(cluster_name_on_cloud)
+            still_alive = any(
+                s.strip() not in terminal_states and s.strip() != 'COMPLETING'
+                for s in jobs_state)
+            if still_alive:
+                raise
+            logger.debug(f'Enforced scancel for cluster '
+                         f'{cluster_name_on_cloud} raced with job exit; '
+                         'job already terminated.')
 
 
 def open_ports(
@@ -1074,6 +1088,16 @@ def cleanup_ports(
     pass
 
 
+# Endpoint resolution requires a live SSH round trip to the login node
+# (squeue/scontrol). SkyServe resolves replica endpoints on every readiness
+# probe round, so cache the resolved node IP briefly. Node IPs of a Slurm
+# allocation are stable for the lifetime of the job, so a short TTL only
+# delays visibility of a re-provisioned allocation.
+_QUERY_PORTS_CACHE_TTL_SECONDS = 60
+_query_ports_cache: Dict[str, Tuple[float, str]] = {}
+_query_ports_cache_lock = threading.Lock()
+
+
 def query_ports(
     cluster_name_on_cloud: str,
     ports: List[str],
@@ -1089,11 +1113,31 @@ def query_ports(
     surrounding network (e.g., VPC routing and security groups).
     """
     del head_ip  # Login node address; not where ports are bound.
-    cluster_info = get_cluster_info('', cluster_name_on_cloud, provider_config)
-    head_instance = cluster_info.get_head_instance()
+    now = time.time()
+    with _query_ports_cache_lock:
+        entry = _query_ports_cache.get(cluster_name_on_cloud)
+        if (entry is not None and
+                now - entry[0] < _QUERY_PORTS_CACHE_TTL_SECONDS):
+            return common.query_ports_passthrough(ports, entry[1])
+    try:
+        cluster_info = get_cluster_info('', cluster_name_on_cloud,
+                                        provider_config)
+        head_instance = cluster_info.get_head_instance()
+    except Exception as e:  # pylint: disable=broad-except
+        # A transient lookup failure (SSH hiccup, job mid-transition) must
+        # not propagate: callers treat an empty result as "endpoint not
+        # exposed yet" and retry, while an exception can abort operations
+        # covering many clusters (e.g., a serve readiness probe round).
+        logger.warning('Failed to resolve port endpoints for cluster '
+                       f'{cluster_name_on_cloud}: '
+                       f'{common_utils.format_exception(e)}')
+        return {}
     if head_instance is None:
         # No running allocation yet; no endpoints to report.
         return {}
+    with _query_ports_cache_lock:
+        _query_ports_cache[cluster_name_on_cloud] = (now,
+                                                     head_instance.internal_ip)
     return common.query_ports_passthrough(ports, head_instance.internal_ip)
 
 
