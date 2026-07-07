@@ -2069,6 +2069,9 @@ def get_config_schema():
                 'provision_timeout': {
                     'type': 'integer',
                 },
+                'enable_ports': {
+                    'type': 'boolean',
+                },
                 'pricing': _PRICING_SCHEMA,
                 'sbatch_options': _SBATCH_OPTIONS_SCHEMA,
                 'gpu_partition_map': _GPU_PARTITION_MAP_SCHEMA,
@@ -2089,6 +2092,9 @@ def get_config_schema():
                             },
                             'tmpdir': {
                                 'type': 'string',
+                            },
+                            'enable_ports': {
+                                'type': 'boolean',
                             },
                             'pricing': _PRICING_SCHEMA,
                             'sbatch_options': _SBATCH_OPTIONS_SCHEMA,

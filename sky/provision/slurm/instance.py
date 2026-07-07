@@ -993,6 +993,12 @@ def terminate_instances(
             ssh_proxy_jump=ssh_proxy_jump,
             identities_only=identities_only,
         )
+    # Endpoints of this cluster are about to become invalid; drop any
+    # cached resolution so a re-provisioned allocation cannot be served a
+    # stale compute-node IP.
+    with _query_ports_cache_lock:
+        _query_ports_cache.pop(cluster_name_on_cloud, None)
+
     jobs_state = client.get_jobs_state_by_name(cluster_name_on_cloud)
     if not jobs_state:
         logger.debug(f'Job for cluster {cluster_name_on_cloud} not found, '
@@ -1017,16 +1023,31 @@ def terminate_instances(
     if job_state in ('PENDING', 'CONFIGURING'):
         # For pending/configuring jobs, cancel without signal to avoid hangs.
         client.cancel_jobs_by_name(cluster_name_on_cloud, signal=None)
-    elif job_state == 'COMPLETING':
-        # Job is already being terminated. No action needed.
-        logger.debug(
-            f'Job for cluster {cluster_name_on_cloud} is already completing. '
-            'No action needed.')
     else:
-        # For other states (e.g., RUNNING, SUSPENDED), send a TERM signal.
-        client.cancel_jobs_by_name(cluster_name_on_cloud,
-                                   signal='TERM',
-                                   full=True)
+        # For all other states (RUNNING, SUSPENDED, and also COMPLETING,
+        # which can stall indefinitely if a process ignores signals),
+        # terminate crash-durably: a graceful TERM to the full job plus a
+        # plain scancel in one remote invocation, so Slurm itself enforces
+        # TERM -> KillWait -> KILL even if this process dies right after
+        # issuing the command. No in-process grace polling: relying on
+        # this worker surviving a wait window would leak the allocation on
+        # an API server crash, with no state left to reconcile it.
+        try:
+            client.terminate_jobs_by_name(cluster_name_on_cloud)
+        except Exception:  # pylint: disable=broad-except
+            # The job may have exited concurrently (e.g., finished or was
+            # cancelled elsewhere). Only propagate if it is actually still
+            # alive; a vanished job means termination already succeeded.
+            # COMPLETING counts as alive here: since the cancel command
+            # itself failed, we cannot assume Slurm is driving the job to
+            # completion, and a stalled COMPLETING job would leak.
+            jobs_state = client.get_jobs_state_by_name(cluster_name_on_cloud)
+            still_alive = any(
+                s.strip() not in terminal_states for s in jobs_state)
+            if still_alive:
+                raise
+            logger.debug(f'Termination of cluster {cluster_name_on_cloud} '
+                         'raced with job exit; job already terminated.')
 
 
 def open_ports(
@@ -1047,6 +1068,59 @@ def cleanup_ports(
     """See sky/provision/__init__.py"""
     del cluster_name_on_cloud, ports, provider_config
     pass
+
+
+# Endpoint resolution requires a live SSH round trip to the login node
+# (squeue/scontrol). SkyServe resolves replica endpoints on every readiness
+# probe round, so cache the resolved node IP briefly. Node IPs of a Slurm
+# allocation are stable for the lifetime of the job, so a short TTL only
+# delays visibility of a re-provisioned allocation.
+_QUERY_PORTS_CACHE_TTL_SECONDS = 60
+_query_ports_cache: Dict[str, Tuple[float, str]] = {}
+_query_ports_cache_lock = threading.Lock()
+
+
+def query_ports(
+    cluster_name_on_cloud: str,
+    ports: List[str],
+    head_ip: Optional[str] = None,
+    provider_config: Optional[Dict[str, Any]] = None,
+) -> Dict[int, List[common.Endpoint]]:
+    """See sky/provision/__init__.py
+
+    The head_ip recorded for Slurm clusters is the login node (the SSH
+    entrypoint), but ports are bound by processes on the allocated compute
+    node. Resolve endpoints to the head compute node's IP instead. Slurm
+    manages no firewall, so reachability of that IP is determined by the
+    surrounding network (e.g., VPC routing and security groups).
+    """
+    del head_ip  # Login node address; not where ports are bound.
+    now = time.time()
+    with _query_ports_cache_lock:
+        entry = _query_ports_cache.get(cluster_name_on_cloud)
+        if (entry is not None and
+                now - entry[0] < _QUERY_PORTS_CACHE_TTL_SECONDS):
+            return common.query_ports_passthrough(ports, entry[1])
+    try:
+        cluster_info = get_cluster_info('', cluster_name_on_cloud,
+                                        provider_config)
+        head_instance = cluster_info.get_head_instance()
+    except Exception as e:  # pylint: disable=broad-except
+        # A transient lookup failure (SSH hiccup, job mid-transition) must
+        # not propagate: callers treat an empty result as "endpoint not
+        # exposed yet" and retry, while an exception can abort operations
+        # covering many clusters (e.g., a serve readiness probe round).
+        logger.warning('Failed to resolve port endpoints for cluster '
+                       f'{cluster_name_on_cloud}: '
+                       f'{common_utils.format_exception(e)}')
+        return {}
+    if head_instance is None:
+        # No running allocation yet; no endpoints to report.
+        return {}
+    with _query_ports_cache_lock:
+        _query_ports_cache[cluster_name_on_cloud] = (now,
+                                                     head_instance.internal_ip)
+    return common.query_ports_passthrough(ports, head_instance.internal_ip)
 
 
 def _build_pyxis_args(cluster_name_on_cloud: str) -> str:
