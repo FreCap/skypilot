@@ -264,6 +264,26 @@ apiService:
   # @schema type: [string, null]
   topologySpreadTopologyKey: null
 
+# SkyServe (model serving) configuration.
+serve:
+  # Portable external load balancer support for controller-owned SkyServe LBs.
+  # When enabled, the chart renders the two platform contracts the in-pod
+  # controller needs to spawn and reach an external LB:
+  #   1. A Service named exactly `skypilot-serve-controller` that exposes the
+  #      controller port range and selects the api-server pod, so external LB
+  #      pods can reach the in-pod controller.
+  #   2. Downward-API env vars (SKYPILOT_POD_NAME / SKYPILOT_POD_NAMESPACE) on
+  #      the api-server container, so the controller can mirror its own image
+  #      onto the LB it creates.
+  externalLoadBalancer:
+    # Enable/disable external load balancer support. Inert by default.
+    enabled: false
+    # First port of the controller port range exposed by the controller Service.
+    controllerPortRangeStart: 20001
+    # Number of consecutive ports (starting at controllerPortRangeStart) to
+    # expose on the controller Service.
+    controllerPortRangeSize: 100
+
 # Authentication configuration for the API server
 # Refer to https://docs.skypilot.co/en/latest/reference/auth.html for more details.
 # @schema type: [object, null]
