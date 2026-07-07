@@ -528,3 +528,105 @@ class TestCleanupStorageStaleBucket:
             'unexpected construct errors must propagate as cleanup failure')
         # The broader except block aborted before reaching teardown.
         mock_backend.teardown_ephemeral_storage.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _select_controller_port: stable per-service port assignment (W2).
+#
+# Default mode must be unchanged (ephemeral find_free_port). External load
+# balancer mode must return a STABLE port from the configured range: reuse the
+# service's own assigned port, and otherwise assign the lowest free port not
+# held by another service.
+# ---------------------------------------------------------------------------
+
+
+def _external_lb_mode():
+    return mock.patch.object(service.serve_utils,
+                             'is_external_load_balancer_mode',
+                             return_value=True)
+
+
+def test_select_controller_port_default_mode_uses_find_free_port():
+    with mock.patch.object(service.serve_utils,
+                           'is_external_load_balancer_mode',
+                           return_value=False), \
+         mock.patch.object(service.common_utils,
+                           'find_free_port',
+                           return_value=54321) as find_free_port:
+        assert service._select_controller_port('svc') == 54321
+        find_free_port.assert_called_once()
+
+
+def test_select_controller_port_reuses_assigned_in_range():
+    base = service.constants.CONTROLLER_PORT_START
+    with _external_lb_mode(), \
+         mock.patch.object(service.serve_state,
+                           'get_service_controller_port',
+                           return_value=base + 5), \
+         mock.patch.object(service.serve_state,
+                           'set_service_controller_port') as setter:
+        assert service._select_controller_port('svc') == base + 5
+        # A stable, in-range assignment must be reused, never rewritten.
+        setter.assert_not_called()
+
+
+def test_select_controller_port_assigns_lowest_free():
+    base = service.constants.CONTROLLER_PORT_START
+    others = [{
+        'name': 'a',
+        'controller_port': base
+    }, {
+        'name': 'b',
+        'controller_port': base + 1
+    }, {
+        'name': 'svc',
+        'controller_port': None
+    }]
+    with _external_lb_mode(), \
+         mock.patch.object(service.serve_state,
+                           'get_service_controller_port',
+                           return_value=None), \
+         mock.patch.object(service.serve_state,
+                           'get_services',
+                           return_value=others), \
+         mock.patch.object(service.serve_state,
+                           'set_service_controller_port') as setter:
+        # base and base+1 are taken by other services -> lowest free is base+2.
+        assert service._select_controller_port('svc') == base + 2
+        setter.assert_called_once_with('svc', base + 2)
+
+
+def test_select_controller_port_reassigns_when_out_of_range():
+    # A stale ephemeral port (from a prior in-pod-LB run) is not in the stable
+    # range and must be replaced with a range port.
+    base = service.constants.CONTROLLER_PORT_START
+    with _external_lb_mode(), \
+         mock.patch.object(service.serve_state,
+                           'get_service_controller_port',
+                           return_value=40000), \
+         mock.patch.object(service.serve_state,
+                           'get_services',
+                           return_value=[]), \
+         mock.patch.object(service.serve_state,
+                           'set_service_controller_port') as setter:
+        assert service._select_controller_port('svc') == base
+        setter.assert_called_once_with('svc', base)
+
+
+def test_select_controller_port_range_exhausted_raises():
+    base = service.constants.CONTROLLER_PORT_START
+    size = service.constants.CONTROLLER_PORT_RANGE_SIZE
+    full = [{
+        'name': f's{port}',
+        'controller_port': port
+    } for port in range(base, base + size)]
+    with _external_lb_mode(), \
+         mock.patch.object(service.serve_state,
+                           'get_service_controller_port',
+                           return_value=None), \
+         mock.patch.object(service.serve_state,
+                           'get_services',
+                           return_value=full), \
+         mock.patch.object(service.serve_state, 'set_service_controller_port'):
+        with pytest.raises(RuntimeError):
+            service._select_controller_port('svc')

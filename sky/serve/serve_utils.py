@@ -369,6 +369,19 @@ def is_consolidation_mode(pool: bool = False) -> bool:
     return consolidation_mode
 
 
+def is_external_load_balancer_mode() -> bool:
+    """Whether the load balancer runs outside the controller pod.
+
+    In external load balancer mode the controller binds a stable per-service
+    port (reused across respawns and pod rolls) and does not spawn an in-pod
+    load balancer, so a separate load balancer Deployment can target the
+    controller at a fixed address. Off by default; the in-pod load balancer
+    behavior is unchanged.
+    """
+    return skypilot_config.get_nested(
+        ('serve', 'controller', 'external_load_balancer'), default_value=False)
+
+
 def ha_recovery_for_consolidation_mode(pool: bool,
                                        still_leader: Optional[Callable[
                                            [], bool]] = None):

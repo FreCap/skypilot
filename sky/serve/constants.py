@@ -131,6 +131,16 @@ CONTROLLER_PORT_START = 20001
 LOAD_BALANCER_PORT_START = 30001
 LOAD_BALANCER_PORT_RANGE = '30001-30020'
 
+# Size of the stable per-service controller port range used in external load
+# balancer mode (serve.controller.external_load_balancer). In that mode each
+# service is assigned a fixed port in [CONTROLLER_PORT_START,
+# CONTROLLER_PORT_START + CONTROLLER_PORT_RANGE_SIZE) that is persisted and
+# reused across controller respawns and pod rolls, so an external load
+# balancer has a stable controller address to target. This bounds the number
+# of concurrent services per controller pod; the k8s Service must expose the
+# same range.
+CONTROLLER_PORT_RANGE_SIZE = 100
+
 # Initial version of service.
 INITIAL_VERSION = 1
 

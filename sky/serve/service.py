@@ -434,6 +434,47 @@ def _spawn_controller(service_name: str,
     return process
 
 
+def _select_controller_port(service_name: str) -> int:
+    """Choose the controller port for a (re)spawn.
+
+    Default (in-pod load balancer) behavior is unchanged: an ephemeral free
+    port is chosen locally on every spawn. This deliberately does NOT reuse
+    the DB port, because on a different recovery pod that port may be held by
+    another service's controller (see the NOTE in `_start`).
+
+    In external load balancer mode, each service instead gets a STABLE port
+    from [CONTROLLER_PORT_START, +CONTROLLER_PORT_RANGE_SIZE), assigned once
+    and persisted, so a load balancer outside the pod has a fixed controller
+    address across respawns and pod rolls. Uniqueness across services makes
+    reuse safe against the shared-port hazard above: a service's assigned port
+    is never held by any other service, so it is always free on any pod.
+
+    Must be called while holding the port-selection file lock, so the
+    scan-and-assign of a new port is serialized within the pod.
+    """
+    if not serve_utils.is_external_load_balancer_mode():
+        return common_utils.find_free_port(constants.CONTROLLER_PORT_START)
+
+    base = constants.CONTROLLER_PORT_START
+    end = base + constants.CONTROLLER_PORT_RANGE_SIZE
+    assigned = serve_state.get_service_controller_port(service_name)
+    if assigned is not None and base <= assigned < end:
+        return assigned
+    in_use = {
+        svc['controller_port']
+        for svc in serve_state.get_services()
+        if svc['name'] != service_name and svc['controller_port'] is not None
+    }
+    for port in range(base, end):
+        if port not in in_use:
+            serve_state.set_service_controller_port(service_name, port)
+            return port
+    raise RuntimeError(
+        f'No free controller port in the external load balancer range '
+        f'[{base}, {end}) for service {service_name}; increase '
+        f'serve.constants.CONTROLLER_PORT_RANGE_SIZE.')
+
+
 def _spawn_load_balancer(
         controller_addr: str, load_balancer_port: int,
         service_spec: 'service_spec_lib.SkyServiceSpec',
@@ -499,8 +540,12 @@ def _respawn_controller_and_lb(
     old_lb: Optional[multiprocessing.Process]
 ) -> Optional[Tuple[multiprocessing.Process, Optional[multiprocessing.Process],
                     int]]:
-    """Re-create the controller (on a FRESH port) and restart the LB after the
-    controller child died while the _start parent is still alive.
+    """Re-create the controller and restart the LB after the controller child
+    died while the _start parent is still alive.
+
+    The controller port is chosen by `_select_controller_port`: a fresh free
+    port in the default (in-pod LB) mode, or the service's stable assigned
+    port in external load balancer mode.
 
     HA recovery only re-creates a controller when the parent `controller_pid`
     row disappears / a pod moves; it does NOT cover the controller child dying
@@ -549,8 +594,7 @@ def _respawn_controller_and_lb(
     try:
         with filelock.FileLock(
                 os.path.expanduser(constants.PORT_SELECTION_FILE_LOCK_PATH)):
-            controller_port = common_utils.find_free_port(
-                constants.CONTROLLER_PORT_START)
+            controller_port = _select_controller_port(service_name)
             new_controller = _spawn_controller(service_name, service_spec,
                                                version, controller_host,
                                                controller_port)
@@ -592,7 +636,7 @@ def _respawn_controller_and_lb(
     controller_addr = f'http://{controller_host}:{controller_port}'
     new_lb = _ensure_load_balancer(None, controller_addr, load_balancer_port,
                                    service_spec, load_balancer_log_file)
-    logger.info(f'Controller for {service_name} respawned on fresh port '
+    logger.info(f'Controller for {service_name} respawned on port '
                 f'{controller_port}; load balancer restarted.')
     return new_controller, new_lb, controller_port
 
@@ -823,17 +867,19 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
         with filelock.FileLock(
                 os.path.expanduser(constants.PORT_SELECTION_FILE_LOCK_PATH)):
             # Start the controller.
-            # NOTE: also pick a fresh free port on recovery — do NOT reuse
-            # the port from DB. The port in DB was chosen on the previous
-            # controller's pod (e.g. Pod A); on a different recovery pod
-            # (Pod B), that port may be in use by another service's
-            # controller, in which case our subprocess would fail to bind
-            # → _wait_for_controller_ready times out → daemon retries
-            # forever. Picking locally guarantees the port is free *on this
-            # pod*, and the post-bind atomic flip writes the new port to
-            # DB together with pid/ip so clients route correctly.
-            controller_port = common_utils.find_free_port(
-                constants.CONTROLLER_PORT_START)
+            # NOTE: in the default (in-pod LB) mode, pick a fresh free port on
+            # recovery — do NOT reuse the port from DB. The port in DB was
+            # chosen on the previous controller's pod (e.g. Pod A); on a
+            # different recovery pod (Pod B), that port may be in use by
+            # another service's controller, in which case our subprocess would
+            # fail to bind → _wait_for_controller_ready times out → daemon
+            # retries forever. Picking locally guarantees the port is free *on
+            # this pod*, and the post-bind atomic flip writes the new port to
+            # DB together with pid/ip so clients route correctly. In external
+            # load balancer mode the port is instead a STABLE per-service
+            # assignment that is unique across services, so it is always free
+            # on any pod and safe to reuse (see _select_controller_port).
+            controller_port = _select_controller_port(service_name)
 
             def _get_controller_host():
                 """Get the controller host address.
