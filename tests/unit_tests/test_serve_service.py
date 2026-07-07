@@ -386,6 +386,68 @@ class TestCleanupBlocksHaRecoveryButKeepsVersionSpecs:
             mock_remove_recovery.assert_called_once_with('svc')
 
 
+class TestRunCleanupAndFinalizeDeletesLb:
+    """`_run_cleanup_and_finalize` must delete the controller-owned external LB
+    on BOTH branches:
+
+    - success (row removed): the service is gone for good.
+    - FAILED_CLEANUP (row kept for --purge): the service no longer serves and
+      its controller port is reclaimable by a new service, so the dead LB must
+      go to keep the port safe to reclaim.
+    """
+
+    @staticmethod
+    def _spec():
+        spec = mock.MagicMock()
+        spec.pool = False
+        return spec
+
+    def test_deletes_lb_on_failed_cleanup(self):
+        with mock.patch('sky.serve.service._cleanup', return_value=True), \
+             mock.patch('sky.serve.service.serve_state.'
+                        'set_service_status_and_active_versions'), \
+             mock.patch('sky.serve.service.serve_state.'
+                        'remove_service_completely') as mock_remove, \
+             mock.patch('sky.serve.service.lb_k8s.delete_lb_objects'
+                       ) as mock_delete_lb, \
+             mock.patch('sky.serve.service._cleanup_task_run_script'):
+            service._run_cleanup_and_finalize('svc',
+                                              self._spec(),
+                                              '/tmp/svc',
+                                              job_id=1)
+        # FAILED_CLEANUP keeps the DB row but tears down the LB.
+        mock_remove.assert_not_called()
+        mock_delete_lb.assert_called_once_with('svc')
+
+    def test_failed_cleanup_lb_delete_error_is_swallowed(self):
+        with mock.patch('sky.serve.service._cleanup', return_value=True), \
+             mock.patch('sky.serve.service.serve_state.'
+                        'set_service_status_and_active_versions'), \
+             mock.patch('sky.serve.service.lb_k8s.delete_lb_objects',
+                        side_effect=RuntimeError('boom')), \
+             mock.patch('sky.serve.service._cleanup_task_run_script'):
+            # A best-effort LB delete failure must not propagate.
+            service._run_cleanup_and_finalize('svc',
+                                              self._spec(),
+                                              '/tmp/svc',
+                                              job_id=1)
+
+    def test_deletes_lb_on_success(self):
+        with mock.patch('sky.serve.service._cleanup', return_value=False), \
+             mock.patch('sky.serve.service.serve_state.'
+                        'remove_service_completely') as mock_remove, \
+             mock.patch('sky.serve.service.lb_k8s.delete_lb_objects'
+                       ) as mock_delete_lb, \
+             mock.patch('sky.serve.service.shutil.rmtree'), \
+             mock.patch('sky.serve.service._cleanup_task_run_script'):
+            service._run_cleanup_and_finalize('svc',
+                                              self._spec(),
+                                              '/tmp/svc',
+                                              job_id=1)
+        mock_remove.assert_called_once_with('svc')
+        mock_delete_lb.assert_called_once_with('svc')
+
+
 class TestCleanupAuditLog:
     """`_cleanup` logs a WARN with the current DB controller_pid / ip /
     status before deleting anything. _cleanup is destructive (deletes
@@ -528,3 +590,218 @@ class TestCleanupStorageStaleBucket:
             'unexpected construct errors must propagate as cleanup failure')
         # The broader except block aborted before reaching teardown.
         mock_backend.teardown_ephemeral_storage.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _select_controller_port: stable per-service port assignment (W2).
+#
+# Default mode must be unchanged (ephemeral find_free_port). External load
+# balancer mode must return a STABLE port from the configured range: reuse the
+# service's own assigned port, and otherwise assign the lowest free port not
+# held by another service.
+# ---------------------------------------------------------------------------
+
+
+def _external_lb_mode():
+    return mock.patch.object(service.serve_utils,
+                             'is_external_load_balancer_mode',
+                             return_value=True)
+
+
+def test_select_controller_port_default_mode_uses_find_free_port():
+    with mock.patch.object(service.serve_utils,
+                           'is_external_load_balancer_mode',
+                           return_value=False), \
+         mock.patch.object(service.common_utils,
+                           'find_free_port',
+                           return_value=54321) as find_free_port:
+        assert service._select_controller_port('svc') == 54321
+        find_free_port.assert_called_once()
+
+
+def test_select_controller_port_reuses_assigned_in_range():
+    base = service.constants.CONTROLLER_PORT_START
+    with _external_lb_mode(), \
+         mock.patch.object(service.serve_state,
+                           'get_service_controller_port',
+                           return_value=base + 5), \
+         mock.patch.object(service.serve_state,
+                           'set_service_controller_port') as setter:
+        assert service._select_controller_port('svc') == base + 5
+        # A stable, in-range assignment must be reused, never rewritten.
+        setter.assert_not_called()
+
+
+def test_select_controller_port_assigns_lowest_free():
+    base = service.constants.CONTROLLER_PORT_START
+    others = [{
+        'name': 'a',
+        'controller_port': base
+    }, {
+        'name': 'b',
+        'controller_port': base + 1
+    }, {
+        'name': 'svc',
+        'controller_port': None
+    }]
+    with _external_lb_mode(), \
+         mock.patch.object(service.serve_state,
+                           'get_service_controller_port',
+                           return_value=None), \
+         mock.patch.object(service.serve_state,
+                           'get_services',
+                           return_value=others), \
+         mock.patch.object(service.serve_state,
+                           'set_service_controller_port') as setter:
+        # base and base+1 are taken by other services -> lowest free is base+2.
+        assert service._select_controller_port('svc') == base + 2
+        setter.assert_called_once_with('svc', base + 2)
+
+
+def test_select_controller_port_reassigns_when_out_of_range():
+    # A stale ephemeral port (from a prior in-pod-LB run) is not in the stable
+    # range and must be replaced with a range port.
+    base = service.constants.CONTROLLER_PORT_START
+    with _external_lb_mode(), \
+         mock.patch.object(service.serve_state,
+                           'get_service_controller_port',
+                           return_value=40000), \
+         mock.patch.object(service.serve_state,
+                           'get_services',
+                           return_value=[]), \
+         mock.patch.object(service.serve_state,
+                           'set_service_controller_port') as setter:
+        assert service._select_controller_port('svc') == base
+        setter.assert_called_once_with('svc', base)
+
+
+def test_select_controller_port_range_exhausted_raises():
+    base = service.constants.CONTROLLER_PORT_START
+    size = service.constants.CONTROLLER_PORT_RANGE_SIZE
+    full = [{
+        'name': f's{port}',
+        'controller_port': port
+    } for port in range(base, base + size)]
+    with _external_lb_mode(), \
+         mock.patch.object(service.serve_state,
+                           'get_service_controller_port',
+                           return_value=None), \
+         mock.patch.object(service.serve_state,
+                           'get_services',
+                           return_value=full), \
+         mock.patch.object(service.serve_state, 'set_service_controller_port'):
+        with pytest.raises(RuntimeError):
+            service._select_controller_port('svc')
+
+
+def test_select_controller_port_reclaims_terminal_service_port():
+    # A terminal (dying/broken) service still holds a row with its stable port,
+    # but under churn that port must be reclaimable -- otherwise the range leaks
+    # one port per dead service. base is occupied only by a terminal service, so
+    # the new service should be assigned base, not base+1.
+    base = service.constants.CONTROLLER_PORT_START
+    others = [{
+        'name': 'dead',
+        'controller_port': base,
+        'status': service.serve_state.ServiceStatus.FAILED_CLEANUP,
+    }, {
+        'name': 'live',
+        'controller_port': base + 1,
+        'status': service.serve_state.ServiceStatus.READY,
+    }]
+    with _external_lb_mode(), \
+         mock.patch.object(service.serve_state,
+                           'get_service_controller_port',
+                           return_value=None), \
+         mock.patch.object(service.serve_state,
+                           'get_services',
+                           return_value=others), \
+         mock.patch.object(service.serve_state,
+                           'set_service_controller_port') as setter:
+        assert service._select_controller_port('svc') == base
+        setter.assert_called_once_with('svc', base)
+
+
+def test_select_controller_port_live_service_port_not_reclaimed():
+    # A live (non-terminal) service's port must stay reserved; the new service
+    # skips base and takes base+1.
+    base = service.constants.CONTROLLER_PORT_START
+    others = [{
+        'name': 'live',
+        'controller_port': base,
+        'status': service.serve_state.ServiceStatus.READY,
+    }]
+    with _external_lb_mode(), \
+         mock.patch.object(service.serve_state,
+                           'get_service_controller_port',
+                           return_value=None), \
+         mock.patch.object(service.serve_state,
+                           'get_services',
+                           return_value=others), \
+         mock.patch.object(service.serve_state,
+                           'set_service_controller_port') as setter:
+        assert service._select_controller_port('svc') == base + 1
+        setter.assert_called_once_with('svc', base + 1)
+
+
+# ---------------------------------------------------------------------------
+# _ensure_load_balancer: in external load balancer mode (W3) the controller
+# must NOT spawn or supervise an in-pod load balancer (the LB is a separate
+# Deployment). Default mode still spawns.
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_load_balancer_skipped_in_external_mode():
+    spec = mock.Mock()
+    spec.pool = False
+    with mock.patch.object(service.serve_utils,
+                           'is_external_load_balancer_mode',
+                           return_value=True), \
+         mock.patch.object(service, '_spawn_load_balancer') as spawn:
+        result = service._ensure_load_balancer(None, 'http://c:1', 30001, spec,
+                                               '/tmp/lb.log')
+        assert result is None
+        spawn.assert_not_called()
+
+
+def test_ensure_load_balancer_spawns_when_not_external():
+    spec = mock.Mock()
+    spec.pool = False
+    sentinel = mock.Mock()
+    with mock.patch.object(service.serve_utils,
+                           'is_external_load_balancer_mode',
+                           return_value=False), \
+         mock.patch.object(service, '_spawn_load_balancer',
+                           return_value=sentinel) as spawn:
+        result = service._ensure_load_balancer(None, 'http://c:1', 30001, spec,
+                                               '/tmp/lb.log')
+        assert result is sentinel
+        spawn.assert_called_once()
+
+
+def test_select_controller_port_assignment_takes_cross_pod_lock():
+    # New-port assignment must serialize across pods via the cross-pod lock;
+    # reuse of an already-assigned in-range port must NOT take the lock.
+    base = service.constants.CONTROLLER_PORT_START
+    lock_cm = mock.MagicMock()
+    with _external_lb_mode(), \
+         mock.patch.object(service.locks, 'get_lock',
+                           return_value=lock_cm) as get_lock, \
+         mock.patch.object(service.serve_state,
+                           'get_service_controller_port',
+                           return_value=None), \
+         mock.patch.object(service.serve_state,
+                           'get_services',
+                           return_value=[]), \
+         mock.patch.object(service.serve_state, 'set_service_controller_port'):
+        assert service._select_controller_port('svc') == base
+        get_lock.assert_called_once()
+        lock_cm.__enter__.assert_called_once()
+
+    with _external_lb_mode(), \
+         mock.patch.object(service.locks, 'get_lock') as get_lock_reuse, \
+         mock.patch.object(service.serve_state,
+                           'get_service_controller_port',
+                           return_value=base + 3):
+        assert service._select_controller_port('svc') == base + 3
+        get_lock_reuse.assert_not_called()

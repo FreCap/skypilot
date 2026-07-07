@@ -1,3 +1,4 @@
+import contextlib
 import pathlib
 import tempfile
 from unittest import mock
@@ -1186,6 +1187,25 @@ class TestTerminateFailedServices:
         remove_service.assert_called_once_with('svc')
         assert message is None
 
+    def test_deletes_external_lb_objects(self):
+        # The failed-service purge path must also reap the controller-owned
+        # external LB (Deployment + Service); otherwise it leaks.
+        infos = [self._replica(1, 'svc-1')]
+        with mock.patch(
+                'sky.serve.serve_utils.serve_state.get_replica_infos',
+                return_value=infos), \
+             mock.patch(
+                 'sky.serve.serve_utils.global_user_state.'
+                 'cluster_with_name_exists', return_value=False), \
+             mock.patch('sky.serve.serve_utils.serve_state.remove_replica'), \
+             mock.patch('sky.serve.serve_utils.serve_state.'
+                        'remove_service_completely'), \
+             mock.patch('sky.serve.serve_utils.shutil.rmtree'), \
+             mock.patch('sky.serve.lb_k8s.delete_lb_objects'
+                       ) as mock_delete_lb:
+            serve_utils._terminate_failed_services('svc', None)
+        mock_delete_lb.assert_called_once_with('svc')
+
 
 class TestHaRecoveryFencesOnLeadershipLoss:
     """`ha_recovery_for_consolidation_mode` must re-check `still_leader`
@@ -1306,3 +1326,53 @@ class TestHaRecoveryRecreatesServiceDir:
             serve_utils.ha_recovery_for_consolidation_mode(pool=True)
         # The script ran exactly once, and the service dir existed by then.
         assert order == [('run', True)]
+
+
+# ---------------------------------------------------------------------------
+# external_lb_socket_endpoint (W4): in external-LB mode the endpoint is the
+# controller-owned LB Service's in-cluster DNS host:port, instead of
+# localhost:{port}. Delegates to lb_k8s.lb_service_endpoint_or_none.
+# ---------------------------------------------------------------------------
+
+
+def _patch_lb_mode(external, incluster=True, namespace='skypilot'):
+    """Patch the external-LB + in-cluster guards that lb_k8s consults."""
+    from sky.serve import lb_k8s
+    return [
+        mock.patch.object(serve_utils,
+                          'is_external_load_balancer_mode',
+                          return_value=external),
+        mock.patch.object(lb_k8s.kubernetes_utils,
+                          'is_incluster_config_available',
+                          return_value=incluster),
+        mock.patch.object(lb_k8s.kubernetes_utils,
+                          'get_kube_config_context_namespace',
+                          return_value=namespace),
+        mock.patch.object(lb_k8s.kubernetes,
+                          'in_cluster_context_name',
+                          return_value='in-cluster'),
+    ]
+
+
+def test_external_lb_socket_endpoint_off_when_mode_disabled():
+    with contextlib.ExitStack() as stack:
+        for patcher in _patch_lb_mode(external=False):
+            stack.enter_context(patcher)
+        assert serve_utils.external_lb_socket_endpoint('svc', 30001) is None
+
+
+def test_external_lb_socket_endpoint_none_when_not_in_cluster():
+    with contextlib.ExitStack() as stack:
+        for patcher in _patch_lb_mode(external=True, incluster=False):
+            stack.enter_context(patcher)
+        assert serve_utils.external_lb_socket_endpoint('svc', 30001) is None
+
+
+def test_external_lb_socket_endpoint_returns_service_dns():
+    from sky.serve import lb_k8s
+    with contextlib.ExitStack() as stack:
+        for patcher in _patch_lb_mode(external=True, namespace='skypilot'):
+            stack.enter_context(patcher)
+        # No scheme; callers re-add http/https based on TLS.
+        assert serve_utils.external_lb_socket_endpoint(
+            'mysvc', 30001) == lb_k8s.lb_service_endpoint('mysvc', 'skypilot')

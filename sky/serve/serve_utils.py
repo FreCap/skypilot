@@ -119,6 +119,13 @@ def _request_to_controller_with_retry(method: str, service_name: str,
     # Force a bounded timeout.
     if 'timeout' not in kwargs:
         kwargs['timeout'] = _CONTROLLER_HTTP_TIMEOUT_SECONDS
+    # Attach the shared bearer token so the controller's authenticated
+    # (destructive) endpoints accept this trusted caller. Harmless on the
+    # unauthenticated read paths. No-op when auth is disabled (token unset).
+    auth_token = get_controller_auth_token()
+    if auth_token is not None:
+        headers = kwargs.setdefault('headers', {})
+        headers.setdefault('Authorization', f'Bearer {auth_token}')
     for attempt in range(_CONTROLLER_HTTP_RETRY_ATTEMPTS):
         url = _get_controller_url(service_name, controller_port) + path
         try:
@@ -369,6 +376,48 @@ def is_consolidation_mode(pool: bool = False) -> bool:
     return consolidation_mode
 
 
+def is_external_load_balancer_mode() -> bool:
+    """Whether the load balancer runs outside the controller pod.
+
+    In external load balancer mode the controller binds a stable per-service
+    port (reused across respawns and pod rolls) and does not spawn an in-pod
+    load balancer, so a separate load balancer Deployment can target the
+    controller at a fixed address. Off by default; the in-pod load balancer
+    behavior is unchanged.
+    """
+    return skypilot_config.get_nested(
+        ('serve', 'controller', 'external_load_balancer'), default_value=False)
+
+
+def get_controller_auth_token() -> Optional[str]:
+    """Shared bearer token guarding the controller's destructive endpoints.
+
+    Read from ``CONTROLLER_AUTH_TOKEN_ENV_VAR``; None (auth disabled) when
+    unset. See the constant for the security rationale.
+    """
+    return os.environ.get(constants.CONTROLLER_AUTH_TOKEN_ENV_VAR) or None
+
+
+def external_lb_socket_endpoint(
+        service_name: str, load_balancer_port: Optional[int]) -> Optional[str]:
+    """The external load balancer's socket endpoint (host:port), or None.
+
+    In external load balancer mode the controller owns a per-service LB
+    Service; this returns that Service's in-cluster DNS ``host:port`` (no
+    scheme -- callers add http/https based on the service's TLS config).
+    Returns None (so callers keep the in-pod ``localhost:{port}`` / controller
+    cluster behavior) unless external-LB mode is on AND we have in-cluster
+    config.
+    """
+    # The LB Service always exposes the fixed LOAD_BALANCER_PORT_START, so the
+    # caller-provided port is not used for the endpoint host:port.
+    del load_balancer_port
+    # Lazy import: lb_k8s imports serve_utils at module level, so a top-level
+    # import here would be circular.
+    from sky.serve import lb_k8s  # pylint: disable=import-outside-toplevel
+    return lb_k8s.lb_service_endpoint_or_none(service_name)
+
+
 def ha_recovery_for_consolidation_mode(pool: bool,
                                        still_leader: Optional[Callable[
                                            [], bool]] = None):
@@ -403,7 +452,13 @@ def ha_recovery_for_consolidation_mode(pool: bool,
               encoding='utf-8') as f:
         start = time.time()
         f.write(f'Starting HA recovery at {datetime.datetime.now()}\n')
-        for service_name in serve_state.get_glob_service_names(None):
+        # Snapshot every service name known to the DB. In external-LB mode this
+        # is the set of live services used below to reap orphaned LB objects
+        # (LBs whose owning service row is gone). It is a superset (also
+        # includes pools), which is safe: reconcile only deletes LBs NOT in the
+        # set, and pools own no LB.
+        all_service_names = serve_state.get_glob_service_names(None)
+        for service_name in all_service_names:
             svc = _get_service_status(service_name,
                                       pool=pool,
                                       with_replica_info=False)
@@ -489,6 +544,18 @@ def ha_recovery_for_consolidation_mode(pool: bool,
                         f'Output: {out}\nError: {err}\n')
             f.write(f'{capnoun} {service_name} completed recovery at '
                     f'{datetime.datetime.now()}\n')
+        # Reap external LB objects whose owning service no longer exists. Only
+        # for services (pools have no LB). No-op outside external-LB +
+        # in-cluster mode. Lazy import: lb_k8s imports serve_utils at module
+        # level, so a top-level import here would be circular.
+        if not pool:
+            from sky.serve import (  # pylint: disable=import-outside-toplevel  # noqa: E501
+                lb_k8s)
+            try:
+                lb_k8s.reconcile_lb_objects(set(all_service_names))
+            except Exception as e:  # pylint: disable=broad-except
+                # Reconcile is best-effort cleanup; never let it abort recovery.
+                f.write(f'Failed to reconcile external LB objects: {e}\n')
         f.write(f'HA recovery completed at {datetime.datetime.now()}\n')
         f.write(f'Total recovery time: {time.time() - start} seconds\n')
 
@@ -1504,6 +1571,18 @@ def _terminate_failed_services(
     # DB state in one transaction so an interrupted purge doesn't leave
     # stragglers.
     serve_state.remove_service_completely(service_name)
+    # Delete the controller-owned external LB objects too (no-op outside
+    # external-LB + in-cluster mode). The failed-service controller never ran
+    # its own success-path teardown, so the LB Deployment + Service would
+    # otherwise leak. Best-effort: a purge must still complete even if the k8s
+    # delete fails. Lazy import: lb_k8s imports serve_utils at module level, so
+    # a top-level import here would be circular.
+    from sky.serve import lb_k8s  # pylint: disable=import-outside-toplevel
+    try:
+        lb_k8s.delete_lb_objects(service_name)
+    except Exception as e:  # pylint: disable=broad-except
+        logger.error(f'Failed to delete external LB objects for failed service '
+                     f'{service_name!r}: {common_utils.format_exception(e)}')
     try:
         shutil.rmtree(service_dir)
     except FileNotFoundError:

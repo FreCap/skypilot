@@ -46,6 +46,8 @@ from sky.utils import yaml_utils
 
 if typing.TYPE_CHECKING:
     import grpc
+
+    from sky.utils import config_utils
 else:
     grpc = adaptors_common.LazyImport('grpc')
 
@@ -529,7 +531,11 @@ def up(
                         'Failed to spin up the service. Please '
                         'check the logs above for more details.') from None
         else:
-            if not serve_utils.is_consolidation_mode(pool) and not pool:
+            external_endpoint = serve_utils.external_lb_socket_endpoint(
+                service_name, lb_port)
+            if external_endpoint is not None:
+                socket_endpoint = external_endpoint
+            elif not serve_utils.is_consolidation_mode(pool) and not pool:
                 socket_endpoint = backend_utils.get_endpoints(
                     controller_handle.cluster_name,
                     lb_port,
@@ -601,6 +607,35 @@ def up(
                     'Service is spinning up and replicas '
                     'will be ready shortly.'))
         return service_name, endpoint
+
+
+def _reject_external_lb_mode_flip(
+        mutated_config: 'config_utils.Config') -> None:
+    """Reject an update that would flip a service's external_load_balancer mode.
+
+    ``external_load_balancer`` selects between an in-pod load balancer and an
+    out-of-pod (external) one. The two topologies have no supported live
+    migration -- switching binds/unbinds the stable controller port and
+    starts/stops the in-pod LB -- so it is an up/down-only choice.
+
+    The mode is a global ``serve.controller`` setting (see
+    ``serve_utils.is_external_load_balancer_mode``); the running service uses
+    the server's current effective mode, while an admin policy applied to this
+    update may rewrite it for the new version. We compare the two and reject
+    only an actual change; a same-mode update proceeds. (A change made by
+    editing the server config between ``up`` and ``update`` is not caught here,
+    because the mode is not persisted per service -- that would need a schema
+    migration, out of scope for this guard.)
+    """
+    existing_external = serve_utils.is_external_load_balancer_mode()
+    with skypilot_config.replace_skypilot_config(mutated_config):
+        new_external = serve_utils.is_external_load_balancer_mode()
+    if existing_external != new_external:
+        with ux_utils.print_exception_no_traceback():
+            raise ValueError(
+                'Cannot change the external_load_balancer mode of a running '
+                'service via update; this switch has no live migration. Tear '
+                'down the service and spin up a new one instead.')
 
 
 def update(
@@ -693,9 +728,13 @@ def _update_impl(
     # and get the mutated config.
     # TODO(cblmemo,zhwu): If a user sets a new skypilot_config, the update
     # will not apply the config.
-    dag, _ = admin_policy_utils.apply(
+    dag, mutated_config = admin_policy_utils.apply(
         task, request_name=request_names.AdminPolicyRequestName.SERVE_UPDATE)
     task = dag.tasks[0]
+    # Pools have no load balancer, so the external_load_balancer mode does not
+    # apply to them; only guard real services.
+    if not pool:
+        _reject_external_lb_mode_flip(mutated_config)
     if pool:
         _maybe_display_run_warning(task)
         # Use dummy run script for pool.
@@ -720,18 +759,6 @@ def _update_impl(
     if prompt is not None:
         with ux_utils.print_exception_no_traceback():
             raise RuntimeError(prompt)
-
-    if not pool:
-        original_lb_policy = service_record['load_balancing_policy']
-        assert task.service is not None, 'Service section not found.'
-        if original_lb_policy != task.service.load_balancing_policy:
-            logger.warning(
-                f'{colorama.Fore.YELLOW}Current load balancing policy '
-                f'{original_lb_policy!r} is different from the new policy '
-                f'{task.service.load_balancing_policy!r}. Updating the load '
-                'balancing policy is not supported yet and it will be ignored. '
-                'The service will continue to use the current load balancing '
-                f'policy.{colorama.Style.RESET_ALL}')
 
     with rich_utils.safe_status(
             ux_utils.spinner_message(f'Initializing {noun}')):
@@ -1075,7 +1102,11 @@ def status(
         if service_record['load_balancer_port'] is not None:
             try:
                 lb_port = service_record['load_balancer_port']
-                if not serve_utils.is_consolidation_mode(pool):
+                external_endpoint = serve_utils.external_lb_socket_endpoint(
+                    service_record['name'], lb_port)
+                if external_endpoint is not None:
+                    endpoint = external_endpoint
+                elif not serve_utils.is_consolidation_mode(pool):
                     endpoint = backend_utils.get_endpoints(
                         cluster=common.SKY_SERVE_CONTROLLER_NAME,
                         port=lb_port).get(lb_port, None)

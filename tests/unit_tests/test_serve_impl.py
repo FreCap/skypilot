@@ -6,6 +6,7 @@ also makes the user-visible failure mode "go run --purge" instead of "look
 at the connection-refused traceback and figure it out."
 """
 # pylint: disable=invalid-name,protected-access
+import contextlib
 from unittest import mock
 
 import pytest
@@ -247,6 +248,37 @@ class TestSanitizedConfigBytes:
         assert parsed['kubernetes']['allowed_contexts'] == ['ctx-a', 'ctx-b']
         assert parsed['kubernetes']['context_configs']['ctx-a'][
             'provision_timeout'] == 10
+
+
+class TestRejectExternalLbModeFlip:
+    """`_reject_external_lb_mode_flip` must reject an update that would flip the
+    service's external_load_balancer mode (no live migration between in-pod and
+    external LB), and let a same-mode update proceed. `existing` is the server's
+    current effective mode; `new` is the mode under the update's applied config.
+    """
+
+    def _run(self, existing, new):
+        with mock.patch.object(impl.serve_utils,
+                               'is_external_load_balancer_mode',
+                               side_effect=[existing, new]), \
+             mock.patch.object(impl.skypilot_config,
+                               'replace_skypilot_config',
+                               return_value=contextlib.nullcontext()):
+            impl._reject_external_lb_mode_flip(mock.MagicMock())
+
+    def test_inpod_to_external_raises(self):
+        with pytest.raises(ValueError):
+            self._run(existing=False, new=True)
+
+    def test_external_to_inpod_raises(self):
+        with pytest.raises(ValueError):
+            self._run(existing=True, new=False)
+
+    def test_same_mode_external_ok(self):
+        self._run(existing=True, new=True)
+
+    def test_same_mode_inpod_ok(self):
+        self._run(existing=False, new=False)
 
 
 class TestLifecycleLocking:

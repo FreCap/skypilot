@@ -60,6 +60,53 @@ def _make_controller() -> controller.SkyServeController:
     return ctrl
 
 
+class _FakeSpec:
+    """Minimal SkyServiceSpec stub exposing the routing-spec properties."""
+
+    def __init__(self, load_balancing_policy, target_qps_per_replica,
+                 lb_stream_timeout_seconds) -> None:
+        self.load_balancing_policy = load_balancing_policy
+        self.target_qps_per_replica = target_qps_per_replica
+        self.lb_stream_timeout_seconds = lb_stream_timeout_seconds
+
+
+class TestGetRoutingSpec:
+    """The load_balancer_sync response ships the routing config so a running
+    external LB picks up `sky serve update` changes without a re-roll."""
+
+    def test_routing_spec_sourced_from_latest_version_spec(self):
+        ctrl = _make_controller()
+        spec = _FakeSpec(load_balancing_policy='instance_aware_least_load',
+                         target_qps_per_replica={'L4': 2.5},
+                         lb_stream_timeout_seconds=120)
+        with mock.patch.object(controller.serve_state,
+                               'get_service_from_name',
+                               return_value={'version': 7}), \
+             mock.patch.object(controller.serve_state,
+                               'get_spec',
+                               return_value=spec) as get_spec:
+            routing_spec = ctrl._get_routing_spec()  # pylint: disable=protected-access
+        # Sourced from the latest (current) version's spec.
+        get_spec.assert_called_once_with('svc', 7)
+        assert routing_spec == {
+            'load_balancing_policy_name': 'instance_aware_least_load',
+            'target_qps_per_replica': {
+                'L4': 2.5
+            },
+            'stream_timeout_seconds': 120,
+        }
+
+    def test_routing_spec_none_when_spec_unavailable(self):
+        ctrl = _make_controller()
+        with mock.patch.object(controller.serve_state,
+                               'get_service_from_name',
+                               return_value={'version': 3}), \
+             mock.patch.object(controller.serve_state,
+                               'get_spec',
+                               return_value=None):
+            assert ctrl._get_routing_spec() is None  # pylint: disable=protected-access
+
+
 def _sync(ctrl: controller.SkyServeController, infos,
           active_versions=(1,)) -> Dict[str, Dict[str, str]]:
     record = {'active_versions': list(active_versions)}

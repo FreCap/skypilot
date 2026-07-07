@@ -350,6 +350,16 @@ def auth_api(context: Optional[str] = None):
 @_api_logging_decorator('urllib3', logging.ERROR)
 @annotations.lru_cache(scope='request')
 @_retryable_kubernetes_client
+def authz_api(context: Optional[str] = None):
+    # AuthorizationV1Api exposes SelfSubjectAccessReview, unlike auth_api()
+    # (RbacAuthorizationV1Api). Used for startup RBAC preflight checks.
+    return kubernetes.client.AuthorizationV1Api(
+        api_client=_get_api_client(context))
+
+
+@_api_logging_decorator('urllib3', logging.ERROR)
+@annotations.lru_cache(scope='request')
+@_retryable_kubernetes_client
 def networking_api(context: Optional[str] = None):
     return kubernetes.client.NetworkingV1Api(
         api_client=_get_api_client(context))

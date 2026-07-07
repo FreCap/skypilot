@@ -3,11 +3,12 @@
 Responsible for autoscaling and replica management.
 """
 import contextlib
+import hmac
 import logging
 import os
 import time
 import traceback
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import colorama
 import fastapi
@@ -17,6 +18,7 @@ import uvicorn
 from sky import serve
 from sky import sky_logging
 from sky.serve import autoscalers
+from sky.serve import lb_rbac_preflight
 from sky.serve import replica_managers
 from sky.serve import serve_state
 from sky.serve import serve_utils
@@ -27,6 +29,32 @@ from sky.utils import thread_utils
 from sky.utils import ux_utils
 
 logger = sky_logging.init_logger(__name__)
+
+
+def _make_auth_dependency() -> Callable:
+    """Build a FastAPI dependency that enforces a shared bearer token.
+
+    The expected token is read fresh from `serve_utils.get_controller_auth_token()`
+    on every request, so a token rotated after the controller boots is honored
+    without a respawn. When the token is None/empty (auth disabled), the
+    dependency is a no-op so in-pod / localhost-only deployments are unchanged.
+    Otherwise it requires an `Authorization: Bearer <token>` header matching in
+    constant time; a missing or wrong token yields 401. Applied only to the
+    destructive endpoints -- the read-only load_balancer_sync path stays open
+    for the credential-free LB.
+    """
+
+    async def _verify(authorization: Optional[str] = fastapi.Header(
+        None)) -> None:
+        expected_token = serve_utils.get_controller_auth_token()
+        if not expected_token:
+            return
+        expected = f'Bearer {expected_token}'
+        if authorization is None or not hmac.compare_digest(
+                authorization, expected):
+            raise fastapi.HTTPException(status_code=401, detail='Unauthorized.')
+
+    return _verify
 
 
 class AutoscalerInfoFilter(logging.Filter):
@@ -144,6 +172,36 @@ class SkyServeController:
         self._lb_replica_cache = replica_cache
         return replica_info
 
+    def _get_routing_spec(self) -> Optional[Dict[str, Any]]:
+        """Build the routing spec for the load_balancer_sync response.
+
+        [boltz fork] The external load balancer fetches its routing
+        configuration -- load-balancing policy, per-replica target QPS, and
+        stream timeout -- over the sync channel instead of static launch
+        args, so a `sky serve update` that only changes these fields reaches
+        a running LB without re-rolling it. Sourced from the latest service
+        version's spec (the same version the replica manager/autoscaler are
+        advanced to on update). TLS is deliberately NOT synced -- it is
+        bound to uvicorn at launch and a private key must not stream over
+        this channel -- so it stays a launch/mounted-secret concern.
+        Returns None when the spec cannot be loaded yet (mid-init); the LB
+        tolerates a missing routing_spec and keeps its default policy until
+        the next sync.
+        """
+        record = serve_state.get_service_from_name(self._service_name)
+        if record is None:
+            return None
+        spec = serve_state.get_spec(self._service_name, record['version'])
+        if spec is None:
+            return None
+        return {
+            # `load_balancing_policy` resolves None to the default policy
+            # name, so the LB always receives a concrete policy to build.
+            'load_balancing_policy_name': spec.load_balancing_policy,
+            'target_qps_per_replica': spec.target_qps_per_replica,
+            'stream_timeout_seconds': spec.lb_stream_timeout_seconds,
+        }
+
     def _run_autoscaler(self):
         logger.info('Starting autoscaler.')
         while True:
@@ -207,6 +265,17 @@ class SkyServeController:
 
     def run(self) -> None:
 
+        # Fail fast at boot if the in-cluster ServiceAccount lacks the RBAC
+        # needed to manage the external load balancer objects. No-op outside
+        # external-LB / in-cluster mode; degrades gracefully if the access
+        # review itself cannot be issued.
+        lb_rbac_preflight.check_lb_rbac_preflight()
+
+        # Guard the destructive endpoints with a shared bearer token (no-op
+        # when unset). The read-only load_balancer_sync path is intentionally
+        # left open so the credential-free external LB can sync.
+        auth_dependency = fastapi.Depends(_make_auth_dependency())
+
         @self._app.get('/autoscaler/info')
         async def get_autoscaler_info() -> fastapi.Response:
             return responses.JSONResponse(content=self._autoscaler.info(),
@@ -223,16 +292,19 @@ class SkyServeController:
             logger.info(f'Received {len(timestamps)} inflight requests.')
             self._autoscaler.collect_request_information(request_aggregator)
 
-            return responses.JSONResponse(
-                content={'replica_info': self._get_lb_replica_info()},
-                status_code=200)
+            return responses.JSONResponse(content={
+                'replica_info': self._get_lb_replica_info(),
+                'routing_spec': self._get_routing_spec(),
+            },
+                                          status_code=200)
 
         # Deliberately a sync handler: FastAPI runs it in the threadpool, so
         # waiting on the replica-manager lock inside `update_version` (a probe
         # round can hold it for tens of seconds when replicas are unreachable)
         # never stalls the event loop — /controller/load_balancer_sync must
         # keep serving while an update waits its turn.
-        @self._app.post('/controller/update_service')
+        @self._app.post('/controller/update_service',
+                        dependencies=[auth_dependency])
         def update_service(request_data: Dict[str, Any] = fastapi.Body(
             ...)) -> fastapi.Response:
             try:
@@ -293,7 +365,8 @@ class SkyServeController:
                 },
                                               status_code=500)
 
-        @self._app.post('/controller/terminate_replica')
+        @self._app.post('/controller/terminate_replica',
+                        dependencies=[auth_dependency])
         async def terminate_replica(
                 request: fastapi.Request) -> fastapi.Response:
             request_data = await request.json()

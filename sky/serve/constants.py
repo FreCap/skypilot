@@ -31,6 +31,16 @@ CONTROLLER_SETUP_TIMEOUT_SECONDS = 300
 # Time to wait in seconds for service to register on the controller.
 SERVICE_REGISTER_TIMEOUT_SECONDS = 60
 
+# Env var holding a shared bearer token that guards the controller's
+# DESTRUCTIVE endpoints (/controller/update_service, terminate_replica). In
+# external load balancer mode the controller port is reachable on the pod
+# network from the credential-free LB pod, so NetworkPolicy alone is
+# insufficient; the platform sets this (from a k8s secret) on both the
+# controller and its trusted callers. The read-only /load_balancer_sync path
+# stays unauthenticated so the LB can sync. When unset (in-pod localhost-only
+# default) auth is disabled and behavior is unchanged.
+CONTROLLER_AUTH_TOKEN_ENV_VAR = 'SKYPILOT_SERVE_CONTROLLER_AUTH_TOKEN'
+
 # [boltz fork] Time budget in seconds for a service update to be accepted by
 # the controller. The /controller/update_service handler serializes on the
 # replica-manager lock, which a readiness-probe round can hold for tens of
@@ -80,6 +90,25 @@ LB_DRAIN_CLOSE_GRACE_SECONDS = 60
 # replica must fail fast into the retry loop even when the stream
 # timeout is sized for hour-long synchronous predictions.
 LB_CONNECT_TIMEOUT_SECONDS = 10
+
+# Passive LB-side replica eviction, for the window where the controller is
+# paused (e.g. during a control-plane roll) and cannot update the ready set.
+# After this many CONSECUTIVE dead-connection failures (refused/reset -- NOT
+# connect timeouts, which indicate a merely-saturated but healthy replica) the
+# LB quarantines a replica: removed from routing and kept out even if the
+# controller's next sync still lists it as ready, until the TTL expires. This
+# stops InstanceAwareLeastLoadPolicy from preferentially routing to a dead
+# replica whose drained in-flight slots read as least-loaded, and avoids
+# evict/re-add oscillation on every sync once the controller recovers.
+LB_EVICTION_CONSECUTIVE_FAILURES = 3
+LB_EVICTION_QUARANTINE_SECONDS = 30
+
+# On SIGTERM the external LB first deregisters (stops POSTing
+# load_balancer_sync so the controller stops counting it -- avoiding a
+# double-count with the maxSurge replacement) and fails readiness (so k8s
+# pulls it from the Service endpoints), then waits this long for in-flight
+# requests to drain before letting the server exit.
+LB_DRAIN_GRACE_SECONDS = 15
 
 # Default interval in seconds to probe replica endpoint.
 DEFAULT_ENDPOINT_PROBE_INTERVAL_SECONDS = 10
@@ -136,11 +165,39 @@ CONTROLLER_PORT_START = 20001
 LOAD_BALANCER_PORT_START = 30001
 LOAD_BALANCER_PORT_RANGE = '30001-30020'
 
+# Size of the stable per-service controller port range used in external load
+# balancer mode (serve.controller.external_load_balancer). In that mode each
+# service is assigned a fixed port in [CONTROLLER_PORT_START,
+# CONTROLLER_PORT_START + CONTROLLER_PORT_RANGE_SIZE) that is persisted and
+# reused across controller respawns and pod rolls, so an external load
+# balancer has a stable controller address to target. This bounds the number
+# of concurrent services per controller pod; the k8s Service must expose the
+# same range.
+CONTROLLER_PORT_RANGE_SIZE = 100
+
+# Cross-pod lock serializing stable controller-port assignment in external
+# load balancer mode. On a Postgres backend get_lock() resolves this to a
+# session advisory lock (shared across api-server pods); on SQLite it is a
+# node-local filelock (single pod, sufficient). Needed because the
+# per-node PORT_SELECTION_FILE_LOCK cannot serialize two pods scanning the
+# shared DB for a free port.
+CONTROLLER_PORT_ASSIGNMENT_LOCK_ID = (
+    '~/.sky/serve_controller_port_assignment_lock')
+CONTROLLER_PORT_ASSIGNMENT_LOCK_TIMEOUT_SECONDS = 30
+
 # Initial version of service.
 INITIAL_VERSION = 1
 
 # Replica ID environment variable name that can be accessed on the replica.
 REPLICA_ID_ENV_VAR = 'SKYPILOT_SERVE_REPLICA_ID'
+
+# Name of the environment variable holding the controller pod's own name.
+# In external load balancer mode the controller (running in the api-server pod)
+# reads its own pod spec to mirror its container image onto the LB Deployment
+# it creates. The platform must inject this via the downward API
+# (metadata.name). It is a hard contract: without it the controller cannot
+# resolve the LB image.
+POD_NAME_ENV_VAR = 'SKYPILOT_POD_NAME'
 
 # The version of the lib files that serve use. Whenever there is an API
 # change for the serve_utils.ServeCodeGen, we need to bump this version, so that

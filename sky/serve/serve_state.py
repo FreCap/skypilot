@@ -990,8 +990,8 @@ def get_latest_committed_version(service_name: str) -> Optional[int]:
     return result[0] if result else None
 
 
-def get_service_controller_port(service_name: str) -> int:
-    """Gets the controller port of a service."""
+def get_service_controller_port(service_name: str) -> Optional[int]:
+    """Gets the controller port of a service (None if not yet assigned)."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         result = session.execute(

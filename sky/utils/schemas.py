@@ -1783,6 +1783,16 @@ def get_config_schema():
                         # servers (--deploy) if no existing controller
                         # clusters are found.
                     },
+                    'external_load_balancer': {
+                        'type': 'boolean',
+                        'default': False,
+                        # When true, each service's controller binds a stable
+                        # per-service port (persisted, reused across respawns
+                        # and pod rolls) so a load balancer running outside the
+                        # controller pod has a stable controller address, and
+                        # the controller does not spawn an in-pod load
+                        # balancer.
+                    },
                     'controller_logs_gc_retention_hours': {
                         'type': 'integer',
                     },

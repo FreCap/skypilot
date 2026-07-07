@@ -24,6 +24,7 @@ from sky.backends import cloud_vm_ray_backend
 from sky.data import data_utils
 from sky.serve import constants
 from sky.serve import controller
+from sky.serve import lb_k8s
 from sky.serve import load_balancer
 from sky.serve import replica_managers
 from sky.serve import serve_state
@@ -32,6 +33,7 @@ from sky.skylet import constants as skylet_constants
 from sky.utils import auth_utils
 from sky.utils import common_utils
 from sky.utils import controller_utils
+from sky.utils import locks
 from sky.utils import subprocess_utils
 from sky.utils import thread_utils
 from sky.utils import ux_utils
@@ -434,6 +436,64 @@ def _spawn_controller(service_name: str,
     return process
 
 
+def _select_controller_port(service_name: str) -> int:
+    """Choose the controller port for a (re)spawn.
+
+    Default (in-pod load balancer) behavior is unchanged: an ephemeral free
+    port is chosen locally on every spawn. This deliberately does NOT reuse
+    the DB port, because on a different recovery pod that port may be held by
+    another service's controller (see the NOTE in `_start`).
+
+    In external load balancer mode, each service instead gets a STABLE port
+    from [CONTROLLER_PORT_START, +CONTROLLER_PORT_RANGE_SIZE), assigned once
+    and persisted, so a load balancer outside the pod has a fixed controller
+    address across respawns and pod rolls. Uniqueness across services makes
+    reuse safe against the shared-port hazard above: a service's assigned port
+    is never held by any other service, so it is always free on any pod.
+
+    The default path is called while holding the node-local port-selection
+    file lock. External-mode assignment additionally takes a CROSS-POD lock
+    (Postgres advisory lock under an HA deployment), because the file lock
+    cannot serialize two api-server pods scanning the shared DB for the same
+    free port.
+    """
+    if not serve_utils.is_external_load_balancer_mode():
+        return common_utils.find_free_port(constants.CONTROLLER_PORT_START)
+
+    base = constants.CONTROLLER_PORT_START
+    end = base + constants.CONTROLLER_PORT_RANGE_SIZE
+    assigned = serve_state.get_service_controller_port(service_name)
+    if assigned is not None and base <= assigned < end:
+        return assigned
+    # Assigning a new stable port: serialize across pods so two concurrent
+    # up()s cannot pick the same free port. Re-read inside the lock in case a
+    # peer already assigned this service's port while we waited.
+    with locks.get_lock(
+            constants.CONTROLLER_PORT_ASSIGNMENT_LOCK_ID,
+            timeout=constants.CONTROLLER_PORT_ASSIGNMENT_LOCK_TIMEOUT_SECONDS):
+        assigned = serve_state.get_service_controller_port(service_name)
+        if assigned is not None and base <= assigned < end:
+            return assigned
+        # Terminal services (dying or already broken) no longer hold their
+        # controller port -- excluding them lets the stable-port range be
+        # reclaimed under churn instead of leaking one port per dead service.
+        terminal = serve_state.ServiceStatus.terminal_statuses()
+        in_use = {
+            svc['controller_port']
+            for svc in serve_state.get_services()
+            if svc['name'] != service_name and svc['controller_port']
+            is not None and svc.get('status') not in terminal
+        }
+        for port in range(base, end):
+            if port not in in_use:
+                serve_state.set_service_controller_port(service_name, port)
+                return port
+    raise RuntimeError(
+        f'No free controller port in the external load balancer range '
+        f'[{base}, {end}) for service {service_name}; increase '
+        f'serve.constants.CONTROLLER_PORT_RANGE_SIZE.')
+
+
 def _spawn_load_balancer(
         controller_addr: str, load_balancer_port: int,
         service_spec: 'service_spec_lib.SkyServiceSpec',
@@ -564,8 +624,12 @@ def _ensure_load_balancer(
     Restarts it -- on the same public `load_balancer_port`, pointing at
     `controller_addr` -- if it is missing or dead. Pool services have no LB.
     Contained: never raises into _start's destructive cleanup.
+
+    In external load balancer mode the load balancer runs as a separate
+    Deployment outside this pod, so the controller neither spawns nor
+    supervises an in-pod one.
     """
-    if service_spec.pool:
+    if service_spec.pool or serve_utils.is_external_load_balancer_mode():
         return lb_process
     if lb_process is not None and lb_process.is_alive():
         return lb_process
@@ -587,8 +651,12 @@ def _respawn_controller_and_lb(
     old_lb: Optional[multiprocessing.Process]
 ) -> Optional[Tuple[multiprocessing.Process, Optional[multiprocessing.Process],
                     int]]:
-    """Re-create the controller (on a FRESH port) and restart the LB after the
-    controller child died while the _start parent is still alive.
+    """Re-create the controller and restart the LB after the controller child
+    died while the _start parent is still alive.
+
+    The controller port is chosen by `_select_controller_port`: a fresh free
+    port in the default (in-pod LB) mode, or the service's stable assigned
+    port in external load balancer mode.
 
     HA recovery only re-creates a controller when the parent `controller_pid`
     row disappears / a pod moves; it does NOT cover the controller child dying
@@ -637,8 +705,7 @@ def _respawn_controller_and_lb(
     try:
         with filelock.FileLock(
                 os.path.expanduser(constants.PORT_SELECTION_FILE_LOCK_PATH)):
-            controller_port = common_utils.find_free_port(
-                constants.CONTROLLER_PORT_START)
+            controller_port = _select_controller_port(service_name)
             new_controller = _spawn_controller(service_name, service_spec,
                                                version, controller_host,
                                                controller_port)
@@ -680,7 +747,7 @@ def _respawn_controller_and_lb(
     controller_addr = f'http://{controller_host}:{controller_port}'
     new_lb = _ensure_load_balancer(None, controller_addr, load_balancer_port,
                                    service_spec, load_balancer_log_file)
-    logger.info(f'Controller for {service_name} respawned on fresh port '
+    logger.info(f'Controller for {service_name} respawned on port '
                 f'{controller_port}; load balancer restarted.')
     return new_controller, new_lb, controller_port
 
@@ -733,8 +800,27 @@ def _run_cleanup_and_finalize(service_name: str,
         serve_state.set_service_status_and_active_versions(
             service_name, serve_state.ServiceStatus.FAILED_CLEANUP)
         logger.error(f'Service {service_name} failed to clean up.')
+        # A FAILED_CLEANUP service is no longer serving, and its controller
+        # port is reclaimable by a new service (FAILED_CLEANUP is a terminal
+        # status excluded from `_select_controller_port`'s in-use set). If we
+        # kept the dead service's LB, a new service reusing that port would
+        # receive the dead LB's traffic -- so tear the data-plane LB down here.
+        # The DB row is intentionally kept for `--purge`; if the service is
+        # ever retried, up() recreates the LB idempotently. Best-effort so a
+        # delete failure does not worsen cleanup.
+        try:
+            lb_k8s.delete_lb_objects(service_name)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.error(f'Failed to delete external LB objects for '
+                         f'{service_name} during failed cleanup: {e}')
     else:
         serve_state.remove_service_completely(service_name)
+        # Real teardown: the service row is gone for good. Delete the
+        # controller-owned external LB objects (no-op outside external-LB +
+        # in-cluster mode). This runs only on the success/removal path -- the
+        # FAILED_CLEANUP branch above keeps the row (and its LB) for --purge,
+        # and orphan-exit/respawn bypass this function entirely via os._exit.
+        lb_k8s.delete_lb_objects(service_name)
         try:
             shutil.rmtree(service_dir)
         except FileNotFoundError:
@@ -911,17 +997,19 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
         with filelock.FileLock(
                 os.path.expanduser(constants.PORT_SELECTION_FILE_LOCK_PATH)):
             # Start the controller.
-            # NOTE: also pick a fresh free port on recovery — do NOT reuse
-            # the port from DB. The port in DB was chosen on the previous
-            # controller's pod (e.g. Pod A); on a different recovery pod
-            # (Pod B), that port may be in use by another service's
-            # controller, in which case our subprocess would fail to bind
-            # → _wait_for_controller_ready times out → daemon retries
-            # forever. Picking locally guarantees the port is free *on this
-            # pod*, and the post-bind atomic flip writes the new port to
-            # DB together with pid/ip so clients route correctly.
-            controller_port = common_utils.find_free_port(
-                constants.CONTROLLER_PORT_START)
+            # NOTE: in the default (in-pod LB) mode, pick a fresh free port on
+            # recovery — do NOT reuse the port from DB. The port in DB was
+            # chosen on the previous controller's pod (e.g. Pod A); on a
+            # different recovery pod (Pod B), that port may be in use by
+            # another service's controller, in which case our subprocess would
+            # fail to bind → _wait_for_controller_ready times out → daemon
+            # retries forever. Picking locally guarantees the port is free *on
+            # this pod*, and the post-bind atomic flip writes the new port to
+            # DB together with pid/ip so clients route correctly. In external
+            # load balancer mode the port is instead a STABLE per-service
+            # assignment that is unique across services, so it is always free
+            # on any pod and safe to reuse (see _select_controller_port).
+            controller_port = _select_controller_port(service_name)
 
             def _get_controller_host():
                 """Get the controller host address.
@@ -993,11 +1081,21 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
 
             controller_addr = f'http://{controller_host}:{controller_port}'
 
-            # Start the load balancer.
-            load_balancer_port = (
-                common_utils.find_free_port(constants.LOAD_BALANCER_PORT_START)
-                if not is_recovery else
-                serve_state.get_service_load_balancer_port(service_name))
+            # Start the load balancer. In external load balancer mode the LB
+            # runs as a separate Deployment (not in this pod), so we bind the
+            # port that the external LB listens on -- fixed and known so the
+            # platform can configure the LB Deployment/Service consistently --
+            # and still record it in DB so up()'s registration wait completes
+            # and the endpoint is reported, but we do not spawn an in-pod LB.
+            external_lb = serve_utils.is_external_load_balancer_mode()
+            if external_lb:
+                load_balancer_port = constants.LOAD_BALANCER_PORT_START
+            elif not is_recovery:
+                load_balancer_port = common_utils.find_free_port(
+                    constants.LOAD_BALANCER_PORT_START)
+            else:
+                load_balancer_port = serve_state.get_service_load_balancer_port(
+                    service_name)
             load_balancer_log_file = os.path.expanduser(
                 serve_utils.generate_remote_load_balancer_log_file_name(
                     service_name))
@@ -1006,15 +1104,32 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
             # service spec and we could start multiple load balancers.
             # After that, we will have a mapping from replica port to endpoint.
             # NOTE(tian): We don't need the load balancer for pool.
-            # Skip the load balancer process for pool.
-            if not service_spec.pool:
+            # Skip the load balancer process for pool, and in external LB mode.
+            if not service_spec.pool and not external_lb:
                 load_balancer_process = _spawn_load_balancer(
                     controller_addr, load_balancer_port, service_spec,
                     load_balancer_log_file)
 
-            if not is_recovery:
-                serve_state.set_service_load_balancer_port(
-                    service_name, load_balancer_port)
+        # In external load balancer mode, ensure the controller-owned per-
+        # service LB Deployment + Service exist BEFORE the load_balancer_port
+        # DB write below. wait_service_registration returns as soon as
+        # load_balancer_port is non-null, so writing it first would let
+        # `sky serve up` report the endpoint before the LB Service exists.
+        # Creating the LB objects first closes that window. Idempotent (409 ==
+        # already exists), so it is safe on the recovery path too. No-op outside
+        # external-LB + in-cluster mode. Done outside the port-selection
+        # filelock to avoid holding a host-global lock across k8s API calls;
+        # controller_port is already recorded in DB.
+        if external_lb:
+            lb_k8s.create_lb_deployment_and_service(service_name,
+                                                    controller_port)
+
+        # Publish load_balancer_port only now -- after the LB objects exist (in
+        # external mode) or the in-pod LB has been spawned -- so registration
+        # unblocks once the data plane is actually reachable.
+        if not is_recovery:
+            serve_state.set_service_load_balancer_port(service_name,
+                                                       load_balancer_port)
 
         # Self-check cadence (seconds): how often we re-read DB to confirm
         # we're still the authoritative controller. Ghost detection only

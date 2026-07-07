@@ -1,10 +1,14 @@
 """LoadBalancer: Distribute any incoming request to all ready replicas."""
+import argparse
 import asyncio
+import contextlib
 import logging
 import os
+import signal
 import threading
+import time
 import traceback
-from typing import Dict, List, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Set, Union
 
 import aiohttp
 import fastapi
@@ -43,6 +47,71 @@ class _RetriableStatusError(Exception):
         self.status_code = status_code
 
 
+def _is_dead_connection_error(exc: Exception) -> bool:
+    """Whether a proxy failure indicates a DEAD replica vs a saturated one.
+
+    A healthy replica overloaded at high RPS trips the connect/read timeout
+    (httpx.TimeoutException), so timeouts must NOT count toward eviction --
+    evicting a merely-saturated replica shrinks capacity under load and
+    cascades. Only genuine connection failures (refused/reset: NetworkError,
+    ProtocolError) indicate a dead replica worth evicting.
+    """
+    if isinstance(exc, httpx.TimeoutException):
+        return False
+    return isinstance(exc, (httpx.NetworkError, httpx.ProtocolError))
+
+
+class _DrainableServer(uvicorn.Server):
+    """A uvicorn Server that drains gracefully on SIGTERM.
+
+    uvicorn installs its own SIGTERM/SIGINT handlers inside
+    ``Server.serve()`` via ``capture_signals()`` (there is no
+    ``install_signal_handlers`` config knob in modern uvicorn), and its default
+    handler sets ``should_exit`` immediately -- which would kill in-flight
+    requests and skip the deregister step. We instead install our own
+    event-loop signal handlers (asyncio-safe) and suppress uvicorn's, so
+    SIGTERM begins draining (fail readiness + stop the controller sync) and the
+    server only exits after ``LB_DRAIN_GRACE_SECONDS`` -- long enough for k8s to
+    pull the pod from the Service and for in-flight requests to finish. A
+    second signal / SIGINT exits promptly.
+    """
+
+    def __init__(self, config: 'uvicorn.Config', on_drain: 'Any') -> None:
+        super().__init__(config)
+        self._on_drain = on_drain
+        self._own_signals = False
+
+    @contextlib.contextmanager
+    def capture_signals(self):
+        # Suppress uvicorn's own signal handlers when we installed ours;
+        # otherwise fall back to uvicorn's handling (e.g. platforms without
+        # loop.add_signal_handler).
+        if self._own_signals:
+            yield
+        else:
+            with super().capture_signals():
+                yield
+
+    async def serve_with_drain(self) -> None:
+        loop = asyncio.get_running_loop()
+
+        def _on_sigterm() -> None:
+            self._on_drain()
+            loop.call_later(constants.LB_DRAIN_GRACE_SECONDS,
+                            lambda: setattr(self, 'should_exit', True))
+
+        try:
+            loop.add_signal_handler(signal.SIGTERM, _on_sigterm)
+            loop.add_signal_handler(signal.SIGINT,
+                                    lambda: setattr(self, 'should_exit', True))
+            self._own_signals = True
+        except NotImplementedError:
+            # add_signal_handler is unavailable (e.g. Windows); let uvicorn
+            # manage signals (no graceful drain, but a correct shutdown).
+            self._own_signals = False
+        await self.serve()
+
+
 class SkyServeLoadBalancer:
     """SkyServeLoadBalancer: distribute incoming traffic with proxy.
 
@@ -58,29 +127,46 @@ class SkyServeLoadBalancer:
         load_balancing_policy_name: Optional[str] = None,
         tls_credential: Optional[serve_utils.TLSCredential] = None,
         target_qps_per_replica: Optional[Union[float, Dict[str, float]]] = None,
-        stream_timeout_seconds: int = constants.DEFAULT_LB_STREAM_TIMEOUT,
+        stream_timeout_seconds: Optional[int] = None,
         retriable_status_codes: Optional[List[int]] = None,
     ) -> None:
         """Initialize the load balancer.
 
+        The routing spec -- load-balancing policy, per-replica target QPS, and
+        stream timeout -- is fetched from the controller over the
+        load_balancer_sync channel (see `_apply_routing_spec`), so `sky serve
+        update` changes to those fields reach a running LB without re-rolling
+        it. The corresponding constructor args are only a bootstrap seed (used
+        by the in-pod caller, which already has the spec): until the first sync
+        lands, the LB serves with whatever policy is built here, and the
+        readiness gate keeps traffic away until that first sync arrives. A
+        standalone LB passes None for all three and picks them up from sync.
+
         Args:
             controller_url: The URL of the controller.
             load_balancer_port: The port where the load balancer listens to.
-            load_balancing_policy_name: The name of the load balancing policy
-                to use. Defaults to None.
+            load_balancing_policy_name: Seed load balancing policy name.
+                Defaults to None (the default policy until the first sync).
             tls_credentials: The TLS credentials for HTTPS endpoint. Defaults
                 to None.
-            target_qps_per_replica: Target QPS per replica for instance-aware
-                load balancing. Can be a float or dict mapping GPU types to QPS.
-                Defaults to None.
-            stream_timeout_seconds: Timeout in seconds for proxied responses.
+            target_qps_per_replica: Seed target QPS per replica for
+                instance-aware load balancing. Can be a float or dict mapping
+                GPU types to QPS. Defaults to None.
+            stream_timeout_seconds: Seed timeout in seconds for proxied
+                responses. Defaults to None (the built-in default until synced).
         """
         self._app = fastapi.FastAPI()
         self._controller_url: str = controller_url
         self._load_balancer_port: int = load_balancer_port
-        # Use the registry to create the load balancing policy
+        # Use the registry to create the load balancing policy. Track the
+        # resolved policy name so a sync only rebuilds the policy object when
+        # the name actually changes (a policy swap is rare -- only on an
+        # update that changes the policy).
+        self._load_balancing_policy_name: str = (
+            lb_policies.LoadBalancingPolicy.make_policy_name(
+                load_balancing_policy_name))
         self._load_balancing_policy = lb_policies.LoadBalancingPolicy.make(
-            load_balancing_policy_name)
+            self._load_balancing_policy_name)
 
         # Set accelerator QPS for instance-aware policies
         if (target_qps_per_replica and
@@ -91,12 +177,14 @@ class SkyServeLoadBalancer:
                 target_qps_per_replica)
 
         logger.info('Starting load balancer with policy '
-                    f'{load_balancing_policy_name}.')
+                    f'{self._load_balancing_policy_name}.')
         self._request_aggregator: serve_utils.RequestsAggregator = (
             serve_utils.RequestTimestamp())
         self._tls_credential: Optional[serve_utils.TLSCredential] = (
             tls_credential)
-        self._stream_timeout_seconds: int = stream_timeout_seconds
+        self._stream_timeout_seconds: int = (
+            stream_timeout_seconds if stream_timeout_seconds is not None else
+            constants.DEFAULT_LB_STREAM_TIMEOUT)
         # Replica responses with these statuses are re-routed like
         # transport failures (empty = never, the default). Safe only for
         # idempotent workloads and "not now" statuses (503/429): the body
@@ -115,13 +203,140 @@ class SkyServeLoadBalancer:
         # We need this lock to avoid getting from the client pool while
         # updating it from _sync_with_controller.
         self._client_pool_lock: threading.Lock = threading.Lock()
+        # Passive replica eviction state, guarded by _client_pool_lock (the
+        # same lock that guards the policy's ready set). _replica_dead_failures
+        # counts consecutive dead-connection failures per replica;
+        # _replica_quarantine_until maps a replica URL to the wall-clock time
+        # until which it stays out of routing.
+        self._replica_dead_failures: Dict[str, int] = dict()
+        self._replica_quarantine_until: Dict[str, float] = dict()
+        # Rollout state. `_ready` flips true after the first successful
+        # controller sync, so k8s never routes to a cold LB. `_draining` flips
+        # true on SIGTERM, which fails readiness and stops the controller sync
+        # (deregister-before-drain).
+        self._ready: bool = False
+        self._draining: bool = False
         # Strong refs to in-progress drain-close tasks (see
         # _drain_and_close_client); a bare create_task result can be GCed.
         self._client_close_tasks: Set[asyncio.Task] = set()
 
+    def _quarantined_replicas(self) -> Set[str]:
+        """Replica URLs currently quarantined (TTL not yet expired).
+
+        Must be called while holding `_client_pool_lock`.
+        """
+        now = time.time()
+        return {
+            url for url, until in self._replica_quarantine_until.items()
+            if until > now
+        }
+
+    def _quarantine_replica(self, url: str) -> None:
+        """Remove a dead replica from routing for the quarantine TTL.
+
+        Must be called while holding `_client_pool_lock`. Drops the replica
+        from the policy's ready set immediately so in-flight routing stops
+        selecting it; the sync loop keeps it out (even if the controller still
+        lists it as ready) until the TTL expires.
+        """
+        self._replica_quarantine_until[url] = (
+            time.time() + constants.LB_EVICTION_QUARANTINE_SECONDS)
+        self._replica_dead_failures.pop(url, None)
+        remaining = [
+            u for u in self._load_balancing_policy.ready_replicas if u != url
+        ]
+        self._load_balancing_policy.set_ready_replicas(remaining)
+        logger.warning(
+            f'Evicted replica {url} after '
+            f'{constants.LB_EVICTION_CONSECUTIVE_FAILURES} consecutive '
+            f'dead-connection failures; quarantined for '
+            f'{constants.LB_EVICTION_QUARANTINE_SECONDS}s.')
+
+    def _record_proxy_outcome(
+        self, url: str,
+        response_or_exception: Union['fastapi.responses.Response', Exception]
+    ) -> None:
+        """Update per-replica eviction bookkeeping after a proxy attempt.
+
+        Eviction is deliberately scoped to TCP-dead replicas (connection
+        refused/reset before headers): those are the ones whose drained
+        in-flight slots read as least-loaded and attract preferential routing.
+        A dead-connection failure increments the consecutive count and
+        quarantines once the threshold is reached. Everything else -- a
+        response of any status (incl. 5xx: the replica is reachable and
+        releasing its slot), a saturation timeout, or a mid-stream failure
+        after headers -- counts as a completed attempt and clears the streak.
+        Application errors and saturation are intentionally NOT eviction
+        signals (evicting a reachable-but-slow replica shrinks capacity).
+        """
+        with self._client_pool_lock:
+            if isinstance(response_or_exception, Exception):
+                if _is_dead_connection_error(response_or_exception):
+                    count = self._replica_dead_failures.get(url, 0) + 1
+                    self._replica_dead_failures[url] = count
+                    if count >= constants.LB_EVICTION_CONSECUTIVE_FAILURES:
+                        self._quarantine_replica(url)
+            else:
+                self._replica_dead_failures.pop(url, None)
+                self._replica_quarantine_until.pop(url, None)
+
+    def _apply_routing_spec(self, routing_spec: Dict[str, Any]) -> None:
+        """Apply a routing spec fetched from the controller.
+
+        Must be called while holding `_client_pool_lock` (it mutates the
+        policy object the routing hot path reads under that lock). The three
+        routing fields arrive over the sync channel so `sky serve update` can
+        change them on a running LB without a re-roll:
+
+        - policy: rebuild + swap the policy object ONLY when the resolved
+          name changes (cheap + idempotent otherwise). The fresh policy is
+          left empty; the caller's immediately-following `set_ready_replicas`
+          re-populates it from this same sync, which is why we do not copy
+          the old ready set over (that would short-circuit set_ready_replicas
+          and skip load-map initialization).
+        - target_qps_per_replica: applied to the active policy when it is
+          instance-aware and the value is a per-accelerator dict.
+        - stream_timeout_seconds: stored into the per-request instance var so
+          it takes effect on subsequent proxied requests.
+        """
+        policy_name = routing_spec.get('load_balancing_policy_name')
+        if (policy_name is not None and
+                policy_name != self._load_balancing_policy_name):
+            self._load_balancing_policy = lb_policies.LoadBalancingPolicy.make(
+                policy_name)
+            self._load_balancing_policy_name = (
+                lb_policies.LoadBalancingPolicy.make_policy_name(policy_name))
+        target_qps_per_replica = routing_spec.get('target_qps_per_replica')
+        if (isinstance(target_qps_per_replica, dict) and
+                isinstance(self._load_balancing_policy,
+                           lb_policies.InstanceAwareLeastLoadPolicy)):
+            self._load_balancing_policy.set_target_qps_per_accelerator(
+                target_qps_per_replica)
+        stream_timeout_seconds = routing_spec.get('stream_timeout_seconds')
+        if stream_timeout_seconds is not None:
+            self._stream_timeout_seconds = stream_timeout_seconds
+
+    def _is_ready_to_serve(self) -> bool:
+        """Readiness: true only once synced at least once and not draining."""
+        return self._ready and not self._draining
+
+    def _begin_draining(self) -> None:
+        """Start draining (idempotent): fail readiness + stop syncing."""
+        if not self._draining:
+            logger.info('Draining load balancer: failing readiness and '
+                        'deregistering from the controller sync.')
+        self._draining = True
+
+    async def _health(self,
+                      request: fastapi.Request) -> fastapi.responses.Response:
+        del request  # Unused.
+        return fastapi.responses.Response(
+            status_code=200 if self._is_ready_to_serve() else 503)
+
     async def _sync_with_controller_once(self) -> None:
         ready_replica_urls = []
         replica_info = {}
+        routing_spec = None
 
         async with aiohttp.ClientSession() as session:
             try:
@@ -140,6 +355,12 @@ class SkyServeLoadBalancer:
                     response.raise_for_status()
                     response_json = await response.json()
                     replica_info = response_json.get('replica_info', {})
+                    # [boltz fork] The controller ships the routing config
+                    # (policy/target-qps/stream-timeout) alongside replica_info
+                    # so `sky serve update` changes reach this LB without a
+                    # re-roll. Older controllers omit the key -> None -> the LB
+                    # keeps its launch-seeded policy.
+                    routing_spec = response_json.get('routing_spec')
                     ready_replica_urls = list(replica_info.keys())
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 logger.error(f'An error occurred when syncing with '
@@ -148,13 +369,44 @@ class SkyServeLoadBalancer:
             else:
                 logger.info(f'Available Replica URLs: {ready_replica_urls}')
                 with self._client_pool_lock:
-                    self._load_balancing_policy.set_ready_replicas(
-                        ready_replica_urls)
+                    # Apply the fetched routing spec BEFORE (re)setting the
+                    # ready replicas: if the policy object was swapped, the
+                    # set_ready_replicas below re-populates the fresh policy
+                    # from this same sync.
+                    if routing_spec:
+                        self._apply_routing_spec(routing_spec)
+                    # Keep quarantined (locally-evicted) replicas out of
+                    # routing even if the controller still lists them as
+                    # ready, until their TTL expires -- otherwise a dead
+                    # replica would be re-added on every sync and eviction
+                    # would oscillate.
+                    quarantined = self._quarantined_replicas()
+                    routable = [
+                        url for url in ready_replica_urls
+                        if url not in quarantined
+                    ]
+                    self._load_balancing_policy.set_ready_replicas(routable)
                     # Set replica info for instance-aware policies
                     if isinstance(self._load_balancing_policy,
                                   lb_policies.InstanceAwareLeastLoadPolicy):
                         self._load_balancing_policy.set_replica_info(
                             replica_info)
+                    # Drop eviction bookkeeping for replicas the controller no
+                    # longer lists, and for expired quarantines, so the maps
+                    # do not grow unbounded.
+                    ready_set = set(ready_replica_urls)
+                    now = time.time()
+                    self._replica_dead_failures = {
+                        url: count
+                        for url, count in self._replica_dead_failures.items()
+                        if url in ready_set
+                    }
+                    self._replica_quarantine_until = {
+                        url: until
+                        for url, until in
+                        self._replica_quarantine_until.items()
+                        if url in ready_set and until > now
+                    }
                     for replica_url in ready_replica_urls:
                         if replica_url not in self._client_pool:
                             self._client_pool[replica_url] = httpx.AsyncClient(
@@ -174,6 +426,8 @@ class SkyServeLoadBalancer:
                         self._drain_and_close_client(replica_url, client))
                     self._client_close_tasks.add(task)
                     task.add_done_callback(self._client_close_tasks.discard)
+                # First successful sync -> ready to serve (readiness gate).
+                self._ready = True
 
     async def _drain_and_close_client(self, url: str,
                                       client: httpx.AsyncClient) -> None:
@@ -213,6 +467,12 @@ class SkyServeLoadBalancer:
         await asyncio.sleep(5)
 
         while True:
+            # Once draining, stop POSTing load_balancer_sync so the controller
+            # stops counting this LB's request timestamps -- otherwise it would
+            # double-count with the maxSurge replacement during a roll.
+            if self._draining:
+                logger.info('Draining: stopped syncing with the controller.')
+                return
             try:
                 await self._sync_with_controller_once()
                 await asyncio.sleep(
@@ -373,6 +633,10 @@ class SkyServeLoadBalancer:
             else:
                 response_or_exception = await self._proxy_request_to(
                     ready_replica_url, request)
+                # Passively evict a replica that keeps failing with dead
+                # connections during the controller-pause window.
+                self._record_proxy_outcome(ready_replica_url,
+                                           response_or_exception)
             if not isinstance(response_or_exception, Exception):
                 return response_or_exception
             if ready_replica_url is not None:
@@ -402,6 +666,10 @@ class SkyServeLoadBalancer:
             await asyncio.sleep(current_backoff)
 
     def run(self):
+        # Register the readiness route BEFORE the catch-all proxy route so it
+        # is matched first (Starlette matches in registration order) instead of
+        # being proxied to a replica.
+        self._app.add_api_route('/_lb/health', self._health, methods=['GET'])
         self._app.add_api_route('/{path:path}',
                                 self._proxy_with_retries,
                                 methods=['GET', 'POST', 'PUT', 'DELETE'])
@@ -425,10 +693,16 @@ class SkyServeLoadBalancer:
                     f'{protocol}://0.0.0.0:{self._load_balancer_port}. '
                     f'PID: {os.getpid()}')
 
-        uvicorn.run(self._app,
-                    host='0.0.0.0',
-                    port=self._load_balancer_port,
-                    **uvicorn_tls_kwargs)
+        # Drain gracefully on SIGTERM (rolling update): _DrainableServer
+        # deregisters + fails readiness immediately, then exits only after a
+        # grace period so in-flight requests finish and k8s has pulled us from
+        # the Service.
+        config = uvicorn.Config(self._app,
+                                host='0.0.0.0',
+                                port=self._load_balancer_port,
+                                **uvicorn_tls_kwargs)
+        server = _DrainableServer(config, on_drain=self._begin_draining)
+        asyncio.run(server.serve_with_drain())
 
 
 def run_load_balancer(
@@ -437,22 +711,28 @@ def run_load_balancer(
     load_balancing_policy_name: Optional[str] = None,
     tls_credential: Optional[serve_utils.TLSCredential] = None,
     target_qps_per_replica: Optional[Union[float, Dict[str, float]]] = None,
-    stream_timeout_seconds: int = constants.DEFAULT_LB_STREAM_TIMEOUT,
+    stream_timeout_seconds: Optional[int] = None,
     retriable_status_codes: Optional[List[int]] = None,
 ) -> None:
     """Run the load balancer.
 
+    The routing spec (policy / target QPS / stream timeout) is fetched from the
+    controller over the sync channel; the corresponding args here are only a
+    bootstrap seed for the in-pod caller and default to None for the standalone
+    launcher (see `SkyServeLoadBalancer.__init__`).
+
     Args:
         controller_addr: The address of the controller.
         load_balancer_port: The port where the load balancer listens to.
-        policy_name: The name of the load balancing policy to use.
-        Defaults to None.
+        load_balancing_policy_name: Seed load balancing policy name.
+            Defaults to None.
         tls_credential:
             The TLS credentials for HTTPS endpoint. Defaults to None.
-        target_qps_per_replica: Target QPS per replica for instance-aware
+        target_qps_per_replica: Seed target QPS per replica for instance-aware
             load balancing. Can be a float or dict mapping GPU types to QPS.
             Defaults to None.
-        stream_timeout_seconds: Timeout in seconds for proxied responses.
+        stream_timeout_seconds: Seed timeout in seconds for proxied responses.
+            Defaults to None.
     """
     load_balancer = SkyServeLoadBalancer(
         controller_url=controller_addr,
@@ -465,28 +745,65 @@ def run_load_balancer(
     load_balancer.run()
 
 
-if __name__ == '__main__':
-    import argparse
+def _build_argument_parser() -> argparse.ArgumentParser:
+    """Build the standalone (external) load balancer CLI parser.
+
+    The routing spec -- load-balancing policy, per-replica target QPS, and
+    stream timeout -- is NOT a launch arg: the LB fetches it from the
+    controller over the load_balancer_sync channel (see
+    `SkyServeLoadBalancer._apply_routing_spec`), so `sky serve update` changes
+    reach a running LB without a re-roll. Only the controller address, the
+    listen port, and the TLS material stay CLI args: TLS is bound to uvicorn at
+    launch and a private key must never stream over the sync channel, so it
+    remains a launch/mounted-secret concern.
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument('--controller-addr',
                         required=True,
-                        default='127.0.0.1',
                         help='The address of the controller.')
     parser.add_argument('--load-balancer-port',
                         type=int,
                         required=True,
-                        default=8890,
                         help='The port where the load balancer listens to.')
-    available_policies = list(lb_policies.LB_POLICIES.keys())
     parser.add_argument(
-        '--load-balancing-policy',
-        choices=available_policies,
-        default=lb_policies.DEFAULT_LB_POLICY,
-        help=f'The load balancing policy to use. Available policies: '
-        f'{", ".join(available_policies)}.')
-    args = parser.parse_args()
-    run_load_balancer(args.controller_addr,
-                      args.load_balancer_port,
-                      args.load_balancing_policy,
-                      tls_credential=None,
-                      target_qps_per_replica=None)
+        '--tls-keyfile',
+        type=str,
+        default=None,
+        help='Path to the TLS private key file for the HTTPS endpoint. Must '
+        'be given together with --tls-certfile.')
+    parser.add_argument(
+        '--tls-certfile',
+        type=str,
+        default=None,
+        help='Path to the TLS certificate file for the HTTPS endpoint. Must '
+        'be given together with --tls-keyfile.')
+    return parser
+
+
+def _resolve_launch_kwargs(parser: argparse.ArgumentParser,
+                           args: argparse.Namespace) -> Dict[str, Any]:
+    """Coerce parsed CLI args into `run_load_balancer` kwargs.
+
+    Invalid combinations exit via `parser.error()`. Factored out of __main__
+    so the TLS coercion is unit-testable without starting a server. The
+    routing spec (policy / target QPS / stream timeout) is sync-fetched, so it
+    is not resolved here -- the standalone launcher passes None and the values
+    arrive on the first controller sync.
+    """
+    if (args.tls_keyfile is None) != (args.tls_certfile is None):
+        parser.error('--tls-keyfile and --tls-certfile must be given together.')
+    tls_credential: Optional[serve_utils.TLSCredential] = None
+    if args.tls_keyfile is not None:
+        tls_credential = serve_utils.TLSCredential(keyfile=args.tls_keyfile,
+                                                   certfile=args.tls_certfile)
+
+    return dict(
+        controller_addr=args.controller_addr,
+        load_balancer_port=args.load_balancer_port,
+        tls_credential=tls_credential,
+    )
+
+
+if __name__ == '__main__':
+    _parser = _build_argument_parser()
+    run_load_balancer(**_resolve_launch_kwargs(_parser, _parser.parse_args()))
