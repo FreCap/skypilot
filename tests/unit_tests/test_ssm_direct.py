@@ -6,10 +6,9 @@ from sky.utils import command_runner
 from sky.utils import ssm_direct
 
 CURRENT_SSM_CMD = (
-    'export AWS_RETRY_MODE=adaptive AWS_MAX_ATTEMPTS=12; '
-    'aws ssm start-session --target "$(aws ec2 describe-instances)" '
-    '--region us-east-1 --document-name AWS-StartSSHSession '
-    '--parameters portNumber=%p')
+    'env AWS_RETRY_MODE=adaptive AWS_MAX_ATTEMPTS=12 /bin/sh -c '
+    '\'aws ssm start-session --target "$(aws ec2 describe-instances)" --region us-east-1 --document-name AWS-StartSSHSession --parameters portNumber=%p\''
+)
 LEGACY_SSM_CMD = (
     'aws ssm start-session --target "$(aws ec2 describe-instances)" '
     '--region us-east-1 --document-name AWS-StartSSHSession '

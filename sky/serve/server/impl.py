@@ -1,5 +1,6 @@
 """Implementation of the SkyServe core APIs."""
 import base64
+import contextlib
 import os
 import pathlib
 import re
@@ -645,6 +646,23 @@ def update(
     workers: Optional[int] = None,
 ) -> None:
     """Updates an existing service or pool."""
+    # Same per-service lock as apply()/down(): an update racing a
+    # concurrent down on the same service can otherwise launch replicas
+    # mid-teardown, leaving orphaned (billable) clusters that no state
+    # tracks. apply() calls _update_impl directly because it already
+    # holds this lock (a second FileLock on the same path in the same
+    # process can self-deadlock).
+    with filelock.FileLock(serve_utils.get_service_filelock_path(service_name)):
+        _update_impl(task, service_name, mode, pool, workers)
+
+
+def _update_impl(
+    task: Optional['task_lib.Task'],
+    service_name: str,
+    mode: serve_utils.UpdateMode = serve_utils.DEFAULT_UPDATE_MODE,
+    pool: bool = False,
+    workers: Optional[int] = None,
+) -> None:
     noun = 'pool' if pool else 'service'
     capnoun = noun.capitalize()
 
@@ -893,10 +911,38 @@ def apply(
                                f'it up and retry.')
                     with ux_utils.print_exception_no_traceback():
                         raise RuntimeError(msg)
-                return update(task, service_name, mode, pool, workers)
+                return _update_impl(task, service_name, mode, pool, workers)
         except exceptions.ClusterNotUpError:
             pass
         up(task, service_name, pool)
+
+
+def _terminate_services(handle: 'backends.CloudVmRayResourceHandle',
+                        service_names: Optional[List[str]], purge: bool,
+                        pool: bool, noun: str) -> str:
+    assert isinstance(handle, backends.CloudVmRayResourceHandle)
+    use_legacy = not handle.is_grpc_enabled_with_flag
+
+    if not use_legacy:
+        try:
+            return serve_rpc_utils.RpcRunner.terminate_services(
+                handle, service_names, purge, pool)
+        except exceptions.SkyletMethodNotImplementedError:
+            use_legacy = True
+
+    backend = backend_utils.get_backend_from_handle(handle)
+    assert isinstance(backend, backends.CloudVmRayBackend)
+    code = serve_utils.ServeCodeGen.terminate_services(service_names, purge,
+                                                       pool)
+
+    returncode, stdout, _ = backend.run_on_head(handle,
+                                                code,
+                                                require_outputs=True,
+                                                stream_logs=False)
+
+    subprocess_utils.handle_returncode(returncode, code,
+                                       f'Failed to terminate {noun}', stdout)
+    return stdout
 
 
 def down(
@@ -927,30 +973,19 @@ def down(
     service_names = None if all else service_names
 
     try:
-        assert isinstance(handle, backends.CloudVmRayResourceHandle)
-        use_legacy = not handle.is_grpc_enabled_with_flag
-
-        if not use_legacy:
-            try:
-                stdout = serve_rpc_utils.RpcRunner.terminate_services(
-                    handle, service_names, purge, pool)
-            except exceptions.SkyletMethodNotImplementedError:
-                use_legacy = True
-
-        if use_legacy:
-            backend = backend_utils.get_backend_from_handle(handle)
-            assert isinstance(backend, backends.CloudVmRayBackend)
-            code = serve_utils.ServeCodeGen.terminate_services(
-                service_names, purge, pool)
-
-            returncode, stdout, _ = backend.run_on_head(handle,
-                                                        code,
-                                                        require_outputs=True,
-                                                        stream_logs=False)
-
-            subprocess_utils.handle_returncode(returncode, code,
-                                               f'Failed to terminate {noun}',
-                                               stdout)
+        # Serialize against apply()/update() on the same services so a
+        # teardown cannot interleave with an in-flight update that would
+        # launch replicas mid-teardown (orphaned clusters). Sorted so two
+        # concurrent multi-service downs cannot deadlock on lock order.
+        # `--all` resolves names on the controller side and keeps the
+        # previous (unserialized) semantics.
+        with contextlib.ExitStack() as stack:
+            for name in sorted(set(service_names or [])):
+                stack.enter_context(
+                    filelock.FileLock(
+                        serve_utils.get_service_filelock_path(name)))
+            stdout = _terminate_services(handle, service_names, purge, pool,
+                                         noun)
     except exceptions.FetchClusterInfoError as e:
         raise RuntimeError(
             'Failed to fetch controller IP. Please refresh controller status '

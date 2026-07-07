@@ -10,6 +10,7 @@ Deterministic min() tie-breaking also biased cold starts.
 # pylint: disable=protected-access
 import asyncio
 import threading
+import unittest
 from unittest import mock
 
 import httpx
@@ -84,7 +85,10 @@ class TestTieBreakRandomization:
 
     def test_least_load_zero_ties_spread(self):
         policy = _make_least_load()
-        seen = {policy._select_replica(None) for _ in range(100)}
+        seen = {
+            policy._select_replica(None, policy.ready_replicas)
+            for _ in range(100)
+        }
         assert seen == {'http://a:8080', 'http://b:8080'}
 
     def test_instance_aware_zero_ties_spread(self):
@@ -101,7 +105,10 @@ class TestTieBreakRandomization:
             },
         })
         policy.set_target_qps_per_accelerator({'L4': 0.1})
-        seen = {policy._select_replica(None) for _ in range(100)}
+        seen = {
+            policy._select_replica(None, policy.ready_replicas)
+            for _ in range(100)
+        }
         assert seen == {'http://a:8080', 'http://b:8080'}
 
 
@@ -111,6 +118,8 @@ def _make_lb(policy, client_pool):
     balancer._client_pool = client_pool
     balancer._client_pool_lock = threading.Lock()
     balancer._stream_timeout_seconds = 5
+    balancer._client_close_tasks = set()
+    balancer._retriable_status_codes = frozenset()
     return balancer
 
 
@@ -269,3 +278,95 @@ class TestProxySlotRelease:
         assert isinstance(t, httpx.Timeout)
         assert t.connect == 10
         assert t.read == 3700
+
+
+class TestDrainPrunedClients(unittest.TestCase):
+    """Pruning a replica must not abort its in-flight requests.
+
+    aclose() at prune time cancelled every running request on the pruned
+    client — every graceful removal (spot drain, rolling update,
+    transient NOT_READY) killed in-flight predictions that the drain was
+    supposed to protect (observed live in the FIS spot-interruption
+    drill: a 90s request aborted at 74s, well before instance death).
+    """
+
+    def _request(self):
+        request = mock.MagicMock()
+        request.url.path = '/x'
+        request.url.query = ''
+        request.headers.raw = []
+
+        async def _body():
+            return b''
+
+        request.body = _body
+        return request
+
+    def test_refcount_increment_and_release_on_error(self):
+        policy = mock.MagicMock()
+        client = mock.MagicMock()
+        seen = {}
+
+        def _build_request(*args, **kwargs):
+            # In-flight while the request is being executed.
+            seen['inflight_during'] = getattr(client, lb_module._INFLIGHT_ATTR,
+                                              0)
+            raise httpx.RequestError('boom')
+
+        client.build_request = _build_request
+        # MagicMock auto-creates attributes; seed the counter so getattr's
+        # default path matches a real httpx client.
+        setattr(client, lb_module._INFLIGHT_ATTR, 0)
+        balancer = _make_lb(policy, client_pool={'http://a:8080': client})
+        asyncio.run(balancer._proxy_request_to('http://a:8080',
+                                               self._request()))
+        self.assertEqual(seen['inflight_during'], 1)
+        self.assertEqual(getattr(client, lb_module._INFLIGHT_ATTR), 0)
+
+    def test_drain_waits_for_inflight_then_closes(self):
+        policy = mock.MagicMock()
+        balancer = _make_lb(policy, client_pool={})
+
+        closed = asyncio.Event()
+
+        class _Client:
+
+            async def aclose(self):
+                closed.set()
+
+        client = _Client()
+        setattr(client, lb_module._INFLIGHT_ATTR, 1)
+
+        async def _run():
+            task = asyncio.create_task(
+                balancer._drain_and_close_client('http://a:8080', client))
+            await asyncio.sleep(1.5)
+            self.assertFalse(closed.is_set())  # still in flight: not closed
+            setattr(client, lb_module._INFLIGHT_ATTR, 0)
+            await asyncio.wait_for(task, timeout=5)
+            self.assertTrue(closed.is_set())
+
+        asyncio.run(_run())
+
+    def test_drain_deadline_force_closes_stuck_counter(self):
+        policy = mock.MagicMock()
+        balancer = _make_lb(policy, client_pool={})
+        balancer._stream_timeout_seconds = 0
+
+        closed = asyncio.Event()
+
+        class _Client:
+
+            async def aclose(self):
+                closed.set()
+
+        client = _Client()
+        setattr(client, lb_module._INFLIGHT_ATTR, 7)  # never drains
+
+        with mock.patch.object(lb_module.constants,
+                               'LB_DRAIN_CLOSE_GRACE_SECONDS', 0):
+            asyncio.run(
+                asyncio.wait_for(balancer._drain_and_close_client(
+                    'http://a:8080', client),
+                                 timeout=5))
+        self.assertTrue(closed.is_set())

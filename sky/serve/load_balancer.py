@@ -24,6 +24,28 @@ from sky.utils import common_utils
 
 logger = sky_logging.init_logger(__name__)
 
+# Per-client in-flight request counter attribute. Attached to the
+# httpx.AsyncClient OBJECT (not keyed by URL): a URL pruned and re-added
+# gets a fresh client while the old one is still draining, and the two
+# must not share a counter.
+_INFLIGHT_ATTR = '_sky_inflight_requests'
+
+
+class _RetriableStatusError(Exception):
+    """A replica answered with a status the service marked retriable.
+
+    Returned from _proxy_request_to like transport errors so
+    _proxy_with_retries re-routes the (idempotent) request to another
+    replica. Only statuses listed in the service's
+    load_balancer.retriable_status_codes take this path — everything
+    else streams to the client verbatim.
+    """
+
+    def __init__(self, status_code: int, url: str) -> None:
+        super().__init__(
+            f'replica {url} answered retriable status {status_code}')
+        self.status_code = status_code
+
 
 def _is_dead_connection_error(exc: Exception) -> bool:
     """Whether a proxy failure indicates a DEAD replica vs a saturated one.
@@ -106,6 +128,7 @@ class SkyServeLoadBalancer:
         tls_credential: Optional[serve_utils.TLSCredential] = None,
         target_qps_per_replica: Optional[Union[float, Dict[str, float]]] = None,
         stream_timeout_seconds: Optional[int] = None,
+        retriable_status_codes: Optional[List[int]] = None,
     ) -> None:
         """Initialize the load balancer.
 
@@ -162,6 +185,11 @@ class SkyServeLoadBalancer:
         self._stream_timeout_seconds: int = (
             stream_timeout_seconds if stream_timeout_seconds is not None else
             constants.DEFAULT_LB_STREAM_TIMEOUT)
+        # Replica responses with these statuses are re-routed like
+        # transport failures (empty = never, the default). Safe only for
+        # idempotent workloads and "not now" statuses (503/429): the body
+        # is discarded before any byte reaches the client.
+        self._retriable_status_codes = frozenset(retriable_status_codes or ())
         # TODO(tian): httpx.Client has a resource limit of 100 max connections
         # for each client. We should wait for feedback on the best max
         # connections.
@@ -188,6 +216,9 @@ class SkyServeLoadBalancer:
         # (deregister-before-drain).
         self._ready: bool = False
         self._draining: bool = False
+        # Strong refs to in-progress drain-close tasks (see
+        # _drain_and_close_client); a bare create_task result can be GCed.
+        self._client_close_tasks: Set[asyncio.Task] = set()
 
     def _quarantined_replicas(self) -> Set[str]:
         """Replica URLs currently quarantined (TTL not yet expired).
@@ -302,8 +333,7 @@ class SkyServeLoadBalancer:
         return fastapi.responses.Response(
             status_code=200 if self._is_ready_to_serve() else 503)
 
-    async def _sync_with_controller_once(self) -> List[asyncio.Task]:
-        close_client_tasks = []
+    async def _sync_with_controller_once(self) -> None:
         ready_replica_urls = []
         replica_info = {}
         routing_spec = None
@@ -386,12 +416,43 @@ class SkyServeLoadBalancer:
                     client_to_close = []
                     for replica_url in urls_to_close:
                         client_to_close.append(
-                            self._client_pool.pop(replica_url))
-                for client in client_to_close:
-                    close_client_tasks.append(client.aclose())
+                            (replica_url, self._client_pool.pop(replica_url)))
+                for replica_url, client in client_to_close:
+                    # Fire-and-forget: a drain can legitimately take as long
+                    # as the longest in-flight prediction; the sync loop must
+                    # never wait on it. Strong refs held in the task set (a
+                    # bare create_task result can be garbage collected).
+                    task = asyncio.create_task(
+                        self._drain_and_close_client(replica_url, client))
+                    self._client_close_tasks.add(task)
+                    task.add_done_callback(self._client_close_tasks.discard)
                 # First successful sync -> ready to serve (readiness gate).
                 self._ready = True
-        return close_client_tasks
+
+    async def _drain_and_close_client(self, url: str,
+                                      client: httpx.AsyncClient) -> None:
+        """Close a pruned replica's client once its in-flight work drains.
+
+        aclose() cancels every request still running on the client, so
+        closing at prune time turned every graceful replica removal
+        (spot drain, rolling update, transient NOT_READY) into aborted
+        in-flight predictions. Wait for the per-client in-flight counter
+        (maintained by _proxy_request_to) to reach zero; the deadline
+        (stream timeout + margin) bounds leaked connections if a counter
+        is ever stuck.
+        """
+        deadline = (asyncio.get_event_loop().time() +
+                    self._stream_timeout_seconds +
+                    constants.LB_DRAIN_CLOSE_GRACE_SECONDS)
+        while (getattr(client, _INFLIGHT_ATTR, 0) > 0 and
+               asyncio.get_event_loop().time() < deadline):
+            await asyncio.sleep(1)
+        inflight = getattr(client, _INFLIGHT_ATTR, 0)
+        if inflight > 0:
+            logger.warning(f'Closing drained client for {url} with '
+                           f'{inflight} request(s) still in flight '
+                           '(drain deadline exceeded).')
+        await client.aclose()
 
     async def _sync_with_controller(self):
         """Sync with controller periodically.
@@ -413,11 +474,9 @@ class SkyServeLoadBalancer:
                 logger.info('Draining: stopped syncing with the controller.')
                 return
             try:
-                close_client_tasks = await self._sync_with_controller_once()
+                await self._sync_with_controller_once()
                 await asyncio.sleep(
                     constants.LB_CONTROLLER_SYNC_INTERVAL_SECONDS)
-                # Await those tasks after the interval to avoid blocking.
-                await asyncio.gather(*close_client_tasks)
             except Exception as e:  # pylint: disable=broad-except
                 logger.error(f'An error occurred when syncing with '
                              f'the controller: {e}'
@@ -451,6 +510,22 @@ class SkyServeLoadBalancer:
                 client = self._client_pool.get(url, None)
             if client is None:
                 return RuntimeError(f'Client for {url} not found.')
+            # Counted on the CLIENT object so a pruned client is closed
+            # only after its in-flight work drains (a re-added URL gets a
+            # fresh client with its own counter). Decremented exactly once
+            # per request alongside the slot release below.
+            setattr(client, _INFLIGHT_ATTR,
+                    getattr(client, _INFLIGHT_ATTR, 0) + 1)
+            client_refcount_dropped = False
+
+            def _drop_client_refcount():
+                nonlocal client_refcount_dropped
+                if client_refcount_dropped:
+                    return
+                client_refcount_dropped = True
+                setattr(client, _INFLIGHT_ATTR,
+                        getattr(client, _INFLIGHT_ATTR, 1) - 1)
+
             worker_url = httpx.URL(path=request.url.path,
                                    query=request.url.query.encode('utf-8'))
             proxy_request = client.build_request(
@@ -468,6 +543,15 @@ class SkyServeLoadBalancer:
                     self._stream_timeout_seconds,
                     connect=constants.LB_CONNECT_TIMEOUT_SECONDS))
             proxy_response = await client.send(proxy_request, stream=True)
+
+            if proxy_response.status_code in self._retriable_status_codes:
+                # "Not now" from the replica (e.g. 503 while the model
+                # warms, 429 shedding): discard and re-route. No byte has
+                # reached the client — send() returns at headers with
+                # stream=True. Slot + client refcount release via the
+                # not-released finally below.
+                await proxy_response.aclose()
+                return _RetriableStatusError(proxy_response.status_code, url)
 
             # The slot is owned by the stream now. Starlette runs
             # BackgroundTasks strictly AFTER a successful stream — a
@@ -487,6 +571,7 @@ class SkyServeLoadBalancer:
                 finally:
                     self._load_balancing_policy.post_execute_hook(
                         url, request, slot_token)
+                    _drop_client_refcount()
 
             async def _stream_with_release():
                 try:
@@ -513,6 +598,10 @@ class SkyServeLoadBalancer:
             if not released:
                 self._load_balancing_policy.post_execute_hook(
                     url, request, slot_token)
+                # Only defined once the client was checked out; exits
+                # before that (no client) have nothing to drop.
+                if 'client' in locals() and client is not None:
+                    _drop_client_refcount()
 
     async def _proxy_with_retries(
             self, request: fastapi.Request) -> fastapi.responses.Response:
@@ -523,11 +612,16 @@ class SkyServeLoadBalancer:
         # SkyServe supports serving on Spot Instances. To avoid preemptions
         # during request handling, we add a retry here.
         retry_cnt = 0
+        # URLs that already failed THIS request: without exclusion,
+        # least-load retries deterministically re-select a
+        # dead-but-not-yet-pruned replica on a busy fleet (it sits at
+        # load 0 while every healthy replica carries traffic).
+        failed_urls: Set[str] = set()
         while True:
             retry_cnt += 1
             with self._client_pool_lock:
                 ready_replica_url = self._load_balancing_policy.select_replica(
-                    request)
+                    request, exclude=failed_urls)
             if ready_replica_url is None:
                 response_or_exception = fastapi.HTTPException(
                     # 503 means that the server is currently
@@ -545,6 +639,8 @@ class SkyServeLoadBalancer:
                                            response_or_exception)
             if not isinstance(response_or_exception, Exception):
                 return response_or_exception
+            if ready_replica_url is not None:
+                failed_urls.add(ready_replica_url)
             # When the user aborts the request during streaming, the request
             # will be disconnected. We do not need to retry for this case.
             if await request.is_disconnected():
@@ -616,6 +712,7 @@ def run_load_balancer(
     tls_credential: Optional[serve_utils.TLSCredential] = None,
     target_qps_per_replica: Optional[Union[float, Dict[str, float]]] = None,
     stream_timeout_seconds: Optional[int] = None,
+    retriable_status_codes: Optional[List[int]] = None,
 ) -> None:
     """Run the load balancer.
 
@@ -643,7 +740,8 @@ def run_load_balancer(
         load_balancing_policy_name=load_balancing_policy_name,
         tls_credential=tls_credential,
         target_qps_per_replica=target_qps_per_replica,
-        stream_timeout_seconds=stream_timeout_seconds)
+        stream_timeout_seconds=stream_timeout_seconds,
+        retriable_status_codes=retriable_status_codes)
     load_balancer.run()
 
 

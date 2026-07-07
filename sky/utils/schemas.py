@@ -946,6 +946,18 @@ def get_service_schema():
                     'stream_timeout_seconds': {
                         'type': 'number',
                     },
+                    # Replica responses with these statuses are re-routed
+                    # to another replica like transport failures. Only
+                    # sensible for idempotent services and "not now"
+                    # statuses (503 while warming, 429 shedding).
+                    'retriable_status_codes': {
+                        'type': 'array',
+                        'items': {
+                            'type': 'integer',
+                            'minimum': 100,
+                            'maximum': 599,
+                        },
+                    },
                 },
             },
             'pool': {
@@ -2079,6 +2091,9 @@ def get_config_schema():
                 'provision_timeout': {
                     'type': 'integer',
                 },
+                'enable_ports': {
+                    'type': 'boolean',
+                },
                 'pricing': _PRICING_SCHEMA,
                 'sbatch_options': _SBATCH_OPTIONS_SCHEMA,
                 'gpu_partition_map': _GPU_PARTITION_MAP_SCHEMA,
@@ -2099,6 +2114,9 @@ def get_config_schema():
                             },
                             'tmpdir': {
                                 'type': 'string',
+                            },
+                            'enable_ports': {
+                                'type': 'boolean',
                             },
                             'pricing': _PRICING_SCHEMA,
                             'sbatch_options': _SBATCH_OPTIONS_SCHEMA,

@@ -3,7 +3,7 @@ import collections
 import random
 import threading
 import typing
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from sky import sky_logging
 
@@ -50,8 +50,27 @@ class LoadBalancingPolicy:
     def set_ready_replicas(self, ready_replicas: List[str]) -> None:
         raise NotImplementedError
 
-    def select_replica(self, request: 'fastapi.Request') -> Optional[str]:
-        replica = self._select_replica(request)
+    def select_replica(self,
+                       request: 'fastapi.Request',
+                       exclude: Optional[Set[str]] = None) -> Optional[str]:
+        """Select a replica, optionally excluding already-failed URLs.
+
+        `exclude` carries the URLs that already failed THIS request's
+        earlier retry attempts. Without it, least-load retries are a
+        failure magnet on a busy fleet: a dead-but-not-yet-pruned
+        replica sits at load 0 (its failed attempts release their
+        slots) while every healthy replica carries traffic, so it is
+        the strict minimum and every retry deterministically re-selects
+        the corpse. Falls back to the full set when every candidate has
+        failed — a lone replica with a transient blip deserves the
+        remaining attempts more than a guaranteed error.
+        """
+        candidates = self.ready_replicas
+        if exclude:
+            filtered = [url for url in candidates if url not in exclude]
+            if filtered:
+                candidates = filtered
+        replica = self._select_replica(request, candidates)
         # NOTE: this runs on the per-request routing hot path, inside the load
         # balancer's client-pool lock on the uvicorn event-loop thread, so log
         # only the cheap method + url. The previous code formatted a full
@@ -72,7 +91,8 @@ class LoadBalancingPolicy:
 
     # TODO(tian): We should have an abstract class for Request to
     # compatible with all frameworks.
-    def _select_replica(self, request: 'fastapi.Request') -> Optional[str]:
+    def _select_replica(self, request: 'fastapi.Request',
+                        candidates: List[str]) -> Optional[str]:
         raise NotImplementedError
 
     def pre_execute_hook(self, replica_url: str,
@@ -108,12 +128,13 @@ class RoundRobinPolicy(LoadBalancingPolicy, name='round_robin'):
         self.ready_replicas = ready_replicas
         self.index = 0
 
-    def _select_replica(self, request: 'fastapi.Request') -> Optional[str]:
+    def _select_replica(self, request: 'fastapi.Request',
+                        candidates: List[str]) -> Optional[str]:
         del request  # Unused.
-        if not self.ready_replicas:
+        if not candidates:
             return None
-        ready_replica_url = self.ready_replicas[self.index]
-        self.index = (self.index + 1) % len(self.ready_replicas)
+        ready_replica_url = candidates[self.index % len(candidates)]
+        self.index = (self.index + 1) % len(candidates)
         return ready_replica_url
 
 
@@ -144,19 +165,19 @@ class LeastLoadPolicy(LoadBalancingPolicy, name='least_load', default=True):
                     self._generation[replica] += 1
                     self.load_map[replica] = 0
 
-    def _select_replica(self, request: 'fastapi.Request') -> Optional[str]:
+    def _select_replica(self, request: 'fastapi.Request',
+                        candidates: List[str]) -> Optional[str]:
         del request  # Unused.
-        if not self.ready_replicas:
+        if not candidates:
             return None
         with self.lock:
             min_load = min(
-                self.load_map.get(replica, 0)
-                for replica in self.ready_replicas)
+                self.load_map.get(replica, 0) for replica in candidates)
             # Random tie-break: deterministic min() over URL order biases
             # cold starts (all-zero loads) onto the same replica wave
             # after wave.
             candidates = [
-                replica for replica in self.ready_replicas
+                replica for replica in candidates
                 if self.load_map.get(replica, 0) == min_load
             ]
             return random.choice(candidates)
@@ -330,25 +351,26 @@ class InstanceAwareLeastLoadPolicy(LeastLoadPolicy,
             f'Using default value 1.0 as fallback.')
         return 1.0
 
-    def _select_replica(self, request: 'fastapi.Request') -> Optional[str]:
+    def _select_replica(self, request: 'fastapi.Request',
+                        candidates: List[str]) -> Optional[str]:
         del request  # Unused.
-        if not self.ready_replicas:
+        if not candidates:
             return None
         with self.lock:
             # Calculate normalized loads for all replicas
             replica_loads = []
-            for replica in self.ready_replicas:
+            for replica in candidates:
                 normalized_load = self._get_normalized_load(replica)
                 replica_loads.append((replica, normalized_load))
 
             # Select among the (near-)minimum normalized loads at random:
             # deterministic min() over URL order biases cold starts.
             min_load = min(load for _, load in replica_loads)
-            candidates = [
+            tie_break = [
                 replica for replica, load in replica_loads
                 if load - min_load <= 1e-9
             ]
-            selected_replica = random.choice(candidates)
+            selected_replica = random.choice(tie_break)
             logger.debug('Available replicas and loads: %s', replica_loads)
             logger.debug('Selected replica: %s', selected_replica)
             return selected_replica
