@@ -247,6 +247,11 @@ def up(
     """Spins up a service or a pool."""
     task.validate()
     serve_utils.validate_service_task(task, pool=pool)
+    if not pool:
+        # External load balancer mode needs an endpoint template to report the
+        # service endpoint; fail early with a clear message rather than
+        # spinning up and then reporting a dead/undefined endpoint.
+        serve_utils.validate_external_load_balancer_config()
     assert task.service is not None
     assert task.service.pool == pool, 'Inconsistent pool flag.'
     noun = 'pool' if pool else 'service'

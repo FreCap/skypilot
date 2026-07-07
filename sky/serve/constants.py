@@ -170,6 +170,16 @@ LOAD_BALANCER_PORT_RANGE = '30001-30020'
 # same range.
 CONTROLLER_PORT_RANGE_SIZE = 100
 
+# Cross-pod lock serializing stable controller-port assignment in external
+# load balancer mode. On a Postgres backend get_lock() resolves this to a
+# session advisory lock (shared across api-server pods); on SQLite it is a
+# node-local filelock (single pod, sufficient). Needed because the
+# per-node PORT_SELECTION_FILE_LOCK cannot serialize two pods scanning the
+# shared DB for a free port.
+CONTROLLER_PORT_ASSIGNMENT_LOCK_ID = (
+    '~/.sky/serve_controller_port_assignment_lock')
+CONTROLLER_PORT_ASSIGNMENT_LOCK_TIMEOUT_SECONDS = 30
+
 # Initial version of service.
 INITIAL_VERSION = 1
 

@@ -32,6 +32,7 @@ from sky.skylet import constants as skylet_constants
 from sky.utils import auth_utils
 from sky.utils import common_utils
 from sky.utils import controller_utils
+from sky.utils import locks
 from sky.utils import subprocess_utils
 from sky.utils import thread_utils
 from sky.utils import ux_utils
@@ -449,8 +450,11 @@ def _select_controller_port(service_name: str) -> int:
     reuse safe against the shared-port hazard above: a service's assigned port
     is never held by any other service, so it is always free on any pod.
 
-    Must be called while holding the port-selection file lock, so the
-    scan-and-assign of a new port is serialized within the pod.
+    The default path is called while holding the node-local port-selection
+    file lock. External-mode assignment additionally takes a CROSS-POD lock
+    (Postgres advisory lock under an HA deployment), because the file lock
+    cannot serialize two api-server pods scanning the shared DB for the same
+    free port.
     """
     if not serve_utils.is_external_load_balancer_mode():
         return common_utils.find_free_port(constants.CONTROLLER_PORT_START)
@@ -460,15 +464,23 @@ def _select_controller_port(service_name: str) -> int:
     assigned = serve_state.get_service_controller_port(service_name)
     if assigned is not None and base <= assigned < end:
         return assigned
-    in_use = {
-        svc['controller_port']
-        for svc in serve_state.get_services()
-        if svc['name'] != service_name and svc['controller_port'] is not None
-    }
-    for port in range(base, end):
-        if port not in in_use:
-            serve_state.set_service_controller_port(service_name, port)
-            return port
+    # Assigning a new stable port: serialize across pods so two concurrent
+    # up()s cannot pick the same free port. Re-read inside the lock in case a
+    # peer already assigned this service's port while we waited.
+    with locks.get_lock(
+            constants.CONTROLLER_PORT_ASSIGNMENT_LOCK_ID,
+            timeout=constants.CONTROLLER_PORT_ASSIGNMENT_LOCK_TIMEOUT_SECONDS):
+        assigned = serve_state.get_service_controller_port(service_name)
+        if assigned is not None and base <= assigned < end:
+            return assigned
+        in_use = {
+            svc['controller_port'] for svc in serve_state.get_services() if
+            svc['name'] != service_name and svc['controller_port'] is not None
+        }
+        for port in range(base, end):
+            if port not in in_use:
+                serve_state.set_service_controller_port(service_name, port)
+                return port
     raise RuntimeError(
         f'No free controller port in the external load balancer range '
         f'[{base}, {end}) for service {service_name}; increase '

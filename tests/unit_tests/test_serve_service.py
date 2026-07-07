@@ -665,3 +665,31 @@ def test_ensure_load_balancer_spawns_when_not_external():
                                                '/tmp/lb.log')
         assert result is sentinel
         spawn.assert_called_once()
+
+
+def test_select_controller_port_assignment_takes_cross_pod_lock():
+    # New-port assignment must serialize across pods via the cross-pod lock;
+    # reuse of an already-assigned in-range port must NOT take the lock.
+    base = service.constants.CONTROLLER_PORT_START
+    lock_cm = mock.MagicMock()
+    with _external_lb_mode(), \
+         mock.patch.object(service.locks, 'get_lock',
+                           return_value=lock_cm) as get_lock, \
+         mock.patch.object(service.serve_state,
+                           'get_service_controller_port',
+                           return_value=None), \
+         mock.patch.object(service.serve_state,
+                           'get_services',
+                           return_value=[]), \
+         mock.patch.object(service.serve_state, 'set_service_controller_port'):
+        assert service._select_controller_port('svc') == base
+        get_lock.assert_called_once()
+        lock_cm.__enter__.assert_called_once()
+
+    with _external_lb_mode(), \
+         mock.patch.object(service.locks, 'get_lock') as get_lock_reuse, \
+         mock.patch.object(service.serve_state,
+                           'get_service_controller_port',
+                           return_value=base + 3):
+        assert service._select_controller_port('svc') == base + 3
+        get_lock_reuse.assert_not_called()
