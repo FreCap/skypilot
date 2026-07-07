@@ -1,0 +1,29 @@
+{{- if .Values.serve.externalLoadBalancer.enabled }}
+{{- $fullName := include "skypilot.fullname" . -}}
+{{- $start := int .Values.serve.externalLoadBalancer.controllerPortRangeStart -}}
+{{- $size := int .Values.serve.externalLoadBalancer.controllerPortRangeSize -}}
+apiVersion: v1
+kind: Service
+metadata:
+  # Name is hardcoded in the app (sky/serve/lb_k8s.py CONTROLLER_SERVICE_NAME),
+  # so it must be exactly `skypilot-serve-controller` and NOT a templated name.
+  name: skypilot-serve-controller
+  namespace: {{ .Release.Namespace }}
+  labels:
+    parent: skypilot
+    skypilot.co/component: serve-controller
+spec:
+  type: ClusterIP
+  # Select the api-server pod by its `app` label ONLY (no skypilot.co/ready
+  # gate), so the controller is reachable regardless of API readiness.
+  selector:
+    app: {{ $fullName }}-api
+  ports:
+  {{- range $i := until $size }}
+  {{- $port := add $start $i }}
+  - port: {{ $port }}
+    name: ctrl-{{ $port }}
+    targetPort: {{ $port }}
+    protocol: TCP
+  {{- end }}
+{{- end }}
