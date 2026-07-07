@@ -511,7 +511,9 @@ def _spawn_load_balancer(
               service_spec.load_balancing_policy, service_spec.tls_credential,
               service_spec.target_qps_per_replica,
               service_spec.lb_stream_timeout_seconds,
-              service_spec.lb_retriable_status_codes))
+              service_spec.lb_retriable_status_codes,
+              service_spec.lb_max_retries,
+              service_spec.lb_retry_initial_backoff_seconds))
     process.start()
     return process
 

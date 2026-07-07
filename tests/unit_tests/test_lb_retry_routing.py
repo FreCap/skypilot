@@ -77,6 +77,11 @@ class TestRetryExclusion(unittest.TestCase):
         balancer._load_balancing_policy = policy
         balancer._client_pool_lock = threading.Lock()
         balancer._request_aggregator = mock.MagicMock()
+        balancer._max_retries = lb_module.constants.LB_MAX_RETRY
+        balancer._retry_initial_backoff_seconds = (
+            lb_module.constants.LB_RETRY_INITIAL_BACKOFF_SECONDS)
+        balancer._replica_dead_failures = {}
+        balancer._replica_quarantine_until = {}
         attempts = []
 
         async def _proxy(url, request):
@@ -150,3 +155,63 @@ class TestRetriableStatusCodes(unittest.TestCase):
         result = asyncio.run(
             balancer._proxy_request_to('http://a:8080', _request()))
         self.assertNotIsInstance(result, Exception)
+
+
+class TestRetryTuning(unittest.TestCase):
+    """max_retries and retry backoff are service-configurable."""
+
+    def _balancer(self, max_retries=None, backoff=None):
+        balancer = object.__new__(lb_module.SkyServeLoadBalancer)
+        policy = lb_policies.LeastLoadPolicy()
+        policy.set_ready_replicas(['http://a:8080', 'http://b:8080'])
+        balancer._load_balancing_policy = policy
+        balancer._client_pool_lock = threading.Lock()
+        balancer._request_aggregator = mock.MagicMock()
+        balancer._max_retries = (max_retries if max_retries is not None else
+                                 lb_module.constants.LB_MAX_RETRY)
+        balancer._retry_initial_backoff_seconds = (
+            backoff if backoff is not None else
+            lb_module.constants.LB_RETRY_INITIAL_BACKOFF_SECONDS)
+        balancer._replica_dead_failures = {}
+        balancer._replica_quarantine_until = {}
+        return balancer
+
+    def _run_all_failing(self, balancer):
+        attempts = []
+
+        async def _proxy(url, request):
+            del request
+            attempts.append(url)
+            return httpx.ConnectError('down')
+
+        balancer._proxy_request_to = _proxy
+        with mock.patch('sky.serve.load_balancer.asyncio.sleep',
+                        new=mock.AsyncMock()):
+            with self.assertRaises(fastapi.HTTPException) as ctx:
+                asyncio.run(balancer._proxy_with_retries(_request()))
+        return attempts, ctx.exception
+
+    def test_max_retries_bounds_attempts(self):
+        attempts, exc = self._run_all_failing(self._balancer(max_retries=5))
+        self.assertEqual(len(attempts), 5)
+        self.assertEqual(exc.status_code, 500)
+        self.assertIn('Max retries 5 exceeded', exc.detail)
+
+    def test_default_max_retries_unchanged(self):
+        attempts, _ = self._run_all_failing(self._balancer())
+        self.assertEqual(len(attempts), lb_module.constants.LB_MAX_RETRY)
+
+    def test_backoff_seeded_from_config(self):
+        balancer = self._balancer(max_retries=2, backoff=0.25)
+        captured = {}
+        real_backoff = lb_module.common_utils.Backoff
+
+        def _spy(initial_backoff):
+            captured['initial'] = initial_backoff
+            return real_backoff(initial_backoff=initial_backoff)
+
+        with mock.patch.object(lb_module.common_utils,
+                               'Backoff',
+                               side_effect=_spy):
+            self._run_all_failing(balancer)
+        self.assertEqual(captured['initial'], 0.25)
