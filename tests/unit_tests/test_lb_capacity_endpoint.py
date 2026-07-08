@@ -29,6 +29,9 @@ def _make_balancer(policy):
     balancer._reject_last_seen = {}
     balancer._reject_fallback_seq = 0
     balancer._capacity_hint = None
+    balancer._replica_occupancy = {}
+    balancer._replica_free_slots = {}
+    balancer._last_occupancy_probe_time = None
     return balancer
 
 
@@ -117,3 +120,50 @@ class TestCapacityEndpoint(unittest.TestCase):
         body = json.loads(
             asyncio.run(balancer._capacity(mock.MagicMock())).body)
         self.assertEqual(body['in_flight'], 1)
+
+    def test_never_probed_reports_zero_occupancy_and_null_age(self):
+        # Without a completed probe round the endpoint must not invent
+        # capacity: no probed replicas, no free slots, null age.
+        policy = lb_policies.LeastLoadPolicy()
+        policy.set_ready_replicas(['http://a:8080'])
+        balancer = _make_balancer(policy)
+        import json
+        body = json.loads(
+            asyncio.run(balancer._capacity(mock.MagicMock())).body)
+        self.assertEqual(body['probed_replicas'], 0)
+        self.assertEqual(body['busy_replicas'], 0)
+        self.assertEqual(body['free_slots'], 0)
+        self.assertIsNone(body['occupancy_probe_age_seconds'])
+
+    def test_occupancy_aggregates(self):
+        # a: busy (1 running / concurrency 1 -> 0 free), b: idle (1 free),
+        # c: ready but unprobed (contributes nothing).
+        policy = lb_policies.LeastLoadPolicy()
+        policy.set_ready_replicas(
+            ['http://a:8080', 'http://b:8080', 'http://c:8080'])
+        balancer = _make_balancer(policy)
+        balancer._replica_occupancy = {'http://a:8080': 1, 'http://b:8080': 0}
+        balancer._replica_free_slots = {'http://a:8080': 0, 'http://b:8080': 1}
+        balancer._last_occupancy_probe_time = time.monotonic() - 2.0
+        import json
+        body = json.loads(
+            asyncio.run(balancer._capacity(mock.MagicMock())).body)
+        self.assertEqual(body['probed_replicas'], 2)
+        self.assertEqual(body['busy_replicas'], 1)
+        self.assertEqual(body['free_slots'], 1)
+        self.assertGreaterEqual(body['occupancy_probe_age_seconds'], 1.0)
+
+    def test_occupancy_ignores_pruned_replicas(self):
+        # A probe entry for a replica the controller since removed from the
+        # ready set must not count toward the aggregates.
+        policy = lb_policies.LeastLoadPolicy()
+        policy.set_ready_replicas(['http://a:8080'])
+        balancer = _make_balancer(policy)
+        balancer._replica_occupancy = {'http://a:8080': 0, 'http://gone': 0}
+        balancer._replica_free_slots = {'http://a:8080': 1, 'http://gone': 1}
+        balancer._last_occupancy_probe_time = time.monotonic()
+        import json
+        body = json.loads(
+            asyncio.run(balancer._capacity(mock.MagicMock())).body)
+        self.assertEqual(body['probed_replicas'], 1)
+        self.assertEqual(body['free_slots'], 1)

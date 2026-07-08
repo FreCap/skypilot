@@ -112,6 +112,17 @@ class LoadBalancingPolicy:
         """
         return None
 
+    def set_occupancy(self, occupancy: Dict[str, int]) -> None:
+        """Set the replica-reported async occupancy (url -> running jobs).
+
+        [boltz fork] Fed by the LB's occupancy probe: async fast-ack
+        workloads finish the HTTP envelope in milliseconds while the
+        replica crunches for hours, so the in-flight accounting alone
+        reads every replica as idle. Policies that track load fold this
+        into selection; policies without load accounting ignore it.
+        """
+        del occupancy
+
     def pre_execute_hook(self, replica_url: str,
                          request: 'fastapi.Request') -> Optional[Any]:
         """Account an in-flight request. Returns an opaque token that the
@@ -155,16 +166,47 @@ class RoundRobinPolicy(LoadBalancingPolicy, name='round_robin'):
         return ready_replica_url
 
 
+# [boltz fork] Weight of one replica-reported running async job in the
+# load-selection score, relative to one in-flight HTTP request. An async job
+# occupies a whole predict slot for up to hours while envelope requests live
+# for milliseconds, so occupancy must dominate: any busy replica sorts after
+# any idle one regardless of transient envelope counts. Deliberately a
+# weight (not a hard filter) — when EVERY replica is busy the min is still
+# defined, the request proxies, and the replica's own shedding (429 ->
+# retry -> LB 503) stays the authoritative backstop, so a stale probe can
+# deprioritize but never black-hole routing.
+OCCUPANCY_LOAD_WEIGHT = 1000.0
+
+
 class LeastLoadPolicy(LoadBalancingPolicy, name='least_load', default=True):
     """Least load load balancing policy."""
 
     def __init__(self) -> None:
         super().__init__()
         self.load_map: Dict[str, int] = collections.defaultdict(int)
+        # url -> replica-reported running async jobs (see set_occupancy).
+        # Absent url == occupancy unknown == treated as 0: an unreachable
+        # probe must fall back to today's envelope-only behavior, not
+        # exile the replica.
+        self.occupancy_map: Dict[str, int] = {}
         # url -> accounting generation; bumped whenever a key is (re)added
         # so stale releases from before a prune are ignored (ABA).
         self._generation: Dict[str, int] = collections.defaultdict(int)
         self.lock = threading.Lock()
+
+    def set_occupancy(self, occupancy: Dict[str, int]) -> None:
+        # Replace wholesale: the probe rebuilds the map every round from
+        # the current ready set, so replacement is also the prune.
+        with self.lock:
+            self.occupancy_map = dict(occupancy)
+
+    def _effective_load(self, replica_url: str) -> float:
+        """Selection score: envelope in-flight + weighted async occupancy.
+
+        Must be called while holding `self.lock`.
+        """
+        return (self.load_map.get(replica_url, 0) +
+                OCCUPANCY_LOAD_WEIGHT * self.occupancy_map.get(replica_url, 0))
 
     def set_ready_replicas(self, ready_replicas: List[str]) -> None:
         if set(self.ready_replicas) == set(ready_replicas):
@@ -206,13 +248,13 @@ class LeastLoadPolicy(LoadBalancingPolicy, name='least_load', default=True):
             return None
         with self.lock:
             min_load = min(
-                self.load_map.get(replica, 0) for replica in candidates)
+                self._effective_load(replica) for replica in candidates)
             # Random tie-break: deterministic min() over URL order biases
             # cold starts (all-zero loads) onto the same replica wave
             # after wave.
             candidates = [
                 replica for replica in candidates
-                if self.load_map.get(replica, 0) == min_load
+                if self._effective_load(replica) == min_load
             ]
             return random.choice(candidates)
 
@@ -338,7 +380,11 @@ class InstanceAwareLeastLoadPolicy(LeastLoadPolicy,
 
     def _get_normalized_load(self, replica_url: str) -> float:
         """Get normalized load for a replica based on its GPU shape."""
-        current_load = self.load_map.get(replica_url, 0)
+        # Occupancy folds in BEFORE normalization, like extra in-flight
+        # load: within one GPU shape (the common single-shape fleet) busy
+        # replicas sort strictly after idle ones; across shapes the same
+        # target-QPS normalization applies to both terms.
+        current_load = self._effective_load(replica_url)
 
         # Get accelerator shape for this replica
         replica_data = self.replica_info.get(replica_url, {})
