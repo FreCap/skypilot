@@ -559,7 +559,7 @@ class TestEnsureLbObjectsExist:
     def test_missing_deployment_recreates(self, monkeypatch):
         apps = mock.MagicMock()
         apps.read_namespaced_deployment.side_effect = _ApiException(404)
-        _install(monkeypatch, apps_api=apps)
+        _install(monkeypatch, apps_api=apps, db_service_names=('svc',))
         with mock.patch.object(lb_k8s,
                                'create_lb_deployment_and_service') as create:
             lb_k8s.ensure_lb_objects_exist('svc', 20001)
@@ -568,11 +568,22 @@ class TestEnsureLbObjectsExist:
     def test_missing_service_recreates(self, monkeypatch):
         core = mock.MagicMock()
         core.read_namespaced_service.side_effect = _ApiException(404)
-        _install(monkeypatch, core_api=core)
+        _install(monkeypatch, core_api=core, db_service_names=('svc',))
         with mock.patch.object(lb_k8s,
                                'create_lb_deployment_and_service') as create:
             lb_k8s.ensure_lb_objects_exist('svc', 20001)
         create.assert_called_once_with('svc', 20001)
+
+    def test_missing_objects_but_service_row_gone_skips(self, monkeypatch):
+        # The create-time DB fence: objects missing because the service is
+        # being torn down concurrently must NOT be resurrected.
+        apps = mock.MagicMock()
+        apps.read_namespaced_deployment.side_effect = _ApiException(404)
+        _install(monkeypatch, apps_api=apps)  # 'svc' absent from the DB.
+        with mock.patch.object(lb_k8s,
+                               'create_lb_deployment_and_service') as create:
+            lb_k8s.ensure_lb_objects_exist('svc', 20001)
+        create.assert_not_called()
 
     def test_non_404_read_error_raises(self, monkeypatch):
         apps = mock.MagicMock()

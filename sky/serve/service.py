@@ -1149,11 +1149,24 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
         elif external_lb:
             # Recovery normally keeps the recorded port, but a service that
             # just migrated from in-pod mode (upped before the external-LB
-            # flag) still records its legacy in-pod port. The external port is
-            # a fixed constant, so re-publishing on recovery is always correct
-            # and brings the row in line with the actual data plane.
-            serve_state.set_service_load_balancer_port(service_name,
-                                                       load_balancer_port)
+            # flag) still records its legacy in-pod port. Republish the
+            # (constant) external port only when a DIFFERENT port is already
+            # recorded: the setter is a name-only write with no owner guard,
+            # and wait_service_registration returns on any non-null port -- so
+            # writing over a NULL row could prematurely unblock a concurrent
+            # same-name registration. Best-effort: a DB error must not reach
+            # _start's destructive cleanup over a cosmetic row fix.
+            try:
+                record = serve_state.get_service_from_name(service_name)
+                if (record is not None and
+                        record.get('load_balancer_port') is not None and
+                        record.get('load_balancer_port') != load_balancer_port):
+                    serve_state.set_service_load_balancer_port(
+                        service_name, load_balancer_port)
+            except Exception as e:  # pylint: disable=broad-except
+                logger.warning(
+                    f'Failed to republish load_balancer_port for '
+                    f'{service_name}: {common_utils.format_exception(e)}')
 
         # Self-check cadence (seconds): how often we re-read DB to confirm
         # we're still the authoritative controller. Ghost detection only
