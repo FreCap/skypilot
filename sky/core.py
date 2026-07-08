@@ -13,6 +13,7 @@ from sky import clouds
 from sky import dag as dag_lib
 from sky import data
 from sky import exceptions
+from sky import execution
 from sky import global_user_state
 from sky import models
 from sky import optimizer
@@ -583,9 +584,24 @@ def _start(
             f'Starting cluster {cluster_name!r} with backend {backend.NAME} '
             'is not supported.')
 
+    controller = controller_utils.Controllers.from_name(cluster_name)
+    if (controller is None and idle_minutes_to_autostop is not None and
+            idle_minutes_to_autostop >= 0):
+        # `sky start --force -i N` on an UP cluster reaches set_autostop
+        # without core.autostop()'s validation or the launch path's
+        # requested-features check, so an unstoppable-resources config
+        # (non-down autostop on e.g. AWS one-time spot, whose idle-time
+        # StopInstances fails forever while the instance keeps billing)
+        # would slip through this path. Same checks as core.autostop().
+        # Controllers are excluded: per-request settings are rejected
+        # below, and their config-derived autostop is force-converted by
+        # set_autostop on Kubernetes/RunPod.
+        launched = handle.launched_resources.assert_launchable()
+        launched.cloud.check_features_are_supported(
+            launched, execution.autostop_requested_features(down))
+
     hook: Optional[str] = None
     hook_timeout: Optional[int] = None
-    controller = controller_utils.Controllers.from_name(cluster_name)
     if controller is not None:
         if down or idle_minutes_to_autostop:
             arguments = []
@@ -685,6 +701,36 @@ def _start(
     backend.sync_file_mounts(handle=handle,
                              all_file_mounts=None,
                              storage_mounts=storage_mounts)
+    if idle_minutes_to_autostop is not None and idle_minutes_to_autostop >= 0:
+        # Choke-point validation covering the values that did NOT come
+        # from an explicit `-i` (already validated above with a hard
+        # error): autostop RESTORED from the local record and
+        # controller CONFIG-derived autostop can both predate the
+        # launch-time validation (e.g. non-down autostop stored for an
+        # AWS one-time spot cluster). Re-applying such a config would
+        # re-arm an idle timer whose StopInstances fails at every idle
+        # tick while the instance keeps billing. Warn and skip the
+        # re-apply instead of failing the whole start: the user asked to
+        # start the cluster, not to be blocked by a legacy value.
+        # Kubernetes/RunPod controllers are exempt -- set_autostop
+        # force-converts them to autodown/no-op.
+        launched = handle.launched_resources.assert_launchable()
+        exempt = (controller is not None and
+                  isinstance(launched.cloud,
+                             (clouds.Kubernetes, clouds.RunPod)))
+        if not exempt:
+            try:
+                launched.cloud.check_features_are_supported(
+                    launched, execution.autostop_requested_features(down))
+            except exceptions.NotSupportedError as e:
+                logger.warning(
+                    f'Not re-applying autostop ({idle_minutes_to_autostop} '
+                    f'minutes, down={down}) to cluster {cluster_name!r}: '
+                    f'{e}\nUse `sky autostop {cluster_name} -i '
+                    '<minutes> --down` (or `--cancel`) to set a supported '
+                    'configuration.')
+                idle_minutes_to_autostop = None
+
     if idle_minutes_to_autostop is not None:
         # For controller clusters, hook comes from controller_autostop_config.
         # For regular clusters, hook is None so it will be inherited from the
