@@ -167,6 +167,20 @@ class SkyServeLoadBalancer:
     policy.
     """
 
+    # Demand-feed state also gets class-level zero-defaults: the demand
+    # gauges are touched from every request path, so they must degrade to
+    # "no demand" rather than AttributeError on a partially-initialized
+    # instance (this fork's tests build the LB via object.__new__ with
+    # only the attrs under test). All defaults are immutable -- the
+    # reject dict defaults to None and is materialized per-instance by
+    # _prune_reject_window (the single funnel every read and write goes
+    # through), so instances cannot leak reject state into one another.
+    _queue_depth: int = 0
+    _reject_last_seen: Optional[Dict[str, float]] = None
+    _reject_fallback_seq: int = 0
+    _capacity_hint: Optional[Dict[str, Any]] = None
+    _draining_clients: Optional[Dict[str, List[httpx.AsyncClient]]] = None
+
     def __init__(
         self,
         controller_url: str,
@@ -282,6 +296,36 @@ class SkyServeLoadBalancer:
         # steps (NTP) — hiding staleness is the exact failure this field
         # exists to expose.
         self._last_sync_time: Optional[float] = None
+        # Demand-feed gauges for concurrency-native autoscaling. All three
+        # are GAUGES re-read whole on every controller sync -- never
+        # cleared on ack -- so a failed or duplicated sync cannot lose or
+        # double-count demand (only the timestamp aggregator keeps
+        # clear-on-report semantics).
+        #
+        # Requests currently inside _proxy_with_retries (selecting a
+        # replica, dispatching, awaiting headers). Plain int is safe:
+        # single uvicorn event loop, and the +=/-= pair brackets the
+        # handler without an await between a read and its write.
+        self._queue_depth: int = 0
+        # Reject window with dedup: job key -> last-seen monotonic time.
+        # Keyed by the LB_JOB_ID_HEADER value (stable across retries of
+        # the same job) so a held job the platform re-fires every ~30s
+        # counts as ONE unit of pressure, not window/retry-period units
+        # (see the constant's comment for why raw counting over-provisions
+        # ~10x). Entries older than LB_REJECT_WINDOW_SECONDS are pruned on
+        # access. Monotonic clock: TTLs must not be distorted by
+        # wall-clock steps (NTP). (Typed Optional at class level; always
+        # a real dict on instances -- _prune_reject_window materializes.)
+        self._reject_last_seen = {}
+        # Fallback key sequence for requests without the job-id header:
+        # each such reject counts once (raw-count over-estimation,
+        # documented -- the platform sends the header).
+        self._reject_fallback_seq: int = 0
+        # Latest capacity_hint from the controller sync response
+        # (provisioning/target replica counts). None until a sync carries
+        # one (old controller, or never synced); /_lb/capacity readers
+        # judge its freshness via last_sync_age_seconds.
+        self._capacity_hint: Optional[Dict[str, Any]] = None
         # [boltz fork] Replica-reported async occupancy, from the probe loop
         # (see _probe_occupancy_loop): url -> running async jobs, and
         # url -> free predict slots (max(0, predict_concurrency - running)).
@@ -378,8 +422,11 @@ class SkyServeLoadBalancer:
           re-populates it from this same sync, which is why we do not copy
           the old ready set over (that would short-circuit set_ready_replicas
           and skip load-map initialization).
-        - target_qps_per_replica: applied to the active policy when it is
-          instance-aware and the value is a per-accelerator dict.
+        - target_qps_per_replica / target_concurrency_per_replica: applied
+          to the active policy when it is instance-aware -- a QPS dict
+          sets per-accelerator weights; a concurrency knob (no dict) sets
+          a uniform per-GPU weight and clears stale dict weights left by
+          a previous version.
         - stream_timeout_seconds: stored into the per-request instance var so
           it takes effect on subsequent proxied requests.
         """
@@ -391,11 +438,20 @@ class SkyServeLoadBalancer:
             self._load_balancing_policy_name = (
                 lb_policies.LoadBalancingPolicy.make_policy_name(policy_name))
         target_qps_per_replica = routing_spec.get('target_qps_per_replica')
-        if (isinstance(target_qps_per_replica, dict) and
-                isinstance(self._load_balancing_policy,
-                           lb_policies.InstanceAwareLeastLoadPolicy)):
-            self._load_balancing_policy.set_target_qps_per_accelerator(
-                target_qps_per_replica)
+        target_concurrency = routing_spec.get('target_concurrency_per_replica')
+        if isinstance(self._load_balancing_policy,
+                      lb_policies.InstanceAwareLeastLoadPolicy):
+            if isinstance(target_qps_per_replica, dict):
+                self._load_balancing_policy.set_target_qps_per_accelerator(
+                    target_qps_per_replica)
+            elif target_concurrency is not None:
+                # Concurrency-sized service: no QPS dict, uniform per-GPU
+                # capacity. This also CLEARS a previous version's QPS
+                # weights after an update switches sizing modes --
+                # keeping them would normalize routing with obsolete
+                # per-accelerator targets indefinitely.
+                self._load_balancing_policy.set_default_per_gpu_target(
+                    float(target_concurrency))
         stream_timeout_seconds = routing_spec.get('stream_timeout_seconds')
         if stream_timeout_seconds is not None:
             self._stream_timeout_seconds = stream_timeout_seconds
@@ -430,6 +486,74 @@ class SkyServeLoadBalancer:
         return fastapi.responses.Response(
             status_code=200 if self._is_ready_to_serve() else 503)
 
+    def _in_flight_with_draining(self) -> Optional[Dict[str, int]]:
+        """Per-url in-flight snapshot including pruned-but-draining work.
+
+        The policy's load_map drops a url the moment it leaves the
+        routable set, but the requests already running on that replica
+        keep running on its draining client (see
+        _drain_and_close_client) -- for synchronous predictions, up to
+        an hour. Without this overlay a probe-blipped replica vanishes
+        from the in-flight report one sync after the blip, reads as
+        idle to the autoscaler, and becomes a preferred scale-down
+        victim mid-job. Draining counts never double the policy's: a
+        pruned url's streams released (or generation-stale-dropped)
+        their load_map slot at prune time, and a re-added url's NEW
+        client tracks its requests in the load_map while the OLD
+        draining client only carries the pre-blip streams.
+        """
+        with self._client_pool_lock:
+            in_flight = self._load_balancing_policy.snapshot_in_flight()
+        if in_flight is None:
+            return None
+        for url, clients in (self._draining_clients or {}).items():
+            draining = sum(
+                getattr(client, _INFLIGHT_ATTR, 0) for client in clients)
+            if draining > 0:
+                in_flight[url] = in_flight.get(url, 0) + draining
+        return in_flight
+
+    def _prune_reject_window(self) -> Dict[str, float]:
+        """Drop reject entries older than the window; return the live dict.
+
+        Called on every access (record + read) rather than on a timer:
+        the dict is bounded by unique keys seen in one window, so an
+        O(entries) rebuild on the sync/capacity cadence is cheap, and
+        lazy pruning means no extra task to keep alive. Always assigns a
+        fresh instance dict (materializing it from the None class
+        default on first touch), so the class default stays immutable
+        and cannot leak state across instances.
+        """
+        cutoff = time.monotonic() - constants.LB_REJECT_WINDOW_SECONDS
+        current = self._reject_last_seen
+        pruned: Dict[str, float] = {}
+        if current:
+            pruned = {
+                key: seen for key, seen in current.items() if seen > cutoff
+            }
+        self._reject_last_seen = pruned
+        return pruned
+
+    def _record_rejection(self, request: fastapi.Request) -> None:
+        """Record a terminal-503 exit for the reject-window gauge.
+
+        Keyed by the job-id header when present: the platform re-fires
+        the SAME held job every ~30s, so the re-fire must refresh the
+        TTL and still count once -- that dedup is the whole point of the
+        window (raw counting over-provisions ~10x, see constants).
+        Headerless requests get a unique per-request key: one unit each.
+        """
+        # Starlette header lookup is case-insensitive per the HTTP spec.
+        key = request.headers.get(constants.LB_JOB_ID_HEADER)
+        if key is None:
+            self._reject_fallback_seq += 1
+            key = f'_headerless_{self._reject_fallback_seq}'
+        self._prune_reject_window()[key] = time.monotonic()
+
+    def _rejected_in_window(self) -> int:
+        """Unique jobs terminally 503'd within the reject window (gauge)."""
+        return len(self._prune_reject_window())
+
     async def _capacity(
             self, request: fastapi.Request) -> fastapi.responses.JSONResponse:
         """Data-plane capacity read: the volatile half of admission sizing.
@@ -449,7 +573,6 @@ class SkyServeLoadBalancer:
         with self._client_pool_lock:
             ready_set = set(self._load_balancing_policy.ready_replicas)
             ready_replicas = len(ready_set)
-            in_flight = self._load_balancing_policy.total_in_flight()
             # [boltz fork] Occupancy aggregates, over probed AND ready
             # replicas only: a probe entry for a since-pruned replica must
             # not count, and an unprobed replica contributes no free slot
@@ -464,9 +587,19 @@ class SkyServeLoadBalancer:
             probed_replicas = len(probed)
             busy_replicas = sum(1 for free in probed.values() if free <= 0)
             free_slots = sum(probed.values())
+        # Includes pruned-but-draining work: those requests still occupy
+        # replica capacity, which is what an admission reader sizes by.
+        # (Called outside the pool lock — it acquires the lock itself.)
+        in_flight_map = self._in_flight_with_draining()
+        in_flight = (sum(in_flight_map.values())
+                     if in_flight_map is not None else None)
         last_sync_age: Optional[float] = None
         if self._last_sync_time is not None:
             last_sync_age = max(time.monotonic() - self._last_sync_time, 0.0)
+        # Capacity hint fields stay null until a controller sync carries
+        # one: an admission reader must see "unknown" (and fall back to
+        # its conservative floor) rather than zeros it would act on.
+        hint = self._capacity_hint or {}
         occupancy_probe_age: Optional[float] = None
         if self._last_occupancy_probe_time is not None:
             occupancy_probe_age = max(
@@ -477,6 +610,10 @@ class SkyServeLoadBalancer:
             'draining': self._draining,
             'synced': self._ready,
             'last_sync_age_seconds': last_sync_age,
+            'queue_depth': self._queue_depth,
+            'rejected_in_window': self._rejected_in_window(),
+            'provisioning_replicas': hint.get('provisioning_replicas'),
+            'target_replicas': hint.get('target_num_replicas'),
             # [boltz fork] Async-occupancy aggregates (see the probe loop).
             # For fast-ack async fleets `in_flight` reads ~0 while replicas
             # crunch, so admission should size on free_slots gated by
@@ -608,6 +745,7 @@ class SkyServeLoadBalancer:
         ready_replica_urls = []
         replica_info = {}
         routing_spec = None
+        capacity_hint = None
 
         # Present the control-plane bearer token so the (now-authenticated)
         # sync path accepts this LB. No-op header when auth is disabled.
@@ -616,15 +754,30 @@ class SkyServeLoadBalancer:
             'Authorization': f'Bearer {controller_token}'
         } if controller_token is not None else None)
 
+        # [boltz fork] Demand gauges ride alongside the timestamp
+        # aggregator so the concurrency autoscaler sees outstanding work,
+        # not just arrival compression. They are GAUGES -- re-read whole
+        # every sync, never cleared on ack -- so a controller hiccup can
+        # neither lose nor double-count demand; only the timestamps below
+        # keep their existing clear-on-report semantics. The in-flight
+        # map may be None (policy without load accounting): sent as-is,
+        # the controller treats it as unknown rather than an idle fleet.
+        # NOTE: gauges are last-writer-wins per LB (unlike the additive
+        # timestamps) -- correct for the pinned single-replica LB
+        # deployment; a multi-LB rollout would need per-LB keying.
+        in_flight = self._in_flight_with_draining()
+        sync_payload = {
+            'request_aggregator': self._request_aggregator.to_dict(),
+            'in_flight': in_flight,
+            'queue_depth': self._queue_depth,
+            'rejected_in_window': self._rejected_in_window(),
+        }
         async with aiohttp.ClientSession() as session:
             try:
                 # Send request information
                 async with session.post(
                         self._controller_url + '/controller/load_balancer_sync',
-                        json={
-                            'request_aggregator':
-                                self._request_aggregator.to_dict()
-                        },
+                        json=sync_payload,
                         headers=sync_headers,
                         timeout=aiohttp.ClientTimeout(
                             constants.LB_CONTROLLER_SYNC_TIMEOUT_SECONDS),
@@ -647,6 +800,9 @@ class SkyServeLoadBalancer:
                     # re-roll. Older controllers omit the key -> None -> the LB
                     # keeps its launch-seeded policy.
                     routing_spec = response_json.get('routing_spec')
+                    # [boltz fork] Provisioning/target counts for the
+                    # /_lb/capacity read; absent on older controllers.
+                    capacity_hint = response_json.get('capacity_hint')
                     ready_replica_urls = list(replica_info.keys())
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 logger.error(f'An error occurred when syncing with '
@@ -708,10 +864,23 @@ class SkyServeLoadBalancer:
                     # as the longest in-flight prediction; the sync loop must
                     # never wait on it. Strong refs held in the task set (a
                     # bare create_task result can be garbage collected).
+                    # Registered in _draining_clients first so the demand
+                    # feed keeps attributing the still-running work to the
+                    # pruned url (see _in_flight_with_draining).
+                    if self._draining_clients is None:
+                        self._draining_clients = {}
+                    self._draining_clients.setdefault(replica_url,
+                                                      []).append(client)
                     task = asyncio.create_task(
                         self._drain_and_close_client(replica_url, client))
                     self._client_close_tasks.add(task)
                     task.add_done_callback(self._client_close_tasks.discard)
+                # Cache the controller's capacity hint for /_lb/capacity.
+                # Absence (older controller) resets to None rather than
+                # keeping a stale previous value: readers must see
+                # "unknown", not confidently-wrong counts.
+                self._capacity_hint = (capacity_hint if isinstance(
+                    capacity_hint, dict) else None)
                 # First successful sync -> ready to serve (readiness gate).
                 self._ready = True
                 self._last_sync_time = time.monotonic()
@@ -739,7 +908,19 @@ class SkyServeLoadBalancer:
             logger.warning(f'Closing drained client for {url} with '
                            f'{inflight} request(s) still in flight '
                            '(drain deadline exceeded).')
-        await client.aclose()
+        try:
+            await client.aclose()
+        finally:
+            # Deregister from the demand feed: the drained client's work
+            # is finished (or force-closed) and must stop counting as
+            # in-flight for this url.
+            clients = (self._draining_clients or {}).get(url)
+            if clients is not None:
+                with contextlib.suppress(ValueError):
+                    clients.remove(client)
+                if not clients:
+                    assert self._draining_clients is not None
+                    del self._draining_clients[url]
 
     async def _sync_with_controller(self):
         """Sync with controller periodically.
@@ -893,6 +1074,32 @@ class SkyServeLoadBalancer:
     async def _proxy_with_retries(
             self, request: fastapi.Request) -> fastapi.responses.Response:
         """Try to proxy the request to the endpoint replica with retries."""
+        # Queue-depth gauge: requests currently inside the retry handler
+        # but NOT dispatched to a replica (selecting, in retry backoff).
+        # The dispatched phase is deliberately excluded: the dispatch
+        # site below hands the unit off to the policy's load_map for the
+        # duration of the proxy await. For synchronous model servers,
+        # response headers arrive only when compute completes, so
+        # counting that await here too would double-count every RUNNING
+        # job (load_map + queue_depth) for its entire ~1h duration —
+        # a sustained ~2x inflation of the autoscaler's outstanding-work
+        # sum, not a transient blip.
+        # Incremented on entry, decremented on EVERY exit -- return,
+        # raise, cancellation -- via the finally; a leaked unit would
+        # permanently inflate the autoscaler's demand signal. A returned
+        # StreamingResponse leaves the handler while its body still
+        # streams: that phase is accounted by the policy's load_map, not
+        # here. Plain int is safe: single uvicorn event loop, no await
+        # between each read and its paired write.
+        self._queue_depth += 1
+        try:
+            return await self._proxy_with_retries_inner(request)
+        finally:
+            self._queue_depth -= 1
+
+    async def _proxy_with_retries_inner(
+            self, request: fastapi.Request) -> fastapi.responses.Response:
+        """Retry loop body, bracketed by the queue-depth gauge above."""
         self._request_aggregator.add(request)
         # TODO(tian): Finetune backoff parameters.
         backoff = common_utils.Backoff(
@@ -907,6 +1114,12 @@ class SkyServeLoadBalancer:
         failed_urls: Set[str] = set()
 
         def _unavailable(detail: str) -> fastapi.HTTPException:
+            # Both terminal-503 exits ("no ready replicas", "all ready
+            # replicas at capacity") funnel through here: record the
+            # rejection so the demand feed keeps pressure on the
+            # autoscaler for as long as the job stays unplaced (the QPS
+            # window alone decays while the need persists).
+            self._record_rejection(request)
             # Retry-After lets a well-behaved client back off instead of
             # hammering; the ready set only changes on the controller
             # sync cadence, so in-LB sleeping is not a useful wait.
@@ -930,8 +1143,18 @@ class SkyServeLoadBalancer:
                                    'Use "sky serve status [SERVICE_NAME]" '
                                    'to check the replica status.')
             else:
-                response_or_exception = await self._proxy_request_to(
-                    ready_replica_url, request)
+                # Hand the unit off for the dispatch: the proxy await is
+                # accounted by the policy's load_map (pre_execute_hook),
+                # and for synchronous servers it lasts until compute
+                # completes — keeping it in queue_depth as well would
+                # double-count the running job. Re-taken in the finally
+                # so a failed attempt is queued again while it backs off.
+                self._queue_depth -= 1
+                try:
+                    response_or_exception = await self._proxy_request_to(
+                        ready_replica_url, request)
+                finally:
+                    self._queue_depth += 1
                 # Passively evict a replica that keeps failing with dead
                 # connections during the controller-pause window.
                 self._record_proxy_outcome(ready_replica_url,

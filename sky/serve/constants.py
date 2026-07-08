@@ -157,6 +157,24 @@ LB_CONNECT_TIMEOUT_SECONDS = 10
 LB_EVICTION_CONSECUTIVE_FAILURES = 3
 LB_EVICTION_QUARANTINE_SECONDS = 30
 
+# [boltz fork] Demand feed for concurrency-native autoscaling. Terminal LB
+# 503s ("no ready replicas" / "all ready replicas at capacity") are backlog
+# pressure the QPS window cannot express: the platform's marker-timeout loop
+# re-fires the SAME held job every ~30s, so summing raw rejects over a window
+# would multiply one outstanding job by window/retry-period (~10x
+# over-target, each over-launched GPU then pinned by hysteresis). The LB
+# instead dedups rejects by the stable per-job header below and reports the
+# count of UNIQUE jobs terminally rejected within this TTL window: a held job
+# re-firing refreshes its TTL and still counts as one unit of pressure; once
+# it lands (or spills for good) its pressure decays after one window.
+LB_REJECT_WINDOW_SECONDS = 360
+
+# Request header carrying a job id that is STABLE across retries of the same
+# job -- that is its contract, and what makes the reject-window dedup above
+# possible. Requests without it fall back to a unique per-request key
+# (documented raw-count over-estimation; the platform sends the header).
+LB_JOB_ID_HEADER = 'X-SkyServe-Job-Id'
+
 # On SIGTERM the external LB first deregisters (stops POSTing
 # load_balancer_sync so the controller stops counting it -- avoiding a
 # double-count with the maxSurge replacement) and fails readiness (so k8s

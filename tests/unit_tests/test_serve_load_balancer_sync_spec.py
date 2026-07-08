@@ -83,6 +83,68 @@ def test_target_qps_ignored_for_non_instance_aware_policy():
     assert lb._stream_timeout_seconds == 60
 
 
+def test_concurrency_knob_sets_uniform_per_gpu_weight():
+    # A concurrency-sized service ships no QPS dict; the knob weights
+    # replicas per-GPU so bigger replicas absorb proportional load.
+    lb = _make_lb('instance_aware_least_load')
+    lb._apply_routing_spec({
+        'load_balancing_policy_name': 'instance_aware_least_load',
+        'target_qps_per_replica': None,
+        'target_concurrency_per_replica': 2.0,
+        'stream_timeout_seconds': 60,
+    })
+    policy = lb._load_balancing_policy
+    assert policy._get_target_qps_for_accelerator('L4', 4) == 8.0
+    assert policy._get_target_qps_for_accelerator('A100', 1) == 2.0
+
+
+def test_concurrency_update_clears_stale_qps_weights():
+    # v1 (QPS dict) -> v2 (concurrency knob): keeping the old dict would
+    # normalize routing with obsolete per-accelerator targets forever.
+    lb = _make_lb('instance_aware_least_load')
+    lb._apply_routing_spec({
+        'load_balancing_policy_name': 'instance_aware_least_load',
+        'target_qps_per_replica': {
+            'L4': 0.1,
+            'A100': 10.0
+        },
+        'stream_timeout_seconds': 60,
+    })
+    lb._apply_routing_spec({
+        'load_balancing_policy_name': 'instance_aware_least_load',
+        'target_qps_per_replica': None,
+        'target_concurrency_per_replica': 1.0,
+        'stream_timeout_seconds': 60,
+    })
+    policy = lb._load_balancing_policy
+    assert policy.target_qps_per_accelerator == {}
+    # Uniform per-GPU weighting replaced the stale dict wholesale.
+    assert policy._get_target_qps_for_accelerator('L4', 1) == 1.0
+    assert policy._get_target_qps_for_accelerator('A100', 1) == 1.0
+
+
+def test_qps_dict_update_clears_per_gpu_default():
+    # The reverse switch (concurrency -> QPS dict) must also not mix
+    # weighting modes: the concrete dict wins.
+    lb = _make_lb('instance_aware_least_load')
+    lb._apply_routing_spec({
+        'load_balancing_policy_name': 'instance_aware_least_load',
+        'target_qps_per_replica': None,
+        'target_concurrency_per_replica': 1.0,
+        'stream_timeout_seconds': 60,
+    })
+    lb._apply_routing_spec({
+        'load_balancing_policy_name': 'instance_aware_least_load',
+        'target_qps_per_replica': {
+            'L4': 2.5
+        },
+        'stream_timeout_seconds': 60,
+    })
+    policy = lb._load_balancing_policy
+    assert policy._default_per_gpu_qps is None
+    assert policy._get_target_qps_for_accelerator('L4', 1) == 2.5
+
+
 def test_ready_replicas_repopulated_after_swap():
     # After a policy swap the new object is empty; a subsequent
     # set_ready_replicas (what the sync loop does) fully initializes it.

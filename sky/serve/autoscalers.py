@@ -207,6 +207,18 @@ class Autoscaler:
         """Collect request information from aggregator for autoscaling."""
         raise NotImplementedError
 
+    def has_recomputed_with_fresh_data(self) -> bool:
+        """Whether target_num_replicas reflects a fresh-data recompute.
+
+        QPS/queue autoscalers recompute from always-available signals on
+        every tick, so their target is never the rebuilt-blind minimum.
+        The concurrency autoscaler overrides this: after a controller
+        restart its target stays at min_replicas until the first
+        decision tick that consumed a fresh demand report, and the
+        capacity hint must keep flooring until then.
+        """
+        return True
+
     def info(self) -> Dict[str, Any]:
         """Get information about the autoscaler."""
         return {
@@ -247,6 +259,14 @@ class Autoscaler:
         # TODO(MaoZiming): use NAME to get the class.
         if spec.pool:
             return QueueLengthAutoscaler(service_name, spec, version)
+        # getattr: keep from_spec robust against spec objects predating the
+        # concurrency knob (e.g. specs unpickled from old DB rows).
+        elif getattr(spec, 'target_concurrency_per_replica', None) is not None:
+            # Checked before the qps branches: the knob is mutually
+            # exclusive with target_qps_per_replica (validated at spec
+            # load), so a set knob unambiguously selects concurrency-based
+            # autoscaling.
+            return ConcurrencyAutoscaler(service_name, spec, version)
         elif spec.use_ondemand_fallback:
             return FallbackRequestRateAutoscaler(service_name, spec, version)
         elif isinstance(spec.target_qps_per_replica, dict):
@@ -630,7 +650,65 @@ class RequestRateAutoscaler(_AutoscalerWithHysteresis):
             logger.info(f'Remaining dynamic states: {dynamic_states}')
 
 
-class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
+class _GpuShapeResolverMixin:
+    """Shared GPU-shape resolution with a post-launch-only memo.
+
+    Used by the shape-aware autoscalers (instance-aware QPS and
+    concurrency): both need a replica's (gpu_type, gpu_count) to size its
+    capacity, and both must avoid repeating the blocking handle() DB read
+    + unpickle for the same replica across the 2-3 passes per decision
+    tick. Subclasses must initialize `_gpu_shape_cache` in __init__ and
+    prune it to the live replica set each tick via
+    `_prune_gpu_shape_cache` so the memo stays bounded.
+    """
+    # replica_id -> (gpu_type, gpu_count). A shape is cached only once the
+    # replica's launch has finished: while it is still provisioning, the
+    # cluster record is rewritten for every failover attempt and its
+    # accelerators can change, so a mid-launch resolution must be
+    # re-resolved on later ticks. After launch the shape is fixed for the
+    # replica's lifetime.
+    _gpu_shape_cache: Dict[int, Tuple[str, int]]
+
+    def _prune_gpu_shape_cache(self, live_replica_ids: Set[int]) -> None:
+        """Drop cached shapes for replicas that no longer exist."""
+        for replica_id in list(self._gpu_shape_cache):
+            if replica_id not in live_replica_ids:
+                del self._gpu_shape_cache[replica_id]
+
+    def _get_gpu_shape_from_replica_info(
+            self,
+            replica_info: 'replica_managers.ReplicaInfo') -> Tuple[str, int]:
+        """Extract (GPU type, GPU count) from ReplicaInfo object."""
+        cached = self._gpu_shape_cache.get(replica_info.replica_id)
+        if cached is not None:
+            return cached
+        gpu_type = 'unknown'
+        gpu_count = 1
+        handle = replica_info.handle()
+        if handle is not None:
+            accelerators = handle.launched_resources.accelerators
+            if accelerators and len(accelerators) > 0:
+                # Get the first accelerator entry.
+                gpu_type = list(accelerators.keys())[0]
+                try:
+                    gpu_count = max(1, int(accelerators[gpu_type]))
+                except (TypeError, ValueError):
+                    gpu_count = 1
+        # Cache only a resolved shape of a replica whose launch has finished.
+        # While the replica is still provisioning, the cluster record (and
+        # thus launched_resources) is rewritten for every failover attempt, so
+        # the accelerator resolved mid-launch may not be the one the launch
+        # finally lands on and must be re-resolved on later ticks.
+        if (gpu_type != 'unknown' and
+                replica_info.status_property.sky_launch_status
+                == common_utils.ProcessStatus.SUCCEEDED):
+            self._gpu_shape_cache[replica_info.replica_id] = (gpu_type,
+                                                              gpu_count)
+        return gpu_type, gpu_count
+
+
+class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
+                                         RequestRateAutoscaler):
     """Instance-aware RequestRateAutoscaler:
     Autoscale based on each replica's GPU-specific QPS.
 
@@ -705,9 +783,7 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
         # Drop cached GPU types for replicas that no longer exist so the
         # cache stays bounded to the live replica set.
         live_replica_ids = {info.replica_id for info in replica_infos}
-        for replica_id in list(self._gpu_shape_cache):
-            if replica_id not in live_replica_ids:
-                del self._gpu_shape_cache[replica_id]
+        self._prune_gpu_shape_cache(live_replica_ids)
         for replica_id in list(self._replica_cost_cache):
             if replica_id not in live_replica_ids:
                 del self._replica_cost_cache[replica_id]
@@ -1067,37 +1143,6 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
             self._replica_cost_cache[replica_info.replica_id] = cost
         return cost
 
-    def _get_gpu_shape_from_replica_info(
-            self,
-            replica_info: 'replica_managers.ReplicaInfo') -> Tuple[str, int]:
-        """Extract (GPU type, GPU count) from ReplicaInfo object."""
-        cached = self._gpu_shape_cache.get(replica_info.replica_id)
-        if cached is not None:
-            return cached
-        gpu_type = 'unknown'
-        gpu_count = 1
-        handle = replica_info.handle()
-        if handle is not None:
-            accelerators = handle.launched_resources.accelerators
-            if accelerators and len(accelerators) > 0:
-                # Get the first accelerator entry.
-                gpu_type = list(accelerators.keys())[0]
-                try:
-                    gpu_count = max(1, int(accelerators[gpu_type]))
-                except (TypeError, ValueError):
-                    gpu_count = 1
-        # Cache only a resolved shape of a replica whose launch has finished.
-        # While the replica is still provisioning, the cluster record (and
-        # thus launched_resources) is rewritten for every failover attempt, so
-        # the accelerator resolved mid-launch may not be the one the launch
-        # finally lands on and must be re-resolved on later ticks.
-        if (gpu_type != 'unknown' and
-                replica_info.status_property.sky_launch_status
-                == common_utils.ProcessStatus.SUCCEEDED):
-            self._gpu_shape_cache[replica_info.replica_id] = (gpu_type,
-                                                              gpu_count)
-        return gpu_type, gpu_count
-
     def _select_replicas_to_scale_down_by_qps(
             self, num_replicas_to_scale_down: int,
             replica_infos: List['replica_managers.ReplicaInfo']) -> List[int]:
@@ -1223,6 +1268,643 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
         super(RequestRateAutoscaler,
               self).update_version(version, spec, update_mode)
         self._snap_target_on_next_recompute = True
+
+
+class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
+    """ConcurrencyAutoscaler: size the fleet by outstanding work.
+
+    For long synchronous jobs (~1 h, one per GPU) request RATE measures
+    arrival compression, not load: 100 hour-long jobs arriving over 2 min
+    vs over 10 min are the same 100 concurrent jobs but produce 3x
+    different QPS targets. This autoscaler instead targets
+    `ceil(outstanding / per_replica_concurrency)` where outstanding =
+    in-flight + queued + recently-rejected jobs, all reported by the LB as
+    GAUGES over the sync channel (no clear-on-ack batches to lose or
+    double-count on controller hiccups).
+
+    The knob `target_concurrency_per_replica` is PER GPU: a replica's
+    capacity is knob x gpu_count, so heterogeneous fleets pack correctly.
+
+    SIGNAL-GAP RULE: the demand gauges only exist in LB reports. A report
+    is fresh iff it carried a non-None in-flight map and is younger than
+    3x the LB sync interval. While no fresh report exists -- including a
+    freshly (re)built autoscaler, which starts stale -- this autoscaler
+    emits NO scale-down decisions and NO rolling-drain retirements at all:
+    a rebuilt controller starts at target=min_replicas with no data, and
+    acting on that would mass-retire a live fleet before the first sync.
+    Scale-UP stays available while stale via the arrival floor
+    ceil(arrivals_in_window / best_capacity) from request timestamps
+    (which ride every sync), so a blind controller can still grow, never
+    shrink.
+    """
+
+    def __init__(self,
+                 service_name: str,
+                 spec: 'service_spec.SkyServiceSpec',
+                 version: int = constants.INITIAL_VERSION) -> None:
+        super().__init__(service_name, spec, version)
+        target_concurrency = getattr(spec, 'target_concurrency_per_replica',
+                                     None)
+        assert target_concurrency is not None, (
+            'ConcurrencyAutoscaler requires target_concurrency_per_replica')
+        # Per-GPU target concurrency; a replica's capacity in concurrency
+        # units is this knob x its gpu_count.
+        self.target_concurrency_per_replica: float = float(target_concurrency)
+        # Request timestamps back the arrival floor (the only up-signal
+        # available while the demand report is stale), windowed exactly
+        # like RequestRateAutoscaler's QPS window.
+        self.qps_window_size: int = constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS
+        self.request_timestamps: List[float] = []
+        # Latest demand report from the LB. `None` in-flight means no
+        # usable report has ever been received (or the loaded one carried
+        # none): the signal-gap rule keys on this plus the report's age.
+        # The gauges are stored verbatim; freshness is derived, never
+        # stored, so a report ages out automatically (also after a
+        # _load_dynamic_states round-trip, since the received-at time is
+        # absolute).
+        self._in_flight_by_replica_id: Optional[Dict[int, int]] = None
+        self._queue_depth: int = 0
+        self._rejected_in_window: int = 0
+        self._report_received_at: Optional[float] = None
+        self._gpu_shape_cache: Dict[int, Tuple[str, int]] = {}
+        # version -> that version's per-GPU knob. A live replica's
+        # capacity is a property of the spec it was launched under: after
+        # an update that raises the knob (1 -> 2), sizing old-version
+        # replicas with the NEW knob overstates their coverage 2x, so
+        # the rolling drain would retire old replicas the kept set cannot
+        # actually replace (same hazard the instance-aware autoscaler
+        # guards with _qps_dict_by_version). Pruned each tick to the live
+        # replica versions (+ latest).
+        self._knob_by_version: Dict[int, float] = {
+            version: float(target_concurrency)
+        }
+        # One-shot hysteresis bypass, armed by update_version AND at
+        # construction, same as the instance-aware autoscaler: the target
+        # can only be recomputed on a tick (it needs replica shapes), and
+        # that first recompute must apply immediately instead of being
+        # gated behind the delay counters -- a rebuilt autoscaler
+        # (controller restart) starts at target=min_replicas with no
+        # hysteresis history worth protecting. Unlike the instance-aware
+        # class the snap is consumed only once a FRESH demand report
+        # exists: snapping on stale data would just re-assert the blind
+        # minimum.
+        self._snap_target_on_next_recompute: bool = True
+        # Per-tick freshness snapshot (see _fresh_for_tick). None outside
+        # a tick.
+        self._tick_fresh: Optional[bool] = None
+
+    def _staleness_threshold_seconds(self) -> float:
+        """Age beyond which a demand report no longer counts as fresh.
+
+        Three sync intervals: one for the in-flight sync, one for jitter,
+        one for a single dropped sync -- beyond that the LB is gone or
+        wedged and the gauges describe a fleet state that may no longer
+        exist.
+        """
+        return 3.0 * constants.LB_CONTROLLER_SYNC_INTERVAL_SECONDS
+
+    def has_fresh_demand_report(self) -> bool:
+        if (self._in_flight_by_replica_id is None or
+                self._report_received_at is None):
+            return False
+        return (time.time() - self._report_received_at
+               ) <= self._staleness_threshold_seconds()
+
+    def has_recomputed_with_fresh_data(self) -> bool:
+        """Whether the target reflects at least one fresh-data recompute.
+
+        The first LB report flips has_fresh_demand_report() on the SYNC
+        thread, but target_num_replicas stays at the rebuilt-blind
+        min_replicas until the autoscaler thread's next decision tick
+        consumes the one-shot snap. Consumers that would act on a blind
+        target (the controller's capacity hint) must keep their
+        stale-mode floor until this is True, or a routine controller
+        restart reports target=min_replicas to the platform's spill
+        logic for a tick.
+        """
+        return not self._snap_target_on_next_recompute
+
+    def _fresh_for_tick(self) -> bool:
+        """Freshness as snapshotted once at the top of the current tick.
+
+        collect_request_information runs concurrently on the sync
+        thread; if the first fresh report landed mid-tick,
+        re-evaluating freshness at each consumer would let the
+        recompute take the stale path (target still the rebuilt-blind
+        minimum) while the later drain/scale-down guards saw fresh and
+        proceeded -- marrying a blind target to fresh-mode kills. Falls
+        back to a live evaluation when no tick snapshot is active (a
+        direct call outside generate_scaling_decisions).
+        """
+        if self._tick_fresh is not None:
+            return self._tick_fresh
+        return self.has_fresh_demand_report()
+
+    def _replica_is_busy(self, info: 'replica_managers.ReplicaInfo') -> bool:
+        """Whether the latest report shows in-flight work on a replica.
+
+        READY replicas missing from the report count as BUSY: the LB may
+        simply not have picked them up yet, and guessing idle kills a
+        job. Non-READY replicas missing from the report count as idle
+        (never routable, e.g. still provisioning) -- but a non-READY
+        replica WITH reported work is busy: a probe blip mid-job demotes
+        a replica from READY while its hour-long request keeps running,
+        and the controller deliberately keeps its url translatable while
+        it is nonterminal so that work stays attributed.
+        """
+        in_flight = self._in_flight_by_replica_id or {}
+        if info.status == serve_state.ReplicaStatus.READY:
+            return in_flight.get(info.replica_id) != 0
+        return in_flight.get(info.replica_id, 0) > 0
+
+    def collect_request_information(
+            self, request_aggregator_info: Dict[str, Any]) -> None:
+        """Collect timestamps and the latest LB demand report.
+
+        Expected dict (extra keys ignored; all demand keys optional so an
+        old LB that only ships timestamps degrades to the signal-gap
+        rules):
+
+        {
+            'timestamps': [...],
+            'in_flight_by_replica_id': {replica_id: int} | None,
+            'queue_depth': int | None,
+            'rejected_in_window': int | None,
+        }
+        """
+        self.request_timestamps.extend(
+            request_aggregator_info.get('timestamps', []))
+        current_time = time.time()
+        index = bisect.bisect_left(self.request_timestamps,
+                                   current_time - self.qps_window_size)
+        self.request_timestamps = self.request_timestamps[index:]
+
+        in_flight = request_aggregator_info.get('in_flight_by_replica_id')
+        if in_flight is None:
+            # No usable demand report in this sync (old LB, or a policy
+            # that cannot track in-flight). Keep the previous report: it
+            # ages out on its own; overwriting it with nothing would
+            # discard a still-fresh signal.
+            return
+        # Normalize keys/values: the controller builds this dict
+        # in-process today, but a defensive int() keeps us safe if it is
+        # ever rebuilt from a JSON round-trip (string keys).
+        self._in_flight_by_replica_id = {
+            int(replica_id): int(count)
+            for replica_id, count in in_flight.items()
+        }
+        queue_depth = request_aggregator_info.get('queue_depth')
+        self._queue_depth = int(queue_depth) if queue_depth is not None else 0
+        rejected = request_aggregator_info.get('rejected_in_window')
+        self._rejected_in_window = int(rejected) if rejected is not None else 0
+        self._report_received_at = current_time
+        logger.info(f'Concurrency report: in_flight_total='
+                    f'{sum(self._in_flight_by_replica_id.values())}, '
+                    f'queue_depth={self._queue_depth}, '
+                    f'rejected_in_window={self._rejected_in_window}, '
+                    f'requests in the last {self.qps_window_size}s: '
+                    f'{len(self.request_timestamps)}')
+
+    def _get_knob_for_version(self, version: int) -> float:
+        """The per-GPU knob a given service version was launched under.
+
+        Unknown versions (the autoscaler was rebuilt after the update
+        that created them, e.g. a controller restart mid-rolling-update)
+        rehydrate from the durable per-version spec so old-version
+        replicas keep their real capacity. Falls back to the latest knob
+        when the version's spec is unavailable; misses are not memoized
+        so a transient DB error can heal on the next tick.
+        """
+        cached = self._knob_by_version.get(version)
+        if cached is not None:
+            return cached
+        knob = None
+        try:
+            spec = serve_state.get_spec(self._service_name, version)
+            if spec is not None:
+                knob = getattr(spec, 'target_concurrency_per_replica', None)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning('Failed to load spec for version '
+                           f'{version}: {common_utils.format_exception(e)}')
+        if knob is None:
+            return self.target_concurrency_per_replica
+        self._knob_by_version[version] = float(knob)
+        return float(knob)
+
+    def _replica_capacity(self, info: 'replica_managers.ReplicaInfo') -> float:
+        """A replica's capacity in concurrency units (knob x gpu_count).
+
+        The knob is resolved for the replica's OWN version: after a
+        knob-changing update, old-version replicas keep the capacity
+        they were launched with, so the rolling drain neither over- nor
+        under-states the coverage the kept old set provides.
+        """
+        _, gpu_count = self._get_gpu_shape_from_replica_info(info)
+        return self._get_knob_for_version(info.version) * gpu_count
+
+    def _latest_capacities(
+            self,
+            replica_infos: List['replica_managers.ReplicaInfo']) -> List[float]:
+        """Capacities of live latest-version replicas, largest first."""
+        capacities = []
+        for info in replica_infos:
+            if info.is_terminal or info.version != self.latest_version:
+                continue
+            capacity = self._replica_capacity(info)
+            if capacity > 0:
+                capacities.append(capacity)
+        capacities.sort(reverse=True)
+        return capacities
+
+    def _outstanding_work(self) -> float:
+        """Outstanding jobs per the latest report (gauges, one snapshot).
+
+        A job can transiently appear in both queue_depth (one sync) and
+        rejected_in_window (a later sync) -- at most a 2x count per job,
+        absorbed by hysteresis (accepted in the plan).
+        """
+        assert self._in_flight_by_replica_id is not None
+        return float(
+            sum(self._in_flight_by_replica_id.values()) + self._queue_depth +
+            self._rejected_in_window)
+
+    def _set_target_num_replicas_with_concurrency_logic(
+            self, replica_infos: List['replica_managers.ReplicaInfo']) -> None:
+        """Recompute target_num_replicas for this tick.
+
+        Mirrors _set_target_num_replicas_with_instance_aware_logic's
+        structure: pack demand onto the existing latest replicas (largest
+        first), size the remainder with the best live capacity (falling
+        back to knob x 1 for an empty fleet so scale-from-zero is not
+        stuck), then apply the snap/zero/hysteresis ladder.
+        """
+        latest_capacities = self._latest_capacities(replica_infos)
+        best_capacity = (latest_capacities[0] if latest_capacities else
+                         self.target_concurrency_per_replica)
+
+        if not self._fresh_for_tick():
+            # SIGNAL GAP: the only trustworthy signal is arrivals (they
+            # ride every sync). Raise-only floor, applied without
+            # hysteresis -- while blind we must not delay growth, and we
+            # never shrink. The one-shot snap is deliberately NOT
+            # consumed here: it waits for the first recompute with fresh
+            # data.
+            # Prune the window here, not just in
+            # collect_request_information: once syncs stop entirely,
+            # collect is never called again, and unpruned timestamps
+            # would keep asserting an arrival floor for arrivals long
+            # outside the window.
+            index = bisect.bisect_left(self.request_timestamps,
+                                       time.time() - self.qps_window_size)
+            self.request_timestamps = self.request_timestamps[index:]
+            arrivals = len(self.request_timestamps)
+            if arrivals > 0 and best_capacity > 0:
+                arrival_floor = self._clip_target_num_replicas(
+                    math.ceil(arrivals / best_capacity))
+                if arrival_floor > self.target_num_replicas:
+                    logger.info(
+                        'Concurrency autoscaler signal-stale: raising '
+                        f'target to arrival floor {arrival_floor} '
+                        f'({arrivals} arrivals / capacity {best_capacity}).')
+                    self.target_num_replicas = arrival_floor
+            else:
+                logger.info('Concurrency autoscaler signal-stale: holding '
+                            f'target at {self.target_num_replicas}.')
+            return
+
+        outstanding = self._outstanding_work()
+        raw_target_num = 0
+        covered = 0.0
+        for capacity in latest_capacities:
+            if covered >= outstanding:
+                break
+            raw_target_num += 1
+            covered += capacity
+        if covered < outstanding:
+            remaining = outstanding - covered
+            if best_capacity > 0:
+                raw_target_num += math.ceil(remaining / best_capacity)
+
+        target_num_replicas = self._clip_target_num_replicas(raw_target_num)
+        old_target_num_replicas = self.target_num_replicas
+
+        if self._snap_target_on_next_recompute:
+            # First recompute with fresh data after construction or an
+            # update: apply directly (the base class's post-update snap
+            # semantics, but shape- and demand-aware).
+            self._snap_target_on_next_recompute = False
+            self.upscale_counter = 0
+            self.downscale_counter = 0
+            self.target_num_replicas = target_num_replicas
+        # Faster scale up when there is no replica.
+        elif self.target_num_replicas == 0:
+            self.target_num_replicas = target_num_replicas
+        elif target_num_replicas > self.target_num_replicas:
+            self.upscale_counter += 1
+            self.downscale_counter = 0
+            if self.upscale_counter >= self.scale_up_threshold:
+                self.upscale_counter = 0
+                self.target_num_replicas = target_num_replicas
+        elif target_num_replicas < self.target_num_replicas:
+            self.downscale_counter += 1
+            self.upscale_counter = 0
+            if self.downscale_counter >= self.scale_down_threshold:
+                self.downscale_counter = 0
+                self.target_num_replicas = target_num_replicas
+        else:
+            self.upscale_counter = self.downscale_counter = 0
+
+        logger.info(
+            f'Concurrency: outstanding work: {outstanding}. '
+            f'Latest-version capacities: {latest_capacities}. '
+            f'Old target number of replicas: {old_target_num_replicas}. '
+            f'Current target number of replicas: {target_num_replicas}. '
+            f'Final target number of replicas: {self.target_num_replicas}. '
+            f'Upscale counter: {self.upscale_counter}/'
+            f'{self.scale_up_threshold}. '
+            f'Downscale counter: {self.downscale_counter}/'
+            f'{self.scale_down_threshold}. ')
+
+    def generate_scaling_decisions(
+        self,
+        replica_infos: List['replica_managers.ReplicaInfo'],
+        active_versions: List[int],
+    ) -> List[AutoscalerDecision]:
+        # Recompute the target BEFORE the base class runs the
+        # outdated-replica drain, for the same reason as the
+        # instance-aware autoscaler: the drain compares ready new-version
+        # replicas against target_num_replicas, and a stale target would
+        # let it retire old capacity that is still needed. Single
+        # recompute per tick.
+        # Freshness is snapshotted ONCE per tick: collect_request_
+        # information runs concurrently on the sync thread, and if the
+        # first fresh report landed mid-tick the recompute would take
+        # the stale path (target still the rebuilt-blind minimum) while
+        # the later drain/scale-down guards saw "fresh" and proceeded --
+        # marrying a blind target to fresh-mode kills. All three
+        # consumers read this snapshot instead of re-evaluating.
+        self._tick_fresh = self.has_fresh_demand_report()
+        try:
+            self._prune_gpu_shape_cache(
+                {info.replica_id for info in replica_infos})
+            keep_versions = {info.version for info in replica_infos}
+            keep_versions.add(self.latest_version)
+            for version in list(self._knob_by_version):
+                if version not in keep_versions:
+                    del self._knob_by_version[version]
+            self._set_target_num_replicas_with_concurrency_logic(replica_infos)
+            return super().generate_scaling_decisions(replica_infos,
+                                                      active_versions)
+        finally:
+            self._tick_fresh = None
+
+    def _calculate_target_num_replicas(self) -> int:
+        # Demand-aware sizing needs replica_infos, which this hook
+        # (invoked by the base update_version to snap the target after an
+        # update) does not receive. Keep the current target (re-clipped to
+        # the new bounds); the next decision tick recomputes from live
+        # replica shapes and the fresh demand report.
+        return self._clip_target_num_replicas(self.target_num_replicas)
+
+    def update_version(self, version: int, spec: 'service_spec.SkyServiceSpec',
+                       update_mode: serve_utils.UpdateMode) -> None:
+        if version <= self.latest_version:
+            # The base class rejects stale versions; don't overwrite the
+            # live concurrency knob or arm the post-update snap for a
+            # rejected call either.
+            super().update_version(version, spec, update_mode)
+            return
+        target_concurrency = getattr(spec, 'target_concurrency_per_replica',
+                                     None)
+        if target_concurrency is not None:
+            # Assign BEFORE the base update runs so any recompute it
+            # triggers sees the new knob.
+            self.target_concurrency_per_replica = float(target_concurrency)
+            self._knob_by_version[version] = float(target_concurrency)
+        super().update_version(version, spec, update_mode)
+        self._snap_target_on_next_recompute = True
+
+    def _select_outdated_replicas_to_scale_down(
+        self,
+        replica_infos: List['replica_managers.ReplicaInfo'],
+        active_versions: List[int],
+    ) -> List[int]:
+        """Capacity-aware rolling drain in concurrency units.
+
+        Mirrors the instance-aware implementation with demand =
+        outstanding work: keep enough READY old replicas to cover the
+        demand the ready latest replicas cannot yet serve (never fewer
+        than the base class's count rule), and retire the rest. Two
+        concurrency-specific twists:
+        - SIGNAL GAP: no retirements at all while the demand report is
+          stale (a rebuilt controller at target=min_replicas would
+          otherwise mass-retire a live fleet before the first sync).
+        - Idle-preferred victims: among READY old replicas, busy ones
+          (fresh in-flight > 0 or unknown) are preferentially KEPT as
+          coverage, so the retired remainder skews to idle replicas and
+          mid-job kills are avoided when coverage allows. This is a
+          preference, not a hard gate -- a rolling update must still
+          complete when every old replica is busy.
+        """
+        if not self._fresh_for_tick():
+            return []
+        if self.update_mode != serve_utils.UpdateMode.ROLLING:
+            return super()._select_outdated_replicas_to_scale_down(
+                replica_infos, active_versions)
+        old_nonterminal = [
+            info for info in replica_infos
+            if info.version < self.latest_version and not info.is_terminal
+        ]
+        if not old_nonterminal:
+            return []
+        num_ready_latest = 0
+        ready_latest_capacity = 0.0
+        for info in replica_infos:
+            if info.version == self.latest_version and info.is_ready:
+                num_ready_latest += 1
+                ready_latest_capacity += self._replica_capacity(info)
+        if num_ready_latest >= self.get_final_target_num_replicas():
+            # Enough latest-version replicas: retire the old ones -- but
+            # only those not visibly mid-job. The base class retires all
+            # of them unconditionally, which for hour-long jobs would
+            # abort every in-progress prediction the moment the new
+            # fleet is ready; a busy old replica is instead retired on a
+            # later tick, once its job finishes and it reports idle.
+            return [
+                info.replica_id
+                for info in old_nonterminal
+                if not self._replica_is_busy(info)
+            ]
+
+        shortfall = self._outstanding_work() - ready_latest_capacity
+        # Never keep fewer old replicas than the base class's count rule
+        # (target - ready_new): capacity packing with a few big old
+        # replicas could otherwise drain the standby pool a low-traffic
+        # service relies on for its next request.
+        keep_count_floor = min(
+            len(old_nonterminal),
+            max(0,
+                self.get_final_target_num_replicas() - num_ready_latest))
+
+        assert self._in_flight_by_replica_id is not None
+        in_flight = self._in_flight_by_replica_id
+
+        ready_old = []
+        nonready_old = []
+        for info in old_nonterminal:
+            capacity = self._replica_capacity(info)
+            if info.is_ready:
+                ready_old.append((capacity, info))
+            else:
+                nonready_old.append((capacity, info))
+        # Keep-preference order: busy replicas first (retiring them kills
+        # jobs; keeping them retains capacity that is provably serving),
+        # then largest capacity (fewest old replicas kept, fastest
+        # rollout), replica id as a stable tie-break across ticks. A
+        # READY replica missing from the fresh in-flight map counts as
+        # busy: the LB may simply not have reported it yet.
+        ready_old.sort(key=lambda pair: (in_flight.get(pair[1].replica_id) == 0,
+                                         -pair[0], pair[1].replica_id))
+
+        keep_ids: Set[int] = set()
+        covered = 0.0
+        for capacity, info in ready_old:
+            if covered >= shortfall and len(keep_ids) >= keep_count_floor:
+                break
+            keep_ids.add(info.replica_id)
+            if capacity > 0:
+                covered += capacity
+        # Not-yet-ready old replicas add no serving capacity; they only
+        # count toward the base-class floor (the base helper likewise
+        # prefers draining initializing replicas first).
+        for _, info in nonready_old:
+            if len(keep_ids) >= keep_count_floor:
+                break
+            keep_ids.add(info.replica_id)
+        # Never retire a visibly-busy old replica, regardless of the
+        # coverage math: killing it aborts an hour-long job that will
+        # re-run from scratch. The busy-first keep-preference above
+        # usually keeps them anyway; this makes it a guarantee (they
+        # are retired on a later tick, once idle).
+        for info in old_nonterminal:
+            if self._replica_is_busy(info):
+                keep_ids.add(info.replica_id)
+
+        return [
+            info.replica_id
+            for info in old_nonterminal
+            if info.replica_id not in keep_ids
+        ]
+
+    def _generate_scaling_decisions(
+        self,
+        replica_infos: List['replica_managers.ReplicaInfo'],
+    ) -> List[AutoscalerDecision]:
+        """Generate scale-up/down decisions with drain-aware victims.
+
+        The target was already recomputed for this tick in
+        generate_scaling_decisions (before the outdated-replica drain).
+        """
+        latest_nonterminal_replicas: List['replica_managers.ReplicaInfo'] = []
+        for info in replica_infos:
+            if not info.is_terminal and info.version == self.latest_version:
+                latest_nonterminal_replicas.append(info)
+
+        scaling_decisions: List[AutoscalerDecision] = []
+        target_num_replicas = self.get_final_target_num_replicas()
+        current_num_replicas = len(latest_nonterminal_replicas)
+
+        if current_num_replicas < target_num_replicas:
+            scaling_decisions.extend(
+                _generate_scale_up_decisions(
+                    target_num_replicas - current_num_replicas, None))
+        elif current_num_replicas > target_num_replicas:
+            if not self._fresh_for_tick():
+                # SIGNAL GAP: never shrink while blind. (The stale-path
+                # recompute also never lowers the target, but the target
+                # can sit below the live fleet right after a controller
+                # rebuild -- this is the guard that actually prevents the
+                # kills.)
+                logger.info('Concurrency autoscaler signal-stale: suppressing '
+                            f'{current_num_replicas - target_num_replicas} '
+                            'scale-down decision(s).')
+                return scaling_decisions
+            num_to_scale_down = current_num_replicas - target_num_replicas
+            # Drain-aware victim eligibility (see _replica_is_busy): a
+            # READY replica may be killed ONLY if the fresh report shows
+            # zero in-flight work on it (missing entry counts as busy);
+            # non-READY replicas are eligible unless the report shows
+            # work on them (probe-blipped mid-job). Eligible non-READY
+            # replicas keep the existing status-order kill-first
+            # preference via the shared selection helper.
+            eligible_victims = [
+                info for info in latest_nonterminal_replicas
+                if not self._replica_is_busy(info)
+            ]
+            # Clip to the eligible victims and wait otherwise (same
+            # pattern as QueueLengthAutoscaler's idle clip): a busy
+            # replica finishing its ~1 h job frees up on a later tick.
+            actual_num_to_scale_down = min(num_to_scale_down,
+                                           len(eligible_victims))
+            if actual_num_to_scale_down < num_to_scale_down:
+                logger.info(
+                    'Concurrency autoscaler clipping scale-down: requested '
+                    f'{num_to_scale_down}, but only '
+                    f'{len(eligible_victims)} idle/non-ready replicas are '
+                    'eligible.')
+            if actual_num_to_scale_down > 0:
+                scaling_decisions.extend(
+                    _generate_scale_down_decisions(
+                        _select_nonterminal_replicas_to_scale_down(
+                            actual_num_to_scale_down, eligible_victims)))
+
+        return scaling_decisions
+
+    def info(self) -> Dict[str, Any]:
+        info = super().info()
+        in_flight_total = (sum(self._in_flight_by_replica_id.values()) if
+                           self._in_flight_by_replica_id is not None else None)
+        report_age = (time.time() - self._report_received_at
+                      if self._report_received_at is not None else None)
+        info.update({
+            'in_flight_total': in_flight_total,
+            'queue_depth': self._queue_depth,
+            'rejected_in_window': self._rejected_in_window,
+            'report_age_seconds': report_age,
+        })
+        return info
+
+    def _dump_dynamic_states(self) -> Dict[str, Any]:
+        # Only consumed by the in-process autoscaler swap during
+        # update_service (NOT on controller restart). The received-at
+        # time is absolute, so a report that crosses the swap simply
+        # reads as stale once it exceeds the staleness threshold.
+        return {
+            'request_timestamps': self.request_timestamps,
+            'in_flight_by_replica_id': self._in_flight_by_replica_id,
+            'queue_depth': self._queue_depth,
+            'rejected_in_window': self._rejected_in_window,
+            'report_received_at': self._report_received_at,
+        }
+
+    def _load_dynamic_states(self, dynamic_states: Dict[str, Any]) -> None:
+        # Tolerate dumps from other autoscaler types (an update can
+        # change the autoscaler class; e.g. RequestRateAutoscaler only
+        # dumps request_timestamps): missing keys keep the stale-start
+        # defaults.
+        if 'request_timestamps' in dynamic_states:
+            self.request_timestamps = dynamic_states.pop('request_timestamps')
+        if 'in_flight_by_replica_id' in dynamic_states:
+            self._in_flight_by_replica_id = dynamic_states.pop(
+                'in_flight_by_replica_id')
+        if 'queue_depth' in dynamic_states:
+            self._queue_depth = dynamic_states.pop('queue_depth')
+        if 'rejected_in_window' in dynamic_states:
+            self._rejected_in_window = dynamic_states.pop('rejected_in_window')
+        if 'report_received_at' in dynamic_states:
+            self._report_received_at = dynamic_states.pop('report_received_at')
+        if dynamic_states:
+            logger.info(f'Remaining dynamic states: {dynamic_states}')
 
 
 class FallbackRequestRateAutoscaler(RequestRateAutoscaler):

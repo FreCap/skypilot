@@ -45,6 +45,14 @@ class _FakeReplicaInfo:
         self.url_resolutions += 1
         return self._url
 
+    @property
+    def is_ready(self) -> bool:
+        return self.status == serve_state.ReplicaStatus.READY
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.status in serve_state.ReplicaStatus.terminal_statuses()
+
     def handle(self) -> Optional[_FakeHandle]:
         self.handle_resolutions += 1
         if self._handle_is_none:
@@ -57,17 +65,27 @@ def _make_controller() -> controller.SkyServeController:
     ctrl = controller.SkyServeController.__new__(controller.SkyServeController)
     ctrl._service_name = 'svc'  # pylint: disable=protected-access
     ctrl._lb_replica_cache = {}  # pylint: disable=protected-access
+    ctrl._lb_translation_cache = {}  # pylint: disable=protected-access
     return ctrl
 
 
 class _FakeSpec:
     """Minimal SkyServiceSpec stub exposing the routing-spec properties."""
 
-    def __init__(self, load_balancing_policy, target_qps_per_replica,
-                 lb_stream_timeout_seconds) -> None:
+    def __init__(self,
+                 load_balancing_policy,
+                 target_qps_per_replica,
+                 lb_stream_timeout_seconds,
+                 lb_retriable_status_codes=None,
+                 lb_max_retries=None,
+                 lb_retry_initial_backoff_seconds=None) -> None:
         self.load_balancing_policy = load_balancing_policy
         self.target_qps_per_replica = target_qps_per_replica
         self.lb_stream_timeout_seconds = lb_stream_timeout_seconds
+        self.lb_retriable_status_codes = lb_retriable_status_codes
+        self.lb_max_retries = lb_max_retries
+        self.lb_retry_initial_backoff_seconds = (
+            lb_retry_initial_backoff_seconds)
 
 
 class TestGetRoutingSpec:
@@ -78,7 +96,10 @@ class TestGetRoutingSpec:
         ctrl = _make_controller()
         spec = _FakeSpec(load_balancing_policy='instance_aware_least_load',
                          target_qps_per_replica={'L4': 2.5},
-                         lb_stream_timeout_seconds=120)
+                         lb_stream_timeout_seconds=120,
+                         lb_retriable_status_codes=[503],
+                         lb_max_retries=3,
+                         lb_retry_initial_backoff_seconds=0.5)
         with mock.patch.object(controller.serve_state,
                                'get_service_from_name',
                                return_value={'version': 7}), \
@@ -93,7 +114,12 @@ class TestGetRoutingSpec:
             'target_qps_per_replica': {
                 'L4': 2.5
             },
+            # _FakeSpec has no concurrency knob; getattr resolves None.
+            'target_concurrency_per_replica': None,
             'stream_timeout_seconds': 120,
+            'retriable_status_codes': [503],
+            'max_retries': 3,
+            'retry_initial_backoff_seconds': 0.5,
         }
 
     def test_routing_spec_none_when_spec_unavailable(self):
@@ -112,11 +138,8 @@ def _sync(ctrl: controller.SkyServeController, infos,
     record = {'active_versions': list(active_versions)}
     with mock.patch.object(controller.serve_state,
                            'get_service_from_name',
-                           return_value=record), \
-         mock.patch.object(controller.serve_state,
-                           'get_replica_infos',
-                           return_value=infos):
-        return ctrl._get_lb_replica_info()  # pylint: disable=protected-access
+                           return_value=record):
+        return ctrl._get_lb_replica_info(infos)  # pylint: disable=protected-access
 
 
 class TestGetLbReplicaInfo:
@@ -271,3 +294,155 @@ class TestGetLbReplicaInfo:
             }
         }
         assert recovered.url_resolutions == 1
+
+
+class TestTranslateInFlight:
+    """The LB reports in-flight work keyed by replica url; the autoscaler
+    consumes it keyed by replica id. The controller inverts its
+    (id -> url) sync cache to translate."""
+
+    def _synced_controller(self):
+        ctrl = _make_controller()
+        infos = [
+            _FakeReplicaInfo(1,
+                             serve_state.ReplicaStatus.READY,
+                             url='http://1.1.1.1:8080',
+                             accelerators={'L4': 1}),
+            _FakeReplicaInfo(2,
+                             serve_state.ReplicaStatus.READY,
+                             url='http://2.2.2.2:8080',
+                             accelerators={'L4': 1}),
+        ]
+        _sync(ctrl, infos)
+        return ctrl
+
+    def test_urls_translated_to_replica_ids(self):
+        ctrl = self._synced_controller()
+        translated = ctrl._translate_in_flight({  # pylint: disable=protected-access
+            'http://1.1.1.1:8080': 3,
+            'http://2.2.2.2:8080': 0,
+        })
+        assert translated == {1: 3, 2: 0}
+
+    def test_unknown_url_is_dropped(self):
+        # A url the controller never resolved (or whose replica went
+        # terminal) has no live id to attribute the work to.
+        ctrl = self._synced_controller()
+        translated = ctrl._translate_in_flight({  # pylint: disable=protected-access
+            'http://1.1.1.1:8080': 2,
+            'http://9.9.9.9:8080': 7,
+        })
+        assert translated == {1: 2}
+
+    def test_blipped_replica_stays_translatable(self):
+        # A replica demoted from READY (probe blip) mid-job must stay
+        # translatable while nonterminal: dropping it would erase its
+        # in-flight unit AND make it read as an idle scale-down victim.
+        ctrl = self._synced_controller()
+        _sync(ctrl, [
+            _FakeReplicaInfo(1,
+                             serve_state.ReplicaStatus.READY,
+                             url='http://1.1.1.1:8080',
+                             accelerators={'L4': 1}),
+            _FakeReplicaInfo(2,
+                             serve_state.ReplicaStatus.NOT_READY,
+                             url='http://2.2.2.2:8080',
+                             accelerators={'L4': 1}),
+        ])
+        translated = ctrl._translate_in_flight({  # pylint: disable=protected-access
+            'http://1.1.1.1:8080': 0,
+            'http://2.2.2.2:8080': 1,
+        })
+        assert translated == {1: 0, 2: 1}
+
+    def test_terminal_replica_pruned_from_translation(self):
+        ctrl = self._synced_controller()
+        _sync(ctrl, [
+            _FakeReplicaInfo(1,
+                             serve_state.ReplicaStatus.READY,
+                             url='http://1.1.1.1:8080',
+                             accelerators={'L4': 1}),
+            _FakeReplicaInfo(2,
+                             serve_state.ReplicaStatus.SHUTTING_DOWN,
+                             url='http://2.2.2.2:8080',
+                             accelerators={'L4': 1}),
+        ])
+        translated = ctrl._translate_in_flight(
+            {  # pylint: disable=protected-access
+                'http://2.2.2.2:8080': 1,
+            })
+        assert translated == {}
+
+    def test_none_passes_through(self):
+        # None means the LB sent no gauge (old LB / non-tracking policy);
+        # the autoscaler must see None, not an empty (fresh-looking) dict.
+        ctrl = self._synced_controller()
+        assert ctrl._translate_in_flight(None) is None  # pylint: disable=protected-access
+
+
+class _FakeAutoscaler:
+    """Autoscaler stub for the capacity-hint computation."""
+
+    def __init__(self, target, recomputed, latest_version=1) -> None:
+        self._target = target
+        self._recomputed = recomputed
+        self.latest_version = latest_version
+
+    def get_final_target_num_replicas(self) -> int:
+        return self._target
+
+    def has_recomputed_with_fresh_data(self) -> bool:
+        return self._recomputed
+
+
+class TestGetCapacityHint:
+    """capacity_hint rides the sync response so the data plane can see
+    capacity that is already on the way (provisioning) and the fleet's
+    intended size (target)."""
+
+    def _replicas(self):
+        return [
+            # Latest version: one READY, two provisioning-ish, one
+            # terminal (must not count anywhere).
+            _FakeReplicaInfo(1, serve_state.ReplicaStatus.READY, version=2),
+            _FakeReplicaInfo(2,
+                             serve_state.ReplicaStatus.PROVISIONING,
+                             version=2),
+            _FakeReplicaInfo(3, serve_state.ReplicaStatus.STARTING, version=2),
+            _FakeReplicaInfo(4,
+                             serve_state.ReplicaStatus.SHUTTING_DOWN,
+                             version=2),
+            # Old version replicas never count.
+            _FakeReplicaInfo(5, serve_state.ReplicaStatus.READY, version=1),
+        ]
+
+    def test_provisioning_counts_latest_nonterminal_not_ready(self):
+        ctrl = _make_controller()
+        ctrl._autoscaler = _FakeAutoscaler(  # pylint: disable=protected-access
+            target=5,
+            recomputed=True,
+            latest_version=2)
+        hint = ctrl._get_capacity_hint(self._replicas())  # pylint: disable=protected-access
+        assert hint == {'provisioning_replicas': 2, 'target_num_replicas': 5}
+
+    def test_stale_autoscaler_reports_at_least_live_fleet(self):
+        # A rebuilt controller (target reset to min_replicas, no demand
+        # report yet) must not tell the platform the fleet wants to
+        # shrink: while stale, target is floored at the latest-version
+        # nonterminal count.
+        ctrl = _make_controller()
+        ctrl._autoscaler = _FakeAutoscaler(  # pylint: disable=protected-access
+            target=1,
+            recomputed=False,
+            latest_version=2)
+        hint = ctrl._get_capacity_hint(self._replicas())  # pylint: disable=protected-access
+        assert hint == {'provisioning_replicas': 2, 'target_num_replicas': 3}
+
+    def test_stale_max_rule_keeps_larger_target(self):
+        ctrl = _make_controller()
+        ctrl._autoscaler = _FakeAutoscaler(  # pylint: disable=protected-access
+            target=10,
+            recomputed=False,
+            latest_version=2)
+        hint = ctrl._get_capacity_hint(self._replicas())  # pylint: disable=protected-access
+        assert hint['target_num_replicas'] == 10

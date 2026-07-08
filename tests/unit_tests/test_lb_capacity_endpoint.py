@@ -24,6 +24,11 @@ def _make_balancer(policy):
     balancer._ready = True
     balancer._draining = False
     balancer._last_sync_time = time.monotonic() - 4.0
+    # Demand-feed state (normally set in __init__).
+    balancer._queue_depth = 0
+    balancer._reject_last_seen = {}
+    balancer._reject_fallback_seq = 0
+    balancer._capacity_hint = None
     balancer._replica_occupancy = {}
     balancer._replica_free_slots = {}
     balancer._last_occupancy_probe_time = None
@@ -69,6 +74,38 @@ class TestCapacityEndpoint(unittest.TestCase):
         self.assertEqual(body['ready_replicas'], 0)
         self.assertFalse(body['synced'])
         self.assertIsNone(body['last_sync_age_seconds'])
+
+    def test_demand_fields_default_and_hint_absent(self):
+        # Before any sync carries a capacity_hint, the hint-derived fields
+        # must read as unknown (null), not zero.
+        policy = lb_policies.LeastLoadPolicy()
+        policy.set_ready_replicas(['http://a:8080'])
+        balancer = _make_balancer(policy)
+        import json
+        body = json.loads(
+            asyncio.run(balancer._capacity(mock.MagicMock())).body)
+        self.assertEqual(body['queue_depth'], 0)
+        self.assertEqual(body['rejected_in_window'], 0)
+        self.assertIsNone(body['provisioning_replicas'])
+        self.assertIsNone(body['target_replicas'])
+
+    def test_demand_fields_reflect_gauges_and_hint(self):
+        policy = lb_policies.LeastLoadPolicy()
+        policy.set_ready_replicas(['http://a:8080'])
+        balancer = _make_balancer(policy)
+        balancer._queue_depth = 3
+        balancer._reject_last_seen = {'job-1': time.monotonic()}
+        balancer._capacity_hint = {
+            'provisioning_replicas': 4,
+            'target_num_replicas': 12,
+        }
+        import json
+        body = json.loads(
+            asyncio.run(balancer._capacity(mock.MagicMock())).body)
+        self.assertEqual(body['queue_depth'], 3)
+        self.assertEqual(body['rejected_in_window'], 1)
+        self.assertEqual(body['provisioning_replicas'], 4)
+        self.assertEqual(body['target_replicas'], 12)
 
     def test_in_flight_ignores_pruned_replicas(self):
         # Load entries for replicas no longer ready must not inflate the

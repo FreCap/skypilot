@@ -103,6 +103,15 @@ class LoadBalancingPolicy:
         """
         return None
 
+    def snapshot_in_flight(self) -> Optional[Dict[str, int]]:
+        """Per-replica in-flight snapshot (url -> count), when tracked.
+
+        None for policies without load accounting (round robin): the
+        controller sync then reports demand as unknown -- the autoscaler's
+        signal-gap rules apply -- rather than a false all-idle fleet.
+        """
+        return None
+
     def set_occupancy(self, occupancy: Dict[str, int]) -> None:
         """Set the replica-reported async occupancy (url -> running jobs).
 
@@ -221,6 +230,17 @@ class LeastLoadPolicy(LoadBalancingPolicy, name='least_load', default=True):
                 self.load_map.get(replica, 0)
                 for replica in self.ready_replicas)
 
+    def snapshot_in_flight(self) -> Optional[Dict[str, int]]:
+        with self.lock:
+            # Same ready-replica scoping as total_in_flight: an entry for
+            # a pruned replica must not report phantom demand. A COPY, not
+            # the live defaultdict -- the caller serializes it outside the
+            # lock while the routing hot path keeps mutating the original.
+            return {
+                replica: self.load_map.get(replica, 0)
+                for replica in self.ready_replicas
+            }
+
     def _select_replica(self, request: 'fastapi.Request',
                         candidates: List[str]) -> Optional[str]:
         del request  # Unused.
@@ -298,6 +318,10 @@ class InstanceAwareLeastLoadPolicy(LeastLoadPolicy,
         self.replica_info: Dict[str, Dict[str, Any]] = {}  # replica_url -> info
         self.target_qps_per_accelerator: Dict[str, float] = {
         }  # accelerator_type -> target_qps
+        # Uniform per-GPU weight for services without a QPS dict
+        # (concurrency-sized): consulted after the dict keys, before the
+        # flat fallback. See set_default_per_gpu_target.
+        self._default_per_gpu_qps: Optional[float] = None
 
     def set_ready_replicas(self, ready_replicas: List[str]) -> None:
         if set(self.ready_replicas) == set(ready_replicas):
@@ -332,6 +356,27 @@ class InstanceAwareLeastLoadPolicy(LeastLoadPolicy,
         """Set target QPS for each accelerator type."""
         with self.lock:
             self.target_qps_per_accelerator = target_qps_per_accelerator
+            # A concrete QPS dict is authoritative: drop the uniform
+            # per-GPU default so the two weighting modes never mix.
+            if target_qps_per_accelerator:
+                self._default_per_gpu_qps = None
+
+    def set_default_per_gpu_target(self,
+                                   per_gpu_target: Optional[float]) -> None:
+        """Uniform per-GPU weight for services without a QPS dict.
+
+        Concurrency-sized services (target_concurrency_per_replica) have
+        no per-accelerator QPS dict; their per-GPU capacity is uniform,
+        so replicas should absorb load proportionally to gpu_count. The
+        default is consulted after the dict keys and before the flat-1.0
+        fallback, and replaces the dict wholesale when set: mixing a
+        previous version's QPS weights with uniform weighting would bias
+        routing toward whichever shapes the stale dict under-weighted.
+        """
+        with self.lock:
+            self._default_per_gpu_qps = per_gpu_target
+            if per_gpu_target is not None:
+                self.target_qps_per_accelerator = {}
 
     def _get_normalized_load(self, replica_url: str) -> float:
         """Get normalized load for a replica based on its GPU shape."""
@@ -403,6 +448,11 @@ class InstanceAwareLeastLoadPolicy(LeastLoadPolicy,
             if (base_name == accelerator_type and count_str.isdigit() and
                     int(count_str) > 0):
                 return value / int(count_str) * accelerator_count
+
+        # Uniform per-GPU default (concurrency-sized services): every
+        # GPU carries the same weight, so capacity scales with count.
+        if self._default_per_gpu_qps is not None:
+            return self._default_per_gpu_qps * accelerator_count
 
         # Fallback
         logger.warning(
