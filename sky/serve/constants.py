@@ -204,11 +204,17 @@ RESERVED_CAPACITY_STALE_AFTER_INTERVALS = 3
 RESERVED_CAPACITY_FILL_OVERRIDE_KEY = '_reserved_fill_zero_cost_only'
 # Sentinel resources_override key carrying the broker grant epoch a fill
 # scale-up was emitted under. The launch path pops it (never reaches
-# sky.launch) and re-checks the broker's current epoch right before
+# sky.launch) and re-checks the POOL's current round epoch right before
 # committing the launch: a decision computed from a superseded allocation
 # round must skip instead of launching against capacity the broker has
 # since re-granted to a peer service.
 RESERVED_FILL_GRANT_EPOCH_OVERRIDE_KEY = '_reserved_fill_grant_epoch'
+# Sentinel resources_override key carrying the pool key the grant epoch
+# belongs to (always stamped alongside the epoch). Rounds and epochs are
+# per-pool: the launch fence compares the carried epoch against ITS pool's
+# round epoch -- a global comparison would let pool A's grant churn fence
+# pool B's unrelated fill launches.
+RESERVED_FILL_POOL_KEY_OVERRIDE_KEY = '_reserved_fill_pool_key'
 
 # [boltz fork] Reserved-fill broker: multi-service arbitration of the
 # zero-cost pools (see sky/serve/reserved_capacity_broker.py). Cross-process
@@ -216,8 +222,8 @@ RESERVED_FILL_GRANT_EPOCH_OVERRIDE_KEY = '_reserved_fill_grant_epoch'
 # this to a session advisory lock (shared across api-server pods); on SQLite
 # it is a node-local filelock (single pod, sufficient -- every serve
 # controller shares the api-server pod in consolidation mode). Independent of
-# the election primitive, actuation correctness rests on the lease-row epoch
-# (see the broker module), not on this lock.
+# the election primitive, actuation correctness rests on the per-pool round
+# epoch (see the broker module), not on this lock.
 RESERVED_FILL_BROKER_LOCK_ID = '~/.sky/serve_reserved_fill_broker_lock'
 # Bounded by one cluster-wide realtime query plus a handful of DB
 # round-trips; generous so a slow cluster query makes peers wait for the

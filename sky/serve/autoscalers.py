@@ -201,15 +201,18 @@ class Autoscaler:
         self._fill_snapshot_time: Optional[float] = None
         # Last computed fill target, surfaced via info() only.
         self._fill_target: int = 0
-        # Broker grant ceiling + the epoch it was issued under. None grant =
-        # no ceiling (single-service #108 identity; also the pre-broker
-        # default so every existing call path is unchanged). DELIBERATELY
-        # not persisted in dump_dynamic_states: grants are DB-authoritative
+        # Broker grant ceiling + the epoch it was issued under + the pool
+        # key the epoch belongs to (epochs are per-pool round counters, so
+        # the launch fence needs both). None grant = no ceiling
+        # (single-service #108 identity; also the pre-broker default so
+        # every existing call path is unchanged). DELIBERATELY not
+        # persisted in dump_dynamic_states: grants are DB-authoritative
         # and the poller re-feeds them within one interval -- a swapped-in
         # autoscaler briefly without a ceiling is safe (ceilings only gate
         # NEW launches).
         self._fill_grant: Optional[int] = None
         self._fill_grant_epoch: Optional[int] = None
+        self._fill_grant_pool_key: Optional[str] = None
 
     def get_final_target_num_replicas(self) -> int:
         """Get the final target number of replicas."""
@@ -259,7 +262,8 @@ class Autoscaler:
                                   zero_cost_location_keys: List[Dict[str, Any]],
                                   timestamp: float,
                                   grant: Optional[int] = None,
-                                  grant_epoch: Optional[int] = None) -> None:
+                                  grant_epoch: Optional[int] = None,
+                                  grant_pool_key: Optional[str] = None) -> None:
         """Ingest a free-capacity snapshot from the reserved-capacity poller.
 
         `zero_cost_location_keys` are Location.to_pickleable() dicts of
@@ -273,11 +277,13 @@ class Autoscaler:
         cause launch/evict churn. A DECREASE applies immediately:
         capacity that vanished must stop being filled now.
 
-        grant/grant_epoch come from the reserved-fill broker: grant is the
-        entitlement ceiling on the FILL fleet (None = no ceiling, the
-        single-service identity), grant_epoch the fencing token stamped
-        onto fill scale-up decisions so a launch outliving its allocation
-        round is skipped at actuation time.
+        grant/grant_epoch/grant_pool_key come from the reserved-fill
+        broker: grant is the entitlement ceiling on the FILL fleet (None =
+        no ceiling, the single-service identity), grant_epoch the fencing
+        token stamped onto fill scale-up decisions so a launch outliving
+        its allocation round is skipped at actuation time, and
+        grant_pool_key the pool the epoch belongs to (epochs are per-pool
+        round counters; the fence compares against that pool's round).
         """
         free_slots = max(0, int(free_slots))
         prev_raw = self._fill_last_raw_free_slots
@@ -294,6 +300,7 @@ class Autoscaler:
         self._fill_snapshot_time = timestamp
         self._fill_grant = grant
         self._fill_grant_epoch = grant_epoch
+        self._fill_grant_pool_key = grant_pool_key
 
     def count_zero_cost_holdings(
             self, replica_infos: List['replica_managers.ReplicaInfo']
@@ -611,13 +618,18 @@ class Autoscaler:
             }
             if self._fill_grant_epoch is not None:
                 # Epoch fencing: the launch path re-checks this against
-                # the broker's current epoch right before committing.
+                # the POOL's current round epoch right before committing
+                # (epochs are per-pool, so the pool key rides along).
                 # Attached only when a broker round supplied one, so the
                 # pre-broker decision shape (and every existing test) is
                 # unchanged.
                 fill_override[
                     constants.RESERVED_FILL_GRANT_EPOCH_OVERRIDE_KEY] = (
                         self._fill_grant_epoch)
+                if self._fill_grant_pool_key is not None:
+                    fill_override[
+                        constants.RESERVED_FILL_POOL_KEY_OVERRIDE_KEY] = (
+                            self._fill_grant_pool_key)
             result.extend(
                 _generate_scale_up_decisions(num_fill_up, fill_override))
             # Invariant: a free slot is SPENT the moment a launch decision

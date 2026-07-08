@@ -146,6 +146,10 @@ reserved_fill_rounds_table = sqlalchemy.Table(
     # Taken BEFORE the (slow) cluster query, mirroring the #108
     # snapshot/debit invariant at broker level.
     sqlalchemy.Column('snapshot_time', sqlalchemy.Float),
+    # The POOL's fencing epoch: bumps only when this pool's allocation
+    # changes. Readers actuating a grant compare their carried epoch
+    # against it (see reserved_capacity_broker.current_epoch) -- per-pool,
+    # so one pool's grant churn never fences another pool's launches.
     sqlalchemy.Column('epoch', sqlalchemy.Integer),
     # JSON {service: grant}; null grant = single-claimant fast path (no
     # ceiling, #108 identity).
@@ -167,9 +171,9 @@ reserved_fill_rounds_table = sqlalchemy.Table(
     sqlalchemy.Column('last_observed_free_ts', sqlalchemy.Float),
 )
 
-# Singleton lease row (id=1): the broker's fencing-token source. The epoch
-# only moves forward; readers actuating a grant compare their carried epoch
-# against it (see reserved_capacity_broker.current_epoch).
+# Singleton lease row (id=1). The epoch only moves forward; its sole role
+# is the publish CAS in publish_reserved_fill_round (fencing for actuation
+# is the per-pool round epoch above).
 reserved_fill_lease_table = sqlalchemy.Table(
     'reserved_fill_lease',
     Base.metadata,
@@ -1292,12 +1296,6 @@ def get_reserved_fill_lease() -> Optional[Dict[str, Any]]:
     return None if row is None else dict(row._mapping)  # pylint: disable=protected-access
 
 
-def get_reserved_fill_epoch() -> Optional[int]:
-    """Current broker epoch (the fencing token), or None if no lease yet."""
-    lease = get_reserved_fill_lease()
-    return None if lease is None else lease['epoch']
-
-
 def publish_reserved_fill_round(pool_key: str, *, round_id: int,
                                 snapshot_time: float, epoch: int, grants: str,
                                 feeds: str, raw_grants: str, feed_state: str,
@@ -1305,8 +1303,15 @@ def publish_reserved_fill_round(pool_key: str, *, round_id: int,
                                 last_observed_free: Optional[int],
                                 last_observed_free_ts: Optional[float],
                                 owner_service: str, prev_epoch: Optional[int],
+                                lease_epoch: int,
                                 lease_expires_at: float) -> bool:
     """Atomically CAS-advances the lease and publishes a round.
+
+    `epoch` is the POOL's fencing epoch, stored on the round row (per-pool:
+    the launch fence compares against it, and one pool's grant churn must
+    not fence another pool's launches). The lease carries a separate global
+    epoch stream (prev_epoch -> lease_epoch) whose only role is the CAS
+    below.
 
     The lease update is a filtered UPDATE on the previous epoch (the
     *_if_owner CAS pattern): a racing writer that already advanced the epoch
@@ -1328,7 +1333,7 @@ def publish_reserved_fill_round(pool_key: str, *, round_id: int,
                     sqlalchemy.insert(reserved_fill_lease_table).values(
                         id=1,
                         owner_service=owner_service,
-                        epoch=epoch,
+                        epoch=lease_epoch,
                         expires_at=lease_expires_at))
             except sqlalchemy_exc.IntegrityError:
                 session.rollback()
@@ -1338,7 +1343,7 @@ def publish_reserved_fill_round(pool_key: str, *, round_id: int,
                 reserved_fill_lease_table.c.id == 1,
                 reserved_fill_lease_table.c.epoch == prev_epoch).update({
                     reserved_fill_lease_table.c.owner_service: owner_service,
-                    reserved_fill_lease_table.c.epoch: epoch,
+                    reserved_fill_lease_table.c.epoch: lease_epoch,
                     reserved_fill_lease_table.c.expires_at: lease_expires_at,
                 })
             if count == 0:

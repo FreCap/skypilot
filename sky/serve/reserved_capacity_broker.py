@@ -18,9 +18,11 @@ Design invariants (see the 2026-07-08 design doc):
 - Feeds are a separate water-fill of OBSERVED FREE among under-holders: a
   peer's slow graceful drain must not make Sum(feeds) exceed physical free
   capacity (entitlement-as-feed overshoots; feed-split cannot).
-- Grants only ever gate NEW launches, so stale readers are safe; the lease
-  epoch is the fencing token that keeps a respawned/stalled controller from
-  ACTING on a superseded allocation.
+- Grants only ever gate NEW launches, so stale readers are safe; the pool's
+  ROUND epoch is the fencing token that keeps a respawned/stalled controller
+  from ACTING on a superseded allocation (per-pool, so one pool's grant
+  churn never fences another's launches); the global lease epoch exists
+  only for the publish CAS.
 - Exactly one live claim => the fast path: grant None (no ceiling), feed =
   raw observed free -- byte-identical #108 behavior, pinned by the existing
   test suite.
@@ -152,9 +154,20 @@ def get_cached_allocation(service_name: str,
     return allocation
 
 
-def current_epoch() -> Optional[int]:
-    """The broker's current fencing epoch (cheap single-row DB read)."""
-    return serve_state.get_reserved_fill_epoch()
+def current_epoch(pool_key: str) -> Optional[int]:
+    """The POOL's current fencing epoch (cheap single-row DB read).
+
+    Per-pool by design: rounds and grants are per-pool, so the launch
+    fence must compare a carried epoch against ITS pool's round epoch.
+    Fencing on the global lease epoch would let pool A's grant churn
+    fence pool B's unrelated fill launches for up to two poll intervals.
+    None (no round published yet) fails open at the fence: there is no
+    newer allocation to defer to.
+    """
+    round_row = serve_state.get_reserved_fill_round(pool_key)
+    if round_row is None:
+        return None
+    return int(round_row['epoch'])
 
 
 # =========================== Pure allocation math ===========================
@@ -753,15 +766,22 @@ def _run_round_locked(service_name: str, pool_key: str,
     grants_changed = round_row is None or prev_grants_json != grants
     lease_expired = (lease is None or lease['expires_at'] is None or
                      float(lease['expires_at']) < now)
-    new_epoch = prev_epoch if prev_epoch is not None else 0
+    # Two epoch streams: the ROUND epoch is per-pool (the fencing token the
+    # launch path compares against -- pool A's grant churn must not fence
+    # pool B's launches), the LEASE epoch is global and exists only for the
+    # publish CAS. Both bump only when THIS pool's allocation changes (or
+    # after a lease-dead gap where every outstanding grant is suspect), not
+    # on every round: per-round bumps would fence out nearly every fill
+    # launch in steady state (each service's carried epoch is refreshed
+    # only on its own poll), while the fencing intent is precisely "never
+    # actuate a superseded allocation".
+    prev_round_epoch = (int(round_row['epoch'])
+                        if round_row is not None else None)
+    new_epoch = prev_round_epoch if prev_round_epoch is not None else 0
+    new_lease_epoch = prev_epoch if prev_epoch is not None else 0
     if grants_changed or lease_expired:
-        # The epoch bumps only when the ALLOCATION changes (or after a
-        # lease-dead gap where every outstanding grant is suspect), not on
-        # every round: per-round bumps would fence out nearly every fill
-        # launch in steady state (each service's carried epoch is refreshed
-        # only on its own poll), while the fencing intent is precisely
-        # "never actuate a superseded allocation".
         new_epoch += 1
+        new_lease_epoch += 1
     round_id = int(round_row['round_id']) + 1 if round_row is not None else 1
     published = serve_state.publish_reserved_fill_round(
         pool_key,
@@ -777,13 +797,14 @@ def _run_round_locked(service_name: str, pool_key: str,
         last_observed_free_ts=last_free_ts,
         owner_service=service_name,
         prev_epoch=prev_epoch,
+        lease_epoch=new_lease_epoch,
         lease_expires_at=now +
         constants.RESERVED_FILL_LEASE_TTL_INTERVALS * poll_interval_seconds)
     if not published:
         logger.error(
             'Reserved-fill broker: lease CAS failed while publishing round '
-            f'{round_id} for pool {pool_key} (epoch {prev_epoch} -> '
-            f'{new_epoch}); a writer bypassed the round lock. Skipping.')
+            f'{round_id} for pool {pool_key} (lease epoch {prev_epoch} -> '
+            f'{new_lease_epoch}); a writer bypassed the round lock. Skipping.')
         return None
     logger.info(
         f'Reserved-fill broker: round {round_id} (epoch {new_epoch}) for '

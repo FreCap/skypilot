@@ -274,9 +274,9 @@ def _obs(free, gpu_names=('A100',)):
     return broker.PoolObservation(free_slots=free, gpu_names=tuple(gpu_names))
 
 
-def _run(name, free=0, interval=60.0, observation=None):
+def _run(name, free=0, interval=60.0, observation=None, pool=_POOL):
     obs = _obs(free) if observation is None else observation
-    return broker.run_round_if_stale(name, _POOL, lambda: obs, interval)
+    return broker.run_round_if_stale(name, pool, lambda: obs, interval)
 
 
 def _replica_stub(is_ready=True,
@@ -517,8 +517,53 @@ class TestEpochFencing:
         assert changed.epoch == first.epoch + 1
         # Stale-epoch actuation fencing: an actuator carrying the old
         # allocation's epoch sees a newer current epoch and must skip.
-        assert broker.current_epoch() == changed.epoch
-        assert first.epoch != broker.current_epoch()
+        assert broker.current_epoch(_POOL) == changed.epoch
+        assert first.epoch != broker.current_epoch(_POOL)
+
+    def test_cross_pool_epoch_isolation(self, clock):
+        # Rounds (and their fencing epochs) are per-pool: pool A's grant
+        # churn must never fence pool B's fill launches, whose allocation
+        # did not change.
+        pool_b = broker.make_pool_key('other-ctx', 'H100')
+        obs_b = _obs(10, gpu_names=('H100',))
+        _upsert('svc-a')
+        _upsert('svc-b')
+        _upsert('svc-c', pool_key=pool_b)
+        _upsert('svc-d', pool_key=pool_b)
+        a_first = _run('svc-a', free=10)
+        b_first = _run('svc-c', observation=obs_b, pool=pool_b)
+        assert a_first is not None and b_first is not None
+        # Reallocate pool A (weight shift; grant damping needs two rounds).
+        a_changed = None
+        for _ in range(2):
+            clock.advance(61)
+            _upsert('svc-a', weight=9)
+            _upsert('svc-b')
+            _upsert('svc-c', pool_key=pool_b)
+            _upsert('svc-d', pool_key=pool_b)
+            a_changed = _run('svc-a', free=10)
+        assert a_changed is not None
+        assert a_changed.epoch == a_first.epoch + 1
+        # Pool B's fencing epoch is untouched by pool A's bump: a pool-B
+        # launch carrying b_first.epoch still passes the fence.
+        assert broker.current_epoch(pool_b) == b_first.epoch
+        # ... including after pool B republishes an UNCHANGED allocation.
+        b_again = _run('svc-c', observation=obs_b, pool=pool_b)
+        assert b_again is not None
+        assert b_again.epoch == b_first.epoch
+        assert broker.current_epoch(pool_b) == b_first.epoch
+        # Pool B's OWN reallocation still bumps its epoch: a stale pool-B
+        # epoch remains fenced.
+        b_changed = None
+        for _ in range(2):
+            clock.advance(61)
+            _upsert('svc-c', pool_key=pool_b, weight=9)
+            _upsert('svc-d', pool_key=pool_b)
+            b_changed = _run('svc-c', observation=obs_b, pool=pool_b)
+        assert b_changed is not None
+        assert b_changed.epoch == b_first.epoch + 1
+        assert broker.current_epoch(pool_b) == b_changed.epoch
+        assert b_first.epoch != broker.current_epoch(pool_b)
 
 
 @pytest.mark.usefixtures('_broker_db')

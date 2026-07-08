@@ -25,6 +25,7 @@ _SCALE_UP = autoscalers.AutoscalerDecisionOperator.SCALE_UP
 _SCALE_DOWN = autoscalers.AutoscalerDecisionOperator.SCALE_DOWN
 _FILL_KEY = constants.RESERVED_CAPACITY_FILL_OVERRIDE_KEY
 _EPOCH_KEY = constants.RESERVED_FILL_GRANT_EPOCH_OVERRIDE_KEY
+_POOL_KEY = constants.RESERVED_FILL_POOL_KEY_OVERRIDE_KEY
 
 # Pickleable form of the zero-cost k8s location, as handed to
 # collect_reserved_capacity by the poller (Location.to_pickleable()).
@@ -1064,14 +1065,20 @@ class TestCostFeasibilityDegradation(unittest.TestCase):
         self.assertEqual(placer.location2cost, {})
 
 
-def _feed_broker(autoscaler, free_slots, grant, epoch=None, polls=2):
-    """Feed a broker-shaped snapshot (feed + grant + epoch)."""
+def _feed_broker(autoscaler,
+                 free_slots,
+                 grant,
+                 epoch=None,
+                 pool_key=None,
+                 polls=2):
+    """Feed a broker-shaped snapshot (feed + grant + epoch + pool key)."""
     ts = time.time()
     for _ in range(polls):
         autoscaler.collect_reserved_capacity(free_slots, [_K8S_KEY],
                                              ts,
                                              grant=grant,
-                                             grant_epoch=epoch)
+                                             grant_epoch=epoch,
+                                             grant_pool_key=pool_key)
 
 
 class TestGrantCeiling(unittest.TestCase):
@@ -1167,15 +1174,20 @@ class TestGrantCeiling(unittest.TestCase):
 class TestGrantEpochPlumbing(unittest.TestCase):
     """Fill scale-ups carry the grant epoch only when a broker supplied it."""
 
-    def test_epoch_attached_to_sentinel_override(self):
+    def test_epoch_and_pool_key_attached_to_sentinel_override(self):
         autoscaler = _make_autoscaler(min_replicas=1)
-        _feed_broker(autoscaler, 3, grant=5, epoch=7)
+        pool = reserved_capacity_broker.make_pool_key('research-ctx', 'a100')
+        _feed_broker(autoscaler, 3, grant=5, epoch=7, pool_key=pool)
         sentinel = [
             d for d in _ups(_decisions(autoscaler, [])) if d.target is not None
         ]
         self.assertTrue(sentinel)
         for decision in sentinel:
-            self.assertEqual(decision.target, {_FILL_KEY: True, _EPOCH_KEY: 7})
+            self.assertEqual(decision.target, {
+                _FILL_KEY: True,
+                _EPOCH_KEY: 7,
+                _POOL_KEY: pool
+            })
 
     def test_no_epoch_means_pre_broker_decision_shape(self):
         autoscaler = _make_autoscaler(min_replicas=1)
@@ -1191,11 +1203,12 @@ class TestGrantEpochPlumbing(unittest.TestCase):
         # Grants are DB-authoritative: a swapped-in autoscaler must get
         # them from the next poll, never from a stale dump.
         autoscaler = _make_autoscaler(min_replicas=1)
-        _feed_broker(autoscaler, 3, grant=5, epoch=7)
+        _feed_broker(autoscaler, 3, grant=5, epoch=7, pool_key='pool')
         dump = autoscaler.dump_dynamic_states()
         fill_state = dump['reserved_capacity_fill_state']
         self.assertNotIn('fill_grant', fill_state)
         self.assertNotIn('fill_grant_epoch', fill_state)
+        self.assertNotIn('fill_grant_pool_key', fill_state)
 
 
 class TestEpochFencedLaunch(unittest.TestCase):
@@ -1214,12 +1227,15 @@ class TestEpochFencedLaunch(unittest.TestCase):
         manager.latest_version = 1
         return manager
 
-    def _launch(self, current_epoch, carried_epoch=7):
+    def _launch(self, pool_epochs, carried_epoch=7, carried_pool='pool-b'):
+        """pool_epochs: pool_key -> current round epoch (the fence read)."""
         location = _make_location('research-ctx', 'free')
         placer = mock.Mock()
         placer.select_next_zero_cost_location.return_value = location
         manager = self._make_manager(placer)
         override = {_FILL_KEY: True, _EPOCH_KEY: carried_epoch}
+        if carried_pool is not None:
+            override[_POOL_KEY] = carried_pool
         with mock.patch.object(replica_managers,
                                '_should_use_spot',
                                return_value=False), \
@@ -1228,35 +1244,64 @@ class TestEpochFencedLaunch(unittest.TestCase):
                                return_value='8080'), \
              mock.patch.object(replica_managers.reserved_capacity_broker,
                                'current_epoch',
-                               return_value=current_epoch), \
+                               side_effect=pool_epochs.get) as epoch_mock, \
              mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
                                return_value=[]), \
              mock.patch.object(replica_managers.serve_state,
                                'add_or_update_replica') as add_mock:
             launched = manager._launch_replica(7, override)
-        return launched, add_mock
+        return launched, add_mock, epoch_mock
 
     def test_stale_epoch_skips_without_persisting_a_row(self):
-        launched, add_mock = self._launch(current_epoch=8)
+        launched, add_mock, epoch_mock = self._launch({'pool-b': 8})
         self.assertFalse(launched)
         add_mock.assert_not_called()
+        # The fence reads the CARRIED pool's round epoch, not a global one.
+        epoch_mock.assert_called_once_with('pool-b')
 
-    def test_current_epoch_launches_and_strips_the_key(self):
-        launched, add_mock = self._launch(current_epoch=7)
+    def test_current_epoch_launches_and_strips_the_keys(self):
+        launched, add_mock, _ = self._launch({'pool-b': 7})
         self.assertTrue(launched)
         add_mock.assert_called_once()
         info = add_mock.call_args[0][2]
         self.assertNotIn(_EPOCH_KEY, info.resources_override)
+        self.assertNotIn(_POOL_KEY, info.resources_override)
         self.assertNotIn(_FILL_KEY, info.resources_override)
         self.assertTrue(info.reserved_fill)
 
-    def test_missing_lease_fails_open(self):
-        # No lease row (current_epoch None): there is no newer allocation
-        # to defer to -- proceed rather than deadlock fill forever.
-        launched, add_mock = self._launch(current_epoch=None)
+    def test_peer_pool_epoch_bump_does_not_fence(self):
+        # Cross-pool isolation at the fence: pool A's epoch moved (8) but
+        # this launch carries pool B's still-current epoch (7) -- it must
+        # launch. Pool B's own stale epoch (6 vs 7) still fences.
+        launched, add_mock, _ = self._launch({'pool-a': 8, 'pool-b': 7})
         self.assertTrue(launched)
         add_mock.assert_called_once()
+        fenced, fenced_add, _ = self._launch({
+            'pool-a': 8,
+            'pool-b': 7
+        },
+                                             carried_epoch=6)
+        self.assertFalse(fenced)
+        fenced_add.assert_not_called()
+
+    def test_missing_round_fails_open(self):
+        # No round row for the pool (current_epoch None): there is no
+        # newer allocation to defer to -- proceed rather than deadlock
+        # fill forever.
+        launched, add_mock, _ = self._launch({})
+        self.assertTrue(launched)
+        add_mock.assert_called_once()
+
+    def test_epoch_without_pool_key_fails_open(self):
+        # Defensive: the epoch is only meaningful against its pool's
+        # round; a sentinel missing the pool key (never emitted by the
+        # autoscaler) must not fence.
+        launched, add_mock, epoch_mock = self._launch({'pool-b': 8},
+                                                      carried_pool=None)
+        self.assertTrue(launched)
+        add_mock.assert_called_once()
+        epoch_mock.assert_not_called()
 
 
 class TestDemandPlacementGate(unittest.TestCase):
@@ -1390,6 +1435,9 @@ class TestBrokerPollerCycle(unittest.TestCase):
         round_mock.assert_called_once()
         self.assertEqual(autoscaler._fill_grant, 3)
         self.assertEqual(autoscaler._fill_grant_epoch, 4)
+        self.assertEqual(
+            autoscaler._fill_grant_pool_key,
+            reserved_capacity_broker.make_pool_key('research-ctx', 'a100'))
         self.assertEqual(autoscaler._fill_snapshot_time, 1.0)
 
     def test_no_allocation_feeds_zero_without_grant(self):

@@ -1070,6 +1070,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         # long gone and the row already exists).
         zero_cost_only = False
         fill_grant_epoch: Optional[int] = None
+        fill_pool_key: Optional[str] = None
         if (resources_override is not None and
                 serve_constants.RESERVED_CAPACITY_FILL_OVERRIDE_KEY
                 in resources_override):
@@ -1078,6 +1079,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 serve_constants.RESERVED_CAPACITY_FILL_OVERRIDE_KEY)
             fill_grant_epoch = resources_override.pop(
                 serve_constants.RESERVED_FILL_GRANT_EPOCH_OVERRIDE_KEY, None)
+            fill_pool_key = resources_override.pop(
+                serve_constants.RESERVED_FILL_POOL_KEY_OVERRIDE_KEY, None)
             zero_cost_only = True
         logger.info(f'Launching replica {replica_id}...')
         cluster_name = serve_utils.generate_replica_cluster_name(
@@ -1124,18 +1127,23 @@ class SkyPilotReplicaManager(ReplicaManager):
                     current_spot_locations.append(spot_location)
             if zero_cost_only:
                 # Broker epoch fence: a fill decision computed from a
-                # superseded allocation round (the epoch moved because
-                # grants changed, or after a lease-dead gap) must not
-                # launch against capacity re-granted to a peer. Checked
-                # BEFORE any replica row is persisted, so a fenced launch
-                # leaks nothing (same contract as the benched skip below);
-                # the next decision tick re-emits under the fresh epoch.
-                # Only broker-stamped decisions carry an epoch: without a
-                # broker round this is a no-op (single-service identity),
-                # and a missing lease row (current None) fails open --
-                # there is no newer allocation to defer to.
-                if fill_grant_epoch is not None:
-                    broker_epoch = reserved_capacity_broker.current_epoch()
+                # superseded allocation round (the pool's epoch moved
+                # because its grants changed, or after a lease-dead gap)
+                # must not launch against capacity re-granted to a peer.
+                # Compared against the POOL's round epoch (stamped
+                # alongside the carried epoch): rounds are per-pool, so a
+                # grant change on an unrelated pool must not fence this
+                # launch. Checked BEFORE any replica row is persisted, so
+                # a fenced launch leaks nothing (same contract as the
+                # benched skip below); the next decision tick re-emits
+                # under the fresh epoch. Only broker-stamped decisions
+                # carry an epoch + pool key: without a broker round this
+                # is a no-op (single-service identity), and a missing
+                # round row (current None) fails open -- there is no
+                # newer allocation to defer to.
+                if fill_grant_epoch is not None and fill_pool_key is not None:
+                    broker_epoch = reserved_capacity_broker.current_epoch(
+                        fill_pool_key)
                     if (broker_epoch is not None and
                             broker_epoch != fill_grant_epoch):
                         self._log_fill_skip(

@@ -227,7 +227,8 @@ def _broker_cycle(autoscaler: 'autoscalers.Autoscaler',
                                          keys,
                                          allocation.snapshot_time,
                                          grant=allocation.grant,
-                                         grant_epoch=allocation.epoch)
+                                         grant_epoch=allocation.epoch,
+                                         grant_pool_key=pool_key)
     logger.info(f'Reserved-fill broker: {service_name!r} feed='
                 f'{allocation.feed} grant={allocation.grant} '
                 f'(round {allocation.round_id}, epoch {allocation.epoch}).')
