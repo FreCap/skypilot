@@ -231,6 +231,9 @@ class SkyServeLoadBalancer:
         # capacity endpoint reports its age so a data-plane reader can
         # judge freshness during control-plane outages (the whole point
         # of reading capacity from the LB instead of `serve status`).
+        # Monotonic clock: the age must not be distorted by wall-clock
+        # steps (NTP) — hiding staleness is the exact failure this field
+        # exists to expose.
         self._last_sync_time: Optional[float] = None
         # Strong refs to in-progress drain-close tasks (see
         # _drain_and_close_client); a bare create_task result can be GCed.
@@ -388,7 +391,7 @@ class SkyServeLoadBalancer:
             in_flight = self._load_balancing_policy.total_in_flight()
         last_sync_age: Optional[float] = None
         if self._last_sync_time is not None:
-            last_sync_age = max(time.time() - self._last_sync_time, 0.0)
+            last_sync_age = max(time.monotonic() - self._last_sync_time, 0.0)
         return fastapi.responses.JSONResponse({
             'ready_replicas': ready_replicas,
             'in_flight': in_flight,
@@ -492,7 +495,7 @@ class SkyServeLoadBalancer:
                     task.add_done_callback(self._client_close_tasks.discard)
                 # First successful sync -> ready to serve (readiness gate).
                 self._ready = True
-                self._last_sync_time = time.time()
+                self._last_sync_time = time.monotonic()
 
     async def _drain_and_close_client(self, url: str,
                                       client: httpx.AsyncClient) -> None:

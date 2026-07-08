@@ -23,7 +23,7 @@ def _make_balancer(policy):
     balancer._client_pool_lock = threading.Lock()
     balancer._ready = True
     balancer._draining = False
-    balancer._last_sync_time = time.time() - 4.0
+    balancer._last_sync_time = time.monotonic() - 4.0
     return balancer
 
 
