@@ -146,6 +146,8 @@ def _provision_once(prev_cluster_status):
         prev_config_hash=None,
     )
     raised = None
+    teardown = mock.patch.object(backend_lib.CloudVmRayBackend,
+                                 'teardown_no_lock').start()
     with mock.patch.object(backend_lib.optimizer.Optimizer,
                          'optimize',
                          side_effect=exceptions.ResourcesUnavailableError(
@@ -164,7 +166,8 @@ def _provision_once(prev_cluster_status):
                 skip_unnecessary_provisioning=False)
         except Exception as e:  # pylint: disable=broad-except
             raised = e
-    return provisioner, to_provision, raised
+    mock.patch.stopall()
+    return provisioner, to_provision, raised, teardown
 
 
 def test_provisioner_blocks_exact_candidate_not_cloud_wide():
@@ -172,7 +175,7 @@ def test_provisioner_blocks_exact_candidate_not_cloud_wide():
     # candidate: a cloud-wide Resources(cloud=...) block matches only
     # NON-spot siblings (use_spot is never None) and would break
     # any_of [spot, on-demand] fallback entirely.
-    provisioner, to_provision, raised = _provision_once(
+    provisioner, to_provision, raised, _ = _provision_once(
         prev_cluster_status=None)
     assert isinstance(raised, exceptions.ResourcesUnavailableError)
     assert provisioner._blocked_resources == {to_provision}
@@ -183,7 +186,7 @@ def test_provisioner_surfaces_clean_error_for_existing_cluster():
     # resources cannot satisfy must surface the same clean
     # NotSupportedError `sky autostop` gives -- not the INIT-only
     # AssertionError from the loop tail, and no cloud-wide poisoning.
-    provisioner, _, raised = _provision_once(
+    provisioner, _, raised, teardown = _provision_once(
         prev_cluster_status=status_lib.ClusterStatus.UP)
     assert isinstance(raised, exceptions.NotSupportedError)
     assert not provisioner._blocked_resources
@@ -193,7 +196,7 @@ def test_existing_cluster_error_does_not_chain_the_marker():
     # The internal marker must not appear in the propagated exception's
     # chain: failed API requests serialize the full stacktrace to
     # clients under debug.
-    _, _, raised = _provision_once(
+    _, _, raised, _ = _provision_once(
         prev_cluster_status=status_lib.ClusterStatus.UP)
     assert isinstance(raised, exceptions.NotSupportedError)
     assert raised.__cause__ is None
@@ -234,7 +237,7 @@ def test_provisioner_lets_init_cluster_fail_over():
     # feature failure must NOT be treated as non-failoverable -- the
     # tail's INIT branch resets to a fresh launch so the task can fall
     # over to candidates that do support the feature (on-demand).
-    provisioner, _, raised = _provision_once(
+    provisioner, _, raised, teardown = _provision_once(
         prev_cluster_status=status_lib.ClusterStatus.INIT)
     assert not isinstance(raised, exceptions.NotSupportedError)
     assert not isinstance(raised, AssertionError)
@@ -244,6 +247,10 @@ def test_provisioner_lets_init_cluster_fail_over():
     # broad handler would have cloud-wide poisoned here.
     assert isinstance(raised, exceptions.ResourcesUnavailableError)
     assert provisioner._blocked_resources == set()
+    # The tail's INIT reset assumes the old cluster was terminated; the
+    # marker path must do that cleanup itself (feature check fails
+    # before _retry_zones runs).
+    teardown.assert_called_once()
 
 
 def _start_with_stored_autostop(spot_resources, stored_autostop,

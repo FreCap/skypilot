@@ -1913,11 +1913,26 @@ class RetryingVmProvisioner(object):
                     # internal marker class never shows up in the debug
                     # stacktrace serialized to API clients.
                     raise cause from None
-                # New launch: fall through to the loop tail, which blocks
-                # exactly `to_provision` and records the cause -- so
-                # sibling candidates on the same cloud (e.g. on-demand
-                # after a spot candidate failed a STOP requirement) still
-                # get their turn.
+                if (prev_cluster_status == status_lib.ClusterStatus.INIT and
+                        prev_handle is not None):
+                    # The loop tail's INIT branch resets to a fresh
+                    # launch assuming _retry_zones() already terminated
+                    # the old cluster -- but the feature check fails
+                    # BEFORE _retry_zones() runs, so the failed
+                    # attempt's partial resources would leak while
+                    # failover proceeds. Do the equivalent cleanup here
+                    # (same terminate-vs-stop rule as _retry_zones:
+                    # never terminate a cluster that was ever up).
+                    CloudVmRayBackend().teardown_no_lock(
+                        prev_handle,
+                        terminate=not prev_cluster_ever_up,
+                        remove_from_db=False)
+                # Fall through to the loop tail: for a NEW launch it
+                # blocks exactly `to_provision` and records the cause --
+                # so sibling candidates on the same cloud (e.g.
+                # on-demand after a spot candidate failed a STOP
+                # requirement) still get their turn; for INIT the tail
+                # resets to a fresh launch and re-optimizes.
                 logger.warning(common_utils.format_exception(cause))
                 failover_history.append(cause)
             except (exceptions.InvalidClusterNameError,
