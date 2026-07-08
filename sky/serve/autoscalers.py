@@ -207,19 +207,6 @@ class Autoscaler:
         """Collect request information from aggregator for autoscaling."""
         raise NotImplementedError
 
-    def has_fresh_demand_report(self) -> bool:
-        """Whether the autoscaler's demand signal is currently fresh.
-
-        QPS/queue autoscalers derive demand from data that rides every
-        sync (request timestamps) or from the durable job DB, so they are
-        never signal-stale in the sense that matters here. Autoscalers
-        that depend on gauges the LB may not send (e.g. the concurrency
-        autoscaler's in-flight report) override this; the controller uses
-        it to decide whether the capacity hint it hands the data plane can
-        be trusted not to under-report a live fleet.
-        """
-        return True
-
     def has_recomputed_with_fresh_data(self) -> bool:
         """Whether target_num_replicas reflects a fresh-data recompute.
 
@@ -1362,6 +1349,9 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         # exists: snapping on stale data would just re-assert the blind
         # minimum.
         self._snap_target_on_next_recompute: bool = True
+        # Per-tick freshness snapshot (see _fresh_for_tick). None outside
+        # a tick.
+        self._tick_fresh: Optional[bool] = None
 
     def _staleness_threshold_seconds(self) -> float:
         """Age beyond which a demand report no longer counts as fresh.
@@ -1393,6 +1383,22 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         logic for a tick.
         """
         return not self._snap_target_on_next_recompute
+
+    def _fresh_for_tick(self) -> bool:
+        """Freshness as snapshotted once at the top of the current tick.
+
+        collect_request_information runs concurrently on the sync
+        thread; if the first fresh report landed mid-tick,
+        re-evaluating freshness at each consumer would let the
+        recompute take the stale path (target still the rebuilt-blind
+        minimum) while the later drain/scale-down guards saw fresh and
+        proceeded -- marrying a blind target to fresh-mode kills. Falls
+        back to a live evaluation when no tick snapshot is active (a
+        direct call outside generate_scaling_decisions).
+        """
+        if self._tick_fresh is not None:
+            return self._tick_fresh
+        return self.has_fresh_demand_report()
 
     def _replica_is_busy(self, info: 'replica_managers.ReplicaInfo') -> bool:
         """Whether the latest report shows in-flight work on a replica.
@@ -1536,7 +1542,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         best_capacity = (latest_capacities[0] if latest_capacities else
                          self.target_concurrency_per_replica)
 
-        if not self.has_fresh_demand_report():
+        if not self._fresh_for_tick():
             # SIGNAL GAP: the only trustworthy signal is arrivals (they
             # ride every sync). Raise-only floor, applied without
             # hysteresis -- while blind we must not delay growth, and we
@@ -1630,15 +1636,27 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         # replicas against target_num_replicas, and a stale target would
         # let it retire old capacity that is still needed. Single
         # recompute per tick.
-        self._prune_gpu_shape_cache({info.replica_id for info in replica_infos})
-        keep_versions = {info.version for info in replica_infos}
-        keep_versions.add(self.latest_version)
-        for version in list(self._knob_by_version):
-            if version not in keep_versions:
-                del self._knob_by_version[version]
-        self._set_target_num_replicas_with_concurrency_logic(replica_infos)
-        return super().generate_scaling_decisions(replica_infos,
-                                                  active_versions)
+        # Freshness is snapshotted ONCE per tick: collect_request_
+        # information runs concurrently on the sync thread, and if the
+        # first fresh report landed mid-tick the recompute would take
+        # the stale path (target still the rebuilt-blind minimum) while
+        # the later drain/scale-down guards saw "fresh" and proceeded --
+        # marrying a blind target to fresh-mode kills. All three
+        # consumers read this snapshot instead of re-evaluating.
+        self._tick_fresh = self.has_fresh_demand_report()
+        try:
+            self._prune_gpu_shape_cache(
+                {info.replica_id for info in replica_infos})
+            keep_versions = {info.version for info in replica_infos}
+            keep_versions.add(self.latest_version)
+            for version in list(self._knob_by_version):
+                if version not in keep_versions:
+                    del self._knob_by_version[version]
+            self._set_target_num_replicas_with_concurrency_logic(replica_infos)
+            return super().generate_scaling_decisions(replica_infos,
+                                                      active_versions)
+        finally:
+            self._tick_fresh = None
 
     def _calculate_target_num_replicas(self) -> int:
         # Demand-aware sizing needs replica_infos, which this hook
@@ -1688,7 +1706,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
           preference, not a hard gate -- a rolling update must still
           complete when every old replica is busy.
         """
-        if not self.has_fresh_demand_report():
+        if not self._fresh_for_tick():
             return []
         if self.update_mode != serve_utils.UpdateMode.ROLLING:
             return super()._select_outdated_replicas_to_scale_down(
@@ -1801,7 +1819,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 _generate_scale_up_decisions(
                     target_num_replicas - current_num_replicas, None))
         elif current_num_replicas > target_num_replicas:
-            if not self.has_fresh_demand_report():
+            if not self._fresh_for_tick():
                 # SIGNAL GAP: never shrink while blind. (The stale-path
                 # recompute also never lowers the target, but the target
                 # can sit below the live fleet right after a controller

@@ -252,6 +252,55 @@ def test_sync_payload_in_flight_none_without_tracking():
     assert captured['json']['in_flight'] is None
 
 
+class _FakeDrainingClient:
+
+    def __init__(self, inflight):
+        setattr(self, lb_module._INFLIGHT_ATTR, inflight)
+
+
+def test_in_flight_includes_pruned_but_draining_work():
+    # A probe-blipped replica leaves the routable set (load_map entry
+    # pruned) while its hour-long requests keep running on the draining
+    # client; the demand feed must keep attributing that work to the
+    # url or the autoscaler reads the replica as an idle victim.
+    lb = _make_lb()
+    lb._load_balancing_policy.set_ready_replicas(['http://a:8080'])
+    lb._load_balancing_policy.load_map['http://a:8080'] = 1
+    lb._draining_clients = {
+        'http://b:8080': [_FakeDrainingClient(2)],
+    }
+    assert lb._in_flight_with_draining() == {
+        'http://a:8080': 1,
+        'http://b:8080': 2,
+    }
+
+
+def test_draining_overlay_sums_with_readded_url():
+    # Probe recovered: the re-added url's NEW client tracks fresh work
+    # in the load_map while the OLD draining client still carries the
+    # pre-blip streams -- distinct requests, so counts add.
+    lb = _make_lb()
+    lb._load_balancing_policy.set_ready_replicas(['http://a:8080'])
+    lb._load_balancing_policy.load_map['http://a:8080'] = 1
+    lb._draining_clients = {'http://a:8080': [_FakeDrainingClient(1)]}
+    assert lb._in_flight_with_draining() == {'http://a:8080': 2}
+
+
+def test_drained_client_deregisters_from_demand_feed():
+    lb = _make_lb()
+    client = mock.Mock()
+    setattr(client, lb_module._INFLIGHT_ATTR, 0)
+
+    async def _aclose():
+        return None
+
+    client.aclose = _aclose
+    lb._draining_clients = {'http://a:8080': [client]}
+    lb._stream_timeout_seconds = 1
+    asyncio.run(lb._drain_and_close_client('http://a:8080', client))
+    assert lb._draining_clients == {}
+
+
 def test_sync_caches_capacity_hint():
     lb = _make_lb()
     hint = {'provisioning_replicas': 4, 'target_num_replicas': 12}

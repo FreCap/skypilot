@@ -232,6 +232,33 @@ class TestSignalGap(unittest.TestCase):
         with mock.patch.object(autoscalers.time, 'time', return_value=stale_at):
             self.assertFalse(autoscaler.has_fresh_demand_report())
 
+    def test_mid_tick_fresh_report_cannot_unlock_scale_down(self):
+        # TOCTOU guard: freshness is snapshotted once per tick. If the
+        # first fresh report lands DURING the tick (after the recompute
+        # took the stale path, leaving the rebuilt-blind min target),
+        # the scale-down guards must still see the tick as stale --
+        # otherwise current > blind-target mass-kills idle replicas
+        # that the very next tick's snap would have kept.
+        autoscaler = _make_autoscaler(min_replicas=1)
+        replicas = [_replica(i) for i in (1, 2, 3)]
+        original = (autoscaler._set_target_num_replicas_with_concurrency_logic)
+
+        def _report_mid_tick(replica_infos):
+            original(replica_infos)
+            # Fresh report (all idle) arrives between the recompute and
+            # the scale-down guards.
+            _report(autoscaler, in_flight={1: 0, 2: 0, 3: 0})
+
+        with mock.patch.object(
+                autoscaler,
+                '_set_target_num_replicas_with_concurrency_logic',
+                side_effect=_report_mid_tick):
+            decisions = _decisions(autoscaler, replicas)
+        self.assertEqual(_scale_downs(decisions), [])
+        # The next full tick sees the report from its start and may act.
+        decisions = _decisions(autoscaler, replicas)
+        self.assertEqual(len(_scale_downs(decisions)), 2)
+
     def test_stale_arrival_floor_prunes_old_timestamps(self):
         # Once syncs stop, collect_request_information never runs again
         # to prune the window; the stale-branch recompute must prune it

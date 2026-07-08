@@ -179,6 +179,7 @@ class SkyServeLoadBalancer:
     _reject_last_seen: Optional[Dict[str, float]] = None
     _reject_fallback_seq: int = 0
     _capacity_hint: Optional[Dict[str, Any]] = None
+    _draining_clients: Optional[Dict[str, List[httpx.AsyncClient]]] = None
 
     def __init__(
         self,
@@ -472,6 +473,33 @@ class SkyServeLoadBalancer:
         return fastapi.responses.Response(
             status_code=200 if self._is_ready_to_serve() else 503)
 
+    def _in_flight_with_draining(self) -> Optional[Dict[str, int]]:
+        """Per-url in-flight snapshot including pruned-but-draining work.
+
+        The policy's load_map drops a url the moment it leaves the
+        routable set, but the requests already running on that replica
+        keep running on its draining client (see
+        _drain_and_close_client) -- for synchronous predictions, up to
+        an hour. Without this overlay a probe-blipped replica vanishes
+        from the in-flight report one sync after the blip, reads as
+        idle to the autoscaler, and becomes a preferred scale-down
+        victim mid-job. Draining counts never double the policy's: a
+        pruned url's streams released (or generation-stale-dropped)
+        their load_map slot at prune time, and a re-added url's NEW
+        client tracks its requests in the load_map while the OLD
+        draining client only carries the pre-blip streams.
+        """
+        with self._client_pool_lock:
+            in_flight = self._load_balancing_policy.snapshot_in_flight()
+        if in_flight is None:
+            return None
+        for url, clients in (self._draining_clients or {}).items():
+            draining = sum(
+                getattr(client, _INFLIGHT_ATTR, 0) for client in clients)
+            if draining > 0:
+                in_flight[url] = in_flight.get(url, 0) + draining
+        return in_flight
+
     def _prune_reject_window(self) -> Dict[str, float]:
         """Drop reject entries older than the window; return the live dict.
 
@@ -531,7 +559,11 @@ class SkyServeLoadBalancer:
         del request  # Unused.
         with self._client_pool_lock:
             ready_replicas = len(self._load_balancing_policy.ready_replicas)
-            in_flight = self._load_balancing_policy.total_in_flight()
+        # Includes pruned-but-draining work: those requests still occupy
+        # replica capacity, which is what an admission reader sizes by.
+        in_flight_map = self._in_flight_with_draining()
+        in_flight = (sum(in_flight_map.values())
+                     if in_flight_map is not None else None)
         last_sync_age: Optional[float] = None
         if self._last_sync_time is not None:
             last_sync_age = max(time.monotonic() - self._last_sync_time, 0.0)
@@ -569,11 +601,13 @@ class SkyServeLoadBalancer:
         # not just arrival compression. They are GAUGES -- re-read whole
         # every sync, never cleared on ack -- so a controller hiccup can
         # neither lose nor double-count demand; only the timestamps below
-        # keep their existing clear-on-report semantics. snapshot_in_flight
-        # may be None (policy without load accounting): sent as-is, the
-        # controller treats it as unknown rather than an idle fleet.
-        with self._client_pool_lock:
-            in_flight = self._load_balancing_policy.snapshot_in_flight()
+        # keep their existing clear-on-report semantics. The in-flight
+        # map may be None (policy without load accounting): sent as-is,
+        # the controller treats it as unknown rather than an idle fleet.
+        # NOTE: gauges are last-writer-wins per LB (unlike the additive
+        # timestamps) -- correct for the pinned single-replica LB
+        # deployment; a multi-LB rollout would need per-LB keying.
+        in_flight = self._in_flight_with_draining()
         sync_payload = {
             'request_aggregator': self._request_aggregator.to_dict(),
             'in_flight': in_flight,
@@ -672,6 +706,13 @@ class SkyServeLoadBalancer:
                     # as the longest in-flight prediction; the sync loop must
                     # never wait on it. Strong refs held in the task set (a
                     # bare create_task result can be garbage collected).
+                    # Registered in _draining_clients first so the demand
+                    # feed keeps attributing the still-running work to the
+                    # pruned url (see _in_flight_with_draining).
+                    if self._draining_clients is None:
+                        self._draining_clients = {}
+                    self._draining_clients.setdefault(replica_url,
+                                                      []).append(client)
                     task = asyncio.create_task(
                         self._drain_and_close_client(replica_url, client))
                     self._client_close_tasks.add(task)
@@ -709,7 +750,19 @@ class SkyServeLoadBalancer:
             logger.warning(f'Closing drained client for {url} with '
                            f'{inflight} request(s) still in flight '
                            '(drain deadline exceeded).')
-        await client.aclose()
+        try:
+            await client.aclose()
+        finally:
+            # Deregister from the demand feed: the drained client's work
+            # is finished (or force-closed) and must stop counting as
+            # in-flight for this url.
+            clients = (self._draining_clients or {}).get(url)
+            if clients is not None:
+                with contextlib.suppress(ValueError):
+                    clients.remove(client)
+                if not clients:
+                    assert self._draining_clients is not None
+                    del self._draining_clients[url]
 
     async def _sync_with_controller(self):
         """Sync with controller periodically.
