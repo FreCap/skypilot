@@ -182,6 +182,27 @@ LB_JOB_ID_HEADER = 'X-SkyServe-Job-Id'
 # requests to drain before letting the server exit.
 LB_DRAIN_GRACE_SECONDS = 15
 
+# [boltz fork] Reserved-capacity fill (opt-in via
+# replica_policy.reserved_capacity_fill): the controller runs a poller that
+# measures FREE capacity on the service's zero-cost locations and the
+# autoscaler additionally scales up onto it (bounded by max_replicas). Poll
+# cadence of that poller; the realtime free-GPU query lists every pod in the
+# cluster, so it must stay well above the autoscaler decision interval.
+RESERVED_CAPACITY_POLL_INTERVAL_SECONDS = 60
+RESERVED_CAPACITY_POLL_INTERVAL_ENV_VAR = (
+    'SKYPILOT_SERVE_RESERVED_CAPACITY_POLL_SECONDS')
+# A capacity snapshot older than this many poll intervals contributes 0 free
+# slots: a dead poller must never assert a fill floor. Zero-cost replicas
+# that ALREADY exist keep counting toward the fill target, so a poller
+# outage never turns the live fill fleet into scale-down victims.
+RESERVED_CAPACITY_STALE_AFTER_INTERVALS = 3
+# Sentinel resources_override key marking a scale-up decision as
+# capacity-driven fill: the launch path pops it and restricts placement to
+# zero-cost ACTIVE locations, skipping the launch entirely when none is
+# available (fill must NEVER spill to paid capacity). Underscore-prefixed so
+# it can never collide with a real Resources field.
+RESERVED_CAPACITY_FILL_OVERRIDE_KEY = '_reserved_fill_zero_cost_only'
+
 # Default interval in seconds to probe replica endpoint.
 DEFAULT_ENDPOINT_PROBE_INTERVAL_SECONDS = 10
 # Backward compatibility alias.

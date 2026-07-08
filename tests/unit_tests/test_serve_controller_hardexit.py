@@ -27,6 +27,10 @@ def _make_controller(monkeypatch):
     ctrl._app = fastapi.FastAPI()
     ctrl._host = '127.0.0.1'
     ctrl._port = 20010
+    # run() consults the reserved-capacity fill flag before deciding whether
+    # to start the poller thread; disabled short-circuits before touching
+    # the (absent) replica manager.
+    ctrl._reserved_capacity_fill_enabled = False
     # Don't actually start a control-loop thread during the test.
     monkeypatch.setattr(controller_mod.thread_utils, 'start_supervised_thread',
                         lambda *a, **k: None)

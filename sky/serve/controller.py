@@ -20,6 +20,7 @@ from sky import sky_logging
 from sky.serve import autoscalers
 from sky.serve import lb_rbac_preflight
 from sky.serve import replica_managers
+from sky.serve import reserved_capacity
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.skylet import constants
@@ -91,6 +92,14 @@ class SkyServeController:
         self._autoscaler: autoscalers.Autoscaler = (
             autoscalers.Autoscaler.from_spec(service_name, service_spec,
                                              version))
+        # [boltz fork] Reserved-capacity fill is boot-wired: the poller
+        # thread (the only component allowed to issue the expensive
+        # cluster-wide realtime free-GPU query) starts in run() only when
+        # the service booted with the flag on. A flag toggled on via
+        # update_service reaches the autoscaler's consumption immediately
+        # but gets its poller on the next controller respawn.
+        self._reserved_capacity_fill_enabled: bool = bool(
+            getattr(service_spec, 'reserved_capacity_fill', False))
         self._host = host
         self._port = port
         # [boltz fork] Cache of replica_id -> (url, gpu_type, gpu_count)
@@ -580,6 +589,19 @@ class SkyServeController:
         # loop returning) does not silently stop all scaling decisions while
         # the controller keeps serving HTTP -- it is restarted instead.
         thread_utils.start_supervised_thread(self._run_autoscaler, 'autoscaler')
+
+        # Reserved-capacity fill poller: started only when the service
+        # opted in AND a spot placer exists (the placer defines the
+        # zero-cost location set fill draws from). Getters, not the live
+        # objects: update_service can replace self._autoscaler and the
+        # poller must feed the current one.
+        if (self._reserved_capacity_fill_enabled and getattr(
+                self._replica_manager, '_spot_placer', None) is not None):
+            thread_utils.start_supervised_thread(
+                lambda: reserved_capacity.poller_loop(
+                    lambda: self._autoscaler, lambda: getattr(
+                        self._replica_manager, '_spot_placer', None)),
+                'reserved-capacity-poller')
 
         logger.info('SkyServe Controller started on '
                     f'http://{self._host}:{self._port}. PID: {os.getpid()}')

@@ -11,8 +11,10 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 from sky import sky_logging
 from sky.jobs import state as managed_job_state
 from sky.serve import constants
+from sky.serve import reserved_capacity
 from sky.serve import serve_state
 from sky.serve import serve_utils
+from sky.serve import spot_placer
 from sky.utils import common_utils
 
 if typing.TYPE_CHECKING:
@@ -176,6 +178,22 @@ class Autoscaler:
         # unrecoverable failure.
         self.latest_version_ever_ready: int = self.latest_version - 1
         self.update_mode = serve_utils.DEFAULT_UPDATE_MODE
+        # [boltz fork] Reserved-capacity fill (opt-in): snapshot state fed
+        # by the controller's poller thread via collect_reserved_capacity.
+        # Lives in the base class so fill composes with every autoscaler
+        # type without touching their demand math. getattr: robust against
+        # spec objects predating the flag (e.g. unpickled from old DB
+        # rows).
+        self.reserved_capacity_fill: bool = bool(
+            getattr(spec, 'reserved_capacity_fill', False))
+        # Damped free-slot value the fill target acts on (see
+        # collect_reserved_capacity for the two-poll increase damping).
+        self._fill_free_slots: int = 0
+        self._fill_last_raw_free_slots: Optional[int] = None
+        self._fill_zero_cost_locations: List[spot_placer.Location] = []
+        self._fill_snapshot_time: Optional[float] = None
+        # Last computed fill target, surfaced via info() only.
+        self._fill_target: int = 0
 
     def get_final_target_num_replicas(self) -> int:
         """Get the final target number of replicas."""
@@ -201,11 +219,149 @@ class Autoscaler:
         self.target_num_replicas = self._clip_target_num_replicas(
             self.target_num_replicas)
         self.update_mode = update_mode
+        # An update can toggle the fill flag; consumption follows the new
+        # spec immediately. (The poller thread is boot-wired: enabling the
+        # flag on a service that booted without it takes effect on the
+        # next controller respawn.)
+        self.reserved_capacity_fill = bool(
+            getattr(spec, 'reserved_capacity_fill', False))
 
     def collect_request_information(
             self, request_aggregator_info: Dict[str, Any]) -> None:
         """Collect request information from aggregator for autoscaling."""
         raise NotImplementedError
+
+    def collect_reserved_capacity(self, free_slots: int,
+                                  zero_cost_location_keys: List[Dict[str, Any]],
+                                  timestamp: float) -> None:
+        """Ingest a free-capacity snapshot from the reserved-capacity poller.
+
+        `zero_cost_location_keys` are Location.to_pickleable() dicts of
+        the placer's zero-cost location set (benched ones included: they
+        still identify which existing replicas are fill).
+
+        Damping: an INCREASE in free slots is acted on only when two
+        consecutive snapshots both exceed the previously-acted-on value
+        (acting on the min of the two -- the level that persisted across
+        both polls), so an eviction storm's transient free spike cannot
+        cause launch/evict churn. A DECREASE applies immediately:
+        capacity that vanished must stop being filled now.
+        """
+        free_slots = max(0, int(free_slots))
+        prev_raw = self._fill_last_raw_free_slots
+        self._fill_last_raw_free_slots = free_slots
+        if free_slots <= self._fill_free_slots:
+            self._fill_free_slots = free_slots
+        elif prev_raw is not None and prev_raw > self._fill_free_slots:
+            self._fill_free_slots = min(prev_raw, free_slots)
+        self._fill_zero_cost_locations = [
+            location for location in (spot_placer.Location.from_pickleable(key)
+                                      for key in zero_cost_location_keys)
+            if location is not None
+        ]
+        self._fill_snapshot_time = timestamp
+
+    def _fresh_fill_free_slots(self) -> int:
+        """Damped free slots, decayed to 0 when the snapshot is stale."""
+        if self._fill_snapshot_time is None:
+            return 0
+        max_age = (reserved_capacity.poll_interval_seconds() *
+                   constants.RESERVED_CAPACITY_STALE_AFTER_INTERVALS)
+        if time.time() - self._fill_snapshot_time > max_age:
+            return 0
+        return self._fill_free_slots
+
+    def _replica_on_zero_cost_location(
+            self, info: 'replica_managers.ReplicaInfo') -> bool:
+        if not self._fill_zero_cost_locations:
+            return False
+        location = info.get_spot_location()
+        if location is None:
+            return False
+        return any(location == zero_cost
+                   for zero_cost in self._fill_zero_cost_locations)
+
+    def _apply_reserved_capacity_fill(
+        self,
+        replica_infos: List['replica_managers.ReplicaInfo'],
+        decisions: List[AutoscalerDecision],
+    ) -> List[AutoscalerDecision]:
+        """Overlay zero-cost capacity fill onto the demand decisions.
+
+        fill_target = (nonterminal replicas already on a zero-cost
+        location) + (fresh damped free slots), clamped to max_replicas
+        but deliberately NOT floored by min_replicas -- an empty free
+        tier must not assert a floor. target_num_replicas and thus the
+        controller's capacity hint stay DEMAND-ONLY: fill replicas are
+        opportunistic supply, and the platform's spill logic must not
+        read them as demand.
+
+        - Surplus scale-ups beyond max(current, demand target) carry the
+          sentinel override so the launch path pins them to zero-cost
+          ACTIVE locations only (and skips entirely when none is).
+        - Scale-downs covered by the fill surplus are suppressed. The
+          subclass ordered its victims most-preferred-first, so keeping
+          the prefix preserves its victim selection (cost-aware /
+          drain-aware logic untouched).
+        - With a stale snapshot, fill_target degrades to exactly the
+          zero-cost replica count: existing fill replicas are protected
+          from victimization by staleness, but no new fill is launched.
+        """
+        if not self.reserved_capacity_fill:
+            return decisions
+        zero_cost_count = 0
+        num_latest_nonterminal = 0
+        for info in replica_infos:
+            if info.is_terminal:
+                continue
+            if info.version == self.latest_version:
+                num_latest_nonterminal += 1
+            if self._replica_on_zero_cost_location(info):
+                zero_cost_count += 1
+        fill_target = min(zero_cost_count + self._fresh_fill_free_slots(),
+                          self.max_replicas)
+        self._fill_target = fill_target
+        demand_target = self.get_final_target_num_replicas()
+        surplus_covered = fill_target - demand_target
+        if surplus_covered <= 0:
+            return decisions
+        num_downs = sum(
+            1 for decision in decisions
+            if decision.operator == AutoscalerDecisionOperator.SCALE_DOWN)
+        downs_to_keep = max(0, num_downs - surplus_covered)
+        result: List[AutoscalerDecision] = []
+        kept_downs = 0
+        for decision in decisions:
+            if decision.operator == AutoscalerDecisionOperator.SCALE_DOWN:
+                if kept_downs >= downs_to_keep:
+                    continue
+                kept_downs += 1
+            result.append(decision)
+        num_fill_up = fill_target - max(num_latest_nonterminal, demand_target)
+        if num_fill_up > 0:
+            logger.info(f'Reserved-capacity fill: target {fill_target} '
+                        f'(zero-cost replicas {zero_cost_count} + free '
+                        f'slots {self._fresh_fill_free_slots()}), demand '
+                        f'target {demand_target}; scaling up {num_fill_up} '
+                        'zero-cost-only replica(s).')
+            result.extend(
+                _generate_scale_up_decisions(
+                    num_fill_up,
+                    {constants.RESERVED_CAPACITY_FILL_OVERRIDE_KEY: True}))
+        return result
+
+    def has_fresh_demand_report(self) -> bool:
+        """Whether the autoscaler's demand signal is currently fresh.
+
+        QPS/queue autoscalers derive demand from data that rides every
+        sync (request timestamps) or from the durable job DB, so they are
+        never signal-stale in the sense that matters here. Autoscalers
+        that depend on gauges the LB may not send (e.g. the concurrency
+        autoscaler's in-flight report) override this; the controller uses
+        it to decide whether the capacity hint it hands the data plane can
+        be trusted not to under-report a live fleet.
+        """
+        return True
 
     def has_recomputed_with_fresh_data(self) -> bool:
         """Whether target_num_replicas reflects a fresh-data recompute.
@@ -221,11 +377,22 @@ class Autoscaler:
 
     def info(self) -> Dict[str, Any]:
         """Get information about the autoscaler."""
-        return {
+        info: Dict[str, Any] = {
             'target_num_replicas': self.target_num_replicas,
             'min_replicas': self.min_replicas,
             'max_replicas': self.max_replicas,
         }
+        if self.reserved_capacity_fill:
+            # target_num_replicas above stays demand-only; the fill
+            # overlay is observable through these keys instead.
+            snapshot_age = (time.time() - self._fill_snapshot_time
+                            if self._fill_snapshot_time is not None else None)
+            info.update({
+                'fill_free_slots': self._fill_free_slots,
+                'fill_snapshot_age': snapshot_age,
+                'fill_target': self._fill_target,
+            })
+        return info
 
     def _generate_scaling_decisions(
         self,
@@ -401,9 +568,13 @@ class Autoscaler:
                     replica_infos, active_versions)))
 
         # If the latest version is ever ready, we can proceed to generate
-        # decisions from the implementations in subclasses.
+        # decisions from the implementations in subclasses. The
+        # reserved-capacity fill overlay wraps only the subclass's demand
+        # decisions -- the outdated-replica drain above is version
+        # control, not demand, and must never be suppressed by fill.
         scaling_decisions.extend(
-            self._generate_scaling_decisions(replica_infos))
+            self._apply_reserved_capacity_fill(
+                replica_infos, self._generate_scaling_decisions(replica_infos)))
 
         if not scaling_decisions:
             logger.info('No scaling needed.')

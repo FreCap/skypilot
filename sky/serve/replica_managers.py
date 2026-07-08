@@ -55,6 +55,8 @@ _RETRY_INIT_GAP_SECONDS = 60
 # re-hammering the same exhausted zone (see _launch_replica).
 _DEFAULT_LAUNCH_MAX_RETRY = 3
 _DEFAULT_DRAIN_SECONDS = 120
+# Rate limit for the "fill launch skipped" log (see _log_fill_skip).
+_FILL_SKIP_LOG_INTERVAL_SECONDS = 60
 _WAIT_LAUNCH_THREAD_TIMEOUT_SECONDS = 15
 
 # Sentinel for to_info_dict's pre-fetched cluster_record
@@ -815,6 +817,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         task = task_lib.Task.from_yaml_str(self.yaml_content)
         self._spot_placer: Optional[spot_placer.SpotPlacer] = (
             spot_placer.SpotPlacer.from_task(spec, task))
+        self._fill_skip_last_log_time: float = 0.0
         # TODO(tian): Store launch/down request id in the replica table, to make
         # the manager more persistent.
         self._launch_thread_pool: thread_utils.ThreadSafeDict[
@@ -999,11 +1002,31 @@ class SkyPilotReplicaManager(ReplicaManager):
         replica_id: int,
         resources_override: Optional[Dict[str, Any]] = None,
         existing_replica_infos: Optional[List['ReplicaInfo']] = None,
-    ) -> None:
+    ) -> bool:
+        """Enqueue one replica launch.
+
+        Returns whether a launch was actually enqueued: a zero-cost-only
+        fill launch is skipped when no zero-cost location is ACTIVE, and
+        the skip must leak nothing -- no replica row, no launch thread.
+        """
         if replica_id in self._launch_thread_pool:
             logger.warning(f'Launch thread for replica {replica_id} '
                            'already exists. Skipping.')
-            return
+            return False
+        # [boltz fork] Reserved-capacity fill scale-ups carry a sentinel
+        # override key restricting the launch to zero-cost locations. Pop
+        # it on a COPY: the caller may reuse the dict, and the popped copy
+        # is what gets persisted on the ReplicaInfo row -- the recovery
+        # re-drive relaunches with the recorded (location-pinned) override
+        # and must not re-enter the fill-selection path.
+        zero_cost_only = False
+        if (resources_override is not None and
+                serve_constants.RESERVED_CAPACITY_FILL_OVERRIDE_KEY
+                in resources_override):
+            resources_override = dict(resources_override)
+            resources_override.pop(
+                serve_constants.RESERVED_CAPACITY_FILL_OVERRIDE_KEY)
+            zero_cost_only = True
         logger.info(f'Launching replica {replica_id}...')
         cluster_name = serve_utils.generate_replica_cluster_name(
             self._service_name, replica_id)
@@ -1012,7 +1035,18 @@ class SkyPilotReplicaManager(ReplicaManager):
         use_spot = _should_use_spot(self.yaml_content, resources_override)
         retry_until_up = True
         location = None
-        if self._spot_placer is not None and use_spot:
+        if zero_cost_only and self._spot_placer is None:
+            # Defensive: fill decisions are only emitted while the capacity
+            # poller runs, which requires a placer. Without one there is no
+            # way to guarantee zero-cost placement -- skip rather than risk
+            # a paid launch.
+            self._log_fill_skip('no spot placer available to pin a '
+                                'zero-cost-only fill launch')
+            return False
+        # A fill launch must reach the placer even though zero-cost k8s
+        # entries are use_spot=False (the _should_use_spot gate above keys
+        # on the task/override spot-ness, which says nothing about fill).
+        if self._spot_placer is not None and (use_spot or zero_cost_only):
             # For spot placer, we don't retry until up so any launch failed
             # due to availability issue will be handled by the placer.
             retry_until_up = False
@@ -1036,8 +1070,23 @@ class SkyPilotReplicaManager(ReplicaManager):
                 spot_location = info.get_spot_location()
                 if spot_location is not None:
                     current_spot_locations.append(spot_location)
-            location = self._spot_placer.select_next_location(
-                current_spot_locations)
+            if zero_cost_only:
+                # The no-spill guarantee: a fill launch either lands on a
+                # zero-cost ACTIVE location or does not happen at all --
+                # checked BEFORE any replica row is persisted, so an
+                # aborted fill launch leaks nothing and the autoscaler
+                # simply retries on a later tick as capacity frees.
+                zero_cost_location = (
+                    self._spot_placer.select_next_zero_cost_location(
+                        current_spot_locations))
+                if zero_cost_location is None:
+                    self._log_fill_skip(
+                        'no ACTIVE zero-cost location available')
+                    return False
+                location = zero_cost_location
+            else:
+                location = self._spot_placer.select_next_location(
+                    current_spot_locations)
             resources_override.update(location.to_dict())
             # The location dictates the actual spot-ness of THIS launch
             # (a zero-cost reserved location is non-spot even though the
@@ -1075,6 +1124,23 @@ class SkyPilotReplicaManager(ReplicaManager):
         # Don't start right now; we will start it later in _refresh_thread_pool
         # to avoid too many sky.launch running at the same time.
         self._launch_thread_pool[replica_id] = t
+        return True
+
+    def _log_fill_skip(self, reason: str) -> None:
+        """Rate-limited skip log for aborted reserved-capacity fill launches.
+
+        A tick can carry a whole batch of fill scale-ups; when the
+        zero-cost tier is benched every one of them skips with the same
+        reason, every tick, until capacity frees -- log at INFO once per
+        window and DEBUG otherwise.
+        """
+        now = time.time()
+        if now - self._fill_skip_last_log_time >= (
+                _FILL_SKIP_LOG_INTERVAL_SECONDS):
+            self._fill_skip_last_log_time = now
+            logger.info(f'Reserved-capacity fill launch skipped: {reason}.')
+        else:
+            logger.debug(f'Reserved-capacity fill launch skipped: {reason}.')
 
     def _scale_up_one_locked(
             self, resources_override: Optional[Dict[str, Any]]) -> None:
@@ -1092,8 +1158,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                            'durable replica row; skipping it to avoid '
                            'clobbering a live replica.')
             self._next_replica_id += 1
-        self._launch_replica(self._next_replica_id, resources_override)
-        self._next_replica_id += 1
+        # An aborted launch (zero-cost-only fill with no ACTIVE zero-cost
+        # location) consumed nothing: keep the id free for the next
+        # scale-up.
+        if self._launch_replica(self._next_replica_id, resources_override):
+            self._next_replica_id += 1
 
     @with_lock
     def scale_up(self,
