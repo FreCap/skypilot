@@ -1421,7 +1421,7 @@ class TestPlacerSkipZeroCostPreference(unittest.TestCase):
 class TestBrokerPollerCycle(unittest.TestCase):
     """The broker cycle claims, reads the round, and feeds grant + epoch."""
 
-    def _run_cycle(self, allocation, zero_cost=None):
+    def _run_cycle(self, allocation, zero_cost=None, replica_infos=()):
         autoscaler = _make_autoscaler(min_replicas=1)
         if zero_cost is None:
             zero_cost = [spot_placer.Location.from_pickleable(_K8S_KEY)]
@@ -1431,7 +1431,7 @@ class TestBrokerPollerCycle(unittest.TestCase):
         keys = [location.to_pickleable() for location in zero_cost]
         with mock.patch.object(reserved_capacity.serve_state,
                                'get_replica_infos',
-                               return_value=[]), \
+                               return_value=list(replica_infos)), \
              mock.patch.object(reserved_capacity.reserved_capacity_broker,
                                'upsert_claim') as upsert_mock, \
              mock.patch.object(reserved_capacity.reserved_capacity_broker,
@@ -1442,6 +1442,23 @@ class TestBrokerPollerCycle(unittest.TestCase):
             reserved_capacity._broker_cycle(autoscaler, placer, 'svc',
                                             zero_cost, keys)
         return autoscaler, upsert_mock, remove_mock, round_mock
+
+    def test_unseeded_autoscaler_still_heartbeats_holdings(self):
+        # Respawn path whose best-effort boot seed failed: the cycle must
+        # seed the location set itself before counting, or the heartbeat
+        # under-reports holdings as 0 and the broker reads a holdings
+        # SHRINK -- cutting peers' grants past the down-damping on a pure
+        # reporting artifact.
+        holder = _replica(1, _K8S_KEY)
+        holder.reserved_fill = True
+        allocation = reserved_capacity_broker.Allocation(grant=3,
+                                                         feed=0,
+                                                         round_id=1,
+                                                         epoch=1,
+                                                         snapshot_time=1.0)
+        _, upsert_mock, _, _ = self._run_cycle(allocation,
+                                               replica_infos=[holder])
+        self.assertEqual(upsert_mock.call_args.kwargs['holdings_fill'], 1)
 
     def test_allocation_feeds_grant_and_epoch(self):
         allocation = reserved_capacity_broker.Allocation(grant=3,

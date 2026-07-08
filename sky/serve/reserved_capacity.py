@@ -185,6 +185,12 @@ def _broker_cycle(autoscaler: 'autoscalers.Autoscaler',
     (context, gpu_name), per_replica = next(iter(shapes.items()))
     pool_key = reserved_capacity_broker.make_pool_key(context, gpu_name)
     replica_infos = serve_state.get_replica_infos(service_name)
+    # Seed before counting (idempotent no-op when already seeded): after a
+    # respawn whose best-effort boot seed failed, an unseeded autoscaler
+    # counts zero holdings, and that under-report reaches the broker as a
+    # holdings SHRINK -- bypassing the two-round down-damping and cutting
+    # peers' grants on a pure reporting artifact.
+    autoscaler.seed_zero_cost_locations(keys)
     holdings_fill, holdings_demand = autoscaler.count_zero_cost_holdings(
         replica_infos)
     floor = autoscaler.reserved_fill_floor_replicas
