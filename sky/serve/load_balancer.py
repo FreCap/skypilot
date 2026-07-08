@@ -601,6 +601,21 @@ class SkyServeLoadBalancer:
         counts, not targets. Slow-changing spec fields (max_replicas,
         target qps) intentionally stay on the `serve status` path — they
         only change on `serve update`.
+
+        CONTRACT for admission readers (deliberate, do not "fix"):
+        - ready_replicas / in_flight / the occupancy aggregates describe
+          MATERIALIZED capacity only, and they are the authoritative
+          floor inputs. With reserved-capacity fill enabled, idle
+          reserved (zero-cost) machines surface here exclusively by
+          becoming ready replicas — the platform is intentionally never
+          told about unmaterialized reserved capacity, so readers need
+          no notion of it and must not grow one.
+        - target_replicas is the DEMAND-side autoscaler target, not a
+          capacity statement: under fill, ready_replicas legitimately
+          exceeds it (opportunistic zero-cost supply). Admission must
+          never use it as a floor or clamp capacity down to it — sizing
+          on target_replicas would idle exactly the free machines the
+          fill feature exists to use.
         """
         del request  # Unused.
         with self._client_pool_lock:
