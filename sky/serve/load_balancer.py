@@ -2,6 +2,7 @@
 import argparse
 import asyncio
 import contextlib
+import hmac
 import logging
 import os
 import signal
@@ -110,6 +111,52 @@ class _DrainableServer(uvicorn.Server):
             # manage signals (no graceful drain, but a correct shutdown).
             self._own_signals = False
         await self.serve()
+
+
+class _InboundAuthMiddleware:
+    """Pure-ASGI bearer gate for inbound inference requests (data-plane auth).
+
+    Implemented as raw ASGI rather than ``BaseHTTPMiddleware`` on purpose: it
+    inspects only the request headers and either short-circuits with a 401 or
+    delegates to the app, so it NEVER buffers or re-relays the response body.
+    Streaming/SSE inference responses and the catch-all proxy's slot-release
+    (generator ``finally`` + ``BackgroundTask``) pass through untouched, and the
+    hot path takes no per-request task/memory-stream overhead.
+
+    No-op when ``LB_AUTH_TOKEN_ENV_VAR`` is unset (dev / in-pod). Exempts ONLY
+    GET/HEAD on the readiness route -- any other method there falls through to
+    the (authenticated) catch-all proxy. Constant-time compare, ASCII-guarded so
+    a malformed header is a clean 401 rather than a 500.
+    """
+
+    def __init__(self, app) -> None:
+        self._app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope['type'] == 'http' and not self._authorized(scope):
+            await fastapi.responses.JSONResponse(status_code=401,
+                                                 content={
+                                                     'detail': 'Unauthorized.'
+                                                 })(scope, receive, send)
+            return
+        await self._app(scope, receive, send)
+
+    @staticmethod
+    def _authorized(scope) -> bool:
+        expected_token = serve_utils.get_lb_auth_token()
+        if expected_token is None:
+            return True
+        if (scope['method'] in ('GET', 'HEAD') and
+                scope['path'] == constants.LB_HEALTH_ENDPOINT_PATH):
+            return True
+        authorization = None
+        for name, value in scope.get('headers', []):
+            if name == b'authorization':
+                authorization = value.decode('latin-1')
+                break
+        if authorization is None or not authorization.isascii():
+            return False
+        return hmac.compare_digest(authorization, f'Bearer {expected_token}')
 
 
 class SkyServeLoadBalancer:
@@ -405,6 +452,13 @@ class SkyServeLoadBalancer:
         replica_info = {}
         routing_spec = None
 
+        # Present the control-plane bearer token so the (now-authenticated)
+        # sync path accepts this LB. No-op header when auth is disabled.
+        controller_token = serve_utils.get_controller_auth_token()
+        sync_headers = ({
+            'Authorization': f'Bearer {controller_token}'
+        } if controller_token is not None else None)
+
         async with aiohttp.ClientSession() as session:
             try:
                 # Send request information
@@ -414,12 +468,20 @@ class SkyServeLoadBalancer:
                             'request_aggregator':
                                 self._request_aggregator.to_dict()
                         },
+                        headers=sync_headers,
                         timeout=aiohttp.ClientTimeout(
                             constants.LB_CONTROLLER_SYNC_TIMEOUT_SECONDS),
                 ) as response:
-                    # Clean up after reporting request info to avoid OOM.
-                    self._request_aggregator.clear()
                     response.raise_for_status()
+                    # Clean up only after the controller ACCEPTED the report
+                    # (2xx). Clearing before raise_for_status would silently
+                    # drop the batch on a failed sync (e.g. 401), starving the
+                    # autoscaler of load signal it never received. The rare
+                    # partial-failure inverse (controller counted it but the LB
+                    # saw a non-2xx) re-sends the batch, double-counting a few
+                    # timestamps -- tolerated: it biases autoscaling toward
+                    # transient over-provisioning, the safe direction.
+                    self._request_aggregator.clear()
                     response_json = await response.json()
                     replica_info = response_json.get('replica_info', {})
                     # [boltz fork] The controller ships the routing config
@@ -759,10 +821,19 @@ class SkyServeLoadBalancer:
             await asyncio.sleep(current_backoff)
 
     def run(self):
+        # Gate inbound inference requests on the shared bearer token (no-op when
+        # unset). Pure-ASGI so it wraps the catch-all proxy without buffering
+        # streaming responses; exempts the readiness probe by method+path.
+        self._app.add_middleware(_InboundAuthMiddleware)
         # Register the readiness route BEFORE the catch-all proxy route so it
         # is matched first (Starlette matches in registration order) instead of
         # being proxied to a replica.
-        self._app.add_api_route('/_lb/health', self._health, methods=['GET'])
+        self._app.add_api_route(constants.LB_HEALTH_ENDPOINT_PATH,
+                                self._health,
+                                methods=['GET'])
+        # /_lb/capacity is a data-plane read for external admission systems, so
+        # it stays behind the inbound bearer (unlike the readiness probe): the
+        # same authenticated client that sends inference reads capacity.
         self._app.add_api_route('/_lb/capacity',
                                 self._capacity,
                                 methods=['GET'])
