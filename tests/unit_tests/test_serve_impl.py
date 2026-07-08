@@ -6,7 +6,6 @@ also makes the user-visible failure mode "go run --purge" instead of "look
 at the connection-refused traceback and figure it out."
 """
 # pylint: disable=invalid-name,protected-access
-import contextlib
 from unittest import mock
 
 import pytest
