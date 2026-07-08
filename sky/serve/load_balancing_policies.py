@@ -95,6 +95,14 @@ class LoadBalancingPolicy:
                         candidates: List[str]) -> Optional[str]:
         raise NotImplementedError
 
+    def total_in_flight(self) -> Optional[int]:
+        """Total in-flight requests across ready replicas, when tracked.
+
+        None for policies without load accounting (round robin): the
+        capacity endpoint reports it as unknown rather than zero.
+        """
+        return None
+
     def pre_execute_hook(self, replica_url: str,
                          request: 'fastapi.Request') -> Optional[Any]:
         """Account an in-flight request. Returns an opaque token that the
@@ -164,6 +172,12 @@ class LeastLoadPolicy(LoadBalancingPolicy, name='least_load', default=True):
                     # decrement the fresh counter (ABA).
                     self._generation[replica] += 1
                     self.load_map[replica] = 0
+
+    def total_in_flight(self) -> Optional[int]:
+        with self.lock:
+            return sum(
+                self.load_map.get(replica, 0)
+                for replica in self.ready_replicas)
 
     def _select_replica(self, request: 'fastapi.Request',
                         candidates: List[str]) -> Optional[str]:
