@@ -323,12 +323,13 @@ class Autoscaler:
         """Overlay zero-cost capacity fill onto the demand decisions.
 
         fill_target = (nonterminal replicas already on a zero-cost
-        location) + (fresh damped free slots), clamped to max_replicas
-        but deliberately NOT floored by min_replicas -- an empty free
-        tier must not assert a floor. target_num_replicas and thus the
-        controller's capacity hint stay DEMAND-ONLY: fill replicas are
-        opportunistic supply, and the platform's spill logic must not
-        read them as demand.
+        location) + (spendable free slots: fresh damped free slots minus
+        launched-but-not-READY latest zero-cost replicas), clamped to
+        max_replicas but deliberately NOT floored by min_replicas -- an
+        empty free tier must not assert a floor. target_num_replicas and
+        thus the controller's capacity hint stay DEMAND-ONLY: fill
+        replicas are opportunistic supply, and the platform's spill
+        logic must not read them as demand.
 
         - Surplus scale-ups beyond max(current, demand target) carry the
           sentinel override so the launch path pins them to zero-cost
@@ -343,16 +344,54 @@ class Autoscaler:
         """
         if not self.reserved_capacity_fill:
             return decisions
+        # Zero-cost accounting is version-asymmetric by design:
+        # - The LAUNCH math counts latest-version zero-cost replicas
+        #   only: its baseline below is max(num_latest_nonterminal,
+        #   demand_target), which is latest-only, so old-version
+        #   zero-cost replicas (a rolling update draining its previous
+        #   fleet) would inflate the launch target by replicas the
+        #   baseline never sees -- compounding fill launches every tick.
+        # - The SUPPRESSION math keeps the ALL-version count: every
+        #   existing zero-cost replica occupies free-tier capacity
+        #   regardless of version and deserves shelter from DEMAND
+        #   scale-downs; sheltering is bounded by the victims actually
+        #   present (demand victims are latest-version, and the
+        #   outdated-version drain bypasses this overlay entirely).
         zero_cost_count = 0
+        zero_cost_latest = 0
+        zero_cost_not_ready_latest = 0
         num_latest_nonterminal = 0
         for info in replica_infos:
             if info.is_terminal:
                 continue
-            if info.version == self.latest_version:
+            is_latest = info.version == self.latest_version
+            if is_latest:
                 num_latest_nonterminal += 1
             if self._replica_on_zero_cost_location(info):
                 zero_cost_count += 1
-        fill_target = min(zero_cost_count + self._fresh_fill_free_slots(),
+                if is_latest:
+                    zero_cost_latest += 1
+                    if not info.is_ready:
+                        zero_cost_not_ready_latest += 1
+        # Three defense layers keep fill launches within physical free
+        # capacity:
+        # 1. Emission-time spend (below): free-slot memory is deducted
+        #    the moment launch decisions are emitted, covering the
+        #    intra-poll window.
+        # 2. Not-ready subtraction (here): launched-but-not-READY latest
+        #    zero-cost replicas occupy slots even while their pods are
+        #    invisible to the poller (launch threads can queue for
+        #    multiple poll intervals), so they are subtracted from the
+        #    spendable free level. This may overlap with slots the
+        #    poller already excluded once pods bind; subtracting is the
+        #    conservative direction -- never over-launch, worst case
+        #    under-fill for one poll.
+        # 3. Poll re-sync: subsequent snapshots restore the true level
+        #    (immediately on decrease, two-poll damped on increase).
+        spendable_free_slots = max(
+            0,
+            self._fresh_fill_free_slots() - zero_cost_not_ready_latest)
+        fill_target = min(zero_cost_count + spendable_free_slots,
                           self.max_replicas)
         self._fill_target = fill_target
         demand_target = self.get_final_target_num_replicas()
@@ -379,12 +418,19 @@ class Autoscaler:
                     num_suppressed += 1
                     continue
             result.append(decision)
-        num_fill_up = fill_target - max(num_latest_nonterminal, demand_target)
+        # Launch target: latest-version zero-cost replicas only (see the
+        # version-asymmetry note above), against the latest-only
+        # baseline.
+        fill_target_launch = min(zero_cost_latest + spendable_free_slots,
+                                 self.max_replicas)
+        num_fill_up = (fill_target_launch -
+                       max(num_latest_nonterminal, demand_target))
         if num_fill_up > 0:
-            logger.info(f'Reserved-capacity fill: target {fill_target} '
-                        f'(zero-cost replicas {zero_cost_count} + free '
-                        f'slots {self._fresh_fill_free_slots()}), demand '
-                        f'target {demand_target}; scaling up {num_fill_up} '
+            logger.info(f'Reserved-capacity fill: launch target '
+                        f'{fill_target_launch} (latest zero-cost replicas '
+                        f'{zero_cost_latest} + spendable free slots '
+                        f'{spendable_free_slots}), demand target '
+                        f'{demand_target}; scaling up {num_fill_up} '
                         'zero-cost-only replica(s).')
             result.extend(
                 _generate_scale_up_decisions(

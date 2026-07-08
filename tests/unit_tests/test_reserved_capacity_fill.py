@@ -234,6 +234,103 @@ class TestMultiTickSlotSpending(unittest.TestCase):
         self.assertEqual(autoscaler.info()['fill_free_slots'], 0)
 
 
+def _fill_ups(decisions):
+    return [d for d in _ups(decisions) if d.target == {_FILL_KEY: True}]
+
+
+class TestVersionAwareLaunchBaseline(unittest.TestCase):
+    """Old-version zero-cost replicas never inflate fill launches.
+
+    The launch baseline (max(latest nonterminal, demand target)) is
+    latest-version-only, so the zero-cost count feeding the launch math
+    must be too -- otherwise a rolling update's draining old fleet
+    compounds fill launches every tick.
+    """
+
+    def test_rolling_update_zero_free_no_fill_launches(self):
+        autoscaler = autoscalers.RequestRateAutoscaler('svc',
+                                                       _spec(min_replicas=2,
+                                                             max_replicas=20),
+                                                       version=2)
+        _feed(autoscaler, 0)
+        # 5 old-version zero-cost replicas still draining; the reserved
+        # capacity they occupy polls as 0 free.
+        replicas = [_replica(i, _K8S_KEY, version=1) for i in range(1, 6)]
+        next_id = 100
+        for _ in range(3):
+            decisions = autoscaler.generate_scaling_decisions(replicas, [1])
+            self.assertEqual(len(_fill_ups(decisions)), 0)
+            # Demand launches persist rows immediately at the latest
+            # version, pinned to the zero-cost location.
+            for decision in _ups(decisions):
+                if decision.target != {_FILL_KEY: True}:
+                    replicas.append(
+                        _replica(next_id,
+                                 _K8S_KEY,
+                                 status=serve_state.ReplicaStatus.PROVISIONING,
+                                 version=2))
+                    next_id += 1
+
+    def test_old_zero_cost_replicas_do_not_inflate_free_slot_fill(self):
+        autoscaler = autoscalers.RequestRateAutoscaler('svc',
+                                                       _spec(min_replicas=1,
+                                                             max_replicas=20),
+                                                       version=2)
+        _feed(autoscaler, 3)
+        replicas = [_replica(i, _K8S_KEY, version=1) for i in range(1, 6)]
+        decisions = autoscaler.generate_scaling_decisions(replicas, [1])
+        # Latest zero-cost 0 + 3 free slots, demand target 1: fill ups
+        # bounded by the free slots (2 fill + 1 demand), NOT inflated to
+        # 5 old + 3 free by the draining old-version fleet.
+        self.assertEqual(len(_fill_ups(decisions)), 2)
+
+
+class TestPendingReplicasOccupySlots(unittest.TestCase):
+    """Not-yet-READY fill replicas keep their slots spent across polls.
+
+    Launch threads can queue past the two-poll damping window; while the
+    pods are invisible to the poller, raw polls keep reporting the
+    pre-launch free level and damping re-raises the damped value. The
+    pending rows must be treated as occupying those slots.
+    """
+
+    def test_unchanged_polls_with_pending_rows_emit_no_more_fills(self):
+        autoscaler = _make_autoscaler(min_replicas=0, max_replicas=20)
+        _feed(autoscaler, 5)
+        first = _decisions(autoscaler, [])
+        self.assertEqual(len(_fill_ups(first)), 5)
+        # Rows persist immediately, pods not created yet (not READY).
+        replicas = [
+            _replica(i, _K8S_KEY, status=serve_state.ReplicaStatus.PROVISIONING)
+            for i in range(1, 6)
+        ]
+        # Two more polls still see the pre-launch level: damping re-raises
+        # the damped free value, but the 5 pending rows occupy the slots.
+        _feed(autoscaler, 5, polls=2)
+        second = _decisions(autoscaler, replicas)
+        self.assertEqual(len(_fill_ups(second)), 0)
+
+    def test_steady_state_once_pending_turn_ready(self):
+        autoscaler = _make_autoscaler(min_replicas=0, max_replicas=20)
+        _feed(autoscaler, 5)
+        self.assertEqual(len(_fill_ups(_decisions(autoscaler, []))), 5)
+        replicas = [
+            _replica(i, _K8S_KEY, status=serve_state.ReplicaStatus.PROVISIONING)
+            for i in range(1, 6)
+        ]
+        _feed(autoscaler, 5, polls=2)  # pods still invisible
+        self.assertEqual(len(_fill_ups(_decisions(autoscaler, replicas))), 0)
+        # Pods bind and turn READY; the poller now sees the slots taken
+        # (decrease applies immediately).
+        replicas = [_replica(i, _K8S_KEY) for i in range(1, 6)]
+        _feed(autoscaler, 0, polls=1)
+        for _ in range(2):
+            decisions = _decisions(autoscaler, replicas)
+            # Steady state: no new fills, no scale-down of the fill
+            # fleet (no oscillation).
+            self.assertEqual(decisions, [])
+
+
 class TestVictimAwareSuppression(unittest.TestCase):
     """Only zero-cost victims are sheltered; paid downs always pass."""
 
