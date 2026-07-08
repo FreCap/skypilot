@@ -471,7 +471,7 @@ class ReplicaStatusProperty:
 class ReplicaInfo:
     """Replica info for each replica."""
 
-    _VERSION = 3
+    _VERSION = 4
 
     def __init__(self, replica_id: int, cluster_name: str, replica_port: str,
                  is_spot: bool, location: Optional[spot_placer.Location],
@@ -482,6 +482,14 @@ class ReplicaInfo:
         self.cluster_name: str = cluster_name
         self.version: int = version
         self.replica_port: str = replica_port
+        # Row creation time, set the moment the row object is built (before
+        # the row is persisted or any launch/pod exists), so it is present
+        # for every nonterminal status including PROVISIONING. The
+        # reserved-capacity fill overlay compares it against its free-slot
+        # snapshot time to debit replicas that landed on the zero-cost tier
+        # after the snapshot was taken (see
+        # Autoscaler._fill_row_occupies_free_slot).
+        self.created_at: Optional[float] = time.time()
         self.first_not_ready_time: Optional[float] = None
         self.consecutive_failure_times: List[float] = []
         self.status_property: ReplicaStatusProperty = ReplicaStatusProperty()
@@ -733,6 +741,15 @@ class ReplicaInfo:
 
         if version < 2:
             self.resources_override = None
+
+        if version < 4:
+            # Pre-upgrade rows carry no creation time. None deliberately
+            # reads as "older than any fill snapshot" in
+            # Autoscaler._fill_row_occupies_free_slot: these rows predate
+            # the build, their bound pods are already excluded by fresh
+            # polls, and treating them as new would debit free slots for
+            # their whole lifetime.
+            self.created_at = None
 
         self.__dict__.update(state)
         self._version = version if version >= 0 else 0

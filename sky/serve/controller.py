@@ -100,6 +100,18 @@ class SkyServeController:
         # but gets its poller on the next controller respawn.
         self._reserved_capacity_fill_enabled: bool = bool(
             getattr(service_spec, 'reserved_capacity_fill', False))
+        # Seed the zero-cost location set synchronously, before run()
+        # starts the autoscaler thread: a respawned controller's
+        # autoscaler boots with empty fill state (from_spec above; there
+        # is no cross-process dump/load) and its first decision tick can
+        # beat the first poll by a lot (per-location cost warm-up + the
+        # cluster-wide realtime query). Without the seed, a QPS-family
+        # autoscaler's first tick computes target=min_replicas from its
+        # empty window and, with zero_cost_count=0, suppression cannot
+        # shelter the live fill fleet -- the whole fill surplus would be
+        # mass-terminated. Seeding grants NO free slots (snapshot time
+        # stays None), so no new fill launches until the first real poll.
+        self._seed_fill_zero_cost_locations(self._autoscaler)
         self._host = host
         self._port = port
         # [boltz fork] Cache of replica_id -> (url, gpu_type, gpu_count)
@@ -127,6 +139,29 @@ class SkyServeController:
             handler.setFormatter(sky_logging.FORMATTER)
             handler.addFilter(AutoscalerInfoFilter())
         yield
+
+    def _seed_fill_zero_cost_locations(
+            self, autoscaler: autoscalers.Autoscaler) -> None:
+        """Seed an autoscaler's zero-cost location set from the placer.
+
+        Spec-derived and cheap by construction: zero_cost_locations()
+        computes per-location costs via the placer's cache, which reads
+        local catalog files only (never the Kubernetes API), so it is
+        safe to call synchronously at boot / inside update_service. The
+        seed only sets the location identity set (no free slots, no
+        snapshot time), and an already-populated set (e.g. loaded from a
+        dump) is never overwritten -- see
+        Autoscaler.seed_zero_cost_locations.
+        """
+        if not autoscaler.reserved_capacity_fill:
+            return
+        placer = getattr(self._replica_manager, '_spot_placer', None)
+        if placer is None:
+            return
+        autoscaler.seed_zero_cost_locations([
+            location.to_pickleable()
+            for location in placer.zero_cost_locations()
+        ])
 
     def _get_lb_replica_info(
         self, replica_infos: List['replica_managers.ReplicaInfo']
@@ -498,11 +533,24 @@ class SkyServeController:
                     new_autoscaler.update_version(version,
                                                   service,
                                                   update_mode=update_mode)
+                    # Seed BEFORE publishing: if the old autoscaler's dump
+                    # carried no fill state (build predating the feature,
+                    # or fill just enabled), the replacement would
+                    # otherwise take decision ticks with an empty zero-cost
+                    # set until the next poll -- one tick with suppression
+                    # off can terminate the whole fill fleet. A dump that
+                    # did carry locations wins (the seed never overwrites).
+                    self._seed_fill_zero_cost_locations(new_autoscaler)
                     self._autoscaler = new_autoscaler
                 else:
                     self._autoscaler.update_version(version,
                                                     service,
                                                     update_mode=update_mode)
+                    # An update can newly enable the fill flag on the
+                    # retained autoscaler; give it the location set so
+                    # suppression works before the (respawn-gated) poller
+                    # exists. No-op when already populated.
+                    self._seed_fill_zero_cost_locations(self._autoscaler)
                 return responses.JSONResponse(content={'message': 'Success'},
                                               status_code=200)
             except Exception as e:  # pylint: disable=broad-except

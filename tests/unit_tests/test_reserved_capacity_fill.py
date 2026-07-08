@@ -60,7 +60,11 @@ def _make_autoscaler(**spec_kwargs):
 def _replica(replica_id,
              location_key=None,
              status=serve_state.ReplicaStatus.READY,
-             version=1):
+             version=1,
+             created_at=None):
+    # created_at=None mirrors a pre-upgrade pickled row (treated as older
+    # than any fill snapshot); pass a float to model a row created at a
+    # known time relative to the snapshot.
     info = mock.Mock()
     info.replica_id = replica_id
     info.version = version
@@ -68,6 +72,7 @@ def _replica(replica_id,
     info.is_terminal = status in serve_state.ReplicaStatus.terminal_statuses()
     info.is_ready = status == serve_state.ReplicaStatus.READY
     info.cluster_name = f'cluster-{replica_id}'
+    info.created_at = created_at
     info.status_property.unrecoverable_failure.return_value = False
     info.get_spot_location.return_value = (
         spot_placer.Location.from_pickleable(location_key))
@@ -350,6 +355,165 @@ class TestVictimAwareSuppression(unittest.TestCase):
         # demand 1 = 3) covers both, but only the zero-cost victim (2)
         # may be sheltered: the paid down (3) must pass through.
         self.assertEqual([d.target for d in _downs(decisions)], [3])
+
+
+class TestPostSnapshotZeroCostDebit(unittest.TestCase):
+    """Zero-cost rows created after the snapshot occupy free slots.
+
+    A DEMAND launch placed on the zero-cost tier that binds AND turns
+    READY within one inter-poll gap escapes the not-READY debit, yet the
+    slot it sits on was counted free when the snapshot was taken: it
+    must be subtracted from the spendable level regardless of readiness.
+    """
+
+    def test_ready_within_gap_debits_slot(self):
+        autoscaler = _make_autoscaler(min_replicas=1, max_replicas=10)
+        ts = time.time()
+        _feed(autoscaler, 3, timestamp=ts)
+        # Demand launch landed zero-cost and turned READY after the
+        # snapshot, before the next poll.
+        replicas = [_replica(1, _K8S_KEY, created_at=ts + 1)]
+        decisions = _decisions(autoscaler, replicas)
+        # Spendable 3 - 1 occupied = 2 fill ups (not 3).
+        self.assertEqual(len(_fill_ups(decisions)), 2)
+        self.assertEqual(len(_ups(decisions)), 2)
+        self.assertEqual(len(_downs(decisions)), 0)
+
+    def test_pre_snapshot_ready_row_not_debited(self):
+        # A READY row older than the snapshot has a bound pod the poll
+        # already excluded: debiting it again would double-subtract.
+        autoscaler = _make_autoscaler(min_replicas=1, max_replicas=10)
+        ts = time.time()
+        _feed(autoscaler, 3, timestamp=ts)
+        replicas = [_replica(1, _K8S_KEY, created_at=ts - 100)]
+        decisions = _decisions(autoscaler, replicas)
+        self.assertEqual(len(_fill_ups(decisions)), 3)
+
+    def test_row_without_created_at_treated_as_pre_snapshot(self):
+        # Pre-upgrade pickled rows carry created_at=None: always-debiting
+        # them would under-fill for their whole lifetime.
+        autoscaler = _make_autoscaler(min_replicas=1, max_replicas=10)
+        _feed(autoscaler, 3)
+        replicas = [_replica(1, _K8S_KEY, created_at=None)]
+        decisions = _decisions(autoscaler, replicas)
+        self.assertEqual(len(_fill_ups(decisions)), 3)
+
+    def test_not_ready_and_post_snapshot_debited_once(self):
+        # A row that is BOTH not READY and created after the snapshot
+        # matches both clauses of the debit rule but occupies one slot:
+        # it must be subtracted exactly once.
+        autoscaler = _make_autoscaler(min_replicas=1, max_replicas=10)
+        ts = time.time()
+        _feed(autoscaler, 3, timestamp=ts)
+        replicas = [
+            _replica(1,
+                     _K8S_KEY,
+                     status=serve_state.ReplicaStatus.PROVISIONING,
+                     created_at=ts + 1)
+        ]
+        decisions = _decisions(autoscaler, replicas)
+        # Spendable 3 - 1 = 2 (double subtraction would leave 1).
+        self.assertEqual(len(_fill_ups(decisions)), 2)
+
+
+class TestBootSeeding(unittest.TestCase):
+    """Respawn: a seeded location set protects the fill fleet at tick 0.
+
+    A respawned controller's autoscaler starts with empty fill state and
+    can tick before the first (slow) poll; seeding only the zero-cost
+    location set makes suppression work immediately while granting no
+    free slots.
+    """
+
+    def _fleet(self):
+        return [
+            _replica(1, _K8S_KEY),
+            _replica(2, _K8S_KEY),
+            # Paid replica with the highest id: first demand victim.
+            _replica(3),
+        ]
+
+    def test_seeded_fresh_autoscaler_shelters_fill_on_first_tick(self):
+        autoscaler = _make_autoscaler(min_replicas=1)
+        autoscaler.seed_zero_cost_locations([_K8S_KEY])
+        # First tick, before any collect_reserved_capacity: the paid
+        # down passes, the zero-cost victim is sheltered.
+        decisions = _decisions(autoscaler, self._fleet())
+        self.assertEqual([d.target for d in _downs(decisions)], [3])
+        # No free slots granted by seeding: no fill launches either.
+        self.assertEqual(len(_ups(decisions)), 0)
+        self.assertIsNone(autoscaler._fill_snapshot_time)
+        self.assertEqual(autoscaler.info()['fill_free_slots'], 0)
+
+    def test_unseeded_fresh_autoscaler_terminates_fleet(self):
+        # The failure mode the seed prevents: with an empty location set
+        # every zero-cost victim is fair game on the first tick.
+        autoscaler = _make_autoscaler(min_replicas=1)
+        decisions = _decisions(autoscaler, self._fleet())
+        self.assertEqual(len(_downs(decisions)), 2)
+
+    def test_seed_never_overwrites_loaded_locations(self):
+        old = _make_autoscaler()
+        _feed(old, 3)
+        fresh = _make_autoscaler()
+        fresh.load_dynamic_states(old.dump_dynamic_states())
+        fresh.seed_zero_cost_locations([dict(_K8S_KEY, region='other-ctx')])
+        self.assertEqual(fresh._fill_zero_cost_locations,
+                         [spot_placer.Location.from_pickleable(_K8S_KEY)])
+
+
+class TestControllerSeeding(unittest.TestCase):
+    """Controller-side seeding: boot / update_service swap wiring."""
+
+    def _make_controller(self, autoscaler, placer):
+        # pylint: disable=import-outside-toplevel
+        from sky.serve import controller as controller_lib
+        ctrl = controller_lib.SkyServeController.__new__(
+            controller_lib.SkyServeController)
+        ctrl._autoscaler = autoscaler
+        ctrl._replica_manager = types.SimpleNamespace(_spot_placer=placer)
+        return ctrl
+
+    def _placer(self):
+        placer = mock.Mock()
+        placer.zero_cost_locations.return_value = [
+            spot_placer.Location.from_pickleable(_K8S_KEY)
+        ]
+        return placer
+
+    def test_swap_without_fill_state_gets_seeded(self):
+        # update_service swap where the old autoscaler's dump carried no
+        # fill state (build predating the feature): the replacement must
+        # still shelter the fill fleet on its first tick.
+        new = _make_autoscaler(min_replicas=1)
+        new.load_dynamic_states({
+            'latest_version_ever_ready': 1,
+            'request_timestamps': [],
+        })
+        ctrl = self._make_controller(new, self._placer())
+        ctrl._seed_fill_zero_cost_locations(new)
+        replicas = [
+            _replica(1, _K8S_KEY),
+            _replica(2, _K8S_KEY),
+            _replica(3),
+        ]
+        decisions = _decisions(new, replicas)
+        self.assertEqual([d.target for d in _downs(decisions)], [3])
+        self.assertIsNone(new._fill_snapshot_time)
+
+    def test_flag_off_does_not_seed(self):
+        autoscaler = _make_autoscaler(fill=False)
+        placer = self._placer()
+        ctrl = self._make_controller(autoscaler, placer)
+        ctrl._seed_fill_zero_cost_locations(autoscaler)
+        self.assertEqual(autoscaler._fill_zero_cost_locations, [])
+        placer.zero_cost_locations.assert_not_called()
+
+    def test_no_placer_does_not_seed(self):
+        autoscaler = _make_autoscaler()
+        ctrl = self._make_controller(autoscaler, placer=None)
+        ctrl._seed_fill_zero_cost_locations(autoscaler)
+        self.assertEqual(autoscaler._fill_zero_cost_locations, [])
 
 
 class TestDumpLoadFillState(unittest.TestCase):
@@ -642,6 +806,10 @@ class TestFillLaunchPath(unittest.TestCase):
         self.assertEqual(info.resources_override['region'], 'research-ctx')
         self.assertIs(info.is_spot, False)
         self.assertEqual(manager._next_replica_id, 8)
+        # The persisted row carries its creation time from the start
+        # (PROVISIONING included): the fill overlay's post-snapshot debit
+        # relies on it.
+        self.assertIsNotNone(info.created_at)
 
     def test_sentinel_without_placer_aborts(self):
         manager = self._make_manager(placer=None)
