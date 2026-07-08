@@ -180,6 +180,7 @@ class SkyServeLoadBalancer:
     _reject_fallback_seq: int = 0
     _capacity_hint: Optional[Dict[str, Any]] = None
     _draining_clients: Optional[Dict[str, List[httpx.AsyncClient]]] = None
+    _occupancy_capable: Optional[Set[str]] = None
 
     def __init__(
         self,
@@ -487,30 +488,62 @@ class SkyServeLoadBalancer:
             status_code=200 if self._is_ready_to_serve() else 503)
 
     def _in_flight_with_draining(self) -> Optional[Dict[str, int]]:
-        """Per-url in-flight snapshot including pruned-but-draining work.
+        """Per-url busyness snapshot: envelopes, occupancy, and draining.
 
-        The policy's load_map drops a url the moment it leaves the
-        routable set, but the requests already running on that replica
-        keep running on its draining client (see
-        _drain_and_close_client) -- for synchronous predictions, up to
-        an hour. Without this overlay a probe-blipped replica vanishes
-        from the in-flight report one sync after the blip, reads as
-        idle to the autoscaler, and becomes a preferred scale-down
-        victim mid-job. Draining counts never double the policy's: a
-        pruned url's streams released (or generation-stale-dropped)
-        their load_map slot at prune time, and a re-added url's NEW
-        client tracks its requests in the load_map while the OLD
-        draining client only carries the pre-blip streams.
+        Three measures of the same running jobs, unioned:
+        - The policy's envelope in-flight (load_map) covers synchronous
+          requests dispatched through this LB.
+        - The replica-reported async occupancy covers fast-ack
+          workloads, where the HTTP envelope closes in milliseconds and
+          the load_map reads ~0 while the replica crunches for an hour.
+          Per-url MAX with the envelope count, never sum: a job awaiting
+          its fast-ack (in the envelope count) may already appear in
+          occupancy -- the same job must count once.
+        - The draining overlay covers pruned-but-draining urls: the
+          load_map drops a url the moment it leaves the routable set,
+          but requests already running keep running on its draining
+          client (see _drain_and_close_client). Without it, a
+          probe-blipped replica vanishes from the report one sync after
+          the blip, reads as idle to the autoscaler, and becomes a
+          preferred scale-down victim mid-job. Draining counts add to
+          (not max with) the url's total: a re-added url's NEW client
+          tracks its fresh requests in the load_map while the OLD
+          draining client only carries the pre-blip streams -- distinct
+          requests.
         """
         with self._client_pool_lock:
             in_flight = self._load_balancing_policy.snapshot_in_flight()
+            occupancy = dict(self._replica_occupancy)
+            capable = set(self._occupancy_capable or ())
         if in_flight is None:
             return None
+        # Fold draining refcounts into the envelope totals first: a
+        # draining client's streams and the current client's are
+        # DISJOINT request sets on the same replica, so they add.
         for url, clients in (self._draining_clients or {}).items():
             draining = sum(
                 getattr(client, _INFLIGHT_ATTR, 0) for client in clients)
             if draining > 0:
                 in_flight[url] = in_flight.get(url, 0) + draining
+        # Occupancy supersedes the envelope view where known: it counts
+        # jobs RUNNING on the replica regardless of which client (or
+        # which LB incarnation) delivered them, so per-url MAX with the
+        # envelope total -- never sum -- keeps one job from counting as
+        # both an open envelope and an occupancy unit (a just-pruned
+        # url's probe entry survives until the next round and would
+        # otherwise double its still-draining stream).
+        for url, running in occupancy.items():
+            if running > in_flight.get(url, 0):
+                in_flight[url] = running
+        # An occupancy-CAPABLE url absent from this round's probe is
+        # UNKNOWN, not idle: its envelope count is meaningless for
+        # fast-ack work, and reporting the explicit envelope zero would
+        # bypass the autoscaler's missing-entry-means-busy protection
+        # and let a drain kill it mid-job. Omit it so the autoscaler
+        # sees no entry.
+        for url in capable:
+            if url not in occupancy and url in in_flight:
+                del in_flight[url]
         return in_flight
 
     def _prune_reject_window(self) -> Dict[str, float]:
@@ -587,23 +620,25 @@ class SkyServeLoadBalancer:
             probed_replicas = len(probed)
             busy_replicas = sum(1 for free in probed.values() if free <= 0)
             free_slots = sum(probed.values())
-        # Includes pruned-but-draining work: those requests still occupy
-        # replica capacity, which is what an admission reader sizes by.
-        # (Called outside the pool lock — it acquires the lock itself.)
+        # Envelope in-flight unioned with occupancy per url (max, same
+        # jobs measured two ways) and including pruned-but-draining work:
+        # those requests still occupy replica capacity, which is what an
+        # admission reader sizes by. (Called outside the pool lock -- it
+        # acquires the lock itself.)
         in_flight_map = self._in_flight_with_draining()
         in_flight = (sum(in_flight_map.values())
                      if in_flight_map is not None else None)
         last_sync_age: Optional[float] = None
         if self._last_sync_time is not None:
             last_sync_age = max(time.monotonic() - self._last_sync_time, 0.0)
-        # Capacity hint fields stay null until a controller sync carries
-        # one: an admission reader must see "unknown" (and fall back to
-        # its conservative floor) rather than zeros it would act on.
-        hint = self._capacity_hint or {}
         occupancy_probe_age: Optional[float] = None
         if self._last_occupancy_probe_time is not None:
             occupancy_probe_age = max(
                 time.monotonic() - self._last_occupancy_probe_time, 0.0)
+        # Capacity hint fields stay null until a controller sync carries
+        # one: an admission reader must see "unknown" (and fall back to
+        # its conservative floor) rather than zeros it would act on.
+        hint = self._capacity_hint or {}
         return fastapi.responses.JSONResponse({
             'ready_replicas': ready_replicas,
             'in_flight': in_flight,
@@ -615,10 +650,10 @@ class SkyServeLoadBalancer:
             'provisioning_replicas': hint.get('provisioning_replicas'),
             'target_replicas': hint.get('target_num_replicas'),
             # [boltz fork] Async-occupancy aggregates (see the probe loop).
-            # For fast-ack async fleets `in_flight` reads ~0 while replicas
-            # crunch, so admission should size on free_slots gated by
-            # occupancy_probe_age_seconds, exactly like last_sync_age gates
-            # the ready count.
+            # For fast-ack async fleets envelope-only in_flight reads ~0
+            # while replicas crunch, so admission should size on
+            # free_slots gated by occupancy_probe_age_seconds, exactly
+            # like last_sync_age gates the ready count.
             'probed_replicas': probed_replicas,
             'busy_replicas': busy_replicas,
             'free_slots': free_slots,
@@ -709,6 +744,17 @@ class SkyServeLoadBalancer:
             self._replica_occupancy = occupancy
             self._replica_free_slots = free_slots
             self._last_occupancy_probe_time = time.monotonic()
+            # A url that EVER reported occupancy is occupancy-capable:
+            # its envelope in-flight is meaningless for busyness
+            # (fast-ack jobs close the envelope in ms), so a later probe
+            # MISS for it must read as UNKNOWN -- never as the
+            # envelope's explicit zero, which would let the drain paths
+            # kill it mid-job (see _in_flight_with_draining). Pruned to
+            # urls still relevant so the set stays bounded to the fleet.
+            capable = (self._occupancy_capable or set()) | set(occupancy)
+            keep = (set(ready_urls) | set(occupancy) |
+                    set(self._draining_clients or {}))
+            self._occupancy_capable = {url for url in capable if url in keep}
             # Push into the policy under the same lock the sync loop holds
             # for policy swaps; a policy swapped after this round serves
             # without occupancy for at most one probe interval.

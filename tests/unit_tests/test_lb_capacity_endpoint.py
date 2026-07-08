@@ -24,7 +24,7 @@ def _make_balancer(policy):
     balancer._ready = True
     balancer._draining = False
     balancer._last_sync_time = time.monotonic() - 4.0
-    # Demand-feed state (normally set in __init__).
+    # Demand-feed + occupancy state (normally set in __init__).
     balancer._queue_depth = 0
     balancer._reject_last_seen = {}
     balancer._reject_fallback_seq = 0
