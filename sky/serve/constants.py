@@ -93,6 +93,24 @@ LB_CONTROLLER_SYNC_INTERVAL_SECONDS = 20
 # ready-replica list so it 503s every request even when READY replicas exist.
 LB_CONTROLLER_SYNC_TIMEOUT_SECONDS = 30
 
+# [boltz fork] Cadence of the LB's per-replica async-occupancy probe (the
+# `async_capacity` action). The HTTP-envelope in-flight accounting reads ~0
+# for fast-ack async workloads while replicas crunch hour-long jobs, so the
+# LB asks each ready replica for its true running-job count and uses it to
+# deprioritize busy replicas in routing and to report real free slots on
+# /_lb/capacity. Overridable via SKYPILOT_LB_OCCUPANCY_PROBE_INTERVAL_SECONDS
+# (<= 0 disables the probe entirely — accounting falls back to envelope-only).
+LB_OCCUPANCY_PROBE_INTERVAL_SECONDS = 10
+LB_OCCUPANCY_PROBE_INTERVAL_ENV_VAR = (
+    'SKYPILOT_LB_OCCUPANCY_PROBE_INTERVAL_SECONDS')
+
+# [boltz fork] Per-replica timeout for one occupancy probe request. The
+# action is answered by the replica's HTTP handler (the crunching happens in
+# a background thread), so a healthy replica responds in milliseconds; a
+# probe that needs seconds is indistinguishable from a dead pod and is
+# treated as "occupancy unknown" (never as busy).
+LB_OCCUPANCY_PROBE_TIMEOUT_SECONDS = 2
+
 # The maximum retry times for load balancer for each request. After changing to
 # proxy implementation, we do retry for failed requests.
 # TODO(tian): Expose this option to users in yaml file.
