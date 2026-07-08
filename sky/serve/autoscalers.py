@@ -418,22 +418,29 @@ class Autoscaler:
         """
         if not self.reserved_capacity_fill:
             return decisions
-        # Zero-cost accounting is version-asymmetric by design:
-        # - The LAUNCH math counts latest-version zero-cost replicas
-        #   only: its baseline below is max(num_latest_nonterminal,
-        #   demand_target), which is latest-only, so old-version
-        #   zero-cost replicas (a rolling update draining its previous
-        #   fleet) would inflate the launch target by replicas the
-        #   baseline never sees -- compounding fill launches every tick.
-        # - The SUPPRESSION math keeps the ALL-version count: every
-        #   existing zero-cost replica occupies free-tier capacity
-        #   regardless of version and deserves shelter from DEMAND
-        #   scale-downs; sheltering is bounded by the victims actually
-        #   present (demand victims are latest-version, and the
-        #   outdated-version drain bypasses this overlay entirely).
+        # Zero-cost accounting is version-asymmetric by design; the
+        # three roles use different version scopes:
+        # - LAUNCH BASELINE: latest-version only. The baseline below is
+        #   max(num_latest_nonterminal, demand_target), which is
+        #   latest-only, so old-version zero-cost replicas (a rolling
+        #   update draining its previous fleet) would inflate the launch
+        #   target by replicas the baseline never sees -- compounding
+        #   fill launches every tick.
+        # - OCCUPANCY DEBIT: all versions. ANY nonterminal zero-cost row
+        #   whose pod may be unbound (not READY, or created after the
+        #   snapshot) holds a claim on a slot the snapshot counted free
+        #   regardless of version -- an old-version PROVISIONING row
+        #   left out of the debit would let a fill launch collide with
+        #   its claim, fail on capacity, and bench the zero-cost tier.
+        # - SUPPRESSION: all versions. Every existing zero-cost replica
+        #   occupies free-tier capacity regardless of version and
+        #   deserves shelter from DEMAND scale-downs; sheltering is
+        #   bounded by the victims actually present (demand victims are
+        #   latest-version, and the outdated-version drain bypasses this
+        #   overlay entirely).
         zero_cost_count = 0
         zero_cost_latest = 0
-        zero_cost_occupying_latest = 0
+        zero_cost_occupying = 0
         num_latest_nonterminal = 0
         for info in replica_infos:
             if info.is_terminal:
@@ -445,20 +452,20 @@ class Autoscaler:
                 zero_cost_count += 1
                 if is_latest:
                     zero_cost_latest += 1
-                    if self._fill_row_occupies_free_slot(info):
-                        zero_cost_occupying_latest += 1
+                if self._fill_row_occupies_free_slot(info):
+                    zero_cost_occupying += 1
         # Three defense layers keep fill launches within physical free
         # capacity:
         # 1. Emission-time spend (below): free-slot memory is deducted
         #    the moment launch decisions are emitted, covering the
         #    intra-poll window.
-        # 2. Occupied-slot subtraction (here): latest zero-cost replicas
-        #    that are not READY (pods invisible to the poller -- launch
-        #    threads can queue for multiple poll intervals) or that were
-        #    created after the snapshot (e.g. a demand launch landing on
-        #    the zero-cost tier and turning READY within one inter-poll
-        #    gap) occupy slots the snapshot counted free, so they are
-        #    subtracted from the spendable free level (see
+        # 2. Occupied-slot subtraction (here): zero-cost replicas of ANY
+        #    version that are not READY (pods invisible to the poller --
+        #    launch threads can queue for multiple poll intervals) or
+        #    that were created after the snapshot (e.g. a demand launch
+        #    landing on the zero-cost tier and turning READY within one
+        #    inter-poll gap) occupy slots the snapshot counted free, so
+        #    they are subtracted from the spendable free level (see
         #    _fill_row_occupies_free_slot). This may overlap with slots
         #    the poller already excluded once pods bind; subtracting is
         #    the conservative direction -- never over-launch, worst case
@@ -467,7 +474,7 @@ class Autoscaler:
         #    (immediately on decrease, two-poll damped on increase).
         spendable_free_slots = max(
             0,
-            self._fresh_fill_free_slots() - zero_cost_occupying_latest)
+            self._fresh_fill_free_slots() - zero_cost_occupying)
         fill_target = min(zero_cost_count + spendable_free_slots,
                           self.max_replicas)
         self._fill_target = fill_target

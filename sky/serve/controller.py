@@ -149,19 +149,20 @@ class SkyServeController:
 
     def _seed_fill_zero_cost_locations(
             self, autoscaler: autoscalers.Autoscaler) -> None:
-        """Seed an autoscaler's zero-cost location set from the placer.
+        """Best-effort seed of an autoscaler's zero-cost location set.
 
-        The seed only sets the location identity set (no free slots, no
+        zero_cost_locations() computes per-location costs via the
+        placer's cache, but an UNCACHED Kubernetes location's cost
+        lookup CAN hit the live Kubernetes API (instance-fit check), so
+        a transient API blip in that window can raise. Seeding is
+        therefore best-effort: any failure is logged and swallowed,
+        degrading to the documented pre-seed behavior (empty location
+        set; suppression engages after the first successful poll feeds
+        it) instead of killing controller boot / update_service. The
+        seed only sets the location identity set (no free slots, no
         snapshot time), and an already-populated set (e.g. loaded from a
         dump) is never overwritten -- see
         Autoscaler.seed_zero_cost_locations.
-
-        Best-effort, never fatal: zero_cost_locations() resolves
-        per-location costs, and for Kubernetes locations feasibility is
-        a LIVE API call -- an unreachable research-cluster context at
-        boot must degrade to an unseeded autoscaler (the first
-        successful poll re-seeds via collect_reserved_capacity), not
-        crash-loop the controller through __init__.
         """
         if not autoscaler.reserved_capacity_fill:
             return
@@ -174,9 +175,9 @@ class SkyServeController:
                 for location in placer.zero_cost_locations()
             ])
         except Exception as e:  # pylint: disable=broad-except
-            logger.warning('Failed to seed zero-cost locations (fill '
-                           'suppression degrades until the first '
-                           'successful capacity poll): '
+            logger.warning('Failed to seed zero-cost locations '
+                           '(best-effort; will rely on the first '
+                           'successful poll instead): '
                            f'{common_utils.format_exception(e)}')
 
     def _get_lb_replica_info(
