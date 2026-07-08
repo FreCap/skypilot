@@ -673,16 +673,27 @@ class DynamicFallbackSpotPlacer(SpotPlacer,
         # it gets benched, and the TTL retry re-probes it as capacity
         # frees — so load drifts back automatically.
         # skip_zero_cost_preference (the broker's demand-placement gate:
-        # this service already holds its zero-cost grant) demotes the
-        # free tier to normal least-loaded/min-cost competition, where
-        # its grant-full load steers new demand to paid capacity instead
-        # of squatting on a peer's entitlement.
+        # this service already holds its zero-cost grant) EXCLUDES the
+        # free tier from the candidate set — merely demoting it to
+        # normal competition is not enough, because selection breaks
+        # load ties by cost and a zero-cost location wins every tie, so
+        # tied demand launches would still land on a peer's entitlement
+        # one by one. Excluded only while a paid candidate exists: a
+        # zero-cost-only set must still serve (the gate throttles
+        # placement preference, never availability).
         zero_cost = [
             location for location in active_locations
             if self._get_cost_per_hour_cached(location) == 0
         ]
         if zero_cost and not skip_zero_cost_preference:
             active_locations = zero_cost
+        elif zero_cost and skip_zero_cost_preference:
+            paid = [
+                location for location in active_locations
+                if location not in zero_cost
+            ]
+            if paid:
+                active_locations = paid
         res = self._select_least_loaded_min_cost(active_locations,
                                                  current_locations)
         self._consume_retry_if_benched(res)

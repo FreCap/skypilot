@@ -1379,7 +1379,7 @@ class TestDemandPlacementGate(unittest.TestCase):
 
 
 class TestPlacerSkipZeroCostPreference(unittest.TestCase):
-    """skip_zero_cost_preference demotes the free tier to load competition."""
+    """skip_zero_cost_preference excludes the free tier while paid exists."""
 
     def setUp(self):
         self.k8s = _make_location('research-ctx', 'free')
@@ -1394,6 +1394,28 @@ class TestPlacerSkipZeroCostPreference(unittest.TestCase):
         selected = self.placer.select_next_location(
             [self.k8s, self.k8s], skip_zero_cost_preference=True)
         self.assertEqual(selected, self.paid)
+
+    def test_skip_excludes_zero_cost_on_load_tie(self):
+        # Fleetless service: every candidate ties at load 0, and the
+        # min-cost tiebreak would pick the free tier — the gate must
+        # exclude it, not merely stop preferring it, or tied demand
+        # launches squat a peer's entitlement one by one.
+        selected = self.placer.select_next_location(
+            [], skip_zero_cost_preference=True)
+        self.assertEqual(selected, self.paid)
+        # Equal nonzero load on both tiers: same rule.
+        selected = self.placer.select_next_location(
+            [self.k8s, self.k8s, self.paid, self.paid],
+            skip_zero_cost_preference=True)
+        self.assertEqual(selected, self.paid)
+
+    def test_skip_with_zero_cost_only_set_still_serves(self):
+        # The gate throttles placement preference, never availability: a
+        # zero-cost-only candidate set must still yield a location.
+        placer = _make_placer({self.k8s: 0.0})
+        selected = placer.select_next_location(
+            [], skip_zero_cost_preference=True)
+        self.assertEqual(selected, self.k8s)
 
 
 class TestBrokerPollerCycle(unittest.TestCase):
