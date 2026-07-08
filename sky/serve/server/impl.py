@@ -618,24 +618,28 @@ def _reject_external_lb_mode_flip(
     migration -- switching binds/unbinds the stable controller port and
     starts/stops the in-pod LB -- so it is an up/down-only choice.
 
-    The mode is a global ``serve.controller`` setting (see
-    ``serve_utils.is_external_load_balancer_mode``); the running service uses
-    the server's current effective mode, while an admin policy applied to this
-    update may rewrite it for the new version. We compare the two and reject
-    only an actual change; a same-mode update proceeds. (A change made by
-    editing the server config between ``up`` and ``update`` is not caught here,
-    because the mode is not persisted per service -- that would need a schema
-    migration, out of scope for this guard.)
+    The mode is SERVER TOPOLOGY (``serve_utils.is_external_load_balancer_mode``
+    resolves it from the live server config in consolidation mode, immune to
+    per-service/request config), so an update-supplied value cannot take
+    effect at all. Comparing two ``is_external_load_balancer_mode()`` calls
+    (as this guard originally did) is therefore always a no-op; instead,
+    reject any update config that explicitly carries the key with a value
+    different from the server's effective mode — surfacing 'this knob is
+    server-side' instead of silently ignoring it.
     """
+    requested = mutated_config.get_nested(
+        ('serve', 'controller', 'external_load_balancer'), default_value=None)
+    if requested is None:
+        return
     existing_external = serve_utils.is_external_load_balancer_mode()
-    with skypilot_config.replace_skypilot_config(mutated_config):
-        new_external = serve_utils.is_external_load_balancer_mode()
-    if existing_external != new_external:
+    if bool(requested) != existing_external:
         with ux_utils.print_exception_no_traceback():
             raise ValueError(
                 'Cannot change the external_load_balancer mode of a running '
-                'service via update; this switch has no live migration. Tear '
-                'down the service and spin up a new one instead.')
+                'service via update: the mode is server topology (resolved '
+                'from the server config, not per-service config) and has no '
+                'live migration. Change the server config and tear down / '
+                're-create the service instead.')
 
 
 def update(

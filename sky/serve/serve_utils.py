@@ -381,6 +381,12 @@ def is_consolidation_mode(pool: bool = False) -> bool:
     return consolidation_mode
 
 
+# Per-process cache for the extlb topology flag resolved from the LIVE
+# server config (one DB read per process; topology only changes with a pod
+# restart, which resets the cache by construction).
+_external_lb_mode_cache: Optional[bool] = None
+
+
 def is_external_load_balancer_mode() -> bool:
     """Whether the load balancer runs outside the controller pod.
 
@@ -389,9 +395,48 @@ def is_external_load_balancer_mode() -> bool:
     load balancer, so a separate load balancer Deployment can target the
     controller at a fixed address. Off by default; the in-pod load balancer
     behavior is unchanged.
+
+    TOPOLOGY, NOT PER-SERVICE CONFIG: consolidation-mode controllers run
+    under a per-service SKYPILOT_CONFIG snapshot frozen at `serve up` (never
+    refreshed, not even by `serve update`). Reading this flag from the
+    loaded config let a pre-flag service's controller answer False while
+    the API server (live DB config) answered True — the server advertised
+    the external-LB DNS endpoint and ran the orphan reaper while the
+    controller kept an in-pod LB and never created the LB objects: a
+    permanently dangling endpoint (observed live). In any consolidation-pod
+    process, resolve from the SAME live server config the API server uses.
+    Flipping the flag OFF with external-LB services running reverts each
+    service to an in-pod LB on its next recovery; the LB objects stay until
+    the service is downed (the reaper only reaps services that no longer
+    exist).
     """
-    return skypilot_config.get_nested(
-        ('serve', 'controller', 'external_load_balancer'), default_value=False)
+    global _external_lb_mode_cache
+    if os.environ.get(skylet_constants.ENV_VAR_IS_SKYPILOT_SERVER) is None:
+        # VM-mode / client processes: unchanged.
+        return skypilot_config.get_nested(
+            ('serve', 'controller', 'external_load_balancer'),
+            default_value=False)
+    if _external_lb_mode_cache is None:
+        try:
+            _external_lb_mode_cache = bool(
+                skypilot_config.get_effective_server_config().get_nested(
+                    ('serve', 'controller', 'external_load_balancer'),
+                    default_value=False))
+        except Exception as e:  # pylint: disable=broad-except
+            # Fail-soft to the loaded-config read: this is called from
+            # _start, whose failure path is DESTRUCTIVE service cleanup —
+            # a transient DB blip at controller boot must degrade to the
+            # snapshot value (pre-fix behavior for one evaluation), not
+            # tear the service down. Deliberately NOT cached, so the next
+            # evaluation retries the live read.
+            logger.warning(
+                'Failed to resolve external_load_balancer from the live '
+                f'server config; falling back to the loaded config: '
+                f'{common_utils.format_exception(e)}')
+            return skypilot_config.get_nested(
+                ('serve', 'controller', 'external_load_balancer'),
+                default_value=False)
+    return _external_lb_mode_cache
 
 
 def get_controller_auth_token() -> Optional[str]:

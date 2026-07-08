@@ -306,6 +306,51 @@ def get_server_config() -> config_utils.Config:
     return _get_config_from_path(_resolve_server_config_path())
 
 
+def _overlay_db_config(server_config: config_utils.Config,
+                       db_url: str) -> config_utils.Config:
+    """Overlay the DB-stored api_server_config onto ``server_config``."""
+    if len(server_config.keys()) > 1:
+        raise ValueError(
+            'If db config is specified, no other config is allowed')
+    logger.debug('retrieving config from database')
+    del db_url  # Connection resolved via the env var by the engine.
+
+    def _get_config_yaml_from_db(key: str) -> Optional[config_utils.Config]:
+        with orm.Session(_db_manager.get_engine()) as session:
+            row = session.query(config_yaml_table).filter_by(key=key).first()
+        if row:
+            db_config = config_utils.Config(yaml_utils.safe_load(row.value))
+            db_config.pop_nested(('db',), None)
+            return db_config
+        return None
+
+    db_config = _get_config_yaml_from_db(API_SERVER_CONFIG_KEY)
+    if db_config:
+        server_config = overlay_skypilot_config(server_config, db_config)
+    return server_config
+
+
+def get_effective_server_config() -> config_utils.Config:
+    """The LIVE server config (server file + DB overlay), snapshot-immune.
+
+    Consolidation-mode controller processes run under a per-service
+    ``SKYPILOT_CONFIG`` snapshot frozen at `serve up` (embedded in the HA
+    recovery script and never refreshed — not even by `serve update`), so
+    their *loaded* config can disagree with the server's for keys that
+    changed after the service was created. Control-plane TOPOLOGY decisions
+    (e.g. whether the serve load balancer runs as an external Deployment)
+    must instead agree across the server and every controller in the pod:
+    this resolves the same config the API server itself uses, ignoring the
+    per-service snapshot.
+    """
+    server_config_path = _resolve_server_config_path()
+    server_config = _get_config_from_path(server_config_path)
+    db_url = os.environ.get(constants.ENV_VAR_DB_CONNECTION_URI)
+    if db_url:
+        server_config = _overlay_db_config(server_config, db_url)
+    return server_config
+
+
 def get_nested(keys: Tuple[str, ...],
                default_value: Any,
                override_configs: Optional[Dict[str, Any]] = None) -> Any:
@@ -708,24 +753,7 @@ def _reload_config_as_server() -> None:
     db_url = os.environ.get(constants.ENV_VAR_DB_CONNECTION_URI)
 
     if db_url:
-        if len(server_config.keys()) > 1:
-            raise ValueError(
-                'If db config is specified, no other config is allowed')
-        logger.debug('retrieving config from database')
-
-        def _get_config_yaml_from_db(key: str) -> Optional[config_utils.Config]:
-            with orm.Session(_db_manager.get_engine()) as session:
-                row = session.query(config_yaml_table).filter_by(
-                    key=key).first()
-            if row:
-                db_config = config_utils.Config(yaml_utils.safe_load(row.value))
-                db_config.pop_nested(('db',), None)
-                return db_config
-            return None
-
-        db_config = _get_config_yaml_from_db(API_SERVER_CONFIG_KEY)
-        if db_config:
-            server_config = overlay_skypilot_config(server_config, db_config)
+        server_config = _overlay_db_config(server_config, db_url)
     if sky_logging.logging_enabled(logger, sky_logging.DEBUG):
         logger.debug(f'server config: \n'
                      f'{yaml_utils.dump_yaml_str(dict(server_config))}')
