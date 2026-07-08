@@ -6,6 +6,7 @@ gpu_type is expensive (cluster handle fetch + endpoint query), so both must
 be resolved at most once per replica lifetime and cached; the cache must be
 pruned when a replica leaves the ready set.
 """
+import threading
 from typing import Dict, Optional
 from unittest import mock
 
@@ -446,3 +447,56 @@ class TestGetCapacityHint:
             latest_version=2)
         hint = ctrl._get_capacity_hint(self._replicas())  # pylint: disable=protected-access
         assert hint['target_num_replicas'] == 10
+
+
+class TestReservedCapacityPollerStart:
+    """Poller lifecycle: seeded, idempotent, inert without a placer."""
+
+    def _controller_with(self, placer):
+        ctrl = _make_controller()
+        ctrl._replica_manager = mock.Mock()
+        ctrl._replica_manager.spot_placer = placer
+        ctrl._autoscaler = mock.Mock()
+        ctrl._reserved_capacity_poller_started = False
+        ctrl._reserved_capacity_poller_lock = threading.Lock()
+        return ctrl
+
+    def test_starts_thread_once(self):
+        # Idempotent: one poller thread across repeated calls (boot +
+        # any number of fill-enabling updates). Location seeding is
+        # handled separately by _seed_fill_zero_cost_locations.
+        placer = mock.Mock()
+        ctrl = self._controller_with(placer)
+        with mock.patch.object(controller.thread_utils,
+                               'start_supervised_thread') as start_mock:
+            ctrl._start_reserved_capacity_poller_if_needed()
+            ctrl._start_reserved_capacity_poller_if_needed()
+        assert start_mock.call_count == 1
+
+    def test_without_placer_is_inert(self):
+        ctrl = self._controller_with(placer=None)
+        with mock.patch.object(controller.thread_utils,
+                               'start_supervised_thread') as start_mock:
+            ctrl._start_reserved_capacity_poller_if_needed()
+        start_mock.assert_not_called()
+        # Not marked started: a later update that adds a placer (new
+        # service version) may still start it.
+        assert ctrl._reserved_capacity_poller_started is False
+
+
+class TestSeedFillZeroCostLocations:
+    """The constructor-time seed is best-effort, never fatal."""
+
+    def test_seed_failure_does_not_propagate(self):
+        # zero_cost_locations() can hit a LIVE K8s feasibility check; an
+        # unreachable context at boot must not crash-loop the controller
+        # through __init__ -- the first successful poll re-seeds.
+        ctrl = _make_controller()
+        placer = mock.Mock()
+        placer.zero_cost_locations.side_effect = RuntimeError('api down')
+        ctrl._replica_manager = mock.Mock()
+        ctrl._replica_manager.spot_placer = placer
+        autoscaler = mock.Mock()
+        autoscaler.reserved_capacity_fill = True
+        ctrl._seed_fill_zero_cost_locations(autoscaler)
+        autoscaler.seed_zero_cost_locations.assert_not_called()

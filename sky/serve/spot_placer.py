@@ -194,6 +194,42 @@ class Location:
             'disk_tier': self.disk_tier,
         }
 
+    @classmethod
+    def from_resources_override(
+            cls, override: Optional[Dict[str, Any]]) -> Optional['Location']:
+        """Reconstruct a location from an override that inlined to_dict().
+
+        A placer-pinned launch stamps its location fields into the
+        persisted resources_override (see to_dict). A re-driven launch
+        (controller crash mid-PENDING) replays that override without
+        re-entering the selection path, so the location must be
+        recovered from the override itself -- otherwise the replica row
+        is upserted with location=None and permanently drops out of
+        placer load counting and zero-cost fill accounting. Returns None
+        unless the override carries the placer's pin signature
+        (cloud + region).
+        """
+        if not override:
+            return None
+        cloud_val = override.get('cloud')
+        region = override.get('region')
+        if cloud_val is None or region is None:
+            return None
+        cloud: Optional[sky_clouds.Cloud] = (cloud_val if isinstance(
+            cloud_val, sky_clouds.Cloud) else registry.CLOUD_REGISTRY.from_str(
+                str(cloud_val)))
+        if cloud is None:
+            return None
+        return cls(
+            cloud=cloud,
+            region=region,
+            zone=override.get('zone'),
+            accelerators=override.get('accelerators'),
+            use_spot=override.get('use_spot', True),
+            image_id=override.get('image_id'),
+            disk_tier=override.get('disk_tier'),
+        )
+
 
 class LocationStatus(enum.Enum):
     """Location Spot Status."""
@@ -395,6 +431,20 @@ class SpotPlacer:
         assert r.cloud is not None
         rs = r.cloud.get_feasible_launchable_resources(
             r, num_nodes=self.num_nodes).resources_list
+        if not rs:
+            # Feasibility can be transiently empty: for Kubernetes
+            # locations the check is a LIVE API call (an unreachable
+            # context is swallowed into an empty region list), and a
+            # catalog regression can empty cloud entries too. min() over
+            # an empty list would raise -- through the constructor-time
+            # zero-cost seed that would crash-loop the controller at
+            # boot. Degrade to infinity: the location reads as
+            # not-zero-cost and maximally expensive this round, and the
+            # miss is NOT memoized so it heals on the next call.
+            logger.warning('No feasible resources for location '
+                           f'{location}; treating its cost as infinite '
+                           'for this round.')
+            return float('inf')
         # For some clouds, there might have multiple instance types
         # satisfying the resource request. In such case we choose the
         # cheapest one, as the optimizer does. Reference:
@@ -447,6 +497,70 @@ class SpotPlacer:
 
     def preemptive_locations(self) -> List[Location]:
         return self._location_with_status(LocationStatus.PREEMPTED)
+
+    def _select_least_loaded_min_cost(
+            self, candidate_locations: List[Location],
+            current_locations: List[Location]) -> Location:
+        """Least-loaded candidate, cheapest on ties (shared selection core).
+
+        Prioritize the least-loaded locations (unused ones have load 0, so
+        this preserves the prefer-unused behavior while any location is
+        still free). Without the load tiebreak, once every location hosts
+        at least one replica the min-cost rule pins EVERY subsequent launch
+        to the single cheapest active location: at fleet scale this
+        serially hammers one spot-exhausted zone (observed live: >1000
+        consecutive failed attempts in one zone while other zones and
+        clouds sat idle) instead of spreading. Pre-upgrade replica rows
+        carry shape-less locations; resolve them onto the current key set
+        so they still count as load.
+        """
+        location_load = collections.Counter(resolved for resolved in (
+            self.resolve_location(loc) for loc in current_locations)
+                                            if resolved is not None)
+        min_load = min(
+            (location_load[location] for location in candidate_locations),
+            default=0)
+        least_loaded: List[Location] = [
+            location for location in candidate_locations
+            if location_load[location] == min_load
+        ]
+        if not least_loaded:
+            least_loaded = candidate_locations
+        return self._min_cost_location(least_loaded)
+
+    def zero_cost_locations(self) -> List[Location]:
+        """All zero-cost locations, regardless of bench status.
+
+        Enumeration surface for the reserved-capacity fill poller: a
+        benched (PREEMPTED) zero-cost location still defines capacity to
+        watch -- it comes back via the TTL retry, and free slots observed
+        on it should already be feeding the fill target.
+        """
+        return [
+            location for location in self.location2status
+            if self._get_cost_per_hour_cached(location) == 0
+        ]
+
+    def select_next_zero_cost_location(
+            self, current_locations: List[Location]) -> Optional[Location]:
+        """Select among zero-cost ACTIVE locations only; None when none is.
+
+        The no-spill guarantee of reserved-capacity fill: a fill launch
+        either lands on a zero-cost location or does not happen at all, so
+        this deliberately does NOT fall back to paid locations (unlike
+        select_next_location). Uses effective status, so a benched
+        zero-cost location whose TTL expired is selectable again -- and
+        its retry budget is consumed on selection like any other probe.
+        """
+        candidates = [
+            location for location in self.zero_cost_locations()
+            if self._effective_status(location) == LocationStatus.ACTIVE
+        ]
+        if not candidates:
+            return None
+        res = self._select_least_loaded_min_cost(candidates, current_locations)
+        self._consume_retry_if_benched(res)
+        return res
 
     @classmethod
     def from_task(cls, spec: 'service_spec.SkyServiceSpec',
@@ -517,34 +631,11 @@ class DynamicFallbackSpotPlacer(SpotPlacer,
         ]
         if zero_cost:
             active_locations = zero_cost
-        # Prioritize the least-loaded locations (unused ones have load 0,
-        # so this preserves the original prefer-unused behavior while any
-        # location is still free). Without the load tiebreak, once every
-        # location hosts at least one replica the min-cost rule pins
-        # EVERY subsequent launch to the single cheapest active location:
-        # at fleet scale this serially hammers one spot-exhausted zone
-        # (observed live: >1000 consecutive failed attempts in one zone
-        # while other zones and clouds sat idle) instead of spreading.
-        # Pre-upgrade replica rows carry shape-less locations; resolve
-        # them onto the current key set so they still count as load.
-        location_load = collections.Counter(resolved for resolved in (
-            self.resolve_location(loc) for loc in current_locations)
-                                            if resolved is not None)
-        min_load = min(
-            (location_load[location] for location in active_locations),
-            default=0)
-        candidate_locations: List[Location] = [
-            location for location in active_locations
-            if location_load[location] == min_load
-        ]
-        # If no candidate locations, use all active locations.
-        if not candidate_locations:
-            candidate_locations = active_locations
-        res = self._min_cost_location(candidate_locations)
+        res = self._select_least_loaded_min_cost(active_locations,
+                                                 current_locations)
         self._consume_retry_if_benched(res)
         logger.info(f'Active locations: {active_locations}\n'
                     f'Current locations: {current_locations}\n'
-                    f'Candidate locations: {candidate_locations}\n'
                     f'Selected location: {res}\n')
         return res
 

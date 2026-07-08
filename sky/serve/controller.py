@@ -6,6 +6,7 @@ import contextlib
 import hmac
 import logging
 import os
+import threading
 import time
 import traceback
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -20,6 +21,7 @@ from sky import sky_logging
 from sky.serve import autoscalers
 from sky.serve import lb_rbac_preflight
 from sky.serve import replica_managers
+from sky.serve import reserved_capacity
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.skylet import constants
@@ -91,6 +93,32 @@ class SkyServeController:
         self._autoscaler: autoscalers.Autoscaler = (
             autoscalers.Autoscaler.from_spec(service_name, service_spec,
                                              version))
+        # [boltz fork] Reserved-capacity fill poller lifecycle: started
+        # from run() when the service booted with the flag on, and
+        # lazily from update_service when an update enables the flag on
+        # a live service (idempotent -- at most one poller thread; a
+        # flag toggled OFF leaves the thread alive but dormant, see
+        # poller_loop). The poller is the only component allowed to
+        # issue the expensive cluster-wide realtime free-GPU query.
+        self._reserved_capacity_fill_enabled: bool = bool(
+            getattr(service_spec, 'reserved_capacity_fill', False))
+        self._reserved_capacity_poller_started: bool = False
+        # update_service handlers run in FastAPI's threadpool, so two
+        # concurrent fill-enabling updates could both observe the
+        # started flag as False; the lock makes start-once atomic.
+        self._reserved_capacity_poller_lock = threading.Lock()
+        # Seed the zero-cost location set synchronously, before run()
+        # starts the autoscaler thread: a respawned controller's
+        # autoscaler boots with empty fill state (from_spec above; there
+        # is no cross-process dump/load) and its first decision tick can
+        # beat the first poll by a lot (per-location cost warm-up + the
+        # cluster-wide realtime query). Without the seed, a QPS-family
+        # autoscaler's first tick computes target=min_replicas from its
+        # empty window and, with zero_cost_count=0, suppression cannot
+        # shelter the live fill fleet -- the whole fill surplus would be
+        # mass-terminated. Seeding grants NO free slots (snapshot time
+        # stays None), so no new fill launches until the first real poll.
+        self._seed_fill_zero_cost_locations(self._autoscaler)
         self._host = host
         self._port = port
         # [boltz fork] Cache of replica_id -> (url, gpu_type, gpu_count)
@@ -118,6 +146,39 @@ class SkyServeController:
             handler.setFormatter(sky_logging.FORMATTER)
             handler.addFilter(AutoscalerInfoFilter())
         yield
+
+    def _seed_fill_zero_cost_locations(
+            self, autoscaler: autoscalers.Autoscaler) -> None:
+        """Best-effort seed of an autoscaler's zero-cost location set.
+
+        zero_cost_locations() computes per-location costs via the
+        placer's cache, but an UNCACHED Kubernetes location's cost
+        lookup CAN hit the live Kubernetes API (instance-fit check), so
+        a transient API blip in that window can raise. Seeding is
+        therefore best-effort: any failure is logged and swallowed,
+        degrading to the documented pre-seed behavior (empty location
+        set; suppression engages after the first successful poll feeds
+        it) instead of killing controller boot / update_service. The
+        seed only sets the location identity set (no free slots, no
+        snapshot time), and an already-populated set (e.g. loaded from a
+        dump) is never overwritten -- see
+        Autoscaler.seed_zero_cost_locations.
+        """
+        if not autoscaler.reserved_capacity_fill:
+            return
+        placer = self._replica_manager.spot_placer
+        if placer is None:
+            return
+        try:
+            autoscaler.seed_zero_cost_locations([
+                location.to_pickleable()
+                for location in placer.zero_cost_locations()
+            ])
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning('Failed to seed zero-cost locations '
+                           '(best-effort; will rely on the first '
+                           'successful poll instead): '
+                           f'{common_utils.format_exception(e)}')
 
     def _get_lb_replica_info(
         self, replica_infos: List['replica_managers.ReplicaInfo']
@@ -317,6 +378,41 @@ class SkyServeController:
                 (spec.lb_retry_initial_backoff_seconds),
         }
 
+    def _start_reserved_capacity_poller_if_needed(self) -> None:
+        """Start the reserved-capacity poller (idempotent).
+
+        Called from run() (boot-enabled flag) and from update_service
+        (flag enabled on a live service). Getters, not the live objects:
+        update_service can replace self._autoscaler and the poller must
+        feed the current one. The zero-cost location seeding that
+        protects the pre-first-poll window is handled separately by
+        _seed_fill_zero_cost_locations (at construction and on update).
+        """
+        placer = self._replica_manager.spot_placer
+        if placer is None:
+            # The flag without a spot placer is inert (the placer defines
+            # the zero-cost location set fill draws from): say so
+            # instead of silently never filling. NOTE: the placer is
+            # built once at ReplicaManager construction from the BOOT
+            # spec -- an update that INTRODUCES the placer (adds the
+            # any_of set / spot_placer field) cannot activate fill until
+            # the next controller respawn; this is a pre-existing
+            # property of the placer machinery, not of fill.
+            logger.warning(
+                'reserved_capacity_fill is enabled but the service has no '
+                'spot placer (no any_of location set); fill is inactive '
+                'until the controller is respawned with a placer-bearing '
+                'spec.')
+            return
+        with self._reserved_capacity_poller_lock:
+            if self._reserved_capacity_poller_started:
+                return
+            self._reserved_capacity_poller_started = True
+        thread_utils.start_supervised_thread(
+            lambda: reserved_capacity.poller_loop(
+                lambda: self._autoscaler, lambda: self._replica_manager.
+                spot_placer), 'reserved-capacity-poller')
+
     def _run_autoscaler(self):
         logger.info('Starting autoscaler.')
         while True:
@@ -489,11 +585,28 @@ class SkyServeController:
                     new_autoscaler.update_version(version,
                                                   service,
                                                   update_mode=update_mode)
+                    # Seed BEFORE publishing: if the old autoscaler's dump
+                    # carried no fill state (build predating the feature,
+                    # or fill just enabled), the replacement would
+                    # otherwise take decision ticks with an empty zero-cost
+                    # set until the next poll -- one tick with suppression
+                    # off can terminate the whole fill fleet. A dump that
+                    # did carry locations wins (the seed never overwrites).
+                    self._seed_fill_zero_cost_locations(new_autoscaler)
                     self._autoscaler = new_autoscaler
                 else:
                     self._autoscaler.update_version(version,
                                                     service,
                                                     update_mode=update_mode)
+                if getattr(service, 'reserved_capacity_fill', False):
+                    # An update can enable fill on a live service: give
+                    # the (retained or replaced) autoscaler the location
+                    # set so suppression works immediately (no-op when
+                    # already populated), and make sure the poller
+                    # exists -- without it fill would sit half-active
+                    # (flag on, no free-slot feed) until a respawn.
+                    self._seed_fill_zero_cost_locations(self._autoscaler)
+                    self._start_reserved_capacity_poller_if_needed()
                 return responses.JSONResponse(content={'message': 'Success'},
                                               status_code=200)
             except Exception as e:  # pylint: disable=broad-except
@@ -580,6 +693,9 @@ class SkyServeController:
         # loop returning) does not silently stop all scaling decisions while
         # the controller keeps serving HTTP -- it is restarted instead.
         thread_utils.start_supervised_thread(self._run_autoscaler, 'autoscaler')
+
+        if self._reserved_capacity_fill_enabled:
+            self._start_reserved_capacity_poller_if_needed()
 
         logger.info('SkyServe Controller started on '
                     f'http://{self._host}:{self._port}. PID: {os.getpid()}')

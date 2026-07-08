@@ -11,8 +11,10 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 from sky import sky_logging
 from sky.jobs import state as managed_job_state
 from sky.serve import constants
+from sky.serve import reserved_capacity
 from sky.serve import serve_state
 from sky.serve import serve_utils
+from sky.serve import spot_placer
 from sky.utils import common_utils
 
 if typing.TYPE_CHECKING:
@@ -176,6 +178,22 @@ class Autoscaler:
         # unrecoverable failure.
         self.latest_version_ever_ready: int = self.latest_version - 1
         self.update_mode = serve_utils.DEFAULT_UPDATE_MODE
+        # [boltz fork] Reserved-capacity fill (opt-in): snapshot state fed
+        # by the controller's poller thread via collect_reserved_capacity.
+        # Lives in the base class so fill composes with every autoscaler
+        # type without touching their demand math. getattr: robust against
+        # spec objects predating the flag (e.g. unpickled from old DB
+        # rows).
+        self.reserved_capacity_fill: bool = bool(
+            getattr(spec, 'reserved_capacity_fill', False))
+        # Damped free-slot value the fill target acts on (see
+        # collect_reserved_capacity for the two-poll increase damping).
+        self._fill_free_slots: int = 0
+        self._fill_last_raw_free_slots: Optional[int] = None
+        self._fill_zero_cost_locations: List[spot_placer.Location] = []
+        self._fill_snapshot_time: Optional[float] = None
+        # Last computed fill target, surfaced via info() only.
+        self._fill_target: int = 0
 
     def get_final_target_num_replicas(self) -> int:
         """Get the final target number of replicas."""
@@ -201,11 +219,338 @@ class Autoscaler:
         self.target_num_replicas = self._clip_target_num_replicas(
             self.target_num_replicas)
         self.update_mode = update_mode
+        # An update can toggle the fill flag; consumption follows the new
+        # spec immediately. (The controller's update_service handler
+        # seeds the zero-cost location set and starts the poller when an
+        # update enables the flag -- no respawn needed, provided the spot
+        # placer already exists.)
+        self.reserved_capacity_fill = bool(
+            getattr(spec, 'reserved_capacity_fill', False))
 
     def collect_request_information(
             self, request_aggregator_info: Dict[str, Any]) -> None:
         """Collect request information from aggregator for autoscaling."""
         raise NotImplementedError
+
+    def collect_reserved_capacity(self, free_slots: int,
+                                  zero_cost_location_keys: List[Dict[str, Any]],
+                                  timestamp: float) -> None:
+        """Ingest a free-capacity snapshot from the reserved-capacity poller.
+
+        `zero_cost_location_keys` are Location.to_pickleable() dicts of
+        the placer's zero-cost location set (benched ones included: they
+        still identify which existing replicas are fill).
+
+        Damping: an INCREASE in free slots is acted on only when two
+        consecutive snapshots both exceed the previously-acted-on value
+        (acting on the min of the two -- the level that persisted across
+        both polls), so an eviction storm's transient free spike cannot
+        cause launch/evict churn. A DECREASE applies immediately:
+        capacity that vanished must stop being filled now.
+        """
+        free_slots = max(0, int(free_slots))
+        prev_raw = self._fill_last_raw_free_slots
+        self._fill_last_raw_free_slots = free_slots
+        if free_slots <= self._fill_free_slots:
+            self._fill_free_slots = free_slots
+        elif prev_raw is not None and prev_raw > self._fill_free_slots:
+            self._fill_free_slots = min(prev_raw, free_slots)
+        self._fill_zero_cost_locations = [
+            location for location in (spot_placer.Location.from_pickleable(key)
+                                      for key in zero_cost_location_keys)
+            if location is not None
+        ]
+        self._fill_snapshot_time = timestamp
+
+    def seed_zero_cost_locations(
+            self, zero_cost_location_keys: List[Dict[str, Any]]) -> None:
+        """Seed the zero-cost location set WITHOUT granting free slots.
+
+        Called synchronously by the controller (at boot, and on the
+        autoscaler swap in update_service) with the placer's spec-derived
+        location set, BEFORE the seeded instance takes decision ticks.
+        After a controller respawn the fill state is empty (boot builds
+        the autoscaler via from_spec; there is no dump/load across
+        processes) and the first poll can lag the first decision tick by
+        a lot (per-location cost warm-up + the cluster-wide realtime
+        query). A QPS-family autoscaler's first tick then computes
+        target=min_replicas from its empty window and, with
+        zero_cost_count=0, suppression cannot shelter the live fill
+        fleet from the resulting mass scale-down. Seeding only the
+        location set makes zero_cost_count-based suppression work from
+        tick zero, while _fill_snapshot_time stays None and free slots
+        stay 0 so no new fill is launched until the first real poll.
+
+        A loaded dump wins: never overwrite an existing location set
+        (it may carry a fresher view than the spec-derived one).
+        """
+        if self._fill_zero_cost_locations:
+            return
+        self._fill_zero_cost_locations = [
+            location for location in (spot_placer.Location.from_pickleable(key)
+                                      for key in zero_cost_location_keys)
+            if location is not None
+        ]
+
+    def _fresh_fill_free_slots(self) -> int:
+        """Damped free slots, decayed to 0 when the snapshot is stale."""
+        if self._fill_snapshot_time is None:
+            return 0
+        max_age = (reserved_capacity.poll_interval_seconds() *
+                   constants.RESERVED_CAPACITY_STALE_AFTER_INTERVALS)
+        if time.time() - self._fill_snapshot_time > max_age:
+            return 0
+        return self._fill_free_slots
+
+    @staticmethod
+    def _fill_location_matches(replica_location: spot_placer.Location,
+                               zero_cost: spot_placer.Location) -> bool:
+        """Relaxed zero-cost identity match for fill accounting.
+
+        Deliberately NOT Location.__eq__: full equality includes
+        image_id/disk_tier (via _accel_key), so pre-upgrade shape-less
+        replica rows and replicas surviving an image-changing update
+        would stop matching, undercounting zero_cost_count and stripping
+        the fleet's scale-down protection. For "is this replica on the
+        free tier" only the placement identity matters: cloud, region,
+        zone (when both sides pin one), accelerator shape and spot-ness.
+        Legacy shape-less rows (no accelerators/use_spot persisted) match
+        by cloud+region alone.
+        """
+        if str(replica_location.cloud).lower() != str(zero_cost.cloud).lower():
+            return False
+        if replica_location.region != zero_cost.region:
+            return False
+        if (replica_location.zone is not None and zero_cost.zone is not None and
+                replica_location.zone != zero_cost.zone):
+            return False
+        if replica_location.accelerators:
+            if (zero_cost.accelerators and
+                    replica_location.accelerators != zero_cost.accelerators):
+                return False
+            # Only shape-carrying rows enforce spot-ness: legacy rows
+            # deserialize with the use_spot=True default, which must not
+            # exclude them from a non-spot zero-cost pool.
+            if replica_location.use_spot != zero_cost.use_spot:
+                return False
+        return True
+
+    def _fill_row_occupies_free_slot(
+            self, info: 'replica_managers.ReplicaInfo') -> bool:
+        """Whether a zero-cost row occupies a slot the snapshot counted free.
+
+        Subtract rows that are (not READY) OR (created after the
+        snapshot). Each row is evaluated once against this single
+        predicate, so the two clauses can never double-subtract the same
+        row:
+        - not READY: launched-but-unbound pods are invisible to the
+          poller, so their slots still read free. A not-READY row OLDER
+          than the snapshot (long provisioning) may in fact have a bound
+          pod the poll already excluded; still subtracting it is the
+          conservative direction -- never over-launch, at worst
+          under-fill until it turns READY (layer 3 re-syncs).
+        - created after the snapshot: a DEMAND launch placed on the
+          zero-cost tier that binds AND turns READY within one
+          inter-poll gap escapes the not-READY clause, yet the slot it
+          sits on was counted free when the snapshot was taken. Any
+          zero-cost row newer than the snapshot occupies such a slot
+          regardless of readiness.
+        Rows without a creation timestamp (pickles from builds predating
+        ReplicaInfo.created_at) are treated as older than the snapshot:
+        they predate this build entirely, their bound pods are already
+        excluded by every fresh poll, and always-subtracting them would
+        under-fill for their whole lifetime.
+
+        Known sampling window (accepted): a row created BEFORE the
+        snapshot whose pod binds after it escapes both clauses once
+        READY -- up to one poll interval of over-launch; the extra fill
+        fails fast on the full tier and at worst benches it for one
+        retry TTL. Inherent to sampling free capacity at an instant.
+        """
+        if not info.is_ready:
+            return True
+        if self._fill_snapshot_time is None:
+            # No snapshot: spendable free slots are 0 regardless.
+            return False
+        created_at = getattr(info, 'created_at', None)
+        return created_at is not None and created_at > self._fill_snapshot_time
+
+    def _replica_on_zero_cost_location(
+            self, info: 'replica_managers.ReplicaInfo') -> bool:
+        if not self._fill_zero_cost_locations:
+            return False
+        location = info.get_spot_location()
+        if location is None:
+            return False
+        return any(
+            self._fill_location_matches(location, zero_cost)
+            for zero_cost in self._fill_zero_cost_locations)
+
+    def _apply_reserved_capacity_fill(
+        self,
+        replica_infos: List['replica_managers.ReplicaInfo'],
+        decisions: List[AutoscalerDecision],
+    ) -> List[AutoscalerDecision]:
+        """Overlay zero-cost capacity fill onto the demand decisions.
+
+        fill_target = (nonterminal replicas already on a zero-cost
+        location) + (spendable free slots: fresh damped free slots minus
+        launched-but-not-READY latest zero-cost replicas), clamped to
+        max_replicas but deliberately NOT floored by min_replicas -- an
+        empty free tier must not assert a floor. target_num_replicas and
+        thus the controller's capacity hint stay DEMAND-ONLY: fill
+        replicas are opportunistic supply, and the platform's spill
+        logic must not read them as demand.
+
+        - Surplus scale-ups beyond max(current, demand target) carry the
+          sentinel override so the launch path pins them to zero-cost
+          ACTIVE locations only (and skips entirely when none is).
+        - Scale-downs covered by the fill surplus are suppressed, taking
+          the shelter quota from the TAIL of the zero-cost victims: the
+          subclass ordered its victims most-preferred-first (initializing
+          replicas before READY ones), so when the surplus only covers
+          part of them the ones sheltered must be the LEAST preferred --
+          a prefix keep would shelter a warming PROVISIONING replica
+          while killing the READY one serving traffic. Output order (and
+          the cost-aware / drain-aware selection itself) is untouched.
+        - With a stale snapshot, fill_target degrades to exactly the
+          zero-cost replica count: existing fill replicas are protected
+          from victimization by staleness, but no new fill is launched.
+        """
+        if not self.reserved_capacity_fill:
+            return decisions
+        # Zero-cost accounting is version-asymmetric by design; the
+        # three roles use different version scopes:
+        # - LAUNCH BASELINE: latest-version only. The baseline below is
+        #   max(num_latest_nonterminal, demand_target), which is
+        #   latest-only, so old-version zero-cost replicas (a rolling
+        #   update draining its previous fleet) would inflate the launch
+        #   target by replicas the baseline never sees -- compounding
+        #   fill launches every tick.
+        # - OCCUPANCY DEBIT: all versions. ANY nonterminal zero-cost row
+        #   whose pod may be unbound (not READY, or created after the
+        #   snapshot) holds a claim on a slot the snapshot counted free
+        #   regardless of version -- an old-version PROVISIONING row
+        #   left out of the debit would let a fill launch collide with
+        #   its claim, fail on capacity, and bench the zero-cost tier.
+        # - SUPPRESSION: all versions. Every existing zero-cost replica
+        #   occupies free-tier capacity regardless of version and
+        #   deserves shelter from DEMAND scale-downs; sheltering is
+        #   bounded by the victims actually present (demand victims are
+        #   latest-version, and the outdated-version drain bypasses this
+        #   overlay entirely).
+        zero_cost_count = 0
+        zero_cost_latest = 0
+        zero_cost_occupying = 0
+        num_latest_nonterminal = 0
+        for info in replica_infos:
+            if info.is_terminal:
+                continue
+            is_latest = info.version == self.latest_version
+            if is_latest:
+                num_latest_nonterminal += 1
+            if self._replica_on_zero_cost_location(info):
+                zero_cost_count += 1
+                if is_latest:
+                    zero_cost_latest += 1
+                if self._fill_row_occupies_free_slot(info):
+                    zero_cost_occupying += 1
+        # Three defense layers keep fill launches within physical free
+        # capacity:
+        # 1. Emission-time spend (below): free-slot memory is deducted
+        #    the moment launch decisions are emitted, covering the
+        #    intra-poll window.
+        # 2. Occupied-slot subtraction (here): zero-cost replicas of ANY
+        #    version that are not READY (pods invisible to the poller --
+        #    launch threads can queue for multiple poll intervals) or
+        #    that were created after the snapshot (e.g. a demand launch
+        #    landing on the zero-cost tier and turning READY within one
+        #    inter-poll gap) occupy slots the snapshot counted free, so
+        #    they are subtracted from the spendable free level (see
+        #    _fill_row_occupies_free_slot). This may overlap with slots
+        #    the poller already excluded once pods bind; subtracting is
+        #    the conservative direction -- never over-launch, worst case
+        #    under-fill for one poll.
+        # 3. Poll re-sync: subsequent snapshots restore the true level
+        #    (immediately on decrease, two-poll damped on increase).
+        spendable_free_slots = max(
+            0,
+            self._fresh_fill_free_slots() - zero_cost_occupying)
+        fill_target = min(zero_cost_count + spendable_free_slots,
+                          self.max_replicas)
+        self._fill_target = fill_target
+        demand_target = self.get_final_target_num_replicas()
+        surplus_covered = fill_target - demand_target
+        if surplus_covered <= 0:
+            return decisions
+        # Victim-aware suppression: shelter ONLY scale-downs whose victim
+        # replica sits on a zero-cost location, up to the fill surplus.
+        # Downs targeting paid replicas always pass through -- fill
+        # surplus must never keep a PAID replica alive (the subclass
+        # orders victims newest-first, so a victim-blind prefix keep
+        # could shelter a paid replica indefinitely while repeatedly
+        # killing and relaunching zero-cost ones).
+        id_to_info = {info.replica_id: info for info in replica_infos}
+        # Take the shelter quota from the TAIL of the zero-cost victims:
+        # the subclass emits victims most-preferred-first, so a partial
+        # surplus must shelter the LEAST-preferred ones (e.g. keep the
+        # READY replica serving traffic, not the PROVISIONING one ahead
+        # of it in the list). Two passes so output order is preserved.
+        zero_cost_decision_ids = []
+        for idx, decision in enumerate(decisions):
+            if (decision.operator == AutoscalerDecisionOperator.SCALE_DOWN and
+                    isinstance(decision.target, int)):
+                victim = id_to_info.get(decision.target)
+                if (victim is not None and
+                        self._replica_on_zero_cost_location(victim)):
+                    zero_cost_decision_ids.append(idx)
+        suppressed_ids = set(zero_cost_decision_ids[-surplus_covered:])
+        result: List[AutoscalerDecision] = [
+            decision for idx, decision in enumerate(decisions)
+            if idx not in suppressed_ids
+        ]
+        # Launch target: latest-version zero-cost replicas only (see the
+        # version-asymmetry note above), against the latest-only
+        # baseline.
+        fill_target_launch = min(zero_cost_latest + spendable_free_slots,
+                                 self.max_replicas)
+        num_fill_up = (fill_target_launch -
+                       max(num_latest_nonterminal, demand_target))
+        if num_fill_up > 0:
+            logger.info(f'Reserved-capacity fill: launch target '
+                        f'{fill_target_launch} (latest zero-cost replicas '
+                        f'{zero_cost_latest} + spendable free slots '
+                        f'{spendable_free_slots}), demand target '
+                        f'{demand_target}; scaling up {num_fill_up} '
+                        'zero-cost-only replica(s).')
+            result.extend(
+                _generate_scale_up_decisions(
+                    num_fill_up,
+                    {constants.RESERVED_CAPACITY_FILL_OVERRIDE_KEY: True}))
+            # Invariant: a free slot is SPENT the moment a launch decision
+            # is emitted, not when the poller next observes the pod. Fill
+            # launches persist replica rows immediately, so
+            # zero_cost_count already grows on the next tick while the
+            # snapshot only refreshes on the poll interval -- without this
+            # deduction the same static snapshot would be re-consumed
+            # every tick, compounding the fill fleet. Deduct from BOTH the
+            # damped value and the last raw poll value:
+            # collect_reserved_capacity re-raises the damped value from
+            # min(prev_raw, new) on the next poll, so an undeducted stale
+            # prev_raw would re-grant the spent slots after a single poll,
+            # defeating the two-poll damping. The next polls re-sync the
+            # true level (immediate on decrease, damped on increase).
+            # This read-modify-write races the poller thread's
+            # collect_reserved_capacity (no lock, same as the other
+            # cross-thread gauges here): worst case one poll's decrease
+            # is overwritten for a single interval, and the resulting
+            # over-launch fails fast on the benched location and is
+            # re-synced by the next poll.
+            self._fill_free_slots = max(0, self._fill_free_slots - num_fill_up)
+            if self._fill_last_raw_free_slots is not None:
+                self._fill_last_raw_free_slots = max(
+                    0, self._fill_last_raw_free_slots - num_fill_up)
+        return result
 
     def has_recomputed_with_fresh_data(self) -> bool:
         """Whether target_num_replicas reflects a fresh-data recompute.
@@ -221,11 +566,22 @@ class Autoscaler:
 
     def info(self) -> Dict[str, Any]:
         """Get information about the autoscaler."""
-        return {
+        info: Dict[str, Any] = {
             'target_num_replicas': self.target_num_replicas,
             'min_replicas': self.min_replicas,
             'max_replicas': self.max_replicas,
         }
+        if self.reserved_capacity_fill:
+            # target_num_replicas above stays demand-only; the fill
+            # overlay is observable through these keys instead.
+            snapshot_age = (time.time() - self._fill_snapshot_time
+                            if self._fill_snapshot_time is not None else None)
+            info.update({
+                'fill_free_slots': self._fill_free_slots,
+                'fill_snapshot_age': snapshot_age,
+                'fill_target': self._fill_target,
+            })
+        return info
 
     def _generate_scaling_decisions(
         self,
@@ -401,9 +757,13 @@ class Autoscaler:
                     replica_infos, active_versions)))
 
         # If the latest version is ever ready, we can proceed to generate
-        # decisions from the implementations in subclasses.
+        # decisions from the implementations in subclasses. The
+        # reserved-capacity fill overlay wraps only the subclass's demand
+        # decisions -- the outdated-replica drain above is version
+        # control, not demand, and must never be suppressed by fill.
         scaling_decisions.extend(
-            self._generate_scaling_decisions(replica_infos))
+            self._apply_reserved_capacity_fill(
+                replica_infos, self._generate_scaling_decisions(replica_infos)))
 
         if not scaling_decisions:
             logger.info('No scaling needed.')
@@ -412,7 +772,24 @@ class Autoscaler:
 
     def dump_dynamic_states(self) -> Dict[str, Any]:
         """Dump dynamic states from autoscaler."""
-        states = {'latest_version_ever_ready': self.latest_version_ever_ready}
+        states: Dict[str, Any] = {
+            'latest_version_ever_ready': self.latest_version_ever_ready
+        }
+        # Reserved-capacity fill snapshot: carried across the in-process
+        # autoscaler swap in update_service. Without it a fresh autoscaler
+        # instance has no zero-cost location set until the next poll, so
+        # one decision tick with suppression off could terminate the whole
+        # fill fleet. Nested under a single key (in pickleable form) so
+        # subclass _load_dynamic_states leftover-logging never sees it.
+        states['reserved_capacity_fill_state'] = {
+            'fill_free_slots': self._fill_free_slots,
+            'fill_last_raw_free_slots': self._fill_last_raw_free_slots,
+            'fill_zero_cost_location_keys': [
+                location.to_pickleable()
+                for location in self._fill_zero_cost_locations
+            ],
+            'fill_snapshot_time': self._fill_snapshot_time,
+        }
         states.update(self._dump_dynamic_states())
         return states
 
@@ -420,6 +797,20 @@ class Autoscaler:
         """Load dynamic states to autoscaler."""
         self.latest_version_ever_ready = dynamic_states.pop(
             'latest_version_ever_ready', constants.INITIAL_VERSION)
+        # Absent in dumps from builds predating the fill feature: keep
+        # the constructor defaults (empty snapshot).
+        fill_state = dynamic_states.pop('reserved_capacity_fill_state', None)
+        if fill_state is not None:
+            self._fill_free_slots = fill_state.get('fill_free_slots', 0)
+            self._fill_last_raw_free_slots = fill_state.get(
+                'fill_last_raw_free_slots')
+            self._fill_zero_cost_locations = [
+                location for location in
+                (spot_placer.Location.from_pickleable(key)
+                 for key in fill_state.get('fill_zero_cost_location_keys', []))
+                if location is not None
+            ]
+            self._fill_snapshot_time = fill_state.get('fill_snapshot_time')
         self._load_dynamic_states(dynamic_states)
 
 
@@ -668,12 +1059,47 @@ class _GpuShapeResolverMixin:
     # re-resolved on later ticks. After launch the shape is fixed for the
     # replica's lifetime.
     _gpu_shape_cache: Dict[int, Tuple[str, int]]
+    # replica_id -> hourly cost of launched resources (same lifecycle
+    # rules as the shape cache). Backs cost-aware victim ordering in both
+    # shape-aware autoscalers.
+    _replica_cost_cache: Dict[int, float]
 
     def _prune_gpu_shape_cache(self, live_replica_ids: Set[int]) -> None:
-        """Drop cached shapes for replicas that no longer exist."""
+        """Drop cached shapes/costs for replicas that no longer exist."""
         for replica_id in list(self._gpu_shape_cache):
             if replica_id not in live_replica_ids:
                 del self._gpu_shape_cache[replica_id]
+        for replica_id in list(self._replica_cost_cache):
+            if replica_id not in live_replica_ids:
+                del self._replica_cost_cache[replica_id]
+
+    def _get_hourly_cost_from_replica_info(
+            self, replica_info: 'replica_managers.ReplicaInfo') -> float:
+        """Hourly cost of a replica's launched resources (0.0 = reserved).
+
+        Used to prefer scaling down PAID replicas before zero-cost ones
+        (e.g. cloud spot before a reserved Kubernetes pool) -- without
+        this, shedding the expensive replica first is luck, not policy.
+        Unknown costs resolve to 0.0 (treated like reserved capacity, so
+        they are shed last -- the conservative direction for cost).
+        """
+        cached = self._replica_cost_cache.get(replica_info.replica_id)
+        if cached is not None:
+            return cached
+        cost = 0.0
+        try:
+            handle = replica_info.handle()
+            if handle is not None:
+                # Coerce: anything non-numeric degrades to 0.0 (shed last).
+                cost = float(handle.launched_resources.get_cost(seconds=3600))
+        except Exception:  # pylint: disable=broad-except
+            cost = 0.0
+        # Same post-launch-only cache rule as the shape memo: while the
+        # replica is provisioning the record may be rewritten by failover.
+        if (replica_info.status_property.sky_launch_status ==
+                common_utils.ProcessStatus.SUCCEEDED):
+            self._replica_cost_cache[replica_info.replica_id] = cost
+        return cost
 
     def _get_gpu_shape_from_replica_info(
             self,
@@ -784,9 +1210,6 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         # cache stays bounded to the live replica set.
         live_replica_ids = {info.replica_id for info in replica_infos}
         self._prune_gpu_shape_cache(live_replica_ids)
-        for replica_id in list(self._replica_cost_cache):
-            if replica_id not in live_replica_ids:
-                del self._replica_cost_cache[replica_id]
         keep_versions = {info.version for info in replica_infos}
         keep_versions.add(self.latest_version)
         for version in list(self._qps_dict_by_version):
@@ -1115,34 +1538,6 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
                        f'Using minimum QPS as fallback.')
         return min(target_qps_dict.values())
 
-    def _get_hourly_cost_from_replica_info(
-            self, replica_info: 'replica_managers.ReplicaInfo') -> float:
-        """Hourly cost of a replica's launched resources (0.0 = reserved).
-
-        Used to prefer scaling down PAID replicas before zero-cost ones
-        (e.g. cloud spot before a reserved Kubernetes pool) — without
-        this, shedding the expensive replica first is luck, not policy.
-        Unknown costs resolve to 0.0 (treated like reserved capacity, so
-        they are shed last — the conservative direction for cost).
-        """
-        cached = self._replica_cost_cache.get(replica_info.replica_id)
-        if cached is not None:
-            return cached
-        cost = 0.0
-        try:
-            handle = replica_info.handle()
-            if handle is not None:
-                # Coerce: anything non-numeric degrades to 0.0 (shed last).
-                cost = float(handle.launched_resources.get_cost(seconds=3600))
-        except Exception:  # pylint: disable=broad-except
-            cost = 0.0
-        # Same post-launch-only cache rule as the shape memo: while the
-        # replica is provisioning the record may be rewritten by failover.
-        if (replica_info.status_property.sky_launch_status ==
-                common_utils.ProcessStatus.SUCCEEDED):
-            self._replica_cost_cache[replica_info.replica_id] = cost
-        return cost
-
     def _select_replicas_to_scale_down_by_qps(
             self, num_replicas_to_scale_down: int,
             replica_infos: List['replica_managers.ReplicaInfo']) -> List[int]:
@@ -1327,6 +1722,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         self._rejected_in_window: int = 0
         self._report_received_at: Optional[float] = None
         self._gpu_shape_cache: Dict[int, Tuple[str, int]] = {}
+        # Backs the cost-descending victim tiebreak (shed paid spot
+        # before zero-cost reserved capacity); pruned with the shape
+        # cache each tick.
+        self._replica_cost_cache: Dict[int, float] = {}
         # version -> that version's per-GPU knob. A live replica's
         # capacity is a property of the spec it was launched under: after
         # an update that raises the knob (1 -> 2), sizing old-version
@@ -1839,9 +2238,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             # READY replica may be killed ONLY if the fresh report shows
             # zero in-flight work on it (missing entry counts as busy);
             # non-READY replicas are eligible unless the report shows
-            # work on them (probe-blipped mid-job). Eligible non-READY
-            # replicas keep the existing status-order kill-first
-            # preference via the shared selection helper.
+            # work on them (probe-blipped mid-job).
             eligible_victims = [
                 info for info in latest_nonterminal_replicas
                 if not self._replica_is_busy(info)
@@ -1860,10 +2257,49 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             if actual_num_to_scale_down > 0:
                 scaling_decisions.extend(
                     _generate_scale_down_decisions(
-                        _select_nonterminal_replicas_to_scale_down(
+                        self._select_victims_capacity_and_cost_aware(
                             actual_num_to_scale_down, eligible_victims)))
 
         return scaling_decisions
+
+    def _select_victims_capacity_and_cost_aware(
+            self, num_to_scale_down: int,
+            eligible_victims: List['replica_managers.ReplicaInfo']
+    ) -> List[int]:
+        """Order victims: status, capacity (asc), then COST (desc).
+
+        Mirrors the instance-aware autoscaler's rationale: among equal
+        status, shed the lowest-capacity replicas first (the packing
+        target assumes the largest capacities are kept), and among equal
+        capacity shed the most EXPENSIVE first -- cloud spot before a
+        zero-cost reserved pool. Without the cost key, the routine
+        reclaim cycle (research jobs evict the zero-cost fill fleet,
+        demand relaunches land on paid spot, jobs finish, fill relaunches
+        zero-cost with the newest ids, demand drops) picks the newest --
+        zero-cost -- replicas as victims and settles into a stable state
+        that pays for spot while free reserved slots sit unfilled.
+        Cost must not outrank capacity, same as the instance-aware
+        ordering (the target math assumed the biggest replicas survive);
+        the capacity key is quantized so float noise cannot split
+        mathematically equal capacities away from the cost tiebreak.
+        """
+        status_order = serve_state.ReplicaStatus.scale_down_decision_order()
+
+        def _status_rank(info: 'replica_managers.ReplicaInfo') -> int:
+            try:
+                return status_order.index(info.status)
+            except ValueError:
+                return len(status_order)
+
+        ordered = sorted(eligible_victims,
+                         key=lambda info: (
+                             _status_rank(info),
+                             round(self._replica_capacity(info), 9),
+                             -self._get_hourly_cost_from_replica_info(info),
+                             info.version,
+                             -info.replica_id,
+                         ))
+        return [info.replica_id for info in ordered[:num_to_scale_down]]
 
     def info(self) -> Dict[str, Any]:
         info = super().info()

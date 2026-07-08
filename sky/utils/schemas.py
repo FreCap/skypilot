@@ -1058,6 +1058,13 @@ def get_service_schema():
                         'type': 'number',
                         'exclusiveMinimum': 0,
                     },
+                    # Opt-in: allow the autoscaler to scale up onto free
+                    # reserved (zero-cost) capacity. Absent/False means no
+                    # behavior change; orthogonal to the demand knobs, so no
+                    # cross-field constraints here or in the spec.
+                    'reserved_capacity_fill': {
+                        'type': 'boolean',
+                    },
                     'dynamic_ondemand_fallback': {
                         'type': 'boolean',
                     },
