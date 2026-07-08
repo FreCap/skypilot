@@ -1041,10 +1041,6 @@ class TestQueryFreeSlots(unittest.TestCase):
         query.assert_called_once()
 
 
-if __name__ == '__main__':
-    unittest.main()
-
-
 class TestCostFeasibilityDegradation(unittest.TestCase):
     """Empty feasible list degrades to inf cost, never a boot crash."""
 
@@ -1064,3 +1060,29 @@ class TestCostFeasibilityDegradation(unittest.TestCase):
         self.assertEqual(cost, float('inf'))
         # Not memoized: a transient K8s API blip heals on the next call.
         self.assertEqual(placer.location2cost, {})
+
+
+class TestReplicaManagerInitIntact(unittest.TestCase):
+    """Real __init__ must fully run (fill fixtures bypass it via __new__).
+
+    Pins the regression class where an addition spliced into the middle
+    of ReplicaManager.__init__ silently truncated it: the suite passed
+    while least_recent_version was never set and the version-cleanup
+    refresher AttributeError'd every cycle.
+    """
+
+    def test_base_init_sets_version_fields_and_placer_accessor(self):
+        spec = types.SimpleNamespace(pool=False,
+                                     readiness_headers=None,
+                                     readiness_path='/health',
+                                     initial_delay_seconds=60,
+                                     endpoint_probe_interval_seconds=10,
+                                     post_data=None)
+        manager = replica_managers.ReplicaManager('svc', spec, version=3)
+        self.assertEqual(manager.latest_version, 3)
+        self.assertEqual(manager.least_recent_version, 3)
+        self.assertIsNone(manager.spot_placer)
+
+
+if __name__ == '__main__':
+    unittest.main()

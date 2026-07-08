@@ -778,6 +778,8 @@ class ReplicaManager:
 
         # Newest version among the currently provisioned and launched replicas
         self.latest_version: int = version
+        # Oldest version among the currently provisioned and launched replicas
+        self.least_recent_version: int = version
 
     @property
     def spot_placer(self) -> Optional['spot_placer.SpotPlacer']:
@@ -788,8 +790,6 @@ class ReplicaManager:
         SkyPilotReplicaManager actually builds one.
         """
         return getattr(self, '_spot_placer', None)
-        # Oldest version among the currently provisioned and launched replicas
-        self.least_recent_version: int = version
 
     def scale_up(self,
                  resources_override: Optional[Dict[str, Any]] = None) -> None:
