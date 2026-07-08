@@ -119,6 +119,12 @@ reserved_fill_claims_table = sqlalchemy.Table(
     # (max_replicas - demand_target - floor); NULL = unbounded. Reported by
     # the claimant so the water-fill can redistribute share it can never use.
     sqlalchemy.Column('headroom', sqlalchemy.Integer, server_default=None),
+    # Real capacity cap the claimant can materialize right now
+    # (max(0, max_replicas - demand_target)); NULL = unbounded. The broker
+    # clamps both the effective floor and the feed need by it, so an
+    # unattainable floor cannot permanently absorb entitlement and feed the
+    # service never launches (its excess joins the burst remainder).
+    sqlalchemy.Column('effective_cap', sqlalchemy.Integer, server_default=None),
     # Whether the claimant can launch on the pool right now (its zero-cost
     # tier is not benched): feeds to un-launchable claimants are wasted for a
     # whole round, so the feed split redistributes them.
@@ -1182,7 +1188,8 @@ def upsert_reserved_fill_claim(service_name: str, *, pool_key: str,
                                weight: float, floor_replicas: int,
                                gpus_per_replica: int, holdings_fill: int,
                                holdings_demand: int, headroom: Optional[int],
-                               launchable: bool, heartbeat_ts: float,
+                               effective_cap: Optional[int], launchable: bool,
+                               heartbeat_ts: float,
                                owner_epoch: Optional[int]) -> None:
     """Upserts a service's reserved-fill claim (the per-poll heartbeat)."""
     engine = _db_manager.get_engine()
@@ -1195,6 +1202,7 @@ def upsert_reserved_fill_claim(service_name: str, *, pool_key: str,
         'holdings_fill': holdings_fill,
         'holdings_demand': holdings_demand,
         'headroom': headroom,
+        'effective_cap': effective_cap,
         'launchable': int(launchable),
         'heartbeat_ts': heartbeat_ts,
         'owner_epoch': owner_epoch,

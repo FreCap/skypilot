@@ -248,6 +248,25 @@ def test_object_form_rejects_bad_knobs_at_constructor(bad_obj):
         _make_spec(min_replicas=2, reserved_capacity_fill=bad_obj)
 
 
+def test_floor_above_max_replicas_rejected():
+    # A floor beyond max_replicas can never be materialized (the fill
+    # target is clamped to max_replicas); it would sit as a permanent
+    # phantom claim on the broker.
+    with pytest.raises(ValueError):
+        _make_spec(min_replicas=1,
+                   max_replicas=3,
+                   target_qps_per_replica=1.0,
+                   reserved_capacity_fill={'floor_replicas': 4})
+
+
+def test_floor_at_max_replicas_accepted():
+    spec = _make_spec(min_replicas=1,
+                      max_replicas=3,
+                      target_qps_per_replica=1.0,
+                      reserved_capacity_fill={'floor_replicas': 3})
+    assert spec.reserved_fill_floor_replicas == 3
+
+
 def test_object_form_rejected_with_ondemand_fallback():
     # The object form is still the same opt-in: the fallback exclusivity
     # must apply to it too, including the falsy-{} spelling.

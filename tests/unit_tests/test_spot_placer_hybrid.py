@@ -265,6 +265,61 @@ class TestMixedValidation:
                                               pool=False)
 
 
+class TestReservedFillSinglePoolValidation:
+    """validate_service_task rejects fill specs spanning >1 k8s pool.
+
+    The broker's v1 arbitration supports exactly one (context, GPU) pool
+    per service; the runtime cycle rejects violations too, but only via
+    controller error logs, so misconfigurations must also fail at submit
+    time. All Kubernetes entries are treated as candidate pool shapes
+    (zero-cost-ness is not knowable client-side).
+    """
+
+    def _task(self, k8s_entries):
+        # pylint: disable=import-outside-toplevel
+        import sky
+        entries = '\n'.join(f'    - infra: k8s/{ctx}\n'
+                            f'      accelerators: {gpu}:1'
+                            for ctx, gpu in k8s_entries)
+        yaml_str = f"""
+resources:
+  cpus: 2+
+  ports: 8080
+  any_of:
+{entries}
+service:
+  readiness_probe: /health
+  replica_policy:
+    min_replicas: 1
+    max_replicas: 4
+    target_qps_per_replica: 0.1
+    reserved_capacity_fill: true
+run: echo hi
+"""
+        return sky.Task.from_yaml_str(yaml_str)
+
+    def test_two_distinct_pools_rejected(self):
+        # pylint: disable=import-outside-toplevel
+        from sky.serve import serve_utils
+        for entries in (
+            [('ctx-a', 'A100'), ('ctx-a', 'H100')],  # same ctx, two GPUs
+            [('ctx-a', 'A100'), ('ctx-b', 'A100')],  # two contexts, one GPU
+        ):
+            with pytest.raises(ValueError, match='exactly one Kubernetes'):
+                serve_utils.validate_service_task(self._task(entries),
+                                                  pool=False)
+
+    def test_single_pool_accepted(self):
+        # pylint: disable=import-outside-toplevel
+        from sky.serve import serve_utils
+        serve_utils.validate_service_task(self._task([('ctx-a', 'A100')]),
+                                          pool=False)
+        # Same pool enumerated case-insensitively still counts once.
+        serve_utils.validate_service_task(self._task([('ctx-a', 'A100'),
+                                                      ('ctx-a', 'a100')]),
+                                          pool=False)
+
+
 class TestImageIdNormalizationEndToEnd:
     """Enumerated locations must carry region-independent image dicts."""
 

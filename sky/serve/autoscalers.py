@@ -470,10 +470,21 @@ class Autoscaler:
         #   bounded by the victims actually present (demand victims are
         #   latest-version, and the outdated-version drain bypasses this
         #   overlay entirely).
+        # - CEILING: split by side, mirroring the asymmetry above. The
+        #   LAUNCH-side ceiling (grant + demand-placed rows riding on top
+        #   of it) counts latest-version demand-placed rows only: it caps
+        #   fill_target_launch, which is latest-only, and an old-version
+        #   demand row draining through a rolling update would otherwise
+        #   inflate the ceiling and let fill overshoot the grant by its
+        #   count (bench churn against peers). The TARGET/SHELTER-side
+        #   ceiling keeps the all-version count, consistent with
+        #   all-version suppression: every existing demand-placed row
+        #   deserves its exemption regardless of version.
         zero_cost_count = 0
         zero_cost_latest = 0
         zero_cost_occupying = 0
         zero_cost_demand_placed = 0
+        zero_cost_demand_placed_latest = 0
         num_latest_nonterminal = 0
         for info in replica_infos:
             if info.is_terminal:
@@ -498,6 +509,8 @@ class Autoscaler:
                 # replaces them with flagged rows.
                 if not getattr(info, 'reserved_fill', False):
                     zero_cost_demand_placed += 1
+                    if is_latest:
+                        zero_cost_demand_placed_latest += 1
         # Three defense layers keep fill launches within physical free
         # capacity:
         # 1. Emission-time spend (below): free-slot memory is deducted
@@ -528,9 +541,14 @@ class Autoscaler:
         # (single-service identity). Demand-placed zero-cost rows ride on
         # top of the grant: they are demand-protected, and the broker
         # already excludes them from the fill capacity it arbitrates.
+        # Version scope per side per the CEILING note above: launch-side
+        # counts latest-version demand-placed rows only.
         fill_ceiling: Optional[int] = None
+        fill_ceiling_launch: Optional[int] = None
         if self._fill_grant is not None:
             fill_ceiling = self._fill_grant + zero_cost_demand_placed
+            fill_ceiling_launch = (self._fill_grant +
+                                   zero_cost_demand_placed_latest)
         fill_target = min(zero_cost_count + spendable_free_slots,
                           self.max_replicas)
         if fill_ceiling is not None:
@@ -571,11 +589,14 @@ class Autoscaler:
         # baseline.
         fill_target_launch = min(zero_cost_latest + spendable_free_slots,
                                  self.max_replicas)
-        if fill_ceiling is not None:
-            # Same ceiling on the launch side: a feed above the remaining
-            # grant headroom (e.g. a stale feed raced by a peer's launch)
-            # must not push the fleet past its entitlement.
-            fill_target_launch = min(fill_target_launch, fill_ceiling)
+        if fill_ceiling_launch is not None:
+            # Launch-side ceiling: a feed above the remaining grant
+            # headroom (e.g. a stale feed raced by a peer's launch) must
+            # not push the fleet past its entitlement. Latest-only
+            # demand-placed exemption here (see the CEILING note above):
+            # old-version demand rows must not inflate launches during a
+            # rolling update.
+            fill_target_launch = min(fill_target_launch, fill_ceiling_launch)
         num_fill_up = (fill_target_launch -
                        max(num_latest_nonterminal, demand_target))
         if num_fill_up > 0:

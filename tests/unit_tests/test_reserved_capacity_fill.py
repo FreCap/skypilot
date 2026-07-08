@@ -1127,6 +1127,29 @@ class TestGrantCeiling(unittest.TestCase):
         self.assertEqual(autoscaler.info()['fill_target'], 2)
         self.assertEqual(len(_downs(decisions)), 2)
 
+    def test_old_demand_rows_do_not_inflate_launch_ceiling(self):
+        # Rolling update: 3 OLD-version demand-placed zero-cost rows are
+        # still draining. The launch-side ceiling must count only
+        # LATEST-version demand-placed rows (here 0), so fill launches
+        # stay capped at the grant: ceiling 2, demand baseline 1 ->
+        # exactly 1 fill up. An all-version launch ceiling (2 + 3 old
+        # rows) would fund 4 fill ups, overshooting the grant by the old
+        # rows' count.
+        autoscaler = autoscalers.RequestRateAutoscaler('svc',
+                                                       _spec(min_replicas=1,
+                                                             max_replicas=20),
+                                                       version=2)
+        _feed_broker(autoscaler, 5, grant=2)
+        old_demand = [_replica(i, _K8S_KEY, version=1) for i in range(1, 4)]
+        for row in old_demand:
+            row.reserved_fill = False
+        decisions = autoscaler.generate_scaling_decisions(old_demand, [1])
+        self.assertEqual(len(_fill_ups(decisions)), 1)
+        # The target/shelter-side ceiling keeps the all-version count
+        # (grant 2 + 3 demand-placed rows): existing rows keep their
+        # exemption regardless of version.
+        self.assertEqual(autoscaler.info()['fill_target'], 5)
+
     def test_stale_broker_snapshot_still_shelters_holdings(self):
         # Ceiling + staleness compose: a dead poller decays the feed to 0
         # but holdings at-or-under the ceiling keep their shelter.

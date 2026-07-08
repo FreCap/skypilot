@@ -136,6 +136,20 @@ class SkyServiceSpec:
                 with ux_utils.print_exception_no_traceback():
                     raise ValueError('reserved_capacity_fill.weight must be '
                                      f'a number > 0. Got: {fill_weight}')
+            # A floor above max_replicas can never be materialized: the fill
+            # target is clamped to max_replicas, so the excess would sit as
+            # a permanent phantom claim on the broker (absorbing entitlement
+            # and feed the service never launches). The dynamic
+            # demand-pressure clamp (effective_cap in the broker claim) is
+            # the real guard; this is the cheap spec-time misconfiguration
+            # catch for the explicit-max case.
+            if max_replicas is not None and fill_floor > max_replicas:
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        'reserved_capacity_fill.floor_replicas must not '
+                        'exceed max_replicas. Got: '
+                        f'floor_replicas={fill_floor}, '
+                        f'max_replicas={max_replicas}')
         if reserved_fill_enabled:
             # Fill launches land as NON-spot replicas on zero-cost
             # locations, indistinguishable (via is_spot) from paid

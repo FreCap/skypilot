@@ -188,12 +188,17 @@ def _broker_cycle(autoscaler: 'autoscalers.Autoscaler',
     holdings_fill, holdings_demand = autoscaler.count_zero_cost_holdings(
         replica_infos)
     floor = autoscaler.reserved_fill_floor_replicas
+    # Real capacity cap this claimant can materialize right now: fill rides
+    # ABOVE the demand target, so anything past max_replicas - demand_target
+    # is phantom capacity. The broker clamps both the effective floor and
+    # the feed need by it -- otherwise an unattainable floor permanently
+    # absorbs entitlement and feed the service never launches.
+    effective_cap = max(
+        0, autoscaler.max_replicas - autoscaler.get_final_target_num_replicas())
     # Headroom cap on the share above the floor, pinned against the demand
     # target so the water-fill never grants slots this service could only
     # use by double-counting its demand replicas.
-    headroom = max(
-        0, autoscaler.max_replicas -
-        autoscaler.get_final_target_num_replicas() - floor)
+    headroom = max(0, effective_cap - floor)
     reserved_capacity_broker.upsert_claim(
         service_name,
         pool_key=pool_key,
@@ -203,6 +208,7 @@ def _broker_cycle(autoscaler: 'autoscalers.Autoscaler',
         holdings_fill=holdings_fill,
         holdings_demand=holdings_demand,
         headroom=headroom,
+        effective_cap=effective_cap,
         launchable=_placer_can_launch_zero_cost(placer))
     allocation = reserved_capacity_broker.run_round_if_stale(
         service_name, pool_key,

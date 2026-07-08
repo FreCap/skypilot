@@ -101,6 +101,20 @@ class ClaimInput:
     holdings_fill: int
     holdings_demand: int
     launchable: bool
+    # Real capacity cap the claimant can materialize right now
+    # (max(0, max_replicas - demand_target)); None = unbounded (legacy
+    # claim rows). Clamps both the effective floor and the feed need: a
+    # floor the service cannot actually launch (floor > cap) must not
+    # absorb entitlement or feed -- the excess joins the burst remainder
+    # (work conservation).
+    effective_cap: Optional[int] = None
+
+    def attainable_floor(self) -> int:
+        """The floor, clamped to what the claimant can materialize."""
+        floor = max(0, self.floor)
+        if self.effective_cap is not None:
+            floor = min(floor, max(0, self.effective_cap))
+        return floor
 
 
 @dataclasses.dataclass(frozen=True)
@@ -236,13 +250,28 @@ def compute_entitlements(total: int,
     + Sum of fill holdings) -- whole-pool allocation, no grandfathering.
     Sum(entitlements) <= total in all reachable states (floors are scaled
     into total; the water-fill never exceeds its amount).
+
+    Floors are clamped to each claimant's effective_cap first: an
+    unattainable floor (floor > what the service can launch under its
+    demand pressure) must not absorb entitlement it can never
+    materialize; the clamped excess joins the weighted remainder and
+    flows to peers. The water-fill share is capped so the whole
+    entitlement never exceeds effective_cap either.
     """
     floors = scale_floors(
-        total, {name: max(0, claim.floor) for name, claim in claims.items()})
+        total,
+        {name: claim.attainable_floor() for name, claim in claims.items()})
     remainder = max(0, total) - sum(floors.values())
-    shares = water_fill(
-        remainder, {name: claim.weight for name, claim in claims.items()},
-        {name: claim.headroom for name, claim in claims.items()})
+    caps: Dict[str, Optional[int]] = {}
+    for name, claim in claims.items():
+        cap = claim.headroom
+        if claim.effective_cap is not None:
+            room = max(0, claim.effective_cap - floors[name])
+            cap = room if cap is None else min(cap, room)
+        caps[name] = cap
+    shares = water_fill(remainder,
+                        {name: claim.weight for name, claim in claims.items()},
+                        caps)
     return {name: floors[name] + shares[name] for name in claims}
 
 
@@ -318,11 +347,16 @@ def compute_feeds(
     start, not the last assignment.
     """
     free = max(0, observed_free)
-    need = {
-        name: max(0,
-                  grants.get(name, 0) - claim.holdings_fill)
-        for name, claim in claims.items()
-    }
+    # Need is clamped by effective_cap, not just the grant: damping (and
+    # the blind-round holdings floor) can keep a published grant above
+    # what the claimant can currently materialize, and feed handed to a
+    # service that cannot launch it idles for the whole round.
+    need = {}
+    for name, claim in claims.items():
+        grant = grants.get(name, 0)
+        if claim.effective_cap is not None:
+            grant = min(grant, max(0, claim.effective_cap))
+        need[name] = max(0, grant - claim.holdings_fill)
     eligible = {
         name for name, claim in claims.items()
         if claim.launchable and need[name] > 0
@@ -375,10 +409,17 @@ def compute_feeds(
 # ============================== Round driver ================================
 
 
-def upsert_claim(service_name: str, *, pool_key: str, weight: float,
-                 floor_replicas: int, gpus_per_replica: int, holdings_fill: int,
-                 holdings_demand: int, headroom: Optional[int],
-                 launchable: bool) -> None:
+def upsert_claim(service_name: str,
+                 *,
+                 pool_key: str,
+                 weight: float,
+                 floor_replicas: int,
+                 gpus_per_replica: int,
+                 holdings_fill: int,
+                 holdings_demand: int,
+                 headroom: Optional[int],
+                 launchable: bool,
+                 effective_cap: Optional[int] = None) -> None:
     """Upserts this service's claim (the per-poll heartbeat)."""
     last = _ALLOCATION_CACHE.get(service_name)
     serve_state.upsert_reserved_fill_claim(
@@ -390,6 +431,7 @@ def upsert_claim(service_name: str, *, pool_key: str, weight: float,
         holdings_fill=holdings_fill,
         holdings_demand=holdings_demand,
         headroom=headroom,
+        effective_cap=effective_cap,
         launchable=launchable,
         heartbeat_ts=time.time(),
         owner_epoch=last[0].epoch if last is not None else None)
@@ -401,13 +443,16 @@ def remove_claim(service_name: str) -> None:
 
 
 def _claim_input(row: Dict[str, Any]) -> ClaimInput:
+    effective_cap = row.get('effective_cap')
     return ClaimInput(floor=int(row['floor_replicas'] or 0),
                       weight=float(row['weight'] or 1.0),
                       headroom=(int(row['headroom'])
                                 if row['headroom'] is not None else None),
                       holdings_fill=int(row['holdings_fill'] or 0),
                       holdings_demand=int(row['holdings_demand'] or 0),
-                      launchable=bool(row['launchable']))
+                      launchable=bool(row['launchable']),
+                      effective_cap=(int(effective_cap)
+                                     if effective_cap is not None else None))
 
 
 def _reject_mixed_gpus_per_replica(

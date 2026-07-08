@@ -25,13 +25,15 @@ def _claim(floor=0,
            headroom=None,
            holdings_fill=0,
            holdings_demand=0,
-           launchable=True):
+           launchable=True,
+           effective_cap=None):
     return broker.ClaimInput(floor=floor,
                              weight=weight,
                              headroom=headroom,
                              holdings_fill=holdings_fill,
                              holdings_demand=holdings_demand,
-                             launchable=launchable)
+                             launchable=launchable,
+                             effective_cap=effective_cap)
 
 
 # =========================== Pure allocation math ===========================
@@ -87,6 +89,25 @@ class TestEntitlements:
             grants = broker.compute_entitlements(total, claims)
             assert sum(grants.values()) <= total
 
+    def test_unattainable_floor_clamped_excess_flows_to_peer(self):
+        # a's floor of 5 exceeds what it can materialize (effective_cap
+        # 2): the floor is clamped and the freed 3 slots flow to the
+        # peer instead of sitting as a permanent phantom entitlement.
+        claims = {
+            'a': _claim(floor=5, effective_cap=2),
+            'b': _claim(),
+        }
+        assert broker.compute_entitlements(5, claims) == {'a': 2, 'b': 3}
+
+    def test_entitlement_never_exceeds_effective_cap(self):
+        claims = {
+            'a': _claim(weight=100, effective_cap=3),
+            'b': _claim(),
+        }
+        grants = broker.compute_entitlements(10, claims)
+        assert grants['a'] == 3
+        assert grants['b'] == 7
+
 
 class TestFeeds:
 
@@ -110,6 +131,15 @@ class TestFeeds:
         claims = {'a': _claim(), 'b': _claim()}
         feeds, _ = broker.compute_feeds(7, grants, claims, {}, 0.0, 100.0)
         assert sum(feeds.values()) <= 7
+
+    def test_feed_need_clamped_by_effective_cap(self):
+        # A grant kept above the claimant's real capacity (e.g. damping
+        # holding a stale level) must not translate into feed the
+        # claimant can never launch; the excess goes to the peer.
+        grants = {'a': 5, 'b': 5}
+        claims = {'a': _claim(effective_cap=2), 'b': _claim()}
+        feeds, _ = broker.compute_feeds(10, grants, claims, {}, 0.0, 100.0)
+        assert feeds == {'a': 2, 'b': 5}
 
     def test_sticky_feed_survives_weight_shift_within_window(self):
         # A single free GPU must stay with its assignee long enough for the
@@ -226,7 +256,8 @@ def _upsert(name,
             holdings_fill=0,
             holdings_demand=0,
             headroom=None,
-            launchable=True):
+            launchable=True,
+            effective_cap=None):
     broker.upsert_claim(name,
                         pool_key=pool_key,
                         weight=weight,
@@ -235,7 +266,8 @@ def _upsert(name,
                         holdings_fill=holdings_fill,
                         holdings_demand=holdings_demand,
                         headroom=headroom,
-                        launchable=launchable)
+                        launchable=launchable,
+                        effective_cap=effective_cap)
 
 
 def _obs(free, gpu_names=('A100',)):
@@ -334,6 +366,22 @@ class TestMultiClaimantRounds:
         assert alloc_b.grant is not None and alloc_b.grant >= 5
         # No free capacity yet: nobody gets a feed out of thin air.
         assert alloc_a.feed == 0 and alloc_b.feed == 0
+
+    def test_unattainable_floor_grant_and_feed_clamped(self):
+        # svc-a claims floor 5 but can only materialize 2 (demand pressure
+        # against max_replicas): both its grant and its feed clamp to 2,
+        # and the freed 3 slots flow to the peer -- no permanent phantom
+        # need absorbing feed it never launches.
+        _upsert('svc-a', floor=5, effective_cap=2)
+        _upsert('svc-b')
+        alloc_a = _run('svc-a', free=5)
+        assert alloc_a is not None
+        assert alloc_a.grant == 2
+        assert alloc_a.feed == 2
+        alloc_b = broker.get_my_allocation('svc-b')
+        assert alloc_b is not None
+        assert alloc_b.grant == 3
+        assert alloc_b.feed == 3
 
     def test_fresh_round_is_read_not_redriven(self, clock):
         _upsert('svc-a')
