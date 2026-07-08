@@ -321,6 +321,47 @@ run: echo hi
         assert l4[0].to_dict()['disk_tier'] == 'high'
         assert a10g[0].to_dict()['disk_tier'] is None
 
+    def test_shape_passed_to_feasibility_has_no_leaked_attrs(
+            self, monkeypatch):
+        # pylint: disable=import-outside-toplevel
+        import sky
+        from sky.clouds import aws as aws_cloud
+        from sky.utils import resources_utils
+
+        captured = []
+
+        def _capture(self, resources, num_nodes=1):
+            del self, num_nodes
+            captured.append(resources)
+            return resources_utils.FeasibleResources([], [], None)
+
+        monkeypatch.setattr(aws_cloud.AWS, 'get_feasible_launchable_resources',
+                            _capture)
+        t = sky.Task.from_yaml_str("""
+resources:
+  cpus: 4+
+  ports: 8080
+  any_of:
+    - infra: aws/us-east-1
+      accelerators: L4:1
+      use_spot: true
+      disk_tier: high
+      image_id: docker:myrepo/model:v1
+    - infra: aws/us-east-2
+      accelerators: A10G:1
+      use_spot: false
+run: echo hi
+""")
+        spot_placer._get_possible_location_from_task(t)
+        by_acc = {list(r.accelerators)[0]: r for r in captured}
+        assert by_acc['L4'].disk_tier is not None
+        assert by_acc['L4'].image_id is not None
+        # The tier-less/image-less entry must not inherit the other
+        # entry's disk_tier or image_id in the feasibility shape: clouds
+        # that reject those attributes would silently drop the location.
+        assert by_acc['A10G'].disk_tier is None
+        assert by_acc['A10G'].image_id is None
+
     def test_pickle_roundtrip_and_backcompat(self):
         with mock.patch.object(spot_placer.registry.CLOUD_REGISTRY,
                                'from_str',
