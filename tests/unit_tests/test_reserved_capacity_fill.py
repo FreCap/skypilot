@@ -546,7 +546,7 @@ class TestControllerSeeding(unittest.TestCase):
         ctrl = controller_lib.SkyServeController.__new__(
             controller_lib.SkyServeController)
         ctrl._autoscaler = autoscaler
-        ctrl._replica_manager = types.SimpleNamespace(_spot_placer=placer)
+        ctrl._replica_manager = types.SimpleNamespace(spot_placer=placer)
         return ctrl
 
     def _placer(self):

@@ -74,7 +74,10 @@ def query_free_slots(
             per_replica = max(1, int(per_replica))
         except (TypeError, ValueError):
             per_replica = 1
-        key = (location.region, gpu_name)
+        # Lowercased gpu name: the realtime query matches
+        # case-insensitively, so 'A100' and 'a100' entries hit the same
+        # pool and must dedupe to one key.
+        key = (location.region, gpu_name.lower())
         per_key_replica_size[key] = max(per_key_replica_size.get(key, 1),
                                         per_replica)
     for (region, gpu_name), per_replica in per_key_replica_size.items():

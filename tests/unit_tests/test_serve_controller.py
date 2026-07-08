@@ -455,7 +455,7 @@ class TestReservedCapacityPollerStart:
     def _controller_with(self, placer):
         ctrl = _make_controller()
         ctrl._replica_manager = mock.Mock()
-        ctrl._replica_manager._spot_placer = placer
+        ctrl._replica_manager.spot_placer = placer
         ctrl._autoscaler = mock.Mock()
         ctrl._reserved_capacity_poller_started = False
         ctrl._reserved_capacity_poller_lock = threading.Lock()
@@ -495,7 +495,7 @@ class TestSeedFillZeroCostLocations:
         placer = mock.Mock()
         placer.zero_cost_locations.side_effect = RuntimeError('api down')
         ctrl._replica_manager = mock.Mock()
-        ctrl._replica_manager._spot_placer = placer
+        ctrl._replica_manager.spot_placer = placer
         autoscaler = mock.Mock()
         autoscaler.reserved_capacity_fill = True
         ctrl._seed_fill_zero_cost_locations(autoscaler)

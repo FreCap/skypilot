@@ -166,7 +166,7 @@ class SkyServeController:
         """
         if not autoscaler.reserved_capacity_fill:
             return
-        placer = getattr(self._replica_manager, '_spot_placer', None)
+        placer = self._replica_manager.spot_placer
         if placer is None:
             return
         try:
@@ -388,7 +388,7 @@ class SkyServeController:
         protects the pre-first-poll window is handled separately by
         _seed_fill_zero_cost_locations (at construction and on update).
         """
-        placer = getattr(self._replica_manager, '_spot_placer', None)
+        placer = self._replica_manager.spot_placer
         if placer is None:
             # The flag without a spot placer is inert (the placer defines
             # the zero-cost location set fill draws from): say so
@@ -410,9 +410,8 @@ class SkyServeController:
             self._reserved_capacity_poller_started = True
         thread_utils.start_supervised_thread(
             lambda: reserved_capacity.poller_loop(
-                lambda: self._autoscaler, lambda: getattr(
-                    self._replica_manager, '_spot_placer', None)),
-            'reserved-capacity-poller')
+                lambda: self._autoscaler, lambda: self._replica_manager.
+                spot_placer), 'reserved-capacity-poller')
 
     def _run_autoscaler(self):
         logger.info('Starting autoscaler.')

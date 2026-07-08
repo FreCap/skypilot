@@ -220,9 +220,10 @@ class Autoscaler:
             self.target_num_replicas)
         self.update_mode = update_mode
         # An update can toggle the fill flag; consumption follows the new
-        # spec immediately. (The poller thread is boot-wired: enabling the
-        # flag on a service that booted without it takes effect on the
-        # next controller respawn.)
+        # spec immediately. (The controller's update_service handler
+        # seeds the zero-cost location set and starts the poller when an
+        # update enables the flag -- no respawn needed, provided the spot
+        # placer already exists.)
         self.reserved_capacity_fill = bool(
             getattr(spec, 'reserved_capacity_fill', False))
 

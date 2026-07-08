@@ -778,6 +778,16 @@ class ReplicaManager:
 
         # Newest version among the currently provisioned and launched replicas
         self.latest_version: int = version
+
+    @property
+    def spot_placer(self) -> Optional['spot_placer.SpotPlacer']:
+        """The placer, if this manager kind carries one (else None).
+
+        Public accessor for the controller's fill machinery, which needs
+        the placer's zero-cost location set; only
+        SkyPilotReplicaManager actually builds one.
+        """
+        return getattr(self, '_spot_placer', None)
         # Oldest version among the currently provisioned and launched replicas
         self.least_recent_version: int = version
 
