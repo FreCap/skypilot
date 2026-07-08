@@ -36,6 +36,7 @@ class SkyServiceSpec:
         num_overprovision: Optional[int] = None,
         ports: Optional[str] = None,
         target_qps_per_replica: Optional[Union[float, Dict[str, float]]] = None,
+        target_concurrency_per_replica: Optional[float] = None,
         post_data: Optional[Dict[str, Any]] = None,
         tls_credential: Optional[serve_utils.TLSCredential] = None,
         readiness_headers: Optional[Dict[str, str]] = None,
@@ -57,6 +58,7 @@ class SkyServiceSpec:
             unsupported_fields = [
                 'num_overprovision',
                 'target_qps_per_replica',
+                'target_concurrency_per_replica',
                 'base_ondemand_fallback_replicas',
                 'dynamic_ondemand_fallback',
                 'spot_placer',
@@ -103,11 +105,35 @@ class SkyServiceSpec:
                                  f'min_replicas={min_replicas}, '
                                  f'max_replicas={max_replicas}')
 
+        # The two demand knobs select different autoscalers (request-rate vs
+        # concurrency); allowing both would make the sizing model ambiguous.
+        if (target_qps_per_replica is not None and
+                target_concurrency_per_replica is not None):
+            with ux_utils.print_exception_no_traceback():
+                raise ValueError(
+                    'target_qps_per_replica and '
+                    'target_concurrency_per_replica are mutually exclusive. '
+                    'Please set only one of them.')
+
+        if target_concurrency_per_replica is not None:
+            # Zero (or negative) per-GPU capacity would make every replica
+            # capacity 0 and feed divisions in the concurrency autoscaler.
+            if target_concurrency_per_replica <= 0:
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        'target_concurrency_per_replica must be > 0. '
+                        f'Got: {target_concurrency_per_replica}')
+
         if target_qps_per_replica is not None:
             if max_replicas is None:
                 with ux_utils.print_exception_no_traceback():
                     raise ValueError('max_replicas must be set where '
                                      'target_qps_per_replica is set.')
+        elif target_concurrency_per_replica is not None:
+            if max_replicas is None:
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError('max_replicas must be set where '
+                                     'target_concurrency_per_replica is set.')
         else:
             # Allow different min/max replicas for pools with queue-length
             # autoscaling
@@ -116,8 +142,9 @@ class SkyServiceSpec:
                 with ux_utils.print_exception_no_traceback():
                     raise ValueError(
                         'Detected different min_replicas and max_replicas '
-                        'while target_qps_per_replica is not set. To enable '
-                        'autoscaling, please set target_qps_per_replica.')
+                        'while neither target_qps_per_replica nor '
+                        'target_concurrency_per_replica is set. To enable '
+                        'autoscaling, please set one of them.')
 
         if not readiness_path.startswith('/'):
             with ux_utils.print_exception_no_traceback():
@@ -131,6 +158,25 @@ class SkyServiceSpec:
                 raise ValueError(
                     f'Unknown load balancing policy: {load_balancing_policy}. '
                     f'Available policies: {list(serve.LB_POLICIES.keys())}')
+
+        if target_concurrency_per_replica is not None:
+            # The concurrency autoscaler sizes on the LB's in-flight gauges;
+            # a policy that does not track per-replica load (e.g.
+            # round_robin) would leave the autoscaler blind, so reject at
+            # spec load rather than at runtime. `make_policy_name` resolves
+            # None to the default policy (least_load), which does track.
+            resolved_policy = lb_policies.LoadBalancingPolicy.make_policy_name(
+                load_balancing_policy)
+            policy_cls = lb_policies.LB_POLICIES.get(resolved_policy)
+            if policy_cls is None or not issubclass(
+                    policy_cls, lb_policies.LeastLoadPolicy):
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        'target_concurrency_per_replica requires a '
+                        'load-tracking load balancing policy (e.g. '
+                        'least_load or instance_aware_least_load). '
+                        f'Got: {resolved_policy}')
+
         self._readiness_path: str = readiness_path
         self._initial_delay_seconds: int = initial_delay_seconds
         self._readiness_timeout_seconds: int = readiness_timeout_seconds
@@ -148,6 +194,9 @@ class SkyServiceSpec:
         self._ports: Optional[str] = ports
         self._target_qps_per_replica: Optional[Union[float, Dict[
             str, float]]] = target_qps_per_replica
+        # Per-GPU target concurrency: replica capacity = knob * gpu_count.
+        self._target_concurrency_per_replica: Optional[float] = (
+            target_concurrency_per_replica)
         self._post_data: Optional[Dict[str, Any]] = post_data
         self._tls_credential: Optional[serve_utils.TLSCredential] = (
             tls_credential)
@@ -183,6 +232,8 @@ class SkyServiceSpec:
         state.setdefault('_lb_max_retries', None)
         state.setdefault('_lb_retry_initial_backoff_seconds', None)
         state.setdefault('_consecutive_failure_threshold_timeout', None)
+        # Added with the concurrency autoscaler; old DB rows predate it.
+        state.setdefault('_target_concurrency_per_replica', None)
         self.__dict__.update(state)
 
     @staticmethod
@@ -365,6 +416,7 @@ class SkyServiceSpec:
             service_config['downscale_delay_seconds'] = pool_downscale_delay
             service_config['num_overprovision'] = None
             service_config['target_qps_per_replica'] = None
+            service_config['target_concurrency_per_replica'] = None
         else:
             service_config['min_replicas'] = policy_section['min_replicas']
             service_config['max_replicas'] = policy_section.get(
@@ -373,6 +425,8 @@ class SkyServiceSpec:
                 'num_overprovision', None)
             service_config['target_qps_per_replica'] = policy_section.get(
                 'target_qps_per_replica', None)
+            service_config['target_concurrency_per_replica'] = (
+                policy_section.get('target_concurrency_per_replica', None))
             service_config['upscale_delay_seconds'] = policy_section.get(
                 'upscale_delay_seconds', None)
             service_config['downscale_delay_seconds'] = policy_section.get(
@@ -393,6 +447,8 @@ class SkyServiceSpec:
 
         # Validate instance-aware settings
         target_qps_per_replica = service_config['target_qps_per_replica']
+        target_concurrency_per_replica = service_config.get(
+            'target_concurrency_per_replica', None)
         load_balancing_policy = service_config['load_balancing_policy']
 
         if isinstance(target_qps_per_replica, dict):
@@ -414,8 +470,27 @@ class SkyServiceSpec:
                         '(dynamic_ondemand_fallback / '
                         'base_ondemand_fallback_replicas).')
 
+        if target_concurrency_per_replica is not None:
+            # Same trap as the dict-qps case above: on-demand fallback
+            # selects FallbackRequestRateAutoscaler in from_spec, which
+            # would silently ignore the concurrency knob (or, with the
+            # knob checked first, silently drop the user's spot-safety
+            # fallback config). Reject at load instead of at runtime.
+            if (service_config.get('dynamic_ondemand_fallback') or
+                    service_config.get('base_ondemand_fallback_replicas')):
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        'target_concurrency_per_replica is not supported '
+                        'with on-demand fallback '
+                        '(dynamic_ondemand_fallback / '
+                        'base_ondemand_fallback_replicas).')
+
         if load_balancing_policy == 'instance_aware_least_load':
-            if not isinstance(target_qps_per_replica, dict):
+            # The per-GPU concurrency knob carries its own shape-aware
+            # capacity model (knob * gpu_count), so the QPS dict is only
+            # mandatory when it is the sizing signal.
+            if (target_concurrency_per_replica is None and
+                    not isinstance(target_qps_per_replica, dict)):
                 with ux_utils.print_exception_no_traceback():
                     raise ValueError(
                         'When using "instance_aware_least_load" policy, '
@@ -521,6 +596,8 @@ class SkyServiceSpec:
                         self.num_overprovision)
         add_if_not_none('replica_policy', 'target_qps_per_replica',
                         self.target_qps_per_replica)
+        add_if_not_none('replica_policy', 'target_concurrency_per_replica',
+                        self.target_concurrency_per_replica)
         add_if_not_none('replica_policy', 'dynamic_ondemand_fallback',
                         self.dynamic_ondemand_fallback)
         add_if_not_none('replica_policy', 'base_ondemand_fallback_replicas',
@@ -590,14 +667,23 @@ class SkyServiceSpec:
         min_plural = '' if self.min_replicas == 1 else 's'
         if self.max_replicas == self.min_replicas or self.max_replicas is None:
             return f'Fixed {self.min_replicas} {noun}{min_plural}'
-        # Already checked in __init__.
-        assert self.target_qps_per_replica is not None
         # TODO(tian): Refactor to contain more information
         max_plural = '' if self.max_replicas == 1 else 's'
         overprovision_str = ''
         if self.num_overprovision is not None:
             overprovision_str = (
                 f' with {self.num_overprovision} overprovisioned replicas')
+        # This runs on every service record build (serve_state.get_service),
+        # so it must render (not assert) for every valid autoscaling spec.
+        if self.target_concurrency_per_replica is not None:
+            return (
+                f'Autoscaling from {self.min_replicas} to {self.max_replicas} '
+                f'{noun}{max_plural}{overprovision_str} '
+                '(target_concurrency_per_replica: '
+                f'{self.target_concurrency_per_replica} per GPU)')
+        # Already checked in __init__: a non-fixed, non-pool service without
+        # the concurrency knob must carry the QPS knob.
+        assert self.target_qps_per_replica is not None
         return (f'Autoscaling from {self.min_replicas} to {self.max_replicas} '
                 f'{noun}{max_plural}{overprovision_str} (target QPS per '
                 f'{noun}: {self.target_qps_per_replica})')
@@ -679,6 +765,12 @@ class SkyServiceSpec:
     def target_qps_per_replica(
             self) -> Optional[Union[float, Dict[str, float]]]:
         return self._target_qps_per_replica
+
+    @property
+    def target_concurrency_per_replica(self) -> Optional[float]:
+        # Per GPU: replica capacity = knob * gpu_count. Guarded with getattr
+        # semantics via __setstate__ for specs unpickled from old DB rows.
+        return self._target_concurrency_per_replica
 
     @property
     def post_data(self) -> Optional[Dict[str, Any]]:
@@ -766,6 +858,9 @@ class SkyServiceSpec:
             ports=override.pop('ports', self._ports),
             target_qps_per_replica=override.pop('target_qps_per_replica',
                                                 self._target_qps_per_replica),
+            target_concurrency_per_replica=override.pop(
+                'target_concurrency_per_replica',
+                self._target_concurrency_per_replica),
             post_data=override.pop('post_data', self._post_data),
             tls_credential=override.pop('tls_credential', self._tls_credential),
             readiness_headers=override.pop('readiness_headers',

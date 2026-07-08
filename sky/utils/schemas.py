@@ -1048,6 +1048,16 @@ def get_service_schema():
                             }
                         ]
                     },
+                    # Per-GPU target concurrency (replica capacity =
+                    # knob * gpu_count). Mutually exclusive with
+                    # target_qps_per_replica; the exclusivity (and the
+                    # load-tracking LB policy requirement) is validated in
+                    # SkyServiceSpec.__init__, not here — this schema has no
+                    # cross-field constructs.
+                    'target_concurrency_per_replica': {
+                        'type': 'number',
+                        'exclusiveMinimum': 0,
+                    },
                     'dynamic_ondemand_fallback': {
                         'type': 'boolean',
                     },

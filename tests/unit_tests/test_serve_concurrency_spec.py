@@ -1,0 +1,169 @@
+"""Spec plumbing for target_concurrency_per_replica.
+
+The knob is the third autoscaling signal (after target_qps_per_replica and
+pool queue_length_threshold): per-GPU target concurrency, replica capacity =
+knob * gpu_count. These tests pin the spec-level contract only — validation
+gates, yaml/copy/pickle round-trips, and the status string path that runs on
+every service record build.
+"""
+from typing import Any, Dict
+
+import pytest
+
+from sky.serve import service_spec as service_spec_lib
+
+
+def _make_spec(**kwargs: Any) -> service_spec_lib.SkyServiceSpec:
+    """Construct a spec with the minimal required fields."""
+    base: Dict[str, Any] = {
+        'readiness_path': '/health',
+        'initial_delay_seconds': 60,
+        'readiness_timeout_seconds': 30,
+        'endpoint_probe_interval_seconds': 10,
+        'lb_stream_timeout_seconds': 60,
+        'min_replicas': 1,
+    }
+    base.update(kwargs)
+    return service_spec_lib.SkyServiceSpec(**base)
+
+
+def test_concurrency_knob_enables_autoscaling():
+    # min != max without target_qps_per_replica used to be rejected; the
+    # concurrency knob must open the same gate.
+    spec = _make_spec(min_replicas=1,
+                      max_replicas=5,
+                      target_concurrency_per_replica=2.0)
+    assert spec.target_concurrency_per_replica == 2.0
+    assert spec.target_qps_per_replica is None
+
+
+def test_both_knobs_rejected():
+    with pytest.raises(ValueError):
+        _make_spec(min_replicas=1,
+                   max_replicas=5,
+                   target_qps_per_replica=1.0,
+                   target_concurrency_per_replica=2.0)
+
+
+@pytest.mark.parametrize('bad_value', [0, -1, -0.5])
+def test_non_positive_knob_rejected(bad_value):
+    with pytest.raises(ValueError):
+        _make_spec(min_replicas=1,
+                   max_replicas=5,
+                   target_concurrency_per_replica=bad_value)
+
+
+def test_knob_requires_max_replicas():
+    # Mirrors the target_qps_per_replica analog: without a ceiling the
+    # autoscaler has no clip bound.
+    with pytest.raises(ValueError):
+        _make_spec(min_replicas=1, target_concurrency_per_replica=2.0)
+
+
+def test_knob_requires_load_tracking_policy():
+    # round_robin carries no in-flight gauge, so the concurrency autoscaler
+    # would be blind; must be rejected at spec load.
+    with pytest.raises(ValueError):
+        _make_spec(min_replicas=1,
+                   max_replicas=5,
+                   target_concurrency_per_replica=2.0,
+                   load_balancing_policy='round_robin')
+    # The default (None -> least_load) and explicit least_load both track.
+    _make_spec(min_replicas=1,
+               max_replicas=5,
+               target_concurrency_per_replica=2.0,
+               load_balancing_policy='least_load')
+
+
+def test_knob_rejected_for_pool():
+    with pytest.raises(ValueError):
+        _make_spec(min_replicas=1,
+                   max_replicas=5,
+                   target_concurrency_per_replica=2.0,
+                   pool=True)
+
+
+def test_min_neq_max_without_any_knob_still_rejected():
+    with pytest.raises(ValueError):
+        _make_spec(min_replicas=1, max_replicas=5)
+
+
+@pytest.mark.parametrize('fallback_field', [
+    {
+        'dynamic_ondemand_fallback': True
+    },
+    {
+        'base_ondemand_fallback_replicas': 1
+    },
+])
+def test_knob_rejected_with_ondemand_fallback(fallback_field):
+    # from_spec routes on-demand fallback to FallbackRequestRateAutoscaler,
+    # which would silently ignore the concurrency knob (or the knob branch
+    # would silently drop the spot-safety fallback). Reject at load, same
+    # as the dict-qps + fallback combination.
+    spec = _make_spec(min_replicas=1,
+                      max_replicas=5,
+                      target_concurrency_per_replica=2.0)
+    config = spec.to_yaml_config()
+    config['replica_policy'].update(fallback_field)
+    with pytest.raises(ValueError):
+        service_spec_lib.SkyServiceSpec.from_yaml_config(config)
+
+
+def test_yaml_round_trip_preserves_knob():
+    spec = _make_spec(min_replicas=1,
+                      max_replicas=5,
+                      target_concurrency_per_replica=2.0)
+    config = spec.to_yaml_config()
+    # from_yaml_config also runs the JSON schema, so this covers schema
+    # acceptance of the new field.
+    restored = service_spec_lib.SkyServiceSpec.from_yaml_config(config)
+    assert restored.target_concurrency_per_replica == 2.0
+    assert restored.target_qps_per_replica is None
+    assert restored.max_replicas == 5
+
+
+def test_yaml_round_trip_omits_unset_knob():
+    # An unset knob must not appear in the yaml (older controllers would
+    # reject unknown fields during serve update).
+    spec = _make_spec(min_replicas=2)
+    config = spec.to_yaml_config()
+    assert 'target_concurrency_per_replica' not in config.get(
+        'replica_policy', {})
+    restored = service_spec_lib.SkyServiceSpec.from_yaml_config(config)
+    assert restored.target_concurrency_per_replica is None
+
+
+def test_copy_preserves_knob():
+    # copy() threads every field manually; omission would silently drop the
+    # knob on `sky serve update`.
+    spec = _make_spec(min_replicas=1,
+                      max_replicas=5,
+                      target_concurrency_per_replica=2.0)
+    copied = spec.copy()
+    assert copied.target_concurrency_per_replica == 2.0
+    overridden = spec.copy(target_concurrency_per_replica=3.0)
+    assert overridden.target_concurrency_per_replica == 3.0
+
+
+def test_autoscaling_policy_str_renders_for_concurrency_service():
+    # Called on every service record build; without a concurrency branch it
+    # asserts target_qps_per_replica is not None and crashes status.
+    spec = _make_spec(min_replicas=1,
+                      max_replicas=5,
+                      target_concurrency_per_replica=2.0)
+    result = spec.autoscaling_policy_str()
+    assert isinstance(result, str)
+    assert result
+
+
+def test_setstate_defaults_knob_for_old_rows():
+    # Specs pickled before the field existed must unpickle with the knob
+    # unset instead of raising AttributeError on property access.
+    spec = _make_spec(min_replicas=2)
+    old_state = dict(spec.__dict__)
+    del old_state['_target_concurrency_per_replica']
+    restored = service_spec_lib.SkyServiceSpec.__new__(
+        service_spec_lib.SkyServiceSpec)
+    restored.__setstate__(old_state)
+    assert restored.target_concurrency_per_replica is None

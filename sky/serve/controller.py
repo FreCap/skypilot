@@ -110,7 +110,9 @@ class SkyServeController:
             handler.addFilter(AutoscalerInfoFilter())
         yield
 
-    def _get_lb_replica_info(self) -> Dict[str, Dict[str, str]]:
+    def _get_lb_replica_info(
+        self, replica_infos: List['replica_managers.ReplicaInfo']
+    ) -> Dict[str, Dict[str, str]]:
         """Build the url -> replica info mapping for load_balancer_sync.
 
         [boltz fork] Resolving a replica's url and gpu_type is expensive (a
@@ -120,6 +122,10 @@ class SkyServeController:
         resolved on a sync.
         A brand-new replica whose gpu_type cannot be resolved yet is reported
         as 'unknown' until it is.
+
+        `replica_infos` is fetched once by the caller and shared with the
+        capacity-hint computation, so the async sync handler issues no
+        extra replica-list DB reads.
         """
         record = serve_state.get_service_from_name(self._service_name)
         assert record is not None, ('No service record found for '
@@ -127,7 +133,7 @@ class SkyServeController:
         active_versions = set(record['active_versions'])
         replica_cache: Dict[int, Tuple[str, str, int]] = {}
         replica_info: Dict[str, Dict[str, str]] = {}
-        for info in serve_state.get_replica_infos(self._service_name):
+        for info in replica_infos:
             if (info.status != serve_state.ReplicaStatus.READY or
                     info.version not in active_versions):
                 continue
@@ -171,6 +177,73 @@ class SkyServeController:
         # replicas that are no longer READY.
         self._lb_replica_cache = replica_cache
         return replica_info
+
+    def _translate_in_flight(
+            self,
+            in_flight_by_url: Optional[Dict[str,
+                                            int]]) -> Optional[Dict[int, int]]:
+        """Translate the LB's url-keyed in-flight gauge to replica ids.
+
+        [boltz fork] The LB only knows replicas by url; the autoscaler
+        only knows them by id. `_lb_replica_cache` (replica_id -> (url,
+        gpu_type, gpu_count), rebuilt by `_get_lb_replica_info` on every
+        sync, so call that first) provides the inversion. A url the cache
+        does not know (the replica left the READY set between the LB's
+        snapshot and this sync) is dropped: there is no live replica id
+        to attribute the work to, and the drain-aware victim selection
+        already treats unknown-to-the-report replicas as busy.
+
+        None passes through: it means the LB (old version, or a policy
+        that cannot track in-flight) sent no gauge, which the autoscaler
+        must distinguish from an empty fleet.
+        """
+        if in_flight_by_url is None:
+            return None
+        url_to_replica_id = {
+            url: replica_id
+            for replica_id, (url, _, _) in self._lb_replica_cache.items()
+        }
+        in_flight_by_replica_id: Dict[int, int] = {}
+        for url, count in in_flight_by_url.items():
+            replica_id = url_to_replica_id.get(url)
+            if replica_id is not None:
+                in_flight_by_replica_id[replica_id] = int(count)
+        return in_flight_by_replica_id
+
+    def _get_capacity_hint(
+            self, replica_infos: List['replica_managers.ReplicaInfo']
+    ) -> Dict[str, int]:
+        """Build the capacity_hint block of the sync response.
+
+        [boltz fork] Computed from the replica_infos list the handler
+        already fetched for `_get_lb_replica_info` -- no extra DB reads.
+
+        - provisioning_replicas: latest-version, nonterminal, not-yet-
+          ready replicas (capacity that will serve soon; lets the data
+          plane hold spill decisions for capacity already on the way).
+        - target_num_replicas: the autoscaler's current target. While the
+          autoscaler reports its demand signal stale (e.g. a rebuilt
+          controller that has not received an in-flight report yet, whose
+          target reset to min_replicas), report max(target, latest
+          nonterminal count) instead: a routine controller restart must
+          not tell the platform a live fleet wants to shrink.
+        """
+        latest_version = self._autoscaler.latest_version
+        num_provisioning = 0
+        num_latest_nonterminal = 0
+        for info in replica_infos:
+            if info.version != latest_version or info.is_terminal:
+                continue
+            num_latest_nonterminal += 1
+            if not info.is_ready:
+                num_provisioning += 1
+        target = self._autoscaler.get_final_target_num_replicas()
+        if not self._autoscaler.has_fresh_demand_report():
+            target = max(target, num_latest_nonterminal)
+        return {
+            'provisioning_replicas': num_provisioning,
+            'target_num_replicas': target,
+        }
 
     def _get_routing_spec(self) -> Optional[Dict[str, Any]]:
         """Build the routing spec for the load_balancer_sync response.
@@ -294,11 +367,32 @@ class SkyServeController:
                 'request_aggregator', {})
             timestamps: List[int] = request_aggregator.get('timestamps', [])
             logger.info(f'Received {len(timestamps)} inflight requests.')
-            self._autoscaler.collect_request_information(request_aggregator)
+            # One replica-list fetch shared by the LB replica info and the
+            # capacity hint (this handler is async on the event loop --
+            # keep its added work O(replicas) with no new blocking DB
+            # calls).
+            replica_infos = serve_state.get_replica_infos(self._service_name)
+            # Resolve the url->id mapping BEFORE translating in_flight:
+            # _get_lb_replica_info rebuilds _lb_replica_cache from this
+            # sync's READY replicas.
+            lb_replica_info = self._get_lb_replica_info(replica_infos)
+            # Merge the new demand gauges (all optional; an old LB simply
+            # omits them) into the single dict handed to the autoscaler.
+            # The QPS/pool autoscalers only .get('timestamps'), so the
+            # extra keys are safe for every autoscaler type.
+            request_information: Dict[str, Any] = {
+                'timestamps': timestamps,
+                'in_flight_by_replica_id': self._translate_in_flight(
+                    request_data.get('in_flight')),
+                'queue_depth': request_data.get('queue_depth'),
+                'rejected_in_window': request_data.get('rejected_in_window'),
+            }
+            self._autoscaler.collect_request_information(request_information)
 
             return responses.JSONResponse(content={
-                'replica_info': self._get_lb_replica_info(),
+                'replica_info': lb_replica_info,
                 'routing_spec': self._get_routing_spec(),
+                'capacity_hint': self._get_capacity_hint(replica_infos),
             },
                                           status_code=200)
 

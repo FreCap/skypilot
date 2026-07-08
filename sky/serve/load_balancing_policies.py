@@ -103,6 +103,15 @@ class LoadBalancingPolicy:
         """
         return None
 
+    def snapshot_in_flight(self) -> Optional[Dict[str, int]]:
+        """Per-replica in-flight snapshot (url -> count), when tracked.
+
+        None for policies without load accounting (round robin): the
+        controller sync then reports demand as unknown -- the autoscaler's
+        signal-gap rules apply -- rather than a false all-idle fleet.
+        """
+        return None
+
     def pre_execute_hook(self, replica_url: str,
                          request: 'fastapi.Request') -> Optional[Any]:
         """Account an in-flight request. Returns an opaque token that the
@@ -178,6 +187,17 @@ class LeastLoadPolicy(LoadBalancingPolicy, name='least_load', default=True):
             return sum(
                 self.load_map.get(replica, 0)
                 for replica in self.ready_replicas)
+
+    def snapshot_in_flight(self) -> Optional[Dict[str, int]]:
+        with self.lock:
+            # Same ready-replica scoping as total_in_flight: an entry for
+            # a pruned replica must not report phantom demand. A COPY, not
+            # the live defaultdict -- the caller serializes it outside the
+            # lock while the routing hot path keeps mutating the original.
+            return {
+                replica: self.load_map.get(replica, 0)
+                for replica in self.ready_replicas
+            }
 
     def _select_replica(self, request: 'fastapi.Request',
                         candidates: List[str]) -> Optional[str]:
