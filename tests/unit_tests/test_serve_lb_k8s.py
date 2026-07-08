@@ -478,35 +478,56 @@ class TestLbImagePullPolicyMirror(unittest.TestCase):
     lacked /_lb/capacity and proxied it to the model server).
     """
 
-    def _pod(self, image='ecr/skypilot:tag', pull_policy='Always'):
+    def _pod(self,
+             image='ecr/skypilot:tag',
+             pull_policy='Always',
+             image_id='ecr/skypilot@sha256:abc123'):
         container = mock.Mock()
         container.image = image
         container.image_pull_policy = pull_policy
+        status = mock.Mock()
+        status.image_id = image_id
         pod = mock.Mock()
         pod.spec.containers = [container]
+        pod.status.container_statuses = [status] if image_id else []
         return pod
 
-    def test_mirrors_always_from_controller(self):
+    def test_mirrors_always_and_digest_from_controller(self):
         with mock.patch.dict(lb_k8s.os.environ,
                              {constants.POD_NAME_ENV_VAR: 'ctrl-pod'}), \
              mock.patch.object(lb_k8s.kubernetes, 'core_api') as mock_api:
             mock_api.return_value.read_namespaced_pod.return_value = (self._pod(
                 pull_policy='Always'))
-            image, policy = lb_k8s._resolve_lb_image('ns', 'ctx')
+            image, policy, digest = lb_k8s._resolve_lb_image('ns', 'ctx')
         self.assertEqual(image, 'ecr/skypilot:tag')
         self.assertEqual(policy, 'Always')
+        self.assertEqual(digest, 'ecr/skypilot@sha256:abc123')
 
-    def test_defaults_when_controller_policy_unset(self):
+    def test_defaults_when_controller_policy_and_status_unset(self):
         with mock.patch.dict(lb_k8s.os.environ,
                              {constants.POD_NAME_ENV_VAR: 'ctrl-pod'}), \
              mock.patch.object(lb_k8s.kubernetes, 'core_api') as mock_api:
             mock_api.return_value.read_namespaced_pod.return_value = (self._pod(
-                pull_policy=None))
-            _, policy = lb_k8s._resolve_lb_image('ns', 'ctx')
+                pull_policy=None, image_id=None))
+            _, policy, digest = lb_k8s._resolve_lb_image('ns', 'ctx')
         self.assertEqual(policy, 'IfNotPresent')
+        self.assertIsNone(digest)
 
-    def test_deployment_dict_carries_policy(self):
+    def test_deployment_dict_carries_policy_and_rollout_annotation(self):
         deployment = lb_k8s._build_deployment_dict('svc', 'dep', 'img', 'ns',
-                                                   30001, [], 'Always')
-        container = deployment['spec']['template']['spec']['containers'][0]
+                                                   30001, [], 'Always',
+                                                   'img@sha256:abc')
+        template = deployment['spec']['template']
+        container = template['spec']['containers'][0]
         self.assertEqual(container['imagePullPolicy'], 'Always')
+        # The digest annotation is the rollout trigger: a controller roll on
+        # the same tag changes it, and the 409-patch makes k8s roll the LB.
+        self.assertEqual(
+            template['metadata']['annotations'][
+                lb_k8s.CONTROLLER_DIGEST_ANNOTATION], 'img@sha256:abc')
+
+    def test_unknown_digest_omits_annotation(self):
+        deployment = lb_k8s._build_deployment_dict('svc', 'dep', 'img', 'ns',
+                                                   30001, [], 'Always', None)
+        template = deployment['spec']['template']
+        self.assertNotIn('annotations', template['metadata'])

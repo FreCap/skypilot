@@ -35,6 +35,10 @@ from sky.serve import serve_utils
 
 logger = sky_logging.init_logger(__name__)
 
+# Pod-template annotation carrying the controller's resolved image digest —
+# the LB Deployment's rollout trigger (see _resolve_lb_image).
+CONTROLLER_DIGEST_ANNOTATION = 'skypilot.co/controller-image-digest'
+
 # Shared, platform-provided Service that exposes the controller port range so
 # LB pods can reach the in-pod controller. The controller does NOT create this.
 CONTROLLER_SERVICE_NAME = 'skypilot-serve-controller'
@@ -143,7 +147,8 @@ def _object_labels(service_name: str) -> dict:
     }
 
 
-def _resolve_lb_image(namespace: str, context: str) -> Tuple[str, str]:
+def _resolve_lb_image(namespace: str,
+                      context: str) -> Tuple[str, str, Optional[str]]:
     """Mirror the controller's container image AND pull policy onto the LB.
 
     Reads the controller pod (name from ``POD_NAME_ENV_VAR``) and returns its
@@ -167,7 +172,20 @@ def _resolve_lb_image(namespace: str, context: str) -> Tuple[str, str]:
             'external load balancer mode.')
     pod = kubernetes.core_api(context).read_namespaced_pod(pod_name, namespace)
     container = pod.spec.containers[0]
-    return container.image, (container.image_pull_policy or 'IfNotPresent')
+    # The RESOLVED digest of the running controller image (imageID from the
+    # container status; None while the status is not yet populated). Stamped
+    # on the LB pod template as an annotation: `Always` alone only re-pulls
+    # at pod (re)creation, so without a template change a controller roll on
+    # the SAME moving tag would leave an existing LB pod running old code
+    # forever. The ensure/409-patch on controller respawn updates the
+    # annotation, and the changed template makes Kubernetes roll the LB pod
+    # exactly when the controller's digest actually changed.
+    digest = None
+    statuses = getattr(pod.status, 'container_statuses', None) or []
+    if statuses and getattr(statuses[0], 'image_id', None):
+        digest = statuses[0].image_id
+    return (container.image, (container.image_pull_policy or
+                              'IfNotPresent'), digest)
 
 
 def _mirror_pod_env(pod_containers, env_name: str, token_value: str) -> dict:
@@ -228,9 +246,15 @@ def _resolve_lb_auth_envs(namespace: str, context: str) -> list:
     return [_mirror_pod_env(pod_containers, name, tok) for name, tok in active]
 
 
-def _build_deployment_dict(service_name: str, deployment_name: str, image: str,
-                           namespace: str, controller_port: int,
-                           auth_envs: list, image_pull_policy: str) -> dict:
+def _build_deployment_dict(
+        service_name: str,
+        deployment_name: str,
+        image: str,
+        namespace: str,
+        controller_port: int,
+        auth_envs: list,
+        image_pull_policy: str,
+        controller_image_digest: Optional[str] = None) -> dict:
     container = {
         'name': 'load-balancer',
         'image': image,
@@ -292,7 +316,18 @@ def _build_deployment_dict(service_name: str, deployment_name: str, image: str,
             },
             'template': {
                 'metadata': {
-                    'labels': pod_labels
+                    'labels': pod_labels,
+                    # Rollout trigger: changes exactly when the controller's
+                    # RESOLVED image digest changes, so the ensure/409-patch
+                    # on controller respawn rolls the LB pod onto the new
+                    # code (Always alone only re-pulls at pod creation).
+                    # Omitted when the digest is not yet known — an absent
+                    # annotation never forces a spurious roll.
+                    **({
+                        'annotations': {
+                            CONTROLLER_DIGEST_ANNOTATION: controller_image_digest,
+                        }
+                    } if controller_image_digest else {}),
                 },
                 'spec': {
                     'containers': [container]
@@ -338,12 +373,14 @@ def create_lb_deployment_and_service(service_name: str,
     namespace = kubernetes_utils.get_kube_config_context_namespace(context)
     deployment_name = lb_deployment_name(service_name)
     service_name_k8s = lb_service_name(service_name)
-    image, image_pull_policy = _resolve_lb_image(namespace, context)
+    image, image_pull_policy, controller_digest = _resolve_lb_image(
+        namespace, context)
     auth_envs = _resolve_lb_auth_envs(namespace, context)
 
     deployment_dict = _build_deployment_dict(service_name, deployment_name,
                                              image, namespace, controller_port,
-                                             auth_envs, image_pull_policy)
+                                             auth_envs, image_pull_policy,
+                                             controller_digest)
     service_dict = _build_service_dict(service_name, service_name_k8s,
                                        deployment_name)
 
