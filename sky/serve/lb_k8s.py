@@ -448,20 +448,26 @@ def ensure_lb_objects_exist(service_name: str, controller_port: int) -> None:
         lb_service_name(service_name))
     if not deployment_missing and not service_missing:
         return
-    # The objects may be missing because the service is being torn down
-    # concurrently (down/purge deleted them after the caller's last ownership
-    # check). Re-check the DB row right before mutating -- the create-time
-    # mirror of reconcile's delete-time re-check -- so the self-heal cannot
-    # resurrect a dead service's LB, whose name would otherwise keep serving
-    # and whose controller port is reclaimable by a new service. A residual
-    # TOCTOU window remains (the row can vanish between this read and the k8s
-    # create; the two stores cannot be updated transactionally), but it is
-    # milliseconds wide and self-correcting: an LB recreated for a dead
-    # service is reaped by the next recovery's reconcile_lb_objects, and a
-    # same-name successor's own ensure converges the objects to its spec.
-    if serve_state.get_service_from_name(service_name) is None:
+    # The objects may be missing because the service is being torn down or
+    # taken over concurrently. Re-check OWNERSHIP (not mere row existence)
+    # right before mutating -- the create-time mirror of reconcile's
+    # delete-time re-check: a row that is gone means down/purge won, and a
+    # row carrying another controller_pid means a same-name successor or an
+    # HA takeover owns the service now. Without the pid check, a stale
+    # controller could 409-patch the successor's fresh Deployment back to its
+    # own (stale) controller port -- and the periodic ensure deliberately
+    # never repairs drift, so that would stick until the next recovery. A
+    # residual TOCTOU window remains (the row can flip between this read and
+    # the k8s create; the two stores cannot be updated transactionally), but
+    # it is milliseconds wide, requires losing ownership in exactly that
+    # window, and is bounded: the next recovery's reconcile reaps a dead
+    # service's LB, and the live owner's own ensure/recovery converges a
+    # same-name successor's objects.
+    record = serve_state.get_service_from_name(service_name)
+    if record is None or record.get('controller_pid') != os.getpid():
         logger.info(f'External LB objects for {service_name!r} are missing '
-                    'but the service row is gone; skipping recreation.')
+                    'but this process no longer owns the service '
+                    '(row gone or taken over); skipping recreation.')
         return
     logger.warning(f'External LB objects for {service_name!r} are missing '
                    f'(deployment_missing={deployment_missing}, '

@@ -1146,24 +1146,29 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
         if not is_recovery:
             serve_state.set_service_load_balancer_port(service_name,
                                                        load_balancer_port)
-        elif external_lb:
-            # Recovery re-publishes the (constant) external port. This heals
-            # two stale-row shapes: a service migrated from in-pod mode still
-            # records its legacy in-pod port, and an up() that crashed between
-            # row creation and registration left the port NULL (registration
-            # would starve on recovery without this). Compare-and-swap on
-            # controller_pid -- pre-claimed by this process above -- so a
-            # stale recovery racing a purge + same-name re-up cannot write to
-            # the successor's row and prematurely unblock its registration.
-            # Best-effort: a DB error must not reach _start's destructive
-            # cleanup over a row fix.
+        # On recovery in external mode, re-publish the (constant) external
+        # port. This heals two stale-row shapes: a service migrated from
+        # in-pod mode still records its legacy in-pod port, and an up() that
+        # crashed between row creation and registration left the port NULL
+        # (registration would starve on recovery without this). Compare-and-
+        # swap on controller_pid -- pre-claimed by this process above -- so a
+        # stale recovery racing a purge + same-name re-up cannot write to the
+        # successor's row and prematurely unblock its registration. A
+        # transient DB error must not reach _start's destructive cleanup and
+        # must not starve the NULL case either, so the attempt is retried
+        # from the supervision loop until the CAS resolves (True: written;
+        # False: ownership lost, someone else owns the row now).
+        lb_port_republish_pending = is_recovery and external_lb
+        if lb_port_republish_pending:
             try:
                 serve_state.set_service_load_balancer_port_if_owner(
                     service_name, os.getpid(), load_balancer_port)
+                lb_port_republish_pending = False
             except Exception as e:  # pylint: disable=broad-except
                 logger.warning(
                     f'Failed to republish load_balancer_port for '
-                    f'{service_name}: {common_utils.format_exception(e)}')
+                    f'{service_name}: {common_utils.format_exception(e)}; '
+                    'will retry from the supervision loop.')
 
         # Self-check cadence (seconds): how often we re-read DB to confirm
         # we're still the authoritative controller. Ghost detection only
@@ -1228,6 +1233,19 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
             # must never reach _start's destructive cleanup.
             if (external_lb and
                     loop_count % external_lb_ensure_interval_seconds == 0):
+                if lb_port_republish_pending:
+                    try:
+                        # Either outcome resolves the retry: True means the
+                        # row is healed, False means ownership was lost and
+                        # the write is no longer ours to make.
+                        serve_state.set_service_load_balancer_port_if_owner(
+                            service_name, os.getpid(), load_balancer_port)
+                        lb_port_republish_pending = False
+                    except Exception as e:  # pylint: disable=broad-except
+                        logger.warning(
+                            f'Failed to republish load_balancer_port for '
+                            f'{service_name}: '
+                            f'{common_utils.format_exception(e)}; will retry.')
                 try:
                     lb_k8s.ensure_lb_objects_exist(service_name,
                                                    controller_port)
