@@ -453,7 +453,12 @@ def ensure_lb_objects_exist(service_name: str, controller_port: int) -> None:
     # check). Re-check the DB row right before mutating -- the create-time
     # mirror of reconcile's delete-time re-check -- so the self-heal cannot
     # resurrect a dead service's LB, whose name would otherwise keep serving
-    # and whose controller port is reclaimable by a new service.
+    # and whose controller port is reclaimable by a new service. A residual
+    # TOCTOU window remains (the row can vanish between this read and the k8s
+    # create; the two stores cannot be updated transactionally), but it is
+    # milliseconds wide and self-correcting: an LB recreated for a dead
+    # service is reaped by the next recovery's reconcile_lb_objects, and a
+    # same-name successor's own ensure converges the objects to its spec.
     if serve_state.get_service_from_name(service_name) is None:
         logger.info(f'External LB objects for {service_name!r} are missing '
                     'but the service row is gone; skipping recreation.')

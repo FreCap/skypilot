@@ -313,6 +313,38 @@ class TestSetServiceControllerPortIfOwner:
             'never-existed', 12345, 20123) is False
 
 
+class TestSetServiceLoadBalancerPortIfOwner:
+    """CAS port write for recovery's external-LB republish: the UPDATE is
+    filtered on controller_pid so a stale recovery cannot write to a
+    same-name successor's row."""
+
+    def test_owner_updates_port(self, _mock_serve_db):
+        _add_minimal_service('svc')  # seeds controller_pid=12345
+        assert serve_state.set_service_load_balancer_port_if_owner(
+            'svc', 12345, 30001) is True
+        assert _read_row(_mock_serve_db, 'svc')['load_balancer_port'] == 30001
+
+    def test_owner_updates_null_port(self, _mock_serve_db):
+        # NULL -> port must work for the owner: recovery of an up() that
+        # crashed before registration is the case this setter exists for.
+        _add_minimal_service('svc')
+        assert _read_row(_mock_serve_db, 'svc')['load_balancer_port'] is None
+        assert serve_state.set_service_load_balancer_port_if_owner(
+            'svc', 12345, 30001) is True
+        assert _read_row(_mock_serve_db, 'svc')['load_balancer_port'] == 30001
+
+    def test_non_owner_is_rejected(self, _mock_serve_db):
+        _add_minimal_service('svc')
+        serve_state.set_service_load_balancer_port('svc', 30002)
+        assert serve_state.set_service_load_balancer_port_if_owner(
+            'svc', 99999, 30001) is False
+        assert _read_row(_mock_serve_db, 'svc')['load_balancer_port'] == 30002
+
+    def test_missing_service_returns_false(self, _mock_serve_db):
+        assert serve_state.set_service_load_balancer_port_if_owner(
+            'never-existed', 12345, 30001) is False
+
+
 class TestSetServiceControllerIp:
     """Standalone IP setter is rarely called (the atomic version is preferred
     for recovery), but kept for symmetry with set_service_controller_port."""

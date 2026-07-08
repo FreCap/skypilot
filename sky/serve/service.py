@@ -1147,23 +1147,19 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
             serve_state.set_service_load_balancer_port(service_name,
                                                        load_balancer_port)
         elif external_lb:
-            # Recovery normally keeps the recorded port, but a service that
-            # just migrated from in-pod mode (upped before the external-LB
-            # flag) still records its legacy in-pod port. Republish the
-            # (constant) external port only when a DIFFERENT port is already
-            # recorded: the setter is a name-only write with no owner guard,
-            # and wait_service_registration returns on any non-null port -- so
-            # writing over a NULL row could prematurely unblock a concurrent
-            # same-name registration. Best-effort: a DB error must not reach
-            # _start's destructive cleanup over a cosmetic row fix.
+            # Recovery re-publishes the (constant) external port. This heals
+            # two stale-row shapes: a service migrated from in-pod mode still
+            # records its legacy in-pod port, and an up() that crashed between
+            # row creation and registration left the port NULL (registration
+            # would starve on recovery without this). Compare-and-swap on
+            # controller_pid -- pre-claimed by this process above -- so a
+            # stale recovery racing a purge + same-name re-up cannot write to
+            # the successor's row and prematurely unblock its registration.
+            # Best-effort: a DB error must not reach _start's destructive
+            # cleanup over a row fix.
             try:
-                recovered = serve_state.get_service_from_name(service_name)
-                if (recovered is not None and
-                        recovered.get('load_balancer_port') is not None and
-                        recovered.get('load_balancer_port') !=
-                        load_balancer_port):
-                    serve_state.set_service_load_balancer_port(
-                        service_name, load_balancer_port)
+                serve_state.set_service_load_balancer_port_if_owner(
+                    service_name, os.getpid(), load_balancer_port)
             except Exception as e:  # pylint: disable=broad-except
                 logger.warning(
                     f'Failed to republish load_balancer_port for '

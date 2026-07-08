@@ -526,6 +526,32 @@ def set_service_controller_port_if_owner(service_name: str, controller_pid: int,
     return count > 0
 
 
+def set_service_load_balancer_port_if_owner(service_name: str,
+                                            controller_pid: int,
+                                            load_balancer_port: int) -> bool:
+    """Sets the load balancer port only if `controller_pid` owns the row.
+
+    Compare-and-swap for recovery's external-LB port republish: the plain
+    setter below is a name-only write, so a stale recovery process racing a
+    purge + same-name re-up could write to the successor's row and
+    prematurely unblock its registration (`wait_service_registration` returns
+    on any non-null port). Filtering on controller_pid makes the
+    ownership check and the write one atomic UPDATE.
+
+    Returns:
+        True if the row was updated (the pid owns the service), False if
+        ownership was lost or the row no longer exists.
+    """
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        count = session.query(services_table).filter(
+            services_table.c.name == service_name,
+            services_table.c.controller_pid == controller_pid).update(
+                {services_table.c.load_balancer_port: load_balancer_port})
+        session.commit()
+    return count > 0
+
+
 def set_service_load_balancer_port(service_name: str,
                                    load_balancer_port: int) -> None:
     """Sets the load balancer port of a service."""
