@@ -116,7 +116,7 @@ def _make_provisioner(requested):
     )
 
 
-def _provision_once(prev_cluster_status):
+def _provision_once(prev_cluster_status, prev_cluster_ever_up=None):
     """Drive provision_with_retries one iteration with a cloud stub whose
     feature check raises NotSupportedError; returns (provisioner,
     to_provision, raised exception)."""
@@ -142,7 +142,9 @@ def _provision_once(prev_cluster_status):
         num_nodes=1,
         prev_cluster_status=prev_cluster_status,
         prev_handle=mock.Mock(),
-        prev_cluster_ever_up=prev_cluster_status is not None,
+        prev_cluster_ever_up=(prev_cluster_status is not None
+                              if prev_cluster_ever_up is None else
+                              prev_cluster_ever_up),
         prev_config_hash=None,
     )
     raised = None
@@ -190,6 +192,8 @@ def test_provisioner_surfaces_clean_error_for_existing_cluster():
         prev_cluster_status=status_lib.ClusterStatus.UP)
     assert isinstance(raised, exceptions.NotSupportedError)
     assert not provisioner._blocked_resources
+    # The clean-error path performs no teardown.
+    teardown.assert_not_called()
 
 
 def test_existing_cluster_error_does_not_chain_the_marker():
@@ -232,13 +236,15 @@ def test_start_rejects_non_down_autostop_on_unstoppable_resources():
     # tests; driving _start further needs the whole provision stack.)
 
 
-def test_provisioner_lets_init_cluster_fail_over():
-    # INIT is the retryable state (e.g. a failed spot attempt): a
-    # feature failure must NOT be treated as non-failoverable -- the
-    # tail's INIT branch resets to a fresh launch so the task can fall
-    # over to candidates that do support the feature (on-demand).
+def test_provisioner_lets_never_up_init_cluster_fail_over():
+    # NEVER-UP INIT is the retryable state (e.g. a failed first spot
+    # attempt): a feature failure must NOT be treated as
+    # non-failoverable -- the tail's INIT branch resets to a fresh
+    # launch so the task can fall over to candidates that do support
+    # the feature (on-demand).
     provisioner, _, raised, teardown = _provision_once(
-        prev_cluster_status=status_lib.ClusterStatus.INIT)
+        prev_cluster_status=status_lib.ClusterStatus.INIT,
+        prev_cluster_ever_up=False)
     assert not isinstance(raised, exceptions.NotSupportedError)
     assert not isinstance(raised, AssertionError)
     # The stubbed optimizer ends the loop after the INIT reset pass;
@@ -249,8 +255,25 @@ def test_provisioner_lets_init_cluster_fail_over():
     assert provisioner._blocked_resources == set()
     # The tail's INIT reset assumes the old cluster was terminated; the
     # marker path must do that cleanup itself (feature check fails
-    # before _retry_zones runs).
+    # before _retry_zones runs). Unconditional terminate: a STOP
+    # teardown is impossible on the very resources that tripped the
+    # check.
     teardown.assert_called_once()
+    assert teardown.call_args.kwargs['terminate'] is True
+
+
+def test_provisioner_ever_up_init_cluster_gets_clean_error():
+    # An EVER-UP INIT cluster (e.g. ctrl-c mid-restart of a previously
+    # UP spot cluster) must take the clean-error path like UP/STOPPED:
+    # _yield_zones forbids its failover to preserve data, and a
+    # stop-teardown would fail on exactly the resources that tripped
+    # the check.
+    provisioner, _, raised, teardown = _provision_once(
+        prev_cluster_status=status_lib.ClusterStatus.INIT,
+        prev_cluster_ever_up=True)
+    assert isinstance(raised, exceptions.NotSupportedError)
+    teardown.assert_not_called()
+    assert not provisioner._blocked_resources
 
 
 def _start_with_stored_autostop(spot_resources, stored_autostop,

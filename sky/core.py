@@ -13,6 +13,7 @@ from sky import clouds
 from sky import dag as dag_lib
 from sky import data
 from sky import exceptions
+from sky import execution
 from sky import global_user_state
 from sky import models
 from sky import optimizer
@@ -583,8 +584,8 @@ def _start(
             f'Starting cluster {cluster_name!r} with backend {backend.NAME} '
             'is not supported.')
 
-    if (controller_utils.Controllers.from_name(cluster_name) is None and
-            idle_minutes_to_autostop is not None and
+    controller = controller_utils.Controllers.from_name(cluster_name)
+    if (controller is None and idle_minutes_to_autostop is not None and
             idle_minutes_to_autostop >= 0):
         # `sky start --force -i N` on an UP cluster reaches set_autostop
         # without core.autostop()'s validation or the launch path's
@@ -596,19 +597,11 @@ def _start(
         # below, and their config-derived autostop is force-converted by
         # set_autostop on Kubernetes/RunPod.
         launched = handle.launched_resources.assert_launchable()
-        if down:
-            launched.cloud.check_features_are_supported(
-                launched, {clouds.CloudImplementationFeatures.AUTODOWN})
-        else:
-            launched.cloud.check_features_are_supported(
-                launched, {
-                    clouds.CloudImplementationFeatures.STOP,
-                    clouds.CloudImplementationFeatures.AUTOSTOP,
-                })
+        launched.cloud.check_features_are_supported(
+            launched, execution._autostop_requested_features(down))
 
     hook: Optional[str] = None
     hook_timeout: Optional[int] = None
-    controller = controller_utils.Controllers.from_name(cluster_name)
     if controller is not None:
         if down or idle_minutes_to_autostop:
             arguments = []
@@ -726,16 +719,9 @@ def _start(
                   isinstance(launched.cloud,
                              (clouds.Kubernetes, clouds.RunPod)))
         if not exempt:
-            if down:
-                needed_features = {clouds.CloudImplementationFeatures.AUTODOWN}
-            else:
-                needed_features = {
-                    clouds.CloudImplementationFeatures.STOP,
-                    clouds.CloudImplementationFeatures.AUTOSTOP,
-                }
             try:
                 launched.cloud.check_features_are_supported(
-                    launched, needed_features)
+                    launched, execution._autostop_requested_features(down))
             except exceptions.NotSupportedError as e:
                 logger.warning(
                     f'Not re-applying autostop ({idle_minutes_to_autostop} '

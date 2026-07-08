@@ -1894,17 +1894,22 @@ class RetryingVmProvisioner(object):
                 # autostop on a one-time spot candidate).
                 cause = e.__cause__
                 assert cause is not None, e
-                if prev_cluster_status not in (None,
-                                               status_lib.ClusterStatus.INIT):
-                    # Existing UP/STOPPED cluster relaunched with a
-                    # config its (fixed) launched resources cannot
-                    # satisfy: failover cannot help, and the loop tail
-                    # asserts INIT-only. INIT clusters deliberately fall
-                    # through instead -- INIT is the retryable state
-                    # (e.g. a failed spot attempt), and the tail's INIT
-                    # branch resets to a fresh launch so the task can
-                    # fail over to candidates that DO support the
-                    # feature (e.g. on-demand).
+                init_never_up = (prev_cluster_status
+                                 == status_lib.ClusterStatus.INIT and
+                                 not prev_cluster_ever_up)
+                if prev_cluster_status is not None and not init_never_up:
+                    # Existing UP/STOPPED clusters -- and EVER-UP INIT
+                    # clusters -- relaunched with a config their (fixed)
+                    # launched resources cannot satisfy: failover cannot
+                    # help (for ever-up clusters _yield_zones forbids it
+                    # outright to preserve data), and a stop-teardown
+                    # would be attempted on exactly the resources that
+                    # tripped this check. Only NEVER-UP INIT clusters
+                    # (e.g. a failed first spot attempt) fall through:
+                    # INIT is their retryable state, and the tail resets
+                    # to a fresh launch so the task can fail over to
+                    # candidates that DO support the feature (e.g.
+                    # on-demand).
                     # Raised from within this handler, the cause
                     # propagates out of the function (sibling except
                     # clauses of the same try do not catch it) -- the
@@ -1913,20 +1918,21 @@ class RetryingVmProvisioner(object):
                     # internal marker class never shows up in the debug
                     # stacktrace serialized to API clients.
                     raise cause from None
-                if (prev_cluster_status == status_lib.ClusterStatus.INIT and
-                        prev_handle is not None):
+                if init_never_up and prev_handle is not None:
                     # The loop tail's INIT branch resets to a fresh
                     # launch assuming _retry_zones() already terminated
                     # the old cluster -- but the feature check fails
                     # BEFORE _retry_zones() runs, so the failed
                     # attempt's partial resources would leak while
-                    # failover proceeds. Do the equivalent cleanup here
-                    # (same terminate-vs-stop rule as _retry_zones:
-                    # never terminate a cluster that was ever up).
-                    CloudVmRayBackend().teardown_no_lock(
-                        prev_handle,
-                        terminate=not prev_cluster_ever_up,
-                        remove_from_db=False)
+                    # failover proceeds. Do the equivalent cleanup here.
+                    # Unconditional terminate: only never-up clusters
+                    # reach this branch (ever-up ones took the clean
+                    # error above), and a STOP teardown would be
+                    # impossible on exactly the resources that tripped
+                    # the feature check.
+                    CloudVmRayBackend().teardown_no_lock(prev_handle,
+                                                         terminate=True,
+                                                         remove_from_db=False)
                 # Fall through to the loop tail: for a NEW launch it
                 # blocks exactly `to_provision` and records the cause --
                 # so sibling candidates on the same cloud (e.g.
