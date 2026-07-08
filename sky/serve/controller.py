@@ -149,12 +149,16 @@ class SkyServeController:
 
     def _seed_fill_zero_cost_locations(
             self, autoscaler: autoscalers.Autoscaler) -> None:
-        """Seed an autoscaler's zero-cost location set from the placer.
+        """Best-effort seed of an autoscaler's zero-cost location set.
 
-        Spec-derived and cheap by construction: zero_cost_locations()
-        computes per-location costs via the placer's cache, which reads
-        local catalog files only (never the Kubernetes API), so it is
-        safe to call synchronously at boot / inside update_service. The
+        zero_cost_locations() computes per-location costs via the
+        placer's cache, but an UNCACHED Kubernetes location's cost
+        lookup CAN hit the live Kubernetes API (instance-fit check), so
+        a transient API blip in that window can raise. Seeding is
+        therefore best-effort: any failure is logged and swallowed,
+        degrading to the documented pre-seed behavior (empty location
+        set; suppression engages after the first successful poll feeds
+        it) instead of killing controller boot / update_service. The
         seed only sets the location identity set (no free slots, no
         snapshot time), and an already-populated set (e.g. loaded from a
         dump) is never overwritten -- see
@@ -165,10 +169,16 @@ class SkyServeController:
         placer = getattr(self._replica_manager, '_spot_placer', None)
         if placer is None:
             return
-        autoscaler.seed_zero_cost_locations([
-            location.to_pickleable()
-            for location in placer.zero_cost_locations()
-        ])
+        try:
+            autoscaler.seed_zero_cost_locations([
+                location.to_pickleable()
+                for location in placer.zero_cost_locations()
+            ])
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning('Failed to seed zero-cost locations '
+                           '(best-effort; will rely on the first '
+                           'successful poll instead): '
+                           f'{common_utils.format_exception(e)}')
 
     def _get_lb_replica_info(
         self, replica_infos: List['replica_managers.ReplicaInfo']

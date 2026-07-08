@@ -290,6 +290,35 @@ class TestVersionAwareLaunchBaseline(unittest.TestCase):
         self.assertEqual(len(_fill_ups(decisions)), 2)
 
 
+class TestAllVersionOccupancyDebit(unittest.TestCase):
+    """The occupancy debit spans ALL versions, not just the latest.
+
+    An old-version zero-cost replica still PROVISIONING has an unbound
+    pod: its slot polls free, yet the row holds a claim on it. If only
+    latest-version rows were debited, a fill launch would collide with
+    that claim and fail on capacity.
+    """
+
+    def test_old_version_provisioning_row_debits_spendable(self):
+        autoscaler = autoscalers.RequestRateAutoscaler('svc',
+                                                       _spec(min_replicas=1,
+                                                             max_replicas=20),
+                                                       version=2)
+        _feed(autoscaler, 3)
+        replicas = [
+            _replica(1,
+                     _K8S_KEY,
+                     status=serve_state.ReplicaStatus.PROVISIONING,
+                     version=1)
+        ]
+        decisions = autoscaler.generate_scaling_decisions(replicas, [1])
+        # Spendable 3 - 1 (old-version pending claim) = 2; the launch
+        # baseline stays latest-only: fill_target_launch = 0 latest
+        # zero-cost + 2 spendable, demand target 1 -> exactly 1 fill up
+        # (a latest-only debit would emit 2, one onto the claimed slot).
+        self.assertEqual(len(_fill_ups(decisions)), 1)
+
+
 class TestPendingReplicasOccupySlots(unittest.TestCase):
     """Not-yet-READY fill replicas keep their slots spent across polls.
 
@@ -559,6 +588,18 @@ class TestControllerSeeding(unittest.TestCase):
         autoscaler = _make_autoscaler()
         ctrl = self._make_controller(autoscaler, placer=None)
         ctrl._seed_fill_zero_cost_locations(autoscaler)
+        self.assertEqual(autoscaler._fill_zero_cost_locations, [])
+
+    def test_seed_failure_is_swallowed_and_leaves_unseeded(self):
+        # The cost path behind zero_cost_locations() can hit the live
+        # Kubernetes API; a blip there must not propagate out of the
+        # seed (it runs inside controller __init__), only degrade to
+        # the pre-seed behavior.
+        autoscaler = _make_autoscaler()
+        placer = mock.Mock()
+        placer.zero_cost_locations.side_effect = ValueError('api blip')
+        ctrl = self._make_controller(autoscaler, placer)
+        ctrl._seed_fill_zero_cost_locations(autoscaler)  # must not raise
         self.assertEqual(autoscaler._fill_zero_cost_locations, [])
 
 
