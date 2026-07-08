@@ -271,6 +271,39 @@ class Autoscaler:
             return 0
         return self._fill_free_slots
 
+    @staticmethod
+    def _fill_location_matches(replica_location: spot_placer.Location,
+                               zero_cost: spot_placer.Location) -> bool:
+        """Relaxed zero-cost identity match for fill accounting.
+
+        Deliberately NOT Location.__eq__: full equality includes
+        image_id/disk_tier (via _accel_key), so pre-upgrade shape-less
+        replica rows and replicas surviving an image-changing update
+        would stop matching, undercounting zero_cost_count and stripping
+        the fleet's scale-down protection. For "is this replica on the
+        free tier" only the placement identity matters: cloud, region,
+        zone (when both sides pin one), accelerator shape and spot-ness.
+        Legacy shape-less rows (no accelerators/use_spot persisted) match
+        by cloud+region alone.
+        """
+        if str(replica_location.cloud).lower() != str(zero_cost.cloud).lower():
+            return False
+        if replica_location.region != zero_cost.region:
+            return False
+        if (replica_location.zone is not None and zero_cost.zone is not None and
+                replica_location.zone != zero_cost.zone):
+            return False
+        if replica_location.accelerators:
+            if (zero_cost.accelerators and
+                    replica_location.accelerators != zero_cost.accelerators):
+                return False
+            # Only shape-carrying rows enforce spot-ness: legacy rows
+            # deserialize with the use_spot=True default, which must not
+            # exclude them from a non-spot zero-cost pool.
+            if replica_location.use_spot != zero_cost.use_spot:
+                return False
+        return True
+
     def _replica_on_zero_cost_location(
             self, info: 'replica_managers.ReplicaInfo') -> bool:
         if not self._fill_zero_cost_locations:
@@ -278,8 +311,9 @@ class Autoscaler:
         location = info.get_spot_location()
         if location is None:
             return False
-        return any(location == zero_cost
-                   for zero_cost in self._fill_zero_cost_locations)
+        return any(
+            self._fill_location_matches(location, zero_cost)
+            for zero_cost in self._fill_zero_cost_locations)
 
     def _apply_reserved_capacity_fill(
         self,
@@ -325,17 +359,25 @@ class Autoscaler:
         surplus_covered = fill_target - demand_target
         if surplus_covered <= 0:
             return decisions
-        num_downs = sum(
-            1 for decision in decisions
-            if decision.operator == AutoscalerDecisionOperator.SCALE_DOWN)
-        downs_to_keep = max(0, num_downs - surplus_covered)
+        # Victim-aware suppression: shelter ONLY scale-downs whose victim
+        # replica sits on a zero-cost location, up to the fill surplus.
+        # Downs targeting paid replicas always pass through -- fill
+        # surplus must never keep a PAID replica alive (the subclass
+        # orders victims newest-first, so a victim-blind prefix keep
+        # could shelter a paid replica indefinitely while repeatedly
+        # killing and relaunching zero-cost ones).
+        id_to_info = {info.replica_id: info for info in replica_infos}
         result: List[AutoscalerDecision] = []
-        kept_downs = 0
+        num_suppressed = 0
         for decision in decisions:
-            if decision.operator == AutoscalerDecisionOperator.SCALE_DOWN:
-                if kept_downs >= downs_to_keep:
+            if (decision.operator == AutoscalerDecisionOperator.SCALE_DOWN and
+                    num_suppressed < surplus_covered):
+                victim = (id_to_info.get(decision.target) if isinstance(
+                    decision.target, int) else None)
+                if (victim is not None and
+                        self._replica_on_zero_cost_location(victim)):
+                    num_suppressed += 1
                     continue
-                kept_downs += 1
             result.append(decision)
         num_fill_up = fill_target - max(num_latest_nonterminal, demand_target)
         if num_fill_up > 0:
@@ -348,6 +390,23 @@ class Autoscaler:
                 _generate_scale_up_decisions(
                     num_fill_up,
                     {constants.RESERVED_CAPACITY_FILL_OVERRIDE_KEY: True}))
+            # Invariant: a free slot is SPENT the moment a launch decision
+            # is emitted, not when the poller next observes the pod. Fill
+            # launches persist replica rows immediately, so
+            # zero_cost_count already grows on the next tick while the
+            # snapshot only refreshes on the poll interval -- without this
+            # deduction the same static snapshot would be re-consumed
+            # every tick, compounding the fill fleet. Deduct from BOTH the
+            # damped value and the last raw poll value:
+            # collect_reserved_capacity re-raises the damped value from
+            # min(prev_raw, new) on the next poll, so an undeducted stale
+            # prev_raw would re-grant the spent slots after a single poll,
+            # defeating the two-poll damping. The next polls re-sync the
+            # true level (immediate on decrease, damped on increase).
+            self._fill_free_slots = max(0, self._fill_free_slots - num_fill_up)
+            if self._fill_last_raw_free_slots is not None:
+                self._fill_last_raw_free_slots = max(
+                    0, self._fill_last_raw_free_slots - num_fill_up)
         return result
 
     def has_fresh_demand_report(self) -> bool:
@@ -583,7 +642,24 @@ class Autoscaler:
 
     def dump_dynamic_states(self) -> Dict[str, Any]:
         """Dump dynamic states from autoscaler."""
-        states = {'latest_version_ever_ready': self.latest_version_ever_ready}
+        states: Dict[str, Any] = {
+            'latest_version_ever_ready': self.latest_version_ever_ready
+        }
+        # Reserved-capacity fill snapshot: carried across the in-process
+        # autoscaler swap in update_service. Without it a fresh autoscaler
+        # instance has no zero-cost location set until the next poll, so
+        # one decision tick with suppression off could terminate the whole
+        # fill fleet. Nested under a single key (in pickleable form) so
+        # subclass _load_dynamic_states leftover-logging never sees it.
+        states['reserved_capacity_fill_state'] = {
+            'fill_free_slots': self._fill_free_slots,
+            'fill_last_raw_free_slots': self._fill_last_raw_free_slots,
+            'fill_zero_cost_location_keys': [
+                location.to_pickleable()
+                for location in self._fill_zero_cost_locations
+            ],
+            'fill_snapshot_time': self._fill_snapshot_time,
+        }
         states.update(self._dump_dynamic_states())
         return states
 
@@ -591,6 +667,20 @@ class Autoscaler:
         """Load dynamic states to autoscaler."""
         self.latest_version_ever_ready = dynamic_states.pop(
             'latest_version_ever_ready', constants.INITIAL_VERSION)
+        # Absent in dumps from builds predating the fill feature: keep
+        # the constructor defaults (empty snapshot).
+        fill_state = dynamic_states.pop('reserved_capacity_fill_state', None)
+        if fill_state is not None:
+            self._fill_free_slots = fill_state.get('fill_free_slots', 0)
+            self._fill_last_raw_free_slots = fill_state.get(
+                'fill_last_raw_free_slots')
+            self._fill_zero_cost_locations = [
+                location for location in
+                (spot_placer.Location.from_pickleable(key)
+                 for key in fill_state.get('fill_zero_cost_location_keys', []))
+                if location is not None
+            ]
+            self._fill_snapshot_time = fill_state.get('fill_snapshot_time')
         self._load_dynamic_states(dynamic_states)
 
 

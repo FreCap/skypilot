@@ -191,6 +191,167 @@ class TestScaleDownSuppression(unittest.TestCase):
         self.assertEqual(len(_ups(decisions)), 0)
 
 
+class TestMultiTickSlotSpending(unittest.TestCase):
+    """A free slot is spent when the launch decision is emitted.
+
+    Fill launches persist replica rows immediately, so zero_cost_count
+    grows on the very next tick while the poller snapshot only refreshes
+    on its interval: without spending, the same static snapshot would be
+    re-consumed every tick, compounding the fill fleet.
+    """
+
+    def test_static_snapshot_not_reconsumed_across_ticks(self):
+        autoscaler = _make_autoscaler(min_replicas=0, max_replicas=10)
+        _feed(autoscaler, 4)
+        replicas = []
+        next_id = 1
+        total_fill_ups = 0
+        for _ in range(3):
+            decisions = _decisions(autoscaler, replicas)
+            fill_ups = [
+                d for d in _ups(decisions) if d.target == {
+                    _FILL_KEY: True
+                }
+            ]
+            total_fill_ups += len(fill_ups)
+            # Emitted launches persist immediately: visible as zero-cost
+            # nonterminal replicas on the next tick, before any new poll.
+            for _ in fill_ups:
+                replicas.append(_replica(next_id, _K8S_KEY))
+                next_id += 1
+        self.assertEqual(total_fill_ups, 4)
+        self.assertEqual(len(replicas), 4)
+
+    def test_spent_slots_not_regranted_by_single_stale_poll(self):
+        # The raw-poll memory is deducted too: one poll still reporting
+        # the pre-launch level (pods pending) must not re-raise the
+        # damped value past the two-poll damping.
+        autoscaler = _make_autoscaler(min_replicas=0, max_replicas=10)
+        _feed(autoscaler, 4)
+        decisions = _decisions(autoscaler, [])
+        self.assertEqual(len(_ups(decisions)), 4)
+        _feed(autoscaler, 4, polls=1)  # stale raw: pods not scheduled yet
+        self.assertEqual(autoscaler.info()['fill_free_slots'], 0)
+
+
+class TestVictimAwareSuppression(unittest.TestCase):
+    """Only zero-cost victims are sheltered; paid downs always pass."""
+
+    def test_paid_down_passes_zero_cost_suppressed(self):
+        autoscaler = _make_autoscaler(min_replicas=1)
+        replicas = [
+            _replica(1, _K8S_KEY),
+            _replica(2, _K8S_KEY),
+            # Paid replica with the HIGHEST id: first victim in the
+            # subclass's newest-first ordering, so a victim-blind
+            # surplus keep would shelter it while killing zero-cost.
+            _replica(3),
+        ]
+        _feed(autoscaler, 2)
+        decisions = _decisions(autoscaler, replicas)
+        # Demand target 1 -> victims [3, 2]; surplus (fill_target 4 -
+        # demand 1 = 3) covers both, but only the zero-cost victim (2)
+        # may be sheltered: the paid down (3) must pass through.
+        self.assertEqual([d.target for d in _downs(decisions)], [3])
+
+
+class TestDumpLoadFillState(unittest.TestCase):
+    """Fill state survives the update_service autoscaler swap."""
+
+    def test_roundtrip_suppresses_pre_poll(self):
+        old = _make_autoscaler(min_replicas=1)
+        _feed(old, 3)
+        fresh = _make_autoscaler(min_replicas=1)
+        fresh.load_dynamic_states(old.dump_dynamic_states())
+        self.assertEqual(fresh.info()['fill_free_slots'], 3)
+        # Before any poll reaches the fresh instance, it must already
+        # protect the fill fleet: paid victim passes, zero-cost victim
+        # is suppressed.
+        replicas = [
+            _replica(1, _K8S_KEY),
+            _replica(2, _K8S_KEY),
+            _replica(3),
+        ]
+        decisions = _decisions(fresh, replicas)
+        self.assertEqual([d.target for d in _downs(decisions)], [3])
+
+    def test_load_tolerates_dump_without_fill_state(self):
+        fresh = _make_autoscaler()
+        # Dump shape from a build predating the fill feature.
+        fresh.load_dynamic_states({
+            'latest_version_ever_ready': 1,
+            'request_timestamps': [],
+        })
+        self.assertEqual(fresh.info()['fill_free_slots'], 0)
+        self.assertIsNone(fresh.info()['fill_snapshot_age'])
+
+
+class TestRelaxedZeroCostMatching(unittest.TestCase):
+    """Matching ignores image_id/disk_tier; legacy rows match by region."""
+
+    def setUp(self):
+        self.autoscaler = _make_autoscaler(min_replicas=1)
+        _feed(self.autoscaler, 0)
+
+    def test_legacy_shape_less_row_matches(self):
+        legacy = _replica(1, {
+            'cloud': 'Kubernetes',
+            'region': 'research-ctx',
+            'zone': None,
+        })
+        self.assertTrue(self.autoscaler._replica_on_zero_cost_location(legacy))
+
+    def test_image_changed_row_matches(self):
+        image_changed = _replica(
+            2,
+            dict(_K8S_KEY, image_id={None: 'docker:model:v2'},
+                 disk_tier='high'))
+        self.assertTrue(
+            self.autoscaler._replica_on_zero_cost_location(image_changed))
+
+    def test_different_shape_or_region_does_not_match(self):
+        other_gpu = _replica(3, dict(_K8S_KEY, accelerators={'H100': 1}))
+        other_region = _replica(4, dict(_K8S_KEY, region='other-ctx'))
+        self.assertFalse(
+            self.autoscaler._replica_on_zero_cost_location(other_gpu))
+        self.assertFalse(
+            self.autoscaler._replica_on_zero_cost_location(other_region))
+
+
+class TestPollerFlagOff(unittest.TestCase):
+    """Poller skips the expensive query when the live flag is off."""
+
+    class _Stop(Exception):
+        pass
+
+    def _run_one_cycle(self, autoscaler):
+        placer = mock.Mock()
+        placer.zero_cost_locations.return_value = []
+        with mock.patch.object(reserved_capacity,
+                               'query_free_slots',
+                               return_value=0) as query, \
+             mock.patch.object(reserved_capacity.time,
+                               'sleep',
+                               side_effect=self._Stop):
+            with self.assertRaises(self._Stop):
+                reserved_capacity.poller_loop(lambda: autoscaler,
+                                              lambda: placer)
+        return placer, query
+
+    def test_flag_off_sleeps_without_querying(self):
+        autoscaler = _make_autoscaler(fill=False)
+        placer, query = self._run_one_cycle(autoscaler)
+        query.assert_not_called()
+        placer.zero_cost_locations.assert_not_called()
+        self.assertIsNone(autoscaler._fill_snapshot_time)
+
+    def test_flag_on_queries_and_feeds(self):
+        autoscaler = _make_autoscaler(fill=True)
+        _, query = self._run_one_cycle(autoscaler)
+        query.assert_called_once()
+        self.assertIsNotNone(autoscaler._fill_snapshot_time)
+
+
 class TestStaleSnapshot(unittest.TestCase):
     """Stale snapshot: 0 free contribution, existing fill still protected."""
 

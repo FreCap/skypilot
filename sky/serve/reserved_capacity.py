@@ -107,7 +107,12 @@ def poller_loop(
     while True:
         try:
             placer = get_spot_placer()
-            if placer is not None:
+            # An update can turn the flag off on the live autoscaler; the
+            # thread stays alive (a later update can re-enable it) but
+            # must not keep issuing the expensive cluster-wide pod-listing
+            # query for a snapshot nobody consumes.
+            fill_enabled = get_autoscaler().reserved_capacity_fill
+            if placer is not None and fill_enabled:
                 zero_cost = placer.zero_cost_locations()
                 free_slots = query_free_slots(zero_cost)
                 keys: List[Dict[str, Any]] = [
