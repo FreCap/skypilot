@@ -277,6 +277,11 @@ class SkyServeLoadBalancer:
         response of any status (incl. 5xx: the replica is reachable and
         releasing its slot), a saturation timeout, or a mid-stream failure
         after headers -- counts as a completed attempt and clears the streak.
+        Exception: statuses configured as retriable arrive here as
+        _RetriableStatusError and are INERT for eviction — neither a dead
+        failure (the replica answered; it is alive) nor a streak-clearing
+        success (a shedding replica should not launder an in-progress
+        dead-connection streak).
         Application errors and saturation are intentionally NOT eviction
         signals (evicting a reachable-but-slow replica shrinks capacity).
         """
@@ -642,19 +647,30 @@ class SkyServeLoadBalancer:
         # dead-but-not-yet-pruned replica on a busy fleet (it sits at
         # load 0 while every healthy replica carries traffic).
         failed_urls: Set[str] = set()
+
+        def _unavailable(detail: str) -> fastapi.HTTPException:
+            # Retry-After lets a well-behaved client back off instead of
+            # hammering; the ready set only changes on the controller
+            # sync cadence, so in-LB sleeping is not a useful wait.
+            return fastapi.HTTPException(
+                status_code=503,
+                detail=detail,
+                headers={
+                    'Retry-After': str(constants.LB_503_RETRY_AFTER_SECONDS)
+                })
+
         while True:
             retry_cnt += 1
             with self._client_pool_lock:
                 ready_replica_url = self._load_balancing_policy.select_replica(
                     request, exclude=failed_urls)
             if ready_replica_url is None:
-                response_or_exception = fastapi.HTTPException(
-                    # 503 means that the server is currently
-                    # unable to handle the incoming requests.
-                    status_code=503,
-                    detail='No ready replicas. '
-                    'Use "sky serve status [SERVICE_NAME]" '
-                    'to check the replica status.')
+                # Nothing to select at all: burning the remaining attempts
+                # asleep only adds latency (and multiplies under the
+                # client retry layer) — fail fast with a backoff hint.
+                raise _unavailable('No ready replicas. '
+                                   'Use "sky serve status [SERVICE_NAME]" '
+                                   'to check the replica status.')
             else:
                 response_or_exception = await self._proxy_request_to(
                     ready_replica_url, request)
@@ -664,14 +680,27 @@ class SkyServeLoadBalancer:
                                            response_or_exception)
             if not isinstance(response_or_exception, Exception):
                 return response_or_exception
-            if ready_replica_url is not None:
-                failed_urls.add(ready_replica_url)
+            failed_urls.add(ready_replica_url)
+            with self._client_pool_lock:
+                all_ready_tried = failed_urls.issuperset(
+                    self._load_balancing_policy.ready_replicas)
             # When the user aborts the request during streaming, the request
             # will be disconnected. We do not need to retry for this case.
             if await request.is_disconnected():
                 # 499 means a client terminates the connection
                 # before the server is able to respond.
                 return fastapi.responses.Response(status_code=499)
+            if (all_ready_tried and
+                    isinstance(response_or_exception, _RetriableStatusError)):
+                # Every ready replica already shed THIS request with a
+                # retriable status (e.g. all busy at PREDICT_CONCURRENCY
+                # capacity, or warming): none of them will free within the
+                # 0.5-4s backoff schedule, so remaining attempts are pure
+                # added latency. Transport failures deliberately do NOT
+                # take this exit: a lone replica's connection blip still
+                # recovers transparently via the full-set fallback.
+                raise _unavailable('All ready replicas are at capacity. '
+                                   f'Last error: {response_or_exception}.')
             # TODO(tian): Fail fast for errors like 404 not found.
             if retry_cnt >= self._max_retries:
                 if isinstance(response_or_exception, fastapi.HTTPException):
