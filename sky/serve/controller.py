@@ -34,14 +34,15 @@ logger = sky_logging.init_logger(__name__)
 def _make_auth_dependency() -> Callable:
     """Build a FastAPI dependency that enforces a shared bearer token.
 
-    The expected token is read fresh from `serve_utils.get_controller_auth_token()`
-    on every request, so a token rotated after the controller boots is honored
-    without a respawn. When the token is None/empty (auth disabled), the
+    The expected token is read fresh from
+    `serve_utils.get_controller_auth_token()` on every request, so a token
+    rotated after the controller boots is honored without a respawn. When the
+    token is None/empty (auth disabled), the
     dependency is a no-op so in-pod / localhost-only deployments are unchanged.
     Otherwise it requires an `Authorization: Bearer <token>` header matching in
-    constant time; a missing or wrong token yields 401. Applied only to the
-    destructive endpoints -- the read-only load_balancer_sync path stays open
-    for the credential-free LB.
+    constant time; a missing or wrong token yields 401. Applied to every
+    control-plane endpoint -- the destructive ones and the read-only
+    sync/status paths -- since the LB now presents the token on every sync.
     """
 
     async def _verify(authorization: Optional[str] = fastapi.Header(
@@ -50,8 +51,10 @@ def _make_auth_dependency() -> Callable:
         if not expected_token:
             return
         expected = f'Bearer {expected_token}'
-        if authorization is None or not hmac.compare_digest(
-                authorization, expected):
+        # isascii() guards hmac.compare_digest, which raises TypeError on a
+        # non-ASCII str -- a malformed header must be a clean 401, not a 500.
+        if (authorization is None or not authorization.isascii() or
+                not hmac.compare_digest(authorization, expected)):
             raise fastapi.HTTPException(status_code=401, detail='Unauthorized.')
 
     return _verify
@@ -275,17 +278,22 @@ class SkyServeController:
         # review itself cannot be issued.
         lb_rbac_preflight.check_lb_rbac_preflight()
 
-        # Guard the destructive endpoints with a shared bearer token (no-op
-        # when unset). The read-only load_balancer_sync path is intentionally
-        # left open so the credential-free external LB can sync.
+        # Guard every control-plane endpoint with a shared bearer token (no-op
+        # when unset). The read-only sync/status paths are gated too: the LB
+        # presents the token on every sync (get_controller_auth_token, mounted
+        # from the same Secret), so an in-cluster foothold can no longer scrape
+        # the replica set. Safe to enforce from the first deploy -- there are no
+        # live LBs to strand, and the token is present consistently on the
+        # controller and every spawned LB.
         auth_dependency = fastapi.Depends(_make_auth_dependency())
 
-        @self._app.get('/autoscaler/info')
+        @self._app.get('/autoscaler/info', dependencies=[auth_dependency])
         async def get_autoscaler_info() -> fastapi.Response:
             return responses.JSONResponse(content=self._autoscaler.info(),
                                           status_code=200)
 
-        @self._app.post('/controller/load_balancer_sync')
+        @self._app.post('/controller/load_balancer_sync',
+                        dependencies=[auth_dependency])
         async def load_balancer_sync(
                 request: fastapi.Request) -> fastapi.Response:
             request_data = await request.json()

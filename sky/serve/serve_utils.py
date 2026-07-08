@@ -285,7 +285,12 @@ class RequestTimestamp(RequestsAggregator):
     """
 
     def __init__(self) -> None:
-        self.timestamps: List[float] = []
+        # Bounded: the batch is retained across a failed controller sync (so
+        # load signal is not dropped), but a persistent failure must not grow it
+        # without limit -- maxlen keeps only the most recent samples (ample for
+        # QPS autoscaling). See constants.LB_REQUEST_TIMESTAMP_CAP.
+        self.timestamps: 'collections.deque[float]' = collections.deque(
+            maxlen=constants.LB_REQUEST_TIMESTAMP_CAP)
 
     def add(self, request: 'fastapi.Request') -> None:
         """Add a request to the request aggregator."""
@@ -294,14 +299,14 @@ class RequestTimestamp(RequestsAggregator):
 
     def clear(self) -> None:
         """Clear all current request aggregator."""
-        self.timestamps = []
+        self.timestamps.clear()
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert the aggregator to a dict."""
-        return {'timestamps': self.timestamps}
+        return {'timestamps': list(self.timestamps)}
 
     def __repr__(self) -> str:
-        return f'RequestTimestamp(timestamps={self.timestamps})'
+        return f'RequestTimestamp(timestamps={list(self.timestamps)})'
 
 
 def get_service_filelock_path(pool: str) -> str:
@@ -390,12 +395,23 @@ def is_external_load_balancer_mode() -> bool:
 
 
 def get_controller_auth_token() -> Optional[str]:
-    """Shared bearer token guarding the controller's destructive endpoints.
+    """Shared bearer token guarding the controller's control-plane endpoints.
 
     Read from ``CONTROLLER_AUTH_TOKEN_ENV_VAR``; None (auth disabled) when
     unset. See the constant for the security rationale.
     """
     return os.environ.get(constants.CONTROLLER_AUTH_TOKEN_ENV_VAR) or None
+
+
+def get_lb_auth_token() -> Optional[str]:
+    """Shared bearer token guarding INBOUND inference requests to the external
+    load balancer (data-plane auth).
+
+    Read from ``LB_AUTH_TOKEN_ENV_VAR``; None (auth disabled) when unset. Kept
+    distinct from :func:`get_controller_auth_token` (control-plane) on purpose;
+    see the constant for the security rationale.
+    """
+    return os.environ.get(constants.LB_AUTH_TOKEN_ENV_VAR) or None
 
 
 def external_lb_socket_endpoint(

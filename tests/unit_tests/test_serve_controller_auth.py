@@ -1,10 +1,11 @@
-"""Tests for controller destructive-endpoint auth (W6b).
+"""Tests for controller control-plane auth (W6b).
 
-The controller guards /controller/update_service and terminate_replica with a
-shared bearer token (no-op when unset). The read-only load_balancer_sync path
-is intentionally left open for the credential-free external LB. The expected
-token is read fresh per request, so a token rotated after boot is honored
-without a controller respawn.
+The controller guards every control-plane endpoint -- the destructive ones
+(/controller/update_service, terminate_replica) AND the read-only sync/status
+paths (/load_balancer_sync, /autoscaler/info) -- with a shared bearer token
+(no-op when unset). The LB presents the token on every sync. The expected token
+is read fresh per request, so a token rotated after boot is honored without a
+controller respawn.
 """
 # pylint: disable=invalid-name,protected-access
 import asyncio
@@ -50,6 +51,7 @@ def test_auth_correct_token_passes(monkeypatch):
         's3cret',  # missing the "Bearer " scheme
         'Bearer ',
         '',
+        'Bearer ñ',  # non-ASCII must 401, not crash compare_digest (500)
     ])
 def test_auth_wrong_or_missing_rejected(monkeypatch, bad):
     _set_token(monkeypatch, 's3cret')
