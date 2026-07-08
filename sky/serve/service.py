@@ -1157,10 +1157,11 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
             # same-name registration. Best-effort: a DB error must not reach
             # _start's destructive cleanup over a cosmetic row fix.
             try:
-                record = serve_state.get_service_from_name(service_name)
-                if (record is not None and
-                        record.get('load_balancer_port') is not None and
-                        record.get('load_balancer_port') != load_balancer_port):
+                recovered = serve_state.get_service_from_name(service_name)
+                if (recovered is not None and
+                        recovered.get('load_balancer_port') is not None and
+                        recovered.get('load_balancer_port') !=
+                        load_balancer_port):
                     serve_state.set_service_load_balancer_port(
                         service_name, load_balancer_port)
             except Exception as e:  # pylint: disable=broad-except
