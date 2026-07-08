@@ -5,6 +5,7 @@ issued (create/delete/list) under mocked clients. They never assert on log or
 exception message text.
 """
 import re
+import unittest
 from unittest import mock
 
 import pytest
@@ -466,3 +467,46 @@ def test_endpoint_or_none_active(monkeypatch):
     _install(monkeypatch)
     ep = lb_k8s.lb_service_endpoint_or_none('svc-a')
     assert ep == lb_k8s.lb_service_endpoint('svc-a', 'skypilot')
+
+
+class TestLbImagePullPolicyMirror(unittest.TestCase):
+    """The LB must mirror the controller pod's imagePullPolicy.
+
+    The platform deploys a moving tag with Always; an LB hardcoding
+    IfNotPresent pins whatever digest its node cached — controller and LB
+    then run DIFFERENT code from the SAME tag (observed live: the LB
+    lacked /_lb/capacity and proxied it to the model server).
+    """
+
+    def _pod(self, image='ecr/skypilot:tag', pull_policy='Always'):
+        container = mock.Mock()
+        container.image = image
+        container.image_pull_policy = pull_policy
+        pod = mock.Mock()
+        pod.spec.containers = [container]
+        return pod
+
+    def test_mirrors_always_from_controller(self):
+        with mock.patch.dict(lb_k8s.os.environ,
+                             {constants.POD_NAME_ENV_VAR: 'ctrl-pod'}), \
+             mock.patch.object(lb_k8s.kubernetes, 'core_api') as mock_api:
+            mock_api.return_value.read_namespaced_pod.return_value = (self._pod(
+                pull_policy='Always'))
+            image, policy = lb_k8s._resolve_lb_image('ns', 'ctx')
+        self.assertEqual(image, 'ecr/skypilot:tag')
+        self.assertEqual(policy, 'Always')
+
+    def test_defaults_when_controller_policy_unset(self):
+        with mock.patch.dict(lb_k8s.os.environ,
+                             {constants.POD_NAME_ENV_VAR: 'ctrl-pod'}), \
+             mock.patch.object(lb_k8s.kubernetes, 'core_api') as mock_api:
+            mock_api.return_value.read_namespaced_pod.return_value = (self._pod(
+                pull_policy=None))
+            _, policy = lb_k8s._resolve_lb_image('ns', 'ctx')
+        self.assertEqual(policy, 'IfNotPresent')
+
+    def test_deployment_dict_carries_policy(self):
+        deployment = lb_k8s._build_deployment_dict('svc', 'dep', 'img', 'ns',
+                                                   30001, [], 'Always')
+        container = deployment['spec']['template']['spec']['containers'][0]
+        self.assertEqual(container['imagePullPolicy'], 'Always')

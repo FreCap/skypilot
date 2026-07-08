@@ -24,7 +24,7 @@ guard.
 import hashlib
 import os
 import re
-from typing import Optional, Set
+from typing import Optional, Set, Tuple
 
 from sky import sky_logging
 from sky.adaptors import kubernetes
@@ -143,12 +143,20 @@ def _object_labels(service_name: str) -> dict:
     }
 
 
-def _resolve_lb_image(namespace: str, context: str) -> str:
-    """Mirror the controller's own container image onto the LB Deployment.
+def _resolve_lb_image(namespace: str, context: str) -> Tuple[str, str]:
+    """Mirror the controller's container image AND pull policy onto the LB.
 
     Reads the controller pod (name from ``POD_NAME_ENV_VAR``) and returns its
-    first container's image. Raises if the env var is unset -- that injection
-    is part of the platform contract.
+    first container's (image, imagePullPolicy). The pull policy MUST be
+    mirrored together with the image: the platform deploys a moving tag
+    (``-improvements``) with ``Always``, and an LB Deployment hardcoding
+    ``IfNotPresent`` silently pins whatever digest its node had cached — the
+    controller and its LB then run DIFFERENT code from the SAME tag (observed
+    live: an LB missing the /_lb/capacity route the controller image carried,
+    so the request fell through to the catch-all and was proxied to the model
+    server). A digest-pinned deployment keeps its own policy unchanged.
+    Raises if the env var is unset -- that injection is part of the platform
+    contract.
     """
     pod_name = os.environ.get(constants.POD_NAME_ENV_VAR)
     if not pod_name:
@@ -158,7 +166,8 @@ def _resolve_lb_image(namespace: str, context: str) -> str:
             'inject the controller pod name (downward API metadata.name) in '
             'external load balancer mode.')
     pod = kubernetes.core_api(context).read_namespaced_pod(pod_name, namespace)
-    return pod.spec.containers[0].image
+    container = pod.spec.containers[0]
+    return container.image, (container.image_pull_policy or 'IfNotPresent')
 
 
 def _mirror_pod_env(pod_containers, env_name: str, token_value: str) -> dict:
@@ -221,11 +230,11 @@ def _resolve_lb_auth_envs(namespace: str, context: str) -> list:
 
 def _build_deployment_dict(service_name: str, deployment_name: str, image: str,
                            namespace: str, controller_port: int,
-                           auth_envs: list) -> dict:
+                           auth_envs: list, image_pull_policy: str) -> dict:
     container = {
         'name': 'load-balancer',
         'image': image,
-        'imagePullPolicy': 'IfNotPresent',
+        'imagePullPolicy': image_pull_policy,
         'command': ['python', '-m', 'sky.serve.load_balancer'],
         'args': [
             '--controller-addr',
@@ -329,12 +338,12 @@ def create_lb_deployment_and_service(service_name: str,
     namespace = kubernetes_utils.get_kube_config_context_namespace(context)
     deployment_name = lb_deployment_name(service_name)
     service_name_k8s = lb_service_name(service_name)
-    image = _resolve_lb_image(namespace, context)
+    image, image_pull_policy = _resolve_lb_image(namespace, context)
     auth_envs = _resolve_lb_auth_envs(namespace, context)
 
     deployment_dict = _build_deployment_dict(service_name, deployment_name,
                                              image, namespace, controller_port,
-                                             auth_envs)
+                                             auth_envs, image_pull_policy)
     service_dict = _build_service_dict(service_name, service_name_k8s,
                                        deployment_name)
 
