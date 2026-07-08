@@ -602,7 +602,8 @@ class SkyServeLoadBalancer:
         # Envelope in-flight unioned with occupancy per url (max, same
         # jobs measured two ways) and including pruned-but-draining work:
         # those requests still occupy replica capacity, which is what an
-        # admission reader sizes by.
+        # admission reader sizes by. (Called outside the pool lock -- it
+        # acquires the lock itself.)
         in_flight_map = self._in_flight_with_draining()
         in_flight = (sum(in_flight_map.values())
                      if in_flight_map is not None else None)
