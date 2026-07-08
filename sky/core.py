@@ -583,6 +583,29 @@ def _start(
             f'Starting cluster {cluster_name!r} with backend {backend.NAME} '
             'is not supported.')
 
+    if (controller_utils.Controllers.from_name(cluster_name) is None and
+            idle_minutes_to_autostop is not None and
+            idle_minutes_to_autostop >= 0):
+        # `sky start --force -i N` on an UP cluster reaches set_autostop
+        # without core.autostop()'s validation or the launch path's
+        # requested-features check, so an unstoppable-resources config
+        # (non-down autostop on e.g. AWS one-time spot, whose idle-time
+        # StopInstances fails forever while the instance keeps billing)
+        # would slip through this path. Same checks as core.autostop().
+        # Controllers are excluded: per-request settings are rejected
+        # below, and their config-derived autostop is force-converted by
+        # set_autostop on Kubernetes/RunPod.
+        launched = handle.launched_resources.assert_launchable()
+        if down:
+            launched.cloud.check_features_are_supported(
+                launched, {clouds.CloudImplementationFeatures.AUTODOWN})
+        else:
+            launched.cloud.check_features_are_supported(
+                launched, {
+                    clouds.CloudImplementationFeatures.STOP,
+                    clouds.CloudImplementationFeatures.AUTOSTOP,
+                })
+
     hook: Optional[str] = None
     hook_timeout: Optional[int] = None
     controller = controller_utils.Controllers.from_name(cluster_name)

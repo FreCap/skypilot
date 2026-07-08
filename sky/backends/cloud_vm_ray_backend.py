@@ -1901,8 +1901,11 @@ class RetryingVmProvisioner(object):
                     # Raised from within this handler, the cause
                     # propagates out of the function (sibling except
                     # clauses of the same try do not catch it) -- the
-                    # same clean error `sky autostop` gives.
-                    raise cause
+                    # same clean error `sky autostop` gives. `from None`
+                    # suppresses the implicit __context__ chain so the
+                    # internal marker class never shows up in the debug
+                    # stacktrace serialized to API clients.
+                    raise cause from None
                 # New launch: fall through to the loop tail, which blocks
                 # exactly `to_provision` and records the cause -- so
                 # sibling candidates on the same cloud (e.g. on-demand

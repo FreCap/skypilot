@@ -187,3 +187,43 @@ def test_provisioner_surfaces_clean_error_for_existing_cluster():
         prev_cluster_status=status_lib.ClusterStatus.UP)
     assert isinstance(raised, exceptions.NotSupportedError)
     assert not provisioner._blocked_resources
+
+
+def test_existing_cluster_error_does_not_chain_the_marker():
+    # The internal marker must not appear in the propagated exception's
+    # chain: failed API requests serialize the full stacktrace to
+    # clients under debug.
+    _, _, raised = _provision_once(
+        prev_cluster_status=status_lib.ClusterStatus.UP)
+    assert isinstance(raised, exceptions.NotSupportedError)
+    assert raised.__cause__ is None
+    assert raised.__suppress_context__
+
+
+def test_start_rejects_non_down_autostop_on_unstoppable_resources():
+    # `sky start --force -i N` on an UP one-time-spot cluster reaches
+    # set_autostop with no validation anywhere else on the path -- the
+    # same incident class as the launch gap, through a different door.
+    from sky import core  # pylint: disable=import-outside-toplevel
+    spot = resources_lib.Resources(cloud=clouds.AWS(), use_spot=True)
+    handle = mock.Mock()
+    # Child mocks do not inherit unsafe=True (needed for the
+    # assert_-prefixed method name).
+    handle.launched_resources = mock.Mock(unsafe=True)
+    handle.launched_resources.assert_launchable.return_value = spot
+    with mock.patch.object(
+            core.backend_utils,
+            'refresh_cluster_status_handle',
+            return_value=(status_lib.ClusterStatus.UP, handle)), \
+         mock.patch.object(core.backend_utils,
+                           'get_backend_from_handle',
+                           return_value=mock.Mock(
+                               spec=backend_lib.CloudVmRayBackend)):
+        with pytest.raises(exceptions.NotSupportedError):
+            core._start('t-cluster',
+                        idle_minutes_to_autostop=30,
+                        down=False,
+                        force=True)
+    # (Autodown on the same spot resources passing the gate is covered
+    # by test_early_check_allows_autodown_on_spot / the AWS feature
+    # tests; driving _start further needs the whole provision stack.)
