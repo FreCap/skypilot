@@ -227,6 +227,11 @@ class SkyServeLoadBalancer:
         # (deregister-before-drain).
         self._ready: bool = False
         self._draining: bool = False
+        # Wall-clock time of the last SUCCESSFUL controller sync; the
+        # capacity endpoint reports its age so a data-plane reader can
+        # judge freshness during control-plane outages (the whole point
+        # of reading capacity from the LB instead of `serve status`).
+        self._last_sync_time: Optional[float] = None
         # Strong refs to in-progress drain-close tasks (see
         # _drain_and_close_client); a bare create_task result can be GCed.
         self._client_close_tasks: Set[asyncio.Task] = set()
@@ -362,6 +367,36 @@ class SkyServeLoadBalancer:
         return fastapi.responses.Response(
             status_code=200 if self._is_ready_to_serve() else 503)
 
+    async def _capacity(
+            self, request: fastapi.Request) -> fastapi.responses.JSONResponse:
+        """Data-plane capacity read: the volatile half of admission sizing.
+
+        External admission systems size against `sky serve status`, which
+        rides the control plane — every API-server restart or outage
+        blinds them and they must decay to a conservative floor. The LB
+        IS the data plane: it knows the ready set and (for load-tracking
+        policies) the in-flight count, and with an external LB it keeps
+        serving straight through control-plane restarts. Aggregates only:
+        per-replica URLs are internal addresses and admission needs
+        counts, not targets. Slow-changing spec fields (max_replicas,
+        target qps) intentionally stay on the `serve status` path — they
+        only change on `serve update`.
+        """
+        del request  # Unused.
+        with self._client_pool_lock:
+            ready_replicas = len(self._load_balancing_policy.ready_replicas)
+            in_flight = self._load_balancing_policy.total_in_flight()
+        last_sync_age: Optional[float] = None
+        if self._last_sync_time is not None:
+            last_sync_age = max(time.time() - self._last_sync_time, 0.0)
+        return fastapi.responses.JSONResponse({
+            'ready_replicas': ready_replicas,
+            'in_flight': in_flight,
+            'draining': self._draining,
+            'synced': self._ready,
+            'last_sync_age_seconds': last_sync_age,
+        })
+
     async def _sync_with_controller_once(self) -> None:
         ready_replica_urls = []
         replica_info = {}
@@ -457,6 +492,7 @@ class SkyServeLoadBalancer:
                     task.add_done_callback(self._client_close_tasks.discard)
                 # First successful sync -> ready to serve (readiness gate).
                 self._ready = True
+                self._last_sync_time = time.time()
 
     async def _drain_and_close_client(self, url: str,
                                       client: httpx.AsyncClient) -> None:
@@ -724,6 +760,9 @@ class SkyServeLoadBalancer:
         # is matched first (Starlette matches in registration order) instead of
         # being proxied to a replica.
         self._app.add_api_route('/_lb/health', self._health, methods=['GET'])
+        self._app.add_api_route('/_lb/capacity',
+                                self._capacity,
+                                methods=['GET'])
         self._app.add_api_route('/{path:path}',
                                 self._proxy_with_retries,
                                 methods=['GET', 'POST', 'PUT', 'DELETE'])

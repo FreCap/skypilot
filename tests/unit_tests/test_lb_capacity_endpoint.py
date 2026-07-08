@@ -1,0 +1,82 @@
+"""/_lb/capacity: data-plane admission read.
+
+External admission sizes against `sky serve status` (control plane) and
+goes blind on every API-server restart/outage. The LB knows the ready
+set and in-flight counts and — with an external LB — keeps serving
+through control-plane restarts, so it exposes the volatile half of the
+sizing read directly.
+"""
+# pylint: disable=protected-access
+import asyncio
+import threading
+import time
+import unittest
+from unittest import mock
+
+from sky.serve import load_balancer as lb_module
+from sky.serve import load_balancing_policies as lb_policies
+
+
+def _make_balancer(policy):
+    balancer = object.__new__(lb_module.SkyServeLoadBalancer)
+    balancer._load_balancing_policy = policy
+    balancer._client_pool_lock = threading.Lock()
+    balancer._ready = True
+    balancer._draining = False
+    balancer._last_sync_time = time.time() - 4.0
+    return balancer
+
+
+class TestCapacityEndpoint(unittest.TestCase):
+
+    def test_reports_ready_and_in_flight(self):
+        policy = lb_policies.LeastLoadPolicy()
+        policy.set_ready_replicas(['http://a:8080', 'http://b:8080'])
+        policy.load_map['http://a:8080'] = 2
+        policy.load_map['http://b:8080'] = 1
+        balancer = _make_balancer(policy)
+        response = asyncio.run(balancer._capacity(mock.MagicMock()))
+        import json
+        body = json.loads(response.body)
+        self.assertEqual(body['ready_replicas'], 2)
+        self.assertEqual(body['in_flight'], 3)
+        self.assertFalse(body['draining'])
+        self.assertTrue(body['synced'])
+        self.assertGreaterEqual(body['last_sync_age_seconds'], 3.0)
+
+    def test_round_robin_reports_unknown_in_flight(self):
+        policy = lb_policies.RoundRobinPolicy()
+        policy.set_ready_replicas(['http://a:8080'])
+        balancer = _make_balancer(policy)
+        import json
+        body = json.loads(
+            asyncio.run(balancer._capacity(mock.MagicMock())).body)
+        self.assertEqual(body['ready_replicas'], 1)
+        self.assertIsNone(body['in_flight'])
+
+    def test_never_synced_reports_null_age(self):
+        policy = lb_policies.LeastLoadPolicy()
+        policy.set_ready_replicas([])
+        balancer = _make_balancer(policy)
+        balancer._ready = False
+        balancer._last_sync_time = None
+        import json
+        body = json.loads(
+            asyncio.run(balancer._capacity(mock.MagicMock())).body)
+        self.assertEqual(body['ready_replicas'], 0)
+        self.assertFalse(body['synced'])
+        self.assertIsNone(body['last_sync_age_seconds'])
+
+    def test_in_flight_ignores_pruned_replicas(self):
+        # Load entries for replicas no longer ready must not inflate the
+        # aggregate (prune keeps the map clean, but assert the contract).
+        policy = lb_policies.InstanceAwareLeastLoadPolicy()
+        policy.set_ready_replicas(['http://a:8080', 'http://b:8080'])
+        policy.load_map['http://a:8080'] = 1
+        policy.load_map['http://b:8080'] = 1
+        policy.set_ready_replicas(['http://a:8080'])
+        balancer = _make_balancer(policy)
+        import json
+        body = json.loads(
+            asyncio.run(balancer._capacity(mock.MagicMock())).body)
+        self.assertEqual(body['in_flight'], 1)
