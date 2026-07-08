@@ -266,3 +266,99 @@ class TestRoutingSpecSync(unittest.TestCase):
                          lb_module.constants.LB_MAX_RETRY)
         self.assertEqual(balancer._retry_initial_backoff_seconds,
                          lb_module.constants.LB_RETRY_INITIAL_BACKOFF_SECONDS)
+
+
+class TestRetryShortCircuit(unittest.TestCase):
+    """Retries must stop when there is nothing left worth trying.
+
+    Without this, an empty or fully-shedding fleet burned every attempt
+    WITH full backoff (~7.5s of sleep at fleet values) before the 503 —
+    multiplied by the client retry layer above during outages/warm-up.
+    """
+
+    def _balancer(self, replicas, proxy):
+        balancer = object.__new__(lb_module.SkyServeLoadBalancer)
+        policy = lb_policies.LeastLoadPolicy()
+        policy.set_ready_replicas(list(replicas))
+        balancer._load_balancing_policy = policy
+        balancer._client_pool_lock = threading.Lock()
+        balancer._request_aggregator = mock.MagicMock()
+        balancer._max_retries = 5
+        balancer._retry_initial_backoff_seconds = 0.5
+        balancer._replica_dead_failures = {}
+        balancer._replica_quarantine_until = {}
+        balancer._proxy_request_to = proxy
+        return balancer
+
+    def _run(self, balancer):
+        sleeps = []
+
+        async def _sleep(t):
+            sleeps.append(t)
+
+        with mock.patch('sky.serve.load_balancer.asyncio.sleep', new=_sleep):
+            with self.assertRaises(fastapi.HTTPException) as ctx:
+                asyncio.run(balancer._proxy_with_retries(_request()))
+        return sleeps, ctx.exception
+
+    def test_no_replicas_fails_fast_with_retry_after(self):
+
+        async def _proxy(url, request):
+            raise AssertionError('must not be called')
+
+        sleeps, exc = self._run(self._balancer([], _proxy))
+        self.assertEqual(sleeps, [])  # zero backoff sleeps
+        self.assertEqual(exc.status_code, 503)
+        self.assertEqual(exc.headers['Retry-After'],
+                         str(lb_module.constants.LB_503_RETRY_AFTER_SECONDS))
+
+    def test_all_replicas_shedding_short_circuits(self):
+        attempts = []
+
+        async def _proxy(url, request):
+            del request
+            attempts.append(url)
+            return lb_module._RetriableStatusError(503, url)
+
+        sleeps, exc = self._run(
+            self._balancer(['http://a:8080', 'http://b:8080'], _proxy))
+        # One shed per replica, then out — not 5 attempts / 4 sleeps.
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(len(sleeps), 1)
+        self.assertEqual(exc.status_code, 503)
+        self.assertIn('Retry-After', exc.headers)
+
+    def test_transport_failures_keep_fallback_attempts(self):
+        # A lone replica's connection blip must still recover
+        # transparently: transport errors do NOT take the shed exit.
+        attempts = []
+
+        async def _proxy(url, request):
+            del request
+            attempts.append(url)
+            if len(attempts) < 3:
+                return httpx.ConnectError('blip')
+            return fastapi.responses.Response(status_code=200)
+
+        balancer = self._balancer(['http://only:8080'], _proxy)
+        with mock.patch('sky.serve.load_balancer.asyncio.sleep',
+                        new=mock.AsyncMock()):
+            response = asyncio.run(balancer._proxy_with_retries(_request()))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(attempts), 3)
+
+    def test_mixed_fleet_shed_then_healthy_succeeds(self):
+
+        async def _proxy(url, request):
+            del request
+            if url == 'http://shed:8080':
+                return lb_module._RetriableStatusError(503, url)
+            return fastapi.responses.Response(status_code=200)
+
+        balancer = self._balancer(['http://shed:8080', 'http://ok:8080'],
+                                  _proxy)
+        balancer._load_balancing_policy.load_map['http://ok:8080'] = 1
+        with mock.patch('sky.serve.load_balancer.asyncio.sleep',
+                        new=mock.AsyncMock()):
+            response = asyncio.run(balancer._proxy_with_retries(_request()))
+        self.assertEqual(response.status_code, 200)

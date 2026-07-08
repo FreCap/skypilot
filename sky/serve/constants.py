@@ -74,6 +74,13 @@ LB_CONTROLLER_SYNC_TIMEOUT_SECONDS = 30
 # TODO(tian): Expose this option to users in yaml file.
 LB_MAX_RETRY = 3
 
+# Retry-After advertised on LB-generated 503s (no ready replicas, or
+# every ready replica already shed this request). The client retry
+# layer's backoff is the right waiting room: the LB's ready set only
+# changes on the controller sync cadence, so holding the connection
+# through in-LB sleeps rarely helps.
+LB_503_RETRY_AFTER_SECONDS = 10
+
 # Default first-retry backoff for the LB proxy retry loop
 # (exponential with jitter after that). Service-overridable via
 # load_balancer.retry_initial_backoff_seconds.
