@@ -1062,8 +1062,28 @@ def get_service_schema():
                     # reserved (zero-cost) capacity. Absent/False means no
                     # behavior change; orthogonal to the demand knobs, so no
                     # cross-field constraints here or in the spec.
+                    # Bool form: plain enable. Object form: enable with
+                    # tuning knobs (all-defaults object == plain True).
                     'reserved_capacity_fill': {
-                        'type': 'boolean',
+                        'oneOf': [
+                            {
+                                'type': 'boolean',
+                            },
+                            {
+                                'type': 'object',
+                                'additionalProperties': False,
+                                'properties': {
+                                    'floor_replicas': {
+                                        'type': 'integer',
+                                        'minimum': 0,
+                                    },
+                                    'weight': {
+                                        'type': 'number',
+                                        'exclusiveMinimum': 0,
+                                    },
+                                },
+                            },
+                        ],
                     },
                     'dynamic_ondemand_fallback': {
                         'type': 'boolean',

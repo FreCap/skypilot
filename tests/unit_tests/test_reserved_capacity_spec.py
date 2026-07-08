@@ -1,8 +1,10 @@
 """Spec plumbing for reserved_capacity_fill.
 
-Opt-in boolean under replica_policy that will later let the autoscaler
-scale up onto free zero-cost capacity. These tests pin the spec-level
-contract only: absent means False with no yaml footprint, True round-trips,
+Opt-in field under replica_policy that will later let the autoscaler
+scale up onto free zero-cost capacity. Bool form (plain enable) or object
+form ({floor_replicas, weight}, which implies enabled). These tests pin the
+spec-level contract only: absent means False with no yaml footprint, both
+forms round-trip (an all-defaults object canonicalizes to the bool form),
 and the flag is orthogonal to the autoscaling knobs.
 """
 from typing import Any, Dict
@@ -117,4 +119,141 @@ def test_flag_rejected_with_fallback_at_constructor():
                    max_replicas=5,
                    target_qps_per_replica=1.0,
                    reserved_capacity_fill=True,
+                   dynamic_ondemand_fallback=True)
+
+
+# ---------------------------------------------------------------------------
+# Object form: reserved_capacity_fill: {floor_replicas, weight}
+# ---------------------------------------------------------------------------
+
+
+def test_object_form_parses_and_exposes_knobs():
+    spec = _make_spec(min_replicas=2,
+                      reserved_capacity_fill={
+                          'floor_replicas': 10,
+                          'weight': 3,
+                      })
+    assert spec.reserved_capacity_fill is True
+    assert spec.reserved_fill_floor_replicas == 10
+    assert spec.reserved_fill_weight == 3.0
+    config = spec.to_yaml_config()
+    assert config['replica_policy']['reserved_capacity_fill'] == {
+        'floor_replicas': 10,
+        'weight': 3.0,
+    }
+    # from_yaml_config also runs the JSON schema, so this covers schema
+    # acceptance of the object form.
+    restored = service_spec_lib.SkyServiceSpec.from_yaml_config(config)
+    assert restored.reserved_capacity_fill is True
+    assert restored.reserved_fill_floor_replicas == 10
+    assert restored.reserved_fill_weight == 3.0
+
+
+def test_bool_form_exposes_default_knobs():
+    # Callers of the new knob properties must not need to care which form
+    # the user wrote.
+    assert _make_spec(min_replicas=2).reserved_fill_floor_replicas == 0
+    assert _make_spec(min_replicas=2).reserved_fill_weight == 1.0
+    enabled = _make_spec(min_replicas=2, reserved_capacity_fill=True)
+    assert enabled.reserved_fill_floor_replicas == 0
+    assert enabled.reserved_fill_weight == 1.0
+
+
+@pytest.mark.parametrize('obj', [
+    {},
+    {
+        'floor_replicas': 0
+    },
+    {
+        'weight': 1
+    },
+    {
+        'floor_replicas': 0,
+        'weight': 1
+    },
+])
+def test_object_form_with_defaults_still_enables_and_canonicalizes(obj):
+    # An all-defaults object is the same opt-in as plain True (note {} is
+    # falsy: truthiness must not decide enablement), and to_yaml_config
+    # canonicalizes it to the bool form so older controllers keep seeing
+    # the shape they understand.
+    spec = _make_spec(min_replicas=2, reserved_capacity_fill=obj)
+    assert spec.reserved_capacity_fill is True
+    config = spec.to_yaml_config()
+    assert config['replica_policy']['reserved_capacity_fill'] is True
+    restored = service_spec_lib.SkyServiceSpec.from_yaml_config(config)
+    assert restored.reserved_capacity_fill is True
+    assert restored.reserved_fill_floor_replicas == 0
+    assert restored.reserved_fill_weight == 1.0
+
+
+def test_object_form_partial_round_trips_only_non_defaults():
+    spec = _make_spec(min_replicas=2,
+                      reserved_capacity_fill={'floor_replicas': 4})
+    config = spec.to_yaml_config()
+    assert config['replica_policy']['reserved_capacity_fill'] == {
+        'floor_replicas': 4
+    }
+    restored = service_spec_lib.SkyServiceSpec.from_yaml_config(config)
+    assert restored.reserved_fill_floor_replicas == 4
+    assert restored.reserved_fill_weight == 1.0
+
+
+def test_copy_preserves_object_form():
+    spec = _make_spec(min_replicas=2,
+                      reserved_capacity_fill={
+                          'floor_replicas': 7,
+                          'weight': 2.5,
+                      })
+    copied = spec.copy()
+    assert copied.reserved_capacity_fill is True
+    assert copied.reserved_fill_floor_replicas == 7
+    assert copied.reserved_fill_weight == 2.5
+    # Override still works and downgrades cleanly to the bool form.
+    downgraded = spec.copy(reserved_capacity_fill=False)
+    assert downgraded.reserved_capacity_fill is False
+    assert downgraded.reserved_fill_floor_replicas == 0
+    assert downgraded.reserved_fill_weight == 1.0
+
+
+def test_setstate_pre_object_bool_pickles_expose_default_knobs():
+    # Specs pickled while the field was still a plain bool must keep
+    # working once the knob properties exist.
+    spec = _make_spec(min_replicas=2, reserved_capacity_fill=True)
+    old_state = dict(spec.__dict__)
+    old_state['_reserved_capacity_fill'] = True  # pre-object representation
+    restored = service_spec_lib.SkyServiceSpec.__new__(
+        service_spec_lib.SkyServiceSpec)
+    restored.__setstate__(old_state)
+    assert restored.reserved_capacity_fill is True
+    assert restored.reserved_fill_floor_replicas == 0
+    assert restored.reserved_fill_weight == 1.0
+
+
+@pytest.mark.parametrize('bad_obj', [
+    {
+        'floor_replicas': -1
+    },
+    {
+        'weight': 0
+    },
+    {
+        'weight': -2
+    },
+])
+def test_object_form_rejects_bad_knobs_at_constructor(bad_obj):
+    # The schema guards the YAML path; the constructor guards programmatic
+    # construction.
+    with pytest.raises(ValueError):
+        _make_spec(min_replicas=2, reserved_capacity_fill=bad_obj)
+
+
+def test_object_form_rejected_with_ondemand_fallback():
+    # The object form is still the same opt-in: the fallback exclusivity
+    # must apply to it too, including the falsy-{} spelling.
+    with pytest.raises(ValueError):
+        _make_spec(min_replicas=1,
+                   max_replicas=5,
+                   target_qps_per_replica=1.0,
+                   reserved_capacity_fill={},
                    dynamic_ondemand_fallback=True)

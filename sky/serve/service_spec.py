@@ -37,7 +37,7 @@ class SkyServiceSpec:
         ports: Optional[str] = None,
         target_qps_per_replica: Optional[Union[float, Dict[str, float]]] = None,
         target_concurrency_per_replica: Optional[float] = None,
-        reserved_capacity_fill: Optional[bool] = None,
+        reserved_capacity_fill: Optional[Union[bool, Dict[str, Any]]] = None,
         post_data: Optional[Dict[str, Any]] = None,
         tls_credential: Optional[serve_utils.TLSCredential] = None,
         readiness_headers: Optional[Dict[str, str]] = None,
@@ -116,7 +116,27 @@ class SkyServiceSpec:
                     'target_concurrency_per_replica are mutually exclusive. '
                     'Please set only one of them.')
 
-        if reserved_capacity_fill:
+        # Object form implies enabled even when empty (an all-defaults
+        # object is the same opt-in as a plain `true`).
+        reserved_fill_enabled = (isinstance(reserved_capacity_fill, dict) or
+                                 bool(reserved_capacity_fill))
+        if isinstance(reserved_capacity_fill, dict):
+            # The YAML path is schema-validated; enforce ranges here too so
+            # programmatic construction cannot feed bad knobs to the
+            # autoscaler.
+            fill_floor = reserved_capacity_fill.get('floor_replicas', 0)
+            if not isinstance(fill_floor, int) or fill_floor < 0:
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        'reserved_capacity_fill.floor_replicas must be an '
+                        f'integer >= 0. Got: {fill_floor}')
+            fill_weight = reserved_capacity_fill.get('weight', 1)
+            if (not isinstance(fill_weight, (int, float)) or
+                    isinstance(fill_weight, bool) or fill_weight <= 0):
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError('reserved_capacity_fill.weight must be '
+                                     f'a number > 0. Got: {fill_weight}')
+        if reserved_fill_enabled:
             # Fill launches land as NON-spot replicas on zero-cost
             # locations, indistinguishable (via is_spot) from paid
             # on-demand fallback capacity: FallbackRequestRateAutoscaler
@@ -214,8 +234,10 @@ class SkyServiceSpec:
         self._target_concurrency_per_replica: Optional[float] = (
             target_concurrency_per_replica)
         # Opt-in: allow scaling up onto free reserved (zero-cost) capacity.
-        # Absent/False means no behavior change.
-        self._reserved_capacity_fill: Optional[bool] = reserved_capacity_fill
+        # Absent/False means no behavior change. Bool form or object form
+        # ({floor_replicas, weight}); object form implies enabled.
+        self._reserved_capacity_fill: Optional[Union[bool, Dict[
+            str, Any]]] = reserved_capacity_fill
         self._post_data: Optional[Dict[str, Any]] = post_data
         self._tls_credential: Optional[serve_utils.TLSCredential] = (
             tls_credential)
@@ -623,10 +645,20 @@ class SkyServiceSpec:
         add_if_not_none('replica_policy', 'target_concurrency_per_replica',
                         self.target_concurrency_per_replica)
         # no_empty: omit both None and False so older controllers never see
-        # the field unless the user opted in.
+        # the field unless the user opted in. Canonicalize: an object form
+        # carrying only default knobs collapses to the plain bool form.
+        reserved_fill_config: Optional[Union[bool, Dict[str, Any]]] = (
+            self._reserved_capacity_fill)
+        if isinstance(self._reserved_capacity_fill, dict):
+            fill_obj: Dict[str, Any] = {}
+            if self.reserved_fill_floor_replicas != 0:
+                fill_obj['floor_replicas'] = self.reserved_fill_floor_replicas
+            if self.reserved_fill_weight != 1.0:
+                fill_obj['weight'] = self.reserved_fill_weight
+            reserved_fill_config = fill_obj if fill_obj else True
         add_if_not_none('replica_policy',
                         'reserved_capacity_fill',
-                        self._reserved_capacity_fill,
+                        reserved_fill_config,
                         no_empty=True)
         add_if_not_none('replica_policy', 'dynamic_ondemand_fallback',
                         self.dynamic_ondemand_fallback)
@@ -805,8 +837,27 @@ class SkyServiceSpec:
     @property
     def reserved_capacity_fill(self) -> bool:
         # Opt-in flag; absent (None) collapses to False so callers never
-        # need to distinguish unset from disabled.
+        # need to distinguish unset from disabled. The object form implies
+        # enabled even when empty (all-defaults object == plain True).
+        if isinstance(self._reserved_capacity_fill, dict):
+            return True
         return bool(self._reserved_capacity_fill)
+
+    @property
+    def reserved_fill_floor_replicas(self) -> int:
+        # Minimum number of fill replicas to keep; only the object form can
+        # set it, everything else means no floor.
+        if isinstance(self._reserved_capacity_fill, dict):
+            return int(self._reserved_capacity_fill.get('floor_replicas', 0))
+        return 0
+
+    @property
+    def reserved_fill_weight(self) -> float:
+        # Relative weight of this service when brokering shared reserved
+        # capacity; only the object form can set it.
+        if isinstance(self._reserved_capacity_fill, dict):
+            return float(self._reserved_capacity_fill.get('weight', 1.0))
+        return 1.0
 
     @property
     def post_data(self) -> Optional[Dict[str, Any]]:
