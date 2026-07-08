@@ -4,6 +4,7 @@ These tests exercise only name/endpoint logic and which k8s API calls are
 issued (create/delete/list) under mocked clients. They never assert on log or
 exception message text.
 """
+import os
 import re
 import unittest
 from unittest import mock
@@ -46,9 +47,13 @@ def _install(monkeypatch,
     # service is treated as absent (truly gone). Tests can pass a set of names
     # the DB should still report as live.
     live_in_db = set(db_service_names or ())
+    # ensure_lb_objects_exist additionally checks ownership: the stub row
+    # carries this process's pid so 'live in DB' also means 'owned by us'.
     monkeypatch.setattr(
-        lb_k8s.serve_state, 'get_service_from_name',
-        lambda name: {'name': name} if name in live_in_db else None)
+        lb_k8s.serve_state, 'get_service_from_name', lambda name: {
+            'name': name,
+            'controller_pid': os.getpid(),
+        } if name in live_in_db else None)
     monkeypatch.setattr(lb_k8s.kubernetes_utils,
                         'is_incluster_config_available', lambda: incluster)
     monkeypatch.setattr(lb_k8s.kubernetes_utils,
@@ -531,3 +536,83 @@ class TestLbImagePullPolicyMirror(unittest.TestCase):
                                                    30001, [], 'Always', None)
         template = deployment['spec']['template']
         self.assertNotIn('annotations', template['metadata'])
+
+
+# --------------------------------------------------------------------------- #
+# ensure_lb_objects_exist (periodic self-heal)
+# --------------------------------------------------------------------------- #
+class TestEnsureLbObjectsExist:
+
+    def test_noop_outside_lb_mode(self, monkeypatch):
+        apps, core = _install(monkeypatch, external=False)
+        with mock.patch.object(lb_k8s,
+                               'create_lb_deployment_and_service') as create:
+            lb_k8s.ensure_lb_objects_exist('svc', 20001)
+        create.assert_not_called()
+        apps.read_namespaced_deployment.assert_not_called()
+        core.read_namespaced_service.assert_not_called()
+
+    def test_both_present_reads_only(self, monkeypatch):
+        apps, core = _install(monkeypatch)
+        with mock.patch.object(lb_k8s,
+                               'create_lb_deployment_and_service') as create:
+            lb_k8s.ensure_lb_objects_exist('svc', 20001)
+        create.assert_not_called()
+        apps.read_namespaced_deployment.assert_called_once()
+        core.read_namespaced_service.assert_called_once()
+
+    def test_missing_deployment_recreates(self, monkeypatch):
+        apps = mock.MagicMock()
+        apps.read_namespaced_deployment.side_effect = _ApiException(404)
+        _install(monkeypatch, apps_api=apps, db_service_names=('svc',))
+        with mock.patch.object(lb_k8s,
+                               'create_lb_deployment_and_service') as create:
+            lb_k8s.ensure_lb_objects_exist('svc', 20001)
+        create.assert_called_once_with('svc', 20001)
+
+    def test_missing_service_recreates(self, monkeypatch):
+        core = mock.MagicMock()
+        core.read_namespaced_service.side_effect = _ApiException(404)
+        _install(monkeypatch, core_api=core, db_service_names=('svc',))
+        with mock.patch.object(lb_k8s,
+                               'create_lb_deployment_and_service') as create:
+            lb_k8s.ensure_lb_objects_exist('svc', 20001)
+        create.assert_called_once_with('svc', 20001)
+
+    def test_missing_objects_but_row_owned_elsewhere_skips(self, monkeypatch):
+        # Ownership fence: a same-name successor / HA takeover owns the row
+        # (different controller_pid) -- the stale process must not recreate,
+        # or a 409-patch could point the successor's LB at a stale port.
+        apps = mock.MagicMock()
+        apps.read_namespaced_deployment.side_effect = _ApiException(404)
+        _install(monkeypatch, apps_api=apps)
+        monkeypatch.setattr(
+            lb_k8s.serve_state, 'get_service_from_name', lambda name: {
+                'name': name,
+                'controller_pid': os.getpid() + 1,
+            })
+        with mock.patch.object(lb_k8s,
+                               'create_lb_deployment_and_service') as create:
+            lb_k8s.ensure_lb_objects_exist('svc', 20001)
+        create.assert_not_called()
+
+    def test_missing_objects_but_service_row_gone_skips(self, monkeypatch):
+        # The create-time DB fence: objects missing because the service is
+        # being torn down concurrently must NOT be resurrected.
+        apps = mock.MagicMock()
+        apps.read_namespaced_deployment.side_effect = _ApiException(404)
+        _install(monkeypatch, apps_api=apps)  # 'svc' absent from the DB.
+        with mock.patch.object(lb_k8s,
+                               'create_lb_deployment_and_service') as create:
+            lb_k8s.ensure_lb_objects_exist('svc', 20001)
+        create.assert_not_called()
+
+    def test_non_404_read_error_raises(self, monkeypatch):
+        apps = mock.MagicMock()
+        apps.read_namespaced_deployment.side_effect = _ApiException(500)
+        _install(monkeypatch, apps_api=apps)
+        with mock.patch.object(lb_k8s,
+                               'create_lb_deployment_and_service') as create:
+            with pytest.raises(_ApiException):
+                lb_k8s.ensure_lb_objects_exist('svc', 20001)
+        create.assert_not_called()

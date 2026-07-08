@@ -410,6 +410,71 @@ def create_lb_deployment_and_service(service_name: str,
         logger.debug(f'LB Service {service_name_k8s} already exists.')
 
 
+def ensure_lb_objects_exist(service_name: str, controller_port: int) -> None:
+    """Recreate the per-service LB Deployment + Service if either is missing.
+
+    Self-heal for out-of-band deletion: the k8s Deployment only heals its own
+    *pod*, and nothing recreates a deleted Deployment/Service until the next
+    HA recovery -- so the per-service supervision loop calls this
+    periodically. Reads first and only mutates when an object is missing, so
+    the steady-state cost is two GETs with no patch churn. An
+    existing-but-drifted object is deliberately left alone: the controller
+    port is stable in external-LB mode (`_select_controller_port`) and the
+    image/auth inputs only change on a controller pod restart, which re-runs
+    the full ensure in `_start`.
+
+    No-op outside external-LB + in-cluster mode. Raises on k8s API errors
+    other than 404; callers treat this as best-effort and retry.
+    """
+    if not _lb_mode_active():
+        return
+    context = kubernetes.in_cluster_context_name()
+    namespace = kubernetes_utils.get_kube_config_context_namespace(context)
+
+    def _is_missing(read_fn, name: str) -> bool:
+        try:
+            read_fn(name, namespace)
+            return False
+        except kubernetes.api_exception() as e:
+            if getattr(e, 'status', None) != 404:
+                raise
+            return True
+
+    deployment_missing = _is_missing(
+        kubernetes.apps_api(context).read_namespaced_deployment,
+        lb_deployment_name(service_name))
+    service_missing = _is_missing(
+        kubernetes.core_api(context).read_namespaced_service,
+        lb_service_name(service_name))
+    if not deployment_missing and not service_missing:
+        return
+    # The objects may be missing because the service is being torn down or
+    # taken over concurrently. Re-check OWNERSHIP (not mere row existence)
+    # right before mutating -- the create-time mirror of reconcile's
+    # delete-time re-check: a row that is gone means down/purge won, and a
+    # row carrying another controller_pid means a same-name successor or an
+    # HA takeover owns the service now. Without the pid check, a stale
+    # controller could 409-patch the successor's fresh Deployment back to its
+    # own (stale) controller port -- and the periodic ensure deliberately
+    # never repairs drift, so that would stick until the next recovery. A
+    # residual TOCTOU window remains (the row can flip between this read and
+    # the k8s create; the two stores cannot be updated transactionally), but
+    # it is milliseconds wide, requires losing ownership in exactly that
+    # window, and is bounded: the next recovery's reconcile reaps a dead
+    # service's LB, and the live owner's own ensure/recovery converges a
+    # same-name successor's objects.
+    record = serve_state.get_service_from_name(service_name)
+    if record is None or record.get('controller_pid') != os.getpid():
+        logger.info(f'External LB objects for {service_name!r} are missing '
+                    'but this process no longer owns the service '
+                    '(row gone or taken over); skipping recreation.')
+        return
+    logger.warning(f'External LB objects for {service_name!r} are missing '
+                   f'(deployment_missing={deployment_missing}, '
+                   f'service_missing={service_missing}); recreating them.')
+    create_lb_deployment_and_service(service_name, controller_port)
+
+
 def delete_lb_objects(service_name: str) -> None:
     """Delete the per-service LB Deployment + Service (idempotent).
 
