@@ -1,0 +1,189 @@
+"""Launch-time validation of auto{stop,down} feature requirements.
+
+Incident: a one-time AWS spot cluster launched with `-i 30` (autostop
+WITHOUT down) was accepted, and at idle time the skylet's StopInstances
+call failed forever (AWS rejects stopping one-time spot), pinning the
+cluster in AUTOSTOPPING while it kept billing. `sky autostop` validates
+the STOP feature post-launch; the launch path only requested AUTOSTOP,
+which AWS does not restrict for spot. These tests pin the launch-time
+contract: non-down autostop requires STOP too.
+"""
+# pylint: disable=protected-access
+import pathlib
+from unittest import mock
+
+import pytest
+
+import sky
+from sky import clouds
+from sky import exceptions
+from sky import execution
+from sky import resources as resources_lib
+from sky.backends import cloud_vm_ray_backend as backend_lib
+from sky.utils import status_lib
+
+_FEATURES = clouds.CloudImplementationFeatures
+
+
+def test_non_down_autostop_requires_stop_feature():
+    assert execution._autostop_requested_features(down=False) == {
+        _FEATURES.AUTOSTOP,
+        _FEATURES.STOP,
+    }
+
+
+def test_autodown_requires_only_autodown_feature():
+    assert execution._autostop_requested_features(down=True) == {
+        _FEATURES.AUTODOWN,
+    }
+
+
+def test_aws_spot_rejects_the_non_down_autostop_feature_set():
+    # The gate that makes the launch-time request meaningful: AWS
+    # declares STOP unsupported for spot, so the non-down feature set
+    # must be rejected for a spot candidate...
+    spot = resources_lib.Resources(cloud=clouds.AWS(), use_spot=True)
+    with pytest.raises(exceptions.NotSupportedError):
+        clouds.AWS().check_features_are_supported(
+            spot, execution._autostop_requested_features(down=False))
+    # ...while AUTOSTOP alone (the pre-fix request) passes -- the exact
+    # gap that let the incident config through.
+    clouds.AWS().check_features_are_supported(spot, {_FEATURES.AUTOSTOP})
+
+
+def test_aws_ondemand_accepts_both_feature_sets():
+    ondemand = resources_lib.Resources(cloud=clouds.AWS(), use_spot=False)
+    clouds.AWS().check_features_are_supported(
+        ondemand, execution._autostop_requested_features(down=False))
+    clouds.AWS().check_features_are_supported(
+        ondemand, execution._autostop_requested_features(down=True))
+
+
+def _task_with(*resources):
+    task = sky.Task()
+    task.set_resources(set(resources))
+    return task
+
+
+def test_early_check_rejects_when_all_candidates_unstoppable():
+    task = _task_with(resources_lib.Resources(cloud=clouds.AWS(),
+                                              use_spot=True))
+    with pytest.raises(exceptions.NotSupportedError):
+        execution._check_autostop_feasibility_early(
+            task,
+            execution._autostop_requested_features(down=False),
+            cluster_name='my-cluster')
+
+
+def test_early_check_passes_with_one_stoppable_candidate():
+    # Mixed any_of [spot, on-demand]: one supported candidate is enough;
+    # the provisioner's per-resource feature filtering handles the rest.
+    task = _task_with(
+        resources_lib.Resources(cloud=clouds.AWS(), use_spot=True),
+        resources_lib.Resources(cloud=clouds.AWS(), use_spot=False))
+    execution._check_autostop_feasibility_early(
+        task,
+        execution._autostop_requested_features(down=False),
+        cluster_name='my-cluster')
+
+
+def test_early_check_inconclusive_with_cloud_agnostic_candidate():
+    task = _task_with(resources_lib.Resources(use_spot=True))
+    execution._check_autostop_feasibility_early(
+        task,
+        execution._autostop_requested_features(down=False),
+        cluster_name='my-cluster')
+
+
+def test_early_check_allows_autodown_on_spot():
+    task = _task_with(resources_lib.Resources(cloud=clouds.AWS(),
+                                              use_spot=True))
+    execution._check_autostop_feasibility_early(
+        task,
+        execution._autostop_requested_features(down=True),
+        cluster_name='my-cluster')
+
+
+def _make_provisioner(requested):
+    return backend_lib.RetryingVmProvisioner(
+        log_dir='/tmp',
+        dag=mock.Mock(),
+        optimize_target=mock.Mock(),
+        requested_features=requested,
+        local_wheel_path=pathlib.Path('/tmp/wheel'),
+        wheel_hash='',
+        extra_launch_context={},
+    )
+
+
+def _provision_once(prev_cluster_status):
+    """Drive provision_with_retries one iteration with a cloud stub whose
+    feature check raises NotSupportedError; returns (provisioner,
+    to_provision, raised exception)."""
+    # unsafe=True: assert_launchable trips Mock's assert_* typo guard.
+    to_provision = mock.Mock(unsafe=True)
+    to_provision.assert_launchable.return_value = to_provision
+    cloud_stub = mock.Mock()
+    cloud_stub.check_features_are_supported.side_effect = (
+        exceptions.NotSupportedError('stop unsupported for spot'))
+    cloud_stub.get_active_user_identity.return_value = None
+    to_provision.cloud = cloud_stub
+
+    task = mock.Mock()
+    task.is_controller_task.return_value = False
+    task.num_nodes = 1
+    task.resources = {to_provision}
+
+    provisioner = _make_provisioner(
+        execution._autostop_requested_features(down=False))
+    config = backend_lib.RetryingVmProvisioner.ToProvisionConfig(
+        cluster_name='t-cluster',
+        resources=to_provision,
+        num_nodes=1,
+        prev_cluster_status=prev_cluster_status,
+        prev_handle=mock.Mock(),
+        prev_cluster_ever_up=prev_cluster_status is not None,
+        prev_config_hash=None,
+    )
+    raised = None
+    with mock.patch.object(backend_lib.optimizer.Optimizer,
+                         'optimize',
+                         side_effect=exceptions.ResourcesUnavailableError(
+                             'exhausted')), \
+         mock.patch.object(backend_lib,
+                         '_format_provision_failure_blocks',
+                         return_value=''):
+        # The failure formatter renders Resources for humans; it is
+        # presentation-only and chokes on the Mock candidate.
+        try:
+            provisioner.provision_with_retries(
+                task,
+                config,
+                dryrun=False,
+                stream_logs=False,
+                skip_unnecessary_provisioning=False)
+        except Exception as e:  # pylint: disable=broad-except
+            raised = e
+    return provisioner, to_provision, raised
+
+
+def test_provisioner_blocks_exact_candidate_not_cloud_wide():
+    # A per-resource feature failure must block only the failing
+    # candidate: a cloud-wide Resources(cloud=...) block matches only
+    # NON-spot siblings (use_spot is never None) and would break
+    # any_of [spot, on-demand] fallback entirely.
+    provisioner, to_provision, raised = _provision_once(
+        prev_cluster_status=None)
+    assert isinstance(raised, exceptions.ResourcesUnavailableError)
+    assert provisioner._blocked_resources == {to_provision}
+
+
+def test_provisioner_surfaces_clean_error_for_existing_cluster():
+    # Relaunching an existing UP cluster with a config its launched
+    # resources cannot satisfy must surface the same clean
+    # NotSupportedError `sky autostop` gives -- not the INIT-only
+    # AssertionError from the loop tail, and no cloud-wide poisoning.
+    provisioner, _, raised = _provision_once(
+        prev_cluster_status=status_lib.ClusterStatus.UP)
+    assert isinstance(raised, exceptions.NotSupportedError)
+    assert not provisioner._blocked_resources

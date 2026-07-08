@@ -388,6 +388,17 @@ class GangSchedulingStatus(enum.Enum):
     HEAD_FAILED = 2
 
 
+class _ResourcesFeaturesUnsupportedError(Exception):
+    """Internal marker: `to_provision` cannot satisfy the requested features.
+
+    Raised (chained onto the original NotSupportedError) inside the
+    provision retry loop so the failure is handled per-RESOURCE -- the
+    loop tail blocks exactly the failing candidate -- instead of the
+    broad NotSupportedError handler's cloud-wide block, which is only
+    correct for genuinely cloud-global failures.
+    """
+
+
 def _add_to_blocked_resources(blocked_resources: Set['resources_lib.Resources'],
                               resources: 'resources_lib.Resources') -> None:
     # If the resources is already blocked by blocked_resources, we don't need to
@@ -1827,10 +1838,39 @@ class RetryingVmProvisioner(object):
                     # requested, so use discard() instead of remove().
                     requested_features.discard(
                         clouds.CloudImplementationFeatures.AUTOSTOP)
+                    # Non-down autostop also requests STOP (see
+                    # execution._autostop_requested_features); controllers
+                    # on Kubernetes/RunPod get force-converted to
+                    # autodown/no-op by set_autostop, so the same
+                    # carve-out applies.
+                    requested_features.discard(
+                        clouds.CloudImplementationFeatures.STOP)
 
-                # Skip if to_provision.cloud does not support requested features
-                to_provision.cloud.check_features_are_supported(
-                    to_provision, requested_features)
+                # Skip if to_provision.cloud does not support requested
+                # features. Feature support can be RESOURCE-dependent
+                # (e.g. STOP is unsupported for AWS one-time spot but
+                # fine on-demand), so the failure is re-raised as the
+                # internal marker below and handled by its own except
+                # clause -- the broad handler's cloud-wide block would
+                # poison sibling candidates on the same cloud (and,
+                # because Resources.use_spot is never None, a bare
+                # Resources(cloud=...) block matches only NON-spot
+                # candidates, breaking any_of [spot, on-demand] fallback
+                # entirely).
+                try:
+                    to_provision.cloud.check_features_are_supported(
+                        to_provision, requested_features)
+                except exceptions.NotSupportedError as e:
+                    # NOTE: raised unconditionally (never a bare
+                    # re-raise): this inner handler is nested INSIDE the
+                    # outer try, so a re-raised NotSupportedError would
+                    # be swallowed by the broad sibling handler below and
+                    # take the cloud-wide-block path. The marker handler
+                    # decides what to do (including propagating cleanly
+                    # for existing clusters -- an exception raised from
+                    # within an outer-level handler is NOT caught by its
+                    # sibling except clauses).
+                    raise _ResourcesFeaturesUnsupportedError() from e
 
                 config_dict = self._retry_zones(
                     to_provision,
@@ -1849,6 +1889,27 @@ class RetryingVmProvisioner(object):
                 )
                 if dryrun:
                     return config_dict
+            except _ResourcesFeaturesUnsupportedError as e:
+                # Resource-dependent feature failure (e.g. non-down
+                # autostop on a one-time spot candidate).
+                cause = e.__cause__
+                assert cause is not None, e
+                if prev_cluster_status is not None:
+                    # Existing cluster relaunched with a config its
+                    # (fixed) launched resources cannot satisfy: failover
+                    # cannot help, and the loop tail asserts INIT-only.
+                    # Raised from within this handler, the cause
+                    # propagates out of the function (sibling except
+                    # clauses of the same try do not catch it) -- the
+                    # same clean error `sky autostop` gives.
+                    raise cause
+                # New launch: fall through to the loop tail, which blocks
+                # exactly `to_provision` and records the cause -- so
+                # sibling candidates on the same cloud (e.g. on-demand
+                # after a spot candidate failed a STOP requirement) still
+                # get their turn.
+                logger.warning(common_utils.format_exception(cause))
+                failover_history.append(cause)
             except (exceptions.InvalidClusterNameError,
                     exceptions.NotSupportedError,
                     exceptions.CloudUserIdentityError) as e:

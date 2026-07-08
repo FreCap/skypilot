@@ -9,7 +9,7 @@ import os
 import tempfile
 import time
 import typing
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import colorama
 
@@ -196,6 +196,62 @@ def _compute_set_autostop_args_for_hooks_only_relaunch(
         down=prior_to_down,
         hooks=hooks_payload,
     )
+
+
+def _autostop_requested_features(
+        down: bool) -> Set[clouds.CloudImplementationFeatures]:
+    """Cloud features a launch-time auto{stop,down} config requires.
+
+    Autostop WITHOUT down ultimately performs a STOP, so any candidate
+    that cannot stop cannot satisfy it -- most notably AWS one-time spot
+    instances, which reject StopInstances. Without requesting STOP here,
+    the launch accepts the config and the skylet's stop attempt then
+    fails forever at idle time, leaving the cluster in AUTOSTOPPING
+    while it keeps billing (core.autostop() validates STOP for the
+    post-launch path; this mirrors it for launch, and set_autostop in
+    the backend deliberately trusts its callers). The provisioner keeps
+    its Kubernetes/RunPod CONTROLLER carve-out, where set_autostop
+    force-converts to autodown/no-op.
+    """
+    if down:
+        return {clouds.CloudImplementationFeatures.AUTODOWN}
+    return {
+        clouds.CloudImplementationFeatures.AUTOSTOP,
+        clouds.CloudImplementationFeatures.STOP,
+    }
+
+
+def _check_autostop_feasibility_early(task: 'sky.Task', autostop_features: Set[
+    clouds.CloudImplementationFeatures], cluster_name: Optional[str]) -> None:
+    """Fail fast when NO candidate can satisfy the autostop config.
+
+    Gives the crisp `sky autostop`-style NotSupportedError up front
+    (e.g. `-i 30` without --down on an AWS one-time spot request)
+    instead of surfacing it as provision failover noise after an
+    optimizer round-trip. Only conclusive when every candidate names a
+    cloud: a cloud-agnostic candidate might optimize onto a supported
+    cloud, and a single supported candidate means the provisioner
+    feature filtering can still do its job. Controllers skip entirely
+    -- the provisioner carves autostop features out for them on
+    Kubernetes/RunPod (set_autostop force-converts).
+    """
+    if cluster_name is not None and controller_utils.Controllers.from_name(
+            cluster_name) is not None:
+        return
+    first_error: Optional[Exception] = None
+    for resource in task.resources:
+        if resource.cloud is None:
+            return
+        try:
+            resource.cloud.check_features_are_supported(resource,
+                                                        autostop_features)
+            return
+        except exceptions.NotSupportedError as e:
+            if first_error is None:
+                first_error = e
+    if first_error is not None:
+        with ux_utils.print_exception_no_traceback():
+            raise first_error
 
 
 def _execute(
@@ -458,15 +514,17 @@ def _execute_dag(
             if Stage.DOWN in stages:
                 stages.remove(Stage.DOWN)
             if idle_minutes_to_autostop >= 0:
-                if down:
-                    requested_features.add(
-                        clouds.CloudImplementationFeatures.AUTODOWN)
-                else:
-                    requested_features.add(
-                        clouds.CloudImplementationFeatures.AUTOSTOP)
-        # NOTE: in general we may not have sufficiently specified info
-        # (cloud/resource) to check STOP_SPOT_INSTANCE here. This is checked in
-        # the backend.
+                autostop_features = _autostop_requested_features(down)
+                if Stage.PRE_EXEC in stages or Stage.PROVISION in stages:
+                    # Fail fast only when this run will actually APPLY
+                    # the autostop config. `sky exec` (no PRE_EXEC /
+                    # PROVISION stage) has always ignored a task YAML
+                    # autostop declaration; erroring on the unapplied
+                    # config would block job submission to clusters
+                    # whose YAML predates this validation.
+                    _check_autostop_feasibility_early(task, autostop_features,
+                                                      cluster_name)
+                requested_features |= autostop_features
 
     if Stage.CLONE_DISK in stages:
         task = _maybe_clone_disk_from_cluster(clone_disk_from, cluster_name,
