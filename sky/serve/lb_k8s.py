@@ -60,7 +60,7 @@ _HASH_LEN = 8
 # It returns 503 while the LB is draining (SIGTERM / rolling update), so a
 # readinessProbe on it pulls a draining pod out of the Service endpoints before
 # the pod terminates -- no traffic to a pod that is going away.
-_LB_HEALTH_PATH = '/_lb/health'
+_LB_HEALTH_PATH = constants.LB_HEALTH_ENDPOINT_PATH
 
 
 def _sanitize(service_name: str) -> str:
@@ -161,8 +161,67 @@ def _resolve_lb_image(namespace: str, context: str) -> str:
     return pod.spec.containers[0].image
 
 
+def _mirror_pod_env(pod_containers, env_name: str, token_value: str) -> dict:
+    """Manifest env entry for ``env_name``, mirrored from the controller pod.
+
+    If the controller pod carries ``env_name`` as a ``secretKeyRef`` (the
+    platform/ESO shape), reference the SAME Secret so the token never lands as
+    plaintext in the LB Deployment spec. Falls back to an inline value only when
+    the env is not sourced from a Secret on the pod (non-k8s / test / inline
+    helm value -- already plaintext in the controller's own spec, so no new
+    exposure).
+    """
+    for container in (pod_containers or []):
+        for env in (container.env or []):
+            if env.name != env_name:
+                continue
+            secret_key_ref = getattr(getattr(env, 'value_from', None),
+                                     'secret_key_ref', None)
+            if secret_key_ref is not None:
+                ref = {'name': secret_key_ref.name, 'key': secret_key_ref.key}
+                if secret_key_ref.optional is not None:
+                    ref['optional'] = secret_key_ref.optional
+                return {'name': env_name, 'valueFrom': {'secretKeyRef': ref}}
+            # Present but inline (or an unsupported source): mirror the resolved
+            # value below rather than the raw env spec.
+            break
+    return {'name': env_name, 'value': token_value}
+
+
+def _resolve_lb_auth_envs(namespace: str, context: str) -> list:
+    """LB container env entries for BOTH shared bearer tokens (manifest dicts).
+
+    - ``CONTROLLER_AUTH_TOKEN_ENV_VAR``: the LB presents it to the controller on
+      every sync (control-plane auth).
+    - ``LB_AUTH_TOKEN_ENV_VAR``: the LB validates INBOUND inference requests
+      against it (data-plane auth). Without this the spawned LB pod would never
+      see the inbound token and its auth middleware would be a silent no-op.
+
+    Each is included only when set on this (controller) process, and is mirrored
+    from the controller pod's own env source (a ``secretKeyRef``) so tokens are
+    never written as plaintext into the LB Deployment spec -- symmetric with
+    :func:`_resolve_lb_image`. Returns ``[]`` when neither token is set.
+    """
+    wanted = [
+        (constants.CONTROLLER_AUTH_TOKEN_ENV_VAR,
+         serve_utils.get_controller_auth_token()),
+        (constants.LB_AUTH_TOKEN_ENV_VAR, serve_utils.get_lb_auth_token()),
+    ]
+    active = [(name, tok) for name, tok in wanted if tok is not None]
+    if not active:
+        return []
+    pod_containers = None
+    pod_name = os.environ.get(constants.POD_NAME_ENV_VAR)
+    if pod_name:
+        pod = kubernetes.core_api(context).read_namespaced_pod(
+            pod_name, namespace)
+        pod_containers = pod.spec.containers
+    return [_mirror_pod_env(pod_containers, name, tok) for name, tok in active]
+
+
 def _build_deployment_dict(service_name: str, deployment_name: str, image: str,
-                           namespace: str, controller_port: int) -> dict:
+                           namespace: str, controller_port: int,
+                           auth_envs: list) -> dict:
     container = {
         'name': 'load-balancer',
         'image': image,
@@ -189,16 +248,13 @@ def _build_deployment_dict(service_name: str, deployment_name: str, image: str,
             'failureThreshold': 1,
         },
     }
-    # TODO(fcapponi): prod should mount the controller auth token from a
-    # Secret rather than an inline env value. For this iteration we pass it
-    # through directly when set.
-    token = serve_utils.get_controller_auth_token()
-    if token is not None:
-        container['env'] = [{
-            'name': constants.CONTROLLER_AUTH_TOKEN_ENV_VAR,
-            'value': token,
-        }]
-    # TODO(fcapponi): no TLS handling in this pass.
+    # The bearer tokens (control-plane + inbound LB) are mirrored from the
+    # controller pod's own env sources (secretKeyRef into the platform Secret)
+    # by _resolve_lb_auth_envs, so they never land as plaintext in this spec.
+    if auth_envs:
+        container['env'] = auth_envs
+    # TODO(fcapponi): no TLS handling in this pass -- TLS terminates at the
+    # ingress/ALB (see the LB ingress+auth design), not at the LB pod.
     pod_labels = {APP_LABEL_KEY: deployment_name}
     pod_labels.update(_object_labels(service_name))
     return {
@@ -274,9 +330,11 @@ def create_lb_deployment_and_service(service_name: str,
     deployment_name = lb_deployment_name(service_name)
     service_name_k8s = lb_service_name(service_name)
     image = _resolve_lb_image(namespace, context)
+    auth_envs = _resolve_lb_auth_envs(namespace, context)
 
     deployment_dict = _build_deployment_dict(service_name, deployment_name,
-                                             image, namespace, controller_port)
+                                             image, namespace, controller_port,
+                                             auth_envs)
     service_dict = _build_service_dict(service_name, service_name_k8s,
                                        deployment_name)
 

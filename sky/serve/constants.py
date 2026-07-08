@@ -32,14 +32,38 @@ CONTROLLER_SETUP_TIMEOUT_SECONDS = 300
 SERVICE_REGISTER_TIMEOUT_SECONDS = 60
 
 # Env var holding a shared bearer token that guards the controller's
-# DESTRUCTIVE endpoints (/controller/update_service, terminate_replica). In
-# external load balancer mode the controller port is reachable on the pod
-# network from the credential-free LB pod, so NetworkPolicy alone is
+# CONTROL-PLANE endpoints: the destructive ones (/controller/update_service,
+# terminate_replica) AND the read-only sync/status paths (/load_balancer_sync,
+# /autoscaler/info). In external load balancer mode the controller port is
+# reachable on the pod network from the LB pod, so NetworkPolicy alone is
 # insufficient; the platform sets this (from a k8s secret) on both the
-# controller and its trusted callers. The read-only /load_balancer_sync path
-# stays unauthenticated so the LB can sync. When unset (in-pod localhost-only
-# default) auth is disabled and behavior is unchanged.
+# controller and its trusted callers, and the LB presents it on every sync so a
+# leaked in-cluster foothold can no longer scrape the replica set or drive the
+# controller. When unset (in-pod localhost-only default) auth is disabled and
+# behavior is unchanged.
 CONTROLLER_AUTH_TOKEN_ENV_VAR = 'SKYPILOT_SERVE_CONTROLLER_AUTH_TOKEN'
+
+# Env var holding a shared bearer token that guards INBOUND inference requests
+# to the external load balancer (data-plane auth), held by the inference
+# client. Kept DISTINCT from CONTROLLER_AUTH_TOKEN_ENV_VAR (control-plane) on
+# purpose: sharing them would let an inference client reach the controller's
+# destructive endpoints. The LB's readiness route (LB_HEALTH_ENDPOINT_PATH)
+# stays open so k8s can probe it. When unset, inbound auth is disabled and
+# behavior is unchanged.
+LB_AUTH_TOKEN_ENV_VAR = 'SKYPILOT_SERVE_LB_AUTH_TOKEN'
+
+# The load balancer's readiness route; exempt from inbound bearer auth so the
+# k8s readinessProbe (and any LB-level health check) can reach it. Kept here so
+# the route registration and the auth middleware share one source of truth.
+LB_HEALTH_ENDPOINT_PATH = '/_lb/health'
+
+# Hard cap on the number of request timestamps the LB retains between successful
+# controller syncs. The batch is retained (not dropped) across a failed sync so
+# the autoscaler does not lose load signal, but a PERSISTENT sync failure must
+# not grow it without bound (one float per proxied request). The most recent
+# CAP samples are kept -- ample for QPS autoscaling even at the top of the
+# supported RPS range across several sync intervals.
+LB_REQUEST_TIMESTAMP_CAP = 100_000
 
 # [boltz fork] Time budget in seconds for a service update to be accepted by
 # the controller. The /controller/update_service handler serializes on the

@@ -212,10 +212,11 @@ class _FakeSession:
     async def __aexit__(self, *exc):
         return False
 
-    def post(self, url, json=None, timeout=None):  # pylint: disable=redefined-builtin
+    def post(self, url, json=None, timeout=None, headers=None):  # pylint: disable=redefined-builtin
         del timeout
         self._captured['url'] = url
         self._captured['json'] = json
+        self._captured['headers'] = headers
         return _FakeResponse(self._payload)
 
 

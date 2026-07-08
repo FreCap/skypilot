@@ -32,6 +32,9 @@ def _install(monkeypatch,
              incluster=True,
              namespace='skypilot',
              token=None,
+             token_secret=None,
+             lb_token=None,
+             lb_token_secret=None,
              pod_name='controller-pod-0',
              image='my-repo/skypilot:v1',
              db_service_names=None):
@@ -54,6 +57,8 @@ def _install(monkeypatch,
                         lambda: 'in-cluster')
     monkeypatch.setattr(lb_k8s.serve_utils, 'get_controller_auth_token',
                         lambda: token)
+    monkeypatch.setattr(lb_k8s.serve_utils, 'get_lb_auth_token',
+                        lambda: lb_token)
     if pod_name is not None:
         monkeypatch.setenv(constants.POD_NAME_ENV_VAR, pod_name)
     else:
@@ -62,10 +67,37 @@ def _install(monkeypatch,
     apps_api = apps_api if apps_api is not None else mock.MagicMock()
     core_api = core_api if core_api is not None else mock.MagicMock()
 
-    # read_namespaced_pod(...).spec.containers[0].image -> image
+    # read_namespaced_pod(...).spec.containers[0] -> image + (optionally) the
+    # controller's auth-token envs, which _resolve_lb_auth_envs mirrors onto the
+    # LB. *_secret=(name, key) makes the controller carry that token as a
+    # secretKeyRef (the prod/ESO shape); when None but the token is set, the
+    # controller carries it inline (the fallback path).
+    def _mk_env(name, value, secret):
+        ev = mock.MagicMock()
+        ev.name = name
+        if secret is not None:
+            ev.value = None
+            skr = mock.MagicMock()
+            skr.name, skr.key = secret
+            skr.optional = None
+            ev.value_from.secret_key_ref = skr
+        else:
+            ev.value = value
+            ev.value_from = None
+        return ev
+
     pod = mock.MagicMock()
     container = mock.MagicMock()
     container.image = image
+    env_list = []
+    if token is not None:
+        env_list.append(
+            _mk_env(constants.CONTROLLER_AUTH_TOKEN_ENV_VAR, token,
+                    token_secret))
+    if lb_token is not None:
+        env_list.append(
+            _mk_env(constants.LB_AUTH_TOKEN_ENV_VAR, lb_token, lb_token_secret))
+    container.env = env_list
     pod.spec.containers = [container]
     core_api.read_namespaced_pod.return_value = pod
 
@@ -168,13 +200,67 @@ def test_create_builds_both_objects(monkeypatch):
     assert svc['spec']['ports'][0]['port'] == constants.LOAD_BALANCER_PORT_START
 
 
-def test_create_auth_token_env(monkeypatch):
-    apps, _ = _install(monkeypatch, token='secret-token')
+def test_create_auth_token_mirrors_secret_ref(monkeypatch):
+    # Prod/ESO shape: the controller carries the token as a secretKeyRef, so the
+    # LB must reference the SAME Secret -- never a plaintext value in its spec.
+    apps, _ = _install(monkeypatch,
+                       token='secret-token',
+                       token_secret=('skypilot-serve-token', 'token'))
     lb_k8s.create_lb_deployment_and_service('svc-a', 20005)
     _, dep = apps.create_namespaced_deployment.call_args.args
     env = dep['spec']['template']['spec']['containers'][0].get('env', [])
-    names = {e['name']: e['value'] for e in env}
+    entry = next(
+        e for e in env if e['name'] == constants.CONTROLLER_AUTH_TOKEN_ENV_VAR)
+    assert 'value' not in entry  # No plaintext token in the manifest.
+    ref = entry['valueFrom']['secretKeyRef']
+    assert ref['name'] == 'skypilot-serve-token'
+    assert ref['key'] == 'token'
+
+
+def test_create_auth_token_inline_fallback(monkeypatch):
+    # When the controller carries the token inline (non-ESO / test), the LB
+    # mirrors the resolved value rather than a secretKeyRef.
+    apps, _ = _install(monkeypatch, token='secret-token', token_secret=None)
+    lb_k8s.create_lb_deployment_and_service('svc-a', 20005)
+    _, dep = apps.create_namespaced_deployment.call_args.args
+    env = dep['spec']['template']['spec']['containers'][0].get('env', [])
+    names = {e['name']: e.get('value') for e in env}
     assert names.get(constants.CONTROLLER_AUTH_TOKEN_ENV_VAR) == 'secret-token'
+
+
+def test_create_mirrors_both_tokens(monkeypatch):
+    # Regression: the LB pod must receive BOTH the control-plane token (to reach
+    # the controller) AND the inbound LB token (or its auth middleware is a
+    # silent no-op in the real pod). Both mirrored as secretKeyRef.
+    apps, _ = _install(monkeypatch,
+                       token='ctrl-tok',
+                       token_secret=('skypilot-serve-token', 'controller'),
+                       lb_token='lb-tok',
+                       lb_token_secret=('skypilot-serve-token', 'lb'))
+    lb_k8s.create_lb_deployment_and_service('svc-a', 20005)
+    _, dep = apps.create_namespaced_deployment.call_args.args
+    env = dep['spec']['template']['spec']['containers'][0].get('env', [])
+    by_name = {e['name']: e for e in env}
+    assert set(by_name) == {
+        constants.CONTROLLER_AUTH_TOKEN_ENV_VAR, constants.LB_AUTH_TOKEN_ENV_VAR
+    }
+    for entry in by_name.values():
+        assert 'value' not in entry  # No plaintext token in the manifest.
+        assert entry['valueFrom']['secretKeyRef']['name'] == \
+            'skypilot-serve-token'
+    assert by_name[constants.LB_AUTH_TOKEN_ENV_VAR]['valueFrom'][
+        'secretKeyRef']['key'] == 'lb'
+
+
+def test_create_injects_inbound_token_even_without_controller_token(
+        monkeypatch):
+    # Inbound data-plane auth must activate independently of control-plane auth.
+    apps, _ = _install(monkeypatch, token=None, lb_token='lb-tok')
+    lb_k8s.create_lb_deployment_and_service('svc-a', 20005)
+    _, dep = apps.create_namespaced_deployment.call_args.args
+    env = dep['spec']['template']['spec']['containers'][0].get('env', [])
+    names = {e['name'] for e in env}
+    assert names == {constants.LB_AUTH_TOKEN_ENV_VAR}
 
 
 def test_create_no_auth_token_omits_env(monkeypatch):
