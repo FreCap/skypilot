@@ -410,6 +410,50 @@ def create_lb_deployment_and_service(service_name: str,
         logger.debug(f'LB Service {service_name_k8s} already exists.')
 
 
+def ensure_lb_objects_exist(service_name: str, controller_port: int) -> None:
+    """Recreate the per-service LB Deployment + Service if either is missing.
+
+    Self-heal for out-of-band deletion: the k8s Deployment only heals its own
+    *pod*, and nothing recreates a deleted Deployment/Service until the next
+    HA recovery -- so the per-service supervision loop calls this
+    periodically. Reads first and only mutates when an object is missing, so
+    the steady-state cost is two GETs with no patch churn. An
+    existing-but-drifted object is deliberately left alone: the controller
+    port is stable in external-LB mode (`_select_controller_port`) and the
+    image/auth inputs only change on a controller pod restart, which re-runs
+    the full ensure in `_start`.
+
+    No-op outside external-LB + in-cluster mode. Raises on k8s API errors
+    other than 404; callers treat this as best-effort and retry.
+    """
+    if not _lb_mode_active():
+        return
+    context = kubernetes.in_cluster_context_name()
+    namespace = kubernetes_utils.get_kube_config_context_namespace(context)
+
+    def _is_missing(read_fn, name: str) -> bool:
+        try:
+            read_fn(name, namespace)
+            return False
+        except kubernetes.api_exception() as e:
+            if getattr(e, 'status', None) != 404:
+                raise
+            return True
+
+    deployment_missing = _is_missing(
+        kubernetes.apps_api(context).read_namespaced_deployment,
+        lb_deployment_name(service_name))
+    service_missing = _is_missing(
+        kubernetes.core_api(context).read_namespaced_service,
+        lb_service_name(service_name))
+    if not deployment_missing and not service_missing:
+        return
+    logger.warning(f'External LB objects for {service_name!r} are missing '
+                   f'(deployment_missing={deployment_missing}, '
+                   f'service_missing={service_missing}); recreating them.')
+    create_lb_deployment_and_service(service_name, controller_port)
+
+
 def delete_lb_objects(service_name: str) -> None:
     """Delete the per-service LB Deployment + Service (idempotent).
 

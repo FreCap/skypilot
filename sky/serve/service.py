@@ -1146,6 +1146,14 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
         if not is_recovery:
             serve_state.set_service_load_balancer_port(service_name,
                                                        load_balancer_port)
+        elif external_lb:
+            # Recovery normally keeps the recorded port, but a service that
+            # just migrated from in-pod mode (upped before the external-LB
+            # flag) still records its legacy in-pod port. The external port is
+            # a fixed constant, so re-publishing on recovery is always correct
+            # and brings the row in line with the actual data plane.
+            serve_state.set_service_load_balancer_port(service_name,
+                                                       load_balancer_port)
 
         # Self-check cadence (seconds): how often we re-read DB to confirm
         # we're still the authoritative controller. Ghost detection only
@@ -1158,6 +1166,11 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
         # once per interval; actual respawns additionally honor the
         # exponential backoff below.
         controller_respawn_check_interval_seconds = 5
+        # How often to re-ensure the external LB Deployment + Service exist.
+        # Self-heal for out-of-band deletion: the k8s Deployment respawns its
+        # own pod, but nothing else recreates a deleted Deployment/Service
+        # until the next HA recovery. Steady state is two GETs per interval.
+        external_lb_ensure_interval_seconds = 60
         own_pid = os.getpid()
         loop_count = 0
         # Consecutive controller-respawn/LB-bind failures (shared counter: one
@@ -1201,6 +1214,18 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
                         f'{own_pid}; another instance has taken over. '
                         'Exiting as orphan without running cleanup.')
                     _orphan_exit(controller_process, load_balancer_process)
+            # Self-heal the external LB objects. Best-effort: a k8s API error
+            # must never reach _start's destructive cleanup.
+            if (external_lb and
+                    loop_count % external_lb_ensure_interval_seconds == 0):
+                try:
+                    lb_k8s.ensure_lb_objects_exist(service_name,
+                                                   controller_port)
+                except Exception as e:  # pylint: disable=broad-except
+                    logger.warning(
+                        f'Failed to ensure external LB objects for '
+                        f'{service_name}: {common_utils.format_exception(e)}; '
+                        'will retry.')
             # Keep the serve subprocesses alive while we (the parent) own the
             # DB row. HA recovery does not cover a child dying while the parent
             # stays alive, and in VM mode nothing does -- the service would
@@ -1237,9 +1262,9 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
                                 child_failures)
                 elif not _has_in_pod_load_balancer(service_spec):
                     # No in-pod LB to supervise: pool services have none, and
-                    # external-LB services run a controller-owned k8s LB outside
-                    # this pod (created in setup, reconciled by the serve LB
-                    # reconcile daemon -- not this per-service loop). A live
+                    # external-LB services run a controller-owned k8s LB
+                    # outside this pod (its Deployment respawns the LB pod;
+                    # the ensure above recreates deleted objects). A live
                     # controller is therefore healthy; falling through to the
                     # in-pod-LB branch below would count the (correctly) absent
                     # load_balancer_process as a dead LB and flag the service

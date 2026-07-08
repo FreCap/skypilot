@@ -531,3 +531,55 @@ class TestLbImagePullPolicyMirror(unittest.TestCase):
                                                    30001, [], 'Always', None)
         template = deployment['spec']['template']
         self.assertNotIn('annotations', template['metadata'])
+
+
+# --------------------------------------------------------------------------- #
+# ensure_lb_objects_exist (periodic self-heal)
+# --------------------------------------------------------------------------- #
+class TestEnsureLbObjectsExist:
+
+    def test_noop_outside_lb_mode(self, monkeypatch):
+        apps, core = _install(monkeypatch, external=False)
+        with mock.patch.object(lb_k8s,
+                               'create_lb_deployment_and_service') as create:
+            lb_k8s.ensure_lb_objects_exist('svc', 20001)
+        create.assert_not_called()
+        apps.read_namespaced_deployment.assert_not_called()
+        core.read_namespaced_service.assert_not_called()
+
+    def test_both_present_reads_only(self, monkeypatch):
+        apps, core = _install(monkeypatch)
+        with mock.patch.object(lb_k8s,
+                               'create_lb_deployment_and_service') as create:
+            lb_k8s.ensure_lb_objects_exist('svc', 20001)
+        create.assert_not_called()
+        apps.read_namespaced_deployment.assert_called_once()
+        core.read_namespaced_service.assert_called_once()
+
+    def test_missing_deployment_recreates(self, monkeypatch):
+        apps = mock.MagicMock()
+        apps.read_namespaced_deployment.side_effect = _ApiException(404)
+        _install(monkeypatch, apps_api=apps)
+        with mock.patch.object(lb_k8s,
+                               'create_lb_deployment_and_service') as create:
+            lb_k8s.ensure_lb_objects_exist('svc', 20001)
+        create.assert_called_once_with('svc', 20001)
+
+    def test_missing_service_recreates(self, monkeypatch):
+        core = mock.MagicMock()
+        core.read_namespaced_service.side_effect = _ApiException(404)
+        _install(monkeypatch, core_api=core)
+        with mock.patch.object(lb_k8s,
+                               'create_lb_deployment_and_service') as create:
+            lb_k8s.ensure_lb_objects_exist('svc', 20001)
+        create.assert_called_once_with('svc', 20001)
+
+    def test_non_404_read_error_raises(self, monkeypatch):
+        apps = mock.MagicMock()
+        apps.read_namespaced_deployment.side_effect = _ApiException(500)
+        _install(monkeypatch, apps_api=apps)
+        with mock.patch.object(lb_k8s,
+                               'create_lb_deployment_and_service') as create:
+            with pytest.raises(_ApiException):
+                lb_k8s.ensure_lb_objects_exist('svc', 20001)
+        create.assert_not_called()
