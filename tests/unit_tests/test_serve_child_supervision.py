@@ -44,6 +44,39 @@ class TestLbPortIsBound:
         assert not service._lb_port_is_bound(port)
 
 
+class _FakeSpec:
+
+    def __init__(self, pool):
+        self.pool = pool
+
+
+class TestHasInPodLoadBalancer:
+    """The supervision health check and the LB-spawn path must agree on whether
+    an in-pod LB exists: in external-LB mode there is none (it runs as a
+    separate k8s Deployment), so the loop must not treat its absence as a dead
+    LB and flag the service CONTROLLER_FAILED."""
+
+    def test_regular_service_has_in_pod_lb(self):
+        with mock.patch.object(service.serve_utils,
+                               'is_external_load_balancer_mode',
+                               return_value=False):
+            assert service._has_in_pod_load_balancer(_FakeSpec(pool=False))
+
+    def test_external_lb_mode_has_no_in_pod_lb(self):
+        # Regression: without this, the health branch counts the absent in-pod
+        # LB process as a dead LB and flags CONTROLLER_FAILED after 3 ticks.
+        with mock.patch.object(service.serve_utils,
+                               'is_external_load_balancer_mode',
+                               return_value=True):
+            assert not service._has_in_pod_load_balancer(_FakeSpec(pool=False))
+
+    def test_pool_service_has_no_in_pod_lb(self):
+        with mock.patch.object(service.serve_utils,
+                               'is_external_load_balancer_mode',
+                               return_value=False):
+            assert not service._has_in_pod_load_balancer(_FakeSpec(pool=True))
+
+
 def _record(status):
     return {'status': status}
 

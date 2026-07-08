@@ -616,6 +616,20 @@ def _heal_service_degraded(service_name: str) -> bool:
         return False
 
 
+def _has_in_pod_load_balancer(
+        service_spec: 'service_spec_lib.SkyServiceSpec') -> bool:
+    """Whether this service runs a load balancer subprocess inside this pod.
+
+    False for pool services (no LB) and in external-LB mode (the LB runs as a
+    separate controller-owned k8s Deployment outside this pod). Single source of
+    truth so the LB-spawn path (_ensure_load_balancer) and the supervision
+    loop's health check agree -- a mismatch made external-LB services look like
+    they had a dead in-pod LB and flagged them CONTROLLER_FAILED.
+    """
+    return not service_spec.pool and not (
+        serve_utils.is_external_load_balancer_mode())
+
+
 def _ensure_load_balancer(
         lb_process: Optional[multiprocessing.Process], controller_addr: str,
         load_balancer_port: int,
@@ -631,7 +645,7 @@ def _ensure_load_balancer(
     Deployment outside this pod, so the controller neither spawns nor
     supervises an in-pod one.
     """
-    if service_spec.pool or serve_utils.is_external_load_balancer_mode():
+    if not _has_in_pod_load_balancer(service_spec):
         return lb_process
     if lb_process is not None and lb_process.is_alive():
         return lb_process
@@ -1221,8 +1235,15 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
                             child_failures += 1
                             child_retry_at = now + _child_respawn_backoff_seconds(
                                 child_failures)
-                elif service_spec.pool:
-                    # Pool services have no LB; a live controller is healthy.
+                elif not _has_in_pod_load_balancer(service_spec):
+                    # No in-pod LB to supervise: pool services have none, and
+                    # external-LB services run a controller-owned k8s LB outside
+                    # this pod (created in setup, reconciled by the serve LB
+                    # reconcile daemon -- not this per-service loop). A live
+                    # controller is therefore healthy; falling through to the
+                    # in-pod-LB branch below would count the (correctly) absent
+                    # load_balancer_process as a dead LB and flag the service
+                    # CONTROLLER_FAILED after _CHILD_FAILURES_BEFORE_FLAG ticks.
                     healthy = True
                 else:
                     lb_alive = (load_balancer_process is not None and

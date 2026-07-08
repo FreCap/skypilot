@@ -52,7 +52,11 @@ spec:
         # This label indicates that the API server is ready to serve requests.
         skypilot.co/ready: "true"
     spec:
-      automountServiceAccountToken: {{ .Values.kubernetesCredentials.useApiServerCluster }}
+      # External-LB mode also needs the SA token: the consolidated controller
+      # uses in-cluster config (is_incluster_config_available() checks for the
+      # projected token) to create/reconcile each service's LB Deployment+Service.
+      # Without it create_lb_deployment_and_service() silently no-ops.
+      automountServiceAccountToken: {{ or .Values.kubernetesCredentials.useApiServerCluster .Values.serve.externalLoadBalancer.enabled }}
       serviceAccountName: {{ include "skypilot.serviceAccountName" . }}
       {{- with .Values.podSecurityContext }}
       securityContext:
