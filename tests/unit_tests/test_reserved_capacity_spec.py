@@ -107,3 +107,14 @@ def test_flag_rejected_with_ondemand_fallback(fallback_field):
     config['replica_policy'].update(fallback_field)
     with pytest.raises(ValueError):
         service_spec_lib.SkyServiceSpec.from_yaml_config(config)
+
+
+def test_flag_rejected_with_fallback_at_constructor():
+    # The YAML-path check alone is bypassable by programmatic
+    # construction; the constructor is the single enforcement point.
+    with pytest.raises(ValueError):
+        _make_spec(min_replicas=1,
+                   max_replicas=5,
+                   target_qps_per_replica=1.0,
+                   reserved_capacity_fill=True,
+                   dynamic_ondemand_fallback=True)

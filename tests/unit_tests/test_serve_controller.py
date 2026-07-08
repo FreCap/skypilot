@@ -6,6 +6,7 @@ gpu_type is expensive (cluster handle fetch + endpoint query), so both must
 be resolved at most once per replica lifetime and cached; the cache must be
 pruned when a replica leaves the ready set.
 """
+import threading
 from typing import Dict, Optional
 from unittest import mock
 
@@ -457,6 +458,7 @@ class TestReservedCapacityPollerStart:
         ctrl._replica_manager._spot_placer = placer
         ctrl._autoscaler = mock.Mock()
         ctrl._reserved_capacity_poller_started = False
+        ctrl._reserved_capacity_poller_lock = threading.Lock()
         return ctrl
 
     def test_starts_thread_once(self):

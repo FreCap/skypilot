@@ -6,6 +6,7 @@ import contextlib
 import hmac
 import logging
 import os
+import threading
 import time
 import traceback
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -102,6 +103,10 @@ class SkyServeController:
         self._reserved_capacity_fill_enabled: bool = bool(
             getattr(service_spec, 'reserved_capacity_fill', False))
         self._reserved_capacity_poller_started: bool = False
+        # update_service handlers run in FastAPI's threadpool, so two
+        # concurrent fill-enabling updates could both observe the
+        # started flag as False; the lock makes start-once atomic.
+        self._reserved_capacity_poller_lock = threading.Lock()
         # Seed the zero-cost location set synchronously, before run()
         # starts the autoscaler thread: a respawned controller's
         # autoscaler boots with empty fill state (from_spec above; there
@@ -377,14 +382,22 @@ class SkyServeController:
         if placer is None:
             # The flag without a spot placer is inert (the placer defines
             # the zero-cost location set fill draws from): say so
-            # instead of silently never filling.
+            # instead of silently never filling. NOTE: the placer is
+            # built once at ReplicaManager construction from the BOOT
+            # spec -- an update that INTRODUCES the placer (adds the
+            # any_of set / spot_placer field) cannot activate fill until
+            # the next controller respawn; this is a pre-existing
+            # property of the placer machinery, not of fill.
             logger.warning(
                 'reserved_capacity_fill is enabled but the service has no '
-                'spot placer (no any_of location set); fill is inactive.')
+                'spot placer (no any_of location set); fill is inactive '
+                'until the controller is respawned with a placer-bearing '
+                'spec.')
             return
-        if self._reserved_capacity_poller_started:
-            return
-        self._reserved_capacity_poller_started = True
+        with self._reserved_capacity_poller_lock:
+            if self._reserved_capacity_poller_started:
+                return
+            self._reserved_capacity_poller_started = True
         thread_utils.start_supervised_thread(
             lambda: reserved_capacity.poller_loop(
                 lambda: self._autoscaler, lambda: getattr(

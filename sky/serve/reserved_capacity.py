@@ -120,12 +120,19 @@ def poller_loop(
             fill_enabled = get_autoscaler().reserved_capacity_fill
             if placer is not None and fill_enabled:
                 zero_cost = placer.zero_cost_locations()
+                # Snapshot time is captured BEFORE the (slow, cluster-
+                # wide) availability query: a zero-cost replica row
+                # created while the query runs already occupies a slot
+                # the query may still have counted free, and the
+                # post-snapshot debit (created_at > snapshot_time) only
+                # catches it if the snapshot predates the row.
+                snapshot_time = time.time()
                 free_slots = query_free_slots(zero_cost)
                 keys: List[Dict[str, Any]] = [
                     location.to_pickleable() for location in zero_cost
                 ]
                 get_autoscaler().collect_reserved_capacity(
-                    free_slots, keys, time.time())
+                    free_slots, keys, snapshot_time)
                 logger.info(f'Reserved-capacity poll: {free_slots} free '
                             f'slot(s) across {len(keys)} zero-cost '
                             'location(s).')

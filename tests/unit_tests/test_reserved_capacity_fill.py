@@ -658,6 +658,35 @@ class TestPollerFlagOff(unittest.TestCase):
         query.assert_called_once()
         self.assertIsNotNone(autoscaler._fill_snapshot_time)
 
+    def test_snapshot_time_predates_the_query(self):
+        # A zero-cost row created WHILE the (slow) availability query
+        # runs occupies a slot the query may still count free; the
+        # post-snapshot debit (created_at > snapshot_time) only catches
+        # it if the snapshot timestamp predates the query, not follows
+        # it.
+        autoscaler = _make_autoscaler(fill=True)
+        placer = mock.Mock()
+        placer.zero_cost_locations.return_value = []
+        pre_query_time = None
+
+        def _slow_query(zero_cost):
+            del zero_cost
+            nonlocal pre_query_time
+            pre_query_time = time.time()
+            return 0
+
+        with mock.patch.object(reserved_capacity,
+                               'query_free_slots',
+                               side_effect=_slow_query), \
+             mock.patch.object(reserved_capacity.time,
+                               'sleep',
+                               side_effect=self._Stop):
+            with self.assertRaises(self._Stop):
+                reserved_capacity.poller_loop(lambda: autoscaler,
+                                              lambda: placer)
+        self.assertIsNotNone(autoscaler._fill_snapshot_time)
+        self.assertLessEqual(autoscaler._fill_snapshot_time, pre_query_time)
+
 
 class TestStaleSnapshot(unittest.TestCase):
     """Stale snapshot: 0 free contribution, existing fill still protected."""
