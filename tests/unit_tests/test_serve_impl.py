@@ -251,34 +251,35 @@ class TestSanitizedConfigBytes:
 
 
 class TestRejectExternalLbModeFlip:
-    """`_reject_external_lb_mode_flip` must reject an update that would flip the
-    service's external_load_balancer mode (no live migration between in-pod and
-    external LB), and let a same-mode update proceed. `existing` is the server's
-    current effective mode; `new` is the mode under the update's applied config.
+    """The extlb mode is SERVER TOPOLOGY: an update config cannot change it
+    (is_external_load_balancer_mode resolves from the live server config in
+    consolidation mode, immune to per-request config). The guard now rejects
+    an update whose config EXPLICITLY carries the key with a value different
+    from the server's effective mode — surfacing "server-side knob" instead
+    of silently ignoring it — and passes when absent or same-valued.
     """
 
-    def _run(self, existing, new):
+    def _run(self, existing, requested):
+        mutated = mock.MagicMock()
+        mutated.get_nested.return_value = requested
         with mock.patch.object(impl.serve_utils,
                                'is_external_load_balancer_mode',
-                               side_effect=[existing, new]), \
-             mock.patch.object(impl.skypilot_config,
-                               'replace_skypilot_config',
-                               return_value=contextlib.nullcontext()):
-            impl._reject_external_lb_mode_flip(mock.MagicMock())
+                               return_value=existing):
+            impl._reject_external_lb_mode_flip(mutated)
 
-    def test_inpod_to_external_raises(self):
+    def test_explicit_different_value_raises(self):
         with pytest.raises(ValueError):
-            self._run(existing=False, new=True)
-
-    def test_external_to_inpod_raises(self):
+            self._run(existing=False, requested=True)
         with pytest.raises(ValueError):
-            self._run(existing=True, new=False)
+            self._run(existing=True, requested=False)
 
-    def test_same_mode_external_ok(self):
-        self._run(existing=True, new=True)
+    def test_explicit_same_value_ok(self):
+        self._run(existing=True, requested=True)
+        self._run(existing=False, requested=False)
 
-    def test_same_mode_inpod_ok(self):
-        self._run(existing=False, new=False)
+    def test_absent_key_ok(self):
+        self._run(existing=True, requested=None)
+        self._run(existing=False, requested=None)
 
 
 class TestLifecycleLocking:

@@ -417,10 +417,25 @@ def is_external_load_balancer_mode() -> bool:
             ('serve', 'controller', 'external_load_balancer'),
             default_value=False)
     if _external_lb_mode_cache is None:
-        _external_lb_mode_cache = bool(
-            skypilot_config.get_effective_server_config().get_nested(
+        try:
+            _external_lb_mode_cache = bool(
+                skypilot_config.get_effective_server_config().get_nested(
+                    ('serve', 'controller', 'external_load_balancer'),
+                    default_value=False))
+        except Exception as e:  # pylint: disable=broad-except
+            # Fail-soft to the loaded-config read: this is called from
+            # _start, whose failure path is DESTRUCTIVE service cleanup —
+            # a transient DB blip at controller boot must degrade to the
+            # snapshot value (pre-fix behavior for one evaluation), not
+            # tear the service down. Deliberately NOT cached, so the next
+            # evaluation retries the live read.
+            logger.warning(
+                'Failed to resolve external_load_balancer from the live '
+                f'server config; falling back to the loaded config: '
+                f'{common_utils.format_exception(e)}')
+            return skypilot_config.get_nested(
                 ('serve', 'controller', 'external_load_balancer'),
-                default_value=False))
+                default_value=False)
     return _external_lb_mode_cache
 
 
