@@ -1710,17 +1710,22 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
     def _replica_is_busy(self, info: 'replica_managers.ReplicaInfo') -> bool:
         """Whether the latest report shows in-flight work on a replica.
 
-        READY replicas missing from the report count as BUSY: the LB may
-        simply not have picked them up yet, and guessing idle kills a
-        job. Non-READY replicas missing from the report count as idle
-        (never routable, e.g. still provisioning) -- but a non-READY
-        replica WITH reported work is busy: a probe blip mid-job demotes
-        a replica from READY while its hour-long request keeps running,
-        and the controller deliberately keeps its url translatable while
-        it is nonterminal so that work stays attributed.
+        READY and NOT_READY replicas missing from the report count as
+        BUSY: for READY the LB may simply not have picked them up yet;
+        for NOT_READY the replica WAS serving and blipped a probe -- for
+        async fast-ack work the LB's occupancy probe only covers the
+        routable set, so a blipped replica's running jobs may be
+        unreported, and guessing idle kills them. Both also count busy
+        with reported work > 0, which the controller keeps attributable
+        (sticky url translation) while the replica is nonterminal.
+        Never-served statuses (PENDING/PROVISIONING/STARTING) missing
+        from the report count as idle: they cannot carry jobs, and
+        treating them busy would starve scale-down of its preferred
+        kill-first victims.
         """
         in_flight = self._in_flight_by_replica_id or {}
-        if info.status == serve_state.ReplicaStatus.READY:
+        if info.status in (serve_state.ReplicaStatus.READY,
+                           serve_state.ReplicaStatus.NOT_READY):
             return in_flight.get(info.replica_id) != 0
         return in_flight.get(info.replica_id, 0) > 0
 

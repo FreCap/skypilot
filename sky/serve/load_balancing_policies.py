@@ -95,14 +95,6 @@ class LoadBalancingPolicy:
                         candidates: List[str]) -> Optional[str]:
         raise NotImplementedError
 
-    def total_in_flight(self) -> Optional[int]:
-        """Total in-flight requests across ready replicas, when tracked.
-
-        None for policies without load accounting (round robin): the
-        capacity endpoint reports it as unknown rather than zero.
-        """
-        return None
-
     def snapshot_in_flight(self) -> Optional[Dict[str, int]]:
         """Per-replica in-flight snapshot (url -> count), when tracked.
 
@@ -224,18 +216,12 @@ class LeastLoadPolicy(LoadBalancingPolicy, name='least_load', default=True):
                     self._generation[replica] += 1
                     self.load_map[replica] = 0
 
-    def total_in_flight(self) -> Optional[int]:
-        with self.lock:
-            return sum(
-                self.load_map.get(replica, 0)
-                for replica in self.ready_replicas)
-
     def snapshot_in_flight(self) -> Optional[Dict[str, int]]:
         with self.lock:
-            # Same ready-replica scoping as total_in_flight: an entry for
-            # a pruned replica must not report phantom demand. A COPY, not
-            # the live defaultdict -- the caller serializes it outside the
-            # lock while the routing hot path keeps mutating the original.
+            # Scoped to the READY set: an entry for a pruned replica must
+            # not report phantom demand. A COPY, not the live defaultdict
+            # -- the caller serializes it outside the lock while the
+            # routing hot path keeps mutating the original.
             return {
                 replica: self.load_map.get(replica, 0)
                 for replica in self.ready_replicas
