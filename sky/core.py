@@ -598,7 +598,7 @@ def _start(
         # set_autostop on Kubernetes/RunPod.
         launched = handle.launched_resources.assert_launchable()
         launched.cloud.check_features_are_supported(
-            launched, execution._autostop_requested_features(down))
+            launched, execution.autostop_requested_features(down))
 
     hook: Optional[str] = None
     hook_timeout: Optional[int] = None
@@ -721,7 +721,7 @@ def _start(
         if not exempt:
             try:
                 launched.cloud.check_features_are_supported(
-                    launched, execution._autostop_requested_features(down))
+                    launched, execution.autostop_requested_features(down))
             except exceptions.NotSupportedError as e:
                 logger.warning(
                     f'Not re-applying autostop ({idle_minutes_to_autostop} '

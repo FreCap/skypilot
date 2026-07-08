@@ -1839,7 +1839,7 @@ class RetryingVmProvisioner(object):
                     requested_features.discard(
                         clouds.CloudImplementationFeatures.AUTOSTOP)
                     # Non-down autostop also requests STOP (see
-                    # execution._autostop_requested_features); controllers
+                    # execution.autostop_requested_features); controllers
                     # on Kubernetes/RunPod get force-converted to
                     # autodown/no-op by set_autostop, so the same
                     # carve-out applies.

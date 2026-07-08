@@ -198,7 +198,7 @@ def _compute_set_autostop_args_for_hooks_only_relaunch(
     )
 
 
-def _autostop_requested_features(
+def autostop_requested_features(
         down: bool) -> Set[clouds.CloudImplementationFeatures]:
     """Cloud features a launch-time auto{stop,down} config requires.
 
@@ -514,7 +514,7 @@ def _execute_dag(
             if Stage.DOWN in stages:
                 stages.remove(Stage.DOWN)
             if idle_minutes_to_autostop >= 0:
-                autostop_features = _autostop_requested_features(down)
+                autostop_features = autostop_requested_features(down)
                 if Stage.PRE_EXEC in stages or Stage.PROVISION in stages:
                     # Fail fast only when this run will actually APPLY
                     # the autostop config. `sky exec` (no PRE_EXEC /

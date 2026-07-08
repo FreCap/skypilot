@@ -26,14 +26,14 @@ _FEATURES = clouds.CloudImplementationFeatures
 
 
 def test_non_down_autostop_requires_stop_feature():
-    assert execution._autostop_requested_features(down=False) == {
+    assert execution.autostop_requested_features(down=False) == {
         _FEATURES.AUTOSTOP,
         _FEATURES.STOP,
     }
 
 
 def test_autodown_requires_only_autodown_feature():
-    assert execution._autostop_requested_features(down=True) == {
+    assert execution.autostop_requested_features(down=True) == {
         _FEATURES.AUTODOWN,
     }
 
@@ -45,7 +45,7 @@ def test_aws_spot_rejects_the_non_down_autostop_feature_set():
     spot = resources_lib.Resources(cloud=clouds.AWS(), use_spot=True)
     with pytest.raises(exceptions.NotSupportedError):
         clouds.AWS().check_features_are_supported(
-            spot, execution._autostop_requested_features(down=False))
+            spot, execution.autostop_requested_features(down=False))
     # ...while AUTOSTOP alone (the pre-fix request) passes -- the exact
     # gap that let the incident config through.
     clouds.AWS().check_features_are_supported(spot, {_FEATURES.AUTOSTOP})
@@ -54,9 +54,9 @@ def test_aws_spot_rejects_the_non_down_autostop_feature_set():
 def test_aws_ondemand_accepts_both_feature_sets():
     ondemand = resources_lib.Resources(cloud=clouds.AWS(), use_spot=False)
     clouds.AWS().check_features_are_supported(
-        ondemand, execution._autostop_requested_features(down=False))
+        ondemand, execution.autostop_requested_features(down=False))
     clouds.AWS().check_features_are_supported(
-        ondemand, execution._autostop_requested_features(down=True))
+        ondemand, execution.autostop_requested_features(down=True))
 
 
 def _task_with(*resources):
@@ -71,7 +71,7 @@ def test_early_check_rejects_when_all_candidates_unstoppable():
     with pytest.raises(exceptions.NotSupportedError):
         execution._check_autostop_feasibility_early(
             task,
-            execution._autostop_requested_features(down=False),
+            execution.autostop_requested_features(down=False),
             cluster_name='my-cluster')
 
 
@@ -83,7 +83,7 @@ def test_early_check_passes_with_one_stoppable_candidate():
         resources_lib.Resources(cloud=clouds.AWS(), use_spot=False))
     execution._check_autostop_feasibility_early(
         task,
-        execution._autostop_requested_features(down=False),
+        execution.autostop_requested_features(down=False),
         cluster_name='my-cluster')
 
 
@@ -91,7 +91,7 @@ def test_early_check_inconclusive_with_cloud_agnostic_candidate():
     task = _task_with(resources_lib.Resources(use_spot=True))
     execution._check_autostop_feasibility_early(
         task,
-        execution._autostop_requested_features(down=False),
+        execution.autostop_requested_features(down=False),
         cluster_name='my-cluster')
 
 
@@ -100,7 +100,7 @@ def test_early_check_allows_autodown_on_spot():
                                               use_spot=True))
     execution._check_autostop_feasibility_early(
         task,
-        execution._autostop_requested_features(down=True),
+        execution.autostop_requested_features(down=True),
         cluster_name='my-cluster')
 
 
@@ -135,7 +135,7 @@ def _provision_once(prev_cluster_status, prev_cluster_ever_up=None):
     task.resources = {to_provision}
 
     provisioner = _make_provisioner(
-        execution._autostop_requested_features(down=False))
+        execution.autostop_requested_features(down=False))
     config = backend_lib.RetryingVmProvisioner.ToProvisionConfig(
         cluster_name='t-cluster',
         resources=to_provision,
