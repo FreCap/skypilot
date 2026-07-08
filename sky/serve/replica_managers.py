@@ -1123,6 +1123,16 @@ class SkyPilotReplicaManager(ReplicaManager):
                 resources_override)
             if location is not None:
                 use_spot = location.use_spot
+                # Same fail-fast contract as the selection path above: a
+                # recovered pin targets ONE location, so a capacity
+                # failure there must surface immediately (the placer
+                # benches it and the next launch picks elsewhere).
+                # Leaving retry_until_up=True would spin inside
+                # sky.launch forever on a full zero-cost tier, occupying
+                # a bounded launch-pool slot and starving demand
+                # launches -- while availability_max_retry=1 (armed by
+                # this location below) never sees the error.
+                retry_until_up = False
         # When the spot placer owns failover (use_spot + placer above sets
         # retry_until_up=False), the launch is pinned to ONE location, so a
         # capacity failure there must propagate immediately for the placer to

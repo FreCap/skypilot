@@ -215,9 +215,9 @@ class Location:
         region = override.get('region')
         if cloud_val is None or region is None:
             return None
-        cloud: Optional[sky_clouds.Cloud] = (
-            cloud_val if isinstance(cloud_val, sky_clouds.Cloud) else
-            registry.CLOUD_REGISTRY.from_str(str(cloud_val)))
+        cloud: Optional[sky_clouds.Cloud] = (cloud_val if isinstance(
+            cloud_val, sky_clouds.Cloud) else registry.CLOUD_REGISTRY.from_str(
+                str(cloud_val)))
         if cloud is None:
             return None
         return cls(
@@ -431,6 +431,20 @@ class SpotPlacer:
         assert r.cloud is not None
         rs = r.cloud.get_feasible_launchable_resources(
             r, num_nodes=self.num_nodes).resources_list
+        if not rs:
+            # Feasibility can be transiently empty: for Kubernetes
+            # locations the check is a LIVE API call (an unreachable
+            # context is swallowed into an empty region list), and a
+            # catalog regression can empty cloud entries too. min() over
+            # an empty list would raise -- through the constructor-time
+            # zero-cost seed that would crash-loop the controller at
+            # boot. Degrade to infinity: the location reads as
+            # not-zero-cost and maximally expensive this round, and the
+            # miss is NOT memoized so it heals on the next call.
+            logger.warning('No feasible resources for location '
+                           f'{location}; treating its cost as infinite '
+                           'for this round.')
+            return float('inf')
         # For some clouds, there might have multiple instance types
         # satisfying the resource request. In such case we choose the
         # cheapest one, as the optimizer does. Reference:

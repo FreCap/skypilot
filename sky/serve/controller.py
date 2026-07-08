@@ -151,24 +151,33 @@ class SkyServeController:
             self, autoscaler: autoscalers.Autoscaler) -> None:
         """Seed an autoscaler's zero-cost location set from the placer.
 
-        Spec-derived and cheap by construction: zero_cost_locations()
-        computes per-location costs via the placer's cache, which reads
-        local catalog files only (never the Kubernetes API), so it is
-        safe to call synchronously at boot / inside update_service. The
-        seed only sets the location identity set (no free slots, no
+        The seed only sets the location identity set (no free slots, no
         snapshot time), and an already-populated set (e.g. loaded from a
         dump) is never overwritten -- see
         Autoscaler.seed_zero_cost_locations.
+
+        Best-effort, never fatal: zero_cost_locations() resolves
+        per-location costs, and for Kubernetes locations feasibility is
+        a LIVE API call -- an unreachable research-cluster context at
+        boot must degrade to an unseeded autoscaler (the first
+        successful poll re-seeds via collect_reserved_capacity), not
+        crash-loop the controller through __init__.
         """
         if not autoscaler.reserved_capacity_fill:
             return
         placer = getattr(self._replica_manager, '_spot_placer', None)
         if placer is None:
             return
-        autoscaler.seed_zero_cost_locations([
-            location.to_pickleable()
-            for location in placer.zero_cost_locations()
-        ])
+        try:
+            autoscaler.seed_zero_cost_locations([
+                location.to_pickleable()
+                for location in placer.zero_cost_locations()
+            ])
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning('Failed to seed zero-cost locations (fill '
+                           'suppression degrades until the first '
+                           'successful capacity poll): '
+                           f'{common_utils.format_exception(e)}')
 
     def _get_lb_replica_info(
         self, replica_infos: List['replica_managers.ReplicaInfo']

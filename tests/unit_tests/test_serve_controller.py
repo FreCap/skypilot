@@ -482,3 +482,21 @@ class TestReservedCapacityPollerStart:
         # Not marked started: a later update that adds a placer (new
         # service version) may still start it.
         assert ctrl._reserved_capacity_poller_started is False
+
+
+class TestSeedFillZeroCostLocations:
+    """The constructor-time seed is best-effort, never fatal."""
+
+    def test_seed_failure_does_not_propagate(self):
+        # zero_cost_locations() can hit a LIVE K8s feasibility check; an
+        # unreachable context at boot must not crash-loop the controller
+        # through __init__ -- the first successful poll re-seeds.
+        ctrl = _make_controller()
+        placer = mock.Mock()
+        placer.zero_cost_locations.side_effect = RuntimeError('api down')
+        ctrl._replica_manager = mock.Mock()
+        ctrl._replica_manager._spot_placer = placer
+        autoscaler = mock.Mock()
+        autoscaler.reserved_capacity_fill = True
+        ctrl._seed_fill_zero_cost_locations(autoscaler)
+        autoscaler.seed_zero_cost_locations.assert_not_called()

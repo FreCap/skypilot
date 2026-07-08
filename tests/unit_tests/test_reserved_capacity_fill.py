@@ -1002,3 +1002,24 @@ class TestQueryFreeSlots(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestCostFeasibilityDegradation(unittest.TestCase):
+    """Empty feasible list degrades to inf cost, never a boot crash."""
+
+    def test_empty_feasible_list_is_infinite_not_raise(self):
+        placer = spot_placer.DynamicFallbackSpotPlacer.__new__(
+            spot_placer.DynamicFallbackSpotPlacer)
+        placer.location2cost = {}
+        placer.num_nodes = 1
+        placer.resources = mock.Mock()
+        empty = mock.Mock()
+        empty.resources_list = []
+        copied = mock.Mock()
+        copied.cloud.get_feasible_launchable_resources.return_value = empty
+        placer.resources.copy.return_value = copied
+        location = _make_location('research-ctx', 'free')
+        cost = placer._get_cost_per_hour_cached(location)
+        self.assertEqual(cost, float('inf'))
+        # Not memoized: a transient K8s API blip heals on the next call.
+        self.assertEqual(placer.location2cost, {})

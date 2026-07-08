@@ -359,6 +359,12 @@ class Autoscaler:
         they predate this build entirely, their bound pods are already
         excluded by every fresh poll, and always-subtracting them would
         under-fill for their whole lifetime.
+
+        Known sampling window (accepted): a row created BEFORE the
+        snapshot whose pod binds after it escapes both clauses once
+        READY -- up to one poll interval of over-launch; the extra fill
+        fails fast on the full tier and at worst benches it for one
+        retry TTL. Inherent to sampling free capacity at an instant.
         """
         if not info.is_ready:
             return True
