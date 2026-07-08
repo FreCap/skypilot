@@ -286,6 +286,72 @@ def test_draining_overlay_sums_with_readded_url():
     assert lb._in_flight_with_draining() == {'http://a:8080': 2}
 
 
+def test_occupancy_supersedes_envelope_by_max():
+    # Fast-ack work: envelope reads 0 while the replica crunches; the
+    # probe's occupancy must lift the url's reported busyness. Max, not
+    # sum: a job awaiting its ack may appear in both measures.
+    lb = _make_lb()
+    lb._load_balancing_policy.set_ready_replicas(
+        ['http://a:8080', 'http://b:8080'])
+    lb._load_balancing_policy.load_map['http://b:8080'] = 2
+    lb._replica_occupancy = {'http://a:8080': 3, 'http://b:8080': 1}
+    lb._occupancy_capable = {'http://a:8080', 'http://b:8080'}
+    assert lb._in_flight_with_draining() == {
+        'http://a:8080': 3,
+        'http://b:8080': 2,
+    }
+
+
+def test_occupancy_capable_probe_miss_reads_unknown_not_zero():
+    # A url that EVER reported occupancy but is absent from this probe
+    # round is UNKNOWN: reporting the envelope's explicit 0 would bypass
+    # the autoscaler's missing-entry-means-busy protection and let a
+    # drain kill it mid-async-job. Non-capable urls keep their envelope
+    # count (sync workloads have no occupancy endpoint at all).
+    lb = _make_lb()
+    lb._load_balancing_policy.set_ready_replicas(
+        ['http://cap:8080', 'http://sync:8080'])
+    lb._replica_occupancy = {}
+    lb._occupancy_capable = {'http://cap:8080'}
+    assert lb._in_flight_with_draining() == {'http://sync:8080': 0}
+
+
+def test_pruned_url_occupancy_not_doubled_with_draining():
+    # A just-pruned url can appear in BOTH the last probe round's
+    # occupancy and the draining refcounts for the same job: max, not
+    # sum.
+    lb = _make_lb()
+    lb._load_balancing_policy.set_ready_replicas([])
+    lb._replica_occupancy = {'http://gone:8080': 1}
+    lb._occupancy_capable = {'http://gone:8080'}
+    lb._draining_clients = {'http://gone:8080': [_FakeDrainingClient(1)]}
+    assert lb._in_flight_with_draining() == {'http://gone:8080': 1}
+
+
+def test_probe_round_marks_and_prunes_capability():
+    lb = _make_lb()
+    lb._load_balancing_policy.set_ready_replicas(['http://a:8080'])
+
+    async def _fake_fetch(session, url):
+        del session, url
+        return (1, 0)
+
+    lb._fetch_replica_occupancy = _fake_fetch
+    asyncio.run(lb._probe_replica_occupancy_once())
+    assert lb._occupancy_capable == {'http://a:8080'}
+    # The replica disappears entirely (not ready, not draining): the
+    # capability entry is pruned so the set stays fleet-bounded.
+    lb._load_balancing_policy.set_ready_replicas(['http://b:8080'])
+
+    async def _fake_fetch_none(session, url):
+        del session, url
+        return None
+
+    lb._fetch_replica_occupancy = _fake_fetch_none
+    asyncio.run(lb._probe_replica_occupancy_once())
+    assert lb._occupancy_capable == set()
+
+
 def test_drained_client_deregisters_from_demand_feed():
     lb = _make_lb()
     client = mock.Mock()
