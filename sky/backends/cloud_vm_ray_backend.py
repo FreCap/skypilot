@@ -1894,10 +1894,17 @@ class RetryingVmProvisioner(object):
                 # autostop on a one-time spot candidate).
                 cause = e.__cause__
                 assert cause is not None, e
-                if prev_cluster_status is not None:
-                    # Existing cluster relaunched with a config its
-                    # (fixed) launched resources cannot satisfy: failover
-                    # cannot help, and the loop tail asserts INIT-only.
+                if prev_cluster_status not in (None,
+                                               status_lib.ClusterStatus.INIT):
+                    # Existing UP/STOPPED cluster relaunched with a
+                    # config its (fixed) launched resources cannot
+                    # satisfy: failover cannot help, and the loop tail
+                    # asserts INIT-only. INIT clusters deliberately fall
+                    # through instead -- INIT is the retryable state
+                    # (e.g. a failed spot attempt), and the tail's INIT
+                    # branch resets to a fresh launch so the task can
+                    # fail over to candidates that DO support the
+                    # feature (e.g. on-demand).
                     # Raised from within this handler, the cause
                     # propagates out of the function (sibling except
                     # clauses of the same try do not catch it) -- the

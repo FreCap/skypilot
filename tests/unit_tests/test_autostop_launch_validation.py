@@ -227,3 +227,70 @@ def test_start_rejects_non_down_autostop_on_unstoppable_resources():
     # (Autodown on the same spot resources passing the gate is covered
     # by test_early_check_allows_autodown_on_spot / the AWS feature
     # tests; driving _start further needs the whole provision stack.)
+
+
+def test_provisioner_lets_init_cluster_fail_over():
+    # INIT is the retryable state (e.g. a failed spot attempt): a
+    # feature failure must NOT be treated as non-failoverable -- the
+    # tail's INIT branch resets to a fresh launch so the task can fall
+    # over to candidates that do support the feature (on-demand).
+    provisioner, _, raised = _provision_once(
+        prev_cluster_status=status_lib.ClusterStatus.INIT)
+    assert not isinstance(raised, exceptions.NotSupportedError)
+    assert not isinstance(raised, AssertionError)
+    # The stubbed optimizer ends the loop after the INIT reset pass;
+    # what matters is that the INIT branch ran (no INIT-only assert, no
+    # clean-error raise) and that this pass added NO block -- the old
+    # broad handler would have cloud-wide poisoned here.
+    assert isinstance(raised, exceptions.ResourcesUnavailableError)
+    assert provisioner._blocked_resources == set()
+
+
+def _start_with_stored_autostop(spot_resources, stored_autostop,
+                                stored_to_down):
+    """Drive core._start with NO explicit -i and a stored record value."""
+    from sky import core  # pylint: disable=import-outside-toplevel
+    handle = mock.Mock()
+    handle.launched_resources = spot_resources
+    handle.launched_nodes = 1
+    backend = mock.Mock(spec=backend_lib.CloudVmRayBackend)
+    backend.provision.return_value = (handle, None)
+    record = {'autostop': stored_autostop, 'to_down': stored_to_down}
+    with mock.patch.object(
+            core.backend_utils,
+            'refresh_cluster_status_handle',
+            return_value=(status_lib.ClusterStatus.STOPPED, handle)), \
+         mock.patch.object(core.backend_utils,
+                           'get_backend_from_handle',
+                           return_value=backend), \
+         mock.patch.object(core.global_user_state,
+                           'get_cluster_from_name',
+                           return_value=record):
+        core._start('t-cluster', idle_minutes_to_autostop=None, down=False)
+    return backend
+
+
+def test_start_skips_restoring_unsupported_stored_autostop():
+    # A stored non-down autostop on one-time spot predates the
+    # launch-time validation: `sky start` (no -i) must not silently
+    # re-arm the broken idle timer -- but must not fail the start
+    # either (the user asked to start the cluster, not to be blocked
+    # by a legacy value).
+    spot = resources_lib.Resources(cloud=clouds.AWS(),
+                                   instance_type='g6.4xlarge',
+                                   use_spot=True)
+    backend = _start_with_stored_autostop(spot,
+                                          stored_autostop=30,
+                                          stored_to_down=False)
+    backend.set_autostop.assert_not_called()
+
+
+def test_start_restores_supported_stored_autostop():
+    # The same restore on stoppable resources keeps working.
+    ondemand = resources_lib.Resources(cloud=clouds.AWS(),
+                                       instance_type='g6.4xlarge',
+                                       use_spot=False)
+    backend = _start_with_stored_autostop(ondemand,
+                                          stored_autostop=30,
+                                          stored_to_down=False)
+    backend.set_autostop.assert_called_once()
