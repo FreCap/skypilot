@@ -17,12 +17,14 @@ from sky.serve import autoscalers
 from sky.serve import constants
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity
+from sky.serve import reserved_capacity_broker
 from sky.serve import serve_state
 from sky.serve import spot_placer
 
 _SCALE_UP = autoscalers.AutoscalerDecisionOperator.SCALE_UP
 _SCALE_DOWN = autoscalers.AutoscalerDecisionOperator.SCALE_DOWN
 _FILL_KEY = constants.RESERVED_CAPACITY_FILL_OVERRIDE_KEY
+_EPOCH_KEY = constants.RESERVED_FILL_GRANT_EPOCH_OVERRIDE_KEY
 
 # Pickleable form of the zero-cost k8s location, as handed to
 # collect_reserved_capacity by the poller (Location.to_pickleable()).
@@ -1060,6 +1062,334 @@ class TestCostFeasibilityDegradation(unittest.TestCase):
         self.assertEqual(cost, float('inf'))
         # Not memoized: a transient K8s API blip heals on the next call.
         self.assertEqual(placer.location2cost, {})
+
+
+def _feed_broker(autoscaler, free_slots, grant, epoch=None, polls=2):
+    """Feed a broker-shaped snapshot (feed + grant + epoch)."""
+    ts = time.time()
+    for _ in range(polls):
+        autoscaler.collect_reserved_capacity(free_slots, [_K8S_KEY],
+                                             ts,
+                                             grant=grant,
+                                             grant_epoch=epoch)
+
+
+class TestGrantCeiling(unittest.TestCase):
+    """Broker grant ceiling: caps fill, strips over-grant shelter."""
+
+    def test_grant_none_is_identity(self):
+        with_none = _make_autoscaler(min_replicas=1)
+        _feed_broker(with_none, 5, grant=None)
+        control = _make_autoscaler(min_replicas=1)
+        _feed(control, 5)
+        got = _decisions(with_none, [])
+        expected = _decisions(control, [])
+        self.assertEqual([(d.operator, d.target) for d in got],
+                         [(d.operator, d.target) for d in expected])
+
+    def test_ceiling_caps_fill_launches(self):
+        autoscaler = _make_autoscaler(min_replicas=1, max_replicas=10)
+        _feed_broker(autoscaler, 5, grant=2)
+        decisions = _decisions(autoscaler, [])
+        sentinel = [d for d in _ups(decisions) if d.target is not None]
+        # Without the ceiling the feed of 5 would fund 4 fill ups (demand
+        # target 1); the grant of 2 allows only 2 - 1 = 1 beyond the
+        # demand baseline.
+        self.assertEqual(len(sentinel), 1)
+
+    def test_snap_back_reclaim_shrinks_borrower(self):
+        # The load-bearing broker actuator: the #108 fill target is
+        # structurally >= holdings, so only the ceiling can strip the
+        # borrower's surplus of its scale-down shelter and let the normal
+        # graceful scale-down return the machines.
+        autoscaler = _make_autoscaler(min_replicas=1)
+        replicas = [_replica(i, _K8S_KEY) for i in range(1, 5)]
+        _feed_broker(autoscaler, 0, grant=2)
+        decisions = _decisions(autoscaler, replicas)
+        # Demand target 1, holdings 4, ceiling 2: fill shelters only ONE
+        # of the three demand scale-downs; two pass through and the
+        # borrower actually shrinks toward its grant.
+        self.assertEqual(len(_downs(decisions)), 2)
+        self.assertEqual(len(_ups(decisions)), 0)
+        self.assertEqual(autoscaler.info()['fill_target'], 2)
+
+    def test_demand_placed_rows_exempt_from_ceiling(self):
+        autoscaler = _make_autoscaler(min_replicas=1)
+        fill_rows = [_replica(1, _K8S_KEY), _replica(2, _K8S_KEY)]
+        demand_rows = [_replica(3, _K8S_KEY), _replica(4, _K8S_KEY)]
+        for row in demand_rows:
+            row.reserved_fill = False
+        _feed_broker(autoscaler, 0, grant=0)
+        decisions = _decisions(autoscaler, fill_rows + demand_rows)
+        # Ceiling = grant 0 + 2 demand-placed rows: the demand rows are
+        # demand-protected (not broker property), only the two FILL rows
+        # are over-ceiling and lose their shelter.
+        self.assertEqual(autoscaler.info()['fill_target'], 2)
+        self.assertEqual(len(_downs(decisions)), 2)
+
+    def test_stale_broker_snapshot_still_shelters_holdings(self):
+        # Ceiling + staleness compose: a dead poller decays the feed to 0
+        # but holdings at-or-under the ceiling keep their shelter.
+        autoscaler = _make_autoscaler(min_replicas=1)
+        replicas = [_replica(1, _K8S_KEY), _replica(2, _K8S_KEY)]
+        ts = _stale_timestamp()
+        autoscaler.collect_reserved_capacity(5, [_K8S_KEY],
+                                             ts,
+                                             grant=2,
+                                             grant_epoch=1)
+        decisions = _decisions(autoscaler, replicas)
+        self.assertEqual(decisions, [])
+
+
+class TestGrantEpochPlumbing(unittest.TestCase):
+    """Fill scale-ups carry the grant epoch only when a broker supplied it."""
+
+    def test_epoch_attached_to_sentinel_override(self):
+        autoscaler = _make_autoscaler(min_replicas=1)
+        _feed_broker(autoscaler, 3, grant=5, epoch=7)
+        sentinel = [
+            d for d in _ups(_decisions(autoscaler, [])) if d.target is not None
+        ]
+        self.assertTrue(sentinel)
+        for decision in sentinel:
+            self.assertEqual(decision.target, {_FILL_KEY: True, _EPOCH_KEY: 7})
+
+    def test_no_epoch_means_pre_broker_decision_shape(self):
+        autoscaler = _make_autoscaler(min_replicas=1)
+        _feed(autoscaler, 3)
+        sentinel = [
+            d for d in _ups(_decisions(autoscaler, [])) if d.target is not None
+        ]
+        self.assertTrue(sentinel)
+        for decision in sentinel:
+            self.assertEqual(decision.target, {_FILL_KEY: True})
+
+    def test_grant_not_persisted_in_dynamic_state_dump(self):
+        # Grants are DB-authoritative: a swapped-in autoscaler must get
+        # them from the next poll, never from a stale dump.
+        autoscaler = _make_autoscaler(min_replicas=1)
+        _feed_broker(autoscaler, 3, grant=5, epoch=7)
+        dump = autoscaler.dump_dynamic_states()
+        fill_state = dump['reserved_capacity_fill_state']
+        self.assertNotIn('fill_grant', fill_state)
+        self.assertNotIn('fill_grant_epoch', fill_state)
+
+
+class TestEpochFencedLaunch(unittest.TestCase):
+    """A fill launch carrying a superseded epoch skips, leaking nothing."""
+
+    def _make_manager(self, placer):
+        manager = replica_managers.SkyPilotReplicaManager.__new__(
+            replica_managers.SkyPilotReplicaManager)
+        manager._service_name = 'svc'
+        manager.yaml_content = 'unused: patched helpers below'
+        manager._spot_placer = placer
+        manager._launch_thread_pool = {}
+        manager._replica_to_request_id = {}
+        manager._replica_to_launch_cancelled = {}
+        manager._fill_skip_last_log_time = 0.0
+        manager.latest_version = 1
+        return manager
+
+    def _launch(self, current_epoch, carried_epoch=7):
+        location = _make_location('research-ctx', 'free')
+        placer = mock.Mock()
+        placer.select_next_zero_cost_location.return_value = location
+        manager = self._make_manager(placer)
+        override = {_FILL_KEY: True, _EPOCH_KEY: carried_epoch}
+        with mock.patch.object(replica_managers,
+                               '_should_use_spot',
+                               return_value=False), \
+             mock.patch.object(replica_managers,
+                               '_get_resources_ports',
+                               return_value='8080'), \
+             mock.patch.object(replica_managers.reserved_capacity_broker,
+                               'current_epoch',
+                               return_value=current_epoch), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(replica_managers.serve_state,
+                               'add_or_update_replica') as add_mock:
+            launched = manager._launch_replica(7, override)
+        return launched, add_mock
+
+    def test_stale_epoch_skips_without_persisting_a_row(self):
+        launched, add_mock = self._launch(current_epoch=8)
+        self.assertFalse(launched)
+        add_mock.assert_not_called()
+
+    def test_current_epoch_launches_and_strips_the_key(self):
+        launched, add_mock = self._launch(current_epoch=7)
+        self.assertTrue(launched)
+        add_mock.assert_called_once()
+        info = add_mock.call_args[0][2]
+        self.assertNotIn(_EPOCH_KEY, info.resources_override)
+        self.assertNotIn(_FILL_KEY, info.resources_override)
+        self.assertTrue(info.reserved_fill)
+
+    def test_missing_lease_fails_open(self):
+        # No lease row (current_epoch None): there is no newer allocation
+        # to defer to -- proceed rather than deadlock fill forever.
+        launched, add_mock = self._launch(current_epoch=None)
+        self.assertTrue(launched)
+        add_mock.assert_called_once()
+
+
+class TestDemandPlacementGate(unittest.TestCase):
+    """Zero-cost holdings >= grant: NEW demand launches skip the free tier."""
+
+    def _make_manager(self, placer):
+        manager = replica_managers.SkyPilotReplicaManager.__new__(
+            replica_managers.SkyPilotReplicaManager)
+        manager._service_name = 'svc'
+        manager.yaml_content = 'unused: patched helpers below'
+        manager._spot_placer = placer
+        manager._launch_thread_pool = {}
+        manager._replica_to_request_id = {}
+        manager._replica_to_launch_cancelled = {}
+        manager._fill_skip_last_log_time = 0.0
+        manager.latest_version = 1
+        return manager
+
+    def _launch_demand(self, allocation, replicas):
+        zero_cost_location = spot_placer.Location.from_pickleable(_K8S_KEY)
+        placer = mock.Mock()
+        placer.zero_cost_locations.return_value = [zero_cost_location]
+        selected = _make_location('us-east-1', 'paid', use_spot=True)
+        placer.select_next_location.return_value = selected
+        manager = self._make_manager(placer)
+        with mock.patch.object(replica_managers,
+                               '_should_use_spot',
+                               return_value=True), \
+             mock.patch.object(replica_managers,
+                               '_get_resources_ports',
+                               return_value='8080'), \
+             mock.patch.object(replica_managers.reserved_capacity_broker,
+                               'get_cached_allocation',
+                               return_value=allocation), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=replicas), \
+             mock.patch.object(replica_managers.serve_state,
+                               'add_or_update_replica'):
+            manager._launch_replica(9)
+        return placer
+
+    def test_holdings_at_grant_skip_zero_cost_preference(self):
+        allocation = reserved_capacity_broker.Allocation(grant=1,
+                                                         feed=0,
+                                                         round_id=3,
+                                                         epoch=2,
+                                                         snapshot_time=0.0)
+        placer = self._launch_demand(allocation, [_replica(1, _K8S_KEY)])
+        placer.select_next_location.assert_called_once()
+        self.assertTrue(
+            placer.select_next_location.call_args.kwargs.get(
+                'skip_zero_cost_preference'))
+
+    def test_holdings_under_grant_keep_preference(self):
+        allocation = reserved_capacity_broker.Allocation(grant=5,
+                                                         feed=0,
+                                                         round_id=3,
+                                                         epoch=2,
+                                                         snapshot_time=0.0)
+        placer = self._launch_demand(allocation, [_replica(1, _K8S_KEY)])
+        placer.select_next_location.assert_called_once()
+        self.assertEqual(placer.select_next_location.call_args.kwargs, {})
+
+    def test_no_allocation_or_none_grant_is_inert(self):
+        for allocation in (None,
+                           reserved_capacity_broker.Allocation(
+                               grant=None,
+                               feed=4,
+                               round_id=3,
+                               epoch=2,
+                               snapshot_time=0.0)):
+            placer = self._launch_demand(allocation, [_replica(1, _K8S_KEY)])
+            self.assertEqual(placer.select_next_location.call_args.kwargs, {})
+
+
+class TestPlacerSkipZeroCostPreference(unittest.TestCase):
+    """skip_zero_cost_preference demotes the free tier to load competition."""
+
+    def setUp(self):
+        self.k8s = _make_location('research-ctx', 'free')
+        self.paid = _make_location('us-east-1', 'paid', use_spot=True)
+        self.placer = _make_placer({self.k8s: 0.0, self.paid: 0.2})
+
+    def test_default_prefers_loaded_zero_cost(self):
+        selected = self.placer.select_next_location([self.k8s, self.k8s])
+        self.assertEqual(selected, self.k8s)
+
+    def test_skip_lets_load_steer_to_paid(self):
+        selected = self.placer.select_next_location(
+            [self.k8s, self.k8s], skip_zero_cost_preference=True)
+        self.assertEqual(selected, self.paid)
+
+
+class TestBrokerPollerCycle(unittest.TestCase):
+    """The broker cycle claims, reads the round, and feeds grant + epoch."""
+
+    def _run_cycle(self, allocation, zero_cost=None):
+        autoscaler = _make_autoscaler(min_replicas=1)
+        if zero_cost is None:
+            zero_cost = [spot_placer.Location.from_pickleable(_K8S_KEY)]
+        placer = mock.Mock()
+        placer.zero_cost_locations.return_value = zero_cost
+        placer.active_locations.return_value = list(zero_cost)
+        keys = [location.to_pickleable() for location in zero_cost]
+        with mock.patch.object(reserved_capacity.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(reserved_capacity.reserved_capacity_broker,
+                               'upsert_claim') as upsert_mock, \
+             mock.patch.object(reserved_capacity.reserved_capacity_broker,
+                               'remove_claim') as remove_mock, \
+             mock.patch.object(reserved_capacity.reserved_capacity_broker,
+                               'run_round_if_stale',
+                               return_value=allocation) as round_mock:
+            reserved_capacity._broker_cycle(autoscaler, placer, 'svc',
+                                            zero_cost, keys)
+        return autoscaler, upsert_mock, remove_mock, round_mock
+
+    def test_allocation_feeds_grant_and_epoch(self):
+        allocation = reserved_capacity_broker.Allocation(grant=3,
+                                                         feed=2,
+                                                         round_id=1,
+                                                         epoch=4,
+                                                         snapshot_time=1.0)
+        autoscaler, upsert_mock, _, round_mock = self._run_cycle(allocation)
+        upsert_mock.assert_called_once()
+        self.assertEqual(
+            upsert_mock.call_args.kwargs['pool_key'],
+            reserved_capacity_broker.make_pool_key('research-ctx', 'a100'))
+        round_mock.assert_called_once()
+        self.assertEqual(autoscaler._fill_grant, 3)
+        self.assertEqual(autoscaler._fill_grant_epoch, 4)
+        self.assertEqual(autoscaler._fill_snapshot_time, 1.0)
+
+    def test_no_allocation_feeds_zero_without_grant(self):
+        autoscaler, _, _, _ = self._run_cycle(allocation=None)
+        self.assertIsNone(autoscaler._fill_grant)
+        self.assertIsNotNone(autoscaler._fill_snapshot_time)
+        self.assertEqual(autoscaler.info()['fill_free_slots'], 0)
+
+    def test_multi_pool_service_withdraws_claim_and_feeds_zero(self):
+        other = dict(_K8S_KEY, accelerators={'H100': 1})
+        zero_cost = [
+            spot_placer.Location.from_pickleable(_K8S_KEY),
+            spot_placer.Location.from_pickleable(other),
+        ]
+        autoscaler, upsert_mock, remove_mock, round_mock = self._run_cycle(
+            allocation=None, zero_cost=zero_cost)
+        remove_mock.assert_called_once_with('svc')
+        upsert_mock.assert_not_called()
+        round_mock.assert_not_called()
+        self.assertIsNone(autoscaler._fill_grant)
+        # The location set is still seeded: existing holdings keep their
+        # scale-down shelter even while fill is inactive.
+        self.assertIsNotNone(autoscaler._fill_snapshot_time)
 
 
 class TestReplicaManagerInitIntact(unittest.TestCase):

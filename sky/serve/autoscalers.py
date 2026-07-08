@@ -186,6 +186,13 @@ class Autoscaler:
         # rows).
         self.reserved_capacity_fill: bool = bool(
             getattr(spec, 'reserved_capacity_fill', False))
+        # Broker claim parameters, snapshotted from the spec so the poller
+        # can read them off the live autoscaler (update_version refreshes
+        # them). getattr: spec objects predating the knobs.
+        self.reserved_fill_floor_replicas: int = int(
+            getattr(spec, 'reserved_fill_floor_replicas', 0) or 0)
+        self.reserved_fill_weight: float = float(
+            getattr(spec, 'reserved_fill_weight', 1.0) or 1.0)
         # Damped free-slot value the fill target acts on (see
         # collect_reserved_capacity for the two-poll increase damping).
         self._fill_free_slots: int = 0
@@ -194,6 +201,15 @@ class Autoscaler:
         self._fill_snapshot_time: Optional[float] = None
         # Last computed fill target, surfaced via info() only.
         self._fill_target: int = 0
+        # Broker grant ceiling + the epoch it was issued under. None grant =
+        # no ceiling (single-service #108 identity; also the pre-broker
+        # default so every existing call path is unchanged). DELIBERATELY
+        # not persisted in dump_dynamic_states: grants are DB-authoritative
+        # and the poller re-feeds them within one interval -- a swapped-in
+        # autoscaler briefly without a ceiling is safe (ceilings only gate
+        # NEW launches).
+        self._fill_grant: Optional[int] = None
+        self._fill_grant_epoch: Optional[int] = None
 
     def get_final_target_num_replicas(self) -> int:
         """Get the final target number of replicas."""
@@ -226,15 +242,24 @@ class Autoscaler:
         # placer already exists.)
         self.reserved_capacity_fill = bool(
             getattr(spec, 'reserved_capacity_fill', False))
+        # Broker claim knobs follow the update too: the poller reads them
+        # off the live autoscaler on its next heartbeat.
+        self.reserved_fill_floor_replicas = int(
+            getattr(spec, 'reserved_fill_floor_replicas', 0) or 0)
+        self.reserved_fill_weight = float(
+            getattr(spec, 'reserved_fill_weight', 1.0) or 1.0)
 
     def collect_request_information(
             self, request_aggregator_info: Dict[str, Any]) -> None:
         """Collect request information from aggregator for autoscaling."""
         raise NotImplementedError
 
-    def collect_reserved_capacity(self, free_slots: int,
+    def collect_reserved_capacity(self,
+                                  free_slots: int,
                                   zero_cost_location_keys: List[Dict[str, Any]],
-                                  timestamp: float) -> None:
+                                  timestamp: float,
+                                  grant: Optional[int] = None,
+                                  grant_epoch: Optional[int] = None) -> None:
         """Ingest a free-capacity snapshot from the reserved-capacity poller.
 
         `zero_cost_location_keys` are Location.to_pickleable() dicts of
@@ -247,6 +272,12 @@ class Autoscaler:
         both polls), so an eviction storm's transient free spike cannot
         cause launch/evict churn. A DECREASE applies immediately:
         capacity that vanished must stop being filled now.
+
+        grant/grant_epoch come from the reserved-fill broker: grant is the
+        entitlement ceiling on the FILL fleet (None = no ceiling, the
+        single-service identity), grant_epoch the fencing token stamped
+        onto fill scale-up decisions so a launch outliving its allocation
+        round is skipped at actuation time.
         """
         free_slots = max(0, int(free_slots))
         prev_raw = self._fill_last_raw_free_slots
@@ -261,6 +292,33 @@ class Autoscaler:
             if location is not None
         ]
         self._fill_snapshot_time = timestamp
+        self._fill_grant = grant
+        self._fill_grant_epoch = grant_epoch
+
+    def count_zero_cost_holdings(
+            self, replica_infos: List['replica_managers.ReplicaInfo']
+    ) -> Tuple[int, int]:
+        """(fill, demand) split of nonterminal zero-cost replicas.
+
+        The broker claim heartbeat reports this split: fill holdings are
+        broker property (arbitrated by grants), demand-placed rows are
+        demand-protected and exempt from the ceiling. Rows pickled before
+        the reserved_fill flag existed read as demand (getattr default) --
+        the conservative direction: they keep their shelter and inflate
+        nobody's fill count.
+        """
+        fill = 0
+        demand = 0
+        for info in replica_infos:
+            if info.is_terminal:
+                continue
+            if not self._replica_on_zero_cost_location(info):
+                continue
+            if getattr(info, 'reserved_fill', False):
+                fill += 1
+            else:
+                demand += 1
+        return fill, demand
 
     def seed_zero_cost_locations(
             self, zero_cost_location_keys: List[Dict[str, Any]]) -> None:
@@ -302,38 +360,11 @@ class Autoscaler:
             return 0
         return self._fill_free_slots
 
-    @staticmethod
-    def _fill_location_matches(replica_location: spot_placer.Location,
-                               zero_cost: spot_placer.Location) -> bool:
-        """Relaxed zero-cost identity match for fill accounting.
-
-        Deliberately NOT Location.__eq__: full equality includes
-        image_id/disk_tier (via _accel_key), so pre-upgrade shape-less
-        replica rows and replicas surviving an image-changing update
-        would stop matching, undercounting zero_cost_count and stripping
-        the fleet's scale-down protection. For "is this replica on the
-        free tier" only the placement identity matters: cloud, region,
-        zone (when both sides pin one), accelerator shape and spot-ness.
-        Legacy shape-less rows (no accelerators/use_spot persisted) match
-        by cloud+region alone.
-        """
-        if str(replica_location.cloud).lower() != str(zero_cost.cloud).lower():
-            return False
-        if replica_location.region != zero_cost.region:
-            return False
-        if (replica_location.zone is not None and zero_cost.zone is not None and
-                replica_location.zone != zero_cost.zone):
-            return False
-        if replica_location.accelerators:
-            if (zero_cost.accelerators and
-                    replica_location.accelerators != zero_cost.accelerators):
-                return False
-            # Only shape-carrying rows enforce spot-ness: legacy rows
-            # deserialize with the use_spot=True default, which must not
-            # exclude them from a non-spot zero-cost pool.
-            if replica_location.use_spot != zero_cost.use_spot:
-                return False
-        return True
+    # Kept as a staticmethod alias: the matcher moved to spot_placer so the
+    # launch path's demand-placement gate can share it without importing
+    # autoscalers (see spot_placer.locations_match_placement for the full
+    # relaxed-identity rationale).
+    _fill_location_matches = staticmethod(spot_placer.locations_match_placement)
 
     def _fill_row_occupies_free_slot(
             self, info: 'replica_managers.ReplicaInfo') -> bool:
@@ -442,6 +473,7 @@ class Autoscaler:
         zero_cost_count = 0
         zero_cost_latest = 0
         zero_cost_occupying = 0
+        zero_cost_demand_placed = 0
         num_latest_nonterminal = 0
         for info in replica_infos:
             if info.is_terminal:
@@ -455,6 +487,17 @@ class Autoscaler:
                     zero_cost_latest += 1
                 if self._fill_row_occupies_free_slot(info):
                     zero_cost_occupying += 1
+                # reserved_fill is the persisted launch-origin flag: only
+                # sentinel (fill) launches carry it. Demand-placed
+                # zero-cost rows are demand-protected, not broker
+                # property, so the grant ceiling below exempts them. Rows
+                # pickled before the flag existed read as demand
+                # (__setstate__ default False, same as the claim-heartbeat
+                # split in count_zero_cost_holdings): they keep their
+                # shelter but stay ceiling-exempt until natural churn
+                # replaces them with flagged rows.
+                if not getattr(info, 'reserved_fill', False):
+                    zero_cost_demand_placed += 1
         # Three defense layers keep fill launches within physical free
         # capacity:
         # 1. Emission-time spend (below): free-slot memory is deducted
@@ -476,8 +519,22 @@ class Autoscaler:
         spendable_free_slots = max(
             0,
             self._fresh_fill_free_slots() - zero_cost_occupying)
+        # Broker grant ceiling: the one new actuator arbitration needs.
+        # The #108 fill target is structurally >= current holdings, so
+        # lowering the FEED alone can never shrink a fleet; capping the
+        # target at grant + demand-placed rows makes holdings above the
+        # ceiling lose their scale-down shelter, and the normal graceful,
+        # drain-aware scale-down returns the machines. None = no ceiling
+        # (single-service identity). Demand-placed zero-cost rows ride on
+        # top of the grant: they are demand-protected, and the broker
+        # already excludes them from the fill capacity it arbitrates.
+        fill_ceiling: Optional[int] = None
+        if self._fill_grant is not None:
+            fill_ceiling = self._fill_grant + zero_cost_demand_placed
         fill_target = min(zero_cost_count + spendable_free_slots,
                           self.max_replicas)
+        if fill_ceiling is not None:
+            fill_target = min(fill_target, fill_ceiling)
         self._fill_target = fill_target
         demand_target = self.get_final_target_num_replicas()
         surplus_covered = fill_target - demand_target
@@ -514,6 +571,11 @@ class Autoscaler:
         # baseline.
         fill_target_launch = min(zero_cost_latest + spendable_free_slots,
                                  self.max_replicas)
+        if fill_ceiling is not None:
+            # Same ceiling on the launch side: a feed above the remaining
+            # grant headroom (e.g. a stale feed raced by a peer's launch)
+            # must not push the fleet past its entitlement.
+            fill_target_launch = min(fill_target_launch, fill_ceiling)
         num_fill_up = (fill_target_launch -
                        max(num_latest_nonterminal, demand_target))
         if num_fill_up > 0:
@@ -523,10 +585,20 @@ class Autoscaler:
                         f'{spendable_free_slots}), demand target '
                         f'{demand_target}; scaling up {num_fill_up} '
                         'zero-cost-only replica(s).')
+            fill_override: Dict[str, Any] = {
+                constants.RESERVED_CAPACITY_FILL_OVERRIDE_KEY: True
+            }
+            if self._fill_grant_epoch is not None:
+                # Epoch fencing: the launch path re-checks this against
+                # the broker's current epoch right before committing.
+                # Attached only when a broker round supplied one, so the
+                # pre-broker decision shape (and every existing test) is
+                # unchanged.
+                fill_override[
+                    constants.RESERVED_FILL_GRANT_EPOCH_OVERRIDE_KEY] = (
+                        self._fill_grant_epoch)
             result.extend(
-                _generate_scale_up_decisions(
-                    num_fill_up,
-                    {constants.RESERVED_CAPACITY_FILL_OVERRIDE_KEY: True}))
+                _generate_scale_up_decisions(num_fill_up, fill_override))
             # Invariant: a free slot is SPENT the moment a launch decision
             # is emitted, not when the poller next observes the pod. Fill
             # launches persist replica rows immediately, so

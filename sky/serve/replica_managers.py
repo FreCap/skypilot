@@ -22,6 +22,8 @@ from sky import task as task_lib
 from sky.backends import backend_utils
 from sky.client import sdk
 from sky.serve import constants as serve_constants
+from sky.serve import reserved_capacity
+from sky.serve import reserved_capacity_broker
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve import service
@@ -471,7 +473,7 @@ class ReplicaStatusProperty:
 class ReplicaInfo:
     """Replica info for each replica."""
 
-    _VERSION = 4
+    _VERSION = 5
 
     def __init__(self, replica_id: int, cluster_name: str, replica_port: str,
                  is_spot: bool, location: Optional[spot_placer.Location],
@@ -497,6 +499,15 @@ class ReplicaInfo:
         self.location: Optional[Dict[str, Optional[str]]] = (
             location.to_pickleable() if location is not None else None)
         self.resources_override: Optional[Dict[str, Any]] = resources_override
+        # Launch-origin attribution: True only for sentinel (fill)
+        # launches; set by _launch_replica before the row is persisted.
+        # The broker's holdings split and the grant ceiling's demand
+        # exemption both key on it. NOTE: a fill row re-driven after a
+        # controller crash mid-PENDING is re-upserted with the flag False
+        # (the sentinel was consumed at original emission) -- it then
+        # reads as demand-placed and stays ceiling-exempt for its
+        # lifetime; rare, bounded, accepted in v1.
+        self.reserved_fill: bool = False
 
     def get_spot_location(self) -> Optional[spot_placer.Location]:
         return spot_placer.Location.from_pickleable(self.location)
@@ -750,6 +761,14 @@ class ReplicaInfo:
             # polls, and treating them as new would debit free slots for
             # their whole lifetime.
             self.created_at = None
+
+        if version < 5:
+            # Pre-broker rows carry no launch-origin flag. False reads as
+            # demand-placed: they keep their scale-down shelter and stay
+            # exempt from the broker's grant ceiling until natural churn
+            # replaces them with flagged rows -- the conservative
+            # direction for a live fleet crossing the upgrade.
+            self.reserved_fill = False
 
         self.__dict__.update(state)
         self._version = version if version >= 0 else 0
@@ -1041,18 +1060,24 @@ class SkyPilotReplicaManager(ReplicaManager):
                            'already exists. Skipping.')
             return False
         # [boltz fork] Reserved-capacity fill scale-ups carry a sentinel
-        # override key restricting the launch to zero-cost locations. Pop
-        # it on a COPY: the caller may reuse the dict, and the popped copy
-        # is what gets persisted on the ReplicaInfo row -- the recovery
-        # re-drive relaunches with the recorded (location-pinned) override
-        # and must not re-enter the fill-selection path.
+        # override key restricting the launch to zero-cost locations (plus,
+        # under the broker, the grant epoch the decision was emitted
+        # under). Pop them on a COPY: the caller may reuse the dict, and
+        # the popped copy is what gets persisted on the ReplicaInfo row --
+        # the recovery re-drive relaunches with the recorded
+        # (location-pinned) override and must not re-enter the
+        # fill-selection path (nor re-run the epoch fence: its round is
+        # long gone and the row already exists).
         zero_cost_only = False
+        fill_grant_epoch: Optional[int] = None
         if (resources_override is not None and
                 serve_constants.RESERVED_CAPACITY_FILL_OVERRIDE_KEY
                 in resources_override):
             resources_override = dict(resources_override)
             resources_override.pop(
                 serve_constants.RESERVED_CAPACITY_FILL_OVERRIDE_KEY)
+            fill_grant_epoch = resources_override.pop(
+                serve_constants.RESERVED_FILL_GRANT_EPOCH_OVERRIDE_KEY, None)
             zero_cost_only = True
         logger.info(f'Launching replica {replica_id}...')
         cluster_name = serve_utils.generate_replica_cluster_name(
@@ -1098,6 +1123,25 @@ class SkyPilotReplicaManager(ReplicaManager):
                 if spot_location is not None:
                     current_spot_locations.append(spot_location)
             if zero_cost_only:
+                # Broker epoch fence: a fill decision computed from a
+                # superseded allocation round (the epoch moved because
+                # grants changed, or after a lease-dead gap) must not
+                # launch against capacity re-granted to a peer. Checked
+                # BEFORE any replica row is persisted, so a fenced launch
+                # leaks nothing (same contract as the benched skip below);
+                # the next decision tick re-emits under the fresh epoch.
+                # Only broker-stamped decisions carry an epoch: without a
+                # broker round this is a no-op (single-service identity),
+                # and a missing lease row (current None) fails open --
+                # there is no newer allocation to defer to.
+                if fill_grant_epoch is not None:
+                    broker_epoch = reserved_capacity_broker.current_epoch()
+                    if (broker_epoch is not None and
+                            broker_epoch != fill_grant_epoch):
+                        self._log_fill_skip(
+                            f'grant epoch {fill_grant_epoch} superseded '
+                            f'(current {broker_epoch})')
+                        return False
                 # The no-spill guarantee: a fill launch either lands on a
                 # zero-cost ACTIVE location or does not happen at all --
                 # checked BEFORE any replica row is persisted, so an
@@ -1111,6 +1155,14 @@ class SkyPilotReplicaManager(ReplicaManager):
                         'no ACTIVE zero-cost location available')
                     return False
                 location = zero_cost_location
+            elif self._demand_should_skip_zero_cost(existing_replica_infos):
+                # Broker demand-placement gate engaged: this service
+                # already holds its zero-cost grant, so new DEMAND
+                # placements compete normally instead of squatting on a
+                # peer's entitlement. Passed only when engaged so the
+                # ungated call shape stays byte-identical.
+                location = self._spot_placer.select_next_location(
+                    current_spot_locations, skip_zero_cost_preference=True)
             else:
                 location = self._spot_placer.select_next_location(
                     current_spot_locations)
@@ -1164,6 +1216,9 @@ class SkyPilotReplicaManager(ReplicaManager):
 
         info = ReplicaInfo(replica_id, cluster_name, replica_port, use_spot,
                            location, self.latest_version, resources_override)
+        # Persisted launch-origin attribution: the broker's holdings split
+        # and the ceiling's demand exemption key on this flag.
+        info.reserved_fill = zero_cost_only
         serve_state.add_or_update_replica(self._service_name, replica_id, info)
         if existing_replica_infos is not None:
             # Bulk callers (recovery re-drive) reuse one snapshot across a
@@ -1176,6 +1231,51 @@ class SkyPilotReplicaManager(ReplicaManager):
         # to avoid too many sky.launch running at the same time.
         self._launch_thread_pool[replica_id] = t
         return True
+
+    def _demand_should_skip_zero_cost(
+            self,
+            existing_replica_infos: Optional[List['ReplicaInfo']]) -> bool:
+        """Broker demand-placement gate: stop NEW squatting at the grant.
+
+        When this service already holds at least its broker grant on the
+        zero-cost tier, its DEMAND launches stop preferring that tier and
+        compete normally (in practice: go to paid capacity, since the
+        grant-full tier carries more load). Reads ONLY the poller's
+        in-process allocation cache -- no DB on the launch path, and with
+        no broker allocation (single service, broker disabled, or unit
+        tests) the gate is inert and behavior is exactly pre-broker.
+        Demand replicas already ON the pool are untouched: the gate
+        prevents new squatting only; existing rows are demand-protected
+        until their traffic recedes (v1 semantics per the design doc).
+        """
+        allocation = reserved_capacity_broker.get_cached_allocation(
+            self._service_name,
+            # The poller refreshes the cache every poll interval; 2x
+            # tolerates scheduling jitter without letting the gate flap
+            # open between polls. A poller outage past that reopens the
+            # zero-cost preference -- the safe direction (pre-broker
+            # behavior), and the broker's ceiling still bounds the fill
+            # fleet itself.
+            max_age_seconds=2 * reserved_capacity.poll_interval_seconds())
+        if allocation is None or allocation.grant is None:
+            return False
+        if self._spot_placer is None:
+            return False
+        zero_cost = self._spot_placer.zero_cost_locations()
+        if not zero_cost:
+            return False
+        holdings = 0
+        for info in existing_replica_infos or []:
+            if info.is_terminal:
+                continue
+            replica_location = info.get_spot_location()
+            if replica_location is None:
+                continue
+            if any(
+                    spot_placer.locations_match_placement(replica_location, zc)
+                    for zc in zero_cost):
+                holdings += 1
+        return holdings >= allocation.grant
 
     def _log_fill_skip(self, reason: str) -> None:
         """Rate-limited skip log for aborted reserved-capacity fill launches.

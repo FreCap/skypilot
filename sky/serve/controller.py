@@ -411,7 +411,7 @@ class SkyServeController:
         thread_utils.start_supervised_thread(
             lambda: reserved_capacity.poller_loop(
                 lambda: self._autoscaler, lambda: self._replica_manager.
-                spot_placer), 'reserved-capacity-poller')
+                spot_placer, self._service_name), 'reserved-capacity-poller')
 
     def _run_autoscaler(self):
         logger.info('Starting autoscaler.')
