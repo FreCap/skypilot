@@ -221,9 +221,6 @@ def _get_possible_location_from_task(task: 'task_lib.Task') -> List[Location]:
 
     assert task.resources  # Guaranteed in task constructor
     resources_list = list(task.resources)
-    empty_location_resources = resources_list[0].copy(cloud=None,
-                                                      region=None,
-                                                      zone=None)
     empty_location_resources_config = _shape_free_config(resources_list[0])
 
     for r in resources_list:
@@ -265,15 +262,13 @@ def _get_possible_location_from_task(task: 'task_lib.Task') -> List[Location]:
             for cloud in clouds_list:
                 _ = location_requirements[str(cloud)]
 
-        shape_kwargs: Dict[str, Any] = {
-            'accelerators': r.accelerators,
-            'use_spot': r.use_spot,
-        }
-        if r.image_id is not None:
-            shape_kwargs['image_id'] = r.image_id
-        if r.disk_tier is not None:
-            shape_kwargs['disk_tier'] = r.disk_tier
-        shape_resources = empty_location_resources.copy(**shape_kwargs)
+        # The entry itself is the shape template: building the shape from
+        # resources_list[0] and overriding only the keys this entry sets
+        # leaks the template's per-location attributes into entries that
+        # leave them unset (e.g. a cloud entry's disk_tier poisons a
+        # Kubernetes entry, whose feasibility check then rejects
+        # custom_disk_tier and silently drops the context).
+        shape_resources = r.copy(cloud=None, region=None, zone=None)
         for cloud in clouds_list:
             feasible_resources: resources_utils.FeasibleResources = (
                 cloud.get_feasible_launchable_resources(
