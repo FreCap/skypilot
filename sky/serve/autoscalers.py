@@ -334,10 +334,14 @@ class Autoscaler:
         - Surplus scale-ups beyond max(current, demand target) carry the
           sentinel override so the launch path pins them to zero-cost
           ACTIVE locations only (and skips entirely when none is).
-        - Scale-downs covered by the fill surplus are suppressed. The
-          subclass ordered its victims most-preferred-first, so keeping
-          the prefix preserves its victim selection (cost-aware /
-          drain-aware logic untouched).
+        - Scale-downs covered by the fill surplus are suppressed, taking
+          the shelter quota from the TAIL of the zero-cost victims: the
+          subclass ordered its victims most-preferred-first (initializing
+          replicas before READY ones), so when the surplus only covers
+          part of them the ones sheltered must be the LEAST preferred --
+          a prefix keep would shelter a warming PROVISIONING replica
+          while killing the READY one serving traffic. Output order (and
+          the cost-aware / drain-aware selection itself) is untouched.
         - With a stale snapshot, fill_target degrades to exactly the
           zero-cost replica count: existing fill replicas are protected
           from victimization by staleness, but no new fill is launched.
@@ -406,18 +410,24 @@ class Autoscaler:
         # could shelter a paid replica indefinitely while repeatedly
         # killing and relaunching zero-cost ones).
         id_to_info = {info.replica_id: info for info in replica_infos}
-        result: List[AutoscalerDecision] = []
-        num_suppressed = 0
-        for decision in decisions:
+        # Take the shelter quota from the TAIL of the zero-cost victims:
+        # the subclass emits victims most-preferred-first, so a partial
+        # surplus must shelter the LEAST-preferred ones (e.g. keep the
+        # READY replica serving traffic, not the PROVISIONING one ahead
+        # of it in the list). Two passes so output order is preserved.
+        zero_cost_decision_ids = []
+        for idx, decision in enumerate(decisions):
             if (decision.operator == AutoscalerDecisionOperator.SCALE_DOWN and
-                    num_suppressed < surplus_covered):
-                victim = (id_to_info.get(decision.target) if isinstance(
-                    decision.target, int) else None)
+                    isinstance(decision.target, int)):
+                victim = id_to_info.get(decision.target)
                 if (victim is not None and
                         self._replica_on_zero_cost_location(victim)):
-                    num_suppressed += 1
-                    continue
-            result.append(decision)
+                    zero_cost_decision_ids.append(idx)
+        suppressed_ids = set(zero_cost_decision_ids[-surplus_covered:])
+        result: List[AutoscalerDecision] = [
+            decision for idx, decision in enumerate(decisions)
+            if idx not in suppressed_ids
+        ]
         # Launch target: latest-version zero-cost replicas only (see the
         # version-asymmetry note above), against the latest-only
         # baseline.
@@ -449,24 +459,17 @@ class Autoscaler:
             # prev_raw would re-grant the spent slots after a single poll,
             # defeating the two-poll damping. The next polls re-sync the
             # true level (immediate on decrease, damped on increase).
+            # This read-modify-write races the poller thread's
+            # collect_reserved_capacity (no lock, same as the other
+            # cross-thread gauges here): worst case one poll's decrease
+            # is overwritten for a single interval, and the resulting
+            # over-launch fails fast on the benched location and is
+            # re-synced by the next poll.
             self._fill_free_slots = max(0, self._fill_free_slots - num_fill_up)
             if self._fill_last_raw_free_slots is not None:
                 self._fill_last_raw_free_slots = max(
                     0, self._fill_last_raw_free_slots - num_fill_up)
         return result
-
-    def has_fresh_demand_report(self) -> bool:
-        """Whether the autoscaler's demand signal is currently fresh.
-
-        QPS/queue autoscalers derive demand from data that rides every
-        sync (request timestamps) or from the durable job DB, so they are
-        never signal-stale in the sense that matters here. Autoscalers
-        that depend on gauges the LB may not send (e.g. the concurrency
-        autoscaler's in-flight report) override this; the controller uses
-        it to decide whether the capacity hint it hands the data plane can
-        be trusted not to under-report a live fleet.
-        """
-        return True
 
     def has_recomputed_with_fresh_data(self) -> bool:
         """Whether target_num_replicas reflects a fresh-data recompute.
@@ -975,12 +978,47 @@ class _GpuShapeResolverMixin:
     # re-resolved on later ticks. After launch the shape is fixed for the
     # replica's lifetime.
     _gpu_shape_cache: Dict[int, Tuple[str, int]]
+    # replica_id -> hourly cost of launched resources (same lifecycle
+    # rules as the shape cache). Backs cost-aware victim ordering in both
+    # shape-aware autoscalers.
+    _replica_cost_cache: Dict[int, float]
 
     def _prune_gpu_shape_cache(self, live_replica_ids: Set[int]) -> None:
-        """Drop cached shapes for replicas that no longer exist."""
+        """Drop cached shapes/costs for replicas that no longer exist."""
         for replica_id in list(self._gpu_shape_cache):
             if replica_id not in live_replica_ids:
                 del self._gpu_shape_cache[replica_id]
+        for replica_id in list(self._replica_cost_cache):
+            if replica_id not in live_replica_ids:
+                del self._replica_cost_cache[replica_id]
+
+    def _get_hourly_cost_from_replica_info(
+            self, replica_info: 'replica_managers.ReplicaInfo') -> float:
+        """Hourly cost of a replica's launched resources (0.0 = reserved).
+
+        Used to prefer scaling down PAID replicas before zero-cost ones
+        (e.g. cloud spot before a reserved Kubernetes pool) -- without
+        this, shedding the expensive replica first is luck, not policy.
+        Unknown costs resolve to 0.0 (treated like reserved capacity, so
+        they are shed last -- the conservative direction for cost).
+        """
+        cached = self._replica_cost_cache.get(replica_info.replica_id)
+        if cached is not None:
+            return cached
+        cost = 0.0
+        try:
+            handle = replica_info.handle()
+            if handle is not None:
+                # Coerce: anything non-numeric degrades to 0.0 (shed last).
+                cost = float(handle.launched_resources.get_cost(seconds=3600))
+        except Exception:  # pylint: disable=broad-except
+            cost = 0.0
+        # Same post-launch-only cache rule as the shape memo: while the
+        # replica is provisioning the record may be rewritten by failover.
+        if (replica_info.status_property.sky_launch_status ==
+                common_utils.ProcessStatus.SUCCEEDED):
+            self._replica_cost_cache[replica_info.replica_id] = cost
+        return cost
 
     def _get_gpu_shape_from_replica_info(
             self,
@@ -1091,9 +1129,6 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         # cache stays bounded to the live replica set.
         live_replica_ids = {info.replica_id for info in replica_infos}
         self._prune_gpu_shape_cache(live_replica_ids)
-        for replica_id in list(self._replica_cost_cache):
-            if replica_id not in live_replica_ids:
-                del self._replica_cost_cache[replica_id]
         keep_versions = {info.version for info in replica_infos}
         keep_versions.add(self.latest_version)
         for version in list(self._qps_dict_by_version):
@@ -1422,34 +1457,6 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
                        f'Using minimum QPS as fallback.')
         return min(target_qps_dict.values())
 
-    def _get_hourly_cost_from_replica_info(
-            self, replica_info: 'replica_managers.ReplicaInfo') -> float:
-        """Hourly cost of a replica's launched resources (0.0 = reserved).
-
-        Used to prefer scaling down PAID replicas before zero-cost ones
-        (e.g. cloud spot before a reserved Kubernetes pool) — without
-        this, shedding the expensive replica first is luck, not policy.
-        Unknown costs resolve to 0.0 (treated like reserved capacity, so
-        they are shed last — the conservative direction for cost).
-        """
-        cached = self._replica_cost_cache.get(replica_info.replica_id)
-        if cached is not None:
-            return cached
-        cost = 0.0
-        try:
-            handle = replica_info.handle()
-            if handle is not None:
-                # Coerce: anything non-numeric degrades to 0.0 (shed last).
-                cost = float(handle.launched_resources.get_cost(seconds=3600))
-        except Exception:  # pylint: disable=broad-except
-            cost = 0.0
-        # Same post-launch-only cache rule as the shape memo: while the
-        # replica is provisioning the record may be rewritten by failover.
-        if (replica_info.status_property.sky_launch_status ==
-                common_utils.ProcessStatus.SUCCEEDED):
-            self._replica_cost_cache[replica_info.replica_id] = cost
-        return cost
-
     def _select_replicas_to_scale_down_by_qps(
             self, num_replicas_to_scale_down: int,
             replica_infos: List['replica_managers.ReplicaInfo']) -> List[int]:
@@ -1634,6 +1641,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         self._rejected_in_window: int = 0
         self._report_received_at: Optional[float] = None
         self._gpu_shape_cache: Dict[int, Tuple[str, int]] = {}
+        # Backs the cost-descending victim tiebreak (shed paid spot
+        # before zero-cost reserved capacity); pruned with the shape
+        # cache each tick.
+        self._replica_cost_cache: Dict[int, float] = {}
         # version -> that version's per-GPU knob. A live replica's
         # capacity is a property of the spec it was launched under: after
         # an update that raises the knob (1 -> 2), sizing old-version
@@ -2146,9 +2157,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             # READY replica may be killed ONLY if the fresh report shows
             # zero in-flight work on it (missing entry counts as busy);
             # non-READY replicas are eligible unless the report shows
-            # work on them (probe-blipped mid-job). Eligible non-READY
-            # replicas keep the existing status-order kill-first
-            # preference via the shared selection helper.
+            # work on them (probe-blipped mid-job).
             eligible_victims = [
                 info for info in latest_nonterminal_replicas
                 if not self._replica_is_busy(info)
@@ -2167,10 +2176,49 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             if actual_num_to_scale_down > 0:
                 scaling_decisions.extend(
                     _generate_scale_down_decisions(
-                        _select_nonterminal_replicas_to_scale_down(
+                        self._select_victims_capacity_and_cost_aware(
                             actual_num_to_scale_down, eligible_victims)))
 
         return scaling_decisions
+
+    def _select_victims_capacity_and_cost_aware(
+            self, num_to_scale_down: int,
+            eligible_victims: List['replica_managers.ReplicaInfo']
+    ) -> List[int]:
+        """Order victims: status, capacity (asc), then COST (desc).
+
+        Mirrors the instance-aware autoscaler's rationale: among equal
+        status, shed the lowest-capacity replicas first (the packing
+        target assumes the largest capacities are kept), and among equal
+        capacity shed the most EXPENSIVE first -- cloud spot before a
+        zero-cost reserved pool. Without the cost key, the routine
+        reclaim cycle (research jobs evict the zero-cost fill fleet,
+        demand relaunches land on paid spot, jobs finish, fill relaunches
+        zero-cost with the newest ids, demand drops) picks the newest --
+        zero-cost -- replicas as victims and settles into a stable state
+        that pays for spot while free reserved slots sit unfilled.
+        Cost must not outrank capacity, same as the instance-aware
+        ordering (the target math assumed the biggest replicas survive);
+        the capacity key is quantized so float noise cannot split
+        mathematically equal capacities away from the cost tiebreak.
+        """
+        status_order = serve_state.ReplicaStatus.scale_down_decision_order()
+
+        def _status_rank(info: 'replica_managers.ReplicaInfo') -> int:
+            try:
+                return status_order.index(info.status)
+            except ValueError:
+                return len(status_order)
+
+        ordered = sorted(eligible_victims,
+                         key=lambda info: (
+                             _status_rank(info),
+                             round(self._replica_capacity(info), 9),
+                             -self._get_hourly_cost_from_replica_info(info),
+                             info.version,
+                             -info.replica_id,
+                         ))
+        return [info.replica_id for info in ordered[:num_to_scale_down]]
 
     def info(self) -> Dict[str, Any]:
         info = super().info()

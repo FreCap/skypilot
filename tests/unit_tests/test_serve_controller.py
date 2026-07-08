@@ -446,3 +446,57 @@ class TestGetCapacityHint:
             latest_version=2)
         hint = ctrl._get_capacity_hint(self._replicas())  # pylint: disable=protected-access
         assert hint['target_num_replicas'] == 10
+
+
+class TestReservedCapacityPollerStart:
+    """Poller lifecycle: seeded, idempotent, inert without a placer."""
+
+    def _controller_with(self, placer):
+        ctrl = _make_controller()
+        ctrl._replica_manager = mock.Mock()
+        ctrl._replica_manager._spot_placer = placer
+        ctrl._autoscaler = mock.Mock()
+        ctrl._reserved_capacity_poller_started = False
+        return ctrl
+
+    def test_seeds_locations_and_starts_thread_once(self):
+        location = mock.Mock()
+        location.to_pickleable.return_value = {'cloud': 'Kubernetes'}
+        placer = mock.Mock()
+        placer.zero_cost_locations.return_value = [location]
+        ctrl = self._controller_with(placer)
+        with mock.patch.object(controller.thread_utils,
+                               'start_supervised_thread') as start_mock:
+            ctrl._start_reserved_capacity_poller_if_needed()
+            ctrl._start_reserved_capacity_poller_if_needed()
+        # Seeded BEFORE the thread starts: zero free slots + the
+        # placer's location set, so the fill overlay can classify
+        # existing zero-cost replicas from tick 0 (a rebuilt controller
+        # must not pass demand scale-downs of the live fill fleet
+        # through while the first poll is still in flight).
+        seed_args = ctrl._autoscaler.collect_reserved_capacity.call_args
+        assert seed_args[0][0] == 0
+        assert seed_args[0][1] == [{'cloud': 'Kubernetes'}]
+        # Idempotent: one poller thread across repeated calls.
+        assert start_mock.call_count == 1
+
+    def test_without_placer_is_inert(self):
+        ctrl = self._controller_with(placer=None)
+        with mock.patch.object(controller.thread_utils,
+                               'start_supervised_thread') as start_mock:
+            ctrl._start_reserved_capacity_poller_if_needed()
+        start_mock.assert_not_called()
+        ctrl._autoscaler.collect_reserved_capacity.assert_not_called()
+        # Not marked started: a later update that adds a placer (new
+        # service version) may still start it.
+        assert ctrl._reserved_capacity_poller_started is False
+
+    def test_seed_failure_still_starts_poller(self):
+        placer = mock.Mock()
+        placer.zero_cost_locations.side_effect = RuntimeError('boom')
+        ctrl = self._controller_with(placer)
+        with mock.patch.object(controller.thread_utils,
+                               'start_supervised_thread') as start_mock:
+            ctrl._start_reserved_capacity_poller_if_needed()
+        # Seeding is best-effort; the poller heals it on its first poll.
+        assert start_mock.call_count == 1

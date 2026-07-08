@@ -1092,6 +1092,20 @@ class SkyPilotReplicaManager(ReplicaManager):
             # (a zero-cost reserved location is non-spot even though the
             # task as a whole is spot-managed).
             use_spot = location.use_spot
+        elif self._spot_placer is not None:
+            # Re-driven pinned launch (controller crash mid-PENDING): the
+            # persisted override already carries the placer's inlined
+            # location fields, but skipped the selection path above (a
+            # non-spot pin fails the use_spot gate and the fill sentinel
+            # was consumed at original emission). Recover the location
+            # from the override so the upserted replica row keeps it --
+            # location=None would permanently drop the replica from the
+            # placer's load counting and from zero-cost fill accounting
+            # (no scale-down shelter, undercounted fill baseline).
+            location = spot_placer.Location.from_resources_override(
+                resources_override)
+            if location is not None:
+                use_spot = location.use_spot
         # When the spot placer owns failover (use_spot + placer above sets
         # retry_until_up=False), the launch is pinned to ONE location, so a
         # capacity failure there must propagate immediately for the placer to

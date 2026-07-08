@@ -358,6 +358,26 @@ class TestDrainAwareDownscale(unittest.TestCase):
         decisions = _decisions(autoscaler, replicas)
         self.assertEqual(_scale_downs(decisions), [])
 
+    def test_equal_capacity_victims_shed_paid_before_zero_cost(self):
+        # Cost tiebreak (mirrors the instance-aware ordering): among
+        # idle victims of equal status and capacity, the EXPENSIVE
+        # replica dies first -- otherwise the routine reclaim cycle
+        # (evict fill -> demand relaunches on paid spot -> fill returns
+        # zero-cost with newest ids -> demand drops) always kills the
+        # newest (zero-cost) replicas and settles into paying for spot
+        # while free reserved slots idle.
+        autoscaler = _make_autoscaler(knob=1.0, min_replicas=1)
+        paid = _replica(1)
+        paid.handle.return_value.launched_resources.get_cost.return_value = 2.0
+        free = _replica(2)
+        free.handle.return_value.launched_resources.get_cost.return_value = 0.0
+        # Outstanding 1 -> target 1 -> one victim; both idle. Without
+        # the cost key the -replica_id tiebreak would kill the newest
+        # (id 2, the zero-cost one).
+        _report(autoscaler, in_flight={1: 0, 2: 0})
+        decisions = _decisions(autoscaler, [paid, free])
+        self.assertEqual(_scale_downs(decisions), [1])
+
     def test_not_ready_missing_from_report_is_busy(self):
         # A NOT_READY replica WAS serving: for async fast-ack work the
         # LB probe only covers the routable set, so a blipped replica's

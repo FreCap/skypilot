@@ -7,6 +7,8 @@ and the flag is orthogonal to the autoscaling knobs.
 """
 from typing import Any, Dict
 
+import pytest
+
 from sky.serve import service_spec as service_spec_lib
 
 
@@ -81,3 +83,27 @@ def test_setstate_defaults_flag_for_old_rows():
         service_spec_lib.SkyServiceSpec)
     restored.__setstate__(old_state)
     assert restored.reserved_capacity_fill is False
+
+
+@pytest.mark.parametrize('fallback_field', [
+    {
+        'dynamic_ondemand_fallback': True
+    },
+    {
+        'base_ondemand_fallback_replicas': 1
+    },
+])
+def test_flag_rejected_with_ondemand_fallback(fallback_field):
+    # Fill launches land as NON-spot replicas on zero-cost locations,
+    # indistinguishable (via is_spot) from paid on-demand fallback
+    # capacity: FallbackRequestRateAutoscaler would count them toward
+    # the fallback quota and pick them as excess-on-demand victims.
+    # Reject at load.
+    spec = _make_spec(min_replicas=1,
+                      max_replicas=5,
+                      target_qps_per_replica=1.0,
+                      reserved_capacity_fill=True)
+    config = spec.to_yaml_config()
+    config['replica_policy'].update(fallback_field)
+    with pytest.raises(ValueError):
+        service_spec_lib.SkyServiceSpec.from_yaml_config(config)

@@ -494,6 +494,23 @@ class SkyServiceSpec:
                         '(dynamic_ondemand_fallback / '
                         'base_ondemand_fallback_replicas).')
 
+        if service_config.get('reserved_capacity_fill'):
+            # Fill launches land as NON-spot replicas on zero-cost
+            # locations, which FallbackRequestRateAutoscaler cannot tell
+            # apart from paid on-demand fallback capacity (both read
+            # is_spot=False): it would count fill replicas toward the
+            # fallback quota and pick them as excess-on-demand victims.
+            # No deployment uses the combination (the zero-cost tier
+            # rides the placer, not base_ondemand_fallback_replicas), so
+            # reject at load instead of mis-accounting at runtime.
+            if (service_config.get('dynamic_ondemand_fallback') or
+                    service_config.get('base_ondemand_fallback_replicas')):
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        'reserved_capacity_fill is not supported with '
+                        'on-demand fallback (dynamic_ondemand_fallback / '
+                        'base_ondemand_fallback_replicas).')
+
         if load_balancing_policy == 'instance_aware_least_load':
             # The per-GPU concurrency knob carries its own shape-aware
             # capacity model (knob * gpu_count), so the QPS dict is only

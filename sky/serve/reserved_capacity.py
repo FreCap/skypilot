@@ -12,7 +12,7 @@ import os
 import re
 import time
 import typing
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from sky import sky_logging
 from sky.catalog import kubernetes_catalog
@@ -57,7 +57,13 @@ def query_free_slots(
       locations contribute no fill.
     """
     total = 0
-    seen: set = set()
+    # Same (context, gpu) shape enumerated with different per-replica
+    # counts (e.g. A100:1 and A100:8 entries over one pool) draws from
+    # the same free GPUs: count the key once with the LARGEST
+    # per-replica size -- deterministic and conservative (fewest fill
+    # launches). A first-seen-wins dedupe would let any_of entry ORDER
+    # change the fill level.
+    per_key_replica_size: Dict[Tuple[str, str], int] = {}
     for location in zero_cost_locations:
         if str(location.cloud).lower() != 'kubernetes':
             continue
@@ -69,14 +75,14 @@ def query_free_slots(
         except (TypeError, ValueError):
             per_replica = 1
         key = (location.region, gpu_name)
-        if key in seen:
-            continue
-        seen.add(key)
+        per_key_replica_size[key] = max(per_key_replica_size.get(key, 1),
+                                        per_replica)
+    for (region, gpu_name), per_replica in per_key_replica_size.items():
         try:
             _, _, available = kubernetes_catalog.list_accelerators_realtime(
                 gpus_only=True,
                 name_filter=f'^{re.escape(gpu_name)}$',
-                region_filter=location.region,
+                region_filter=region,
                 quantity_filter=None,
                 case_sensitive=False,
                 require_price=False)
@@ -84,7 +90,7 @@ def query_free_slots(
             # A failed context contributes 0 this cycle; the autoscaler's
             # staleness decay handles a persistently failing poller.
             logger.warning('Reserved-capacity poll failed for context '
-                           f'{location.region!r} gpu {gpu_name!r}: '
+                           f'{region!r} gpu {gpu_name!r}: '
                            f'{common_utils.format_exception(e)}')
             continue
         free_gpus = sum(count for count in available.values() if count > 0)

@@ -352,6 +352,52 @@ class TestVictimAwareSuppression(unittest.TestCase):
         self.assertEqual([d.target for d in _downs(decisions)], [3])
 
 
+class TestTailSuppression(unittest.TestCase):
+    """Partial surplus shelters the LEAST-preferred zero-cost victims."""
+
+    def test_partial_surplus_keeps_ready_kills_provisioning(self):
+        # Victims are emitted most-preferred-first (PROVISIONING before
+        # READY). With surplus 1 covering only one of the two zero-cost
+        # victims, the shelter must go to the READY replica serving
+        # traffic -- a prefix keep would shelter the warming one and
+        # kill the serving one.
+        autoscaler = _make_autoscaler(min_replicas=1)
+        replicas = [
+            _replica(1),  # paid READY (oldest): survives as the target.
+            _replica(2, _K8S_KEY),  # zero-cost READY
+            _replica(3, _K8S_KEY,
+                     status=serve_state.ReplicaStatus.PROVISIONING),
+        ]
+        # Fresh snapshot with 0 free slots: fill_target = zc_count (2),
+        # demand 1 -> surplus 1.
+        _feed(autoscaler, 0)
+        decisions = _decisions(autoscaler, replicas)
+        # Demand victims: [3 (PROVISIONING), 2 (READY, newest)]. Tail
+        # suppression shelters 2; the PROVISIONING one is retired.
+        self.assertEqual([d.target for d in _downs(decisions)], [3])
+
+
+class TestLocationFromResourcesOverride(unittest.TestCase):
+    """Re-driven pinned launches must recover their location."""
+
+    def test_roundtrip_from_inlined_to_dict(self):
+        location = spot_placer.Location.from_pickleable(_K8S_KEY)
+        override = {'some_user_key': 1}
+        override.update(location.to_dict())
+        rebuilt = spot_placer.Location.from_resources_override(override)
+        self.assertIsNotNone(rebuilt)
+        assert rebuilt is not None
+        self.assertEqual(rebuilt.region, location.region)
+        self.assertEqual(rebuilt.accelerators, location.accelerators)
+        self.assertIs(rebuilt.use_spot, False)
+
+    def test_non_pinned_override_returns_none(self):
+        self.assertIsNone(spot_placer.Location.from_resources_override(None))
+        self.assertIsNone(spot_placer.Location.from_resources_override({}))
+        self.assertIsNone(
+            spot_placer.Location.from_resources_override({'use_spot': True}))
+
+
 class TestDumpLoadFillState(unittest.TestCase):
     """Fill state survives the update_service autoscaler swap."""
 
@@ -643,6 +689,35 @@ class TestFillLaunchPath(unittest.TestCase):
         self.assertIs(info.is_spot, False)
         self.assertEqual(manager._next_replica_id, 8)
 
+    def test_redriven_pinned_launch_keeps_location(self):
+        # Controller crash mid-PENDING: the launch is re-driven with the
+        # persisted override (location inlined, sentinel already
+        # stripped, use_spot=False). The placer selection path is
+        # skipped, but the upserted row must keep the pinned location --
+        # location=None would permanently drop the replica from fill
+        # accounting and the placer's load counter.
+        location = spot_placer.Location.from_pickleable(_K8S_KEY)
+        placer = mock.Mock()
+        manager = self._make_manager(placer)
+        persisted_override = dict(location.to_dict())
+        with mock.patch.object(replica_managers,
+                               '_should_use_spot',
+                               return_value=False), \
+             mock.patch.object(replica_managers,
+                               '_get_resources_ports',
+                               return_value='8080'), \
+             mock.patch.object(replica_managers.serve_state,
+                               'add_or_update_replica') as add_mock:
+            launched = manager._launch_replica(7, persisted_override)
+        self.assertTrue(launched)
+        placer.select_next_location.assert_not_called()
+        placer.select_next_zero_cost_location.assert_not_called()
+        info = add_mock.call_args[0][2]
+        recovered = info.get_spot_location()
+        self.assertIsNotNone(recovered)
+        self.assertEqual(recovered.region, 'research-ctx')
+        self.assertIs(info.is_spot, False)
+
     def test_sentinel_without_placer_aborts(self):
         manager = self._make_manager(placer=None)
         with mock.patch.object(replica_managers,
@@ -687,6 +762,24 @@ class TestQueryFreeSlots(unittest.TestCase):
                                })):
             self.assertEqual(
                 reserved_capacity.query_free_slots([self._k8s_location()]), 0)
+
+    def test_same_shape_different_counts_use_largest_deterministically(self):
+        # A100:1 and A100:8 entries over one pool draw from the same
+        # free GPUs: the LARGEST per-replica size wins regardless of
+        # any_of entry order (first-seen-wins would let YAML order
+        # change the fill level).
+        with mock.patch.object(reserved_capacity.kubernetes_catalog,
+                               'list_accelerators_realtime',
+                               return_value=({}, {}, {
+                                   'A100': 8
+                               })):
+            for locations in ([
+                    self._k8s_location(count=1),
+                    self._k8s_location(count=8)
+            ], [self._k8s_location(count=8),
+                    self._k8s_location(count=1)]):
+                self.assertEqual(reserved_capacity.query_free_slots(locations),
+                                 1)
 
     def test_same_shape_counted_once_and_non_k8s_skipped(self):
         aws = spot_placer.Location.from_pickleable({

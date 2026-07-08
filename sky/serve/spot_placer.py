@@ -194,6 +194,42 @@ class Location:
             'disk_tier': self.disk_tier,
         }
 
+    @classmethod
+    def from_resources_override(
+            cls, override: Optional[Dict[str, Any]]) -> Optional['Location']:
+        """Reconstruct a location from an override that inlined to_dict().
+
+        A placer-pinned launch stamps its location fields into the
+        persisted resources_override (see to_dict). A re-driven launch
+        (controller crash mid-PENDING) replays that override without
+        re-entering the selection path, so the location must be
+        recovered from the override itself -- otherwise the replica row
+        is upserted with location=None and permanently drops out of
+        placer load counting and zero-cost fill accounting. Returns None
+        unless the override carries the placer's pin signature
+        (cloud + region).
+        """
+        if not override:
+            return None
+        cloud_val = override.get('cloud')
+        region = override.get('region')
+        if cloud_val is None or region is None:
+            return None
+        cloud: Optional[sky_clouds.Cloud] = (
+            cloud_val if isinstance(cloud_val, sky_clouds.Cloud) else
+            registry.CLOUD_REGISTRY.from_str(str(cloud_val)))
+        if cloud is None:
+            return None
+        return cls(
+            cloud=cloud,
+            region=region,
+            zone=override.get('zone'),
+            accelerators=override.get('accelerators'),
+            use_spot=override.get('use_spot', True),
+            image_id=override.get('image_id'),
+            disk_tier=override.get('disk_tier'),
+        )
+
 
 class LocationStatus(enum.Enum):
     """Location Spot Status."""

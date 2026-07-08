@@ -92,14 +92,16 @@ class SkyServeController:
         self._autoscaler: autoscalers.Autoscaler = (
             autoscalers.Autoscaler.from_spec(service_name, service_spec,
                                              version))
-        # [boltz fork] Reserved-capacity fill is boot-wired: the poller
-        # thread (the only component allowed to issue the expensive
-        # cluster-wide realtime free-GPU query) starts in run() only when
-        # the service booted with the flag on. A flag toggled on via
-        # update_service reaches the autoscaler's consumption immediately
-        # but gets its poller on the next controller respawn.
+        # [boltz fork] Reserved-capacity fill poller lifecycle: started
+        # from run() when the service booted with the flag on, and
+        # lazily from update_service when an update enables the flag on
+        # a live service (idempotent -- at most one poller thread; a
+        # flag toggled OFF leaves the thread alive but dormant, see
+        # poller_loop). The poller is the only component allowed to
+        # issue the expensive cluster-wide realtime free-GPU query.
         self._reserved_capacity_fill_enabled: bool = bool(
             getattr(service_spec, 'reserved_capacity_fill', False))
+        self._reserved_capacity_poller_started: bool = False
         self._host = host
         self._port = port
         # [boltz fork] Cache of replica_id -> (url, gpu_type, gpu_count)
@@ -326,6 +328,54 @@ class SkyServeController:
                 (spec.lb_retry_initial_backoff_seconds),
         }
 
+    def _start_reserved_capacity_poller_if_needed(self) -> None:
+        """Start the reserved-capacity poller (idempotent).
+
+        Called from run() (boot-enabled flag) and from update_service
+        (flag enabled on a live service). Getters, not the live objects:
+        update_service can replace self._autoscaler and the poller must
+        feed the current one.
+
+        Before the thread starts, the autoscaler is SEEDED with the
+        placer's zero-cost location set and zero free slots: the
+        location set derives from the spec (no cluster query), and
+        having it from tick 0 lets the fill overlay classify existing
+        zero-cost replicas -- without the seed, a rebuilt controller's
+        first demand tick (as early as the first LB sync, ~20-40s,
+        before the poller's first successful poll) would see
+        zero_cost_count=0 and pass demand scale-downs of the live fill
+        fleet straight through. Zero free slots means no NEW fill until
+        a real poll lands -- the conservative direction.
+        """
+        placer = getattr(self._replica_manager, '_spot_placer', None)
+        if placer is None:
+            # The flag without a spot placer is inert (the placer defines
+            # the zero-cost location set fill draws from): say so once
+            # instead of silently never filling.
+            logger.warning(
+                'reserved_capacity_fill is enabled but the service has no '
+                'spot placer (no any_of location set); fill is inactive.')
+            return
+        if self._reserved_capacity_poller_started:
+            return
+        self._reserved_capacity_poller_started = True
+        try:
+            keys = [
+                location.to_pickleable()
+                for location in placer.zero_cost_locations()
+            ]
+            self._autoscaler.collect_reserved_capacity(0, keys, time.time())
+        except Exception as e:  # pylint: disable=broad-except
+            # Seeding is an optimization for the restart window; the
+            # poller heals it on its first successful poll.
+            logger.warning('Failed to seed reserved-capacity locations: '
+                           f'{common_utils.format_exception(e)}')
+        thread_utils.start_supervised_thread(
+            lambda: reserved_capacity.poller_loop(
+                lambda: self._autoscaler, lambda: getattr(
+                    self._replica_manager, '_spot_placer', None)),
+            'reserved-capacity-poller')
+
     def _run_autoscaler(self):
         logger.info('Starting autoscaler.')
         while True:
@@ -503,6 +553,13 @@ class SkyServeController:
                     self._autoscaler.update_version(version,
                                                     service,
                                                     update_mode=update_mode)
+                if getattr(service, 'reserved_capacity_fill', False):
+                    # An update can enable fill on a live service: the
+                    # autoscaler consumes the flag immediately, so the
+                    # poller must exist now too -- without it fill would
+                    # sit half-active (flag on, no free-slot feed) until
+                    # a controller respawn.
+                    self._start_reserved_capacity_poller_if_needed()
                 return responses.JSONResponse(content={'message': 'Success'},
                                               status_code=200)
             except Exception as e:  # pylint: disable=broad-except
@@ -590,18 +647,8 @@ class SkyServeController:
         # the controller keeps serving HTTP -- it is restarted instead.
         thread_utils.start_supervised_thread(self._run_autoscaler, 'autoscaler')
 
-        # Reserved-capacity fill poller: started only when the service
-        # opted in AND a spot placer exists (the placer defines the
-        # zero-cost location set fill draws from). Getters, not the live
-        # objects: update_service can replace self._autoscaler and the
-        # poller must feed the current one.
-        if (self._reserved_capacity_fill_enabled and getattr(
-                self._replica_manager, '_spot_placer', None) is not None):
-            thread_utils.start_supervised_thread(
-                lambda: reserved_capacity.poller_loop(
-                    lambda: self._autoscaler, lambda: getattr(
-                        self._replica_manager, '_spot_placer', None)),
-                'reserved-capacity-poller')
+        if self._reserved_capacity_fill_enabled:
+            self._start_reserved_capacity_poller_if_needed()
 
         logger.info('SkyServe Controller started on '
                     f'http://{self._host}:{self._port}. PID: {os.getpid()}')
