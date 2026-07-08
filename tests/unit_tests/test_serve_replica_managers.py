@@ -131,10 +131,15 @@ def _fake_replica_info(replica_id):
 
 
 def _record_launch(launched):
-    """A _launch_replica side_effect that records the allocated replica id."""
+    """A _launch_replica side_effect that records the allocated replica id.
+
+    Returns True per the production contract ("launch enqueued"): the id
+    allocator only advances past an id whose launch was actually enqueued.
+    """
 
     def _side_effect(replica_id, _resources_override):
         launched.append(replica_id)
+        return True
 
     return _side_effect
 

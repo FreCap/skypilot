@@ -261,6 +261,36 @@ class Autoscaler:
         ]
         self._fill_snapshot_time = timestamp
 
+    def seed_zero_cost_locations(
+            self, zero_cost_location_keys: List[Dict[str, Any]]) -> None:
+        """Seed the zero-cost location set WITHOUT granting free slots.
+
+        Called synchronously by the controller (at boot, and on the
+        autoscaler swap in update_service) with the placer's spec-derived
+        location set, BEFORE the seeded instance takes decision ticks.
+        After a controller respawn the fill state is empty (boot builds
+        the autoscaler via from_spec; there is no dump/load across
+        processes) and the first poll can lag the first decision tick by
+        a lot (per-location cost warm-up + the cluster-wide realtime
+        query). A QPS-family autoscaler's first tick then computes
+        target=min_replicas from its empty window and, with
+        zero_cost_count=0, suppression cannot shelter the live fill
+        fleet from the resulting mass scale-down. Seeding only the
+        location set makes zero_cost_count-based suppression work from
+        tick zero, while _fill_snapshot_time stays None and free slots
+        stay 0 so no new fill is launched until the first real poll.
+
+        A loaded dump wins: never overwrite an existing location set
+        (it may carry a fresher view than the spec-derived one).
+        """
+        if self._fill_zero_cost_locations:
+            return
+        self._fill_zero_cost_locations = [
+            location for location in (spot_placer.Location.from_pickleable(key)
+                                      for key in zero_cost_location_keys)
+            if location is not None
+        ]
+
     def _fresh_fill_free_slots(self) -> int:
         """Damped free slots, decayed to 0 when the snapshot is stale."""
         if self._fill_snapshot_time is None:
@@ -303,6 +333,40 @@ class Autoscaler:
             if replica_location.use_spot != zero_cost.use_spot:
                 return False
         return True
+
+    def _fill_row_occupies_free_slot(
+            self, info: 'replica_managers.ReplicaInfo') -> bool:
+        """Whether a zero-cost row occupies a slot the snapshot counted free.
+
+        Subtract rows that are (not READY) OR (created after the
+        snapshot). Each row is evaluated once against this single
+        predicate, so the two clauses can never double-subtract the same
+        row:
+        - not READY: launched-but-unbound pods are invisible to the
+          poller, so their slots still read free. A not-READY row OLDER
+          than the snapshot (long provisioning) may in fact have a bound
+          pod the poll already excluded; still subtracting it is the
+          conservative direction -- never over-launch, at worst
+          under-fill until it turns READY (layer 3 re-syncs).
+        - created after the snapshot: a DEMAND launch placed on the
+          zero-cost tier that binds AND turns READY within one
+          inter-poll gap escapes the not-READY clause, yet the slot it
+          sits on was counted free when the snapshot was taken. Any
+          zero-cost row newer than the snapshot occupies such a slot
+          regardless of readiness.
+        Rows without a creation timestamp (pickles from builds predating
+        ReplicaInfo.created_at) are treated as older than the snapshot:
+        they predate this build entirely, their bound pods are already
+        excluded by every fresh poll, and always-subtracting them would
+        under-fill for their whole lifetime.
+        """
+        if not info.is_ready:
+            return True
+        if self._fill_snapshot_time is None:
+            # No snapshot: spendable free slots are 0 regardless.
+            return False
+        created_at = getattr(info, 'created_at', None)
+        return created_at is not None and created_at > self._fill_snapshot_time
 
     def _replica_on_zero_cost_location(
             self, info: 'replica_managers.ReplicaInfo') -> bool:
@@ -363,7 +427,7 @@ class Autoscaler:
         #   outdated-version drain bypasses this overlay entirely).
         zero_cost_count = 0
         zero_cost_latest = 0
-        zero_cost_not_ready_latest = 0
+        zero_cost_occupying_latest = 0
         num_latest_nonterminal = 0
         for info in replica_infos:
             if info.is_terminal:
@@ -375,26 +439,29 @@ class Autoscaler:
                 zero_cost_count += 1
                 if is_latest:
                     zero_cost_latest += 1
-                    if not info.is_ready:
-                        zero_cost_not_ready_latest += 1
+                    if self._fill_row_occupies_free_slot(info):
+                        zero_cost_occupying_latest += 1
         # Three defense layers keep fill launches within physical free
         # capacity:
         # 1. Emission-time spend (below): free-slot memory is deducted
         #    the moment launch decisions are emitted, covering the
         #    intra-poll window.
-        # 2. Not-ready subtraction (here): launched-but-not-READY latest
-        #    zero-cost replicas occupy slots even while their pods are
-        #    invisible to the poller (launch threads can queue for
-        #    multiple poll intervals), so they are subtracted from the
-        #    spendable free level. This may overlap with slots the
-        #    poller already excluded once pods bind; subtracting is the
-        #    conservative direction -- never over-launch, worst case
+        # 2. Occupied-slot subtraction (here): latest zero-cost replicas
+        #    that are not READY (pods invisible to the poller -- launch
+        #    threads can queue for multiple poll intervals) or that were
+        #    created after the snapshot (e.g. a demand launch landing on
+        #    the zero-cost tier and turning READY within one inter-poll
+        #    gap) occupy slots the snapshot counted free, so they are
+        #    subtracted from the spendable free level (see
+        #    _fill_row_occupies_free_slot). This may overlap with slots
+        #    the poller already excluded once pods bind; subtracting is
+        #    the conservative direction -- never over-launch, worst case
         #    under-fill for one poll.
         # 3. Poll re-sync: subsequent snapshots restore the true level
         #    (immediately on decrease, two-poll damped on increase).
         spendable_free_slots = max(
             0,
-            self._fresh_fill_free_slots() - zero_cost_not_ready_latest)
+            self._fresh_fill_free_slots() - zero_cost_occupying_latest)
         fill_target = min(zero_cost_count + spendable_free_slots,
                           self.max_replicas)
         self._fill_target = fill_target
