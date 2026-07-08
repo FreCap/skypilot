@@ -100,6 +100,12 @@ class SkyServeController:
         # READY; a replica that recovers with a new endpoint is thus
         # re-resolved.
         self._lb_replica_cache: Dict[int, Tuple[str, str, int]] = {}
+        # Superset of _lb_replica_cache for url -> replica_id translation
+        # of the LB's in-flight report: keeps entries for replicas that
+        # left READY but are still nonterminal, so a probe-blipped
+        # replica's running job stays attributed to it (see
+        # _get_lb_replica_info / _translate_in_flight).
+        self._lb_translation_cache: Dict[int, Tuple[str, str, int]] = {}
         self._app = fastapi.FastAPI(lifespan=self.lifespan)
 
     @contextlib.asynccontextmanager
@@ -173,6 +179,24 @@ class SkyServeController:
                 'gpu_type': gpu_type,
                 'gpu_count': str(gpu_count),
             }
+        # The translation cache retains entries for replicas that left
+        # READY but are still alive: the LB's in-flight snapshot is taken
+        # against ITS last routing view, so a replica probe-blipped out
+        # of READY mid-job would otherwise become untranslatable -- its
+        # in-flight unit would vanish from the autoscaler's outstanding
+        # sum and, worse, the replica would read as idle and become a
+        # scale-down victim while an hour-long job still runs on it.
+        # Terminal replicas are pruned so the cache stays bounded.
+        nonterminal_ids = {
+            info.replica_id for info in replica_infos if not info.is_terminal
+        }
+        translation_cache = {
+            replica_id: cached
+            for replica_id, cached in self._lb_translation_cache.items()
+            if replica_id in nonterminal_ids
+        }
+        translation_cache.update(replica_cache)
+        self._lb_translation_cache = translation_cache
         # Replacing the cache with this sync's active replicas prunes the
         # replicas that are no longer READY.
         self._lb_replica_cache = replica_cache
@@ -185,13 +209,15 @@ class SkyServeController:
         """Translate the LB's url-keyed in-flight gauge to replica ids.
 
         [boltz fork] The LB only knows replicas by url; the autoscaler
-        only knows them by id. `_lb_replica_cache` (replica_id -> (url,
-        gpu_type, gpu_count), rebuilt by `_get_lb_replica_info` on every
-        sync, so call that first) provides the inversion. A url the cache
-        does not know (the replica left the READY set between the LB's
-        snapshot and this sync) is dropped: there is no live replica id
-        to attribute the work to, and the drain-aware victim selection
-        already treats unknown-to-the-report replicas as busy.
+        only knows them by id. `_lb_translation_cache` (replica_id ->
+        (url, gpu_type, gpu_count), rebuilt by `_get_lb_replica_info` on
+        every sync, so call that first) provides the inversion. It
+        deliberately includes still-alive replicas that left READY, so a
+        probe-blipped replica's running job stays attributed instead of
+        vanishing (which would both shrink the outstanding sum and make
+        the replica read as an idle scale-down victim). A url the cache
+        does not know (the replica went terminal) is dropped: there is
+        no live replica id to attribute the work to.
 
         None passes through: it means the LB (old version, or a policy
         that cannot track in-flight) sent no gauge, which the autoscaler
@@ -201,7 +227,7 @@ class SkyServeController:
             return None
         url_to_replica_id = {
             url: replica_id
-            for replica_id, (url, _, _) in self._lb_replica_cache.items()
+            for replica_id, (url, _, _) in self._lb_translation_cache.items()
         }
         in_flight_by_replica_id: Dict[int, int] = {}
         for url, count in in_flight_by_url.items():
@@ -222,11 +248,15 @@ class SkyServeController:
           ready replicas (capacity that will serve soon; lets the data
           plane hold spill decisions for capacity already on the way).
         - target_num_replicas: the autoscaler's current target. While the
-          autoscaler reports its demand signal stale (e.g. a rebuilt
-          controller that has not received an in-flight report yet, whose
-          target reset to min_replicas), report max(target, latest
-          nonterminal count) instead: a routine controller restart must
-          not tell the platform a live fleet wants to shrink.
+          autoscaler's target may still be the rebuilt-blind minimum,
+          report max(target, latest nonterminal count) instead: a routine
+          controller restart must not tell the platform a live fleet
+          wants to shrink. The floor keys on has_recomputed_with_fresh_
+          data(), not has_fresh_demand_report(): the sync handler feeds
+          the report BEFORE building this hint, so the very first
+          post-restart sync is already "fresh" while the target stays
+          min_replicas until the autoscaler thread's next decision tick
+          consumes the snap.
         """
         latest_version = self._autoscaler.latest_version
         num_provisioning = 0
@@ -238,7 +268,7 @@ class SkyServeController:
             if not info.is_ready:
                 num_provisioning += 1
         target = self._autoscaler.get_final_target_num_replicas()
-        if not self._autoscaler.has_fresh_demand_report():
+        if not self._autoscaler.has_recomputed_with_fresh_data():
             target = max(target, num_latest_nonterminal)
         return {
             'provisioning_replicas': num_provisioning,
@@ -272,6 +302,11 @@ class SkyServeController:
             # name, so the LB always receives a concrete policy to build.
             'load_balancing_policy_name': spec.load_balancing_policy,
             'target_qps_per_replica': spec.target_qps_per_replica,
+            # Lets an instance-aware LB weight replicas per-GPU when the
+            # service sizes on concurrency (no QPS dict to weight by) --
+            # and clear stale QPS weights after an update switches modes.
+            'target_concurrency_per_replica':
+                (getattr(spec, 'target_concurrency_per_replica', None)),
             'stream_timeout_seconds': spec.lb_stream_timeout_seconds,
             'retriable_status_codes': spec.lb_retriable_status_codes,
             'max_retries': spec.lb_max_retries,

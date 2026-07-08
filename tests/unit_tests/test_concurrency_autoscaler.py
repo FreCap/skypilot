@@ -232,6 +232,32 @@ class TestSignalGap(unittest.TestCase):
         with mock.patch.object(autoscalers.time, 'time', return_value=stale_at):
             self.assertFalse(autoscaler.has_fresh_demand_report())
 
+    def test_stale_arrival_floor_prunes_old_timestamps(self):
+        # Once syncs stop, collect_request_information never runs again
+        # to prune the window; the stale-branch recompute must prune it
+        # itself or arrivals long outside the window keep asserting a
+        # floor.
+        autoscaler = _make_autoscaler(min_replicas=0)
+        _report(autoscaler, in_flight={}, timestamps=[time.time()] * 7)
+        replicas: list = []
+        stale_at = (time.time() + autoscaler.qps_window_size +
+                    3 * constants.LB_CONTROLLER_SYNC_INTERVAL_SECONDS + 2)
+        with mock.patch.object(autoscalers.time, 'time', return_value=stale_at):
+            _decisions(autoscaler, replicas)
+        self.assertEqual(autoscaler.target_num_replicas, 0)
+
+    def test_recomputed_with_fresh_data_flips_on_tick_not_on_report(self):
+        # The first report flips freshness on the sync thread, but the
+        # target stays at the rebuilt-blind minimum until the decision
+        # tick consumes the snap -- the capacity hint floors until then.
+        autoscaler = _make_autoscaler(min_replicas=1)
+        self.assertFalse(autoscaler.has_recomputed_with_fresh_data())
+        _report(autoscaler, in_flight={1: 1})
+        self.assertTrue(autoscaler.has_fresh_demand_report())
+        self.assertFalse(autoscaler.has_recomputed_with_fresh_data())
+        _decisions(autoscaler, [_replica(1)])
+        self.assertTrue(autoscaler.has_recomputed_with_fresh_data())
+
     def test_no_scale_down_while_stale(self):
         # Rebuilt-controller scenario: target=min_replicas, live fleet of
         # 3 -- nothing may be retired before the first fresh report.
@@ -305,6 +331,17 @@ class TestDrainAwareDownscale(unittest.TestCase):
         decisions = _decisions(autoscaler, replicas)
         self.assertEqual(_scale_downs(decisions), [])
 
+    def test_probe_blipped_replica_with_work_is_not_a_victim(self):
+        # A replica demoted from READY mid-job (probe blip) still shows
+        # in-flight work via the controller's sticky url translation; it
+        # must not inherit the non-READY kill-first eligibility.
+        autoscaler = _make_autoscaler(knob=5.0, min_replicas=1)
+        blipped = _replica(2, status=serve_state.ReplicaStatus.NOT_READY)
+        replicas = [_replica(1), blipped]
+        _report(autoscaler, in_flight={1: 0, 2: 5})
+        decisions = _decisions(autoscaler, replicas)
+        self.assertEqual(_scale_downs(decisions), [1])
+
     def test_non_ready_replicas_keep_kill_first_preference(self):
         # A PROVISIONING replica carries no jobs: it is eligible without
         # an in-flight entry and dies before the idle READY one.
@@ -343,14 +380,46 @@ class TestRollingDrain(unittest.TestCase):
             old + [new_ready], [1, 2])
         self.assertEqual(retired, [3])
 
-    def test_all_old_retired_once_enough_latest_ready(self):
+    def test_all_idle_old_retired_once_enough_latest_ready(self):
         autoscaler = self._mid_update(target=1)
         old = [_replica(i, version=1) for i in (1, 2, 3)]
         new_ready = _replica(4, version=2)
-        _report(autoscaler, in_flight={4: 1})
+        _report(autoscaler, in_flight={1: 0, 2: 0, 3: 0, 4: 1})
         retired = autoscaler._select_outdated_replicas_to_scale_down(
             old + [new_ready], [1, 2])
         self.assertEqual(sorted(retired), [1, 2, 3])
+
+    def test_terminal_branch_never_retires_busy_old_replicas(self):
+        # Enough ready latest replicas is NOT a license to abort
+        # in-progress hour-long jobs: busy old replicas (including
+        # READY ones missing from the report) wait for a later tick.
+        autoscaler = self._mid_update(target=1)
+        busy = _replica(1, version=1)
+        idle = _replica(2, version=1)
+        missing = _replica(3, version=1)  # READY, not in report => busy
+        new_ready = _replica(4, version=2)
+        _report(autoscaler, in_flight={1: 1, 2: 0, 4: 1})
+        retired = autoscaler._select_outdated_replicas_to_scale_down(
+            [busy, idle, missing, new_ready], [1, 2])
+        self.assertEqual(retired, [2])
+
+    def test_shortfall_branch_never_retires_busy_old_replicas(self):
+        # Even when coverage math says the busy replica is surplus, it
+        # is kept: a probe-blipped non-READY old replica with reported
+        # work is protected the same way.
+        autoscaler = self._mid_update(target=2)
+        blipped = _replica(1,
+                           version=1,
+                           status=serve_state.ReplicaStatus.NOT_READY)
+        idle = _replica(2, version=1)
+        new_ready = _replica(3, version=2)
+        # Outstanding 1, ready latest covers it -> shortfall <= 0, floor
+        # keeps one old; the blipped-busy replica must not be the one
+        # retired to satisfy the count.
+        _report(autoscaler, in_flight={1: 1, 2: 0, 3: 1})
+        retired = autoscaler._select_outdated_replicas_to_scale_down(
+            [blipped, idle, new_ready], [1, 2])
+        self.assertNotIn(1, retired)
 
     def test_count_floor_keeps_standby_on_zero_demand(self):
         # Zero outstanding work but no ready latest replica: the

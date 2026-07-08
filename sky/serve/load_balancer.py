@@ -361,8 +361,11 @@ class SkyServeLoadBalancer:
           re-populates it from this same sync, which is why we do not copy
           the old ready set over (that would short-circuit set_ready_replicas
           and skip load-map initialization).
-        - target_qps_per_replica: applied to the active policy when it is
-          instance-aware and the value is a per-accelerator dict.
+        - target_qps_per_replica / target_concurrency_per_replica: applied
+          to the active policy when it is instance-aware -- a QPS dict
+          sets per-accelerator weights; a concurrency knob (no dict) sets
+          a uniform per-GPU weight and clears stale dict weights left by
+          a previous version.
         - stream_timeout_seconds: stored into the per-request instance var so
           it takes effect on subsequent proxied requests.
         """
@@ -374,11 +377,20 @@ class SkyServeLoadBalancer:
             self._load_balancing_policy_name = (
                 lb_policies.LoadBalancingPolicy.make_policy_name(policy_name))
         target_qps_per_replica = routing_spec.get('target_qps_per_replica')
-        if (isinstance(target_qps_per_replica, dict) and
-                isinstance(self._load_balancing_policy,
-                           lb_policies.InstanceAwareLeastLoadPolicy)):
-            self._load_balancing_policy.set_target_qps_per_accelerator(
-                target_qps_per_replica)
+        target_concurrency = routing_spec.get('target_concurrency_per_replica')
+        if isinstance(self._load_balancing_policy,
+                      lb_policies.InstanceAwareLeastLoadPolicy):
+            if isinstance(target_qps_per_replica, dict):
+                self._load_balancing_policy.set_target_qps_per_accelerator(
+                    target_qps_per_replica)
+            elif target_concurrency is not None:
+                # Concurrency-sized service: no QPS dict, uniform per-GPU
+                # capacity. This also CLEARS a previous version's QPS
+                # weights after an update switches sizing modes --
+                # keeping them would normalize routing with obsolete
+                # per-accelerator targets indefinitely.
+                self._load_balancing_policy.set_default_per_gpu_target(
+                    float(target_concurrency))
         stream_timeout_seconds = routing_spec.get('stream_timeout_seconds')
         if stream_timeout_seconds is not None:
             self._stream_timeout_seconds = stream_timeout_seconds

@@ -220,6 +220,18 @@ class Autoscaler:
         """
         return True
 
+    def has_recomputed_with_fresh_data(self) -> bool:
+        """Whether target_num_replicas reflects a fresh-data recompute.
+
+        QPS/queue autoscalers recompute from always-available signals on
+        every tick, so their target is never the rebuilt-blind minimum.
+        The concurrency autoscaler overrides this: after a controller
+        restart its target stays at min_replicas until the first
+        decision tick that consumed a fresh demand report, and the
+        capacity hint must keep flooring until then.
+        """
+        return True
+
     def info(self) -> Dict[str, Any]:
         """Get information about the autoscaler."""
         return {
@@ -1368,6 +1380,37 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         return (time.time() - self._report_received_at
                ) <= self._staleness_threshold_seconds()
 
+    def has_recomputed_with_fresh_data(self) -> bool:
+        """Whether the target reflects at least one fresh-data recompute.
+
+        The first LB report flips has_fresh_demand_report() on the SYNC
+        thread, but target_num_replicas stays at the rebuilt-blind
+        min_replicas until the autoscaler thread's next decision tick
+        consumes the one-shot snap. Consumers that would act on a blind
+        target (the controller's capacity hint) must keep their
+        stale-mode floor until this is True, or a routine controller
+        restart reports target=min_replicas to the platform's spill
+        logic for a tick.
+        """
+        return not self._snap_target_on_next_recompute
+
+    def _replica_is_busy(self, info: 'replica_managers.ReplicaInfo') -> bool:
+        """Whether the latest report shows in-flight work on a replica.
+
+        READY replicas missing from the report count as BUSY: the LB may
+        simply not have picked them up yet, and guessing idle kills a
+        job. Non-READY replicas missing from the report count as idle
+        (never routable, e.g. still provisioning) -- but a non-READY
+        replica WITH reported work is busy: a probe blip mid-job demotes
+        a replica from READY while its hour-long request keeps running,
+        and the controller deliberately keeps its url translatable while
+        it is nonterminal so that work stays attributed.
+        """
+        in_flight = self._in_flight_by_replica_id or {}
+        if info.status == serve_state.ReplicaStatus.READY:
+            return in_flight.get(info.replica_id) != 0
+        return in_flight.get(info.replica_id, 0) > 0
+
     def collect_request_information(
             self, request_aggregator_info: Dict[str, Any]) -> None:
         """Collect timestamps and the latest LB demand report.
@@ -1500,6 +1543,14 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             # never shrink. The one-shot snap is deliberately NOT
             # consumed here: it waits for the first recompute with fresh
             # data.
+            # Prune the window here, not just in
+            # collect_request_information: once syncs stop entirely,
+            # collect is never called again, and unpruned timestamps
+            # would keep asserting an arrival floor for arrivals long
+            # outside the window.
+            index = bisect.bisect_left(self.request_timestamps,
+                                       time.time() - self.qps_window_size)
+            self.request_timestamps = self.request_timestamps[index:]
             arrivals = len(self.request_timestamps)
             if arrivals > 0 and best_capacity > 0:
                 arrival_floor = self._clip_target_num_replicas(
@@ -1655,9 +1706,17 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 num_ready_latest += 1
                 ready_latest_capacity += self._replica_capacity(info)
         if num_ready_latest >= self.get_final_target_num_replicas():
-            # Enough latest-version replicas: retire all old ones (same
-            # terminal condition as the base class).
-            return [info.replica_id for info in old_nonterminal]
+            # Enough latest-version replicas: retire the old ones -- but
+            # only those not visibly mid-job. The base class retires all
+            # of them unconditionally, which for hour-long jobs would
+            # abort every in-progress prediction the moment the new
+            # fleet is ready; a busy old replica is instead retired on a
+            # later tick, once its job finishes and it reports idle.
+            return [
+                info.replica_id
+                for info in old_nonterminal
+                if not self._replica_is_busy(info)
+            ]
 
         shortfall = self._outstanding_work() - ready_latest_capacity
         # Never keep fewer old replicas than the base class's count rule
@@ -1704,6 +1763,14 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             if len(keep_ids) >= keep_count_floor:
                 break
             keep_ids.add(info.replica_id)
+        # Never retire a visibly-busy old replica, regardless of the
+        # coverage math: killing it aborts an hour-long job that will
+        # re-run from scratch. The busy-first keep-preference above
+        # usually keeps them anyway; this makes it a guarantee (they
+        # are retired on a later tick, once idle).
+        for info in old_nonterminal:
+            if self._replica_is_busy(info):
+                keep_ids.add(info.replica_id)
 
         return [
             info.replica_id
@@ -1745,20 +1812,17 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                             'scale-down decision(s).')
                 return scaling_decisions
             num_to_scale_down = current_num_replicas - target_num_replicas
-            in_flight = self._in_flight_by_replica_id or {}
-            # Drain-aware victim eligibility: a READY replica may be
-            # killed ONLY if the fresh report shows zero in-flight work
-            # on it; a READY replica missing from the report counts as
-            # busy (the LB may not have picked it up yet). Non-READY
-            # replicas carry no jobs and keep the existing status-order
-            # kill-first preference via the shared selection helper.
-            eligible_victims = []
-            for info in latest_nonterminal_replicas:
-                if info.status == serve_state.ReplicaStatus.READY:
-                    if in_flight.get(info.replica_id) == 0:
-                        eligible_victims.append(info)
-                else:
-                    eligible_victims.append(info)
+            # Drain-aware victim eligibility (see _replica_is_busy): a
+            # READY replica may be killed ONLY if the fresh report shows
+            # zero in-flight work on it (missing entry counts as busy);
+            # non-READY replicas are eligible unless the report shows
+            # work on them (probe-blipped mid-job). Eligible non-READY
+            # replicas keep the existing status-order kill-first
+            # preference via the shared selection helper.
+            eligible_victims = [
+                info for info in latest_nonterminal_replicas
+                if not self._replica_is_busy(info)
+            ]
             # Clip to the eligible victims and wait otherwise (same
             # pattern as QueueLengthAutoscaler's idle clip): a busy
             # replica finishing its ~1 h job frees up on a later tick.
