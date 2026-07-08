@@ -37,6 +37,7 @@ class SkyServiceSpec:
         ports: Optional[str] = None,
         target_qps_per_replica: Optional[Union[float, Dict[str, float]]] = None,
         target_concurrency_per_replica: Optional[float] = None,
+        reserved_capacity_fill: Optional[bool] = None,
         post_data: Optional[Dict[str, Any]] = None,
         tls_credential: Optional[serve_utils.TLSCredential] = None,
         readiness_headers: Optional[Dict[str, str]] = None,
@@ -197,6 +198,9 @@ class SkyServiceSpec:
         # Per-GPU target concurrency: replica capacity = knob * gpu_count.
         self._target_concurrency_per_replica: Optional[float] = (
             target_concurrency_per_replica)
+        # Opt-in: allow scaling up onto free reserved (zero-cost) capacity.
+        # Absent/False means no behavior change.
+        self._reserved_capacity_fill: Optional[bool] = reserved_capacity_fill
         self._post_data: Optional[Dict[str, Any]] = post_data
         self._tls_credential: Optional[serve_utils.TLSCredential] = (
             tls_credential)
@@ -234,6 +238,8 @@ class SkyServiceSpec:
         state.setdefault('_consecutive_failure_threshold_timeout', None)
         # Added with the concurrency autoscaler; old DB rows predate it.
         state.setdefault('_target_concurrency_per_replica', None)
+        # Added with reserved-capacity fill; old DB rows predate it.
+        state.setdefault('_reserved_capacity_fill', None)
         self.__dict__.update(state)
 
     @staticmethod
@@ -417,6 +423,7 @@ class SkyServiceSpec:
             service_config['num_overprovision'] = None
             service_config['target_qps_per_replica'] = None
             service_config['target_concurrency_per_replica'] = None
+            service_config['reserved_capacity_fill'] = None
         else:
             service_config['min_replicas'] = policy_section['min_replicas']
             service_config['max_replicas'] = policy_section.get(
@@ -427,6 +434,8 @@ class SkyServiceSpec:
                 'target_qps_per_replica', None)
             service_config['target_concurrency_per_replica'] = (
                 policy_section.get('target_concurrency_per_replica', None))
+            service_config['reserved_capacity_fill'] = policy_section.get(
+                'reserved_capacity_fill', None)
             service_config['upscale_delay_seconds'] = policy_section.get(
                 'upscale_delay_seconds', None)
             service_config['downscale_delay_seconds'] = policy_section.get(
@@ -598,6 +607,12 @@ class SkyServiceSpec:
                         self.target_qps_per_replica)
         add_if_not_none('replica_policy', 'target_concurrency_per_replica',
                         self.target_concurrency_per_replica)
+        # no_empty: omit both None and False so older controllers never see
+        # the field unless the user opted in.
+        add_if_not_none('replica_policy',
+                        'reserved_capacity_fill',
+                        self._reserved_capacity_fill,
+                        no_empty=True)
         add_if_not_none('replica_policy', 'dynamic_ondemand_fallback',
                         self.dynamic_ondemand_fallback)
         add_if_not_none('replica_policy', 'base_ondemand_fallback_replicas',
@@ -773,6 +788,12 @@ class SkyServiceSpec:
         return self._target_concurrency_per_replica
 
     @property
+    def reserved_capacity_fill(self) -> bool:
+        # Opt-in flag; absent (None) collapses to False so callers never
+        # need to distinguish unset from disabled.
+        return bool(self._reserved_capacity_fill)
+
+    @property
     def post_data(self) -> Optional[Dict[str, Any]]:
         return self._post_data
 
@@ -861,6 +882,8 @@ class SkyServiceSpec:
             target_concurrency_per_replica=override.pop(
                 'target_concurrency_per_replica',
                 self._target_concurrency_per_replica),
+            reserved_capacity_fill=override.pop('reserved_capacity_fill',
+                                                self._reserved_capacity_fill),
             post_data=override.pop('post_data', self._post_data),
             tls_credential=override.pop('tls_credential', self._tls_credential),
             readiness_headers=override.pop('readiness_headers',
