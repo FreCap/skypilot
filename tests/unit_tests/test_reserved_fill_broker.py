@@ -141,6 +141,22 @@ class TestFeeds:
         feeds, _ = broker.compute_feeds(10, grants, claims, {}, 0.0, 100.0)
         assert feeds == {'a': 2, 'b': 5}
 
+    def test_feed_need_clamped_by_raw_grant_during_down_damping(self):
+        # a is inside a down-move's damping window: its published (damped)
+        # grant is still 5 but this round's raw entitlement is 1. Feeding
+        # the gap would launch a replica the grant is about to catch down
+        # to and cull -- the need must clamp to min(damped, raw).
+        grants = {'a': 5, 'b': 2}
+        raw = {'a': 1, 'b': 2}
+        claims = {'a': _claim(), 'b': _claim()}
+        feeds, _ = broker.compute_feeds(5,
+                                        grants,
+                                        claims, {},
+                                        0.0,
+                                        100.0,
+                                        raw_grants=raw)
+        assert feeds == {'a': 1, 'b': 2}
+
     def test_sticky_feed_survives_weight_shift_within_window(self):
         # A single free GPU must stay with its assignee long enough for the
         # local two-poll damping to act, even when fairness would now point
@@ -468,10 +484,51 @@ class TestClaimLifecycle:
         rejoined = _run('svc-b', free=10)
         assert rejoined is not None and rejoined.grant is not None
 
-    def test_phantom_pool_rejects_all_claims(self):
+    def test_phantom_gate_needs_consecutive_observations(self, clock):
+        # kubernetes_catalog returns empty dicts WITHOUT raising on
+        # credential/cache failures, so a single phantom reading can be a
+        # transient kube-apiserver blip: suspect rounds must feed 0 and
+        # keep every claim; only the Nth consecutive one rejects.
         _upsert('svc-a')
         _upsert('svc-b')
-        assert _run('svc-a', observation=_obs(5, gpu_names=())) is None
+        phantom = _obs(0, gpu_names=())
+        for _ in range(2):
+            suspect = _run('svc-a', observation=phantom)
+            assert suspect is not None
+            assert suspect.feed == 0
+            assert len(
+                serve_state.get_reserved_fill_claims(pool_key=_POOL)) == 2
+            clock.advance(61)
+            _upsert('svc-a')
+            _upsert('svc-b')
+        # Third consecutive phantom observation: claims rejected.
+        assert _run('svc-a', observation=phantom) is None
+        assert not serve_state.get_reserved_fill_claims(pool_key=_POOL)
+
+    def test_healthy_observation_resets_phantom_streak(self, clock):
+        _upsert('svc-a')
+        _upsert('svc-b')
+        phantom = _obs(0, gpu_names=())
+        for _ in range(2):
+            assert _run('svc-a', observation=phantom) is not None
+            clock.advance(61)
+            _upsert('svc-a')
+            _upsert('svc-b')
+        # A healthy observation interleaves: the streak resets, so two
+        # MORE phantom rounds still do not reject...
+        assert _run('svc-a', free=4) is not None
+        for _ in range(2):
+            clock.advance(61)
+            _upsert('svc-a')
+            _upsert('svc-b')
+            assert _run('svc-a', observation=phantom) is not None
+            assert len(
+                serve_state.get_reserved_fill_claims(pool_key=_POOL)) == 2
+        # ...and the third consecutive one does.
+        clock.advance(61)
+        _upsert('svc-a')
+        _upsert('svc-b')
+        assert _run('svc-a', observation=phantom) is None
         assert not serve_state.get_reserved_fill_claims(pool_key=_POOL)
 
     def test_mixed_gpus_per_replica_rejected(self):
@@ -610,3 +667,62 @@ class TestMidQueryDemandBindDebit:
         round_row = serve_state.get_reserved_fill_round(_POOL)
         assert round_row is not None
         assert sum(json.loads(round_row['feeds']).values()) == 4
+
+
+@pytest.mark.usefixtures('_broker_db')
+class TestFedLaunchBootSurvival:
+    """The broker must never cull replicas its own feeds just launched.
+
+    Regression: bound-but-not-READY pods are excluded from the measured
+    free AND counted in their owner's fill holdings, so also debiting them
+    from the ENTITLEMENT total double-subtracted them for the whole
+    bind->READY window; grants dropped below holdings, the ceiling
+    stripped the booting replicas' shelter, and initializing-first victim
+    ordering killed exactly the pods the previous round's feed launched.
+    """
+
+    def test_grant_never_drops_below_holdings_while_booting(
+            self, clock, monkeypatch):
+        rows = []
+        monkeypatch.setattr(
+            serve_state, 'get_replica_infos',
+            mock.Mock(side_effect=lambda name: rows if name == 'svc-a' else []))
+        # Round 1: 4 free slots, no holdings -> each service fed 2.
+        _upsert('svc-a')
+        _upsert('svc-b')
+        first = _run('svc-a', free=4)
+        assert first is not None
+        assert first.grant == 2 and first.feed == 2
+        # svc-a launches its feed: 2 pods bind (created BEFORE the next
+        # snapshot) but stay not-READY; the pool's measured free drops to
+        # 2 because the bound pods already consume node capacity.
+        created = clock.now
+        rows = [
+            _replica_stub(is_ready=False, created_at=created) for _ in range(2)
+        ]
+        for _ in range(3):
+            clock.advance(61)
+            _upsert('svc-a', holdings_fill=2)
+            _upsert('svc-b')
+            alloc = _run('svc-a', free=2)
+            assert alloc is not None
+            # The booting pods keep their shelter: the grant never drops
+            # below holdings, so the ceiling never strips them.
+            assert alloc.grant is not None and alloc.grant >= 2
+            # The remaining free is fully debited by the in-flight rows:
+            # conservative, no over-launch while the pods boot.
+            assert alloc.feed == 0
+        # Pods turn READY: the state converges with no cull, and the
+        # still-free capacity flows to the peer.
+        rows = [
+            _replica_stub(is_ready=True, created_at=created) for _ in range(2)
+        ]
+        clock.advance(61)
+        _upsert('svc-a', holdings_fill=2)
+        _upsert('svc-b')
+        settled = _run('svc-a', free=2)
+        assert settled is not None
+        assert settled.grant == 2
+        alloc_b = broker.get_my_allocation('svc-b')
+        assert alloc_b is not None
+        assert alloc_b.grant == 2 and alloc_b.feed == 2

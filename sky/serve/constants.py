@@ -247,6 +247,15 @@ RESERVED_FILL_LEASE_TTL_INTERVALS = 5
 # every round would never survive the local two-poll increase damping and
 # idle forever.
 RESERVED_FILL_STICKY_FEED_INTERVALS = 2
+# Consecutive phantom observations (successful realtime query reporting NO
+# labeled nodes for the claimed GPU) required before the broker rejects a
+# pool's claims. kubernetes_catalog returns empty dicts without raising on
+# credential/cache/label-formatter failures, so a single "phantom" reading
+# can be a transient kube-apiserver blip masquerading as a successful
+# observation; deleting every claim on one reading turns that blip into a
+# pool-wide fill outage. Suspect rounds feed 0 (conservative) but keep the
+# claims; only a persistent phantom (this many rounds in a row) rejects.
+RESERVED_FILL_PHANTOM_CONFIRM_ROUNDS = 3
 
 # Default interval in seconds to probe replica endpoint.
 DEFAULT_ENDPOINT_PROBE_INTERVAL_SECONDS = 10

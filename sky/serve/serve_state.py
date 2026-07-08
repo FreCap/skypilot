@@ -169,6 +169,11 @@ reserved_fill_rounds_table = sqlalchemy.Table(
     # not trigger releases).
     sqlalchemy.Column('last_observed_free', sqlalchemy.Integer),
     sqlalchemy.Column('last_observed_free_ts', sqlalchemy.Float),
+    # Consecutive phantom observations (successful query, no labeled nodes
+    # for the claimed GPU). Persisted so the consecutive-phantom claim
+    # rejection gate survives writer rotation; a non-phantom observation
+    # resets it to 0.
+    sqlalchemy.Column('phantom_streak', sqlalchemy.Integer, server_default='0'),
 )
 
 # Singleton lease row (id=1). The epoch only moves forward; its sole role
@@ -1302,8 +1307,8 @@ def publish_reserved_fill_round(pool_key: str, *, round_id: int,
                                 sum_holdings: int,
                                 last_observed_free: Optional[int],
                                 last_observed_free_ts: Optional[float],
-                                owner_service: str, prev_epoch: Optional[int],
-                                lease_epoch: int,
+                                phantom_streak: int, owner_service: str,
+                                prev_epoch: Optional[int], lease_epoch: int,
                                 lease_expires_at: float) -> bool:
     """Atomically CAS-advances the lease and publishes a round.
 
@@ -1361,6 +1366,7 @@ def publish_reserved_fill_round(pool_key: str, *, round_id: int,
             'sum_holdings': sum_holdings,
             'last_observed_free': last_observed_free,
             'last_observed_free_ts': last_observed_free_ts,
+            'phantom_streak': phantom_streak,
         }
         insert_stmt = _upsert_insert_func(engine)(
             reserved_fill_rounds_table).values(**values)

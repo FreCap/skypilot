@@ -341,6 +341,7 @@ def compute_feeds(
     sticky_state: Mapping[str, Dict[str, Any]],
     now: float,
     sticky_window_seconds: float,
+    raw_grants: Optional[Mapping[str, int]] = None,
 ) -> Tuple[Dict[str, int], Dict[str, Dict[str, Any]]]:
     """Splits OBSERVED FREE among launchable under-holders.
 
@@ -358,6 +359,14 @@ def compute_feeds(
     two-poll increase damping and idles forever. `since` is preserved
     across consecutive positive rounds, so the window measures the streak
     start, not the last assignment.
+
+    raw_grants (this round's UNDAMPED entitlements) additionally clamps the
+    feed need to min(damped, raw): during a down-move's two-round damping
+    window the published grant sits ABOVE the raw entitlement, and feeding
+    that gap launches a replica the damped grant is about to catch down to
+    and cull (the ceiling strips its shelter as soon as it boots). Damping
+    exists to protect launches, never to originate doomed ones; up-damping
+    is unaffected (there min(damped, raw) == damped).
     """
     free = max(0, observed_free)
     # Need is clamped by effective_cap, not just the grant: damping (and
@@ -367,6 +376,8 @@ def compute_feeds(
     need = {}
     for name, claim in claims.items():
         grant = grants.get(name, 0)
+        if raw_grants is not None and name in raw_grants:
+            grant = min(grant, raw_grants[name])
         if claim.effective_cap is not None:
             grant = min(grant, max(0, claim.effective_cap))
         need[name] = max(0, grant - claim.holdings_fill)
@@ -524,20 +535,33 @@ def _replica_row_on_pool(info: Any, context: str, gpu_name: str) -> bool:
 
 
 def _occupying_debit(claim_names: List[str], pool_key: str,
-                     snapshot_time: float) -> int:
+                     snapshot_time: float) -> Tuple[int, int]:
     """Pool slots claimed by rows the snapshot may still have counted free.
 
     Mirrors the #108 occupied-slot subtraction at broker level, across ALL
-    claimants: any nonterminal row on the pool that is not READY (pod may
-    be unbound, invisible to the query) or was created after the snapshot
-    (e.g. a demand launch binding mid-query) holds a slot that must not be
-    granted again. Each claimant's local overlay additionally debits its
-    OWN occupying rows from its feed; the overlap under-fills that service
-    by its in-flight count for at most a poll interval -- the conservative
-    direction, never over-launch.
+    claimants, returning (feed_debit, entitlement_debit):
+
+    - feed_debit (rows not READY, or created after the snapshot): applied
+      to the observed free the FEED split spends. A launching pod may be
+      unbound and invisible to the query, and a demand launch binding
+      mid-query holds a slot the snapshot counted free; either way the
+      slot must not be fed again -- never over-launch. Each claimant's
+      local overlay additionally debits its OWN occupying rows from its
+      feed, so this under-fills a launching service by its in-flight
+      count for its whole bind->READY window; feeds only add NEW
+      launches, so the cost is a delayed launch, never a cull.
+    - entitlement_debit (ONLY rows created after the snapshot): applied to
+      the ENTITLEMENT total. Entitlements launch nothing, and a bound
+      not-READY pod is ALREADY excluded from the measured free (its node
+      capacity is taken); subtracting it here again would shrink the
+      whole-pool total for the entire bind->READY window, driving grants
+      below the owner's holdings and culling exactly the pods that are
+      booting (a broker-generated churn wave). Only the mid-query bind
+      race (created_at > snapshot) still needs the debit.
     """
     context, gpu_name = parse_pool_key(pool_key)
-    occupying = 0
+    feed_debit = 0
+    entitlement_debit = 0
     for name in sorted(claim_names):
         try:
             infos = serve_state.get_replica_infos(name)
@@ -555,10 +579,13 @@ def _occupying_debit(claim_names: List[str], pool_key: str,
             if not _replica_row_on_pool(info, context, gpu_name):
                 continue
             created_at = getattr(info, 'created_at', None)
-            if (not info.is_ready) or (created_at is not None and
-                                       created_at > snapshot_time):
-                occupying += 1
-    return occupying
+            post_snapshot = (created_at is not None and
+                             created_at > snapshot_time)
+            if (not info.is_ready) or post_snapshot:
+                feed_debit += 1
+            if post_snapshot:
+                entitlement_debit += 1
+    return feed_debit, entitlement_debit
 
 
 def _allocation_from_round(service_name: str,
@@ -664,18 +691,43 @@ def _run_round_locked(service_name: str, pool_key: str,
         logger.warning('Reserved-fill broker: pool query failed for '
                        f'{pool_key}: {common_utils.format_exception(e)}')
     query_ok = observation is not None and observation.free_slots is not None
+    prev_phantom_streak = (int(round_row['phantom_streak'] or 0)
+                           if round_row is not None else 0)
+    # Carried unchanged through a measurement blackout: a failed query is
+    # not an observation, so it neither confirms nor clears a phantom
+    # suspicion.
+    phantom_streak = prev_phantom_streak
     if query_ok:
         assert observation is not None
-        if not observation.gpu_names:
+        if observation.gpu_names:
+            phantom_streak = 0
+        else:
             # Phantom pool: the claimed GPU resolves to no labeled nodes.
-            # Reject every claim on it (their pollers re-log per interval)
-            # rather than silently arbitrating an empty pool.
-            logger.error(
-                f'Reserved-fill broker: pool {pool_key} is phantom (the '
-                'realtime query reports no such accelerator in the '
-                'context). Rejecting all claims on it.')
-            serve_state.remove_reserved_fill_claims_for_pool(pool_key)
-            return None
+            # kubernetes_catalog reports empty dicts WITHOUT raising on
+            # credential/cache/label-formatter failures, so one phantom
+            # reading can be a transient kube-apiserver blip disguised as
+            # a successful observation. Require N consecutive phantom
+            # observations before rejecting every claim on the pool
+            # (their pollers re-log per interval); until confirmed, treat
+            # the round as a measurement blackout: feed 0 (conservative),
+            # release nothing, keep the claims.
+            phantom_streak = prev_phantom_streak + 1
+            if (phantom_streak >=
+                    constants.RESERVED_FILL_PHANTOM_CONFIRM_ROUNDS):
+                logger.error(
+                    f'Reserved-fill broker: pool {pool_key} is phantom (the '
+                    'realtime query reports no such accelerator in the '
+                    f'context, {phantom_streak} consecutive rounds). '
+                    'Rejecting all claims on it.')
+                serve_state.remove_reserved_fill_claims_for_pool(pool_key)
+                return None
+            logger.warning(
+                f'Reserved-fill broker: pool {pool_key} looks phantom '
+                f'({phantom_streak} consecutive observation(s), need '
+                f'{constants.RESERVED_FILL_PHANTOM_CONFIRM_ROUNDS} to '
+                'reject claims); treating the round as a measurement '
+                'blackout.')
+            query_ok = False
 
     claims = {name: _claim_input(row) for name, row in claim_rows.items()}
     names = sorted(claims)
@@ -715,8 +767,16 @@ def _run_round_locked(service_name: str, pool_key: str,
             assert observation is not None and observation.free_slots is not None
             measured = max(0, int(observation.free_slots))
             last_free, last_free_ts = measured, snapshot_time
-            observed_free = max(
-                0, measured - _occupying_debit(names, pool_key, snapshot_time))
+            feed_debit, entitlement_debit = _occupying_debit(
+                names, pool_key, snapshot_time)
+            observed_free = max(0, measured - feed_debit)
+            # The entitlement total only debits the mid-query bind race:
+            # bound not-READY pods are already excluded from the measured
+            # free AND counted in their owner's fill holdings, so the full
+            # feed debit here would double-subtract them for the whole
+            # bind->READY window and cull the booting pods (see
+            # _occupying_debit).
+            entitlement_free = max(0, measured - entitlement_debit)
         else:
             # Measurement blackout: staleness-decayed last-known free, never
             # a raw 0 -- a blackout must not trigger releases. Past the
@@ -728,7 +788,8 @@ def _run_round_locked(service_name: str, pool_key: str,
             if (last_free is not None and last_free_ts is not None and
                     now - float(last_free_ts) <= stale_after):
                 observed_free = int(last_free)
-        total = observed_free + sum_holdings
+            entitlement_free = observed_free
+        total = entitlement_free + sum_holdings
         raw_grants = compute_entitlements(total, claims)
         # Previous single-claimant None grants carry no integer baseline:
         # drop them so damping treats the service as newly-baselined.
@@ -746,10 +807,19 @@ def _run_round_locked(service_name: str, pool_key: str,
         damped = damp_grants(raw_grants, prev_published, prev_raw,
                              holdings_shrank)
         if query_ok:
+            # raw_grants clamps each feed need to min(damped, raw): a
+            # service inside a down-move's damping window must not be fed
+            # above its raw entitlement -- the damped grant catches down
+            # next round and the just-launched replica would be culled.
             feeds, new_sticky = compute_feeds(
-                observed_free, damped, claims, sticky, now,
+                observed_free,
+                damped,
+                claims,
+                sticky,
+                now,
                 constants.RESERVED_FILL_STICKY_FEED_INTERVALS *
-                poll_interval_seconds)
+                poll_interval_seconds,
+                raw_grants=raw_grants)
         else:
             # Blind round: never grant BELOW current holdings (no release
             # on blackout) and launch nothing new (feeds 0). Sticky state
@@ -795,6 +865,7 @@ def _run_round_locked(service_name: str, pool_key: str,
         sum_holdings=sum_holdings,
         last_observed_free=last_free,
         last_observed_free_ts=last_free_ts,
+        phantom_streak=phantom_streak,
         owner_service=service_name,
         prev_epoch=prev_epoch,
         lease_epoch=new_lease_epoch,
