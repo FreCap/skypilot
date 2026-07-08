@@ -180,6 +180,7 @@ class SkyServeLoadBalancer:
     _reject_fallback_seq: int = 0
     _capacity_hint: Optional[Dict[str, Any]] = None
     _draining_clients: Optional[Dict[str, List[httpx.AsyncClient]]] = None
+    _occupancy_capable: Optional[Set[str]] = None
 
     def __init__(
         self,
@@ -513,16 +514,36 @@ class SkyServeLoadBalancer:
         with self._client_pool_lock:
             in_flight = self._load_balancing_policy.snapshot_in_flight()
             occupancy = dict(self._replica_occupancy)
+            capable = set(self._occupancy_capable or ())
         if in_flight is None:
             return None
-        for url, running in occupancy.items():
-            if running > in_flight.get(url, 0):
-                in_flight[url] = running
+        # Fold draining refcounts into the envelope totals first: a
+        # draining client's streams and the current client's are
+        # DISJOINT request sets on the same replica, so they add.
         for url, clients in (self._draining_clients or {}).items():
             draining = sum(
                 getattr(client, _INFLIGHT_ATTR, 0) for client in clients)
             if draining > 0:
                 in_flight[url] = in_flight.get(url, 0) + draining
+        # Occupancy supersedes the envelope view where known: it counts
+        # jobs RUNNING on the replica regardless of which client (or
+        # which LB incarnation) delivered them, so per-url MAX with the
+        # envelope total -- never sum -- keeps one job from counting as
+        # both an open envelope and an occupancy unit (a just-pruned
+        # url's probe entry survives until the next round and would
+        # otherwise double its still-draining stream).
+        for url, running in occupancy.items():
+            if running > in_flight.get(url, 0):
+                in_flight[url] = running
+        # An occupancy-CAPABLE url absent from this round's probe is
+        # UNKNOWN, not idle: its envelope count is meaningless for
+        # fast-ack work, and reporting the explicit envelope zero would
+        # bypass the autoscaler's missing-entry-means-busy protection
+        # and let a drain kill it mid-job. Omit it so the autoscaler
+        # sees no entry.
+        for url in capable:
+            if url not in occupancy and url in in_flight:
+                del in_flight[url]
         return in_flight
 
     def _prune_reject_window(self) -> Dict[str, float]:
@@ -723,6 +744,17 @@ class SkyServeLoadBalancer:
             self._replica_occupancy = occupancy
             self._replica_free_slots = free_slots
             self._last_occupancy_probe_time = time.monotonic()
+            # A url that EVER reported occupancy is occupancy-capable:
+            # its envelope in-flight is meaningless for busyness
+            # (fast-ack jobs close the envelope in ms), so a later probe
+            # MISS for it must read as UNKNOWN -- never as the
+            # envelope's explicit zero, which would let the drain paths
+            # kill it mid-job (see _in_flight_with_draining). Pruned to
+            # urls still relevant so the set stays bounded to the fleet.
+            capable = (self._occupancy_capable or set()) | set(occupancy)
+            keep = (set(ready_urls) | set(occupancy) |
+                    set(self._draining_clients or {}))
+            self._occupancy_capable = {url for url in capable if url in keep}
             # Push into the policy under the same lock the sync loop holds
             # for policy swaps; a policy swapped after this round serves
             # without occupancy for at most one probe interval.

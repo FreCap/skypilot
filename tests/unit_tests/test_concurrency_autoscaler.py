@@ -358,6 +358,19 @@ class TestDrainAwareDownscale(unittest.TestCase):
         decisions = _decisions(autoscaler, replicas)
         self.assertEqual(_scale_downs(decisions), [])
 
+    def test_not_ready_missing_from_report_is_busy(self):
+        # A NOT_READY replica WAS serving: for async fast-ack work the
+        # LB probe only covers the routable set, so a blipped replica's
+        # running jobs may be unreported entirely. Missing => busy, same
+        # as READY. (PROVISIONING-family replicas stay idle-when-missing
+        # -- they never served.)
+        autoscaler = _make_autoscaler(knob=5.0, min_replicas=1)
+        blipped = _replica(2, status=serve_state.ReplicaStatus.NOT_READY)
+        replicas = [_replica(1), blipped]
+        _report(autoscaler, in_flight={1: 0})
+        decisions = _decisions(autoscaler, replicas)
+        self.assertEqual(_scale_downs(decisions), [1])
+
     def test_probe_blipped_replica_with_work_is_not_a_victim(self):
         # A replica demoted from READY mid-job (probe blip) still shows
         # in-flight work via the controller's sticky url translation; it
