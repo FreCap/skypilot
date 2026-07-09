@@ -46,6 +46,11 @@ boto3-stubs[s3,ec2,sts,iam,service-quotas]
 
 # For postgres
 psycopg2-binary==2.9.10
+# Real-Postgres unit tests (tests/unit_tests/test_reserved_fill_broker_pg.py):
+# boots a throwaway postgres:16 container per test session. 4.14.x pulls
+# docker-py >= 7 (compatible with the docker 29.x daemon) but needs
+# python >= 3.10, hence the marker; on older interpreters the module skips.
+testcontainers[postgres]==4.14.2; python_version >= "3.10"
 
 # For helm okta test
 selenium==4.33.0

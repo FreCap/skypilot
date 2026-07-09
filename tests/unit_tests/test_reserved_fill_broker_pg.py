@@ -5,8 +5,9 @@ broker SQL (dialect-switched upserts, lease CAS rowcount, prune predicate)
 and the alembic migration chain must be exercised on a real PG engine, not
 only sqlite. This module:
 
-- boots a throwaway postgres:16 container once per session (skipping the
-  whole module cleanly when docker is unavailable);
+- boots a throwaway postgres:16 container once per session via
+  testcontainers (skipping the whole module cleanly when docker is
+  unavailable or the container cannot start);
 - re-runs the FULL sqlite round-mechanics/claims/prune/lease/epoch suite
   from test_reserved_fill_broker.py against the PG engine by overriding its
   `broker_engine` fixture (the test bodies are inherited, not copied);
@@ -17,8 +18,6 @@ only sqlite. This module:
 """
 # pylint: disable=protected-access,unused-import
 import shutil
-import socket
-import subprocess
 import threading
 import time
 from unittest import mock
@@ -42,102 +41,52 @@ from tests.unit_tests.test_reserved_fill_broker import _broker_db  # noqa: F401
 from tests.unit_tests.test_reserved_fill_broker import clock  # noqa: F401
 
 psycopg2 = pytest.importorskip('psycopg2')
+testcontainers_postgres = pytest.importorskip('testcontainers.postgres')
 
-_PG_PASSWORD = 'sky-broker-pg-test'
-_PG_USER = 'postgres'
-_PG_HOST = '127.0.0.1'
 _PG_IMAGE = 'postgres:16'
-_READY_TIMEOUT_SECONDS = 60.0
-
-
-def _docker_available() -> bool:
-    docker = shutil.which('docker')
-    if docker is None:
-        return False
-    try:
-        return subprocess.run(['docker', 'info'],
-                              capture_output=True,
-                              timeout=30,
-                              check=False).returncode == 0
-    except (subprocess.SubprocessError, OSError):
-        return False
-
 
 pytestmark = pytest.mark.skipif(
-    not _docker_available(),
+    shutil.which('docker') is None,
     reason='docker unavailable; skipping real-Postgres broker tests')
-
-
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind((_PG_HOST, 0))
-        return sock.getsockname()[1]
 
 
 @pytest.fixture(scope='session')
 def pg_server():
     """One throwaway postgres:16 container for the whole session.
 
-    Yields the mapped host port. Skips (never fails) when the container
-    cannot start or never becomes ready: CI without a working docker
-    daemon must not go red on this module.
+    Yields the started PostgresContainer (testcontainers handles port
+    mapping and readiness). Skips (never fails) when the container cannot
+    start or never becomes ready: CI without a working docker daemon must
+    not go red on this module.
     """
-    port = _free_port()
-    name = f'sky-broker-pg-{uuid.uuid4().hex[:8]}'
+    container = testcontainers_postgres.PostgresContainer(_PG_IMAGE)
     try:
-        subprocess.run([
-            'docker', 'run', '-d', '--rm', '--name', name, '-e',
-            f'POSTGRES_PASSWORD={_PG_PASSWORD}', '-p', f'{port}:5432', _PG_IMAGE
-        ],
-                       check=True,
-                       capture_output=True,
-                       timeout=120)
-    except (subprocess.SubprocessError, OSError) as e:
+        container.start()
+    except Exception as e:  # pylint: disable=broad-except
         pytest.skip(f'could not start postgres container: {e}')
     try:
-        # Readiness: retry TCP connects. The official image's init-phase
-        # temporary server listens on the unix socket only, so a successful
-        # TCP connect is the final server.
-        deadline = time.time() + _READY_TIMEOUT_SECONDS
-        last_error: Exception = RuntimeError('never attempted')
-        while True:
-            try:
-                conn = psycopg2.connect(host=_PG_HOST,
-                                        port=port,
-                                        user=_PG_USER,
-                                        password=_PG_PASSWORD,
-                                        dbname='postgres',
-                                        connect_timeout=2)
-                conn.close()
-                break
-            except psycopg2.OperationalError as e:
-                last_error = e
-                if time.time() > deadline:
-                    pytest.skip(
-                        f'postgres container never became ready: {last_error}')
-                time.sleep(0.5)
-        yield port
+        yield container
     finally:
-        subprocess.run(['docker', 'rm', '-f', name],
-                       capture_output=True,
-                       check=False)
+        container.stop()
 
 
-def _create_database(port: int, dbname: str) -> str:
+def _create_database(pg_server, dbname: str) -> str:
     """Creates a fresh database on the server; returns its SQLAlchemy URL."""
-    conn = psycopg2.connect(host=_PG_HOST,
+    host = pg_server.get_container_host_ip()
+    port = pg_server.get_exposed_port(pg_server.port)
+    conn = psycopg2.connect(host=host,
                             port=port,
-                            user=_PG_USER,
-                            password=_PG_PASSWORD,
-                            dbname='postgres')
+                            user=pg_server.username,
+                            password=pg_server.password,
+                            dbname=pg_server.dbname)
     conn.autocommit = True
     try:
         with conn.cursor() as cursor:
             cursor.execute(f'CREATE DATABASE "{dbname}"')
     finally:
         conn.close()
-    return (f'postgresql://{_PG_USER}:{_PG_PASSWORD}@{_PG_HOST}:{port}'
-            f'/{dbname}')
+    return (f'postgresql://{pg_server.username}:{pg_server.password}'
+            f'@{host}:{port}/{dbname}')
 
 
 @pytest.fixture(scope='session')

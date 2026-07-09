@@ -20,6 +20,8 @@ from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_broker
 from sky.serve import serve_state
 from sky.serve import spot_placer
+from tests.unit_tests.spot_placer_test_utils import make_location
+from tests.unit_tests.spot_placer_test_utils import make_placer as _make_placer
 
 _SCALE_UP = autoscalers.AutoscalerDecisionOperator.SCALE_UP
 _SCALE_DOWN = autoscalers.AutoscalerDecisionOperator.SCALE_DOWN
@@ -211,7 +213,7 @@ class TestMultiTickSlotSpending(unittest.TestCase):
     def test_static_snapshot_not_reconsumed_across_ticks(self):
         autoscaler = _make_autoscaler(min_replicas=0, max_replicas=10)
         _feed(autoscaler, 4)
-        replicas = []
+        replicas: list = []
         next_id = 1
         total_fill_ups = 0
         for _ in range(3):
@@ -840,24 +842,23 @@ class TestCapacityHintDemandOnly(unittest.TestCase):
 
 def _make_location(region, cost_marker, use_spot=False):
     del cost_marker  # readability only; cost set via _make_placer
-    cloud = mock.MagicMock()
-    cloud.is_same_cloud = lambda other: str(other) == str(cloud)
-    return spot_placer.Location(cloud=cloud,
-                                region=region,
-                                zone=None,
-                                accelerators={'A100': 1},
-                                use_spot=use_spot)
+    return make_location(region, accelerators={'A100': 1}, use_spot=use_spot)
 
 
-def _make_placer(costs):
-    placer = spot_placer.DynamicFallbackSpotPlacer.__new__(
-        spot_placer.DynamicFallbackSpotPlacer)
-    placer.location2status = {
-        loc: spot_placer.LocationStatus.ACTIVE for loc in costs
-    }
-    placer.location2preempted_at = {}
-    placer.location2cost = dict(costs)
-    return placer
+def _make_manager(placer):
+    """Bare SkyPilotReplicaManager wired for the launch-path tests."""
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    manager._service_name = 'svc'
+    manager.yaml_content = 'unused: patched helpers below'
+    manager._spot_placer = placer
+    manager._launch_thread_pool = {}
+    manager._replica_to_request_id = {}
+    manager._replica_to_launch_cancelled = {}
+    manager._fill_skip_last_log_time = 0.0
+    manager._next_replica_id = 7
+    manager.latest_version = 1
+    return manager
 
 
 class TestZeroCostSelection(unittest.TestCase):
@@ -896,24 +897,10 @@ class TestZeroCostSelection(unittest.TestCase):
 class TestFillLaunchPath(unittest.TestCase):
     """Sentinel launches pin zero-cost-only; aborts leak nothing."""
 
-    def _make_manager(self, placer):
-        manager = replica_managers.SkyPilotReplicaManager.__new__(
-            replica_managers.SkyPilotReplicaManager)
-        manager._service_name = 'svc'
-        manager.yaml_content = 'unused: patched helpers below'
-        manager._spot_placer = placer
-        manager._launch_thread_pool = {}
-        manager._replica_to_request_id = {}
-        manager._replica_to_launch_cancelled = {}
-        manager._fill_skip_last_log_time = 0.0
-        manager._next_replica_id = 7
-        manager.latest_version = 1
-        return manager
-
     def test_abort_creates_no_record_and_keeps_id(self):
         placer = mock.Mock()
         placer.select_next_zero_cost_location.return_value = None
-        manager = self._make_manager(placer)
+        manager = _make_manager(placer)
         override = {_FILL_KEY: True}
         # use_spot=False: the sentinel alone must force the placer path
         # (zero-cost k8s entries are non-spot).
@@ -940,7 +927,7 @@ class TestFillLaunchPath(unittest.TestCase):
         location = _make_location('research-ctx', 'free')
         placer = mock.Mock()
         placer.select_next_zero_cost_location.return_value = location
-        manager = self._make_manager(placer)
+        manager = _make_manager(placer)
         with mock.patch.object(replica_managers,
                                '_should_use_spot',
                                return_value=False), \
@@ -978,7 +965,7 @@ class TestFillLaunchPath(unittest.TestCase):
         # accounting and the placer's load counter.
         location = spot_placer.Location.from_pickleable(_K8S_KEY)
         placer = mock.Mock()
-        manager = self._make_manager(placer)
+        manager = _make_manager(placer)
         persisted_override = dict(location.to_dict())
         with mock.patch.object(replica_managers,
                                '_should_use_spot',
@@ -999,7 +986,7 @@ class TestFillLaunchPath(unittest.TestCase):
         self.assertIs(info.is_spot, False)
 
     def test_sentinel_without_placer_aborts(self):
-        manager = self._make_manager(placer=None)
+        manager = _make_manager(placer=None)
         with mock.patch.object(replica_managers,
                                '_should_use_spot',
                                return_value=False), \
@@ -1253,25 +1240,12 @@ class TestGrantEpochPlumbing(unittest.TestCase):
 class TestEpochFencedLaunch(unittest.TestCase):
     """A fill launch carrying a superseded epoch skips, leaking nothing."""
 
-    def _make_manager(self, placer):
-        manager = replica_managers.SkyPilotReplicaManager.__new__(
-            replica_managers.SkyPilotReplicaManager)
-        manager._service_name = 'svc'
-        manager.yaml_content = 'unused: patched helpers below'
-        manager._spot_placer = placer
-        manager._launch_thread_pool = {}
-        manager._replica_to_request_id = {}
-        manager._replica_to_launch_cancelled = {}
-        manager._fill_skip_last_log_time = 0.0
-        manager.latest_version = 1
-        return manager
-
     def _launch(self, pool_epochs, carried_epoch=7, carried_pool='pool-b'):
         """pool_epochs: pool_key -> current round epoch (the fence read)."""
         location = _make_location('research-ctx', 'free')
         placer = mock.Mock()
         placer.select_next_zero_cost_location.return_value = location
-        manager = self._make_manager(placer)
+        manager = _make_manager(placer)
         override = {_FILL_KEY: True, _EPOCH_KEY: carried_epoch}
         if carried_pool is not None:
             override[_POOL_KEY] = carried_pool
@@ -1346,26 +1320,13 @@ class TestEpochFencedLaunch(unittest.TestCase):
 class TestDemandPlacementGate(unittest.TestCase):
     """Zero-cost holdings >= grant: NEW demand launches skip the free tier."""
 
-    def _make_manager(self, placer):
-        manager = replica_managers.SkyPilotReplicaManager.__new__(
-            replica_managers.SkyPilotReplicaManager)
-        manager._service_name = 'svc'
-        manager.yaml_content = 'unused: patched helpers below'
-        manager._spot_placer = placer
-        manager._launch_thread_pool = {}
-        manager._replica_to_request_id = {}
-        manager._replica_to_launch_cancelled = {}
-        manager._fill_skip_last_log_time = 0.0
-        manager.latest_version = 1
-        return manager
-
     def _launch_demand(self, grant, replicas):
         zero_cost_location = spot_placer.Location.from_pickleable(_K8S_KEY)
         placer = mock.Mock()
         placer.zero_cost_locations.return_value = [zero_cost_location]
         selected = _make_location('us-east-1', 'paid', use_spot=True)
         placer.select_next_location.return_value = selected
-        manager = self._make_manager(placer)
+        manager = _make_manager(placer)
         with mock.patch.object(replica_managers,
                                '_should_use_spot',
                                return_value=True), \

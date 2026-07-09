@@ -8,31 +8,17 @@ Selection is now least-loaded-first with cost as the tiebreak, which is
 identical to the old prefer-unused behavior while any location is free.
 """
 # pylint: disable=redefined-outer-name,unused-variable
-from unittest import mock
-
 import pytest
 
 from sky.serve import spot_placer
+from tests.unit_tests.spot_placer_test_utils import make_location
+from tests.unit_tests.spot_placer_test_utils import make_placer
 
 
 def _make_location(name: str) -> spot_placer.Location:
-    cloud = mock.MagicMock()
-    cloud.is_same_cloud = lambda other: str(other) == str(cloud)
-    cloud.__str__ = lambda self: name.split('/', maxsplit=1)[0]
-    region_zone = name.split('/', maxsplit=1)[1]
-    return spot_placer.Location(cloud=cloud, region=region_zone, zone=None)
-
-
-def _make_placer(locations, costs):
-    """Build a placer without running task-based discovery."""
-    placer = spot_placer.DynamicFallbackSpotPlacer.__new__(
-        spot_placer.DynamicFallbackSpotPlacer)
-    placer.location2status = {
-        loc: spot_placer.LocationStatus.ACTIVE for loc in locations
-    }
-    placer.location2preempted_at = {}
-    placer.location2cost = dict(costs)
-    return placer
+    """'cloud/region-zone' shorthand for a str-identified mock cloud."""
+    cloud_name, region_zone = name.split('/', maxsplit=1)
+    return make_location(region_zone, cloud_name=cloud_name)
 
 
 @pytest.fixture
@@ -40,7 +26,7 @@ def three_zone_placer():
     cheap = _make_location('aws/us-east-2c')
     mid = _make_location('aws/us-west-2a')
     pricey = _make_location('gcp/us-central1-a')
-    placer = _make_placer([cheap, mid, pricey], {
+    placer = make_placer({
         cheap: 1.0,
         mid: 2.0,
         pricey: 3.0,
