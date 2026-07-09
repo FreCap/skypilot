@@ -239,7 +239,10 @@ def _check_autostop_feasibility_early(task: 'sky.Task', autostop_features: Set[
             cluster_name) is not None:
         return
     first_error: Optional[Exception] = None
-    for resource in task.resources:
+    # Stable iteration order: task.resources is a set, and which
+    # candidate's error surfaces as first_error must not vary run to
+    # run when several fail for different reasons.
+    for resource in sorted(task.resources, key=str):
         if resource.cloud is None:
             return
         try:

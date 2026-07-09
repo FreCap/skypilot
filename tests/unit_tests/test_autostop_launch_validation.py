@@ -150,25 +150,30 @@ def _provision_once(prev_cluster_status, prev_cluster_ever_up=None):
     raised = None
     teardown = mock.patch.object(backend_lib.CloudVmRayBackend,
                                  'teardown_no_lock').start()
-    with mock.patch.object(backend_lib.optimizer.Optimizer,
-                         'optimize',
-                         side_effect=exceptions.ResourcesUnavailableError(
-                             'exhausted')), \
-         mock.patch.object(backend_lib,
-                         '_format_provision_failure_blocks',
-                         return_value=''):
-        # The failure formatter renders Resources for humans; it is
-        # presentation-only and chokes on the Mock candidate.
-        try:
-            provisioner.provision_with_retries(
-                task,
-                config,
-                dryrun=False,
-                stream_logs=False,
-                skip_unnecessary_provisioning=False)
-        except Exception as e:  # pylint: disable=broad-except
-            raised = e
-    mock.patch.stopall()
+    try:
+        with mock.patch.object(
+                backend_lib.optimizer.Optimizer,
+                'optimize',
+                side_effect=exceptions.ResourcesUnavailableError(
+                    'exhausted')), \
+             mock.patch.object(backend_lib,
+                               '_format_provision_failure_blocks',
+                               return_value=''):
+            # The failure formatter renders Resources for humans; it is
+            # presentation-only and chokes on the Mock candidate.
+            try:
+                provisioner.provision_with_retries(
+                    task,
+                    config,
+                    dryrun=False,
+                    stream_logs=False,
+                    skip_unnecessary_provisioning=False)
+            except Exception as e:  # pylint: disable=broad-except
+                raised = e
+    finally:
+        # An exception raised while entering the with-block must not
+        # leak the started teardown patch into subsequent tests.
+        mock.patch.stopall()
     return provisioner, to_provision, raised, teardown
 
 
