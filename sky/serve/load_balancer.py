@@ -675,6 +675,35 @@ class SkyServeLoadBalancer:
             'occupancy_probe_age_seconds': occupancy_probe_age,
         })
 
+    def _should_keep_ready_set_on_empty_sync(
+            self, ready_replica_urls: List[str],
+            num_ready_replicas: Optional[int]) -> bool:
+        """Whether to keep the current ready set instead of applying an empty
+        sync result.
+
+        [boltz fork] The controller lists a replica only when it is READY *and*
+        its endpoint resolves. A cold url cache (controller restart) or the
+        endpoint DB being contended under a launch storm can make every READY
+        replica transiently unresolvable, so a 2xx sync returns an empty map
+        even though replicas are alive -- and blindly applying it would
+        ``set_ready_replicas([])`` and 503 all live traffic.
+
+        Keep the existing set only when all three hold: the map is empty, the
+        controller still reports >=1 READY replica (num_ready_replicas), and we
+        currently have a non-empty set to protect. A genuine scale-to-zero
+        (num_ready_replicas == 0) or an older controller that omits the count
+        (None) still applies the empty map, preserving prior behavior.
+
+        Convergence while a set is pinned this way relies on the data-plane
+        quarantine (``_record_proxy_outcome``): a truly-dead replica is evicted
+        once it accrues enough TCP-dead failures, which shrinks the pinned set
+        until it empties and the guard stops firing. A partial resolution (any
+        non-empty map) always takes the normal path and prunes dead replicas
+        directly, so this only ever pins on a fully-empty sync.
+        """
+        return (not ready_replica_urls and bool(num_ready_replicas) and
+                bool(self._load_balancing_policy.ready_replicas))
+
     # ------------------------------------------------------------------
     # [boltz fork] Async-occupancy probing.
     #
@@ -806,6 +835,7 @@ class SkyServeLoadBalancer:
         ready_replica_urls = []
         replica_info = {}
         routing_spec = None
+        num_ready_replicas: Optional[int] = None
         capacity_hint = None
 
         # Present the control-plane bearer token so the (now-authenticated)
@@ -855,6 +885,10 @@ class SkyServeLoadBalancer:
                     self._request_aggregator.clear()
                     response_json = await response.json()
                     replica_info = response_json.get('replica_info', {})
+                    # Count of READY, active replicas the controller has, which
+                    # can exceed len(replica_info) when endpoints are briefly
+                    # unresolvable. None from an older controller that omits it.
+                    num_ready_replicas = response_json.get('num_ready_replicas')
                     # [boltz fork] The controller ships the routing config
                     # (policy/target-qps/stream-timeout) alongside replica_info
                     # so `sky serve update` changes reach this LB without a
@@ -871,6 +905,25 @@ class SkyServeLoadBalancer:
                              f'\nTraceback: {traceback.format_exc()}')
             else:
                 logger.info(f'Available Replica URLs: {ready_replica_urls}')
+                if self._should_keep_ready_set_on_empty_sync(
+                        ready_replica_urls, num_ready_replicas):
+                    # Spurious empty sync: the controller still has READY
+                    # replicas but none resolved this round. Keep the existing
+                    # ready set rather than blanking it (which would 503 all
+                    # live traffic), and try again next sync.
+                    logger.warning(
+                        f'Controller reported {num_ready_replicas} READY '
+                        'replica(s) but no resolvable URLs this sync; keeping '
+                        'the existing ready set instead of blanking it.')
+                    # The capacity hint is independent of the ready set, so
+                    # keep it fresh even while pinning (a spurious-empty sync
+                    # is often a controller restart -- exactly when admission
+                    # needs current provisioning/target counts).
+                    self._capacity_hint = (capacity_hint if isinstance(
+                        capacity_hint, dict) else None)
+                    self._ready = True
+                    self._last_sync_time = time.monotonic()
+                    return
                 with self._client_pool_lock:
                     # Apply the fetched routing spec BEFORE (re)setting the
                     # ready replicas: if the policy object was swapped, the

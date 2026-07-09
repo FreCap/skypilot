@@ -134,13 +134,19 @@ class TestGetRoutingSpec:
             assert ctrl._get_routing_spec() is None  # pylint: disable=protected-access
 
 
-def _sync(ctrl: controller.SkyServeController, infos,
-          active_versions=(1,)) -> Dict[str, Dict[str, str]]:
+def _sync_full(ctrl: controller.SkyServeController, infos,
+               active_versions=(1,)):
+    """Returns the full (replica_info, num_ready) tuple."""
     record = {'active_versions': list(active_versions)}
     with mock.patch.object(controller.serve_state,
                            'get_service_from_name',
                            return_value=record):
         return ctrl._get_lb_replica_info(infos)  # pylint: disable=protected-access
+
+
+def _sync(ctrl: controller.SkyServeController, infos,
+          active_versions=(1,)) -> Dict[str, Dict[str, str]]:
+    return _sync_full(ctrl, infos, active_versions)[0]
 
 
 class TestGetLbReplicaInfo:
@@ -295,6 +301,56 @@ class TestGetLbReplicaInfo:
             }
         }
         assert recovered.url_resolutions == 1
+
+
+class TestNumReadyReplicas:
+    """The sync response reports the count of READY, active replicas -- which
+    can exceed the size of the resolved url map when endpoints are transiently
+    unresolvable. The load balancer uses this to distinguish an authoritative
+    zero from a spurious empty map and avoid blanking a healthy ready set."""
+
+    def test_counts_ready_replicas_even_when_urls_unresolvable(self):
+        # Both replicas are READY but their endpoints don't resolve this round:
+        # the map is empty yet num_ready is 2 (the transient-empty signal).
+        ctrl = _make_controller()
+        infos = [
+            _FakeReplicaInfo(1, serve_state.ReplicaStatus.READY, url=None),
+            _FakeReplicaInfo(2, serve_state.ReplicaStatus.READY, url=None),
+        ]
+        replica_info, num_ready = _sync_full(ctrl, infos)
+        assert not replica_info
+        assert num_ready == 2
+
+    def test_zero_when_no_ready_replicas(self):
+        # A genuine authoritative zero: nothing READY -> empty map, count 0.
+        ctrl = _make_controller()
+        infos = [
+            _FakeReplicaInfo(1, serve_state.ReplicaStatus.PROVISIONING),
+            _FakeReplicaInfo(2, serve_state.ReplicaStatus.NOT_READY),
+        ]
+        replica_info, num_ready = _sync_full(ctrl, infos)
+        assert not replica_info
+        assert num_ready == 0
+
+    def test_counts_only_active_version_ready_replicas(self):
+        # Outdated-version and not-ready replicas are excluded from the count.
+        ctrl = _make_controller()
+        infos = [
+            _FakeReplicaInfo(1,
+                             serve_state.ReplicaStatus.READY,
+                             version=1,
+                             url='http://1.1.1.1:8080',
+                             accelerators={'L4': 1}),
+            _FakeReplicaInfo(2,
+                             serve_state.ReplicaStatus.READY,
+                             version=2,
+                             url=None),
+            _FakeReplicaInfo(3, serve_state.ReplicaStatus.PROVISIONING),
+        ]
+        replica_info, num_ready = _sync_full(ctrl, infos, active_versions=(2,))
+        # Only replica 2 is active+READY; its url is unresolvable this round.
+        assert not replica_info
+        assert num_ready == 1
 
 
 class TestTranslateInFlight:

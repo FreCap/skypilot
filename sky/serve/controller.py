@@ -182,7 +182,7 @@ class SkyServeController:
 
     def _get_lb_replica_info(
         self, replica_infos: List['replica_managers.ReplicaInfo']
-    ) -> Dict[str, Dict[str, str]]:
+    ) -> Tuple[Dict[str, Dict[str, str]], int]:
         """Build the url -> replica info mapping for load_balancer_sync.
 
         [boltz fork] Resolving a replica's url and gpu_type is expensive (a
@@ -196,6 +196,13 @@ class SkyServeController:
         `replica_infos` is fetched once by the caller and shared with the
         capacity-hint computation, so the async sync handler issues no
         extra replica-list DB reads.
+
+        Returns the (url -> info) mapping and the number of READY, active
+        replicas seen -- which can exceed len(mapping) when a READY replica's
+        endpoint is transiently unresolvable this round. The load balancer uses
+        that count to tell an authoritative zero (no READY replicas) apart from
+        a spurious empty map (READY replicas exist but none resolved), so it
+        never blanks a healthy routing set on a transient blip.
         """
         record = serve_state.get_service_from_name(self._service_name)
         assert record is not None, ('No service record found for '
@@ -203,10 +210,12 @@ class SkyServeController:
         active_versions = set(record['active_versions'])
         replica_cache: Dict[int, Tuple[str, str, int]] = {}
         replica_info: Dict[str, Dict[str, str]] = {}
+        num_ready = 0
         for info in replica_infos:
             if (info.status != serve_state.ReplicaStatus.READY or
                     info.version not in active_versions):
                 continue
+            num_ready += 1
             cached = self._lb_replica_cache.get(info.replica_id)
             if cached is None:
                 url = info.url
@@ -264,7 +273,7 @@ class SkyServeController:
         # Replacing the cache with this sync's active replicas prunes the
         # replicas that are no longer READY.
         self._lb_replica_cache = replica_cache
-        return replica_info
+        return replica_info, num_ready
 
     def _translate_in_flight(
             self,
@@ -514,7 +523,8 @@ class SkyServeController:
             # Resolve the url->id mapping BEFORE translating in_flight:
             # _get_lb_replica_info rebuilds _lb_replica_cache from this
             # sync's READY replicas.
-            lb_replica_info = self._get_lb_replica_info(replica_infos)
+            lb_replica_info, num_ready = self._get_lb_replica_info(
+                replica_infos)
             # Merge the new demand gauges (all optional; an old LB simply
             # omits them) into the single dict handed to the autoscaler.
             # The QPS/pool autoscalers only .get('timestamps'), so the
@@ -530,6 +540,7 @@ class SkyServeController:
 
             return responses.JSONResponse(content={
                 'replica_info': lb_replica_info,
+                'num_ready_replicas': num_ready,
                 'routing_spec': self._get_routing_spec(),
                 'capacity_hint': self._get_capacity_hint(replica_infos),
             },

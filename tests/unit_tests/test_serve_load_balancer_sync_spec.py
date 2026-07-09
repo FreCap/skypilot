@@ -7,6 +7,9 @@ live. These tests exercise that handler on parsed state (which policy object is
 active, its target-qps map, the stored stream timeout) -- not on any logging.
 """
 # pylint: disable=invalid-name,protected-access
+import asyncio
+from unittest import mock
+
 from sky.serve import constants
 from sky.serve import load_balancer
 from sky.serve import load_balancing_policies as lb_policies
@@ -156,3 +159,123 @@ def test_ready_replicas_repopulated_after_swap():
     assert set(lb._load_balancing_policy.ready_replicas) == set(urls)
     # Load map initialized for each replica (not short-circuited).
     assert all(lb._load_balancing_policy.load_map[u] == 0 for u in urls)
+
+
+class TestKeepReadySetOnEmptySync:
+    """A 2xx sync with an empty url map must not blank a healthy ready set when
+    the controller still reports READY replicas (they were transiently
+    unresolvable) -- otherwise the LB 503s all live traffic on a controller
+    restart / launch-storm blip. A genuine zero or an older controller (no
+    count) still applies the empty map."""
+
+    def _lb_with_ready(self, urls):
+        lb = _make_lb()  # least_load
+        lb._load_balancing_policy.set_ready_replicas(urls)
+        return lb
+
+    def test_keep_when_empty_map_but_controller_has_ready(self):
+        lb = self._lb_with_ready(['http://a:8080'])
+        # empty urls + num_ready > 0 + a set to protect -> keep it.
+        assert lb._should_keep_ready_set_on_empty_sync([], 2) is True
+
+    def test_blank_on_authoritative_zero(self):
+        lb = self._lb_with_ready(['http://a:8080'])
+        # Controller confirms zero READY replicas -> apply the empty map.
+        assert lb._should_keep_ready_set_on_empty_sync([], 0) is False
+
+    def test_blank_when_count_absent_old_controller(self):
+        lb = self._lb_with_ready(['http://a:8080'])
+        # Older controller omits the count (None) -> preserve prior behavior.
+        assert lb._should_keep_ready_set_on_empty_sync([], None) is False
+
+    def test_no_keep_when_current_set_already_empty(self):
+        lb = self._lb_with_ready([])
+        # Nothing to protect (e.g. first sync) -> don't special-case.
+        assert lb._should_keep_ready_set_on_empty_sync([], 3) is False
+
+    def test_no_keep_when_map_non_empty(self):
+        lb = self._lb_with_ready(['http://a:8080'])
+        # Normal sync with resolvable urls -> apply as usual.
+        assert lb._should_keep_ready_set_on_empty_sync(['http://b:8080'],
+                                                       1) is False
+
+
+class _FakeResp:
+    """Async-context-manager stub for aiohttp's response."""
+
+    def __init__(self, body) -> None:
+        self._body = body
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc) -> bool:
+        return False
+
+    def raise_for_status(self) -> None:
+        pass
+
+    async def json(self):
+        return self._body
+
+
+class _FakeSession:
+    """Async-context-manager stub for aiohttp.ClientSession."""
+
+    def __init__(self, resp: _FakeResp) -> None:
+        self._resp = resp
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc) -> bool:
+        return False
+
+    def post(self, *args, **kwargs) -> _FakeResp:
+        return self._resp
+
+
+def _run_one_sync(lb: load_balancer.SkyServeLoadBalancer, body) -> None:
+    """Drive a single _sync_with_controller_once with a mocked controller
+    response carrying `body`."""
+    session = _FakeSession(_FakeResp(body))
+    with mock.patch.object(load_balancer.aiohttp,
+                           'ClientSession',
+                           return_value=session), \
+         mock.patch.object(load_balancer.serve_utils,
+                           'get_controller_auth_token',
+                           return_value=None):
+        asyncio.new_event_loop().run_until_complete(
+            lb._sync_with_controller_once())
+
+
+class TestSyncOnceEmptyMapWiring:
+    """Integration coverage for the empty-sync guard inside
+    _sync_with_controller_once: the pure predicate is proven elsewhere; these
+    assert the method actually preserves vs blanks the ready set end to end."""
+
+    def test_empty_map_with_ready_count_preserves_set(self):
+        lb = _make_lb()
+        urls = ['http://a:8080', 'http://b:8080']
+        lb._load_balancing_policy.set_ready_replicas(urls)
+        _run_one_sync(lb, {
+            'replica_info': {},
+            'num_ready_replicas': 2,
+            'routing_spec': None,
+        })
+        # Spurious empty sync: the healthy set survives...
+        assert set(lb._load_balancing_policy.ready_replicas) == set(urls)
+        # ...and the LB still marks itself synced.
+        assert lb._ready is True
+
+    def test_empty_map_authoritative_zero_blanks_set(self):
+        lb = _make_lb()
+        lb._load_balancing_policy.set_ready_replicas(['http://a:8080'])
+        _run_one_sync(lb, {
+            'replica_info': {},
+            'num_ready_replicas': 0,
+            'routing_spec': None,
+        })
+        # Genuine zero -> the set is blanked (prior behavior).
+        assert lb._load_balancing_policy.ready_replicas == []
+        assert lb._ready is True
