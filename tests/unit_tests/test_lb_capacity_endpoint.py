@@ -88,6 +88,7 @@ class TestCapacityEndpoint(unittest.TestCase):
         self.assertEqual(body['rejected_in_window'], 0)
         self.assertIsNone(body['provisioning_replicas'])
         self.assertIsNone(body['target_replicas'])
+        self.assertIsNone(body['max_replicas'])
 
     def test_demand_fields_reflect_gauges_and_hint(self):
         policy = lb_policies.LeastLoadPolicy()
@@ -98,6 +99,7 @@ class TestCapacityEndpoint(unittest.TestCase):
         balancer._capacity_hint = {
             'provisioning_replicas': 4,
             'target_num_replicas': 12,
+            'max_replicas': 20,
         }
         import json
         body = json.loads(
@@ -106,6 +108,7 @@ class TestCapacityEndpoint(unittest.TestCase):
         self.assertEqual(body['rejected_in_window'], 1)
         self.assertEqual(body['provisioning_replicas'], 4)
         self.assertEqual(body['target_replicas'], 12)
+        self.assertEqual(body['max_replicas'], 20)
 
     def test_in_flight_ignores_pruned_replicas(self):
         # Load entries for replicas no longer ready must not inflate the

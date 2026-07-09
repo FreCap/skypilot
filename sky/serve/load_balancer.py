@@ -670,9 +670,9 @@ class SkyServeLoadBalancer:
         policies) the in-flight count, and with an external LB it keeps
         serving straight through control-plane restarts. Aggregates only:
         per-replica URLs are internal addresses and admission needs
-        counts, not targets. Slow-changing spec fields (max_replicas,
-        target qps) intentionally stay on the `serve status` path — they
-        only change on `serve update`.
+        counts, not targets. The controller sync also carries the configured
+        max_replicas ceiling so this endpoint is a complete admission read;
+        it remains null until a controller supporting the field has synced.
 
         CONTRACT for admission readers (deliberate, do not "fix"):
         - ready_replicas / in_flight / the occupancy aggregates describe
@@ -736,6 +736,7 @@ class SkyServeLoadBalancer:
             'rejected_in_window': self._rejected_in_window(),
             'provisioning_replicas': hint.get('provisioning_replicas'),
             'target_replicas': hint.get('target_num_replicas'),
+            'max_replicas': hint.get('max_replicas'),
             # [boltz fork] Async-occupancy aggregates (see the probe loop).
             # For fast-ack async fleets envelope-only in_flight reads ~0
             # while replicas crunch, so admission should size on

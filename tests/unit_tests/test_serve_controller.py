@@ -467,6 +467,7 @@ class _FakeAutoscaler:
         self._target = target
         self._recomputed = recomputed
         self.latest_version = latest_version
+        self.max_replicas = 20
 
     def get_final_target_num_replicas(self) -> int:
         return self._target
@@ -503,7 +504,11 @@ class TestGetCapacityHint:
             recomputed=True,
             latest_version=2)
         hint = ctrl._get_capacity_hint(self._replicas())  # pylint: disable=protected-access
-        assert hint == {'provisioning_replicas': 2, 'target_num_replicas': 5}
+        assert hint == {
+            'provisioning_replicas': 2,
+            'target_num_replicas': 5,
+            'max_replicas': 20,
+        }
 
     def test_stale_autoscaler_reports_at_least_live_fleet(self):
         # A rebuilt controller (target reset to min_replicas, no demand
@@ -516,7 +521,11 @@ class TestGetCapacityHint:
             recomputed=False,
             latest_version=2)
         hint = ctrl._get_capacity_hint(self._replicas())  # pylint: disable=protected-access
-        assert hint == {'provisioning_replicas': 2, 'target_num_replicas': 3}
+        assert hint == {
+            'provisioning_replicas': 2,
+            'target_num_replicas': 3,
+            'max_replicas': 20,
+        }
 
     def test_stale_max_rule_keeps_larger_target(self):
         ctrl = _make_controller()
@@ -526,6 +535,7 @@ class TestGetCapacityHint:
             latest_version=2)
         hint = ctrl._get_capacity_hint(self._replicas())  # pylint: disable=protected-access
         assert hint['target_num_replicas'] == 10
+        assert hint['max_replicas'] == 20
 
 
 class TestReservedCapacityPollerStart:
