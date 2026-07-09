@@ -147,6 +147,14 @@ class TestEpochFencingPG(sqlite_suite.TestEpochFencing):
     pass
 
 
+class TestStaleWriterFencePG(sqlite_suite.TestStaleWriterFence):
+    pass
+
+
+class TestAtomicPersistFencePG(sqlite_suite.TestAtomicPersistFence):
+    pass
+
+
 class TestMidQueryDemandBindDebitPG(sqlite_suite.TestMidQueryDemandBindDebit):
     pass
 
@@ -197,6 +205,7 @@ class TestMigrationChainPG:
                     for column in inspector.get_columns('reserved_fill_rounds')
                 }
                 assert 'phantom_streak' in columns, columns
+                assert 'shrink_baseline' in columns, columns
         finally:
             engine.dispose()
 

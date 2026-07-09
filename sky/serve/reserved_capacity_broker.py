@@ -32,6 +32,7 @@ shared serve DB every controller in the api-server pod already uses).
 """
 import dataclasses
 import json
+import math
 import os
 import time
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
@@ -460,8 +461,18 @@ def remove_claim(service_name: str) -> None:
 
 def _claim_input(row: Dict[str, Any]) -> ClaimInput:
     effective_cap = row.get('effective_cap')
+    weight = float(row['weight'] or 1.0)
+    if not math.isfinite(weight):
+        # Defensive: SkyServiceSpec rejects non-finite weights, but a
+        # poisoned DB row (older writer, manual surgery) must not crash
+        # water-filling (inf/inf -> NaN in rounding) EVERY round for the
+        # pool while the claim stays live. Clamp loudly to the default.
+        logger.warning(
+            f'Reserved-fill broker: claim of {row["service_name"]!r} '
+            f'carries a non-finite weight {weight!r}; clamping to 1.0.')
+        weight = 1.0
     return ClaimInput(floor=int(row['floor_replicas'] or 0),
-                      weight=float(row['weight'] or 1.0),
+                      weight=weight,
                       holdings_fill=int(row['holdings_fill'] or 0),
                       launchable=bool(row['launchable']),
                       effective_cap=(int(effective_cap)
@@ -697,9 +708,10 @@ def run_round_if_stale(service_name: str, pool_key: str,
     first. Under the cross-process broker lock: if the published round is
     younger than ~one poll interval, return the caller's slice of it (no
     cluster query -- this is what collapses N per-interval queries to one);
-    otherwise drive a new round: snapshot time BEFORE the slow query, read
-    all live claims, validate, debit, allocate, publish atomically under a
-    CAS-advanced lease epoch.
+    otherwise drive a new round: CAS-advance the global lease to take an
+    ownership token, snapshot time BEFORE the slow query, read all live
+    claims, validate, debit, allocate, publish atomically conditional on
+    the lease still holding that exact token.
 
     Returns None when the caller holds no live claim (expired, or rejected
     by a validation) or the round could not be driven; the caller then
@@ -743,6 +755,29 @@ def _run_round_locked(service_name: str, pool_key: str,
         return _allocation_from_round(service_name, round_row)
 
     # ---- Drive a new round. ----
+    # Ownership token FIRST, committed before the slow cluster query: the
+    # advisory round lock can die mid-query (e.g. a PostgreSQL advisory-lock
+    # session drop), letting a replacement writer drive and publish a newer
+    # round while this writer is still querying. The lease epoch is
+    # unconditionally CAS-advanced here, so the replacement's own advance
+    # invalidates this writer's token and its eventual publish fails closed
+    # (rowcount 0 -> rollback -> observation discarded). Reading the lease
+    # only at publish time could not fence that writer: it would read the
+    # replacement's epoch and publish "successfully" over the newer round.
+    lease = serve_state.get_reserved_fill_lease()
+    lease_expired = (lease is None or lease['expires_at'] is None or
+                     float(lease['expires_at']) < now)
+    lease_ttl_seconds = (constants.RESERVED_FILL_LEASE_TTL_INTERVALS *
+                         poll_interval_seconds)
+    lease_token = serve_state.acquire_reserved_fill_lease_token(
+        prev_epoch=int(lease['epoch']) if lease is not None else None,
+        expires_at=now + lease_ttl_seconds)
+    if lease_token is None:
+        logger.error(
+            'Reserved-fill broker: lost the lease-token race before the '
+            f'round query (pool {pool_key}); a writer bypassed the round '
+            'lock. Skipping this cycle.')
+        return None
     # Snapshot time BEFORE the slow cluster query: a zero-cost row created
     # while the query runs already occupies a slot the query may still have
     # counted free, and the created_at > snapshot_time debit only catches it
@@ -811,8 +846,6 @@ def _run_round_locked(service_name: str, pool_key: str,
 
     claims = {name: _claim_input(row) for name, row in claim_rows.items()}
     names = sorted(claims)
-    lease = serve_state.get_reserved_fill_lease()
-    prev_epoch = int(lease['epoch']) if lease is not None else None
     prev_grants_json: Dict[str, Any] = (json.loads(round_row['grants'] or '{}')
                                         if round_row is not None else {})
     prev_raw: Dict[str, int] = (json.loads(round_row['raw_grants'] or '{}')
@@ -845,8 +878,11 @@ def _run_round_locked(service_name: str, pool_key: str,
         # No debit scan on the fast path (#108 identity), so no draining
         # term either; harmless -- a single-claimant round's stored sum is
         # never a damping baseline (its None grant carries no integer
-        # baseline into the next multi-claimant round).
+        # baseline into the next multi-claimant round). Any pending shrink
+        # candidate is dropped for the same reason: with the peers gone
+        # there is no damping bypass left to confirm.
         conserved_holdings = sum_holdings
+        new_shrink_baseline: Optional[int] = None
     else:
         # The debit scan runs on blind rounds too (replica rows are DB
         # reads, not cluster queries): draining rows keep occupying the
@@ -920,14 +956,43 @@ def _run_round_locked(service_name: str, pool_key: str,
             }
         prev_sum_holdings = (round_row['sum_holdings']
                              if round_row is not None else None)
+        prev_shrink_baseline = (round_row['shrink_baseline']
+                                if round_row is not None else None)
         # The immediate-down bypass keys on (holdings + draining): a
         # holdings drop whose slots merely moved into a graceful drain is
         # NOT capacity that physically vanished -- the drainers' pods are
-        # still bound. Only when the drain completes (rows leave
-        # SHUTTING_DOWN and the pods are actually gone) does the
-        # conserved sum shrink and the bypass fire.
-        holdings_shrank = (prev_sum_holdings is not None and
-                           conserved_holdings < int(prev_sum_holdings))
+        # still bound. And a one-round conserved shrink can be a pure
+        # observation artifact: a drain completing between the cluster
+        # query and the row scan leaves the slot counted occupied by the
+        # query (not free) yet already deleted from the rows (not held,
+        # not draining), so BOTH terms omit it for exactly this round;
+        # firing the bypass on that phantom culls a warm replica the next
+        # query would have vindicated. The bypass therefore requires
+        # CONFIRMATION: a shrink below the previous round's conserved sum
+        # only records that sum as a pending baseline (this round takes
+        # the normal two-round damped path), and only a next round still
+        # below the baseline treats the capacity as physically gone. A
+        # legitimate fast reclaim (pods really deleted) loses at most one
+        # round of down-speed to this -- acceptable, and the ordinary
+        # two-round damped down usually lands the same round anyway. The
+        # blind-round holdings floor below is unaffected: it keys on
+        # CURRENT holdings, and still overrides any confirmed-shrink down
+        # while the pool is unmeasurable.
+        new_shrink_baseline = None
+        if (prev_shrink_baseline is not None and
+                conserved_holdings < int(prev_shrink_baseline)):
+            # Confirmed: the shrink persisted across two consecutive
+            # row-consistent scans -- pods are physically gone.
+            holdings_shrank = True
+        elif (prev_sum_holdings is not None and
+              conserved_holdings < int(prev_sum_holdings)):
+            # First observation of this shrink: could be the
+            # query-then-scan gap; damp normally and remember the
+            # pre-shrink baseline for next round's confirmation.
+            holdings_shrank = False
+            new_shrink_baseline = int(prev_sum_holdings)
+        else:
+            holdings_shrank = False
         damped = damp_grants(raw_grants, prev_published, prev_raw,
                              holdings_shrank)
         if query_ok:
@@ -958,24 +1023,32 @@ def _run_round_locked(service_name: str, pool_key: str,
         grants = dict(damped)
 
     grants_changed = round_row is None or prev_grants_json != grants
-    lease_expired = (lease is None or lease['expires_at'] is None or
-                     float(lease['expires_at']) < now)
-    # Two epoch streams: the ROUND epoch is per-pool (the fencing token the
-    # launch path compares against -- pool A's grant churn must not fence
-    # pool B's launches), the LEASE epoch is global and exists only for the
-    # publish CAS. Both bump only when THIS pool's allocation changes (or
-    # after a lease-dead gap where every outstanding grant is suspect), not
-    # on every round: per-round bumps would fence out nearly every fill
-    # launch in steady state (each service's carried epoch is refreshed
-    # only on its own poll), while the fencing intent is precisely "never
-    # actuate a superseded allocation".
+    # Feeds are part of the allocation the fence protects: a feed-only
+    # redistribution (grants damped in place while the launchable-now
+    # split moved to a peer) or a positive-feed round giving way to a
+    # blackout must fence launch batches queued under the previous round
+    # -- their slots may now be fed to someone else, or unmeasurable.
+    # Multi-claimant rounds only: the single-claimant fast-path feed is
+    # the raw measured free (fluctuates every round, redistributes to
+    # nobody), and bumping on it would fence steady-state fill launches
+    # the pre-broker #108 path never fenced.
+    feeds_changed = (len(claims) != 1 and round_row is not None and
+                     json.loads(round_row['feeds'] or '{}') != feeds)
+    # The ROUND epoch is per-pool (the fencing token the launch path
+    # compares against -- pool A's grant churn must not fence pool B's
+    # launches). It bumps only when THIS pool's allocation (grants OR
+    # feeds) changes, or after a lease-dead gap where every outstanding
+    # grant is suspect -- not on every round: per-round bumps would fence
+    # out nearly every fill launch in steady state (each service's carried
+    # epoch is refreshed only on its own poll), while the fencing intent
+    # is precisely "never actuate a superseded allocation". The LEASE
+    # epoch is a separate global stream advanced unconditionally per
+    # driven round (the pre-query ownership token above).
     prev_round_epoch = (int(round_row['epoch'])
                         if round_row is not None else None)
     new_epoch = prev_round_epoch if prev_round_epoch is not None else 0
-    new_lease_epoch = prev_epoch if prev_epoch is not None else 0
-    if grants_changed or lease_expired:
+    if grants_changed or feeds_changed or lease_expired:
         new_epoch += 1
-        new_lease_epoch += 1
     round_id = int(round_row['round_id']) + 1 if round_row is not None else 1
     published = serve_state.publish_reserved_fill_round(
         pool_key,
@@ -990,15 +1063,15 @@ def _run_round_locked(service_name: str, pool_key: str,
         last_observed_free=last_free,
         last_observed_free_ts=last_free_ts,
         phantom_streak=phantom_streak,
-        prev_epoch=prev_epoch,
-        lease_epoch=new_lease_epoch,
-        lease_expires_at=now +
-        constants.RESERVED_FILL_LEASE_TTL_INTERVALS * poll_interval_seconds)
+        shrink_baseline=new_shrink_baseline,
+        lease_token=lease_token,
+        lease_expires_at=now + lease_ttl_seconds)
     if not published:
         logger.error(
-            'Reserved-fill broker: lease CAS failed while publishing round '
-            f'{round_id} for pool {pool_key} (lease epoch {prev_epoch} -> '
-            f'{new_lease_epoch}); a writer bypassed the round lock. Skipping.')
+            'Reserved-fill broker: lease token superseded while publishing '
+            f'round {round_id} for pool {pool_key} (token {lease_token}); a '
+            'replacement writer took over mid-query. Discarding this '
+            'observation.')
         return None
     logger.info(
         f'Reserved-fill broker: round {round_id} (epoch {new_epoch}) for '

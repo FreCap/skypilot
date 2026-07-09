@@ -434,6 +434,21 @@ class TestMultiClaimantRounds:
         assert alloc_b.grant == 3
         assert alloc_b.feed == 3
 
+    @pytest.mark.parametrize('poisoned', [float('inf'), float('nan')])
+    def test_poisoned_non_finite_weight_clamps_to_default(self, poisoned):
+        # SkyServiceSpec rejects non-finite weights at construction, but
+        # a poisoned DB claim row (older writer, manual surgery) must not
+        # crash weighted water-filling (inf/inf -> NaN in rounding) on
+        # every round for the pool while the claim stays live: the broker
+        # clamps it to the default weight and the round completes.
+        _upsert('svc-a', weight=poisoned)
+        _upsert('svc-b', weight=1.0)
+        alloc = _run('svc-a', free=10)
+        assert alloc is not None
+        assert alloc.grant == 5  # clamped to 1.0: equal-weight split
+        alloc_b = broker.get_my_allocation('svc-b')
+        assert alloc_b is not None and alloc_b.grant == 5
+
     def test_fresh_round_is_read_not_redriven(self, clock):
         _upsert('svc-a')
         _upsert('svc-b')
@@ -694,11 +709,14 @@ class TestEpochFencing:
         _upsert('svc-b')
         same = _run('svc-a', free=10)
         assert same is not None
-        # Identical inputs -> identical grants -> stable epoch: steady-state
-        # fill launches are never fenced out.
+        # Identical inputs -> identical grants AND feeds -> stable epoch:
+        # steady-state fill launches are never fenced out.
         assert same.epoch == first.epoch
         # Reallocation: grant damping needs the new split proposed by two
-        # consecutive rounds before it is published (and the epoch bumps).
+        # consecutive rounds before it is published. The epoch bumps twice
+        # across the window: once when the raw-clamped FEEDS move (round
+        # after the weight shift -- feed redistribution already supersedes
+        # queued launches), once when the damped grants land.
         proposal = None
         for _ in range(2):
             clock.advance(61)
@@ -709,7 +727,7 @@ class TestEpochFencing:
         changed = proposal
         assert changed is not None
         assert changed.grant == 9
-        assert changed.epoch == first.epoch + 1
+        assert changed.epoch == first.epoch + 2
         # Stale-epoch actuation fencing: an actuator carrying the old
         # allocation's epoch sees a newer current epoch and must skip.
         assert broker.current_epoch(_POOL) == changed.epoch
@@ -728,7 +746,8 @@ class TestEpochFencing:
         a_first = _run('svc-a', free=10)
         b_first = _run('svc-c', observation=obs_b, pool=pool_b)
         assert a_first is not None and b_first is not None
-        # Reallocate pool A (weight shift; grant damping needs two rounds).
+        # Reallocate pool A (weight shift; grant damping needs two rounds;
+        # the epoch bumps twice -- feed re-clamp, then the damped grants).
         a_changed = None
         for _ in range(2):
             clock.advance(61)
@@ -738,7 +757,7 @@ class TestEpochFencing:
             _upsert('svc-d', pool_key=pool_b)
             a_changed = _run('svc-a', free=10)
         assert a_changed is not None
-        assert a_changed.epoch == a_first.epoch + 1
+        assert a_changed.epoch == a_first.epoch + 2
         # Pool B's fencing epoch is untouched by pool A's bump: a pool-B
         # launch carrying b_first.epoch still passes the fence.
         assert broker.current_epoch(pool_b) == b_first.epoch
@@ -756,9 +775,180 @@ class TestEpochFencing:
             _upsert('svc-d', pool_key=pool_b)
             b_changed = _run('svc-c', observation=obs_b, pool=pool_b)
         assert b_changed is not None
-        assert b_changed.epoch == b_first.epoch + 1
+        assert b_changed.epoch == b_first.epoch + 2
         assert broker.current_epoch(pool_b) == b_changed.epoch
         assert b_first.epoch != broker.current_epoch(pool_b)
+
+    def test_feed_only_redistribution_bumps_epoch(self, clock, monkeypatch):
+        rows: List[mock.Mock] = []
+        monkeypatch.setattr(
+            serve_state, 'get_replica_infos',
+            mock.Mock(side_effect=lambda name: rows if name == 'svc-a' else []))
+        _upsert('svc-a')
+        _upsert('svc-b')
+        first = _run('svc-a', free=4)
+        assert first is not None
+        assert first.grant == 2 and first.feed == 2
+        # svc-a materializes its feed: the measured free drops by the
+        # same amount, the total is conserved and the damped grants stay
+        # {2, 2} -- but the launchable-now split moves entirely to svc-b.
+        # A svc-a launch batch queued under the previous round would now
+        # spend slots fed to the peer: the epoch must bump on the
+        # feed-only change even though grants are identical.
+        rows = _live_fill_rows(2)
+        clock.advance(61)
+        _upsert('svc-a', holdings_fill=2)
+        _upsert('svc-b')
+        second = _run('svc-a', free=2)
+        assert second is not None
+        assert second.grant == 2 and second.feed == 0
+        alloc_b = broker.get_my_allocation('svc-b')
+        assert alloc_b is not None and alloc_b.feed == 2
+        assert second.epoch == first.epoch + 1
+
+    def test_positive_feed_to_blackout_bumps_epoch(self, clock):
+        _upsert('svc-a')
+        _upsert('svc-b')
+        first = _run('svc-a', free=4)
+        assert first is not None
+        assert first.grant == 2 and first.feed == 2
+        clock.advance(61)
+        _upsert('svc-a')
+        _upsert('svc-b')
+        blind = _run('svc-a', observation=_obs(None, gpu_names=()))
+        assert blind is not None
+        # The blackout releases nothing (grants carried) and feeds
+        # nothing -- and the positive-feed -> blackout transition is an
+        # allocation change: launches queued under the positive round
+        # must not execute into an unmeasurable pool.
+        assert blind.grant == first.grant
+        assert blind.feed == 0
+        assert blind.epoch == first.epoch + 1
+
+
+@pytest.mark.usefixtures('_broker_db')
+class TestStaleWriterFence:
+    """A writer that lost the round handoff mid-query cannot publish.
+
+    The lease epoch is the writer's ownership token, CAS-advanced and
+    committed BEFORE the slow cluster query: a replacement writer's own
+    acquisition invalidates it, so the stale writer's publish fails
+    closed and its (older) observation is discarded -- even when the
+    grants it computed are byte-identical to the published ones (the
+    old post-query lease read allowed same-epoch overwrites).
+    """
+
+    def test_replacement_writer_supersedes_slow_query(self):
+        _upsert('svc-a')
+        _upsert('svc-b')
+
+        def racing_query():
+            # Writer B drives a FULL round from inside A's query window
+            # (the test lock is a nullcontext, so re-entry stands in for
+            # "A's advisory-lock session died and B took over"). Two
+            # sequential calls on one DB: no real threads needed for the
+            # token logic.
+            inner = broker.run_round_if_stale('svc-b', _POOL, lambda: _obs(6),
+                                              60.0)
+            assert inner is not None
+            assert inner.feed == 3
+            return _obs(10)
+
+        stale = broker.run_round_if_stale('svc-a', _POOL, racing_query, 60.0)
+        # A's publish CAS failed: no allocation, observation discarded.
+        assert stale is None
+        round_row = serve_state.get_reserved_fill_round(_POOL)
+        assert round_row is not None
+        # B's round survives untouched: A's older 10-free observation
+        # never overwrote the newer 6-free one.
+        assert int(round_row['round_id']) == 1
+        assert int(round_row['last_observed_free']) == 6
+        assert sum(json.loads(round_row['feeds']).values()) == 6
+
+
+@pytest.mark.usefixtures('_broker_db')
+class TestAtomicPersistFence:
+    """The launch-path epoch recheck is atomic with the replica persist."""
+
+    _STUB_INFO = 'replica-info-stub'  # pickled opaquely by the persist
+
+    def _replica_row_count(self):
+        engine = serve_state._db_manager.get_engine()
+        with orm.Session(engine) as session:
+            return session.execute(
+                sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                    serve_state.replicas_table)).scalar()
+
+    def test_stale_epoch_not_persisted(self):
+        _upsert('svc-a')
+        _upsert('svc-b')
+        alloc = _run('svc-a', free=4)
+        assert alloc is not None
+        assert not serve_state.add_replica_if_round_epoch(
+            'svc-a',
+            1,
+            self._STUB_INFO,
+            pool_key=_POOL,
+            expected_epoch=alloc.epoch - 1)
+        assert self._replica_row_count() == 0
+
+    def test_current_epoch_persists_and_missing_round_fails_open(self):
+        _upsert('svc-a')
+        _upsert('svc-b')
+        alloc = _run('svc-a', free=4)
+        assert alloc is not None
+        assert serve_state.add_replica_if_round_epoch(
+            'svc-a',
+            1,
+            self._STUB_INFO,
+            pool_key=_POOL,
+            expected_epoch=alloc.epoch)
+        # No round row for the pool: fail open, like the pre-check.
+        assert serve_state.add_replica_if_round_epoch(
+            'svc-a',
+            2,
+            self._STUB_INFO,
+            pool_key=broker.make_pool_key('other-ctx', 'H100'),
+            expected_epoch=99)
+        assert self._replica_row_count() == 2
+
+    def test_round_published_between_precheck_and_persist_fences(
+            self, monkeypatch):
+        # The cheap pre-check read passes, then a new round publishes
+        # BEFORE the row persist (injected via the session hook right as
+        # the atomic recheck's SELECT executes -- the same pattern as the
+        # prune-race test): the persist must see the new epoch and write
+        # nothing.
+        _upsert('svc-a')
+        _upsert('svc-b')
+        alloc = _run('svc-a', free=4)
+        assert alloc is not None
+        carried = alloc.epoch
+        assert broker.current_epoch(_POOL) == carried  # pre-check passes
+        real_execute = orm.Session.execute
+        raced = {'done': False}
+        rounds_table = serve_state.reserved_fill_rounds_table
+
+        def racing_execute(session, statement, *args, **kwargs):
+            if (not raced['done'] and
+                    isinstance(statement, sqlalchemy.Select) and
+                    'reserved_fill_rounds' in str(statement)):
+                raced['done'] = True
+                engine = serve_state._db_manager.get_engine()
+                with orm.Session(engine) as other:
+                    real_execute(
+                        other,
+                        sqlalchemy.update(rounds_table).where(
+                            rounds_table.c.pool_key == _POOL).values(
+                                epoch=carried + 1))
+                    other.commit()
+            return real_execute(session, statement, *args, **kwargs)
+
+        monkeypatch.setattr(orm.Session, 'execute', racing_execute)
+        assert not serve_state.add_replica_if_round_epoch(
+            'svc-a', 1, self._STUB_INFO, pool_key=_POOL, expected_epoch=carried)
+        assert raced['done']
+        assert self._replica_row_count() == 0
 
 
 @pytest.mark.usefixtures('_broker_db')
@@ -1074,3 +1264,87 @@ class TestDrainWindowConservation:
         alloc_b = broker.get_my_allocation('svc-b')
         assert alloc_b is not None
         assert alloc_b.grant == 2 and alloc_b.feed == 2
+
+    def test_one_round_phantom_shrink_does_not_bypass_damping(
+            self, clock, monkeypatch):
+        rows = {'svc-a': _live_fill_rows(5), 'svc-b': _live_fill_rows(5)}
+        monkeypatch.setattr(
+            serve_state, 'get_replica_infos',
+            mock.Mock(side_effect=lambda name: rows.get(name, [])))
+        _upsert('svc-a', holdings_fill=5)
+        _upsert('svc-b', holdings_fill=5)
+        steady = _run('svc-a', free=0)
+        assert steady is not None and steady.grant == 5
+        # One svc-a drain completes AFTER the cluster query counted its
+        # slot occupied but BEFORE the row scan deleted the row: the
+        # conserved sum reads 9 while the freed slot is missing from
+        # this round's measured free too -- a one-round observation
+        # artifact, not capacity that physically vanished. The
+        # immediate-down bypass must NOT fire on this unconfirmed
+        # shrink; the round only records the pre-shrink baseline.
+        rows = {'svc-a': _live_fill_rows(4), 'svc-b': _live_fill_rows(5)}
+        clock.advance(61)
+        _upsert('svc-a', holdings_fill=4)
+        _upsert('svc-b', holdings_fill=5)
+        phantom = _run('svc-a', free=0)
+        assert phantom is not None
+        alloc_b = broker.get_my_allocation('svc-b')
+        assert alloc_b is not None and alloc_b.grant == 5  # damping held
+        round_row = serve_state.get_reserved_fill_round(_POOL)
+        assert round_row is not None
+        assert int(round_row['shrink_baseline']) == 10
+        # Next round the freed slot shows up in the measured free: the
+        # total recovers to 10, so even though the holdings-level shrink
+        # is now confirmed (the replica really is gone), the raw
+        # entitlements are back at the fixpoint and nobody is culled.
+        clock.advance(61)
+        _upsert('svc-a', holdings_fill=4)
+        _upsert('svc-b', holdings_fill=5)
+        recovered = _run('svc-a', free=1)
+        assert recovered is not None
+        assert recovered.grant == 5
+        assert recovered.feed == 1  # the visible slot refills svc-a
+        alloc_b = broker.get_my_allocation('svc-b')
+        assert alloc_b is not None and alloc_b.grant == 5
+        round_row = serve_state.get_reserved_fill_round(_POOL)
+        assert round_row is not None
+        assert round_row['shrink_baseline'] is None  # resolved
+
+    def test_two_round_confirmed_shrink_bypasses_damping(
+            self, clock, monkeypatch):
+        rows = {'svc-a': _live_fill_rows(5), 'svc-b': _live_fill_rows(5)}
+        monkeypatch.setattr(
+            serve_state, 'get_replica_infos',
+            mock.Mock(side_effect=lambda name: rows.get(name, [])))
+        _upsert('svc-a', holdings_fill=5)
+        _upsert('svc-b', holdings_fill=5)
+        steady = _run('svc-a', free=0)
+        assert steady is not None and steady.grant == 5
+        # svc-a's pods start physically vanishing (external preemption,
+        # nothing shows up as free). First shrunken scan (conserved 8):
+        # unconfirmed, damping holds the published grants.
+        rows = {'svc-a': _live_fill_rows(3), 'svc-b': _live_fill_rows(5)}
+        clock.advance(61)
+        _upsert('svc-a', holdings_fill=3)
+        _upsert('svc-b', holdings_fill=5)
+        pending = _run('svc-a', free=0)
+        assert pending is not None
+        alloc_b = broker.get_my_allocation('svc-b')
+        assert alloc_b is not None and alloc_b.grant == 5
+        # Second consecutive shrunken scan (conserved 6 < baseline 10):
+        # CONFIRMED -- the bypass fires and the down applies immediately
+        # at the raw entitlement (3/3 of total 6). The ordinary two-round
+        # damped path would only act on max(proposed, last proposed) =
+        # 4: the bypass is observably faster on a confirmed shrink.
+        rows = {'svc-a': _live_fill_rows(1), 'svc-b': _live_fill_rows(5)}
+        clock.advance(61)
+        _upsert('svc-a', holdings_fill=1)
+        _upsert('svc-b', holdings_fill=5)
+        confirmed = _run('svc-a', free=0)
+        assert confirmed is not None
+        assert confirmed.grant == 3
+        alloc_b = broker.get_my_allocation('svc-b')
+        assert alloc_b is not None and alloc_b.grant == 3
+        round_row = serve_state.get_reserved_fill_round(_POOL)
+        assert round_row is not None
+        assert round_row['shrink_baseline'] is None  # consumed

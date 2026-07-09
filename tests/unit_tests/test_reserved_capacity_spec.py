@@ -230,17 +230,28 @@ def test_setstate_pre_object_bool_pickles_expose_default_knobs():
     assert restored.reserved_fill_weight == 1.0
 
 
-@pytest.mark.parametrize('bad_obj', [
-    {
-        'floor_replicas': -1
-    },
-    {
-        'weight': 0
-    },
-    {
-        'weight': -2
-    },
-])
+@pytest.mark.parametrize(
+    'bad_obj',
+    [
+        {
+            'floor_replicas': -1
+        },
+        {
+            'weight': 0
+        },
+        {
+            'weight': -2
+        },
+        # Non-finite weights pass naive sign checks (inf > 0; NaN compares
+        # False to everything) and would poison the broker's weighted
+        # water-fill (inf/inf -> NaN) every round for the whole pool.
+        {
+            'weight': float('inf')
+        },
+        {
+            'weight': float('nan')
+        },
+    ])
 def test_object_form_rejects_bad_knobs_at_constructor(bad_obj):
     # The schema guards the YAML path; the constructor guards programmatic
     # construction.

@@ -94,12 +94,17 @@ def query_pool_observation(
     thread (or the broker round it drives), never from the autoscaler
     decision tick.
 
-    Unknown availability (-1, e.g. missing list-pods permission) counts as
-    0 free: fill must never launch on guessed capacity. A FAILED query
-    returns free_slots=None (measurement blackout) -- distinct from a
-    successful 0. gpu_names carries the canonical accelerator names the
-    query saw, the broker's phantom-pool signal (empty = the claimed GPU
-    resolves to no labeled nodes).
+    Unknown availability (any negative count, e.g. a swallowed pod-list
+    403 surfacing as {'A100': -1}) is a MEASUREMENT BLACKOUT
+    (free_slots=None), exactly like a raised query error: converting it
+    to an authoritative 0 would let a new claimant or weight change
+    redistribute grants and drain existing holdings while availability is
+    unknown -- precisely what the broker's blackout semantics prohibit.
+    (Single-claimant observable behavior is unchanged: a blackout feeds 0,
+    same as a 0 measurement.) A FAILED/unknown query is distinct from a
+    successful 0 (full pool). gpu_names carries the canonical accelerator
+    names the query saw, the broker's phantom-pool signal (empty = the
+    claimed GPU resolves to no labeled nodes).
     """
     try:
         _, _, available = kubernetes_catalog.list_accelerators_realtime(
@@ -114,6 +119,13 @@ def query_pool_observation(
                        f'{context!r} gpu {gpu_name!r}: '
                        f'{common_utils.format_exception(e)}')
         return reserved_capacity_broker.PoolObservation(free_slots=None)
+    if any(count < 0 for count in available.values()):
+        logger.warning('Reserved-capacity poll: availability unknown for '
+                       f'context {context!r} gpu {gpu_name!r} '
+                       f'({available}); treating as a measurement blackout.')
+        return reserved_capacity_broker.PoolObservation(free_slots=None,
+                                                        gpu_names=tuple(
+                                                            available.keys()))
     free_gpus = sum(count for count in available.values() if count > 0)
     return reserved_capacity_broker.PoolObservation(
         free_slots=free_gpus // max(1, per_replica),

@@ -1349,7 +1349,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # carry an epoch + pool key: without a broker round this
                 # is a no-op (single-service identity), and a missing
                 # round row (current None) fails open -- there is no
-                # newer allocation to defer to.
+                # newer allocation to defer to. This read is only the
+                # cheap EARLY-OUT before location selection: a round can
+                # still publish between it and the row persist, so the
+                # authoritative recheck runs atomically WITH the persist
+                # below (add_replica_if_round_epoch).
                 if fill_grant_epoch is not None and fill_pool_key is not None:
                     broker_epoch = reserved_capacity_broker.current_epoch(
                         fill_pool_key)
@@ -1438,7 +1442,29 @@ class SkyPilotReplicaManager(ReplicaManager):
         # replaced row's attribution on recovery re-drives (the sentinel
         # only exists at original emission).
         info.reserved_fill = bool(zero_cost_only or prior_reserved_fill)
-        serve_state.add_or_update_replica(self._service_name, replica_id, info)
+        if (zero_cost_only and fill_grant_epoch is not None and
+                fill_pool_key is not None):
+            # Broker epoch fence, authoritative leg: the pre-check above
+            # is TOCTOU (a round can publish a new epoch between it and
+            # this persist, after capacity was already fed to a peer), so
+            # the final recheck and the row upsert are ONE transaction.
+            # The transaction spans only this persist -- never the launch
+            # thread (built above, started later by _refresh_thread_pool).
+            if not serve_state.add_replica_if_round_epoch(
+                    self._service_name,
+                    replica_id,
+                    info,
+                    pool_key=fill_pool_key,
+                    expected_epoch=fill_grant_epoch):
+                # No row was written and the launch thread was never
+                # registered/started: same leak-nothing contract as the
+                # pre-check fence.
+                self._log_fill_skip(
+                    f'grant epoch {fill_grant_epoch} superseded at persist')
+                return False
+        else:
+            serve_state.add_or_update_replica(self._service_name, replica_id,
+                                              info)
         if existing_replica_infos is not None:
             # Bulk callers (recovery re-drive) reuse one snapshot across a
             # whole wave of launches. Append the replica we just placed so
