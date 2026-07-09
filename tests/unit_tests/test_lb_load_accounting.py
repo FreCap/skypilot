@@ -128,6 +128,7 @@ class TestProxySlotRelease:
 
     def _request(self):
         request = mock.MagicMock()
+        request.method = 'POST'
         request.url.path = '/x'
         request.url.query = ''
         request.headers.raw = []
@@ -137,6 +138,26 @@ class TestProxySlotRelease:
 
         request.body = _body
         return request
+
+    @staticmethod
+    def _asgi_scope():
+        return {
+            'type': 'http',
+            'asgi': {
+                'version': '3.0',
+                'spec_version': '2.4'
+            },
+            'http_version': '1.1',
+            'method': 'POST',
+            'scheme': 'http',
+            'path': '/x',
+            'raw_path': b'/x',
+            'query_string': b'',
+            'root_path': '',
+            'headers': [],
+            'client': None,
+            'server': None,
+        }
 
     def test_missing_client_releases_slot(self):
         policy = mock.MagicMock()
@@ -256,6 +277,139 @@ class TestProxySlotRelease:
 
         asyncio.run(_run())
         policy.post_execute_hook.assert_called_once()
+
+    def test_policy_swap_releases_the_policy_that_owned_the_slot(self):
+        """A live routing-spec update must not redirect an old release to
+        the replacement policy and steal one of its new slots."""
+        url = 'http://a:8080'
+        old_policy = lb_policies.LeastLoadPolicy()
+        old_policy.set_ready_replicas([url])
+        client = mock.MagicMock()
+        setattr(client, lb_module._INFLIGHT_ATTR, 0)
+        send_response = mock.MagicMock()
+        send_response.status_code = 200
+        send_response.headers = {}
+
+        async def _aiter_raw():
+            yield b'done'
+
+        send_response.aiter_raw = _aiter_raw
+        send_response.aclose = mock.AsyncMock()
+        client.send = mock.AsyncMock(return_value=send_response)
+        balancer = _make_lb(old_policy, client_pool={url: client})
+
+        async def _run():
+            response = await balancer._proxy_request_to(url, self._request())
+            assert old_policy.load_map[url] == 1
+
+            new_policy = lb_policies.InstanceAwareLeastLoadPolicy()
+            new_policy.set_ready_replicas([url])
+            new_policy.pre_execute_hook(url, self._request())
+            balancer._load_balancing_policy = new_policy
+            assert new_policy.load_map[url] == 1
+
+            async for _ in response.body_iterator:
+                pass
+            assert old_policy.load_map[url] == 0
+            assert new_policy.load_map[url] == 1
+
+        asyncio.run(_run())
+
+    def test_response_start_failure_releases_slot_and_client(self):
+        """A downstream failure before body iteration still releases both
+        owners; StreamingResponse never starts its iterator in this case."""
+        policy = mock.MagicMock()
+        client = mock.MagicMock()
+        setattr(client, lb_module._INFLIGHT_ATTR, 0)
+        send_response = mock.MagicMock()
+        send_response.status_code = 200
+        send_response.headers = {}
+        iterator_started = False
+
+        async def _aiter_raw():
+            nonlocal iterator_started
+            iterator_started = True
+            yield b'unreachable'
+
+        send_response.aiter_raw = _aiter_raw
+        send_response.aclose = mock.AsyncMock()
+        client.send = mock.AsyncMock(return_value=send_response)
+        balancer = _make_lb(policy, client_pool={'http://a:8080': client})
+
+        async def _run():
+            response = await balancer._proxy_request_to('http://a:8080',
+                                                        self._request())
+            send_started = asyncio.Event()
+
+            async def _send(message):
+                del message
+                send_started.set()
+                raise OSError('downstream closed before response start')
+
+            async def _receive():
+                await send_started.wait()
+                return {'type': 'http.disconnect'}
+
+            try:
+                await response(self._asgi_scope(), _receive, _send)
+            except BaseException:  # Starlette version-specific wrapper.
+                pass
+
+        asyncio.run(_run())
+        assert not iterator_started
+        policy.post_execute_hook.assert_called_once()
+        assert getattr(client, lb_module._INFLIGHT_ATTR) == 0
+        send_response.aclose.assert_awaited_once()
+
+    def test_cancellation_before_body_iteration_releases_owners(self):
+        policy = mock.MagicMock()
+        client = mock.MagicMock()
+        setattr(client, lb_module._INFLIGHT_ATTR, 0)
+        send_response = mock.MagicMock()
+        send_response.status_code = 200
+        send_response.headers = {}
+        iterator_started = False
+
+        async def _aiter_raw():
+            nonlocal iterator_started
+            iterator_started = True
+            yield b'unreachable'
+
+        send_response.aiter_raw = _aiter_raw
+        send_response.aclose = mock.AsyncMock()
+        client.send = mock.AsyncMock(return_value=send_response)
+        balancer = _make_lb(policy, client_pool={'http://a:8080': client})
+
+        async def _run():
+            response = await balancer._proxy_request_to('http://a:8080',
+                                                        self._request())
+            send_started = asyncio.Event()
+            never = asyncio.Event()
+
+            async def _send(message):
+                del message
+                send_started.set()
+                await never.wait()
+
+            async def _receive():
+                await never.wait()
+                return {'type': 'http.disconnect'}
+
+            task = asyncio.create_task(
+                response(self._asgi_scope(), _receive, _send))
+            await send_started.wait()
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            assert task.cancelled()
+
+        asyncio.run(_run())
+        assert not iterator_started
+        policy.post_execute_hook.assert_called_once()
+        assert getattr(client, lb_module._INFLIGHT_ATTR) == 0
+        send_response.aclose.assert_awaited_once()
 
     def test_proxy_uses_split_connect_read_timeout(self):
         """The proxy must pass a split httpx.Timeout: long read (sync

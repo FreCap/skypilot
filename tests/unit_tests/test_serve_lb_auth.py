@@ -130,6 +130,9 @@ class _FakeResp:
         return {'replica_info': {}, 'routing_spec': None}
 
     async def __aenter__(self):
+        on_response_enter = self._captured.get('on_response_enter')
+        if on_response_enter is not None:
+            on_response_enter()
         return self
 
     async def __aexit__(self, *exc):
@@ -144,6 +147,7 @@ class _FakeSession:
 
     def post(self, *args, **kwargs):
         self._captured['headers'] = kwargs.get('headers')
+        self._captured['json'] = kwargs.get('json')
         return _FakeResp(self._status, self._captured)
 
     async def __aenter__(self):
@@ -254,21 +258,66 @@ def test_request_aggregator_is_bounded():
         agg.to_dict()['timestamps']) == constants.LB_REQUEST_TIMESTAMP_CAP
 
 
-def test_aggregator_cleared_only_on_success(monkeypatch):
+def test_aggregator_drained_on_success_and_restored_on_failure(monkeypatch):
     monkeypatch.delenv(constants.CONTROLLER_AUTH_TOKEN_ENV_VAR, raising=False)
 
     # Failed sync (401): the batch must be retained for the next report.
     lb = _make_lb()
-    agg = mock.MagicMock()
-    agg.to_dict.return_value = {'timestamps': [1, 2, 3]}
+    agg = serve_utils.RequestTimestamp()
+    agg.timestamps.extend([1, 2, 3])
     lb._request_aggregator = agg
     _sync_once(monkeypatch, lb, 401, {})
-    agg.clear.assert_not_called()
+    assert agg.to_dict()['timestamps'] == [1, 2, 3]
 
-    # Successful sync (200): the batch is cleared to avoid unbounded growth.
+    # Successful sync (200): only the delivered batch is acknowledged.
     lb2 = _make_lb()
-    agg2 = mock.MagicMock()
-    agg2.to_dict.return_value = {'timestamps': [1, 2, 3]}
+    agg2 = serve_utils.RequestTimestamp()
+    agg2.timestamps.extend([1, 2, 3])
     lb2._request_aggregator = agg2
     _sync_once(monkeypatch, lb2, 200, {})
-    agg2.clear.assert_called_once()
+    assert agg2.to_dict()['timestamps'] == []
+
+
+def test_aggregator_keeps_arrivals_during_successful_sync(monkeypatch):
+    """A request arriving after drain but before the 2xx belongs to the
+    next batch; acknowledging the sent batch must not erase it."""
+    monkeypatch.delenv(constants.CONTROLLER_AUTH_TOKEN_ENV_VAR, raising=False)
+    lb = _make_lb()
+    lb._request_aggregator.timestamps.append(1)
+    captured = {
+        'on_response_enter': lambda: lb._request_aggregator.timestamps.append(2)
+    }
+
+    _sync_once(monkeypatch, lb, 200, captured)
+
+    assert captured['json']['request_aggregator']['timestamps'] == [1]
+    assert lb._request_aggregator.to_dict()['timestamps'] == [2]
+
+
+def test_aggregator_restores_failed_batch_before_new_arrivals(monkeypatch):
+    monkeypatch.delenv(constants.CONTROLLER_AUTH_TOKEN_ENV_VAR, raising=False)
+    lb = _make_lb()
+    lb._request_aggregator.timestamps.append(1)
+    captured = {
+        'on_response_enter': lambda: lb._request_aggregator.timestamps.append(2)
+    }
+
+    _sync_once(monkeypatch, lb, 401, captured)
+
+    assert captured['json']['request_aggregator']['timestamps'] == [1]
+    assert lb._request_aggregator.to_dict()['timestamps'] == [1, 2]
+
+
+def test_aggregator_restore_cap_keeps_newest_samples():
+    agg = serve_utils.RequestTimestamp()
+    cap = constants.LB_REQUEST_TIMESTAMP_CAP
+    agg.timestamps.extend(range(cap))
+    drained = agg.drain()
+    agg.timestamps.append(cap)  # New arrival while the old batch is in flight.
+
+    agg.restore(drained)
+
+    restored = agg.to_dict()['timestamps']
+    assert len(restored) == cap
+    assert restored[0] == 1
+    assert restored[-1] == cap

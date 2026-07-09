@@ -32,6 +32,17 @@ logger = sky_logging.init_logger(__name__)
 # must not share a counter.
 _INFLIGHT_ATTR = '_sky_inflight_requests'
 
+# HTTP methods whose defined semantics tolerate replay after an ambiguous
+# transport failure. POST is intentionally absent: a replica may have accepted
+# an async job before the LB sees a read/reset/protocol error.
+_IDEMPOTENT_METHODS = frozenset(
+    {'GET', 'HEAD', 'PUT', 'DELETE', 'OPTIONS', 'TRACE'})
+
+# These failures happen before any request bytes can reach the replica. They
+# remain safe to retry even for non-idempotent methods.
+_PRE_SEND_TRANSPORT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout,
+                              httpx.PoolTimeout)
+
 
 class _RetriableStatusError(Exception):
     """A replica answered with a status the service marked retriable.
@@ -47,6 +58,34 @@ class _RetriableStatusError(Exception):
         super().__init__(
             f'replica {url} answered retriable status {status_code}')
         self.status_code = status_code
+
+
+def _transport_retry_is_safe(method: str, exc: httpx.RequestError) -> bool:
+    """Whether replay after a transport error cannot duplicate side effects."""
+    if method.upper() in _IDEMPOTENT_METHODS:
+        return True
+    return isinstance(exc, _PRE_SEND_TRANSPORT_ERRORS)
+
+
+class _ReleasingStreamingResponse(fastapi.responses.StreamingResponse):
+    """Streaming response that releases its upstream owner on every ASGI exit.
+
+    A normal StreamingResponse only runs its body iterator and background task
+    after the response-start message succeeds. If the downstream disconnects,
+    or the response task is cancelled, before then, neither cleanup path runs.
+    Bracketing the complete ASGI call closes that gap; the callback itself is
+    idempotent because the iterator/background paths still release eagerly.
+    """
+
+    def __init__(self, *args: Any, release: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._release = release
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await self._release()
 
 
 def _is_dead_connection_error(exc: Exception) -> bool:
@@ -980,17 +1019,23 @@ class SkyServeLoadBalancer:
             self._in_flight_with_draining())
         if self._session_id is None:
             self._session_id = str(uuid.uuid4())
-        sync_payload = {
-            'request_aggregator': self._request_aggregator.to_dict(),
-            'in_flight': in_flight,
-            'routing_urls': routing_urls,
-            'unknown_in_flight_urls': unknown_urls,
-            'draining_urls': list(self._draining_clients or {}),
-            'lb_session_id': self._session_id,
-            'queue_depth': self._queue_depth,
-            'rejected_in_window': self._rejected_in_window(),
-        }
         async with aiohttp.ClientSession() as session:
+            # Remove exactly the batch being sent BEFORE awaiting the
+            # controller. Requests arriving during the await accumulate in the
+            # now-empty aggregator for the next sync. A failed/cancelled send
+            # restores this batch ahead of those newer arrivals in `finally`.
+            request_batch = self._request_aggregator.drain()
+            request_batch_accepted = False
+            sync_payload = {
+                'request_aggregator': request_batch,
+                'in_flight': in_flight,
+                'routing_urls': routing_urls,
+                'unknown_in_flight_urls': unknown_urls,
+                'draining_urls': list(self._draining_clients or {}),
+                'lb_session_id': self._session_id,
+                'queue_depth': self._queue_depth,
+                'rejected_in_window': self._rejected_in_window(),
+            }
             try:
                 # Send request information
                 async with session.post(
@@ -1001,15 +1046,13 @@ class SkyServeLoadBalancer:
                             constants.LB_CONTROLLER_SYNC_TIMEOUT_SECONDS),
                 ) as response:
                     response.raise_for_status()
-                    # Clean up only after the controller ACCEPTED the report
-                    # (2xx). Clearing before raise_for_status would silently
-                    # drop the batch on a failed sync (e.g. 401), starving the
-                    # autoscaler of load signal it never received. The rare
-                    # partial-failure inverse (controller counted it but the LB
-                    # saw a non-2xx) re-sends the batch, double-counting a few
-                    # timestamps -- tolerated: it biases autoscaling toward
-                    # transient over-provisioning, the safe direction.
-                    self._request_aggregator.clear()
+                    # A 2xx acknowledges this exact drained batch. Mark it
+                    # accepted before decoding the response: the controller has
+                    # already collected the timestamps even if its response body
+                    # is malformed. The inverse partial-failure case (controller
+                    # counted it but the LB never receives 2xx) restores and
+                    # re-sends the batch, conservatively over-counting.
+                    request_batch_accepted = True
                     response_json = await response.json()
                     replica_info = response_json.get('replica_info', {})
                     # Count of READY, active replicas the controller has, which
@@ -1132,6 +1175,9 @@ class SkyServeLoadBalancer:
                 # First successful sync -> ready to serve (readiness gate).
                 self._ready = True
                 self._last_sync_time = time.monotonic()
+            finally:
+                if not request_batch_accepted:
+                    self._request_aggregator.restore(request_batch)
 
     async def _drain_and_close_client(self, url: str,
                                       client: httpx.AsyncClient) -> None:
@@ -1209,8 +1255,12 @@ class SkyServeLoadBalancer:
         """
         logger.info(f'Proxy request to {url}')
         # The token ties this request's release to the exact accounting
-        # generation it incremented (see LoadBalancingPolicy hooks).
-        slot_token = self._load_balancing_policy.pre_execute_hook(url, request)
+        # generation it incremented (see LoadBalancingPolicy hooks). Keep the
+        # policy OBJECT too: a live routing-spec update may replace
+        # self._load_balancing_policy while this request is awaiting headers or
+        # streaming. Its release must go back to the owner that incremented it.
+        slot_policy = self._load_balancing_policy
+        slot_token = slot_policy.pre_execute_hook(url, request)
         # Every exit that does NOT hand a streaming response to the client
         # must release the in-flight slot itself, or failed/aborted attempts
         # permanently inflate this replica's load and skew routing away
@@ -1285,8 +1335,7 @@ class SkyServeLoadBalancer:
                 try:
                     await proxy_response.aclose()
                 finally:
-                    self._load_balancing_policy.post_execute_hook(
-                        url, request, slot_token)
+                    slot_policy.post_execute_hook(url, request, slot_token)
                     _drop_client_refcount()
 
             async def _stream_with_release():
@@ -1296,11 +1345,12 @@ class SkyServeLoadBalancer:
                 finally:
                     await _release_slot()
 
-            response = fastapi.responses.StreamingResponse(
+            response = _ReleasingStreamingResponse(
                 content=_stream_with_release(),
                 status_code=proxy_response.status_code,
                 headers=proxy_response.headers,
-                background=background.BackgroundTask(_release_slot))
+                background=background.BackgroundTask(_release_slot),
+                release=_release_slot)
             # Ownership of the slot transfers to the stream/background pair
             # only once the response object exists and will be returned.
             released = True
@@ -1312,8 +1362,7 @@ class SkyServeLoadBalancer:
             return e
         finally:
             if not released:
-                self._load_balancing_policy.post_execute_hook(
-                    url, request, slot_token)
+                slot_policy.post_execute_hook(url, request, slot_token)
                 # Only defined once the client was checked out; exits
                 # before that (no client) have nothing to drop.
                 if 'client' in locals() and client is not None:
@@ -1419,6 +1468,25 @@ class SkyServeLoadBalancer:
                 # 499 means a client terminates the connection
                 # before the server is able to respond.
                 return fastapi.responses.Response(status_code=499)
+            if (isinstance(response_or_exception, httpx.RequestError) and
+                    not _transport_retry_is_safe(request.method,
+                                                 response_or_exception)):
+                # A read/write/protocol failure does not prove whether the
+                # replica accepted a non-idempotent request before the
+                # connection failed. Replaying an async POST could enqueue the
+                # same job twice while returning only the later acknowledgement.
+                # Connect/pool failures remain retryable because no request
+                # bytes reached the replica.
+                exception = common_utils.remove_color(
+                    common_utils.format_exception(response_or_exception,
+                                                  use_bracket=True))
+                raise fastapi.HTTPException(
+                    status_code=502,
+                    detail=(
+                        f'Not retrying non-idempotent {request.method} request '
+                        'after an ambiguous replica transport failure; the '
+                        'replica may already have accepted it. '
+                        f'Error: {exception}.'))
             if (all_ready_tried and
                     isinstance(response_or_exception, _RetriableStatusError)):
                 # Every ready replica already shed THIS request with a
