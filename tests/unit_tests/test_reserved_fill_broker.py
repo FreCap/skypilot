@@ -306,12 +306,14 @@ def _replica_stub(is_ready=True,
                   created_at=None,
                   region='research-ctx',
                   gpu='A100',
-                  reserved_fill=False):
+                  reserved_fill=False,
+                  status=None):
     info = mock.Mock()
     info.is_ready = is_ready
     info.is_terminal = is_terminal
     info.created_at = created_at
     info.reserved_fill = reserved_fill
+    info.status = status
     info.location = {
         'cloud': 'Kubernetes',
         'region': region,
@@ -539,6 +541,53 @@ class TestClaimLifecycle:
         _upsert('svc-b')
         assert _run('svc-a', observation=phantom) is None
         assert not serve_state.get_reserved_fill_claims(pool_key=_POOL)
+
+    def test_confirmed_phantom_publishes_blackout_round(self, clock):
+        # A confirmed rejection must still publish a round: without one
+        # the freshness gate never engages and every claimant re-drives
+        # the full cluster query each interval forever (with the pinned
+        # streak re-confirming each time).
+        _upsert('svc-a')
+        _upsert('svc-b')
+        phantom = _obs(0, gpu_names=())
+        for _ in range(2):
+            assert _run('svc-a', observation=phantom) is not None
+            clock.advance(61)
+            _upsert('svc-a')
+            _upsert('svc-b')
+        before = serve_state.get_reserved_fill_round(_POOL)
+        assert before is not None
+        confirm_time = clock.now
+        assert _run('svc-a', observation=phantom) is None
+        assert not serve_state.get_reserved_fill_claims(pool_key=_POOL)
+        round_row = serve_state.get_reserved_fill_round(_POOL)
+        assert round_row is not None
+        assert json.loads(round_row['grants']) == {}
+        assert json.loads(round_row['feeds']) == {}
+        assert float(round_row['snapshot_time']) == confirm_time
+        # Grants went from something to nothing: an allocation change, so
+        # the fencing epoch bumps once at the transition.
+        assert int(round_row['epoch']) == int(before['epoch']) + 1
+        # Within the interval, pollers (which re-upsert their claims each
+        # cycle) read the fresh blackout round: no allocation, and
+        # crucially NO new cluster query.
+        clock.advance(10)
+        _upsert('svc-a')
+        _upsert('svc-b')
+        query = mock.Mock(side_effect=AssertionError('must not re-query'))
+        assert broker.run_round_if_stale('svc-a', _POOL, query, 60.0) is None
+        query.assert_not_called()
+        # A later healthy observation resets the streak and resumes
+        # normal rounds for the re-claimed services.
+        clock.advance(61)
+        _upsert('svc-a')
+        _upsert('svc-b')
+        healthy = _run('svc-a', free=6)
+        assert healthy is not None
+        assert healthy.grant == 3 and healthy.feed == 3
+        resumed = serve_state.get_reserved_fill_round(_POOL)
+        assert resumed is not None
+        assert int(resumed['phantom_streak']) == 0
 
     def test_service_teardown_deletes_claim_row(self):
         # Service-level teardown must not leave a live claim absorbing
@@ -820,6 +869,120 @@ class TestFedLaunchBootSurvival:
         settled = _run('svc-a', free=2)
         assert settled is not None
         assert settled.grant == 2
+        alloc_b = broker.get_my_allocation('svc-b')
+        assert alloc_b is not None
+        assert alloc_b.grant == 2 and alloc_b.feed == 2
+
+
+@pytest.mark.usefixtures('_broker_db')
+class TestDrainWindowConservation:
+    """Draining fill replicas must not vanish from the pool total.
+
+    Regression: a culled zero-cost fill replica turns SHUTTING_DOWN
+    (terminal -> excluded from its owner's claimed holdings) while its pod
+    stays bound for the whole graceful drain (excluded from the measured
+    free too), so the round total undercounted by every drainer AND the
+    holdings drop read as "pods physically gone", firing the immediate
+    down-move bypass -- a rebalance then culled warm replicas below the
+    allocation fixpoint (killed 10 where 6 was correct, refilled after).
+    """
+
+    def _draining_stub(self):
+        return _replica_stub(is_ready=False,
+                             is_terminal=True,
+                             status=serve_state.ReplicaStatus.SHUTTING_DOWN,
+                             reserved_fill=True,
+                             created_at=1.0)
+
+    def test_grants_hold_the_fixpoint_while_drains_are_in_flight(
+            self, clock, monkeypatch):
+        rows = {'svc-a': [], 'svc-b': []}
+        monkeypatch.setattr(
+            serve_state, 'get_replica_infos',
+            mock.Mock(side_effect=lambda name: rows.get(name, [])))
+        # Steady state: pool of 20, svc-a and svc-b hold 10 fill each.
+        _upsert('svc-a', holdings_fill=10)
+        _upsert('svc-b', holdings_fill=10)
+        steady = _run('svc-a', free=0)
+        assert steady is not None and steady.grant == 10
+        # svc-c arrives with floor 8: fixpoint is a=4, b=4, c=12. The
+        # down-move persists across two rounds (damping), then a and b
+        # each cull exactly 6 replicas.
+        for _ in range(2):
+            clock.advance(61)
+            _upsert('svc-a', holdings_fill=10)
+            _upsert('svc-b', holdings_fill=10)
+            _upsert('svc-c', floor=8)
+            alloc = _run('svc-a', free=0)
+            assert alloc is not None
+        assert alloc.grant == 4
+        # The 12 culled replicas enter their graceful drain: terminal (out
+        # of claimed holdings) but their pods stay bound, so the measured
+        # free stays 0 for multiple broker rounds.
+        rows = {
+            'svc-a': [self._draining_stub() for _ in range(6)],
+            'svc-b': [self._draining_stub() for _ in range(6)],
+        }
+        for _ in range(2):
+            clock.advance(61)
+            _upsert('svc-a', holdings_fill=4)
+            _upsert('svc-b', holdings_fill=4)
+            _upsert('svc-c', floor=8)
+            draining = _run('svc-a', free=0)
+            # The drainers still count into the pool total: grants hold
+            # the fixpoint (no spurious immediate down below it), and
+            # nothing is fed out of thin air.
+            assert draining is not None
+            assert draining.grant == 4 and draining.feed == 0
+            alloc_c = broker.get_my_allocation('svc-c')
+            assert alloc_c is not None
+            assert alloc_c.grant == 12 and alloc_c.feed == 0
+        # Drains complete: the pods are actually gone, the freed slots
+        # show up as measured free, and svc-c gets fed to its grant.
+        rows = {'svc-a': [], 'svc-b': []}
+        clock.advance(61)
+        _upsert('svc-a', holdings_fill=4)
+        _upsert('svc-b', holdings_fill=4)
+        _upsert('svc-c', floor=8)
+        settled = _run('svc-a', free=12)
+        assert settled is not None
+        assert settled.grant == 4 and settled.feed == 0
+        alloc_c = broker.get_my_allocation('svc-c')
+        assert alloc_c is not None
+        assert alloc_c.grant == 12 and alloc_c.feed == 12
+
+    def test_draining_demand_and_failed_cleanup_rows_do_not_count(
+            self, monkeypatch):
+        # Scope of the conservation fix: only SHUTTING_DOWN rows with
+        # reserved_fill=True join the total. A draining DEMAND row's pod
+        # also occupies the pool, but demand rows were never in holdings
+        # and their bound pod was already excluded from the measured free
+        # while LIVE -- the pre-drain steady state undercounted them the
+        # same way by design (demand capacity is not fill-arbitrable).
+        # FAILED_CLEANUP rows persist indefinitely and would over-count
+        # the pool once the pod eventually dies.
+        rows = [
+            _replica_stub(is_ready=False,
+                          is_terminal=True,
+                          status=serve_state.ReplicaStatus.SHUTTING_DOWN,
+                          reserved_fill=False,
+                          created_at=1.0),
+            _replica_stub(is_ready=False,
+                          is_terminal=True,
+                          status=serve_state.ReplicaStatus.FAILED_CLEANUP,
+                          reserved_fill=True,
+                          created_at=1.0),
+        ]
+        monkeypatch.setattr(
+            serve_state, 'get_replica_infos',
+            mock.Mock(side_effect=lambda name: rows if name == 'svc-a' else []))
+        _upsert('svc-a')
+        _upsert('svc-b')
+        alloc = _run('svc-a', free=4)
+        # total = 4 free + 0 holdings + 0 draining: neither terminal row
+        # inflates the split.
+        assert alloc is not None
+        assert alloc.grant == 2 and alloc.feed == 2
         alloc_b = broker.get_my_allocation('svc-b')
         assert alloc_b is not None
         assert alloc_b.grant == 2 and alloc_b.feed == 2

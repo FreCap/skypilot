@@ -160,6 +160,10 @@ class TestFedLaunchBootSurvivalPG(sqlite_suite.TestFedLaunchBootSurvival):
     pass
 
 
+class TestDrainWindowConservationPG(sqlite_suite.TestDrainWindowConservation):
+    pass
+
+
 # ========================= Migration chain on PG =========================
 
 

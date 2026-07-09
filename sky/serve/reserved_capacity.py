@@ -254,8 +254,8 @@ def poller_loop(get_autoscaler: Callable[[], 'autoscalers.Autoscaler'],
     """
     # Whether a broker claim of ours may exist. Starts True: a previous
     # incarnation of this controller may have left one behind (respawn),
-    # so the first disabled observation still clears it. Reset to True by
-    # every broker cycle (which upserts the claim).
+    # so the first disabled observation still clears it. Reset to True
+    # BEFORE every broker cycle (which upserts the claim).
     claim_may_exist = service_name is not None
     while True:
         try:
@@ -274,9 +274,15 @@ def poller_loop(get_autoscaler: Callable[[], 'autoscalers.Autoscaler'],
                 if service_name is None:
                     _standalone_cycle(autoscaler, zero_cost, keys)
                 else:
+                    # Set BEFORE the cycle: it upserts the claim partway
+                    # through, and an exception after that upsert (e.g.
+                    # the round query) must still leave the flag true --
+                    # otherwise a subsequent disable would skip
+                    # remove_claim and leave a ghost claim absorbing
+                    # entitlement for the whole claim TTL.
+                    claim_may_exist = True
                     _broker_cycle(autoscaler, placer, service_name, zero_cost,
                                   keys)
-                    claim_may_exist = True
             elif service_name is not None and claim_may_exist:
                 # Fill turned off (or the placer is gone): withdraw the
                 # claim NOW instead of leaving peers arbitrating around a

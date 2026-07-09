@@ -772,6 +772,49 @@ class TestPollerClaimLifecycle(unittest.TestCase):
         # on every subsequent disabled cycle.
         remove_claim.assert_called_once_with('svc')
 
+    def test_cycle_failure_after_enable_still_withdraws_on_disable(self):
+        # A broker cycle can die AFTER upserting its claim (e.g. the
+        # round query raises), so the claim-may-exist flag must be set
+        # BEFORE the cycle runs -- otherwise a subsequent disable would
+        # skip remove_claim and leave a ghost claim absorbing entitlement
+        # for the whole claim TTL.
+        autoscaler = _make_autoscaler(fill=False)
+        placer = mock.Mock()
+        placer.zero_cost_locations.return_value = []
+        cycles = {'n': 0}
+
+        def _sleep(_seconds):
+            cycles['n'] += 1
+            if cycles['n'] == 1:
+                # The first disabled cycle consumed the initial flag; an
+                # update now re-enables fill.
+                autoscaler.reserved_capacity_fill = True
+            elif cycles['n'] == 2:
+                # The (failed) enabled cycle ran; disable again.
+                autoscaler.reserved_capacity_fill = False
+            elif cycles['n'] >= 3:
+                raise self._Stop()
+
+        with mock.patch.object(
+                reserved_capacity,
+                '_broker_cycle',
+                side_effect=RuntimeError('cycle died')) as broker_cycle, \
+             mock.patch.object(reserved_capacity.reserved_capacity_broker,
+                               'remove_claim') as remove_claim, \
+             mock.patch.object(reserved_capacity.time,
+                               'sleep',
+                               side_effect=_sleep):
+            with self.assertRaises(self._Stop):
+                reserved_capacity.poller_loop(lambda: autoscaler,
+                                              lambda: placer,
+                                              service_name='svc')
+        broker_cycle.assert_called_once()
+        # Once for the initial disabled observation, and AGAIN after the
+        # failed enabled cycle: the possibly-upserted claim is withdrawn
+        # instead of ghosting until the TTL.
+        self.assertEqual(remove_claim.call_count, 2)
+        remove_claim.assert_called_with('svc')
+
 
 class TestStaleSnapshot(unittest.TestCase):
     """Stale snapshot: 0 free contribution, existing fill still protected."""
