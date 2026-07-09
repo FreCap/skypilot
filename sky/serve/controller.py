@@ -139,8 +139,8 @@ class SkyServeController:
         # _get_lb_replica_info / _translate_in_flight).
         self._lb_translation_cache: Dict[int, Tuple[str, str, int]] = {}
         # Recent LB incarnations. External-LB maxSurge briefly runs two
-        # last-writer-wins reporters, so declared async occupancy fails closed
-        # until the old session heartbeat ages out.
+        # last-writer-wins reporters, so every live replica fails closed for
+        # autoscaling and drain proofs until the old heartbeat ages out.
         self._lb_session_heartbeats: Dict[str, float] = {}
         self._app = fastapi.FastAPI(lifespan=self.lifespan)
 
@@ -266,7 +266,8 @@ class SkyServeController:
                 # rolling update old and new versions may have different
                 # fast-ack contracts. Emit explicit false as a tri-state
                 # protocol: omission means old controller / preserve prior LB
-                # knowledge, while false authoritatively clears it.
+                # knowledge, while false starts a two-phase disable that keeps
+                # old work visible until a generation-valid idle sample.
                 replica_info[url]['async_occupancy'] = (
                     'true' if async_occupancy else 'false')
         # The translation cache retains entries for replicas that left

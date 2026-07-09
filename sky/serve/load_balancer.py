@@ -831,11 +831,11 @@ class SkyServeLoadBalancer:
             probed_replicas = len(probed)
             busy_replicas = sum(1 for free in probed.values() if free <= 0)
             free_slots = sum(probed.values())
-        # Envelope in-flight unioned with occupancy per url (max, same
-        # jobs measured two ways) and including pruned-but-draining work:
-        # those requests still occupy replica capacity, which is what an
-        # admission reader sizes by. (Called outside the pool lock -- it
-        # acquires the lock itself.)
+        # Envelope in-flight plus occupancy per url and including
+        # pruned-but-draining work. The count API has no job ids, so the brief
+        # fast-ack overlap is summed conservatively rather than risking that
+        # distinct synchronous and async work collapse into one unit. (Called
+        # outside the pool lock -- it acquires the lock itself.)
         in_flight_map, _, _, _ = self._in_flight_with_draining()
         in_flight = (sum(in_flight_map.values())
                      if in_flight_map is not None else None)
@@ -1166,9 +1166,10 @@ class SkyServeLoadBalancer:
         # keep their existing clear-on-report semantics. The in-flight
         # map may be None (policy without load accounting): sent as-is,
         # the controller treats it as unknown rather than an idle fleet.
-        # NOTE: gauges are last-writer-wins per LB (unlike the additive
-        # timestamps) -- correct for the pinned single-replica LB
-        # deployment; a multi-LB rollout would need per-LB keying.
+        # NOTE: gauges remain last-writer-wins per LB (unlike additive
+        # timestamps). During maxSurge overlap the controller detects multiple
+        # session ids, treats every live replica as unknown, and suppresses
+        # early drain proofs until only one reporter remains.
         in_flight, routing_urls, unknown_urls, occupancy_sampled_urls = (
             self._in_flight_with_draining())
         if self._session_id is None:
