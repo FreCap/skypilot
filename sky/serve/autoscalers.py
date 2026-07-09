@@ -1825,6 +1825,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         self._in_flight_by_replica_id: Optional[Dict[int, int]] = None
         self._queue_depth: int = 0
         self._rejected_in_window: int = 0
+        # Replica ids whose declared async occupancy could not be sampled.
+        # They contribute their full per-version capacity to outstanding work:
+        # unknown is a potentially-full replica, never an idle zero.
+        self._unknown_in_flight_replica_ids: Set[int] = set()
         self._report_received_at: Optional[float] = None
         self._gpu_shape_cache: Dict[int, Tuple[str, int]] = {}
         # Backs the cost-descending victim tiebreak (shed paid spot
@@ -1920,6 +1924,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         treating them busy would starve scale-down of its preferred
         kill-first victims.
         """
+        if info.replica_id in self._unknown_in_flight_replica_ids:
+            return True
         in_flight = self._in_flight_by_replica_id or {}
         if info.status in (serve_state.ReplicaStatus.READY,
                            serve_state.ReplicaStatus.NOT_READY):
@@ -1939,6 +1945,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             'in_flight_by_replica_id': {replica_id: int} | None,
             'queue_depth': int | None,
             'rejected_in_window': int | None,
+            'unknown_in_flight_replica_ids': [replica_id, ...],
         }
         """
         self.request_timestamps.extend(
@@ -1966,11 +1973,17 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         self._queue_depth = int(queue_depth) if queue_depth is not None else 0
         rejected = request_aggregator_info.get('rejected_in_window')
         self._rejected_in_window = int(rejected) if rejected is not None else 0
+        self._unknown_in_flight_replica_ids = {
+            int(replica_id) for replica_id in (request_aggregator_info.get(
+                'unknown_in_flight_replica_ids', []) or [])
+        }
         self._report_received_at = current_time
         logger.info(f'Concurrency report: in_flight_total='
                     f'{sum(self._in_flight_by_replica_id.values())}, '
                     f'queue_depth={self._queue_depth}, '
                     f'rejected_in_window={self._rejected_in_window}, '
+                    f'unknown_replicas='
+                    f'{len(self._unknown_in_flight_replica_ids)}, '
                     f'requests in the last {self.qps_window_size}s: '
                     f'{len(self.request_timestamps)}')
 
@@ -2025,7 +2038,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         capacities.sort(reverse=True)
         return capacities
 
-    def _outstanding_work(self) -> float:
+    def _outstanding_work(
+        self,
+        replica_infos: Optional[List['replica_managers.ReplicaInfo']] = None,
+    ) -> float:
         """Outstanding jobs per the latest report (gauges, one snapshot).
 
         A job can transiently appear in both queue_depth (one sync) and
@@ -2033,9 +2049,28 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         absorbed by hysteresis (accepted in the plan).
         """
         assert self._in_flight_by_replica_id is not None
+        unknown_floor = 0.0
+        if self._unknown_in_flight_replica_ids:
+            infos_by_id = {
+                info.replica_id: info
+                for info in (replica_infos or [])
+                if not info.is_terminal
+            }
+            fallback_capacity = max(
+                (self._replica_capacity(info) for info in infos_by_id.values()),
+                default=self.target_concurrency_per_replica)
+            for replica_id in self._unknown_in_flight_replica_ids:
+                info = infos_by_id.get(replica_id)
+                if info is None:
+                    # Defensive fallback for transient list/cache skew: use
+                    # the best live capacity rather than silently shrinking a
+                    # potentially multi-GPU unknown replica to one GPU.
+                    unknown_floor += fallback_capacity
+                else:
+                    unknown_floor += self._replica_capacity(info)
         return float(
             sum(self._in_flight_by_replica_id.values()) + self._queue_depth +
-            self._rejected_in_window)
+            self._rejected_in_window + unknown_floor)
 
     def _set_target_num_replicas_with_concurrency_logic(
             self, replica_infos: List['replica_managers.ReplicaInfo']) -> None:
@@ -2081,7 +2116,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                             f'target at {self.target_num_replicas}.')
             return
 
-        outstanding = self._outstanding_work()
+        outstanding = self._outstanding_work(replica_infos)
         raw_target_num = 0
         covered = 0.0
         for capacity in latest_capacities:
@@ -2245,7 +2280,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 if not self._replica_is_busy(info)
             ]
 
-        shortfall = self._outstanding_work() - ready_latest_capacity
+        shortfall = (self._outstanding_work(replica_infos) -
+                     ready_latest_capacity)
         # Never keep fewer old replicas than the base class's count rule
         # (target - ready_new): capacity packing with a few big old
         # replicas could otherwise drain the standby pool a low-traffic
@@ -2254,9 +2290,6 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             len(old_nonterminal),
             max(0,
                 self.get_final_target_num_replicas() - num_ready_latest))
-
-        assert self._in_flight_by_replica_id is not None
-        in_flight = self._in_flight_by_replica_id
 
         ready_old = []
         nonready_old = []
@@ -2272,7 +2305,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         # rollout), replica id as a stable tie-break across ticks. A
         # READY replica missing from the fresh in-flight map counts as
         # busy: the LB may simply not have reported it yet.
-        ready_old.sort(key=lambda pair: (in_flight.get(pair[1].replica_id) == 0,
+        ready_old.sort(key=lambda pair: (not self._replica_is_busy(pair[1]),
                                          -pair[0], pair[1].replica_id))
 
         keep_ids: Set[int] = set()
@@ -2416,6 +2449,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             'in_flight_total': in_flight_total,
             'queue_depth': self._queue_depth,
             'rejected_in_window': self._rejected_in_window,
+            'unknown_in_flight_replicas': len(
+                self._unknown_in_flight_replica_ids),
             'report_age_seconds': report_age,
         })
         return info
@@ -2430,6 +2465,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             'in_flight_by_replica_id': self._in_flight_by_replica_id,
             'queue_depth': self._queue_depth,
             'rejected_in_window': self._rejected_in_window,
+            'unknown_in_flight_replica_ids': sorted(
+                self._unknown_in_flight_replica_ids),
             'report_received_at': self._report_received_at,
         }
 
@@ -2447,6 +2484,11 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             self._queue_depth = dynamic_states.pop('queue_depth')
         if 'rejected_in_window' in dynamic_states:
             self._rejected_in_window = dynamic_states.pop('rejected_in_window')
+        if 'unknown_in_flight_replica_ids' in dynamic_states:
+            self._unknown_in_flight_replica_ids = {
+                int(replica_id) for replica_id in dynamic_states.pop(
+                    'unknown_in_flight_replica_ids')
+            }
         if 'report_received_at' in dynamic_states:
             self._report_received_at = dynamic_states.pop('report_received_at')
         if dynamic_states:

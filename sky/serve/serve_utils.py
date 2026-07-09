@@ -270,6 +270,18 @@ class RequestsAggregator:
         """Clear all current request aggregator."""
         raise NotImplementedError
 
+    def drain(self) -> Dict[str, Any]:
+        """Atomically take the current report batch out of the aggregator.
+
+        New samples added after this method returns belong to the next batch.
+        The caller must restore the returned batch if delivery fails.
+        """
+        raise NotImplementedError
+
+    def restore(self, batch: Dict[str, Any]) -> None:
+        """Restore a previously drained batch after failed delivery."""
+        raise NotImplementedError
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert the aggregator to a dict."""
         raise NotImplementedError
@@ -300,6 +312,27 @@ class RequestTimestamp(RequestsAggregator):
     def clear(self) -> None:
         """Clear all current request aggregator."""
         self.timestamps.clear()
+
+    def drain(self) -> Dict[str, Any]:
+        """Take the current timestamps, leaving later arrivals untouched."""
+        batch = self.to_dict()
+        self.timestamps.clear()
+        return batch
+
+    def restore(self, batch: Dict[str, Any]) -> None:
+        """Merge a failed batch back ahead of any arrivals made in-flight.
+
+        Extending oldest-to-newest also preserves the deque's bounded behavior:
+        if the combined batches exceed the cap, only the newest timestamps are
+        retained.
+        """
+        drained = batch.get('timestamps', [])
+        if not drained:
+            return
+        current = list(self.timestamps)
+        self.timestamps.clear()
+        self.timestamps.extend(drained)
+        self.timestamps.extend(current)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert the aggregator to a dict."""

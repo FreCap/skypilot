@@ -67,12 +67,18 @@ def _replica(replica_id,
     return info
 
 
-def _report(autoscaler, in_flight, queue_depth=0, rejected=0, timestamps=()):
+def _report(autoscaler,
+            in_flight,
+            queue_depth=0,
+            rejected=0,
+            timestamps=(),
+            unknown=()):
     autoscaler.collect_request_information({
         'timestamps': list(timestamps),
         'in_flight_by_replica_id': in_flight,
         'queue_depth': queue_depth,
         'rejected_in_window': rejected,
+        'unknown_in_flight_replica_ids': list(unknown),
     })
 
 
@@ -178,6 +184,25 @@ class TestTargetMath(unittest.TestCase):
         _report(autoscaler, in_flight={}, queue_depth=2, rejected=3)
         self._recompute(autoscaler, [])
         self.assertEqual(autoscaler.target_num_replicas, 5)
+
+    def test_unknown_async_occupancy_adds_full_capacity_floor(self):
+        # Two declared async replicas missed their occupancy probes. Their
+        # envelope zeros cannot erase potentially-full work; two additional
+        # rejected jobs need two replacement slots on top of that floor.
+        autoscaler = _make_autoscaler(knob=1.0)
+        replicas = [_replica(1), _replica(2)]
+        _report(autoscaler, in_flight={1: 0, 2: 0}, rejected=2, unknown=(1, 2))
+        self._recompute(autoscaler, replicas)
+        self.assertEqual(autoscaler.target_num_replicas, 4)
+
+    def test_unknown_floor_uses_each_versions_multi_gpu_capacity(self):
+        autoscaler = _make_autoscaler(knob=1.0)
+        autoscaler.update_version(2, _spec(knob=3.0),
+                                  serve_utils.DEFAULT_UPDATE_MODE)
+        old = _replica(1, gpu_count=2, version=1)  # 1 * 2 = 2
+        new = _replica(2, gpu_count=1, version=2)  # 3 * 1 = 3
+        _report(autoscaler, in_flight={1: 0, 2: 0}, unknown=(1, 2))
+        self.assertEqual(autoscaler._outstanding_work([old, new]), 5)
 
     def test_zero_outstanding_scales_to_min(self):
         autoscaler = _make_autoscaler(knob=1.0, min_replicas=0)
@@ -339,6 +364,14 @@ class TestSignalGap(unittest.TestCase):
 class TestDrainAwareDownscale(unittest.TestCase):
     """READY victims require fresh in_flight == 0; missing entry = busy."""
 
+    def test_unknown_async_replica_is_busy_despite_envelope_zero(self):
+        autoscaler = _make_autoscaler(knob=5.0, min_replicas=1)
+        replicas = [_replica(1), _replica(2)]
+        _report(autoscaler, in_flight={1: 0, 2: 0}, unknown=(2,))
+        decisions = _decisions(autoscaler, replicas)
+        self.assertEqual(autoscaler.target_num_replicas, 1)
+        self.assertEqual(_scale_downs(decisions), [1])
+
     def test_only_idle_ready_replicas_are_victims(self):
         # Capacity 5/replica, 5 outstanding -> target 1 of 3 replicas.
         # Replica 1 idle, replica 2 busy, replica 3 MISSING from the
@@ -480,6 +513,19 @@ class TestRollingDrain(unittest.TestCase):
         retired = autoscaler._select_outdated_replicas_to_scale_down(
             [blipped, idle, new_ready], [1, 2])
         self.assertNotIn(1, retired)
+
+    def test_unknown_old_replica_is_kept_before_idle_coverage(self):
+        autoscaler = self._mid_update(target=2)
+        idle = _replica(1, version=1)
+        unknown = _replica(2, version=1)
+        new_ready = _replica(3, version=2)
+        _report(autoscaler, in_flight={1: 0, 2: 0, 3: 1}, unknown=(2,))
+        retired = autoscaler._select_outdated_replicas_to_scale_down(
+            [idle, unknown, new_ready], [1, 2])
+        # Busy-first coverage must keep the unknown replica and retire the
+        # truly idle one; adding unknowns only in the final safety pass would
+        # retain both and stall the rollout.
+        self.assertEqual(retired, [1])
 
     def test_count_floor_keeps_standby_on_zero_demand(self):
         # Zero outstanding work but no ready latest replica: the

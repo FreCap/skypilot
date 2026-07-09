@@ -310,3 +310,87 @@ async def test_api_login(mock_to_thread, mock_sdk_functions):
     assert result is None
     mock_sdk_functions['api_login'].assert_called_once_with(
         'http://test-endpoint', True)
+
+
+def _request_payload_dict(status):
+    return {
+        'request_id': 'req-1',
+        'name': 'launch',
+        'entrypoint': '',
+        'request_body': '',
+        'status': status,
+        'created_at': 0.0,
+        'user_id': 'user',
+        'return_value': 'null',
+        'error': 'null',
+        'pid': None,
+        'schedule_type': 'long',
+    }
+
+
+class _FakeGetResponse:
+
+    def __init__(self, status, body):
+        self.status = status
+        self._body = body
+        self.closed = False
+
+    async def json(self):
+        return self._body
+
+    async def text(self):
+        return 'error body'
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_get_raises_typed_error_from_500_detail():
+    """A failed request payload is decoded from the response detail."""
+    response = _FakeGetResponse(500,
+                                {'detail': _request_payload_dict('FAILED')})
+    decoded = mock.MagicMock()
+    decoded.get_error.return_value = {
+        'object': exceptions.StorageSpecError('bad storage spec')
+    }
+
+    with mock.patch(
+            'sky.client.sdk_async.server_common.'
+            'make_authenticated_request_async',
+            new=mock.AsyncMock(return_value=response)), \
+         mock.patch(
+             'sky.client.sdk_async.requests_lib.Request.decode',
+             return_value=decoded) as mock_decode:
+        with pytest.raises(exceptions.StorageSpecError, match='bad storage'):
+            await sdk_async.get('req-1')
+
+    decoded_payload = mock_decode.call_args.args[0]
+    assert decoded_payload.request_id == 'req-1'
+    assert decoded_payload.status == 'FAILED'
+    assert response.closed
+
+
+@pytest.mark.asyncio
+async def test_get_success_still_decodes_top_level_payload():
+    """A successful request payload remains top-level and returns its value."""
+    response = _FakeGetResponse(200, _request_payload_dict('SUCCEEDED'))
+    decoded = mock.MagicMock()
+    decoded.get_error.return_value = None
+    decoded.status = 'SUCCEEDED'
+    decoded.get_return_value.return_value = {'result': 42}
+
+    with mock.patch(
+            'sky.client.sdk_async.server_common.'
+            'make_authenticated_request_async',
+            new=mock.AsyncMock(return_value=response)), \
+         mock.patch(
+             'sky.client.sdk_async.requests_lib.Request.decode',
+             return_value=decoded) as mock_decode:
+        result = await sdk_async.get('req-1')
+
+    assert result == {'result': 42}
+    decoded_payload = mock_decode.call_args.args[0]
+    assert decoded_payload.request_id == 'req-1'
+    assert decoded_payload.status == 'SUCCEEDED'
+    assert response.closed

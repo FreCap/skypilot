@@ -950,6 +950,12 @@ def get_service_schema():
                 'minimum': 0,
                 'maximum': 3600,
             },
+            # Fast-ack jobs continue after their HTTP response. Declaring the
+            # contract makes failed/never-run occupancy probes unknown from
+            # the outset, so autoscaling and retirement fail closed.
+            'graceful_drain_async_occupancy': {
+                'type': 'boolean',
+            },
             'load_balancer': {
                 'type': 'object',
                 'required': [],

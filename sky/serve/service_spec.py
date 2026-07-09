@@ -51,6 +51,7 @@ class SkyServiceSpec:
         queue_length_threshold: Optional[int] = None,
         consecutive_failure_threshold_timeout: Optional[int] = None,
         graceful_drain_seconds: Optional[int] = None,
+        graceful_drain_async_occupancy: Optional[bool] = None,
     ) -> None:
         if pool:
             # For pools, max_replicas should never be specified directly by the
@@ -254,6 +255,12 @@ class SkyServiceSpec:
         self._lb_retry_initial_backoff_seconds: Optional[float] = (
             lb_retry_initial_backoff_seconds)
         self._graceful_drain_seconds: Optional[int] = graceful_drain_seconds
+        # Declares fast-ack work whose lifetime outlives its HTTP envelope.
+        # The LB must treat a missing occupancy sample as unknown from the
+        # first request, rather than inferring capability from a successful
+        # probe (which cannot protect a never-probed replica).
+        self._graceful_drain_async_occupancy: Optional[bool] = (
+            graceful_drain_async_occupancy)
         self._min_replicas: int = min_replicas
         self._max_replicas: Optional[int] = max_replicas
         self._num_overprovision: Optional[int] = num_overprovision
@@ -310,6 +317,7 @@ class SkyServiceSpec:
         # Added with the in-flight-aware graceful drain; old DB rows
         # predate it (None -> default drain semantics).
         state.setdefault('_graceful_drain_seconds', None)
+        state.setdefault('_graceful_drain_async_occupancy', None)
         self.__dict__.update(state)
 
     @staticmethod
@@ -361,6 +369,8 @@ class SkyServiceSpec:
             consecutive_failure_threshold_timeout)
         service_config['graceful_drain_seconds'] = config.get(
             'graceful_drain_seconds', None)
+        service_config['graceful_drain_async_occupancy'] = config.get(
+            'graceful_drain_async_occupancy', None)
         load_balancer_section = config.get('load_balancer', None)
         lb_stream_timeout_seconds = None
         if load_balancer_section is not None:
@@ -635,6 +645,8 @@ class SkyServiceSpec:
         # uses the same bounded drain, just without the in-flight gauge).
         add_if_not_none('graceful_drain_seconds', None,
                         self.graceful_drain_seconds)
+        add_if_not_none('graceful_drain_async_occupancy', None,
+                        self.graceful_drain_async_occupancy)
 
         if self.pool:
             if self.max_replicas is not None:
@@ -843,6 +855,10 @@ class SkyServiceSpec:
         return self._graceful_drain_seconds
 
     @property
+    def graceful_drain_async_occupancy(self) -> Optional[bool]:
+        return self._graceful_drain_async_occupancy
+
+    @property
     def lb_max_retries(self) -> Optional[int]:
         return self._lb_max_retries
 
@@ -984,6 +1000,9 @@ class SkyServiceSpec:
                 self._lb_retry_initial_backoff_seconds),
             graceful_drain_seconds=override.pop('graceful_drain_seconds',
                                                 self._graceful_drain_seconds),
+            graceful_drain_async_occupancy=override.pop(
+                'graceful_drain_async_occupancy',
+                self._graceful_drain_async_occupancy),
             min_replicas=override.pop('min_replicas', self._min_replicas),
             max_replicas=override.pop('max_replicas', self._max_replicas),
             num_overprovision=override.pop('num_overprovision',

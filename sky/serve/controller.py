@@ -9,7 +9,7 @@ import os
 import threading
 import time
 import traceback
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import colorama
 import fastapi
@@ -19,6 +19,7 @@ import uvicorn
 from sky import serve
 from sky import sky_logging
 from sky.serve import autoscalers
+from sky.serve import constants as serve_constants
 from sky.serve import lb_rbac_preflight
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity
@@ -137,6 +138,10 @@ class SkyServeController:
         # replica's running job stays attributed to it (see
         # _get_lb_replica_info / _translate_in_flight).
         self._lb_translation_cache: Dict[int, Tuple[str, str, int]] = {}
+        # Recent LB incarnations. External-LB maxSurge briefly runs two
+        # last-writer-wins reporters, so every live replica fails closed for
+        # autoscaling and drain proofs until the old heartbeat ages out.
+        self._lb_session_heartbeats: Dict[str, float] = {}
         self._app = fastapi.FastAPI(lifespan=self.lifespan)
 
     @contextlib.asynccontextmanager
@@ -181,7 +186,9 @@ class SkyServeController:
                            f'{common_utils.format_exception(e)}')
 
     def _get_lb_replica_info(
-        self, replica_infos: List['replica_managers.ReplicaInfo']
+        self,
+        replica_infos: List['replica_managers.ReplicaInfo'],
+        async_occupancy_by_version: Optional[Dict[int, Optional[bool]]] = None,
     ) -> Tuple[Dict[str, Dict[str, str]], int]:
         """Build the url -> replica info mapping for load_balancer_sync.
 
@@ -252,6 +259,17 @@ class SkyServeController:
                 'gpu_type': gpu_type,
                 'gpu_count': str(gpu_count),
             }
+            async_occupancy = ((async_occupancy_by_version or
+                                {}).get(info.version))
+            if async_occupancy is not None:
+                # Per-replica (not latest-service) declaration: during a
+                # rolling update old and new versions may have different
+                # fast-ack contracts. Emit explicit false as a tri-state
+                # protocol: omission means old controller / preserve prior LB
+                # knowledge, while false starts a two-phase disable that keeps
+                # old work visible until a generation-valid idle sample.
+                replica_info[url]['async_occupancy'] = (
+                    'true' if async_occupancy else 'false')
         # The translation cache retains entries for replicas that left
         # READY but are still alive: the LB's in-flight snapshot is taken
         # against ITS last routing view, so a replica probe-blipped out
@@ -319,6 +337,87 @@ class SkyServeController:
             if replica_id is not None:
                 in_flight_by_replica_id[replica_id] = int(count)
         return in_flight_by_replica_id
+
+    def _unknown_async_replica_ids(
+        self,
+        replica_infos: List['replica_managers.ReplicaInfo'],
+        async_occupancy_by_version: Dict[int, Optional[bool]],
+        occupancy_sampled_urls: Optional[List[str]],
+        unknown_in_flight_urls: Optional[List[str]],
+        force_all_live_unknown: bool = False,
+    ) -> Set[int]:
+        """Resolve the fail-closed async occupancy set for one LB report.
+
+        An envelope count (including explicit zero) does not prove anything
+        about fast-ack work. A declared async replica is known only when the
+        LB says its numeric entry includes a validity-filtered occupancy
+        sample. Old LBs omit that proof, and a first sync necessarily precedes
+        application of the controller's declaration, so both remain unknown.
+        """
+        url_to_replica_id = self._url_to_replica_id_map()
+        sampled_replica_ids: Set[int] = set()
+        if not force_all_live_unknown:
+            sampled_replica_ids = {
+                url_to_replica_id[url]
+                for url in (occupancy_sampled_urls or [])
+                if url in url_to_replica_id
+            }
+        unknown_replica_ids = {
+            url_to_replica_id[url]
+            for url in (unknown_in_flight_urls or [])
+            if url in url_to_replica_id
+        }
+        live_infos = [
+            info for info in replica_infos
+            if info.status in (serve_state.ReplicaStatus.READY,
+                               serve_state.ReplicaStatus.NOT_READY)
+        ]
+        if force_all_live_unknown:
+            # Two maxSurge LBs publish last-writer-wins gauges. A sampled zero
+            # from either cannot prove that the other accepted no work, so the
+            # short overlap/grace fails closed for every live replica,
+            # including legacy services without a declaration.
+            unknown_replica_ids.update(info.replica_id for info in live_infos)
+        else:
+            unknown_replica_ids.update(
+                info.replica_id
+                for info in live_infos
+                if async_occupancy_by_version.get(info.version, False) and
+                info.replica_id not in sampled_replica_ids)
+        return unknown_replica_ids
+
+    def _record_lb_session_heartbeat(
+            self,
+            session_id: Optional[str],
+            current_time: Optional[float] = None) -> bool:
+        """Record one LB sync and report whether maxSurge overlap is active."""
+        now = time.monotonic() if current_time is None else current_time
+        cutoff = (now - 3 * serve_constants.LB_CONTROLLER_SYNC_INTERVAL_SECONDS)
+        heartbeats = {
+            session: seen for session, seen in getattr(
+                self, '_lb_session_heartbeats', {}).items() if seen >= cutoff
+        }
+        if session_id:
+            heartbeats[session_id] = now
+        self._lb_session_heartbeats = heartbeats
+        return len(heartbeats) > 1
+
+    @staticmethod
+    def _lb_drain_report_view(
+        request_data: Dict[str, Any],
+        sessions_overlap: bool,
+    ) -> Tuple[Optional[Dict[str, int]], Optional[List[str]]]:
+        """Return a raw drain view that cannot prove idle across two LBs."""
+        in_flight = request_data.get('in_flight')
+        routing_urls = request_data.get('routing_urls')
+        if sessions_overlap:
+            # Publish a deliberately untrustworthy routing view (None). The
+            # drain tracker rejects it before considering a clean gauge, so a
+            # zero from LB-A cannot terminate while LB-B still routes/works.
+            # Materialize {} when an old/nontracking LB omitted its gauge so
+            # this blocking report replaces, rather than leaves, a prior proof.
+            return (in_flight if in_flight is not None else {}), None
+        return in_flight, routing_urls
 
     def _get_capacity_hint(
             self, replica_infos: List['replica_managers.ReplicaInfo']
@@ -531,19 +630,36 @@ class SkyServeController:
             # keep its added work O(replicas) with no new blocking DB
             # calls).
             replica_infos = serve_state.get_replica_infos(self._service_name)
+            async_occupancy_by_version: Dict[int, Optional[bool]] = {}
+            for replica_version in {info.version for info in replica_infos}:
+                version_spec = serve_state.get_spec(self._service_name,
+                                                    replica_version)
+                async_occupancy_by_version[replica_version] = (
+                    None if version_spec is None else getattr(
+                        version_spec, 'graceful_drain_async_occupancy', None))
             # Resolve the url->id mapping BEFORE translating in_flight:
             # _get_lb_replica_info rebuilds _lb_replica_cache from this
             # sync's READY replicas.
             lb_replica_info, num_ready = self._get_lb_replica_info(
-                replica_infos)
+                replica_infos, async_occupancy_by_version)
             # Merge the new demand gauges (all optional; an old LB simply
             # omits them) into the single dict handed to the autoscaler.
             # The QPS/pool autoscalers only .get('timestamps'), so the
             # extra keys are safe for every autoscaler type.
+            translated_in_flight = self._translate_in_flight(
+                request_data.get('in_flight'))
+            lb_sessions_overlap = self._record_lb_session_heartbeat(
+                request_data.get('lb_session_id'))
+            unknown_replica_ids = self._unknown_async_replica_ids(
+                replica_infos,
+                async_occupancy_by_version,
+                request_data.get('occupancy_sampled_urls', []),
+                request_data.get('unknown_in_flight_urls', []),
+                force_all_live_unknown=lb_sessions_overlap)
             request_information: Dict[str, Any] = {
                 'timestamps': timestamps,
-                'in_flight_by_replica_id': self._translate_in_flight(
-                    request_data.get('in_flight')),
+                'in_flight_by_replica_id': translated_in_flight,
+                'unknown_in_flight_replica_ids': list(unknown_replica_ids),
                 'queue_depth': request_data.get('queue_depth'),
                 'rejected_in_window': request_data.get('rejected_in_window'),
             }
@@ -558,8 +674,10 @@ class SkyServeController:
             # gaps (cold cache after a restart, urls of already-removed
             # replicas lingering in the LB's retention) neither poison
             # unrelated drains nor mask the target.
+            drain_in_flight, drain_routing_urls = self._lb_drain_report_view(
+                request_data, lb_sessions_overlap)
             self._replica_manager.update_lb_in_flight(
-                request_data.get('in_flight'), request_data.get('routing_urls'),
+                drain_in_flight, drain_routing_urls,
                 request_data.get('unknown_in_flight_urls'),
                 request_data.get('draining_urls'),
                 request_data.get('lb_session_id'))

@@ -179,6 +179,210 @@ def test_terminal_503_records_rejection():
     assert lb._rejected_in_window() == 1
 
 
+def test_accepted_retry_clears_same_job_rejection():
+    lb = _make_lb()
+    lb._record_rejection(_request(job_id='job-1'))
+    lb._load_balancing_policy.set_ready_replicas(['http://a:8080'])
+    response = fastapi.responses.Response(status_code=200)
+
+    async def _fake_proxy(url, request):
+        del url, request
+        return response
+
+    lb._proxy_request_to = _fake_proxy
+    request = _request(job_id='job-1')
+    assert asyncio.run(lb._proxy_with_retries(request)) is response
+    assert lb._rejected_in_window() == 0
+
+
+def test_non_success_response_keeps_same_job_rejection():
+    lb = _make_lb()
+    lb._record_rejection(_request(job_id='job-1'))
+    lb._load_balancing_policy.set_ready_replicas(['http://a:8080'])
+    response = fastapi.responses.Response(status_code=503)
+
+    async def _fake_proxy(url, request):
+        del url, request
+        return response
+
+    lb._proxy_request_to = _fake_proxy
+    request = _request(job_id='job-1')
+    assert asyncio.run(lb._proxy_with_retries(request)) is response
+    assert lb._rejected_in_window() == 1
+
+
+def test_async_request_contract_marks_replica_capable_before_dispatch():
+    lb = _make_lb()
+    url = 'http://async:8080'
+    lb._load_balancing_policy.set_ready_replicas([url])
+    response = fastapi.responses.Response(status_code=202)
+    request = _request()
+    request.headers = {'content-type': 'application/json'}
+    request.json = mock.AsyncMock(return_value={'action': 'async_predict'})
+
+    async def _fake_proxy(selected_url, forwarded_request):
+        assert selected_url == url
+        assert forwarded_request is request
+        assert url in lb._occupancy_capable
+        return response
+
+    lb._proxy_request_to = _fake_proxy
+    assert asyncio.run(lb._proxy_with_retries(request)) is response
+
+
+def test_async_dispatch_invalidates_prior_sampled_zero():
+    lb = _make_lb()
+    url = 'http://async:8080'
+    lb._load_balancing_policy.set_ready_replicas([url])
+    lb._occupancy_capable = {url}
+    lb._replica_occupancy = {url: 0}
+    lb._occupancy_dispatch_generation = {url: 0}
+    lb._occupancy_sample_generation = {url: 0}
+    request = _request(job_id='job-1')
+
+    async def _fake_proxy(selected_url, forwarded_request):
+        del selected_url, forwarded_request
+        return fastapi.responses.Response(status_code=202)
+
+    lb._proxy_request_to = _fake_proxy
+    asyncio.run(lb._proxy_with_retries(request))
+    in_flight, _, unknown_urls, sampled_urls = (lb._in_flight_with_draining())
+    assert url not in (in_flight or {})
+    assert unknown_urls == [url]
+    assert sampled_urls == []
+
+
+def test_declared_url_custom_request_invalidates_occupancy_sample():
+    lb = _make_lb()
+    url = 'http://mixed:8080'
+    lb._load_balancing_policy.set_ready_replicas([url])
+    lb._occupancy_capable = {url}
+    lb._occupancy_declared_urls = {url}
+    lb._replica_occupancy = {url: 0}
+    lb._occupancy_dispatch_generation = {url: 0}
+    lb._occupancy_sample_generation = {url: 0}
+    request = _request()
+
+    async def _fake_proxy(selected_url, forwarded_request):
+        del selected_url, forwarded_request
+        return fastapi.responses.Response(status_code=200)
+
+    lb._proxy_request_to = _fake_proxy
+    asyncio.run(lb._proxy_with_retries(request))
+    assert lb._occupancy_dispatch_generation[url] == 2
+    in_flight, _, unknown_urls, sampled_urls = (lb._in_flight_with_draining())
+    assert url not in (in_flight or {})
+    assert unknown_urls == [url]
+    assert sampled_urls == []
+
+
+def test_probe_started_before_async_dispatch_cannot_revalidate_zero():
+    lb = _make_lb()
+    url = 'http://async:8080'
+    lb._load_balancing_policy.set_ready_replicas([url])
+    lb._occupancy_capable = {url}
+    lb._replica_occupancy = {url: 0}
+    lb._replica_free_slots = {url: 1}
+    lb._occupancy_dispatch_generation = {url: 0}
+    lb._occupancy_sample_generation = {url: 0}
+    probe_started = asyncio.Event()
+    finish_probe = asyncio.Event()
+
+    async def _fetch(session, selected_url):
+        del session, selected_url
+        probe_started.set()
+        await finish_probe.wait()
+        return (0, 1)
+
+    async def _fake_proxy(selected_url, forwarded_request):
+        del selected_url, forwarded_request
+        return fastapi.responses.Response(status_code=202)
+
+    lb._fetch_replica_occupancy = _fetch
+    lb._proxy_request_to = _fake_proxy
+
+    async def _race():
+        probe_task = asyncio.create_task(lb._probe_replica_occupancy_once())
+        await probe_started.wait()
+        await lb._proxy_with_retries(_request(job_id='job-1'))
+        finish_probe.set()
+        await probe_task
+
+    asyncio.run(_race())
+    in_flight, _, unknown_urls, sampled_urls = (lb._in_flight_with_draining())
+    assert url not in (in_flight or {})
+    assert unknown_urls == [url]
+    assert sampled_urls == []
+    assert url not in lb._replica_free_slots
+
+
+def test_probe_during_async_dispatch_cannot_publish_idle_after_accept():
+    lb = _make_lb()
+    url = 'http://async:8080'
+    lb._load_balancing_policy.set_ready_replicas([url])
+    lb._occupancy_capable = {url}
+    lb._occupancy_declared_urls = {url}
+    lb._replica_occupancy = {url: 0}
+    lb._occupancy_dispatch_generation = {url: 0}
+    lb._occupancy_sample_generation = {url: 0}
+    proxy_started = asyncio.Event()
+    finish_proxy = asyncio.Event()
+
+    async def _fetch_zero(session, selected_url):
+        del session, selected_url
+        return (0, 1)
+
+    async def _held_proxy(selected_url, forwarded_request):
+        del selected_url, forwarded_request
+        proxy_started.set()
+        await finish_proxy.wait()
+        return fastapi.responses.Response(status_code=202)
+
+    lb._fetch_replica_occupancy = _fetch_zero
+    lb._proxy_request_to = _held_proxy
+
+    async def _race():
+        proxy_task = asyncio.create_task(lb._proxy_with_retries(_request()))
+        await proxy_started.wait()
+        # This probe captures the post-start generation, then overtakes the
+        # held POST and publishes zero before the replica accepts it.
+        await lb._probe_replica_occupancy_once()
+        assert lb._replica_free_slots == {url: 1}
+        finish_proxy.set()
+        await proxy_task
+
+    asyncio.run(_race())
+    in_flight, _, unknown_urls, sampled_urls = (lb._in_flight_with_draining())
+    assert lb._occupancy_dispatch_generation[url] == 2
+    assert url not in (in_flight or {})
+    assert unknown_urls == [url]
+    assert sampled_urls == []
+    assert url not in lb._replica_free_slots
+
+
+def test_probe_started_after_async_dispatch_revalidates_occupancy():
+    lb = _make_lb()
+    url = 'http://async:8080'
+    lb._load_balancing_policy.set_ready_replicas([url])
+    lb._occupancy_capable = {url}
+    lb._replica_occupancy = {url: 0}
+    lb._occupancy_dispatch_generation = {url: 1}
+    lb._occupancy_sample_generation = {url: 0}
+
+    async def _fetch(session, selected_url):
+        del session, selected_url
+        return (1, 0)
+
+    lb._fetch_replica_occupancy = _fetch
+    asyncio.run(lb._probe_replica_occupancy_once())
+    in_flight, _, unknown_urls, sampled_urls = (lb._in_flight_with_draining())
+    assert in_flight == {url: 1}
+    assert unknown_urls == []
+    assert sampled_urls == [url]
+    assert lb._occupancy_sample_generation[url] == 1
+    assert lb._replica_free_slots == {url: 0}
+
+
 # --- controller sync: payload gauges + capacity_hint caching ---
 
 
@@ -246,6 +450,211 @@ def test_sync_payload_carries_demand_gauges():
     assert lb._rejected_in_window() == 1
 
 
+def test_declared_async_replica_is_unknown_before_first_probe():
+    url = 'http://async:8080'
+    lb = _make_lb()
+    first = _run_sync(
+        lb, {
+            'replica_info': {
+                url: {
+                    'gpu_type': 'L4',
+                    'gpu_count': '1',
+                    'async_occupancy': 'true',
+                }
+            }
+        })
+    # The outgoing snapshot precedes application of this sync response, so it
+    # cannot claim an occupancy sample yet.
+    assert first['json']['occupancy_sampled_urls'] == []
+    assert lb._occupancy_capable == {url}
+    assert lb._occupancy_declared_urls == {url}
+
+    in_flight, _, unknown_urls, sampled_urls = (lb._in_flight_with_draining())
+    assert url not in (in_flight or {})
+    assert unknown_urls == [url]
+    assert sampled_urls == []
+
+
+def test_sync_payload_proves_valid_occupancy_sample():
+    url = 'http://async:8080'
+    lb = _make_lb()
+    lb._load_balancing_policy.set_ready_replicas([url])
+    lb._occupancy_capable = {url}
+    lb._replica_occupancy = {url: 0}
+
+    captured = _run_sync(lb, {'replica_info': {}})
+    assert captured['json']['in_flight'] == {url: 0}
+    assert captured['json']['occupancy_sampled_urls'] == [url]
+
+
+def test_old_controller_omission_preserves_async_declaration():
+    url = 'http://async:8080'
+    lb = _make_lb()
+    lb._occupancy_declared_urls = {url}
+    _run_sync(lb,
+              {'replica_info': {
+                  url: {
+                      'gpu_type': 'L4',
+                      'gpu_count': '1',
+                  }
+              }})
+    assert lb._occupancy_declared_urls == {url}
+
+
+def test_old_controller_omission_preserves_explicit_disabled_state():
+    url = 'http://sync:8080'
+    lb = _make_lb()
+    lb._occupancy_explicitly_disabled_urls = {url}
+    _run_sync(lb,
+              {'replica_info': {
+                  url: {
+                      'gpu_type': 'L4',
+                      'gpu_count': '1',
+                  }
+              }})
+    assert lb._occupancy_explicitly_disabled_urls == {url}
+
+
+def test_explicit_false_waits_for_idle_before_clearing_capability():
+    url = 'http://async:8080'
+    lb = _make_lb()
+    lb._occupancy_declared_urls = {url}
+    lb._occupancy_capable = {url}
+    lb._replica_occupancy = {url: 1}
+    lb._replica_free_slots = {url: 0}
+    lb._occupancy_dispatch_generation = {url: 2}
+    lb._occupancy_sample_generation = {url: 2}
+    _run_sync(
+        lb, {
+            'replica_info': {
+                url: {
+                    'gpu_type': 'L4',
+                    'gpu_count': '1',
+                    'async_occupancy': 'false',
+                }
+            }
+        })
+    assert lb._occupancy_declared_urls == set()
+    assert lb._occupancy_disable_pending == {url}
+    assert lb._occupancy_capable == {url}
+    assert lb._replica_occupancy == {url: 1}
+    in_flight, _, unknown_urls, _ = lb._in_flight_with_draining()
+    assert in_flight == {url: 1}
+    assert unknown_urls == []
+
+    async def _fetch_idle(session, selected_url):
+        del session, selected_url
+        return (0, 1)
+
+    lb._fetch_replica_occupancy = _fetch_idle
+    asyncio.run(lb._probe_replica_occupancy_once())
+    assert lb._occupancy_disable_pending == set()
+    assert lb._occupancy_capable == set()
+    assert lb._occupancy_explicitly_disabled_urls == {url}
+    assert lb._replica_occupancy == {url: 0}
+    assert lb._replica_free_slots == {url: 1}
+    in_flight, _, unknown_urls, sampled_urls = (lb._in_flight_with_draining())
+    assert in_flight == {url: 0}
+    assert unknown_urls == []
+    assert sampled_urls == [url]
+
+    # A second passive zero remains disabled; it does not oscillate.
+    asyncio.run(lb._probe_replica_occupancy_once())
+    assert lb._occupancy_capable == set()
+    assert lb._occupancy_disable_pending == set()
+
+
+def test_cold_explicit_false_preserves_positive_runtime_occupancy():
+    url = 'http://async:8080'
+    lb = _make_lb()
+    _run_sync(
+        lb, {
+            'replica_info': {
+                url: {
+                    'gpu_type': 'L4',
+                    'gpu_count': '1',
+                    'async_occupancy': 'false',
+                }
+            }
+        })
+    assert lb._occupancy_capable == {url}
+    assert lb._occupancy_disable_pending == {url}
+    assert lb._occupancy_explicitly_disabled_urls == {url}
+    _, _, unknown_urls, _ = lb._in_flight_with_draining()
+    assert unknown_urls == [url]
+
+    # The controller can retire the reused URL before this cold LB's first
+    # probe. Transition evidence must survive off-ready and remain unknown.
+    lb._load_balancing_policy.set_ready_replicas([])
+    _, _, unknown_urls, _ = lb._in_flight_with_draining()
+    assert unknown_urls == [url]
+
+    results = [(1, 0), None, (0, 1), (0, 1)]
+
+    async def _fetch(session, selected_url):
+        del session, selected_url
+        return results.pop(0)
+
+    lb._fetch_replica_occupancy = _fetch
+    asyncio.run(lb._probe_replica_occupancy_once())
+    assert lb._occupancy_capable == {url}
+    assert lb._occupancy_disable_pending == {url}
+    assert lb._in_flight_with_draining()[0] == {url: 1}
+
+    asyncio.run(lb._probe_replica_occupancy_once())
+    assert lb._occupancy_capable == {url}
+    assert lb._occupancy_disable_pending == {url}
+    _, _, unknown_urls, _ = lb._in_flight_with_draining()
+    assert unknown_urls == [url]
+
+    asyncio.run(lb._probe_replica_occupancy_once())
+    assert lb._occupancy_capable == set()
+    assert lb._occupancy_disable_pending == set()
+    assert lb._occupancy_explicitly_disabled_urls == {url}
+
+    asyncio.run(lb._probe_replica_occupancy_once())
+    assert lb._occupancy_capable == set()
+    assert lb._occupancy_disable_pending == set()
+
+
+def test_recognized_async_request_temporarily_overrides_explicit_false():
+    url = 'http://async:8080'
+    lb = _make_lb()
+    _run_sync(
+        lb, {
+            'replica_info': {
+                url: {
+                    'gpu_type': 'L4',
+                    'gpu_count': '1',
+                    'async_occupancy': 'false',
+                }
+            }
+        })
+
+    async def _accept_async(selected_url, forwarded_request):
+        del selected_url, forwarded_request
+        return fastapi.responses.Response(status_code=202)
+
+    lb._proxy_request_to = _accept_async
+    asyncio.run(lb._proxy_with_retries(_request(job_id='job-after-false')))
+    assert lb._occupancy_capable == {url}
+    assert lb._occupancy_disable_pending == {url}
+    assert lb._occupancy_explicitly_disabled_urls == {url}
+    _, _, unknown_urls, sampled_urls = lb._in_flight_with_draining()
+    assert unknown_urls == [url]
+    assert sampled_urls == []
+
+    async def _fetch_idle(session, selected_url):
+        del session, selected_url
+        return (0, 1)
+
+    lb._fetch_replica_occupancy = _fetch_idle
+    asyncio.run(lb._probe_replica_occupancy_once())
+    assert lb._occupancy_capable == set()
+    assert lb._occupancy_disable_pending == set()
+    assert lb._occupancy_explicitly_disabled_urls == {url}
+
+
 def test_sync_payload_in_flight_none_without_tracking():
     lb = _make_lb(policy_name='round_robin')
     captured = _run_sync(lb, {'replica_info': {}})
@@ -286,10 +695,10 @@ def test_draining_overlay_sums_with_readded_url():
     assert lb._in_flight_with_draining()[0] == {'http://a:8080': 2}
 
 
-def test_occupancy_supersedes_envelope_by_max():
-    # Fast-ack work: envelope reads 0 while the replica crunches; the
-    # probe's occupancy must lift the url's reported busyness. Max, not
-    # sum: a job awaiting its ack may appear in both measures.
+def test_occupancy_and_envelope_counts_sum_conservatively():
+    # Counts cannot prove overlap. Summing may briefly double a fast-ack
+    # submit before its acknowledgement closes, but it must not collapse
+    # distinct synchronous and async work into one unit.
     lb = _make_lb()
     lb._load_balancing_policy.set_ready_replicas(
         ['http://a:8080', 'http://b:8080'])
@@ -298,7 +707,7 @@ def test_occupancy_supersedes_envelope_by_max():
     lb._occupancy_capable = {'http://a:8080', 'http://b:8080'}
     assert lb._in_flight_with_draining()[0] == {
         'http://a:8080': 3,
-        'http://b:8080': 2,
+        'http://b:8080': 3,
     }
 
 
@@ -316,16 +725,17 @@ def test_occupancy_capable_probe_miss_reads_unknown_not_zero():
     assert lb._in_flight_with_draining()[0] == {'http://sync:8080': 0}
 
 
-def test_pruned_url_occupancy_not_doubled_with_draining():
-    # A just-pruned url can appear in BOTH the last probe round's
-    # occupancy and the draining refcounts for the same job: max, not
-    # sum.
+def test_pruned_url_occupancy_and_draining_sum_fail_closed():
+    # A just-pruned url can appear in both the last probe round and draining
+    # refcounts. Counts alone cannot identify overlap, so retain the safe upper
+    # bound until a post-retirement sample resolves it.
     lb = _make_lb()
     lb._load_balancing_policy.set_ready_replicas([])
     lb._replica_occupancy = {'http://gone:8080': 1}
     lb._occupancy_capable = {'http://gone:8080'}
+    lb._occupancy_sampled_off_ready = {'http://gone:8080'}
     lb._draining_clients = {'http://gone:8080': [_FakeDrainingClient(1)]}
-    assert lb._in_flight_with_draining()[0] == {'http://gone:8080': 1}
+    assert lb._in_flight_with_draining()[0] == {'http://gone:8080': 2}
 
 
 def test_probe_round_marks_and_prunes_capability():
@@ -360,6 +770,28 @@ def test_probe_round_marks_and_prunes_capability():
     }
     asyncio.run(lb._probe_replica_occupancy_once())
     assert lb._occupancy_capable == set()
+
+
+def test_scale_to_zero_prunes_all_occupancy_metadata():
+    lb = _make_lb()
+    lb._load_balancing_policy.set_ready_replicas([])
+    lb._occupancy_capable = set()
+    lb._occupancy_declared_urls = {'http://gone:8080'}
+    lb._occupancy_disable_pending = {'http://gone:8080'}
+    lb._occupancy_explicitly_disabled_urls = {'http://gone:8080'}
+    lb._occupancy_dispatch_generation = {'http://gone:8080': 2}
+    lb._occupancy_sample_generation = {'http://gone:8080': 1}
+    lb._occupancy_off_ready_since = {'http://gone:8080': time.monotonic()}
+    lb._occupancy_sampled_off_ready = {'http://gone:8080'}
+
+    asyncio.run(lb._probe_replica_occupancy_once())
+    assert lb._occupancy_declared_urls == set()
+    assert lb._occupancy_disable_pending == set()
+    assert lb._occupancy_explicitly_disabled_urls == set()
+    assert lb._occupancy_dispatch_generation == {}
+    assert lb._occupancy_sample_generation == {}
+    assert lb._occupancy_off_ready_since == {}
+    assert lb._occupancy_sampled_off_ready == set()
 
 
 def test_drained_client_deregisters_from_demand_feed():
@@ -411,7 +843,7 @@ def test_routing_urls_sampled_with_gauge():
     lb = _make_lb()
     lb._load_balancing_policy.set_ready_replicas(
         ['http://a:8080', 'http://b:8080'])
-    _, routing_urls, _ = lb._in_flight_with_draining()
+    _, routing_urls, _, _ = lb._in_flight_with_draining()
     assert sorted(routing_urls) == ['http://a:8080', 'http://b:8080']
 
 
@@ -431,7 +863,7 @@ def test_quarantined_url_keeps_draining_refcounts_attributed():
         lb._quarantine_replica('http://q:8080')
 
     asyncio.run(_quarantine())
-    in_flight, routing_urls, _ = lb._in_flight_with_draining()
+    in_flight, routing_urls, _, _ = lb._in_flight_with_draining()
     assert routing_urls == []
     assert in_flight == {'http://q:8080': 1}
 
@@ -444,7 +876,7 @@ def test_occupancy_capable_probe_miss_is_reported_unknown():
     lb._load_balancing_policy.set_ready_replicas(['http://cap:8080'])
     lb._replica_occupancy = {}
     lb._occupancy_capable = {'http://cap:8080'}
-    in_flight, _, unknown_urls = lb._in_flight_with_draining()
+    in_flight, _, unknown_urls, _ = lb._in_flight_with_draining()
     assert 'http://cap:8080' not in (in_flight or {})
     assert unknown_urls == ['http://cap:8080']
 
@@ -467,7 +899,7 @@ def test_off_ready_capable_url_survives_probe_miss():
     lb._fetch_replica_occupancy = _fetch_none
     asyncio.run(lb._probe_replica_occupancy_once())
     assert 'http://gone:8080' in lb._occupancy_capable
-    _, _, unknown_urls = lb._in_flight_with_draining()
+    _, _, unknown_urls, _ = lb._in_flight_with_draining()
     assert unknown_urls == ['http://gone:8080']
 
     # After the retention TTL with no successful answer, it is pruned.
@@ -515,11 +947,11 @@ def test_stale_pre_retirement_occupancy_zero_reads_unknown():
     # Stale sample from when the url was ready (not marked off-ready).
     lb._replica_occupancy = {'http://gone:8080': 0}
     lb._occupancy_sampled_off_ready = set()
-    in_flight, _, unknown_urls = lb._in_flight_with_draining()
+    in_flight, _, unknown_urls, _ = lb._in_flight_with_draining()
     assert 'http://gone:8080' not in (in_flight or {})
     assert unknown_urls == ['http://gone:8080']
     # Once the prober samples it off-ready, the explicit zero is usable.
     lb._occupancy_sampled_off_ready = {'http://gone:8080'}
-    in_flight, _, unknown_urls = lb._in_flight_with_draining()
+    in_flight, _, unknown_urls, _ = lb._in_flight_with_draining()
     assert in_flight == {'http://gone:8080': 0}
     assert unknown_urls == []
