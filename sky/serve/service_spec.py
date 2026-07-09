@@ -50,6 +50,7 @@ class SkyServiceSpec:
         pool: Optional[bool] = None,
         queue_length_threshold: Optional[int] = None,
         consecutive_failure_threshold_timeout: Optional[int] = None,
+        graceful_drain_seconds: Optional[int] = None,
     ) -> None:
         if pool:
             # For pools, max_replicas should never be specified directly by the
@@ -193,6 +194,20 @@ class SkyServiceSpec:
                         'least_load or instance_aware_least_load). '
                         f'Got: {resolved_policy}')
 
+        if graceful_drain_seconds is not None and (
+                not isinstance(graceful_drain_seconds, int) or
+                isinstance(graceful_drain_seconds, bool) or
+                graceful_drain_seconds < 0 or graceful_drain_seconds >
+                constants.LB_OFF_READY_OCCUPANCY_RETENTION_SECONDS):
+            # The upper bound keeps the drain within the window the LB
+            # retains (and reports) a retiring replica's unknown async
+            # occupancy; a longer cap could end early once that retention
+            # expires.
+            with ux_utils.print_exception_no_traceback():
+                raise ValueError(
+                    'graceful_drain_seconds must be an integer between 0 and '
+                    f'{constants.LB_OFF_READY_OCCUPANCY_RETENTION_SECONDS}. '
+                    f'Got: {graceful_drain_seconds!r}')
         self._readiness_path: str = readiness_path
         self._initial_delay_seconds: int = initial_delay_seconds
         self._readiness_timeout_seconds: int = readiness_timeout_seconds
@@ -204,6 +219,7 @@ class SkyServiceSpec:
         self._lb_max_retries: Optional[int] = lb_max_retries
         self._lb_retry_initial_backoff_seconds: Optional[float] = (
             lb_retry_initial_backoff_seconds)
+        self._graceful_drain_seconds: Optional[int] = graceful_drain_seconds
         self._min_replicas: int = min_replicas
         self._max_replicas: Optional[int] = max_replicas
         self._num_overprovision: Optional[int] = num_overprovision
@@ -255,6 +271,9 @@ class SkyServiceSpec:
         state.setdefault('_target_concurrency_per_replica', None)
         # Added with reserved-capacity fill; old DB rows predate it.
         state.setdefault('_reserved_capacity_fill', None)
+        # Added with the in-flight-aware graceful drain; old DB rows
+        # predate it (None -> default drain semantics).
+        state.setdefault('_graceful_drain_seconds', None)
         self.__dict__.update(state)
 
     @staticmethod
@@ -304,6 +323,8 @@ class SkyServiceSpec:
             endpoint_probe_interval_seconds)
         service_config['consecutive_failure_threshold_timeout'] = (
             consecutive_failure_threshold_timeout)
+        service_config['graceful_drain_seconds'] = config.get(
+            'graceful_drain_seconds', None)
         load_balancer_section = config.get('load_balancer', None)
         lb_stream_timeout_seconds = None
         if load_balancer_section is not None:
@@ -573,6 +594,11 @@ class SkyServiceSpec:
                     config[section][key] = value
 
         add_if_not_none('pool', None, self._pool)
+        # Emitted before the pool early-return: the field is service-level
+        # and must survive serialization for pools too (their retirement
+        # uses the same bounded drain, just without the in-flight gauge).
+        add_if_not_none('graceful_drain_seconds', None,
+                        self.graceful_drain_seconds)
 
         if self.pool:
             if self.max_replicas is not None:
@@ -767,6 +793,10 @@ class SkyServiceSpec:
         return self._lb_retriable_status_codes
 
     @property
+    def graceful_drain_seconds(self) -> Optional[int]:
+        return self._graceful_drain_seconds
+
+    @property
     def lb_max_retries(self) -> Optional[int]:
         return self._lb_max_retries
 
@@ -887,6 +917,8 @@ class SkyServiceSpec:
             lb_retry_initial_backoff_seconds=override.pop(
                 'lb_retry_initial_backoff_seconds',
                 self._lb_retry_initial_backoff_seconds),
+            graceful_drain_seconds=override.pop('graceful_drain_seconds',
+                                                self._graceful_drain_seconds),
             min_replicas=override.pop('min_replicas', self._min_replicas),
             max_replicas=override.pop('max_replicas', self._max_replicas),
             num_overprovision=override.pop('num_overprovision',

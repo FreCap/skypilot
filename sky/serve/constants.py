@@ -101,6 +101,16 @@ LB_CONTROLLER_SYNC_TIMEOUT_SECONDS = 30
 # /_lb/capacity. Overridable via SKYPILOT_LB_OCCUPANCY_PROBE_INTERVAL_SECONDS
 # (<= 0 disables the probe entirely — accounting falls back to envelope-only).
 LB_OCCUPANCY_PROBE_INTERVAL_SECONDS = 10
+# How long an occupancy-capable url that left the ready set is retained
+# (and kept probed / reported as occupancy-unknown) without a successful
+# occupancy answer. Off-ready probe misses are ambiguous -- torn down vs
+# transiently unreachable with async work still running -- so retention
+# errs long: a retirement drain blocked on 'unknown' is still bounded by
+# its own graceful_drain_seconds deadline, while pruning early would let
+# it read the replica as idle and kill live async work. Also the upper
+# bound for the service-spec `graceful_drain_seconds` (a drain longer
+# than the retention would lose the unknown protection partway through).
+LB_OFF_READY_OCCUPANCY_RETENTION_SECONDS = 3600
 LB_OCCUPANCY_PROBE_INTERVAL_ENV_VAR = (
     'SKYPILOT_LB_OCCUPANCY_PROBE_INTERVAL_SECONDS')
 

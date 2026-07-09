@@ -10,6 +10,7 @@ import threading
 import time
 import traceback
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
+import uuid
 
 import aiohttp
 import fastapi
@@ -181,6 +182,23 @@ class SkyServeLoadBalancer:
     _capacity_hint: Optional[Dict[str, Any]] = None
     _draining_clients: Optional[Dict[str, List[httpx.AsyncClient]]] = None
     _occupancy_capable: Optional[Set[str]] = None
+    # url -> monotonic time of the FIRST probe round that observed the
+    # capable url off-ready and unanswered (cleared whenever the url is
+    # confirmed again). Bounds how long such a url survives consecutive
+    # probe misses -- and, because it starts at retirement rather than at
+    # the last pre-retirement confirmation, guarantees the retention
+    # outlives any allowed graceful_drain_seconds deadline.
+    _occupancy_off_ready_since: Optional[Dict[str, float]] = None
+    # urls whose occupancy sample in the LAST completed probe round was
+    # taken while the url was off-ready. Only such samples can prove
+    # post-retirement idleness: a sample taken while the url was still
+    # routed may predate work that arrived just before retirement.
+    _occupancy_sampled_off_ready: Optional[Set[str]] = None
+    # Identifies this LB process incarnation. The retirement drain requires
+    # seen-then-clean within ONE incarnation: a restarted LB loses its
+    # draining/occupancy overlays, so its clean-looking reports must not
+    # combine with an older incarnation's acknowledgement.
+    _session_id: Optional[str] = None
 
     def __init__(
         self,
@@ -370,6 +388,23 @@ class SkyServeLoadBalancer:
             u for u in self._load_balancing_policy.ready_replicas if u != url
         ]
         self._load_balancing_policy.set_ready_replicas(remaining)
+        # Route the quarantined url's client through the same drain path as
+        # controller-pruned urls: set_ready_replicas above dropped its
+        # load_map entry, so without the draining overlay its still-running
+        # requests would vanish from the demand feed -- reading as idle to
+        # the autoscaler and, worse, as 'drained' to a retirement waiting on
+        # the in-flight gauge. A post-quarantine re-add creates a fresh
+        # client; the old one closes once its in-flight work finishes.
+        client_pool = getattr(self, '_client_pool', None)
+        client = client_pool.pop(url, None) if client_pool else None
+        if client is not None:
+            if self._draining_clients is None:
+                self._draining_clients = {}
+            self._draining_clients.setdefault(url, []).append(client)
+            task = asyncio.create_task(self._drain_and_close_client(
+                url, client))
+            self._client_close_tasks.add(task)
+            task.add_done_callback(self._client_close_tasks.discard)
         logger.warning(
             f'Evicted replica {url} after '
             f'{constants.LB_EVICTION_CONSECUTIVE_FAILURES} consecutive '
@@ -487,7 +522,8 @@ class SkyServeLoadBalancer:
         return fastapi.responses.Response(
             status_code=200 if self._is_ready_to_serve() else 503)
 
-    def _in_flight_with_draining(self) -> Optional[Dict[str, int]]:
+    def _in_flight_with_draining(
+            self) -> Tuple[Optional[Dict[str, int]], List[str], List[str]]:
         """Per-url busyness snapshot: envelopes, occupancy, and draining.
 
         Three measures of the same running jobs, unioned:
@@ -514,16 +550,37 @@ class SkyServeLoadBalancer:
         with self._client_pool_lock:
             in_flight = self._load_balancing_policy.snapshot_in_flight()
             occupancy = dict(self._replica_occupancy)
+            sampled_off_ready = set(self._occupancy_sampled_off_ready or ())
             capable = set(self._occupancy_capable or ())
+            # Sampled under the same lock as the gauge: the controller's
+            # retirement drain uses this to prove the gauge was taken
+            # against a routing view that already excluded the retiring
+            # replica (the gauge is sampled BEFORE this sync's response
+            # re-applies the ready set, so the gauge alone cannot prove
+            # it).
+            routing_urls = list(self._load_balancing_policy.ready_replicas)
         if in_flight is None:
-            return None
+            return None, routing_urls, []
+        # An occupancy sample taken while the url was still routed cannot
+        # prove post-retirement idleness (work may have arrived after the
+        # sample but before the url left routing): for off-ready urls,
+        # only keep samples the prober took AFTER they left the ready
+        # set; the rest read as unprobed (-> unknown below).
+        routing_set = set(routing_urls)
+        occupancy = {
+            url: count
+            for url, count in occupancy.items()
+            if url in routing_set or url in sampled_off_ready
+        }
         # Fold draining refcounts into the envelope totals first: a
         # draining client's streams and the current client's are
         # DISJOINT request sets on the same replica, so they add.
+        draining_totals: Dict[str, int] = {}
         for url, clients in (self._draining_clients or {}).items():
             draining = sum(
                 getattr(client, _INFLIGHT_ATTR, 0) for client in clients)
             if draining > 0:
+                draining_totals[url] = draining
                 in_flight[url] = in_flight.get(url, 0) + draining
         # Occupancy supersedes the envelope view where known: it counts
         # jobs RUNNING on the replica regardless of which client (or
@@ -533,7 +590,11 @@ class SkyServeLoadBalancer:
         # url's probe entry survives until the next round and would
         # otherwise double its still-draining stream).
         for url, running in occupancy.items():
-            if running > in_flight.get(url, 0):
+            current = in_flight.get(url)
+            if current is None or running > current:
+                # Inserting an explicit 0 for a probed-idle url matters for
+                # retiring urls with no envelope entry: absent would read
+                # as unknown to the drain, an explicit 0 as drained.
                 in_flight[url] = running
         # An occupancy-CAPABLE url absent from this round's probe is
         # UNKNOWN, not idle: its envelope count is meaningless for
@@ -541,10 +602,21 @@ class SkyServeLoadBalancer:
         # bypass the autoscaler's missing-entry-means-busy protection
         # and let a drain kill it mid-job. Omit it so the autoscaler
         # sees no entry.
+        # ... unless the url still has live DRAINING streams: those are
+        # exact refcounts (not envelope guesses), and dropping them would
+        # let a retirement drain read the url as gone and kill the very
+        # requests it is waiting for.
+        unknown_urls: List[str] = []
         for url in capable:
-            if url not in occupancy and url in in_flight:
-                del in_flight[url]
-        return in_flight
+            if url not in occupancy and draining_totals.get(url, 0) <= 0:
+                if url in in_flight:
+                    del in_flight[url]
+                # Shipped alongside the gauge so the retirement drain can
+                # distinguish 'no in-flight work' (absent, trustworthy)
+                # from 'occupancy unknown' (capable url with no probe
+                # answer this round) and keep waiting on the latter.
+                unknown_urls.append(url)
+        return in_flight, routing_urls, unknown_urls
 
     def _prune_reject_window(self) -> Dict[str, float]:
         """Drop reject entries older than the window; return the live dict.
@@ -640,7 +712,7 @@ class SkyServeLoadBalancer:
         # those requests still occupy replica capacity, which is what an
         # admission reader sizes by. (Called outside the pool lock -- it
         # acquires the lock itself.)
-        in_flight_map = self._in_flight_with_draining()
+        in_flight_map, _, _ = self._in_flight_with_draining()
         in_flight = (sum(in_flight_map.values())
                      if in_flight_map is not None else None)
         last_sync_age: Optional[float] = None
@@ -764,10 +836,20 @@ class SkyServeLoadBalancer:
             return None
 
     async def _probe_replica_occupancy_once(self) -> None:
-        """One probe round: rebuild the occupancy maps from the ready set."""
+        """One probe round: rebuild the occupancy maps from the ready set.
+
+        Occupancy-capable urls that LEFT the ready set (retiring or
+        quarantined) are probed too: their async work must stay observable
+        until they answer idle, or a retirement drain would see them as
+        unknown forever and always wait out its full deadline. They fall
+        out of the probe set once torn down (probe fails -> no occupancy
+        -> pruned from the capable set below).
+        """
         with self._client_pool_lock:
             ready_urls = list(self._load_balancing_policy.ready_replicas)
-        if not ready_urls:
+            probe_urls = list(
+                set(ready_urls) | (self._occupancy_capable or set()))
+        if not probe_urls:
             with self._client_pool_lock:
                 self._replica_occupancy = {}
                 self._replica_free_slots = {}
@@ -777,15 +859,29 @@ class SkyServeLoadBalancer:
         async with aiohttp.ClientSession() as session:
             results = await asyncio.gather(
                 *(self._fetch_replica_occupancy(session, url)
-                  for url in ready_urls))
+                  for url in probe_urls))
         occupancy: Dict[str, int] = {}
         free_slots: Dict[str, int] = {}
-        for url, result in zip(ready_urls, results):
+        for url, result in zip(probe_urls, results):
             if result is None:
                 continue
             occupancy[url], free_slots[url] = result
+        # Off-ready urls must not advertise free slots to admission.
+        ready_set = set(ready_urls)
+        free_slots = {
+            url: slots for url, slots in free_slots.items() if url in ready_set
+        }
         with self._client_pool_lock:
             self._replica_occupancy = occupancy
+            # Off-ready both when the round STARTED and at write time: a
+            # url re-added mid-round may have accepted work invisible to
+            # its pre-re-add sample, so that sample cannot prove
+            # post-retirement idleness if the url is retired again.
+            current_ready = set(self._load_balancing_policy.ready_replicas)
+            self._occupancy_sampled_off_ready = {
+                url for url in occupancy
+                if url not in ready_set and url not in current_ready
+            }
             self._replica_free_slots = free_slots
             self._last_occupancy_probe_time = time.monotonic()
             # A url that EVER reported occupancy is occupancy-capable:
@@ -796,9 +892,33 @@ class SkyServeLoadBalancer:
             # kill it mid-job (see _in_flight_with_draining). Pruned to
             # urls still relevant so the set stays bounded to the fleet.
             capable = (self._occupancy_capable or set()) | set(occupancy)
-            keep = (set(ready_urls) | set(occupancy) |
-                    set(self._draining_clients or {}))
+            # An off-ready probe MISS is ambiguous: torn down, or
+            # transiently unreachable with async work still running.
+            # Retain the url (still probed, still reported as
+            # occupancy-unknown) until it answers or the retention TTL
+            # expires, so one dropped probe cannot convert 'unknown' into
+            # 'absent = drained' for a retiring replica. The retirement
+            # drain stays bounded by its own deadline regardless.
+            now = time.monotonic()
+            confirmed = set(ready_urls) | set(occupancy)
+            off_ready_since = dict(self._occupancy_off_ready_since or {})
+            for url in capable:
+                if url in confirmed:
+                    off_ready_since.pop(url, None)
+                else:
+                    off_ready_since.setdefault(url, now)
+            retained = {
+                url for url in capable
+                if (now - off_ready_since.get(url, now) <=
+                    constants.LB_OFF_READY_OCCUPANCY_RETENTION_SECONDS)
+            }
+            keep = (confirmed | set(self._draining_clients or {}) | retained)
             self._occupancy_capable = {url for url in capable if url in keep}
+            self._occupancy_off_ready_since = {
+                url: ts
+                for url, ts in off_ready_since.items()
+                if url in self._occupancy_capable
+            }
             # Push into the policy under the same lock the sync loop holds
             # for policy swaps; a policy swapped after this round serves
             # without occupancy for at most one probe interval.
@@ -856,10 +976,17 @@ class SkyServeLoadBalancer:
         # NOTE: gauges are last-writer-wins per LB (unlike the additive
         # timestamps) -- correct for the pinned single-replica LB
         # deployment; a multi-LB rollout would need per-LB keying.
-        in_flight = self._in_flight_with_draining()
+        in_flight, routing_urls, unknown_urls = (
+            self._in_flight_with_draining())
+        if self._session_id is None:
+            self._session_id = str(uuid.uuid4())
         sync_payload = {
             'request_aggregator': self._request_aggregator.to_dict(),
             'in_flight': in_flight,
+            'routing_urls': routing_urls,
+            'unknown_in_flight_urls': unknown_urls,
+            'draining_urls': list(self._draining_clients or {}),
+            'lb_session_id': self._session_id,
             'queue_depth': self._queue_depth,
             'rejected_in_window': self._rejected_in_window(),
         }
@@ -942,6 +1069,13 @@ class SkyServeLoadBalancer:
                         if url not in quarantined
                     ]
                     self._load_balancing_policy.set_ready_replicas(routable)
+                    # A re-added url voids any off-ready occupancy sample:
+                    # work accepted after the re-add would be invisible in
+                    # it, so it can no longer prove post-retirement
+                    # idleness if the url is retired again.
+                    if self._occupancy_sampled_off_ready:
+                        self._occupancy_sampled_off_ready = (
+                            self._occupancy_sampled_off_ready - set(routable))
                     # Set replica info for instance-aware policies
                     if isinstance(self._load_balancing_policy,
                                   lb_policies.InstanceAwareLeastLoadPolicy):

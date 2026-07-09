@@ -938,6 +938,18 @@ def get_service_schema():
                     }
                 }]
             },
+            # Cap (seconds) on the in-flight-aware drain wait when a replica
+            # is retired (autoscaler scale-down, incl. rolling-update
+            # retirement of outdated replicas). Unset: wait for in-flight
+            # requests to finish, capped at 120s. 0: no drain. The maximum
+            # mirrors serve.constants.LB_OFF_READY_OCCUPANCY_RETENTION_SECONDS:
+            # beyond it the LB may stop reporting a retiring replica's async
+            # occupancy as 'unknown', which would silently end the drain early.
+            'graceful_drain_seconds': {
+                'type': 'integer',
+                'minimum': 0,
+                'maximum': 3600,
+            },
             'load_balancer': {
                 'type': 'object',
                 'required': [],

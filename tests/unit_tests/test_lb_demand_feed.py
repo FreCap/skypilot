@@ -269,7 +269,7 @@ def test_in_flight_includes_pruned_but_draining_work():
     lb._draining_clients = {
         'http://b:8080': [_FakeDrainingClient(2)],
     }
-    assert lb._in_flight_with_draining() == {
+    assert lb._in_flight_with_draining()[0] == {
         'http://a:8080': 1,
         'http://b:8080': 2,
     }
@@ -283,7 +283,7 @@ def test_draining_overlay_sums_with_readded_url():
     lb._load_balancing_policy.set_ready_replicas(['http://a:8080'])
     lb._load_balancing_policy.load_map['http://a:8080'] = 1
     lb._draining_clients = {'http://a:8080': [_FakeDrainingClient(1)]}
-    assert lb._in_flight_with_draining() == {'http://a:8080': 2}
+    assert lb._in_flight_with_draining()[0] == {'http://a:8080': 2}
 
 
 def test_occupancy_supersedes_envelope_by_max():
@@ -296,7 +296,7 @@ def test_occupancy_supersedes_envelope_by_max():
     lb._load_balancing_policy.load_map['http://b:8080'] = 2
     lb._replica_occupancy = {'http://a:8080': 3, 'http://b:8080': 1}
     lb._occupancy_capable = {'http://a:8080', 'http://b:8080'}
-    assert lb._in_flight_with_draining() == {
+    assert lb._in_flight_with_draining()[0] == {
         'http://a:8080': 3,
         'http://b:8080': 2,
     }
@@ -313,7 +313,7 @@ def test_occupancy_capable_probe_miss_reads_unknown_not_zero():
         ['http://cap:8080', 'http://sync:8080'])
     lb._replica_occupancy = {}
     lb._occupancy_capable = {'http://cap:8080'}
-    assert lb._in_flight_with_draining() == {'http://sync:8080': 0}
+    assert lb._in_flight_with_draining()[0] == {'http://sync:8080': 0}
 
 
 def test_pruned_url_occupancy_not_doubled_with_draining():
@@ -325,7 +325,7 @@ def test_pruned_url_occupancy_not_doubled_with_draining():
     lb._replica_occupancy = {'http://gone:8080': 1}
     lb._occupancy_capable = {'http://gone:8080'}
     lb._draining_clients = {'http://gone:8080': [_FakeDrainingClient(1)]}
-    assert lb._in_flight_with_draining() == {'http://gone:8080': 1}
+    assert lb._in_flight_with_draining()[0] == {'http://gone:8080': 1}
 
 
 def test_probe_round_marks_and_prunes_capability():
@@ -339,8 +339,11 @@ def test_probe_round_marks_and_prunes_capability():
     lb._fetch_replica_occupancy = _fake_fetch
     asyncio.run(lb._probe_replica_occupancy_once())
     assert lb._occupancy_capable == {'http://a:8080'}
-    # The replica disappears entirely (not ready, not draining): the
-    # capability entry is pruned so the set stays fleet-bounded.
+    # The replica disappears (not ready, not draining, probe miss): the
+    # capability entry is RETAINED within the off-ready retention TTL (a
+    # single miss is ambiguous -- see retention comment in the prober),
+    # and pruned once the TTL expires without a successful answer, so the
+    # set stays fleet-bounded.
     lb._load_balancing_policy.set_ready_replicas(['http://b:8080'])
 
     async def _fake_fetch_none(session, url):
@@ -348,6 +351,13 @@ def test_probe_round_marks_and_prunes_capability():
         return None
 
     lb._fetch_replica_occupancy = _fake_fetch_none
+    asyncio.run(lb._probe_replica_occupancy_once())
+    assert lb._occupancy_capable == {'http://a:8080'}
+    lb._occupancy_off_ready_since = {
+        'http://a:8080':
+            (time.monotonic() -
+             constants.LB_OFF_READY_OCCUPANCY_RETENTION_SECONDS - 1)
+    }
     asyncio.run(lb._probe_replica_occupancy_once())
     assert lb._occupancy_capable == set()
 
@@ -380,3 +390,136 @@ def test_sync_without_hint_resets_cache_to_unknown():
     lb._capacity_hint = {'provisioning_replicas': 1, 'target_num_replicas': 2}
     _run_sync(lb, {'replica_info': {}})
     assert lb._capacity_hint is None
+
+
+def test_occupancy_miss_with_live_draining_stream_is_kept():
+    # Fix for the retirement drain: an occupancy-capable url absent from
+    # the probe round still carries EXACT draining refcounts; dropping it
+    # would let the drain read the url as gone and kill the very request
+    # it is waiting for.
+    lb = _make_lb()
+    lb._load_balancing_policy.set_ready_replicas([])
+    lb._replica_occupancy = {}
+    lb._occupancy_capable = {'http://gone:8080'}
+    lb._draining_clients = {'http://gone:8080': [_FakeDrainingClient(2)]}
+    assert lb._in_flight_with_draining()[0] == {'http://gone:8080': 2}
+
+
+def test_routing_urls_sampled_with_gauge():
+    # The routing view ships with the gauge so the controller can prove a
+    # retiring replica was already un-routed when the gauge was sampled.
+    lb = _make_lb()
+    lb._load_balancing_policy.set_ready_replicas(
+        ['http://a:8080', 'http://b:8080'])
+    _, routing_urls, _ = lb._in_flight_with_draining()
+    assert sorted(routing_urls) == ['http://a:8080', 'http://b:8080']
+
+
+def test_quarantined_url_keeps_draining_refcounts_attributed():
+    # Quarantine drops a url from routing outside the controller-prune
+    # path; its live client must still enter the draining overlay, or a
+    # retirement drain would read the replica as unrouted AND idle while
+    # a long request still runs on it.
+    lb = _make_lb()
+    lb._load_balancing_policy.set_ready_replicas(['http://q:8080'])
+    lb._client_pool = {'http://q:8080': _FakeDrainingClient(1)}
+    lb._replica_quarantine_until = {}
+    lb._replica_dead_failures = {}
+    lb._client_close_tasks = set()
+
+    async def _quarantine():
+        lb._quarantine_replica('http://q:8080')
+
+    asyncio.run(_quarantine())
+    in_flight, routing_urls, _ = lb._in_flight_with_draining()
+    assert routing_urls == []
+    assert in_flight == {'http://q:8080': 1}
+
+
+def test_occupancy_capable_probe_miss_is_reported_unknown():
+    # The drain must be able to distinguish 'no in-flight work' from
+    # 'occupancy unknown this round': capable urls with no probe answer
+    # and no draining streams ride in the unknown set.
+    lb = _make_lb()
+    lb._load_balancing_policy.set_ready_replicas(['http://cap:8080'])
+    lb._replica_occupancy = {}
+    lb._occupancy_capable = {'http://cap:8080'}
+    in_flight, _, unknown_urls = lb._in_flight_with_draining()
+    assert 'http://cap:8080' not in (in_flight or {})
+    assert unknown_urls == ['http://cap:8080']
+
+
+def test_off_ready_capable_url_survives_probe_miss():
+    # One transient probe miss on a retired occupancy-capable url must not
+    # prune it from the capable set: that would convert 'occupancy
+    # unknown' into 'absent = drained' and let a retirement kill live
+    # async work. It stays capable (and unknown) within the retention TTL,
+    # and is pruned after the TTL expires without a successful answer.
+    lb = _make_lb()
+    lb._load_balancing_policy.set_ready_replicas([])
+    lb._occupancy_capable = {'http://gone:8080'}
+    lb._replica_occupancy = {}
+
+    async def _fetch_none(session, url):
+        del session, url
+        return None
+
+    lb._fetch_replica_occupancy = _fetch_none
+    asyncio.run(lb._probe_replica_occupancy_once())
+    assert 'http://gone:8080' in lb._occupancy_capable
+    _, _, unknown_urls = lb._in_flight_with_draining()
+    assert unknown_urls == ['http://gone:8080']
+
+    # After the retention TTL with no successful answer, it is pruned.
+    lb._occupancy_off_ready_since = {
+        'http://gone:8080':
+            (time.monotonic() -
+             constants.LB_OFF_READY_OCCUPANCY_RETENTION_SECONDS - 1)
+    }
+    asyncio.run(lb._probe_replica_occupancy_once())
+    assert 'http://gone:8080' not in lb._occupancy_capable
+
+
+def test_off_ready_retention_starts_at_retirement_not_last_confirmation():
+    # The retention clock must start at the FIRST off-ready miss, not at
+    # the last pre-retirement confirmation: otherwise a replica confirmed
+    # long ago could lose its unknown protection before a maximum-length
+    # graceful drain deadline expires.
+    lb = _make_lb()
+    lb._load_balancing_policy.set_ready_replicas([])
+    lb._occupancy_capable = {'http://gone:8080'}
+    lb._replica_occupancy = {}
+    # Simulates state carried from when the url was last CONFIRMED long
+    # ago; the new off-ready timer must ignore it and start fresh.
+    lb._occupancy_off_ready_since = None
+
+    async def _fetch_none(session, url):
+        del session, url
+        return None
+
+    lb._fetch_replica_occupancy = _fetch_none
+    asyncio.run(lb._probe_replica_occupancy_once())
+    assert 'http://gone:8080' in lb._occupancy_capable
+    since = lb._occupancy_off_ready_since['http://gone:8080']
+    assert time.monotonic() - since < 5
+
+
+def test_stale_pre_retirement_occupancy_zero_reads_unknown():
+    # An occupancy sample taken while the url was still ROUTED cannot
+    # prove post-retirement idleness: async work may have arrived after
+    # the sample but before the url left routing. Until a post-retirement
+    # probe answers, the url must read as unknown, not as the stale zero.
+    lb = _make_lb()
+    lb._load_balancing_policy.set_ready_replicas([])
+    lb._occupancy_capable = {'http://gone:8080'}
+    # Stale sample from when the url was ready (not marked off-ready).
+    lb._replica_occupancy = {'http://gone:8080': 0}
+    lb._occupancy_sampled_off_ready = set()
+    in_flight, _, unknown_urls = lb._in_flight_with_draining()
+    assert 'http://gone:8080' not in (in_flight or {})
+    assert unknown_urls == ['http://gone:8080']
+    # Once the prober samples it off-ready, the explicit zero is usable.
+    lb._occupancy_sampled_off_ready = {'http://gone:8080'}
+    in_flight, _, unknown_urls = lb._in_flight_with_draining()
+    assert in_flight == {'http://gone:8080': 0}
+    assert unknown_urls == []

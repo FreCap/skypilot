@@ -412,7 +412,12 @@ class TestTranslateInFlight:
         })
         assert translated == {1: 0, 2: 1}
 
-    def test_terminal_replica_pruned_from_translation(self):
+    def test_shutting_down_replica_pruned_from_translation(self):
+        # A retiring replica's in-flight is pinned to it (never re-routed):
+        # counting it as outstanding demand would launch phantom
+        # replacement capacity for the whole drain window. The retirement
+        # drain matches the LB's raw url-keyed report instead, so it does
+        # not depend on this translation.
         ctrl = self._synced_controller()
         _sync(ctrl, [
             _FakeReplicaInfo(1,
@@ -421,6 +426,24 @@ class TestTranslateInFlight:
                              accelerators={'L4': 1}),
             _FakeReplicaInfo(2,
                              serve_state.ReplicaStatus.SHUTTING_DOWN,
+                             url='http://2.2.2.2:8080',
+                             accelerators={'L4': 1}),
+        ])
+        translated = ctrl._translate_in_flight(
+            {  # pylint: disable=protected-access
+                'http://2.2.2.2:8080': 1,
+            })
+        assert translated == {}
+
+    def test_gone_terminal_replica_pruned_from_translation(self):
+        ctrl = self._synced_controller()
+        _sync(ctrl, [
+            _FakeReplicaInfo(1,
+                             serve_state.ReplicaStatus.READY,
+                             url='http://1.1.1.1:8080',
+                             accelerators={'L4': 1}),
+            _FakeReplicaInfo(2,
+                             serve_state.ReplicaStatus.FAILED,
                              url='http://2.2.2.2:8080',
                              accelerators={'L4': 1}),
         ])

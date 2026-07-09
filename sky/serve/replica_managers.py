@@ -1,4 +1,5 @@
 """ReplicaManager: handles the creation and deletion of endpoint replicas."""
+import contextlib
 import dataclasses
 import functools
 from multiprocessing import pool as mp_pool
@@ -8,7 +9,7 @@ import threading
 import time
 import traceback
 import typing
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import colorama
 import filelock
@@ -55,6 +56,12 @@ _RETRY_INIT_GAP_SECONDS = 60
 # re-hammering the same exhausted zone (see _launch_replica).
 _DEFAULT_LAUNCH_MAX_RETRY = 3
 _DEFAULT_DRAIN_SECONDS = 120
+# Poll cadence for the in-flight-aware drain wait during replica retirement.
+_DRAIN_POLL_SECONDS = 2
+# An LB in-flight report older than this is considered stale (LB dead or
+# not reporting): the drain wait then falls back to the full cap.
+_IN_FLIGHT_REPORT_STALENESS_SECONDS = (
+    3 * serve_constants.LB_CONTROLLER_SYNC_INTERVAL_SECONDS)
 # Rate limit for the "fill launch skipped" log (see _log_fill_skip).
 _FILL_SKIP_LOG_INTERVAL_SECONDS = 60
 _WAIT_LAUNCH_THREAD_TIMEOUT_SECONDS = 15
@@ -210,13 +217,129 @@ def launch_cluster(replica_id: int,
             time.sleep(0.1)
 
 
+def _wait_for_drain(drain_deadline: float,
+                    drain_complete: Optional[Callable[[], bool]]) -> None:
+    """Wait for a retiring replica to drain, bounded by the deadline.
+
+    The deadline is anchored at the moment the replica's SHUTTING_DOWN
+    status was persisted (not at thread start), so time spent queued in
+    the down-thread admission pass counts toward the drain budget instead
+    of extending it. Without a `drain_complete` predicate this is a plain
+    bounded sleep. With one, poll it and proceed as soon as it reports the
+    replica drained; a predicate that never fires (no fresh LB report,
+    requests still in flight) degrades to the deadline. A predicate
+    failure must never break the teardown: it is treated as not-drained
+    and the wait continues.
+    """
+    if drain_complete is None:
+        time.sleep(max(drain_deadline - time.monotonic(), 0))
+        return
+    start = time.monotonic()
+    check_failures = 0
+    while time.monotonic() < drain_deadline:
+        try:
+            if drain_complete():
+                logger.info('Replica reported drained after '
+                            f'{time.monotonic() - start:.0f}s of waiting.')
+                return
+        except Exception as e:  # pylint: disable=broad-except
+            # First failure at WARNING, the rest at DEBUG: a persistently
+            # raising check would otherwise emit one warning per poll for
+            # the whole drain window.
+            log = logger.warning if check_failures == 0 else logger.debug
+            check_failures += 1
+            log('Drain check failed; continuing to wait: '
+                f'{common_utils.format_exception(e)}')
+        time.sleep(
+            min(_DRAIN_POLL_SECONDS, max(drain_deadline - time.monotonic(), 0)))
+    logger.info('Drain deadline reached; proceeding with termination.')
+
+
+class _ReplicaDrainTracker:
+    """Stateful drain-complete predicate for one retiring replica.
+
+    'Drained' requires SEEN-THEN-CLEAN: some fresh report received after
+    the drain began must have acknowledged the replica's url (in the
+    routing view, the in-flight gauge, the unknown set, or the draining
+    set) before a later fresh report showing it absent-and-idle is
+    trusted -- and both must come from the SAME LB incarnation (the LB
+    ships a per-process session id): a cold LB (restarted mid-drain, its
+    draining and occupancy overlays lost) ships empty sets and must not
+    'prove' any replica drained, with or without an older incarnation's
+    acknowledgement. An explicit idle entry (gauge zero, or a
+    post-retirement occupancy zero) is both seen and clean at once. A url
+    ever reported occupancy-UNKNOWN in this incarnation is tainted: only
+    an explicit idle entry (never absence, which may just be the LB's
+    off-ready retention expiring) can complete its drain.
+    Matching by the replica's own url -- known from its record, stable
+    for the cluster's lifetime -- needs no id translation, so translation
+    gaps (cold cache after a controller restart, urls of already-removed
+    replicas lingering in the LB's retention) can neither mask the target
+    nor block unrelated drains. No report, an old LB that ships no
+    routing view, and stale reports (LB dead / not reporting) all answer
+    False, degrading the wait to its deadline.
+    """
+
+    def __init__(self, manager: 'ReplicaManager', replica_url: str,
+                 drain_started: float) -> None:
+        self._manager = manager
+        self._replica_url = replica_url
+        self._drain_started = drain_started
+        self._seen = False
+        self._unknown_tainted = False
+        self._session: Optional[str] = None
+
+    def __call__(self) -> bool:
+        report = self._manager._lb_in_flight_report  # pylint: disable=protected-access
+        if report is None:
+            return False
+        (received_at, in_flight, routing_urls, unknown_urls, draining_urls,
+         session) = report
+        if received_at < self._drain_started:
+            return False
+        if routing_urls is None:
+            return False
+        if (time.monotonic() - received_at >
+                _IN_FLIGHT_REPORT_STALENESS_SECONDS):
+            return False
+        url = self._replica_url
+        if session != self._session:
+            # A different LB incarnation: its overlays started empty, so
+            # acknowledgements from the previous one prove nothing about
+            # its reports.
+            self._session = session
+            self._seen = False
+            self._unknown_tainted = False
+        if (url in routing_urls or url in unknown_urls or
+                url in draining_urls or url in in_flight):
+            self._seen = True
+        if url in unknown_urls:
+            # Async occupancy was unproven at least once this incarnation:
+            # a later ABSENCE cannot prove idleness (the LB's off-ready
+            # retention may simply have expired). Only an explicit idle
+            # entry clears the taint.
+            self._unknown_tainted = True
+        explicit_idle = url in in_flight and in_flight[url] == 0
+        if explicit_idle and url not in unknown_urls:
+            # Defensive ordering: an inconsistent report listing the url
+            # both unknown and explicitly idle must not clear the taint.
+            self._unknown_tainted = False
+        blocked = (url in routing_urls or url in unknown_urls or
+                   in_flight.get(url, 0) != 0 or
+                   (self._unknown_tainted and not explicit_idle))
+        return self._seen and not blocked
+
+
 # TODO(tian): Combine this with
 # sky/spot/recovery_strategy.py::terminate_cluster
 @context.contextual
-def terminate_cluster(cluster_name: str,
-                      log_file: str,
-                      replica_drain_delay_seconds: int = 0,
-                      max_retry: int = 3) -> None:
+def terminate_cluster(
+        cluster_name: str,
+        log_file: str,
+        replica_drain_delay_seconds: int = 0,
+        max_retry: int = 3,
+        drain_deadline: Optional[float] = None,
+        drain_complete: Optional[Callable[[], bool]] = None) -> None:
     """Terminate the sky serve replica cluster."""
     # Setup logging redirection.
     ctx = context.get()
@@ -224,8 +347,12 @@ def terminate_cluster(cluster_name: str,
     ctx.redirect_log(pathlib.Path(log_file))
 
     logger.info(f'Terminating replica cluster {cluster_name} with '
-                f'replica_drain_delay_seconds: {replica_drain_delay_seconds}')
-    time.sleep(replica_drain_delay_seconds)
+                f'replica_drain_delay_seconds: {replica_drain_delay_seconds}, '
+                f'drain_deadline: {drain_deadline}')
+    if drain_deadline is not None:
+        _wait_for_drain(drain_deadline, drain_complete)
+    else:
+        time.sleep(replica_drain_delay_seconds)
     retry_cnt = 0
     backoff = common_utils.Backoff()
     while True:
@@ -766,6 +893,19 @@ class ReplicaManager:
         self._uptime: Optional[float] = None
         self._update_mode = serve_utils.DEFAULT_UPDATE_MODE
         self._is_pool: bool = spec.pool
+        # Freshest (received_at, {url: in_flight}, routing_urls,
+        # unknown_urls, draining_urls, lb_session_id) report from the LB,
+        # published raw (url-keyed) by the controller's
+        # load_balancer_sync handler. All sets are sampled by the LB
+        # atomically with the gauge; _ReplicaDrainTracker combines them
+        # to prove 'not routed and nothing in flight' for a retiring
+        # replica's url. Written by whole-tuple replace and read without
+        # a lock (atomic in CPython); None until the first report (old
+        # LB / pool: never).
+        self._lb_in_flight_report: Optional[Tuple[float, Dict[str, int],
+                                                  Optional[Set[str]], Set[str],
+                                                  Set[str],
+                                                  Optional[str]]] = None
         header_keys = None
         if spec.readiness_headers is not None:
             header_keys = list(spec.readiness_headers.keys())
@@ -780,6 +920,34 @@ class ReplicaManager:
         self.latest_version: int = version
         # Oldest version among the currently provisioned and launched replicas
         self.least_recent_version: int = version
+
+    def update_lb_in_flight(self,
+                            in_flight_by_url: Optional[Dict[str, int]],
+                            routing_urls: Optional[List[str]] = None,
+                            unknown_urls: Optional[List[str]] = None,
+                            draining_urls: Optional[List[str]] = None,
+                            lb_session_id: Optional[str] = None) -> None:
+        """Publish the LB's url-keyed in-flight gauge from a sync.
+
+        A None gauge means the LB sent none (old LB version, or a policy
+        that cannot track in-flight) -- keep the previous report so its
+        staleness, not a blind overwrite, decides the drain fallback.
+        `routing_urls` is the LB's routing view sampled atomically with
+        the gauge (None: old LB without the field); `unknown_urls` are
+        occupancy-capable urls whose async work is unknown this round;
+        `draining_urls` are urls whose pruned clients are still open.
+        """
+        if in_flight_by_url is None:
+            return
+        # time.monotonic() throughout the drain machinery: deadlines and
+        # freshness must be immune to wall-clock jumps (an NTP step forward
+        # would otherwise expire a drain instantly and kill in-flight work).
+        self._lb_in_flight_report = (time.monotonic(), in_flight_by_url,
+                                     set(routing_urls)
+                                     if routing_urls is not None else None,
+                                     set(unknown_urls or
+                                         ()), set(draining_urls or
+                                                  ()), lb_session_id)
 
     @property
     def spot_placer(self) -> Optional['spot_placer.SpotPlacer']:
@@ -1007,12 +1175,38 @@ class SkyPilotReplicaManager(ReplicaManager):
         for replica_info in serve_state.get_replicas_at_status(
                 self._service_name, serve_state.ReplicaStatus.SHUTTING_DOWN):
             try:
+                # A scale-down retirement interrupted by a controller
+                # restart re-enters a FULL bounded drain: its pre-crash
+                # drain progress is unknowable without persisted drain
+                # state, and re-driving with no drain (as before) would
+                # kill whatever is still in flight. Worst case the total
+                # drain doubles; it never kills early. Purged and failure
+                # teardowns keep the immediate re-drive. (Preempted rows
+                # never appear here: `to_replica_status` derives PREEMPTED
+                # before SHUTTING_DOWN, so this scan does not see them --
+                # a pre-existing recovery gap independent of draining.)
+                drain_cap: Optional[int] = None
+                status_property = replica_info.status_property
+                if (status_property.is_scale_down and
+                        not status_property.purged):
+                    drain_cap = self._resolve_drain_cap_seconds(
+                        replica_info.replica_id)
+                # Failure teardowns stay in the record
+                # (left_in_record=True), and _terminate_replica asserts
+                # such rows sync logs down for debuggability -- re-driving
+                # them with sync_down_logs=False would trip that assert
+                # into this except and leave the replica SHUTTING_DOWN
+                # forever. Re-syncing after a restart is harmless
+                # (idempotent download).
+                left_in_record = not (status_property.is_scale_down or
+                                      status_property.purged)
                 self._terminate_replica(
                     replica_info.replica_id,
-                    sync_down_logs=False,
+                    sync_down_logs=left_in_record,
                     replica_drain_delay_seconds=0,
-                    purge=replica_info.status_property.purged,
-                    is_scale_down=replica_info.status_property.is_scale_down)
+                    purge=status_property.purged,
+                    is_scale_down=status_property.is_scale_down,
+                    in_flight_drain_cap_seconds=drain_cap)
             except Exception as e:  # pylint: disable=broad-except
                 logger.error('Failed to re-drive termination of replica '
                              f'{replica_info.replica_id}: '
@@ -1288,12 +1482,14 @@ class SkyPilotReplicaManager(ReplicaManager):
 
     # We don't need to add lock here since every caller of this function
     # will acquire the lock.
-    def _terminate_replica(self,
-                           replica_id: int,
-                           sync_down_logs: bool,
-                           replica_drain_delay_seconds: int,
-                           is_scale_down: bool = False,
-                           purge: bool = False) -> None:
+    def _terminate_replica(
+            self,
+            replica_id: int,
+            sync_down_logs: bool,
+            replica_drain_delay_seconds: int,
+            is_scale_down: bool = False,
+            purge: bool = False,
+            in_flight_drain_cap_seconds: Optional[int] = None) -> None:
         left_in_record = not (is_scale_down or purge)
         if left_in_record:
             assert sync_down_logs, (
@@ -1307,6 +1503,12 @@ class SkyPilotReplicaManager(ReplicaManager):
             assert info is not None
             info.status_property.sky_launch_status = (
                 common_utils.ProcessStatus.INTERRUPTED)
+            # Persist the teardown flags in the SAME write as INTERRUPTED:
+            # a crash between them would leave a SHUTTING_DOWN-deriving row
+            # whose flags recovery misreads (a flagless scale-down re-drives
+            # as a left-in-record failure teardown and strands the row).
+            info.status_property.is_scale_down = is_scale_down
+            info.status_property.purged = purge
             serve_state.add_or_update_replica(self._service_name, replica_id,
                                               info)
             launch_thread = self._launch_thread_pool[replica_id]
@@ -1360,13 +1562,24 @@ class SkyPilotReplicaManager(ReplicaManager):
             launch_log_file_name = (
                 serve_utils.generate_replica_launch_log_file_name(
                     self._service_name, replica_id))
-            # Write launch log to replica log file
-            with open(log_file_name, 'w',
-                      encoding='utf-8') as replica_log_file, open(
-                          launch_log_file_name, 'r',
-                          encoding='utf-8') as launch_file:
-                replica_log_file.write(launch_file.read())
-            os.remove(launch_log_file_name)
+            # Write launch log to replica log file. Tolerate a missing
+            # launch log: a recovery re-drive re-enters this after a prior
+            # pass already consumed it, and crashing here would strand the
+            # replica in SHUTTING_DOWN (the recovery loop catches and moves
+            # on without enqueueing the down thread). The replica log from
+            # the prior pass is preserved in that case.
+            if os.path.exists(launch_log_file_name):
+                with open(log_file_name, 'w',
+                          encoding='utf-8') as replica_log_file, open(
+                              launch_log_file_name, 'r',
+                              encoding='utf-8') as launch_file:
+                    replica_log_file.write(launch_file.read())
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(launch_log_file_name)
+            else:
+                logger.info(f'Launch log for replica {replica_id} already '
+                            'consumed (recovery re-drive); keeping the '
+                            'existing replica log.')
 
             logger.info(f'Syncing down logs for replica {replica_id}...')
             backend = backends.CloudVmRayBackend()
@@ -1420,25 +1633,87 @@ class SkyPilotReplicaManager(ReplicaManager):
             self._handle_sky_down_finish(info, format_exc=None)
             return
 
-        # Otherwise, start the thread to terminate the cluster.
+        # Otherwise, schedule the thread to terminate the cluster. The
+        # SHUTTING_DOWN status (sky_down_status set) is persisted FIRST:
+        # the drain deadline and predicate are anchored to a moment at
+        # which the controller provably stops advertising the replica to
+        # the LB, and the deadline is anchored here (not at thread start)
+        # so time queued in the admission pass counts toward the drain
+        # budget instead of extending the terminate-slot hold.
+        info.status_property.sky_down_status = (
+            common_utils.ProcessStatus.SCHEDULED)
+        serve_state.add_or_update_replica(self._service_name, replica_id, info)
+        drain_deadline: Optional[float] = None
+        drain_complete: Optional[Callable[[], bool]] = None
+        if (in_flight_drain_cap_seconds is not None and
+                in_flight_drain_cap_seconds > 0):
+            drain_started = time.monotonic()
+            drain_deadline = drain_started + in_flight_drain_cap_seconds
+            try:
+                # Live endpoint resolution (one DB/provider lookup); a
+                # failure must never block the teardown -- it only costs
+                # the early-exit (bounded sleep to the deadline instead).
+                replica_url = info.url
+            except Exception as e:  # pylint: disable=broad-except
+                logger.warning(
+                    f'Failed to resolve the url of replica {replica_id} for '
+                    f'the drain wait: {common_utils.format_exception(e)}')
+                replica_url = None
+            if not self._is_pool and replica_url is not None:
+                # Pools have no LB (no gauge, nothing routed), and a
+                # replica without a resolvable url never served: both keep
+                # the plain bounded sleep semantics via a None predicate.
+                drain_complete = _ReplicaDrainTracker(self, replica_url,
+                                                      drain_started)
         t = thread_utils.SafeThread(
             target=terminate_cluster,
             args=(info.cluster_name, log_file_name,
                   replica_drain_delay_seconds),
+            kwargs={
+                'drain_deadline': drain_deadline,
+                'drain_complete': drain_complete,
+            },
         )
-        info.status_property.sky_down_status = (
-            common_utils.ProcessStatus.SCHEDULED)
-        serve_state.add_or_update_replica(self._service_name, replica_id, info)
         self._down_thread_pool[replica_id] = t
+
+    def _resolve_drain_cap_seconds(self, replica_id: int) -> int:
+        """Drain cap for retiring this replica, per its own version spec.
+
+        An outdated replica retired by a rolling update drains per the
+        spec it was serving under. Spec lookup failures fall back to the
+        default cap -- a drain regression must never block a teardown.
+        """
+        try:
+            info = serve_state.get_replica_info_from_id(self._service_name,
+                                                        replica_id)
+            if info is not None:
+                spec_drain = self._get_version_spec(
+                    info.version).graceful_drain_seconds
+                if spec_drain is not None:
+                    return spec_drain
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning(
+                f'Failed to resolve graceful_drain_seconds for replica '
+                f'{replica_id}; using the default '
+                f'({_DEFAULT_DRAIN_SECONDS}s): '
+                f'{common_utils.format_exception(e)}')
+        return _DEFAULT_DRAIN_SECONDS
 
     @with_lock
     def scale_down(self, replica_id: int, purge: bool = False) -> None:
-        self._terminate_replica(
-            replica_id,
-            sync_down_logs=False,
-            replica_drain_delay_seconds=_DEFAULT_DRAIN_SECONDS,
-            is_scale_down=True,
-            purge=purge)
+        # Retirement drain: bounded by the replica's version spec,
+        # completing early once the LB provably stopped routing to the
+        # replica and reports zero in-flight for it. A purge is a forceful
+        # cleanup of an already-failed replica: nothing routable is being
+        # retired, so it must not wait out a graceful-drain cap.
+        drain_cap = (None
+                     if purge else self._resolve_drain_cap_seconds(replica_id))
+        self._terminate_replica(replica_id,
+                                sync_down_logs=False,
+                                replica_drain_delay_seconds=0,
+                                is_scale_down=True,
+                                purge=purge,
+                                in_flight_drain_cap_seconds=drain_cap)
 
     # We don't need to add lock here since every caller of this function
     # will acquire the lock.

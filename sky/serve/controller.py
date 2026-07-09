@@ -259,7 +259,14 @@ class SkyServeController:
         # in-flight unit would vanish from the autoscaler's outstanding
         # sum and, worse, the replica would read as idle and become a
         # scale-down victim while an hour-long job still runs on it.
-        # Terminal replicas are pruned so the cache stays bounded.
+        # Terminal replicas (SHUTTING_DOWN included) are pruned so the
+        # cache stays bounded AND so a retiring replica's in-flight stops
+        # counting toward the autoscaler's outstanding-work sum: its
+        # requests are pinned to it and cannot be re-routed, so counting
+        # them as demand would launch phantom replacement capacity for
+        # the whole drain window. The retirement drain itself does not
+        # need translation -- it matches the LB's raw url-keyed report
+        # against the replica's own url (see _ReplicaDrainTracker).
         nonterminal_ids = {
             info.replica_id for info in replica_infos if not info.is_terminal
         }
@@ -274,6 +281,13 @@ class SkyServeController:
         # replicas that are no longer READY.
         self._lb_replica_cache = replica_cache
         return replica_info, num_ready
+
+    def _url_to_replica_id_map(self) -> Dict[str, int]:
+        """Invert the translation cache (url -> replica id)."""
+        return {
+            url: replica_id
+            for replica_id, (url, _, _) in self._lb_translation_cache.items()
+        }
 
     def _translate_in_flight(
             self,
@@ -298,10 +312,7 @@ class SkyServeController:
         """
         if in_flight_by_url is None:
             return None
-        url_to_replica_id = {
-            url: replica_id
-            for replica_id, (url, _, _) in self._lb_translation_cache.items()
-        }
+        url_to_replica_id = self._url_to_replica_id_map()
         in_flight_by_replica_id: Dict[int, int] = {}
         for url, count in in_flight_by_url.items():
             replica_id = url_to_replica_id.get(url)
@@ -537,6 +548,21 @@ class SkyServeController:
                 'rejected_in_window': request_data.get('rejected_in_window'),
             }
             self._autoscaler.collect_request_information(request_information)
+            # Publish the LB's raw url-keyed gauge, routing view, and
+            # occupancy-unknown set to the replica manager: retirement
+            # drains (scale_down) complete early once a report proves the
+            # LB stopped routing to the retiring replica's url AND shows
+            # zero in-flight (and no unknown async occupancy) for it.
+            # Deliberately url-keyed, not translated: the drain target's
+            # url is known from its own replica record, so translation
+            # gaps (cold cache after a restart, urls of already-removed
+            # replicas lingering in the LB's retention) neither poison
+            # unrelated drains nor mask the target.
+            self._replica_manager.update_lb_in_flight(
+                request_data.get('in_flight'), request_data.get('routing_urls'),
+                request_data.get('unknown_in_flight_urls'),
+                request_data.get('draining_urls'),
+                request_data.get('lb_session_id'))
 
             return responses.JSONResponse(content={
                 'replica_info': lb_replica_info,
