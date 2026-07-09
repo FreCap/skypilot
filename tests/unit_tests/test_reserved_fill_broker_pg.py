@@ -155,6 +155,18 @@ class TestAtomicPersistFencePG(sqlite_suite.TestAtomicPersistFence):
     pass
 
 
+class TestRoundPersistExclusionPG(sqlite_suite.TestRoundPersistExclusion):
+    pass
+
+
+class TestFencePendingFailsClosedPG(sqlite_suite.TestFencePendingFailsClosed):
+    pass
+
+
+class TestOrphanFillRowDebitPG(sqlite_suite.TestOrphanFillRowDebit):
+    pass
+
+
 # TestSqliteFenceBusySkip is deliberately not re-collected here: it pins
 # sqlite-only busy-degradation semantics (the PG fence blocks on the FOR
 # SHARE row lock instead of returning False).

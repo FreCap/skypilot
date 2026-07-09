@@ -1318,9 +1318,10 @@ class TestGrantEpochPlumbing(unittest.TestCase):
 class TestEpochFencedLaunch(unittest.TestCase):
     """A fill launch carrying a superseded epoch skips, leaking nothing.
 
-    Broker-stamped launches persist through add_replica_if_round_epoch
-    (the epoch recheck atomic with the row upsert -- the pre-check alone
-    is TOCTOU); un-stamped launches keep the plain persist.
+    Broker-stamped launches persist through the broker's
+    persist_fill_replica (the epoch recheck atomic with the row upsert
+    and mutually excluded with in-flight rounds -- the pre-check alone is
+    TOCTOU); un-stamped launches keep the plain persist.
     """
 
     def _launch(self,
@@ -1355,8 +1356,8 @@ class TestEpochFencedLaunch(unittest.TestCase):
                                return_value=[]), \
              mock.patch.object(replica_managers.serve_state,
                                'add_or_update_replica') as add_mock, \
-             mock.patch.object(replica_managers.serve_state,
-                               'add_replica_if_round_epoch',
+             mock.patch.object(replica_managers.reserved_capacity_broker,
+                               'persist_fill_replica',
                                return_value=persist_epoch_current
                               ) as fenced_add_mock:
             launched = manager._launch_replica(7, override)

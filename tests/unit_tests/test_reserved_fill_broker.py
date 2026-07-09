@@ -23,6 +23,7 @@ from sky.serve import constants as serve_constants
 from sky.serve import reserved_capacity_broker as broker
 from sky.serve import serve_state
 from sky.utils import common_utils
+from sky.utils import locks
 
 _POOL = broker.make_pool_key('research-ctx', 'A100')
 
@@ -290,6 +291,21 @@ def broker_engine(tmp_path):
     return create_engine(f'sqlite:///{tmp_path}/serve_state.db')
 
 
+class _InertLock:
+    """No-op stand-in for locks.get_lock supporting both call shapes:
+    `with lock:` (the round driver) and `with lock.acquire(blocking=...):`
+    (the fill persist)."""
+
+    def acquire(self, blocking: bool = True):  # pylint: disable=unused-argument
+        return contextlib.nullcontext()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return None
+
+
 @pytest.fixture
 def _broker_db(broker_engine, monkeypatch, clock):  # pylint: disable=unused-argument
     """Fresh serve DB + no-op round lock + empty in-process caches."""
@@ -297,10 +313,12 @@ def _broker_db(broker_engine, monkeypatch, clock):  # pylint: disable=unused-arg
     monkeypatch.setattr(serve_state._db_manager, '_engine', engine)
     serve_state.Base.metadata.create_all(engine)
     monkeypatch.setattr(broker.locks, 'get_lock',
-                        lambda *args, **kwargs: contextlib.nullcontext())
+                        lambda *args, **kwargs: _InertLock())
     # Round debits read replica rows; default to none (tests that exercise
     # the debit override this).
     monkeypatch.setattr(serve_state, 'get_replica_infos',
+                        mock.Mock(return_value=[]))
+    monkeypatch.setattr(serve_state, 'get_replica_service_names',
                         mock.Mock(return_value=[]))
     broker.clear_caches()
     yield engine
@@ -934,17 +952,28 @@ class TestStaleWriterFence:
     def test_replacement_writer_supersedes_slow_query(self):
         _upsert('svc-a')
         _upsert('svc-b')
+        rounds_table = serve_state.reserved_fill_rounds_table
 
         def racing_query():
             # Writer B drives a FULL round from inside A's query window
-            # (the test lock is a nullcontext, so re-entry stands in for
-            # "A's advisory-lock session died and B took over"). Two
+            # (the test lock is inert, so re-entry stands in for "A's
+            # advisory-lock session died and B took over"). Two
             # sequential calls on one DB: no real threads needed for the
             # token logic.
             inner = broker.run_round_if_stale('svc-b', _POOL, lambda: _obs(6),
                                               60.0)
             assert inner is not None
             assert inner.feed == 3
+            # A dead-gap marker stamped AFTER B's publish (e.g. by a
+            # post-expiry writer that then crashed): A's failed publish
+            # below must not clear it.
+            engine = serve_state._db_manager.get_engine()
+            with orm.Session(engine) as session:
+                session.execute(
+                    sqlalchemy.update(rounds_table).where(
+                        rounds_table.c.pool_key == _POOL).values(
+                            fence_pending=1))
+                session.commit()
             return _obs(10)
 
         stale = broker.run_round_if_stale('svc-a', _POOL, racing_query, 60.0)
@@ -953,10 +982,62 @@ class TestStaleWriterFence:
         round_row = serve_state.get_reserved_fill_round(_POOL)
         assert round_row is not None
         # B's round survives untouched: A's older 10-free observation
-        # never overwrote the newer 6-free one.
+        # never overwrote the newer 6-free one, the pool epoch never
+        # regressed, and the peer's fence marker survived A's rollback.
         assert int(round_row['round_id']) == 1
         assert int(round_row['last_observed_free']) == 6
         assert sum(json.loads(round_row['feeds']).values()) == 6
+        assert bool(round_row['fence_pending'])
+
+    def test_resumed_writer_rereads_state_after_token(self, clock):
+        # Token-first ordering: every input the publish persists is read
+        # AFTER the ownership token commit. A writer suspended BEFORE its
+        # token acquisition (the old code read claims + round first)
+        # resumes here: writer B published a full round and a dead-gap
+        # marker was stamped in the meantime. A must build on B's round
+        # (no per-pool epoch regress, marker honored via a bump), not
+        # abort or republish pre-B state.
+        _upsert('svc-a')
+        _upsert('svc-b')
+        rounds_table = serve_state.reserved_fill_rounds_table
+        real_acquire = serve_state.acquire_reserved_fill_lease_token
+        raced = {'done': False}
+
+        def racing_acquire(**kwargs):
+            if not raced['done']:
+                raced['done'] = True
+                inner = broker.run_round_if_stale('svc-b', _POOL,
+                                                  lambda: _obs(6), 60.0)
+                assert inner is not None
+                engine = serve_state._db_manager.get_engine()
+                with orm.Session(engine) as session:
+                    session.execute(
+                        sqlalchemy.update(rounds_table).where(
+                            rounds_table.c.pool_key == _POOL).values(
+                                fence_pending=1))
+                    session.commit()
+                # B's round is fresh by wall clock; A only reached the
+                # drive path because the round was absent pre-token.
+                clock.advance(61)
+                _upsert('svc-a')
+                _upsert('svc-b')
+            return real_acquire(**kwargs)
+
+        with mock.patch.object(serve_state,
+                               'acquire_reserved_fill_lease_token',
+                               side_effect=racing_acquire):
+            alloc = broker.run_round_if_stale('svc-a', _POOL, lambda: _obs(6),
+                                              60.0)
+        assert raced['done']
+        # A's post-token reads saw B's round: it published on top of it.
+        assert alloc is not None
+        round_row = serve_state.get_reserved_fill_round(_POOL)
+        assert round_row is not None
+        assert int(round_row['round_id']) == 2
+        # The pending marker forced the bump (allocation itself was
+        # unchanged) and was legitimately cleared by A's publish.
+        assert alloc.epoch == 2
+        assert not bool(round_row['fence_pending'])
 
 
 @pytest.mark.usefixtures('_broker_db')
@@ -996,14 +1077,50 @@ class TestAtomicPersistFence:
             self._STUB_INFO,
             pool_key=_POOL,
             expected_epoch=alloc.epoch)
-        # No round row for the pool: fail open, like the pre-check.
+        # No round row for the pool: fail open, like the pre-check (the
+        # claimant must still hold a live claim on that pool).
+        pool_b = broker.make_pool_key('other-ctx', 'H100')
+        _upsert('svc-c', pool_key=pool_b)
+        assert serve_state.add_replica_if_round_epoch('svc-c',
+                                                      2,
+                                                      self._STUB_INFO,
+                                                      pool_key=pool_b,
+                                                      expected_epoch=99)
+        assert self._replica_row_count() == 2
+
+    def test_persist_requires_live_same_pool_claim(self):
+        # A disabled/pruned claimant's queued fill launch must fence out
+        # at persist time instead of starting against a slot the broker
+        # no longer attributes to it; a claim moved to another pool
+        # fences the same way.
+        _upsert('svc-a')
+        _upsert('svc-b')
+        alloc = _run('svc-a', free=4)
+        assert alloc is not None
+        # No claim at all (former claimant, rows-only service).
+        assert not serve_state.add_replica_if_round_epoch(
+            'svc-gone',
+            1,
+            self._STUB_INFO,
+            pool_key=_POOL,
+            expected_epoch=alloc.epoch)
+        # Claim moved to a different pool.
+        _upsert('svc-moved', pool_key=broker.make_pool_key('other', 'H100'))
+        assert not serve_state.add_replica_if_round_epoch(
+            'svc-moved',
+            1,
+            self._STUB_INFO,
+            pool_key=_POOL,
+            expected_epoch=alloc.epoch)
+        assert self._replica_row_count() == 0
+        # The live claimant itself still persists.
         assert serve_state.add_replica_if_round_epoch(
             'svc-a',
-            2,
+            1,
             self._STUB_INFO,
-            pool_key=broker.make_pool_key('other-ctx', 'H100'),
-            expected_epoch=99)
-        assert self._replica_row_count() == 2
+            pool_key=_POOL,
+            expected_epoch=alloc.epoch)
+        assert self._replica_row_count() == 1
 
     def test_round_published_between_precheck_and_persist_fences(
             self, monkeypatch):
@@ -1049,6 +1166,206 @@ class TestAtomicPersistFence:
             'svc-a', 1, self._STUB_INFO, pool_key=_POOL, expected_epoch=carried)
         assert raced['done']
         assert self._replica_row_count() == 0
+
+
+@pytest.mark.usefixtures('_broker_db')
+class TestRoundPersistExclusion:
+    """Fill persists and broker rounds mutually exclude via the round lock.
+
+    A persist landing inside a round's scan->publish window is counted by
+    neither the completed debit scan nor the not-yet-bumped epoch fence:
+    the broker would re-feed the just-taken slot to a peer. The persist
+    therefore takes the same cross-process lock the round holds for its
+    whole body, non-blocking: contention degrades into a fence-skip
+    (False, retried next tick), so a persist lands either before the scan
+    (counted -- pinned by the live_fill/debit tests) or after the publish
+    (fenced by the bumped epoch).
+    """
+
+    _STUB_INFO = 'replica-info-stub'
+
+    def _replica_row_count(self):
+        engine = serve_state._db_manager.get_engine()
+        with orm.Session(engine) as session:
+            return session.execute(
+                sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                    serve_state.replicas_table)).scalar()
+
+    def test_persist_skips_while_round_holds_the_lock(self, monkeypatch):
+        # Real file locks (the fixture's inert lock cannot contend); the
+        # lock file resolves under SKY_LOCKS_DIR, unique per test run.
+        lock_id = f'test-broker-round-{id(self)}'
+        monkeypatch.setattr(
+            broker.locks, 'get_lock',
+            lambda *args, **kwargs: locks.FileLock(lock_id, timeout=0.0))
+        _upsert('svc-a')
+        _upsert('svc-b')
+        alloc = _run('svc-a', free=4)
+        assert alloc is not None
+        round_lock = locks.FileLock(lock_id)
+        with round_lock.acquire():  # a round is in flight
+            assert not broker.persist_fill_replica('svc-a',
+                                                   1,
+                                                   self._STUB_INFO,
+                                                   pool_key=_POOL,
+                                                   expected_epoch=alloc.epoch)
+            assert self._replica_row_count() == 0
+        # Lock released (round published nothing new): the same persist
+        # goes through.
+        assert broker.persist_fill_replica('svc-a',
+                                           1,
+                                           self._STUB_INFO,
+                                           pool_key=_POOL,
+                                           expected_epoch=alloc.epoch)
+        assert self._replica_row_count() == 1
+        # After a publish that bumped the epoch, a stale-epoch persist is
+        # fenced even with the lock free.
+        engine = serve_state._db_manager.get_engine()
+        rounds_table = serve_state.reserved_fill_rounds_table
+        with orm.Session(engine) as session:
+            session.execute(
+                sqlalchemy.update(rounds_table).where(
+                    rounds_table.c.pool_key == _POOL).values(epoch=alloc.epoch +
+                                                             1))
+            session.commit()
+        assert not broker.persist_fill_replica('svc-a',
+                                               2,
+                                               self._STUB_INFO,
+                                               pool_key=_POOL,
+                                               expected_epoch=alloc.epoch)
+        assert self._replica_row_count() == 1
+
+
+@pytest.mark.usefixtures('_broker_db')
+class TestFencePendingFailsClosed:
+    """A pending dead-gap marker fences actuation until a publish clears it.
+
+    The epoch alone cannot fence a pool whose marker can never be cleared
+    (claims gone -> no round is ever published again): a stalled
+    controller's pre-gap decision would pass the epoch check forever.
+    Both the cheap pre-check read (current_epoch) and the atomic persist
+    must fail closed while the marker is set.
+    """
+
+    _STUB_INFO = 'replica-info-stub'
+
+    def _replica_row_count(self):
+        engine = serve_state._db_manager.get_engine()
+        with orm.Session(engine) as session:
+            return session.execute(
+                sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                    serve_state.replicas_table)).scalar()
+
+    def test_marker_fences_precheck_and_persist_until_publish(self, clock):
+        _upsert('svc-a')
+        _upsert('svc-b')
+        alloc = _run('svc-a', free=4)
+        assert alloc is not None
+        engine = serve_state._db_manager.get_engine()
+        rounds_table = serve_state.reserved_fill_rounds_table
+        with orm.Session(engine) as session:
+            session.execute(
+                sqlalchemy.update(rounds_table).where(
+                    rounds_table.c.pool_key == _POOL).values(fence_pending=1))
+            session.commit()
+        # Pre-check read: the sentinel mismatches any carried epoch.
+        epoch_read = broker.current_epoch(_POOL)
+        assert epoch_read is not None and epoch_read != alloc.epoch
+        # Atomic persist: refused, nothing written -- even with the
+        # matching epoch.
+        assert not serve_state.add_replica_if_round_epoch(
+            'svc-a',
+            1,
+            self._STUB_INFO,
+            pool_key=_POOL,
+            expected_epoch=alloc.epoch)
+        assert self._replica_row_count() == 0
+        # An epoch-bumping publish clears the marker; the NEW epoch
+        # actuates again (the old one stays fenced by the bump itself).
+        clock.advance(61)
+        _upsert('svc-a')
+        _upsert('svc-b')
+        fresh = _run('svc-a', free=4)
+        assert fresh is not None
+        assert fresh.epoch == alloc.epoch + 1
+        assert broker.current_epoch(_POOL) == fresh.epoch
+        assert serve_state.add_replica_if_round_epoch(
+            'svc-a',
+            1,
+            self._STUB_INFO,
+            pool_key=_POOL,
+            expected_epoch=fresh.epoch)
+        assert self._replica_row_count() == 1
+
+
+@pytest.mark.usefixtures('_broker_db')
+class TestOrphanFillRowDebit:
+    """Former claimants' fill rows stay visible to the round debit.
+
+    A disabled/pruned/moved claimant's nonterminal pool-matched fill row
+    (e.g. a queued launch not yet bound) no longer belongs to any
+    claimant's holdings, but its slot must not be fed to a peer: the scan
+    covers ALL services with replica rows and attributes such rows to the
+    unclaimed occupancy/draining terms.
+    """
+
+    def test_orphan_pending_row_debits_feed_and_conserves_total(
+            self, monkeypatch):
+        # svc-gone claimed the pool once, launched a fill replica that is
+        # still unbound (not READY -> its slot still reads free in the
+        # measurement), then lost its claim.
+        orphan_rows = [
+            _replica_stub(is_ready=False, reserved_fill=True, created_at=1.0)
+        ]
+        monkeypatch.setattr(
+            serve_state, 'get_replica_infos',
+            mock.Mock(side_effect=lambda name: orphan_rows
+                      if name == 'svc-gone' else []))
+        monkeypatch.setattr(serve_state, 'get_replica_service_names',
+                            mock.Mock(return_value=['svc-gone']))
+        _upsert('svc-a')
+        _upsert('svc-b')
+        alloc = _run('svc-a', free=4)
+        assert alloc is not None
+        round_row = serve_state.get_reserved_fill_round(_POOL)
+        assert round_row is not None
+        # The orphan's slot is NOT fed to the peers: 4 observed - 1
+        # occupying orphan row = 3 spendable.
+        assert sum(json.loads(round_row['feeds']).values()) == 3
+        # ... but it is conserved in the entitlement total (4 free + 1
+        # unclaimed = 5 granted), like a drainer: granted capacity the
+        # orphan's teardown will eventually free.
+        grants = json.loads(round_row['grants'])
+        assert sum(grants.values()) == 5
+        assert set(grants) == {'svc-a', 'svc-b'}
+
+    def test_former_claimant_drainer_counts_into_total(self, monkeypatch):
+        # A former claimant's graceful drainer (SHUTTING_DOWN, launched)
+        # keeps occupying the pool: previously invisible (the scan only
+        # covered current claimants), undercounting the total.
+        orphan_rows = [
+            _replica_stub(is_ready=False,
+                          is_terminal=True,
+                          status=serve_state.ReplicaStatus.SHUTTING_DOWN,
+                          reserved_fill=True,
+                          created_at=1.0)
+        ]
+        monkeypatch.setattr(
+            serve_state, 'get_replica_infos',
+            mock.Mock(side_effect=lambda name: orphan_rows
+                      if name == 'svc-gone' else []))
+        monkeypatch.setattr(serve_state, 'get_replica_service_names',
+                            mock.Mock(return_value=['svc-gone']))
+        _upsert('svc-a')
+        _upsert('svc-b')
+        alloc = _run('svc-a', free=0)
+        assert alloc is not None
+        round_row = serve_state.get_reserved_fill_round(_POOL)
+        assert round_row is not None
+        # total = 0 free + 0 holdings + 1 unclaimed drainer.
+        assert sum(json.loads(round_row['grants']).values()) == 1
+        # Nothing is feedable: the drainer's pod still holds its slot.
+        assert sum(json.loads(round_row['feeds']).values()) == 0
 
 
 @pytest.mark.usefixtures('_broker_db')

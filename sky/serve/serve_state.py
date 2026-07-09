@@ -189,15 +189,22 @@ reserved_fill_rounds_table = sqlalchemy.Table(
     # leave the NEXT writer seeing an unexpired lease -- with unchanged
     # grants/feeds it would republish the old epoch and launches queued
     # before the dead gap would keep passing the fence unrevalidated.
+    # While set, actuation fails CLOSED: the launch fence reads it as
+    # never-matching (reserved_capacity_broker.current_epoch) and the
+    # atomic persist refuses (add_replica_if_round_epoch), so a pool that
+    # never publishes again (claims gone) cannot leak a pre-gap launch.
     sqlalchemy.Column('fence_pending', sqlalchemy.Integer, server_default='0'),
 )
 
 # Singleton lease row (id=1). The epoch only moves forward; it is the round
-# writer's OWNERSHIP TOKEN: CAS-advanced (and committed) BEFORE the round's
-# slow cluster query starts, and the publish only lands while the lease
-# still holds that exact token. A replacement writer (e.g. after the
-# original's advisory-lock session died mid-query) advances it again, so
-# the stale writer's publish fails and its observation is discarded.
+# writer's OWNERSHIP TOKEN and the round's ENTRY POINT: CAS-advanced (and
+# committed) BEFORE the writer reads any claim/round state and before its
+# slow cluster query, and the publish only lands while the lease still
+# holds that exact token -- so everything a successful publish persisted
+# was read AFTER the token (see acquire_reserved_fill_lease_token). A
+# replacement writer (e.g. after the original's advisory-lock session died
+# mid-query) advances it again, so the stale writer's publish fails and
+# its observation is discarded.
 # Fencing for actuation is the per-pool round epoch above.
 reserved_fill_lease_table = sqlalchemy.Table(
     'reserved_fill_lease',
@@ -962,6 +969,22 @@ def get_replica_infos(
     return [pickle.loads(row[0]) for row in rows]
 
 
+def get_replica_service_names() -> List[str]:
+    """Every service that currently has any replica row (a cheap DISTINCT).
+
+    Used by the reserved-fill broker's round debit to scan rows of FORMER
+    claimants too: a disabled/pruned/moved claimant's fill rows still
+    occupy (or are about to occupy) their pool, and scanning only current
+    claimants would feed those slots to a peer.
+    """
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        rows = session.execute(
+            sqlalchemy.select(
+                replicas_table.c.service_name).distinct()).fetchall()
+    return [row[0] for row in rows]
+
+
 def total_number_provisioning_replicas() -> int:
     """Returns the total number of provisioning replicas."""
     engine = _db_manager.get_engine()
@@ -1324,49 +1347,57 @@ def get_reserved_fill_round(pool_key: str) -> Optional[Dict[str, Any]]:
     return None if row is None else dict(row._mapping)  # pylint: disable=protected-access
 
 
-def get_reserved_fill_lease() -> Optional[Dict[str, Any]]:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        row = session.execute(
-            sqlalchemy.select(reserved_fill_lease_table).where(
-                reserved_fill_lease_table.c.id == 1)).fetchone()
-    return None if row is None else dict(row._mapping)  # pylint: disable=protected-access
-
-
 def acquire_reserved_fill_lease_token(
-        prev_epoch: Optional[int],
-        expires_at: float,
-        mark_fence_pending: bool = False) -> Optional[int]:
-    """CAS-advances the global lease BEFORE a round's cluster query.
+        *, now: float, expires_at: float) -> Optional[Tuple[int, bool]]:
+    """Reads, expiry-checks and CAS-advances the global lease atomically.
 
-    The returned epoch is the writer's OWNERSHIP TOKEN, committed before
-    the slow query starts: publish_reserved_fill_round only lands while the
-    lease still holds this exact token, and any replacement writer must
-    advance it again -- so a writer that lost its advisory lock mid-query
-    can never publish a stale observation over the replacement's round
-    (the lease epoch is unconditionally advanced per driven round, so two
-    same-epoch publishes cannot both succeed either).
+    TOKEN-FIRST ordering invariant (the other half lives in
+    reserved_capacity_broker._run_round_locked): this acquisition is the
+    round's ENTRY POINT, committed before the writer reads ANY claim or
+    round state and before its slow cluster query. The returned epoch is
+    the writer's OWNERSHIP TOKEN: publish_reserved_fill_round only lands
+    while the lease still holds this exact token, and any replacement
+    writer must advance it again. Because every input the publish
+    persists is read AFTER this commit, a writer that lost its advisory
+    lock mid-round can never publish from pre-acquisition (stale) state
+    -- the replacement's own advance invalidates the token first, so the
+    stale publish fails closed instead of regressing a pool's fencing
+    epoch or clearing a peer's fence_pending marker (the lease epoch is
+    advanced unconditionally per driven round, so two same-epoch
+    publishes cannot both succeed either).
 
-    mark_fence_pending (set by the broker when the lease it read had
-    EXPIRED) stamps fence_pending=1 on every pool's round row in the same
-    transaction as the token advance. The acquisition itself commits a
-    fresh expires_at, consuming the only other evidence of the dead gap:
-    if this writer dies before publishing, the next writer sees an
-    unexpired lease, and only the persisted marker still forces the
-    per-pool epoch bump its publish must carry. The marker survives any
-    number of aborted token advances and is cleared per pool exclusively
-    by a successful publish (see publish_reserved_fill_round).
+    The lease read, its expiry check and the CAS ride ONE transaction
+    (the row is read FOR UPDATE where the dialect supports it; on sqlite
+    the epoch-filtered UPDATE still fails closed if the row moved). An
+    expired lease -- a dead gap with no rounds at all -- additionally
+    stamps fence_pending=1 on every pool's round row in the same
+    transaction: the acquisition itself commits a fresh expires_at,
+    consuming the only other evidence of the gap, so if this writer dies
+    before publishing, only the persisted marker still forces the
+    per-pool epoch bump the next publish must carry. The marker survives
+    any number of aborted token advances, fails actuation closed while
+    set (see add_replica_if_round_epoch), and is cleared per pool
+    exclusively by a successful publish (see publish_reserved_fill_round).
+    Rounds are marked per pool because rounds and their fencing epochs
+    are per-pool; a single global flag could be cleared by one pool's
+    publish while another pool never bumped.
 
-    prev_epoch is the lease epoch the caller just read (None = no lease row
-    yet). Returns the new token, or None when the CAS lost a race (another
-    writer advanced the lease concurrently -- a lock-bypass signal; the
-    caller must abort the round).
+    Returns (token, lease_was_expired), or None when the CAS lost a race
+    (another writer advanced the lease concurrently -- a lock-bypass
+    signal; the caller must abort the round).
     """
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
-        if prev_epoch is None:
-            # First lease ever: INSERT; a PK collision means we lost a race
-            # that the round lock should have prevented -- fail closed.
+        row = session.execute(
+            sqlalchemy.select(reserved_fill_lease_table.c.epoch,
+                              reserved_fill_lease_table.c.expires_at).where(
+                                  reserved_fill_lease_table.c.id ==
+                                  1).with_for_update()).fetchone()
+        if row is None:
+            # First lease ever (also an expired "lease": no rounds have
+            # ever run). A PK collision means we lost a race that the
+            # round lock should have prevented -- fail closed.
+            lease_expired = True
             try:
                 session.execute(
                     sqlalchemy.insert(reserved_fill_lease_table).values(
@@ -1376,6 +1407,8 @@ def acquire_reserved_fill_lease_token(
                 return None
             token = 1
         else:
+            prev_epoch = int(row[0])
+            lease_expired = row[1] is None or float(row[1]) < now
             token = prev_epoch + 1
             count = session.query(reserved_fill_lease_table).filter(
                 reserved_fill_lease_table.c.id == 1,
@@ -1386,16 +1419,12 @@ def acquire_reserved_fill_lease_token(
             if count == 0:
                 session.rollback()
                 return None
-        if mark_fence_pending:
-            # Every pool's outstanding grants are suspect after a dead
-            # gap, so every round row is marked (rounds and their fencing
-            # epochs are per-pool; a single global flag could be cleared
-            # by one pool's publish while another pool never bumped).
+        if lease_expired:
             session.execute(
                 sqlalchemy.update(reserved_fill_rounds_table).values(
                     fence_pending=1))
         session.commit()
-    return token
+    return token, lease_expired
 
 
 def publish_reserved_fill_round(pool_key: str, *, round_id: int,
@@ -1490,47 +1519,81 @@ def _is_sqlite_busy_error(error: sqlalchemy_exc.OperationalError) -> bool:
 def add_replica_if_round_epoch(service_name: str, replica_id: int,
                                replica_info: 'replica_managers.ReplicaInfo', *,
                                pool_key: str, expected_epoch: int) -> bool:
-    """Persists a fill replica row iff the pool's round epoch is current.
+    """Persists a fill replica row iff the launch's allocation is current.
 
-    The launch path's cheap epoch pre-check is TOCTOU: a broker round can
-    publish a new epoch between that check and the row persist, making a
-    stale fill launch durable against capacity already re-fed to a peer.
-    The recheck and the persist must therefore be atomic, which needs a
-    dialect split:
+    Three predicates, all evaluated atomically with the row upsert:
 
-    - PostgreSQL: two statements in one transaction; the round row is read
-      FOR SHARE, blocking a concurrent round-row UPDATE until commit, so
-      the epoch cannot move between the read and the upsert.
+    - Round epoch: the launch path's cheap epoch pre-check is TOCTOU (a
+      broker round can publish a new epoch between that check and the row
+      persist, making a stale fill launch durable against capacity
+      already re-fed to a peer), so the recheck is atomic with the
+      persist. A missing round row fails open (persists), mirroring the
+      pre-check: no broker ever ran, there is no newer allocation to
+      defer to.
+    - fence_pending fails CLOSED: the marker means every grant issued
+      before a lease-dead gap is suspect, and only an epoch-bumping
+      publish may clear it. Without this predicate a pool whose marker
+      can never be cleared (its claims are gone, so no round is ever
+      published) would let a stalled controller's pre-gap decision pass
+      the epoch check indefinitely.
+    - Live same-pool claim: the launching service must still hold a claim
+      on this pool. A disabled/pruned/moved claimant's queued fill launch
+      would otherwise start against a slot the broker no longer
+      attributes to it (its rows only count as unclaimed occupancy in the
+      round debit -- see _occupying_debit).
+
+    The atomicity needs a dialect split:
+
+    - PostgreSQL: the round and claim rows are read FOR SHARE in the
+      upsert's transaction, blocking concurrent round/claim UPDATEs until
+      commit, so neither predicate can move between the read and the
+      upsert.
     - sqlite: FOR SHARE is a no-op AND the legacy sqlite3 transaction mode
       does not even open a transaction for the SELECT, so the two-statement
       shape keeps the exact read/publish/upsert interleaving it was meant
       to close (or, under WAL snapshot upgrades, aborts with a BUSY error
       instead of fencing). Chosen shape: ONE conditional statement --
       INSERT ... SELECT literals WHERE NOT EXISTS(round with a DIFFERENT
-      epoch) -- because a single DML statement is atomic under sqlite's
-      writer lock by construction: the epoch predicate is evaluated inside
-      the very statement that writes the row, leaving no window at all and
-      no BEGIN IMMEDIATE/busy-handshake choreography to maintain. rowcount
-      0 means the fence held (nothing written). SQLITE_BUSY-family errors
+      epoch or a pending fence) AND EXISTS(live same-pool claim) --
+      because a single DML statement is atomic under sqlite's writer lock
+      by construction: the predicates are evaluated inside the very
+      statement that writes the row, leaving no window at all and no
+      BEGIN IMMEDIATE/busy-handshake choreography to maintain. rowcount 0
+      means a fence held (nothing written). SQLITE_BUSY-family errors
       (another writer holding the lock past the busy timeout) are retried
       a few times and then degrade into a fence-skip: the launch is simply
       re-emitted on a later tick, exactly like a fenced pre-check.
 
-    A missing round row fails open (persists), mirroring the pre-check:
-    there is no newer allocation to defer to. Returns whether the row was
-    persisted; False = the epoch was superseded (or sqlite stayed busy),
-    nothing was written, the caller must skip the launch exactly like a
-    fenced pre-check.
+    Callers must additionally serialize this persist against broker
+    rounds via the cross-process broker lock (see
+    reserved_capacity_broker.persist_fill_replica): the epoch predicate
+    alone cannot see a round that has finished its debit scan but not yet
+    published.
+
+    Returns whether the row was persisted; False = a predicate failed (or
+    sqlite stayed busy), nothing was written, the caller must skip the
+    launch exactly like a fenced pre-check.
     """
     engine = _db_manager.get_engine()
     pickled_info = pickle.dumps(replica_info)
     if engine.dialect.name != db_utils.SQLAlchemyDialect.SQLITE.value:
         with orm.Session(engine) as session:
             row = session.execute(
-                sqlalchemy.select(reserved_fill_rounds_table.c.epoch).where(
-                    reserved_fill_rounds_table.c.pool_key ==
-                    pool_key).with_for_update(read=True)).fetchone()
-            if row is not None and int(row[0]) != expected_epoch:
+                sqlalchemy.select(
+                    reserved_fill_rounds_table.c.epoch,
+                    reserved_fill_rounds_table.c.fence_pending).where(
+                        reserved_fill_rounds_table.c.pool_key ==
+                        pool_key).with_for_update(read=True)).fetchone()
+            if row is not None and (int(row[0]) != expected_epoch or
+                                    bool(row[1])):
+                session.rollback()
+                return False
+            claim = session.execute(
+                sqlalchemy.select(reserved_fill_claims_table.c.service_name).
+                where(reserved_fill_claims_table.c.service_name == service_name,
+                      reserved_fill_claims_table.c.pool_key ==
+                      pool_key).with_for_update(read=True)).fetchone()
+            if claim is None:
                 session.rollback()
                 return False
             insert_stmt = _upsert_insert_func(engine)(replicas_table).values(
@@ -1543,16 +1606,23 @@ def add_replica_if_round_epoch(service_name: str, replica_id: int,
             session.execute(insert_stmt)
             session.commit()
         return True
-    # sqlite: the epoch fence is the WHERE clause of the insert itself.
+    # sqlite: every fence predicate is the WHERE clause of the insert
+    # itself.
     stale_round = sqlalchemy.select(
         reserved_fill_rounds_table.c.pool_key).where(
             reserved_fill_rounds_table.c.pool_key == pool_key,
-            reserved_fill_rounds_table.c.epoch != expected_epoch).exists()
+            sqlalchemy.or_(
+                reserved_fill_rounds_table.c.epoch != expected_epoch,
+                reserved_fill_rounds_table.c.fence_pending != 0)).exists()
+    live_claim = sqlalchemy.select(
+        reserved_fill_claims_table.c.service_name).where(
+            reserved_fill_claims_table.c.service_name == service_name,
+            reserved_fill_claims_table.c.pool_key == pool_key).exists()
     select_stmt = sqlalchemy.select(
         sqlalchemy.literal(service_name),
         sqlalchemy.literal(replica_id),
         sqlalchemy.literal(pickled_info, sqlalchemy.LargeBinary()),
-    ).where(sqlalchemy.not_(stale_round))
+    ).where(sqlalchemy.not_(stale_round), live_claim)
     insert_stmt = sqlite.insert(replicas_table).from_select(
         ['service_name', 'replica_id', 'replica_info'], select_stmt)
     insert_stmt = insert_stmt.on_conflict_do_update(
