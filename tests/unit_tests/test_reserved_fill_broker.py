@@ -9,6 +9,7 @@ downstream identity.
 # pylint: disable=protected-access,invalid-name
 import contextlib
 import json
+from typing import List
 from unittest import mock
 
 import pytest
@@ -247,9 +248,19 @@ def clock(monkeypatch):
 
 
 @pytest.fixture
-def _broker_db(tmp_path, monkeypatch, clock):  # pylint: disable=unused-argument
-    """Fresh sqlite serve DB + no-op round lock + empty in-process caches."""
-    engine = create_engine(f'sqlite:///{tmp_path}/serve_state.db')
+def broker_engine(tmp_path):
+    """Engine the broker DB tests run against.
+
+    sqlite here; test_reserved_fill_broker_pg.py overrides this fixture to
+    re-run the same test bodies against a real Postgres server.
+    """
+    return create_engine(f'sqlite:///{tmp_path}/serve_state.db')
+
+
+@pytest.fixture
+def _broker_db(broker_engine, monkeypatch, clock):  # pylint: disable=unused-argument
+    """Fresh serve DB + no-op round lock + empty in-process caches."""
+    engine = broker_engine
     monkeypatch.setattr(serve_state._db_manager, '_engine', engine)
     serve_state.Base.metadata.create_all(engine)
     monkeypatch.setattr(broker.locks, 'get_lock',
@@ -769,7 +780,7 @@ class TestFedLaunchBootSurvival:
 
     def test_grant_never_drops_below_holdings_while_booting(
             self, clock, monkeypatch):
-        rows = []
+        rows: List[mock.Mock] = []
         monkeypatch.setattr(
             serve_state, 'get_replica_infos',
             mock.Mock(side_effect=lambda name: rows if name == 'svc-a' else []))
