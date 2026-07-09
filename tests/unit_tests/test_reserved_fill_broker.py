@@ -20,6 +20,7 @@ from sqlalchemy.sql import dml
 
 from sky.serve import reserved_capacity_broker as broker
 from sky.serve import serve_state
+from sky.utils import common_utils
 
 _POOL = broker.make_pool_key('research-ctx', 'A100')
 
@@ -307,13 +308,20 @@ def _replica_stub(is_ready=True,
                   region='research-ctx',
                   gpu='A100',
                   reserved_fill=False,
-                  status=None):
+                  status=None,
+                  launched=True):
     info = mock.Mock()
     info.is_ready = is_ready
     info.is_terminal = is_terminal
     info.created_at = created_at
     info.reserved_fill = reserved_fill
     info.status = status
+    # launched=False models a launch-cancelled row (sky.launch interrupted
+    # before a pod was provisioned).
+    info.status_property = mock.Mock()
+    info.status_property.sky_launch_status = (
+        common_utils.ProcessStatus.SUCCEEDED
+        if launched else common_utils.ProcessStatus.INTERRUPTED)
     info.location = {
         'cloud': 'Kubernetes',
         'region': region,
@@ -323,6 +331,18 @@ def _replica_stub(is_ready=True,
         },
     }
     return info
+
+
+def _live_fill_rows(count):
+    """Nonterminal fill rows backing a claimant's holdings on the pool.
+
+    The round replaces each claim's self-reported holdings_fill with the
+    scan-derived live count whenever the replica rows are readable, so a
+    test whose claims carry holdings must back them with rows.
+    """
+    return [
+        _replica_stub(reserved_fill=True, created_at=1.0) for _ in range(count)
+    ]
 
 
 @pytest.mark.usefixtures('_broker_db')
@@ -373,12 +393,16 @@ class TestMultiClaimantRounds:
         alloc_b = broker.get_my_allocation('svc-b')
         assert alloc_b is not None and alloc_b.grant == 15
 
-    def test_new_claimant_reclaims_from_borrower(self, clock):
+    def test_new_claimant_reclaims_from_borrower(self, clock, monkeypatch):
         # svc-a borrowed the whole pool while alone (grant None); svc-b
         # arrives with a floor. The next round grants svc-a LESS than it
         # holds -- the ceiling then strips its surplus's shelter and the
         # normal graceful scale-down returns the machines (autoscaler-side
         # behavior pinned in test_reserved_capacity_fill.py).
+        monkeypatch.setattr(
+            serve_state, 'get_replica_infos',
+            mock.Mock(side_effect=lambda name: _live_fill_rows(10)
+                      if name == 'svc-a' else []))
         _upsert('svc-a', holdings_fill=10)
         alone = _run('svc-a', free=0)
         assert alone is not None and alone.grant is None
@@ -438,7 +462,12 @@ class TestMultiClaimantRounds:
 @pytest.mark.usefixtures('_broker_db')
 class TestBlackout:
 
-    def test_blackout_releases_nothing_and_feeds_nothing(self, clock):
+    def test_blackout_releases_nothing_and_feeds_nothing(
+            self, clock, monkeypatch):
+        # Holdings are row-backed: blind rounds still run the row scan
+        # (a DB read), so the live counts feed the round math.
+        monkeypatch.setattr(serve_state, 'get_replica_infos',
+                            mock.Mock(return_value=_live_fill_rows(5)))
         _upsert('svc-a', holdings_fill=5)
         _upsert('svc-b', holdings_fill=5)
         good = _run('svc-a', free=10)
@@ -453,7 +482,12 @@ class TestBlackout:
         alloc_b = broker.get_my_allocation('svc-b')
         assert alloc_b is not None and alloc_b.feed == 0
 
-    def test_persistent_blackout_never_grants_below_holdings(self, clock):
+    def test_persistent_blackout_never_grants_below_holdings(
+            self, clock, monkeypatch):
+        monkeypatch.setattr(
+            serve_state, 'get_replica_infos',
+            mock.Mock(side_effect=lambda name: _live_fill_rows(8)
+                      if name == 'svc-a' else []))
         _upsert('svc-a', holdings_fill=8)
         _upsert('svc-b', holdings_fill=0)
         assert _run('svc-a', free=10) is not None
@@ -844,7 +878,9 @@ class TestFedLaunchBootSurvival:
         # 2 because the bound pods already consume node capacity.
         created = clock.now
         rows = [
-            _replica_stub(is_ready=False, created_at=created) for _ in range(2)
+            _replica_stub(is_ready=False,
+                          reserved_fill=True,
+                          created_at=created) for _ in range(2)
         ]
         for _ in range(3):
             clock.advance(61)
@@ -861,7 +897,8 @@ class TestFedLaunchBootSurvival:
         # Pods turn READY: the state converges with no cull, and the
         # still-free capacity flows to the peer.
         rows = [
-            _replica_stub(is_ready=True, created_at=created) for _ in range(2)
+            _replica_stub(is_ready=True, reserved_fill=True, created_at=created)
+            for _ in range(2)
         ]
         clock.advance(61)
         _upsert('svc-a', holdings_fill=2)
@@ -887,16 +924,20 @@ class TestDrainWindowConservation:
     allocation fixpoint (killed 10 where 6 was correct, refilled after).
     """
 
-    def _draining_stub(self):
+    def _draining_stub(self, launched=True):
         return _replica_stub(is_ready=False,
                              is_terminal=True,
                              status=serve_state.ReplicaStatus.SHUTTING_DOWN,
                              reserved_fill=True,
-                             created_at=1.0)
+                             created_at=1.0,
+                             launched=launched)
 
     def test_grants_hold_the_fixpoint_while_drains_are_in_flight(
             self, clock, monkeypatch):
-        rows = {'svc-a': [], 'svc-b': []}
+        rows = {
+            'svc-a': _live_fill_rows(10),
+            'svc-b': _live_fill_rows(10),
+        }
         monkeypatch.setattr(
             serve_state, 'get_replica_infos',
             mock.Mock(side_effect=lambda name: rows.get(name, [])))
@@ -920,8 +961,10 @@ class TestDrainWindowConservation:
         # of claimed holdings) but their pods stay bound, so the measured
         # free stays 0 for multiple broker rounds.
         rows = {
-            'svc-a': [self._draining_stub() for _ in range(6)],
-            'svc-b': [self._draining_stub() for _ in range(6)],
+            'svc-a': _live_fill_rows(4) +
+                     [self._draining_stub() for _ in range(6)],
+            'svc-b': _live_fill_rows(4) +
+                     [self._draining_stub() for _ in range(6)],
         }
         for _ in range(2):
             clock.advance(61)
@@ -939,7 +982,7 @@ class TestDrainWindowConservation:
             assert alloc_c.grant == 12 and alloc_c.feed == 0
         # Drains complete: the pods are actually gone, the freed slots
         # show up as measured free, and svc-c gets fed to its grant.
-        rows = {'svc-a': [], 'svc-b': []}
+        rows = {'svc-a': _live_fill_rows(4), 'svc-b': _live_fill_rows(4)}
         clock.advance(61)
         _upsert('svc-a', holdings_fill=4)
         _upsert('svc-b', holdings_fill=4)
@@ -981,6 +1024,51 @@ class TestDrainWindowConservation:
         alloc = _run('svc-a', free=4)
         # total = 4 free + 0 holdings + 0 draining: neither terminal row
         # inflates the split.
+        assert alloc is not None
+        assert alloc.grant == 2 and alloc.feed == 2
+        alloc_b = broker.get_my_allocation('svc-b')
+        assert alloc_b is not None
+        assert alloc_b.grant == 2 and alloc_b.feed == 2
+
+    def test_stale_claim_holdings_not_double_counted_with_drainers(
+            self, monkeypatch):
+        # svc-a's claim was heartbeated BEFORE 6 of its 10 fill replicas
+        # entered their graceful drain: the claim still reports holdings
+        # 10 while the live row scan sees 4 nonterminal + 6 SHUTTING_DOWN
+        # (bound). The round must use the row-consistent 4 + 6 = 10
+        # conserved total -- summing the stale claim with the scanned
+        # drainers (10 + 6 = 16) would over-grant until svc-a's next
+        # heartbeat.
+        rows = _live_fill_rows(4) + [self._draining_stub() for _ in range(6)]
+        monkeypatch.setattr(
+            serve_state, 'get_replica_infos',
+            mock.Mock(side_effect=lambda name: rows if name == 'svc-a' else []))
+        _upsert('svc-a', holdings_fill=10)  # stale: drains started after
+        _upsert('svc-b')
+        alloc = _run('svc-a', free=0)
+        # total = 0 free + 4 live + 6 draining = 10 -> equal-weight
+        # fixpoint 5/5 (the inflated total 16 would grant 8/8), and no
+        # feed materializes out of thin air.
+        assert alloc is not None
+        assert alloc.grant == 5 and alloc.feed == 0
+        alloc_b = broker.get_my_allocation('svc-b')
+        assert alloc_b is not None
+        assert alloc_b.grant == 5 and alloc_b.feed == 0
+
+    def test_interrupted_unbound_fill_row_is_not_a_drainer(self, monkeypatch):
+        # A launch-cancelled fill row (sky.launch INTERRUPTED -> maps to
+        # SHUTTING_DOWN) may never have bound a pod, so the measured free
+        # still counts its slot; also treating the row as a drainer would
+        # add phantom capacity to the pool total. It counts NOWHERE.
+        rows = [self._draining_stub(launched=False)]
+        monkeypatch.setattr(
+            serve_state, 'get_replica_infos',
+            mock.Mock(side_effect=lambda name: rows if name == 'svc-a' else []))
+        _upsert('svc-a')
+        _upsert('svc-b')
+        alloc = _run('svc-a', free=4)
+        # total = 4 free + 0 holdings + 0 draining (the unbound row's
+        # slot is already in the measured free): 2/2, fully feedable.
         assert alloc is not None
         assert alloc.grant == 2 and alloc.feed == 2
         alloc_b = broker.get_my_allocation('svc-b')

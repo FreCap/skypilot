@@ -523,14 +523,32 @@ def _replica_row_on_pool(info: Any, context: str, gpu_name: str) -> bool:
     return any(name.lower() == gpu_name for name in accelerators)
 
 
+def _row_was_launched(info: Any) -> bool:
+    """Whether the row's sky.launch completed (a cluster was provisioned).
+
+    SHUTTING_DOWN is broader than "bound graceful drainer": a
+    launch-cancelled row (sky.launch INTERRUPTED mid-run) maps to
+    SHUTTING_DOWN too, yet may never have bound a pod -- the measured
+    free still counts its slot. Only sky_launch_status == SUCCEEDED
+    means a pod was actually provisioned and keeps occupying the pool
+    through the drain. Rows failing this signal are counted nowhere,
+    matching physical reality (no pod); an interrupted launch whose pod
+    DID partially bind reads as free-side undercount for its short
+    cleanup window -- the conservative direction (never over-grant).
+    """
+    status_property = getattr(info, 'status_property', None)
+    return (getattr(status_property, 'sky_launch_status',
+                    None) == common_utils.ProcessStatus.SUCCEEDED)
+
+
 def _occupying_debit(
         claim_names: List[str], pool_key: str,
         snapshot_time: float) -> Tuple[int, int, Dict[str, int], int]:
-    """Pool slots claimed by rows the snapshot may still have counted free.
+    """Row-consistent scan of every claimant's replica rows on the pool.
 
     Mirrors the #108 occupied-slot subtraction at broker level, across ALL
-    claimants, returning (feed_debit, entitlement_debit,
-    fill_holdings_extra, draining_fill):
+    claimants, returning (feed_debit, entitlement_debit, live_fill,
+    draining_fill):
 
     - feed_debit (rows not READY, or created after the snapshot): applied
       to the observed free the FEED split spends. A launching pod may be
@@ -549,18 +567,24 @@ def _occupying_debit(
       below the owner's holdings and culling exactly the pods that are
       booting (a broker-generated churn wave). Only the mid-query bind
       race (created_at > snapshot) still needs the debit.
-    - fill_holdings_extra (per-owner count of post-snapshot rows with
-      reserved_fill=True): folded back into the owner's holdings for the
-      entitlement total. A FILL bind persisted mid-query IS arbitrated
-      capacity -- just newer than its owner's (stale) claim row, which
-      still reports it as holdings 0. Debiting it from free WITHOUT
-      re-attributing it would undercount the whole-pool total, drop the
-      owner's grant below its real holdings, and cull the replica the
-      previous round's feed just launched. Post-snapshot DEMAND rows keep
-      the plain debit: they are an external mid-query race, not
-      arbitrated capacity.
+    - live_fill (per-owner CURRENT count of nonterminal pool-matched rows
+      with reserved_fill=True; an entry for EVERY owner whose rows were
+      readable, 0 included): the row-consistent replacement for the
+      owner's claimed holdings_fill. A claim's holdings are only as
+      fresh as its owner's last heartbeat, while draining_fill below is
+      a live row scan; mixing the two views double-counts every replica
+      that turned SHUTTING_DOWN after its owner's last poll. This is the
+      same quantity the owner itself reports (nonterminal fill rows on
+      its zero-cost location), just read from the rows NOW. It inherently
+      includes post-snapshot fill binds, so a mid-query FILL bind stays
+      attributed to its owner (the entitlement debit subtracts it from
+      free; counting it here keeps the whole-pool total conserved and
+      the owner's grant covering the replica the previous round's feed
+      just launched). Post-snapshot DEMAND rows keep the plain debit:
+      they are an external mid-query race, not arbitrated capacity.
     - draining_fill (pool-wide count of SHUTTING_DOWN rows with
-      reserved_fill=True): added to the ENTITLEMENT total. A culled fill
+      reserved_fill=True whose sky.launch SUCCEEDED -- see
+      _row_was_launched): added to the ENTITLEMENT total. A culled fill
       replica leaves its owner's holdings the moment it turns terminal,
       but its pod stays bound for the whole graceful drain (multiple
       broker rounds), so the measured free does not see the slot either;
@@ -583,34 +607,41 @@ def _occupying_debit(
     context, gpu_name = parse_pool_key(pool_key)
     feed_debit = 0
     entitlement_debit = 0
-    fill_holdings_extra: Dict[str, int] = {}
+    live_fill: Dict[str, int] = {}
     draining_fill = 0
     for name in sorted(claim_names):
         try:
             infos = serve_state.get_replica_infos(name)
         except Exception as e:  # pylint: disable=broad-except
             # Failing to read one service's rows must not sink the round;
-            # skipping the debit for it is the OPTIMISTIC direction, but
-            # bounded (one service, one round) and self-healing.
+            # skipping its debit (and falling back to its possibly-stale
+            # claim holdings: no live_fill entry) is the OPTIMISTIC
+            # direction, but bounded (one service, one round) and
+            # self-healing.
             logger.warning(
                 f'Reserved-fill broker: could not read replicas of {name!r} '
                 f'for the round debit: {common_utils.format_exception(e)}')
             continue
+        live_fill[name] = 0
         for info in infos:
             if info.is_terminal:
                 # Draining FILL rows still occupy their pool slot for the
                 # whole graceful drain; count them into the entitlement
-                # total (any version, SHUTTING_DOWN only -- see the
-                # draining_fill docstring above for the demand-drain and
-                # FAILED_CLEANUP reasoning).
+                # total (any version, SHUTTING_DOWN only, and only when
+                # the launch actually provisioned a pod -- see the
+                # draining_fill docstring above for the demand-drain,
+                # FAILED_CLEANUP and unbound-launch reasoning).
                 if (getattr(info, 'status',
                             None) == serve_state.ReplicaStatus.SHUTTING_DOWN and
                         bool(getattr(info, 'reserved_fill', False)) and
-                        _replica_row_on_pool(info, context, gpu_name)):
+                        _replica_row_on_pool(info, context, gpu_name) and
+                        _row_was_launched(info)):
                     draining_fill += 1
                 continue
             if not _replica_row_on_pool(info, context, gpu_name):
                 continue
+            if bool(getattr(info, 'reserved_fill', False)):
+                live_fill[name] += 1
             created_at = getattr(info, 'created_at', None)
             post_snapshot = (created_at is not None and
                              created_at > snapshot_time)
@@ -618,10 +649,7 @@ def _occupying_debit(
                 feed_debit += 1
             if post_snapshot:
                 entitlement_debit += 1
-                if bool(getattr(info, 'reserved_fill', False)):
-                    fill_holdings_extra[name] = (
-                        fill_holdings_extra.get(name, 0) + 1)
-    return feed_debit, entitlement_debit, fill_holdings_extra, draining_fill
+    return feed_debit, entitlement_debit, live_fill, draining_fill
 
 
 def _allocation_from_round(service_name: str,
@@ -820,12 +848,32 @@ def _run_round_locked(service_name: str, pool_key: str,
         # baseline into the next multi-claimant round).
         conserved_holdings = sum_holdings
     else:
-        # The debit scan runs on blind rounds too: draining rows keep
-        # occupying the pool regardless of whether this round's
-        # measurement succeeded, and the conservation bookkeeping below
-        # must not flip on a blackout.
-        (feed_debit, entitlement_debit, fill_extra,
+        # The debit scan runs on blind rounds too (replica rows are DB
+        # reads, not cluster queries): draining rows keep occupying the
+        # pool regardless of whether this round's measurement succeeded,
+        # the live-holdings correction below must apply while blind, and
+        # the conservation bookkeeping must not flip on a blackout.
+        (feed_debit, entitlement_debit, live_fill,
          draining_fill) = _occupying_debit(names, pool_key, snapshot_time)
+        # One row-consistent view: a claim's holdings_fill is only as
+        # fresh as its owner's last heartbeat, while draining_fill comes
+        # from the live row scan above -- summing the two double-counts
+        # every replica that turned SHUTTING_DOWN after its owner's last
+        # poll (the stale claim still holds it AND the scan counts it
+        # draining), inflating the pool total (over-grants, too-permissive
+        # demand gate) until the owner re-heartbeats. For every claimant
+        # whose rows were readable the scan-derived CURRENT nonterminal
+        # fill count REPLACES the claim's holdings for all round math
+        # (grants, feeds, the holdings-shrank bypass, the blind-round
+        # floor); the claim value is only the fallback when the scan
+        # could not cover that service (see _occupying_debit).
+        if live_fill:
+            claims = {
+                name: (dataclasses.replace(claim, holdings_fill=live_fill[name])
+                       if name in live_fill else claim)
+                for name, claim in claims.items()
+            }
+            sum_holdings = sum(claim.holdings_fill for claim in claims.values())
         if query_ok:
             assert observation is not None and observation.free_slots is not None
             measured = max(0, int(observation.free_slots))
@@ -836,26 +884,10 @@ def _run_round_locked(service_name: str, pool_key: str,
             # free AND counted in their owner's fill holdings, so the full
             # feed debit here would double-subtract them for the whole
             # bind->READY window and cull the booting pods (see
-            # _occupying_debit).
+            # _occupying_debit). A mid-query FILL bind stays attributed to
+            # its owner through the live_fill holdings above, keeping the
+            # total conserved.
             entitlement_free = max(0, measured - entitlement_debit)
-            if fill_extra:
-                # Post-snapshot FILL binds are arbitrated capacity newer
-                # than their owner's claim row: fold them back into the
-                # owner's holdings so the whole-pool total never
-                # undercounts and the grant keeps covering the replica the
-                # previous round's feed just launched (see
-                # _occupying_debit). Also reflected in the ClaimInputs so
-                # the feed split does not re-feed a slot the owner already
-                # holds.
-                claims = {
-                    name:
-                    (dataclasses.replace(claim,
-                                         holdings_fill=claim.holdings_fill +
-                                         fill_extra[name])
-                     if name in fill_extra else claim)
-                    for name, claim in claims.items()
-                }
-                sum_holdings += sum(fill_extra.values())
         else:
             # Measurement blackout: staleness-decayed last-known free, never
             # a raw 0 -- a blackout must not trigger releases. Past the
