@@ -228,9 +228,17 @@ def water_fill(amount: int, weights: Mapping[str, float],
         (caps.get(name) is None or (caps[name] or 0) > 0)
     ]
     while remaining > 0 and active:
-        weight_sum = sum(weights[name] for name in active)
+        # Normalize by the largest active weight before summing or
+        # multiplying: finite-but-huge weights (isfinite passes 1e308)
+        # would overflow remaining*weight or sum(weights) into inf, and
+        # inf/inf -> NaN crashes the integer rounding -- every round, for
+        # the whole pool. After normalization each term is <= remaining;
+        # fsum keeps the sum exact across wide magnitude spreads.
+        max_weight = max(weights[name] for name in active)
+        normalized = {name: weights[name] / max_weight for name in active}
+        weight_sum = math.fsum(normalized.values())
         shares = {
-            name: remaining * weights[name] / weight_sum for name in active
+            name: remaining * normalized[name] / weight_sum for name in active
         }
         rounded = _largest_remainder_round(shares, remaining)
         capped_any = False
@@ -471,6 +479,17 @@ def _claim_input(row: Dict[str, Any]) -> ClaimInput:
             f'Reserved-fill broker: claim of {row["service_name"]!r} '
             f'carries a non-finite weight {weight!r}; clamping to 1.0.')
         weight = 1.0
+    elif weight > constants.RESERVED_FILL_MAX_WEIGHT:
+        # Same defense for finite-but-out-of-bound weights (the spec
+        # rejects them at construction): clamp to the documented bound so
+        # a poisoned row degrades to an extreme-but-finite share instead
+        # of crashing rounds (the water-fill normalization above is the
+        # second layer).
+        logger.warning(
+            f'Reserved-fill broker: claim of {row["service_name"]!r} '
+            f'carries weight {weight!r} above the supported maximum; '
+            f'clamping to {constants.RESERVED_FILL_MAX_WEIGHT}.')
+        weight = float(constants.RESERVED_FILL_MAX_WEIGHT)
     return ClaimInput(floor=int(row['floor_replicas'] or 0),
                       weight=weight,
                       holdings_fill=int(row['holdings_fill'] or 0),
@@ -769,9 +788,16 @@ def _run_round_locked(service_name: str, pool_key: str,
                      float(lease['expires_at']) < now)
     lease_ttl_seconds = (constants.RESERVED_FILL_LEASE_TTL_INTERVALS *
                          poll_interval_seconds)
+    # A post-expiry acquisition also stamps the persistent per-pool
+    # fence_pending marker in the same transaction: the acquisition
+    # commits a fresh expires_at (consuming the expiry evidence), so if
+    # this writer dies before publishing, only the marker still tells the
+    # next writer that every outstanding grant crossed a dead gap and its
+    # publish must bump the pool epoch (see the epoch computation below).
     lease_token = serve_state.acquire_reserved_fill_lease_token(
         prev_epoch=int(lease['epoch']) if lease is not None else None,
-        expires_at=now + lease_ttl_seconds)
+        expires_at=now + lease_ttl_seconds,
+        mark_fence_pending=lease_expired)
     if lease_token is None:
         logger.error(
             'Reserved-fill broker: lost the lease-token race before the '
@@ -881,7 +907,7 @@ def _run_round_locked(service_name: str, pool_key: str,
         # baseline into the next multi-claimant round). Any pending shrink
         # candidate is dropped for the same reason: with the peers gone
         # there is no damping bypass left to confirm.
-        conserved_holdings = sum_holdings
+        published_sum_holdings = sum_holdings
         new_shrink_baseline: Optional[int] = None
     else:
         # The debit scan runs on blind rounds too (replica rows are DB
@@ -910,6 +936,26 @@ def _run_round_locked(service_name: str, pool_key: str,
                 for name, claim in claims.items()
             }
             sum_holdings = sum(claim.holdings_fill for claim in claims.values())
+        # Conservation invariant: the whole-pool total is observed free +
+        # live fill holdings + draining fill rows. A drainer has left its
+        # owner's holdings but its pod still occupies the pool (excluded
+        # from the measured free), so without the draining term every
+        # in-flight cull shrinks the total below the pool's real capacity
+        # and the round reclaims slots that are not actually gone.
+        conserved_holdings = sum_holdings + draining_fill
+        # Previous single-claimant None grants carry no integer baseline:
+        # drop them so damping treats the service as newly-baselined.
+        prev_published: Optional[Dict[str, int]] = None
+        if round_row is not None:
+            prev_published = {
+                name: value
+                for name, value in prev_grants_json.items()
+                if isinstance(value, int)
+            }
+        prev_sum_holdings = (round_row['sum_holdings']
+                             if round_row is not None else None)
+        prev_shrink_baseline = (round_row['shrink_baseline']
+                                if round_row is not None else None)
         if query_ok:
             assert observation is not None and observation.free_slots is not None
             measured = max(0, int(observation.free_slots))
@@ -924,78 +970,43 @@ def _run_round_locked(service_name: str, pool_key: str,
             # its owner through the live_fill holdings above, keeping the
             # total conserved.
             entitlement_free = max(0, measured - entitlement_debit)
-        else:
-            # Measurement blackout: staleness-decayed last-known free, never
-            # a raw 0 -- a blackout must not trigger releases. Past the
-            # staleness window the decayed value IS 0, but the holdings
-            # floor below still prevents any release while blind.
-            stale_after = (poll_interval_seconds *
-                           constants.RESERVED_CAPACITY_STALE_AFTER_INTERVALS)
-            observed_free = 0
-            if (last_free is not None and last_free_ts is not None and
-                    now - float(last_free_ts) <= stale_after):
-                observed_free = int(last_free)
-            entitlement_free = observed_free
-        # Conservation invariant: the whole-pool total is observed free +
-        # live fill holdings + draining fill rows. A drainer has left its
-        # owner's holdings but its pod still occupies the pool (excluded
-        # from the measured free), so without the draining term every
-        # in-flight cull shrinks the total below the pool's real capacity
-        # and the round reclaims slots that are not actually gone.
-        conserved_holdings = sum_holdings + draining_fill
-        total = entitlement_free + conserved_holdings
-        raw_grants = compute_entitlements(total, claims)
-        # Previous single-claimant None grants carry no integer baseline:
-        # drop them so damping treats the service as newly-baselined.
-        prev_published: Optional[Dict[str, int]] = None
-        if round_row is not None:
-            prev_published = {
-                name: value
-                for name, value in prev_grants_json.items()
-                if isinstance(value, int)
-            }
-        prev_sum_holdings = (round_row['sum_holdings']
-                             if round_row is not None else None)
-        prev_shrink_baseline = (round_row['shrink_baseline']
-                                if round_row is not None else None)
-        # The immediate-down bypass keys on (holdings + draining): a
-        # holdings drop whose slots merely moved into a graceful drain is
-        # NOT capacity that physically vanished -- the drainers' pods are
-        # still bound. And a one-round conserved shrink can be a pure
-        # observation artifact: a drain completing between the cluster
-        # query and the row scan leaves the slot counted occupied by the
-        # query (not free) yet already deleted from the rows (not held,
-        # not draining), so BOTH terms omit it for exactly this round;
-        # firing the bypass on that phantom culls a warm replica the next
-        # query would have vindicated. The bypass therefore requires
-        # CONFIRMATION: a shrink below the previous round's conserved sum
-        # only records that sum as a pending baseline (this round takes
-        # the normal two-round damped path), and only a next round still
-        # below the baseline treats the capacity as physically gone. A
-        # legitimate fast reclaim (pods really deleted) loses at most one
-        # round of down-speed to this -- acceptable, and the ordinary
-        # two-round damped down usually lands the same round anyway. The
-        # blind-round holdings floor below is unaffected: it keys on
-        # CURRENT holdings, and still overrides any confirmed-shrink down
-        # while the pool is unmeasurable.
-        new_shrink_baseline = None
-        if (prev_shrink_baseline is not None and
-                conserved_holdings < int(prev_shrink_baseline)):
-            # Confirmed: the shrink persisted across two consecutive
-            # row-consistent scans -- pods are physically gone.
-            holdings_shrank = True
-        elif (prev_sum_holdings is not None and
-              conserved_holdings < int(prev_sum_holdings)):
-            # First observation of this shrink: could be the
-            # query-then-scan gap; damp normally and remember the
-            # pre-shrink baseline for next round's confirmation.
-            holdings_shrank = False
-            new_shrink_baseline = int(prev_sum_holdings)
-        else:
-            holdings_shrank = False
-        damped = damp_grants(raw_grants, prev_published, prev_raw,
-                             holdings_shrank)
-        if query_ok:
+            total = entitlement_free + conserved_holdings
+            raw_grants = compute_entitlements(total, claims)
+            # The immediate-down bypass keys on (holdings + draining): a
+            # holdings drop whose slots merely moved into a graceful drain
+            # is NOT capacity that physically vanished -- the drainers'
+            # pods are still bound. And a one-round conserved shrink can
+            # be a pure observation artifact: a drain completing between
+            # the cluster query and the row scan leaves the slot counted
+            # occupied by the query (not free) yet already deleted from
+            # the rows (not held, not draining), so BOTH terms omit it for
+            # exactly this round; firing the bypass on that phantom culls
+            # a warm replica the next query would have vindicated. The
+            # bypass therefore requires CONFIRMATION: a shrink below the
+            # previous round's conserved sum only records that sum as a
+            # pending baseline (this round takes the normal two-round
+            # damped path), and only a next round still below the baseline
+            # treats the capacity as physically gone. A legitimate fast
+            # reclaim (pods really deleted) loses at most one round of
+            # down-speed to this -- acceptable, and the ordinary two-round
+            # damped down usually lands the same round anyway.
+            new_shrink_baseline = None
+            if (prev_shrink_baseline is not None and
+                    conserved_holdings < int(prev_shrink_baseline)):
+                # Confirmed: the shrink persisted across two consecutive
+                # row-consistent scans -- pods are physically gone.
+                holdings_shrank = True
+            elif (prev_sum_holdings is not None and
+                  conserved_holdings < int(prev_sum_holdings)):
+                # First observation of this shrink: could be the
+                # query-then-scan gap; damp normally and remember the
+                # pre-shrink baseline for next round's confirmation.
+                holdings_shrank = False
+                new_shrink_baseline = int(prev_sum_holdings)
+            else:
+                holdings_shrank = False
+            damped = damp_grants(raw_grants, prev_published, prev_raw,
+                                 holdings_shrank)
             # raw_grants clamps each feed need to min(damped, raw): a
             # service inside a down-move's damping window must not be fed
             # above its raw entitlement -- the damped grant catches down
@@ -1009,17 +1020,42 @@ def _run_round_locked(service_name: str, pool_key: str,
                 constants.RESERVED_FILL_STICKY_FEED_INTERVALS *
                 poll_interval_seconds,
                 raw_grants=raw_grants)
+            published_sum_holdings = conserved_holdings
         else:
-            # Blind round: never grant BELOW current holdings (no release
-            # on blackout) and launch nothing new (feeds 0). Sticky state
-            # is carried unchanged; its window is wall-clock, so a short
-            # blackout does not break an in-progress streak.
-            damped = {
-                name: max(grant, claims[name].holdings_fill)
-                for name, grant in damped.items()
-            }
+            # Measurement blackout: a failed query is not an observation,
+            # so it must not CHANGE the allocation -- the previous round's
+            # grants are carried forward as-is (floored at each claimant's
+            # CURRENT holdings so a blackout never strips a live replica's
+            # shelter), never recomputed. Recomputing from a synthesized
+            # total (stale last-known free + current holdings) double-
+            # counts every slot consumed since the last good measurement:
+            # 10 free observed -> 10 launched -> blackout would read
+            # 10 + 10 = 20 and the inflated grants would reopen the
+            # demand-placement gate on a ten-slot pool. Feeds are 0 (never
+            # launch blind), sticky state is carried unchanged (its window
+            # is wall-clock, so a short blackout does not break an
+            # in-progress streak), and the raw-grant damping baselines,
+            # sum_holdings and any pending shrink baseline are carried too
+            # -- the blackout is fully transparent to the shrink
+            # confirmation, which then compares the last measured round
+            # directly against the next one (no bypass evaluation happens
+            # on a carried round: grants are not recomputed at all). A
+            # claimant with no previous grant (joined during the blackout)
+            # gets its holdings floor: nothing new, nothing stripped.
+            raw_grants = {name: int(value) for name, value in prev_raw.items()}
+            damped = {}
+            for name, claim in claims.items():
+                base = (prev_published.get(name)
+                        if prev_published is not None else None)
+                damped[name] = max(base if base is not None else 0,
+                                   claim.holdings_fill)
             feeds = {name: 0 for name in claims}
             new_sticky = dict(sticky)
+            published_sum_holdings = (int(prev_sum_holdings)
+                                      if prev_sum_holdings is not None else
+                                      conserved_holdings)
+            new_shrink_baseline = (int(prev_shrink_baseline) if
+                                   prev_shrink_baseline is not None else None)
         grants = dict(damped)
 
     grants_changed = round_row is None or prev_grants_json != grants
@@ -1047,7 +1083,17 @@ def _run_round_locked(service_name: str, pool_key: str,
     prev_round_epoch = (int(round_row['epoch'])
                         if round_row is not None else None)
     new_epoch = prev_round_epoch if prev_round_epoch is not None else 0
-    if grants_changed or feeds_changed or lease_expired:
+    # lease_expired covers the writer that OBSERVED the dead gap;
+    # fence_pending covers its crash window: a post-expiry writer's token
+    # acquisition already refreshed expires_at, so if it died before
+    # publishing, the next writer reads an unexpired lease and only the
+    # persisted per-pool marker still demands the bump. The successful
+    # publish below clears the marker in the same transaction (safe: any
+    # concurrent marker-setter advanced the lease, so this publish would
+    # CAS-fail instead of clearing).
+    fence_pending = (bool(round_row['fence_pending'])
+                     if round_row is not None else False)
+    if grants_changed or feeds_changed or lease_expired or fence_pending:
         new_epoch += 1
     round_id = int(round_row['round_id']) + 1 if round_row is not None else 1
     published = serve_state.publish_reserved_fill_round(
@@ -1059,7 +1105,7 @@ def _run_round_locked(service_name: str, pool_key: str,
         feeds=json.dumps(feeds, sort_keys=True),
         raw_grants=json.dumps(raw_grants, sort_keys=True),
         feed_state=json.dumps(new_sticky, sort_keys=True),
-        sum_holdings=conserved_holdings,
+        sum_holdings=published_sum_holdings,
         last_observed_free=last_free,
         last_observed_free_ts=last_free_ts,
         phantom_streak=phantom_streak,

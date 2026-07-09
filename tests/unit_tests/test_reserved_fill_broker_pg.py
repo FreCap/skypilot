@@ -155,6 +155,15 @@ class TestAtomicPersistFencePG(sqlite_suite.TestAtomicPersistFence):
     pass
 
 
+# TestSqliteFenceBusySkip is deliberately not re-collected here: it pins
+# sqlite-only busy-degradation semantics (the PG fence blocks on the FOR
+# SHARE row lock instead of returning False).
+
+
+class TestExpiredLeaseFenceMarkerPG(sqlite_suite.TestExpiredLeaseFenceMarker):
+    pass
+
+
 class TestMidQueryDemandBindDebitPG(sqlite_suite.TestMidQueryDemandBindDebit):
     pass
 
@@ -206,6 +215,7 @@ class TestMigrationChainPG:
                 }
                 assert 'phantom_streak' in columns, columns
                 assert 'shrink_baseline' in columns, columns
+                assert 'fence_pending' in columns, columns
         finally:
             engine.dispose()
 

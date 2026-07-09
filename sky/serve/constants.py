@@ -266,6 +266,13 @@ RESERVED_FILL_STICKY_FEED_INTERVALS = 2
 # pool-wide fill outage. Suspect rounds feed 0 (conservative) but keep the
 # claims; only a persistent phantom (this many rounds in a row) rejects.
 RESERVED_FILL_PHANTOM_CONFIRM_ROUNDS = 3
+# Upper bound on reserved_capacity_fill.weight. isfinite alone is not
+# enough: 1e308 is finite yet overflows remaining*weight / sum(weights) in
+# the broker's water-fill into inf (NaN shares crash integer rounding).
+# The spec rejects weights above this at construction; the broker clamps
+# out-of-bound DB rows to it defensively. 1e6 preserves any sane priority
+# ratio while staying far from float overflow.
+RESERVED_FILL_MAX_WEIGHT = 1e6
 
 # Default interval in seconds to probe replica endpoint.
 DEFAULT_ENDPOINT_PROBE_INTERVAL_SECONDS = 10

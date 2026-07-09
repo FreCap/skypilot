@@ -15,9 +15,11 @@ from unittest import mock
 import pytest
 import sqlalchemy
 from sqlalchemy import create_engine
+from sqlalchemy import exc as sqlalchemy_exc
 from sqlalchemy import orm
 from sqlalchemy.sql import dml
 
+from sky.serve import constants as serve_constants
 from sky.serve import reserved_capacity_broker as broker
 from sky.serve import serve_state
 from sky.utils import common_utils
@@ -68,6 +70,36 @@ class TestWaterFill:
     def test_all_capped_leaves_remainder_unassigned(self):
         result = broker.water_fill(10, {'a': 1, 'b': 1}, {'a': 2, 'b': 3})
         assert result == {'a': 2, 'b': 3}
+
+    def test_huge_finite_weights_do_not_overflow(self):
+        # 1e308 passes isfinite, but without max-normalization
+        # remaining*weight (and sum(weights) with two such claimants)
+        # overflows to inf, shares go NaN, and the integer rounding
+        # raises -- crashing every multi-claimant round.
+        assert broker.water_fill(10, {
+            'a': 1e308,
+            'b': 1.0
+        }, {}) == {
+            'a': 10,
+            'b': 0
+        }
+        assert broker.water_fill(10, {
+            'a': 1e308,
+            'b': 1e308
+        }, {}) == {
+            'a': 5,
+            'b': 5
+        }
+
+    def test_wide_weight_ratio_produces_finite_correct_shares(self):
+        # {1e6, 1} at an amount where both shares are exact integers.
+        assert broker.water_fill(2_000_002, {
+            'a': 1e6,
+            'b': 1.0
+        }, {}) == {
+            'a': 2_000_000,
+            'b': 2
+        }
 
 
 class TestEntitlements:
@@ -449,6 +481,20 @@ class TestMultiClaimantRounds:
         alloc_b = broker.get_my_allocation('svc-b')
         assert alloc_b is not None and alloc_b.grant == 5
 
+    def test_poisoned_out_of_bound_weight_clamps_to_bound(self):
+        # Finite but above the documented bound (the spec rejects it at
+        # construction): a poisoned DB row is clamped to the bound, so the
+        # round completes with extreme-but-finite sane grants instead of
+        # crashing the water-fill.
+        _upsert('svc-a', weight=1e308)
+        _upsert('svc-b', weight=1.0)
+        alloc = _run('svc-a', free=10)
+        assert alloc is not None
+        assert alloc.grant == 10 and alloc.feed == 10
+        alloc_b = broker.get_my_allocation('svc-b')
+        assert alloc_b is not None
+        assert alloc_b.grant == 0 and alloc_b.feed == 0
+
     def test_fresh_round_is_read_not_redriven(self, clock):
         _upsert('svc-a')
         _upsert('svc-b')
@@ -496,6 +542,53 @@ class TestBlackout:
         assert blind.feed == 0  # never launch blind
         alloc_b = broker.get_my_allocation('svc-b')
         assert alloc_b is not None and alloc_b.feed == 0
+
+    def test_blackout_after_full_consumption_carries_grants(
+            self, clock, monkeypatch):
+        # Regression: the blind path used to recompute entitlements from
+        # decayed last-known free + current holdings -- but holdings built
+        # FROM those very slots since the last good observation double-
+        # count them: 10 free observed -> 10 launched -> blackout read
+        # 10 + 10 = 20 and granted 10+10 on a ten-slot pool, reopening the
+        # demand-placement gate. A blackout must carry the previous
+        # round's grants (floored at current holdings), never recompute.
+        rows: dict = {}
+        monkeypatch.setattr(
+            serve_state, 'get_replica_infos',
+            mock.Mock(side_effect=lambda name: rows.get(name, [])))
+        _upsert('svc-a')
+        _upsert('svc-b')
+        good = _run('svc-a', free=10)
+        assert good is not None
+        assert good.grant == 5 and good.feed == 5
+        # Both services materialize their feeds: all ten slots consumed.
+        rows = {'svc-a': _live_fill_rows(5), 'svc-b': _live_fill_rows(5)}
+        # Two consecutive blackout rounds: the second one used to inflate
+        # even through grant damping (the first blind round's published
+        # raw_grants became the damping baseline).
+        for _ in range(2):
+            clock.advance(61)
+            _upsert('svc-a', holdings_fill=5)
+            _upsert('svc-b', holdings_fill=5)
+            blind = _run('svc-a', observation=_obs(None, gpu_names=()))
+            assert blind is not None
+            # Carried 5+5, NOT 10+10; holdings >= grant stays true, so
+            # the demand-placement gate never reopens during the blackout.
+            assert blind.grant == 5
+            assert blind.feed == 0
+            alloc_b = broker.get_my_allocation('svc-b')
+            assert alloc_b is not None
+            assert alloc_b.grant == 5 and alloc_b.feed == 0
+        # Recovery round: normal recompute at the fixpoint, no churn.
+        clock.advance(61)
+        _upsert('svc-a', holdings_fill=5)
+        _upsert('svc-b', holdings_fill=5)
+        recovered = _run('svc-a', free=0)
+        assert recovered is not None
+        assert recovered.grant == 5 and recovered.feed == 0
+        alloc_b = broker.get_my_allocation('svc-b')
+        assert alloc_b is not None
+        assert alloc_b.grant == 5 and alloc_b.feed == 0
 
     def test_persistent_blackout_never_grants_below_holdings(
             self, clock, monkeypatch):
@@ -915,10 +1008,15 @@ class TestAtomicPersistFence:
     def test_round_published_between_precheck_and_persist_fences(
             self, monkeypatch):
         # The cheap pre-check read passes, then a new round publishes
-        # BEFORE the row persist (injected via the session hook right as
-        # the atomic recheck's SELECT executes -- the same pattern as the
-        # prune-race test): the persist must see the new epoch and write
-        # nothing.
+        # BEFORE the row persist (injected via the session hook -- the
+        # same pattern as the prune-race test): the persist must see the
+        # new epoch and write nothing. The injection point is the last
+        # pre-fence statement of each dialect's shape: PostgreSQL's
+        # two-step fence hooks the FOR SHARE round SELECT (no lock held
+        # yet when the hook fires); sqlite's single conditional INSERT
+        # hooks the INSERT itself (the epoch predicate is evaluated
+        # inside that very statement, so a publish landing just before
+        # it must fence).
         _upsert('svc-a')
         _upsert('svc-b')
         alloc = _run('svc-a', free=4)
@@ -930,9 +1028,11 @@ class TestAtomicPersistFence:
         rounds_table = serve_state.reserved_fill_rounds_table
 
         def racing_execute(session, statement, *args, **kwargs):
-            if (not raced['done'] and
-                    isinstance(statement, sqlalchemy.Select) and
-                    'reserved_fill_rounds' in str(statement)):
+            fence_statement = ((isinstance(statement, sqlalchemy.Select) and
+                                'reserved_fill_rounds' in str(statement)) or
+                               (isinstance(statement, dml.Insert) and
+                                statement.table.name == 'replicas'))
+            if not raced['done'] and fence_statement:
                 raced['done'] = True
                 engine = serve_state._db_manager.get_engine()
                 with orm.Session(engine) as other:
@@ -949,6 +1049,144 @@ class TestAtomicPersistFence:
             'svc-a', 1, self._STUB_INFO, pool_key=_POOL, expected_epoch=carried)
         assert raced['done']
         assert self._replica_row_count() == 0
+
+
+@pytest.mark.usefixtures('_broker_db')
+class TestSqliteFenceBusySkip:
+    """SQLITE_BUSY-family failures degrade into a fence-skip, not a raise.
+
+    sqlite-only semantics, deliberately NOT re-collected in the PG module:
+    the PostgreSQL fence never returns False on lock contention (it blocks
+    on the FOR SHARE row lock instead). A busy database at persist time
+    must read as "fence held" (launch re-emitted next tick), never as an
+    exception aborting the whole scale-up batch.
+    """
+
+    def test_busy_error_returns_false_without_raising(self, monkeypatch):
+        _upsert('svc-a')
+        _upsert('svc-b')
+        alloc = _run('svc-a', free=4)
+        assert alloc is not None
+        monkeypatch.setattr(serve_state, '_SQLITE_FENCE_BUSY_BACKOFF_SECONDS',
+                            0.0)
+        real_execute = orm.Session.execute
+        attempts = {'count': 0}
+
+        def busy_execute(session, statement, *args, **kwargs):
+            if (isinstance(statement, dml.Insert) and
+                    statement.table.name == 'replicas'):
+                attempts['count'] += 1
+                raise sqlalchemy_exc.OperationalError(
+                    'INSERT INTO replicas', {}, Exception('database is locked'))
+            return real_execute(session, statement, *args, **kwargs)
+
+        monkeypatch.setattr(orm.Session, 'execute', busy_execute)
+        assert not serve_state.add_replica_if_round_epoch(
+            'svc-a', 1, 'stub-info', pool_key=_POOL, expected_epoch=alloc.epoch)
+        assert attempts['count'] == serve_state._SQLITE_FENCE_BUSY_RETRIES
+        monkeypatch.setattr(orm.Session, 'execute', real_execute)
+        engine = serve_state._db_manager.get_engine()
+        with orm.Session(engine) as session:
+            count = session.execute(
+                sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                    serve_state.replicas_table)).scalar()
+        assert count == 0
+
+
+@pytest.mark.usefixtures('_broker_db')
+class TestExpiredLeaseFenceMarker:
+    """A dead-gap epoch bump survives an aborted post-expiry writer.
+
+    Acquiring the lease token commits a fresh expires_at, consuming the
+    expiry evidence: a post-expiry writer that dies before publishing
+    would otherwise leave the next writer seeing an unexpired lease and
+    (with unchanged grants/feeds) republishing the old pool epoch --
+    letting launches queued before the dead gap keep passing the fence.
+    The persisted per-pool fence_pending marker, set atomically with the
+    post-expiry acquisition and cleared only by a successful publish,
+    forces the bump regardless of which writer finally publishes.
+    """
+
+    _LEASE_TTL = serve_constants.RESERVED_FILL_LEASE_TTL_INTERVALS * 60.0
+
+    def _upsert_all(self, pool_b=None):
+        _upsert('svc-a')
+        _upsert('svc-b')
+        if pool_b is not None:
+            _upsert('svc-c', pool_key=pool_b)
+            _upsert('svc-d', pool_key=pool_b)
+
+    def test_aborted_post_expiry_writer_still_forces_bump(
+            self, clock, monkeypatch):
+        pool_b = broker.make_pool_key('other-ctx', 'H100')
+        obs_b = _obs(10, gpu_names=('H100',))
+        self._upsert_all(pool_b)
+        first = _run('svc-a', free=10)
+        b_first = _run('svc-c', observation=obs_b, pool=pool_b)
+        assert first is not None and b_first is not None
+        # The lease dies: no rounds at all for longer than its TTL.
+        clock.advance(self._LEASE_TTL + 61)
+        self._upsert_all()
+        # Writer A acquires the post-expiry token (committing a fresh
+        # expires_at) and crashes before publishing.
+        real_publish = serve_state.publish_reserved_fill_round
+        monkeypatch.setattr(serve_state, 'publish_reserved_fill_round',
+                            mock.Mock(side_effect=RuntimeError('crashed')))
+        with pytest.raises(RuntimeError):
+            _run('svc-a', free=10)
+        monkeypatch.setattr(serve_state, 'publish_reserved_fill_round',
+                            real_publish)
+        # The marker survived the aborted writer, on EVERY pool's row.
+        for pool in (_POOL, pool_b):
+            row = serve_state.get_reserved_fill_round(pool)
+            assert row is not None and bool(row['fence_pending'])
+        # Writer B sees an UNEXPIRED lease (A refreshed it) and computes
+        # unchanged grants/feeds -- the marker alone must force the bump.
+        self._upsert_all()
+        second = _run('svc-b', free=10)
+        assert second is not None
+        assert second.epoch == first.epoch + 1
+        row = serve_state.get_reserved_fill_round(_POOL)
+        assert row is not None and not bool(row['fence_pending'])
+        # Multi-pool: the other pool's next publish (also on an unexpired
+        # lease, also unchanged allocation) must bump its OWN epoch too,
+        # then clear its marker.
+        _upsert('svc-c', pool_key=pool_b)
+        _upsert('svc-d', pool_key=pool_b)
+        b_second = _run('svc-c', observation=obs_b, pool=pool_b)
+        assert b_second is not None
+        assert b_second.epoch == b_first.epoch + 1
+        row_b = serve_state.get_reserved_fill_round(pool_b)
+        assert row_b is not None and not bool(row_b['fence_pending'])
+        # Once cleared, unchanged rounds keep a stable epoch again.
+        clock.advance(61)
+        self._upsert_all()
+        third = _run('svc-a', free=10)
+        assert third is not None
+        assert third.epoch == second.epoch
+
+    def test_non_expiry_abort_does_not_force_bump(self, clock, monkeypatch):
+        self._upsert_all()
+        first = _run('svc-a', free=10)
+        assert first is not None
+        # A writer crashes pre-publish WITHOUT a preceding dead gap (the
+        # lease is still live): no marker, and the next unchanged publish
+        # must not spuriously bump the epoch.
+        clock.advance(61)
+        self._upsert_all()
+        real_publish = serve_state.publish_reserved_fill_round
+        monkeypatch.setattr(serve_state, 'publish_reserved_fill_round',
+                            mock.Mock(side_effect=RuntimeError('crashed')))
+        with pytest.raises(RuntimeError):
+            _run('svc-a', free=10)
+        monkeypatch.setattr(serve_state, 'publish_reserved_fill_round',
+                            real_publish)
+        row = serve_state.get_reserved_fill_round(_POOL)
+        assert row is not None and not bool(row['fence_pending'])
+        self._upsert_all()
+        second = _run('svc-b', free=10)
+        assert second is not None
+        assert second.epoch == first.epoch
 
 
 @pytest.mark.usefixtures('_broker_db')
