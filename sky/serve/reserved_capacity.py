@@ -256,6 +256,11 @@ def poller_loop(get_autoscaler: Callable[[], 'autoscalers.Autoscaler'],
     it); None preserves the standalone pre-broker cycle for direct callers
     and tests.
     """
+    # Whether a broker claim of ours may exist. Starts True: a previous
+    # incarnation of this controller may have left one behind (respawn),
+    # so the first disabled observation still clears it. Reset to True by
+    # every broker cycle (which upserts the claim).
+    claim_may_exist = service_name is not None
     while True:
         try:
             placer = get_spot_placer()
@@ -275,6 +280,15 @@ def poller_loop(get_autoscaler: Callable[[], 'autoscalers.Autoscaler'],
                 else:
                     _broker_cycle(autoscaler, placer, service_name, zero_cost,
                                   keys)
+                    claim_may_exist = True
+            elif service_name is not None and claim_may_exist:
+                # Fill turned off (or the placer is gone): withdraw the
+                # claim NOW instead of leaving peers arbitrating around a
+                # ghost for the whole claim TTL. Once per disable
+                # transition (idempotent; also drops our cached
+                # allocation), not re-spammed every cycle.
+                reserved_capacity_broker.remove_claim(service_name)
+                claim_may_exist = False
         except Exception as e:  # pylint: disable=broad-except
             logger.error('Error in reserved-capacity poller: '
                          f'{common_utils.format_exception(e)}')

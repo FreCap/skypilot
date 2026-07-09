@@ -732,6 +732,45 @@ class TestPollerFlagOff(unittest.TestCase):
         self.assertLessEqual(autoscaler._fill_snapshot_time, pre_query_time)
 
 
+class TestPollerClaimLifecycle(unittest.TestCase):
+    """Disabling fill (or losing the placer) withdraws the broker claim
+    immediately -- a disabled service must not keep absorbing entitlement
+    until its claim TTL expires."""
+
+    class _Stop(Exception):
+        pass
+
+    def test_disable_transition_removes_claim_once(self):
+        autoscaler = _make_autoscaler(fill=True)
+        placer = mock.Mock()
+        placer.zero_cost_locations.return_value = []
+        cycles = {'n': 0}
+
+        def _sleep(_seconds):
+            cycles['n'] += 1
+            if cycles['n'] == 1:
+                # An update turns the flag off on the live autoscaler.
+                autoscaler.reserved_capacity_fill = False
+            if cycles['n'] >= 3:
+                raise self._Stop()
+
+        with mock.patch.object(reserved_capacity,
+                               '_broker_cycle') as broker_cycle, \
+             mock.patch.object(reserved_capacity.reserved_capacity_broker,
+                               'remove_claim') as remove_claim, \
+             mock.patch.object(reserved_capacity.time,
+                               'sleep',
+                               side_effect=_sleep):
+            with self.assertRaises(self._Stop):
+                reserved_capacity.poller_loop(lambda: autoscaler,
+                                              lambda: placer,
+                                              service_name='svc')
+        broker_cycle.assert_called_once()
+        # Withdrawn exactly once on the disable transition, not re-spammed
+        # on every subsequent disabled cycle.
+        remove_claim.assert_called_once_with('svc')
+
+
 class TestStaleSnapshot(unittest.TestCase):
     """Stale snapshot: 0 free contribution, existing fill still protected."""
 
@@ -1413,8 +1452,8 @@ class TestPlacerSkipZeroCostPreference(unittest.TestCase):
         # The gate throttles placement preference, never availability: a
         # zero-cost-only candidate set must still yield a location.
         placer = _make_placer({self.k8s: 0.0})
-        selected = placer.select_next_location(
-            [], skip_zero_cost_preference=True)
+        selected = placer.select_next_location([],
+                                               skip_zero_cost_preference=True)
         self.assertEqual(selected, self.k8s)
 
 

@@ -533,10 +533,12 @@ def remove_service(service_name: str) -> None:
 def remove_service_completely(service_name: str) -> None:
     """Atomically remove the service-level DB state for a service.
 
-    Deletes from `services`, `version_specs`, and
-    `serve_ha_recovery_script` in a single transaction. These were the
-    three tables whose sequential teardown left orphan rows when a
-    subprocess died mid-cleanup.
+    Deletes from `services`, `version_specs`,
+    `serve_ha_recovery_script`, and `reserved_fill_claims` in a single
+    transaction. The first three were the tables whose sequential
+    teardown left orphan rows when a subprocess died mid-cleanup; the
+    claim row must go too, or a torn-down fill-enabled service keeps
+    absorbing broker entitlement until its claim TTL expires.
 
     Replicas are intentionally NOT touched here. Both callers
     (`_cleanup` success path in `_start`, and `_terminate_failed_services`
@@ -555,6 +557,9 @@ def remove_service_completely(service_name: str) -> None:
         session.execute(
             sqlalchemy.delete(serve_ha_recovery_script_table).where(
                 serve_ha_recovery_script_table.c.service_name == service_name))
+        session.execute(
+            sqlalchemy.delete(reserved_fill_claims_table).where(
+                reserved_fill_claims_table.c.service_name == service_name))
         session.commit()
 
 
@@ -1252,23 +1257,36 @@ def remove_reserved_fill_claims_for_pool(pool_key: str) -> None:
 def prune_reserved_fill_claims(expired_before: float) -> List[str]:
     """Deletes claims whose heartbeat predates `expired_before`.
 
-    Returns the pruned service names (for loud logging by the broker).
-    Delete-then-report runs in one transaction so a concurrent heartbeat
-    upsert either survives (it re-creates the row) or is reported.
+    Returns the actually-pruned service names (for loud logging by the
+    broker). The DELETE itself carries the staleness predicate: a
+    heartbeat refreshed after the candidate SELECT can never be deleted
+    (the previous select-then-delete-BY-NAME pair raced exactly that
+    upsert and killed fresh claims). The report is the candidate set
+    minus post-delete survivors, so a row spared by the predicate is
+    never reported as pruned.
     """
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
-        rows = session.execute(
-            sqlalchemy.select(reserved_fill_claims_table.c.service_name).where(
-                reserved_fill_claims_table.c.heartbeat_ts < expired_before)
-        ).fetchall()
-        names = [row[0] for row in rows]
-        if names:
-            session.execute(
-                sqlalchemy.delete(reserved_fill_claims_table).where(
-                    reserved_fill_claims_table.c.service_name.in_(names)))
+        candidates = [
+            row[0] for row in session.execute(
+                sqlalchemy.select(reserved_fill_claims_table.c.service_name).
+                where(reserved_fill_claims_table.c.heartbeat_ts < expired_before
+                     )).fetchall()
+        ]
+        if not candidates:
+            session.commit()
+            return []
+        session.execute(
+            sqlalchemy.delete(reserved_fill_claims_table).where(
+                reserved_fill_claims_table.c.heartbeat_ts < expired_before))
+        survivors = {
+            row[0] for row in session.execute(
+                sqlalchemy.select(reserved_fill_claims_table.c.service_name).
+                where(reserved_fill_claims_table.c.service_name.in_(
+                    candidates))).fetchall()
+        }
         session.commit()
-    return names
+    return [name for name in candidates if name not in survivors]
 
 
 def get_reserved_fill_claims(

@@ -502,11 +502,12 @@ class ReplicaInfo:
         # Launch-origin attribution: True only for sentinel (fill)
         # launches; set by _launch_replica before the row is persisted.
         # The broker's holdings split and the grant ceiling's demand
-        # exemption both key on it. NOTE: a fill row re-driven after a
-        # controller crash mid-PENDING is re-upserted with the flag False
-        # (the sentinel was consumed at original emission) -- it then
-        # reads as demand-placed and stays ceiling-exempt for its
-        # lifetime; rare, bounded, accepted in v1.
+        # exemption both key on it. A fill row re-driven after a
+        # controller crash mid-PENDING keeps the flag: the sentinel was
+        # consumed at original emission, so the recovery path carries the
+        # prior row's attribution into _launch_replica explicitly
+        # (prior_reserved_fill) -- otherwise the replacement row would
+        # read as demand-placed and stay ceiling-exempt for its lifetime.
         self.reserved_fill: bool = False
 
     def get_spot_location(self) -> Optional[spot_placer.Location]:
@@ -1014,10 +1015,16 @@ class SkyPilotReplicaManager(ReplicaManager):
             # Per-replica isolation: one bad row must not strand the rest
             # un-redriven.
             try:
+                # Carry the prior row's launch-origin attribution: the fill
+                # sentinel was consumed at original emission, so without it
+                # the replacement row would flip a fill replica to
+                # demand-placed (permanently ceiling-exempt).
                 self._launch_replica(
                     replica_info.replica_id,
                     resources_override=replica_info.resources_override,
-                    existing_replica_infos=all_replica_infos)
+                    existing_replica_infos=all_replica_infos,
+                    prior_reserved_fill=bool(
+                        getattr(replica_info, 'reserved_fill', False)))
             except Exception as e:  # pylint: disable=broad-except
                 logger.error('Failed to re-drive launch of replica '
                              f'{replica_info.replica_id}: '
@@ -1048,12 +1055,20 @@ class SkyPilotReplicaManager(ReplicaManager):
         replica_id: int,
         resources_override: Optional[Dict[str, Any]] = None,
         existing_replica_infos: Optional[List['ReplicaInfo']] = None,
+        prior_reserved_fill: bool = False,
     ) -> bool:
         """Enqueue one replica launch.
 
         Returns whether a launch was actually enqueued: a zero-cost-only
         fill launch is skipped when no zero-cost location is ACTIVE, and
         the skip must leak nothing -- no replica row, no launch thread.
+
+        prior_reserved_fill: launch-origin attribution of the replica row
+        this launch replaces (recovery re-drive). The fill sentinel is
+        consumed at original emission, so a re-drive cannot re-derive it
+        from the persisted override; OR-ing the prior flag in keeps a
+        recovered fill replica counted as arbitrated (ceiling-governed)
+        capacity instead of silently converting it to demand.
         """
         if replica_id in self._launch_thread_pool:
             logger.warning(f'Launch thread for replica {replica_id} '
@@ -1225,8 +1240,10 @@ class SkyPilotReplicaManager(ReplicaManager):
         info = ReplicaInfo(replica_id, cluster_name, replica_port, use_spot,
                            location, self.latest_version, resources_override)
         # Persisted launch-origin attribution: the broker's holdings split
-        # and the ceiling's demand exemption key on this flag.
-        info.reserved_fill = zero_cost_only
+        # and the ceiling's demand exemption key on this flag. OR in the
+        # replaced row's attribution on recovery re-drives (the sentinel
+        # only exists at original emission).
+        info.reserved_fill = bool(zero_cost_only or prior_reserved_fill)
         serve_state.add_or_update_replica(self._service_name, replica_id, info)
         if existing_replica_infos is not None:
             # Bulk callers (recovery re-drive) reuse one snapshot across a

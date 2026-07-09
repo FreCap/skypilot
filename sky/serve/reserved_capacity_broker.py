@@ -535,11 +535,12 @@ def _replica_row_on_pool(info: Any, context: str, gpu_name: str) -> bool:
 
 
 def _occupying_debit(claim_names: List[str], pool_key: str,
-                     snapshot_time: float) -> Tuple[int, int]:
+                     snapshot_time: float) -> Tuple[int, int, Dict[str, int]]:
     """Pool slots claimed by rows the snapshot may still have counted free.
 
     Mirrors the #108 occupied-slot subtraction at broker level, across ALL
-    claimants, returning (feed_debit, entitlement_debit):
+    claimants, returning (feed_debit, entitlement_debit,
+    fill_holdings_extra):
 
     - feed_debit (rows not READY, or created after the snapshot): applied
       to the observed free the FEED split spends. A launching pod may be
@@ -558,10 +559,21 @@ def _occupying_debit(claim_names: List[str], pool_key: str,
       below the owner's holdings and culling exactly the pods that are
       booting (a broker-generated churn wave). Only the mid-query bind
       race (created_at > snapshot) still needs the debit.
+    - fill_holdings_extra (per-owner count of post-snapshot rows with
+      reserved_fill=True): folded back into the owner's holdings for the
+      entitlement total. A FILL bind persisted mid-query IS arbitrated
+      capacity -- just newer than its owner's (stale) claim row, which
+      still reports it as holdings 0. Debiting it from free WITHOUT
+      re-attributing it would undercount the whole-pool total, drop the
+      owner's grant below its real holdings, and cull the replica the
+      previous round's feed just launched. Post-snapshot DEMAND rows keep
+      the plain debit: they are an external mid-query race, not
+      arbitrated capacity.
     """
     context, gpu_name = parse_pool_key(pool_key)
     feed_debit = 0
     entitlement_debit = 0
+    fill_holdings_extra: Dict[str, int] = {}
     for name in sorted(claim_names):
         try:
             infos = serve_state.get_replica_infos(name)
@@ -585,7 +597,10 @@ def _occupying_debit(claim_names: List[str], pool_key: str,
                 feed_debit += 1
             if post_snapshot:
                 entitlement_debit += 1
-    return feed_debit, entitlement_debit
+                if bool(getattr(info, 'reserved_fill', False)):
+                    fill_holdings_extra[name] = (
+                        fill_holdings_extra.get(name, 0) + 1)
+    return feed_debit, entitlement_debit, fill_holdings_extra
 
 
 def _allocation_from_round(service_name: str,
@@ -767,7 +782,7 @@ def _run_round_locked(service_name: str, pool_key: str,
             assert observation is not None and observation.free_slots is not None
             measured = max(0, int(observation.free_slots))
             last_free, last_free_ts = measured, snapshot_time
-            feed_debit, entitlement_debit = _occupying_debit(
+            feed_debit, entitlement_debit, fill_extra = _occupying_debit(
                 names, pool_key, snapshot_time)
             observed_free = max(0, measured - feed_debit)
             # The entitlement total only debits the mid-query bind race:
@@ -777,6 +792,24 @@ def _run_round_locked(service_name: str, pool_key: str,
             # bind->READY window and cull the booting pods (see
             # _occupying_debit).
             entitlement_free = max(0, measured - entitlement_debit)
+            if fill_extra:
+                # Post-snapshot FILL binds are arbitrated capacity newer
+                # than their owner's claim row: fold them back into the
+                # owner's holdings so the whole-pool total never
+                # undercounts and the grant keeps covering the replica the
+                # previous round's feed just launched (see
+                # _occupying_debit). Also reflected in the ClaimInputs so
+                # the feed split does not re-feed a slot the owner already
+                # holds.
+                claims = {
+                    name:
+                    (dataclasses.replace(claim,
+                                         holdings_fill=claim.holdings_fill +
+                                         fill_extra[name])
+                     if name in fill_extra else claim)
+                    for name, claim in claims.items()
+                }
+                sum_holdings += sum(fill_extra.values())
         else:
             # Measurement blackout: staleness-decayed last-known free, never
             # a raw 0 -- a blackout must not trigger releases. Past the

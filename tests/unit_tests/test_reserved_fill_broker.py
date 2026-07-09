@@ -12,7 +12,10 @@ import json
 from unittest import mock
 
 import pytest
+import sqlalchemy
 from sqlalchemy import create_engine
+from sqlalchemy import orm
+from sqlalchemy.sql import dml
 
 from sky.serve import reserved_capacity_broker as broker
 from sky.serve import serve_state
@@ -299,11 +302,13 @@ def _replica_stub(is_ready=True,
                   is_terminal=False,
                   created_at=None,
                   region='research-ctx',
-                  gpu='A100'):
+                  gpu='A100',
+                  reserved_fill=False):
     info = mock.Mock()
     info.is_ready = is_ready
     info.is_terminal = is_terminal
     info.created_at = created_at
+    info.reserved_fill = reserved_fill
     info.location = {
         'cloud': 'Kubernetes',
         'region': region,
@@ -531,6 +536,52 @@ class TestClaimLifecycle:
         assert _run('svc-a', observation=phantom) is None
         assert not serve_state.get_reserved_fill_claims(pool_key=_POOL)
 
+    def test_service_teardown_deletes_claim_row(self):
+        # Service-level teardown must not leave a live claim absorbing
+        # entitlement until the TTL expires.
+        _upsert('svc-a')
+        _upsert('svc-b')
+        serve_state.remove_service_completely('svc-a')
+        live = {
+            row['service_name']
+            for row in serve_state.get_reserved_fill_claims(pool_key=_POOL)
+        }
+        assert live == {'svc-b'}
+
+    def test_prune_race_spares_freshly_refreshed_heartbeat(self, monkeypatch):
+        # A heartbeat upsert landing between the prune's candidate SELECT
+        # and its DELETE must survive: the DELETE carries the staleness
+        # predicate itself (the old select-then-delete-BY-NAME pair
+        # deleted the freshly refreshed claim), and the report only names
+        # rows actually deleted.
+        _upsert('svc-a')
+        _upsert('svc-b')
+        real_execute = orm.Session.execute
+        raced = {'done': False}
+        claims_table = serve_state.reserved_fill_claims_table
+
+        def racing_execute(session, statement, *args, **kwargs):
+            if isinstance(statement, dml.Delete) and not raced['done']:
+                raced['done'] = True
+                # svc-b's poller refreshes its claim between the candidate
+                # select and the delete.
+                real_execute(
+                    session,
+                    sqlalchemy.update(claims_table).where(
+                        claims_table.c.service_name == 'svc-b').values(
+                            heartbeat_ts=broker.time.time() + 10_000.0))
+            return real_execute(session, statement, *args, **kwargs)
+
+        monkeypatch.setattr(orm.Session, 'execute', racing_execute)
+        pruned = serve_state.prune_reserved_fill_claims(
+            expired_before=broker.time.time() + 1.0)
+        assert pruned == ['svc-a']
+        live = {
+            row['service_name']
+            for row in serve_state.get_reserved_fill_claims(pool_key=_POOL)
+        }
+        assert live == {'svc-b'}
+
     def test_mixed_gpus_per_replica_rejected(self):
         _upsert('svc-a', gpus_per_replica=1)
         _upsert('svc-b', gpus_per_replica=1)
@@ -667,6 +718,48 @@ class TestMidQueryDemandBindDebit:
         round_row = serve_state.get_reserved_fill_round(_POOL)
         assert round_row is not None
         assert sum(json.loads(round_row['feeds']).values()) == 4
+
+
+@pytest.mark.usefixtures('_broker_db')
+class TestMidQueryFillBindAttribution:
+    """A FILL bind persisted mid-query stays attributed to its owner.
+
+    Regression: the entitlement debit subtracted EVERY post-snapshot row
+    from the whole-pool total while holdings came from the (stale) claim
+    rows, so a fill replica persisted while the query ran was debited
+    from free but absent from Sum(holdings) -- the total undercounted,
+    the owner's grant dropped below its real holdings, and the ceiling
+    culled the replica the previous round's feed had just launched.
+    """
+
+    def test_owner_grant_covers_mid_query_fill_bind(self, monkeypatch):
+        rows = []
+
+        def query():
+            # A fill replica row (fed by the previous round) persists
+            # while the query runs: svc-a's claim still reports holdings
+            # 0, but the row IS arbitrated capacity.
+            rows.append(
+                _replica_stub(is_ready=False,
+                              reserved_fill=True,
+                              created_at=broker.time.time() + 0.001))
+            return _obs(1)
+
+        monkeypatch.setattr(
+            serve_state, 'get_replica_infos',
+            mock.Mock(side_effect=lambda name: rows if name == 'svc-a' else []))
+        _upsert('svc-a', weight=2)
+        _upsert('svc-b')
+        alloc = broker.run_round_if_stale('svc-a', _POOL, query, 60.0)
+        assert alloc is not None
+        # The bind folds back into svc-a's holdings for the entitlement
+        # total: its grant keeps covering the just-fed replica (no cull).
+        assert alloc.grant is not None and alloc.grant >= 1
+        # The FEED-side debit is untouched: the occupying row still spends
+        # the observed free -- never over-launch.
+        assert alloc.feed == 0
+        alloc_b = broker.get_my_allocation('svc-b')
+        assert alloc_b is not None and alloc_b.feed == 0
 
 
 @pytest.mark.usefixtures('_broker_db')
