@@ -591,6 +591,13 @@ SKIPPED_CLIENT_OVERRIDE_KEYS: List[Tuple[str, ...]] = [
     # Slurm cluster configs (workdir, tmpdir, etc.) are admin-managed
     # server-side settings and should not be overridden by clients.
     ('slurm', 'cluster_configs'),
+    # The capacity-exhaustion cache is a shared, cross-tenant server-side cache
+    # (rows keyed by cloud account, not by user/workspace). Its TTL and backoff
+    # must be server-owned: a client override would let one tenant poison a
+    # shape for others (long TTL) or disable the noisy-neighbor protection
+    # (zero TTL/backoff) for the whole account.
+    ('provision', 'capacity_exhaustion_ttl'),
+    ('provision', 'capacity_backoff'),
 ]
 
 # Constants for Azure blob storage

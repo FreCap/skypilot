@@ -48,6 +48,7 @@ from sky.clouds.utils import gcp_utils
 from sky.dag import DEFAULT_EXECUTION
 from sky.data import data_utils
 from sky.data import storage as storage_lib
+from sky.provision import capacity_cache
 from sky.provision import common as provision_common
 from sky.provision import constants as provision_constants
 from sky.provision import instance_setup
@@ -803,6 +804,251 @@ class FailoverCloudErrorHandlerV2:
         handler(blocked_resources, launchable_resources, region, zones, error)
 
 
+# Cloud error codes that mean "this exact shape has no capacity right now"
+# (physical capacity; changes slowly).
+# Only the one unambiguous, account-independent, region/AZ-wide signal is
+# cached. Reserved- and host-capacity variants are config/tenancy-scoped (a
+# targeted-reservation miss says nothing about open capacity) and are
+# intentionally excluded so a cached block can never suppress a healthy shape.
+_CAPACITY_ERROR_CODES = frozenset({
+    'InsufficientInstanceCapacity',
+})
+# Cloud error codes that mean "account quota/limit exceeded" (transient; clears
+# as sibling instances terminate). These are paced with backoff but NOT cached
+# (quota is account-scoped and fast-clearing).
+_QUOTA_ERROR_CODES = frozenset({
+    'VcpuLimitExceeded',
+    'MaxSpotInstanceCountExceeded',
+    'InstanceLimitExceeded',
+})
+
+
+def _iter_error_chain(error: BaseException) -> Iterable[BaseException]:
+    """Yields ``error`` and its ``__cause__`` ancestors.
+
+    The failover site (``_retry_zones``) receives a collapsed ``RuntimeError``
+    (e.g. AWS ``_create_instances`` raises "Failed to launch instances. Max
+    attempts exceeded." ``from`` the boto ``ClientError``), so the concrete
+    capacity/quota code lives on the explicitly-chained cause, not the
+    top-level one.
+
+    Only ``__cause__`` (an explicit ``raise ... from``) is followed, not the
+    implicit ``__context__``: classification gates a fast-fail cache block, so
+    precision matters more than recall -- an unrelated error that merely
+    happened to be raised while a capacity error was being handled (implicitly
+    chained via ``__context__``) must not get a healthy shape wrongly blocked.
+    A missed classification only falls back to a normal sweep.
+    """
+    seen: Set[int] = set()
+    exc: Optional[BaseException] = error
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        yield exc
+        exc = exc.__cause__
+
+
+def _classify_capacity_error(error: BaseException) -> Optional[str]:
+    """Classifies a provision failure as ``'capacity'``/``'quota'``/``None``.
+
+    Precision matters: only ``'capacity'`` gates a fast-fail cache block, so a
+    healthy shape must never be classified as capacity. Two passes over the
+    ``__cause__`` chain:
+
+    1. Structured boto codes (``ClientError.response['Error']['Code']``) are
+       authoritative. If *any* exception in the chain carries a structured code,
+       the classification is decided from structured codes alone -- text is never
+       consulted. This is per-*chain*, not per-exception: an unstructured outer
+       wrapper whose message merely echoes a capacity token must not win over a
+       structured inner cause that says otherwise.
+    2. Only when no structured code exists anywhere does it fall back to
+       substring-matching the text (the code is echoed in a boto message that was
+       re-raised as a plain ``RuntimeError``).
+
+    Scope: the recognized codes are AWS/boto codes. The caller records only for
+    AWS launches (see ``_capacity_cache_applies``); other clouds are never
+    cached, so a stray text match cannot poison them.
+    """
+    chain = list(_iter_error_chain(error))
+    saw_structured = False
+    for exc in chain:
+        response = getattr(exc, 'response', None)
+        code = (response.get('Error', {}).get('Code') if isinstance(
+            response, dict) else None)
+        if code is None:
+            continue
+        saw_structured = True
+        if code in _CAPACITY_ERROR_CODES:
+            return 'capacity'
+        if code in _QUOTA_ERROR_CODES:
+            return 'quota'
+    if saw_structured:
+        # The chain's authoritative code(s) were neither capacity nor quota.
+        return None
+    for exc in chain:
+        text = str(exc)
+        if any(c in text for c in _CAPACITY_ERROR_CODES):
+            return 'capacity'
+        if any(c in text for c in _QUOTA_ERROR_CODES):
+            return 'quota'
+    return None
+
+
+def _capacity_cache_applies(cloud: Optional['clouds.Cloud']) -> bool:
+    """Whether the exhaustion cache targets this cloud.
+
+    Scoped to AWS -- the only cloud whose error codes the classifier recognizes,
+    and whose expensive multi-AZ failover sweep this fast-skip is designed to
+    cut short. Every other cloud (Kubernetes, GCP, Azure, ...) is excluded: it is
+    never recorded and its rows are never consulted, so a mis-classified error
+    can never wrongly block it.
+    """
+    return isinstance(cloud, clouds.AWS)
+
+
+def _capacity_cache_account(cloud: 'clouds.Cloud') -> str:
+    """The active *account* id for keying, normalized to ``''`` on failure.
+
+    Not a principal/role: AWS returns identity as ``[UserId, Account]`` and we
+    take the account element, so different IAM roles in one account share cache
+    entries while distinct accounts stay isolated. This disambiguates the shared
+    DB because AWS AZ *names* are account-specific (``us-east-1a`` is a different
+    physical AZ per account). Best-effort and cached upstream
+    (``get_user_identities`` memoizes the slow STS call).
+    """
+    try:
+        identity = cloud.get_active_user_identity()
+        if identity:
+            # AWS: [UserId, Account] -> the account is the last element.
+            return identity[-1] or ''
+    except Exception:  # pylint: disable=broad-except
+        pass
+    return ''
+
+
+def _launch_targets_specific_reservation(
+        to_provision: 'resources_lib.Resources',
+        region: 'clouds.Region') -> bool:
+    """Whether this launch may draw on a targeted (``specific``) reservation.
+
+    Targeted reservations are *separately-selectable* capacity: an ordinary
+    open-capacity ``InsufficientInstanceCapacity`` miss says nothing about
+    another launch's reserved capacity in the same AZ. So a reservation-eligible
+    launch must stay entirely out of the shared cache (no consult/record/clear)
+    -- otherwise one launch's open-capacity miss could make a later launch skip
+    an AZ where it holds paid, available reserved capacity. Reservations never
+    serve spot, so spot launches (the capacity-storm target) are unaffected.
+    """
+    if to_provision.use_spot:
+        return False
+    try:
+        specific_reservations = skypilot_config.get_effective_region_config(
+            cloud=str(to_provision.cloud).lower(),
+            region=region.name,
+            keys=('specific_reservations',),
+            default_value=None)
+    except Exception:  # pylint: disable=broad-except
+        # On any config-resolution error, be conservative and assume a
+        # reservation may be targeted: stay out of the cache.
+        return True
+    return bool(specific_reservations)
+
+
+def _capacity_cache_keys(to_provision: 'resources_lib.Resources',
+                         region: 'clouds.Region',
+                         zones: Optional[List['clouds.Zone']],
+                         num_nodes: int) -> List['capacity_cache.ResourceKey']:
+    """Builds the exhaustion-cache keys for a (region, zones, num_nodes) attempt.
+
+    One key per zone. Returns ``[]`` -- making record/consult/clear no-ops --
+    when the cache does not apply: a non-AWS cloud (see
+    ``_capacity_cache_applies``), a zoneless/empty attempt (AWS always attempts
+    zoned), a reservation-eligible launch (see
+    ``_launch_targets_specific_reservation``), or an unresolved account.
+    """
+    cloud = to_provision.cloud
+    assert cloud is not None, ('cloud must be set by the optimizer before '
+                               'failover reaches the capacity cache')
+    if not _capacity_cache_applies(cloud):
+        return []
+    # AWS always attempts zoned, so an empty/zoneless attempt yields no keys.
+    # This also makes clear() with an unknown success zone (orphan/pending
+    # recovery leaves ``ProvisionRecord.zone=None``) a safe no-op: clearing the
+    # attempted siblings would erase genuinely-exhausted AZs, so we let the
+    # bounded TTL lift the block instead.
+    if not zones:
+        return []
+    if _launch_targets_specific_reservation(to_provision, region):
+        return []
+    account = _capacity_cache_account(cloud)
+    if not account:
+        # Without a resolved account we cannot safely key the shared, cross-
+        # account cache (AWS AZ names are account-specific), so disable caching
+        # for this launch rather than risk an accountless key colliding accounts.
+        return []
+    return [
+        capacity_cache.ResourceKey(
+            cloud=cloud.canonical_name(),
+            account=account,
+            region=region.name,
+            zone=z.name,
+            instance_type=to_provision.instance_type or '',
+            use_spot=bool(to_provision.use_spot),
+            num_nodes=num_nodes,
+        ) for z in zones
+    ]
+
+
+def _capacity_cache_exhausted_zone_names(
+        to_provision: 'resources_lib.Resources', region: 'clouds.Region',
+        zones: Optional[List['clouds.Zone']], num_nodes: int) -> Set[str]:
+    """Zone names in this attempt currently known-exhausted (fresh cache read).
+
+    Consulted at the failover site so a doomed shape is skipped without a real
+    probe, using the attempt's *current* num_nodes -- there is no seeded
+    snapshot to go stale. Best-effort: a cache/DB read error yields an empty set
+    (normal sweep).
+    """
+    keys = _capacity_cache_keys(to_provision, region, zones, num_nodes)
+    if not keys:
+        return set()
+    try:
+        active = capacity_cache.active_exhausted_keys(keys)
+    except Exception as e:  # pylint: disable=broad-except
+        logger.debug(f'Capacity-cache consult skipped (read failed): '
+                     f'{common_utils.format_exception(e)}')
+        return set()
+    return {key.zone for key in active}
+
+
+def _capacity_backoff() -> common_utils.Backoff:
+    """A jittered backoff for pacing genuine capacity/quota probes.
+
+    Config values are clamped to a finite, bounded range so a non-finite or
+    absurd override cannot produce an unbounded per-probe sleep (which would
+    effectively wedge a worker).
+    """
+    _MAX_BACKOFF_SECONDS = 3600.0
+    initial = float(
+        skypilot_config.get_nested(
+            ('provision', 'capacity_backoff', 'initial_seconds'), 2.0))
+    max_seconds = float(
+        skypilot_config.get_nested(
+            ('provision', 'capacity_backoff', 'max_seconds'), 30.0))
+    if not math.isfinite(initial) or initial < 0:
+        initial = 2.0  # invalid (non-finite/negative) -> default
+    # initial == 0 is honored as "backoff disabled": Backoff(0) sleeps 0, so an
+    # operator can turn pacing off explicitly.
+    initial = min(initial, _MAX_BACKOFF_SECONDS)
+    if not math.isfinite(max_seconds) or max_seconds < initial:
+        # An invalid ceiling (non-finite, or below the floor) collapses to a
+        # constant backoff at `initial` rather than a surprising jump.
+        max_seconds = initial if initial > 0 else 30.0
+    max_seconds = min(max_seconds, _MAX_BACKOFF_SECONDS)
+    factor = max(1, int(max_seconds / initial)) if initial > 0 else 1
+    return common_utils.Backoff(initial_backoff=initial,
+                                max_backoff_factor=factor)
+
+
 class RetryingVmProvisioner(object):
     """A provisioner that retries different cloud/regions/zones."""
 
@@ -845,6 +1091,15 @@ class RetryingVmProvisioner(object):
         if blocked_resources:
             # blocked_resources is not None and not empty.
             self._blocked_resources.update(blocked_resources)
+        # A single jittered backoff shared across this launch's whole failover
+        # (all regions/zones), so genuine capacity/quota probes actually grow
+        # toward max_seconds instead of resetting to initial_seconds on every
+        # re-optimized `_retry_zones` attempt. Created lazily.
+        self._capacity_backoff_state: Optional[common_utils.Backoff] = None
+        # The DB-backed capacity cache is consulted per-attempt at the failover
+        # site (see `_capacity_cache_exhausted_zone_names`), not seeded into this
+        # blocklist -- so a doomed shape is skipped with the attempt's current
+        # num_nodes and a fresh read, with no snapshot to go stale.
 
         self.log_dir = os.path.expanduser(log_dir)
         self._dag = dag
@@ -855,6 +1110,113 @@ class RetryingVmProvisioner(object):
         self._is_managed = is_managed
         self._extra_launch_context: Dict[str, Any] = extra_launch_context
         self._is_launched_by_jobs_controller = is_launched_by_jobs_controller
+
+    def _get_capacity_backoff(self) -> common_utils.Backoff:
+        """The launch-scoped capacity/quota backoff (see the instance field).
+
+        Persisted across `_retry_zones` attempts so the exponential growth is
+        real; the outer optimizer re-enters `_retry_zones` per candidate, which
+        would otherwise reset a locally-constructed backoff every time.
+        """
+        if self._capacity_backoff_state is None:
+            self._capacity_backoff_state = _capacity_backoff()
+        return self._capacity_backoff_state
+
+    def _record_capacity_exhaustion(self,
+                                    to_provision: 'resources_lib.Resources',
+                                    region: 'clouds.Region',
+                                    zones: Optional[List['clouds.Zone']],
+                                    num_nodes: int,
+                                    reason: Optional[str],
+                                    record_to_cache: bool = True) -> None:
+        """Persist a capacity-exhausted shape (``reason == 'capacity'``) to the
+        shared cache so later attempts fast-skip it.
+
+        Called BEFORE the failover site's `post_teardown_cleanup`: a concurrent
+        same-shape success that clears this zone *during* that teardown must not
+        be clobbered by this older failure re-inserting the block afterwards.
+        This narrows -- but cannot fully close -- the mark-after-clear race: the
+        provision layer (`bulk_provision`) also tears down before re-raising, so
+        a success can still land between that inner teardown and this mark. For
+        a capacity denial no instances were created, so the inner teardown is
+        near-instant; the residual window is tiny and any re-poisoning of the
+        exact successful AZ self-heals within the (short) TTL. Fully closing it
+        would need cross-process event ordering (tombstones/versioning), which
+        is disproportionate for disposable hint data.
+
+        Only capacity is recorded -- quota is account-scoped and clears fast, so
+        a stale quota block could wrongly suppress a shape whose account-wide
+        limit has since freed. ``record_to_cache`` is False for existing-cluster
+        launches, whose ``num_nodes`` is not the actual acquisition size (some
+        nodes already run), so the entry would not match a fresh launch.
+
+        Zone attribution is coarse: a single-node AWS attempt hands the whole
+        AZ list to one API call and surfaces one error, so every zone in
+        ``zones`` is marked capacity-exhausted even if only some AZs actually
+        were. This can over-mark a healthy sibling AZ, but the block is bounded
+        by the (short) TTL and self-heals on the next probe, so we accept the
+        imprecision rather than plumb per-AZ error attribution up from the
+        provision layer.
+        """
+        if reason != 'capacity' or not record_to_cache:
+            return
+        try:
+            for key in _capacity_cache_keys(to_provision, region, zones,
+                                            num_nodes):
+                capacity_cache.mark_exhausted(key)
+        except Exception as e:  # pylint: disable=broad-except
+            # The cache is a best-effort optimization; never fail a launch on
+            # it. Failover still proceeds (and backs off) regardless.
+            logger.debug(f'Failed to record capacity exhaustion: '
+                         f'{common_utils.format_exception(e)}')
+
+    def _backoff_after_capacity_failure(self,
+                                        to_provision: 'resources_lib.Resources',
+                                        region: 'clouds.Region',
+                                        reason: Optional[str],
+                                        backoff: common_utils.Backoff) -> None:
+        """Pace the next real probe, and short-circuit a doomed regional sweep.
+
+        ``reason``:
+          - ``'quota'``: AWS vCPU/instance limits are *regional*, so once one AZ
+            reports the limit, every sibling AZ shares it. Block the whole
+            region for THIS launch (in-memory only -- quota is never cached) so
+            failover moves to another region instead of probing and sleeping
+            through every doomed AZ. Then back off once.
+          - ``'capacity'``: back off (the shape is already recorded above).
+          - ``None``: neither -- an unclassified error takes the normal sweep.
+        """
+        if reason is None:
+            return
+        if reason == 'quota':
+            _add_to_blocked_resources(
+                self._blocked_resources,
+                to_provision.copy(region=region.name, zone=None))
+        time.sleep(backoff.current_backoff())
+
+    def _clear_capacity_exhaustion(self,
+                                   to_provision: 'resources_lib.Resources',
+                                   region: 'clouds.Region',
+                                   succeeded_zone: Optional[str],
+                                   num_nodes: int) -> None:
+        """On a successful provision, clear ONLY the zone that actually
+        provisioned (``provision_record.zone``) from the shared cache.
+
+        Not the other candidate AZs: a success in one AZ says nothing about a
+        genuinely-exhausted sibling that was merely offered in the same attempt,
+        and clearing it would make the next launch re-probe (and re-fail) it.
+        When the success zone is unknown (rare orphan/pending recovery, where
+        ``provision_record.zone`` is None), nothing is cleared -- clearing the
+        attempted siblings would erase real blocks, so the bounded TTL lifts it
+        instead."""
+        zones = ([clouds.Zone(name=succeeded_zone)] if succeeded_zone else None)
+        try:
+            for key in _capacity_cache_keys(to_provision, region, zones,
+                                            num_nodes):
+                capacity_cache.clear(key)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.debug(f'Failed to clear capacity exhaustion: '
+                         f'{common_utils.format_exception(e)}')
 
     def _yield_zones(
             self, to_provision: resources_lib.Resources, num_nodes: int,
@@ -1098,6 +1460,10 @@ class RetryingVmProvisioner(object):
 
         insufficient_resources = None
         last_error_reason: Optional[str] = None
+        # Jittered backoff shared across this launch's genuine capacity/quota
+        # probes (fires only on the real-probe path; see
+        # `_record_capacity_exhaustion_and_backoff`).
+        capacity_backoff = self._get_capacity_backoff()
         for zones in self._yield_zones(to_provision, num_nodes, cluster_name,
                                        prev_cluster_status,
                                        prev_cluster_ever_up):
@@ -1118,6 +1484,25 @@ class RetryingVmProvisioner(object):
                                     blocked_resources):
                             remaining_unblocked_zones.remove(zone)
                             break
+                # Fast-skip zones a prior attempt (this pod or another, within
+                # the TTL) recorded as capacity-exhausted for this exact shape
+                # and *current* num_nodes -- no real probe. A fresh read each
+                # attempt, so nothing to go stale; AWS-only and best-effort.
+                # Only for FRESH launches: for an existing cluster the skip would
+                # short-circuit config-hash reuse / teardown of partial nodes,
+                # and num_nodes would not be the actual acquisition size.
+                # Never under --dryrun: it must not change the printed plan or
+                # trigger the identity lookup dry-run otherwise avoids.
+                if (not cluster_exists and not dryrun and
+                        remaining_unblocked_zones):
+                    exhausted_zone_names = _capacity_cache_exhausted_zone_names(
+                        to_provision, region, remaining_unblocked_zones,
+                        num_nodes)
+                    if exhausted_zone_names:
+                        remaining_unblocked_zones = [
+                            zone for zone in remaining_unblocked_zones
+                            if zone.name not in exhausted_zone_names
+                        ]
                 if not remaining_unblocked_zones:
                     # Skip the region if all zones are blocked.
                     continue
@@ -1335,6 +1720,16 @@ class RetryingVmProvisioner(object):
                         config_dict['provision_record'] = provision_record
                         config_dict['resources_vars'] = resources_vars
                         config_dict['handle'] = handle
+                        # Capacity was actually found: drop the exhaustion entry
+                        # for the ONE zone that actually provisioned
+                        # (provision_record.zone) so it un-blocks at once -- not
+                        # the other candidate AZs, which were merely offered and
+                        # may be genuinely exhausted. Fresh launches only, to
+                        # match the record/consult scope.
+                        if not cluster_exists:
+                            self._clear_capacity_exhaustion(
+                                to_provision, region, provision_record.zone,
+                                num_nodes)
                         return config_dict
                     except provision_common.StopFailoverError:
                         with ux_utils.print_exception_no_traceback():
@@ -1366,8 +1761,26 @@ class RetryingVmProvisioner(object):
                         FailoverCloudErrorHandlerV2.update_blocklist_on_error(
                             self._blocked_resources, to_provision, region,
                             zones, e)
+                        # Kubernetes is intentionally out of the capacity-cache
+                        # scope (see `_capacity_cache_applies`): its scheduling
+                        # pressure churns in seconds and its launch path yields
+                        # no zones, so a cached block would never be consulted.
+                        # The in-memory `update_blocklist_on_error` above still
+                        # drives normal failover.
                         continue
                     except Exception as e:  # pylint: disable=broad-except
+                        capacity_reason = _classify_capacity_error(e)
+                        # Persist capacity exhaustion BEFORE the (possibly slow)
+                        # teardown below: a concurrent same-shape success that
+                        # clears this zone mid-teardown must win, not be
+                        # overwritten by this older failure re-inserting it.
+                        self._record_capacity_exhaustion(
+                            to_provision,
+                            region,
+                            zones,
+                            num_nodes,
+                            capacity_reason,
+                            record_to_cache=not cluster_exists)
                         # NOTE: We try to cleanup the cluster even if the previous
                         # cluster does not exist. Also we are fast at
                         # cleaning up clusters now if there is no existing node..
@@ -1382,6 +1795,20 @@ class RetryingVmProvisioner(object):
                         FailoverCloudErrorHandlerV2.update_blocklist_on_error(
                             self._blocked_resources, to_provision, region,
                             zones, e)
+                        # Pace the next real probe on capacity/quota exhaustion;
+                        # a regional quota failure also blocks the whole region
+                        # for this launch to skip the doomed sibling-AZ sweep.
+                        self._backoff_after_capacity_failure(
+                            to_provision, region, capacity_reason,
+                            capacity_backoff)
+                        if capacity_reason == 'quota':
+                            # Quota is regional and the whole region is now
+                            # blocked (above), so stop sweeping this region's
+                            # remaining per-VPC failover overrides -- launching
+                            # and sleeping against them is pure waste. Exiting
+                            # the override loop drops to the outer zone loop,
+                            # which skips the now-blocked region.
+                            break
                         continue
                     # NOTE: The code below in the loop should not be reachable
                     # with the new provisioner.
