@@ -688,6 +688,10 @@ class SkyServeLoadBalancer:
           never use it as a floor or clamp capacity down to it — sizing
           on target_replicas would idle exactly the free machines the
           fill feature exists to use.
+        - max_replicas is the configured autoscaler ceiling, not a clamp
+          on materialized capacity. Overprovisioning or a recent ceiling
+          reduction can leave ready_replicas above it temporarily, so
+          readers must floor derived headroom at zero.
         """
         del request  # Unused.
         with self._client_pool_lock:
