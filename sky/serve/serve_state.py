@@ -97,9 +97,10 @@ serve_ha_recovery_script_table = sqlalchemy.Table(
 # [boltz fork] Reserved-fill broker state (multi-service arbitration of the
 # zero-cost fill pools; see sky/serve/reserved_capacity_broker.py). One claim
 # row per fill-enabled service, upserted by its controller's capacity poller
-# every poll interval (the heartbeat). holdings are split fill/demand because
-# only fill holdings are broker property -- demand-placed zero-cost replicas
-# are demand-protected and exempt from the grant ceiling.
+# every poll interval (the heartbeat). Only FILL holdings are reported: they
+# are broker property (arbitrated by grants); demand-placed zero-cost
+# replicas are demand-protected, exempt from the grant ceiling, and derived
+# from live replica rows where needed.
 reserved_fill_claims_table = sqlalchemy.Table(
     'reserved_fill_claims',
     Base.metadata,
@@ -114,14 +115,10 @@ reserved_fill_claims_table = sqlalchemy.Table(
     # rejected); GPU-unit bookkeeping is v2.
     sqlalchemy.Column('gpus_per_replica', sqlalchemy.Integer),
     sqlalchemy.Column('holdings_fill', sqlalchemy.Integer),
-    sqlalchemy.Column('holdings_demand', sqlalchemy.Integer),
-    # Cap on the weighted share ABOVE the floor
-    # (max_replicas - demand_target - floor); NULL = unbounded. Reported by
-    # the claimant so the water-fill can redistribute share it can never use.
-    sqlalchemy.Column('headroom', sqlalchemy.Integer, server_default=None),
     # Real capacity cap the claimant can materialize right now
     # (max(0, max_replicas - demand_target)); NULL = unbounded. The broker
-    # clamps both the effective floor and the feed need by it, so an
+    # clamps the effective floor, the headroom (weighted share above the
+    # floor, derived at allocation time) and the feed need by it, so an
     # unattainable floor cannot permanently absorb entitlement and feed the
     # service never launches (its excess joins the burst remainder).
     sqlalchemy.Column('effective_cap', sqlalchemy.Integer, server_default=None),
@@ -130,8 +127,6 @@ reserved_fill_claims_table = sqlalchemy.Table(
     # whole round, so the feed split redistributes them.
     sqlalchemy.Column('launchable', sqlalchemy.Integer, server_default='1'),
     sqlalchemy.Column('heartbeat_ts', sqlalchemy.Float),
-    # The broker epoch the claimant last observed; diagnostic only in v1.
-    sqlalchemy.Column('owner_epoch', sqlalchemy.Integer, server_default=None),
 )
 
 # Latest published broker round per pool (overwritten in place each round).
@@ -183,7 +178,6 @@ reserved_fill_lease_table = sqlalchemy.Table(
     'reserved_fill_lease',
     Base.metadata,
     sqlalchemy.Column('id', sqlalchemy.Integer, primary_key=True),
-    sqlalchemy.Column('owner_service', sqlalchemy.Text),
     sqlalchemy.Column('epoch', sqlalchemy.Integer),
     sqlalchemy.Column('expires_at', sqlalchemy.Float),
 )
@@ -1201,10 +1195,8 @@ def _upsert_insert_func(engine: sqlalchemy.engine.Engine):
 def upsert_reserved_fill_claim(service_name: str, *, pool_key: str,
                                weight: float, floor_replicas: int,
                                gpus_per_replica: int, holdings_fill: int,
-                               holdings_demand: int, headroom: Optional[int],
                                effective_cap: Optional[int], launchable: bool,
-                               heartbeat_ts: float,
-                               owner_epoch: Optional[int]) -> None:
+                               heartbeat_ts: float) -> None:
     """Upserts a service's reserved-fill claim (the per-poll heartbeat)."""
     engine = _db_manager.get_engine()
     values = {
@@ -1214,12 +1206,9 @@ def upsert_reserved_fill_claim(service_name: str, *, pool_key: str,
         'floor_replicas': floor_replicas,
         'gpus_per_replica': gpus_per_replica,
         'holdings_fill': holdings_fill,
-        'holdings_demand': holdings_demand,
-        'headroom': headroom,
         'effective_cap': effective_cap,
         'launchable': int(launchable),
         'heartbeat_ts': heartbeat_ts,
-        'owner_epoch': owner_epoch,
     }
     with orm.Session(engine) as session:
         insert_stmt = _upsert_insert_func(engine)(
@@ -1325,8 +1314,8 @@ def publish_reserved_fill_round(pool_key: str, *, round_id: int,
                                 sum_holdings: int,
                                 last_observed_free: Optional[int],
                                 last_observed_free_ts: Optional[float],
-                                phantom_streak: int, owner_service: str,
-                                prev_epoch: Optional[int], lease_epoch: int,
+                                phantom_streak: int, prev_epoch: Optional[int],
+                                lease_epoch: int,
                                 lease_expires_at: float) -> bool:
     """Atomically CAS-advances the lease and publishes a round.
 
@@ -1354,10 +1343,7 @@ def publish_reserved_fill_round(pool_key: str, *, round_id: int,
             try:
                 session.execute(
                     sqlalchemy.insert(reserved_fill_lease_table).values(
-                        id=1,
-                        owner_service=owner_service,
-                        epoch=lease_epoch,
-                        expires_at=lease_expires_at))
+                        id=1, epoch=lease_epoch, expires_at=lease_expires_at))
             except sqlalchemy_exc.IntegrityError:
                 session.rollback()
                 return False
@@ -1365,7 +1351,6 @@ def publish_reserved_fill_round(pool_key: str, *, round_id: int,
             count = session.query(reserved_fill_lease_table).filter(
                 reserved_fill_lease_table.c.id == 1,
                 reserved_fill_lease_table.c.epoch == prev_epoch).update({
-                    reserved_fill_lease_table.c.owner_service: owner_service,
                     reserved_fill_lease_table.c.epoch: lease_epoch,
                     reserved_fill_lease_table.c.expires_at: lease_expires_at,
                 })

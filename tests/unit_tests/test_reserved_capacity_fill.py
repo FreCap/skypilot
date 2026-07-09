@@ -1359,7 +1359,7 @@ class TestDemandPlacementGate(unittest.TestCase):
         manager.latest_version = 1
         return manager
 
-    def _launch_demand(self, allocation, replicas):
+    def _launch_demand(self, grant, replicas):
         zero_cost_location = spot_placer.Location.from_pickleable(_K8S_KEY)
         placer = mock.Mock()
         placer.zero_cost_locations.return_value = [zero_cost_location]
@@ -1373,8 +1373,8 @@ class TestDemandPlacementGate(unittest.TestCase):
                                '_get_resources_ports',
                                return_value='8080'), \
              mock.patch.object(replica_managers.reserved_capacity_broker,
-                               'get_cached_allocation',
-                               return_value=allocation), \
+                               'get_cached_grant',
+                               return_value=grant), \
              mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
                                return_value=replicas), \
@@ -1384,37 +1384,22 @@ class TestDemandPlacementGate(unittest.TestCase):
         return placer
 
     def test_holdings_at_grant_skip_zero_cost_preference(self):
-        allocation = reserved_capacity_broker.Allocation(grant=1,
-                                                         feed=0,
-                                                         round_id=3,
-                                                         epoch=2,
-                                                         snapshot_time=0.0)
-        placer = self._launch_demand(allocation, [_replica(1, _K8S_KEY)])
+        placer = self._launch_demand(1, [_replica(1, _K8S_KEY)])
         placer.select_next_location.assert_called_once()
         self.assertTrue(
             placer.select_next_location.call_args.kwargs.get(
                 'skip_zero_cost_preference'))
 
     def test_holdings_under_grant_keep_preference(self):
-        allocation = reserved_capacity_broker.Allocation(grant=5,
-                                                         feed=0,
-                                                         round_id=3,
-                                                         epoch=2,
-                                                         snapshot_time=0.0)
-        placer = self._launch_demand(allocation, [_replica(1, _K8S_KEY)])
+        placer = self._launch_demand(5, [_replica(1, _K8S_KEY)])
         placer.select_next_location.assert_called_once()
         self.assertEqual(placer.select_next_location.call_args.kwargs, {})
 
-    def test_no_allocation_or_none_grant_is_inert(self):
-        for allocation in (None,
-                           reserved_capacity_broker.Allocation(
-                               grant=None,
-                               feed=4,
-                               round_id=3,
-                               epoch=2,
-                               snapshot_time=0.0)):
-            placer = self._launch_demand(allocation, [_replica(1, _K8S_KEY)])
-            self.assertEqual(placer.select_next_location.call_args.kwargs, {})
+    def test_no_grant_is_inert(self):
+        # Both "no cached entry" and the single-claimant fast path's None
+        # grant surface as None from the grant cache: the gate stays inert.
+        placer = self._launch_demand(None, [_replica(1, _K8S_KEY)])
+        self.assertEqual(placer.select_next_location.call_args.kwargs, {})
 
 
 class TestPlacerSkipZeroCostPreference(unittest.TestCase):

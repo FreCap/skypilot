@@ -98,17 +98,15 @@ class ClaimInput:
     """Pure-math view of one live claim."""
     floor: int
     weight: float
-    # Cap on the weighted share ABOVE the floor; None = unbounded.
-    headroom: Optional[int]
     holdings_fill: int
-    holdings_demand: int
     launchable: bool
     # Real capacity cap the claimant can materialize right now
     # (max(0, max_replicas - demand_target)); None = unbounded (legacy
-    # claim rows). Clamps both the effective floor and the feed need: a
-    # floor the service cannot actually launch (floor > cap) must not
-    # absorb entitlement or feed -- the excess joins the burst remainder
-    # (work conservation).
+    # claim rows). Clamps the effective floor, the headroom (weighted
+    # share above the floor, derived in compute_entitlements) and the
+    # feed need: a floor the service cannot actually launch
+    # (floor > cap) must not absorb entitlement or feed -- the excess
+    # joins the burst remainder (work conservation).
     effective_cap: Optional[int] = None
 
     def attainable_floor(self) -> int:
@@ -130,28 +128,30 @@ class Allocation:
     snapshot_time: float
 
 
-# In-process cache of the last allocation each service observed, refreshed
-# by its poller every poll interval. The demand-placement gate in the launch
+# In-process cache of the last GRANT each service observed, refreshed by
+# its poller every poll interval. The demand-placement gate in the launch
 # path reads ONLY this cache (never the DB): the gate is advisory and a
 # poll-interval-stale read is safe (grants only gate NEW launches), while a
-# DB read per demand launch would be a hot-path regression.
-_ALLOCATION_CACHE: Dict[str, Tuple[Allocation, float]] = {}
+# DB read per demand launch would be a hot-path regression. A None grant
+# (single-claimant fast path) and a missing/stale entry read the same --
+# both leave the gate inert.
+_GRANT_CACHE: Dict[str, Tuple[Optional[int], float]] = {}
 
 
 def clear_caches() -> None:
     """Test hook: drop in-process state."""
-    _ALLOCATION_CACHE.clear()
+    _GRANT_CACHE.clear()
 
 
-def get_cached_allocation(service_name: str,
-                          max_age_seconds: float) -> Optional[Allocation]:
-    entry = _ALLOCATION_CACHE.get(service_name)
+def get_cached_grant(service_name: str,
+                     max_age_seconds: float) -> Optional[int]:
+    entry = _GRANT_CACHE.get(service_name)
     if entry is None:
         return None
-    allocation, cached_at = entry
+    grant, cached_at = entry
     if time.time() - cached_at > max_age_seconds:
         return None
-    return allocation
+    return grant
 
 
 def current_epoch(pool_key: str) -> Optional[int]:
@@ -204,8 +204,7 @@ def scale_floors(total: int, floors: Mapping[str, int]) -> Dict[str, int]:
     floor_sum = sum(floors.values())
     if floor_sum <= total:
         return dict(floors)
-    if floor_sum == 0:
-        return {name: 0 for name in floors}
+    # Reaching here implies floor_sum > total >= 0: no division by zero.
     scaled = {name: total * floor / floor_sum for name, floor in floors.items()}
     return _largest_remainder_round(scaled, total)
 
@@ -268,8 +267,9 @@ def compute_entitlements(total: int,
     unattainable floor (floor > what the service can launch under its
     demand pressure) must not absorb entitlement it can never
     materialize; the clamped excess joins the weighted remainder and
-    flows to peers. The water-fill share is capped so the whole
-    entitlement never exceeds effective_cap either.
+    flows to peers. The water-fill share is capped by the HEADROOM
+    (effective_cap minus the attainable floor, derived here rather than
+    stored) so the whole entitlement never exceeds effective_cap either.
     """
     floors = scale_floors(
         total,
@@ -277,11 +277,10 @@ def compute_entitlements(total: int,
     remainder = max(0, total) - sum(floors.values())
     caps: Dict[str, Optional[int]] = {}
     for name, claim in claims.items():
-        cap = claim.headroom
-        if claim.effective_cap is not None:
-            room = max(0, claim.effective_cap - floors[name])
-            cap = room if cap is None else min(cap, room)
-        caps[name] = cap
+        if claim.effective_cap is None:
+            caps[name] = None
+        else:
+            caps[name] = max(0, claim.effective_cap - claim.attainable_floor())
     shares = water_fill(remainder,
                         {name: claim.weight for name, claim in claims.items()},
                         caps)
@@ -440,40 +439,30 @@ def upsert_claim(service_name: str,
                  floor_replicas: int,
                  gpus_per_replica: int,
                  holdings_fill: int,
-                 holdings_demand: int,
-                 headroom: Optional[int],
                  launchable: bool,
                  effective_cap: Optional[int] = None) -> None:
     """Upserts this service's claim (the per-poll heartbeat)."""
-    last = _ALLOCATION_CACHE.get(service_name)
-    serve_state.upsert_reserved_fill_claim(
-        service_name,
-        pool_key=pool_key,
-        weight=weight,
-        floor_replicas=floor_replicas,
-        gpus_per_replica=gpus_per_replica,
-        holdings_fill=holdings_fill,
-        holdings_demand=holdings_demand,
-        headroom=headroom,
-        effective_cap=effective_cap,
-        launchable=launchable,
-        heartbeat_ts=time.time(),
-        owner_epoch=last[0].epoch if last is not None else None)
+    serve_state.upsert_reserved_fill_claim(service_name,
+                                           pool_key=pool_key,
+                                           weight=weight,
+                                           floor_replicas=floor_replicas,
+                                           gpus_per_replica=gpus_per_replica,
+                                           holdings_fill=holdings_fill,
+                                           effective_cap=effective_cap,
+                                           launchable=launchable,
+                                           heartbeat_ts=time.time())
 
 
 def remove_claim(service_name: str) -> None:
     serve_state.remove_reserved_fill_claim(service_name)
-    _ALLOCATION_CACHE.pop(service_name, None)
+    _GRANT_CACHE.pop(service_name, None)
 
 
 def _claim_input(row: Dict[str, Any]) -> ClaimInput:
     effective_cap = row.get('effective_cap')
     return ClaimInput(floor=int(row['floor_replicas'] or 0),
                       weight=float(row['weight'] or 1.0),
-                      headroom=(int(row['headroom'])
-                                if row['headroom'] is not None else None),
                       holdings_fill=int(row['holdings_fill'] or 0),
-                      holdings_demand=int(row['holdings_demand'] or 0),
                       launchable=bool(row['launchable']),
                       effective_cap=(int(effective_cap)
                                      if effective_cap is not None else None))
@@ -616,7 +605,7 @@ def _allocation_from_round(service_name: str,
                             round_id=int(round_row['round_id']),
                             epoch=int(round_row['epoch']),
                             snapshot_time=float(round_row['snapshot_time']))
-    _ALLOCATION_CACHE[service_name] = (allocation, time.time())
+    _GRANT_CACHE[service_name] = (allocation.grant, time.time())
     return allocation
 
 
@@ -899,7 +888,6 @@ def _run_round_locked(service_name: str, pool_key: str,
         last_observed_free=last_free,
         last_observed_free_ts=last_free_ts,
         phantom_streak=phantom_streak,
-        owner_service=service_name,
         prev_epoch=prev_epoch,
         lease_epoch=new_lease_epoch,
         lease_expires_at=now +
@@ -919,5 +907,5 @@ def _run_round_locked(service_name: str, pool_key: str,
                             round_id=round_id,
                             epoch=new_epoch,
                             snapshot_time=snapshot_time)
-    _ALLOCATION_CACHE[service_name] = (allocation, time.time())
+    _GRANT_CACHE[service_name] = (allocation.grant, time.time())
     return allocation

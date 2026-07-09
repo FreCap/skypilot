@@ -25,16 +25,12 @@ _POOL = broker.make_pool_key('research-ctx', 'A100')
 
 def _claim(floor=0,
            weight=1.0,
-           headroom=None,
            holdings_fill=0,
-           holdings_demand=0,
            launchable=True,
            effective_cap=None):
     return broker.ClaimInput(floor=floor,
                              weight=weight,
-                             headroom=headroom,
                              holdings_fill=holdings_fill,
-                             holdings_demand=holdings_demand,
                              launchable=launchable,
                              effective_cap=effective_cap)
 
@@ -84,9 +80,9 @@ class TestEntitlements:
 
     def test_sum_never_exceeds_total(self):
         claims = {
-            'a': _claim(floor=3, weight=2.5, headroom=4),
+            'a': _claim(floor=3, weight=2.5),
             'b': _claim(floor=0, weight=1.0),
-            'c': _claim(floor=7, weight=0.5, headroom=0),
+            'c': _claim(floor=7, weight=0.5),
         }
         for total in range(0, 30):
             grants = broker.compute_entitlements(total, claims)
@@ -273,8 +269,6 @@ def _upsert(name,
             floor=0,
             gpus_per_replica=1,
             holdings_fill=0,
-            holdings_demand=0,
-            headroom=None,
             launchable=True,
             effective_cap=None):
     broker.upsert_claim(name,
@@ -283,8 +277,6 @@ def _upsert(name,
                         floor_replicas=floor,
                         gpus_per_replica=gpus_per_replica,
                         holdings_fill=holdings_fill,
-                        holdings_demand=holdings_demand,
-                        headroom=headroom,
                         launchable=launchable,
                         effective_cap=effective_cap)
 
@@ -355,12 +347,13 @@ class TestMultiClaimantRounds:
         alloc_a = _run('svc-a', free=40)
         assert alloc_a is not None and alloc_a.grant == 10
         assert alloc_a.feed == 10
-        round_row = serve_state.get_reserved_fill_round(_POOL)
-        assert round_row is not None
-        assert '"svc-b": 30' in round_row['grants']
+        alloc_b = broker.get_my_allocation('svc-b')
+        assert alloc_b is not None and alloc_b.grant == 30
 
     def test_headroom_lending(self):
-        _upsert('svc-a', headroom=5)
+        # svc-a's headroom (derived from its effective_cap) caps its share
+        # at 5; the rest lends to the peer instead of evaporating.
+        _upsert('svc-a', effective_cap=5)
         _upsert('svc-b')
         alloc_a = _run('svc-a', free=20)
         assert alloc_a is not None and alloc_a.grant == 5

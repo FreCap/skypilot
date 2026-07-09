@@ -1266,14 +1266,14 @@ class SkyPilotReplicaManager(ReplicaManager):
         zero-cost tier, its DEMAND launches stop preferring that tier and
         compete normally (in practice: go to paid capacity, since the
         grant-full tier carries more load). Reads ONLY the poller's
-        in-process allocation cache -- no DB on the launch path, and with
-        no broker allocation (single service, broker disabled, or unit
-        tests) the gate is inert and behavior is exactly pre-broker.
+        in-process grant cache -- no DB on the launch path, and with no
+        broker grant (single service, broker disabled, or unit tests)
+        the gate is inert and behavior is exactly pre-broker.
         Demand replicas already ON the pool are untouched: the gate
         prevents new squatting only; existing rows are demand-protected
         until their traffic recedes (v1 semantics per the design doc).
         """
-        allocation = reserved_capacity_broker.get_cached_allocation(
+        grant = reserved_capacity_broker.get_cached_grant(
             self._service_name,
             # The poller refreshes the cache every poll interval; 2x
             # tolerates scheduling jitter without letting the gate flap
@@ -1282,7 +1282,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             # behavior), and the broker's ceiling still bounds the fill
             # fleet itself.
             max_age_seconds=2 * reserved_capacity.poll_interval_seconds())
-        if allocation is None or allocation.grant is None:
+        if grant is None:
             return False
         if self._spot_placer is None:
             return False
@@ -1300,7 +1300,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                     spot_placer.locations_match_placement(replica_location, zc)
                     for zc in zero_cost):
                 holdings += 1
-        return holdings >= allocation.grant
+        return holdings >= grant
 
     def _log_fill_skip(self, reason: str) -> None:
         """Rate-limited skip log for aborted reserved-capacity fill launches.
