@@ -545,6 +545,26 @@ class TestSpecField:
         config = dict(self._BASE, graceful_drain_seconds=300)
         jsonschema.validate(config, schemas.get_service_schema())
 
+    def test_schema_and_yaml_round_trip_async_occupancy_declaration(self):
+        config = dict(self._BASE, graceful_drain_async_occupancy=True)
+        jsonschema.validate(config, schemas.get_service_schema())
+        spec = service_spec_lib.SkyServiceSpec.from_yaml_config(config)
+        assert spec.graceful_drain_async_occupancy is True
+        assert spec.to_yaml_config()['graceful_drain_async_occupancy'] is True
+        assert spec.copy().graceful_drain_async_occupancy is True
+        assert spec.copy(graceful_drain_async_occupancy=False
+                        ).graceful_drain_async_occupancy is False
+
+    def test_async_occupancy_declaration_backfills_old_pickles(self):
+        spec = service_spec_lib.SkyServiceSpec.from_yaml_config(dict(
+            self._BASE))
+        state = spec.__dict__.copy()
+        del state['_graceful_drain_async_occupancy']
+        restored = service_spec_lib.SkyServiceSpec.__new__(
+            service_spec_lib.SkyServiceSpec)
+        restored.__setstate__(state)
+        assert restored.graceful_drain_async_occupancy is None
+
     def test_schema_rejects_negative(self):
         config = dict(self._BASE, graceful_drain_seconds=-1)
         with pytest.raises(jsonschema.ValidationError):

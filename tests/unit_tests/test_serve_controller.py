@@ -7,6 +7,7 @@ be resolved at most once per replica lifetime and cached; the cache must be
 pruned when a replica leaves the ready set.
 """
 import threading
+import types
 from typing import Dict, Optional
 from unittest import mock
 
@@ -175,6 +176,42 @@ class TestGetLbReplicaInfo:
                 'gpu_count': '8'
             },
         }
+
+    def test_async_occupancy_declaration_is_per_replica_version(self):
+        ctrl = _make_controller()
+        old = _FakeReplicaInfo(1,
+                               serve_state.ReplicaStatus.READY,
+                               version=1,
+                               url='http://1.1.1.1:8080',
+                               accelerators={'L4': 1})
+        new = _FakeReplicaInfo(2,
+                               serve_state.ReplicaStatus.READY,
+                               version=2,
+                               url='http://2.2.2.2:8080',
+                               accelerators={'L4': 1})
+        with mock.patch.object(controller.serve_state,
+                               'get_service_from_name',
+                               return_value={'active_versions': [1, 2]}):
+            replica_info, _ = ctrl._get_lb_replica_info(  # pylint: disable=protected-access
+                [old, new], {
+                    1: True,
+                    2: False
+                })
+        assert replica_info['http://1.1.1.1:8080']['async_occupancy'] == 'true'
+        assert replica_info['http://2.2.2.2:8080']['async_occupancy'] == 'false'
+
+    def test_unspecified_async_occupancy_declaration_is_omitted(self):
+        ctrl = _make_controller()
+        info = _FakeReplicaInfo(1,
+                                serve_state.ReplicaStatus.READY,
+                                url='http://1.1.1.1:8080',
+                                accelerators={'L4': 1})
+        with mock.patch.object(controller.serve_state,
+                               'get_service_from_name',
+                               return_value={'active_versions': [1]}):
+            replica_info, _ = ctrl._get_lb_replica_info(  # pylint: disable=protected-access
+                [info], {1: None})
+        assert 'async_occupancy' not in replica_info['http://1.1.1.1:8080']
 
     def test_resolution_happens_at_most_once_per_replica(self):
         ctrl = _make_controller()
@@ -458,6 +495,101 @@ class TestTranslateInFlight:
         # the autoscaler must see None, not an empty (fresh-looking) dict.
         ctrl = self._synced_controller()
         assert ctrl._translate_in_flight(None) is None  # pylint: disable=protected-access
+
+
+class TestUnknownAsyncOccupancy:
+
+    def test_declared_ready_requires_sample_proof_not_envelope_zero(self):
+        ctrl = _make_controller()
+        info = _FakeReplicaInfo(1,
+                                serve_state.ReplicaStatus.READY,
+                                url='http://1.1.1.1:8080',
+                                accelerators={'L4': 1})
+        _sync(ctrl, [info])
+        # A numeric envelope entry (even explicit zero) is intentionally not an
+        # input: only occupancy_sampled_urls can prove async idleness.
+        unknown = ctrl._unknown_async_replica_ids(  # pylint: disable=protected-access
+            [info], {1: True}, [], [])
+        assert unknown == {1}
+        unknown = ctrl._unknown_async_replica_ids(  # pylint: disable=protected-access
+            [info], {1: True}, ['http://1.1.1.1:8080'], [])
+        assert unknown == set()
+
+    def test_cold_controller_keeps_declared_not_ready_unknown(self):
+        ctrl = _make_controller()
+        info = _FakeReplicaInfo(2,
+                                serve_state.ReplicaStatus.NOT_READY,
+                                url='http://2.2.2.2:8080')
+        # A cold controller cannot translate the LB's retained URL yet. It must
+        # fail closed from the durable per-version declaration.
+        unknown = ctrl._unknown_async_replica_ids(  # pylint: disable=protected-access
+            [info], {1: True}, ['http://2.2.2.2:8080'], None)
+        assert unknown == {2}
+
+    def test_raw_probe_miss_overrides_sample_if_payload_is_inconsistent(self):
+        ctrl = _make_controller()
+        info = _FakeReplicaInfo(1,
+                                serve_state.ReplicaStatus.READY,
+                                url='http://1.1.1.1:8080',
+                                accelerators={'L4': 1})
+        _sync(ctrl, [info])
+        unknown = ctrl._unknown_async_replica_ids(  # pylint: disable=protected-access
+            [info], {1: True}, ['http://1.1.1.1:8080'], ['http://1.1.1.1:8080'])
+        assert unknown == {1}
+
+    def test_overlapping_lb_sessions_force_declared_replica_unknown(self):
+        ctrl = _make_controller()
+        info = _FakeReplicaInfo(1,
+                                serve_state.ReplicaStatus.READY,
+                                url='http://1.1.1.1:8080',
+                                accelerators={'L4': 1})
+        _sync(ctrl, [info])
+        assert not ctrl._record_lb_session_heartbeat(  # pylint: disable=protected-access
+            'lb-a', current_time=100)
+        overlap = ctrl._record_lb_session_heartbeat(  # pylint: disable=protected-access
+            'lb-b', current_time=101)
+        assert overlap
+        unknown = ctrl._unknown_async_replica_ids(  # pylint: disable=protected-access
+            [info], {1: None}, ['http://1.1.1.1:8080'], [],
+            force_all_live_unknown=overlap)
+        assert unknown == {1}
+
+        # LB-A's zero/off-route view must not complete a drain while LB-B is
+        # also active. routing_urls=None makes the drain tracker fall back to
+        # its bounded deadline regardless of the clean-looking gauge.
+        in_flight, routing_urls = ctrl._lb_drain_report_view(  # pylint: disable=protected-access
+            {
+                'in_flight': {
+                    'http://1.1.1.1:8080': 0
+                },
+                'routing_urls': [],
+            }, overlap)
+        manager = types.SimpleNamespace(_lb_in_flight_report=None)
+        controller.replica_managers.ReplicaManager.update_lb_in_flight(
+            manager,
+            in_flight,
+            routing_urls,
+            unknown_urls=[],
+            draining_urls=[],
+            lb_session_id='lb-a')
+        tracker = controller.replica_managers._ReplicaDrainTracker(  # pylint: disable=protected-access
+            manager,
+            'http://1.1.1.1:8080',
+            drain_started=0)
+        assert not tracker()
+
+        after_stale = (
+            101 +
+            3 * controller.serve_constants.LB_CONTROLLER_SYNC_INTERVAL_SECONDS +
+            1)
+        overlap = ctrl._record_lb_session_heartbeat(  # pylint: disable=protected-access
+            'lb-b',
+            current_time=after_stale)
+        assert not overlap
+        unknown = ctrl._unknown_async_replica_ids(  # pylint: disable=protected-access
+            [info], {1: None}, ['http://1.1.1.1:8080'], [],
+            force_all_live_unknown=overlap)
+        assert unknown == set()
 
 
 class _FakeAutoscaler:

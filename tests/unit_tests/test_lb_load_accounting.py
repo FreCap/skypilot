@@ -197,6 +197,27 @@ class TestProxySlotRelease:
         # background task now.
         policy.post_execute_hook.assert_not_called()
 
+    def test_duplicate_upstream_headers_are_preserved(self):
+        policy = mock.MagicMock()
+        client = mock.MagicMock()
+        send_response = mock.MagicMock()
+        send_response.status_code = 200
+        send_response.headers = httpx.Headers([
+            (b'set-cookie', b'a=1; Path=/'),
+            (b'set-cookie', b'b=2; Path=/'),
+            (b'x-test', b'ok'),
+        ])
+        client.send = mock.AsyncMock(return_value=send_response)
+        balancer = _make_lb(policy, client_pool={'http://a:8080': client})
+
+        response = asyncio.run(
+            balancer._proxy_request_to('http://a:8080', self._request()))
+        assert response.raw_headers == [
+            (b'set-cookie', b'a=1; Path=/'),
+            (b'set-cookie', b'b=2; Path=/'),
+            (b'x-test', b'ok'),
+        ]
+
     def test_midstream_failure_releases_slot_via_iterator_finally(self):
         """Starlette runs background tasks only AFTER a successful
         stream: a mid-stream failure must release via the iterator's
