@@ -1910,14 +1910,23 @@ class RetryingVmProvisioner(object):
                     # to a fresh launch so the task can fail over to
                     # candidates that DO support the feature (e.g.
                     # on-demand).
-                    # Raised from within this handler, the cause
+                    # Raised from within this handler, the error
                     # propagates out of the function (sibling except
                     # clauses of the same try do not catch it) -- the
-                    # same clean error `sky autostop` gives. `from None`
-                    # suppresses the implicit __context__ chain so the
-                    # internal marker class never shows up in the debug
+                    # same clean error `sky autostop` gives, wrapped
+                    # with the cluster name and the actionable fix like
+                    # core.autostop's message. `from None` suppresses
+                    # the implicit __context__ chain so the internal
+                    # marker class never shows up in the debug
                     # stacktrace serialized to API clients.
-                    raise cause from None
+                    raise exceptions.NotSupportedError(
+                        f'The requested configuration for cluster '
+                        f'{cluster_name!r} is not supported by its '
+                        f'launched resources: {cause}\n'
+                        'To fix: drop the unsupported request, e.g. for '
+                        'autostop on unstoppable resources (such as '
+                        'spot) use autodown instead '
+                        '(`-i <minutes> --down`).') from None
                 if init_never_up and prev_handle is not None:
                     # The loop tail's INIT branch resets to a fresh
                     # launch assuming _retry_zones() already terminated
