@@ -711,8 +711,10 @@ class TestRecoveryRetryAndIsolation:
 
         def _launch(replica_id,
                     resources_override=None,
-                    existing_replica_infos=None):
+                    existing_replica_infos=None,
+                    prior_reserved_fill=False):
             del resources_override, existing_replica_infos
+            del prior_reserved_fill
             if replica_id == 2:
                 raise RuntimeError('boom')
             launched.append(replica_id)
@@ -731,6 +733,50 @@ class TestRecoveryRetryAndIsolation:
             mgr._recover_replica_operations()
         # Replica 2 failed; 1 and 3 still re-driven.
         assert launched == [1, 3]
+
+    def test_redrive_preserves_reserved_fill_attribution(self):
+        # A fill replica surviving a controller respawn is re-driven with
+        # its persisted (sentinel-stripped) override; the replacement row
+        # must keep reserved_fill=True or the replica silently converts
+        # to ceiling-exempt "demand" and can starve peers forever. Demand
+        # rows must stay False.
+        mgr = _make_manager()
+        mgr.yaml_content = 'dummy: yaml'
+        mgr.latest_version = 1
+        mgr._spot_placer = None
+        mgr._replica_to_request_id = {}
+        mgr._replica_to_launch_cancelled = {}
+        fill_row = _fake_replica_info(1)
+        fill_row.resources_override = None
+        fill_row.reserved_fill = True
+        demand_row = _fake_replica_info(2)
+        demand_row.resources_override = None
+        demand_row.reserved_fill = False
+        persisted: dict = {}
+        with mock.patch('sky.serve.replica_managers._should_use_spot',
+                        return_value=False), \
+             mock.patch('sky.serve.replica_managers._get_resources_ports',
+                        return_value='8080'), \
+             mock.patch(
+                 'sky.serve.replica_managers.serve_utils.'
+                 'generate_replica_launch_log_file_name',
+                 return_value='/tmp/launch.log'), \
+             mock.patch(
+                 'sky.serve.replica_managers.serve_state.get_replica_infos',
+                 return_value=[fill_row, demand_row]), \
+             mock.patch(
+                 'sky.serve.replica_managers.serve_state.'
+                 'get_replicas_at_status',
+                 side_effect=[[fill_row, demand_row], [], []]), \
+             mock.patch(
+                 'sky.serve.replica_managers.serve_state.'
+                 'add_or_update_replica',
+                 side_effect=lambda _svc, rid, info: persisted.__setitem__(
+                     rid, info)), \
+             mock.patch('sky.serve.replica_managers.thread_utils.SafeThread'):
+            mgr._recover_replica_operations()
+        assert persisted[1].reserved_fill is True
+        assert persisted[2].reserved_fill is False
 
     def test_reentry_with_enqueued_threads_is_tolerated(self):
         mgr = _make_manager(next_replica_id=1)

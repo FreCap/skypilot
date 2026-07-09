@@ -9,36 +9,19 @@ therefore never picked up. The TTL decay retries each benched location
 with one probe launch per window.
 """
 # pylint: disable=redefined-outer-name,protected-access,unused-variable
-from unittest import mock
-
 import pytest
 
 from sky.serve import spot_placer
-
-
-def _make_location(name: str) -> spot_placer.Location:
-    cloud = mock.MagicMock()
-    cloud.is_same_cloud = lambda other: str(other) == str(cloud)
-    return spot_placer.Location(cloud=cloud, region=name, zone=None)
-
-
-def _make_placer(locations, costs):
-    placer = spot_placer.DynamicFallbackSpotPlacer.__new__(
-        spot_placer.DynamicFallbackSpotPlacer)
-    placer.location2status = {
-        loc: spot_placer.LocationStatus.ACTIVE for loc in locations
-    }
-    placer.location2preempted_at = {}
-    placer.location2cost = dict(costs)
-    return placer
+from tests.unit_tests.spot_placer_test_utils import make_location
+from tests.unit_tests.spot_placer_test_utils import make_placer
 
 
 @pytest.fixture
 def placer_and_locations():
-    cheap = _make_location('seoul')
-    other = _make_location('oregon')
-    third = _make_location('iowa')
-    placer = _make_placer([cheap, other, third], {
+    cheap = make_location('seoul')
+    other = make_location('oregon')
+    third = make_location('iowa')
+    placer = make_placer({
         cheap: 1.0,
         other: 2.0,
         third: 3.0,

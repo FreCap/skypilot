@@ -212,6 +212,60 @@ RESERVED_CAPACITY_STALE_AFTER_INTERVALS = 3
 # available (fill must NEVER spill to paid capacity). Underscore-prefixed so
 # it can never collide with a real Resources field.
 RESERVED_CAPACITY_FILL_OVERRIDE_KEY = '_reserved_fill_zero_cost_only'
+# Sentinel resources_override key carrying the broker grant epoch a fill
+# scale-up was emitted under. The launch path pops it (never reaches
+# sky.launch) and re-checks the POOL's current round epoch right before
+# committing the launch: a decision computed from a superseded allocation
+# round must skip instead of launching against capacity the broker has
+# since re-granted to a peer service.
+RESERVED_FILL_GRANT_EPOCH_OVERRIDE_KEY = '_reserved_fill_grant_epoch'
+# Sentinel resources_override key carrying the pool key the grant epoch
+# belongs to (always stamped alongside the epoch). Rounds and epochs are
+# per-pool: the launch fence compares the carried epoch against ITS pool's
+# round epoch -- a global comparison would let pool A's grant churn fence
+# pool B's unrelated fill launches.
+RESERVED_FILL_POOL_KEY_OVERRIDE_KEY = '_reserved_fill_pool_key'
+
+# [boltz fork] Reserved-fill broker: multi-service arbitration of the
+# zero-cost pools (see sky/serve/reserved_capacity_broker.py). Cross-process
+# lock serializing broker rounds. On a Postgres backend get_lock() resolves
+# this to a session advisory lock (shared across api-server pods); on SQLite
+# it is a node-local filelock (single pod, sufficient -- every serve
+# controller shares the api-server pod in consolidation mode). Independent of
+# the election primitive, actuation correctness rests on the per-pool round
+# epoch (see the broker module), not on this lock.
+RESERVED_FILL_BROKER_LOCK_ID = '~/.sky/serve_reserved_fill_broker_lock'
+# Bounded by one cluster-wide realtime query plus a handful of DB
+# round-trips; generous so a slow cluster query makes peers wait for the
+# fresh round instead of timing out into a no-fill cycle.
+RESERVED_FILL_BROKER_LOCK_TIMEOUT_SECONDS = 120
+# A claim whose heartbeat is older than this is dead and drops out of
+# arbitration. Comfortably above the controller respawn+boot+recovery window
+# (the parent respawns children within seconds, but recovery of a large
+# fleet can take minutes): a fast-respawned controller must re-adopt its own
+# claim instead of colliding with its ghost, and a genuinely dead service
+# must not hold a grant forever.
+RESERVED_FILL_CLAIM_TTL_SECONDS = 300
+RESERVED_FILL_CLAIM_TTL_ENV_VAR = (
+    'SKYPILOT_SERVE_RESERVED_FILL_CLAIM_TTL_SECONDS')
+# Broker lease expiry, in poll intervals. Only used to force an epoch bump
+# after a period with no rounds at all (every outstanding grant is then
+# suspect); NOT a liveness bound on any single controller.
+RESERVED_FILL_LEASE_TTL_INTERVALS = 5
+# A positive feed assignment sticks to its service for this many poll
+# intervals: a single free GPU fairness-alternated between two services
+# every round would never survive the local two-poll increase damping and
+# idle forever.
+RESERVED_FILL_STICKY_FEED_INTERVALS = 2
+# Consecutive phantom observations (successful realtime query reporting NO
+# labeled nodes for the claimed GPU) required before the broker rejects a
+# pool's claims. kubernetes_catalog returns empty dicts without raising on
+# credential/cache/label-formatter failures, so a single "phantom" reading
+# can be a transient kube-apiserver blip masquerading as a successful
+# observation; deleting every claim on one reading turns that blip into a
+# pool-wide fill outage. Suspect rounds feed 0 (conservative) but keep the
+# claims; only a persistent phantom (this many rounds in a row) rejects.
+RESERVED_FILL_PHANTOM_CONFIRM_ROUNDS = 3
 
 # Default interval in seconds to probe replica endpoint.
 DEFAULT_ENDPOINT_PROBE_INTERVAL_SECONDS = 10

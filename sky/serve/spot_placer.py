@@ -231,6 +231,43 @@ class Location:
         )
 
 
+def locations_match_placement(replica_location: Location,
+                              zero_cost: Location) -> bool:
+    """Relaxed zero-cost identity match for fill accounting.
+
+    Deliberately NOT Location.__eq__: full equality includes
+    image_id/disk_tier (via _accel_key), so pre-upgrade shape-less
+    replica rows and replicas surviving an image-changing update
+    would stop matching, undercounting zero_cost_count and stripping
+    the fleet's scale-down protection. For "is this replica on the
+    free tier" only the placement identity matters: cloud, region,
+    zone (when both sides pin one), accelerator shape and spot-ness.
+    Legacy shape-less rows (no accelerators/use_spot persisted) match
+    by cloud+region alone.
+
+    Lives here (not on the autoscaler) because both the autoscaler's fill
+    overlay and the launch path's demand-placement gate need it, and
+    replica_managers must not import autoscalers.
+    """
+    if str(replica_location.cloud).lower() != str(zero_cost.cloud).lower():
+        return False
+    if replica_location.region != zero_cost.region:
+        return False
+    if (replica_location.zone is not None and zero_cost.zone is not None and
+            replica_location.zone != zero_cost.zone):
+        return False
+    if replica_location.accelerators:
+        if (zero_cost.accelerators and
+                replica_location.accelerators != zero_cost.accelerators):
+            return False
+        # Only shape-carrying rows enforce spot-ness: legacy rows
+        # deserialize with the use_spot=True default, which must not
+        # exclude them from a non-spot zero-cost pool.
+        if replica_location.use_spot != zero_cost.use_spot:
+            return False
+    return True
+
+
 class LocationStatus(enum.Enum):
     """Location Spot Status."""
     ACTIVE = 'ACTIVE'
@@ -372,9 +409,17 @@ class SpotPlacer:
                 'Only one policy can be default.')
             DEFAULT_SPOT_PLACER = name
 
-    def select_next_location(self,
-                             current_locations: List[Location]) -> Location:
-        """Select next location to place spot instance."""
+    def select_next_location(
+            self,
+            current_locations: List[Location],
+            skip_zero_cost_preference: bool = False) -> Location:
+        """Select next location to place spot instance.
+
+        skip_zero_cost_preference disables the fill-the-free-tier-first
+        rule in placers that have one; the placer stays service-agnostic
+        and the decision to skip (the broker's demand-placement gate) is
+        made by the caller in the launch path.
+        """
         raise NotImplementedError
 
     def resolve_location(self, location: Location) -> Optional[Location]:
@@ -616,8 +661,10 @@ class DynamicFallbackSpotPlacer(SpotPlacer,
                     f'{_PREEMPTION_RETRY_SECONDS_ENV_VAR} (or raise the '
                     'TTL).')
 
-    def select_next_location(self,
-                             current_locations: List[Location]) -> Location:
+    def select_next_location(
+            self,
+            current_locations: List[Location],
+            skip_zero_cost_preference: bool = False) -> Location:
         active_locations = self.active_locations()
         # Zero-cost tier first: locations that cost nothing (reserved /
         # already-paid capacity, e.g. a Kubernetes pool) are filled
@@ -625,12 +672,28 @@ class DynamicFallbackSpotPlacer(SpotPlacer,
         # of load. When such a location is full, its launches fail fast,
         # it gets benched, and the TTL retry re-probes it as capacity
         # frees — so load drifts back automatically.
+        # skip_zero_cost_preference (the broker's demand-placement gate:
+        # this service already holds its zero-cost grant) EXCLUDES the
+        # free tier from the candidate set — merely demoting it to
+        # normal competition is not enough, because selection breaks
+        # load ties by cost and a zero-cost location wins every tie, so
+        # tied demand launches would still land on a peer's entitlement
+        # one by one. Excluded only while a paid candidate exists: a
+        # zero-cost-only set must still serve (the gate throttles
+        # placement preference, never availability).
         zero_cost = [
             location for location in active_locations
             if self._get_cost_per_hour_cached(location) == 0
         ]
-        if zero_cost:
+        if zero_cost and not skip_zero_cost_preference:
             active_locations = zero_cost
+        elif zero_cost and skip_zero_cost_preference:
+            paid = [
+                location for location in active_locations
+                if location not in zero_cost
+            ]
+            if paid:
+                active_locations = paid
         res = self._select_least_loaded_min_cost(active_locations,
                                                  current_locations)
         self._consume_retry_if_benched(res)

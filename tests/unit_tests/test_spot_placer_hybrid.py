@@ -12,41 +12,22 @@ from unittest import mock
 import pytest
 
 from sky.serve import spot_placer
-
-
-def _make_location(region, accelerators=None, use_spot=True):
-    cloud = mock.MagicMock()
-    cloud.is_same_cloud = lambda other: str(other) == str(cloud)
-    return spot_placer.Location(cloud=cloud,
-                                region=region,
-                                zone=None,
-                                accelerators=accelerators,
-                                use_spot=use_spot)
-
-
-def _make_placer(locations, costs):
-    placer = spot_placer.DynamicFallbackSpotPlacer.__new__(
-        spot_placer.DynamicFallbackSpotPlacer)
-    placer.location2status = {
-        loc: spot_placer.LocationStatus.ACTIVE for loc in locations
-    }
-    placer.location2preempted_at = {}
-    placer.location2cost = dict(costs)
-    return placer
+from tests.unit_tests.spot_placer_test_utils import make_location
+from tests.unit_tests.spot_placer_test_utils import make_placer
 
 
 @pytest.fixture
 def hybrid_placer():
-    k8s = _make_location('research-ctx',
-                         accelerators={'A100': 1},
-                         use_spot=False)
-    cheap_spot = _make_location('us-east-1',
+    k8s = make_location('research-ctx',
+                        accelerators={'A100': 1},
+                        use_spot=False)
+    cheap_spot = make_location('us-east-1',
+                               accelerators={'L4': 1},
+                               use_spot=True)
+    pricey_spot = make_location('eu-west-3',
                                 accelerators={'L4': 1},
                                 use_spot=True)
-    pricey_spot = _make_location('eu-west-3',
-                                 accelerators={'L4': 1},
-                                 use_spot=True)
-    placer = _make_placer([k8s, cheap_spot, pricey_spot], {
+    placer = make_placer({
         k8s: 0.0,
         cheap_spot: 0.2,
         pricey_spot: 0.3,
@@ -88,13 +69,13 @@ class TestHeterogeneousLocations:
     """Locations are distinct per shape and carry launch overrides."""
 
     def test_same_region_different_shape_are_distinct(self):
-        a = _make_location('us-east-1', accelerators={'L4': 1})
-        b = _make_location('us-east-1', accelerators={'L4': 4})
+        a = make_location('us-east-1', accelerators={'L4': 1})
+        b = make_location('us-east-1', accelerators={'L4': 4})
         assert a != b
         assert len({a, b}) == 2
 
     def test_to_dict_carries_shape_and_spotness(self):
-        k8s = _make_location('ctx', accelerators={'A100': 1}, use_spot=False)
+        k8s = make_location('ctx', accelerators={'A100': 1}, use_spot=False)
         d = k8s.to_dict()
         assert d['accelerators'] == {'A100': 1}
         assert d['use_spot'] is False
@@ -105,7 +86,7 @@ class TestHeterogeneousLocations:
         assert 'disk_tier' in d and d['disk_tier'] is None
         # accelerators likewise unconditional: a CPU-only location must
         # strip GPU entries' accelerators from its copies.
-        cpu_only = _make_location('cpu-region', accelerators=None)
+        cpu_only = make_location('cpu-region', accelerators=None)
         d_cpu = cpu_only.to_dict()
         assert 'accelerators' in d_cpu and d_cpu['accelerators'] is None
 
@@ -167,9 +148,9 @@ class TestLegacyLocationResolution:
 
     def test_set_preemptive_resolves_by_region(self, monkeypatch):
         monkeypatch.setattr(spot_placer.time, 'time', lambda: 1000.0)
-        keyed = _make_location('us-east-1', accelerators={'L4': 1})
-        other = _make_location('us-east-2', accelerators={'L4': 1})
-        placer = _make_placer([keyed, other], {keyed: 0.2, other: 0.2})
+        keyed = make_location('us-east-1', accelerators={'L4': 1})
+        other = make_location('us-east-2', accelerators={'L4': 1})
+        placer = make_placer({keyed: 0.2, other: 0.2})
         # Shape-less location, as deserialized from a pre-upgrade row.
         placer.set_preemptive(
             spot_placer.Location(cloud=keyed.cloud,
@@ -178,18 +159,18 @@ class TestLegacyLocationResolution:
         assert keyed in placer.preemptive_locations()
 
     def test_unknown_location_is_ignored_not_asserted(self):
-        keyed = _make_location('us-east-1', accelerators={'L4': 1})
-        placer = _make_placer([keyed], {keyed: 0.2})
-        stranger = _make_location('mars-central-1')
+        keyed = make_location('us-east-1', accelerators={'L4': 1})
+        placer = make_placer({keyed: 0.2})
+        stranger = make_location('mars-central-1')
         # Must not raise.
         placer.set_preemptive(stranger)
         placer.set_active(stranger)
         assert keyed in placer.active_locations()
 
     def test_load_counting_resolves_legacy_rows(self):
-        keyed = _make_location('us-east-1', accelerators={'L4': 1})
-        other = _make_location('us-east-2', accelerators={'L4': 1})
-        placer = _make_placer([keyed, other], {keyed: 0.2, other: 0.2})
+        keyed = make_location('us-east-1', accelerators={'L4': 1})
+        other = make_location('us-east-2', accelerators={'L4': 1})
+        placer = make_placer({keyed: 0.2, other: 0.2})
         legacy = spot_placer.Location(cloud=keyed.cloud,
                                       region='us-east-1',
                                       zone=None)
@@ -265,6 +246,61 @@ class TestMixedValidation:
                                               pool=False)
 
 
+class TestReservedFillSinglePoolValidation:
+    """validate_service_task rejects fill specs spanning >1 k8s pool.
+
+    The broker's v1 arbitration supports exactly one (context, GPU) pool
+    per service; the runtime cycle rejects violations too, but only via
+    controller error logs, so misconfigurations must also fail at submit
+    time. All Kubernetes entries are treated as candidate pool shapes
+    (zero-cost-ness is not knowable client-side).
+    """
+
+    def _task(self, k8s_entries):
+        # pylint: disable=import-outside-toplevel
+        import sky
+        entries = '\n'.join(f'    - infra: k8s/{ctx}\n'
+                            f'      accelerators: {gpu}:1'
+                            for ctx, gpu in k8s_entries)
+        yaml_str = f"""
+resources:
+  cpus: 2+
+  ports: 8080
+  any_of:
+{entries}
+service:
+  readiness_probe: /health
+  replica_policy:
+    min_replicas: 1
+    max_replicas: 4
+    target_qps_per_replica: 0.1
+    reserved_capacity_fill: true
+run: echo hi
+"""
+        return sky.Task.from_yaml_str(yaml_str)
+
+    def test_two_distinct_pools_rejected(self):
+        # pylint: disable=import-outside-toplevel
+        from sky.serve import serve_utils
+        for entries in (
+            [('ctx-a', 'A100'), ('ctx-a', 'H100')],  # same ctx, two GPUs
+            [('ctx-a', 'A100'), ('ctx-b', 'A100')],  # two contexts, one GPU
+        ):
+            with pytest.raises(ValueError, match='exactly one Kubernetes'):
+                serve_utils.validate_service_task(self._task(entries),
+                                                  pool=False)
+
+    def test_single_pool_accepted(self):
+        # pylint: disable=import-outside-toplevel
+        from sky.serve import serve_utils
+        serve_utils.validate_service_task(self._task([('ctx-a', 'A100')]),
+                                          pool=False)
+        # Same pool enumerated case-insensitively still counts once.
+        serve_utils.validate_service_task(self._task([('ctx-a', 'A100'),
+                                                      ('ctx-a', 'a100')]),
+                                          pool=False)
+
+
 class TestImageIdNormalizationEndToEnd:
     """Enumerated locations must carry region-independent image dicts."""
 
@@ -321,8 +357,7 @@ run: echo hi
         assert l4[0].to_dict()['disk_tier'] == 'high'
         assert a10g[0].to_dict()['disk_tier'] is None
 
-    def test_shape_passed_to_feasibility_has_no_leaked_attrs(
-            self, monkeypatch):
+    def test_shape_passed_to_feasibility_has_no_leaked_attrs(self, monkeypatch):
         # pylint: disable=import-outside-toplevel
         import sky
         from sky.clouds import aws as aws_cloud

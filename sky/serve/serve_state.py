@@ -94,6 +94,94 @@ serve_ha_recovery_script_table = sqlalchemy.Table(
     sqlalchemy.Column('script', sqlalchemy.Text),
 )
 
+# [boltz fork] Reserved-fill broker state (multi-service arbitration of the
+# zero-cost fill pools; see sky/serve/reserved_capacity_broker.py). One claim
+# row per fill-enabled service, upserted by its controller's capacity poller
+# every poll interval (the heartbeat). Only FILL holdings are reported: they
+# are broker property (arbitrated by grants); demand-placed zero-cost
+# replicas are demand-protected, exempt from the grant ceiling, and derived
+# from live replica rows where needed.
+reserved_fill_claims_table = sqlalchemy.Table(
+    'reserved_fill_claims',
+    Base.metadata,
+    sqlalchemy.Column('service_name', sqlalchemy.Text, primary_key=True),
+    # json.dumps([kubernetes_context, gpu_name_lower]): the pool identity two
+    # services collide on. Deliberately NOT full Location equality --
+    # differing image_id/disk_tier/zone must still collide.
+    sqlalchemy.Column('pool_key', sqlalchemy.Text),
+    sqlalchemy.Column('weight', sqlalchemy.Float),
+    sqlalchemy.Column('floor_replicas', sqlalchemy.Integer),
+    # v1 requires all claimants of a pool to agree on this (mixed pools are
+    # rejected); GPU-unit bookkeeping is v2.
+    sqlalchemy.Column('gpus_per_replica', sqlalchemy.Integer),
+    sqlalchemy.Column('holdings_fill', sqlalchemy.Integer),
+    # Real capacity cap the claimant can materialize right now
+    # (max(0, max_replicas - demand_target)); NULL = unbounded. The broker
+    # clamps the effective floor, the headroom (weighted share above the
+    # floor, derived at allocation time) and the feed need by it, so an
+    # unattainable floor cannot permanently absorb entitlement and feed the
+    # service never launches (its excess joins the burst remainder).
+    sqlalchemy.Column('effective_cap', sqlalchemy.Integer, server_default=None),
+    # Whether the claimant can launch on the pool right now (its zero-cost
+    # tier is not benched): feeds to un-launchable claimants are wasted for a
+    # whole round, so the feed split redistributes them.
+    sqlalchemy.Column('launchable', sqlalchemy.Integer, server_default='1'),
+    sqlalchemy.Column('heartbeat_ts', sqlalchemy.Float),
+)
+
+# Latest published broker round per pool (overwritten in place each round).
+# Grants/feeds are the authoritative allocation record readers act on; the
+# remaining columns are the broker's cross-round memory (damping baselines,
+# feed stickiness, last good free measurement for blackout handling).
+reserved_fill_rounds_table = sqlalchemy.Table(
+    'reserved_fill_rounds',
+    Base.metadata,
+    sqlalchemy.Column('pool_key', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('round_id', sqlalchemy.Integer),
+    # Taken BEFORE the (slow) cluster query, mirroring the #108
+    # snapshot/debit invariant at broker level.
+    sqlalchemy.Column('snapshot_time', sqlalchemy.Float),
+    # The POOL's fencing epoch: bumps only when this pool's allocation
+    # changes. Readers actuating a grant compare their carried epoch
+    # against it (see reserved_capacity_broker.current_epoch) -- per-pool,
+    # so one pool's grant churn never fences another pool's launches.
+    sqlalchemy.Column('epoch', sqlalchemy.Integer),
+    # JSON {service: grant}; null grant = single-claimant fast path (no
+    # ceiling, #108 identity).
+    sqlalchemy.Column('grants', sqlalchemy.Text),
+    # JSON {service: feed}; sum(feeds) <= observed free by construction.
+    sqlalchemy.Column('feeds', sqlalchemy.Text),
+    # JSON {service: raw undamped entitlement} of THIS round; next round's
+    # damping baseline (a move must persist across two rounds to apply).
+    sqlalchemy.Column('raw_grants', sqlalchemy.Text),
+    # JSON {service: {'amount': int, 'since': ts}}: sticky feed assignments.
+    sqlalchemy.Column('feed_state', sqlalchemy.Text),
+    # Sum of fill holdings at round time: a shrink here means pods are
+    # physically gone, making grant down-moves immediate (no damping).
+    sqlalchemy.Column('sum_holdings', sqlalchemy.Integer),
+    # Last SUCCESSFULLY measured free level + its timestamp: a failed query
+    # decays from this instead of reading raw 0 (a measurement blackout must
+    # not trigger releases).
+    sqlalchemy.Column('last_observed_free', sqlalchemy.Integer),
+    sqlalchemy.Column('last_observed_free_ts', sqlalchemy.Float),
+    # Consecutive phantom observations (successful query, no labeled nodes
+    # for the claimed GPU). Persisted so the consecutive-phantom claim
+    # rejection gate survives writer rotation; a non-phantom observation
+    # resets it to 0.
+    sqlalchemy.Column('phantom_streak', sqlalchemy.Integer, server_default='0'),
+)
+
+# Singleton lease row (id=1). The epoch only moves forward; its sole role
+# is the publish CAS in publish_reserved_fill_round (fencing for actuation
+# is the per-pool round epoch above).
+reserved_fill_lease_table = sqlalchemy.Table(
+    'reserved_fill_lease',
+    Base.metadata,
+    sqlalchemy.Column('id', sqlalchemy.Integer, primary_key=True),
+    sqlalchemy.Column('epoch', sqlalchemy.Integer),
+    sqlalchemy.Column('expires_at', sqlalchemy.Float),
+)
+
 
 def create_table(engine: sqlalchemy.engine.Engine):
     """Creates the service and replica tables if they do not exist."""
@@ -439,10 +527,12 @@ def remove_service(service_name: str) -> None:
 def remove_service_completely(service_name: str) -> None:
     """Atomically remove the service-level DB state for a service.
 
-    Deletes from `services`, `version_specs`, and
-    `serve_ha_recovery_script` in a single transaction. These were the
-    three tables whose sequential teardown left orphan rows when a
-    subprocess died mid-cleanup.
+    Deletes from `services`, `version_specs`,
+    `serve_ha_recovery_script`, and `reserved_fill_claims` in a single
+    transaction. The first three were the tables whose sequential
+    teardown left orphan rows when a subprocess died mid-cleanup; the
+    claim row must go too, or a torn-down fill-enabled service keeps
+    absorbing broker entitlement until its claim TTL expires.
 
     Replicas are intentionally NOT touched here. Both callers
     (`_cleanup` success path in `_start`, and `_terminate_failed_services`
@@ -461,6 +551,9 @@ def remove_service_completely(service_name: str) -> None:
         session.execute(
             sqlalchemy.delete(serve_ha_recovery_script_table).where(
                 serve_ha_recovery_script_table.c.service_name == service_name))
+        session.execute(
+            sqlalchemy.delete(reserved_fill_claims_table).where(
+                reserved_fill_claims_table.c.service_name == service_name))
         session.commit()
 
 
@@ -1082,3 +1175,211 @@ def remove_ha_recovery_script(service_name: str) -> None:
             sqlalchemy.delete(serve_ha_recovery_script_table).where(
                 serve_ha_recovery_script_table.c.service_name == service_name))
         session.commit()
+
+
+# === Reserved-fill broker state (see sky/serve/reserved_capacity_broker.py).
+# These functions own ALL SQL for the broker tables; the broker module owns
+# the allocation logic. Multi-statement functions run in one session so each
+# is a single transaction.
+
+
+def _upsert_insert_func(engine: sqlalchemy.engine.Engine):
+    """Dialect-specific INSERT with ON CONFLICT support."""
+    if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
+        return sqlite.insert
+    if engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        return postgresql.insert
+    raise ValueError('Unsupported database dialect')
+
+
+def upsert_reserved_fill_claim(service_name: str, *, pool_key: str,
+                               weight: float, floor_replicas: int,
+                               gpus_per_replica: int, holdings_fill: int,
+                               effective_cap: Optional[int], launchable: bool,
+                               heartbeat_ts: float) -> None:
+    """Upserts a service's reserved-fill claim (the per-poll heartbeat)."""
+    engine = _db_manager.get_engine()
+    values = {
+        'service_name': service_name,
+        'pool_key': pool_key,
+        'weight': weight,
+        'floor_replicas': floor_replicas,
+        'gpus_per_replica': gpus_per_replica,
+        'holdings_fill': holdings_fill,
+        'effective_cap': effective_cap,
+        'launchable': int(launchable),
+        'heartbeat_ts': heartbeat_ts,
+    }
+    with orm.Session(engine) as session:
+        insert_stmt = _upsert_insert_func(engine)(
+            reserved_fill_claims_table).values(**values)
+        insert_stmt = insert_stmt.on_conflict_do_update(
+            index_elements=['service_name'],
+            set_={
+                key: getattr(insert_stmt.excluded, key)
+                for key in values
+                if key != 'service_name'
+            })
+        session.execute(insert_stmt)
+        session.commit()
+
+
+def remove_reserved_fill_claim(service_name: str) -> None:
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        session.execute(
+            sqlalchemy.delete(reserved_fill_claims_table).where(
+                reserved_fill_claims_table.c.service_name == service_name))
+        session.commit()
+
+
+def remove_reserved_fill_claims_for_pool(pool_key: str) -> None:
+    """Drops every claim on a pool (phantom-pool rejection)."""
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        session.execute(
+            sqlalchemy.delete(reserved_fill_claims_table).where(
+                reserved_fill_claims_table.c.pool_key == pool_key))
+        session.commit()
+
+
+def prune_reserved_fill_claims(expired_before: float) -> List[str]:
+    """Deletes claims whose heartbeat predates `expired_before`.
+
+    Returns the actually-pruned service names (for loud logging by the
+    broker). The DELETE itself carries the staleness predicate: a
+    heartbeat refreshed after the candidate SELECT can never be deleted
+    (the previous select-then-delete-BY-NAME pair raced exactly that
+    upsert and killed fresh claims). The report is the candidate set
+    minus post-delete survivors, so a row spared by the predicate is
+    never reported as pruned.
+    """
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        candidates = [
+            row[0] for row in session.execute(
+                sqlalchemy.select(reserved_fill_claims_table.c.service_name).
+                where(reserved_fill_claims_table.c.heartbeat_ts < expired_before
+                     )).fetchall()
+        ]
+        if not candidates:
+            session.commit()
+            return []
+        session.execute(
+            sqlalchemy.delete(reserved_fill_claims_table).where(
+                reserved_fill_claims_table.c.heartbeat_ts < expired_before))
+        survivors = {
+            row[0] for row in session.execute(
+                sqlalchemy.select(reserved_fill_claims_table.c.service_name).
+                where(reserved_fill_claims_table.c.service_name.in_(
+                    candidates))).fetchall()
+        }
+        session.commit()
+    return [name for name in candidates if name not in survivors]
+
+
+def get_reserved_fill_claims(
+        pool_key: Optional[str] = None) -> List[Dict[str, Any]]:
+    """All claim rows (optionally restricted to one pool), as dicts."""
+    engine = _db_manager.get_engine()
+    query = sqlalchemy.select(reserved_fill_claims_table)
+    if pool_key is not None:
+        query = query.where(reserved_fill_claims_table.c.pool_key == pool_key)
+    with orm.Session(engine) as session:
+        rows = session.execute(query).fetchall()
+    return [dict(row._mapping) for row in rows]  # pylint: disable=protected-access
+
+
+def get_reserved_fill_round(pool_key: str) -> Optional[Dict[str, Any]]:
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        row = session.execute(
+            sqlalchemy.select(reserved_fill_rounds_table).where(
+                reserved_fill_rounds_table.c.pool_key == pool_key)).fetchone()
+    return None if row is None else dict(row._mapping)  # pylint: disable=protected-access
+
+
+def get_reserved_fill_lease() -> Optional[Dict[str, Any]]:
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        row = session.execute(
+            sqlalchemy.select(reserved_fill_lease_table).where(
+                reserved_fill_lease_table.c.id == 1)).fetchone()
+    return None if row is None else dict(row._mapping)  # pylint: disable=protected-access
+
+
+def publish_reserved_fill_round(pool_key: str, *, round_id: int,
+                                snapshot_time: float, epoch: int, grants: str,
+                                feeds: str, raw_grants: str, feed_state: str,
+                                sum_holdings: int,
+                                last_observed_free: Optional[int],
+                                last_observed_free_ts: Optional[float],
+                                phantom_streak: int, prev_epoch: Optional[int],
+                                lease_epoch: int,
+                                lease_expires_at: float) -> bool:
+    """Atomically CAS-advances the lease and publishes a round.
+
+    `epoch` is the POOL's fencing epoch, stored on the round row (per-pool:
+    the launch fence compares against it, and one pool's grant churn must
+    not fence another pool's launches). The lease carries a separate global
+    epoch stream (prev_epoch -> lease_epoch) whose only role is the CAS
+    below.
+
+    The lease update is a filtered UPDATE on the previous epoch (the
+    *_if_owner CAS pattern): a racing writer that already advanced the epoch
+    makes rowcount 0 and the whole round (lease + round row) rolls back --
+    grants can never be published under an epoch that is not current. The
+    broker holds the cross-process round lock, so a CAS failure indicates a
+    lock-bypass bug or manual DB surgery; failing closed is the only safe
+    reaction.
+
+    Returns True if the round was published.
+    """
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        if prev_epoch is None:
+            # First lease ever: INSERT; a PK collision means we lost a race
+            # that the round lock should have prevented -- fail closed.
+            try:
+                session.execute(
+                    sqlalchemy.insert(reserved_fill_lease_table).values(
+                        id=1, epoch=lease_epoch, expires_at=lease_expires_at))
+            except sqlalchemy_exc.IntegrityError:
+                session.rollback()
+                return False
+        else:
+            count = session.query(reserved_fill_lease_table).filter(
+                reserved_fill_lease_table.c.id == 1,
+                reserved_fill_lease_table.c.epoch == prev_epoch).update({
+                    reserved_fill_lease_table.c.epoch: lease_epoch,
+                    reserved_fill_lease_table.c.expires_at: lease_expires_at,
+                })
+            if count == 0:
+                session.rollback()
+                return False
+        values = {
+            'pool_key': pool_key,
+            'round_id': round_id,
+            'snapshot_time': snapshot_time,
+            'epoch': epoch,
+            'grants': grants,
+            'feeds': feeds,
+            'raw_grants': raw_grants,
+            'feed_state': feed_state,
+            'sum_holdings': sum_holdings,
+            'last_observed_free': last_observed_free,
+            'last_observed_free_ts': last_observed_free_ts,
+            'phantom_streak': phantom_streak,
+        }
+        insert_stmt = _upsert_insert_func(engine)(
+            reserved_fill_rounds_table).values(**values)
+        insert_stmt = insert_stmt.on_conflict_do_update(
+            index_elements=['pool_key'],
+            set_={
+                key: getattr(insert_stmt.excluded, key)
+                for key in values
+                if key != 'pool_key'
+            })
+        session.execute(insert_stmt)
+        session.commit()
+    return True

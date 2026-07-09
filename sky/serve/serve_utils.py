@@ -745,6 +745,36 @@ def validate_service_task(task: 'sky.Task', pool: bool) -> None:
     # is valid for spot placer.
     spot_placer.SpotPlacer.from_task(task.service, task)
 
+    # [boltz fork] Reserved-capacity fill v1 arbitrates exactly ONE
+    # Kubernetes (context, GPU) pool per service; the broker cycle rejects
+    # multi-pool claims at runtime, but that surfaces only as a controller
+    # error log -- reject at submit time too. Zero-cost-ness is not fully
+    # knowable client-side (it needs per-location pricing on the
+    # controller), so ALL Kubernetes entries are treated as candidate pool
+    # shapes: the conservative superset (a Kubernetes entry is the
+    # zero-cost tier in every supported fill topology). The runtime guard
+    # stays as the backstop for specs that slip past (e.g. older clients).
+    if task.service.reserved_capacity_fill:
+        pool_shapes = set()
+        for requested_resources in task.resources:
+            if str(requested_resources.cloud).lower() != 'kubernetes':
+                continue
+            accelerators = requested_resources.accelerators or {}
+            if not accelerators:
+                continue
+            gpu_name = next(iter(accelerators))
+            pool_shapes.add((requested_resources.region, gpu_name.lower()))
+        if len(pool_shapes) > 1:
+            # key=repr: a shape's context may be None (no context pinned),
+            # which does not order against strings.
+            shapes = sorted(pool_shapes, key=repr)
+            with ux_utils.print_exception_no_traceback():
+                raise ValueError(
+                    'reserved_capacity_fill supports exactly one Kubernetes '
+                    '(context, GPU) pool per service; the resources span '
+                    f'{shapes}. Keep a single Kubernetes '
+                    'shape, or disable reserved_capacity_fill.')
+
     replica_ingress_port: Optional[int] = int(
         task.service.ports) if (task.service.ports is not None) else None
     for requested_resources in task.resources:
