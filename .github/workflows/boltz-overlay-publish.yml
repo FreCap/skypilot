@@ -62,7 +62,11 @@ jobs:
           fi
           version="$(awk -F"'" '/^__version__ = / {print $2; exit}' sky/__init__.py)"
           test -n "${version}"
-          echo "tag_immutable=${ECR_REGISTRY}/${ECR_REPO}:${version}-g$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          # Use a fixed width rather than git's repository-dependent --short
+          # abbreviation so image and chart builds have the same identity.
+          build_id="$(git rev-parse HEAD | cut -c1-8)"
+          test "${#build_id}" -eq 8
+          echo "tag_immutable=${ECR_REGISTRY}/${ECR_REPO}:${version}-g${build_id}" >> "$GITHUB_OUTPUT"
           echo "tag_moving=${ECR_REGISTRY}/${ECR_REPO}:${version}-improvements" >> "$GITHUB_OUTPUT"
 
       - name: Configure AWS credentials
