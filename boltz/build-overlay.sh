@@ -20,10 +20,12 @@
 # be older than the fork's python (stale enums render wrong) and fork dashboard
 # changes would never deploy. out/ is gitignored, hence built here, not tracked.
 #
-#   PUSH=true TAG=<ecr>/skypilot-nightly-boltz:<version>-g<sha> ./boltz/build-overlay.sh
+#   RELEASE_VERSION=1.1.1 PUSH=true \
+#     TAG=<ecr>/skypilot-nightly-boltz:1.1.1 ./boltz/build-overlay.sh
 #
 # Env (all have sensible defaults):
 #   BASE_IMAGE upstream runtime dependency (default is pinned below)
+#   RELEASE_VERSION version stamped into the wheel/image (default: source version)
 #   TAG        full image ref to build/push (default builds a local dev tag)
 #   PUSH       "true" to docker push (default false)
 #   PLATFORM   docker build --platform (default linux/amd64 — control-plane arch)
@@ -32,9 +34,14 @@ set -euo pipefail
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
-SKYPILOT_VERSION="$(awk -F"'" '/^__version__ = / {print $2; exit}' sky/__init__.py)"
-if [ -z "$SKYPILOT_VERSION" ]; then
+source_version="$(awk -F"'" '/^__version__ = / {print $2; exit}' sky/__init__.py)"
+if [ -z "$source_version" ]; then
   echo "error: unable to read canonical version from sky/__init__.py" >&2
+  exit 1
+fi
+SKYPILOT_VERSION="${RELEASE_VERSION:-$source_version}"
+if [[ ! "$SKYPILOT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "error: release version must be <major>.<minor>.<patch>, got ${SKYPILOT_VERSION}" >&2
   exit 1
 fi
 BASE_IMAGE="${BASE_IMAGE:-berkeleyskypilot/skypilot-nightly:1.0.0.dev20260620}"
@@ -125,6 +132,7 @@ done
 # before building it. There is no .git directory in the final image from which
 # the runtime fallback could recover this identity.
 OVERLAY_COMMIT="$overlay_commit" OVERLAY_BUILD="$overlay_build" \
+  OVERLAY_VERSION="$SKYPILOT_VERSION" \
   python3 - "$ctx/sky/__init__.py" <<'PY'
 import os
 from pathlib import Path
@@ -145,9 +153,17 @@ for name, value in (
         flags=re.MULTILINE)
     if replacements != 1:
         raise RuntimeError(f'could not stamp {name} in {path}')
+content, replacements = re.subn(
+    r'^__version__ = [\'\"][^\'\"]*[\'\"]',
+    f"__version__ = '{os.environ['OVERLAY_VERSION']}'",
+    content,
+    count=1,
+    flags=re.MULTILINE)
+if replacements != 1:
+    raise RuntimeError(f'could not stamp __version__ in {path}')
 path.write_text(content, encoding='utf-8')
 PY
-echo ">> Stamped overlay identity: commit ${overlay_commit}, build ${overlay_build}"
+echo ">> Stamped overlay identity: version ${SKYPILOT_VERSION}, commit ${overlay_commit}, build ${overlay_build}"
 
 # Ship ONLY the static export (out/) — never node_modules/.next; the server
 # serves sky/dashboard/out directly (sky/server/constants.py: DASHBOARD_DIR),

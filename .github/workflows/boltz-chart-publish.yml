@@ -1,110 +1,162 @@
 name: Publish boltz Helm chart
 
-# Packages the fork's `charts/skypilot` Helm chart and pushes it to the private
-# distribution ECR OCI registry (account 699626303757). The platform repo
-# consumes it via a terraform `helm_release` pointed at
-# `oci://699626303757.dkr.ecr.us-east-1.amazonaws.com/helm-charts/skypilot`,
-# replacing the raw-manifest + inline-values bridge.
-#
-# This is the chart-publish sibling of boltz-overlay-publish.yml (which ships the
-# image). It does NOT touch upstream's public chart on helm.skypilot.co.
-#
-# One-time setup to enable pushes (external, terraform-managed — see the platform
-# repo's ecr-distribution module): create the IMMUTABLE `helm-charts/skypilot` ECR
-# repo in 699626303757 and a GitHub-OIDC push role trusting this repo, then set its
-# ARN as the `CHART_ECR_ROLE_ARN` repo variable. Until then the push steps no-op
-# (packaging + dependency build are still exercised on every run, so PRs validate).
+# Packages the fork's chart only after the matching overlay image succeeds.
+# Image, chart, chart appVersion, packaged default image, and Git success tag
+# all share one deterministic patch version. This never touches the upstream
+# public chart on helm.skypilot.co.
 
 on:
-  push:
-    branches: [improvements]
-    paths:
-      - 'charts/**'
-      - 'sky/__init__.py'
-      - '.github/workflows/boltz-chart-publish.yml'
-  workflow_dispatch: {}
+  workflow_run:
+    workflows: ['Publish boltz overlay image']
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      release_sha:
+        description: Full improvements first-parent commit SHA whose image is already published
+        required: true
+        type: string
+
+concurrency:
+  group: boltz-chart-publish
+  cancel-in-progress: false
 
 permissions:
   id-token: write   # OIDC -> AWS
-  contents: read
+  contents: write   # push v<version> only after both artifacts verify
 
 env:
   AWS_REGION: us-east-1
-  ECR_REGISTRY: 699626303757.dkr.ecr.us-east-1.amazonaws.com
-  # OCI repository (namespace) the chart is pushed under. The chart's own name
-  # (`skypilot`, from Chart.yaml) is appended by helm on push.
+  IMAGE_ECR_REGISTRY: 255203429798.dkr.ecr.us-east-1.amazonaws.com
+  IMAGE_ECR_REPO: skypilot-nightly-boltz
+  CHART_ECR_REGISTRY: 699626303757.dkr.ecr.us-east-1.amazonaws.com
+  # OCI repository (namespace) the chart is pushed under. Helm appends the
+  # chart name (`skypilot`) from Chart.yaml.
   OCI_REPO: helm-charts
   CHART_NAME: skypilot
 
 jobs:
   publish:
+    # workflow_run emits completed events for failures too. Only a successful
+    # overlay run for this repository's improvements branch may continue.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'improvements' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || inputs.release_sha }}
+          fetch-depth: 0
 
-      # The overlay workflow does NOT install Helm; the chart workflow must.
+      - name: Validate release commit
+        id: commit
+        shell: bash
+        env:
+          REQUESTED_SHA: ${{ github.event.workflow_run.head_sha || inputs.release_sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${REQUESTED_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "release_sha must be a full lowercase commit SHA: ${REQUESTED_SHA}" >&2
+            exit 1
+          fi
+          checked_out_sha="$(git rev-parse HEAD)"
+          if [ "${checked_out_sha}" != "${REQUESTED_SHA}" ]; then
+            echo "Checked out ${checked_out_sha}, expected ${REQUESTED_SHA}." >&2
+            exit 1
+          fi
+
+          # Manual recovery is restricted to a commit on the published
+          # branch's first-parent history; arbitrary branches cannot mint a
+          # release or success tag.
+          git fetch --no-tags origin improvements:refs/remotes/origin/improvements
+          git rev-list --first-parent origin/improvements > "${RUNNER_TEMP}/improvements-first-parent"
+          if ! grep -Fqx "${checked_out_sha}" "${RUNNER_TEMP}/improvements-first-parent"; then
+            echo "${checked_out_sha} is not on improvements first-parent history." >&2
+            exit 1
+          fi
+          echo "sha=${checked_out_sha}" >> "${GITHUB_OUTPUT}"
+
       - name: Install Helm
         uses: azure/setup-helm@v4
         with:
           version: '3.16.4'
 
-      - name: Resolve config
+      - name: Resolve release
         id: cfg
+        shell: bash
         run: |
           set -euo pipefail
-          if [ -z "${{ vars.CHART_ECR_ROLE_ARN }}" ]; then
-            echo "::warning::CHART_ECR_ROLE_ARN not set — packaging only, skipping push."
-            echo "push=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "push=true" >> "$GITHUB_OUTPUT"
-          fi
-          # Use the same fixed-width build identity as the image publisher.
-          # git --short is repository-dependent and differs in shallow clones.
-          build_id="$(git rev-parse HEAD | cut -c1-8)"
-          test "${#build_id}" -eq 8
-          version="$(awk -F"'" '/^__version__ = / {print $2; exit}' sky/__init__.py)"
-          test -n "${version}"
-          chart_app_version="$(sed -nE 's/^appVersion: "?([^\"]+)"?$/\1/p' charts/skypilot/Chart.yaml)"
-          if [ "${chart_app_version}" != "${version}" ]; then
-            echo "Chart appVersion ${chart_app_version} does not match SkyPilot ${version}." >&2
+          release_version="$(python3 boltz/release_version.py --ref HEAD)"
+          if [[ ! "${release_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid deterministic release version: ${release_version}" >&2
             exit 1
           fi
-          # Attach the commit as SemVer2 build metadata.
-          # Build metadata keeps every commit's chart immutable/distinct while
-          # remaining a valid SemVer2 that `helm push`/`helm show` accept (helm
-          # maps the '+' to '_' for the OCI tag automatically).
-          ver="${version}+g${build_id}"
-          echo "ver=${ver}" >> "$GITHUB_OUTPUT"
-          echo "app_version=${version}" >> "$GITHUB_OUTPUT"
-          echo "oci_ref=oci://${ECR_REGISTRY}/${OCI_REPO}" >> "$GITHUB_OUTPUT"
-          echo "chart_ref=oci://${ECR_REGISTRY}/${OCI_REPO}/${CHART_NAME}" >> "$GITHUB_OUTPUT"
-          echo "Resolved chart version: ${ver}"
 
-      - name: Configure AWS credentials
-        if: steps.cfg.outputs.push == 'true'
+          image_ref="${IMAGE_ECR_REGISTRY}/${IMAGE_ECR_REPO}:${release_version}"
+          oci_ref="oci://${CHART_ECR_REGISTRY}/${OCI_REPO}"
+          chart_ref="${oci_ref}/${CHART_NAME}"
+
+          # The image and chart live in different AWS accounts and retain their
+          # existing OIDC roles. Publishing is disabled unless both artifacts
+          # can be independently read back and verified.
+          if [ -z "${{ vars.OVERLAY_ECR_ROLE_ARN }}" ] || [ -z "${{ vars.CHART_ECR_ROLE_ARN }}" ]; then
+            echo "::warning::Both OVERLAY_ECR_ROLE_ARN and CHART_ECR_ROLE_ARN are required — packaging only."
+            publish=false
+          else
+            publish=true
+          fi
+          {
+            echo "publish=${publish}"
+            echo "version=${release_version}"
+            echo "image_ref=${image_ref}"
+            echo "oci_ref=${oci_ref}"
+            echo "chart_ref=${chart_ref}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "Resolved release ${release_version} from ${{ steps.commit.outputs.sha }}"
+
+      - name: Configure image ECR credentials
+        if: steps.cfg.outputs.publish == 'true'
         uses: aws-actions/configure-aws-credentials@v6
         with:
-          role-to-assume: ${{ vars.CHART_ECR_ROLE_ARN }}
+          role-to-assume: ${{ vars.OVERLAY_ECR_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Login to ECR (Docker)
-        if: steps.cfg.outputs.push == 'true'
+      - name: Login to image ECR
+        if: steps.cfg.outputs.publish == 'true'
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Login to ECR (Helm registry)
-        # amazon-ecr-login logs in the Docker client, NOT Helm. Helm needs its
-        # own OCI registry login for `helm show chart` / `helm push`.
-        if: steps.cfg.outputs.push == 'true'
+      - name: Verify matching release image
+        if: steps.cfg.outputs.publish == 'true'
+        shell: bash
+        env:
+          IMAGE_REF: ${{ steps.cfg.outputs.image_ref }}
+          RELEASE_VERSION: ${{ steps.cfg.outputs.version }}
+          RELEASE_SHA: ${{ steps.commit.outputs.sha }}
         run: |
           set -euo pipefail
-          aws ecr get-login-password --region "${AWS_REGION}" \
-            | helm registry login --username AWS --password-stdin "${ECR_REGISTRY}"
+          # This exact tag must already exist: the successful overlay workflow
+          # is the release entrypoint. Never substitute the moving tag.
+          aws ecr describe-images \
+            --region "${AWS_REGION}" \
+            --repository-name "${IMAGE_ECR_REPO}" \
+            --image-ids "imageTag=${RELEASE_VERSION}" > /dev/null
+          docker pull "${IMAGE_REF}"
+          revision="$(docker image inspect --format \
+            '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
+            "${IMAGE_REF}")"
+          if [ "${revision}" != "${RELEASE_SHA}" ]; then
+            echo "Image ${IMAGE_REF} records ${revision}, expected ${RELEASE_SHA}." >&2
+            exit 1
+          fi
+          docker run --rm --platform linux/amd64 \
+            -e EXPECTED_VERSION="${RELEASE_VERSION}" \
+            -e EXPECTED_COMMIT="${RELEASE_SHA}" \
+            "${IMAGE_REF}" python -c \
+            'import os, sky; assert sky.__version__ == os.environ["EXPECTED_VERSION"], sky.__version__; assert sky.__commit__ == os.environ["EXPECTED_COMMIT"], sky.__commit__'
 
       - name: Build chart dependencies
-        # The three subchart tarballs + Chart.lock are gitignored, so they are
-        # absent in CI; pull them from the public repos before packaging. `helm
-        # repo add` is defensive for older helm where `dependency build` needs the
-        # repos registered (helm >= 3.16 can resolve from Chart.yaml directly).
         run: |
           set -euo pipefail
           helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
@@ -113,50 +165,236 @@ jobs:
           helm repo update
           helm dependency build charts/skypilot
 
-      - name: Version-stamp Chart.yaml
+      - name: Stamp and package release chart
+        id: package
+        shell: bash
+        env:
+          IMAGE_REF: ${{ steps.cfg.outputs.image_ref }}
+          RELEASE_VERSION: ${{ steps.cfg.outputs.version }}
+          RELEASE_SHA: ${{ steps.commit.outputs.sha }}
         run: |
           set -euo pipefail
-          ver='${{ steps.cfg.outputs.ver }}'
-          sed -i "s/^version:.*$/version: ${ver}/" charts/skypilot/Chart.yaml
-          sed -i "s/^appVersion:.*$/appVersion: \"${{ steps.cfg.outputs.app_version }}\"/" charts/skypilot/Chart.yaml
-          echo "--- Chart.yaml (version/appVersion) ---"
-          grep -E '^(version|appVersion):' charts/skypilot/Chart.yaml
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import re
 
-      - name: Package, push (immutability-guarded) and summarize
-        run: |
-          set -euo pipefail
-          VER='${{ steps.cfg.outputs.ver }}'
-          PUSH='${{ steps.cfg.outputs.push }}'
-          CHART_REF='${{ steps.cfg.outputs.chart_ref }}'
-          OCI_REF='${{ steps.cfg.outputs.oci_ref }}'
+          chart_path = Path('charts/skypilot/Chart.yaml')
+          chart = chart_path.read_text(encoding='utf-8')
+          version = os.environ['RELEASE_VERSION']
+          revision = os.environ['RELEASE_SHA']
+          for field, value in (('version', version), ('appVersion', f'"{version}"')):
+              chart, replacements = re.subn(
+                  rf'^{field}:.*$', f'{field}: {value}', chart,
+                  count=1, flags=re.MULTILINE)
+              if replacements != 1:
+                  raise RuntimeError(f'could not stamp {field} in {chart_path}')
 
+          revision_line = f'  org.opencontainers.image.revision: "{revision}"'
+          revision_pattern = r'^  org\.opencontainers\.image\.revision:.*$'
+          if re.search(revision_pattern, chart, flags=re.MULTILINE):
+              chart = re.sub(revision_pattern, revision_line, chart,
+                             count=1, flags=re.MULTILINE)
+          elif re.search(r'^annotations:\s*$', chart, flags=re.MULTILINE):
+              chart = re.sub(r'^annotations:\s*$',
+                             f'annotations:\n{revision_line}', chart,
+                             count=1, flags=re.MULTILINE)
+          else:
+              chart = chart.rstrip() + f'\nannotations:\n{revision_line}\n'
+          chart_path.write_text(chart, encoding='utf-8')
+
+          values_path = Path('charts/skypilot/values.yaml')
+          lines = values_path.read_text(encoding='utf-8').splitlines()
+          in_api_service = False
+          replacements = 0
+          for index, line in enumerate(lines):
+              if line == 'apiService:':
+                  in_api_service = True
+                  continue
+              if in_api_service and line and not line.startswith((' ', '#')):
+                  break
+              if in_api_service and re.match(r'^  image:', line):
+                  lines[index] = f'  image: {os.environ["IMAGE_REF"]}'
+                  replacements += 1
+                  break
+          if replacements != 1:
+              raise RuntimeError(f'could not stamp apiService.image in {values_path}')
+          values_path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+          PY
+
+          mkdir -p dist
           helm package charts/skypilot -d dist
-          pkg="$(ls dist/${CHART_NAME}-*.tgz)"
-          echo "Packaged: ${pkg}"
+          package="dist/${CHART_NAME}-${RELEASE_VERSION}.tgz"
+          test -f "${package}"
+          echo "path=${package}" >> "${GITHUB_OUTPUT}"
 
-          pushed=false
-          if [ "${PUSH}" = 'true' ]; then
-            # Immutability skip-guard: ECR repos here are IMMUTABLE, so a repeat
-            # push of an existing version hard-fails the job. If the version is
-            # already present, skip the push (do NOT fail) — mirrors the platform
-            # repo's release.yml `helm show chart` guard.
-            if helm show chart "${CHART_REF}" --version "${VER}" >/dev/null 2>&1; then
-              echo "::notice::${CHART_REF}:${VER} already exists — skipping push (immutable)."
-            else
-              helm push "${pkg}" "${OCI_REF}"
-              pushed=true
+          metadata="$(helm show chart "${package}")"
+          values="$(helm show values "${package}")"
+          actual_version="$(sed -nE 's/^version:[[:space:]]*"?([^"[:space:]]+)"?$/\1/p' <<<"${metadata}")"
+          actual_app_version="$(sed -nE 's/^appVersion:[[:space:]]*"?([^"[:space:]]+)"?$/\1/p' <<<"${metadata}")"
+          actual_revision="$(sed -nE 's/^[[:space:]]*org\.opencontainers\.image\.revision:[[:space:]]*"?([^"[:space:]]+)"?$/\1/p' <<<"${metadata}")"
+          actual_image="$(awk '
+            /^apiService:$/ { in_api = 1; next }
+            in_api && /^[^[:space:]]/ { exit }
+            in_api && /^  image:/ {
+              sub(/^  image:[[:space:]]*/, "")
+              gsub(/^"|"$/, "")
+              print
+              exit
+            }' <<<"${values}")"
+          test "${actual_version}" = "${RELEASE_VERSION}"
+          test "${actual_app_version}" = "${RELEASE_VERSION}"
+          test "${actual_revision}" = "${RELEASE_SHA}"
+          test "${actual_image}" = "${IMAGE_REF}"
+
+      - name: Configure chart ECR credentials
+        if: steps.cfg.outputs.publish == 'true'
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.CHART_ECR_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to chart ECR
+        if: steps.cfg.outputs.publish == 'true'
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Login Helm to chart registry
+        if: steps.cfg.outputs.publish == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws ecr get-login-password --region "${AWS_REGION}" \
+            | helm registry login --username AWS --password-stdin "${CHART_ECR_REGISTRY}"
+
+      - name: Publish or verify exact chart version
+        if: steps.cfg.outputs.publish == 'true'
+        id: chart
+        shell: bash
+        env:
+          CHART_REF: ${{ steps.cfg.outputs.chart_ref }}
+          IMAGE_REF: ${{ steps.cfg.outputs.image_ref }}
+          OCI_REF: ${{ steps.cfg.outputs.oci_ref }}
+          PACKAGE: ${{ steps.package.outputs.path }}
+          RELEASE_VERSION: ${{ steps.cfg.outputs.version }}
+          RELEASE_SHA: ${{ steps.commit.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          verify_remote_chart() {
+            local metadata values actual_version actual_app_version actual_revision actual_image
+            metadata="$(helm show chart "${CHART_REF}" --version "${RELEASE_VERSION}")"
+            values="$(helm show values "${CHART_REF}" --version "${RELEASE_VERSION}")"
+            actual_version="$(sed -nE 's/^version:[[:space:]]*"?([^"[:space:]]+)"?$/\1/p' <<<"${metadata}")"
+            actual_app_version="$(sed -nE 's/^appVersion:[[:space:]]*"?([^"[:space:]]+)"?$/\1/p' <<<"${metadata}")"
+            actual_revision="$(sed -nE 's/^[[:space:]]*org\.opencontainers\.image\.revision:[[:space:]]*"?([^"[:space:]]+)"?$/\1/p' <<<"${metadata}")"
+            actual_image="$(awk '
+              /^apiService:$/ { in_api = 1; next }
+              in_api && /^[^[:space:]]/ { exit }
+              in_api && /^  image:/ {
+                sub(/^  image:[[:space:]]*/, "")
+                gsub(/^"|"$/, "")
+                print
+                exit
+              }' <<<"${values}")"
+            if [ "${actual_version}" != "${RELEASE_VERSION}" ] || \
+               [ "${actual_app_version}" != "${RELEASE_VERSION}" ] || \
+               [ "${actual_revision}" != "${RELEASE_SHA}" ] || \
+               [ "${actual_image}" != "${IMAGE_REF}" ]; then
+              echo "Chart collision for ${CHART_REF}:${RELEASE_VERSION}." >&2
+              echo "  version=${actual_version} appVersion=${actual_app_version}" >&2
+              echo "  revision=${actual_revision} image=${actual_image}" >&2
+              return 1
             fi
+          }
+
+          error_file="$(mktemp)"
+          trap 'rm -f "${error_file}"' EXIT
+          chart_repository="${OCI_REPO}/${CHART_NAME}"
+          if aws ecr describe-images \
+              --region "${AWS_REGION}" \
+              --repository-name "${chart_repository}" \
+              --image-ids "imageTag=${RELEASE_VERSION}" \
+              --query 'imageDetails[0].imageDigest' \
+              --output text > /dev/null 2>"${error_file}"; then
+            verify_remote_chart
+            echo "::notice::${CHART_REF}:${RELEASE_VERSION} already exists and matches; reusing it."
+            echo "reused=true" >> "${GITHUB_OUTPUT}"
+            echo "pushed=false" >> "${GITHUB_OUTPUT}"
+          elif grep -q 'ImageNotFoundException' "${error_file}"; then
+            helm push "${PACKAGE}" "${OCI_REF}"
+            # Read back the immutable artifact, not merely the local package.
+            verified=false
+            for attempt in 1 2 3 4 5; do
+              if verify_remote_chart; then
+                verified=true
+                break
+              fi
+              echo "Chart readback attempt ${attempt} failed; retrying."
+              sleep "$((attempt * 2))"
+            done
+            if [ "${verified}" != 'true' ]; then
+              echo "Unable to verify published chart ${CHART_REF}:${RELEASE_VERSION}." >&2
+              exit 1
+            fi
+            echo "reused=false" >> "${GITHUB_OUTPUT}"
+            echo "pushed=true" >> "${GITHUB_OUTPUT}"
           else
-            echo "::warning::push disabled (CHART_ECR_ROLE_ARN unset) — packaged only."
+            cat "${error_file}" >&2
+            exit 1
           fi
 
+          digest="$(aws ecr describe-images \
+            --region "${AWS_REGION}" \
+            --repository-name "${chart_repository}" \
+            --image-ids "imageTag=${RELEASE_VERSION}" \
+            --query 'imageDetails[0].imageDigest' \
+            --output text)"
+          test -n "${digest}"
+          test "${digest}" != 'None'
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+
+      - name: Mark verified release with Git tag
+        if: steps.cfg.outputs.publish == 'true'
+        id: tag
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.cfg.outputs.version }}
+          RELEASE_SHA: ${{ steps.commit.outputs.sha }}
+        run: |
+          set -euo pipefail
+          tag="v${RELEASE_VERSION}"
+          remote_tag="$(git ls-remote --tags origin "refs/tags/${tag}")"
+          if [ -n "${remote_tag}" ]; then
+            git fetch --force origin "refs/tags/${tag}:refs/tags/${tag}"
+            existing_sha="$(git rev-parse "${tag}^{commit}")"
+            if [ "${existing_sha}" != "${RELEASE_SHA}" ]; then
+              echo "Git tag collision: ${tag} points to ${existing_sha}, expected ${RELEASE_SHA}." >&2
+              exit 1
+            fi
+            echo "::notice::${tag} already points to ${RELEASE_SHA}; reusing it."
+            echo "created=false" >> "${GITHUB_OUTPUT}"
+          else
+            git tag "${tag}" "${RELEASE_SHA}"
+            git push origin "refs/tags/${tag}"
+            echo "created=true" >> "${GITHUB_OUTPUT}"
+          fi
+          echo "name=${tag}" >> "${GITHUB_OUTPUT}"
+
+      - name: Summarize
+        if: always()
+        shell: bash
+        run: |
           {
             echo "### boltz Helm chart"
             echo ""
-            echo "- chart:   \`${CHART_REF}\`"
-            echo "- version: \`${VER}\`"
-            echo "- package: \`${pkg}\`"
-            echo "- pushed:  ${pushed}"
+            echo "- release:  \`${{ steps.cfg.outputs.version }}\`"
+            echo "- chart:    \`${{ steps.cfg.outputs.chart_ref }}\`"
+            echo "- image:    \`${{ steps.cfg.outputs.image_ref }}\`"
+            echo "- revision: \`${{ steps.commit.outputs.sha }}\`"
+            echo "- digest:   \`${{ steps.chart.outputs.digest || 'not pushed' }}\`"
+            echo "- reused:   \`${{ steps.chart.outputs.reused || 'false' }}\`"
+            echo "- pushed:   \`${{ steps.chart.outputs.pushed || 'false' }}\`"
+            echo "- Git tag:  \`${{ steps.tag.outputs.name || 'not created' }}\`"
             echo ""
-            echo "Consume via a terraform \`helm_release\` with \`repository = \"${OCI_REF}\"\`, \`chart = \"${CHART_NAME}\"\`, \`version = \"${VER}\"\`."
-          } >> "$GITHUB_STEP_SUMMARY"
+            echo "The Git tag is written only after the exact image and chart pass registry readback."
+          } >> "${GITHUB_STEP_SUMMARY}"

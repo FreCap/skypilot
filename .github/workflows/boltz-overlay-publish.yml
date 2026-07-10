@@ -2,27 +2,40 @@ name: Publish boltz overlay image
 
 # Builds the boltz image (the full fork wheel plus a freshly built dashboard,
 # installed on the pinned upstream runtime) and pushes it to the gitops-hub
-# ECR. The platform repo consumes it via apiService.image in the
-# skypilot-control-plane terragrunt.
+# ECR. Each relevant improvements commit has one deterministic patch version;
+# source provenance remains in the OCI revision label and sky.__commit__.
 #
 # One-time setup to enable pushes: create an OIDC role in the gitops-hub account
 # (255203429798) trusting this repo, with ECR push on `skypilot-nightly-boltz`,
-# and set it as the `OVERLAY_ECR_ROLE_ARN` repo variable. Until then the publish
-# steps no-op (the build is still exercised on demand via workflow_dispatch).
+# and set it as the `OVERLAY_ECR_ROLE_ARN` repo variable. The workflow refuses
+# to reuse an existing release tag unless its revision and runtime identity
+# match; the `*-improvements` tag remains a diagnostic moving pointer. Until
+# the role is configured, this workflow builds without pushing.
 
 on:
   push:
     branches: [improvements]
+    # Keep this union in sync with boltz/release_version.py. Application and
+    # chart changes are one release family and must never publish separately.
     paths:
       - 'sky/**'
       - 'sky_templates/**'
+      - 'charts/**'
       - 'boltz/**'
       - 'setup.py'
       - 'pyproject.toml'
       - 'MANIFEST.in'
       - 'README.md'
       - '.github/workflows/boltz-overlay-publish.yml'
+      - '.github/workflows/boltz-chart-publish.yml'
   workflow_dispatch: {}
+
+# Do not let two improvements releases race on the moving tag or registry
+# collision checks. A queued release must run after, rather than cancel, the
+# release ahead of it.
+concurrency:
+  group: boltz-overlay-publish-improvements
+  cancel-in-progress: false
 
 permissions:
   id-token: write   # OIDC -> AWS
@@ -35,12 +48,15 @@ env:
 
 jobs:
   publish:
+    # Manual retries may only publish the integration branch; selecting a
+    # feature branch must not reserve one of its deterministic versions.
+    if: github.event_name == 'push' || github.ref == 'refs/heads/improvements'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        # The overlay stamps git rev-list --count as its build number. A
-        # shallow checkout would incorrectly stamp every image as build 1.
         with:
+          # release_version.py uses improvements first-parent history and the
+          # image records the full-history build count.
           fetch-depth: 0
 
       - uses: actions/setup-node@v4
@@ -51,23 +67,37 @@ jobs:
           cache: npm
           cache-dependency-path: sky/dashboard/package-lock.json
 
-      - name: Resolve config
+      - name: Resolve release
         id: cfg
+        shell: bash
         run: |
+          set -euo pipefail
+          release_version="$(python3 boltz/release_version.py --ref HEAD)"
+          if [[ ! "${release_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid deterministic release version: ${release_version}" >&2
+            exit 1
+          fi
+
+          # Keep the established moving tag anchored to the canonical source
+          # version. Platform must consume only the exact release tag.
+          source_version="$(awk -F"'" '/^__version__ = / {print $2; exit}' sky/__init__.py)"
+          test -n "${source_version}"
+          exact_ref="${ECR_REGISTRY}/${ECR_REPO}:${release_version}"
+          moving_ref="${ECR_REGISTRY}/${ECR_REPO}:${source_version}-improvements"
+
           if [ -z "${{ vars.OVERLAY_ECR_ROLE_ARN }}" ]; then
             echo "::warning::OVERLAY_ECR_ROLE_ARN not set — building only, skipping push."
-            echo "push=false" >> "$GITHUB_OUTPUT"
+            push=false
           else
-            echo "push=true" >> "$GITHUB_OUTPUT"
+            push=true
           fi
-          version="$(awk -F"'" '/^__version__ = / {print $2; exit}' sky/__init__.py)"
-          test -n "${version}"
-          # Use a fixed width rather than git's repository-dependent --short
-          # abbreviation so image and chart builds have the same identity.
-          build_id="$(git rev-parse HEAD | cut -c1-8)"
-          test "${#build_id}" -eq 8
-          echo "tag_immutable=${ECR_REGISTRY}/${ECR_REPO}:${version}-g${build_id}" >> "$GITHUB_OUTPUT"
-          echo "tag_moving=${ECR_REGISTRY}/${ECR_REPO}:${version}-improvements" >> "$GITHUB_OUTPUT"
+          {
+            echo "push=${push}"
+            echo "version=${release_version}"
+            echo "exact_ref=${exact_ref}"
+            echo "moving_ref=${moving_ref}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "Resolved release ${release_version} from ${GITHUB_SHA}"
 
       - name: Configure AWS credentials
         if: steps.cfg.outputs.push == 'true'
@@ -80,21 +110,106 @@ jobs:
         if: steps.cfg.outputs.push == 'true'
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build (+ push) overlay
+      - name: Guard an existing release image
+        id: existing
+        if: steps.cfg.outputs.push == 'true'
+        shell: bash
+        env:
+          EXACT_REF: ${{ steps.cfg.outputs.exact_ref }}
+          RELEASE_VERSION: ${{ steps.cfg.outputs.version }}
         run: |
           set -euo pipefail
-          PUSH='${{ steps.cfg.outputs.push }}' TAG='${{ steps.cfg.outputs.tag_immutable }}' \
-            ./boltz/build-overlay.sh
-          if [ '${{ steps.cfg.outputs.push }}' = 'true' ]; then
-            docker tag '${{ steps.cfg.outputs.tag_immutable }}' '${{ steps.cfg.outputs.tag_moving }}'
-            docker push '${{ steps.cfg.outputs.tag_moving }}'
+          error_file="$(mktemp)"
+          trap 'rm -f "${error_file}"' EXIT
+          if aws ecr describe-images \
+              --region "${AWS_REGION}" \
+              --repository-name "${ECR_REPO}" \
+              --image-ids "imageTag=${RELEASE_VERSION}" \
+              --query 'imageDetails[0].imageDigest' \
+              --output text > /dev/null 2>"${error_file}"; then
+            echo "${EXACT_REF} already exists; verifying before reuse."
+            docker pull "${EXACT_REF}"
+            revision="$(docker image inspect --format \
+              '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
+              "${EXACT_REF}")"
+            if [ "${revision}" != "${GITHUB_SHA}" ]; then
+              echo "Release collision: ${EXACT_REF} records ${revision}, expected ${GITHUB_SHA}." >&2
+              exit 1
+            fi
+            docker run --rm --platform linux/amd64 \
+              -e EXPECTED_VERSION="${RELEASE_VERSION}" \
+              -e EXPECTED_COMMIT="${GITHUB_SHA}" \
+              "${EXACT_REF}" python -c \
+              'import os, sky; assert sky.__version__ == os.environ["EXPECTED_VERSION"], sky.__version__; assert sky.__commit__ == os.environ["EXPECTED_COMMIT"], sky.__commit__'
+            echo "exists=true" >> "${GITHUB_OUTPUT}"
+          elif grep -q 'ImageNotFoundException' "${error_file}"; then
+            echo "exists=false" >> "${GITHUB_OUTPUT}"
+          else
+            cat "${error_file}" >&2
+            exit 1
           fi
+
+      - name: Build and publish exact release image
+        if: steps.cfg.outputs.push != 'true' || steps.existing.outputs.exists != 'true'
+        shell: bash
+        env:
+          PUSH: ${{ steps.cfg.outputs.push }}
+          TAG: ${{ steps.cfg.outputs.exact_ref }}
+          RELEASE_VERSION: ${{ steps.cfg.outputs.version }}
+        run: |
+          set -euo pipefail
+          ./boltz/build-overlay.sh
+
+      - name: Verify release image and update moving tag
+        if: steps.cfg.outputs.push == 'true'
+        id: published
+        shell: bash
+        env:
+          EXACT_REF: ${{ steps.cfg.outputs.exact_ref }}
+          MOVING_REF: ${{ steps.cfg.outputs.moving_ref }}
+          RELEASE_VERSION: ${{ steps.cfg.outputs.version }}
+        run: |
+          set -euo pipefail
+          revision="$(docker image inspect --format \
+            '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
+            "${EXACT_REF}")"
+          if [ "${revision}" != "${GITHUB_SHA}" ]; then
+            echo "Published image records ${revision}, expected ${GITHUB_SHA}." >&2
+            exit 1
+          fi
+          docker run --rm --platform linux/amd64 \
+            -e EXPECTED_VERSION="${RELEASE_VERSION}" \
+            -e EXPECTED_COMMIT="${GITHUB_SHA}" \
+            "${EXACT_REF}" python -c \
+            'import os, sky; assert sky.__version__ == os.environ["EXPECTED_VERSION"], sky.__version__; assert sky.__commit__ == os.environ["EXPECTED_COMMIT"], sky.__commit__'
+
+          digest="$(aws ecr describe-images \
+            --region "${AWS_REGION}" \
+            --repository-name "${ECR_REPO}" \
+            --image-ids "imageTag=${RELEASE_VERSION}" \
+            --query 'imageDetails[0].imageDigest' \
+            --output text)"
+          test -n "${digest}"
+          test "${digest}" != "None"
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+
+          docker tag "${EXACT_REF}" "${MOVING_REF}"
+          docker push "${MOVING_REF}"
+
+      - name: Summarize
+        if: always()
+        shell: bash
+        run: |
           {
             echo "### boltz overlay"
             echo ""
-            echo "- immutable: \`${{ steps.cfg.outputs.tag_immutable }}\`"
-            echo "- moving:    \`${{ steps.cfg.outputs.tag_moving }}\`"
-            echo "- pushed:    ${{ steps.cfg.outputs.push }}"
+            echo "- release:  \`${{ steps.cfg.outputs.version }}\`"
+            echo "- exact:    \`${{ steps.cfg.outputs.exact_ref }}\`"
+            echo "- moving:   \`${{ steps.cfg.outputs.moving_ref }}\`"
+            echo "- revision: \`${GITHUB_SHA}\`"
+            echo "- digest:   \`${{ steps.published.outputs.digest || 'not pushed' }}\`"
+            echo "- reused:   \`${{ steps.existing.outputs.exists == 'true' }}\`"
+            echo "- pushed:   \`${{ steps.cfg.outputs.push }}\`"
             echo ""
-            echo "Bump \`apiService.image\` in the platform repo to the immutable tag to deploy."
-          } >> "$GITHUB_STEP_SUMMARY"
+            echo "Platform must pin the exact release tag; the moving tag is diagnostic only."
+          } >> "${GITHUB_STEP_SUMMARY}"
