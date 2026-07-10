@@ -168,7 +168,8 @@ from sky.server import constants as server_constants
 assert sky.__commit__ == os.environ['EXPECTED_SKYPILOT_COMMIT']
 assert sky.__build__ == os.environ['EXPECTED_SKYPILOT_BUILD']
 assert sky.__display_version__ == sky._compose_display_version(
-    sky.__version__, sky.__build__)
+    sky._SKYPILOT_DISPLAY_VERSION, sky.__build__,
+    sky._SKYPILOT_DISPLAY_VERSION_PATCH_BASE)
 assert hasattr(controller_utils, 'in_flight_launch_count')
 assert 'in_flight' in inspect.signature(controller_utils.can_provision).parameters
 index = os.path.join(server_constants.DASHBOARD_DIR, 'index.html')

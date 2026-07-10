@@ -1,8 +1,9 @@
 """Tests for external-LB auth: inbound data-plane bearer + control-plane sync.
 
-Two distinct tokens:
-  - LB_AUTH_TOKEN_ENV_VAR gates INBOUND inference requests (data plane). The
-    readiness route is exempt so the k8s probe still works; no-op when unset.
+Independent tokens:
+  - LB_AUTH_TOKEN_ENV_VAR gates INBOUND inference requests (data plane) via a
+    dedicated header consumed by the LB. The readiness route is exempt so the
+    k8s probe still works; no-op when unset.
   - CONTROLLER_AUTH_TOKEN_ENV_VAR is presented by the LB on every sync so the
     (now-authenticated) controller accepts it. The request aggregator must be
     cleared only after a SUCCESSFUL sync -- a failed sync (e.g. 401) must not
@@ -52,6 +53,10 @@ def _authorized(scope) -> bool:
     return load_balancer._InboundAuthMiddleware._authorized(scope)
 
 
+def _edge_auth(token: str):
+    return {constants.LB_AUTHORIZATION_HEADER: f'Bearer {token}'}
+
+
 # --------------------------------------------------------------------------- #
 # Inbound data-plane bearer middleware (pure-ASGI _authorized decision)
 # --------------------------------------------------------------------------- #
@@ -79,7 +84,12 @@ def test_inbound_non_get_health_not_exempt(monkeypatch):
 
 def test_inbound_correct_token_accepted(monkeypatch):
     monkeypatch.setenv(constants.LB_AUTH_TOKEN_ENV_VAR, 's3cret')
-    assert _authorized(
+    assert _authorized(_scope('/predict', headers=_edge_auth('s3cret')))
+
+
+def test_standard_authorization_is_reserved_for_replica(monkeypatch):
+    monkeypatch.setenv(constants.LB_AUTH_TOKEN_ENV_VAR, 's3cret')
+    assert not _authorized(
         _scope('/predict', headers={'authorization': 'Bearer s3cret'}))
 
 
@@ -95,7 +105,7 @@ def test_inbound_correct_token_accepted(monkeypatch):
     ])
 def test_inbound_wrong_or_missing_rejected(monkeypatch, bad):
     monkeypatch.setenv(constants.LB_AUTH_TOKEN_ENV_VAR, 's3cret')
-    headers = {} if bad is None else {'authorization': bad}
+    headers = ({} if bad is None else {constants.LB_AUTHORIZATION_HEADER: bad})
     assert not _authorized(_scope('/predict', headers=headers))
 
 
@@ -153,10 +163,8 @@ def test_inbound_token_ring_accepts_overlap(monkeypatch, tmp_path):
     ring.write_text('new\nold\n', encoding='utf-8')
     monkeypatch.setenv(constants.LB_AUTH_TOKENS_FILE_ENV_VAR, str(ring))
     for token in ('new', 'old'):
-        assert _authorized(
-            _scope('/predict', headers={'authorization': f'Bearer {token}'}))
-    assert not _authorized(
-        _scope('/predict', headers={'authorization': 'Bearer stale'}))
+        assert _authorized(_scope('/predict', headers=_edge_auth(token)))
+    assert not _authorized(_scope('/predict', headers=_edge_auth('stale')))
 
 
 def test_inbound_and_control_plane_tokens_are_independent(monkeypatch):
@@ -313,9 +321,33 @@ def test_stack_health_get_exempt_but_proxy_requires_auth(monkeypatch):
     assert client.get(constants.LB_HEALTH_ENDPOINT_PATH).status_code != 401
     # Inference path requires auth.
     assert client.get('/predict').status_code == 401
-    assert client.get('/predict', headers={
-        'Authorization': 'Bearer s3cret'
-    }).status_code == 200
+    assert client.get('/predict',
+                      headers=_edge_auth('s3cret')).status_code == 200
+
+
+def test_stack_consumes_edge_auth_but_preserves_replica_auth(monkeypatch):
+    monkeypatch.setenv(constants.LB_AUTH_TOKEN_ENV_VAR, 'edge-secret')
+    lb = _make_lb()
+    lb._app.add_middleware(load_balancer._InboundAuthMiddleware)
+
+    async def _headers(request: fastapi.Request):
+        return {
+            'edge': request.headers.get(constants.LB_AUTHORIZATION_HEADER),
+            'replica': request.headers.get('Authorization'),
+        }
+
+    lb._app.add_api_route('/predict', _headers, methods=['GET'])
+    client = TestClient(lb._app)
+    response = client.get('/predict',
+                          headers={
+                              **_edge_auth('edge-secret'),
+                              'Authorization': 'Bearer model-secret',
+                          })
+    assert response.status_code == 200
+    assert response.json() == {
+        'edge': None,
+        'replica': 'Bearer model-secret',
+    }
 
 
 def test_stack_non_get_health_path_still_requires_auth(monkeypatch):
@@ -366,7 +398,7 @@ def test_stack_streaming_response_passes_through(monkeypatch):
 
     lb._app.add_api_route('/stream', _stream, methods=['GET'])
     client = TestClient(lb._app)
-    ok = client.get('/stream', headers={'Authorization': 'Bearer s3cret'})
+    ok = client.get('/stream', headers=_edge_auth('s3cret'))
     assert ok.status_code == 200 and ok.content == b'abc'
     assert client.get('/stream').status_code == 401
 
