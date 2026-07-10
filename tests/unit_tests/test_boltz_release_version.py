@@ -1,11 +1,24 @@
 """Tests for deterministic Boltz artifact release versions."""
 
+import importlib.util
 import pathlib
 import subprocess
 
 import pytest
 
-from boltz import release_version
+
+def _load_release_version_module():
+    path = pathlib.Path(
+        __file__).resolve().parents[2] / 'boltz' / 'release_version.py'
+    spec = importlib.util.spec_from_file_location('boltz_release_version', path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f'Unable to load release version module from {path}')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+release_version = _load_release_version_module()
 
 
 def _git(repo: pathlib.Path, *args: str) -> str:
