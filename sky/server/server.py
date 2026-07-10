@@ -2818,7 +2818,7 @@ async def health(request: fastapi.Request) -> responses.APIHealthResponse:
         # field to check compatibility and hint the user to upgrade the CLI.
         # TODO(aylei): remove this field after 0.13.0
         api_version=str(server_constants.API_VERSION),
-        # User-facing version; the minor number auto-increments with every
+        # User-facing version; the patch number auto-increments with every
         # commit. The internal sky.__version__ (with its -dev0 marker) keeps
         # flowing through the version-compatibility headers.
         version=sky.__display_version__,
