@@ -2,14 +2,16 @@ name: Pylint
 
 on:
   # Trigger the workflow on push or pull request,
-  # but only for the main branch
+  # including the boltz fork's integration branch
   push:
     branches:
       - master
+      - improvements
       - 'releases/**'
   pull_request:
     branches:
       - master
+      - improvements
       - 'releases/**'
   merge_group:
 
