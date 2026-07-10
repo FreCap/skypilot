@@ -567,6 +567,7 @@ def up(
         else:
             external_endpoint = serve_utils.external_lb_socket_endpoint(
                 service_name, lb_port)
+            socket_endpoint: Optional[str]
             if external_endpoint is not None:
                 socket_endpoint = external_endpoint
             elif not serve_utils.is_consolidation_mode(pool) and not pool:
@@ -1132,6 +1133,7 @@ def status(
         if pool:
             continue
         if service_record['load_balancer_port'] is not None:
+            endpoint: Optional[str] = None
             try:
                 lb_port = service_record['load_balancer_port']
                 external_endpoint = serve_utils.external_lb_socket_endpoint(
