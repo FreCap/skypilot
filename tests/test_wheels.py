@@ -12,6 +12,19 @@ from sky.backends import wheel_utils
 from sky.server import common
 
 
+@pytest.mark.parametrize(
+    ('version', 'build', 'expected'),
+    [
+        ('1.0.0-dev0', '5791', '1.0.5791'),
+        ('2.7.4', '42', '2.7.42'),
+        ('1.0.0-dev0', None, '1.0.0-dev0'),
+        ('1.0.0-dev0', 'unknown', '1.0.0-dev0'),
+    ])
+def test_compose_display_version_uses_patch(version, build, expected):
+    assert sky._compose_display_version(  # pylint: disable=protected-access
+        version, build) == expected
+
+
 def test_wheel_build_version_guard_uses_internal_version():
     """Display build metadata must not make provisioning reject the wheel."""
     display_version = sky._compose_display_version(  # pylint: disable=protected-access

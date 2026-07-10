@@ -67,15 +67,18 @@ def _get_commit_count() -> Optional[str]:
 
 
 def _compose_display_version(version: str, build: Optional[str]) -> str:
-    """Product version shown to users: '<major>.<build>.0'.
+    """Product version shown to users: '<major>.<minor>.<build>'.
 
-    The minor version number auto-increments with every commit. Falls back to
+    The patch version number auto-increments with every commit. Falls back to
     the internal version when the build number is unknown.
     """
     if not build or not build.isdigit():
         return version
-    major = version.split('.', 1)[0]
-    return f'{major}.{build}.0'
+    version_parts = version.split('.', 2)
+    if len(version_parts) < 2:
+        return version
+    major, minor = version_parts[:2]
+    return f'{major}.{minor}.{build}'
 
 
 __commit__ = _get_git_commit()
@@ -85,7 +88,7 @@ __commit__ = _get_git_commit()
 __version__ = '1.0.0-dev0'
 # Monotonic build number (git commit count); None when unknown.
 __build__ = _get_commit_count()
-# User-facing version, e.g. '1.891.0'; the minor number is the build number.
+# User-facing version, e.g. '1.0.891'; the patch number is the build number.
 __display_version__ = _compose_display_version(__version__, __build__)
 __root_dir__ = directory_utils.get_sky_dir()
 
