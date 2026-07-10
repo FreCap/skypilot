@@ -282,3 +282,90 @@ class TestStatusDelegatesToRunner:
             'tls_encrypted': False,
             'endpoint': None,
         }]
+
+    @pytest.mark.parametrize(('tls_encrypted', 'expected_endpoint'), [
+        (False, 'http://skypilot-serve-lb-svc.ns.svc:30001'),
+        (True, 'https://skypilot-serve-lb-svc.ns.svc:30001'),
+    ])
+    def test_status_uses_only_external_service_endpoint(self, tls_encrypted,
+                                                        expected_endpoint):
+        records = [{
+            'name': 'svc',
+            # Registration sentinel only; it must not affect the URL.
+            'load_balancer_port': 39999,
+            'tls_encrypted': tls_encrypted,
+        }]
+        runner = mock.Mock()
+        runner.get_service_status.return_value = records
+        serve_runner.register(runner)
+
+        with contextlib.ExitStack() as stack:
+            for p in self._common_patches():
+                stack.enter_context(p)
+            external_endpoint = stack.enter_context(
+                mock.patch.object(
+                    impl.lb_k8s,
+                    'lb_service_endpoint_or_none',
+                    return_value='skypilot-serve-lb-svc.ns.svc:30001'))
+            legacy_endpoint = stack.enter_context(
+                mock.patch.object(
+                    impl.backend_utils,
+                    'get_endpoints',
+                    side_effect=AssertionError('legacy endpoint fallback')))
+            result = impl.status(pool=False)
+
+        assert result[0]['endpoint'] == expected_endpoint
+        external_endpoint.assert_called_once_with('svc')
+        legacy_endpoint.assert_not_called()
+
+    def test_status_keeps_endpoint_unavailable_without_external_runtime(self):
+        records = [{
+            'name': 'svc',
+            'load_balancer_port': 30001,
+            'tls_encrypted': False,
+        }]
+        runner = mock.Mock()
+        runner.get_service_status.return_value = records
+        serve_runner.register(runner)
+
+        with contextlib.ExitStack() as stack:
+            for p in self._common_patches():
+                stack.enter_context(p)
+            external_endpoint = stack.enter_context(
+                mock.patch.object(impl.lb_k8s,
+                                  'lb_service_endpoint_or_none',
+                                  return_value=None))
+            legacy_endpoint = stack.enter_context(
+                mock.patch.object(
+                    impl.backend_utils,
+                    'get_endpoints',
+                    side_effect=AssertionError('legacy endpoint fallback')))
+            result = impl.status(pool=False)
+
+        assert result[0]['endpoint'] is None
+        external_endpoint.assert_called_once_with('svc')
+        legacy_endpoint.assert_not_called()
+
+    def test_pool_status_never_constructs_inference_endpoint(self):
+        records = [{
+            'name': 'pool',
+            # Pools retain this DB registration sentinel for compatibility.
+            'load_balancer_port': 30001,
+            'tls_encrypted': False,
+        }]
+        runner = mock.Mock()
+        runner.get_service_status.return_value = records
+        serve_runner.register(runner)
+
+        with contextlib.ExitStack() as stack:
+            for p in self._common_patches():
+                stack.enter_context(p)
+            external_endpoint = stack.enter_context(
+                mock.patch.object(
+                    impl.lb_k8s,
+                    'lb_service_endpoint_or_none',
+                    side_effect=AssertionError('pool endpoint construction')))
+            result = impl.status(pool=True)
+
+        assert result[0]['endpoint'] is None
+        external_endpoint.assert_not_called()

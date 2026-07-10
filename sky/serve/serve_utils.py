@@ -716,26 +716,6 @@ def get_lb_auth_token() -> Optional[str]:
     return tokens[0] if tokens else None
 
 
-def external_lb_socket_endpoint(
-        service_name: str, load_balancer_port: Optional[int]) -> Optional[str]:
-    """The external load balancer's socket endpoint (host:port), or None.
-
-    In external load balancer mode the controller owns a per-service LB
-    Service; this returns that Service's in-cluster DNS ``host:port`` (no
-    scheme -- callers add http/https based on the service's TLS config).
-    Returns None (so callers keep the in-pod ``localhost:{port}`` / controller
-    cluster behavior) unless external-LB mode is on AND we have in-cluster
-    config.
-    """
-    # The LB Service always exposes the fixed LOAD_BALANCER_PORT_START, so the
-    # caller-provided port is not used for the endpoint host:port.
-    del load_balancer_port
-    # Lazy import: lb_k8s imports serve_utils at module level, so a top-level
-    # import here would be circular.
-    from sky.serve import lb_k8s  # pylint: disable=import-outside-toplevel
-    return lb_k8s.lb_service_endpoint_or_none(service_name)
-
-
 def ha_recovery_for_consolidation_mode(pool: bool,
                                        still_leader: Optional[Callable[
                                            [], bool]] = None):

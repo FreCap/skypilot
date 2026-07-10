@@ -64,6 +64,16 @@ def _service_test_request_command(endpoint: str) -> str:
     return f'curl -H {header} {endpoint}'
 
 
+def _external_service_endpoint_url(service_name: str,
+                                   tls_encrypted: bool) -> Optional[str]:
+    """Return the sole supported service endpoint, or None if unavailable."""
+    socket_endpoint = lb_k8s.lb_service_endpoint_or_none(service_name)
+    if socket_endpoint is None:
+        return None
+    protocol = 'https' if tls_encrypted else 'http'
+    return f'{protocol}://{socket_endpoint}'
+
+
 def _get_service_record(
         service_name: str, pool: bool,
         handle: backends.CloudVmRayResourceHandle,
@@ -475,14 +485,14 @@ def up(
             with rich_utils.safe_status(
                     ux_utils.spinner_message(
                         f'Waiting for the {noun} to register')):
-                # This function will check the controller job id in the database
-                # and return the endpoint if the job id matches. Otherwise it
-                # will return None.
+                # This checks the controller job id in the database and waits
+                # for the historical registration-port sentinel. The actual
+                # endpoint is always derived from the Kubernetes LB Service.
                 use_legacy = not controller_handle.is_grpc_enabled_with_flag
 
                 if controller_handle.is_grpc_enabled_with_flag:
                     try:
-                        lb_port = serve_rpc_utils.RpcRunner.wait_service_registration(  # pylint: disable=line-too-long
+                        serve_rpc_utils.RpcRunner.wait_service_registration(  # pylint: disable=line-too-long
                             controller_handle, service_name, controller_job_id,
                             pool)
                     except exceptions.SkyletMethodNotImplementedError:
@@ -500,7 +510,7 @@ def up(
                         returncode, code,
                         f'Failed to wait for {noun} initialization',
                         lb_port_payload)
-                    lb_port = serve_utils.load_service_initialization_result(
+                    serve_utils.load_service_initialization_result(
                         lb_port_payload)
         except (exceptions.CommandError, grpc.FutureTimeoutError,
                 grpc.RpcError):
@@ -536,27 +546,26 @@ def up(
                         'Failed to spin up the service. Please '
                         'check the logs above for more details.') from None
         else:
-            external_endpoint = serve_utils.external_lb_socket_endpoint(
-                service_name, lb_port)
-            socket_endpoint: Optional[str]
-            if external_endpoint is not None:
-                socket_endpoint = external_endpoint
-            elif not serve_utils.is_consolidation_mode(pool) and not pool:
-                socket_endpoint = backend_utils.get_endpoints(
-                    controller_handle.cluster_name,
-                    lb_port,
-                    skip_status_check=True).get(lb_port)
-            else:
-                socket_endpoint = f'localhost:{lb_port}'
-            assert socket_endpoint is not None, (
-                'Did not get endpoint for controller.')
-            # Already checked by validate_service_task
-            assert task.service is not None
-            protocol = ('http'
-                        if task.service.tls_credential is None else 'https')
-            socket_endpoint = socket_endpoint.replace('https://', '').replace(
-                'http://', '')
-            endpoint = f'{protocol}://{socket_endpoint}'
+            # Pools have no inference endpoint. Keep returning a string for
+            # the internal up() compatibility contract; apply() discards it.
+            endpoint = ''
+            if not pool:
+                # Already checked by validate_service_task. The registration
+                # port remains a DB/API readiness sentinel, but does not
+                # participate in endpoint construction: every external LB
+                # Service exposes the fixed Kubernetes Service port.
+                assert task.service is not None
+                external_endpoint = _external_service_endpoint_url(
+                    service_name,
+                    tls_encrypted=task.service.tls_credential is not None)
+                if external_endpoint is None:
+                    raise RuntimeError(
+                        'The external load balancer endpoint is unavailable '
+                        f'for service {service_name!r}. The per-service '
+                        'Kubernetes Service is the only supported inference '
+                        'endpoint; check the API server external-LB runtime '
+                        'configuration.')
+                endpoint = external_endpoint
 
         if pool:
             logger.info(
@@ -1070,28 +1079,12 @@ def status(
         if pool:
             continue
         if service_record['load_balancer_port'] is not None:
-            endpoint: Optional[str] = None
-            try:
-                lb_port = service_record['load_balancer_port']
-                external_endpoint = serve_utils.external_lb_socket_endpoint(
-                    service_record['name'], lb_port)
-                if external_endpoint is not None:
-                    endpoint = external_endpoint
-                elif not serve_utils.is_consolidation_mode(pool):
-                    endpoint = backend_utils.get_endpoints(
-                        cluster=common.SKY_SERVE_CONTROLLER_NAME,
-                        port=lb_port).get(lb_port, None)
-                else:
-                    endpoint = f'localhost:{lb_port}'
-            except exceptions.ClusterNotUpError:
-                pass
-            else:
-                protocol = ('https'
-                            if service_record['tls_encrypted'] else 'http')
-                if endpoint is not None:
-                    endpoint = endpoint.replace('https://',
-                                                '').replace('http://', '')
-                service_record['endpoint'] = f'{protocol}://{endpoint}'
+            # load_balancer_port remains the registration sentinel exposed by
+            # the status API. It is deliberately not a routing input: the
+            # external per-service Kubernetes Service is the only supported
+            # endpoint, and an unavailable external runtime stays unavailable.
+            service_record['endpoint'] = _external_service_endpoint_url(
+                service_record['name'], service_record['tls_encrypted'])
 
     return service_records
 
