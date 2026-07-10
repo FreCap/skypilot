@@ -46,15 +46,34 @@ tests:
           value: test-release-serve-lb-role
         documentIndex: 7
 
-  - it: should not add a duplicate LB role when workloads use the release namespace
+  - it: should isolate LB permissions from reused same-namespace defaults
     release:
       name: test-release
       namespace: test-namespace
     set:
       serve.externalLoadBalancer.enabled: true
+      rbac.namespaceRules:
+        - apiGroups: [""]
+          resources: ["pods"]
+          verbs: ["get", "list"]
     asserts:
       - hasDocuments:
-          count: 5
+          count: 7
+      - equal:
+          path: metadata.name
+          value: test-release-serve-lb-role
+        documentIndex: 5
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["pods/log"]
+            verbs: ["get"]
+        documentIndex: 5
+      - equal:
+          path: roleRef.name
+          value: test-release-serve-lb-role
+        documentIndex: 6
 
   - it: should retain split-namespace cleanup permission when external LB is disabled
     release:
