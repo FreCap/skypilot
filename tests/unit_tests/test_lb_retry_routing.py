@@ -348,9 +348,10 @@ class TestRetryShortCircuit(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(attempts), 3)
 
-    def test_post_ambiguous_transport_failure_is_not_retried(self):
-        # A read/protocol failure can happen after the replica accepted an
-        # async POST. Replaying it could enqueue the same job twice.
+    def test_post_ambiguous_transport_failure_is_retried(self):
+        # Async serving uses at-least-once delivery: a read/protocol failure
+        # may have followed acceptance, but availability takes precedence and
+        # the request is retried on another replica.
         for error in (httpx.ReadError('reset after send'),
                       httpx.RemoteProtocolError('bad response after send')):
             with self.subTest(error=type(error).__name__):
@@ -359,15 +360,19 @@ class TestRetryShortCircuit(unittest.TestCase):
                 async def _proxy(url, request):
                     del request
                     attempts.append(url)
-                    return error
+                    if len(attempts) == 1:
+                        return error
+                    return fastapi.responses.Response(status_code=202)
 
                 balancer = self._balancer(['http://a:8080', 'http://b:8080'],
                                           _proxy)
-                sleeps, exc = self._run(balancer)
-                self.assertEqual(len(attempts), 1)
-                self.assertEqual(sleeps, [])
-                self.assertEqual(exc.status_code, 502)
-                self.assertIn('may already have accepted it', exc.detail)
+                with mock.patch('sky.serve.load_balancer.asyncio.sleep',
+                                new=mock.AsyncMock()):
+                    response = asyncio.run(
+                        balancer._proxy_with_retries(_request()))
+                self.assertEqual(response.status_code, 202)
+                self.assertEqual(len(attempts), 2)
+                self.assertNotEqual(attempts[0], attempts[1])
 
     def test_get_ambiguous_transport_failure_remains_retryable(self):
         attempts = []
