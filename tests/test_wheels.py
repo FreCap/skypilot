@@ -7,7 +7,28 @@ from unittest import mock
 
 import pytest
 
+import sky
 from sky.backends import wheel_utils
+from sky.server import common
+
+
+def test_wheel_build_version_guard_uses_internal_version():
+    """Display build metadata must not make provisioning reject the wheel."""
+    display_version = sky._compose_display_version(  # pylint: disable=protected-access
+        sky.__version__, '999999')
+    with mock.patch.object(sky, '_get_commit_count', return_value='999999'), \
+         mock.patch.object(sky, '__display_version__', display_version):
+        assert common.get_skypilot_version_on_disk() == sky.__version__
+        assert (common.get_skypilot_display_version_on_disk() ==
+                display_version)
+
+        pip_error = subprocess.CalledProcessError(
+            returncode=1,
+            cmd=[sys.executable, '-m', 'pip', 'wheel'],
+            stderr='intentional regression-test failure')
+        with mock.patch('subprocess.run', side_effect=pip_error):
+            with pytest.raises(RuntimeError, match='pip wheel command failed'):
+                wheel_utils._build_sky_wheel()
 
 
 def test_build_wheels():

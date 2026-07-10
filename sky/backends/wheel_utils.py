@@ -68,13 +68,17 @@ def _build_sky_wheel() -> pathlib.Path:
     # running code. If not, the wheel we build will not match _WHEEL_PATTERN.
     # See https://github.com/skypilot-org/skypilot/issues/5311.
     version_on_disk = common.get_skypilot_version_on_disk()
-    if version_on_disk != sky.__version__:
+    display_version_on_disk = common.get_skypilot_display_version_on_disk()
+    if (version_on_disk != sky.__version__ or
+            display_version_on_disk != sky.__display_version__):
         logger.warning(
             'Wheel build: The installed SkyPilot version is different from the '
             'running code.\n'
             f'{colorama.Style.DIM}'
-            f'running version: {sky.__version__}\n'
-            f'installed version: {version_on_disk}\n'
+            f'running internal version: {sky.__version__}\n'
+            f'installed internal version: {version_on_disk}\n'
+            f'running display version: {sky.__display_version__}\n'
+            f'installed display version: {display_version_on_disk}\n'
             f'{colorama.Style.RESET_ALL}'
             # The following message only applies to local API server. We have no
             # way to tell from here if this is a remote or local API server. But
@@ -136,6 +140,11 @@ def _build_sky_wheel() -> pathlib.Path:
         init_file_content = re.sub(
             r'_SKYPILOT_COMMIT_SHA = [\'"](.*?)[\'"]',
             f'_SKYPILOT_COMMIT_SHA = \'{sky.__commit__}\'', init_file_content)
+        if sky.__build__ is not None:
+            init_file_content = re.sub(
+                r'_SKYPILOT_COMMIT_COUNT = [\'"](.*?)[\'"]',
+                f'_SKYPILOT_COMMIT_COUNT = \'{sky.__build__}\'',
+                init_file_content)
         (tmp_dir / 'sky' / '__init__.py').write_text(init_file_content)
 
         # It is important to normalize the path, otherwise 'pip wheel' would
