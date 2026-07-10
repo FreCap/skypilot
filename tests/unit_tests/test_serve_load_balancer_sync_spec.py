@@ -312,12 +312,17 @@ class TestMissingRoutingSpecReadiness:
             },
             'num_ready_replicas': 1,
             'routing_spec': None,
+            'capacity_hint': {
+                'provisioning_replicas': 1,
+                'target_num_replicas': 2,
+            },
         },
                       on_response_enter=lambda: lb._request_aggregator.
                       timestamps.append(4))
 
         assert lb._ready is False
         assert lb._last_sync_time is None
+        assert lb._capacity_hint is None
         assert not lb._load_balancing_policy.ready_replicas
         # The controller returned 2xx and has already ingested [1, 2, 3]. An
         # incomplete response must not replay that batch or clear the concurrent
@@ -364,8 +369,13 @@ class TestMissingRoutingSpecReadiness:
                     'load_balancing_policy_name': 'round_robin',
                     'stream_timeout_seconds': 90,
                 },
+                'capacity_hint': {
+                    'provisioning_replicas': 0,
+                    'target_num_replicas': 1,
+                },
             })
         last_complete_sync = lb._last_sync_time
+        last_complete_capacity = lb._capacity_hint
 
         _run_one_sync(
             lb, {
@@ -374,10 +384,15 @@ class TestMissingRoutingSpecReadiness:
                 },
                 'num_ready_replicas': 1,
                 'routing_spec': None,
+                'capacity_hint': {
+                    'provisioning_replicas': 2,
+                    'target_num_replicas': 3,
+                },
             })
 
         assert lb._ready is True
         assert lb._last_sync_time == last_complete_sync
+        assert lb._capacity_hint == last_complete_capacity
         assert lb._load_balancing_policy_name == 'round_robin'
         assert lb._stream_timeout_seconds == 90
         assert lb._load_balancing_policy.ready_replicas == ['http://old:8080']
