@@ -165,7 +165,7 @@ def test_burstable_executor_pool_recovery():
         submit_call_count = 0
 
         # Mock the PoolExecutor.submit method at class level to control
-        # behavior across all instances
+        # behavior across all instances.
         original_submit = PoolExecutor.submit
 
         def mock_submit(self, fn, *args, **kwargs):
@@ -175,24 +175,24 @@ def test_burstable_executor_pool_recovery():
                 # First call raises BrokenProcessPool to simulate pool failure
                 raise concurrent.futures.process.BrokenProcessPool(
                     "Simulated process pool failure")
-            else:
-                # Subsequent calls should work normally
-                # Call the original submit method
-                return original_submit(self, fn, *args, **kwargs)
+            # Subsequent calls exercise the replacement process pool.
+            return original_submit(self, fn, *args, **kwargs)
 
         with unittest.mock.patch.object(PoolExecutor, 'submit',
                                         new=mock_submit):
             # This should trigger the pool recovery logic in
             # _submit_to_guaranteed_pool
             future = executor.submit_until_success(dummy_task)
-            result = future.result(timeout=5.0)
+            # Process startup can be slow under the full xdist suite, but a
+            # bounded timeout still detects a hung replacement pool.
+            result = future.result(timeout=60.0)
 
             # Verify the task completed successfully despite initial failure
             assert result is True
 
-            # Verify that submit was called at least twice
+            # Verify that submit was called exactly twice
             # (initial failure + successful retry)
-            assert submit_call_count >= 2
+            assert submit_call_count == 2
 
             # Verify that a new executor was created after the failure
             assert executor._executor is not original_executor
