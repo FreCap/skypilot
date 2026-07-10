@@ -32,24 +32,13 @@ logger = sky_logging.init_logger(__name__)
 # must not share a counter.
 _INFLIGHT_ATTR = '_sky_inflight_requests'
 
-# HTTP methods whose defined semantics tolerate replay after an ambiguous
-# transport failure. POST is intentionally absent: a replica may have accepted
-# an async job before the LB sees a read/reset/protocol error.
-_IDEMPOTENT_METHODS = frozenset(
-    {'GET', 'HEAD', 'PUT', 'DELETE', 'OPTIONS', 'TRACE'})
-
-# These failures happen before any request bytes can reach the replica. They
-# remain safe to retry even for non-idempotent methods.
-_PRE_SEND_TRANSPORT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout,
-                              httpx.PoolTimeout)
-
 
 class _RetriableStatusError(Exception):
     """A replica answered with a status the service marked retriable.
 
     Returned from _proxy_request_to like transport errors so
-    _proxy_with_retries re-routes the (idempotent) request to another
-    replica. Only statuses listed in the service's
+    _proxy_with_retries re-routes the request to another replica. Only
+    statuses listed in the service's
     load_balancer.retriable_status_codes take this path — everything
     else streams to the client verbatim.
     """
@@ -58,13 +47,6 @@ class _RetriableStatusError(Exception):
         super().__init__(
             f'replica {url} answered retriable status {status_code}')
         self.status_code = status_code
-
-
-def _transport_retry_is_safe(method: str, exc: httpx.RequestError) -> bool:
-    """Whether replay after a transport error cannot duplicate side effects."""
-    if method.upper() in _IDEMPOTENT_METHODS:
-        return True
-    return isinstance(exc, _PRE_SEND_TRANSPORT_ERRORS)
 
 
 class _ReleasingStreamingResponse(fastapi.responses.StreamingResponse):
@@ -1701,25 +1683,10 @@ class SkyServeLoadBalancer:
                 # 499 means a client terminates the connection
                 # before the server is able to respond.
                 return fastapi.responses.Response(status_code=499)
-            if (isinstance(response_or_exception, httpx.RequestError) and
-                    not _transport_retry_is_safe(request.method,
-                                                 response_or_exception)):
-                # A read/write/protocol failure does not prove whether the
-                # replica accepted a non-idempotent request before the
-                # connection failed. Replaying an async POST could enqueue the
-                # same job twice while returning only the later acknowledgement.
-                # Connect/pool failures remain retryable because no request
-                # bytes reached the replica.
-                exception = common_utils.remove_color(
-                    common_utils.format_exception(response_or_exception,
-                                                  use_bracket=True))
-                raise fastapi.HTTPException(
-                    status_code=502,
-                    detail=(
-                        f'Not retrying non-idempotent {request.method} request '
-                        'after an ambiguous replica transport failure; the '
-                        'replica may already have accepted it. '
-                        f'Error: {exception}.'))
+            # Transport failures retry for every method, including POST.
+            # SkyServe uses at-least-once delivery: an ambiguous failure may
+            # replay accepted work, but availability takes precedence and the
+            # loop remains bounded by max_retries below.
             if (all_ready_tried and
                     isinstance(response_or_exception, _RetriableStatusError)):
                 # Every ready replica already shed THIS request with a

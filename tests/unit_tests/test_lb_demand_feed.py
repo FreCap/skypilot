@@ -123,7 +123,9 @@ def test_queue_depth_recounts_between_failed_dispatches():
         del url, request
         depths_during_dispatch.append(lb._queue_depth)
         if len(depths_during_dispatch) == 1:
-            return httpx.ConnectError('boom')
+            # The POST may have been accepted before this ambiguous failure;
+            # at-least-once delivery still retries it.
+            return httpx.ReadError('reset after send')
         return response
 
     lb._proxy_request_to = _fake_proxy
@@ -274,6 +276,41 @@ def test_declared_url_custom_request_invalidates_occupancy_sample():
     assert url not in (in_flight or {})
     assert unknown_urls == [url]
     assert sampled_urls == []
+
+
+def test_ambiguous_async_retry_keeps_both_attempts_occupancy_unknown():
+    lb = _make_lb()
+    urls = ['http://a:8080', 'http://b:8080']
+    lb._load_balancing_policy.set_ready_replicas(urls)
+    lb._replica_occupancy = {url: 0 for url in urls}
+    lb._replica_free_slots = {url: 1 for url in urls}
+    lb._occupancy_dispatch_generation = {url: 0 for url in urls}
+    lb._occupancy_sample_generation = {url: 0 for url in urls}
+    attempts = []
+
+    async def _fake_proxy(url, request):
+        del request
+        attempts.append(url)
+        if len(attempts) == 1:
+            return httpx.ReadError('reset after possible acceptance')
+        return fastapi.responses.Response(status_code=202)
+
+    request = _request(job_id='job-retried')
+    request.is_disconnected = mock.AsyncMock(return_value=False)
+    lb._proxy_request_to = _fake_proxy
+    with mock.patch('sky.serve.load_balancer.asyncio.sleep',
+                    new=mock.AsyncMock()):
+        response = asyncio.run(lb._proxy_with_retries(request))
+
+    assert response.status_code == 202
+    assert len(attempts) == 2
+    assert set(attempts) == set(urls)
+    assert lb._occupancy_dispatch_generation == {url: 2 for url in urls}
+    in_flight, _, unknown_urls, sampled_urls = (lb._in_flight_with_draining())
+    assert not in_flight
+    assert set(unknown_urls) == set(urls)
+    assert sampled_urls == []
+    assert lb._replica_free_slots == {}
 
 
 def test_probe_started_before_async_dispatch_cannot_revalidate_zero():
