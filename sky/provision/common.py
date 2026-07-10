@@ -27,6 +27,10 @@ logger = sky_logging.init_logger(__name__)
 class ProvisionerError(RuntimeError):
     """Exception for provisioner."""
     errors: List[Dict[str, str]]
+    # Number of instances in the failed provider request, when known. This lets
+    # higher layers distinguish a full-demand failure from filling a partial or
+    # orphaned cluster without parsing provider-specific messages.
+    requested_count: Optional[int] = None
 
 
 class StopFailoverError(Exception):

@@ -166,6 +166,15 @@ SKY_APISERVER_SHORT_EXECUTORS = prom.Gauge(
     'Total number of short-running request executors in the API server',
 )
 
+# Capacity-storm control signals. Keep labels deliberately low-cardinality:
+# resource locations, account IDs, and instance types belong in structured
+# logs, not Prometheus labels.
+SKY_PROVISION_CAPACITY_EVENTS_TOTAL = prom.Counter(
+    'sky_provision_capacity_events_total',
+    'Capacity and quota control events during provisioning',
+    ['reason', 'action'],
+)
+
 # Time a request spends waiting in the task queue (from creation to dequeue).
 SKY_APISERVER_QUEUE_WAIT_SECONDS = prom.Histogram(
     'sky_apiserver_queue_wait_seconds',
