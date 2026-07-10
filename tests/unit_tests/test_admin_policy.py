@@ -2,6 +2,7 @@ import contextlib
 import copy
 import importlib
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -20,7 +21,6 @@ from sky import skypilot_config
 from sky.server import versions
 from sky.server.requests import request_names
 from sky.utils import admin_policy_utils
-from sky.utils import common_utils
 from sky.utils import config_utils
 
 logger = sky_logging.init_logger(__name__)
@@ -681,7 +681,6 @@ def test_restful_policy(add_example_policy_paths, task):
 
 @contextlib.contextmanager
 def _policy_server(policy: str) -> Iterator[str]:
-    port = common_utils.find_free_port(start_port=8080)
     env = os.environ.copy()
     # Clear the SKYPILOT_CONFIG to avoid conflicts with the test environment
     env.pop('SKYPILOT_CONFIG', None)
@@ -690,16 +689,46 @@ def _policy_server(policy: str) -> Iterator[str]:
     if env.get('PYTHONPATH'):
         pypath = pypath + ':' + env['PYTHONPATH']
     env['PYTHONPATH'] = pypath
-    proc = subprocess.Popen(
-        f'python {POLICY_PATH}/example_server/dynamic_policy_server.py --port {port} --policy {policy}',
-        shell=True,
-        env=env)
+    # Reserve the kernel-selected port until the child inherits the listening
+    # socket. ``unused_tcp_port_factory`` releases its probe socket before
+    # Popen, so another xdist worker can claim the same port in that window.
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(('127.0.0.1', 0))
+    listener.listen()
+    listener.set_inheritable(True)
+    port = listener.getsockname()[1]
+    try:
+        proc = subprocess.Popen([
+            sys.executable,
+            f'{POLICY_PATH}/example_server/dynamic_policy_server.py', '--fd',
+            str(listener.fileno()), '--policy', policy
+        ],
+                                env=env,
+                                pass_fds=(listener.fileno(),))
+    finally:
+        listener.close()
+
+    def _stop_server() -> None:
+        if proc.poll() is not None:
+            return
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+
     start_time = time.time()
     server_ready = False
-    # 30s budget: cold-start of a uvicorn subprocess (interpreter + fastapi
-    # + sky imports) routinely exceeds the prior 5s on CI runners.
-    timeout_s = 30.0
+    # A full xdist runner can heavily contend on imports. Keep a bounded cold
+    # start budget, while the process-exit check below reports bind/import
+    # failures immediately instead of sleeping through the whole timeout.
+    timeout_s = 60.0
     while time.time() - start_time < timeout_s:
+        if proc.poll() is not None:
+            raise RuntimeError(
+                f'Policy server on port {port} exited during startup with '
+                f'code {proc.returncode}.')
         try:
             response = requests.get(f'http://localhost:{port}', timeout=0.5)
             if response.status_code == 200:
@@ -711,14 +740,14 @@ def _policy_server(policy: str) -> Iterator[str]:
         time.sleep(0.1)
 
     if not server_ready:
-        proc.terminate()
+        _stop_server()
         raise RuntimeError(
             f'Policy server on port {port} failed to start within '
             f'{timeout_s:.0f} seconds')
     try:
         yield f'http://localhost:{port}'
     finally:
-        proc.terminate()
+        _stop_server()
 
 
 def test_restful_policy_server(add_example_policy_paths, task):

@@ -11,7 +11,7 @@ import uvicorn
 
 import sky
 
-app = FastAPI(title="Example Admin Policy Server", version="1.0.0")
+app = FastAPI(title='Example Admin Policy Server', version='1.0.0')
 
 
 @app.post('/')
@@ -65,6 +65,10 @@ if __name__ == '__main__':
                         type=int,
                         default=8080,
                         help='Port to bind to (default: 8080)')
+    parser.add_argument('--fd',
+                        type=int,
+                        default=None,
+                        help='Inherited listening socket file descriptor')
     parser.add_argument('--policy',
                         default='DoNothingPolicy',
                         help='Policy to use (default: DoNothingPolicy)')
@@ -78,4 +82,5 @@ if __name__ == '__main__':
                 workers=1,
                 host=args.host,
                 port=args.port,
-                log_level="info")
+                fd=args.fd,
+                log_level='info')
