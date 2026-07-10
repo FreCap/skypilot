@@ -28,12 +28,17 @@ from sky.serve import serve_utils
 
 
 @pytest.fixture(autouse=True)
-def _clear_token_file_envs(monkeypatch):
+def _clear_token_file_envs(monkeypatch, tmp_path):
     for env_var in (constants.LB_SYNC_AUTH_TOKENS_FILE_ENV_VAR,
                     constants.CONTROLLER_ADMIN_AUTH_TOKENS_FILE_ENV_VAR,
                     constants.LB_AUTH_TOKENS_FILE_ENV_VAR,
                     constants.LB_DATA_PLANE_AUTH_ENABLED_ENV_VAR):
         monkeypatch.delenv(env_var, raising=False)
+    sync_ring = tmp_path / 'default-sync.tokens'
+    sync_ring.write_text('default-sync-token\n', encoding='utf-8')
+    monkeypatch.setenv(constants.LB_SYNC_AUTH_TOKENS_FILE_ENV_VAR,
+                       str(sync_ring))
+    monkeypatch.setenv(constants.LB_POD_UID_ENV_VAR, 'test-pod-uid')
 
 
 def _make_lb() -> load_balancer.SkyServeLoadBalancer:
@@ -107,8 +112,6 @@ class _NoopDrainableServer:
 
 
 def test_lb_process_starts_without_optional_data_auth(monkeypatch):
-    monkeypatch.setattr(serve_utils, 'is_external_load_balancer_mode',
-                        lambda: True)
     monkeypatch.setenv(constants.LB_DATA_PLANE_AUTH_ENABLED_ENV_VAR, 'false')
     sync_tokens = mock.Mock(return_value=('sync',))
     data_tokens = mock.Mock(
@@ -134,8 +137,6 @@ def test_lb_process_starts_without_optional_data_auth(monkeypatch):
 
 
 def test_lb_process_requires_data_ring_when_enabled(monkeypatch):
-    monkeypatch.setattr(serve_utils, 'is_external_load_balancer_mode',
-                        lambda: True)
     monkeypatch.setenv(constants.LB_DATA_PLANE_AUTH_ENABLED_ENV_VAR, 'true')
     sync_tokens = mock.Mock(return_value=('sync',))
     data_tokens = mock.Mock(return_value=('data',))
@@ -195,16 +196,6 @@ def test_inbound_wrong_or_missing_rejected(monkeypatch, bad):
     assert not _authorized(_scope('/predict', headers=headers))
 
 
-def test_get_lb_auth_token_reads_env(monkeypatch):
-    monkeypatch.delenv(constants.LB_AUTH_TOKEN_ENV_VAR, raising=False)
-    assert serve_utils.get_lb_auth_token() is None
-    monkeypatch.setenv(constants.LB_AUTH_TOKEN_ENV_VAR, 'tok')
-    assert serve_utils.get_lb_auth_token() == 'tok'
-    # Empty string is treated as unset (auth disabled).
-    monkeypatch.setenv(constants.LB_AUTH_TOKEN_ENV_VAR, '')
-    assert serve_utils.get_lb_auth_token() is None
-
-
 def test_file_token_ring_is_live_and_legacy_env_is_only_fallback(
         monkeypatch, tmp_path):
     ring = tmp_path / 'lb.tokens'
@@ -258,7 +249,7 @@ def test_inbound_and_control_plane_tokens_are_independent(monkeypatch):
     # versa -- an inference client's token must never reach the controller.
     monkeypatch.setenv(constants.CONTROLLER_AUTH_TOKEN_ENV_VAR, 'ctrl')
     monkeypatch.delenv(constants.LB_AUTH_TOKEN_ENV_VAR, raising=False)
-    assert serve_utils.get_lb_auth_token() is None
+    assert not serve_utils.get_lb_auth_tokens()
     # Inbound auth disabled -> authorized despite the control-plane token.
     assert _authorized(_scope('/predict'))
 
@@ -336,13 +327,13 @@ def test_sync_sends_control_plane_bearer(monkeypatch, tmp_path):
     }
 
 
-def test_sync_without_token_still_fences_service_incarnation(monkeypatch):
+def test_sync_without_token_fails_before_http_request(monkeypatch):
+    monkeypatch.delenv(constants.LB_SYNC_AUTH_TOKENS_FILE_ENV_VAR)
     lb = _make_lb()
     captured = {}
-    _sync_once(monkeypatch, lb, 200, captured)
-    assert captured['headers'] == {
-        constants.SERVICE_HASH_HEADER: 'incarnation-a'
-    }
+    with pytest.raises(serve_utils.AuthTokenConfigurationError):
+        _sync_once(monkeypatch, lb, 200, captured)
+    assert captured == {}
 
 
 def test_sync_ring_falls_back_only_after_401_without_redraining(

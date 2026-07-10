@@ -485,7 +485,13 @@ def _run_sync(lb, response_payload):
         })
     captured = {}
     with mock.patch.object(lb_module.aiohttp, 'ClientSession',
-                           lambda: _FakeSession(response_payload, captured)):
+                           lambda: _FakeSession(response_payload, captured)), \
+         mock.patch.object(lb_module.serve_utils,
+                           'get_lb_sync_auth_tokens',
+                           return_value=('sync-token',)), \
+         mock.patch.object(lb,
+                           '_get_lb_session_id',
+                           return_value='test-pod-uid'):
         asyncio.run(lb._sync_with_controller_once())
     return captured
 
