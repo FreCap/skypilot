@@ -695,7 +695,6 @@ def _policy_server(policy: str) -> Iterator[str]:
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.bind(('127.0.0.1', 0))
     listener.listen()
-    listener.set_inheritable(True)
     port = listener.getsockname()[1]
     try:
         proc = subprocess.Popen([

@@ -163,44 +163,39 @@ def test_burstable_executor_pool_recovery():
         # Store reference to original executor
         original_executor = executor._executor
         submit_call_count = 0
-        submitted_executors = []
 
-        # Mock PoolExecutor.submit at class level to control behavior across
-        # both the original and replacement instances. Pool execution itself
-        # is covered by test_pool_executor; this test only needs to prove the
-        # BrokenProcessPool replacement and retry path deterministically.
+        # Mock the PoolExecutor.submit method at class level to control
+        # behavior across all instances.
+        original_submit = PoolExecutor.submit
 
         def mock_submit(self, fn, *args, **kwargs):
             nonlocal submit_call_count
             submit_call_count += 1
-            submitted_executors.append(self)
             if submit_call_count == 1:
                 # First call raises BrokenProcessPool to simulate pool failure
                 raise concurrent.futures.process.BrokenProcessPool(
                     "Simulated process pool failure")
-            future = Future()
-            future.set_result(fn(*args, **kwargs))
-            return future
+            # Subsequent calls exercise the replacement process pool.
+            return original_submit(self, fn, *args, **kwargs)
 
         with unittest.mock.patch.object(PoolExecutor, 'submit',
                                         new=mock_submit):
             # This should trigger the pool recovery logic in
             # _submit_to_guaranteed_pool
             future = executor.submit_until_success(dummy_task)
-            result = future.result()
+            # Process startup can be slow under the full xdist suite, but a
+            # bounded timeout still detects a hung replacement pool.
+            result = future.result(timeout=60.0)
 
             # Verify the task completed successfully despite initial failure
             assert result is True
 
-            # Verify that submit was called at least twice
+            # Verify that submit was called exactly twice
             # (initial failure + successful retry)
-            assert submit_call_count >= 2
+            assert submit_call_count == 2
 
             # Verify that a new executor was created after the failure
             assert executor._executor is not original_executor
-            assert submitted_executors == [
-                original_executor, executor._executor
-            ]
 
     finally:
         executor.shutdown()
