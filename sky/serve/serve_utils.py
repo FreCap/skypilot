@@ -561,23 +561,6 @@ def quarantine_service_directory(service_dir: str,
     return [quarantine_dir]
 
 
-def restore_quarantined_service_directory(service_name: str, service_dir: str,
-                                          quarantine_dirs: Optional[List[str]],
-                                          service_hash: str) -> None:
-    """Restore a quarantine only if the same incarnation still owns name."""
-    if not quarantine_dirs:
-        return
-    if serve_state.get_service_hash(service_name) == service_hash:
-        if not os.path.lexists(service_dir):
-            # The final entry is the canonical directory moved by this
-            # attempt; restore it for the authoritative same-hash owner. Older
-            # crash quarantine(s) remain hash-owned for the next retry.
-            for quarantine_dir in reversed(quarantine_dirs):
-                if os.path.lexists(quarantine_dir):
-                    os.rename(quarantine_dir, service_dir)
-                    break
-
-
 def remove_quarantined_service_directory(
         quarantine_dirs: Optional[List[str]]) -> None:
     """Remove only a hash-owned quarantine, never the canonical path."""
@@ -2147,9 +2130,10 @@ def _terminate_failed_services_locked(
     quarantine_dir = quarantine_service_directory(service_dir,
                                                   expected_service_hash)
     if not _still_owns():
-        restore_quarantined_service_directory(service_name, service_dir,
-                                              quarantine_dir,
-                                              expected_service_hash)
+        # Never restore a name-scoped path after ownership is lost. A DB hash
+        # check followed by rename cannot be atomic with a same-name successor
+        # creating its canonical directory. Keep this incarnation's files in
+        # hash-owned quarantine; the authoritative retry will collect them.
         return _purge_ownership_failure(
             service_name, 'ownership lost while quarantining service files')
 
@@ -2160,9 +2144,9 @@ def _terminate_failed_services_locked(
     removed = serve_state.remove_service_completely(service_name,
                                                     expected_service_hash)
     if not removed:
-        restore_quarantined_service_directory(service_name, service_dir,
-                                              quarantine_dir,
-                                              expected_service_hash)
+        # The compare-delete failure is itself proof that this process may no
+        # longer own the name. Leave the old files hash-scoped rather than
+        # racing a successor's canonical directory.
         return _purge_ownership_failure(
             service_name, 'final database compare-and-delete '
             'lost ownership')

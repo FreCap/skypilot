@@ -140,7 +140,7 @@ def test_service_directory_quarantine_recovers_crash_and_ha_mkdir(tmp_path):
     assert not any(tmp_path.iterdir())
 
 
-def test_request_lock_path_does_not_block_quarantine_restore(
+def test_request_lock_and_quarantine_cleanup_do_not_touch_successor(
         tmp_path, monkeypatch):
     canonical = tmp_path / 'svc'
     canonical.mkdir()
@@ -156,12 +156,14 @@ def test_request_lock_path_does_not_block_quarantine_restore(
     assert request_lock.parent == runtime_locks
     assert not canonical.exists()
 
-    monkeypatch.setattr(serve_state, 'get_service_hash',
-                        lambda name: 'incarnation-a')
-    serve_utils.restore_quarantined_service_directory('svc', str(canonical),
-                                                      quarantines,
-                                                      'incarnation-a')
-    assert (canonical / 'owned-by-a').read_text(encoding='utf-8') == 'a'
+    # A same-name successor may create its canonical directory after A loses
+    # the lifecycle lock. A's only safe file operation is removal of its
+    # hash-owned quarantine; it must never restore/rename over B's directory.
+    canonical.mkdir()
+    (canonical / 'owned-by-b').write_text('b', encoding='utf-8')
+    serve_utils.remove_quarantined_service_directory(quarantines)
+    assert (canonical / 'owned-by-b').read_text(encoding='utf-8') == 'b'
+    assert not any(tmp_path.glob('svc.teardown-*'))
 
 
 def test_serve_preemption_skips_autostopping():
@@ -1514,6 +1516,58 @@ class TestTerminateFailedServices:
         assert not terminated
         remove_service.assert_called_once_with('svc', 'incarnation-a')
         assert message is None
+
+    def test_failed_final_cas_never_restores_over_successor(self, tmp_path):
+        canonical = tmp_path / 'svc'
+        canonical.mkdir()
+        (canonical / 'owned-by-a').write_text('a', encoding='utf-8')
+        lifecycle_lock = mock.MagicMock()
+
+        def _lose_final_cas(*_args, **_kwargs):
+            # Model the authoritative actor winning after A quarantined its
+            # files: B now owns the canonical name before A learns its final
+            # compare-delete failed.
+            canonical.mkdir()
+            (canonical / 'owned-by-b').write_text('b', encoding='utf-8')
+            return False
+
+        owner = {
+            'hash': 'incarnation-a',
+            'controller_pid': 101,
+            'controller_ip': '10.0.0.1',
+            'controller_port': constants.CONTROLLER_TEARDOWN_ACK_PORT,
+        }
+        with mock.patch.object(serve_utils,
+                               'lifecycle_lock_is_valid',
+                               return_value=True), \
+             mock.patch.object(serve_state,
+                               'service_owner_matches',
+                               return_value=True), \
+             mock.patch.object(
+                 serve_state,
+                 'set_service_status_and_active_versions_if_hash',
+                 return_value=True), \
+             mock.patch.object(serve_state,
+                               'get_service_controller_owner',
+                               return_value=owner), \
+             mock.patch.object(serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(serve_utils,
+                               'generate_remote_service_dir_name',
+                               return_value=str(canonical)), \
+             mock.patch.object(serve_state,
+                               'remove_service_completely',
+                               side_effect=_lose_final_cas):
+            message = serve_utils._terminate_failed_services_locked(
+                'svc', 'incarnation-a', True, lifecycle_lock)
+
+        assert message is not None and 'compare-and-delete' in message
+        assert (canonical / 'owned-by-b').read_text(encoding='utf-8') == 'b'
+        quarantines = list(tmp_path.glob('svc.teardown-*'))
+        assert len(quarantines) == 1
+        assert (quarantines[0] /
+                'owned-by-a').read_text(encoding='utf-8') == 'a'
 
     def test_deletes_external_lb_objects(self):
         # The failed-service purge path must also reap the controller-owned

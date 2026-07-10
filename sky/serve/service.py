@@ -879,16 +879,15 @@ def _run_cleanup_and_finalize_locked(
         quarantine_dir = serve_utils.quarantine_service_directory(
             service_dir, service_hash)
         if not _still_owns():
-            serve_utils.restore_quarantined_service_directory(
-                service_name, service_dir, quarantine_dir, service_hash)
+            # Never recreate a name-scoped path after ownership is lost. The
+            # hash-owned quarantine remains retryable without risking a
+            # same-name successor's canonical directory.
             return
         removed = serve_state.remove_service_completely(
             service_name,
             service_hash,
             expected_controller_owner=expected_owner)
         if not removed:
-            serve_utils.restore_quarantined_service_directory(
-                service_name, service_dir, quarantine_dir, service_hash)
             logger.warning(f'Lost ownership during final removal of '
                            f'{service_name!r}.')
             return
