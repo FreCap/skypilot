@@ -36,6 +36,7 @@ on:
 concurrency:
   group: boltz-overlay-publish-improvements
   cancel-in-progress: false
+  queue: max
 
 permissions:
   id-token: write   # OIDC -> AWS
