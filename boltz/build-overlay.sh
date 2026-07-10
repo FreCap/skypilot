@@ -2,19 +2,17 @@
 # Build (and optionally push) the boltz overlay image from THIS fork checkout.
 # Run from anywhere inside the repo; uses the current HEAD.
 #
-# Policy: overlay the FULL fork sky/ tree (every tracked file under sky/**,
-# tests excluded) onto the pinned upstream nightly base. This is deliberate,
-# not an optimization opportunity:
+# Policy: install a wheel containing the FULL fork sky/ tree (every tracked
+# file under sky/**, tests excluded) onto the pinned upstream runtime base.
+# This is deliberate, not an optimization opportunity:
 #
-#   The base image is pinned (BASE_VER, e.g. a June-20 nightly) while the fork
+#   The base image is pinned to a June-20 nightly while the fork
 #   tree tracks upstream master via rebases, so the fork's checkout is NEWER
 #   than the base wheel even for files the fork never touched. A partial
-#   overlay (changed-files-only) would mix old-wheel modules with fork modules
+#   package (changed-files-only) would mix old-wheel modules with fork modules
 #   that assume their newer counterparts — a version skew inside one image.
-#   Shipping the whole fork tree keeps sky/ internally consistent at exactly
-#   the fork's commit, and is the composition production has been validated
-#   on. Only files the base has but the fork tree lacks fall through to the
-#   wheel (COPY overlays; it never deletes).
+#   Installing the whole fork wheel keeps both source and Python distribution
+#   metadata internally consistent at exactly the fork's commit.
 #
 # The dashboard is ALWAYS rebuilt from this fork's source (sky/dashboard ->
 # out/, requires node/npm) and shipped in the overlay: the base image's bundle
@@ -22,12 +20,10 @@
 # be older than the fork's python (stale enums render wrong) and fork dashboard
 # changes would never deploy. out/ is gitignored, hence built here, not tracked.
 #
-#   PUSH=true TAG=<ecr>/skypilot-nightly-boltz:<ver>-<n> ./boltz/build-overlay.sh
+#   PUSH=true TAG=<ecr>/skypilot-nightly-boltz:<version>-g<sha> ./boltz/build-overlay.sh
 #
 # Env (all have sensible defaults):
-#   BASE_VER   upstream nightly tag to base on (keep in sync with the platform
-#              chart_version, normalized "-dev." -> ".dev"). Default below.
-#   BASE_IMAGE override the full base image (default berkeleyskypilot/...:$BASE_VER)
+#   BASE_IMAGE upstream runtime dependency (default is pinned below)
 #   TAG        full image ref to build/push (default builds a local dev tag)
 #   PUSH       "true" to docker push (default false)
 #   PLATFORM   docker build --platform (default linux/amd64 — control-plane arch)
@@ -36,10 +32,14 @@ set -euo pipefail
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
-BASE_VER="${BASE_VER:-1.0.0.dev20260620}"
-BASE_IMAGE="${BASE_IMAGE:-berkeleyskypilot/skypilot-nightly:${BASE_VER}}"
+SKYPILOT_VERSION="$(awk -F"'" '/^__version__ = / {print $2; exit}' sky/__init__.py)"
+if [ -z "$SKYPILOT_VERSION" ]; then
+  echo "error: unable to read canonical version from sky/__init__.py" >&2
+  exit 1
+fi
+BASE_IMAGE="${BASE_IMAGE:-berkeleyskypilot/skypilot-nightly:1.0.0.dev20260620}"
 PLATFORM="${PLATFORM:-linux/amd64}"
-TAG="${TAG:-skypilot-nightly-boltz:${BASE_VER}-dev}"
+TAG="${TAG:-skypilot-nightly-boltz:${SKYPILOT_VERSION}-dev}"
 PUSH="${PUSH:-false}"
 
 # Fail before pulling the base image or rebuilding the dashboard: the commit
@@ -113,10 +113,17 @@ fi
 
 ctx="$(mktemp -d)"; trap 'rm -rf "$ctx"' EXIT
 for f in "${files[@]}"; do mkdir -p "$ctx/$(dirname "$f")"; cp "$f" "$ctx/$f"; done
+template_files=()
+while IFS= read -r f; do [ -n "$f" ] && template_files+=("$f"); done < <(
+  git ls-tree -r --name-only HEAD -- 'sky_templates')
+for f in "${template_files[@]}"; do
+  mkdir -p "$ctx/$(dirname "$f")"
+  cp "$f" "$ctx/$f"
+done
 
-# The overlay replaces the base wheel's sky/__init__.py, so its source-tree
-# placeholders must be stamped here. There is no .git directory in the final
-# image from which the runtime fallback could recover this metadata.
+# The wheel replaces the base package, so stamp the source-tree placeholders
+# before building it. There is no .git directory in the final image from which
+# the runtime fallback could recover this identity.
 OVERLAY_COMMIT="$overlay_commit" OVERLAY_BUILD="$overlay_build" \
   python3 - "$ctx/sky/__init__.py" <<'PY'
 import os
@@ -149,17 +156,23 @@ echo ">> Stamped overlay identity: commit ${overlay_commit}, build ${overlay_bui
 mkdir -p "$ctx/sky/dashboard"
 cp -R sky/dashboard/out "$ctx/sky/dashboard/out"
 echo ">> Dashboard bundle added to context: $(du -sh "$ctx/sky/dashboard/out" | cut -f1)"
+cp -L setup.py "$ctx/setup.py"
+cp pyproject.toml MANIFEST.in README.md "$ctx/"
 cp boltz/Dockerfile.overlay "$ctx/Dockerfile"
 
 echo ">> Building ${TAG} (${PLATFORM}, base ${BASE_IMAGE})"
-docker build --platform "$PLATFORM" --build-arg "BASE_IMAGE=${BASE_IMAGE}" -t "$TAG" "$ctx"
+docker build --platform "$PLATFORM" \
+  --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
+  --build-arg "SKYPILOT_VERSION=${SKYPILOT_VERSION}" \
+  --build-arg "SKYPILOT_COMMIT_SHA=${overlay_commit}" \
+  -t "$TAG" "$ctx"
 
-echo ">> Verifying overlay identity + modules + control-loop API + dashboard"
+echo ">> Verifying canonical version + identity + modules + dashboard"
 docker run --rm --platform "$PLATFORM" \
   -e "EXPECTED_SKYPILOT_COMMIT=${overlay_commit}" \
   -e "EXPECTED_SKYPILOT_BUILD=${overlay_build}" \
   "$TAG" python -c "
-import inspect, os
+import importlib.metadata, inspect, os
 import sky
 import sky.serve.controller, sky.serve.replica_managers, sky.serve.load_balancer
 from sky.utils import controller_utils
@@ -167,11 +180,10 @@ import sky.server.config
 from sky.server import constants as server_constants
 assert sky.__commit__ == os.environ['EXPECTED_SKYPILOT_COMMIT']
 assert sky.__build__ == os.environ['EXPECTED_SKYPILOT_BUILD']
-assert sky.__display_version__ == sky._compose_display_version(
-    sky._SKYPILOT_DISPLAY_VERSION, sky.__build__,
-    sky._SKYPILOT_DISPLAY_VERSION_PATCH_BASE)
 assert hasattr(controller_utils, 'in_flight_launch_count')
 assert 'in_flight' in inspect.signature(controller_utils.can_provision).parameters
+assert sky.__version__ == '${SKYPILOT_VERSION}', sky.__version__
+assert importlib.metadata.version('skypilot-nightly') == sky.__version__
 index = os.path.join(server_constants.DASHBOARD_DIR, 'index.html')
 assert os.path.isfile(index), f'dashboard missing from image: {index}'
 print('overlay verify OK')"
