@@ -58,7 +58,10 @@ jobs:
           else
             echo "push=true" >> "$GITHUB_OUTPUT"
           fi
-          short_sha="$(git rev-parse --short HEAD)"
+          # Use the same fixed-width build identity as the image publisher.
+          # git --short is repository-dependent and differs in shallow clones.
+          build_id="$(git rev-parse HEAD | cut -c1-8)"
+          test "${#build_id}" -eq 8
           version="$(awk -F"'" '/^__version__ = / {print $2; exit}' sky/__init__.py)"
           test -n "${version}"
           chart_app_version="$(sed -nE 's/^appVersion: "?([^\"]+)"?$/\1/p' charts/skypilot/Chart.yaml)"
@@ -70,7 +73,7 @@ jobs:
           # Build metadata keeps every commit's chart immutable/distinct while
           # remaining a valid SemVer2 that `helm push`/`helm show` accept (helm
           # maps the '+' to '_' for the OCI tag automatically).
-          ver="${version}+g${short_sha}"
+          ver="${version}+g${build_id}"
           echo "ver=${ver}" >> "$GITHUB_OUTPUT"
           echo "app_version=${version}" >> "$GITHUB_OUTPUT"
           echo "oci_ref=oci://${ECR_REGISTRY}/${OCI_REPO}" >> "$GITHUB_OUTPUT"
