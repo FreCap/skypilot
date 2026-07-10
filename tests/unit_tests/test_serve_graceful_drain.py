@@ -284,6 +284,7 @@ def _scale_down_manager(spec_drain, is_pool=False, spec_error=None):
     rm._service_name = 'svc'
     rm._is_pool = is_pool
     rm._lb_in_flight_report = None
+    rm._spot_placer = None
     rm.lock = threading.Lock()
     rm._terminate_replica = mock.Mock()
     spec = mock.Mock()
@@ -344,32 +345,34 @@ class TestRecoveryRedrive:
     """A scale-down retirement interrupted by a controller restart must
     re-enter a full bounded drain, not re-drive with no drain."""
 
-    def _redrive(self, is_scale_down, purged=False, persisted_cap=None):
+    def _redrive(self,
+                 is_scale_down,
+                 purged=False,
+                 persisted_cap=None,
+                 preempted=False,
+                 derived_status=None):
         rm = _scale_down_manager(spec_drain=600)
         rm._launch_thread_pool = {}
         rm._down_thread_pool = {}
         sp = mock.Mock()
         sp.is_scale_down = is_scale_down
         sp.purged = purged
+        sp.preempted = preempted
         # None models a legacy row without a persisted cap (a bare Mock
         # attribute would read as a truthy persisted value).
         sp.drain_cap_seconds = persisted_cap
         info = mock.Mock()
         info.replica_id = 7
         info.status_property = sp
-
-        def _replicas_at_status(_, status):
-            if status == replica_managers.serve_state.ReplicaStatus.\
-                    SHUTTING_DOWN:
-                return [info]
-            return []
+        info.status = (derived_status or
+                       replica_managers.serve_state.ReplicaStatus.SHUTTING_DOWN)
 
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
-                               return_value=[]), \
+                               return_value=[info]), \
              mock.patch.object(replica_managers.serve_state,
                                'get_replicas_at_status',
-                               side_effect=_replicas_at_status), \
+                               return_value=[]), \
              mock.patch.object(replica_managers.serve_state,
                                'get_replica_info_from_id',
                                return_value=info):
@@ -397,6 +400,118 @@ class TestRecoveryRedrive:
         kwargs = self._redrive(is_scale_down=True)
         assert kwargs['sync_down_logs'] is False
 
+    @pytest.mark.parametrize(
+        'derived_status',
+        [
+            replica_managers.serve_state.ReplicaStatus.PREEMPTED,
+            # Crash after persisting preempted=True but before scheduling
+            # sky.down: status derivation has not reached PREEMPTED yet.
+            replica_managers.serve_state.ReplicaStatus.NOT_READY,
+        ])
+    def test_preempted_redrive_forces_immediate_scale_down(
+            self, derived_status):
+        kwargs = self._redrive(is_scale_down=False,
+                               persisted_cap=450,
+                               preempted=True,
+                               derived_status=derived_status)
+        assert kwargs['is_scale_down'] is True
+        assert kwargs['sync_down_logs'] is False
+        assert kwargs['in_flight_drain_cap_seconds'] is None
+
+    def test_persisted_preemption_rebuilds_spot_bench(self):
+        rm = _scale_down_manager(spec_drain=600)
+        rm._launch_thread_pool = {}
+        rm._down_thread_pool = {}
+        rm._spot_placer = mock.Mock()
+        sp = mock.Mock(is_scale_down=True,
+                       purged=False,
+                       preempted=True,
+                       drain_cap_seconds=None)
+        info = mock.Mock(
+            replica_id=7,
+            cluster_name='svc-7',
+            is_spot=True,
+            status_property=sp,
+            status=replica_managers.serve_state.ReplicaStatus.PREEMPTED)
+        location = mock.sentinel.location
+        info.get_spot_location.return_value = location
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[info]), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replicas_at_status',
+                               return_value=[]):
+            rm._recover_replica_operations()
+
+        rm._spot_placer.set_preemptive.assert_called_once_with(location)
+
+    def test_preemption_refresh_crash_window_recovers_missing_cluster_row(self):
+        # The cloud-status refresh already removed the cluster row, but the
+        # controller crashed before persisting preempted=True.
+        rm = _scale_down_manager(spec_drain=600)
+        rm._launch_thread_pool = {}
+        rm._down_thread_pool = {}
+        rm._spot_placer = mock.Mock()
+        sp = mock.Mock(is_scale_down=False,
+                       purged=False,
+                       preempted=False,
+                       drain_cap_seconds=None)
+        info = mock.Mock(
+            replica_id=7,
+            cluster_name='svc-7',
+            is_spot=True,
+            status_property=sp,
+            status=replica_managers.serve_state.ReplicaStatus.NOT_READY)
+        location = mock.sentinel.location
+        info.get_spot_location.return_value = location
+        writes = []
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[info]), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replicas_at_status',
+                               return_value=[]), \
+             mock.patch.object(replica_managers.global_user_state,
+                               'get_cluster_status_fields',
+                               return_value={}), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'add_or_update_replica',
+                 side_effect=lambda *args: writes.append(sp.preempted)):
+            rm._recover_replica_operations()
+
+        assert writes == [True]
+        rm._spot_placer.set_preemptive.assert_called_once_with(location)
+        kwargs = rm._terminate_replica.call_args.kwargs
+        assert kwargs['is_scale_down'] is True
+        assert kwargs['sync_down_logs'] is False
+        assert kwargs['in_flight_drain_cap_seconds'] is None
+
+    def test_active_spot_with_cluster_row_is_not_misclassified(self):
+        rm = _scale_down_manager(spec_drain=600)
+        rm._launch_thread_pool = {}
+        rm._down_thread_pool = {}
+        sp = mock.Mock(preempted=False)
+        info = mock.Mock(
+            replica_id=7,
+            cluster_name='svc-7',
+            is_spot=True,
+            status_property=sp,
+            status=replica_managers.serve_state.ReplicaStatus.READY)
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[info]), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replicas_at_status',
+                               return_value=[]), \
+             mock.patch.object(
+                 replica_managers.global_user_state,
+                 'get_cluster_status_fields',
+                 return_value={'svc-7': ('UP', mock.sentinel.updated_at)}):
+            rm._recover_replica_operations()
+
+        rm._terminate_replica.assert_not_called()
+
     def test_persisted_cap_reused_exactly_over_resolver(self):
         # The spec here resolves to 600; the persisted cap (written when
         # the retirement was scheduled) must win.
@@ -418,19 +533,18 @@ class TestRecoveryRedrive:
         sp = mock.Mock()
         sp.is_scale_down = True
         sp.purged = False
+        sp.preempted = False
         del sp.drain_cap_seconds
         info = mock.Mock()
         info.replica_id = 7
         info.status_property = sp
+        info.status = (replica_managers.serve_state.ReplicaStatus.SHUTTING_DOWN)
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
+                               return_value=[info]), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replicas_at_status',
                                return_value=[]), \
-             mock.patch.object(
-                 replica_managers.serve_state,
-                 'get_replicas_at_status',
-                 side_effect=lambda _, status: [info] if status ==
-                 replica_managers.serve_state.ReplicaStatus.SHUTTING_DOWN else
-                 []), \
              mock.patch.object(replica_managers.serve_state,
                                'get_replica_info_from_id',
                                return_value=info):

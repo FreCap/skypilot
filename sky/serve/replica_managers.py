@@ -1205,8 +1205,50 @@ class SkyPilotReplicaManager(ReplicaManager):
                              f'{replica_info.replica_id}: '
                              f'{common_utils.format_exception(e)}')
 
-        for replica_info in serve_state.get_replicas_at_status(
-                self._service_name, serve_state.ReplicaStatus.SHUTTING_DOWN):
+        # A forced status refresh can remove a preempted spot cluster from
+        # global state before the replica row is marked preempted. If the
+        # controller crashes between those writes, the next prober cannot
+        # classify the replica (its handle is already gone). Detect that
+        # earliest crash window in one bulk lookup. Only active, successfully
+        # launched spot rows qualify; pending launches and retained failure
+        # records can legitimately lack a handle and must keep their existing
+        # recovery semantics.
+        active_statuses = {
+            serve_state.ReplicaStatus.STARTING,
+            serve_state.ReplicaStatus.READY,
+            serve_state.ReplicaStatus.NOT_READY,
+        }
+        active_spot_replicas = [
+            info for info in all_replica_infos
+            if (info.is_spot and not info.status_property.preempted and
+                info.status in active_statuses)
+        ]
+        active_spot_cluster_names = [
+            info.cluster_name for info in active_spot_replicas
+        ]
+        active_spot_status_fields = global_user_state.get_cluster_status_fields(
+            active_spot_cluster_names)
+        orphaned_spot_clusters = {
+            info.cluster_name
+            for info in active_spot_replicas
+            if info.cluster_name not in active_spot_status_fields
+        }
+
+        # Inspect the raw durable rows instead of querying only the derived
+        # SHUTTING_DOWN status.  A preemption is persisted before teardown is
+        # scheduled; a controller crash in that window leaves
+        # ``preempted=True`` with no ``sky_down_status``, so the derived status
+        # is not PREEMPTED or SHUTTING_DOWN yet.  Once teardown is scheduled,
+        # PREEMPTED also deliberately wins status derivation.  Both shapes
+        # must be re-driven or the cluster cleanup and replica row are
+        # stranded indefinitely.
+        to_down_replicas = [
+            info for info in all_replica_infos
+            if (info.status == serve_state.ReplicaStatus.SHUTTING_DOWN or
+                info.status_property.preempted or
+                info.cluster_name in orphaned_spot_clusters)
+        ]
+        for replica_info in to_down_replicas:
             try:
                 # A scale-down retirement interrupted by a controller
                 # restart re-enters a FULL bounded drain: its pre-crash
@@ -1214,14 +1256,37 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # state, and re-driving with no drain (as before) would
                 # kill whatever is still in flight. Worst case the total
                 # drain doubles; it never kills early. Purged and failure
-                # teardowns keep the immediate re-drive. (Preempted rows
-                # never appear here: `to_replica_status` derives PREEMPTED
-                # before SHUTTING_DOWN, so this scan does not see them --
-                # a pre-existing recovery gap independent of draining.)
+                # teardowns keep the immediate re-drive. Preempted replicas
+                # also re-drive immediately: their cloud instance is already
+                # gone (or partially gone), and the persisted preempted bit
+                # is itself sufficient to classify this as scale-down cleanup
+                # even if the crash preceded the is_scale_down write.
                 drain_cap: Optional[int] = None
                 status_property = replica_info.status_property
-                if (status_property.is_scale_down and
-                        not status_property.purged):
+                if replica_info.cluster_name in orphaned_spot_clusters:
+                    logger.warning(
+                        f'Recovering preempted replica '
+                        f'{replica_info.replica_id}: cluster '
+                        f'{replica_info.cluster_name!r} was removed before '
+                        'the preemption intent was persisted.')
+                    status_property.preempted = True
+                    # Persist the recovered intent before scheduling cleanup;
+                    # another crash is then caught by the raw preempted scan.
+                    serve_state.add_or_update_replica(self._service_name,
+                                                      replica_info.replica_id,
+                                                      replica_info)
+                is_preempted = status_property.preempted
+                # SpotPlacer is reconstructed with every location ACTIVE on a
+                # controller restart. Rebuild the preemption bench before the
+                # durable replica row (and its location evidence) is removed,
+                # including when the preempted intent was already persisted.
+                if is_preempted and self._spot_placer is not None:
+                    spot_location = replica_info.get_spot_location()
+                    if spot_location is not None:
+                        self._spot_placer.set_preemptive(spot_location)
+                is_scale_down = status_property.is_scale_down or is_preempted
+                if (is_scale_down and not status_property.purged and
+                        not is_preempted):
                     # Prefer the cap persisted when the retirement was
                     # scheduled (exact reuse across the restart); legacy
                     # rows predating the field re-resolve. getattr: the
@@ -1238,15 +1303,13 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # into this except and leave the replica SHUTTING_DOWN
                 # forever. Re-syncing after a restart is harmless
                 # (idempotent download).
-                left_in_record = not (status_property.is_scale_down or
-                                      status_property.purged)
-                self._terminate_replica(
-                    replica_info.replica_id,
-                    sync_down_logs=left_in_record,
-                    replica_drain_delay_seconds=0,
-                    purge=status_property.purged,
-                    is_scale_down=status_property.is_scale_down,
-                    in_flight_drain_cap_seconds=drain_cap)
+                left_in_record = not (is_scale_down or status_property.purged)
+                self._terminate_replica(replica_info.replica_id,
+                                        sync_down_logs=left_in_record,
+                                        replica_drain_delay_seconds=0,
+                                        purge=status_property.purged,
+                                        is_scale_down=is_scale_down,
+                                        in_flight_drain_cap_seconds=drain_cap)
             except Exception as e:  # pylint: disable=broad-except
                 logger.error('Failed to re-drive termination of replica '
                              f'{replica_info.replica_id}: '
