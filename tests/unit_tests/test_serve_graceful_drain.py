@@ -344,13 +344,16 @@ class TestRecoveryRedrive:
     """A scale-down retirement interrupted by a controller restart must
     re-enter a full bounded drain, not re-drive with no drain."""
 
-    def _redrive(self, is_scale_down, purged=False):
+    def _redrive(self, is_scale_down, purged=False, persisted_cap=None):
         rm = _scale_down_manager(spec_drain=600)
         rm._launch_thread_pool = {}
         rm._down_thread_pool = {}
         sp = mock.Mock()
         sp.is_scale_down = is_scale_down
         sp.purged = purged
+        # None models a legacy row without a persisted cap (a bare Mock
+        # attribute would read as a truthy persisted value).
+        sp.drain_cap_seconds = persisted_cap
         info = mock.Mock()
         info.replica_id = 7
         info.status_property = sp
@@ -394,6 +397,47 @@ class TestRecoveryRedrive:
         kwargs = self._redrive(is_scale_down=True)
         assert kwargs['sync_down_logs'] is False
 
+    def test_persisted_cap_reused_exactly_over_resolver(self):
+        # The spec here resolves to 600; the persisted cap (written when
+        # the retirement was scheduled) must win.
+        kwargs = self._redrive(is_scale_down=True, persisted_cap=450)
+        assert kwargs['in_flight_drain_cap_seconds'] == 450
+
+    def test_persisted_zero_cap_is_reused_not_re_resolved(self):
+        kwargs = self._redrive(is_scale_down=True, persisted_cap=0)
+        assert kwargs['in_flight_drain_cap_seconds'] == 0
+
+    def test_pre_field_row_falls_back_to_resolver(self):
+        # An unpickled row from before the field existed has no
+        # drain_cap_seconds attribute at all; getattr must default it.
+        kwargs = self._redrive(is_scale_down=True)
+        del kwargs  # Re-run with the attribute genuinely absent.
+        rm = _scale_down_manager(spec_drain=600)
+        rm._launch_thread_pool = {}
+        rm._down_thread_pool = {}
+        sp = mock.Mock()
+        sp.is_scale_down = True
+        sp.purged = False
+        del sp.drain_cap_seconds
+        info = mock.Mock()
+        info.replica_id = 7
+        info.status_property = sp
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_replicas_at_status',
+                 side_effect=lambda _, status: [info] if status ==
+                 replica_managers.serve_state.ReplicaStatus.SHUTTING_DOWN else
+                 []), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_info_from_id',
+                               return_value=info):
+            rm._recover_replica_operations()
+        kwargs = rm._terminate_replica.call_args.kwargs
+        assert kwargs['in_flight_drain_cap_seconds'] == 600
+
 
 class TestTerminateReplicaDrainAssembly:
     """Exercise the REAL _terminate_replica drain assembly (no mock of
@@ -410,7 +454,8 @@ class TestTerminateReplicaDrainAssembly:
                        is_pool=False,
                        url='http://r1:8080',
                        url_error=None,
-                       cap=300):
+                       cap=300,
+                       interrupted_launch=False):
         """Build a real manager and run the real _terminate_replica."""
         rm = replica_managers.SkyPilotReplicaManager.__new__(
             replica_managers.SkyPilotReplicaManager)
@@ -422,6 +467,11 @@ class TestTerminateReplicaDrainAssembly:
         rm._down_thread_pool = {}
         rm._replica_to_request_id = {}
         rm._replica_to_launch_cancelled = {}
+        if interrupted_launch:
+            finished_launch = mock.Mock()
+            finished_launch.is_alive.return_value = False
+            rm._launch_thread_pool = {7: finished_launch}
+            rm._replica_to_request_id = {7: 'req-7'}
         info = mock.Mock()
         info.cluster_name = 'svc-7-abc'
         info.status_property = replica_managers.ReplicaStatusProperty()
@@ -438,11 +488,19 @@ class TestTerminateReplicaDrainAssembly:
                 captured['args'] = args
                 captured['kwargs'] = kwargs or {}
 
+        writes = []
+
+        def _snapshot_write(_service_name, _replica_id, written_info):
+            writes.append((written_info.status_property.sky_launch_status,
+                           written_info.status_property.sky_down_status,
+                           written_info.status_property.drain_cap_seconds))
+
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_info_from_id',
                                return_value=info), \
              mock.patch.object(replica_managers.serve_state,
-                               'add_or_update_replica'), \
+                               'add_or_update_replica',
+                               side_effect=_snapshot_write), \
              mock.patch.object(replica_managers.global_user_state,
                                'cluster_with_name_exists',
                                return_value=True), \
@@ -453,7 +511,26 @@ class TestTerminateReplicaDrainAssembly:
                                   replica_drain_delay_seconds=0,
                                   is_scale_down=True,
                                   in_flight_drain_cap_seconds=cap)
+        captured['writes'] = writes
         return captured
+
+    def test_scheduled_write_persists_the_cap(self):
+        # The cap must land in the same write as SCHEDULED so recovery
+        # after a crash reuses it exactly (no re-resolution window).
+        captured = self._assemble_impl(cap=450)
+        scheduled = [
+            w for w in captured['writes']
+            if w[1] is replica_managers.common_utils.ProcessStatus.SCHEDULED
+        ]
+        assert scheduled and scheduled[0][2] == 450
+
+    def test_interrupted_launch_write_persists_the_cap(self):
+        # The INTERRUPTED row already derives SHUTTING_DOWN, so a crash
+        # between it and the SCHEDULED write must also leave the cap.
+        captured = self._assemble_impl(cap=450, interrupted_launch=True)
+        first = captured['writes'][0]
+        assert first == (
+            replica_managers.common_utils.ProcessStatus.INTERRUPTED, None, 450)
 
     def test_deadline_and_tracker_reach_the_thread(self):
         before = replica_managers.time.monotonic()
@@ -613,6 +690,15 @@ class TestSpecField:
             jsonschema.validate(
                 dict(self._BASE, graceful_drain_seconds=limit + 1),
                 schemas.get_service_schema())
+
+    def test_hour_scale_job_cap_fits_under_the_bound(self):
+        # A fleet whose async jobs run up to 3600s needs a cap strictly
+        # above 3600 (a job admitted at retirement runs its full length
+        # into the drain); the bound must keep accommodating ~3900.
+        config = dict(self._BASE, graceful_drain_seconds=3900)
+        jsonschema.validate(config, schemas.get_service_schema())
+        spec = service_spec_lib.SkyServiceSpec.from_yaml_config(config)
+        assert spec.graceful_drain_seconds == 3900
 
     def test_copy_preserves_and_overrides(self):
         spec = service_spec_lib.SkyServiceSpec.from_yaml_config(

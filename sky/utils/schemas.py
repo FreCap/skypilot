@@ -948,7 +948,7 @@ def get_service_schema():
             'graceful_drain_seconds': {
                 'type': 'integer',
                 'minimum': 0,
-                'maximum': 3600,
+                'maximum': 7200,
             },
             # Fast-ack jobs continue after their HTTP response. Declaring the
             # contract makes failed/never-run occupancy probes unknown from
