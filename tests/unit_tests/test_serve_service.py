@@ -107,7 +107,7 @@ class TestWaitForControllerReady:
 
 class TestOrphanExit:
     """Critical contract: _orphan_exit must NOT touch any DB state. It only
-    kills our forked subprocesses and calls os._exit(0). This is what
+    kills our controller child and calls os._exit(0). This is what
     distinguishes orphan exit from normal cleanup — the new owner is now
     responsible for replica state, version cleanup, services row deletion,
     etc."""
@@ -116,10 +116,8 @@ class TestOrphanExit:
         with mock.patch('os._exit') as mock_exit, \
              mock.patch('sky.serve.service.subprocess_utils.'
                         'kill_children_processes'):
-            # Pass two mock processes so the function has something to kill.
             ctrl = mock.Mock(pid=11111)
-            lb = mock.Mock(pid=22222)
-            service._orphan_exit(ctrl, lb)
+            service._orphan_exit(ctrl)
             mock_exit.assert_called_once_with(0)
 
     def test_does_not_call_cleanup(self):
@@ -129,32 +127,30 @@ class TestOrphanExit:
              mock.patch('sky.serve.service._cleanup') as mock_cleanup, \
              mock.patch('sky.serve.service.serve_state.'
                         'remove_service') as mock_remove, \
-             mock.patch('sky.serve.service.serve_state.'
+            mock.patch('sky.serve.service.serve_state.'
                         'remove_replica') as mock_remove_replica:
             ctrl = mock.Mock(pid=11111)
-            service._orphan_exit(ctrl, None)
+            service._orphan_exit(ctrl)
             mock_cleanup.assert_not_called()
             mock_remove.assert_not_called()
             mock_remove_replica.assert_not_called()
 
-    def test_kills_only_provided_subprocesses(self):
+    def test_kills_controller_child(self):
         with mock.patch('os._exit'), \
-             mock.patch('sky.serve.service.subprocess_utils.'
+            mock.patch('sky.serve.service.subprocess_utils.'
                         'kill_children_processes') as mock_kill:
             ctrl = mock.Mock(pid=11111)
-            lb = mock.Mock(pid=22222)
-            service._orphan_exit(ctrl, lb)
+            service._orphan_exit(ctrl)
             _, kwargs = mock_kill.call_args
-            # Both pids included.
-            assert sorted(kwargs['parent_pids']) == [11111, 22222]
+            assert kwargs['parent_pids'] == [11111]
             assert kwargs['force'] is True
 
     def test_handles_none_subprocesses(self):
-        """Both subprocesses may be None if we crashed before spawning."""
+        """The child may be None if we crashed before spawning."""
         with mock.patch('os._exit') as mock_exit, \
              mock.patch('sky.serve.service.subprocess_utils.'
                         'kill_children_processes') as mock_kill:
-            service._orphan_exit(None, None)
+            service._orphan_exit(None)
             mock_kill.assert_not_called()
             mock_exit.assert_called_once_with(0)
 
@@ -163,12 +159,34 @@ class TestOrphanExit:
         still must os._exit. Otherwise an exception leaves the orphan loop
         running."""
         with mock.patch('os._exit') as mock_exit, \
-             mock.patch('sky.serve.service.subprocess_utils.'
+            mock.patch('sky.serve.service.subprocess_utils.'
                         'kill_children_processes',
                         side_effect=OSError('no such process')):
             ctrl = mock.Mock(pid=11111)
-            service._orphan_exit(ctrl, None)
+            service._orphan_exit(ctrl)
             mock_exit.assert_called_once_with(0)
+
+
+class TestExitOnOwnershipLoss:
+
+    def test_success_does_not_exit(self):
+        with mock.patch('sky.serve.service._orphan_exit') as orphan_exit:
+            service._exit_on_ownership_loss(True, 'svc', 'publishing', None)
+        orphan_exit.assert_not_called()
+
+    def test_failed_cas_discards_child_via_orphan_exit(self):
+        controller = mock.Mock(pid=11111)
+        with mock.patch('sky.serve.service._orphan_exit') as orphan_exit, \
+             mock.patch('sky.serve.service._cleanup') as cleanup:
+            service._exit_on_ownership_loss(False, 'svc', 'publishing',
+                                            controller)
+        orphan_exit.assert_called_once_with(controller)
+        cleanup.assert_not_called()
+
+    def test_failed_preclaim_exits_without_child(self):
+        with mock.patch('sky.serve.service._orphan_exit') as orphan_exit:
+            service._exit_on_ownership_loss(False, 'svc', 'preclaiming', None)
+        orphan_exit.assert_called_once_with(None)
 
 
 class TestBailOnBootFailure:
@@ -387,14 +405,7 @@ class TestCleanupBlocksHaRecoveryButKeepsVersionSpecs:
 
 
 class TestRunCleanupAndFinalizeDeletesLb:
-    """`_run_cleanup_and_finalize` must delete the controller-owned external LB
-    on BOTH branches:
-
-    - success (row removed): the service is gone for good.
-    - FAILED_CLEANUP (row kept for --purge): the service no longer serves and
-      its controller port is reclaimable by a new service, so the dead LB must
-      go to keep the port safe to reclaim.
-    """
+    """The external LB is quiesced before destructive replica cleanup."""
 
     @staticmethod
     def _spec():
@@ -420,7 +431,8 @@ class TestRunCleanupAndFinalizeDeletesLb:
         mock_delete_lb.assert_called_once_with('svc')
 
     def test_failed_cleanup_lb_delete_error_is_swallowed(self):
-        with mock.patch('sky.serve.service._cleanup', return_value=True), \
+        with mock.patch('sky.serve.service._cleanup',
+                        return_value=True) as mock_cleanup, \
              mock.patch('sky.serve.service.serve_state.'
                         'set_service_status_and_active_versions'), \
              mock.patch('sky.serve.service.lb_k8s.delete_lb_objects',
@@ -431,6 +443,9 @@ class TestRunCleanupAndFinalizeDeletesLb:
                                               self._spec(),
                                               '/tmp/svc',
                                               job_id=1)
+        # Fail closed: replicas are not destroyed while their public LB may
+        # still be accepting requests.
+        mock_cleanup.assert_not_called()
 
     def test_deletes_lb_on_success(self):
         with mock.patch('sky.serve.service._cleanup', return_value=False), \
@@ -593,215 +608,19 @@ class TestCleanupStorageStaleBucket:
 
 
 # ---------------------------------------------------------------------------
-# _select_controller_port: stable per-service port assignment (W2).
-#
-# Default mode must be unchanged (ephemeral find_free_port). External load
-# balancer mode must return a STABLE port from the configured range: reuse the
-# service's own assigned port, and otherwise assign the lowest free port not
-# held by another service.
+# External-only controller port selection.
 # ---------------------------------------------------------------------------
 
 
-def _external_lb_mode():
-    return mock.patch.object(service.serve_utils,
-                             'is_external_load_balancer_mode',
-                             return_value=True)
-
-
-def test_select_controller_port_default_mode_uses_find_free_port():
-    with mock.patch.object(service.serve_utils,
-                           'is_external_load_balancer_mode',
-                           return_value=False), \
-         mock.patch.object(service.common_utils,
+def test_select_controller_port_is_always_local_and_ephemeral():
+    with mock.patch.object(service.common_utils,
                            'find_free_port',
-                           return_value=54321) as find_free_port:
+                           return_value=54321) as find_free_port, \
+         mock.patch.object(service.serve_state,
+                           'get_services') as get_services:
         assert service._select_controller_port('svc') == 54321
-        find_free_port.assert_called_once()
 
-
-def test_select_controller_port_reuses_assigned_in_range():
-    base = service.constants.CONTROLLER_PORT_START
-    with _external_lb_mode(), \
-         mock.patch.object(service.serve_state,
-                           'get_service_controller_port',
-                           return_value=base + 5), \
-         mock.patch.object(service.serve_state,
-                           'set_service_controller_port') as setter:
-        assert service._select_controller_port('svc') == base + 5
-        # A stable, in-range assignment must be reused, never rewritten.
-        setter.assert_not_called()
-
-
-def test_select_controller_port_assigns_lowest_free():
-    base = service.constants.CONTROLLER_PORT_START
-    others = [{
-        'name': 'a',
-        'controller_port': base
-    }, {
-        'name': 'b',
-        'controller_port': base + 1
-    }, {
-        'name': 'svc',
-        'controller_port': None
-    }]
-    with _external_lb_mode(), \
-         mock.patch.object(service.serve_state,
-                           'get_service_controller_port',
-                           return_value=None), \
-         mock.patch.object(service.serve_state,
-                           'get_services',
-                           return_value=others), \
-         mock.patch.object(service.serve_state,
-                           'set_service_controller_port') as setter:
-        # base and base+1 are taken by other services -> lowest free is base+2.
-        assert service._select_controller_port('svc') == base + 2
-        setter.assert_called_once_with('svc', base + 2)
-
-
-def test_select_controller_port_reassigns_when_out_of_range():
-    # A stale ephemeral port (from a prior in-pod-LB run) is not in the stable
-    # range and must be replaced with a range port.
-    base = service.constants.CONTROLLER_PORT_START
-    with _external_lb_mode(), \
-         mock.patch.object(service.serve_state,
-                           'get_service_controller_port',
-                           return_value=40000), \
-         mock.patch.object(service.serve_state,
-                           'get_services',
-                           return_value=[]), \
-         mock.patch.object(service.serve_state,
-                           'set_service_controller_port') as setter:
-        assert service._select_controller_port('svc') == base
-        setter.assert_called_once_with('svc', base)
-
-
-def test_select_controller_port_range_exhausted_raises():
-    base = service.constants.CONTROLLER_PORT_START
-    size = service.constants.CONTROLLER_PORT_RANGE_SIZE
-    full = [{
-        'name': f's{port}',
-        'controller_port': port
-    } for port in range(base, base + size)]
-    with _external_lb_mode(), \
-         mock.patch.object(service.serve_state,
-                           'get_service_controller_port',
-                           return_value=None), \
-         mock.patch.object(service.serve_state,
-                           'get_services',
-                           return_value=full), \
-         mock.patch.object(service.serve_state, 'set_service_controller_port'):
-        with pytest.raises(RuntimeError):
-            service._select_controller_port('svc')
-
-
-def test_select_controller_port_reclaims_terminal_service_port():
-    # A terminal (dying/broken) service still holds a row with its stable port,
-    # but under churn that port must be reclaimable -- otherwise the range leaks
-    # one port per dead service. base is occupied only by a terminal service, so
-    # the new service should be assigned base, not base+1.
-    base = service.constants.CONTROLLER_PORT_START
-    others = [{
-        'name': 'dead',
-        'controller_port': base,
-        'status': service.serve_state.ServiceStatus.FAILED_CLEANUP,
-    }, {
-        'name': 'live',
-        'controller_port': base + 1,
-        'status': service.serve_state.ServiceStatus.READY,
-    }]
-    with _external_lb_mode(), \
-         mock.patch.object(service.serve_state,
-                           'get_service_controller_port',
-                           return_value=None), \
-         mock.patch.object(service.serve_state,
-                           'get_services',
-                           return_value=others), \
-         mock.patch.object(service.serve_state,
-                           'set_service_controller_port') as setter:
-        assert service._select_controller_port('svc') == base
-        setter.assert_called_once_with('svc', base)
-
-
-def test_select_controller_port_live_service_port_not_reclaimed():
-    # A live (non-terminal) service's port must stay reserved; the new service
-    # skips base and takes base+1.
-    base = service.constants.CONTROLLER_PORT_START
-    others = [{
-        'name': 'live',
-        'controller_port': base,
-        'status': service.serve_state.ServiceStatus.READY,
-    }]
-    with _external_lb_mode(), \
-         mock.patch.object(service.serve_state,
-                           'get_service_controller_port',
-                           return_value=None), \
-         mock.patch.object(service.serve_state,
-                           'get_services',
-                           return_value=others), \
-         mock.patch.object(service.serve_state,
-                           'set_service_controller_port') as setter:
-        assert service._select_controller_port('svc') == base + 1
-        setter.assert_called_once_with('svc', base + 1)
-
-
-# ---------------------------------------------------------------------------
-# _ensure_load_balancer: in external load balancer mode (W3) the controller
-# must NOT spawn or supervise an in-pod load balancer (the LB is a separate
-# Deployment). Default mode still spawns.
-# ---------------------------------------------------------------------------
-
-
-def test_ensure_load_balancer_skipped_in_external_mode():
-    spec = mock.Mock()
-    spec.pool = False
-    with mock.patch.object(service.serve_utils,
-                           'is_external_load_balancer_mode',
-                           return_value=True), \
-         mock.patch.object(service, '_spawn_load_balancer') as spawn:
-        result = service._ensure_load_balancer(None, 'http://c:1', 30001, spec,
-                                               '/tmp/lb.log')
-        assert result is None
-        spawn.assert_not_called()
-
-
-def test_ensure_load_balancer_spawns_when_not_external():
-    spec = mock.Mock()
-    spec.pool = False
-    sentinel = mock.Mock()
-    with mock.patch.object(service.serve_utils,
-                           'is_external_load_balancer_mode',
-                           return_value=False), \
-         mock.patch.object(service, '_spawn_load_balancer',
-                           return_value=sentinel) as spawn:
-        result = service._ensure_load_balancer(None, 'http://c:1', 30001, spec,
-                                               '/tmp/lb.log')
-        assert result is sentinel
-        spawn.assert_called_once()
-
-
-def test_select_controller_port_assignment_takes_cross_pod_lock():
-    # New-port assignment must serialize across pods via the cross-pod lock;
-    # reuse of an already-assigned in-range port must NOT take the lock.
-    base = service.constants.CONTROLLER_PORT_START
-    lock_cm = mock.MagicMock()
-    with _external_lb_mode(), \
-         mock.patch.object(service.locks, 'get_lock',
-                           return_value=lock_cm) as get_lock, \
-         mock.patch.object(service.serve_state,
-                           'get_service_controller_port',
-                           return_value=None), \
-         mock.patch.object(service.serve_state,
-                           'get_services',
-                           return_value=[]), \
-         mock.patch.object(service.serve_state, 'set_service_controller_port'):
-        assert service._select_controller_port('svc') == base
-        get_lock.assert_called_once()
-        lock_cm.__enter__.assert_called_once()
-
-    with _external_lb_mode(), \
-         mock.patch.object(service.locks, 'get_lock') as get_lock_reuse, \
-         mock.patch.object(service.serve_state,
-                           'get_service_controller_port',
-                           return_value=base + 3):
-        assert service._select_controller_port('svc') == base + 3
-        get_lock_reuse.assert_not_called()
+    find_free_port.assert_called_once_with(
+        service.constants.CONTROLLER_PORT_START)
+    # The stable API proxy removes any need for a DB-wide port allocator.
+    get_services.assert_not_called()

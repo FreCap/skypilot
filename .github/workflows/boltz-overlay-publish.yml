@@ -34,8 +34,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        # build-overlay.sh ships the full sky/ tree at HEAD (git ls-tree), so a
-        # shallow default checkout is enough — no history or upstream ref needed.
+        # The overlay stamps git rev-list --count as its build number. A
+        # shallow checkout would incorrectly stamp every image as build 1.
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         # build-overlay.sh builds the dashboard (npm ci + npm run build in

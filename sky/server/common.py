@@ -876,13 +876,8 @@ def check_server_healthy(
 
 
 # Keep in sync with sky/setup_files/setup.py find_version()
-def get_skypilot_version_on_disk() -> str:
-    """Get the display version of the SkyPilot code on disk.
-
-    Composed the same way as sky.__display_version__ so that the running
-    process and the code on disk compare equal unless the code actually
-    changed (new commits bump the build number, hinting a server restart).
-    """
+def _get_skypilot_version_metadata_on_disk() -> Tuple[str, Optional[str]]:
+    """Get the internal version and stamped build number from disk."""
     current_file_path = pathlib.Path(__file__)
     assert str(current_file_path).endswith(
         'server/common.py'), current_file_path
@@ -897,6 +892,28 @@ def get_skypilot_version_on_disk() -> str:
     count_match = re.search(r'^_SKYPILOT_COMMIT_COUNT = [\'"]([^\'"]*)[\'"]',
                             content, re.M)
     build = count_match.group(1) if count_match else None
+    return version, build
+
+
+def get_skypilot_version_on_disk() -> str:
+    """Get the internal package version of the SkyPilot code on disk.
+
+    This value is used by the wheel builder to verify that the running code
+    and installed package match.  It must therefore stay in the same version
+    domain as ``sky.__version__``; user-facing build metadata belongs to
+    :func:`get_skypilot_display_version_on_disk`.
+    """
+    version, _ = _get_skypilot_version_metadata_on_disk()
+    return version
+
+
+def get_skypilot_display_version_on_disk() -> str:
+    """Get the user-facing version of the SkyPilot code on disk.
+
+    Composed the same way as ``sky.__display_version__`` so that the health
+    endpoint can detect a code update that requires an API server restart.
+    """
+    version, build = _get_skypilot_version_metadata_on_disk()
     if build is not None and 'SKYPILOT_COMMIT_COUNT' in build:
         # Development build: the placeholder is not stamped, so the code on
         # disk is the git checkout; get the count the same way the runtime

@@ -4,10 +4,62 @@ import subprocess
 import sys
 import time
 from unittest import mock
+import zipfile
 
 import pytest
 
+import sky
 from sky.backends import wheel_utils
+from sky.server import common
+
+
+@pytest.fixture
+def _current_version_guard():
+    """Keep subprocess mocks focused on the pip invocation under test."""
+    with mock.patch.object(common,
+                           'get_skypilot_version_on_disk',
+                           return_value=sky.__version__), \
+         mock.patch.object(common,
+                           'get_skypilot_display_version_on_disk',
+                           return_value=sky.__display_version__):
+        yield
+
+
+def test_wheel_build_version_guard_uses_internal_version():
+    """Display build metadata must not make provisioning reject the wheel."""
+    display_version = sky._compose_display_version(  # pylint: disable=protected-access
+        sky.__version__, '999999')
+    with mock.patch.object(sky, '_get_commit_count', return_value='999999'), \
+         mock.patch.object(sky, '__display_version__', display_version):
+        assert common.get_skypilot_version_on_disk() == sky.__version__
+        assert (
+            common.get_skypilot_display_version_on_disk() == display_version)
+
+        # Reaching pip proves _build_sky_wheel() compared internal package
+        # versions. Before the regression fix it raised a version mismatch
+        # before invoking pip because the on-disk helper returned 1.999999.0.
+        pip_error = subprocess.CalledProcessError(
+            returncode=1,
+            cmd=[sys.executable, '-m', 'pip', 'wheel'],
+            stderr='intentional regression-test failure')
+        with mock.patch('subprocess.run', side_effect=pip_error):
+            with pytest.raises(RuntimeError, match='pip wheel command failed'):
+                wheel_utils._build_sky_wheel()
+
+
+def test_wheel_build_version_guard_rejects_stale_display_version():
+    """A running server must not build a wheel from a newer checkout."""
+    with mock.patch.object(common,
+                           'get_skypilot_version_on_disk',
+                           return_value=sky.__version__), \
+         mock.patch.object(common,
+                           'get_skypilot_display_version_on_disk',
+                           return_value='1.999999.0'), \
+         mock.patch('subprocess.run') as mock_run:
+        with pytest.raises(RuntimeError,
+                           match='installed SkyPilot version is different'):
+            wheel_utils._build_sky_wheel()
+        mock_run.assert_not_called()
 
 
 def test_build_wheels():
@@ -15,6 +67,11 @@ def test_build_wheels():
     start = time.time()
     wheel_path, _ = wheel_utils.build_sky_wheel()
     assert wheel_path.exists()
+    if sky.__build__ is not None:
+        built_wheel = next(wheel_path.glob('*.whl'))
+        with zipfile.ZipFile(built_wheel) as wheel:
+            init_content = wheel.read('sky/__init__.py').decode('utf-8')
+        assert (f"_SKYPILOT_COMMIT_COUNT = '{sky.__build__}'" in init_content)
     duration = time.time() - start
 
     start = time.time()
@@ -38,7 +95,7 @@ def test_build_wheels():
     shutil.rmtree(wheel_utils.WHEEL_DIR, ignore_errors=True)
 
 
-def test_pip_missing_uv_environment():
+def test_pip_missing_uv_environment(_current_version_guard):
     """Test error handling when pip module is not found in UV environment."""
     with mock.patch('subprocess.run') as mock_run:
         mock_run.side_effect = subprocess.CalledProcessError(
@@ -59,7 +116,7 @@ def test_pip_missing_uv_environment():
             assert 'uv pip install pip' in error_msg
 
 
-def test_pip_missing_conda_environment():
+def test_pip_missing_conda_environment(_current_version_guard):
     """Test error handling when pip module is not found in conda environment."""
     with mock.patch('subprocess.run') as mock_run:
         mock_run.side_effect = subprocess.CalledProcessError(
@@ -87,7 +144,7 @@ def test_pip_missing_conda_environment():
             assert 'conda install pip' in error_msg
 
 
-def test_pip_missing_no_package_manager():
+def test_pip_missing_no_package_manager(_current_version_guard):
     """Test error handling when pip is missing with no known package manager."""
     with mock.patch('subprocess.run') as mock_run:
         mock_run.side_effect = subprocess.CalledProcessError(
@@ -107,7 +164,7 @@ def test_pip_missing_no_package_manager():
             assert sys.executable in error_msg
 
 
-def test_pip_command_other_failure():
+def test_pip_command_other_failure(_current_version_guard):
     """Test error handling when pip command fails for non-module reasons."""
     with mock.patch('subprocess.run') as mock_run:
         mock_run.side_effect = subprocess.CalledProcessError(
@@ -125,7 +182,7 @@ def test_pip_command_other_failure():
         assert 'Directory /tmp/something is not installable' in error_msg
 
 
-def test_python_executable_not_found():
+def test_python_executable_not_found(_current_version_guard):
     """Test error handling when Python executable is not found (rare case)."""
     with mock.patch('subprocess.run') as mock_run:
         mock_run.side_effect = FileNotFoundError(
@@ -139,7 +196,7 @@ def test_python_executable_not_found():
         assert sys.executable in error_msg
 
 
-def test_python_m_pip_usage():
+def test_python_m_pip_usage(_current_version_guard):
     """Test that we use 'python -m pip' instead of 'pip3'."""
     # This is a simpler test that just verifies the command format
     # The actual wheel building is tested in test_wheels.py

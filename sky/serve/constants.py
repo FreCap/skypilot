@@ -28,34 +28,54 @@ SERVE_CONSOLIDATION_MODE_LOCK_ID = '~/.sky/serve_consolidation_mode_lock'
 # Time to wait in seconds for controller to setup, this involves the time to run
 # cloud dependencies installation.
 CONTROLLER_SETUP_TIMEOUT_SECONDS = 300
-# Time to wait in seconds for service to register on the controller.
-SERVICE_REGISTER_TIMEOUT_SECONDS = 60
+# Time to wait for controller + external-LB registration. The LB image may need
+# a cold pull and must pass its sync-backed readiness probe before ``serve up``
+# can truthfully publish the endpoint.
+SERVICE_REGISTER_TIMEOUT_SECONDS = 180
+LB_DEPLOYMENT_READY_TIMEOUT_SECONDS = 120
+LB_DEPLOYMENT_READY_POLL_SECONDS = 1
 
-# Env var holding a shared bearer token that guards the controller's
-# CONTROL-PLANE endpoints: the destructive ones (/controller/update_service,
-# terminate_replica) AND the read-only sync/status paths (/load_balancer_sync,
-# /autoscaler/info). In external load balancer mode the controller port is
-# reachable on the pod network from the LB pod, so NetworkPolicy alone is
-# insufficient; the platform sets this (from a k8s secret) on both the
-# controller and its trusted callers, and the LB presents it on every sync so a
-# leaked in-cluster foothold can no longer scrape the replica set or drive the
-# controller. When unset (in-pod localhost-only default) auth is disabled and
-# behavior is unchanged.
+# Legacy env var holding one shared controller bearer token. New deployments
+# should use the two independent file-backed rings below: sharing the LB sync
+# credential with the controller-admin credential needlessly lets a compromised
+# LB invoke destructive controller endpoints. This remains as a fallback for
+# rolling upgrades from deployments that supplied one token to both callers.
 CONTROLLER_AUTH_TOKEN_ENV_VAR = 'SKYPILOT_SERVE_CONTROLLER_AUTH_TOKEN'
+
+# Newline-delimited token-ring files. The first line is the primary credential;
+# subsequent lines are overlap credentials accepted during a rotation. Files
+# are read on every request/sync so projected Kubernetes Secret updates take
+# effect without restarting the controller or LB.
+LB_SYNC_AUTH_TOKENS_FILE_ENV_VAR = ('SKYPILOT_SERVE_LB_SYNC_AUTH_TOKENS_FILE')
+CONTROLLER_ADMIN_AUTH_TOKENS_FILE_ENV_VAR = (
+    'SKYPILOT_SERVE_CONTROLLER_ADMIN_AUTH_TOKENS_FILE')
 
 # Env var holding a shared bearer token that guards INBOUND inference requests
 # to the external load balancer (data-plane auth), held by the inference
 # client. Kept DISTINCT from CONTROLLER_AUTH_TOKEN_ENV_VAR (control-plane) on
 # purpose: sharing them would let an inference client reach the controller's
 # destructive endpoints. The LB's readiness route (LB_HEALTH_ENDPOINT_PATH)
-# stays open so k8s can probe it. When unset, inbound auth is disabled and
-# behavior is unchanged.
+# stays open so k8s can probe it. External mode requires the file-backed ring;
+# this legacy value is only the single-token compatibility fallback.
 LB_AUTH_TOKEN_ENV_VAR = 'SKYPILOT_SERVE_LB_AUTH_TOKEN'
+LB_AUTH_TOKENS_FILE_ENV_VAR = 'SKYPILOT_SERVE_LB_AUTH_TOKENS_FILE'
+
+# Helm renders this explicit platform-capability signal. It is the single
+# source of truth for in-cluster API/controller/LB processes, avoiding a split
+# between the Helm values that create RBAC/Secret projections and a separate
+# persisted SkyPilot config flag.
+EXTERNAL_LB_ENABLED_ENV_VAR = 'SKYPILOT_SERVE_EXTERNAL_LB_ENABLED'
+
+# Downward-API-injected UID of the external LB pod. Unlike a process-local
+# UUID, this survives controller restarts as the durable LB incarnation key.
+LB_POD_UID_ENV_VAR = 'SKYPILOT_SERVE_LB_POD_UID'
+LB_RESOURCES_ENV_VAR = 'SKYPILOT_SERVE_LB_RESOURCES_JSON'
 
 # The load balancer's readiness route; exempt from inbound bearer auth so the
 # k8s readinessProbe (and any LB-level health check) can reach it. Kept here so
 # the route registration and the auth middleware share one source of truth.
 LB_HEALTH_ENDPOINT_PATH = '/_lb/health'
+LB_LIVENESS_ENDPOINT_PATH = '/_lb/liveness'
 
 # Hard cap on the number of request timestamps the LB retains between successful
 # controller syncs. The batch is retained (not dropped) across a failed sync so
@@ -92,6 +112,9 @@ LB_CONTROLLER_SYNC_INTERVAL_SECONDS = 20
 # tight makes the sync fail, leaving the load balancer with an empty
 # ready-replica list so it 503s every request even when READY replicas exist.
 LB_CONTROLLER_SYNC_TIMEOUT_SECONDS = 30
+# The API-service proxy must finish before the LB's outer timeout. Leave a
+# five-second budget for its owner reads and response forwarding.
+LB_CONTROLLER_PROXY_TIMEOUT_SECONDS = 25
 
 # [boltz fork] Cadence of the LB's per-replica async-occupancy probe (the
 # `async_capacity` action). The HTTP-envelope in-flight accounting reads ~0
@@ -323,31 +346,11 @@ CONTROLLER_AUTOSTOP = {
 DEFAULT_INITIAL_DELAY_SECONDS = 1200
 DEFAULT_MIN_REPLICAS = 1
 
-# Default port range start for controller and load balancer. Ports will be
-# automatically generated from this start port.
+# Default dynamic controller-port start and fixed per-service LB container
+# port. Controller ports stay pod-local; only each Kubernetes LB Service
+# exposes its own port 30001.
 CONTROLLER_PORT_START = 20001
 LOAD_BALANCER_PORT_START = 30001
-LOAD_BALANCER_PORT_RANGE = '30001-30020'
-
-# Size of the stable per-service controller port range used in external load
-# balancer mode (serve.controller.external_load_balancer). In that mode each
-# service is assigned a fixed port in [CONTROLLER_PORT_START,
-# CONTROLLER_PORT_START + CONTROLLER_PORT_RANGE_SIZE) that is persisted and
-# reused across controller respawns and pod rolls, so an external load
-# balancer has a stable controller address to target. This bounds the number
-# of concurrent services per controller pod; the k8s Service must expose the
-# same range.
-CONTROLLER_PORT_RANGE_SIZE = 100
-
-# Cross-pod lock serializing stable controller-port assignment in external
-# load balancer mode. On a Postgres backend get_lock() resolves this to a
-# session advisory lock (shared across api-server pods); on SQLite it is a
-# node-local filelock (single pod, sufficient). Needed because the
-# per-node PORT_SELECTION_FILE_LOCK cannot serialize two pods scanning the
-# shared DB for a free port.
-CONTROLLER_PORT_ASSIGNMENT_LOCK_ID = (
-    '~/.sky/serve_controller_port_assignment_lock')
-CONTROLLER_PORT_ASSIGNMENT_LOCK_TIMEOUT_SECONDS = 30
 
 # Initial version of service.
 INITIAL_VERSION = 1
@@ -362,6 +365,10 @@ REPLICA_ID_ENV_VAR = 'SKYPILOT_SERVE_REPLICA_ID'
 # (metadata.name). It is a hard contract: without it the controller cannot
 # resolve the LB image.
 POD_NAME_ENV_VAR = 'SKYPILOT_POD_NAME'
+# Downward-API-injected namespace of the API/controller pod. Controller-owned
+# LB objects and their projected Secrets live beside that pod even when the
+# configured Kubernetes workload namespace is different.
+POD_NAMESPACE_ENV_VAR = 'SKYPILOT_POD_NAMESPACE'
 
 # The version of the lib files that serve use. Whenever there is an API
 # change for the serve_utils.ServeCodeGen, we need to bump this version, so that

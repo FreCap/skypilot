@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 import contextlib
 import datetime
 import hashlib
+import hmac
 import html
 import json
 import multiprocessing
@@ -60,6 +61,9 @@ from sky.provision.kubernetes import utils as kubernetes_utils
 from sky.provision.slurm import utils as slurm_utils
 from sky.recipes import server as recipes_rest
 from sky.schemas.api import responses
+from sky.serve import lb_rbac_preflight
+from sky.serve import serve_utils
+from sky.serve.server import controller_proxy as serve_controller_proxy
 from sky.serve.server import server as serve_rest
 from sky.server import clean_env as clean_env_module
 from sky.server import common
@@ -541,6 +545,83 @@ class BearerTokenMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
 
 
 @middleware_utils.websocket_aware
+class InternalServeControllerSyncAuthMiddleware(
+        starlette.middleware.base.BaseHTTPMiddleware):
+    """Authenticate the external LB's stable controller-sync route.
+
+    This middleware sits outside the normal Bearer, Basic, and OAuth
+    middlewares.  Only a request carrying one of the dedicated LB-sync tokens
+    is marked as authenticated, which lets that exact internal route bypass
+    user-facing authentication without exposing any other API route.
+    """
+
+    async def dispatch(self, request: fastapi.Request, call_next):
+        if not serve_controller_proxy.is_controller_sync_path(request.url.path):
+            return await call_next(request)
+
+        try:
+            # Read the ring on every request so a projected Secret rotation is
+            # honored without restarting the API server.
+            auth_tokens = serve_utils.get_lb_sync_auth_tokens(required=True)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.error(f'LB sync authentication is unavailable: {e}')
+            return fastapi.responses.JSONResponse(
+                status_code=503,
+                content={
+                    'detail': 'Controller sync authentication is '
+                              'unavailable.'
+                })
+
+        if not auth_tokens:
+            logger.error('LB sync authentication returned an empty token ring.')
+            return fastapi.responses.JSONResponse(
+                status_code=503,
+                content={
+                    'detail': 'Controller sync authentication is '
+                              'unavailable.'
+                })
+
+        authorization = request.headers.get('authorization')
+        presented_token: Optional[str] = None
+        if authorization is not None:
+            scheme, separator, token_value = authorization.partition(' ')
+            if (separator and scheme.lower() == 'bearer' and token_value and
+                    token_value == token_value.strip() and
+                    not any(character.isspace() for character in token_value)):
+                presented_token = token_value
+
+        authenticated = False
+        if presented_token is not None:
+            presented_bytes = presented_token.encode('utf-8')
+            # Do not stop on the first match: keep comparison work independent
+            # of which token in the overlap ring was presented.
+            for expected_token in auth_tokens:
+                if not isinstance(expected_token, str) or not expected_token:
+                    logger.error('LB sync authentication returned an invalid '
+                                 'token ring.')
+                    return fastapi.responses.JSONResponse(
+                        status_code=503,
+                        content={
+                            'detail': 'Controller sync authentication is '
+                                      'unavailable.'
+                        })
+                authenticated |= hmac.compare_digest(
+                    presented_bytes, expected_token.encode('utf-8'))
+
+        if not authenticated:
+            return _bearer_auth_401_response(
+                {'detail': 'Invalid controller sync bearer token.'})
+
+        # Normal authentication middlewares use this state as their trusted
+        # "already authenticated" signal.  RBAC does not apply to /api/*.
+        request.state.auth_user = models.User(
+            id='skypilot-system-lb-sync',
+            name='SkyServe external load balancer',
+            user_type=models.UserType.SYSTEM.value)
+        return await call_next(request)
+
+
+@middleware_utils.websocket_aware
 class AuthProxyMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
     """Middleware to handle external auth proxy.
 
@@ -752,6 +833,11 @@ async def schedule_on_boot_check_async():
 async def lifespan(app: fastapi.FastAPI):  # pylint: disable=redefined-outer-name
     """FastAPI lifespan context manager."""
     del app  # unused
+
+    # LB RBAC is namespace-wide, not service-specific. Run this once in the
+    # API process instead of issuing 11 identical access reviews in every
+    # per-service controller child during a large recovery.
+    await asyncio.to_thread(lb_rbac_preflight.check_lb_rbac_preflight)
 
     # Startup: Run background tasks. Delete any persisted daemon rows whose
     # ids are no longer in INTERNAL_REQUEST_DAEMONS first (daemon renamed /
@@ -994,6 +1080,11 @@ if (str(enable_basic_auth).lower() == 'true' and
 # Bearer token middleware should always be present to handle service account
 # authentication
 app.add_middleware(BearerTokenMiddleware)
+# This must be added after the normal auth middlewares (therefore wrapping
+# them), but before InitializeRequestAuthUserMiddleware (which wraps this and
+# initializes request.state.auth_user first). A valid dedicated sync token can
+# then bypass Basic/OAuth; an invalid token never reaches them or the handler.
+app.add_middleware(InternalServeControllerSyncAuthMiddleware)
 # InitializeRequestAuthUserMiddleware must be the last added middleware so that
 # request.state.auth_user is always set, but can be overridden by the auth
 # middleware above.
@@ -1017,6 +1108,7 @@ if __name__ == 'sky.server.server':
 
 app.include_router(jobs_rest.router, prefix='/jobs', tags=['jobs'])
 app.include_router(serve_rest.router, prefix='/serve', tags=['serve'])
+app.include_router(serve_controller_proxy.router)
 app.include_router(users_rest.router, prefix='/users', tags=['users'])
 app.include_router(workspaces_rest.router,
                    prefix='/workspaces',
@@ -2730,7 +2822,7 @@ async def health(request: fastapi.Request) -> responses.APIHealthResponse:
         # commit. The internal sky.__version__ (with its -dev0 marker) keeps
         # flowing through the version-compatibility headers.
         version=sky.__display_version__,
-        version_on_disk=common.get_skypilot_version_on_disk(),
+        version_on_disk=common.get_skypilot_display_version_on_disk(),
         commit=sky.__commit__,
         # Build number that auto-increments with every commit.
         build=sky.__build__,

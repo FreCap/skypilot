@@ -330,8 +330,8 @@ class TestRetryShortCircuit(unittest.TestCase):
         self.assertIn('Retry-After', exc.headers)
 
     def test_transport_failures_keep_fallback_attempts(self):
-        # A lone replica's pre-send connection blip must still recover
-        # transparently, including for a non-idempotent POST.
+        # A lone replica's pre-dispatch connection blip proves the POST did not
+        # reach the application, so it can still recover transparently.
         attempts = []
 
         async def _proxy(url, request):
@@ -348,10 +348,9 @@ class TestRetryShortCircuit(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(attempts), 3)
 
-    def test_post_ambiguous_transport_failure_is_retried(self):
-        # Async serving uses at-least-once delivery: a read/protocol failure
-        # may have followed acceptance, but availability takes precedence and
-        # the request is retried on another replica.
+    def test_post_ambiguous_transport_failure_is_not_retried(self):
+        # A read/protocol failure may have followed acceptance. Replaying the
+        # POST on another replica would silently create a duplicate job.
         for error in (httpx.ReadError('reset after send'),
                       httpx.RemoteProtocolError('bad response after send')):
             with self.subTest(error=type(error).__name__):
@@ -368,11 +367,11 @@ class TestRetryShortCircuit(unittest.TestCase):
                                           _proxy)
                 with mock.patch('sky.serve.load_balancer.asyncio.sleep',
                                 new=mock.AsyncMock()):
-                    response = asyncio.run(
-                        balancer._proxy_with_retries(_request()))
-                self.assertEqual(response.status_code, 202)
-                self.assertEqual(len(attempts), 2)
-                self.assertNotEqual(attempts[0], attempts[1])
+                    with self.assertRaises(fastapi.HTTPException) as ctx:
+                        asyncio.run(balancer._proxy_with_retries(_request()))
+                self.assertEqual(ctx.exception.status_code, 502)
+                self.assertIn('was not replayed', ctx.exception.detail)
+                self.assertEqual(len(attempts), 1)
 
     def test_get_ambiguous_transport_failure_remains_retryable(self):
         attempts = []

@@ -42,6 +42,20 @@ PLATFORM="${PLATFORM:-linux/amd64}"
 TAG="${TAG:-skypilot-nightly-boltz:${BASE_VER}-dev}"
 PUSH="${PUSH:-false}"
 
+# Fail before pulling the base image or rebuilding the dashboard: the commit
+# count is part of the shipped identity and cannot be computed correctly from
+# a shallow clone.
+if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+  echo "error: a full git history is required to compute the overlay build number" >&2
+  echo "       fetch with --unshallow before running this build." >&2
+  exit 1
+fi
+overlay_commit="$(git rev-parse HEAD)"
+if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+  overlay_commit="${overlay_commit}-dirty"
+fi
+overlay_build="$(git rev-list --count HEAD)"
+
 echo ">> Overlay file set: full fork sky/ tree at HEAD (tests excluded)"
 files=()
 while IFS= read -r f; do [ -n "$f" ] && files+=("$f"); done < <(
@@ -99,6 +113,35 @@ fi
 
 ctx="$(mktemp -d)"; trap 'rm -rf "$ctx"' EXIT
 for f in "${files[@]}"; do mkdir -p "$ctx/$(dirname "$f")"; cp "$f" "$ctx/$f"; done
+
+# The overlay replaces the base wheel's sky/__init__.py, so its source-tree
+# placeholders must be stamped here. There is no .git directory in the final
+# image from which the runtime fallback could recover this metadata.
+OVERLAY_COMMIT="$overlay_commit" OVERLAY_BUILD="$overlay_build" \
+  python3 - "$ctx/sky/__init__.py" <<'PY'
+import os
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+content = path.read_text(encoding='utf-8')
+for name, value in (
+    ('_SKYPILOT_COMMIT_SHA', os.environ['OVERLAY_COMMIT']),
+    ('_SKYPILOT_COMMIT_COUNT', os.environ['OVERLAY_BUILD']),
+):
+    content, replacements = re.subn(
+        rf'^{name} = [\'\"][^\'\"]*[\'\"]',
+        f"{name} = '{value}'",
+        content,
+        count=1,
+        flags=re.MULTILINE)
+    if replacements != 1:
+        raise RuntimeError(f'could not stamp {name} in {path}')
+path.write_text(content, encoding='utf-8')
+PY
+echo ">> Stamped overlay identity: commit ${overlay_commit}, build ${overlay_build}"
+
 # Ship ONLY the static export (out/) — never node_modules/.next; the server
 # serves sky/dashboard/out directly (sky/server/constants.py: DASHBOARD_DIR),
 # so the recursive COPY sky/ in the Dockerfile lands it at
@@ -111,13 +154,21 @@ cp boltz/Dockerfile.overlay "$ctx/Dockerfile"
 echo ">> Building ${TAG} (${PLATFORM}, base ${BASE_IMAGE})"
 docker build --platform "$PLATFORM" --build-arg "BASE_IMAGE=${BASE_IMAGE}" -t "$TAG" "$ctx"
 
-echo ">> Verifying overlaid modules import + control-loop API + dashboard present"
-docker run --rm --platform "$PLATFORM" "$TAG" python -c "
+echo ">> Verifying overlay identity + modules + control-loop API + dashboard"
+docker run --rm --platform "$PLATFORM" \
+  -e "EXPECTED_SKYPILOT_COMMIT=${overlay_commit}" \
+  -e "EXPECTED_SKYPILOT_BUILD=${overlay_build}" \
+  "$TAG" python -c "
 import inspect, os
+import sky
 import sky.serve.controller, sky.serve.replica_managers, sky.serve.load_balancer
 from sky.utils import controller_utils
 import sky.server.config
 from sky.server import constants as server_constants
+assert sky.__commit__ == os.environ['EXPECTED_SKYPILOT_COMMIT']
+assert sky.__build__ == os.environ['EXPECTED_SKYPILOT_BUILD']
+assert sky.__display_version__ == sky._compose_display_version(
+    sky.__version__, sky.__build__)
 assert hasattr(controller_utils, 'in_flight_launch_count')
 assert 'in_flight' in inspect.signature(controller_utils.can_provision).parameters
 index = os.path.join(server_constants.DASHBOARD_DIR, 'index.html')

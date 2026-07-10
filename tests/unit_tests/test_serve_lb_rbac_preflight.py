@@ -27,9 +27,8 @@ def _install(monkeypatch,
                         'is_external_load_balancer_mode', lambda: external)
     monkeypatch.setattr(lb_rbac_preflight.kubernetes_utils,
                         'is_incluster_config_available', lambda: incluster)
-    monkeypatch.setattr(lb_rbac_preflight.kubernetes_utils,
-                        'get_kube_config_context_namespace',
-                        lambda ctx: namespace)
+    monkeypatch.setattr(lb_rbac_preflight.lb_k8s, 'get_lb_namespace',
+                        lambda: namespace)
     monkeypatch.setattr(lb_rbac_preflight.kubernetes, 'in_cluster_context_name',
                         lambda: 'in-cluster')
     # Body construction goes through kubernetes.kubernetes.client.*; the real
@@ -41,8 +40,9 @@ def _install(monkeypatch,
                         lambda ctx=None: authz_client)
 
 
-# deployments x 4 verbs + services x 4 verbs + pods x 1 verb (get) = 9.
-_EXPECTED_REVIEW_CALLS = 9
+# deployments x 5 + services x 5 + pods x 2 + pods/log x 1 = 13.
+_EXPECTED_REVIEW_CALLS = sum(
+    len(verbs) for _, _, verbs in lb_rbac_preflight._REQUIRED_CHECKS)
 
 
 def test_all_allowed_does_not_raise(monkeypatch):
@@ -60,17 +60,9 @@ def test_one_verb_denied_raises(monkeypatch):
     authz = mock.MagicMock()
     # First review allowed, then one denied; the loop should collect it and
     # ultimately raise.
-    authz.create_self_subject_access_review.side_effect = [
-        _make_review(True),
-        _make_review(False),
-        _make_review(True),
-        _make_review(True),
-        _make_review(True),
-        _make_review(True),
-        _make_review(True),
-        _make_review(True),
-        _make_review(True),
-    ]
+    authz.create_self_subject_access_review.side_effect = (
+        [_make_review(True), _make_review(False)] + [_make_review(True)] *
+        (_EXPECTED_REVIEW_CALLS - 2))
     _install(monkeypatch, authz)
 
     with pytest.raises(RuntimeError):

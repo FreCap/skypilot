@@ -200,17 +200,36 @@ spec:
             fieldRef:
               fieldPath: status.podIP
         {{- end }}
-        {{- if .Values.serve.externalLoadBalancer.enabled }}
-        # The controller reads SKYPILOT_POD_NAME to mirror its own image onto
-        # the external LB it spawns (matches sky/serve/constants.py POD_NAME_ENV_VAR).
-        - name: SKYPILOT_POD_NAME
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.name
+        # Keep the API pod namespace available even when external LB creation
+        # is disabled. Cleanup code can still remove residual LB objects when
+        # this pod retains in-cluster credentials (the supported disable flow
+        # downs services before changing the Helm capability).
         - name: SKYPILOT_POD_NAMESPACE
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace
+        - name: SKYPILOT_SERVE_EXTERNAL_LB_ENABLED
+          value: {{ ternary "true" "false" .Values.serve.externalLoadBalancer.enabled | quote }}
+        {{- if .Values.serve.externalLoadBalancer.enabled }}
+        # Identity used to mirror the owning pod's image and selected Secret
+        # projections onto each per-service external LB Deployment.
+        - name: SKYPILOT_POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        # Stable API Service address for controller administration/recovery.
+        - name: SKYPILOT_SERVE_API_SERVICE_URL
+          value: {{ printf "http://%s-api-service.%s.svc" $fullName .Release.Namespace | quote }}
+        - name: SKYPILOT_SERVE_LB_RESOURCES_JSON
+          value: {{ toJson .Values.serve.externalLoadBalancer.resources | quote }}
+        # Projected files are re-read by SkyServe, allowing overlap-token
+        # rotation without restarting the API server or external LB pods.
+        - name: SKYPILOT_SERVE_LB_SYNC_AUTH_TOKENS_FILE
+          value: /etc/skypilot/serve-auth/lb-sync/tokens
+        - name: SKYPILOT_SERVE_CONTROLLER_ADMIN_AUTH_TOKENS_FILE
+          value: /etc/skypilot/serve-auth/controller-admin/tokens
+        - name: SKYPILOT_SERVE_LB_AUTH_TOKENS_FILE
+          value: /etc/skypilot/serve-auth/lb-data-plane/tokens
         {{- end }}
         # Use tini as the init process
         command: ["tini", "--"]
@@ -474,6 +493,20 @@ spec:
         {{- if .Values.nebiusCredentials.enabled }}
         - name: nebius-credentials
           mountPath: /root/.nebius_credentials
+        {{- end }}
+        {{- if .Values.serve.externalLoadBalancer.enabled }}
+        # Keep the three trust domains in independent mounts. lb_k8s mirrors
+        # only the sync and data-plane volumes into LB pods; the controller
+        # admin ring must never be present there.
+        - name: skypilot-serve-lb-sync-auth
+          mountPath: /etc/skypilot/serve-auth/lb-sync
+          readOnly: true
+        - name: skypilot-serve-controller-admin-auth
+          mountPath: /etc/skypilot/serve-auth/controller-admin
+          readOnly: true
+        - name: skypilot-serve-lb-auth
+          mountPath: /etc/skypilot/serve-auth/lb-data-plane
+          readOnly: true
         {{- end }}
         {{- if .Values.apiService.extraVolumeMounts }}
         {{- toYaml .Values.apiService.extraVolumeMounts | nindent 8 }}
@@ -883,6 +916,37 @@ spec:
       - name: slurm-config
         secret:
           secretName: {{ $fullName }}-slurm-config
+      {{- end }}
+      {{- if .Values.serve.externalLoadBalancer.enabled }}
+      # Separate projected volumes make the source Secret metadata explicit to
+      # lb_k8s while preserving strict trust-domain boundaries.
+      - name: skypilot-serve-lb-sync-auth
+        projected:
+          defaultMode: 0400
+          sources:
+          - secret:
+              name: {{ required "serve.externalLoadBalancer.auth.lbSync.existingSecret is required when serve.externalLoadBalancer.enabled=true" .Values.serve.externalLoadBalancer.auth.lbSync.existingSecret | quote }}
+              items:
+              - key: {{ required "serve.externalLoadBalancer.auth.lbSync.key is required when serve.externalLoadBalancer.enabled=true" .Values.serve.externalLoadBalancer.auth.lbSync.key | quote }}
+                path: tokens
+      - name: skypilot-serve-controller-admin-auth
+        projected:
+          defaultMode: 0400
+          sources:
+          - secret:
+              name: {{ required "serve.externalLoadBalancer.auth.controllerAdmin.existingSecret is required when serve.externalLoadBalancer.enabled=true" .Values.serve.externalLoadBalancer.auth.controllerAdmin.existingSecret | quote }}
+              items:
+              - key: {{ required "serve.externalLoadBalancer.auth.controllerAdmin.key is required when serve.externalLoadBalancer.enabled=true" .Values.serve.externalLoadBalancer.auth.controllerAdmin.key | quote }}
+                path: tokens
+      - name: skypilot-serve-lb-auth
+        projected:
+          defaultMode: 0400
+          sources:
+          - secret:
+              name: {{ required "serve.externalLoadBalancer.auth.lbDataPlane.existingSecret is required when serve.externalLoadBalancer.enabled=true" .Values.serve.externalLoadBalancer.auth.lbDataPlane.existingSecret | quote }}
+              items:
+              - key: {{ required "serve.externalLoadBalancer.auth.lbDataPlane.key is required when serve.externalLoadBalancer.enabled=true" .Values.serve.externalLoadBalancer.auth.lbDataPlane.key | quote }}
+                path: tokens
       {{- end }}
       {{- if .Values.apiService.extraVolumes }}
       {{- toYaml .Values.apiService.extraVolumes | nindent 6 }}

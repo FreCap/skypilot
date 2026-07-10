@@ -1331,11 +1331,12 @@ tests:
           content:
             name: SOME_OTHER_ENV
             value: "x"
-      # Total env count = baseline (9, with chart's POD_IP suppressed: 8) + 2
-      # user-provided = 10. A duplicate would push it to 11.
+      # Total env count = baseline (11, including POD_NAMESPACE and the
+      # explicit external-LB capability flag, with chart POD_IP suppressed:
+      # 10) + 2 user-provided = 12. A duplicate would push it to 13.
       - lengthEqual:
           path: spec.template.spec.containers[0].env
-          count: 10
+          count: 12
 
   - it: should not duplicate POD_IP env when global.extraEnvs already provides it
     set:
@@ -1345,7 +1346,8 @@ tests:
             fieldRef:
               fieldPath: status.podIP
     asserts:
-      # Baseline (9) - chart's POD_IP suppressed (8) + user's POD_IP (1) = 9.
+      # Baseline (11, including POD_NAMESPACE and the external-LB capability)
+      # - chart POD_IP (10) + user POD_IP (1) = 11.
       - lengthEqual:
           path: spec.template.spec.containers[0].env
-          count: 9
+          count: 11

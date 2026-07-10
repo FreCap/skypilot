@@ -24,6 +24,14 @@ from sky.serve import load_balancer
 from sky.serve import serve_utils
 
 
+@pytest.fixture(autouse=True)
+def _clear_token_file_envs(monkeypatch):
+    for env_var in (constants.LB_SYNC_AUTH_TOKENS_FILE_ENV_VAR,
+                    constants.CONTROLLER_ADMIN_AUTH_TOKENS_FILE_ENV_VAR,
+                    constants.LB_AUTH_TOKENS_FILE_ENV_VAR):
+        monkeypatch.delenv(env_var, raising=False)
+
+
 def _make_lb() -> load_balancer.SkyServeLoadBalancer:
     return load_balancer.SkyServeLoadBalancer(controller_url='http://ctrl:8001',
                                               load_balancer_port=8890)
@@ -101,6 +109,56 @@ def test_get_lb_auth_token_reads_env(monkeypatch):
     assert serve_utils.get_lb_auth_token() is None
 
 
+def test_file_token_ring_is_live_and_legacy_env_is_only_fallback(
+        monkeypatch, tmp_path):
+    ring = tmp_path / 'lb.tokens'
+    ring.write_text('new\nold\n', encoding='utf-8')
+    monkeypatch.setenv(constants.LB_AUTH_TOKENS_FILE_ENV_VAR, str(ring))
+    monkeypatch.setenv(constants.LB_AUTH_TOKEN_ENV_VAR, 'legacy')
+    assert serve_utils.get_lb_auth_tokens() == ('new', 'old')
+
+    # The same process observes a projected-secret rewrite on the next call.
+    ring.write_text('next\nnew\n', encoding='utf-8')
+    assert serve_utils.get_lb_auth_tokens() == ('next', 'new')
+
+    monkeypatch.delenv(constants.LB_AUTH_TOKENS_FILE_ENV_VAR)
+    assert serve_utils.get_lb_auth_tokens() == ('legacy',)
+
+
+@pytest.mark.parametrize('contents',
+                         ['', '\n', 'ok\n\nbad\n', 'bad token\n', 'nñ\n'])
+def test_file_token_ring_rejects_empty_or_malformed(monkeypatch, tmp_path,
+                                                    contents):
+    ring = tmp_path / 'lb.tokens'
+    ring.write_text(contents, encoding='utf-8')
+    monkeypatch.setenv(constants.LB_AUTH_TOKENS_FILE_ENV_VAR, str(ring))
+    with pytest.raises(serve_utils.AuthTokenConfigurationError):
+        serve_utils.get_lb_auth_tokens(required=True)
+
+
+def test_required_token_ring_rejects_missing_or_unreadable(
+        monkeypatch, tmp_path):
+    monkeypatch.delenv(constants.LB_AUTH_TOKEN_ENV_VAR, raising=False)
+    with pytest.raises(serve_utils.AuthTokenConfigurationError):
+        serve_utils.get_lb_auth_tokens(required=True)
+
+    monkeypatch.setenv(constants.LB_AUTH_TOKENS_FILE_ENV_VAR,
+                       str(tmp_path / 'missing'))
+    with pytest.raises(serve_utils.AuthTokenConfigurationError):
+        serve_utils.get_lb_auth_tokens(required=True)
+
+
+def test_inbound_token_ring_accepts_overlap(monkeypatch, tmp_path):
+    ring = tmp_path / 'lb.tokens'
+    ring.write_text('new\nold\n', encoding='utf-8')
+    monkeypatch.setenv(constants.LB_AUTH_TOKENS_FILE_ENV_VAR, str(ring))
+    for token in ('new', 'old'):
+        assert _authorized(
+            _scope('/predict', headers={'authorization': f'Bearer {token}'}))
+    assert not _authorized(
+        _scope('/predict', headers={'authorization': 'Bearer stale'}))
+
+
 def test_inbound_and_control_plane_tokens_are_independent(monkeypatch):
     # Setting the control-plane token must NOT enable inbound auth, and vice
     # versa -- an inference client's token must never reach the controller.
@@ -126,6 +184,10 @@ class _FakeResp:
                                               history=(),
                                               status=self._status)
 
+    @property
+    def status(self):
+        return self._status
+
     async def json(self):
         return {'replica_info': {}, 'routing_spec': None}
 
@@ -142,13 +204,17 @@ class _FakeResp:
 class _FakeSession:
 
     def __init__(self, status, captured):
-        self._status = status
+        self._statuses = list(status) if isinstance(status, list) else [status]
         self._captured = captured
 
     def post(self, *args, **kwargs):
         self._captured['headers'] = kwargs.get('headers')
         self._captured['json'] = kwargs.get('json')
-        return _FakeResp(self._status, self._captured)
+        self._captured.setdefault('headers_history',
+                                  []).append(kwargs.get('headers'))
+        self._captured.setdefault('json_history', []).append(kwargs.get('json'))
+        status = self._statuses.pop(0)
+        return _FakeResp(status, self._captured)
 
     async def __aenter__(self):
         return self
@@ -177,6 +243,47 @@ def test_sync_no_token_sends_no_header(monkeypatch):
     captured = {}
     _sync_once(monkeypatch, lb, 200, captured)
     assert captured['headers'] is None
+
+
+def test_sync_ring_falls_back_only_after_401_without_redraining(
+        monkeypatch, tmp_path):
+    ring = tmp_path / 'sync.tokens'
+    ring.write_text('primary\noverlap\n', encoding='utf-8')
+    monkeypatch.setenv(constants.LB_SYNC_AUTH_TOKENS_FILE_ENV_VAR, str(ring))
+    lb = _make_lb()
+    lb._request_aggregator.timestamps.extend([1, 2, 3])
+    captured = {}
+
+    _sync_once(monkeypatch, lb, [401, 200], captured)
+
+    assert captured['headers_history'] == [
+        {
+            'Authorization': 'Bearer primary'
+        },
+        {
+            'Authorization': 'Bearer overlap'
+        },
+    ]
+    assert len(captured['json_history']) == 2
+    assert captured['json_history'][0] is captured['json_history'][1]
+    assert captured['json_history'][0]['request_aggregator']['timestamps'] == [
+        1, 2, 3
+    ]
+    assert lb._request_aggregator.to_dict()['timestamps'] == []
+
+
+def test_sync_ring_does_not_fallback_on_non_401(monkeypatch, tmp_path):
+    ring = tmp_path / 'sync.tokens'
+    ring.write_text('primary\noverlap\n', encoding='utf-8')
+    monkeypatch.setenv(constants.LB_SYNC_AUTH_TOKENS_FILE_ENV_VAR, str(ring))
+    lb = _make_lb()
+    lb._request_aggregator.timestamps.append(1)
+    captured = {}
+
+    _sync_once(monkeypatch, lb, [500], captured)
+
+    assert captured['headers_history'] == [{'Authorization': 'Bearer primary'}]
+    assert lb._request_aggregator.to_dict()['timestamps'] == [1]
 
 
 def _client_with_routes(lb) -> TestClient:
@@ -221,6 +328,22 @@ def test_stack_non_get_health_path_still_requires_auth(monkeypatch):
     for method in ('post', 'put', 'delete'):
         resp = getattr(client, method)(constants.LB_HEALTH_ENDPOINT_PATH)
         assert resp.status_code == 401, method
+
+
+def test_external_stack_missing_auth_fails_closed_but_health_is_exempt(
+        monkeypatch):
+    monkeypatch.delenv(constants.LB_AUTH_TOKEN_ENV_VAR, raising=False)
+    monkeypatch.setattr(serve_utils, 'is_external_load_balancer_mode',
+                        lambda: True)
+    client = _client_with_routes(_make_lb())
+
+    assert client.get('/predict').status_code == 503
+    # The probe still reaches the real health handler. A cold LB is 503 for
+    # readiness, but not because auth rejected it (and it becomes 200 synced).
+    lb = _make_lb()
+    lb._ready = True
+    client = _client_with_routes(lb)
+    assert client.get(constants.LB_HEALTH_ENDPOINT_PATH).status_code == 200
 
 
 def test_stack_streaming_response_passes_through(monkeypatch):

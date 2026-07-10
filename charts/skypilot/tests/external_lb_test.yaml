@@ -1,0 +1,177 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/helm-unittest/helm-unittest/main/schema/helm-testsuite.json
+suite: external_lb_test
+templates:
+  - templates/api-deployment.yaml
+tests:
+  - it: should remain inert when external LB support is disabled
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_SERVE_EXTERNAL_LB_ENABLED
+            value: "false"
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_SERVE_API_SERVICE_URL
+      - notContains:
+          path: spec.template.spec.volumes
+          content:
+            name: skypilot-serve-lb-sync-auth
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_POD_NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+
+  - it: should fail closed when the LB sync Secret name is missing
+    set:
+      serve.externalLoadBalancer.enabled: true
+    asserts:
+      - failedTemplate:
+          errorMessage: "serve.externalLoadBalancer.auth.lbSync.existingSecret is required when serve.externalLoadBalancer.enabled=true"
+
+  - it: should fail closed when the LB sync Secret key is missing
+    set:
+      serve.externalLoadBalancer.enabled: true
+      serve.externalLoadBalancer.auth.lbSync.existingSecret: serve-lb-sync
+    asserts:
+      - failedTemplate:
+          errorMessage: "serve.externalLoadBalancer.auth.lbSync.key is required when serve.externalLoadBalancer.enabled=true"
+
+  - it: should fail closed when the controller admin Secret name is missing
+    set:
+      serve.externalLoadBalancer.enabled: true
+      serve.externalLoadBalancer.auth.lbSync.existingSecret: serve-lb-sync
+      serve.externalLoadBalancer.auth.lbSync.key: tokens
+    asserts:
+      - failedTemplate:
+          errorMessage: "serve.externalLoadBalancer.auth.controllerAdmin.existingSecret is required when serve.externalLoadBalancer.enabled=true"
+
+  - it: should fail closed when the controller admin Secret key is missing
+    set:
+      serve.externalLoadBalancer.enabled: true
+      serve.externalLoadBalancer.auth.lbSync.existingSecret: serve-lb-sync
+      serve.externalLoadBalancer.auth.lbSync.key: tokens
+      serve.externalLoadBalancer.auth.controllerAdmin.existingSecret: serve-controller-admin
+    asserts:
+      - failedTemplate:
+          errorMessage: "serve.externalLoadBalancer.auth.controllerAdmin.key is required when serve.externalLoadBalancer.enabled=true"
+
+  - it: should fail closed when the data-plane Secret name is missing
+    set:
+      serve.externalLoadBalancer.enabled: true
+      serve.externalLoadBalancer.auth.lbSync.existingSecret: serve-lb-sync
+      serve.externalLoadBalancer.auth.lbSync.key: tokens
+      serve.externalLoadBalancer.auth.controllerAdmin.existingSecret: serve-controller-admin
+      serve.externalLoadBalancer.auth.controllerAdmin.key: tokens
+    asserts:
+      - failedTemplate:
+          errorMessage: "serve.externalLoadBalancer.auth.lbDataPlane.existingSecret is required when serve.externalLoadBalancer.enabled=true"
+
+  - it: should fail closed when the data-plane Secret key is missing
+    set:
+      serve.externalLoadBalancer.enabled: true
+      serve.externalLoadBalancer.auth.lbSync.existingSecret: serve-lb-sync
+      serve.externalLoadBalancer.auth.lbSync.key: tokens
+      serve.externalLoadBalancer.auth.controllerAdmin.existingSecret: serve-controller-admin
+      serve.externalLoadBalancer.auth.controllerAdmin.key: tokens
+      serve.externalLoadBalancer.auth.lbDataPlane.existingSecret: serve-lb-data-plane
+    asserts:
+      - failedTemplate:
+          errorMessage: "serve.externalLoadBalancer.auth.lbDataPlane.key is required when serve.externalLoadBalancer.enabled=true"
+
+  - it: should render isolated token projections and external LB env contracts
+    release:
+      name: test-release
+      namespace: test-namespace
+    set:
+      serve.externalLoadBalancer.enabled: true
+      serve.externalLoadBalancer.auth.lbSync.existingSecret: serve-lb-sync
+      serve.externalLoadBalancer.auth.lbSync.key: sync-tokens
+      serve.externalLoadBalancer.auth.controllerAdmin.existingSecret: serve-controller-admin
+      serve.externalLoadBalancer.auth.controllerAdmin.key: admin-tokens
+      serve.externalLoadBalancer.auth.lbDataPlane.existingSecret: serve-lb-data-plane
+      serve.externalLoadBalancer.auth.lbDataPlane.key: data-tokens
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_SERVE_API_SERVICE_URL
+            value: http://test-release-api-service.test-namespace.svc
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_SERVE_LB_RESOURCES_JSON
+            value: '{"limits":{"memory":"512Mi"},"requests":{"cpu":"100m","memory":"128Mi"}}'
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_SERVE_LB_SYNC_AUTH_TOKENS_FILE
+            value: /etc/skypilot/serve-auth/lb-sync/tokens
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_SERVE_CONTROLLER_ADMIN_AUTH_TOKENS_FILE
+            value: /etc/skypilot/serve-auth/controller-admin/tokens
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_SERVE_LB_AUTH_TOKENS_FILE
+            value: /etc/skypilot/serve-auth/lb-data-plane/tokens
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: skypilot-serve-lb-sync-auth
+            mountPath: /etc/skypilot/serve-auth/lb-sync
+            readOnly: true
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: skypilot-serve-controller-admin-auth
+            mountPath: /etc/skypilot/serve-auth/controller-admin
+            readOnly: true
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: skypilot-serve-lb-auth
+            mountPath: /etc/skypilot/serve-auth/lb-data-plane
+            readOnly: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: skypilot-serve-lb-sync-auth
+            projected:
+              defaultMode: 256
+              sources:
+                - secret:
+                    name: serve-lb-sync
+                    items:
+                      - key: sync-tokens
+                        path: tokens
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: skypilot-serve-controller-admin-auth
+            projected:
+              defaultMode: 256
+              sources:
+                - secret:
+                    name: serve-controller-admin
+                    items:
+                      - key: admin-tokens
+                        path: tokens
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: skypilot-serve-lb-auth
+            projected:
+              defaultMode: 256
+              sources:
+                - secret:
+                    name: serve-lb-data-plane
+                    items:
+                      - key: data-tokens
+                        path: tokens

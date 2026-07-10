@@ -18,6 +18,14 @@ from sky.serve import controller
 from sky.serve import serve_utils
 
 
+@pytest.fixture(autouse=True)
+def _clear_token_file_envs(monkeypatch):
+    monkeypatch.delenv(constants.LB_SYNC_AUTH_TOKENS_FILE_ENV_VAR,
+                       raising=False)
+    monkeypatch.delenv(constants.CONTROLLER_ADMIN_AUTH_TOKENS_FILE_ENV_VAR,
+                       raising=False)
+
+
 def _run(dep, authorization):
     return asyncio.run(dep(authorization=authorization))
 
@@ -84,3 +92,49 @@ def test_get_controller_auth_token_reads_env(monkeypatch):
     # Empty string is treated as unset (auth disabled).
     monkeypatch.setenv(constants.CONTROLLER_AUTH_TOKEN_ENV_VAR, '')
     assert serve_utils.get_controller_auth_token() is None
+
+
+def test_sync_and_admin_rings_are_independent_and_accept_overlap(
+        monkeypatch, tmp_path):
+    sync_ring = tmp_path / 'sync.tokens'
+    sync_ring.write_text('sync-new\nsync-old\n', encoding='utf-8')
+    admin_ring = tmp_path / 'admin.tokens'
+    admin_ring.write_text('admin-new\nadmin-old\n', encoding='utf-8')
+    monkeypatch.setenv(constants.LB_SYNC_AUTH_TOKENS_FILE_ENV_VAR,
+                       str(sync_ring))
+    monkeypatch.setenv(constants.CONTROLLER_ADMIN_AUTH_TOKENS_FILE_ENV_VAR,
+                       str(admin_ring))
+
+    sync_dep = controller._make_auth_dependency(sync=True)
+    admin_dep = controller._make_auth_dependency()
+    for token in ('sync-new', 'sync-old'):
+        assert _run(sync_dep, f'Bearer {token}') is None
+        with pytest.raises(fastapi.HTTPException) as excinfo:
+            _run(admin_dep, f'Bearer {token}')
+        assert excinfo.value.status_code == 401
+    for token in ('admin-new', 'admin-old'):
+        assert _run(admin_dep, f'Bearer {token}') is None
+        with pytest.raises(fastapi.HTTPException) as excinfo:
+            _run(sync_dep, f'Bearer {token}')
+        assert excinfo.value.status_code == 401
+
+
+def test_required_dependency_fails_closed_when_ring_missing(monkeypatch):
+    _set_token(monkeypatch, None)
+    dep = controller._make_auth_dependency(sync=True, required=True)
+    with pytest.raises(fastapi.HTTPException) as excinfo:
+        _run(dep, None)
+    assert excinfo.value.status_code == 503
+
+
+def test_controller_ring_rotation_is_live(monkeypatch, tmp_path):
+    ring = tmp_path / 'admin.tokens'
+    ring.write_text('old\n', encoding='utf-8')
+    monkeypatch.setenv(constants.CONTROLLER_ADMIN_AUTH_TOKENS_FILE_ENV_VAR,
+                       str(ring))
+    dep = controller._make_auth_dependency()
+    assert _run(dep, 'Bearer old') is None
+
+    ring.write_text('new\nold\n', encoding='utf-8')
+    assert _run(dep, 'Bearer new') is None
+    assert _run(dep, 'Bearer old') is None

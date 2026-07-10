@@ -850,14 +850,73 @@
                 "externalLoadBalancer": {
                     "type": "object",
                     "properties": {
-                        "controllerPortRangeSize": {
-                            "type": "integer"
-                        },
-                        "controllerPortRangeStart": {
-                            "type": "integer"
+                        "auth": {
+                            "type": "object",
+                            "properties": {
+                                "controllerAdmin": {
+                                    "type": "object",
+                                    "properties": {
+                                        "existingSecret": {
+                                            "type": "string"
+                                        },
+                                        "key": {
+                                            "type": "string"
+                                        }
+                                    }
+                                },
+                                "lbDataPlane": {
+                                    "type": "object",
+                                    "properties": {
+                                        "existingSecret": {
+                                            "type": "string"
+                                        },
+                                        "key": {
+                                            "type": "string"
+                                        }
+                                    }
+                                },
+                                "lbSync": {
+                                    "type": "object",
+                                    "properties": {
+                                        "existingSecret": {
+                                            "type": "string"
+                                        },
+                                        "key": {
+                                            "type": "string"
+                                        }
+                                    }
+                                }
+                            }
                         },
                         "enabled": {
                             "type": "boolean"
+                        },
+                        "resources": {
+                            "type": [
+                                "object",
+                                "null"
+                            ],
+                            "properties": {
+                                "limits": {
+                                    "type": "object",
+                                    "properties": {
+                                        "memory": {
+                                            "type": "string"
+                                        }
+                                    }
+                                },
+                                "requests": {
+                                    "type": "object",
+                                    "properties": {
+                                        "cpu": {
+                                            "type": "string"
+                                        },
+                                        "memory": {
+                                            "type": "string"
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }

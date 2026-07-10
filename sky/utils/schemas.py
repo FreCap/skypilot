@@ -1858,12 +1858,10 @@ def get_config_schema():
                     'external_load_balancer': {
                         'type': 'boolean',
                         'default': False,
-                        # When true, each service's controller binds a stable
-                        # per-service port (persisted, reused across respawns
-                        # and pod rolls) so a load balancer running outside the
-                        # controller pod has a stable controller address, and
-                        # the controller does not spawn an in-pod load
-                        # balancer.
+                        # Platform capability gate for SkyServe services. When
+                        # true, each service owns an external LB Deployment
+                        # that syncs through the stable API-service proxy. The
+                        # in-pod LB implementation is no longer supported.
                     },
                     'controller_logs_gc_retention_hours': {
                         'type': 'integer',

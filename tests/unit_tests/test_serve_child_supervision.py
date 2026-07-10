@@ -1,14 +1,5 @@
-"""Tests for _start's child supervision: backoff, bind check, degraded flag.
-
-A load balancer that cannot bind its port (or a controller that cannot be
-respawned) must (1) be retried with backoff instead of a tight respawn loop,
-and (2) surface as CONTROLLER_FAILED in the service status instead of the
-service advertising a dead endpoint as healthy. The flag self-heals once the
-children recover, and the replica-driven status writer must not flap the
-status back while the flag is set.
-"""
+"""Tests for external-only controller-child supervision."""
 # pylint: disable=protected-access
-import socket
 from unittest import mock
 
 from sky.serve import serve_state
@@ -27,54 +18,24 @@ class TestBackoff:
         assert huge == service._CHILD_RESPAWN_BACKOFF_CAP_SECONDS
 
 
-class TestLbPortIsBound:
+class TestControllerHealth:
 
-    def test_bound_port_detected(self):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
-            server.bind(('127.0.0.1', 0))
-            server.listen(1)
-            port = server.getsockname()[1]
-            assert service._lb_port_is_bound(port)
-
-    def test_unbound_port_detected(self):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
-            server.bind(('127.0.0.1', 0))
-            port = server.getsockname()[1]
-        # Socket closed; nothing listens on the port anymore.
-        assert not service._lb_port_is_bound(port)
-
-
-class _FakeSpec:
-
-    def __init__(self, pool):
-        self.pool = pool
-
-
-class TestHasInPodLoadBalancer:
-    """The supervision health check and the LB-spawn path must agree on whether
-    an in-pod LB exists: in external-LB mode there is none (it runs as a
-    separate k8s Deployment), so the loop must not treat its absence as a dead
-    LB and flag the service CONTROLLER_FAILED."""
-
-    def test_regular_service_has_in_pod_lb(self):
+    def test_bounded_health_check(self):
+        response = mock.Mock(status_code=200)
         with mock.patch.object(service.serve_utils,
-                               'is_external_load_balancer_mode',
-                               return_value=False):
-            assert service._has_in_pod_load_balancer(_FakeSpec(pool=False))
+                               '_get_to_controller_with_retry',
+                               return_value=response) as get:
+            assert service._controller_child_responding('svc', 20001)
+        get.assert_called_once_with('svc',
+                                    20001,
+                                    '/autoscaler/info',
+                                    timeout=(0.5, 1.0))
 
-    def test_external_lb_mode_has_no_in_pod_lb(self):
-        # Regression: without this, the health branch counts the absent in-pod
-        # LB process as a dead LB and flags CONTROLLER_FAILED after 3 ticks.
+    def test_failed_health_check_is_unhealthy(self):
         with mock.patch.object(service.serve_utils,
-                               'is_external_load_balancer_mode',
-                               return_value=True):
-            assert not service._has_in_pod_load_balancer(_FakeSpec(pool=False))
-
-    def test_pool_service_has_no_in_pod_lb(self):
-        with mock.patch.object(service.serve_utils,
-                               'is_external_load_balancer_mode',
-                               return_value=False):
-            assert not service._has_in_pod_load_balancer(_FakeSpec(pool=True))
+                               '_get_to_controller_with_retry',
+                               side_effect=TimeoutError):
+            assert not service._controller_child_responding('svc', 20001)
 
 
 def _record(status):
