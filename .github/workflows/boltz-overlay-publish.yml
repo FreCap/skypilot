@@ -1,8 +1,8 @@
 name: Publish boltz overlay image
 
-# Builds the boltz overlay image (the full fork sky/ tree plus a freshly built
-# dashboard, layered on the pinned upstream nightly) and pushes it to the
-# gitops-hub ECR. The platform repo consumes it via apiService.image in the
+# Builds the boltz image (the full fork wheel plus a freshly built dashboard,
+# installed on the pinned upstream runtime) and pushes it to the gitops-hub
+# ECR. The platform repo consumes it via apiService.image in the
 # skypilot-control-plane terragrunt.
 #
 # One-time setup to enable pushes: create an OIDC role in the gitops-hub account
@@ -13,7 +13,15 @@ name: Publish boltz overlay image
 on:
   push:
     branches: [improvements]
-    paths: ['sky/**', 'boltz/**', '.github/workflows/boltz-overlay-publish.yml']
+    paths:
+      - 'sky/**'
+      - 'sky_templates/**'
+      - 'boltz/**'
+      - 'setup.py'
+      - 'pyproject.toml'
+      - 'MANIFEST.in'
+      - 'README.md'
+      - '.github/workflows/boltz-overlay-publish.yml'
   workflow_dispatch: {}
 
 permissions:
@@ -24,10 +32,6 @@ env:
   AWS_REGION: us-east-1
   ECR_REGISTRY: 255203429798.dkr.ecr.us-east-1.amazonaws.com
   ECR_REPO: skypilot-nightly-boltz
-  # Keep BASE_VER in sync with chart_version in the platform repo
-  # (deployment/terragrunt/environments/gitops-hub-rainier/skypilot-control-plane),
-  # normalized "-dev." -> ".dev".
-  BASE_VER: 1.0.0.dev20260620
 
 jobs:
   publish:
@@ -56,8 +60,10 @@ jobs:
           else
             echo "push=true" >> "$GITHUB_OUTPUT"
           fi
-          echo "tag_immutable=${ECR_REGISTRY}/${ECR_REPO}:${BASE_VER}-g$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
-          echo "tag_moving=${ECR_REGISTRY}/${ECR_REPO}:${BASE_VER}-improvements" >> "$GITHUB_OUTPUT"
+          version="$(awk -F"'" '/^__version__ = / {print $2; exit}' sky/__init__.py)"
+          test -n "${version}"
+          echo "tag_immutable=${ECR_REGISTRY}/${ECR_REPO}:${version}-g$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "tag_moving=${ECR_REGISTRY}/${ECR_REPO}:${version}-improvements" >> "$GITHUB_OUTPUT"
 
       - name: Configure AWS credentials
         if: steps.cfg.outputs.push == 'true'

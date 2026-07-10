@@ -48,12 +48,6 @@ def _get_git_commit():
 # number that auto-increments with every commit.
 _SKYPILOT_COMMIT_COUNT = '{{SKYPILOT_COMMIT_COUNT}}'
 
-# User-facing release line and the commit count at which its patch starts at
-# zero. Bump the minor version and reset this epoch together when starting a
-# new release line. The merge commit for this bump is commit count 5795.
-_SKYPILOT_DISPLAY_VERSION = '1.1.0'
-_SKYPILOT_DISPLAY_VERSION_PATCH_BASE = 5795
-
 
 def _get_commit_count() -> Optional[str]:
     if 'SKYPILOT_COMMIT_COUNT' not in _SKYPILOT_COMMIT_COUNT:
@@ -72,34 +66,12 @@ def _get_commit_count() -> Optional[str]:
         return None
 
 
-def _compose_display_version(version: str, build: Optional[str],
-                             patch_base: int) -> str:
-    """Product version shown to users: '<major>.<minor>.<patch>'.
-
-    The patch is the number of commits since the current release line began.
-    Falls back to the supplied release version when the build is unknown.
-    """
-    if not build or not build.isdigit():
-        return version
-    version_parts = version.split('.', 2)
-    if len(version_parts) < 2:
-        return version
-    major, minor = version_parts[:2]
-    patch = max(int(build) - patch_base, 0)
-    return f'{major}.{minor}.{patch}'
-
-
 __commit__ = _get_git_commit()
-# Internal version, also sent in the X-SkyPilot-Version wire header. Keep the
-# -dev0 marker: upstream clients skip their version-upgrade nagging and PyPI
-# latest-version checks only for dev versions.
-__version__ = '1.0.0-dev0'
+# Canonical SkyPilot version used by the package, CLI, API, dashboard, wheels,
+# image, and Helm chart.
+__version__ = '1.1.0'
 # Monotonic build number (git commit count); None when unknown.
 __build__ = _get_commit_count()
-# User-facing version, e.g. '1.1.3'; the patch is relative to the release epoch.
-__display_version__ = _compose_display_version(
-    _SKYPILOT_DISPLAY_VERSION, __build__,
-    _SKYPILOT_DISPLAY_VERSION_PATCH_BASE)
 __root_dir__ = directory_utils.get_sky_dir()
 
 
@@ -230,7 +202,6 @@ Verda = clouds.Verda
 
 __all__ = [
     '__build__',
-    '__display_version__',
     '__version__',
     'AWS',
     'Azure',
