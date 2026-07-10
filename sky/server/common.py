@@ -876,8 +876,9 @@ def check_server_healthy(
 
 
 # Keep in sync with sky/setup_files/setup.py find_version()
-def _get_skypilot_version_metadata_on_disk() -> Tuple[str, Optional[str]]:
-    """Get the internal version and stamped build number from disk."""
+def _get_skypilot_version_metadata_on_disk(
+) -> Tuple[str, Optional[str], str, int]:
+    """Get internal and display version metadata from disk."""
     current_file_path = pathlib.Path(__file__)
     assert str(current_file_path).endswith(
         'server/common.py'), current_file_path
@@ -892,24 +893,33 @@ def _get_skypilot_version_metadata_on_disk() -> Tuple[str, Optional[str]]:
     count_match = re.search(r'^_SKYPILOT_COMMIT_COUNT = [\'"]([^\'"]*)[\'"]',
                             content, re.M)
     build = count_match.group(1) if count_match else None
-    return version, build
+    display_version_match = re.search(
+        r'^_SKYPILOT_DISPLAY_VERSION = [\'"]([^\'"]*)[\'"]', content, re.M)
+    display_version = (display_version_match.group(1)
+                       if display_version_match else version)
+    patch_base_match = re.search(
+        r'^_SKYPILOT_DISPLAY_VERSION_PATCH_BASE = (\d+)', content, re.M)
+    patch_base = int(patch_base_match.group(1)) if patch_base_match else 0
+    return version, build, display_version, patch_base
 
 
 def get_skypilot_version_on_disk() -> str:
     """Get the internal package version of the SkyPilot code on disk."""
-    version, _ = _get_skypilot_version_metadata_on_disk()
+    version, _, _, _ = _get_skypilot_version_metadata_on_disk()
     return version
 
 
 def get_skypilot_display_version_on_disk() -> str:
     """Get the user-facing version of the SkyPilot code on disk."""
-    version, build = _get_skypilot_version_metadata_on_disk()
+    _, build, display_version, patch_base = (
+        _get_skypilot_version_metadata_on_disk())
     if build is not None and 'SKYPILOT_COMMIT_COUNT' in build:
         # Development build: the placeholder is not stamped, so the code on
         # disk is the git checkout; get the count the same way the runtime
         # does.
         build = sky._get_commit_count()  # pylint: disable=protected-access
-    return sky._compose_display_version(version, build)  # pylint: disable=protected-access
+    return sky._compose_display_version(  # pylint: disable=protected-access
+        display_version, build, patch_base)
 
 
 def check_server_healthy_or_start_fn(deploy: bool = False,

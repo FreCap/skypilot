@@ -13,22 +13,24 @@ from sky.server import common
 
 
 @pytest.mark.parametrize(
-    ('version', 'build', 'expected'),
+    ('version', 'build', 'patch_base', 'expected'),
     [
-        ('1.0.0-dev0', '5791', '1.0.5791'),
-        ('2.7.4', '42', '2.7.42'),
-        ('1.0.0-dev0', None, '1.0.0-dev0'),
-        ('1.0.0-dev0', 'unknown', '1.0.0-dev0'),
+        ('1.1.0', '5795', 5795, '1.1.0'),
+        ('1.1.0', '5796', 5795, '1.1.1'),
+        ('2.7.0', '42', 40, '2.7.2'),
+        ('1.1.0', None, 5795, '1.1.0'),
+        ('1.1.0', 'unknown', 5795, '1.1.0'),
     ])
-def test_compose_display_version_uses_patch(version, build, expected):
+def test_compose_display_version_uses_patch(version, build, patch_base,
+                                            expected):
     assert sky._compose_display_version(  # pylint: disable=protected-access
-        version, build) == expected
+        version, build, patch_base) == expected
 
 
 def test_wheel_build_version_guard_uses_internal_version():
     """Display build metadata must not make provisioning reject the wheel."""
     display_version = sky._compose_display_version(  # pylint: disable=protected-access
-        sky.__version__, '999999')
+        '1.1.0', '999999', 5795)
     with mock.patch.object(sky, '_get_commit_count', return_value='999999'), \
          mock.patch.object(sky, '__display_version__', display_version):
         assert common.get_skypilot_version_on_disk() == sky.__version__
