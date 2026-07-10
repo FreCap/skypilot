@@ -61,8 +61,9 @@ def _service_test_request_command(endpoint: str) -> str:
     """Return a copyable request example for the installed LB contract."""
     if not serve_utils.is_lb_data_plane_auth_enabled():
         return f'curl {endpoint}'
-    return (f"curl -H '{serve_constants.LB_AUTHORIZATION_HEADER}: "
-            f"Bearer <token>' {endpoint}")
+    header = shlex.quote(
+        f'{serve_constants.LB_AUTHORIZATION_HEADER}: Bearer <token>')
+    return f'curl -H {header} {endpoint}'
 
 
 def _rewrite_tls_credential_paths_and_get_tls_env_vars(

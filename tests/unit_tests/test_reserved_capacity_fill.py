@@ -13,6 +13,9 @@ import types
 import unittest
 from unittest import mock
 
+from spot_placer_test_utils import make_location
+from spot_placer_test_utils import make_placer as _make_placer
+
 from sky.serve import autoscalers
 from sky.serve import constants
 from sky.serve import replica_managers
@@ -20,8 +23,6 @@ from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_broker
 from sky.serve import serve_state
 from sky.serve import spot_placer
-from tests.unit_tests.spot_placer_test_utils import make_location
-from tests.unit_tests.spot_placer_test_utils import make_placer as _make_placer
 
 _SCALE_UP = autoscalers.AutoscalerDecisionOperator.SCALE_UP
 _SCALE_DOWN = autoscalers.AutoscalerDecisionOperator.SCALE_DOWN

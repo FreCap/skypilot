@@ -9,10 +9,10 @@ identical to the old prefer-unused behavior while any location is free.
 """
 # pylint: disable=redefined-outer-name,unused-variable
 import pytest
+from spot_placer_test_utils import make_location
+from spot_placer_test_utils import make_placer
 
 from sky.serve import spot_placer
-from tests.unit_tests.spot_placer_test_utils import make_location
-from tests.unit_tests.spot_placer_test_utils import make_placer
 
 
 def _make_location(name: str) -> spot_placer.Location:

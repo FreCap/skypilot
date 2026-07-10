@@ -26,19 +26,19 @@ import uuid
 import pytest
 import sqlalchemy
 from sqlalchemy import create_engine
-
-from sky.serve import reserved_capacity_broker as broker
-from sky.serve import serve_state
-from sky.utils import locks
-from sky.utils.db import migration_utils
+from test_reserved_fill_broker import _broker_db  # noqa: F401
+from test_reserved_fill_broker import clock  # noqa: F401
 # The sqlite suite: its DB-touching test classes are re-collected below
 # against the PG `broker_engine` override; `clock` and `_broker_db` are the
 # fixtures those inherited test bodies request (importing a fixture function
 # registers it in this module, where fixture resolution picks up the PG
 # `broker_engine` defined here instead of the sqlite one).
-from tests.unit_tests import test_reserved_fill_broker as sqlite_suite
-from tests.unit_tests.test_reserved_fill_broker import _broker_db  # noqa: F401
-from tests.unit_tests.test_reserved_fill_broker import clock  # noqa: F401
+import test_reserved_fill_broker as sqlite_suite
+
+from sky.serve import reserved_capacity_broker as broker
+from sky.serve import serve_state
+from sky.utils import locks
+from sky.utils.db import migration_utils
 
 psycopg2 = pytest.importorskip('psycopg2')
 testcontainers_postgres = pytest.importorskip('testcontainers.postgres')

@@ -122,6 +122,7 @@ class LoadBalancingPolicy:
         to the exact accounting generation it incremented (a replica URL
         pruned and re-added between the two must not absorb a stale
         release — the ABA problem)."""
+        del replica_url, request
         return None
 
     def post_execute_hook(self,

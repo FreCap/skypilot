@@ -10,10 +10,10 @@ location, and pull load back when reserved capacity frees (TTL retry).
 from unittest import mock
 
 import pytest
+from spot_placer_test_utils import make_location
+from spot_placer_test_utils import make_placer
 
 from sky.serve import spot_placer
-from tests.unit_tests.spot_placer_test_utils import make_location
-from tests.unit_tests.spot_placer_test_utils import make_placer
 
 
 @pytest.fixture

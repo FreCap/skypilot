@@ -85,6 +85,10 @@ _KNOWN_VIEWER_DENIED: set = {
     ('/serve/down', 'POST'),
     ('/serve/update', 'POST'),
     ('/serve/terminate-replica', 'POST'),
+    # Authenticated LB-to-controller sync proxy; exposes internal routing and
+    # capacity state and is never a viewer API.
+    ('/api/internal/serve/{service_name}/controller/load_balancer_sync', 'POST'
+    ),
     # --- Volumes writes ---
     ('/volumes/apply', 'POST'),
     ('/volumes/delete', 'POST'),

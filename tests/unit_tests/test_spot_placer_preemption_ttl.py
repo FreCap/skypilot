@@ -10,10 +10,10 @@ with one probe launch per window.
 """
 # pylint: disable=redefined-outer-name,protected-access,unused-variable
 import pytest
+from spot_placer_test_utils import make_location
+from spot_placer_test_utils import make_placer
 
 from sky.serve import spot_placer
-from tests.unit_tests.spot_placer_test_utils import make_location
-from tests.unit_tests.spot_placer_test_utils import make_placer
 
 
 @pytest.fixture
