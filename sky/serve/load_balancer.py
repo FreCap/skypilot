@@ -10,7 +10,6 @@ import threading
 import time
 import traceback
 from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple, Union
-import uuid
 
 import aiohttp
 import fastapi
@@ -309,11 +308,6 @@ class SkyServeLoadBalancer:
     # publishing a stale zero after that submit lands.
     _occupancy_dispatch_generation: Optional[Dict[str, int]] = None
     _occupancy_sample_generation: Optional[Dict[str, int]] = None
-    # Identifies this LB process incarnation. The retirement drain requires
-    # seen-then-clean within ONE incarnation: a restarted LB loses its
-    # draining/occupancy overlays, so its clean-looking reports must not
-    # combine with an older incarnation's acknowledgement.
-    _session_id: Optional[str] = None
 
     def __init__(
         self,
@@ -604,22 +598,15 @@ class SkyServeLoadBalancer:
 
     def _get_lb_session_id(self) -> str:
         """Return the durable external LB identity, failing closed if absent."""
-        if serve_utils.is_external_load_balancer_mode():
-            pod_uid = os.environ.get(constants.LB_POD_UID_ENV_VAR, '').strip()
-            if not pod_uid:
-                raise RuntimeError(
-                    'External load balancer mode requires the Kubernetes '
-                    f'Downward API environment variable '
-                    f'{constants.LB_POD_UID_ENV_VAR}.')
-            # Read the Downward API value on every sync. It is immutable for a
-            # Pod, but a missing/corrupt runtime environment must never fall
-            # back to a process UUID that the controller cannot validate.
-            self._session_id = pod_uid
-        elif self._session_id is None:
-            # Compatibility for the legacy in-process topology and unit tests.
-            self._session_id = str(uuid.uuid4())
-        assert self._session_id is not None
-        return self._session_id
+        pod_uid = os.environ.get(constants.LB_POD_UID_ENV_VAR, '').strip()
+        if not pod_uid:
+            raise RuntimeError(
+                'The external load balancer requires the Kubernetes '
+                f'Downward API environment variable '
+                f'{constants.LB_POD_UID_ENV_VAR}.')
+        # Read the Downward API value on every sync. It is immutable for a Pod,
+        # but a missing/corrupt runtime environment must fail closed.
+        return pod_uid
 
     async def _health(self,
                       request: fastapi.Request) -> fastapi.responses.Response:
@@ -1208,8 +1195,7 @@ class SkyServeLoadBalancer:
 
         # Read the purpose-specific ring fresh for every sync. The primary is
         # tried first; overlap credentials are replayed only after a 401.
-        sync_tokens = serve_utils.get_lb_sync_auth_tokens(
-            required=serve_utils.is_external_load_balancer_mode())
+        sync_tokens = serve_utils.get_lb_sync_auth_tokens(required=True)
 
         # [boltz fork] Demand gauges ride alongside the timestamp
         # aggregator so the concurrency autoscaler sees outstanding work,
@@ -1859,15 +1845,14 @@ class SkyServeLoadBalancer:
             await asyncio.sleep(current_backoff)
 
     def run(self):
-        if serve_utils.is_external_load_balancer_mode():
-            # Refuse to start before every enabled trust boundary is ready.
-            # Data-plane authentication is optional; sync authentication is
-            # not. Subsequent reads remain live and fail closed if an enabled
-            # projected Secret becomes unreadable.
-            serve_utils.get_lb_sync_auth_tokens(required=True)
-            if serve_utils.is_lb_data_plane_auth_enabled():
-                serve_utils.get_lb_auth_tokens(required=True)
-            self._get_lb_session_id()
+        # Refuse to start before every enabled trust boundary is ready.
+        # Data-plane authentication is optional; sync authentication is not.
+        # Subsequent reads remain live and fail closed if an enabled projected
+        # Secret becomes unreadable.
+        serve_utils.get_lb_sync_auth_tokens(required=True)
+        if serve_utils.is_lb_data_plane_auth_enabled():
+            serve_utils.get_lb_auth_tokens(required=True)
+        self._get_lb_session_id()
         # Gate inbound inference requests when data-plane auth is enabled.
         # Pure-ASGI so it wraps the catch-all proxy without buffering streaming
         # responses; exempts the readiness probe by method+path.

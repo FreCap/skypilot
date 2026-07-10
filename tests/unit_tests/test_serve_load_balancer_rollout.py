@@ -57,30 +57,17 @@ def test_draining_rejects_new_inference_requests():
     assert exc_info.value.headers['Retry-After']
 
 
-def test_external_session_id_is_pod_uid(monkeypatch):
+def test_session_id_is_pod_uid(monkeypatch):
     lb = _make_lb()
-    monkeypatch.setattr(load_balancer.serve_utils,
-                        'is_external_load_balancer_mode', lambda: True)
     monkeypatch.setenv(constants.LB_POD_UID_ENV_VAR, 'pod-uid-123')
     assert lb._get_lb_session_id() == 'pod-uid-123'
 
 
-def test_external_session_id_missing_fails_closed(monkeypatch):
+def test_session_id_missing_fails_closed(monkeypatch):
     lb = _make_lb()
-    monkeypatch.setattr(load_balancer.serve_utils,
-                        'is_external_load_balancer_mode', lambda: True)
     monkeypatch.delenv(constants.LB_POD_UID_ENV_VAR, raising=False)
     with pytest.raises(RuntimeError, match=constants.LB_POD_UID_ENV_VAR):
         lb._get_lb_session_id()
-
-
-def test_non_external_session_id_remains_process_uuid(monkeypatch):
-    lb = _make_lb()
-    monkeypatch.setattr(load_balancer.serve_utils,
-                        'is_external_load_balancer_mode', lambda: False)
-    first = lb._get_lb_session_id()
-    assert first
-    assert lb._get_lb_session_id() == first
 
 
 def test_health_endpoint_status_codes():

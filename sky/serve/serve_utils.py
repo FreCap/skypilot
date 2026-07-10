@@ -700,22 +700,6 @@ def get_lb_auth_tokens(required: bool = False) -> Tuple[str, ...]:
                             'load-balancer data plane', required)
 
 
-def get_controller_auth_token() -> Optional[str]:
-    """Legacy single-token view of the controller-admin ring.
-
-    New code should consume the complete, purpose-specific ring. This wrapper
-    remains for backwards-compatible callers during the migration.
-    """
-    tokens = get_controller_admin_auth_tokens()
-    return tokens[0] if tokens else None
-
-
-def get_lb_auth_token() -> Optional[str]:
-    """Legacy single-token view of the inbound LB data-plane ring."""
-    tokens = get_lb_auth_tokens()
-    return tokens[0] if tokens else None
-
-
 def ha_recovery_for_consolidation_mode(pool: bool,
                                        still_leader: Optional[Callable[
                                            [], bool]] = None):

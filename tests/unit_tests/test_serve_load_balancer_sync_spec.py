@@ -250,7 +250,10 @@ def _run_one_sync(lb: load_balancer.SkyServeLoadBalancer,
                            return_value=session), \
          mock.patch.object(load_balancer.serve_utils,
                            'get_lb_sync_auth_tokens',
-                           return_value=()):
+                           return_value=('sync-token',)), \
+         mock.patch.object(lb,
+                           '_get_lb_session_id',
+                           return_value='test-pod-uid'):
         asyncio.new_event_loop().run_until_complete(
             lb._sync_with_controller_once())
 

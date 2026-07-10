@@ -16,24 +16,28 @@ lifecycle through the LB's public surface:
 
 Run manually (not collected by pytest — this spawns servers):
 
-    python tests/lb_local_e2e.py
+    PYTHONPATH=. python tests/lb_local_e2e.py
 """
 import json
 import multiprocessing
 import os
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
 
 from aiohttp import web
 
+from sky.serve import constants
 from sky.serve import load_balancer
 
 LB_PORT = 18080
 CONTROLLER_PORT = 18000
 REPLICA_PORTS = [18101, 18102, 18103]
 PROBE_INTERVAL_SECONDS = 1
+SERVICE_HASH = 'local-e2e-incarnation'
+SYNC_TOKEN = 'local-e2e-sync-token'
 
 
 # ----------------------------------------------------------------------
@@ -93,6 +97,9 @@ def run_fake_replica(port: int) -> None:
 def run_fake_controller(port: int, replica_ports) -> None:
 
     async def sync(request: web.Request) -> web.Response:
+        assert request.headers.get('Authorization') == f'Bearer {SYNC_TOKEN}'
+        assert request.headers.get(
+            constants.SERVICE_HASH_HEADER) == SERVICE_HASH
         await request.json()  # The LB posts its request aggregator.
         return web.json_response({
             'replica_info': {
@@ -116,12 +123,19 @@ def run_fake_controller(port: int, replica_ports) -> None:
 
 
 def run_lb(controller_port: int, lb_port: int) -> None:
-    os.environ['SKYPILOT_LB_OCCUPANCY_PROBE_INTERVAL_SECONDS'] = str(
-        PROBE_INTERVAL_SECONDS)
-    load_balancer.run_load_balancer(
-        controller_addr=f'http://127.0.0.1:{controller_port}',
-        load_balancer_port=lb_port,
-    )
+    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8') as token_file:
+        token_file.write(f'{SYNC_TOKEN}\n')
+        token_file.flush()
+        os.environ[constants.EXTERNAL_LB_ENABLED_ENV_VAR] = 'true'
+        os.environ[constants.LB_POD_UID_ENV_VAR] = 'local-e2e-pod-uid'
+        os.environ[constants.LB_SYNC_AUTH_TOKENS_FILE_ENV_VAR] = token_file.name
+        os.environ[constants.LB_OCCUPANCY_PROBE_INTERVAL_ENV_VAR] = str(
+            PROBE_INTERVAL_SECONDS)
+        load_balancer.run_load_balancer(
+            controller_addr=f'http://127.0.0.1:{controller_port}',
+            load_balancer_port=lb_port,
+            service_hash=SERVICE_HASH,
+        )
 
 
 # ----------------------------------------------------------------------

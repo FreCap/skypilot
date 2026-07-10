@@ -88,16 +88,6 @@ def test_auth_token_rotation_honored_on_next_request(monkeypatch):
         _run(dep, 'Bearer old')
 
 
-def test_get_controller_auth_token_reads_env(monkeypatch):
-    monkeypatch.delenv(constants.CONTROLLER_AUTH_TOKEN_ENV_VAR, raising=False)
-    assert serve_utils.get_controller_auth_token() is None
-    monkeypatch.setenv(constants.CONTROLLER_AUTH_TOKEN_ENV_VAR, 'tok')
-    assert serve_utils.get_controller_auth_token() == 'tok'
-    # Empty string is treated as unset (auth disabled).
-    monkeypatch.setenv(constants.CONTROLLER_AUTH_TOKEN_ENV_VAR, '')
-    assert serve_utils.get_controller_auth_token() is None
-
-
 def test_sync_and_admin_rings_are_independent_and_accept_rotation_overlap(
         monkeypatch, tmp_path):
     sync_ring = tmp_path / 'sync.tokens'
