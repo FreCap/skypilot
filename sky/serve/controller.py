@@ -440,6 +440,9 @@ class SkyServeController:
           post-restart sync is already "fresh" while the target stays
           min_replicas until the autoscaler thread's next decision tick
           consumes the snap.
+        - max_replicas: the configured autoscaling ceiling. It changes only
+          on service updates, so the external load balancer can retain the
+          last synced value while the control plane is temporarily down.
         """
         latest_version = self._autoscaler.latest_version
         num_provisioning = 0
@@ -456,6 +459,7 @@ class SkyServeController:
         return {
             'provisioning_replicas': num_provisioning,
             'target_num_replicas': target,
+            'max_replicas': self._autoscaler.max_replicas,
         }
 
     def _get_routing_spec(self) -> Optional[Dict[str, Any]]:
