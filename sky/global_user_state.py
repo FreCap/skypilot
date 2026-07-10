@@ -121,6 +121,13 @@ cluster_table = sqlalchemy.Table(
                       sqlalchemy.Text,
                       server_default=None),
     sqlalchemy.Column('is_managed', sqlalchemy.Integer, server_default='0'),
+    # Best-effort cost attribution. These scalar fields are populated during
+    # launch without adding a separate lifecycle write or lookup.
+    sqlalchemy.Column('workload_type', sqlalchemy.Text, server_default=None),
+    sqlalchemy.Column('workload_id', sqlalchemy.Text, server_default=None),
+    sqlalchemy.Column('workload_task_id',
+                      sqlalchemy.Integer,
+                      server_default=None),
     sqlalchemy.Column('provision_log_path',
                       sqlalchemy.Text,
                       server_default=None),
@@ -226,6 +233,85 @@ cluster_history_table = sqlalchemy.Table(
     # point the clusters table row is gone and the join can no longer supply
     # the flag.
     sqlalchemy.Column('is_managed', sqlalchemy.Integer, server_default='0'),
+    sqlalchemy.Column('workload_type', sqlalchemy.Text, server_default=None),
+    sqlalchemy.Column('workload_id', sqlalchemy.Text, server_default=None),
+    sqlalchemy.Column('workload_task_id',
+                      sqlalchemy.Integer,
+                      server_default=None),
+    # Updated only when usage_intervals changes. The estimated-spend daemon
+    # uses this as an incremental watermark.
+    sqlalchemy.Column('usage_updated_at',
+                      sqlalchemy.Integer,
+                      server_default='0',
+                      index=True),
+)
+
+# Materialized, best-effort compute-cost estimates. One row represents the
+# overlap of one cluster-history record with one UTC day. Request paths only
+# aggregate this table; pricing and interval splitting happen in a daemon.
+estimated_spend_daily_table = sqlalchemy.Table(
+    'estimated_spend_daily',
+    Base.metadata,
+    sqlalchemy.Column('day_start_utc', sqlalchemy.Integer, primary_key=True),
+    sqlalchemy.Column('cluster_hash', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('cluster_name', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('workload_type', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('workload_id', sqlalchemy.Text, server_default=None),
+    sqlalchemy.Column('workload_task_id',
+                      sqlalchemy.Integer,
+                      server_default=None),
+    sqlalchemy.Column('user_hash', sqlalchemy.Text, server_default=None),
+    sqlalchemy.Column('workspace', sqlalchemy.Text, server_default=None),
+    sqlalchemy.Column('cloud', sqlalchemy.Text, server_default=None),
+    sqlalchemy.Column('region', sqlalchemy.Text, server_default=None),
+    sqlalchemy.Column('use_spot', sqlalchemy.Boolean, server_default=None),
+    sqlalchemy.Column('num_nodes', sqlalchemy.Integer, server_default=None),
+    sqlalchemy.Column('machine_seconds', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.Column('catalog_hourly_rate',
+                      sqlalchemy.Float,
+                      server_default=None),
+    sqlalchemy.Column('estimated_cost', sqlalchemy.Float, server_default=None),
+    sqlalchemy.Column('exclusion_reason', sqlalchemy.Text, server_default=None),
+    sqlalchemy.Column('priced_at', sqlalchemy.Integer, server_default=None),
+    sqlalchemy.Column('updated_at', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.Index('idx_estimated_spend_day_workspace', 'day_start_utc',
+                     'workspace'),
+    sqlalchemy.Index('idx_estimated_spend_day_workload', 'day_start_utc',
+                     'workload_type', 'workload_id'),
+)
+
+estimated_spend_state_table = sqlalchemy.Table(
+    'estimated_spend_state',
+    Base.metadata,
+    sqlalchemy.Column('singleton_id', sqlalchemy.Integer, primary_key=True),
+    sqlalchemy.Column('last_started_at',
+                      sqlalchemy.Integer,
+                      server_default=None),
+    sqlalchemy.Column('last_success_at',
+                      sqlalchemy.Integer,
+                      server_default=None),
+    sqlalchemy.Column('source_watermark',
+                      sqlalchemy.Integer,
+                      server_default=None),
+    sqlalchemy.Column('source_watermark_hash',
+                      sqlalchemy.Text,
+                      server_default=None),
+    sqlalchemy.Column('active_cursor_hash',
+                      sqlalchemy.Text,
+                      server_default=None),
+    sqlalchemy.Column('backfill_cursor_launched_at',
+                      sqlalchemy.Integer,
+                      server_default=None),
+    sqlalchemy.Column('backfill_cursor_hash',
+                      sqlalchemy.Text,
+                      server_default=None),
+    sqlalchemy.Column('backfill_complete',
+                      sqlalchemy.Boolean,
+                      server_default=sqlalchemy.sql.expression.false()),
+    sqlalchemy.Column('coverage_start_utc',
+                      sqlalchemy.Integer,
+                      server_default=None),
+    sqlalchemy.Column('last_error', sqlalchemy.Text, server_default=None),
 )
 
 
@@ -674,7 +760,10 @@ def add_or_update_cluster(cluster_name: str,
                           task_config: Optional[Dict[str, Any]] = None,
                           is_managed: bool = False,
                           provision_log_path: Optional[str] = None,
-                          existing_cluster_hash: Optional[str] = None):
+                          existing_cluster_hash: Optional[str] = None,
+                          workload_type: Optional[str] = None,
+                          workload_id: Optional[str] = None,
+                          workload_task_id: Optional[int] = None):
     """Adds or updates cluster_name -> cluster_handle mapping.
 
     Args:
@@ -693,6 +782,9 @@ def add_or_update_cluster(cluster_name: str,
         existing_cluster_hash: If specified, the cluster will be updated
             only if the cluster_hash matches. If a cluster does not exist,
             it will not be inserted and an error will be raised.
+        workload_type: Best-effort cost attribution type.
+        workload_id: Best-effort cost attribution identifier.
+        workload_task_id: Managed-job task ID, when available.
     """
     engine = _db_manager.get_engine()
 
@@ -751,6 +843,7 @@ def add_or_update_cluster(cluster_name: str,
     cluster_hash = _get_hash_for_existing_cluster(cluster_name) or str(
         uuid.uuid4())
     usage_intervals = _get_cluster_usage_intervals(cluster_hash)
+    usage_intervals_changed = False
 
     # first time a cluster is being launched
     if not usage_intervals:
@@ -766,6 +859,7 @@ def add_or_update_cluster(cluster_name: str,
             # to be more accurate.
             cluster_launched_at = int(time.time())
         usage_intervals.append((cluster_launched_at, None))
+        usage_intervals_changed = True
 
     user_hash = common_utils.get_current_user().id
     active_workspace = skypilot_config.get_active_workspace()
@@ -825,6 +919,12 @@ def add_or_update_cluster(cluster_name: str,
             conditional_values.update({
                 'provision_log_path': provision_log_path,
             })
+        if workload_type is not None:
+            conditional_values['workload_type'] = workload_type
+        if workload_id is not None:
+            conditional_values['workload_id'] = workload_id
+        if workload_task_id is not None:
+            conditional_values['workload_task_id'] = workload_task_id
 
         # Merge newly generated instance links with any existing links so
         # repeated launches (e.g., post-stop start) don't clobber prior entries.
@@ -919,6 +1019,38 @@ def add_or_update_cluster(cluster_name: str,
         # Calculate last_activity_time and launched_at from usage_intervals
         last_activity_time = _get_cluster_last_activity_time(usage_intervals)
         launched_at = _get_cluster_launch_time(usage_intervals)
+        history_update_values = {
+            cluster_history_table.c.name: cluster_name,
+            cluster_history_table.c.num_nodes: launched_nodes,
+            cluster_history_table.c.requested_resources:
+                pickle.dumps(requested_resources),
+            cluster_history_table.c.launched_resources:
+                pickle.dumps(launched_resources),
+            cluster_history_table.c.usage_intervals:
+                pickle.dumps(usage_intervals),
+            cluster_history_table.c.user_hash: history_hash,
+            cluster_history_table.c.workspace: history_workspace,
+            cluster_history_table.c.provision_log_path: provision_log_path,
+            cluster_history_table.c.last_activity_time: last_activity_time,
+            cluster_history_table.c.launched_at: launched_at,
+            cluster_history_table.c.cloud: cloud,
+            cluster_history_table.c.region: region,
+            cluster_history_table.c.zone: zone,
+            cluster_history_table.c.node_names: node_names,
+            **creation_info,
+        }
+        if workload_type is not None:
+            history_update_values[
+                cluster_history_table.c.workload_type] = workload_type
+        if workload_id is not None:
+            history_update_values[
+                cluster_history_table.c.workload_id] = workload_id
+        if workload_task_id is not None:
+            history_update_values[
+                cluster_history_table.c.workload_task_id] = workload_task_id
+        if usage_intervals_changed:
+            history_update_values[
+                cluster_history_table.c.usage_updated_at] = status_updated_at
 
         insert_stmnt = insert_func(cluster_history_table).values(
             cluster_hash=cluster_hash,
@@ -937,35 +1069,22 @@ def add_or_update_cluster(cluster_name: str,
             zone=zone,
             node_names=node_names,
             is_managed=int(is_managed),
+            workload_type=workload_type,
+            workload_id=workload_id,
+            workload_task_id=workload_task_id,
+            usage_updated_at=status_updated_at,
             **creation_info,
         )
         do_update_stmt = insert_stmnt.on_conflict_do_update(
             index_elements=[cluster_history_table.c.cluster_hash],
             set_={
-                cluster_history_table.c.name: cluster_name,
-                cluster_history_table.c.num_nodes: launched_nodes,
-                cluster_history_table.c.requested_resources:
-                    pickle.dumps(requested_resources),
-                cluster_history_table.c.launched_resources:
-                    pickle.dumps(launched_resources),
-                cluster_history_table.c.usage_intervals:
-                    pickle.dumps(usage_intervals),
-                cluster_history_table.c.user_hash: history_hash,
-                cluster_history_table.c.workspace: history_workspace,
-                cluster_history_table.c.provision_log_path: provision_log_path,
-                cluster_history_table.c.last_activity_time: last_activity_time,
-                cluster_history_table.c.launched_at: launched_at,
-                cluster_history_table.c.cloud: cloud,
-                cluster_history_table.c.region: region,
-                cluster_history_table.c.zone: zone,
-                cluster_history_table.c.node_names: node_names,
                 # Intentionally do not update is_managed here (mirrors the
                 # clusters table above, which only sets it on insert).
                 # add_or_update_cluster is called multiple times during a
                 # managed-job launch and is_managed defaults to False on
                 # subsequent calls; overwriting it would reset the flag to 0
                 # and leak managed-job clusters into the history view.
-                **creation_info,
+                **history_update_values,
             })
         session.execute(do_update_stmt)
 
@@ -1862,6 +1981,7 @@ def _set_cluster_usage_intervals(
 
     # Calculate last_activity_time from usage_intervals
     last_activity_time = _get_cluster_last_activity_time(usage_intervals)
+    usage_updated_at = int(time.time())
 
     with orm.Session(engine) as session:
         count = session.query(cluster_history_table).filter_by(
@@ -1869,6 +1989,7 @@ def _set_cluster_usage_intervals(
                 cluster_history_table.c.usage_intervals:
                     pickle.dumps(usage_intervals),
                 cluster_history_table.c.last_activity_time: last_activity_time,
+                cluster_history_table.c.usage_updated_at: usage_updated_at,
             })
         session.commit()
     assert count <= 1, count

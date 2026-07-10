@@ -45,6 +45,7 @@ from sky import catalog
 from sky import check as sky_check
 from sky import clouds
 from sky import core
+from sky import estimated_spend as estimated_spend_lib
 from sky import exceptions
 from sky import execution
 from sky import global_user_state
@@ -95,6 +96,7 @@ from sky.skylet import constants
 from sky.ssh_node_pools import server as ssh_node_pools_rest
 from sky.usage import usage_lib
 from sky.users import permission
+from sky.users import rbac
 from sky.users import server as users_rest
 from sky.utils import admin_policy_utils
 from sky.utils import command_runner
@@ -2338,6 +2340,21 @@ async def cost_report(request: fastapi.Request,
     )
 
 
+@app.get('/estimated_spend')
+def estimated_spend(
+        request: fastapi.Request,
+        days: int = estimated_spend_lib.DEFAULT_LOOKBACK_DAYS
+) -> Dict[str, Any]:
+    """Returns the materialized compute-cost estimate to admins only."""
+    auth_user = request.state.auth_user
+    if auth_user is not None:
+        roles = permission.permission_service.get_user_roles(auth_user.id)
+        if rbac.RoleName.ADMIN.value not in roles:
+            raise fastapi.HTTPException(
+                status_code=403, detail='Only admins can view estimated spend.')
+    return estimated_spend_lib.get_estimated_spend(days=days)
+
+
 @app.post('/cluster_events')
 async def cluster_events(
         request: fastapi.Request,
@@ -3723,6 +3740,8 @@ if __name__ == '__main__':
         global_tasks.append(
             background.create_task(
                 managed_job_state.job_event_retention_daemon()))
+        global_tasks.append(
+            background.create_task(estimated_spend_lib.rollup_daemon()))
         # Unreferenced file mounts cleanup is based on database so should
         # be a singleton task.
         global_tasks.append(

@@ -83,6 +83,10 @@ MIN_JOBS_SUBMITTED_AT_FILTER_API_VERSION = 54
 # downgrades WAITING to RUNNING on the wire for clients below this version.
 MIN_WAITING_STATUS_API_VERSION = 55
 
+# Minimum server API version that exposes the admin-only materialized
+# estimated-spend endpoint used by the dashboard.
+MIN_ESTIMATED_SPEND_API_VERSION = 57
+
 # Prefix for API request names.
 REQUEST_NAME_PREFIX = 'sky.'
 # The memory (GB) that SkyPilot tries to not use to prevent OOM.

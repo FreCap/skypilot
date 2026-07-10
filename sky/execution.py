@@ -633,6 +633,15 @@ def _execute_dag(
 
         planner = _planner
 
+    workload_type = 'cluster'
+    if _is_launched_by_jobs_controller:
+        workload_type = 'managed_job'
+    elif _is_launched_by_sky_serve_controller:
+        workload_type = ('pool' if task.service is not None and
+                         task.service.pool else 'service')
+    elif controller is not None:
+        workload_type = 'controller'
+
     backend.register_info(
         dag=dag,
         optimize_target=optimize_target,
@@ -644,7 +653,8 @@ def _execute_dag(
         is_managed=is_managed,
         planner=planner,
         extra_launch_context=_extra_launch_context,
-        is_launched_by_jobs_controller=_is_launched_by_jobs_controller)
+        is_launched_by_jobs_controller=_is_launched_by_jobs_controller,
+        workload_type=workload_type)
 
     if task.storage_mounts is not None:
         # Optimizer should eventually choose where to store bucket
