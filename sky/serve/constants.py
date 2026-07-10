@@ -60,6 +60,14 @@ CONTROLLER_ADMIN_AUTH_TOKENS_FILE_ENV_VAR = (
 LB_AUTH_TOKEN_ENV_VAR = 'SKYPILOT_SERVE_LB_AUTH_TOKEN'
 LB_AUTH_TOKENS_FILE_ENV_VAR = 'SKYPILOT_SERVE_LB_AUTH_TOKENS_FILE'
 
+# Dedicated inference-client credential header consumed by the external LB.
+# This MUST remain separate from Authorization: model servers commonly use the
+# standard header for their own application auth. The LB removes this header
+# before invoking any downstream route, so its edge credential never reaches a
+# replica.
+LB_AUTHORIZATION_HEADER = 'X-SkyPilot-Serve-Authorization'
+LB_AUTHORIZATION_HEADER_BYTES = LB_AUTHORIZATION_HEADER.lower().encode('ascii')
+
 # Helm renders this explicit platform-capability signal. It is the single
 # source of truth for in-cluster API/controller/LB processes, avoiding a split
 # between the Helm values that create RBAC/Secret projections and a separate

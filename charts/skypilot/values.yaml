@@ -306,6 +306,9 @@ serve:
         key: ""
       # Tokens accepted from inference clients by the external LB.
       lbDataPlane:
+        # Clients send the selected token as:
+        # X-SkyPilot-Serve-Authorization: Bearer <token>
+        # The LB consumes this header, preserving Authorization for the model.
         # Name of an existing Secret in the release namespace.
         existingSecret: ""
         # Key containing the newline-delimited token ring.

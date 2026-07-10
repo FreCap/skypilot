@@ -179,11 +179,11 @@ class _InboundAuthMiddleware:
     """Pure-ASGI bearer gate for inbound inference requests (data-plane auth).
 
     Implemented as raw ASGI rather than ``BaseHTTPMiddleware`` on purpose: it
-    inspects only the request headers and either short-circuits with a 401 or
-    delegates to the app, so it NEVER buffers or re-relays the response body.
-    Streaming/SSE inference responses and the catch-all proxy's slot-release
-    (generator ``finally`` + ``BackgroundTask``) pass through untouched, and the
-    hot path takes no per-request task/memory-stream overhead.
+    consumes the dedicated LB credential header and either short-circuits with
+    a 401 or delegates to the app. ``Authorization`` remains available for the
+    replica's own auth, while the LB credential cannot leak downstream. The
+    middleware NEVER buffers or re-relays the response body, so streaming/SSE
+    responses and the catch-all proxy's slot-release pass through untouched.
 
     In external-LB mode, missing or unreadable auth material fails closed.
     Exempts ONLY GET/HEAD on the readiness route -- any other method there
@@ -214,6 +214,7 @@ class _InboundAuthMiddleware:
                     status_code=401,
                     content={'detail': 'Unauthorized.'})(scope, receive, send)
                 return
+            scope = self._without_auth_header(scope)
         await self._app(scope, receive, send)
 
     @staticmethod
@@ -228,7 +229,7 @@ class _InboundAuthMiddleware:
             return True
         authorization = None
         for name, value in scope.get('headers', []):
-            if name == b'authorization':
+            if name.lower() == constants.LB_AUTHORIZATION_HEADER_BYTES:
                 authorization = value.decode('latin-1')
                 break
         if authorization is None or not authorization.isascii():
@@ -238,6 +239,20 @@ class _InboundAuthMiddleware:
             authorized |= hmac.compare_digest(authorization,
                                               f'Bearer {expected_token}')
         return authorized
+
+    @staticmethod
+    def _without_auth_header(scope):
+        """Return a scope with the LB-only credential consumed."""
+        filtered_headers = [
+            (name, value)
+            for name, value in scope.get('headers', [])
+            if name.lower() != constants.LB_AUTHORIZATION_HEADER_BYTES
+        ]
+        if len(filtered_headers) == len(scope.get('headers', [])):
+            return scope
+        filtered_scope = dict(scope)
+        filtered_scope['headers'] = filtered_headers
+        return filtered_scope
 
 
 class SkyServeLoadBalancer:
