@@ -6,6 +6,7 @@ import pathlib
 from typing import AsyncGenerator, Deque, List, Optional
 
 import aiofiles
+import aiofiles.os
 import fastapi
 
 from sky import global_user_state
@@ -46,6 +47,21 @@ async def _yield_log_file_with_payloads_skipped(
             continue
 
         yield line_str
+
+
+async def _rewind_if_log_truncated(
+        log_file: aiofiles.threadpool.binary.AsyncBufferedReader,
+        log_path: pathlib.Path) -> bool:
+    """Rewind a follower whose offset is beyond an in-place truncation."""
+    position = await log_file.tell()
+    try:
+        current_size = (await aiofiles.os.stat(log_path)).st_size
+    except FileNotFoundError:
+        return False
+    if current_size >= position:
+        return False
+    await log_file.seek(0)
+    return True
 
 
 async def wait_for_request_to_start(
@@ -188,9 +204,14 @@ async def log_streamer(
             yield header
 
             async with aiofiles.open(log_file_path, 'rb') as f:
-                async for chunk in _tail_log_file(f, request_id, plain_logs,
-                                                  tail, follow, cluster_name,
-                                                  polling_interval):
+                async for chunk in _tail_log_file(f,
+                                                  request_id,
+                                                  plain_logs,
+                                                  tail,
+                                                  follow,
+                                                  cluster_name,
+                                                  polling_interval,
+                                                  log_path=log_file_path):
                     yield chunk
 
     # api server request logs (if request_id is provided) or
@@ -198,9 +219,14 @@ async def log_streamer(
     else:
         assert log_path is not None, (request_id, cluster_name)
         async with aiofiles.open(log_path, 'rb') as f:
-            async for chunk in _tail_log_file(f, request_id, plain_logs, tail,
-                                              follow, cluster_name,
-                                              polling_interval):
+            async for chunk in _tail_log_file(f,
+                                              request_id,
+                                              plain_logs,
+                                              tail,
+                                              follow,
+                                              cluster_name,
+                                              polling_interval,
+                                              log_path=log_path):
                 yield chunk
 
 
@@ -211,7 +237,8 @@ async def _tail_log_file(
     tail: Optional[int] = None,
     follow: bool = True,
     cluster_name: Optional[str] = None,
-    polling_interval: float = DEFAULT_POLL_INTERVAL
+    polling_interval: float = DEFAULT_POLL_INTERVAL,
+    log_path: Optional[pathlib.Path] = None,
 ) -> AsyncGenerator[str, None]:
     """Tail the opened log file, buffer the lines and flush in chunks."""
 
@@ -262,6 +289,13 @@ async def _tail_log_file(
         # Read file in chunks for better I/O performance
         file_chunk: bytes = await f.read(_READ_CHUNK_SIZE)
         if not file_chunk:
+            # Bounded streaming logs are truncated in place. Rewind a reader
+            # parked beyond the new EOF so it can keep following the file.
+            if (log_path is not None and
+                    await _rewind_if_log_truncated(f, log_path)):
+                incomplete_line = b''
+                continue
+
             # Process any remaining incomplete line
             if incomplete_line:
                 line_str = incomplete_line.decode('utf-8')

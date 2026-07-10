@@ -247,6 +247,7 @@ class Server(uvicorn.Server):
                 except ProcessLookupError:
                     logger.debug(f'Process {req.pid} already finished.')
             req.status = requests_lib.RequestStatus.CANCELLED
+            req.finished_at = time.time()
             req.should_retry = True
         logger.info(
             f'Request {request_id} interrupted and will be retried by client.')

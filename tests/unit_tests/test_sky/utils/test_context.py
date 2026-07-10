@@ -59,6 +59,35 @@ def test_log_redirection(ctx):
             log_path.unlink()
 
 
+def test_bounded_log_redirection_truncates_earlier_output(ctx, tmp_path):
+    log_path = tmp_path / 'request.log'
+    ctx.redirect_log(log_path, max_bytes=128)
+    stream = ctx.output_stream(None)
+
+    stream.write('old-output-' * 10)
+    stream.write('new-output-' * 10)
+    stream.flush()
+
+    content = log_path.read_text(encoding='utf-8')
+    assert 'Earlier request output was truncated' in content
+    assert 'old-output-' not in content
+    assert 'new-output-' in content
+
+
+def test_bounded_log_redirection_caps_single_write(ctx, tmp_path):
+    log_path = tmp_path / 'request.log'
+    max_bytes = 128
+    ctx.redirect_log(log_path, max_bytes=max_bytes)
+    stream = ctx.output_stream(None)
+
+    oversized_output = 'α' * max_bytes
+    assert stream.write(oversized_output) == len(oversized_output)
+    stream.flush()
+
+    assert log_path.stat().st_size <= max_bytes
+    assert log_path.read_text(encoding='utf-8').endswith('α')
+
+
 def test_env_overrides(ctx):
     """Test environment variable overrides."""
     # Setup env overrides
