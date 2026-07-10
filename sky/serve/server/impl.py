@@ -283,15 +283,34 @@ def up(
     service_name: Optional[str] = None,
     pool: bool = False,
 ) -> Tuple[str, str]:
+    """Spins up a service or pool under the cross-pod name lifecycle lock."""
+    if service_name is None:
+        service_name = serve_utils.generate_service_name(pool)
+    lifecycle_lock = serve_utils.get_service_lifecycle_lock(service_name)
+    with lifecycle_lock:
+        return _up_impl(task, service_name, pool, lifecycle_lock)
+
+
+def _up_impl(task: 'task_lib.Task', service_name: str, pool: bool,
+             lifecycle_lock: Any) -> Tuple[str, str]:
     """Spins up a service or a pool."""
+
+    def _assert_lifecycle_lock(phase: str) -> None:
+        if not serve_utils.lifecycle_lock_is_valid(lifecycle_lock):
+            raise RuntimeError(f'Lost lifecycle ownership while {phase} for '
+                               f'{service_name!r}; retry creation.')
+
+    _assert_lifecycle_lock('starting creation')
+    if (serve_utils.is_consolidation_mode(pool) and
+            serve_state.get_service_hash(service_name) is not None):
+        noun = 'pool' if pool else 'service'
+        raise RuntimeError(f'{noun.capitalize()} {service_name!r} already '
+                           'exists; choose a new name or update it.')
     task.validate()
     serve_utils.validate_service_task(task, pool=pool)
     assert task.service is not None
     assert task.service.pool == pool, 'Inconsistent pool flag.'
     noun = 'pool' if pool else 'service'
-    if service_name is None:
-        service_name = serve_utils.generate_service_name(pool)
-
     # The name becomes a controller/replica cluster name and, for services, a
     # Kubernetes LB ownership label.
     _validate_service_name(service_name, pool)
@@ -413,6 +432,7 @@ def up(
                     # pod is considered a "system" pod and is not subject to
                     # queue limits or preemption.
                     skypilot_config.remove_queue_name_from_config()):
+                _assert_lifecycle_lock('launching the controller')
                 controller_job_id, controller_handle = execution.launch(
                     task=controller_task,
                     cluster_name=controller_name,
@@ -427,6 +447,7 @@ def up(
                 controller=controller_type, stopped_message='')
             backend = backend_utils.get_backend_from_handle(controller_handle)
             assert isinstance(backend, backends.CloudVmRayBackend)
+            _assert_lifecycle_lock('syncing controller files')
             backend.sync_file_mounts(
                 handle=controller_handle,
                 all_file_mounts=controller_task.file_mounts,
@@ -463,6 +484,7 @@ def up(
             restore_cmds = _ha_recovery_restore_cmds(config_files)
             run_script = '\n'.join(env_cmds + restore_cmds + [run_script])
             # Dump script for high availability recovery.
+            _assert_lifecycle_lock('publishing the recovery script')
             serve_state.set_ha_recovery_script(service_name, run_script)
             self_pod_ip_dbg = os.environ.get('POD_IP', '<unset>')
             logger.debug(f'Serve up() run_on_head: spawning controller '
@@ -471,6 +493,7 @@ def up(
             # supplies a clean server env to the subprocess so per-request
             # env pollution doesn't leak into the long-lived serve
             # controller. See LocalProcessCommandRunner.run for details.
+            _assert_lifecycle_lock('spawning the controller')
             backend.run_on_head(controller_handle, run_script)
 
         style = colorama.Style
@@ -486,6 +509,7 @@ def up(
             with rich_utils.safe_status(
                     ux_utils.spinner_message(
                         f'Waiting for the {noun} to register')):
+                _assert_lifecycle_lock('waiting for registration')
                 # This checks the controller job id in the database and waits
                 # for the historical registration-port sentinel. The actual
                 # endpoint is always derived from the Kubernetes LB Service.
@@ -547,6 +571,7 @@ def up(
                         'Failed to spin up the service. Please '
                         'check the logs above for more details.') from None
         else:
+            _assert_lifecycle_lock('completing registration')
             # Pools have no inference endpoint. Keep returning a string for
             # the internal up() compatibility contract; apply() discards it.
             endpoint = ''
@@ -631,14 +656,42 @@ def update(
     workers: Optional[int] = None,
 ) -> None:
     """Updates an existing service or pool."""
-    # Same per-service lock as apply()/down(): an update racing a
-    # concurrent down on the same service can otherwise launch replicas
-    # mid-teardown, leaving orphaned (billable) clusters that no state
-    # tracks. apply() calls _update_impl directly because it already
-    # holds this lock (a second FileLock on the same path in the same
-    # process can self-deadlock).
+    # The lifecycle lock is cross-pod on PostgreSQL and lives outside the
+    # service directory. Keep the legacy local lock outermost to match named
+    # down's local-lock -> controller-purge lifecycle-lock order; reversing the
+    # order can deadlock. The lifecycle lock remains the actual HA boundary.
     with filelock.FileLock(serve_utils.get_service_filelock_path(service_name)):
-        _update_impl(task, service_name, mode, pool, workers)
+        lifecycle_lock = serve_utils.get_service_lifecycle_lock(service_name)
+        with lifecycle_lock:
+            _update_impl(task,
+                         service_name,
+                         mode,
+                         pool,
+                         workers,
+                         lifecycle_lock=lifecycle_lock)
+
+
+def _assert_service_update_fence(service_name: str, pool: bool,
+                                 handle: 'backends.CloudVmRayResourceHandle',
+                                 backend: 'backends.CloudVmRayBackend',
+                                 expected_service_hash: str,
+                                 lifecycle_lock: Any,
+                                 phase: str) -> Dict[str, Any]:
+    """Revalidate one update before a name-scoped external mutation."""
+    if not serve_utils.lifecycle_lock_is_valid(lifecycle_lock):
+        raise RuntimeError(f'Lost lifecycle ownership while {phase} for '
+                           f'{service_name!r}; retry the update.')
+    current = _get_service_record(service_name, pool, handle, backend)
+    if (current is None or current.get('hash') != expected_service_hash):
+        raise RuntimeError(f'Service {service_name!r} changed incarnation '
+                           f'while {phase}; retry against the current service.')
+    service_status = current['status']
+    if service_status in serve_state.ServiceStatus.terminal_statuses():
+        raise RuntimeError(f'Service {service_name!r} entered terminal status '
+                           f'{service_status.value} while {phase}; clean it '
+                           'up and '
+                           'retry.')
+    return current
 
 
 def _update_impl(
@@ -647,6 +700,7 @@ def _update_impl(
     mode: serve_utils.UpdateMode = serve_utils.DEFAULT_UPDATE_MODE,
     pool: bool = False,
     workers: Optional[int] = None,
+    lifecycle_lock: Optional[Any] = None,
 ) -> None:
     noun = 'pool' if pool else 'service'
     capnoun = noun.capitalize()
@@ -675,6 +729,12 @@ def _update_impl(
             raise RuntimeError(f'Cannot find {noun} {service_name!r}.'
                                f'To spin up a {noun}, use {ux_utils.BOLD}'
                                f'{cmd}{ux_utils.RESET_BOLD}')
+    expected_service_hash = service_record.get('hash')
+    if not isinstance(expected_service_hash, str) or not expected_service_hash:
+        raise RuntimeError(f'Cannot safely update {noun} {service_name!r} '
+                           'without a durable service incarnation.')
+    if lifecycle_lock is None:
+        raise RuntimeError('Service update requires lifecycle ownership.')
 
     # If task is None and workers is specified, load existing configuration
     # and update replica count.
@@ -725,17 +785,21 @@ def _update_impl(
     _require_supported_service_topology(task, pool)
 
     prompt = None
-    if (service_record['status'] == serve_state.ServiceStatus.CONTROLLER_FAILED
-       ):
-        prompt = (f'{capnoun} {service_name!r} has a failed controller. '
-                  f'Please clean up the {noun} and try again.')
-    elif (service_record['status'] == serve_state.ServiceStatus.CONTROLLER_INIT
-         ):
+    service_status = service_record['status']
+    if service_status in serve_state.ServiceStatus.terminal_statuses():
+        prompt = (f'{capnoun} {service_name!r} is in terminal status '
+                  f'{service_status.value}. Please clean up the {noun} and '
+                  'try again.')
+    elif service_status == serve_state.ServiceStatus.CONTROLLER_INIT:
         prompt = (f'{capnoun} {service_name!r} is still initializing '
                   'its controller. Please try again later.')
     if prompt is not None:
         with ux_utils.print_exception_no_traceback():
             raise RuntimeError(prompt)
+
+    _assert_service_update_fence(service_name, pool, handle, backend,
+                                 expected_service_hash, lifecycle_lock,
+                                 'preparing the update')
 
     with rich_utils.safe_status(
             ux_utils.spinner_message(f'Initializing {noun}')):
@@ -745,6 +809,9 @@ def _update_impl(
     use_legacy = not handle.is_grpc_enabled_with_flag
 
     if not use_legacy:
+        _assert_service_update_fence(service_name, pool, handle, backend,
+                                     expected_service_hash, lifecycle_lock,
+                                     'adding a version')
         try:
             current_version = serve_rpc_utils.RpcRunner.add_version(
                 handle, service_name)
@@ -752,6 +819,9 @@ def _update_impl(
             use_legacy = True
 
     if use_legacy:
+        _assert_service_update_fence(service_name, pool, handle, backend,
+                                     expected_service_hash, lifecycle_lock,
+                                     'adding a version')
         code = serve_utils.ServeCodeGen.add_version(service_name)
         returncode, version_string_payload, stderr = backend.run_on_head(
             handle,
@@ -785,6 +855,9 @@ def _update_impl(
             service_name, current_version, expand_user=False)
 
         with sky_logging.silent():
+            _assert_service_update_fence(service_name, pool, handle, backend,
+                                         expected_service_hash, lifecycle_lock,
+                                         'syncing the update YAML')
             backend.sync_file_mounts(handle,
                                      {remote_task_yaml_path: service_file.name},
                                      storage_mounts=None)
@@ -792,6 +865,9 @@ def _update_impl(
         use_legacy = not handle.is_grpc_enabled_with_flag
 
         if not use_legacy:
+            _assert_service_update_fence(service_name, pool, handle, backend,
+                                         expected_service_hash, lifecycle_lock,
+                                         'submitting the update')
             try:
                 serve_rpc_utils.RpcRunner.update_service(
                     handle, service_name, current_version, mode, pool)
@@ -799,6 +875,9 @@ def _update_impl(
                 use_legacy = True
 
         if use_legacy:
+            _assert_service_update_fence(service_name, pool, handle, backend,
+                                         expected_service_hash, lifecycle_lock,
+                                         'submitting the update')
             code = serve_utils.ServeCodeGen.update_service(service_name,
                                                            current_version,
                                                            mode=mode.value,
@@ -849,49 +928,52 @@ def apply(
 ) -> None:
     """Applies the config to the service or pool."""
     with filelock.FileLock(serve_utils.get_service_filelock_path(service_name)):
-        try:
-            controller_type = controller_utils.get_controller_for_pool(pool)
-            handle = backend_utils.is_controller_accessible(
-                controller=controller_type, stopped_message='')
-            backend = backend_utils.get_backend_from_handle(handle)
-            assert isinstance(backend, backends.CloudVmRayBackend)
-            service_record = _get_service_record(service_name, pool, handle,
-                                                 backend)
-            if service_record is not None:
-                # Refuse update for terminal-state rows (CONTROLLER_FAILED /
-                # FAILED_CLEANUP / SHUTTING_DOWN). The controller HTTP
-                # listener may already be gone, so update would just hit
-                # ECONNREFUSED with a confusing error. SHUTTING_DOWN is the
-                # ambiguous case: it can be a normal in-progress shutdown
-                # (will self-resolve in seconds) or a zombie (cleanup died
-                # mid-flight; recoverable only via --purge). We give it a
-                # friendlier message so a user who just ran `sky serve down`
-                # and immediately re-applies isn't pushed to --purge.
-                svc_status = service_record['status']
-                if svc_status in (
-                        serve_state.ServiceStatus.terminal_statuses()):
-                    noun = 'pool' if pool else 'service'
-                    purge_cmd = (f'sky jobs pool down {service_name} --purge'
-                                 if pool else
-                                 f'sky serve down {service_name} --purge')
-                    if svc_status == serve_state.ServiceStatus.SHUTTING_DOWN:
-                        msg = (f'{noun.capitalize()} {service_name!r} is '
-                               f'shutting down. Wait for shutdown to '
-                               f'complete, then re-apply. If it stays in '
-                               f'this state for a long time, the cleanup '
-                               f'may be stuck; run `{purge_cmd}` to '
-                               f'force-clean.')
-                    else:
-                        msg = (f'{noun.capitalize()} {service_name!r} is '
-                               f'in {svc_status.value} state and cannot '
-                               f'be updated. Run `{purge_cmd}` to clean '
-                               f'it up and retry.')
-                    with ux_utils.print_exception_no_traceback():
-                        raise RuntimeError(msg)
-                return _update_impl(task, service_name, mode, pool, workers)
-        except exceptions.ClusterNotUpError:
-            pass
-        up(task, service_name, pool)
+        lifecycle_lock = serve_utils.get_service_lifecycle_lock(service_name)
+        with lifecycle_lock:
+            try:
+                controller_type = controller_utils.get_controller_for_pool(pool)
+                handle = backend_utils.is_controller_accessible(
+                    controller=controller_type, stopped_message='')
+                backend = backend_utils.get_backend_from_handle(handle)
+                assert isinstance(backend, backends.CloudVmRayBackend)
+                service_record = _get_service_record(service_name, pool, handle,
+                                                     backend)
+                if service_record is not None:
+                    # Refuse update for terminal-state rows
+                    # (CONTROLLER_FAILED / FAILED_CLEANUP / SHUTTING_DOWN).
+                    # The controller listener may already be gone, so update
+                    # would otherwise surface an opaque ECONNREFUSED.
+                    svc_status = service_record['status']
+                    if svc_status in (
+                            serve_state.ServiceStatus.terminal_statuses()):
+                        noun = 'pool' if pool else 'service'
+                        purge_cmd = (
+                            f'sky jobs pool down {service_name} --purge' if pool
+                            else f'sky serve down {service_name} --purge')
+                        if (svc_status ==
+                                serve_state.ServiceStatus.SHUTTING_DOWN):
+                            msg = (f'{noun.capitalize()} {service_name!r} is '
+                                   'shutting down. Wait for shutdown to '
+                                   'complete, then re-apply. If it stays in '
+                                   'this state for a long time, the cleanup '
+                                   f'may be stuck; run `{purge_cmd}` to '
+                                   'force-clean.')
+                        else:
+                            msg = (f'{noun.capitalize()} {service_name!r} is '
+                                   f'in {svc_status.value} state and cannot '
+                                   f'be updated. Run `{purge_cmd}` to clean '
+                                   'it up and retry.')
+                        with ux_utils.print_exception_no_traceback():
+                            raise RuntimeError(msg)
+                    return _update_impl(task,
+                                        service_name,
+                                        mode,
+                                        pool,
+                                        workers,
+                                        lifecycle_lock=lifecycle_lock)
+            except exceptions.ClusterNotUpError:
+                pass
+            _up_impl(task, service_name, pool, lifecycle_lock)
 
 
 def _terminate_services(handle: 'backends.CloudVmRayResourceHandle',

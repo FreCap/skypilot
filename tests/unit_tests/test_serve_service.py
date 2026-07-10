@@ -349,6 +349,12 @@ class TestCleanupBlocksHaRecoveryButKeepsVersionSpecs:
                            'controller_ip': '10.0.0.1',
                            'status': 'READY',
                        }),
+            mock.patch('sky.serve.service.serve_state.service_owner_matches',
+                       return_value=True),
+            mock.patch(
+                'sky.serve.service.serve_utils.'
+                'lifecycle_lock_is_valid',
+                return_value=True),
         ]
 
     def test_recovery_script_removed_on_storage_success(self):
@@ -364,7 +370,8 @@ class TestCleanupBlocksHaRecoveryButKeepsVersionSpecs:
             for p in patches:
                 p.start()
             try:
-                failed = service._cleanup('svc', pool=False)
+                failed = service._cleanup('svc', False, 'incarnation-a', 9999,
+                                          '10.0.0.1', mock.Mock())
             finally:
                 for p in patches:
                     p.stop()
@@ -372,8 +379,9 @@ class TestCleanupBlocksHaRecoveryButKeepsVersionSpecs:
             # version_specs must NOT be touched by _cleanup (success path
             # in _start handles it via remove_service_completely).
             mock_delete_versions.assert_not_called()
-            # recovery_script MUST be removed up front to block HA daemon.
-            mock_remove_recovery.assert_called_once_with('svc')
+            # Finalization owns recovery-script removal so a lifecycle-lock
+            # loss cannot strand the row between this helper and final CAS.
+            mock_remove_recovery.assert_not_called()
 
     def test_recovery_script_removed_even_when_cleanup_fails(self):
         """Even when storage cleanup fails (we'll end up in FAILED_CLEANUP),
@@ -392,7 +400,8 @@ class TestCleanupBlocksHaRecoveryButKeepsVersionSpecs:
             for p in patches:
                 p.start()
             try:
-                failed = service._cleanup('svc', pool=False)
+                failed = service._cleanup('svc', False, 'incarnation-a', 9999,
+                                          '10.0.0.1', mock.Mock())
             finally:
                 for p in patches:
                     p.stop()
@@ -400,8 +409,7 @@ class TestCleanupBlocksHaRecoveryButKeepsVersionSpecs:
             # version_specs preserved → row still findable via JOIN, --purge
             # can clear it.
             mock_delete_versions.assert_not_called()
-            # recovery_script gone → HA daemon won't respawn.
-            mock_remove_recovery.assert_called_once_with('svc')
+            mock_remove_recovery.assert_not_called()
 
 
 class TestRunCleanupAndFinalizeDeletesLb:
@@ -416,33 +424,56 @@ class TestRunCleanupAndFinalizeDeletesLb:
     def test_deletes_lb_on_failed_cleanup(self):
         with mock.patch('sky.serve.service._cleanup', return_value=True), \
              mock.patch('sky.serve.service.serve_state.'
-                        'set_service_status_and_active_versions'), \
+                        'acknowledge_service_controller_teardown_if_owner',
+                        return_value=True), \
+             mock.patch('sky.serve.service.serve_utils.'
+                        'get_service_lifecycle_lock',
+                        return_value=mock.MagicMock()), \
+             mock.patch('sky.serve.service.serve_utils.'
+                        'lifecycle_lock_is_valid', return_value=True), \
+             mock.patch('sky.serve.service.serve_state.'
+                        'service_owner_matches', return_value=True), \
+             mock.patch('sky.serve.service.serve_state.'
+                        'set_service_status_and_active_versions_if_owner',
+                        return_value=True), \
+             mock.patch('sky.serve.service.serve_state.'
+                        'remove_ha_recovery_script_if_owner'), \
              mock.patch('sky.serve.service.serve_state.'
                         'remove_service_completely') as mock_remove, \
              mock.patch('sky.serve.service.lb_k8s.delete_lb_objects'
                        ) as mock_delete_lb, \
              mock.patch('sky.serve.service._cleanup_task_run_script'):
-            service._run_cleanup_and_finalize('svc',
-                                              self._spec(),
-                                              '/tmp/svc',
-                                              job_id=1)
+            service._run_cleanup_and_finalize('svc', self._spec(), '/tmp/svc',
+                                              1, 'incarnation-a', 123,
+                                              '10.0.0.1')
         # FAILED_CLEANUP keeps the DB row but tears down the LB.
         mock_remove.assert_not_called()
-        mock_delete_lb.assert_called_once_with('svc')
+        mock_delete_lb.assert_called_once_with(
+            'svc', expected_service_hash='incarnation-a')
 
     def test_failed_cleanup_lb_delete_error_is_swallowed(self):
         with mock.patch('sky.serve.service._cleanup',
                         return_value=True) as mock_cleanup, \
              mock.patch('sky.serve.service.serve_state.'
-                        'set_service_status_and_active_versions'), \
+                        'acknowledge_service_controller_teardown_if_owner',
+                        return_value=True), \
+             mock.patch('sky.serve.service.serve_utils.'
+                        'get_service_lifecycle_lock',
+                        return_value=mock.MagicMock()), \
+             mock.patch('sky.serve.service.serve_utils.'
+                        'lifecycle_lock_is_valid', return_value=True), \
+             mock.patch('sky.serve.service.serve_state.'
+                        'service_owner_matches', return_value=True), \
+             mock.patch('sky.serve.service.serve_state.'
+                        'set_service_status_and_active_versions_if_owner',
+                        return_value=True), \
              mock.patch('sky.serve.service.lb_k8s.delete_lb_objects',
                         side_effect=RuntimeError('boom')), \
              mock.patch('sky.serve.service._cleanup_task_run_script'):
             # A best-effort LB delete failure must not propagate.
-            service._run_cleanup_and_finalize('svc',
-                                              self._spec(),
-                                              '/tmp/svc',
-                                              job_id=1)
+            service._run_cleanup_and_finalize('svc', self._spec(), '/tmp/svc',
+                                              1, 'incarnation-a', 123,
+                                              '10.0.0.1')
         # Fail closed: replicas are not destroyed while their public LB may
         # still be accepting requests.
         mock_cleanup.assert_not_called()
@@ -450,17 +481,32 @@ class TestRunCleanupAndFinalizeDeletesLb:
     def test_deletes_lb_on_success(self):
         with mock.patch('sky.serve.service._cleanup', return_value=False), \
              mock.patch('sky.serve.service.serve_state.'
-                        'remove_service_completely') as mock_remove, \
+                        'acknowledge_service_controller_teardown_if_owner',
+                        return_value=True), \
+             mock.patch('sky.serve.service.serve_utils.'
+                        'get_service_lifecycle_lock',
+                        return_value=mock.MagicMock()), \
+             mock.patch('sky.serve.service.serve_utils.'
+                        'lifecycle_lock_is_valid', return_value=True), \
+             mock.patch('sky.serve.service.serve_state.'
+                        'service_owner_matches', return_value=True), \
+             mock.patch('sky.serve.service.serve_state.'
+                        'remove_service_completely',
+                        return_value=True) as mock_remove, \
              mock.patch('sky.serve.service.lb_k8s.delete_lb_objects'
                        ) as mock_delete_lb, \
-             mock.patch('sky.serve.service.shutil.rmtree'), \
+             mock.patch('sky.serve.service.serve_utils.'
+                        'quarantine_service_directory', return_value=None), \
+             mock.patch('sky.serve.service.serve_utils.'
+                        'remove_quarantined_service_directory'), \
              mock.patch('sky.serve.service._cleanup_task_run_script'):
-            service._run_cleanup_and_finalize('svc',
-                                              self._spec(),
-                                              '/tmp/svc',
-                                              job_id=1)
-        mock_remove.assert_called_once_with('svc')
-        mock_delete_lb.assert_called_once_with('svc')
+            service._run_cleanup_and_finalize('svc', self._spec(), '/tmp/svc',
+                                              1, 'incarnation-a', 123,
+                                              '10.0.0.1')
+        mock_remove.assert_called_once_with(
+            'svc', 'incarnation-a', expected_controller_owner=(123, '10.0.0.1'))
+        mock_delete_lb.assert_called_once_with(
+            'svc', expected_service_hash='incarnation-a')
 
 
 class TestCleanupAuditLog:
@@ -489,6 +535,12 @@ class TestCleanupAuditLog:
                        return_value='dummy: yaml'),
             mock.patch('sky.serve.service.serve_state.get_service_from_name',
                        return_value=db_record),
+            mock.patch('sky.serve.service.serve_state.service_owner_matches',
+                       return_value=True),
+            mock.patch(
+                'sky.serve.service.serve_utils.'
+                'lifecycle_lock_is_valid',
+                return_value=True),
             mock.patch(
                 'sky.serve.service.serve_state.remove_ha_recovery_script'),
             mock.patch('sky.serve.service.cleanup_storage', return_value=True),
@@ -504,7 +556,8 @@ class TestCleanupAuditLog:
             p.start()
         try:
             with mock.patch.object(service.logger, 'warning') as mock_warn:
-                service._cleanup('audit-svc', pool=True)
+                service._cleanup('audit-svc', True, 'incarnation-a', 4242,
+                                 '10.4.7.7', mock.Mock())
         finally:
             for p in patches:
                 p.stop()
@@ -521,7 +574,8 @@ class TestCleanupAuditLog:
             p.start()
         try:
             with mock.patch.object(service.logger, 'warning') as mock_warn:
-                service._cleanup('gone-svc', pool=True)
+                service._cleanup('gone-svc', True, 'incarnation-a', 4242,
+                                 '10.4.7.7', mock.Mock())
         finally:
             for p in patches:
                 p.stop()

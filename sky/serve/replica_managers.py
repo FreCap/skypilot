@@ -341,7 +341,8 @@ def terminate_cluster(
         replica_drain_delay_seconds: int = 0,
         max_retry: int = 3,
         drain_deadline: Optional[float] = None,
-        drain_complete: Optional[Callable[[], bool]] = None) -> None:
+        drain_complete: Optional[Callable[[], bool]] = None,
+        continue_guard: Optional[Callable[[], bool]] = None) -> None:
     """Terminate the sky serve replica cluster."""
     # Setup logging redirection.
     ctx = context.get()
@@ -358,6 +359,10 @@ def terminate_cluster(
     retry_cnt = 0
     backoff = common_utils.Backoff()
     while True:
+        if continue_guard is not None and not continue_guard():
+            raise RuntimeError(
+                f'Refusing to retry termination of {cluster_name!r} after '
+                'service lifecycle ownership was lost.')
         retry_cnt += 1
         try:
             usage_lib.messages.usage.set_internal()

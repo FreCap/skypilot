@@ -356,7 +356,7 @@ class TestUpdateServiceControllerPidIpAndPort:
         assert serve_state.update_service_controller_pid_if_owner(
             'svc', old_hash, 777, '10.0.0.7', 888, '10.0.0.8') is True
 
-        serve_state.remove_service_completely('svc')
+        assert serve_state.remove_service_completely('svc', old_hash)
         _add_minimal_service('svc',
                              controller_ip='10.9.0.1',
                              controller_pid=888)
@@ -426,7 +426,7 @@ class TestUpdateServiceControllerPidIfOwner:
     def test_preclaim_rejects_same_name_successor(self, _mock_serve_db):
         _add_minimal_service('svc', controller_pid=111)
         old_hash = _read_row(_mock_serve_db, 'svc')['hash']
-        serve_state.remove_service_completely('svc')
+        assert serve_state.remove_service_completely('svc', old_hash)
         # Deliberately reuse the same PID to model distinct Kubernetes pods.
         _add_minimal_service('svc', controller_pid=111)
         successor_hash = _read_row(_mock_serve_db, 'svc')['hash']
@@ -479,11 +479,39 @@ class TestSetServiceControllerPortIfOwner:
     def test_same_pid_successor_is_rejected_by_hash(self, _mock_serve_db):
         _add_minimal_service('svc', controller_pid=12345)
         old_hash = _read_row(_mock_serve_db, 'svc')['hash']
-        serve_state.remove_service_completely('svc')
+        assert serve_state.remove_service_completely('svc', old_hash)
         _add_minimal_service('svc', controller_pid=12345)
         assert serve_state.set_service_controller_port_if_owner(
             'svc', old_hash, 12345, None, 20123) is False
         assert _read_row(_mock_serve_db, 'svc')['controller_port'] is None
+
+
+class TestAcknowledgeControllerTeardown:
+
+    def test_owner_atomically_publishes_terminal_status_and_ack(
+            self, _mock_serve_db):
+        _add_minimal_service('svc', service_hash='incarnation-a')
+        serve_state.set_service_status_and_active_versions(
+            'svc', serve_state.ServiceStatus.READY)
+
+        assert serve_state.acknowledge_service_controller_teardown_if_owner(
+            'svc', 'incarnation-a', 12345, None)
+
+        row = _read_row(_mock_serve_db, 'svc')
+        assert row['status'] == serve_state.ServiceStatus.SHUTTING_DOWN.value
+        assert (row['controller_port'] ==
+                serve_constants.CONTROLLER_TEARDOWN_ACK_PORT)
+
+    def test_stale_owner_cannot_change_successor_status(self, _mock_serve_db):
+        _add_minimal_service('svc', service_hash='incarnation-b')
+        serve_state.set_service_status_and_active_versions(
+            'svc', serve_state.ServiceStatus.READY)
+
+        assert not serve_state.acknowledge_service_controller_teardown_if_owner(
+            'svc', 'incarnation-a', 12345, None)
+        assert (_read_row(
+            _mock_serve_db,
+            'svc')['status'] == serve_state.ServiceStatus.READY.value)
 
 
 class TestSetServiceLoadBalancerPortIfOwner:
@@ -523,7 +551,7 @@ class TestSetServiceLoadBalancerPortIfOwner:
     def test_same_pid_successor_is_rejected_by_hash(self, _mock_serve_db):
         _add_minimal_service('svc', controller_pid=12345)
         old_hash = _read_row(_mock_serve_db, 'svc')['hash']
-        serve_state.remove_service_completely('svc')
+        assert serve_state.remove_service_completely('svc', old_hash)
         _add_minimal_service('svc', controller_pid=12345)
         assert serve_state.set_service_load_balancer_port_if_owner(
             'svc', old_hash, 12345, None, 30001) is False
@@ -554,9 +582,8 @@ class TestRemoveServiceCompletely:
     """
 
     def _populate(self, engine, name):
-        # Seed all three service-metadata tables plus a replica row so we
-        # can assert metadata is removed atomically while the replica row
-        # survives.
+        # Seed all service tables plus a replica row so the exact incarnation
+        # can be removed atomically.
         _add_minimal_service(name, controller_ip='10.0.0.1')
         serve_state.add_version(name)
         serve_state.set_ha_recovery_script(name, 'dummy script')
@@ -566,6 +593,35 @@ class TestRemoveServiceCompletely:
             session.execute(serve_state.replicas_table.insert().values(
                 service_name=name, replica_id=1, replica_info=b'fake-pickle'))
             session.commit()
+
+    def test_failed_cleanup_status_retains_metadata_and_reserves_name(
+            self, _mock_serve_db):
+        self._populate(_mock_serve_db, 'svc-retained')
+        service_hash = _read_row(_mock_serve_db, 'svc-retained')['hash']
+
+        assert serve_state.set_service_status_and_active_versions_if_owner(
+            'svc-retained',
+            service_hash,
+            12345,
+            '10.0.0.1',
+            serve_state.ServiceStatus.FAILED_CLEANUP,
+            expected_status=serve_state.ServiceStatus.CONTROLLER_INIT)
+
+        with orm.Session(_mock_serve_db) as session:
+            for table, column in [
+                (serve_state.services_table, serve_state.services_table.c.name),
+                (serve_state.replicas_table,
+                 serve_state.replicas_table.c.service_name),
+                (serve_state.version_specs_table,
+                 serve_state.version_specs_table.c.service_name),
+                (serve_state.serve_ha_recovery_script_table,
+                 serve_state.serve_ha_recovery_script_table.c.service_name),
+            ]:
+                assert session.execute(
+                    sqlalchemy.select(column).where(
+                        column == 'svc-retained')).first() is not None
+        # The durable services row keeps same-name H_new from registering.
+        assert not _add_minimal_service('svc-retained')
 
     def test_removes_service_metadata_tables(self, _mock_serve_db):
         self._populate(_mock_serve_db, 'svc-rsc')
@@ -591,7 +647,8 @@ class TestRemoveServiceCompletely:
                         serve_state.version_specs_table.c.service_name ==
                         'svc-rsc')).first() is not None
 
-        serve_state.remove_service_completely('svc-rsc')
+        service_hash = _read_row(_mock_serve_db, 'svc-rsc')['hash']
+        assert serve_state.remove_service_completely('svc-rsc', service_hash)
 
         # The three metadata tables must be gone.
         with orm.Session(_mock_serve_db) as session:
@@ -609,22 +666,22 @@ class TestRemoveServiceCompletely:
                     serve_state.version_specs_table.c.service_name).where(
                         serve_state.version_specs_table.c.service_name ==
                         'svc-rsc')).first() is None
-            # The replicas row must SURVIVE — replicas are the caller's
-            # responsibility, not this function's. Deleting them here
-            # would fold over the per-replica leak-detection and
-            # failure-marking logic in the two real callers.
+            # Replica rows are children of the incarnation and must be gone in
+            # the same transaction, or a stale purge can leave rows that a
+            # same-name successor reads as its own.
             assert session.execute(
                 sqlalchemy.select(
                     serve_state.replicas_table.c.service_name).where(
                         serve_state.replicas_table.c.service_name ==
-                        'svc-rsc')).first() is not None
+                        'svc-rsc')).first() is None
 
     def test_does_not_touch_other_services(self, _mock_serve_db):
         """Make sure deletion is scoped to the named service."""
         self._populate(_mock_serve_db, 'svc-keep')
         self._populate(_mock_serve_db, 'svc-drop')
 
-        serve_state.remove_service_completely('svc-drop')
+        drop_hash = _read_row(_mock_serve_db, 'svc-drop')['hash']
+        assert serve_state.remove_service_completely('svc-drop', drop_hash)
 
         # svc-keep's rows must all survive.
         with orm.Session(_mock_serve_db) as session:
@@ -644,8 +701,33 @@ class TestRemoveServiceCompletely:
 
     def test_no_op_when_nothing_to_delete(self, _mock_serve_db):
         # Should be a silent no-op when no rows exist.
-        serve_state.remove_service_completely('never-existed')
-        # No assertion needed beyond "didn't raise".
+        assert not serve_state.remove_service_completely(
+            'never-existed', 'missing-hash')
+
+    def test_stale_a_delete_spares_successor_b_and_all_children(
+            self, _mock_serve_db):
+        self._populate(_mock_serve_db, 'svc')
+        hash_a = _read_row(_mock_serve_db, 'svc')['hash']
+        assert serve_state.remove_service_completely('svc', hash_a)
+
+        self._populate(_mock_serve_db, 'svc')
+        hash_b = _read_row(_mock_serve_db, 'svc')['hash']
+        assert hash_b != hash_a
+
+        assert not serve_state.remove_service_completely('svc', hash_a)
+        assert _read_row(_mock_serve_db, 'svc')['hash'] == hash_b
+        with orm.Session(_mock_serve_db) as session:
+            for table, column in [
+                (serve_state.replicas_table,
+                 serve_state.replicas_table.c.service_name),
+                (serve_state.version_specs_table,
+                 serve_state.version_specs_table.c.service_name),
+                (serve_state.serve_ha_recovery_script_table,
+                 serve_state.serve_ha_recovery_script_table.c.service_name),
+            ]:
+                assert session.execute(
+                    sqlalchemy.select(column).where(
+                        column == 'svc')).first() is not None, table.name
 
 
 class TestRecoveryVersionSelection:

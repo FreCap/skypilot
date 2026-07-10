@@ -41,7 +41,12 @@ class TestControllerHealth:
 
 
 def _record(status):
-    return {'status': status}
+    return {
+        'status': status,
+        'hash': 'incarnation-a',
+        'controller_pid': 123,
+        'controller_ip': '10.0.0.1',
+    }
 
 
 class TestDegradedFlag:
@@ -53,10 +58,16 @@ class TestDegradedFlag:
                 return_value=_record(serve_state.ServiceStatus.READY)), \
              mock.patch.object(
                  service.serve_state,
-                 'set_service_status_and_active_versions') as set_status:
-            service._flag_service_degraded('svc')
+                 'set_service_status_and_active_versions_if_owner') as set_status:
+            service._flag_service_degraded('svc', 'incarnation-a', 123,
+                                           '10.0.0.1')
         set_status.assert_called_once_with(
-            'svc', serve_state.ServiceStatus.CONTROLLER_FAILED)
+            'svc',
+            'incarnation-a',
+            123,
+            '10.0.0.1',
+            serve_state.ServiceStatus.CONTROLLER_FAILED,
+            expected_status=serve_state.ServiceStatus.READY)
 
     def test_never_overrides_teardown(self):
         for status in (serve_state.ServiceStatus.SHUTTING_DOWN,
@@ -66,8 +77,10 @@ class TestDegradedFlag:
                                    return_value=_record(status)), \
                  mock.patch.object(
                      service.serve_state,
-                     'set_service_status_and_active_versions') as set_status:
-                service._flag_service_degraded('svc')
+                     'set_service_status_and_active_versions_if_owner'
+                 ) as set_status:
+                service._flag_service_degraded('svc', 'incarnation-a', 123,
+                                               '10.0.0.1')
             set_status.assert_not_called()
 
     def test_flag_is_idempotent(self):
@@ -78,15 +91,17 @@ class TestDegradedFlag:
                     serve_state.ServiceStatus.CONTROLLER_FAILED)), \
              mock.patch.object(
                  service.serve_state,
-                 'set_service_status_and_active_versions') as set_status:
-            service._flag_service_degraded('svc')
+                 'set_service_status_and_active_versions_if_owner') as set_status:
+            service._flag_service_degraded('svc', 'incarnation-a', 123,
+                                           '10.0.0.1')
         set_status.assert_not_called()
 
     def test_db_failure_is_contained(self):
         with mock.patch.object(service.serve_state,
                                'get_service_from_name',
                                side_effect=RuntimeError('db down')):
-            service._flag_service_degraded('svc')  # Must not raise.
+            service._flag_service_degraded('svc', 'incarnation-a', 123,
+                                           '10.0.0.1')  # Must not raise.
 
 
 class TestDegradedHeal:
@@ -99,10 +114,17 @@ class TestDegradedHeal:
                     serve_state.ServiceStatus.CONTROLLER_FAILED)), \
              mock.patch.object(
                  service.serve_state,
-                 'set_service_status_and_active_versions') as set_status:
-            assert service._heal_service_degraded('svc')
+                 'set_service_status_and_active_versions_if_owner',
+                 return_value=True) as set_status:
+            assert service._heal_service_degraded('svc', 'incarnation-a', 123,
+                                                  '10.0.0.1')
         set_status.assert_called_once_with(
-            'svc', serve_state.ServiceStatus.REPLICA_INIT)
+            'svc',
+            'incarnation-a',
+            123,
+            '10.0.0.1',
+            serve_state.ServiceStatus.REPLICA_INIT,
+            expected_status=serve_state.ServiceStatus.CONTROLLER_FAILED)
 
     def test_noop_for_other_statuses_reports_complete(self):
         for status in (serve_state.ServiceStatus.READY,
@@ -113,8 +135,10 @@ class TestDegradedHeal:
                                    return_value=_record(status)), \
                  mock.patch.object(
                      service.serve_state,
-                     'set_service_status_and_active_versions') as set_status:
-                assert service._heal_service_degraded('svc')
+                     'set_service_status_and_active_versions_if_owner'
+                 ) as set_status:
+                assert service._heal_service_degraded('svc', 'incarnation-a',
+                                                      123, '10.0.0.1')
             set_status.assert_not_called()
 
     def test_db_failure_reports_incomplete_for_retry(self):
@@ -124,7 +148,8 @@ class TestDegradedHeal:
         with mock.patch.object(service.serve_state,
                                'get_service_from_name',
                                side_effect=RuntimeError('db down')):
-            assert not service._heal_service_degraded('svc')
+            assert not service._heal_service_degraded('svc', 'incarnation-a',
+                                                      123, '10.0.0.1')
         with mock.patch.object(
                 service.serve_state,
                 'get_service_from_name',
@@ -132,9 +157,10 @@ class TestDegradedHeal:
                     serve_state.ServiceStatus.CONTROLLER_FAILED)), \
              mock.patch.object(
                  service.serve_state,
-                 'set_service_status_and_active_versions',
+                 'set_service_status_and_active_versions_if_owner',
                  side_effect=RuntimeError('db down')):
-            assert not service._heal_service_degraded('svc')
+            assert not service._heal_service_degraded('svc', 'incarnation-a',
+                                                      123, '10.0.0.1')
 
 
 class TestReplicaWriterGuard:
@@ -147,7 +173,7 @@ class TestReplicaWriterGuard:
                     serve_state.ServiceStatus.CONTROLLER_FAILED)), \
              mock.patch.object(
                  serve_utils.serve_state,
-                 'set_service_status_and_active_versions') as set_status:
+                 'set_service_status_and_active_versions_if_owner') as set_status:
             serve_utils.set_service_status_and_active_versions_from_replica(
                 'svc', [], serve_utils.UpdateMode.ROLLING)
         set_status.assert_not_called()
