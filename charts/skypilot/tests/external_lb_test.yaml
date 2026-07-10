@@ -234,3 +234,18 @@ tests:
                     items:
                       - key: data-tokens
                         path: tokens
+
+  - it: should render explicitly null resources as an empty object
+    set:
+      serve.externalLoadBalancer.enabled: true
+      serve.externalLoadBalancer.resources: null
+      serve.externalLoadBalancer.auth.lbSync.existingSecret: serve-lb-sync
+      serve.externalLoadBalancer.auth.lbSync.key: sync-tokens
+      serve.externalLoadBalancer.auth.controllerAdmin.existingSecret: serve-controller-admin
+      serve.externalLoadBalancer.auth.controllerAdmin.key: admin-tokens
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_SERVE_LB_RESOURCES_JSON
+            value: '{}'
