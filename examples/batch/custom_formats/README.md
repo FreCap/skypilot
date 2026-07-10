@@ -31,15 +31,15 @@ For each batch, on a worker:
   ├─ Your mapper function receives the batch via sky.batch.load()
   │    → processes it and calls sky.batch.save_results(results)
   │
-  └─ OutputWriter.upload_batch(results, start_idx, end_idx, job_id)
-  │    → uploads the results to cloud storage
+  └─ OutputWriter.upload_batch_attempt(..., job_id, attempt_id)
+  │    → uploads immutable attempt-scoped results
   │
   ▼
 After ALL batches finish (on the jobs controller):
-  OutputWriter.reduce_results(job_id)
-    → optional: merge per-batch files into a single output
+  OutputWriter.reduce_attempt_results(job_id, batch_attempts)
+    → publish only the attempts selected by durable batch state
   OutputWriter.cleanup(job_id)
-    → optional: delete temporary batch files from cloud storage
+    → after SUCCEEDED is durable, delete temporary attempt files
 ```
 
 See `process_range.py` in this directory for the full runnable example.
@@ -168,7 +168,8 @@ class JsonReader(io_formats.InputReader):
 
 An OutputWriter tells Sky Batch how to save your results. Subclass
 `io_formats.OutputWriter` with `@dataclass`, register it, and implement
-three methods:
+the legacy direct-write methods plus the two attempt-fenced methods used by
+the managed Batch runtime:
 
 ```python
 @registry.OUTPUT_WRITER_REGISTRY.type_register(name='my_writer')
@@ -177,9 +178,19 @@ class MyWriter(io_formats.OutputWriter):
     column: str
 
     def upload_batch(self, results, start_idx, end_idx, job_id) -> str: ...
+    def upload_batch_attempt(
+        self, results, start_idx, end_idx, job_id, attempt_id) -> str: ...
     def reduce_results(self, job_id) -> None: ...
+    def reduce_attempt_results(self, job_id, batch_attempts) -> None: ...
     def cleanup(self, job_id) -> None: ...
 ```
+
+`upload_batch_attempt()` must write to an immutable path containing both the
+job and attempt IDs. `reduce_attempt_results()` receives ordered
+`(start_idx, end_idx, attempt_id)` tuples and must publish only those objects.
+Sky Batch raises a clear error if a custom writer does not implement these
+hooks; silently writing retries to the final path is not restart-safe. See
+`process_range.py` for complete per-item and batch-plus-merge implementations.
 
 ### `upload_batch(results, start_idx, end_idx, job_id) -> str`
 
@@ -219,22 +230,24 @@ be aware of the memory limit and keep datasets at a reasonable size.
 
 ### `cleanup(self, job_id) -> None`
 
-Called by the coordinator after `reduce_results` finishes. Delete any
-temporary files your writer created during `upload_batch`.
+Called only after output publication finishes and the managed job's
+`SUCCEEDED` state is durable. Delete temporary attempt files here. Cleanup is
+best effort: failure leaves storage behind but does not turn a successful job
+into a failed one.
 
 If your writer uses the batch + merge pattern with
 `utils.get_batch_path()`, call `utils.delete_batch_files()` and
 `utils.delete_input_batch_files()` here. If your writer writes directly
 to the final location (per-item pattern), just `pass`.
 
-### Common patterns for `reduce_results` and `cleanup`
+### Common patterns for fenced reduction and cleanup
 
 Two common patterns:
 
-| Pattern | `upload_batch` | `reduce_results` | `cleanup` |
+| Pattern | `upload_batch_attempt` | `reduce_attempt_results` | `cleanup` |
 |---------|---------------|-----------------|-----------|
-| **Per-item files** | Write one file per result to the final location. | No-op (`pass`). | No-op (`pass`). |
-| **Batch + merge** | Write batch results to a temp file. | Merge all temp files into the final output. | Delete temp files. |
+| **Per-item files** | Write one file per result under the attempt namespace. | Copy winner files to final paths. | Delete attempt files. |
+| **Batch + merge** | Write batch results under the attempt namespace. | Merge only the supplied winner paths. | Delete attempt files. |
 
 ### Utility functions for cloud storage
 
@@ -266,6 +279,9 @@ so multiple concurrent jobs don't interfere with each other:
   example, with `output_path='s3://bucket/out.jsonl'` and
   `start_idx=0, end_idx=9, job_id='42'`, this returns something like
   `s3://bucket/.sky_batch_tmp/42/batch_00000000-00000009.jsonl`.
+- `utils.get_attempt_batch_path(..., job_id, attempt_id)` --
+  Generate the immutable path used by one retry attempt. Use this from
+  `upload_batch_attempt()` and when resolving winner paths during reduction.
 - `utils.list_batch_files(output_path, job_id)` --
   List all temp batch files for a given job, sorted by starting index.
   Use this in `reduce_results` to iterate over all batches in order.
@@ -280,6 +296,9 @@ so multiple concurrent jobs don't interfere with each other:
 
 **Cleaning up temporary files (for `cleanup`):**
 
+- `utils.get_job_temp_prefix(output_path, job_id)` plus
+  `utils.delete_cloud_prefix(prefix)` -- delete the whole attempt tree in
+  bounded pages; this is preferred for restart-safe writers.
 - `utils.delete_batch_files(output_path, job_id)` --
   Delete all result batch files under `.sky_batch_tmp/{job_id}/` for
   the given output path.
@@ -289,104 +308,29 @@ so multiple concurrent jobs don't interfere with each other:
 
 ### Example: per-item text files (no reduce needed)
 
-Each result item becomes its own `.txt` file. Since files go directly
-to their final location, `reduce_results` and `cleanup` are no-ops.
-
-```python
-@registry.OUTPUT_WRITER_REGISTRY.type_register(name='text')
-@dataclass
-class TextWriter(io_formats.OutputWriter):
-    column: str
-
-    def upload_batch(self, results, start_idx, end_idx, job_id):
-        output_dir = self.path.rstrip('/')
-        for i, result in enumerate(results):
-            idx = start_idx + i
-            text = str(result.get(self.column, ''))
-            utils.upload_bytes_to_cloud(
-                text.encode('utf-8'), f'{output_dir}/{idx:08d}.txt')
-        return output_dir
-
-    def reduce_results(self, job_id):
-        pass  # Files are already in the final location.
-
-    def cleanup(self, job_id):
-        pass  # No temp files to clean up.
-```
+Each result item becomes its own `.txt` file. The restart-safe implementation
+first writes those files below the attempt namespace, then
+`reduce_attempt_results()` copies only the winning attempt to the final
+per-item paths. See `TextWriter` in `process_range.py` for the complete code.
 
 ### Example: single merged YAML file (batch + reduce)
 
-Each batch writes its results to a temporary file using
-`utils.get_batch_path()`. After all batches finish, `reduce_results`
-reads all temp files with `utils.list_batch_files()` and merges them
-into one YAML file, and `cleanup` then deletes the temp files.
-
-```python
-@registry.OUTPUT_WRITER_REGISTRY.type_register(name='yaml')
-@dataclass
-class YamlWriter(io_formats.OutputWriter):
-    column: str
-
-    def upload_batch(self, results, start_idx, end_idx, job_id):
-        batch_path = utils.get_batch_path(
-            self.path, start_idx, end_idx, job_id)
-        filtered = [{self.column: r.get(self.column)} for r in results]
-        utils.save_jsonl_to_cloud(filtered, batch_path)
-        return batch_path
-
-    def reduce_results(self, job_id):
-        import yaml
-        all_items = []
-        for batch_path in utils.list_batch_files(self.path, job_id):
-            all_items.extend(utils.load_jsonl_from_cloud(batch_path))
-        yaml_bytes = yaml.dump(all_items, default_flow_style=False).encode()
-        utils.upload_bytes_to_cloud(yaml_bytes, self.path)
-
-    def cleanup(self, job_id):
-        utils.delete_batch_files(self.path, job_id)
-        utils.delete_input_batch_files(self.path, job_id)
-```
+Each attempt writes its batch to
+`utils.get_attempt_batch_path()`. After all batches finish,
+`reduce_attempt_results()` reads only the explicit winner paths supplied by
+the coordinator and merges them into one YAML file. See `YamlWriter` in
+`process_range.py` for the complete implementation.
 
 ---
 
 ## Recovering partial results on failure
 
-Normally, `reduce_results` and `cleanup` run on the **SkyPilot API Server**
-after all batches complete. If the job fails partway through (e.g. a
-worker crashes or gets preempted), those steps never run -- but the
-per-batch results that workers already uploaded are still sitting in
-cloud storage.
-
-Because all intermediate results live in a shared cloud bucket (not on
-any single machine), you can still retrieve data from a partially
-finished run. Just run `reduce_results` and `cleanup` yourself from
-anywhere -- your local laptop, a notebook, etc. This does the same
-work the controller would have done, just manually. The output will
-contain results from all batches that completed before the failure.
-You can also run only `reduce_results` without `cleanup` to keep the
-temp files around for inspection or debugging.
-
-```python
-import sky.batch
-
-# Use the same output writer you passed to ds.map(), then call
-# reduce_results + cleanup with the managed job ID (printed in the
-# failure message).
-writer = sky.batch.JsonWriter(path='s3://bucket/output.jsonl')
-writer.reduce_results(job_id='42')
-# Optionally, clean up the temp files.
-writer.cleanup(job_id='42')
-```
-
-The managed job ID and the exact code snippet are printed when a batch
-job fails, so you can copy-paste directly.
-
-For custom output writers that use the batch + merge pattern,
-`reduce_results` will merge all per-batch temporary files that were
-uploaded before the failure, and `cleanup` will remove them. Writers
-using the per-item pattern (where `reduce_results` is a no-op) already
-have their completed items in the final location -- `cleanup` will be
-a no-op too since there are no temp files to delete.
+Attempt-scoped objects remain in cloud storage when a controller or worker
+fails. Resume the managed job so the coordinator can use durable batch state
+to select the winning attempt for every batch. Do not manually call the legacy
+`reduce_results()` over an attempt directory: it cannot distinguish winners
+from stale retries. Cleanup intentionally runs only after the resumed job has
+published its final output and durably reached `SUCCEEDED`.
 
 ---
 

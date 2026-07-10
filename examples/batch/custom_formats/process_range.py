@@ -15,6 +15,8 @@ import logging
 import os
 from typing import Any, Dict, List
 
+import yaml
+
 import sky
 from sky.batch import io_formats
 from sky.batch import utils
@@ -66,11 +68,40 @@ class TextWriter(io_formats.OutputWriter):
             utils.upload_bytes_to_cloud(text.encode('utf-8'), cloud_path)
         return output_dir
 
+    def upload_batch_attempt(self, results: List[Dict[str,
+                                                      Any]], start_idx: int,
+                             end_idx: int, job_id: str, attempt_id: int) -> str:
+        del end_idx
+        output_dir = self.path.rstrip('/')
+        attempt_job_id = utils.get_attempt_job_id(job_id, attempt_id)
+        for i, result in enumerate(results):
+            global_idx = start_idx + i
+            text = str(result.get(self.column, ''))
+            cloud_path = (f'{output_dir}/.sky_batch_tmp/{attempt_job_id}/texts/'
+                          f'{global_idx:08d}.txt')
+            utils.upload_bytes_to_cloud(text.encode('utf-8'), cloud_path)
+        return output_dir
+
     def reduce_results(self, job_id: str) -> None:
         pass
 
+    def reduce_attempt_results(
+            self, job_id: str,
+            batch_attempts: List[io_formats.BatchAttempt]) -> None:
+        output_dir = self.path.rstrip('/')
+        for start_idx, end_idx, attempt_id in batch_attempts:
+            if attempt_id == 0:
+                continue
+            attempt_job_id = utils.get_attempt_job_id(job_id, attempt_id)
+            for global_idx in range(start_idx, end_idx + 1):
+                source_path = (
+                    f'{output_dir}/.sky_batch_tmp/{attempt_job_id}/texts/'
+                    f'{global_idx:08d}.txt')
+                destination_path = f'{output_dir}/{global_idx:08d}.txt'
+                utils.copy_cloud_file(source_path, destination_path)
+
     def cleanup(self, job_id: str) -> None:
-        pass
+        utils.delete_cloud_prefix(utils.get_job_temp_prefix(self.path, job_id))
 
 
 @registry.OUTPUT_WRITER_REGISTRY.type_register(name='yaml')
@@ -96,17 +127,36 @@ class YamlWriter(io_formats.OutputWriter):
         utils.save_jsonl_to_cloud(filtered, batch_path)
         return batch_path
 
+    def upload_batch_attempt(self, results: List[Dict[str,
+                                                      Any]], start_idx: int,
+                             end_idx: int, job_id: str, attempt_id: int) -> str:
+        batch_path = utils.get_attempt_batch_path(self.path, start_idx, end_idx,
+                                                  job_id, attempt_id)
+        filtered = [{self.column: r.get(self.column)} for r in results]
+        utils.save_jsonl_to_cloud(filtered, batch_path)
+        return batch_path
+
     def reduce_results(self, job_id: str) -> None:
-        import yaml  # pylint: disable=import-outside-toplevel
         all_items: List[Dict[str, Any]] = []
         for batch_path in utils.list_batch_files(self.path, job_id):
             all_items.extend(utils.load_jsonl_from_cloud(batch_path))
         yaml_bytes = yaml.dump(all_items, default_flow_style=False).encode()
         utils.upload_bytes_to_cloud(yaml_bytes, self.path)
 
+    def reduce_attempt_results(
+            self, job_id: str,
+            batch_attempts: List[io_formats.BatchAttempt]) -> None:
+        all_items: List[Dict[str, Any]] = []
+        for start_idx, end_idx, attempt_id in batch_attempts:
+            batch_path = utils.get_attempt_batch_path(self.path, start_idx,
+                                                      end_idx, job_id,
+                                                      attempt_id)
+            all_items.extend(utils.load_jsonl_from_cloud(batch_path))
+        yaml_bytes = yaml.dump(all_items, default_flow_style=False).encode()
+        utils.upload_bytes_to_cloud(yaml_bytes, self.path)
+
     def cleanup(self, job_id: str) -> None:
-        utils.delete_batch_files(self.path, job_id)
-        utils.delete_input_batch_files(self.path, job_id)
+        utils.delete_cloud_prefix(utils.get_job_temp_prefix(self.path, job_id))
 
 
 # ---- Mapper function ---------------------------------------------------------

@@ -6,6 +6,7 @@ import base64
 import inspect
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import textwrap
@@ -350,6 +351,34 @@ def upload_bytes_to_cloud(data: bytes, cloud_path: str) -> None:
         raise ValueError(f'Unsupported provider: {provider}')
 
 
+def copy_cloud_file(source_path: str, destination_path: str) -> None:
+    """Copy an object within the same cloud provider."""
+    source_provider, source_bucket, source_key = parse_cloud_path(source_path)
+    destination_provider, destination_bucket, destination_key = (
+        parse_cloud_path(destination_path))
+    if source_provider != destination_provider:
+        raise ValueError('Cross-provider batch output copies are unsupported')
+
+    if source_provider == 's3':
+        s3 = aws.client('s3')
+        s3.copy_object(CopySource={
+            'Bucket': source_bucket,
+            'Key': source_key,
+        },
+                       Bucket=destination_bucket,
+                       Key=destination_key)
+    elif source_provider == 'gs':
+        client = gcp.storage_client()
+        source_bucket_obj = client.bucket(source_bucket)
+        destination_bucket_obj = client.bucket(destination_bucket)
+        source_blob = source_bucket_obj.blob(source_key)
+        source_bucket_obj.copy_blob(source_blob,
+                                    destination_bucket_obj,
+                                    new_name=destination_key)
+    else:
+        raise ValueError(f'Unsupported provider: {source_provider}')
+
+
 def _load_jsonl_file(path: str) -> List[Dict[str, Any]]:
     """Load a local JSONL file.
 
@@ -467,6 +496,51 @@ def get_batch_path(output_path: str,
         return f'gs://{bucket}/{batch_key}'
     else:
         raise ValueError(f'Unsupported provider: {provider}')
+
+
+def get_attempt_job_id(job_id: str, attempt_id: int) -> str:
+    """Return the temp namespace for an immutable batch attempt.
+
+    Attempt zero is reserved for outputs produced before attempt fencing was
+    introduced and therefore keeps the legacy job namespace.
+    """
+    if attempt_id < 0:
+        raise ValueError('attempt_id must be non-negative')
+    if attempt_id == 0:
+        return job_id
+    return f'{job_id}/attempts/{attempt_id}'
+
+
+def get_job_temp_prefix(output_path: str, job_id: str) -> str:
+    """Return the cloud prefix containing every temp object for a job."""
+    provider, bucket, key = parse_cloud_path(output_path)
+    base_dir = os.path.dirname(key)
+    if base_dir:
+        base_dir += '/'
+    prefix = f'{base_dir}{constants.TEMP_DIR_NAME}/{job_id}/'
+    if provider == 's3':
+        return f's3://{bucket}/{prefix}'
+    if provider == 'gs':
+        return f'gs://{bucket}/{prefix}'
+    raise ValueError(f'Unsupported provider: {provider}')
+
+
+def get_attempt_batch_path(output_path: str, start_idx: int, end_idx: int,
+                           job_id: str, attempt_id: int) -> str:
+    """Generate the immutable result path for one batch attempt."""
+    return get_batch_path(output_path, start_idx, end_idx,
+                          get_attempt_job_id(job_id, attempt_id))
+
+
+def get_attempt_image_path(output_path: str, global_idx: int, job_id: str,
+                           attempt_id: int) -> str:
+    """Generate an immutable temporary image path for one attempt."""
+    if attempt_id <= 0:
+        raise ValueError('attempt-fenced image paths require attempt_id > 0')
+    output_dir = output_path.rstrip('/')
+    attempt_job_id = get_attempt_job_id(job_id, attempt_id)
+    return (f'{output_dir}/{constants.TEMP_DIR_NAME}/{attempt_job_id}/images/'
+            f'{global_idx:08d}.png')
 
 
 def list_batch_files(output_path: str,
@@ -618,6 +692,29 @@ def delete_input_batch_files(output_path: str,
             _delete_gcs_object(bucket, obj_key)
 
 
+def delete_cloud_prefix(cloud_prefix: str) -> None:
+    """Delete every object under a cloud prefix with bounded memory."""
+    provider, bucket, prefix = parse_cloud_path(cloud_prefix)
+    if provider == 's3':
+        s3 = aws.client('s3')
+        paginator = s3.get_paginator('list_objects_v2')
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            objects = [{'Key': obj['Key']} for obj in page.get('Contents', [])]
+            if objects:
+                s3.delete_objects(Bucket=bucket,
+                                  Delete=typing.cast(Any, {
+                                      'Objects': objects,
+                                      'Quiet': True,
+                                  }))
+    elif provider == 'gs':
+        client = gcp.storage_client()
+        bucket_obj = client.bucket(bucket)
+        for blob in bucket_obj.list_blobs(prefix=prefix):
+            blob.delete()
+    else:
+        raise ValueError(f'Unsupported provider: {provider}')
+
+
 def _delete_s3_object(bucket: str, key: str) -> None:
     """Delete an object from S3."""
     s3 = aws.client('s3')
@@ -661,11 +758,35 @@ def concatenate_batches_to_output(output_path: str,
     if not batch_files:
         return
 
-    # Download and concatenate all batches
-    all_data: List[Dict[str, Any]] = []
-    for batch_path in batch_files:
-        batch_data = load_jsonl_from_cloud(batch_path)
-        all_data.extend(batch_data)
+    concatenate_batch_files_to_output(output_path, batch_files)
 
-    # Upload the concatenated result
-    save_jsonl_to_cloud(all_data, output_path)
+
+def concatenate_batch_files_to_output(output_path: str,
+                                      batch_files: List[str]) -> None:
+    """Concatenate an explicit ordered list of JSONL batch objects."""
+    if not batch_files:
+        raise ValueError('batch_files must not be empty')
+
+    # Stream through local temporary files instead of materializing the full
+    # output as Python dictionaries in the controller process.  Peak memory is
+    # bounded by shutil's copy buffer rather than total dataset size.
+    with tempfile.NamedTemporaryFile(suffix='.jsonl', delete=False) as output:
+        output_temp_path = output.name
+    try:
+        with open(output_temp_path, 'wb') as output:
+            for batch_path in batch_files:
+                with tempfile.NamedTemporaryFile(suffix='.jsonl',
+                                                 delete=False) as batch_file:
+                    batch_temp_path = batch_file.name
+                try:
+                    download_file_from_cloud(batch_path, batch_temp_path)
+                    with open(batch_temp_path, 'rb') as batch_input:
+                        shutil.copyfileobj(batch_input, output)
+                finally:
+                    if os.path.exists(batch_temp_path):
+                        os.remove(batch_temp_path)
+            output.flush()
+        upload_file_to_cloud(output_temp_path, output_path)
+    finally:
+        if os.path.exists(output_temp_path):
+            os.remove(output_temp_path)

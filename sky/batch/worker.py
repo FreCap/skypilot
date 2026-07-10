@@ -32,12 +32,17 @@ logger = logging.getLogger(__name__)
 class _BatchItem:
     """A single batch to be processed by the mapper."""
 
-    def __init__(self, data: List[Dict[str, Any]], start_idx: int, end_idx: int,
-                 batch_idx: int):
+    def __init__(self,
+                 data: List[Dict[str, Any]],
+                 start_idx: int,
+                 end_idx: int,
+                 batch_idx: int,
+                 attempt_id: int = 0):
         self.data = data
         self.start_idx = start_idx
         self.end_idx = end_idx
         self.batch_idx = batch_idx
+        self.attempt_id = attempt_id
         self.done_event = threading.Event()
         self.error: Optional[str] = None
 
@@ -56,6 +61,7 @@ _current_batch_lock = threading.Lock()
 
 _output_path: Optional[str] = None
 _job_id: Optional[str] = None
+_worker_token: Optional[str] = None
 _dataset_format: Optional[io_formats.InputReader] = None
 _output_formats: List[io_formats.OutputWriter] = []
 
@@ -68,6 +74,8 @@ class _WorkerHandler(http_server.BaseHTTPRequestHandler):
     """Handles ``/feed_batch``, ``/shutdown``, and ``/health``."""
 
     def do_POST(self) -> None:  # pylint: disable=invalid-name
+        if not self._is_authorized():
+            return
         if self.path == '/feed_batch':
             self._handle_feed_batch()
         elif self.path == '/shutdown':
@@ -76,6 +84,8 @@ class _WorkerHandler(http_server.BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_GET(self) -> None:  # pylint: disable=invalid-name
+        if not self._is_authorized():
+            return
         if self.path == '/health':
             self._send_json(200, {'status': 'healthy'})
         else:
@@ -86,6 +96,17 @@ class _WorkerHandler(http_server.BaseHTTPRequestHandler):
         logger.debug('WorkerHandler: %s', format % args)
 
     # ---- helpers ----------------------------------------------------------
+
+    def _is_authorized(self) -> bool:
+        # A missing token is accepted only for workers started through the
+        # legacy standalone entrypoint.
+        if _worker_token is None:
+            return True
+        request_token = self.headers.get('X-Sky-Batch-Worker-Token')
+        if request_token == _worker_token:
+            return True
+        self._send_json(409, {'error': 'stale batch coordinator'})
+        return False
 
     def _read_json(self) -> dict:
         length = int(self.headers.get('Content-Length', 0))
@@ -108,6 +129,7 @@ class _WorkerHandler(http_server.BaseHTTPRequestHandler):
         start_idx = int(body['start_idx'])
         end_idx = int(body['end_idx'])
         batch_idx = int(body['batch_idx'])
+        attempt_id = int(body.get('attempt_id', 0))
 
         logger.info('Downloading batch [%d-%d] from %s', start_idx, end_idx,
                     dataset_path)
@@ -124,7 +146,8 @@ class _WorkerHandler(http_server.BaseHTTPRequestHandler):
         item = _BatchItem(data=data,
                           start_idx=start_idx,
                           end_idx=end_idx,
-                          batch_idx=batch_idx)
+                          batch_idx=batch_idx,
+                          attempt_id=attempt_id)
         _batch_queue.put(item)
 
         # Block until save_results() (or an error) sets the event.
@@ -139,8 +162,7 @@ class _WorkerHandler(http_server.BaseHTTPRequestHandler):
                 f'is taking too long or forgot to call '
                 f'sky.batch.save_results().')
             logger.error(timeout_msg)
-            item.error = timeout_msg
-            item.done_event.set()
+            _expire_batch(item, timeout_msg)
 
         if item.error:
             self._send_json(500, {'error': item.error})
@@ -184,6 +206,16 @@ def signal_batch_done(error: Optional[str] = None) -> None:
         if _current_batch is not None:
             _current_batch.error = error
             _current_batch.done_event.set()
+            _current_batch = None
+
+
+def _expire_batch(item: _BatchItem, error: str) -> None:
+    """Fail a timed-out item and prevent a late mapper upload."""
+    global _current_batch
+    with _current_batch_lock:
+        item.error = error
+        item.done_event.set()
+        if _current_batch is item:
             _current_batch = None
 
 
@@ -271,8 +303,9 @@ def save_results(results: List[Dict[str, Any]]) -> None:
     # Upload results using all output formats.
     assert _output_formats and _job_id, 'Worker not initialized'
     for fmt in _output_formats:
-        result_path = fmt.upload_batch(results, batch_item.start_idx,
-                                       batch_item.end_idx, _job_id)
+        result_path = fmt.upload_batch_attempt(results, batch_item.start_idx,
+                                               batch_item.end_idx, _job_id,
+                                               batch_item.attempt_id)
         logger.info('Saved results to %s', result_path)
 
     # Signal completion — unblocks the HTTP handler in worker.py.
@@ -308,7 +341,10 @@ def _resolve_output_formats() -> List[io_formats.OutputWriter]:
 # ---------------------------------------------------------------------------
 
 
-def start_worker(serialized_fn: str, output_path: str, job_id: str) -> None:
+def start_worker(serialized_fn: str,
+                 output_path: str,
+                 job_id: str,
+                 worker_token: Optional[str] = None) -> None:
     """Start the long-running worker service.
 
     1. Launch a localhost HTTP server in a daemon thread.
@@ -316,9 +352,11 @@ def start_worker(serialized_fn: str, output_path: str, job_id: str) -> None:
        ``for batch in sky.batch.load(): ...`` which blocks on the internal
        queue until batches arrive or shutdown is signaled.
     """
-    global _output_path, _job_id, _dataset_format, _output_formats
+    global _output_path, _job_id, _worker_token, _dataset_format
+    global _output_formats
     _output_path = output_path
     _job_id = job_id
+    _worker_token = worker_token
     _dataset_format = _resolve_input_format()
     _output_formats = _resolve_output_formats()
 

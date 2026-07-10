@@ -14,10 +14,12 @@ WORKER_DISCOVERY_TIMEOUT = 300
 WORKER_DISCOVERY_RESUME_TIMEOUT = 600
 BATCH_COMPLETION_TIMEOUT = 3600  # 1 hour max per batch
 
-# Grace period after cancelling stale worker jobs before launching fresh
-# workers.  ``sdk.cancel`` only sends SIGTERM; the Python HTTP service
-# holding port 8290 needs a moment to actually exit and release the port.
-STALE_WORKER_GRACE_PERIOD = 15
+# A dispatcher renews its attempt lease while the worker job is active.  If a
+# controller disappears, another incarnation can reclaim the batch after the
+# lease expires instead of either duplicating it immediately or waiting for a
+# controller-wide timeout.
+BATCH_LEASE_DURATION = 60
+BATCH_LEASE_RENEW_INTERVAL = 20
 
 # Polling interval for sdk.job_status() when waiting for batch completion
 BATCH_POLL_INTERVAL = 5

@@ -607,7 +607,10 @@ class ReplicaStatusProperty:
 class ReplicaInfo:
     """Replica info for each replica."""
 
-    _VERSION = 5
+    # Version 6 is also a worker-runtime compatibility marker for immutable
+    # Sky Batch attempt outputs. New Batch clients reject older pool replicas
+    # so an incompatible worker fails before dispatch rather than mid-run.
+    _VERSION = 6
 
     def __init__(self, replica_id: int, cluster_name: str, replica_port: str,
                  is_spot: bool, location: Optional[spot_placer.Location],

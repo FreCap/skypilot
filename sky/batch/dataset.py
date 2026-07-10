@@ -121,7 +121,7 @@ def _validate_pool_for_batch(pool_name: str) -> None:
     min_ver = server_constants.MIN_BATCH_REPLICA_INFO_VERSION
     for info in replica_infos:
         ri_version = info.get('replica_info_version')
-        if ri_version is not None and ri_version < min_ver:
+        if ri_version is None or ri_version < min_ver:
             raise RuntimeError(
                 f'Pool {pool_name!r} was created with an older SkyPilot '
                 f'version that does not support Sky Batch. Please '
@@ -192,11 +192,13 @@ class Dataset:
         """
         # Gate: require server to support sky.batch.
         remote_api_version = versions.get_remote_api_version()
+        min_batch_api_version = (
+            server_constants.MIN_BATCH_ATTEMPT_FENCING_API_VERSION)
         if (remote_api_version is not None and
-                remote_api_version < server_constants.MIN_BATCH_API_VERSION):
+                remote_api_version < min_batch_api_version):
             raise exceptions.APINotSupportedError(
                 f'Sky Batch requires API server version '
-                f'{server_constants.MIN_BATCH_API_VERSION} or higher, but the '
+                f'{min_batch_api_version} or higher, but the '
                 f'server is running API version {remote_api_version}. '
                 f'Please upgrade your API server.')
 
@@ -218,6 +220,7 @@ class Dataset:
         for fmt in outputs:
             if not fmt.path:
                 raise ValueError('output path cannot be empty')
+            fmt.validate_attempt_fencing()
 
         # Check if any output path already exists and confirm overwrite.
         for fmt in outputs:

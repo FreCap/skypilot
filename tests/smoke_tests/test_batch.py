@@ -8,11 +8,16 @@ Tests cover:
 - Batch cancel: cancel a running batch job mid-flight.
 - Batch HA: kill controller mid-flight, verify resume from DB.
 """
+# The shell-heavy smoke commands intentionally use double-quoted Python
+# strings and long embedded lines for readable quoting at the command layer.
+# pylint: disable=line-too-long,inconsistent-quotes,invalid-string-quote
+# pylint: disable=f-string-without-interpolation
 import tempfile
 
 import pytest
 from smoke_tests import smoke_tests_utils
 
+import sky
 from sky import skypilot_config
 
 # 1. TODO(lloyd): Marking the batch tests below as no_remote_server because
@@ -383,9 +388,10 @@ def test_batch_cancel(generic_cloud: str):
 @pytest.mark.batch
 @pytest.mark.no_remote_server  # see note 1 above
 def test_batch_ha_kill_running(generic_cloud: str):
-    """Kill the jobs controller while a batch job is RUNNING.
+    """Restart the active controller while a batch job is RUNNING.
 
-    After the controller pod restarts, the batch coordinator should
+    In consolidation mode this restarts the API server itself; otherwise it
+    replaces the dedicated jobs-controller pod. The batch coordinator should
     resume from DB (``_resume_from_db``) and complete all batches.
     Uses the simple double-text example (CPU-only) to keep costs low.
     """
@@ -393,35 +399,51 @@ def test_batch_ha_kill_running(generic_cloud: str):
         pytest.skip(
             'Skipping HA test in non-docker remote api server environment as '
             'controller might be managed by different user/test agents')
-    if smoke_tests_utils.server_side_is_consolidation_mode():
-        pytest.skip('Skipping HA kill test in consolidation mode: no separate '
-                    'controller pod to kill')
+    consolidation_mode = smoke_tests_utils.server_side_is_consolidation_mode()
 
     name = smoke_tests_utils.get_cluster_name()
     bucket = f'sky-batch-ha-{name}'
     pool_name = 'test-batch-pool'
+    sentinel_job_name = f'{name}-sentinel'
     url, create_bkt, delete_bkt, cp, rm, _, rm_r = _storage_cmds(
         generic_cloud, bucket)
     store = 'gs' if generic_cloud == 'gcp' else 's3'
 
-    # HA config: run the jobs controller on k8s with high_availability.
-    skypilot_config_path = 'tests/test_yamls/managed_jobs_ha_config.yaml'
     pytest_config_file_override = (
         smoke_tests_utils.pytest_config_file_override())
-    if pytest_config_file_override is not None:
-        with open(pytest_config_file_override, 'r') as f:
-            base_config = f.read()
-        with open(skypilot_config_path, 'r') as f:
-            ha_config = f.read()
-        with tempfile.NamedTemporaryFile(suffix='.yaml', mode='w',
-                                         delete=False) as f:
-            f.write(base_config)
-            f.write(ha_config)
-            f.flush()
-            skypilot_config_path = f.name
+    skypilot_config_path = pytest_config_file_override
+    if consolidation_mode:
+        restart_controller = smoke_tests_utils.SKY_API_RESTART
+    else:
+        # HA config: run the jobs controller on k8s with high_availability.
+        ha_config_path = 'tests/test_yamls/managed_jobs_ha_config.yaml'
+        skypilot_config_path = ha_config_path
+        if pytest_config_file_override is not None:
+            with open(pytest_config_file_override, 'r') as f:
+                base_config = f.read()
+            with open(ha_config_path, 'r') as f:
+                ha_config = f.read()
+            with tempfile.NamedTemporaryFile(suffix='.yaml',
+                                             mode='w',
+                                             delete=False) as f:
+                f.write(base_config)
+                f.write(ha_config)
+                f.flush()
+                skypilot_config_path = f.name
+        restart_controller = smoke_tests_utils.kill_and_wait_controller(
+            name, 'jobs')
+
+    test_env = {
+        'SKY_BATCH_BUCKET': bucket,
+        'SKY_BATCH_STORE': store,
+    }
+    if skypilot_config_path is not None:
+        test_env[skypilot_config.ENV_VAR_SKYPILOT_CONFIG] = (
+            skypilot_config_path)
 
     test = smoke_tests_utils.Test(
-        'batch_ha_kill_running',
+        ('batch_ha_restart_consolidated'
+         if consolidation_mode else 'batch_ha_kill_running'),
         [
             # --- Cloud-cmd cluster for kubectl access ---
             smoke_tests_utils.launch_cluster_for_cloud_cmd(generic_cloud, name),
@@ -433,6 +455,15 @@ def test_batch_ha_kill_running(generic_cloud: str):
              f' examples/batch/simple/pool.yaml -y); '
              f'echo "$s"; '
              f'echo "$s" | grep "Successfully created pool"'),
+            # A regular job shares this pool. Controller recovery must never
+            # cancel it while cleaning up stale batch worker services.
+            (f'sky jobs launch --pool {pool_name} -n {sentinel_job_name} '
+             f'-d -y -- "echo sentinel-started; sleep 1200"'),
+            smoke_tests_utils.
+            get_cmd_wait_until_managed_job_status_contains_matching_job_name(
+                job_name=sentinel_job_name,
+                job_status=[sky.ManagedJobStatus.RUNNING],
+                timeout=300),
             # --- Data setup: 60 items / batch_size 2 = 30 batches ---
             create_bkt,
             (f'for i in $(seq 1 60); do '
@@ -448,7 +479,8 @@ def test_batch_ha_kill_running(generic_cloud: str):
              f'echo "Backgrounded double_text.py (PID=$!)"\n'
              f'for i in $(seq 1 180); do\n'
              f'  if sky jobs queue 2>/dev/null '
-             f'| grep "{pool_name}" | grep -q "RUNNING"; then\n'
+             f'| grep "{pool_name}" | grep -v "{sentinel_job_name}" '
+             f'| grep -q "RUNNING"; then\n'
              f'    echo "Batch job is RUNNING"\n'
              f'    exit 0\n'
              f'  fi\n'
@@ -464,7 +496,8 @@ def test_batch_ha_kill_running(generic_cloud: str):
                 f'for i in $(seq 1 120); do\n'
                 f'  QUEUE=$(sky jobs queue 2>/dev/null)\n'
                 f'  POOL_LINE=$(echo "$QUEUE" '
-                f'| grep "{pool_name}" | head -1)\n'
+                f'| grep "{pool_name}" | grep -v "{sentinel_job_name}" '
+                f'| head -1)\n'
                 f'  PROGRESS=$(echo "$POOL_LINE" '
                 f'| grep -oE "[0-9]+/[0-9]+" | head -1)\n'
                 f'  COMPLETED=${{PROGRESS%%/*}}\n'
@@ -478,7 +511,8 @@ def test_batch_ha_kill_running(generic_cloud: str):
                 f'echo "First batch completed, sleeping 60s for more progress"\n'
                 f'sleep 60\n'
                 f'QUEUE=$(sky jobs queue 2>/dev/null)\n'
-                f'POOL_LINE=$(echo "$QUEUE" | grep "{pool_name}" | head -1)\n'
+                f'POOL_LINE=$(echo "$QUEUE" | grep "{pool_name}" '
+                f'| grep -v "{sentinel_job_name}" | head -1)\n'
                 f'PROGRESS=$(echo "$POOL_LINE" '
                 f'| grep -oE "[0-9]+/[0-9]+" | head -1)\n'
                 f'COMPLETED=${{PROGRESS%%/*}}\n'
@@ -496,8 +530,15 @@ def test_batch_ha_kill_running(generic_cloud: str):
                 f'echo "$JOB_ID" '
                 f'> /tmp/batch-ha-jobid-{name}.txt'),
 
-            # --- Kill controller pod ---
-            smoke_tests_utils.kill_and_wait_controller(name, 'jobs'),
+            # --- Restart the controller process/pod ---
+            restart_controller,
+
+            # The unrelated regular job on the same pool must survive.
+            smoke_tests_utils.
+            get_cmd_wait_until_managed_job_status_contains_matching_job_name(
+                job_name=sentinel_job_name,
+                job_status=[sky.ManagedJobStatus.RUNNING],
+                timeout=120),
 
             # --- Verify resume preserves progress, then wait for SUCCEED ---
             # Bound progress-based, not wall-clock based.  The HA
@@ -515,7 +556,8 @@ def test_batch_ha_kill_running(generic_cloud: str):
                 f'MAX_ITERS=600\n'  # hard cap: 50 min
                 f'for i in $(seq 1 $MAX_ITERS); do\n'
                 f'  LINE=$(sky jobs queue 2>/dev/null '
-                f'| grep "{pool_name}" | head -1)\n'
+                f'| grep "{pool_name}" | grep -v "{sentinel_job_name}" '
+                f'| head -1)\n'
                 f'  if echo "$LINE" | grep -qE "FAILED"; then\n'
                 f'    echo "ERROR: Batch job FAILED after recovery"\n'
                 f'    echo "Job line: $LINE"\n'
@@ -617,7 +659,8 @@ def test_batch_ha_kill_running(generic_cloud: str):
              "PYEOF"),
         ],
         # Teardown: remove pool, bucket, temp files, cloud-cmd cluster.
-        (f'sky jobs pool down {pool_name} -y;'
+        (f'sky jobs cancel -y -n {sentinel_job_name} 2>/dev/null || true;'
+         f' sky jobs pool down {pool_name} -y;'
          f' sky serve down {pool_name} -y 2>/dev/null || true;'
          f' {delete_bkt};'
          f' rm -f /tmp/batch-ha-input-{name}.jsonl'
@@ -627,10 +670,6 @@ def test_batch_ha_kill_running(generic_cloud: str):
          f' /tmp/batch-ha-jobid-{name}.txt;'
          f' {smoke_tests_utils.down_cluster_for_cloud_cmd(name)}'),
         timeout=60 * 60,
-        env={
-            'SKY_BATCH_BUCKET': bucket,
-            'SKY_BATCH_STORE': store,
-            skypilot_config.ENV_VAR_SKYPILOT_CONFIG: skypilot_config_path,
-        },
+        env=test_env,
     )
     smoke_tests_utils.run_one_test(test)
