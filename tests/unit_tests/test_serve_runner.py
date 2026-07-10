@@ -283,12 +283,8 @@ class TestStatusDelegatesToRunner:
             'endpoint': None,
         }]
 
-    @pytest.mark.parametrize(('tls_encrypted', 'expected_endpoint'), [
-        (False, 'http://skypilot-serve-lb-svc.ns.svc:30001'),
-        (True, 'https://skypilot-serve-lb-svc.ns.svc:30001'),
-    ])
-    def test_status_uses_only_external_service_endpoint(self, tls_encrypted,
-                                                        expected_endpoint):
+    @pytest.mark.parametrize('tls_encrypted', [False, True])
+    def test_status_uses_only_external_service_endpoint(self, tls_encrypted):
         records = [{
             'name': 'svc',
             # Registration sentinel only; it must not affect the URL.
@@ -314,7 +310,10 @@ class TestStatusDelegatesToRunner:
                     side_effect=AssertionError('legacy endpoint fallback')))
             result = impl.status(pool=False)
 
-        assert result[0]['endpoint'] == expected_endpoint
+        # A legacy TLS-marked row must not advertise HTTPS: TLS terminates at
+        # platform ingress and the per-service LB itself is HTTP-only.
+        assert (result[0]['endpoint'] ==
+                'http://skypilot-serve-lb-svc.ns.svc:30001')
         external_endpoint.assert_called_once_with('svc')
         legacy_endpoint.assert_not_called()
 

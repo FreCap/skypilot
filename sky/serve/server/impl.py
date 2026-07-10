@@ -64,14 +64,15 @@ def _service_test_request_command(endpoint: str) -> str:
     return f'curl -H {header} {endpoint}'
 
 
-def _external_service_endpoint_url(service_name: str,
-                                   tls_encrypted: bool) -> Optional[str]:
-    """Return the sole supported service endpoint, or None if unavailable."""
+def _external_service_endpoint_url(service_name: str) -> Optional[str]:
+    """Return the HTTP-only in-cluster LB endpoint, or None if unavailable."""
     socket_endpoint = lb_k8s.lb_service_endpoint_or_none(service_name)
     if socket_endpoint is None:
         return None
-    protocol = 'https' if tls_encrypted else 'http'
-    return f'{protocol}://{socket_endpoint}'
+    # TLS terminates at the platform ingress. The per-service LB Deployment
+    # and Service are deliberately HTTP-only, including for legacy rows whose
+    # persisted tls_encrypted bit predates the external-only topology.
+    return f'http://{socket_endpoint}'
 
 
 def _get_service_record(
@@ -550,14 +551,11 @@ def up(
             # the internal up() compatibility contract; apply() discards it.
             endpoint = ''
             if not pool:
-                # Already checked by validate_service_task. The registration
-                # port remains a DB/API readiness sentinel, but does not
+                # The registration port remains a DB/API readiness sentinel,
+                # but does not
                 # participate in endpoint construction: every external LB
                 # Service exposes the fixed Kubernetes Service port.
-                assert task.service is not None
-                external_endpoint = _external_service_endpoint_url(
-                    service_name,
-                    tls_encrypted=task.service.tls_credential is not None)
+                external_endpoint = _external_service_endpoint_url(service_name)
                 if external_endpoint is None:
                     raise RuntimeError(
                         'The external load balancer endpoint is unavailable '
@@ -1084,7 +1082,7 @@ def status(
             # external per-service Kubernetes Service is the only supported
             # endpoint, and an unavailable external runtime stays unavailable.
             service_record['endpoint'] = _external_service_endpoint_url(
-                service_record['name'], service_record['tls_encrypted'])
+                service_record['name'])
 
     return service_records
 
