@@ -14,6 +14,7 @@ import { TourProvider } from '@/hooks/useTour';
 import { PluginProvider } from '@/plugins/PluginProvider';
 import { VersionProvider } from '@/components/elements/version-display';
 import { PluginWrapperSlot } from '@/plugins/PluginWrapperSlot';
+import { initTheme } from '@/lib/theme';
 import { getNonce } from '@/utils/csp';
 
 const Layout = dynamic(
@@ -27,6 +28,11 @@ const Layout = dynamic(
 if (typeof window !== 'undefined') {
   window.React = React;
   window.ReactDOM = { ...ReactDOMAll, ...ReactDOM };
+  // Apply the persisted theme (default: dark) before anything renders. The
+  // whole app is client-rendered (Layout is loaded with ssr: false), so doing
+  // this at module load avoids a light-mode flash without needing an inline
+  // script (which the CSP would reject).
+  initTheme();
 }
 
 // Create an Emotion cache with the CSP nonce so that dynamically injected
