@@ -47,8 +47,6 @@ from sky.utils import yaml_utils
 
 if typing.TYPE_CHECKING:
     import grpc
-
-    from sky.utils import config_utils
 else:
     grpc = adaptors_common.LazyImport('grpc')
 
@@ -654,37 +652,6 @@ def up(
         return service_name, endpoint
 
 
-def _reject_external_lb_mode_flip(
-        mutated_config: 'config_utils.Config') -> None:
-    """Reject an update that disables the required external-LB capability.
-
-    SkyServe no longer has an in-pod LB topology. The flag is a server/platform
-    capability gate, not a per-service setting, so a task update cannot change
-    it.
-
-    The mode is SERVER TOPOLOGY (``serve_utils.is_external_load_balancer_mode``
-    resolves it from the live server config in consolidation mode, immune to
-    per-service/request config), so an update-supplied value cannot take
-    effect at all. Comparing two ``is_external_load_balancer_mode()`` calls
-    (as this guard originally did) is therefore always a no-op; instead,
-    reject any update config that explicitly carries the key with a value
-    different from the server's effective mode — surfacing 'this knob is
-    server-side' instead of silently ignoring it.
-    """
-    requested = mutated_config.get_nested(
-        ('serve', 'controller', 'external_load_balancer'), default_value=None)
-    if requested is None:
-        return
-    existing_external = serve_utils.is_external_load_balancer_mode()
-    if bool(requested) != existing_external:
-        with ux_utils.print_exception_no_traceback():
-            raise ValueError(
-                'Cannot change the external_load_balancer mode of a running '
-                'service via update: external LB support is a required server '
-                'capability resolved from server config, not per-service '
-                'config.')
-
-
 def update(
     task: Optional['task_lib.Task'],
     service_name: str,
@@ -775,13 +742,9 @@ def _update_impl(
     # and get the mutated config.
     # TODO(cblmemo,zhwu): If a user sets a new skypilot_config, the update
     # will not apply the config.
-    dag, mutated_config = admin_policy_utils.apply(
+    dag, _ = admin_policy_utils.apply(
         task, request_name=request_names.AdminPolicyRequestName.SERVE_UPDATE)
     task = dag.tasks[0]
-    # Pools have no load balancer, so the external_load_balancer mode does not
-    # apply to them; only guard real services.
-    if not pool:
-        _reject_external_lb_mode_flip(mutated_config)
     if pool:
         _maybe_display_run_warning(task)
         # Use dummy run script for pool.

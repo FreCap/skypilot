@@ -560,63 +560,18 @@ def is_consolidation_mode(pool: bool = False) -> bool:
     return consolidation_mode
 
 
-# Per-process cache for the extlb topology flag resolved from the LIVE
-# server config (one DB read per process; topology only changes with a pod
-# restart, which resets the cache by construction).
-_external_lb_mode_cache: Optional[bool] = None
-
-
 def is_external_load_balancer_mode() -> bool:
     """Whether the external-LB platform capability is enabled.
 
-    Real services have one supported topology: a per-service Kubernetes LB
-    Deployment syncing through the stable API-service proxy. False therefore
-    means service startup is unsupported (pools remain valid because they have
-    no inference endpoint); it no longer selects an in-pod implementation.
-
-    TOPOLOGY, NOT PER-SERVICE CONFIG: consolidation-mode controllers run
-    under a per-service SKYPILOT_CONFIG snapshot frozen at `serve up` (never
-    refreshed, not even by `serve update`). Reading this flag from the
-    loaded config let a pre-flag service's controller answer False while
-    the API server (live DB config) answered True — the server advertised
-    the external-LB DNS endpoint and ran the orphan reaper while the
-    controller never created the LB objects: a permanently dangling endpoint
-    (observed live). In any consolidation-pod process, resolve from the SAME
-    live server config the API server uses.
+    Helm injects the same explicit capability into the API pod and every
+    generated LB pod. Consolidated controller children inherit the API pod's
+    environment. No persisted or per-service config participates, so all
+    processes in the topology necessarily agree. False/unset means service
+    startup is unsupported (pools remain valid because they have no inference
+    endpoint); it no longer selects an in-pod implementation.
     """
-    global _external_lb_mode_cache
-    platform_enabled = os.environ.get(constants.EXTERNAL_LB_ENABLED_ENV_VAR)
-    if platform_enabled is not None:
-        # The Helm capability gate must win over persisted/per-service config:
-        # it is what actually renders the RBAC, projected Secrets, and pod
-        # identity needed by this topology.
-        return platform_enabled.lower() == 'true'
-    if os.environ.get(skylet_constants.ENV_VAR_IS_SKYPILOT_SERVER) is None:
-        # VM-mode / client processes: unchanged.
-        return skypilot_config.get_nested(
-            ('serve', 'controller', 'external_load_balancer'),
-            default_value=False)
-    if _external_lb_mode_cache is None:
-        try:
-            _external_lb_mode_cache = bool(
-                skypilot_config.get_effective_server_config().get_nested(
-                    ('serve', 'controller', 'external_load_balancer'),
-                    default_value=False))
-        except Exception as e:  # pylint: disable=broad-except
-            # Fail-soft to the loaded-config read: this is called from
-            # _start, whose failure path is DESTRUCTIVE service cleanup —
-            # a transient DB blip at controller boot must degrade to the
-            # snapshot value (pre-fix behavior for one evaluation), not
-            # tear the service down. Deliberately NOT cached, so the next
-            # evaluation retries the live read.
-            logger.warning(
-                'Failed to resolve external_load_balancer from the live '
-                f'server config; falling back to the loaded config: '
-                f'{common_utils.format_exception(e)}')
-            return skypilot_config.get_nested(
-                ('serve', 'controller', 'external_load_balancer'),
-                default_value=False)
-    return _external_lb_mode_cache
+    return (os.environ.get(constants.EXTERNAL_LB_ENABLED_ENV_VAR,
+                           '').lower() == 'true')
 
 
 def is_lb_data_plane_auth_enabled() -> bool:

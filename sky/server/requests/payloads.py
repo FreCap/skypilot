@@ -33,6 +33,7 @@ from sky import sky_logging
 from sky import skypilot_config
 from sky.adaptors import common as adaptors_common
 from sky.adaptors import kubernetes as kubernetes_adaptor
+from sky.serve import constants as serve_constants
 from sky.server import common
 from sky.skylet import autostop_lib
 from sky.skylet import constants
@@ -72,6 +73,22 @@ EXTERNAL_LOCAL_ENV_VARS = [
     'KUBECONFIG',
 ]
 
+# Platform capabilities must come from the server deployment, never a client
+# process or a hand-crafted request body. The external-LB variable predates the
+# SKYPILOT_SERVER_ naming convention, so classify it explicitly while keeping
+# the existing name compatible across rolling chart/image upgrades.
+_SERVER_OWNED_ENV_VARS = frozenset({
+    serve_constants.EXTERNAL_LB_ENABLED_ENV_VAR,
+})
+
+
+def remove_server_owned_env_vars(env_vars: Dict[str, str]) -> None:
+    """Remove deployment-owned variables from a client environment in place."""
+    for env_var in tuple(env_vars):
+        if (env_var.startswith(constants.SKYPILOT_SERVER_ENV_VAR_PREFIX) or
+                env_var in _SERVER_OWNED_ENV_VARS):
+            env_vars.pop(env_var, None)
+
 
 def request_body_env_vars() -> dict:
     env_vars = {}
@@ -107,6 +124,7 @@ def request_body_env_vars() -> dict:
     # local Kubernetes environment and should not be forwarded to the server,
     # which has its own cluster context configuration.
     env_vars.pop(kubernetes_adaptor.IN_CLUSTER_CONTEXT_NAME_ENV_VAR, None)
+    remove_server_owned_env_vars(env_vars)
     return env_vars
 
 

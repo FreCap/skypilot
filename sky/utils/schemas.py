@@ -1835,41 +1835,37 @@ def get_config_schema():
     }
     resources_schema['properties'].pop('ports')
 
-    def _get_controller_schema(extra_properties: Optional[Dict[str,
-                                                               Any]] = None,):
+    def _get_controller_schema(
+        extra_properties: Optional[Dict[str, Any]] = None,
+        extra_controller_properties: Optional[Dict[str, Any]] = None,
+    ):
+        controller_properties = {
+            'resources': resources_schema,
+            'high_availability': {
+                'type': 'boolean',
+                'default': False,
+            },
+            'autostop': _AUTOSTOP_SCHEMA,
+            'consolidation_mode': {
+                'type': 'boolean',
+                # When unset, automatically enabled for deploy-mode servers
+                # (--deploy) if no existing controller clusters are found.
+            },
+            'controller_logs_gc_retention_hours': {
+                'type': 'integer',
+            },
+            'task_logs_gc_retention_hours': {
+                'type': 'integer',
+            },
+        }
+        if extra_controller_properties:
+            controller_properties.update(extra_controller_properties)
         props: Dict[str, Any] = {
             'controller': {
                 'type': 'object',
                 'required': [],
                 'additionalProperties': False,
-                'properties': {
-                    'resources': resources_schema,
-                    'high_availability': {
-                        'type': 'boolean',
-                        'default': False,
-                    },
-                    'autostop': _AUTOSTOP_SCHEMA,
-                    'consolidation_mode': {
-                        'type': 'boolean',
-                        # When unset, automatically enabled for deploy-mode
-                        # servers (--deploy) if no existing controller
-                        # clusters are found.
-                    },
-                    'external_load_balancer': {
-                        'type': 'boolean',
-                        'default': False,
-                        # Platform capability gate for SkyServe services. When
-                        # true, each service owns an external LB Deployment
-                        # that syncs through the stable API-service proxy. The
-                        # in-pod LB implementation is no longer supported.
-                    },
-                    'controller_logs_gc_retention_hours': {
-                        'type': 'integer',
-                    },
-                    'task_logs_gc_retention_hours': {
-                        'type': 'integer',
-                    },
-                },
+                'properties': controller_properties,
             },
             'bucket': {
                 'type': 'string',
@@ -2825,7 +2821,16 @@ def get_config_schema():
             },
             'jobs': _get_controller_schema(
                 extra_properties=_extra_jobs_properties,),
-            'serve': _get_controller_schema(),
+            'serve': _get_controller_schema(
+                extra_controller_properties={
+                    # Deprecated compatibility input. Runtime capability comes
+                    # exclusively from SKYPILOT_SERVE_EXTERNAL_LB_ENABLED; keep
+                    # accepting old server configs during rolling upgrades.
+                    'external_load_balancer': {
+                        'type': 'boolean',
+                        'default': False,
+                    },
+                }),
             'allowed_clouds': allowed_clouds,
             'admin_policy': admin_policy_schema,
             'docker': docker_configs,

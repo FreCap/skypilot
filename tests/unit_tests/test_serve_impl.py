@@ -87,6 +87,77 @@ class TestExternalOnlyTopologyPreflight:
         runtime_check.assert_called_once_with()
         consolidation.assert_called_once_with(pool=False)
 
+    def test_persisted_config_cannot_enable_missing_capability(
+            self, monkeypatch):
+        monkeypatch.delenv(constants.EXTERNAL_LB_ENABLED_ENV_VAR, raising=False)
+        with mock.patch.object(
+                impl.skypilot_config, 'get_nested', return_value=True), \
+             pytest.raises(RuntimeError,
+                           match='serve.externalLoadBalancer.enabled'):
+            impl._require_supported_service_topology(self._task(), pool=False)
+
+
+class TestExternalCapabilityMutationPaths:
+    """Both create and update use the same environment-backed preflight."""
+
+    @staticmethod
+    def _task():
+        task = mock.MagicMock()
+        task.service = mock.MagicMock(pool=False)
+        return task
+
+    def test_up_runs_capability_preflight(self):
+        task = self._task()
+        dag = mock.MagicMock(tasks=[task])
+        with mock.patch.object(impl.serve_utils, 'validate_service_task'), \
+             mock.patch.object(impl, '_validate_service_name'), \
+             mock.patch.object(impl.dag_utils,
+                               'convert_entrypoint_to_dag',
+                               return_value=dag), \
+             mock.patch.object(impl.admin_policy_utils,
+                               'apply',
+                               return_value=(dag, mock.MagicMock())), \
+             mock.patch.object(
+                 impl,
+                 '_require_supported_service_topology',
+                 side_effect=RuntimeError('capability gate')) as preflight, \
+             pytest.raises(RuntimeError, match='capability gate'):
+            impl.up(task, service_name='svc')
+        preflight.assert_called_once_with(task, False)
+
+    def test_update_ignores_legacy_config_and_runs_preflight(self):
+        task = self._task()
+        dag = mock.MagicMock(tasks=[task])
+        handle = mock.MagicMock(spec=backends.CloudVmRayResourceHandle)
+        backend = _backend_mock()
+        legacy_config = mock.MagicMock()
+        legacy_config.get_nested.side_effect = AssertionError(
+            'legacy capability config read')
+        service_record = {'status': serve_state.ServiceStatus.READY}
+        with mock.patch.object(impl.controller_utils,
+                               'get_controller_for_pool'), \
+             mock.patch.object(impl.backend_utils,
+                               'is_controller_accessible',
+                               return_value=handle), \
+             mock.patch.object(impl.backend_utils,
+                               'get_backend_from_handle',
+                               return_value=backend), \
+             mock.patch.object(impl,
+                               '_get_service_record',
+                               return_value=service_record), \
+             mock.patch.object(impl.serve_utils, 'validate_service_task'), \
+             mock.patch.object(impl.admin_policy_utils,
+                               'apply',
+                               return_value=(dag, legacy_config)), \
+             mock.patch.object(
+                 impl,
+                 '_require_supported_service_topology',
+                 side_effect=RuntimeError('capability gate')) as preflight, \
+             pytest.raises(RuntimeError, match='capability gate'):
+            impl._update_impl(task, 'svc')
+        legacy_config.get_nested.assert_not_called()
+        preflight.assert_called_once_with(task, False)
+
 
 class TestServiceNameValidation:
 
@@ -330,38 +401,6 @@ class TestSanitizedConfigBytes:
         assert parsed['kubernetes']['allowed_contexts'] == ['ctx-a', 'ctx-b']
         assert parsed['kubernetes']['context_configs']['ctx-a'][
             'provision_timeout'] == 10
-
-
-class TestRejectExternalLbModeFlip:
-    """The extlb mode is SERVER TOPOLOGY: an update config cannot change it
-    (is_external_load_balancer_mode resolves from the live server config in
-    consolidation mode, immune to per-request config). The guard now rejects
-    an update whose config EXPLICITLY carries the key with a value different
-    from the server's effective mode — surfacing "server-side knob" instead
-    of silently ignoring it — and passes when absent or same-valued.
-    """
-
-    def _run(self, existing, requested):
-        mutated = mock.MagicMock()
-        mutated.get_nested.return_value = requested
-        with mock.patch.object(impl.serve_utils,
-                               'is_external_load_balancer_mode',
-                               return_value=existing):
-            impl._reject_external_lb_mode_flip(mutated)
-
-    def test_explicit_different_value_raises(self):
-        with pytest.raises(ValueError):
-            self._run(existing=False, requested=True)
-        with pytest.raises(ValueError):
-            self._run(existing=True, requested=False)
-
-    def test_explicit_same_value_ok(self):
-        self._run(existing=True, requested=True)
-        self._run(existing=False, requested=False)
-
-    def test_absent_key_ok(self):
-        self._run(existing=True, requested=None)
-        self._run(existing=False, requested=None)
 
 
 class TestLifecycleLocking:

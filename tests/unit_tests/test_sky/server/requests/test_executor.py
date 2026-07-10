@@ -13,6 +13,7 @@ import pytest
 
 from sky import exceptions
 from sky import skypilot_config
+from sky.serve import constants as serve_constants
 from sky.server import config as server_config
 from sky.server import constants as server_constants
 from sky.server import daemons as server_daemons
@@ -1020,6 +1021,31 @@ def test_override_env_applied_for_client_request(stub_override_request_env_deps,
             body, request_id='not-a-daemon-uuid', request_name='sky.launch'):
         assert os.environ['SKYPILOT_POD_MEMORY_BYTES_LIMIT'] == str(100 * 1024 *
                                                                     1024)
+
+
+def test_override_env_rejects_server_owned_client_values(
+        stub_override_request_env_deps, monkeypatch):
+    """A crafted request body cannot replace deployment-owned capabilities."""
+    capability = serve_constants.EXTERNAL_LB_ENABLED_ENV_VAR
+    server_prefixed = f'{constants.SKYPILOT_SERVER_ENV_VAR_PREFIX}TEST_ONLY'
+    monkeypatch.setenv(capability, 'true')
+    monkeypatch.setenv(server_prefixed, 'server-value')
+
+    body = payloads.RequestBody(
+        env_vars={
+            capability: 'false',
+            server_prefixed: 'client-value',
+            constants.USER_ID_ENV_VAR: 'client-user-id',
+            constants.USER_ENV_VAR: 'client-user',
+        })
+
+    with executor.override_request_env_and_config(
+            body, request_id='not-a-daemon-uuid', request_name='sky.launch'):
+        assert os.environ[capability] == 'true'
+        assert os.environ[server_prefixed] == 'server-value'
+
+    assert capability not in body.env_vars
+    assert server_prefixed not in body.env_vars
 
 
 def test_daemon_env_mutations_reverted_on_exit(stub_override_request_env_deps,
