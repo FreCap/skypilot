@@ -428,16 +428,20 @@ def _bail_on_boot_failure(service_name: str,
 
 def _spawn_controller(service_name: str,
                       service_spec: 'service_spec_lib.SkyServiceSpec',
-                      version: int, controller_host: str,
-                      controller_port: int) -> multiprocessing.Process:
+                      version: int, controller_host: str, controller_port: int,
+                      service_hash: str,
+                      controller_ip: Optional[str]) -> multiprocessing.Process:
     """Spawn (and start) the controller server subprocess for a service.
 
     Factored out of `_start` so the supervision loop can re-create the
     controller (on a fresh port) if it dies. See `_respawn_controller`.
     """
+    owner_fingerprint = serve_utils.make_controller_owner_fingerprint(
+        service_hash, os.getpid(), controller_ip, controller_port)
     process = multiprocessing.Process(target=controller.run_controller,
                                       args=(service_name, service_spec, version,
-                                            controller_host, controller_port))
+                                            controller_host, controller_port,
+                                            owner_fingerprint))
     process.start()
     return process
 
@@ -485,13 +489,14 @@ def _child_respawn_backoff_seconds(consecutive_failures: int) -> float:
         _CHILD_RESPAWN_BACKOFF_CAP_SECONDS)
 
 
-def _controller_child_responding(service_name: str,
+def _controller_child_responding(service_name: str, service_hash: str,
+                                 controller_ip: Optional[str],
                                  controller_port: int) -> bool:
     """Bounded health check for a live-but-hung controller child."""
     try:
-        response = serve_utils._get_to_controller_with_retry(  # pylint: disable=protected-access
+        response = serve_utils._get_to_local_controller_with_retry(  # pylint: disable=protected-access
             service_name,
-            controller_port,
+            (service_hash, os.getpid(), controller_ip, controller_port),
             '/autoscaler/info',
             timeout=(0.5, 1.0))
         return response.status_code == 200
@@ -560,7 +565,7 @@ def _respawn_controller(
     version: int,
     controller_host: str,
     dead_controller: Optional[multiprocessing.Process],
-    service_hash: Optional[str] = None,
+    service_hash: str,
     controller_ip: Optional[str] = None
 ) -> Optional[Tuple[multiprocessing.Process, int]]:
     """Re-create a controller child that died while its parent is alive.
@@ -612,7 +617,8 @@ def _respawn_controller(
             controller_port = _select_controller_port(service_name)
             new_controller = _spawn_controller(service_name, service_spec,
                                                version, controller_host,
-                                               controller_port)
+                                               controller_port, service_hash,
+                                               controller_ip)
             # `process=` fails this wait fast if the replacement dies at boot,
             # instead of holding the port-selection lock for the full timeout
             # on every retry of a crash-looping controller.
@@ -766,6 +772,9 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
         # historical bool return, so this process knows the committed hash
         # without a racy name-only read after insertion.
         service_incarnation = str(uuid.uuid4())
+    if not isinstance(service_incarnation, str) or not service_incarnation:
+        raise RuntimeError(
+            f'Service {service_name!r} has no durable incarnation hash.')
 
     def _read_yaml_content(yaml_path: str) -> str:
         with open(os.path.expanduser(yaml_path), 'r', encoding='utf-8') as f:
@@ -969,7 +978,8 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
             controller_host = _get_controller_host()
             controller_process = _spawn_controller(service_name, service_spec,
                                                    version, controller_host,
-                                                   controller_port)
+                                                   controller_port,
+                                                   service_incarnation, pod_ip)
             logger.debug(f'_start() spawned controller_process pid='
                          f'{controller_process.pid} host={controller_host} '
                          f'port={controller_port}')
@@ -1220,7 +1230,8 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
                                             not controller_process.is_alive())
                 if not controller_needs_respawn:
                     controller_responding = _controller_child_responding(
-                        service_name, controller_port)
+                        service_name, service_incarnation, pod_ip,
+                        controller_port)
                     if controller_responding:
                         controller_unresponsive_checks = 0
                     else:

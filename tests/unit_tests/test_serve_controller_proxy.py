@@ -8,17 +8,23 @@ import fastapi
 from fastapi import testclient
 import pytest
 
+from sky.serve import constants
 from sky.serve import serve_state
+from sky.serve import serve_utils
 from sky.serve.server import controller_proxy
 from sky.server import server
 
 
 def _request(path: str,
              authorization: Optional[str] = 'Bearer sync-token',
+             service_hash: Optional[str] = 'service-incarnation-a',
              body: bytes = b'{"request_aggregator": {}}') -> fastapi.Request:
     headers = [(b'content-type', b'application/json')]
     if authorization is not None:
         headers.append((b'authorization', authorization.encode('utf-8')))
+    if service_hash is not None:
+        headers.append((constants.SERVICE_HASH_HEADER.lower().encode('ascii'),
+                        service_hash.encode('utf-8')))
     sent = False
 
     async def receive():
@@ -141,6 +147,8 @@ def test_proxy_forwards_raw_body_once_and_preserves_response(monkeypatch):
     assert calls[0]['data'] == body
     assert calls[0]['headers']['Authorization'] == 'Bearer sync-token'
     assert calls[0]['headers']['Content-Type'] == 'application/json'
+    assert calls[0]['headers'][constants.CONTROLLER_OWNER_HEADER] == (
+        serve_utils.make_controller_owner_fingerprint(*owner))
     assert calls[0]['allow_redirects'] is False
     assert calls[0]['timeout'].total == 25
 
@@ -191,6 +199,24 @@ def test_proxy_detects_same_endpoint_reused_by_new_service_row(monkeypatch):
     assert response.status_code == 503
     assert b'ownership changed' in response.body
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize('service_hash', [None, 'service-incarnation-b'])
+def test_proxy_rejects_stale_lb_before_forward(monkeypatch, service_hash):
+    owner = _owner()
+    _patch_owner_reads(monkeypatch, [owner])
+    calls = []
+    monkeypatch.setattr(controller_proxy.aiohttp, 'ClientSession',
+                        lambda: _FakeClientSession(calls))
+
+    response = asyncio.run(
+        controller_proxy.proxy_load_balancer_sync(
+            'svc',
+            _request('/api/internal/serve/svc/controller/load_balancer_sync',
+                     service_hash=service_hash)))
+
+    assert response.status_code == 409
+    assert not calls
 
 
 @pytest.mark.parametrize('record', [
@@ -291,7 +317,10 @@ def test_api_server_route_authenticates_and_proxies(monkeypatch):
 
     response = client.post(
         '/api/internal/serve/svc/controller/load_balancer_sync',
-        headers={'Authorization': 'Bearer sync-token'},
+        headers={
+            'Authorization': 'Bearer sync-token',
+            constants.SERVICE_HASH_HEADER: 'service-incarnation-a',
+        },
         json={'request_aggregator': {}})
 
     assert response.status_code == 200

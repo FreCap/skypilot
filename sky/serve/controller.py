@@ -20,6 +20,7 @@ import uvicorn
 from sky import serve
 from sky import sky_logging
 from sky.serve import autoscalers
+from sky.serve import constants as serve_constants
 from sky.serve import lb_k8s
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity
@@ -76,6 +77,19 @@ def _make_auth_dependency(*,
     return _verify
 
 
+def _make_controller_owner_dependency(
+        controller_owner_fingerprint: str) -> Callable:
+    """Fence every child request to the exact controller owner tuple."""
+
+    async def _verify(requested_owner: Optional[str] = fastapi.Header(
+        None, alias=serve_constants.CONTROLLER_OWNER_HEADER)) -> None:
+        if requested_owner != controller_owner_fingerprint:
+            raise fastapi.HTTPException(
+                status_code=409, detail='Controller owner identity mismatch.')
+
+    return _verify
+
+
 class AutoscalerInfoFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -93,8 +107,10 @@ class SkyServeController:
     """
 
     def __init__(self, service_name: str, service_spec: serve.SkyServiceSpec,
-                 version: int, host: str, port: int) -> None:
+                 version: int, host: str, port: int,
+                 controller_owner_fingerprint: str) -> None:
         self._service_name = service_name
+        self._controller_owner_fingerprint = controller_owner_fingerprint
         self._is_pool = service_spec.pool
         self._replica_manager: replica_managers.ReplicaManager = (
             replica_managers.SkyPilotReplicaManager(service_name=service_name,
@@ -741,14 +757,20 @@ class SkyServeController:
             _make_auth_dependency(required=auth_required))
         sync_auth_dependency = fastapi.Depends(
             _make_auth_dependency(sync=True, required=auth_required))
+        controller_owner_dependency = fastapi.Depends(
+            _make_controller_owner_dependency(
+                self._controller_owner_fingerprint))
 
-        @self._app.get('/autoscaler/info', dependencies=[admin_auth_dependency])
+        @self._app.get(
+            '/autoscaler/info',
+            dependencies=[admin_auth_dependency, controller_owner_dependency])
         async def get_autoscaler_info() -> fastapi.Response:
             return responses.JSONResponse(content=self._autoscaler.info(),
                                           status_code=200)
 
-        @self._app.post('/controller/load_balancer_sync',
-                        dependencies=[sync_auth_dependency])
+        @self._app.post(
+            '/controller/load_balancer_sync',
+            dependencies=[sync_auth_dependency, controller_owner_dependency])
         async def load_balancer_sync(
                 request: fastapi.Request) -> fastapi.Response:
             request_data = await request.json()
@@ -759,8 +781,9 @@ class SkyServeController:
         # round can hold it for tens of seconds when replicas are unreachable)
         # never stalls the event loop — /controller/load_balancer_sync must
         # keep serving while an update waits its turn.
-        @self._app.post('/controller/update_service',
-                        dependencies=[admin_auth_dependency])
+        @self._app.post(
+            '/controller/update_service',
+            dependencies=[admin_auth_dependency, controller_owner_dependency])
         def update_service(request_data: Dict[str, Any] = fastapi.Body(
             ...)) -> fastapi.Response:
             try:
@@ -838,8 +861,9 @@ class SkyServeController:
                 },
                                               status_code=500)
 
-        @self._app.post('/controller/terminate_replica',
-                        dependencies=[admin_auth_dependency])
+        @self._app.post(
+            '/controller/terminate_replica',
+            dependencies=[admin_auth_dependency, controller_owner_dependency])
         async def terminate_replica(
                 request: fastapi.Request) -> fastapi.Response:
             request_data = await request.json()
@@ -948,10 +972,12 @@ class SkyServeController:
 # TODO(tian): Probably we should support service that will stop the VM in
 # specific time period.
 def run_controller(service_name: str, service_spec: serve.SkyServiceSpec,
-                   version: int, controller_host: str, controller_port: int):
+                   version: int, controller_host: str, controller_port: int,
+                   controller_owner_fingerprint: str):
     os.environ[constants.OVERRIDE_CONSOLIDATION_MODE] = 'true'
     # Hijack sys.stdout/stderr to be context aware.
     context_utils.hijack_sys_attrs()
     controller = SkyServeController(service_name, service_spec, version,
-                                    controller_host, controller_port)
+                                    controller_host, controller_port,
+                                    controller_owner_fingerprint)
     controller.run()

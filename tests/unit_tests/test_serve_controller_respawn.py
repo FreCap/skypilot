@@ -10,6 +10,7 @@ from sky.utils import common_utils
 from sky.utils import subprocess_utils
 
 _PORT = 20005
+_HASH = 'incarnation-a'
 
 
 class _FakeProc:
@@ -57,8 +58,15 @@ def _setup(monkeypatch,
 
     spawn_calls = []
 
-    def _spawn_controller(unused_name, spec, version, unused_host, port):
-        spawn_calls.append({'spec': spec, 'version': version, 'port': port})
+    def _spawn_controller(unused_name, spec, version, unused_host, port,
+                          service_hash, controller_ip):
+        spawn_calls.append({
+            'spec': spec,
+            'version': version,
+            'port': port,
+            'service_hash': service_hash,
+            'controller_ip': controller_ip,
+        })
         if isinstance(new_controller, BaseException):
             raise new_controller
         return new_controller
@@ -82,12 +90,18 @@ def test_respawn_recreates_only_controller_on_fresh_port(monkeypatch):
                                  new_controller=replacement,
                                  killed=[])
 
-    result = service._respawn_controller('svc', _spec(), 1, '127.0.0.1', dead)
+    result = service._respawn_controller('svc',
+                                         _spec(),
+                                         1,
+                                         '127.0.0.1',
+                                         dead,
+                                         service_hash=_HASH)
 
     assert result == (replacement, _PORT)
     assert len(spawn_calls) == 1
     assert spawn_calls[0]['version'] == 1
     assert spawn_calls[0]['port'] == _PORT
+    assert spawn_calls[0]['service_hash'] == _HASH
     assert 111 in killed
     # There is intentionally no in-pod LB process to restart: the stable API
     # proxy resolves the newly published port on its next request.
@@ -120,8 +134,12 @@ def test_respawn_reloads_latest_committed_spec(monkeypatch):
                             latest_version=7,
                             latest_spec=latest_spec)
 
-    service._respawn_controller('svc', _spec(), 1, '127.0.0.1',
-                                _FakeProc(False, 111))
+    service._respawn_controller('svc',
+                                _spec(),
+                                1,
+                                '127.0.0.1',
+                                _FakeProc(False, 111),
+                                service_hash=_HASH)
 
     assert spawn_calls[0]['version'] == 7
     assert spawn_calls[0]['spec'] is latest_spec
@@ -134,8 +152,12 @@ def test_respawn_db_error_retries_without_stale_spec(monkeypatch):
         raise RuntimeError('db unavailable')
 
     monkeypatch.setattr(serve_state, 'get_latest_committed_version', _db_error)
-    result = service._respawn_controller('svc', _spec(), 1, '127.0.0.1',
-                                         _FakeProc(False, 111))
+    result = service._respawn_controller('svc',
+                                         _spec(),
+                                         1,
+                                         '127.0.0.1',
+                                         _FakeProc(False, 111),
+                                         service_hash=_HASH)
     assert result is None
     assert spawn_calls == []
 
@@ -144,8 +166,12 @@ def test_respawn_failure_is_contained(monkeypatch):
     _, killed = _setup(monkeypatch,
                        new_controller=OSError('no memory'),
                        killed=[])
-    result = service._respawn_controller('svc', _spec(), 1, '127.0.0.1',
-                                         _FakeProc(False, 111))
+    result = service._respawn_controller('svc',
+                                         _spec(),
+                                         1,
+                                         '127.0.0.1',
+                                         _FakeProc(False, 111),
+                                         service_hash=_HASH)
     assert result is None
     # The previous dead child is reaped only after a replacement is published;
     # a failed attempt leaves it for a later retry.
@@ -155,8 +181,12 @@ def test_respawn_failure_is_contained(monkeypatch):
 def test_respawn_dead_replacement_is_reaped(monkeypatch):
     replacement = _FakeProc(False, 333)
     _, killed = _setup(monkeypatch, new_controller=replacement, killed=[])
-    result = service._respawn_controller('svc', _spec(), 1, '127.0.0.1',
-                                         _FakeProc(False, 111))
+    result = service._respawn_controller('svc',
+                                         _spec(),
+                                         1,
+                                         '127.0.0.1',
+                                         _FakeProc(False, 111),
+                                         service_hash=_HASH)
     assert result is None
     assert 333 in killed
 
@@ -167,8 +197,12 @@ def test_respawn_lost_ownership_discards_replacement(monkeypatch):
                        new_controller=replacement,
                        killed=[],
                        owns_row=False)
-    result = service._respawn_controller('svc', _spec(), 1, '127.0.0.1',
-                                         _FakeProc(False, 111))
+    result = service._respawn_controller('svc',
+                                         _spec(),
+                                         1,
+                                         '127.0.0.1',
+                                         _FakeProc(False, 111),
+                                         service_hash=_HASH)
     assert result is None
     assert 333 in killed
 

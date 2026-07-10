@@ -50,6 +50,16 @@ LB_SYNC_AUTH_TOKENS_FILE_ENV_VAR = ('SKYPILOT_SERVE_LB_SYNC_AUTH_TOKENS_FILE')
 CONTROLLER_ADMIN_AUTH_TOKENS_FILE_ENV_VAR = (
     'SKYPILOT_SERVE_CONTROLLER_ADMIN_AUTH_TOKENS_FILE')
 
+# A load balancer stamps the durable service incarnation it was created for.
+# The stable API-server proxy rejects stale same-name LBs before forwarding.
+SERVICE_HASH_HEADER = 'X-SkyPilot-Serve-Service-Hash'
+
+# Every controller endpoint lives on an ephemeral per-service port. Callers
+# stamp a fingerprint of the exact authoritative (service hash, parent PID,
+# pod IP, port) tuple and the child verifies it before handling the request, so
+# a recycled socket can never cross-wire a request into another controller.
+CONTROLLER_OWNER_HEADER = 'X-SkyPilot-Serve-Controller-Owner'
+
 # Env var holding a shared bearer token that guards INBOUND inference requests
 # to the external load balancer (data-plane auth), held by the inference
 # client. Kept DISTINCT from CONTROLLER_AUTH_TOKEN_ENV_VAR (control-plane) on

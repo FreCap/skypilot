@@ -17,6 +17,7 @@ import fastapi
 from sky import sky_logging
 from sky.serve import constants
 from sky.serve import serve_state
+from sky.serve import serve_utils
 
 logger = sky_logging.init_logger(__name__)
 
@@ -121,6 +122,12 @@ async def proxy_load_balancer_sync(
         return _service_unavailable(
             'Controller owner is missing or incomplete.')
 
+    expected_service_hash = request.headers.get(constants.SERVICE_HASH_HEADER)
+    if expected_service_hash != owner_before[0]:
+        return fastapi.responses.JSONResponse(
+            status_code=409,
+            content={'detail': 'Service incarnation mismatch.'})
+
     # The outer internal-auth middleware has already validated this header.
     # Forward the same credential to the controller's sync-only dependency.
     authorization = request.headers.get('authorization')
@@ -133,6 +140,8 @@ async def proxy_load_balancer_sync(
     forwarded_headers = {
         'Authorization': authorization,
         'Content-Type': request.headers.get('content-type', 'application/json'),
+        constants.CONTROLLER_OWNER_HEADER:
+            serve_utils.make_controller_owner_fingerprint(*owner_before),
     }
     try:
         async with aiohttp.ClientSession() as session:

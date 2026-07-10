@@ -647,6 +647,8 @@ def _build_deployment_dict(service_name: str,
             _controller_addr(service_name),
             '--load-balancer-port',
             str(constants.LOAD_BALANCER_PORT_START),
+            '--service-hash',
+            service_hash,
         ],
         'ports': [{
             'containerPort': constants.LOAD_BALANCER_PORT_START
@@ -864,10 +866,9 @@ def _wait_for_lb_deployment_ready(context: str, namespace: str,
         'the LB Pod logs.')
 
 
-def create_lb_deployment_and_service(
-        service_name: str,
-        termination_grace_period_seconds: int,
-        service_hash: Optional[str] = None) -> None:
+def create_lb_deployment_and_service(service_name: str,
+                                     termination_grace_period_seconds: int,
+                                     service_hash: str) -> None:
     """Create the per-service LB Deployment + Service (idempotent).
 
     A 409 (already exists) patches the Deployment to the desired proxy/auth/
@@ -876,6 +877,8 @@ def create_lb_deployment_and_service(
     """
     if not _lb_mode_active():
         return
+    if not service_hash:
+        raise RuntimeError('External load balancer requires a service hash.')
     context = kubernetes.in_cluster_context_name()
     namespace = get_lb_namespace()
     deployment_name = lb_deployment_name(service_name)
@@ -969,7 +972,7 @@ def create_lb_deployment_and_service(
 
 def ensure_lb_objects_exist(service_name: str,
                             termination_grace_period_seconds: int,
-                            service_hash: Optional[str] = None,
+                            service_hash: str,
                             controller_ip: Optional[str] = None) -> bool:
     """Recreate the per-service LB Deployment + Service if either is missing.
 
@@ -986,6 +989,8 @@ def ensure_lb_objects_exist(service_name: str,
     """
     if not _lb_mode_active():
         return False
+    if not service_hash:
+        raise RuntimeError('External load balancer requires a service hash.')
     context = kubernetes.in_cluster_context_name()
     namespace = get_lb_namespace()
 
@@ -1066,13 +1071,9 @@ def ensure_lb_objects_exist(service_name: str,
                    f'hash_drifted={hash_drifted}, '
                    f'routing_drifted={routing_drifted}); applying desired '
                    'state.')
-    if service_hash is None and controller_ip is None:
-        create_lb_deployment_and_service(service_name,
-                                         termination_grace_period_seconds)
-    else:
-        create_lb_deployment_and_service(service_name,
-                                         termination_grace_period_seconds,
-                                         service_hash)
+    create_lb_deployment_and_service(service_name,
+                                     termination_grace_period_seconds,
+                                     service_hash)
     return True
 
 
