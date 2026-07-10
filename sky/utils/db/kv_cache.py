@@ -91,6 +91,49 @@ def add_or_update_cache_entry(
 
 
 @metrics_lib.time_me
+def add_or_extend_cache_entry(
+    key: str,
+    value: str,
+    expires_at: float,
+) -> None:
+    """Store an entry without shortening an existing expiration.
+
+    This is useful for negative-cache hints written concurrently by multiple
+    worker processes: a delayed older writer must not shorten a newer hint.
+    """
+    engine = _db_manager.get_engine()
+    if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
+        insert_func = sqlite.insert
+        greatest = sqlalchemy.func.max
+    elif engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        insert_func = postgresql.insert
+        greatest = sqlalchemy.func.greatest
+    else:
+        raise ValueError('Unsupported database dialect')
+
+    with orm.Session(engine) as session:
+        insert_stmt = insert_func(kv_cache_table).values(key=key,
+                                                         value=value,
+                                                         expires_at=expires_at)
+        existing_expiry = sqlalchemy.func.coalesce(
+            kv_cache_table.c.expires_at, insert_stmt.excluded.expires_at)
+        value_at_latest_expiry = sqlalchemy.case((sqlalchemy.or_(
+            kv_cache_table.c.expires_at.is_(None),
+            insert_stmt.excluded.expires_at >= kv_cache_table.c.expires_at),
+                                                  insert_stmt.excluded.value),
+                                                 else_=kv_cache_table.c.value)
+        do_update_stmt = insert_stmt.on_conflict_do_update(
+            index_elements=[kv_cache_table.c.key],
+            set_={
+                kv_cache_table.c.value: value_at_latest_expiry,
+                kv_cache_table.c.expires_at: greatest(
+                    existing_expiry, insert_stmt.excluded.expires_at)
+            })
+        session.execute(do_update_stmt)
+        session.commit()
+
+
+@metrics_lib.time_me
 def get_cache_entry(key: str) -> Optional[str]:
     """Get the value of the cache entry.
 
@@ -104,6 +147,17 @@ def get_cache_entry(key: str) -> Optional[str]:
                 kv_cache_table.c.key == key).where(
                     kv_cache_table.c.expires_at > time.time()))
         return result.scalar()
+
+
+@metrics_lib.time_me
+def delete_cache_entry(key: str) -> None:
+    """Delete exactly one cache entry."""
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        session.execute(
+            sqlalchemy.delete(kv_cache_table).where(
+                kv_cache_table.c.key == key))
+        session.commit()
 
 
 _LIKE_ESCAPE_CHAR = '\\'

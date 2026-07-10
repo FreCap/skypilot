@@ -37,6 +37,34 @@ def test_get_cache_entry_expired(isolated_database):
     assert kv_cache.get_cache_entry('test_key') == 'test_value'
 
 
+def test_add_or_extend_keeps_latest_expiry_and_value(isolated_database,
+                                                     monkeypatch):
+    now = {'value': 1000.0}
+    monkeypatch.setattr(kv_cache.time, 'time', lambda: now['value'])
+
+    kv_cache.add_or_extend_cache_entry('test_key', 'old', 1100.0)
+    kv_cache.add_or_extend_cache_entry('test_key', 'new', 1200.0)
+    # A delayed older writer must not shorten the expiry or replace the value
+    # associated with the newer observation.
+    kv_cache.add_or_extend_cache_entry('test_key', 'stale', 1150.0)
+
+    now['value'] = 1160.0
+    assert kv_cache.get_cache_entry('test_key') == 'new'
+    now['value'] = 1201.0
+    assert kv_cache.get_cache_entry('test_key') is None
+
+
+def test_delete_cache_entry_is_exact(isolated_database):
+    expires = time.time() + 3600
+    kv_cache.add_or_update_cache_entry('key1', 'value1', expires)
+    kv_cache.add_or_update_cache_entry('key2', 'value2', expires)
+
+    kv_cache.delete_cache_entry('key1')
+
+    assert kv_cache.get_cache_entry('key1') is None
+    assert kv_cache.get_cache_entry('key2') == 'value2'
+
+
 def test_delete_cache_entries_by_prefix(isolated_database):
     expires = time.time() + 3600
     kv_cache.add_or_update_cache_entry('perm:ws:ws1:user1', '1', expires)

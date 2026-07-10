@@ -41,6 +41,15 @@ BOTO_CREATE_MAX_RETRIES = 5
 # Max retries for deleting security groups etc.
 BOTO_DELETE_MAX_ATTEMPTS = 6
 
+# These RunInstances failures cannot be repaired by immediately retrying the
+# same request. Quota errors are regional. InsufficientInstanceCapacity is safe
+# to fast-fail only when the request is known to target one availability zone.
+_INSUFFICIENT_CAPACITY_ERROR_CODE = 'InsufficientInstanceCapacity'
+_REGIONAL_QUOTA_ERROR_CODES = frozenset({
+    'VcpuLimitExceeded',
+    'MaxSpotInstanceCountExceeded',
+    'InstanceLimitExceeded',
+})
 _DEPENDENCY_VIOLATION_PATTERN = re.compile(
     r'An error occurred \(DependencyViolation\) when calling the '
     r'DeleteSecurityGroup operation(.*): (.*)')
@@ -184,6 +193,17 @@ def _merge_tag_specs(tag_specs: List[Dict[str, Any]],
             tag_specs += [user_tag_spec]
 
 
+def _is_single_zone_request(provider_config: Dict[str, Any]) -> bool:
+    """Whether the provisioner explicitly targets exactly one AWS zone."""
+    availability_zone = provider_config.get('availability_zone')
+    if not isinstance(availability_zone, str):
+        return False
+    configured_zones = [
+        zone.strip() for zone in availability_zone.split(',') if zone.strip()
+    ]
+    return len(configured_zones) == 1
+
+
 def _create_instances(
     ec2_fail_fast,
     cluster_name: str,
@@ -192,6 +212,7 @@ def _create_instances(
     count: int,
     associate_public_ip_address: bool,
     max_efa_interfaces: int,
+    is_single_zone_request: bool = False,
 ) -> List:
     tags = {
         'Name': cluster_name,
@@ -211,6 +232,11 @@ def _create_instances(
     # SubnetIds is not a real config key: we must resolve to a
     # single SubnetId before invoking the AWS API.
     subnet_ids = conf.pop('SubnetIds')
+    market_options = conf.get('InstanceMarketOptions', {})
+    market_type = (market_options.get('MarketType') if isinstance(
+        market_options, dict) else None)
+    is_spot = (isinstance(market_type, str) and market_type.lower() == 'spot')
+    is_known_single_zone_spot = is_spot and is_single_zone_request
 
     # update config with min/max node counts and tag specs
     conf.update({
@@ -283,20 +309,31 @@ def _create_instances(
             return instances
         except aws.botocore_exceptions().ClientError as exc:
             error_data = exc.response.get('Error', {})
+            error_code = str(error_data.get('Code', ''))
             errors.append({
-                'code': str(error_data.get('Code', '')),
+                'code': error_code,
                 'message': str(error_data.get('Message', exc)),
                 'subnet_id': subnet_id,
             })
+            is_terminal_error = (error_code in _REGIONAL_QUOTA_ERROR_CODES or
+                                 (is_known_single_zone_spot and error_code
+                                  == _INSUFFICIENT_CAPACITY_ERROR_CODE))
             echo = logger.debug
-            if (i + 1) % per_subnet_tries == 0:
+            if is_terminal_error or (i + 1) % per_subnet_tries == 0:
                 # Print the warning only once per subnet
                 echo = logger.warning
             echo(f'create_instances: Attempt failed with {exc}')
+            if is_terminal_error:
+                error = common.ProvisionerError(
+                    'Failed to launch instances due to a terminal AWS error.')
+                error.errors = errors
+                error.requested_count = count
+                raise error from exc
             if (i + 1) >= max_tries:
                 error = common.ProvisionerError(
                     'Failed to launch instances. Max attempts exceeded.')
                 error.errors = errors
+                error.requested_count = count
                 raise error from exc
     assert False, 'This code should not be reachable'
 
@@ -323,6 +360,8 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
                   config: common.ProvisionConfig) -> common.ProvisionRecord:
     """See sky/provision/__init__.py"""
     del cluster_name  # unused
+    is_single_zone_request = _is_single_zone_request(config.provider_config)
+
     ec2 = _default_ec2_resource(region)
     # NOTE: We set max_attempts=0 for fast failing when the resource is not
     # available (although the doc says it will only retry for network
@@ -550,7 +589,8 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
                     reservation_count,
                     associate_public_ip_address=(
                         not config.provider_config['use_internal_ips']),
-                    max_efa_interfaces=max_efa_interfaces)
+                    max_efa_interfaces=max_efa_interfaces,
+                    is_single_zone_request=is_single_zone_request)
                 created_instances.extend(created_reserved_instances)
                 to_start_count -= reservation_count
                 if to_start_count <= 0:
@@ -574,7 +614,8 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
                 to_start_count,
                 associate_public_ip_address=(
                     not config.provider_config['use_internal_ips']),
-                max_efa_interfaces=max_efa_interfaces)
+                max_efa_interfaces=max_efa_interfaces,
+                is_single_zone_request=is_single_zone_request)
 
             created_instances.extend(created_remaining_instances)
         created_instances.sort(key=lambda x: x.id)

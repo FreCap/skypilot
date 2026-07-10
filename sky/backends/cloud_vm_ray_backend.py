@@ -89,6 +89,8 @@ from sky.utils import volume as volume_lib
 from sky.utils import yaml_utils
 from sky.utils.plugin_extensions import ExternalFailureSource
 
+metrics_utils = adaptors_common.LazyImport('sky.metrics.utils')
+
 if typing.TYPE_CHECKING:
     import grpc
 
@@ -813,6 +815,17 @@ _QUOTA_ERROR_CODES = frozenset({
 })
 
 
+def _record_capacity_metric(reason: str, action: str) -> None:
+    try:
+        if metrics_utils.METRICS_ENABLED:
+            metrics_utils.SKY_PROVISION_CAPACITY_EVENTS_TOTAL.labels(
+                reason=reason, action=action).inc()
+    except Exception as e:  # pylint: disable=broad-except
+        # Observability must never alter the provisioning result.
+        logger.debug('Capacity metric update failed: '
+                     f'{common_utils.format_exception(e)}')
+
+
 def _iter_error_chain(error: BaseException) -> Iterable[BaseException]:
     """Yields explicit exception causes, excluding implicit context."""
     seen: Set[int] = set()
@@ -828,8 +841,9 @@ def _classify_capacity_error(cloud: 'clouds.Cloud',
     """Classifies an AWS failure using structured codes only.
 
     AWS's provisioner records every failed RunInstances attempt on a
-    ``ProvisionerError``. A batch is classified only when all of its codes agree
-    on capacity or quota; mixed failures take the normal failover path.
+    ``ProvisionerError``. A batch is classified only when every code is a known
+    capacity/quota code. Quota dominates a mixed known batch because it is
+    regional; any unknown code takes the conservative normal failover path.
     """
     if not isinstance(cloud, clouds.AWS):
         return None
@@ -846,10 +860,15 @@ def _classify_capacity_error(cloud: 'clouds.Cloud',
             code = response.get('Error', {}).get('Code')
             if code is not None:
                 codes.append(str(code))
-    if codes and all(code in _CAPACITY_ERROR_CODES for code in codes):
+    known_codes = _CAPACITY_ERROR_CODES | _QUOTA_ERROR_CODES
+    if codes and all(code in known_codes for code in codes):
+        # A quota denial is regional and makes sibling-AZ attempts for this
+        # demand futile, so it dominates an otherwise-known capacity/quota
+        # aggregate. Unknown codes remain unclassified and take the normal,
+        # conservative failover path.
+        if any(code in _QUOTA_ERROR_CODES for code in codes):
+            return 'quota'
         return 'capacity'
-    if codes and all(code in _QUOTA_ERROR_CODES for code in codes):
-        return 'quota'
     return None
 
 
@@ -880,10 +899,63 @@ def _capacity_cache_exhausted_zone_names(
     try:
         active = capacity_cache.active_exhausted_keys([key])
     except Exception as e:  # pylint: disable=broad-except
+        _record_capacity_metric('capacity', 'cache_error')
         logger.debug('Capacity-cache read failed: '
                      f'{common_utils.format_exception(e)}')
         return set()
+    _record_capacity_metric('capacity', 'hit' if active else 'miss')
     return {active_key.zone for active_key in active}
+
+
+def _quota_cooldown_key(
+        to_provision: 'resources_lib.Resources', region: 'clouds.Region',
+        num_nodes: int,
+        account: Optional[str]) -> Optional['capacity_cache.QuotaCooldownKey']:
+    """Returns a demand-specific key for a brief Spot quota cooldown."""
+    if (not isinstance(to_provision.cloud, clouds.AWS) or
+            not to_provision.use_spot or not account or
+            not to_provision.instance_type):
+        return None
+    return capacity_cache.QuotaCooldownKey(
+        account=account,
+        region=region.name,
+        instance_type=to_provision.instance_type,
+        num_nodes=num_nodes)
+
+
+def _quota_cooldown_is_active(
+        key: Optional['capacity_cache.QuotaCooldownKey']) -> bool:
+    if key is None:
+        return False
+    try:
+        active = capacity_cache.is_quota_cooldown_active(key)
+    except Exception as e:  # pylint: disable=broad-except
+        _record_capacity_metric('quota', 'cache_error')
+        logger.debug('Quota-cooldown read failed: '
+                     f'{common_utils.format_exception(e)}')
+        return False
+    _record_capacity_metric('quota', 'hit' if active else 'miss')
+    return active
+
+
+def _fully_created_fresh_demand(
+        provision_record: 'provision_common.ProvisionRecord', num_nodes: int,
+        cluster_exists: bool) -> bool:
+    """Whether success proves capacity/quota for the full requested demand."""
+    return (not cluster_exists and
+            len(provision_record.created_instance_ids) == num_nodes)
+
+
+def _failure_requested_full_demand(error: BaseException,
+                                   num_nodes: int) -> bool:
+    """Whether provider metadata proves the failed request covered all nodes."""
+    requested_counts = []
+    for exc in _iter_error_chain(error):
+        requested_count = getattr(exc, 'requested_count', None)
+        if isinstance(requested_count, int):
+            requested_counts.append(requested_count)
+    return bool(requested_counts) and all(
+        count == num_nodes for count in requested_counts)
 
 
 class RetryingVmProvisioner(object):
@@ -1150,6 +1222,21 @@ class RetryingVmProvisioner(object):
             to_provision, 'region should have been set by the optimizer.')
         region = clouds.Region(to_provision.region)
 
+        capacity_cache_account = None
+        if (isinstance(to_provision.cloud, clouds.AWS) and cloud_user_identity):
+            capacity_cache_account = str(cloud_user_identity[-1])
+        quota_cooldown_key = _quota_cooldown_key(to_provision, region,
+                                                 num_nodes,
+                                                 capacity_cache_account)
+        if (not cluster_exists and not dryrun and
+                _quota_cooldown_is_active(quota_cooldown_key)):
+            _add_to_blocked_resources(
+                self._blocked_resources,
+                to_provision.copy(region=region.name, zone=None))
+            raise exceptions.ResourcesUnavailableError(
+                'Skipping an AWS Spot demand still in a brief quota-failure '
+                f'cooldown for {to_provision.instance_type} in {region.name}.')
+
         # Optimization - check if user has non-zero quota for
         # the instance type in the target region. If not, fail early
         # instead of trying to provision and failing later.
@@ -1181,9 +1268,6 @@ class RetryingVmProvisioner(object):
 
         insufficient_resources = None
         last_error_reason: Optional[str] = None
-        capacity_cache_account = None
-        if (isinstance(to_provision.cloud, clouds.AWS) and cloud_user_identity):
-            capacity_cache_account = str(cloud_user_identity[-1])
         for zones in self._yield_zones(to_provision, num_nodes, cluster_name,
                                        prev_cluster_status,
                                        prev_cluster_ever_up):
@@ -1434,6 +1518,45 @@ class RetryingVmProvisioner(object):
                         config_dict['provision_record'] = provision_record
                         config_dict['resources_vars'] = resources_vars
                         config_dict['handle'] = handle
+                        # A full fresh create proves that this exact demand can
+                        # launch now. Reusing orphaned/resumed nodes, or only
+                        # creating the missing subset, proves neither the
+                        # original num_nodes capacity nor current quota.
+                        if (capacity_cache_account is not None and
+                                _fully_created_fresh_demand(
+                                    provision_record, num_nodes,
+                                    cluster_exists)):
+                            succeeded_zones = None
+                            if provision_record.zone is not None:
+                                succeeded_zones = [
+                                    clouds.Zone(provision_record.zone)
+                                ]
+                            success_capacity_key = _capacity_cache_key(
+                                to_provision, region, succeeded_zones,
+                                num_nodes, capacity_cache_account)
+                            if success_capacity_key is not None:
+                                try:
+                                    capacity_cache.clear(success_capacity_key)
+                                    _record_capacity_metric('capacity', 'clear')
+                                except Exception as cache_error:  # pylint: disable=broad-except
+                                    _record_capacity_metric(
+                                        'capacity', 'cache_error')
+                                    logger.debug(
+                                        'Capacity-cache clear failed: '
+                                        f'{common_utils.format_exception(cache_error)}'
+                                    )
+                            if quota_cooldown_key is not None:
+                                try:
+                                    capacity_cache.clear_quota_cooldown(
+                                        quota_cooldown_key)
+                                    _record_capacity_metric('quota', 'clear')
+                                except Exception as cache_error:  # pylint: disable=broad-except
+                                    _record_capacity_metric(
+                                        'quota', 'cache_error')
+                                    logger.debug(
+                                        'Quota-cooldown clear failed: '
+                                        f'{common_utils.format_exception(cache_error)}'
+                                    )
                         return config_dict
                     except provision_common.StopFailoverError:
                         with ux_utils.print_exception_no_traceback():
@@ -1469,19 +1592,43 @@ class RetryingVmProvisioner(object):
                     except Exception as e:  # pylint: disable=broad-except
                         capacity_reason = _classify_capacity_error(
                             to_provision.cloud, e)
+                        failure_requested_full_demand = (
+                            capacity_reason is not None and
+                            _failure_requested_full_demand(e, num_nodes))
                         capacity_key = None
                         if capacity_reason == 'capacity' and not cluster_exists:
                             capacity_key = _capacity_cache_key(
                                 to_provision, region, zones, num_nodes,
                                 capacity_cache_account)
-                            if capacity_key is not None:
+                            if (capacity_key is not None and
+                                    failure_requested_full_demand):
                                 try:
                                     capacity_cache.mark_exhausted(capacity_key)
+                                    _record_capacity_metric('capacity', 'mark')
                                 except Exception as cache_error:  # pylint: disable=broad-except
+                                    _record_capacity_metric(
+                                        'capacity', 'cache_error')
                                     logger.debug(
                                         'Capacity-cache write failed: '
                                         f'{common_utils.format_exception(cache_error)}'
                                     )
+                        elif (capacity_reason == 'quota' and
+                              not cluster_exists and
+                              quota_cooldown_key is not None and
+                              failure_requested_full_demand):
+                            try:
+                                capacity_cache.mark_quota_failure(
+                                    quota_cooldown_key)
+                                _record_capacity_metric('quota', 'mark')
+                            except Exception as cache_error:  # pylint: disable=broad-except
+                                _record_capacity_metric('quota', 'cache_error')
+                                logger.debug(
+                                    'Quota-cooldown write failed: '
+                                    f'{common_utils.format_exception(cache_error)}'
+                                )
+                        if capacity_reason is not None:
+                            _record_capacity_metric(capacity_reason,
+                                                    'probe_failure')
                         # NOTE: We try to cleanup the cluster even if the previous
                         # cluster does not exist. Also we are fast at
                         # cleaning up clusters now if there is no existing node..
