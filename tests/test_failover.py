@@ -16,10 +16,8 @@ from sky import sky_logging
 from sky.backends import cloud_vm_ray_backend
 from sky.catalog import aws_catalog
 from sky.clouds.aws import AWS
-from sky.provision import capacity_cache
 from sky.provision.aws import config as aws_config
 from sky.provision.aws import instance as aws_instance
-from sky.utils import common_utils
 from sky.utils import env_options
 from sky.utils.db import db_utils
 
@@ -35,13 +33,6 @@ def _mock_db_conn(tmp_path, monkeypatch):
                         sqlalchemy_engine)
 
     global_user_state.create_table(sqlalchemy_engine)
-
-    # Isolate the capacity-exhaustion cache so a failover recorded during this
-    # test never leaks into the real DB (or a later test run), which would make
-    # a subsequent launch fast-skip the "exhausted" region and suppress failover.
-    cc_engine = create_engine(f'sqlite:///{tmp_path / "capacity_cache.db"}')
-    monkeypatch.setattr(capacity_cache._db_manager, '_engine', cc_engine)
-    capacity_cache.Base.metadata.create_all(cc_engine)
 
 
 @pytest.mark.parametrize('enable_all_clouds', [[sky.AWS()]], indirect=True)
@@ -110,12 +101,6 @@ def test_aws_region_failover(enable_all_clouds, _mock_db_conn, mock_aws_backend,
                                 mock_create_instances)
             monkeypatch.setattr(aws_config, '_need_to_update_outbound_rules',
                                 lambda sg, rules: False)
-            # Pin the capacity/quota backoff to zero so the injected
-            # InsufficientInstanceCapacity failure does not add a real sleep.
-            monkeypatch.setattr(
-                cloud_vm_ray_backend, '_capacity_backoff',
-                lambda: common_utils.Backoff(initial_backoff=0,
-                                             max_backoff_factor=1))
             task = sky.Task(run='echo hi')
             task.set_resources(
                 sky.Resources(infra='aws', instance_type='t2.micro'))

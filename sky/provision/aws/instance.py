@@ -234,6 +234,7 @@ def _create_instances(
     max_tries = max(num_subnets * (BOTO_CREATE_MAX_RETRIES // num_subnets),
                     len(subnet_ids))
     per_subnet_tries = max_tries // num_subnets
+    errors: List[Dict[str, str]] = []
     for i in range(max_tries):
         try:
             # Try each subnet for per_subnet_tries times.
@@ -281,15 +282,22 @@ def _create_instances(
                 ec2_fail_fast.create_instances, **conf)
             return instances
         except aws.botocore_exceptions().ClientError as exc:
+            error_data = exc.response.get('Error', {})
+            errors.append({
+                'code': str(error_data.get('Code', '')),
+                'message': str(error_data.get('Message', exc)),
+                'subnet_id': subnet_id,
+            })
             echo = logger.debug
             if (i + 1) % per_subnet_tries == 0:
                 # Print the warning only once per subnet
                 echo = logger.warning
             echo(f'create_instances: Attempt failed with {exc}')
             if (i + 1) >= max_tries:
-                raise RuntimeError(
-                    'Failed to launch instances. Max attempts exceeded.'
-                ) from exc
+                error = common.ProvisionerError(
+                    'Failed to launch instances. Max attempts exceeded.')
+                error.errors = errors
+                raise error from exc
     assert False, 'This code should not be reachable'
 
 

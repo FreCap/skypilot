@@ -2689,48 +2689,6 @@ def get_config_schema():
             'install_conda': {
                 'type': 'boolean',
             },
-            # Jittered backoff between genuine capacity/quota probes during
-            # failover (only fires when a shape is actually probed, not for
-            # cache-skipped shapes).
-            'capacity_backoff': {
-                'type': 'object',
-                'required': [],
-                'additionalProperties': False,
-                'properties': {
-                    # 0 disables backoff (probes are not paced). A positive
-                    # value is the first sleep; growth is capped by max_seconds.
-                    'initial_seconds': {
-                        'type': 'number',
-                        'minimum': 0,
-                        'maximum': 3600,
-                    },
-                    # Cap on the base backoff before jitter (the backoff then
-                    # adds up to +/-40% jitter, so an effective sleep can reach
-                    # ~1.4x this). Values below initial_seconds collapse to a
-                    # constant backoff at initial_seconds.
-                    'max_seconds': {
-                        'type': 'number',
-                        'minimum': 0,
-                        'maximum': 3600,
-                    },
-                },
-            },
-            # TTL (seconds) for entries in the DB-backed capacity-exhaustion
-            # cache. Every entry auto-expires, so nothing is ever blocked
-            # permanently -- the upper bound is enforced here and, as a backstop,
-            # hard-clamped in code (capacity_cache._MAX_TTL_SECONDS).
-            'capacity_exhaustion_ttl': {
-                'type': 'object',
-                'required': [],
-                'additionalProperties': False,
-                'properties': {
-                    'capacity_seconds': {
-                        'type': 'number',
-                        'minimum': 0,
-                        'maximum': 3600,
-                    },
-                },
-            },
         }
     }
 
