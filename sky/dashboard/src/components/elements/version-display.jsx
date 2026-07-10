@@ -7,6 +7,7 @@ const VersionContext = createContext({
   version: null,
   latestVersion: null,
   commit: null,
+  build: null,
   plugins: [],
 });
 
@@ -14,6 +15,7 @@ export function VersionProvider({ children }) {
   const [version, setVersion] = useState(null);
   const [latestVersion, setLatestVersion] = useState(null);
   const [commit, setCommit] = useState(null);
+  const [build, setBuild] = useState(null);
   const [plugins, setPlugins] = useState([]);
 
   const getVersionAndPlugins = async () => {
@@ -31,6 +33,9 @@ export function VersionProvider({ children }) {
       }
       if (healthData.commit) {
         setCommit(healthData.commit);
+      }
+      if (healthData.build) {
+        setBuild(healthData.build);
       }
       if (healthData.latest_version) {
         setLatestVersion(healthData.latest_version);
@@ -60,7 +65,7 @@ export function VersionProvider({ children }) {
 
   return (
     <VersionContext.Provider
-      value={{ version, latestVersion, commit, plugins }}
+      value={{ version, latestVersion, commit, build, plugins }}
     >
       {children}
     </VersionContext.Provider>
@@ -164,7 +169,7 @@ export function NewVersionAvailable() {
 }
 
 export function VersionDisplay() {
-  const { version, latestVersion, commit, plugins } = useVersionInfo();
+  const { version, latestVersion, commit, build, plugins } = useVersionInfo();
 
   if (!version) return null;
 
@@ -179,6 +184,7 @@ export function VersionDisplay() {
       <div className="inline-flex items-center justify-center transition-colors duration-150 cursor-help">
         <div className="text-sm text-gray-500 border-b border-dotted border-gray-400 hover:text-blue-600 hover:border-blue-600">
           Version: {version}
+          {build ? ` (build ${build})` : ''}
         </div>
       </div>
     </VersionTooltip>

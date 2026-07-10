@@ -47,6 +47,7 @@ const ICON_MAP = {
 import { BASE_PATH, ENDPOINT } from '@/data/connectors/constants';
 import { CustomTooltip } from '@/components/utils';
 import { useMobile } from '@/hooks/useMobile';
+import { ThemeToggle } from '@/components/elements/ThemeToggle';
 import { UpgradeHint } from '@/components/elements/version-display';
 import { useGroupedNavLinks, usePluginRoutes } from '@/plugins/PluginProvider';
 import { PluginSlot } from '@/plugins/PluginSlot';
@@ -656,6 +657,9 @@ export function TopBar() {
                 </CustomTooltip>
 
                 <div className="border-l border-gray-200 h-6"></div>
+
+                {/* Theme Toggle */}
+                <ThemeToggle />
 
                 {/* Version Display */}
                 <UpgradeHint />

@@ -67,6 +67,21 @@
   body {
     @apply bg-background text-foreground;
   }
+  .dark {
+    color-scheme: dark;
+  }
+}
+
+/* `white` is not remapped in the Tailwind palette (so `text-white` on colored
+ * buttons keeps its contrast); only white *surfaces* flip in dark mode. */
+.dark .bg-white {
+  background-color: rgb(var(--tw-c-surface));
+}
+.dark .bg-white\/50 {
+  background-color: rgb(var(--tw-c-surface) / 0.5);
+}
+.dark .bg-white\/70 {
+  background-color: rgb(var(--tw-c-surface) / 0.7);
 }
 
 .sortable {
@@ -574,4 +589,121 @@
   z-index: 5;
   border-radius: inherit;
   pointer-events: none;
+}
+
+/* ===== Dark theme overrides for the hard-coded light styles above ===== */
+
+/* The logo SVG is mostly navy (#0E2E65), invisible on a dark topbar.
+ * invert + hue-rotate lightens it while keeping the blue hue family. */
+.dark img[alt='SkyPilot Logo'] {
+  filter: invert(1) hue-rotate(180deg) saturate(0.85);
+}
+
+.dark .chart {
+  background-color: rgb(var(--tw-c-surface));
+  border-color: rgb(var(--tw-c-gray-200));
+}
+
+.dark .flip-card-front,
+.dark .flip-card-back {
+  background: rgb(var(--tw-c-surface));
+  border-color: rgb(var(--tw-c-gray-200));
+}
+
+.dark .home-cloud-card {
+  /* honeydew -> dark green tint */
+  background-color: #0d2018;
+}
+
+.dark .shepherd-element {
+  background: rgb(var(--tw-c-surface));
+  border-color: rgb(var(--tw-c-gray-200));
+}
+
+.dark .shepherd-title,
+.dark .shepherd-text p:first-child strong {
+  color: rgb(var(--tw-c-gray-900));
+}
+
+.dark .shepherd-text {
+  background: rgb(var(--tw-c-surface));
+  color: rgb(var(--tw-c-gray-700));
+}
+
+.dark .shepherd-text p,
+.dark .shepherd-text li,
+.dark .shepherd-progress {
+  color: rgb(var(--tw-c-gray-500));
+}
+
+.dark .shepherd-text strong {
+  color: rgb(var(--tw-c-gray-800));
+}
+
+.dark .shepherd-text hr {
+  border-top-color: rgb(var(--tw-c-gray-200));
+}
+
+.dark .shepherd-footer {
+  background: rgb(var(--tw-c-surface));
+}
+
+.dark .shepherd-button-secondary,
+.dark .shepherd-button-secondary:hover,
+.dark .shepherd-button-secondary:focus,
+.dark .shepherd-button-secondary:active,
+.dark .shepherd-element .shepherd-button-secondary:hover,
+.dark .shepherd-element .shepherd-button-secondary:focus,
+.dark .shepherd-element .shepherd-button-secondary:active {
+  background: rgb(var(--tw-c-gray-100)) !important;
+  color: rgb(var(--tw-c-gray-900)) !important;
+  border: 1px solid rgb(var(--tw-c-gray-200)) !important;
+}
+
+.dark .shepherd-cancel-icon:hover {
+  background: rgb(var(--tw-c-gray-100));
+  color: rgb(var(--tw-c-gray-500));
+}
+
+.dark .shepherd-element[data-popper-placement^='top'] .shepherd-arrow {
+  border-color: rgb(var(--tw-c-surface)) transparent transparent transparent;
+}
+
+.dark .shepherd-element[data-popper-placement^='bottom'] .shepherd-arrow {
+  border-color: transparent transparent rgb(var(--tw-c-surface)) transparent;
+}
+
+.dark .shepherd-element[data-popper-placement^='left'] .shepherd-arrow {
+  border-color: transparent transparent transparent rgb(var(--tw-c-surface));
+}
+
+.dark .shepherd-element[data-popper-placement^='right'] .shepherd-arrow {
+  border-color: transparent rgb(var(--tw-c-surface)) transparent transparent;
+}
+
+.dark .tour-help-button {
+  color: rgb(var(--tw-c-gray-500));
+}
+
+.dark .tour-help-button:hover {
+  background: rgb(var(--tw-c-gray-100));
+  color: rgb(var(--tw-c-gray-700));
+}
+
+.dark .tour-help-button:active {
+  background: rgb(var(--tw-c-gray-200));
+}
+
+.dark .infra-loading-row::after {
+  background: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0) 0%,
+    rgba(255, 255, 255, 0.08) 50%,
+    rgba(255, 255, 255, 0) 100%
+  );
+  background-size: 200% 100%;
+}
+
+.dark .infra-table-refreshing::before {
+  background: rgba(2, 8, 23, 0.5);
 }

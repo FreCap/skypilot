@@ -93,8 +93,35 @@ def get_commit_hash():
         return commit_hash
 
 
+def get_commit_count():
+    """Get the commit count, i.e. a build number that auto-increments with
+    every commit."""
+    with open(INIT_FILE_PATH, 'r', encoding='utf-8') as fp:
+        count_match = re.search(
+            r'^_SKYPILOT_COMMIT_COUNT = [\'"]([^\'"]*)[\'"]', fp.read(), re.M)
+        if count_match:
+            commit_count = count_match.group(1)
+        else:
+            raise RuntimeError('Unable to find commit count string.')
+
+    if 'SKYPILOT_COMMIT_COUNT' not in commit_count:
+        return commit_count
+    try:
+        # TODO: keep this in sync with sky/__init__.py
+        cwd = os.path.dirname(__file__)
+        commit_count = subprocess.check_output(
+            ['git', 'rev-list', '--count', 'HEAD'],
+            cwd=cwd,
+            universal_newlines=True,
+            stderr=subprocess.DEVNULL).strip()
+    except Exception as e:  # pylint: disable=broad-except
+        print(_COMMIT_FAILURE_MESSAGE.format(verb='get', error=str(e)),
+              file=sys.stderr)
+    return commit_count
+
+
 def replace_commit_hash():
-    """Fill in the commit hash in the __init__.py file."""
+    """Fill in the commit hash and commit count in the __init__.py file."""
     try:
         with open(INIT_FILE_PATH, 'r', encoding='utf-8') as fp:
             content = fp.read()
@@ -104,6 +131,11 @@ def replace_commit_hash():
                              f'_SKYPILOT_COMMIT_SHA = \'{get_commit_hash()}\'',
                              content,
                              flags=re.M)
+            content = re.sub(
+                r'^_SKYPILOT_COMMIT_COUNT = [\'"]([^\'"]*)[\'"]',
+                f'_SKYPILOT_COMMIT_COUNT = \'{get_commit_count()}\'',
+                content,
+                flags=re.M)
         with open(INIT_FILE_PATH, 'w', encoding='utf-8') as fp:
             fp.write(content)
     except Exception as e:  # pylint: disable=broad-except
