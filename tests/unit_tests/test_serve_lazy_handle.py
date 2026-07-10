@@ -365,8 +365,15 @@ class TestGetServiceStatusPickledParallel:
 
     def test_returns_sorted_by_name(self):
         names = ['svc-c', 'svc-a', 'svc-b']
+
+        def status(name, pool, *, with_replica_info, with_replica_counts):
+            assert pool is False
+            assert with_replica_info is True
+            assert with_replica_counts is False
+            return self._fake_status(name)
+
         with mock.patch('sky.serve.serve_utils._get_service_status',
-                        side_effect=lambda n, pool: self._fake_status(n)):
+                        side_effect=status):
             out = serve_utils.get_service_status_pickled(names, pool=False)
         # Decode the pickled 'name' fields to verify the final order.
         decoded_names = [
@@ -379,7 +386,8 @@ class TestGetServiceStatusPickledParallel:
         """A service that vanished mid-call (`_get_service_status` returns
         None) must be silently dropped, not stuffed into the response."""
 
-        def side(name, pool):
+        def side(name, pool, *, with_replica_info, with_replica_counts):
+            del pool, with_replica_info, with_replica_counts
             return None if name == 'svc-gone' else self._fake_status(name)
 
         with mock.patch('sky.serve.serve_utils._get_service_status',
@@ -396,7 +404,8 @@ class TestGetServiceStatusPickledParallel:
         class Boom(Exception):
             pass
 
-        def side(name, pool):
+        def side(name, pool, *, with_replica_info, with_replica_counts):
+            del pool, with_replica_info, with_replica_counts
             if name == 'svc-boom':
                 raise Boom('controller went away')
             return self._fake_status(name)
@@ -420,7 +429,8 @@ class TestGetServiceStatusPickledParallel:
         finish in well under the 400ms serial bound. Tolerant threshold
         (200ms) avoids flakes on slow CI but still proves parallelism."""
 
-        def slow(name, pool):
+        def slow(name, pool, *, with_replica_info, with_replica_counts):
+            del pool, with_replica_info, with_replica_counts
             time.sleep(0.1)
             return self._fake_status(name)
 
@@ -442,7 +452,8 @@ class TestGetServiceStatusPickledParallel:
             contextvars.ContextVar('test_marker', default=None))
         seen_in_worker: List[Optional[str]] = []
 
-        def capture(name, pool):
+        def capture(name, pool, *, with_replica_info, with_replica_counts):
+            del pool, with_replica_info, with_replica_counts
             seen_in_worker.append(marker.get())
             return self._fake_status(name)
 
