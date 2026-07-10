@@ -18,53 +18,27 @@ def _current_version_guard():
     """Keep subprocess mocks focused on the pip invocation under test."""
     with mock.patch.object(common,
                            'get_skypilot_version_on_disk',
-                           return_value=sky.__version__), \
-         mock.patch.object(common,
-                           'get_skypilot_display_version_on_disk',
-                           return_value=sky.__display_version__):
+                           return_value=sky.__version__):
         yield
 
 
-@pytest.mark.parametrize(('version', 'build', 'patch_base', 'expected'), [
-    ('1.1.0', '5795', 5795, '1.1.0'),
-    ('1.1.0', '5796', 5795, '1.1.1'),
-    ('2.7.0', '42', 40, '2.7.2'),
-    ('1.1.0', None, 5795, '1.1.0'),
-    ('1.1.0', 'unknown', 5795, '1.1.0'),
-])
-def test_compose_display_version_uses_patch(version, build, patch_base,
-                                            expected):
-    assert sky._compose_display_version(  # pylint: disable=protected-access
-        version, build, patch_base) == expected
+def test_wheel_build_version_guard_uses_canonical_version():
+    assert common.get_skypilot_version_on_disk() == sky.__version__
+    assert not hasattr(sky, '__display_version__')
+
+    pip_error = subprocess.CalledProcessError(
+        returncode=1,
+        cmd=[sys.executable, '-m', 'pip', 'wheel'],
+        stderr='intentional regression-test failure')
+    with mock.patch('subprocess.run', side_effect=pip_error):
+        with pytest.raises(RuntimeError, match='pip wheel command failed'):
+            wheel_utils._build_sky_wheel()
 
 
-def test_wheel_build_version_guard_uses_internal_version():
-    """Display build metadata must not make provisioning reject the wheel."""
-    display_version = sky._compose_display_version(  # pylint: disable=protected-access
-        '1.1.0', '999999', 5795)
-    with mock.patch.object(sky, '_get_commit_count', return_value='999999'), \
-         mock.patch.object(sky, '__display_version__', display_version):
-        assert common.get_skypilot_version_on_disk() == sky.__version__
-        assert (
-            common.get_skypilot_display_version_on_disk() == display_version)
-        # Reaching pip proves _build_sky_wheel() compared internal package
-        # versions rather than the user-facing display version.
-        pip_error = subprocess.CalledProcessError(
-            returncode=1,
-            cmd=[sys.executable, '-m', 'pip', 'wheel'],
-            stderr='intentional regression-test failure')
-        with mock.patch('subprocess.run', side_effect=pip_error):
-            with pytest.raises(RuntimeError, match='pip wheel command failed'):
-                wheel_utils._build_sky_wheel()
-
-
-def test_wheel_build_version_guard_rejects_stale_display_version():
+def test_wheel_build_version_guard_rejects_stale_version():
     """A running server must not build a wheel from a newer checkout."""
     with mock.patch.object(common,
                            'get_skypilot_version_on_disk',
-                           return_value=sky.__version__), \
-         mock.patch.object(common,
-                           'get_skypilot_display_version_on_disk',
                            return_value='1.999999.0'), \
          mock.patch('subprocess.run') as mock_run:
         with pytest.raises(RuntimeError,

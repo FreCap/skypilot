@@ -18,7 +18,10 @@ name: Publish boltz Helm chart
 on:
   push:
     branches: [improvements]
-    paths: ['charts/**', '.github/workflows/boltz-chart-publish.yml']
+    paths:
+      - 'charts/**'
+      - 'sky/__init__.py'
+      - '.github/workflows/boltz-chart-publish.yml'
   workflow_dispatch: {}
 
 permissions:
@@ -32,9 +35,6 @@ env:
   # (`skypilot`, from Chart.yaml) is appended by helm on push.
   OCI_REPO: helm-charts
   CHART_NAME: skypilot
-  # Keep BASE_VER in sync with boltz-overlay-publish.yml and chart_version in the
-  # platform repo. Normalized to SemVer below (PEP440 "-dev." -> ".dev").
-  BASE_VER: 1.0.0.dev20260620
 
 jobs:
   publish:
@@ -59,18 +59,20 @@ jobs:
             echo "push=true" >> "$GITHUB_OUTPUT"
           fi
           short_sha="$(git rev-parse --short HEAD)"
-          # Convert PEP440 BASE_VER to SemVer (same sed block as upstream
-          # publish-helm.yml), then attach the commit as SemVer2 build metadata.
+          version="$(awk -F"'" '/^__version__ = / {print $2; exit}' sky/__init__.py)"
+          test -n "${version}"
+          chart_app_version="$(sed -nE 's/^appVersion: "?([^\"]+)"?$/\1/p' charts/skypilot/Chart.yaml)"
+          if [ "${chart_app_version}" != "${version}" ]; then
+            echo "Chart appVersion ${chart_app_version} does not match SkyPilot ${version}." >&2
+            exit 1
+          fi
+          # Attach the commit as SemVer2 build metadata.
           # Build metadata keeps every commit's chart immutable/distinct while
           # remaining a valid SemVer2 that `helm push`/`helm show` accept (helm
           # maps the '+' to '_' for the OCI tag automatically).
-          semver="$(echo "${BASE_VER}" | sed -E 's/([0-9]+\.[0-9]+\.[0-9]+)\.dev([0-9]+)/\1-dev.\2/')"
-          semver="$(echo "${semver}" | sed -E 's/([0-9]+\.[0-9]+\.[0-9]+)rc([0-9]+)/\1-rc.\2/')"
-          semver="$(echo "${semver}" | sed -E 's/([0-9]+\.[0-9]+\.[0-9]+)a([0-9]+)/\1-alpha.\2/')"
-          semver="$(echo "${semver}" | sed -E 's/([0-9]+\.[0-9]+\.[0-9]+)b([0-9]+)/\1-beta.\2/')"
-          semver="$(echo "${semver}" | sed -E 's/([0-9]+\.[0-9]+\.[0-9]+)\.post([0-9]+)/\1+post.\2/')"
-          ver="${semver}+g${short_sha}"
+          ver="${version}+g${short_sha}"
           echo "ver=${ver}" >> "$GITHUB_OUTPUT"
+          echo "app_version=${version}" >> "$GITHUB_OUTPUT"
           echo "oci_ref=oci://${ECR_REGISTRY}/${OCI_REPO}" >> "$GITHUB_OUTPUT"
           echo "chart_ref=oci://${ECR_REGISTRY}/${OCI_REPO}/${CHART_NAME}" >> "$GITHUB_OUTPUT"
           echo "Resolved chart version: ${ver}"
@@ -113,8 +115,7 @@ jobs:
           set -euo pipefail
           ver='${{ steps.cfg.outputs.ver }}'
           sed -i "s/^version:.*$/version: ${ver}/" charts/skypilot/Chart.yaml
-          # appVersion tracks the upstream/PEP440 image version (BASE_VER).
-          sed -i "s/^appVersion:.*$/appVersion: \"${BASE_VER}\"/" charts/skypilot/Chart.yaml
+          sed -i "s/^appVersion:.*$/appVersion: \"${{ steps.cfg.outputs.app_version }}\"/" charts/skypilot/Chart.yaml
           echo "--- Chart.yaml (version/appVersion) ---"
           grep -E '^(version|appVersion):' charts/skypilot/Chart.yaml
 

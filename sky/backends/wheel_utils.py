@@ -68,17 +68,13 @@ def _build_sky_wheel() -> pathlib.Path:
     # running code. If not, the wheel we build will not match _WHEEL_PATTERN.
     # See https://github.com/skypilot-org/skypilot/issues/5311.
     version_on_disk = common.get_skypilot_version_on_disk()
-    display_version_on_disk = common.get_skypilot_display_version_on_disk()
-    if (version_on_disk != sky.__version__ or
-            display_version_on_disk != sky.__display_version__):
+    if version_on_disk != sky.__version__:
         logger.warning(
             'Wheel build: The installed SkyPilot version is different from the '
             'running code.\n'
             f'{colorama.Style.DIM}'
-            f'running internal version: {sky.__version__}\n'
-            f'installed internal version: {version_on_disk}\n'
-            f'running display version: {sky.__display_version__}\n'
-            f'installed display version: {display_version_on_disk}\n'
+            f'running version: {sky.__version__}\n'
+            f'installed version: {version_on_disk}\n'
             f'{colorama.Style.RESET_ALL}'
             # The following message only applies to local API server. We have no
             # way to tell from here if this is a remote or local API server. But
@@ -143,7 +139,7 @@ def _build_sky_wheel() -> pathlib.Path:
         if sky.__build__ is not None:
             # setup.py runs outside the source checkout, so it cannot discover
             # the commit count itself. Stamp the running build just like the
-            # commit SHA so cluster-side wheels retain the display metadata.
+            # commit SHA so cluster-side wheels retain the build identity.
             init_file_content = re.sub(
                 r'_SKYPILOT_COMMIT_COUNT = [\'"](.*?)[\'"]',
                 f'_SKYPILOT_COMMIT_COUNT = \'{sky.__build__}\'',

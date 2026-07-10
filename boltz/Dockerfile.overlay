@@ -1,16 +1,24 @@
-# boltz overlay image: layer the FULL fork sky/ tree onto the pinned upstream
-# skypilot-nightly base. The build context is assembled by build-overlay.sh to
-# contain every tracked file under sky/** (tests excluded) PLUS a freshly
-# built dashboard static export at sky/dashboard/out (replacing the base
-# image's stale nightly bundle). Shadowing the whole wheel sky/ is deliberate:
-# the base is pinned to an older nightly than the fork's tree, so a partial
-# overlay would mix old-wheel modules with newer fork modules (version skew
-# inside one image); the full tree keeps sky/ internally consistent at the
-# fork's commit — the composition production has been validated on.
+# Boltz image: build and install the full fork package on top of the pinned
+# upstream runtime base. Installing a wheel (instead of copying only sky/)
+# keeps Python distribution metadata and runtime source on the same version.
 ARG BASE_IMAGE=berkeleyskypilot/skypilot-nightly:1.0.0.dev20260620
+FROM ${BASE_IMAGE} AS wheel-builder
+WORKDIR /tmp/skypilot
+COPY setup.py pyproject.toml MANIFEST.in README.md ./
+COPY sky/ sky/
+COPY sky_templates/ sky_templates/
+# The base runtime installs the nightly distribution name. Build the fork with
+# that same name so pip replaces its files and dist-info atomically.
+RUN sed -i "s/name='skypilot',/name='skypilot-nightly',/" setup.py && \
+    python -m pip wheel --no-deps --no-build-isolation \
+      --wheel-dir /tmp/wheels .
+
 FROM ${BASE_IMAGE}
-# Drop the base image's dashboard bundle entirely: COPY overlays but never
-# deletes, so without this stale hashed chunks / removed routes from the
-# nightly's bundle would linger next to the fork's freshly built export.
-RUN rm -rf /usr/local/lib/python3.10/site-packages/sky/dashboard/out
-COPY sky/ /usr/local/lib/python3.10/site-packages/sky/
+ARG SKYPILOT_VERSION
+ARG SKYPILOT_COMMIT_SHA
+LABEL org.opencontainers.image.version="${SKYPILOT_VERSION}" \
+      org.opencontainers.image.revision="${SKYPILOT_COMMIT_SHA}"
+COPY --from=wheel-builder /tmp/wheels/*.whl /tmp/
+RUN python -m pip install --no-cache-dir --no-deps --force-reinstall \
+      /tmp/*.whl && \
+    rm -f /tmp/*.whl
