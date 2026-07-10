@@ -234,6 +234,11 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.name
+        # Stable owner for controller-created LB Deployments and Services.
+        # Its UID survives ordinary Pod/ReplicaSet rollouts and Kubernetes
+        # garbage-collects the LB objects when the Helm Deployment is removed.
+        - name: SKYPILOT_API_DEPLOYMENT_NAME
+          value: {{ printf "%s-api-server" $fullName | quote }}
         # Stable API Service address for controller administration/recovery.
         - name: SKYPILOT_SERVE_API_SERVICE_URL
           value: {{ printf "http://%s-api-service.%s.svc" $fullName .Release.Namespace | quote }}

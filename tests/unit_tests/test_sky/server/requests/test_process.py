@@ -163,29 +163,31 @@ def test_burstable_executor_pool_recovery():
         # Store reference to original executor
         original_executor = executor._executor
         submit_call_count = 0
+        submitted_executors = []
 
-        # Mock the PoolExecutor.submit method at class level to control
-        # behavior across all instances
-        original_submit = PoolExecutor.submit
+        # Mock PoolExecutor.submit at class level to control behavior across
+        # both the original and replacement instances. Pool execution itself
+        # is covered by test_pool_executor; this test only needs to prove the
+        # BrokenProcessPool replacement and retry path deterministically.
 
         def mock_submit(self, fn, *args, **kwargs):
             nonlocal submit_call_count
             submit_call_count += 1
+            submitted_executors.append(self)
             if submit_call_count == 1:
                 # First call raises BrokenProcessPool to simulate pool failure
                 raise concurrent.futures.process.BrokenProcessPool(
                     "Simulated process pool failure")
-            else:
-                # Subsequent calls should work normally
-                # Call the original submit method
-                return original_submit(self, fn, *args, **kwargs)
+            future = Future()
+            future.set_result(fn(*args, **kwargs))
+            return future
 
         with unittest.mock.patch.object(PoolExecutor, 'submit',
                                         new=mock_submit):
             # This should trigger the pool recovery logic in
             # _submit_to_guaranteed_pool
             future = executor.submit_until_success(dummy_task)
-            result = future.result(timeout=5.0)
+            result = future.result()
 
             # Verify the task completed successfully despite initial failure
             assert result is True
@@ -196,6 +198,9 @@ def test_burstable_executor_pool_recovery():
 
             # Verify that a new executor was created after the failure
             assert executor._executor is not original_executor
+            assert submitted_executors == [
+                original_executor, executor._executor
+            ]
 
     finally:
         executor.shutdown()

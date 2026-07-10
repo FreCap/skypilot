@@ -64,6 +64,7 @@ def test_concurrent_permission_service_no_race(permission_service):
     stop = threading.Event()
     num_threads = 4
     barrier = threading.Barrier(num_threads)
+    supported_roles = tuple(rbac.get_supported_roles())
     query_counter = 0
     query_lock = threading.Lock()
 
@@ -89,7 +90,9 @@ def test_concurrent_permission_service_no_race(permission_service):
         barrier.wait()
         while not stop.is_set():
             try:
-                for role in rbac.get_supported_roles():
+                for role in supported_roles:
+                    if stop.is_set():
+                        return
                     permission_service.get_users_for_role(role)
                 # Query for unknown user IDs to trigger _get_role's
                 # get-or-create, which adds to all_roles.
@@ -97,6 +100,8 @@ def test_concurrent_permission_service_no_race(permission_service):
                     my_counter = query_counter
                     query_counter += 5
                 for i in range(my_counter, my_counter + 5):
+                    if stop.is_set():
+                        return
                     permission_service.get_user_roles(f'unknown_{i}')
             except RuntimeError as e:
                 if 'dictionary changed size during iteration' in str(e):
@@ -120,7 +125,11 @@ def test_concurrent_permission_service_no_race(permission_service):
             stop.wait(timeout=10)
             stop.set()
             for f in futures:
-                f.result(timeout=5)
+                # A heavily contended CI worker can take several seconds to
+                # leave one Casbin read/write critical section. The inner stop
+                # checks above bound shutdown without treating scheduler delay
+                # as a race failure.
+                f.result(timeout=30)
     finally:
         adapter.load_policy = original_load
 
