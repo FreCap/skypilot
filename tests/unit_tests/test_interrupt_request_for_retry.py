@@ -87,6 +87,7 @@ async def test_still_interrupts_running_request(isolated_database, monkeypatch):
     kills = []
     monkeypatch.setattr(uvicorn_module.os, 'kill',
                         lambda pid, sig: kills.append((pid, sig)))
+    monkeypatch.setattr(uvicorn_module.time, 'time', lambda: 123.0)
 
     _server().interrupt_request_for_retry('req-live')
 
@@ -95,4 +96,5 @@ async def test_still_interrupts_running_request(isolated_database, monkeypatch):
     assert kills == [(4242, signal.SIGTERM)]
     record = requests.get_request('req-live')
     assert record.status == RequestStatus.CANCELLED
+    assert record.finished_at == 123.0
     assert record.should_retry is True

@@ -988,7 +988,9 @@ async def _execute_request_coroutine(request: api_requests.Request):
     await api_requests.update_status_async(request.request_id,
                                            api_requests.RequestStatus.RUNNING)
     # Redirect stdout and stderr to the request log path.
-    original_output = ctx.redirect_log(request.log_path)
+    original_output = ctx.redirect_log(
+        request.log_path,
+        max_bytes=server_constants.STREAMING_REQUEST_LOG_MAX_BYTES)
     try:
         fut: asyncio.Future = context_utils.to_thread_with_executor(
             get_request_thread_executor(), _execute_with_config_override, func,

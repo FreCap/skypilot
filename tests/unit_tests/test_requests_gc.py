@@ -108,6 +108,21 @@ async def test_gc_keeps_requests_younger_than_retention(isolated_database):
 
 
 @pytest.mark.asyncio
+async def test_gc_removes_terminal_row_without_finished_at(isolated_database):
+    del isolated_database
+    files = await _seed_request('req-legacy-cancelled', RequestStatus.CANCELLED,
+                                None)
+
+    await requests_lib.clean_finished_requests_with_retention(0)
+
+    # Check before get_request(), which recreates the lock file while looking
+    # up the now-deleted row.
+    for path in files.values():
+        assert not path.exists()
+    assert requests_lib.get_request('req-legacy-cancelled') is None
+
+
+@pytest.mark.asyncio
 async def test_finished_at_index_created(isolated_database):
     temp_db_path = isolated_database
     await _seed_request('req-any', RequestStatus.SUCCEEDED, time.time())

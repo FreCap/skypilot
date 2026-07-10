@@ -24,6 +24,58 @@ _PROCESS_GLOBAL_VARS = {}
 _logger = logging.getLogger(__name__)
 
 
+class _TruncatingLogFile:
+    """Append-only text stream that bounds an actively streamed log file."""
+
+    _TRUNCATION_MARKER = ('[SkyPilot] Earlier request output was truncated to '
+                          'protect API server storage.\n')
+
+    def __init__(self, path: pathlib.Path, max_bytes: int):
+        marker_bytes = len(self._TRUNCATION_MARKER.encode('utf-8'))
+        if max_bytes <= marker_bytes:
+            raise ValueError('max_bytes must be larger than the truncation '
+                             'marker')
+        self._file = open(path, 'a', encoding='utf-8')
+        self._max_bytes = max_bytes
+        self._size_bytes = path.stat().st_size
+        self._lock = threading.Lock()
+
+    def write(self, content: str) -> int:
+        original_length = len(content)
+        encoded_content = content.encode('utf-8')
+        with self._lock:
+            if self._size_bytes + len(encoded_content) > self._max_bytes:
+                self._file.seek(0)
+                self._file.truncate()
+                self._file.write(self._TRUNCATION_MARKER)
+                self._size_bytes = len(self._TRUNCATION_MARKER.encode('utf-8'))
+
+                # A single write can itself exceed the cap. Retain its latest
+                # complete UTF-8 characters and report the full input as
+                # consumed so callers do not retry the discarded prefix.
+                available_bytes = self._max_bytes - self._size_bytes
+                if len(encoded_content) > available_bytes:
+                    encoded_content = encoded_content[-available_bytes:]
+                    content = encoded_content.decode('utf-8', errors='ignore')
+                    encoded_content = content.encode('utf-8')
+            written = self._file.write(content)
+            self._size_bytes += len(encoded_content)
+            if written != original_length:
+                return original_length
+            return written
+
+    def flush(self) -> None:
+        with self._lock:
+            self._file.flush()
+
+    def close(self) -> None:
+        with self._lock:
+            self._file.close()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._file, name)
+
+
 class SkyPilotContext(object):
     """SkyPilot typed context vars for threads and coroutines.
 
@@ -69,6 +121,7 @@ class SkyPilotContext(object):
         self._canceled = asyncio.Event()
         self._log_file = None
         self._log_file_handle = None
+        self._log_file_max_bytes = None
         self.env_overrides = {}
         self.config_context = None
         self.request_context = None
@@ -126,13 +179,17 @@ class SkyPilotContext(object):
             except ValueError:
                 pass
 
-    def redirect_log(
-            self, log_file: Optional[pathlib.Path]) -> Optional[pathlib.Path]:
+    def redirect_log(self,
+                     log_file: Optional[pathlib.Path],
+                     max_bytes: Optional[int] = None) -> Optional[pathlib.Path]:
         """Redirect the stdout and stderr of current context to a file.
 
         Args:
             log_file: The log file to redirect to. If None, the stdout and
-            stderr will be restored to the original streams.
+                stderr will be restored to the original streams.
+            max_bytes: If set, truncate earlier output whenever the file would
+                grow beyond this many bytes. The active stream can continue
+                writing after truncation.
 
         Returns:
             The old log file, or None if the stdout and stderr were not
@@ -142,9 +199,12 @@ class SkyPilotContext(object):
         original_log_handle = self._log_file_handle
         if log_file is None:
             self._log_file_handle = None
+        elif max_bytes is not None:
+            self._log_file_handle = _TruncatingLogFile(log_file, max_bytes)
         else:
             self._log_file_handle = open(log_file, 'a', encoding='utf-8')
         self._log_file = log_file
+        self._log_file_max_bytes = max_bytes
         if original_log_handle is not None:
             original_log_handle.close()
         return original_log_file
@@ -188,7 +248,7 @@ class SkyPilotContext(object):
         Cancellation of the current context will not be propagated to the copy.
         """
         new_context = SkyPilotContext()
-        new_context.redirect_log(self._log_file)
+        new_context.redirect_log(self._log_file, self._log_file_max_bytes)
         new_context.env_overrides = self.env_overrides.copy()
         new_context.config_context = copy.deepcopy(self.config_context)
         return new_context

@@ -1377,6 +1377,9 @@ class RequestTaskFilter:
             Mutually exclusive with exclude_request_names.
         finished_before: if provided, only include requests finished before this
             timestamp.
+        include_missing_finished_at: when used with ``finished_before``, also
+            include terminal requests whose row has no ``finished_at``
+            timestamp, using ``created_at`` as the fallback.
         finished_after: if provided, only include requests finished at or after
             this timestamp. Requests still in progress (finished_at IS NULL)
             are always included.
@@ -1392,6 +1395,7 @@ class RequestTaskFilter:
     exclude_request_names: Optional[List[str]] = None
     include_request_names: Optional[List[str]] = None
     finished_before: Optional[float] = None
+    include_missing_finished_at: bool = False
     finished_after: Optional[float] = None
     limit: Optional[int] = None
     fields: Optional[List[str]] = None
@@ -1437,8 +1441,18 @@ class RequestTaskFilter:
             filters.append(f'{COL_USER_ID} = ?')
             filter_params.append(self.user_id)
         if self.finished_before is not None:
-            filters.append('finished_at < ?')
-            filter_params.append(self.finished_before)
+            if self.include_missing_finished_at:
+                terminal_statuses = ','.join(
+                    repr(status.value)
+                    for status in RequestStatus.finished_status())
+                filters.append(
+                    '(finished_at < ? OR (finished_at IS NULL AND '
+                    f'status IN ({terminal_statuses}) AND created_at < ?))')
+                filter_params.extend(
+                    [self.finished_before, self.finished_before])
+            else:
+                filters.append('finished_at < ?')
+                filter_params.append(self.finished_before)
         if self.finished_after is not None:
             filters.append('(finished_at >= ? OR finished_at IS NULL)')
             filter_params.append(self.finished_after)
@@ -1676,6 +1690,7 @@ async def clean_finished_requests_with_retention(retention_seconds: int,
             req_filter=RequestTaskFilter(status=RequestStatus.finished_status(),
                                          finished_before=time.time() -
                                          retention_seconds,
+                                         include_missing_finished_at=True,
                                          limit=batch_size,
                                          fields=['request_id']))
         if len(reqs) == 0:

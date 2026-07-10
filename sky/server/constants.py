@@ -152,6 +152,12 @@ ON_BOOT_CHECK_REQUEST_ID = 'skypilot-server-on-boot-check'
 # shared storage.
 REQUEST_LOG_PATH_PREFIX = '~/.sky/api_server/request_logs'
 
+# Streaming requests (notably ``sky logs --follow``) proxy remote output
+# through a local request log. Keep that spool bounded so one verbose job
+# cannot exhaust the API server's shared filesystem. A connected client has
+# already received the discarded prefix; reconnects retain the latest window.
+STREAMING_REQUEST_LOG_MAX_BYTES = 64 * 1024 * 1024  # 64 MiB
+
 # Default maximum size of a daemon log file before rotation (bytes).
 # When a daemon log exceeds this threshold, it is backed up to .log.1 and
 # then truncated. One backup is kept per daemon.
