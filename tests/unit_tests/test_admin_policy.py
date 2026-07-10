@@ -2,6 +2,7 @@ import contextlib
 import copy
 import importlib
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -679,7 +680,7 @@ def test_restful_policy(add_example_policy_paths, task):
 
 
 @contextlib.contextmanager
-def _policy_server(policy: str, port: int) -> Iterator[str]:
+def _policy_server(policy: str) -> Iterator[str]:
     env = os.environ.copy()
     # Clear the SKYPILOT_CONFIG to avoid conflicts with the test environment
     env.pop('SKYPILOT_CONFIG', None)
@@ -688,12 +689,24 @@ def _policy_server(policy: str, port: int) -> Iterator[str]:
     if env.get('PYTHONPATH'):
         pypath = pypath + ':' + env['PYTHONPATH']
     env['PYTHONPATH'] = pypath
-    proc = subprocess.Popen([
-        sys.executable,
-        f'{POLICY_PATH}/example_server/dynamic_policy_server.py', '--port',
-        str(port), '--policy', policy
-    ],
-                            env=env)
+    # Reserve the kernel-selected port until the child inherits the listening
+    # socket. ``unused_tcp_port_factory`` releases its probe socket before
+    # Popen, so another xdist worker can claim the same port in that window.
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(('127.0.0.1', 0))
+    listener.listen()
+    listener.set_inheritable(True)
+    port = listener.getsockname()[1]
+    try:
+        proc = subprocess.Popen([
+            sys.executable,
+            f'{POLICY_PATH}/example_server/dynamic_policy_server.py', '--fd',
+            str(listener.fileno()), '--policy', policy
+        ],
+                                env=env,
+                                pass_fds=(listener.fileno(),))
+    finally:
+        listener.close()
 
     def _stop_server() -> None:
         if proc.poll() is not None:
@@ -707,10 +720,15 @@ def _policy_server(policy: str, port: int) -> Iterator[str]:
 
     start_time = time.time()
     server_ready = False
-    # 30s budget: cold-start of a uvicorn subprocess (interpreter + fastapi
-    # + sky imports) routinely exceeds the prior 5s on CI runners.
-    timeout_s = 30.0
+    # A full xdist runner can heavily contend on imports. Keep a bounded cold
+    # start budget, while the process-exit check below reports bind/import
+    # failures immediately instead of sleeping through the whole timeout.
+    timeout_s = 60.0
     while time.time() - start_time < timeout_s:
+        if proc.poll() is not None:
+            raise RuntimeError(
+                f'Policy server on port {port} exited during startup with '
+                f'code {proc.returncode}.')
         try:
             response = requests.get(f'http://localhost:{port}', timeout=0.5)
             if response.status_code == 200:
@@ -732,16 +750,15 @@ def _policy_server(policy: str, port: int) -> Iterator[str]:
         _stop_server()
 
 
-def test_restful_policy_server(add_example_policy_paths, task,
-                               unused_tcp_port_factory):
-    with _policy_server('DoNothingPolicy', unused_tcp_port_factory()) as url, \
+def test_restful_policy_server(add_example_policy_paths, task):
+    with _policy_server('DoNothingPolicy') as url, \
         tempfile.NamedTemporaryFile() as temp_file:
         temp_file.write(f'admin_policy: {url}'.encode('utf-8'))
         temp_file.flush()
 
         _load_task_and_apply_policy(task, temp_file.name)
 
-    with _policy_server('AddLabelsPolicy', unused_tcp_port_factory()) as url, \
+    with _policy_server('AddLabelsPolicy') as url, \
         tempfile.NamedTemporaryFile() as temp_file:
         temp_file.write(f'admin_policy: {url}'.encode('utf-8'))
         temp_file.flush()
@@ -751,7 +768,7 @@ def test_restful_policy_server(add_example_policy_paths, task,
             ('kubernetes', 'custom_metadata', 'labels'),
             {}), ('label should be set')
 
-    with _policy_server('DoNothingPolicy', unused_tcp_port_factory()) as url, \
+    with _policy_server('DoNothingPolicy') as url, \
         tempfile.NamedTemporaryFile() as temp_file:
         temp_file.write(f'admin_policy: {url}/set_autostop'.encode('utf-8'))
         temp_file.flush()
@@ -762,7 +779,7 @@ def test_restful_policy_server(add_example_policy_paths, task,
             assert r.autostop_config.enabled is True
             assert r.autostop_config.idle_minutes == 10
 
-    with _policy_server('RejectAllPolicy', unused_tcp_port_factory()) as url, \
+    with _policy_server('RejectAllPolicy') as url, \
         tempfile.NamedTemporaryFile() as temp_file:
         temp_file.write(f'admin_policy: {url}/'.encode('utf-8'))
         temp_file.flush()

@@ -2,10 +2,10 @@
 
 The controller guards every control-plane endpoint -- the destructive ones
 (/controller/update_service, terminate_replica) AND the read-only sync/status
-paths (/load_balancer_sync, /autoscaler/info) -- with a shared bearer token
-(no-op when unset). The LB presents the token on every sync. The expected token
-is read fresh per request, so a token rotated after boot is honored without a
-controller respawn.
+paths (/load_balancer_sync, /autoscaler/info) -- with purpose-specific bearer
+rings (no-op when unset outside external mode). The LB presents only the sync
+token. Rings are read fresh per request, so a safe overlap rotation after boot
+is honored without a controller respawn.
 """
 # pylint: disable=invalid-name,protected-access
 import asyncio
@@ -98,7 +98,7 @@ def test_get_controller_auth_token_reads_env(monkeypatch):
     assert serve_utils.get_controller_auth_token() is None
 
 
-def test_sync_and_admin_rings_are_independent_and_accept_overlap(
+def test_sync_and_admin_rings_are_independent_and_accept_rotation_overlap(
         monkeypatch, tmp_path):
     sync_ring = tmp_path / 'sync.tokens'
     sync_ring.write_text('sync-new\nsync-old\n', encoding='utf-8')
@@ -121,6 +121,58 @@ def test_sync_and_admin_rings_are_independent_and_accept_overlap(
         with pytest.raises(fastapi.HTTPException) as excinfo:
             _run(sync_dep, f'Bearer {token}')
         assert excinfo.value.status_code == 401
+
+
+def test_cross_domain_token_overlap_fails_both_routes_closed(
+        monkeypatch, tmp_path):
+    sync_ring = tmp_path / 'sync.tokens'
+    sync_ring.write_text('sync-new\nshared-old\n', encoding='utf-8')
+    admin_ring = tmp_path / 'admin.tokens'
+    admin_ring.write_text('admin-new\nshared-old\n', encoding='utf-8')
+    monkeypatch.setenv(constants.LB_SYNC_AUTH_TOKENS_FILE_ENV_VAR,
+                       str(sync_ring))
+    monkeypatch.setenv(constants.CONTROLLER_ADMIN_AUTH_TOKENS_FILE_ENV_VAR,
+                       str(admin_ring))
+
+    for dep in (controller._make_auth_dependency(sync=True),
+                controller._make_auth_dependency()):
+        with pytest.raises(fastapi.HTTPException) as excinfo:
+            _run(dep, 'Bearer shared-old')
+        assert excinfo.value.status_code == 503
+
+
+def test_unsafe_live_rotation_fails_closed_until_rings_are_disjoint(
+        monkeypatch, tmp_path):
+    sync_ring = tmp_path / 'sync.tokens'
+    sync_ring.write_text('sync-new\nsync-old\n', encoding='utf-8')
+    admin_ring = tmp_path / 'admin.tokens'
+    admin_ring.write_text('admin-new\nadmin-old\n', encoding='utf-8')
+    monkeypatch.setenv(constants.LB_SYNC_AUTH_TOKENS_FILE_ENV_VAR,
+                       str(sync_ring))
+    monkeypatch.setenv(constants.CONTROLLER_ADMIN_AUTH_TOKENS_FILE_ENV_VAR,
+                       str(admin_ring))
+    sync_dep = controller._make_auth_dependency(sync=True)
+
+    assert _run(sync_dep, 'Bearer sync-old') is None
+    admin_ring.write_text('admin-new\nsync-old\n', encoding='utf-8')
+    with pytest.raises(fastapi.HTTPException) as excinfo:
+        _run(sync_dep, 'Bearer sync-old')
+    assert excinfo.value.status_code == 503
+
+    admin_ring.write_text('admin-next\nadmin-new\n', encoding='utf-8')
+    assert _run(sync_dep, 'Bearer sync-old') is None
+
+
+def test_legacy_controller_token_is_admin_only(monkeypatch):
+    _set_token(monkeypatch, 'legacy-admin')
+    admin_dep = controller._make_auth_dependency()
+    sync_dep = controller._make_auth_dependency(sync=True, required=True)
+
+    assert _run(admin_dep, 'Bearer legacy-admin') is None
+    with pytest.raises(fastapi.HTTPException) as excinfo:
+        _run(sync_dep, 'Bearer legacy-admin')
+    assert excinfo.value.status_code == 503
+    assert not serve_utils.get_lb_sync_auth_tokens()
 
 
 def test_required_dependency_fails_closed_when_ring_missing(monkeypatch):

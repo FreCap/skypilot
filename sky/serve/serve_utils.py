@@ -597,7 +597,7 @@ def is_lb_data_plane_auth_enabled() -> bool:
 
 
 def _get_auth_tokens(file_env_var: str,
-                     legacy_token_env_var: str,
+                     legacy_token_env_var: Optional[str],
                      ring_name: str,
                      required: bool = False) -> Tuple[str, ...]:
     """Read a newline-delimited bearer-token ring without caching it.
@@ -606,8 +606,9 @@ def _get_auth_tokens(file_env_var: str,
     projected Secret rotation is live. A final newline is accepted; blank
     lines, whitespace-bearing/non-ASCII tokens, an empty file, and I/O/UTF-8
     errors are rejected instead of silently falling back to the legacy env
-    token. The legacy single-token env is consulted only when no file is
-    configured, which keeps rolling upgrades backwards compatible.
+    token. When a legacy singleton env name is supplied, it is consulted only
+    when no file is configured. Callers can omit that fallback for trust
+    domains where sharing the legacy credential would be unsafe.
     """
     token_file = os.environ.get(file_env_var)
     if token_file:
@@ -629,31 +630,73 @@ def _get_auth_tokens(file_env_var: str,
                     'empty or malformed token.')
         return tokens
 
-    legacy_token = os.environ.get(legacy_token_env_var)
+    legacy_token = (os.environ.get(legacy_token_env_var)
+                    if legacy_token_env_var is not None else None)
     if legacy_token:
         if _AUTH_TOKEN_PATTERN.fullmatch(legacy_token) is None:
+            assert legacy_token_env_var is not None
             raise AuthTokenConfigurationError(
                 f'{legacy_token_env_var} contains a malformed token.')
         return (legacy_token,)
     if required:
+        if legacy_token_env_var is not None:
+            missing_sources = (f'neither {file_env_var} nor '
+                               f'{legacy_token_env_var} is configured')
+        else:
+            missing_sources = f'{file_env_var} is not configured'
         raise AuthTokenConfigurationError(
-            f'{ring_name} authentication is required, but neither '
-            f'{file_env_var} nor {legacy_token_env_var} is configured.')
+            f'{ring_name} authentication is required, but '
+            f'{missing_sources}.')
     return ()
+
+
+def _get_controller_auth_token_rings(
+        sync_required: bool = False,
+        admin_required: bool = False
+) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+    """Read both controller rings and reject any cross-domain credential.
+
+    Each ring may contain multiple credentials for an overlap rotation within
+    that trust domain. A credential may never appear in both rings: otherwise
+    an external LB holding the sync ring could invoke destructive controller
+    administration routes. Both files are read on every call so an unsafe
+    Secret rotation fails closed immediately, not only at process startup.
+
+    The legacy singleton remains an admin-only fallback. In particular, it is
+    never returned as an LB-sync credential.
+    """
+    sync_tokens = _get_auth_tokens(constants.LB_SYNC_AUTH_TOKENS_FILE_ENV_VAR,
+                                   None,
+                                   'load-balancer sync',
+                                   required=sync_required)
+    admin_tokens = _get_auth_tokens(
+        constants.CONTROLLER_ADMIN_AUTH_TOKENS_FILE_ENV_VAR,
+        constants.CONTROLLER_AUTH_TOKEN_ENV_VAR,
+        'controller admin',
+        required=admin_required)
+    if not set(sync_tokens).isdisjoint(admin_tokens):
+        raise AuthTokenConfigurationError(
+            'Load-balancer sync and controller-admin token rings must be '
+            'disjoint.')
+    return sync_tokens, admin_tokens
+
+
+def validate_controller_auth_token_isolation(required: bool = False) -> None:
+    """Validate the controller trust-domain boundary without exposing tokens."""
+    _get_controller_auth_token_rings(sync_required=required,
+                                     admin_required=required)
 
 
 def get_lb_sync_auth_tokens(required: bool = False) -> Tuple[str, ...]:
     """Credentials accepted on, and presented to, the LB sync endpoint."""
-    return _get_auth_tokens(constants.LB_SYNC_AUTH_TOKENS_FILE_ENV_VAR,
-                            constants.CONTROLLER_AUTH_TOKEN_ENV_VAR,
-                            'load-balancer sync', required)
+    sync_tokens, _ = _get_controller_auth_token_rings(sync_required=required)
+    return sync_tokens
 
 
 def get_controller_admin_auth_tokens(required: bool = False) -> Tuple[str, ...]:
     """Credentials accepted by trusted controller administration callers."""
-    return _get_auth_tokens(constants.CONTROLLER_ADMIN_AUTH_TOKENS_FILE_ENV_VAR,
-                            constants.CONTROLLER_AUTH_TOKEN_ENV_VAR,
-                            'controller admin', required)
+    _, admin_tokens = _get_controller_auth_token_rings(admin_required=required)
+    return admin_tokens
 
 
 def get_lb_auth_tokens(required: bool = False) -> Tuple[str, ...]:

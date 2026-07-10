@@ -35,11 +35,10 @@ SERVICE_REGISTER_TIMEOUT_SECONDS = 180
 LB_DEPLOYMENT_READY_TIMEOUT_SECONDS = 120
 LB_DEPLOYMENT_READY_POLL_SECONDS = 1
 
-# Legacy env var holding one shared controller bearer token. New deployments
-# should use the two independent file-backed rings below: sharing the LB sync
-# credential with the controller-admin credential needlessly lets a compromised
-# LB invoke destructive controller endpoints. This remains as a fallback for
-# rolling upgrades from deployments that supplied one token to both callers.
+# Legacy env var holding one controller-admin bearer token. New deployments
+# should use the independent file-backed rings below. It deliberately is NOT a
+# fallback for LB sync: letting one legacy credential authenticate both domains
+# would allow a compromised LB to invoke destructive controller endpoints.
 CONTROLLER_AUTH_TOKEN_ENV_VAR = 'SKYPILOT_SERVE_CONTROLLER_AUTH_TOKEN'
 
 # Newline-delimited token-ring files. The first line is the primary credential;
@@ -385,6 +384,15 @@ REPLICA_ID_ENV_VAR = 'SKYPILOT_SERVE_REPLICA_ID'
 # (metadata.name). It is a hard contract: without it the controller cannot
 # resolve the LB image.
 POD_NAME_ENV_VAR = 'SKYPILOT_POD_NAME'
+# Helm-rendered name of the stable API Deployment that owns generated external
+# LB objects. Unlike the API Pod/ReplicaSet identities, this Deployment UID is
+# stable across ordinary rollouts and gives Kubernetes garbage collection the
+# correct release-lifetime anchor.
+API_DEPLOYMENT_NAME_ENV_VAR = 'SKYPILOT_API_DEPLOYMENT_NAME'
+# Existing Helm release identity, retained as the mixed-version fallback for
+# charts that predate API_DEPLOYMENT_NAME_ENV_VAR. The API Deployment rendered
+# by those charts is always named ``<release>-api-server``.
+RELEASE_NAME_ENV_VAR = 'SKYPILOT_RELEASE_NAME'
 # Downward-API-injected namespace of the API/controller pod. Controller-owned
 # LB objects and their projected Secrets live beside that pod even when the
 # configured Kubernetes workload namespace is different.
