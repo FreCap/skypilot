@@ -173,87 +173,120 @@ class TestIsConsolidationMode:
 
 
 class TestGetControllerUrl:
-    """`_get_controller_url` should:
-    - fall back to localhost when no controller_ip is recorded (
-      pre-migration), so existing deployments are unaffected;
-    - fall back to localhost when controller_ip equals our own POD_IP, so the
-      pod that owns the controller doesn't pay for an extra cross-pod hop;
-    - return http://<controller_ip>:<port> only when running on a different
-      pod than the one hosting the controller.
-    """
+    _HASH = 'incarnation-a'
 
-    def _patch_record(self, controller_ip):
+    def _record(self, **overrides):
+        record = {
+            'hash': self._HASH,
+            'status': serve_state.ServiceStatus.READY,
+            'controller_pid': 1234,
+            'controller_port': 20001,
+            'controller_ip': None,
+        }
+        record.update(overrides)
+        return record
+
+    def _patch_record(self, **overrides):
         return mock.patch(
             'sky.serve.serve_utils.serve_state.'
-            'get_service_from_name',
-            return_value={
-                'name': 'svc',
-                'controller_pid': 1234,
-                'controller_port': 20001,
-                'controller_ip': controller_ip,
-            })
+            'get_service_controller_owner',
+            return_value=self._record(**overrides))
 
-    def test_no_record_returns_localhost(self):
-        """Service row missing → fall back to localhost."""
+    def test_no_record_fails_closed(self):
         with mock.patch(
                 'sky.serve.serve_utils.serve_state.'
-                'get_service_from_name',
+                'get_service_controller_owner',
                 return_value=None):
-            assert serve_utils._get_controller_url(
-                'svc', 20001) == 'http://localhost:20001'
+            with pytest.raises(serve_utils.ControllerOwnerError):
+                serve_utils._get_controller_url('svc', self._HASH)
 
     def test_controller_ip_none_returns_localhost(self):
-        """Row exists but controller_ip not yet written (e.g. older row from
-        before the migration) → localhost."""
-        with self._patch_record(None):
-            assert serve_utils._get_controller_url(
-                'svc', 20001) == 'http://localhost:20001'
+        with self._patch_record():
+            url, fingerprint = serve_utils._get_controller_url(
+                'svc', self._HASH)
+        assert url == 'http://localhost:20001'
+        assert fingerprint == serve_utils.make_controller_owner_fingerprint(
+            self._HASH, 1234, None, 20001)
 
     def test_controller_ip_equals_self_returns_localhost(self, monkeypatch):
-        """We are the controller's host pod → loopback is correct + faster."""
         monkeypatch.setenv('POD_IP', '10.0.0.5')
-        with self._patch_record('10.0.0.5'):
-            assert serve_utils._get_controller_url(
-                'svc', 20001) == 'http://localhost:20001'
+        with self._patch_record(controller_ip='10.0.0.5'):
+            url, _ = serve_utils._get_controller_url('svc', self._HASH)
+        assert url == 'http://localhost:20001'
 
     def test_controller_ip_differs_returns_pod_ip(self, monkeypatch):
-        """We are on a follower pod → route to controller pod's IP."""
         monkeypatch.setenv('POD_IP', '10.0.0.5')
-        with self._patch_record('10.0.0.7'):
-            assert serve_utils._get_controller_url(
-                'svc', 20001) == 'http://10.0.0.7:20001'
+        with self._patch_record(controller_ip='10.0.0.7'):
+            url, _ = serve_utils._get_controller_url('svc', self._HASH)
+        assert url == 'http://10.0.0.7:20001'
 
     def test_no_pod_ip_env_routes_via_recorded_ip(self, monkeypatch):
-        """No POD_IP env (non-K8s deploy) but a controller_ip is recorded.
-        We can't decide we're the controller pod — route to recorded IP. This
-        case shouldn't happen in practice (a pod recording controller_ip
-        implies POD_IP env was injected when it started the controller), but
-        the routing must remain deterministic."""
         monkeypatch.delenv('POD_IP', raising=False)
-        with self._patch_record('10.0.0.7'):
-            assert serve_utils._get_controller_url(
-                'svc', 20001) == 'http://10.0.0.7:20001'
+        with self._patch_record(controller_ip='10.0.0.7'):
+            url, _ = serve_utils._get_controller_url('svc', self._HASH)
+        assert url == 'http://10.0.0.7:20001'
+
+    def test_ipv6_literal_is_bracketed(self, monkeypatch):
+        monkeypatch.setenv('POD_IP', '2001:db8::2')
+        with self._patch_record(controller_ip='2001:0db8::1'):
+            url, fingerprint = serve_utils._get_controller_url(
+                'svc', self._HASH)
+        assert url == 'http://[2001:db8::1]:20001'
+        assert fingerprint == serve_utils.make_controller_owner_fingerprint(
+            self._HASH, 1234, '2001:db8::1', 20001)
+
+    def test_same_name_successor_is_rejected(self):
+        with self._patch_record(hash='incarnation-b'):
+            with pytest.raises(serve_utils.ControllerOwnerError):
+                serve_utils._get_controller_url('svc', self._HASH)
+
+    @pytest.mark.parametrize('overrides', [
+        {
+            'controller_pid': None
+        },
+        {
+            'controller_port': 0
+        },
+        {
+            'controller_ip': 'not-an-ip'
+        },
+        {
+            'status': serve_state.ServiceStatus.SHUTTING_DOWN
+        },
+    ])
+    def test_invalid_owner_is_rejected(self, overrides):
+        with self._patch_record(**overrides):
+            with pytest.raises(serve_utils.ControllerOwnerError):
+                serve_utils._get_controller_url('svc', self._HASH)
 
 
 class TestControllerHttpRetry:
 
-    def _patch_record(self, controller_ip):
+    _HASH = 'incarnation-a'
+
+    def _record(self, **overrides):
+        record = {
+            'hash': self._HASH,
+            'status': serve_state.ServiceStatus.READY,
+            'controller_pid': 1234,
+            'controller_port': 20001,
+            'controller_ip': None,
+        }
+        record.update(overrides)
+        return record
+
+    def _patch_record(self, **overrides):
         return mock.patch(
             'sky.serve.serve_utils.serve_state.'
-            'get_service_from_name',
-            return_value={
-                'name': 'svc',
-                'controller_pid': 1234,
-                'controller_port': 20001,
-                'controller_ip': controller_ip,
-            })
+            'get_service_controller_owner',
+            return_value=self._record(**overrides))
 
     def test_post_succeeds_first_try(self):
-        with self._patch_record(None):
+        with self._patch_record():
             with mock.patch('sky.serve.serve_utils.requests.post',
                             return_value=mock.Mock(status_code=200)) as m:
                 resp = serve_utils._post_to_controller_with_retry(
-                    'svc', 20001, '/controller/update_service', json={})
+                    'svc', self._HASH, '/controller/update_service', json={})
                 assert resp.status_code == 200
                 assert m.call_count == 1
 
@@ -263,11 +296,11 @@ class TestControllerHttpRetry:
         monkeypatch.setenv(constants.CONTROLLER_ADMIN_AUTH_TOKENS_FILE_ENV_VAR,
                            str(ring))
         responses = [mock.Mock(status_code=401), mock.Mock(status_code=200)]
-        with self._patch_record(None), \
+        with self._patch_record(), \
              mock.patch('sky.serve.serve_utils.requests.post',
                         side_effect=responses) as request:
             response = serve_utils._post_to_controller_with_retry(
-                'svc', 20001, '/controller/update_service', json={})
+                'svc', self._HASH, '/controller/update_service', json={})
 
         assert response.status_code == 200
         assert [
@@ -281,11 +314,11 @@ class TestControllerHttpRetry:
         ring.write_text('primary\noverlap\n', encoding='utf-8')
         monkeypatch.setenv(constants.CONTROLLER_ADMIN_AUTH_TOKENS_FILE_ENV_VAR,
                            str(ring))
-        with self._patch_record(None), \
+        with self._patch_record(), \
              mock.patch('sky.serve.serve_utils.requests.post',
                         return_value=mock.Mock(status_code=500)) as request:
             response = serve_utils._post_to_controller_with_retry(
-                'svc', 20001, '/controller/update_service', json={})
+                'svc', self._HASH, '/controller/update_service', json={})
 
         assert response.status_code == 500
         request.assert_called_once()
@@ -300,13 +333,17 @@ class TestControllerHttpRetry:
                            str(sync_ring))
         monkeypatch.delenv(constants.CONTROLLER_AUTH_TOKEN_ENV_VAR,
                            raising=False)
-        with self._patch_record(None), \
+        with self._patch_record(), \
              mock.patch('sky.serve.serve_utils.requests.get',
                         return_value=mock.Mock(status_code=200)) as request:
-            serve_utils._get_to_controller_with_retry('svc', 20001,
+            serve_utils._get_to_controller_with_retry('svc', self._HASH,
                                                       '/autoscaler/info')
 
-        assert 'headers' not in request.call_args.kwargs
+        headers = request.call_args.kwargs['headers']
+        assert 'Authorization' not in headers
+        assert headers[constants.CONTROLLER_OWNER_HEADER] == (
+            serve_utils.make_controller_owner_fingerprint(
+                self._HASH, 1234, None, 20001))
 
     def test_post_retries_then_succeeds(self):
         # First 2 calls raise, 3rd succeeds. The default attempt count is
@@ -318,33 +355,33 @@ class TestControllerHttpRetry:
             requests_exceptions.ConnectionError('refused'),
             mock.Mock(status_code=200)
         ]
-        with self._patch_record(None), \
+        with self._patch_record(), \
              mock.patch('sky.serve.serve_utils._CONTROLLER_HTTP_RETRY_ATTEMPTS',
                         3), \
              mock.patch('sky.serve.serve_utils.time.sleep'), \
              mock.patch('sky.serve.serve_utils.requests.post',
                         side_effect=side) as m:
             resp = serve_utils._post_to_controller_with_retry(
-                'svc', 20001, '/controller/update_service', json={})
+                'svc', self._HASH, '/controller/update_service', json={})
             assert resp.status_code == 200
             assert m.call_count == 3
 
     def test_post_exhausts_retries_and_raises(self):
-        with self._patch_record(None), \
+        with self._patch_record(), \
              mock.patch('sky.serve.serve_utils.time.sleep'), \
              mock.patch('sky.serve.serve_utils.requests.post',
                         side_effect=requests_exceptions.ConnectionError('refused')) as m:
             with pytest.raises(requests_exceptions.ConnectionError):
                 serve_utils._post_to_controller_with_retry(
-                    'svc', 20001, '/controller/update_service', json={})
+                    'svc', self._HASH, '/controller/update_service', json={})
             assert m.call_count == serve_utils._CONTROLLER_HTTP_RETRY_ATTEMPTS
 
     def test_get_succeeds_first_try(self):
-        with self._patch_record(None):
+        with self._patch_record():
             with mock.patch('sky.serve.serve_utils.requests.get',
                             return_value=mock.Mock(status_code=200)) as m:
                 resp = serve_utils._get_to_controller_with_retry(
-                    'svc', 20001, '/autoscaler/info')
+                    'svc', self._HASH, '/autoscaler/info')
                 assert resp.status_code == 200
                 assert m.call_count == 1
 
@@ -357,41 +394,60 @@ class TestControllerHttpRetry:
         # lookup says 10.0.0.8.
         records = [
             {
-                'name': 'svc',
+                'hash': self._HASH,
+                'status': serve_state.ServiceStatus.READY,
                 'controller_pid': 1,
                 'controller_port': 20001,
                 'controller_ip': '10.0.0.7'
             },
             {
-                'name': 'svc',
+                'hash': self._HASH,
+                'status': serve_state.ServiceStatus.READY,
                 'controller_pid': 2,
-                'controller_port': 20001,
+                'controller_port': 20002,
                 'controller_ip': '10.0.0.8'
             },
         ]
         urls_called = []
+        owner_headers = []
 
-        def capture_get(url, **kwargs):  # pylint: disable=unused-argument
+        def capture_get(url, **kwargs):
             urls_called.append(url)
+            owner_headers.append(
+                kwargs['headers'][constants.CONTROLLER_OWNER_HEADER])
             if len(urls_called) == 1:
                 raise requests_exceptions.ConnectionError('refused')
             return mock.Mock(status_code=200)
 
         with mock.patch('sky.serve.serve_utils.serve_state.'
-                        'get_service_from_name',
+                        'get_service_controller_owner',
                         side_effect=records), \
              mock.patch('sky.serve.serve_utils._CONTROLLER_HTTP_RETRY_ATTEMPTS',
                         3), \
              mock.patch('sky.serve.serve_utils.time.sleep'), \
              mock.patch('sky.serve.serve_utils.requests.get',
                         side_effect=capture_get):
-            serve_utils._get_to_controller_with_retry('svc', 20001,
+            serve_utils._get_to_controller_with_retry('svc', self._HASH,
                                                       '/autoscaler/info')
         assert urls_called[0] == 'http://10.0.0.7:20001/autoscaler/info'
-        assert urls_called[1] == 'http://10.0.0.8:20001/autoscaler/info'
+        assert urls_called[1] == 'http://10.0.0.8:20002/autoscaler/info'
+        assert owner_headers == [
+            serve_utils.make_controller_owner_fingerprint(
+                self._HASH, 1, '10.0.0.7', 20001),
+            serve_utils.make_controller_owner_fingerprint(
+                self._HASH, 2, '10.0.0.8', 20002),
+        ]
+
+    def test_same_name_successor_is_never_contacted(self):
+        with self._patch_record(hash='incarnation-b'), \
+             mock.patch('sky.serve.serve_utils.requests.post') as request:
+            with pytest.raises(serve_utils.ControllerOwnerError):
+                serve_utils._post_to_controller_with_retry(
+                    'svc', self._HASH, '/controller/update_service', json={})
+        request.assert_not_called()
 
     def test_log_levels_one_warn_per_cycle(self):
-        with self._patch_record(None), \
+        with self._patch_record(), \
              mock.patch('sky.serve.serve_utils.time.sleep'), \
              mock.patch(
                  'sky.serve.serve_utils.requests.get',
@@ -400,7 +456,7 @@ class TestControllerHttpRetry:
              mock.patch.object(serve_utils.logger, 'debug') as debug:
             with pytest.raises(requests_exceptions.ConnectionError):
                 serve_utils._get_to_controller_with_retry(
-                    'svc', 20001, '/autoscaler/info')
+                    'svc', self._HASH, '/autoscaler/info')
         # Final-attempt failure → exactly one WARN.
         assert warn.call_count == 1, (
             f'expected exactly 1 WARN call, got {warn.call_count}: '
@@ -431,10 +487,10 @@ class TestControllerHttpRetry:
             captured.update(kwargs)
             return mock.Mock(status_code=200)
 
-        with self._patch_record(None), \
+        with self._patch_record(), \
              mock.patch('sky.serve.serve_utils.requests.get',
                         side_effect=capture):
-            serve_utils._get_to_controller_with_retry('svc', 20001,
+            serve_utils._get_to_controller_with_retry('svc', self._HASH,
                                                       '/autoscaler/info')
         assert 'timeout' in captured
         assert captured['timeout'] == (
@@ -448,11 +504,11 @@ class TestControllerHttpRetry:
             captured.update(kwargs)
             return mock.Mock(status_code=200)
 
-        with self._patch_record(None), \
+        with self._patch_record(), \
              mock.patch('sky.serve.serve_utils.requests.get',
                         side_effect=capture):
             serve_utils._get_to_controller_with_retry('svc',
-                                                      20001,
+                                                      self._HASH,
                                                       '/autoscaler/info',
                                                       timeout=42)
         assert captured['timeout'] == 42
@@ -470,14 +526,14 @@ class TestControllerHttpRetry:
         ]
         # Patch the attempt count up to 3 so the retry path is actually
         # exercised; the production default is 1 (see lazy-handle PR).
-        with self._patch_record(None), \
+        with self._patch_record(), \
              mock.patch('sky.serve.serve_utils._CONTROLLER_HTTP_RETRY_ATTEMPTS',
                         3), \
              mock.patch('sky.serve.serve_utils.time.sleep'), \
              mock.patch('sky.serve.serve_utils.requests.get',
                         side_effect=side) as m:
             resp = serve_utils._get_to_controller_with_retry(
-                'svc', 20001, '/autoscaler/info')
+                'svc', self._HASH, '/autoscaler/info')
             assert resp.status_code == 200
             assert m.call_count == 3
 

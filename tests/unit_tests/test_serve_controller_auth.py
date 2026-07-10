@@ -30,6 +30,10 @@ def _run(dep, authorization):
     return asyncio.run(dep(authorization=authorization))
 
 
+def _run_owner(dep, requested_owner):
+    return asyncio.run(dep(requested_owner=requested_owner))
+
+
 def _set_token(monkeypatch, token):
     if token is None:
         monkeypatch.delenv(constants.CONTROLLER_AUTH_TOKEN_ENV_VAR,
@@ -138,3 +142,12 @@ def test_controller_ring_rotation_is_live(monkeypatch, tmp_path):
     ring.write_text('new\nold\n', encoding='utf-8')
     assert _run(dep, 'Bearer new') is None
     assert _run(dep, 'Bearer old') is None
+
+
+def test_controller_owner_fence_accepts_only_exact_tuple():
+    dep = controller._make_controller_owner_dependency('owner-a')
+    assert _run_owner(dep, 'owner-a') is None
+    for candidate in (None, '', 'owner-b'):
+        with pytest.raises(fastapi.HTTPException) as excinfo:
+            _run_owner(dep, candidate)
+        assert excinfo.value.status_code == 409

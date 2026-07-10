@@ -6,6 +6,9 @@ import contextvars
 import dataclasses
 import datetime
 import enum
+import hashlib
+import ipaddress
+import json
 import os
 import pathlib
 import pickle
@@ -95,32 +98,111 @@ class AuthTokenConfigurationError(ValueError):
     """A required Serve auth ring is absent or cannot be parsed safely."""
 
 
+class ControllerOwnerError(RuntimeError):
+    """The intended service incarnation has no safe controller target."""
+
+
 _AUTH_TOKEN_PATTERN = re.compile(r'[A-Za-z0-9._~+/=-]+')
 
+_ControllerOwner = Tuple[str, int, Optional[str], int]
 
-def _get_controller_url(service_name: str, controller_port: int) -> str:
-    """Resolve the controller HTTP URL.
+
+def make_controller_owner_fingerprint(service_hash: str, controller_pid: int,
+                                      controller_ip: Optional[str],
+                                      controller_port: int) -> str:
+    """Return a stable fingerprint for one exact controller owner tuple."""
+    if not isinstance(service_hash, str) or not service_hash:
+        raise ControllerOwnerError('Controller service hash is missing.')
+    if (not isinstance(controller_pid, int) or
+            isinstance(controller_pid, bool) or controller_pid <= 0):
+        raise ControllerOwnerError(
+            'Controller parent PID is missing or invalid.')
+    if (not isinstance(controller_port, int) or
+            isinstance(controller_port, bool) or
+            not 1 <= controller_port <= 65535):
+        raise ControllerOwnerError('Controller port is missing or invalid.')
+    normalized_ip: Optional[str] = None
+    if controller_ip is not None:
+        if not isinstance(controller_ip, str) or not controller_ip:
+            raise ControllerOwnerError('Controller IP is invalid.')
+        try:
+            normalized_ip = str(ipaddress.ip_address(controller_ip))
+        except ValueError as e:
+            raise ControllerOwnerError('Controller IP is invalid.') from e
+    payload = json.dumps(
+        [service_hash, controller_pid, normalized_ip, controller_port],
+        separators=(',', ':'))
+    return hashlib.sha256(payload.encode('utf-8')).hexdigest()
+
+
+def _get_controller_url(service_name: str,
+                        expected_service_hash: str) -> Tuple[str, str]:
+    """Resolve and fence the controller HTTP URL.
 
     In single-pod (or daemon == controller pod) deployments the IP read from
     DB either matches our own POD_IP or is None — in both cases we fall back
     to localhost. In HA where the request handler runs on a different pod
     than the controller process, we route via the controller's pod IP from DB.
+    The address and owner fingerprint come from one narrow, atomic row read.
     """
+    record = serve_state.get_service_controller_owner(service_name)
+    if record is None:
+        raise ControllerOwnerError(
+            f'Controller owner for {service_name!r} is missing.')
+    service_hash = record.get('hash')
+    if service_hash != expected_service_hash:
+        raise ControllerOwnerError(
+            f'Service {service_name!r} was replaced while the controller '
+            'request was in flight.')
+    service_status = record.get('status')
+    if (not isinstance(service_status, serve_state.ServiceStatus) or
+            service_status in (serve_state.ServiceStatus.SHUTTING_DOWN,
+                               serve_state.ServiceStatus.FAILED_CLEANUP)):
+        raise ControllerOwnerError(
+            f'Controller owner for {service_name!r} is not routable.')
+    controller_pid = record.get('controller_pid')
+    controller_port = record.get('controller_port')
+    controller_ip = record.get('controller_ip')
+    owner_fingerprint = make_controller_owner_fingerprint(
+        service_hash, controller_pid, controller_ip, controller_port)
     self_ip = os.environ.get('POD_IP')
-    record = serve_state.get_service_from_name(service_name)
-    controller_ip = record.get('controller_ip') if record else None
-    if controller_ip is None or controller_ip == self_ip:
+    normalized_self_ip = None
+    if self_ip is not None:
+        try:
+            normalized_self_ip = str(ipaddress.ip_address(self_ip))
+        except ValueError:
+            pass
+    normalized_controller_ip = None
+    if controller_ip is not None:
+        normalized_controller_ip = str(ipaddress.ip_address(controller_ip))
+    if (normalized_controller_ip is None or
+            normalized_controller_ip == normalized_self_ip):
         url = f'http://localhost:{controller_port}'
     else:
-        url = f'http://{controller_ip}:{controller_port}'
+        host = (f'[{normalized_controller_ip}]' if ':'
+                in normalized_controller_ip else normalized_controller_ip)
+        url = f'http://{host}:{controller_port}'
     logger.debug(f'_get_controller_url for {service_name}: url={url} '
                  f'self_ip={self_ip} controller_ip={controller_ip}')
-    return url
+    return url, owner_fingerprint
 
 
-def _request_to_controller_with_retry(method: str, service_name: str,
-                                      controller_port: int, path: str,
-                                      **kwargs):
+def _get_local_controller_url(owner: _ControllerOwner) -> Tuple[str, str]:
+    """Resolve a specifically supervised local child without consulting DB."""
+    service_hash, controller_pid, controller_ip, controller_port = owner
+    owner_fingerprint = make_controller_owner_fingerprint(
+        service_hash, controller_pid, controller_ip, controller_port)
+    return f'http://localhost:{controller_port}', owner_fingerprint
+
+
+def _request_to_controller_with_retry(
+        method: str,
+        service_name: str,
+        expected_service_hash: str,
+        path: str,
+        *,
+        fixed_controller_owner: Optional[_ControllerOwner] = None,
+        **kwargs):
     """HTTP `method` to the controller with bounded retry on ConnectionError.
     """
     request_fn = getattr(requests, method)
@@ -132,15 +214,31 @@ def _request_to_controller_with_retry(method: str, service_name: str,
     # only after a 401: transport failures retry the SAME credential, while a
     # 403/5xx is an application result and must not replay the request.
     admin_tokens = get_controller_admin_auth_tokens()
-    base_headers = dict(kwargs.pop('headers', {}) or {})
+    owner_header_lower = constants.CONTROLLER_OWNER_HEADER.lower()
+    base_headers = {
+        name: value
+        for name, value in dict(kwargs.pop('headers', {}) or {}).items()
+        if str(name).lower() != owner_header_lower
+    }
     caller_supplied_auth = any(
         str(name).lower() == 'authorization' for name in base_headers)
     token_index = 0
     for attempt in range(_CONTROLLER_HTTP_RETRY_ATTEMPTS):
-        url = _get_controller_url(service_name, controller_port) + path
+        if fixed_controller_owner is None:
+            controller_url, owner_fingerprint = _get_controller_url(
+                service_name, expected_service_hash)
+        else:
+            if fixed_controller_owner[0] != expected_service_hash:
+                raise ControllerOwnerError(
+                    'Fixed controller owner does not match the intended '
+                    'service incarnation.')
+            controller_url, owner_fingerprint = _get_local_controller_url(
+                fixed_controller_owner)
+        url = controller_url + path
         try:
             while True:
                 headers = dict(base_headers)
+                headers[constants.CONTROLLER_OWNER_HEADER] = owner_fingerprint
                 if admin_tokens and not caller_supplied_auth:
                     headers['Authorization'] = (
                         f'Bearer {admin_tokens[token_index]}')
@@ -170,16 +268,31 @@ def _request_to_controller_with_retry(method: str, service_name: str,
             raise
 
 
-def _post_to_controller_with_retry(service_name: str, controller_port: int,
-                                   path: str, **kwargs):
+def _post_to_controller_with_retry(service_name: str,
+                                   expected_service_hash: str, path: str,
+                                   **kwargs):
     return _request_to_controller_with_retry('post', service_name,
-                                             controller_port, path, **kwargs)
+                                             expected_service_hash, path,
+                                             **kwargs)
 
 
-def _get_to_controller_with_retry(service_name: str, controller_port: int,
+def _get_to_controller_with_retry(service_name: str, expected_service_hash: str,
                                   path: str, **kwargs):
     return _request_to_controller_with_retry('get', service_name,
-                                             controller_port, path, **kwargs)
+                                             expected_service_hash, path,
+                                             **kwargs)
+
+
+def _get_to_local_controller_with_retry(service_name: str,
+                                        controller_owner: _ControllerOwner,
+                                        path: str, **kwargs):
+    return _request_to_controller_with_retry(
+        'get',
+        service_name,
+        controller_owner[0],
+        path,
+        fixed_controller_owner=controller_owner,
+        **kwargs)
 
 
 # NOTE(dev): We assume log are print with the hint 'sky api logs -l'. Be careful
@@ -1152,10 +1265,9 @@ def update_service_encoded(service_name: str, version: int, mode: str,
     if service_status is None:
         with ux_utils.print_exception_no_traceback():
             raise ValueError(f'{capnoun} {service_name!r} does not exist.')
-    controller_port = service_status['controller_port']
     resp = _post_to_controller_with_retry(
         service_name,
-        controller_port,
+        service_status['hash'],
         '/controller/update_service',
         json={
             'version': version,
@@ -1204,9 +1316,8 @@ def terminate_replica(service_name: str, replica_id: int, purge: bool) -> str:
                 f'Replica {replica_id} for service {service_name} does not '
                 'exist.')
 
-    controller_port = service_status['controller_port']
     resp = _post_to_controller_with_retry(service_name,
-                                          controller_port,
+                                          service_status['hash'],
                                           '/controller/terminate_replica',
                                           json={
                                               'replica_id': replica_id,
@@ -1288,13 +1399,13 @@ def _get_service_status(
 
     record['target_num_replicas'] = 0
     try:
-        controller_port = record['controller_port']
-        resp = _get_to_controller_with_retry(service_name, controller_port,
+        resp = _get_to_controller_with_retry(service_name, record['hash'],
                                              '/autoscaler/info')
         record['target_num_replicas'] = resp.json()['target_num_replicas']
     except requests.exceptions.RequestException:
         record['target_num_replicas'] = None
     except Exception as e:  # pylint: disable=broad-except
+        record['target_num_replicas'] = None
         logger.error(f'Failed to get autoscaler info for {service_name}: '
                      f'{common_utils.format_exception(e)}\n'
                      f'Traceback: {traceback.format_exc()}')

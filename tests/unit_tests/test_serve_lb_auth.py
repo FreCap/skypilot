@@ -35,7 +35,8 @@ def _clear_token_file_envs(monkeypatch):
 
 def _make_lb() -> load_balancer.SkyServeLoadBalancer:
     return load_balancer.SkyServeLoadBalancer(controller_url='http://ctrl:8001',
-                                              load_balancer_port=8890)
+                                              load_balancer_port=8890,
+                                              service_hash='incarnation-a')
 
 
 def _run(coro):
@@ -242,15 +243,20 @@ def test_sync_sends_control_plane_bearer(monkeypatch):
     lb = _make_lb()
     captured = {}
     _sync_once(monkeypatch, lb, 200, captured)
-    assert captured['headers'] == {'Authorization': 'Bearer ctrl-tok'}
+    assert captured['headers'] == {
+        'Authorization': 'Bearer ctrl-tok',
+        constants.SERVICE_HASH_HEADER: 'incarnation-a',
+    }
 
 
-def test_sync_no_token_sends_no_header(monkeypatch):
+def test_sync_without_token_still_fences_service_incarnation(monkeypatch):
     monkeypatch.delenv(constants.CONTROLLER_AUTH_TOKEN_ENV_VAR, raising=False)
     lb = _make_lb()
     captured = {}
     _sync_once(monkeypatch, lb, 200, captured)
-    assert captured['headers'] is None
+    assert captured['headers'] == {
+        constants.SERVICE_HASH_HEADER: 'incarnation-a'
+    }
 
 
 def test_sync_ring_falls_back_only_after_401_without_redraining(
@@ -266,10 +272,12 @@ def test_sync_ring_falls_back_only_after_401_without_redraining(
 
     assert captured['headers_history'] == [
         {
-            'Authorization': 'Bearer primary'
+            'Authorization': 'Bearer primary',
+            constants.SERVICE_HASH_HEADER: 'incarnation-a',
         },
         {
-            'Authorization': 'Bearer overlap'
+            'Authorization': 'Bearer overlap',
+            constants.SERVICE_HASH_HEADER: 'incarnation-a',
         },
     ]
     assert len(captured['json_history']) == 2
@@ -290,7 +298,10 @@ def test_sync_ring_does_not_fallback_on_non_401(monkeypatch, tmp_path):
 
     _sync_once(monkeypatch, lb, [500], captured)
 
-    assert captured['headers_history'] == [{'Authorization': 'Bearer primary'}]
+    assert captured['headers_history'] == [{
+        'Authorization': 'Bearer primary',
+        constants.SERVICE_HASH_HEADER: 'incarnation-a',
+    }]
     assert lb._request_aggregator.to_dict()['timestamps'] == [1]
 
 

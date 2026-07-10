@@ -20,7 +20,8 @@ def _resolve(argv):
 
 
 _BASE = [
-    '--controller-addr', 'http://ctrl:8001', '--load-balancer-port', '8890'
+    '--controller-addr', 'http://ctrl:8001', '--load-balancer-port', '8890',
+    '--service-hash', 'incarnation-a'
 ]
 
 
@@ -28,8 +29,17 @@ def test_base_args_threaded():
     _, kwargs = _resolve(_BASE)
     assert kwargs['controller_addr'] == 'http://ctrl:8001'
     assert kwargs['load_balancer_port'] == 8890
+    assert kwargs['service_hash'] == 'incarnation-a'
     # An unspecified TLS credential must still be threaded through as None.
     assert kwargs['tls_credential'] is None
+
+
+def test_service_hash_is_required():
+    with pytest.raises(SystemExit):
+        _resolve([
+            '--controller-addr', 'http://ctrl:8001', '--load-balancer-port',
+            '8890'
+        ])
 
 
 def test_routing_spec_args_are_not_parsed():

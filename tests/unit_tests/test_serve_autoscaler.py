@@ -233,11 +233,13 @@ class TestAutoscalerVersionInitialization(unittest.TestCase):
                                'SkyPilotReplicaManager'), \
              mock.patch.object(serve_controller.autoscalers.Autoscaler,
                                'from_spec') as mock_from_spec:
-            serve_controller.SkyServeController('svc',
-                                                mock.MagicMock(),
-                                                version=7,
-                                                host='localhost',
-                                                port=8000)
+            serve_controller.SkyServeController(
+                'svc',
+                mock.MagicMock(),
+                version=7,
+                host='localhost',
+                port=8000,
+                controller_owner_fingerprint=('owner-a'))
         mock_from_spec.assert_called_once()
         # version is the 3rd positional arg (service_name, service_spec,
         # version).

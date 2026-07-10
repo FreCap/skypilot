@@ -318,6 +318,7 @@ class SkyServeLoadBalancer:
         self,
         controller_url: str,
         load_balancer_port: int,
+        service_hash: Optional[str] = None,
         load_balancing_policy_name: Optional[str] = None,
         tls_credential: Optional[serve_utils.TLSCredential] = None,
         target_qps_per_replica: Optional[Union[float, Dict[str, float]]] = None,
@@ -341,6 +342,9 @@ class SkyServeLoadBalancer:
         Args:
             controller_url: The URL of the controller.
             load_balancer_port: The port where the load balancer listens to.
+            service_hash: Durable incarnation of the service this external LB
+                may sync for. Standalone test LBs may omit it when their fake
+                controller does not enforce incarnation fencing.
             load_balancing_policy_name: Seed load balancing policy name.
                 Defaults to None (the default policy until the first sync).
             tls_credentials: The TLS credentials for HTTPS endpoint. Defaults
@@ -354,6 +358,7 @@ class SkyServeLoadBalancer:
         self._app = fastapi.FastAPI()
         self._controller_url: str = controller_url
         self._load_balancer_port: int = load_balancer_port
+        self._service_hash = service_hash
         # Use the registry to create the load balancing policy. Track the
         # resolved policy name so a sync only rebuilds the policy object when
         # the name actually changes (a policy swap is rare -- only on an
@@ -1286,14 +1291,18 @@ class SkyServeLoadBalancer:
                                       ...] = (sync_tokens if sync_tokens else
                                               (None,))
                 for token_index, controller_token in enumerate(token_attempts):
-                    sync_headers = ({
-                        'Authorization': f'Bearer {controller_token}'
-                    } if controller_token is not None else None)
+                    sync_headers = {}
+                    if controller_token is not None:
+                        sync_headers['Authorization'] = (
+                            f'Bearer {controller_token}')
+                    if self._service_hash is not None:
+                        sync_headers[constants.SERVICE_HASH_HEADER] = (
+                            self._service_hash)
                     async with session.post(
                             self._controller_url +
                             '/controller/load_balancer_sync',
                             json=sync_payload,
-                            headers=sync_headers,
+                            headers=sync_headers or None,
                             timeout=aiohttp.ClientTimeout(
                                 constants.LB_CONTROLLER_SYNC_TIMEOUT_SECONDS),
                     ) as response:
@@ -1938,6 +1947,7 @@ class SkyServeLoadBalancer:
 def run_load_balancer(
     controller_addr: str,
     load_balancer_port: int,
+    service_hash: Optional[str] = None,
     load_balancing_policy_name: Optional[str] = None,
     tls_credential: Optional[serve_utils.TLSCredential] = None,
     target_qps_per_replica: Optional[Union[float, Dict[str, float]]] = None,
@@ -1956,6 +1966,8 @@ def run_load_balancer(
     Args:
         controller_addr: The address of the controller.
         load_balancer_port: The port where the load balancer listens to.
+        service_hash: Durable incarnation of the service this external LB may
+            sync for.
         load_balancing_policy_name: Seed load balancing policy name.
             Defaults to None.
         tls_credential:
@@ -1969,6 +1981,7 @@ def run_load_balancer(
     load_balancer = SkyServeLoadBalancer(
         controller_url=controller_addr,
         load_balancer_port=load_balancer_port,
+        service_hash=service_hash,
         load_balancing_policy_name=load_balancing_policy_name,
         tls_credential=tls_credential,
         target_qps_per_replica=target_qps_per_replica,
@@ -1986,10 +1999,10 @@ def _build_argument_parser() -> argparse.ArgumentParser:
     stream timeout -- is NOT a launch arg: the LB fetches it from the
     controller over the load_balancer_sync channel (see
     `SkyServeLoadBalancer._apply_routing_spec`), so `sky serve update` changes
-    reach a running LB without a re-roll. Only the controller address, the
-    listen port, and the TLS material stay CLI args: TLS is bound to uvicorn at
-    launch and a private key must never stream over the sync channel, so it
-    remains a launch/mounted-secret concern.
+    reach a running LB without a re-roll. The controller address, listen port,
+    durable service incarnation, and TLS material stay CLI args: TLS is bound
+    to uvicorn at launch and a private key must never stream over the sync
+    channel, so it remains a launch/mounted-secret concern.
     """
     parser = argparse.ArgumentParser()
     parser.add_argument('--controller-addr',
@@ -1999,6 +2012,9 @@ def _build_argument_parser() -> argparse.ArgumentParser:
                         type=int,
                         required=True,
                         help='The port where the load balancer listens to.')
+    parser.add_argument('--service-hash',
+                        required=True,
+                        help='The durable service incarnation to sync for.')
     parser.add_argument(
         '--tls-keyfile',
         type=str,
@@ -2034,6 +2050,7 @@ def _resolve_launch_kwargs(parser: argparse.ArgumentParser,
     return dict(
         controller_addr=args.controller_addr,
         load_balancer_port=args.load_balancer_port,
+        service_hash=args.service_hash,
         tls_credential=tls_credential,
     )
 

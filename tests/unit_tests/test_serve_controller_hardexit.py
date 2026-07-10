@@ -27,6 +27,7 @@ def _make_controller(monkeypatch):
     ctrl._app = fastapi.FastAPI()
     ctrl._host = '127.0.0.1'
     ctrl._port = 20010
+    ctrl._controller_owner_fingerprint = 'owner-a'
     # run() consults the reserved-capacity fill flag before deciding whether
     # to start the poller thread; disabled short-circuits before touching
     # the (absent) replica manager.

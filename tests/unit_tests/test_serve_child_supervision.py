@@ -23,19 +23,21 @@ class TestControllerHealth:
     def test_bounded_health_check(self):
         response = mock.Mock(status_code=200)
         with mock.patch.object(service.serve_utils,
-                               '_get_to_controller_with_retry',
+                               '_get_to_local_controller_with_retry',
                                return_value=response) as get:
-            assert service._controller_child_responding('svc', 20001)
-        get.assert_called_once_with('svc',
-                                    20001,
-                                    '/autoscaler/info',
-                                    timeout=(0.5, 1.0))
+            assert service._controller_child_responding('svc', 'incarnation-a',
+                                                        '10.0.0.2', 20001)
+        get.assert_called_once_with(
+            'svc', ('incarnation-a', service.os.getpid(), '10.0.0.2', 20001),
+            '/autoscaler/info',
+            timeout=(0.5, 1.0))
 
     def test_failed_health_check_is_unhealthy(self):
         with mock.patch.object(service.serve_utils,
-                               '_get_to_controller_with_retry',
+                               '_get_to_local_controller_with_retry',
                                side_effect=TimeoutError):
-            assert not service._controller_child_responding('svc', 20001)
+            assert not service._controller_child_responding(
+                'svc', 'incarnation-a', '10.0.0.2', 20001)
 
 
 def _record(status):
