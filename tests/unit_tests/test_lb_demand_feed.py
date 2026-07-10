@@ -26,8 +26,9 @@ def _make_lb(policy_name='least_load'):
         load_balancing_policy_name=policy_name)
 
 
-def _request(job_id=None):
+def _request(job_id=None, method='POST'):
     request = mock.MagicMock()
+    request.method = method
     headers = {}
     if job_id is not None:
         headers[constants.LB_JOB_ID_HEADER] = job_id
@@ -112,7 +113,7 @@ def test_queue_depth_recounts_between_failed_dispatches():
         ['http://a:8080', 'http://b:8080'])
     response = fastapi.responses.Response(status_code=200)
     depths_during_dispatch = []
-    request = _request()
+    request = _request(method='GET')
 
     async def _is_disconnected():
         return False
@@ -123,8 +124,8 @@ def test_queue_depth_recounts_between_failed_dispatches():
         del url, request
         depths_during_dispatch.append(lb._queue_depth)
         if len(depths_during_dispatch) == 1:
-            # The POST may have been accepted before this ambiguous failure;
-            # at-least-once delivery still retries it.
+            # GET is idempotent, so an ambiguous read failure remains safe to
+            # retry while we validate the queue-depth handoff.
             return httpx.ReadError('reset after send')
         return response
 
@@ -278,7 +279,7 @@ def test_declared_url_custom_request_invalidates_occupancy_sample():
     assert sampled_urls == []
 
 
-def test_ambiguous_async_retry_keeps_both_attempts_occupancy_unknown():
+def test_ambiguous_async_failure_is_not_replayed_and_stays_unknown():
     lb = _make_lb()
     urls = ['http://a:8080', 'http://b:8080']
     lb._load_balancing_policy.set_ready_replicas(urls)
@@ -300,17 +301,22 @@ def test_ambiguous_async_retry_keeps_both_attempts_occupancy_unknown():
     lb._proxy_request_to = _fake_proxy
     with mock.patch('sky.serve.load_balancer.asyncio.sleep',
                     new=mock.AsyncMock()):
-        response = asyncio.run(lb._proxy_with_retries(request))
+        with pytest.raises(fastapi.HTTPException) as exc_info:
+            asyncio.run(lb._proxy_with_retries(request))
 
-    assert response.status_code == 202
-    assert len(attempts) == 2
-    assert set(attempts) == set(urls)
-    assert lb._occupancy_dispatch_generation == {url: 2 for url in urls}
+    assert exc_info.value.status_code == 502
+    assert len(attempts) == 1
+    attempted_url = attempts[0]
+    untouched_url = next(url for url in urls if url != attempted_url)
+    assert lb._occupancy_dispatch_generation == {
+        attempted_url: 2,
+        untouched_url: 0,
+    }
     in_flight, _, unknown_urls, sampled_urls = (lb._in_flight_with_draining())
-    assert not in_flight
-    assert set(unknown_urls) == set(urls)
-    assert sampled_urls == []
-    assert lb._replica_free_slots == {}
+    assert in_flight == {untouched_url: 0}
+    assert unknown_urls == [attempted_url]
+    assert sampled_urls == [untouched_url]
+    assert lb._replica_free_slots == {untouched_url: 1}
 
 
 def test_probe_started_before_async_dispatch_cannot_revalidate_zero():
@@ -467,6 +473,39 @@ def _run_sync(lb, response_payload):
                            lambda: _FakeSession(response_payload, captured)):
         asyncio.run(lb._sync_with_controller_once())
     return captured
+
+
+def test_sync_loop_sleeps_after_unexpected_failure_and_recovers():
+    lb = _make_lb()
+    sync_rounds = 0
+
+    async def _sync_once():
+        nonlocal sync_rounds
+        sync_rounds += 1
+        if sync_rounds == 1:
+            raise RuntimeError('bad response')
+        # End the loop after proving a later successful round still runs.
+        lb._draining = True
+
+    lb._sync_with_controller_once = _sync_once
+    first_backoff = mock.Mock()
+    first_backoff.current_backoff.return_value = 3
+    reset_backoff = mock.Mock()
+    with mock.patch.object(lb_module.common_utils,
+                           'Backoff',
+                           side_effect=[first_backoff, reset_backoff]), \
+         mock.patch.object(lb_module.asyncio,
+                           'sleep',
+                           new=mock.AsyncMock()) as sleep:
+        asyncio.run(lb._sync_with_controller())
+
+    assert sync_rounds == 2
+    first_backoff.current_backoff.assert_called_once_with()
+    assert sleep.await_args_list == [
+        mock.call(5),
+        mock.call(3),
+        mock.call(constants.LB_CONTROLLER_SYNC_INTERVAL_SECONDS),
+    ]
 
 
 def test_sync_payload_carries_demand_gauges():

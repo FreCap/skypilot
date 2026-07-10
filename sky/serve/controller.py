@@ -2,6 +2,7 @@
 
 Responsible for autoscaling and replica management.
 """
+import asyncio
 import contextlib
 import hmac
 import logging
@@ -19,8 +20,7 @@ import uvicorn
 from sky import serve
 from sky import sky_logging
 from sky.serve import autoscalers
-from sky.serve import constants as serve_constants
-from sky.serve import lb_rbac_preflight
+from sky.serve import lb_k8s
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity
 from sky.serve import serve_state
@@ -34,30 +34,43 @@ from sky.utils import ux_utils
 logger = sky_logging.init_logger(__name__)
 
 
-def _make_auth_dependency() -> Callable:
-    """Build a FastAPI dependency that enforces a shared bearer token.
+def _make_auth_dependency(*,
+                          sync: bool = False,
+                          required: bool = False) -> Callable:
+    """Build a dependency for one purpose-specific controller token ring.
 
-    The expected token is read fresh from
-    `serve_utils.get_controller_auth_token()` on every request, so a token
-    rotated after the controller boots is honored without a respawn. When the
-    token is None/empty (auth disabled), the
-    dependency is a no-op so in-pod / localhost-only deployments are unchanged.
-    Otherwise it requires an `Authorization: Bearer <token>` header matching in
-    constant time; a missing or wrong token yields 401. Applied to every
-    control-plane endpoint -- the destructive ones and the read-only
-    sync/status paths -- since the LB now presents the token on every sync.
+    Rings are read fresh for every request, so mounted Secret rotations do not
+    require a controller restart. The sync endpoint accepts only the LB-sync
+    ring; administrative/status endpoints accept only the admin ring. A broken
+    required ring returns 503 (fail closed without claiming the caller merely
+    supplied a bad credential); a present but nonmatching credential returns
+    401.
     """
 
     async def _verify(authorization: Optional[str] = fastapi.Header(
         None)) -> None:
-        expected_token = serve_utils.get_controller_auth_token()
-        if not expected_token:
+        getter = (serve_utils.get_lb_sync_auth_tokens
+                  if sync else serve_utils.get_controller_admin_auth_tokens)
+        try:
+            expected_tokens = getter(required=required)
+        except serve_utils.AuthTokenConfigurationError as e:
+            logger.error('Controller authentication is unavailable: %s', e)
+            raise fastapi.HTTPException(
+                status_code=503,
+                detail='Controller authentication is unavailable.') from e
+        if not expected_tokens:
             return
-        expected = f'Bearer {expected_token}'
         # isascii() guards hmac.compare_digest, which raises TypeError on a
         # non-ASCII str -- a malformed header must be a clean 401, not a 500.
-        if (authorization is None or not authorization.isascii() or
-                not hmac.compare_digest(authorization, expected)):
+        if authorization is None or not authorization.isascii():
+            raise fastapi.HTTPException(status_code=401, detail='Unauthorized.')
+        authorized = False
+        for expected_token in expected_tokens:
+            # Evaluate every ring member instead of short-circuiting on the
+            # first match, keeping request timing independent of token order.
+            authorized |= hmac.compare_digest(authorization,
+                                              f'Bearer {expected_token}')
+        if not authorized:
             raise fastapi.HTTPException(status_code=401, detail='Unauthorized.')
 
     return _verify
@@ -82,6 +95,7 @@ class SkyServeController:
     def __init__(self, service_name: str, service_spec: serve.SkyServiceSpec,
                  version: int, host: str, port: int) -> None:
         self._service_name = service_name
+        self._is_pool = service_spec.pool
         self._replica_manager: replica_managers.ReplicaManager = (
             replica_managers.SkyPilotReplicaManager(service_name=service_name,
                                                     spec=service_spec,
@@ -138,10 +152,6 @@ class SkyServeController:
         # replica's running job stays attributed to it (see
         # _get_lb_replica_info / _translate_in_flight).
         self._lb_translation_cache: Dict[int, Tuple[str, str, int]] = {}
-        # Recent LB incarnations. External-LB maxSurge briefly runs two
-        # last-writer-wins reporters, so every live replica fails closed for
-        # autoscaling and drain proofs until the old heartbeat ages out.
-        self._lb_session_heartbeats: Dict[str, float] = {}
         self._app = fastapi.FastAPI(lifespan=self.lifespan)
 
     @contextlib.asynccontextmanager
@@ -386,38 +396,158 @@ class SkyServeController:
                 info.replica_id not in sampled_replica_ids)
         return unknown_replica_ids
 
-    def _record_lb_session_heartbeat(
-            self,
-            session_id: Optional[str],
-            current_time: Optional[float] = None) -> bool:
-        """Record one LB sync and report whether maxSurge overlap is active."""
-        now = time.monotonic() if current_time is None else current_time
-        cutoff = (now - 3 * serve_constants.LB_CONTROLLER_SYNC_INTERVAL_SECONDS)
-        heartbeats = {
-            session: seen for session, seen in getattr(
-                self, '_lb_session_heartbeats', {}).items() if seen >= cutoff
-        }
-        if session_id:
-            heartbeats[session_id] = now
-        self._lb_session_heartbeats = heartbeats
-        return len(heartbeats) > 1
+    def _lb_report_authority(
+            self, session_id: Optional[str]) -> Tuple[bool, bool, bool]:
+        """Return ``(live member, demand, drain)`` report authority.
+
+        The sole Ready, non-terminating Pod sees all new Service traffic, so it
+        may continue feeding demand while an old terminating Pod finishes a
+        long stream. Idleness and drain completion are service-wide claims:
+        they remain authoritative only when the reporter is the sole live Pod,
+        including terminating Pods. Both decisions use one Kubernetes list.
+        """
+        try:
+            pod_authority = lb_k8s.get_lb_pod_authority(self._service_name)
+        except Exception as e:  # pylint: disable=broad-except
+            # The lifecycle helper already converts Kubernetes API failures to
+            # None. Keep this boundary defensive too: report validation must
+            # fail closed even if an unexpected adapter error escapes it.
+            logger.warning('Failed to validate the live load balancer Pod '
+                           f'set: {common_utils.format_exception(e)}')
+            return False, False, False
+        if session_id is None or pod_authority is None:
+            return False, False, False
+        reporter_is_live = session_id in pod_authority.live_uids
+        demand_authoritative = (pod_authority.ready_nonterminating_uids == {
+            session_id
+        })
+        drain_authoritative = pod_authority.live_uids == {session_id}
+        return reporter_is_live, demand_authoritative, drain_authoritative
 
     @staticmethod
     def _lb_drain_report_view(
         request_data: Dict[str, Any],
-        sessions_overlap: bool,
+        report_is_authoritative: bool,
     ) -> Tuple[Optional[Dict[str, int]], Optional[List[str]]]:
-        """Return a raw drain view that cannot prove idle across two LBs."""
+        """Return a raw drain view that only the sole live LB can prove."""
         in_flight = request_data.get('in_flight')
         routing_urls = request_data.get('routing_urls')
-        if sessions_overlap:
-            # Publish a deliberately untrustworthy routing view (None). The
-            # drain tracker rejects it before considering a clean gauge, so a
-            # zero from LB-A cannot terminate while LB-B still routes/works.
-            # Materialize {} when an old/nontracking LB omitted its gauge so
-            # this blocking report replaces, rather than leaves, a prior proof.
-            return (in_flight if in_flight is not None else {}), None
+        if not report_is_authoritative:
+            # Never publish any field from a non-authoritative reporter. In
+            # particular, replacing a trusted report with a synthetic blocking
+            # report would still let a different service's/rollout Pod mutate
+            # this service's drain session and freshness timestamp.
+            return None, None
         return in_flight, routing_urls
+
+    async def _ingest_load_balancer_report(
+        self,
+        request_data: Dict[str, Any],
+        replica_infos: List['replica_managers.ReplicaInfo'],
+        async_occupancy_by_version: Dict[int, Optional[bool]],
+        authority: Optional[Tuple[bool, bool, bool]] = None,
+    ) -> bool:
+        """Apply the independently authorized parts of one external LB report.
+
+        A sole Ready reporter keeps scale-up demand live during maxSurge. Until
+        every older Pod is gone, its zero gauges cannot prove service-wide
+        idleness: all live replicas remain occupancy-unknown and the replica
+        manager receives a controller-generated blocking drain view. A wrong
+        UID, multiple Ready Pods, or a failed lookup cannot mutate either
+        subsystem.
+        """
+        if authority is None:
+            loop = asyncio.get_running_loop()
+            authority = await loop.run_in_executor(
+                None, self._lb_report_authority,
+                request_data.get('lb_session_id'))
+        (reporter_is_live, demand_authoritative,
+         drain_authoritative) = authority
+        if not reporter_is_live:
+            logger.warning('Ignoring non-authoritative load balancer demand '
+                           'and drain report for service '
+                           f'{self._service_name!r}.')
+            return False
+        if not demand_authoritative and not drain_authoritative:
+            # Either genuine Pod may refresh routing during the two-Ready
+            # maxSurge window, but neither may mutate last-writer-wins state.
+            return True
+
+        if demand_authoritative:
+            # Parse reporter-controlled demand only after its dedicated gate.
+            # Besides preventing state mutation, this keeps a stale/wrong Pod
+            # from making the controller reject a useful routing response with
+            # a malformed demand-only field.
+            request_aggregator: Dict[str, Any] = request_data.get(
+                'request_aggregator', {})
+            timestamps: List[int] = request_aggregator.get('timestamps', [])
+            logger.info(f'Received {len(timestamps)} inflight requests.')
+            translated_in_flight = self._translate_in_flight(
+                request_data.get('in_flight'))
+            unknown_replica_ids = self._unknown_async_replica_ids(
+                replica_infos,
+                async_occupancy_by_version,
+                request_data.get('occupancy_sampled_urls', []),
+                request_data.get('unknown_in_flight_urls', []),
+                force_all_live_unknown=not drain_authoritative)
+            self._autoscaler.collect_request_information({
+                'timestamps': timestamps,
+                'in_flight_by_replica_id': translated_in_flight,
+                'unknown_in_flight_replica_ids': list(unknown_replica_ids),
+                'queue_depth': request_data.get('queue_depth'),
+                'rejected_in_window': request_data.get('rejected_in_window'),
+            })
+
+        if drain_authoritative:
+            drain_in_flight, drain_routing_urls = self._lb_drain_report_view(
+                request_data, report_is_authoritative=True)
+            unknown_urls = request_data.get('unknown_in_flight_urls')
+            draining_urls = request_data.get('draining_urls')
+        else:
+            # This is the legitimate sole Ready Pod, but another live Pod may
+            # still own streams. Replace any formerly trusted clean snapshot
+            # with a controller-generated blocking view; never copy an
+            # overlap reporter's drain fields into the replica manager.
+            drain_in_flight, drain_routing_urls = {}, None
+            unknown_urls, draining_urls = [], []
+        self._replica_manager.update_lb_in_flight(
+            drain_in_flight, drain_routing_urls, unknown_urls, draining_urls,
+            request_data.get('lb_session_id'))
+        return True
+
+    async def _handle_load_balancer_sync(
+            self, request_data: Dict[str, Any]) -> fastapi.Response:
+        """Validate LB membership before disclosing confidential routing."""
+        loop = asyncio.get_running_loop()
+        authority = await loop.run_in_executor(
+            None, self._lb_report_authority, request_data.get('lb_session_id'))
+        if not authority[0]:
+            # The sync token authenticates the shared LB workload, not
+            # membership in this service. Do not reveal replica URLs, capacity,
+            # or routing policy to another service's Pod.
+            return fastapi.Response(status_code=503)
+
+        replica_infos = serve_state.get_replica_infos(self._service_name)
+        async_occupancy_by_version: Dict[int, Optional[bool]] = {}
+        for replica_version in {info.version for info in replica_infos}:
+            version_spec = serve_state.get_spec(self._service_name,
+                                                replica_version)
+            async_occupancy_by_version[replica_version] = (
+                None if version_spec is None else getattr(
+                    version_spec, 'graceful_drain_async_occupancy', None))
+        lb_replica_info, num_ready = self._get_lb_replica_info(
+            replica_infos, async_occupancy_by_version)
+        await self._ingest_load_balancer_report(request_data,
+                                                replica_infos,
+                                                async_occupancy_by_version,
+                                                authority=authority)
+        return responses.JSONResponse(content={
+            'replica_info': lb_replica_info,
+            'num_ready_replicas': num_ready,
+            'routing_spec': self._get_routing_spec(),
+            'capacity_hint': self._get_capacity_hint(replica_infos),
+        },
+                                      status_code=200)
 
     def _get_capacity_hint(
             self, replica_infos: List['replica_managers.ReplicaInfo']
@@ -599,100 +729,30 @@ class SkyServeController:
 
     def run(self) -> None:
 
-        # Fail fast at boot if the in-cluster ServiceAccount lacks the RBAC
-        # needed to manage the external load balancer objects. No-op outside
-        # external-LB / in-cluster mode; degrades gracefully if the access
-        # review itself cannot be issued.
-        lb_rbac_preflight.check_lb_rbac_preflight()
+        # Every non-pool service uses the external LB topology. Refuse to boot
+        # an externally reachable controller with either auth boundary absent;
+        # pools have no LB and retain optional localhost/admin auth.
+        auth_required = not getattr(self, '_is_pool', True)
+        if auth_required:
+            serve_utils.get_lb_sync_auth_tokens(required=True)
+            serve_utils.get_controller_admin_auth_tokens(required=True)
 
-        # Guard every control-plane endpoint with a shared bearer token (no-op
-        # when unset). The read-only sync/status paths are gated too: the LB
-        # presents the token on every sync (get_controller_auth_token, mounted
-        # from the same Secret), so an in-cluster foothold can no longer scrape
-        # the replica set. Safe to enforce from the first deploy -- there are no
-        # live LBs to strand, and the token is present consistently on the
-        # controller and every spawned LB.
-        auth_dependency = fastapi.Depends(_make_auth_dependency())
+        admin_auth_dependency = fastapi.Depends(
+            _make_auth_dependency(required=auth_required))
+        sync_auth_dependency = fastapi.Depends(
+            _make_auth_dependency(sync=True, required=auth_required))
 
-        @self._app.get('/autoscaler/info', dependencies=[auth_dependency])
+        @self._app.get('/autoscaler/info', dependencies=[admin_auth_dependency])
         async def get_autoscaler_info() -> fastapi.Response:
             return responses.JSONResponse(content=self._autoscaler.info(),
                                           status_code=200)
 
         @self._app.post('/controller/load_balancer_sync',
-                        dependencies=[auth_dependency])
+                        dependencies=[sync_auth_dependency])
         async def load_balancer_sync(
                 request: fastapi.Request) -> fastapi.Response:
             request_data = await request.json()
-            # TODO(MaoZiming): Check aggregator type.
-            request_aggregator: Dict[str, Any] = request_data.get(
-                'request_aggregator', {})
-            timestamps: List[int] = request_aggregator.get('timestamps', [])
-            logger.info(f'Received {len(timestamps)} inflight requests.')
-            # One replica-list fetch shared by the LB replica info and the
-            # capacity hint (this handler is async on the event loop --
-            # keep its added work O(replicas) with no new blocking DB
-            # calls).
-            replica_infos = serve_state.get_replica_infos(self._service_name)
-            async_occupancy_by_version: Dict[int, Optional[bool]] = {}
-            for replica_version in {info.version for info in replica_infos}:
-                version_spec = serve_state.get_spec(self._service_name,
-                                                    replica_version)
-                async_occupancy_by_version[replica_version] = (
-                    None if version_spec is None else getattr(
-                        version_spec, 'graceful_drain_async_occupancy', None))
-            # Resolve the url->id mapping BEFORE translating in_flight:
-            # _get_lb_replica_info rebuilds _lb_replica_cache from this
-            # sync's READY replicas.
-            lb_replica_info, num_ready = self._get_lb_replica_info(
-                replica_infos, async_occupancy_by_version)
-            # Merge the new demand gauges (all optional; an old LB simply
-            # omits them) into the single dict handed to the autoscaler.
-            # The QPS/pool autoscalers only .get('timestamps'), so the
-            # extra keys are safe for every autoscaler type.
-            translated_in_flight = self._translate_in_flight(
-                request_data.get('in_flight'))
-            lb_sessions_overlap = self._record_lb_session_heartbeat(
-                request_data.get('lb_session_id'))
-            unknown_replica_ids = self._unknown_async_replica_ids(
-                replica_infos,
-                async_occupancy_by_version,
-                request_data.get('occupancy_sampled_urls', []),
-                request_data.get('unknown_in_flight_urls', []),
-                force_all_live_unknown=lb_sessions_overlap)
-            request_information: Dict[str, Any] = {
-                'timestamps': timestamps,
-                'in_flight_by_replica_id': translated_in_flight,
-                'unknown_in_flight_replica_ids': list(unknown_replica_ids),
-                'queue_depth': request_data.get('queue_depth'),
-                'rejected_in_window': request_data.get('rejected_in_window'),
-            }
-            self._autoscaler.collect_request_information(request_information)
-            # Publish the LB's raw url-keyed gauge, routing view, and
-            # occupancy-unknown set to the replica manager: retirement
-            # drains (scale_down) complete early once a report proves the
-            # LB stopped routing to the retiring replica's url AND shows
-            # zero in-flight (and no unknown async occupancy) for it.
-            # Deliberately url-keyed, not translated: the drain target's
-            # url is known from its own replica record, so translation
-            # gaps (cold cache after a restart, urls of already-removed
-            # replicas lingering in the LB's retention) neither poison
-            # unrelated drains nor mask the target.
-            drain_in_flight, drain_routing_urls = self._lb_drain_report_view(
-                request_data, lb_sessions_overlap)
-            self._replica_manager.update_lb_in_flight(
-                drain_in_flight, drain_routing_urls,
-                request_data.get('unknown_in_flight_urls'),
-                request_data.get('draining_urls'),
-                request_data.get('lb_session_id'))
-
-            return responses.JSONResponse(content={
-                'replica_info': lb_replica_info,
-                'num_ready_replicas': num_ready,
-                'routing_spec': self._get_routing_spec(),
-                'capacity_hint': self._get_capacity_hint(replica_infos),
-            },
-                                          status_code=200)
+            return await self._handle_load_balancer_sync(request_data)
 
         # Deliberately a sync handler: FastAPI runs it in the threadpool, so
         # waiting on the replica-manager lock inside `update_version` (a probe
@@ -700,7 +760,7 @@ class SkyServeController:
         # never stalls the event loop — /controller/load_balancer_sync must
         # keep serving while an update waits its turn.
         @self._app.post('/controller/update_service',
-                        dependencies=[auth_dependency])
+                        dependencies=[admin_auth_dependency])
         def update_service(request_data: Dict[str, Any] = fastapi.Body(
             ...)) -> fastapi.Response:
             try:
@@ -779,7 +839,7 @@ class SkyServeController:
                                               status_code=500)
 
         @self._app.post('/controller/terminate_replica',
-                        dependencies=[auth_dependency])
+                        dependencies=[admin_auth_dependency])
         async def terminate_replica(
                 request: fastapi.Request) -> fastapi.Response:
             request_data = await request.json()

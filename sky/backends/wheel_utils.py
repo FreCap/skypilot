@@ -141,6 +141,9 @@ def _build_sky_wheel() -> pathlib.Path:
             r'_SKYPILOT_COMMIT_SHA = [\'"](.*?)[\'"]',
             f'_SKYPILOT_COMMIT_SHA = \'{sky.__commit__}\'', init_file_content)
         if sky.__build__ is not None:
+            # setup.py runs outside the source checkout, so it cannot discover
+            # the commit count itself. Stamp the running build just like the
+            # commit SHA so cluster-side wheels retain the display metadata.
             init_file_content = re.sub(
                 r'_SKYPILOT_COMMIT_COUNT = [\'"](.*?)[\'"]',
                 f'_SKYPILOT_COMMIT_COUNT = \'{sky.__build__}\'',

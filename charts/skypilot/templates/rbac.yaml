@@ -73,4 +73,65 @@ roleRef:
   kind: Role
   name: {{ $fullName }}-api-role
   apiGroup: rbac.authorization.k8s.io
+{{- /* SKYPILOT_IN_CLUSTER_NAMESPACE may point workload provisioning at a
+       namespace different from the API release. External SkyServe LBs must
+       stay beside the API pod because their projected auth Secrets live there
+       and image identity is mirrored from that pod. Grant only the LB
+       lifecycle permissions in the release namespace; the broader workload
+       role above remains scoped to the configured workload namespace. */}}
+{{- /* Keep this cleanup capability after the feature is disabled: old LB
+       objects may still need to be reaped by the newly rolled API pod. */}}
+{{- if ne $namespace .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fullName }}-serve-lb-role
+  namespace: {{ .Release.Namespace }}
+rules:
+  - apiGroups: [ "apps" ]
+    resources: [ "deployments" ]
+    verbs:
+      {{- if .Values.serve.externalLoadBalancer.enabled }}
+      - create
+      {{- end }}
+      - get
+      - list
+      {{- if .Values.serve.externalLoadBalancer.enabled }}
+      - patch
+      {{- end }}
+      - delete
+  - apiGroups: [ "" ]
+    resources: [ "services" ]
+    verbs:
+      {{- if .Values.serve.externalLoadBalancer.enabled }}
+      - create
+      {{- end }}
+      - get
+      - list
+      {{- if .Values.serve.externalLoadBalancer.enabled }}
+      - patch
+      {{- end }}
+      - delete
+  - apiGroups: [ "" ]
+    resources: [ "pods" ]
+    verbs: [ "get", "list" ]
+  - apiGroups: [ "" ]
+    resources: [ "pods/log" ]
+    verbs: [ "get" ]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullName }}-serve-lb-role-binding
+  namespace: {{ .Release.Namespace }}
+subjects:
+- kind: ServiceAccount
+  name: {{ include "skypilot.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ $fullName }}-serve-lb-role
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}
 {{- end }}

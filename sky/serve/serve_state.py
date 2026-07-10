@@ -427,7 +427,8 @@ def add_service(name: str,
                 entrypoint: str,
                 spec: Optional['service_spec.SkyServiceSpec'],
                 yaml_content: str,
-                controller_ip: Optional[str] = None) -> bool:
+                controller_ip: Optional[str] = None,
+                service_hash: Optional[str] = None) -> bool:
     """Atomically add a service and its initial version to the database.
 
     The `services` row and the initial `version_specs` row (at
@@ -466,7 +467,8 @@ def add_service(name: str,
                     pool=int(pool),
                     controller_pid=controller_pid,
                     controller_ip=controller_ip,
-                    hash=str(uuid.uuid4()),
+                    hash=(str(uuid.uuid4())
+                          if service_hash is None else service_hash),
                     entrypoint=entrypoint))
             version_insert_stmt = insert_func(version_specs_table).values(
                 service_name=name,
@@ -494,25 +496,41 @@ def add_service(name: str,
     return True
 
 
-def update_service_controller_pid(service_name: str,
-                                  controller_pid: int) -> None:
-    """Updates the controller pid of a service.
+def update_service_controller_pid_if_owner(
+        service_name: str, expected_service_hash: Optional[str],
+        expected_controller_pid: Optional[int],
+        expected_controller_ip: Optional[str], controller_pid: int,
+        controller_ip: Optional[str]) -> bool:
+    """Preclaim recovery only if the incarnation and old owner still match.
 
-    This is used to update the controller pid of a service on ha recovery.
+    A name-only preclaim can overwrite a service that was purged and recreated
+    while recovery was loading its spec. The hash fences same-name successors;
+    the expected PID+IP fence another recovery process that already claimed the
+    original incarnation (PIDs alone collide across Kubernetes pods). On
+    success, publish the new PID+IP and clear the port atomically so the stable
+    proxy fails closed with 503 until the new controller is actually ready.
     """
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
-        session.query(services_table).filter(
-            services_table.c.name == service_name).update(
-                {services_table.c.controller_pid: controller_pid})
+        count = session.query(services_table).filter(
+            services_table.c.name == service_name,
+            services_table.c.hash == expected_service_hash,
+            services_table.c.controller_pid == expected_controller_pid,
+            services_table.c.controller_ip == expected_controller_ip).update({
+                services_table.c.controller_pid: controller_pid,
+                services_table.c.controller_ip: controller_ip,
+                services_table.c.controller_port: None,
+            })
         session.commit()
+    return count > 0
 
 
-def update_service_controller_pid_ip_and_port(service_name: str,
-                                              controller_pid: int,
-                                              controller_ip: Optional[str],
-                                              controller_port: int) -> None:
-    """Atomically updates controller pid + IP + port for a service.
+def update_service_controller_pid_ip_and_port(
+        service_name: str, controller_pid: int, controller_ip: Optional[str],
+        controller_port: int, expected_service_hash: Optional[str],
+        expected_controller_pid: Optional[int],
+        expected_controller_ip: Optional[str]) -> bool:
+    """CAS-publish controller pid + IP + port for one service incarnation.
 
     Used during HA recovery: the controller subprocess on the new pod must be
     listening on the chosen port before we flip DB to point requests at it.
@@ -522,17 +540,27 @@ def update_service_controller_pid_ip_and_port(service_name: str,
 
     Recovery picks the port locally (find_free_port on the recovery pod) —
     it must NOT reuse the previous pod's port — so the port change has to
-    propagate to DB together with the pid/ip flip.
+    propagate to DB together with the pid/ip flip. The hash and expected owner
+    filters prevent a booting process from publishing into a row that was
+    purged/recreated or claimed by another recovery during the readiness wait.
+
+    Returns:
+        True if the original incarnation and expected owner were updated;
+        False if ownership was lost or the row no longer exists.
     """
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
-        session.query(services_table).filter(
-            services_table.c.name == service_name).update({
+        count = session.query(services_table).filter(
+            services_table.c.name == service_name,
+            services_table.c.hash == expected_service_hash,
+            services_table.c.controller_pid == expected_controller_pid,
+            services_table.c.controller_ip == expected_controller_ip).update({
                 services_table.c.controller_pid: controller_pid,
                 services_table.c.controller_ip: controller_ip,
                 services_table.c.controller_port: controller_port,
             })
         session.commit()
+    return count > 0
 
 
 def set_service_controller_ip(service_name: str,
@@ -627,51 +655,58 @@ def set_service_controller_port(service_name: str,
         session.commit()
 
 
-def set_service_controller_port_if_owner(service_name: str, controller_pid: int,
+def set_service_controller_port_if_owner(service_name: str,
+                                         expected_service_hash: Optional[str],
+                                         controller_pid: int,
+                                         controller_ip: Optional[str],
                                          controller_port: int) -> bool:
     """Sets the controller port only if `controller_pid` still owns the row.
 
     Compare-and-swap for the in-place controller respawn: a parent whose
     ownership has been taken over by HA recovery on another pod (which
-    atomically flipped pid/ip/port) must not clobber the new owner's port,
-    which would recreate the half-flipped row (new pid/ip + stale port) that
-    `update_service_controller_pid_ip_and_port` exists to prevent.
+    atomically flipped pid/ip/port) must not clobber the new owner's port.
+    Hash + PID + IP are all required: the hash changes on same-name reuse,
+    while namespace-local PIDs can be identical on two pods.
 
     Returns:
-        True if the row was updated (the pid still owns the service), False
-        if ownership was lost or the row no longer exists.
-    """
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        count = session.query(services_table).filter(
-            services_table.c.name == service_name,
-            services_table.c.controller_pid == controller_pid).update(
-                {services_table.c.controller_port: controller_port})
-        session.commit()
-    return count > 0
-
-
-def set_service_load_balancer_port_if_owner(service_name: str,
-                                            controller_pid: int,
-                                            load_balancer_port: int) -> bool:
-    """Sets the load balancer port only if `controller_pid` owns the row.
-
-    Compare-and-swap for recovery's external-LB port republish: the plain
-    setter below is a name-only write, so a stale recovery process racing a
-    purge + same-name re-up could write to the successor's row and
-    prematurely unblock its registration (`wait_service_registration` returns
-    on any non-null port). Filtering on controller_pid makes the
-    ownership check and the write one atomic UPDATE.
-
-    Returns:
-        True if the row was updated (the pid owns the service), False if
+        True if the full owner tuple still owns the service, False if
         ownership was lost or the row no longer exists.
     """
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         count = session.query(services_table).filter(
             services_table.c.name == service_name,
-            services_table.c.controller_pid == controller_pid).update(
+            services_table.c.hash == expected_service_hash,
+            services_table.c.controller_pid == controller_pid,
+            services_table.c.controller_ip == controller_ip).update(
+                {services_table.c.controller_port: controller_port})
+        session.commit()
+    return count > 0
+
+
+def set_service_load_balancer_port_if_owner(
+        service_name: str, expected_service_hash: Optional[str],
+        controller_pid: int, controller_ip: Optional[str],
+        load_balancer_port: int) -> bool:
+    """Sets the load balancer port only if `controller_pid` owns the row.
+
+    Compare-and-swap for external-LB port publication: the plain setter below
+    is a name-only write, so a stale process racing a purge + same-name re-up
+    could write to the successor's row and prematurely unblock registration.
+    Filtering on hash + PID + IP makes the full ownership check and write one
+    atomic UPDATE.
+
+    Returns:
+        True if the full owner tuple owns the service, False if ownership was
+        lost or the row no longer exists.
+    """
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        count = session.query(services_table).filter(
+            services_table.c.name == service_name,
+            services_table.c.hash == expected_service_hash,
+            services_table.c.controller_pid == controller_pid,
+            services_table.c.controller_ip == controller_ip).update(
                 {services_table.c.load_balancer_port: load_balancer_port})
         session.commit()
     return count > 0
@@ -791,6 +826,36 @@ def get_service_from_name(service_name: str) -> Optional[Dict[str, Any]]:
     for row in rows:
         return _get_service_from_row(row._mapping)  # pylint: disable=protected-access
     return None
+
+
+def get_service_controller_owner(service_name: str) -> Optional[Dict[str, Any]]:
+    """Get only the fields needed to route to a service controller.
+
+    Unlike :func:`get_service_from_name`, this hot-path lookup does not join
+    ``version_specs``, deserialize the latest spec, or issue a second query.
+    The service hash distinguishes a same-name successor from the row read
+    before a proxied request; status lets the proxy reject terminal rows.
+    """
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        row = session.execute(
+            sqlalchemy.select(
+                services_table.c.hash,
+                services_table.c.status,
+                services_table.c.controller_pid,
+                services_table.c.controller_ip,
+                services_table.c.controller_port,
+            ).where(services_table.c.name == service_name)).fetchone()
+    if row is None:
+        return None
+    mapping = row._mapping  # pylint: disable=protected-access
+    return {
+        'hash': mapping['hash'],
+        'status': ServiceStatus[mapping['status']],
+        'controller_pid': mapping['controller_pid'],
+        'controller_ip': mapping['controller_ip'],
+        'controller_port': mapping['controller_port'],
+    }
 
 
 def get_service_hash(service_name: str) -> Optional[str]:
@@ -1155,18 +1220,6 @@ def get_latest_committed_version(service_name: str) -> Optional[int]:
                         version_specs_table.c.yaml_content.isnot(
                             None)))).fetchone()
     return result[0] if result else None
-
-
-def get_service_controller_port(service_name: str) -> Optional[int]:
-    """Gets the controller port of a service (None if not yet assigned)."""
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        result = session.execute(
-            sqlalchemy.select(services_table.c.controller_port).where(
-                services_table.c.name == service_name)).fetchone()
-        if result is None:
-            raise ValueError(f'Service {service_name} does not exist.')
-        return result[0]
 
 
 def get_service_load_balancer_port(service_name: str) -> int:

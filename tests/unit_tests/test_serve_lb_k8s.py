@@ -1,12 +1,8 @@
-"""Logic-only tests for the controller-owned external LB lifecycle.
-
-These tests exercise only name/endpoint logic and which k8s API calls are
-issued (create/delete/list) under mocked clients. They never assert on log or
-exception message text.
-"""
+"""Logic tests for the controller-owned external LB lifecycle."""
+# pylint: disable=protected-access
 import os
 import re
-import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -14,605 +10,741 @@ import pytest
 from sky.serve import constants
 from sky.serve import lb_k8s
 
-# RFC1123 subdomain-ish check for object names: lowercase alnum + '-', starts
-# and ends alphanumeric, <= 63 chars.
 _RFC1123 = re.compile(r'^[a-z0-9]([a-z0-9-]*[a-z0-9])?$')
+_DIGEST_A = f'sha256:{"a" * 64}'
+_DIGEST_B = f'sha256:{"b" * 64}'
 
 
 class _ApiException(Exception):
-    """Stand-in for kubernetes.client.rest.ApiException with a status."""
 
     def __init__(self, status):
         super().__init__(f'status={status}')
         self.status = status
 
 
+def _volume(name, secret):
+    return {
+        'name': name,
+        'projected': {
+            'sources': [{
+                'secret': {
+                    'name': secret,
+                    'items': [{
+                        'key': 'tokens',
+                        'path': 'tokens'
+                    }],
+                }
+            }]
+        },
+    }
+
+
+def _mount(name, path):
+    return {'name': name, 'mountPath': path, 'readOnly': True}
+
+
 def _install(monkeypatch,
+             *,
              apps_api=None,
              core_api=None,
              external=True,
              incluster=True,
              namespace='skypilot',
-             token=None,
-             token_secret=None,
-             lb_token=None,
-             lb_token_secret=None,
-             pod_name='controller-pod-0',
-             image='my-repo/skypilot:v1',
-             db_service_names=None):
-    """Patch environment probes + the k8s adaptor for lb_k8s."""
+             pod_name='api-pod-0',
+             pod_namespace='skypilot',
+             image='repo/skypilot:moving',
+             image_policy='Always',
+             image_id=f'repo/skypilot@{_DIGEST_A}',
+             pod_security_context=None,
+             container_security_context=None,
+             resources=None,
+             node_selector=None,
+             tolerations=None,
+             affinity=None,
+             runtime_class_name=None,
+             priority_class_name=None,
+             scheduler_name=None,
+             image_pull_secrets=({
+                 'name': 'registry-credentials'
+             },),
+             db_service_names=()):
     monkeypatch.setattr(lb_k8s.serve_utils, 'is_external_load_balancer_mode',
                         lambda: external)
-    # reconcile re-checks the DB before reaping an orphan; by default every
-    # service is treated as absent (truly gone). Tests can pass a set of names
-    # the DB should still report as live.
-    live_in_db = set(db_service_names or ())
-    # ensure_lb_objects_exist additionally checks ownership: the stub row
-    # carries this process's pid so 'live in DB' also means 'owned by us'.
-    monkeypatch.setattr(
-        lb_k8s.serve_state, 'get_service_from_name', lambda name: {
-            'name': name,
-            'controller_pid': os.getpid(),
-        } if name in live_in_db else None)
     monkeypatch.setattr(lb_k8s.kubernetes_utils,
                         'is_incluster_config_available', lambda: incluster)
     monkeypatch.setattr(lb_k8s.kubernetes_utils,
                         'get_kube_config_context_namespace',
-                        lambda ctx: namespace)
+                        lambda unused_context: namespace)
     monkeypatch.setattr(lb_k8s.kubernetes, 'in_cluster_context_name',
                         lambda: 'in-cluster')
-    monkeypatch.setattr(lb_k8s.serve_utils, 'get_controller_auth_token',
-                        lambda: token)
-    monkeypatch.setattr(lb_k8s.serve_utils, 'get_lb_auth_token',
-                        lambda: lb_token)
-    if pod_name is not None:
-        monkeypatch.setenv(constants.POD_NAME_ENV_VAR, pod_name)
-    else:
-        monkeypatch.delenv(constants.POD_NAME_ENV_VAR, raising=False)
-
-    apps_api = apps_api if apps_api is not None else mock.MagicMock()
-    core_api = core_api if core_api is not None else mock.MagicMock()
-
-    # read_namespaced_pod(...).spec.containers[0] -> image + (optionally) the
-    # controller's auth-token envs, which _resolve_lb_auth_envs mirrors onto the
-    # LB. *_secret=(name, key) makes the controller carry that token as a
-    # secretKeyRef (the prod/ESO shape); when None but the token is set, the
-    # controller carries it inline (the fallback path).
-    def _mk_env(name, value, secret):
-        ev = mock.MagicMock()
-        ev.name = name
-        if secret is not None:
-            ev.value = None
-            skr = mock.MagicMock()
-            skr.name, skr.key = secret
-            skr.optional = None
-            ev.value_from.secret_key_ref = skr
-        else:
-            ev.value = value
-            ev.value_from = None
-        return ev
-
-    pod = mock.MagicMock()
-    container = mock.MagicMock()
-    container.image = image
-    env_list = []
-    if token is not None:
-        env_list.append(
-            _mk_env(constants.CONTROLLER_AUTH_TOKEN_ENV_VAR, token,
-                    token_secret))
-    if lb_token is not None:
-        env_list.append(
-            _mk_env(constants.LB_AUTH_TOKEN_ENV_VAR, lb_token, lb_token_secret))
-    container.env = env_list
-    pod.spec.containers = [container]
-    core_api.read_namespaced_pod.return_value = pod
-
-    monkeypatch.setattr(lb_k8s.kubernetes,
-                        'apps_api',
-                        lambda ctx=None: apps_api)
-    monkeypatch.setattr(lb_k8s.kubernetes,
-                        'core_api',
-                        lambda ctx=None: core_api)
     monkeypatch.setattr(lb_k8s.kubernetes, 'api_exception',
                         lambda: _ApiException)
+    monkeypatch.setattr(lb_k8s.serve_utils,
+                        'get_lb_sync_auth_tokens',
+                        lambda required=False: ('sync-current', 'sync-old'))
+    monkeypatch.setattr(lb_k8s.serve_utils,
+                        'get_controller_admin_auth_tokens',
+                        lambda required=False: ('admin-current',))
+    monkeypatch.setattr(lb_k8s.serve_utils,
+                        'get_lb_auth_tokens',
+                        lambda required=False: ('data-current', 'data-old'))
+
+    env = {
+        'SKYPILOT_SERVE_API_SERVICE_URL': 'http://sky-api.skypilot.svc.cluster.local',
+        constants.LB_SYNC_AUTH_TOKENS_FILE_ENV_VAR: '/etc/skypilot/serve-auth/lb-sync/tokens',
+        constants.CONTROLLER_ADMIN_AUTH_TOKENS_FILE_ENV_VAR: '/etc/skypilot/serve-auth/controller-admin/tokens',
+        constants.LB_AUTH_TOKENS_FILE_ENV_VAR: '/etc/skypilot/serve-auth/lb-data-plane/tokens',
+    }
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    if pod_name is None:
+        monkeypatch.delenv(constants.POD_NAME_ENV_VAR, raising=False)
+    else:
+        monkeypatch.setenv(constants.POD_NAME_ENV_VAR, pod_name)
+    if pod_namespace is None:
+        monkeypatch.delenv(constants.POD_NAMESPACE_ENV_VAR, raising=False)
+    else:
+        monkeypatch.setenv(constants.POD_NAMESPACE_ENV_VAR, pod_namespace)
+
+    apps_api = apps_api or mock.MagicMock()
+    core_api = core_api or mock.MagicMock()
+    read_service = core_api.read_namespaced_service
+    if (read_service.side_effect is None and
+            isinstance(read_service.return_value, mock.MagicMock)):
+        read_service.return_value = SimpleNamespace(spec=SimpleNamespace(
+            selector={'app': lb_k8s.lb_deployment_name('svc')},
+            ports=[
+                SimpleNamespace(port=constants.LOAD_BALANCER_PORT_START,
+                                target_port=constants.LOAD_BALANCER_PORT_START,
+                                protocol='TCP')
+            ]))
+    read_deployment = apps_api.read_namespaced_deployment
+    if (read_deployment.side_effect is None and
+            isinstance(read_deployment.return_value, mock.MagicMock)):
+        read_deployment.return_value = SimpleNamespace(
+            metadata=SimpleNamespace(generation=1),
+            spec=SimpleNamespace(replicas=1),
+            status=SimpleNamespace(observed_generation=1,
+                                   updated_replicas=1,
+                                   available_replicas=1,
+                                   unavailable_replicas=0))
+    monkeypatch.setattr(lb_k8s.kubernetes,
+                        'apps_api',
+                        lambda unused_context=None: apps_api)
+    monkeypatch.setattr(lb_k8s.kubernetes,
+                        'core_api',
+                        lambda unused_context=None: core_api)
+
+    container = SimpleNamespace(
+        image=image,
+        image_pull_policy=image_policy,
+        security_context=container_security_context,
+        resources=resources,
+        volume_mounts=[
+            _mount(lb_k8s.LB_SYNC_AUTH_VOLUME_NAME,
+                   '/etc/skypilot/serve-auth/lb-sync'),
+            _mount('skypilot-serve-controller-admin-auth',
+                   '/etc/skypilot/serve-auth/controller-admin'),
+            _mount(lb_k8s.LB_DATA_PLANE_AUTH_VOLUME_NAME,
+                   '/etc/skypilot/serve-auth/lb-data-plane'),
+        ])
+    status = SimpleNamespace(image_id=image_id)
+    pod = SimpleNamespace(
+        spec=SimpleNamespace(containers=[container],
+                             security_context=pod_security_context,
+                             node_selector=node_selector,
+                             tolerations=tolerations,
+                             affinity=affinity,
+                             runtime_class_name=runtime_class_name,
+                             priority_class_name=priority_class_name,
+                             scheduler_name=scheduler_name,
+                             image_pull_secrets=list(image_pull_secrets),
+                             volumes=[
+                                 _volume(lb_k8s.LB_SYNC_AUTH_VOLUME_NAME,
+                                         'sync-secret'),
+                                 _volume('skypilot-serve-controller-admin-auth',
+                                         'admin-secret'),
+                                 _volume(lb_k8s.LB_DATA_PLANE_AUTH_VOLUME_NAME,
+                                         'data-secret'),
+                             ]),
+        status=SimpleNamespace(container_statuses=[status] if image_id else []))
+    core_api.read_namespaced_pod.return_value = pod
+
+    live = set(db_service_names)
+    monkeypatch.setattr(
+        lb_k8s.serve_state, 'get_service_from_name', lambda name: {
+            'name': name,
+            'controller_pid': os.getpid(),
+            'hash': 'incarnation',
+        } if name in live else None)
     return apps_api, core_api
 
 
-# --------------------------------------------------------------------------- #
-# Name helpers
-# --------------------------------------------------------------------------- #
-def test_name_helpers_rfc1123_simple():
-    dep = lb_k8s.lb_deployment_name('my-service')
-    svc = lb_k8s.lb_service_name('my-service')
-    assert dep == svc  # Deployment and Service share the base name.
-    assert _RFC1123.match(dep)
-    assert len(dep) <= 63
+def test_name_helpers_are_unique_rfc1123():
+    names = ['my-service', 'My_Service', 'svc-a', 'svc_a', 'x' * 200, '___']
+    rendered = [lb_k8s.lb_base_name(name) for name in names]
+    assert len(set(rendered)) == len(rendered)
+    assert all(
+        _RFC1123.fullmatch(name) and len(name) <= 63 for name in rendered)
 
 
-@pytest.mark.parametrize('name', [
-    'My_Service',
-    'UPPER',
-    'has spaces & symbols!!',
-    'a' * 200,
-    '____',
-    'trailing-dash-',
-])
-def test_name_helpers_sanitize(name):
-    dep = lb_k8s.lb_deployment_name(name)
-    assert _RFC1123.match(dep), dep
-    assert len(dep) <= 63
-    # Deterministic.
-    assert dep == lb_k8s.lb_deployment_name(name)
+def test_external_runtime_fails_closed(monkeypatch):
+    _install(monkeypatch, external=False)
+    with pytest.raises(RuntimeError, match='external load balancer'):
+        lb_k8s.require_external_lb_runtime()
+
+    _install(monkeypatch, incluster=False)
+    with pytest.raises(RuntimeError, match='in-cluster'):
+        lb_k8s.require_external_lb_runtime()
 
 
-def test_long_name_gets_hash_suffix_and_is_unique():
-    a = lb_k8s.lb_deployment_name('x' * 100 + '-alpha')
-    b = lb_k8s.lb_deployment_name('x' * 100 + '-beta')
-    assert a != b
-    assert len(a) <= 63 and len(b) <= 63
+def test_external_runtime_requires_projected_files(monkeypatch):
+    _install(monkeypatch)
+    monkeypatch.delenv(constants.LB_SYNC_AUTH_TOKENS_FILE_ENV_VAR)
+    with pytest.raises(RuntimeError, match='projected Secret'):
+        lb_k8s.require_external_lb_runtime()
 
 
-def test_sanitize_collision_gets_distinct_names():
-    # Distinct originals that sanitize to the same string ('svc-a') must NOT
-    # collide: the hash of the ORIGINAL name keeps them apart.
-    a = lb_k8s.lb_deployment_name('svc_a')
-    b = lb_k8s.lb_deployment_name('svc-a')
-    assert a != b
-    # Deterministic + RFC1123 for both.
-    assert a == lb_k8s.lb_deployment_name('svc_a')
-    assert _RFC1123.match(a) and _RFC1123.match(b)
-    assert len(a) <= 63 and len(b) <= 63
+def test_external_runtime_requires_pod_namespace(monkeypatch):
+    _install(monkeypatch, pod_namespace=None)
+    with pytest.raises(RuntimeError, match=constants.POD_NAMESPACE_ENV_VAR):
+        lb_k8s.require_external_lb_runtime()
 
 
-def test_lb_service_endpoint_format():
-    ep = lb_k8s.lb_service_endpoint('my-service', 'skypilot')
-    name = lb_k8s.lb_service_name('my-service')
-    assert ep == (f'{name}.skypilot.svc.cluster.local'
-                  f':{constants.LOAD_BALANCER_PORT_START}')
-    assert '://' not in ep  # No scheme.
-
-
-# --------------------------------------------------------------------------- #
-# create_lb_deployment_and_service
-# --------------------------------------------------------------------------- #
-def test_create_builds_both_objects(monkeypatch):
+def test_create_builds_proxy_deployment_and_service(monkeypatch):
     apps, core = _install(monkeypatch)
+    lb_k8s.create_lb_deployment_and_service('svc-a', 225)
 
-    lb_k8s.create_lb_deployment_and_service('svc-a', controller_port=20005)
-
-    apps.create_namespaced_deployment.assert_called_once()
-    core.create_namespaced_service.assert_called_once()
-
-    ns_arg, dep = apps.create_namespaced_deployment.call_args.args
-    assert ns_arg == 'skypilot'
-    assert dep['metadata']['name'] == lb_k8s.lb_deployment_name('svc-a')
-    container = dep['spec']['template']['spec']['containers'][0]
-    # Controller address wires the shared controller Service + the port.
+    namespace, deployment = apps.create_namespaced_deployment.call_args.args
+    assert namespace == 'skypilot'
+    pod_spec = deployment['spec']['template']['spec']
+    container = pod_spec['containers'][0]
+    assert container['image'] == f'repo/skypilot@{_DIGEST_A}'
+    assert pod_spec['automountServiceAccountToken'] is False
+    assert pod_spec['imagePullSecrets'] == [{'name': 'registry-credentials'}]
     args = container['args']
     controller_addr = args[args.index('--controller-addr') + 1]
-    assert lb_k8s.CONTROLLER_SERVICE_NAME in controller_addr
-    assert '20005' in controller_addr
-    # Must carry the http:// scheme: the LB POSTs directly to this address and
-    # the HTTP client rejects a schemeless URL (regression from live testing).
-    assert controller_addr.startswith('http://')
-    # LB listens on LOAD_BALANCER_PORT_START.
-    lb_port = args[args.index('--load-balancer-port') + 1]
-    assert lb_port == str(constants.LOAD_BALANCER_PORT_START)
-    assert container['image'] == 'my-repo/skypilot:v1'
+    assert controller_addr == (
+        'http://sky-api.skypilot.svc.cluster.local/api/internal/serve/svc-a')
+    assert '10.' not in controller_addr
+    assert ':200' not in controller_addr
+    assert pod_spec['terminationGracePeriodSeconds'] == 225
+    assert container['startupProbe']['httpGet'][
+        'path'] == constants.LB_LIVENESS_ENDPOINT_PATH
+    assert container['livenessProbe']['httpGet'][
+        'path'] == constants.LB_LIVENESS_ENDPOINT_PATH
+    assert container['readinessProbe']['httpGet'][
+        'path'] == constants.LB_HEALTH_ENDPOINT_PATH
 
-    ns_svc, svc = core.create_namespaced_service.call_args.args
-    assert ns_svc == 'skypilot'
-    assert svc['metadata']['name'] == lb_k8s.lb_service_name('svc-a')
-    assert svc['spec']['ports'][0]['port'] == constants.LOAD_BALANCER_PORT_START
+    env = {entry['name']: entry for entry in container['env']}
+    assert constants.LB_SYNC_AUTH_TOKENS_FILE_ENV_VAR in env
+    assert constants.LB_AUTH_TOKENS_FILE_ENV_VAR in env
+    assert constants.CONTROLLER_ADMIN_AUTH_TOKENS_FILE_ENV_VAR not in env
+    assert env[constants.EXTERNAL_LB_ENABLED_ENV_VAR]['value'] == 'true'
+    assert env[constants.LB_POD_UID_ENV_VAR]['valueFrom']['fieldRef'][
+        'fieldPath'] == 'metadata.uid'
 
-
-def test_create_auth_token_mirrors_secret_ref(monkeypatch):
-    # Prod/ESO shape: the controller carries the token as a secretKeyRef, so the
-    # LB must reference the SAME Secret -- never a plaintext value in its spec.
-    apps, _ = _install(monkeypatch,
-                       token='secret-token',
-                       token_secret=('skypilot-serve-token', 'token'))
-    lb_k8s.create_lb_deployment_and_service('svc-a', 20005)
-    _, dep = apps.create_namespaced_deployment.call_args.args
-    env = dep['spec']['template']['spec']['containers'][0].get('env', [])
-    entry = next(
-        e for e in env if e['name'] == constants.CONTROLLER_AUTH_TOKEN_ENV_VAR)
-    assert 'value' not in entry  # No plaintext token in the manifest.
-    ref = entry['valueFrom']['secretKeyRef']
-    assert ref['name'] == 'skypilot-serve-token'
-    assert ref['key'] == 'token'
-
-
-def test_create_auth_token_inline_fallback(monkeypatch):
-    # When the controller carries the token inline (non-ESO / test), the LB
-    # mirrors the resolved value rather than a secretKeyRef.
-    apps, _ = _install(monkeypatch, token='secret-token', token_secret=None)
-    lb_k8s.create_lb_deployment_and_service('svc-a', 20005)
-    _, dep = apps.create_namespaced_deployment.call_args.args
-    env = dep['spec']['template']['spec']['containers'][0].get('env', [])
-    names = {e['name']: e.get('value') for e in env}
-    assert names.get(constants.CONTROLLER_AUTH_TOKEN_ENV_VAR) == 'secret-token'
-
-
-def test_create_mirrors_both_tokens(monkeypatch):
-    # Regression: the LB pod must receive BOTH the control-plane token (to reach
-    # the controller) AND the inbound LB token (or its auth middleware is a
-    # silent no-op in the real pod). Both mirrored as secretKeyRef.
-    apps, _ = _install(monkeypatch,
-                       token='ctrl-tok',
-                       token_secret=('skypilot-serve-token', 'controller'),
-                       lb_token='lb-tok',
-                       lb_token_secret=('skypilot-serve-token', 'lb'))
-    lb_k8s.create_lb_deployment_and_service('svc-a', 20005)
-    _, dep = apps.create_namespaced_deployment.call_args.args
-    env = dep['spec']['template']['spec']['containers'][0].get('env', [])
-    by_name = {e['name']: e for e in env}
-    assert set(by_name) == {
-        constants.CONTROLLER_AUTH_TOKEN_ENV_VAR, constants.LB_AUTH_TOKEN_ENV_VAR
+    volume_names = {volume['name'] for volume in pod_spec['volumes']}
+    assert volume_names == {
+        lb_k8s.LB_SYNC_AUTH_VOLUME_NAME,
+        lb_k8s.LB_DATA_PLANE_AUTH_VOLUME_NAME,
     }
-    for entry in by_name.values():
-        assert 'value' not in entry  # No plaintext token in the manifest.
-        assert entry['valueFrom']['secretKeyRef']['name'] == \
-            'skypilot-serve-token'
-    assert by_name[constants.LB_AUTH_TOKEN_ENV_VAR]['valueFrom'][
-        'secretKeyRef']['key'] == 'lb'
+    serialized = repr(deployment)
+    assert 'admin-secret' not in serialized
+    assert 'sync-current' not in serialized
+    assert 'data-current' not in serialized
+
+    _, service = core.create_namespaced_service.call_args.args
+    assert service['spec']['ports'][0]['port'] == \
+        constants.LOAD_BALANCER_PORT_START
 
 
-def test_create_injects_inbound_token_even_without_controller_token(
-        monkeypatch):
-    # Inbound data-plane auth must activate independently of control-plane auth.
-    apps, _ = _install(monkeypatch, token=None, lb_token='lb-tok')
-    lb_k8s.create_lb_deployment_and_service('svc-a', 20005)
-    _, dep = apps.create_namespaced_deployment.call_args.args
-    env = dep['spec']['template']['spec']['containers'][0].get('env', [])
-    names = {e['name'] for e in env}
-    assert names == {constants.LB_AUTH_TOKEN_ENV_VAR}
+def test_create_mirrors_only_safe_nonroot_volume_access(monkeypatch):
+    apps, core = _install(monkeypatch,
+                          pod_security_context={
+                              'runAsUser': 10001,
+                              'runAsGroup': 10001,
+                              'fsGroup': 10001,
+                              'fsGroupChangePolicy': 'OnRootMismatch',
+                          },
+                          container_security_context={
+                              'runAsUser': 10001,
+                              'runAsNonRoot': True,
+                              'allowPrivilegeEscalation': False,
+                              'readOnlyRootFilesystem': True,
+                              'privileged': True,
+                              'capabilities': {
+                                  'add': ['SYS_ADMIN'],
+                                  'drop': ['ALL']
+                              },
+                          },
+                          resources={
+                              'requests': {
+                                  'cpu': '250m',
+                                  'memory': '256Mi'
+                              },
+                              'limits': {
+                                  'cpu': '1',
+                                  'memory': '1Gi'
+                              },
+                          })
+    # Host/service-account identity belongs to the API Pod and must not leak
+    # into the lower-trust data-plane Pod even when present on the source.
+    source_spec = core.read_namespaced_pod.return_value.spec
+    source_spec.host_network = True
+    source_spec.host_pid = True
+    source_spec.service_account_name = 'api-admin'
+
+    lb_k8s.create_lb_deployment_and_service('svc-a', 225)
+
+    deployment = apps.create_namespaced_deployment.call_args.args[1]
+    pod_spec = deployment['spec']['template']['spec']
+    container = pod_spec['containers'][0]
+    assert pod_spec['securityContext'] == {
+        'runAsUser': 10001,
+        'runAsGroup': 10001,
+        'fsGroup': 10001,
+        'fsGroupChangePolicy': 'OnRootMismatch',
+    }
+    assert container['securityContext'] == {
+        'runAsUser': 10001,
+        'runAsNonRoot': True,
+        'allowPrivilegeEscalation': False,
+        'readOnlyRootFilesystem': True,
+        'capabilities': {
+            'drop': ['ALL']
+        },
+    }
+    assert container['resources'] == lb_k8s._DEFAULT_LB_RESOURCES
+    assert 'privileged' not in container['securityContext']
+    assert 'add' not in container['securityContext']['capabilities']
+    assert pod_spec['automountServiceAccountToken'] is False
+    assert 'hostNetwork' not in pod_spec
+    assert 'hostPID' not in pod_spec
+    assert 'serviceAccountName' not in pod_spec
 
 
-def test_create_no_auth_token_omits_env(monkeypatch):
-    apps, _ = _install(monkeypatch, token=None)
-    lb_k8s.create_lb_deployment_and_service('svc-a', 20005)
-    _, dep = apps.create_namespaced_deployment.call_args.args
-    assert 'env' not in dep['spec']['template']['spec']['containers'][0]
+def test_create_mirrors_tainted_pool_and_runtime_scheduling(monkeypatch):
+    affinity = {
+        'nodeAffinity': {
+            'requiredDuringSchedulingIgnoredDuringExecution': {
+                'nodeSelectorTerms': [{
+                    'matchExpressions': [{
+                        'key': 'pool',
+                        'operator': 'In',
+                        'values': ['control-plane'],
+                    }]
+                }]
+            }
+        }
+    }
+    tolerations = [{
+        'key': 'dedicated',
+        'operator': 'Equal',
+        'value': 'control-plane',
+        'effect': 'NoSchedule',
+    }]
+    apps, _ = _install(monkeypatch,
+                       node_selector={'pool': 'control-plane'},
+                       tolerations=tolerations,
+                       affinity=affinity,
+                       runtime_class_name='gvisor',
+                       priority_class_name='platform-critical',
+                       scheduler_name='custom-scheduler')
+
+    lb_k8s.create_lb_deployment_and_service('svc-a', 225)
+
+    deployment = apps.create_namespaced_deployment.call_args.args[1]
+    pod_spec = deployment['spec']['template']['spec']
+    assert pod_spec['nodeSelector'] == {'pool': 'control-plane'}
+    assert pod_spec['tolerations'] == tolerations
+    assert 'affinity' not in pod_spec
+    assert pod_spec['runtimeClassName'] == 'gvisor'
+    assert 'priorityClassName' not in pod_spec
+    assert pod_spec['schedulerName'] == 'custom-scheduler'
 
 
-def test_create_swallows_409(monkeypatch):
-    apps = mock.MagicMock()
-    core = mock.MagicMock()
-    apps.create_namespaced_deployment.side_effect = _ApiException(409)
-    core.create_namespaced_service.side_effect = _ApiException(409)
-    _install(monkeypatch, apps_api=apps, core_api=core)
+def test_api_pod_namespace_wins_over_workload_context(monkeypatch):
+    apps, core = _install(monkeypatch,
+                          namespace='workloads',
+                          pod_namespace='control-plane')
+    lb_k8s.create_lb_deployment_and_service('svc-a', 225)
 
-    # Must not raise.
-    lb_k8s.create_lb_deployment_and_service('svc-a', 20005)
-    apps.create_namespaced_deployment.assert_called_once()
-    core.create_namespaced_service.assert_called_once()
-
-
-def test_create_409_patches_deployment(monkeypatch):
-    apps = mock.MagicMock()
-    core = mock.MagicMock()
-    apps.create_namespaced_deployment.side_effect = _ApiException(409)
-    _install(monkeypatch, apps_api=apps, core_api=core)
-
-    # 409 on create -> patch the existing Deployment to the desired spec so
-    # image/arg bumps roll out. Must not raise.
-    lb_k8s.create_lb_deployment_and_service('svc-a', 20005)
-    apps.patch_namespaced_deployment.assert_called_once()
-    name_arg, ns_arg, body = apps.patch_namespaced_deployment.call_args.args
-    assert name_arg == lb_k8s.lb_deployment_name('svc-a')
-    assert ns_arg == 'skypilot'
-    assert body['metadata']['name'] == lb_k8s.lb_deployment_name('svc-a')
+    assert apps.create_namespaced_deployment.call_args.args[
+        0] == 'control-plane'
+    assert core.create_namespaced_service.call_args.args[0] == 'control-plane'
+    assert core.read_namespaced_pod.call_args_list[0].args[1] == 'control-plane'
+    assert (lb_k8s.lb_service_endpoint_or_none('svc-a') ==
+            f'{lb_k8s.lb_service_name("svc-a")}.control-plane.svc:30001')
 
 
-def test_deployment_has_readiness_probe_and_rolling_update(monkeypatch):
+def test_image_pull_secret_refs_are_name_only(monkeypatch):
+    apps, _ = _install(monkeypatch,
+                       image_pull_secrets=({
+                           'name': 'registry-credentials',
+                           'unexpected': 'must-not-propagate',
+                       },))
+    lb_k8s.create_lb_deployment_and_service('svc-a', 225)
+
+    deployment = apps.create_namespaced_deployment.call_args.args[1]
+    pod_spec = deployment['spec']['template']['spec']
+    assert pod_spec['imagePullSecrets'] == [{'name': 'registry-credentials'}]
+    assert 'must-not-propagate' not in repr(deployment)
+
+
+def test_controller_owner_change_does_not_change_lb_template(monkeypatch):
     apps, _ = _install(monkeypatch)
-    lb_k8s.create_lb_deployment_and_service('svc-a', 20005)
-    _, dep = apps.create_namespaced_deployment.call_args.args
-    container = dep['spec']['template']['spec']['containers'][0]
-    # Readiness gated on the LB's drain-aware health route.
-    probe = container['readinessProbe']
-    assert probe['httpGet']['path'] == '/_lb/health'
-    assert probe['httpGet']['port'] == constants.LOAD_BALANCER_PORT_START
-    # Rolling update keeps the old pod until the new one is Ready (no gap).
-    strategy = dep['spec']['strategy']
-    assert strategy['type'] == 'RollingUpdate'
-    assert strategy['rollingUpdate']['maxUnavailable'] == 0
+    lb_k8s.create_lb_deployment_and_service('svc', 225)
+    first = apps.create_namespaced_deployment.call_args.args[1]
+    monkeypatch.setenv('POD_IP', '10.99.0.5')
+    lb_k8s.create_lb_deployment_and_service('svc', 225)
+    second = apps.create_namespaced_deployment.call_args.args[1]
+    assert first['spec']['template'] == second['spec']['template']
 
 
-def test_create_reraises_non_409(monkeypatch):
+def test_rollout_readiness_rejects_old_available_surge_pod():
+    deployment = SimpleNamespace(metadata=SimpleNamespace(generation=2),
+                                 spec=SimpleNamespace(replicas=1),
+                                 status=SimpleNamespace(observed_generation=2,
+                                                        replicas=2,
+                                                        updated_replicas=1,
+                                                        available_replicas=1,
+                                                        unavailable_replicas=0))
+    assert not lb_k8s._lb_deployment_is_ready(deployment)
+
+
+def test_create_409_patches_legacy_deployment(monkeypatch):
     apps = mock.MagicMock()
-    apps.create_namespaced_deployment.side_effect = _ApiException(500)
+    apps.create_namespaced_deployment.side_effect = _ApiException(409)
     _install(monkeypatch, apps_api=apps)
+    lb_k8s.create_lb_deployment_and_service('svc', 225)
+    apps.patch_namespaced_deployment.assert_called_once()
+    patched = apps.patch_namespaced_deployment.call_args.args[2]
+    args = patched['spec']['template']['spec']['containers'][0]['args']
+    assert '/api/internal/serve/svc' in args[1]
 
-    with pytest.raises(_ApiException):
-        lb_k8s.create_lb_deployment_and_service('svc-a', 20005)
+
+def test_same_name_recreation_fences_old_service_before_reconcile(monkeypatch):
+    apps = mock.MagicMock()
+    core = mock.MagicMock()
+    core.create_namespaced_service.side_effect = _ApiException(409)
+    core.read_namespaced_service.return_value = SimpleNamespace(
+        spec=SimpleNamespace(
+            selector={
+                'app': lb_k8s.lb_deployment_name('svc'),
+                lb_k8s.SERVICE_HASH_LABEL_KEY: 'old-incarnation',
+            }))
+    _install(monkeypatch, apps_api=apps, core_api=core)
+
+    lb_k8s.create_lb_deployment_and_service('svc',
+                                            225,
+                                            service_hash='new-incarnation')
+
+    assert core.patch_namespaced_service.call_count == 2
+    fence = core.patch_namespaced_service.call_args_list[0].args[2]
+    assert fence['spec'] == {
+        'selector': {
+            'app': lb_k8s.lb_deployment_name('svc'),
+            lb_k8s.SERVICE_HASH_LABEL_KEY: 'new-incarnation',
+        }
+    }
+    final = core.patch_namespaced_service.call_args_list[1].args[2]
+    assert final['spec']['ports'][0][
+        'targetPort'] == constants.LOAD_BALANCER_PORT_START
 
 
-def test_create_requires_pod_name(monkeypatch):
+def test_create_fails_until_updated_lb_pod_is_ready(monkeypatch):
+    apps = mock.MagicMock()
+    apps.read_namespaced_deployment.return_value = SimpleNamespace(
+        metadata=SimpleNamespace(generation=2),
+        spec=SimpleNamespace(replicas=1),
+        status=SimpleNamespace(observed_generation=2,
+                               updated_replicas=0,
+                               available_replicas=0,
+                               unavailable_replicas=1))
+    _install(monkeypatch, apps_api=apps)
+    clock = [0.0]
+    monkeypatch.setattr(lb_k8s.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(
+        lb_k8s.time, 'sleep',
+        lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    monkeypatch.setattr(constants, 'LB_DEPLOYMENT_READY_TIMEOUT_SECONDS', 2)
+    with pytest.raises(RuntimeError, match='did not become ready'):
+        lb_k8s.create_lb_deployment_and_service('svc', 225)
+
+
+def test_create_requires_chart_pod_contract(monkeypatch):
     _install(monkeypatch, pod_name=None)
-    with pytest.raises(RuntimeError):
-        lb_k8s.create_lb_deployment_and_service('svc-a', 20005)
+    with pytest.raises(RuntimeError, match=constants.POD_NAME_ENV_VAR):
+        lb_k8s.create_lb_deployment_and_service('svc', 225)
 
 
-# --------------------------------------------------------------------------- #
-# delete_lb_objects
-# --------------------------------------------------------------------------- #
-def test_delete_both_objects(monkeypatch):
-    apps, core = _install(monkeypatch)
-    lb_k8s.delete_lb_objects('svc-a')
-    apps.delete_namespaced_deployment.assert_called_once()
-    core.delete_namespaced_service.assert_called_once()
-    dep_name, _ = apps.delete_namespaced_deployment.call_args.args
-    assert dep_name == lb_k8s.lb_deployment_name('svc-a')
+def test_image_policy_and_digest_are_pinned(monkeypatch):
+    _install(monkeypatch, image_policy='Always')
+    image, policy, digest = lb_k8s._resolve_lb_image('skypilot', 'in-cluster')
+    assert image == f'repo/skypilot@{_DIGEST_A}'
+    assert policy == 'Always'
+    assert digest == f'repo/skypilot@{_DIGEST_A}'
 
 
-def test_delete_swallows_404(monkeypatch):
+def test_declared_digest_is_accepted_before_runtime_status(monkeypatch):
+    declared = f'repo/skypilot@{_DIGEST_A}'
+    _install(monkeypatch, image=declared, image_id=None)
+    image, policy, digest = lb_k8s._resolve_lb_image('skypilot', 'in-cluster')
+    assert (image, policy, digest) == (declared, 'Always', declared)
+
+
+def test_lb_resources_are_configurable(monkeypatch):
+    monkeypatch.setenv(constants.LB_RESOURCES_ENV_VAR,
+                       '{"requests":{"cpu":"250m","memory":"256Mi"}}')
+    assert lb_k8s._lb_resources() == {
+        'requests': {
+            'cpu': '250m',
+            'memory': '256Mi'
+        }
+    }
+
+
+@pytest.mark.parametrize(('declared_image', 'image_id', 'expected'), [
+    ('repo/skypilot:moving',
+     f'docker-pullable://registry.example/repo/skypilot@{_DIGEST_A}',
+     f'registry.example/repo/skypilot@{_DIGEST_A}'),
+    ('registry.example:5000/repo/skypilot:moving', f'containerd://{_DIGEST_B}',
+     f'registry.example:5000/repo/skypilot@{_DIGEST_B}'),
+    ('repo/skypilot:moving', f'repo/skypilot@{_DIGEST_A}',
+     f'repo/skypilot@{_DIGEST_A}'),
+])
+def test_runtime_image_id_formats_are_pinned(monkeypatch, declared_image,
+                                             image_id, expected):
+    _install(monkeypatch, image=declared_image, image_id=image_id)
+    image, policy, digest = lb_k8s._resolve_lb_image('skypilot', 'in-cluster')
+    assert image == expected
+    assert policy == 'Always'
+    assert digest == expected
+
+
+@pytest.mark.parametrize('image_id', [
+    None,
+    'repo/skypilot@sha256:abc',
+    f'unknown-runtime://{_DIGEST_A}',
+    'not-a-digest',
+])
+def test_unparseable_runtime_image_id_fails_closed(monkeypatch, image_id):
+    _install(monkeypatch, image='repo/skypilot:moving', image_id=image_id)
+    with pytest.raises(RuntimeError, match='Cannot pin'):
+        lb_k8s._resolve_lb_image('skypilot', 'in-cluster')
+
+
+def test_digest_only_image_id_with_unsafe_declared_image_fails_closed(
+        monkeypatch):
+    _install(monkeypatch,
+             image='https://registry.example/repo/skypilot:moving',
+             image_id=f'containerd://{_DIGEST_A}')
+    with pytest.raises(RuntimeError, match='Cannot pin'):
+        lb_k8s._resolve_lb_image('skypilot', 'in-cluster')
+
+
+def test_termination_grace_budget():
+    assert lb_k8s.lb_termination_grace_period_seconds(120, None) == 165
+    assert lb_k8s.lb_termination_grace_period_seconds(120, 600) == 645
+    assert lb_k8s.lb_termination_grace_period_seconds(0.5, None) == 46
+
+
+@pytest.mark.parametrize(
+    ('stream_timeout', 'graceful_drain'), [(-1, None), (float('nan'), None),
+                                           (float('inf'), None), (1, -0.1),
+                                           (1, float('nan')), (1, float('inf')),
+                                           (True, None), (1, False)])
+def test_termination_grace_budget_rejects_invalid_numbers(
+        stream_timeout, graceful_drain):
+    with pytest.raises(ValueError, match='finite, nonnegative'):
+        lb_k8s.lb_termination_grace_period_seconds(stream_timeout,
+                                                   graceful_drain)
+
+
+def test_ensure_missing_object_is_ownership_fenced(monkeypatch):
+    apps = mock.MagicMock()
+    apps.read_namespaced_deployment.side_effect = _ApiException(404)
+    _install(monkeypatch, apps_api=apps, db_service_names=())
+    with mock.patch.object(lb_k8s,
+                           'create_lb_deployment_and_service') as create:
+        lb_k8s.ensure_lb_objects_exist('svc', 225)
+    create.assert_not_called()
+
+    _install(monkeypatch, apps_api=apps, db_service_names=('svc',))
+    with mock.patch.object(lb_k8s,
+                           'create_lb_deployment_and_service') as create:
+        lb_k8s.ensure_lb_objects_exist('svc', 225)
+    create.assert_called_once_with('svc', 225)
+
+
+def test_ensure_reconciles_updated_termination_budget(monkeypatch):
+    apps = mock.MagicMock()
+    apps.read_namespaced_deployment.return_value = {
+        'spec': {
+            'template': {
+                'spec': {
+                    'terminationGracePeriodSeconds': 165
+                }
+            }
+        }
+    }
+    _install(monkeypatch, apps_api=apps, db_service_names=('svc',))
+    with mock.patch.object(lb_k8s,
+                           'create_lb_deployment_and_service') as create:
+        lb_k8s.ensure_lb_objects_exist('svc', 645)
+    create.assert_called_once_with('svc', 645)
+
+
+def test_ensure_reports_existing_crashloop_as_unhealthy(monkeypatch):
+    apps = mock.MagicMock()
+    apps.read_namespaced_deployment.return_value = SimpleNamespace(
+        metadata=SimpleNamespace(generation=1),
+        spec=SimpleNamespace(replicas=1,
+                             template=SimpleNamespace(spec=SimpleNamespace(
+                                 termination_grace_period_seconds=225))),
+        status=SimpleNamespace(observed_generation=1,
+                               updated_replicas=1,
+                               available_replicas=0,
+                               unavailable_replicas=1))
+    _install(monkeypatch, apps_api=apps, db_service_names=('svc',))
+    assert not lb_k8s.ensure_lb_objects_exist('svc', 225)
+
+
+def _lb_pod(uid, phase='Running', deleting=False, ready=True):
+    return SimpleNamespace(metadata=SimpleNamespace(
+        uid=uid, deletion_timestamp='now' if deleting else None),
+                           status=SimpleNamespace(
+                               phase=phase,
+                               conditions=[
+                                   SimpleNamespace(
+                                       type='Ready',
+                                       status=('True' if ready else 'False'))
+                               ]))
+
+
+def test_pod_authority_splits_ready_from_live_with_one_listing(monkeypatch):
+    _, core = _install(monkeypatch, db_service_names=('svc',))
+    core.list_namespaced_pod.return_value = SimpleNamespace(items=[
+        _lb_pod('new'),
+        _lb_pod('old', deleting=True),
+        _lb_pod('unready', ready=False),
+        _lb_pod('pending', phase='Pending'),
+        _lb_pod('done', phase='Succeeded'),
+        _lb_pod('failed', phase='Failed'),
+    ])
+    assert lb_k8s.get_lb_pod_authority('svc') == lb_k8s.LbPodAuthority(
+        ready_nonterminating_uids={'new'},
+        live_uids={'new', 'old', 'unready', 'pending'})
+    core.list_namespaced_pod.assert_called_once()
+    assert core.list_namespaced_pod.call_args.kwargs['label_selector'] == (
+        f'app={lb_k8s.lb_deployment_name("svc")},'
+        f'{lb_k8s.SERVICE_HASH_LABEL_KEY}=incarnation')
+
+
+def test_pod_authority_query_failure_is_unknown(monkeypatch):
+    _, core = _install(monkeypatch, db_service_names=('svc',))
+    core.list_namespaced_pod.side_effect = RuntimeError('apiserver down')
+    assert lb_k8s.get_lb_pod_authority('svc') is None
+
+
+def test_pod_authority_missing_live_uid_fails_closed(monkeypatch):
+    _, core = _install(monkeypatch, db_service_names=('svc',))
+    core.list_namespaced_pod.return_value = SimpleNamespace(items=[
+        _lb_pod('known'),
+        _lb_pod(None, ready=False),
+    ])
+    assert lb_k8s.get_lb_pod_authority('svc') is None
+
+
+def test_external_lb_logs_come_from_current_pod(monkeypatch, capsys):
+    _, core = _install(monkeypatch, db_service_names=('svc',))
+    older = _lb_pod('old')
+    older.metadata.name = 'lb-old'
+    older.metadata.creation_timestamp = '2026-01-01T00:00:00Z'
+    newer = _lb_pod('new')
+    newer.metadata.name = 'lb-new'
+    newer.metadata.creation_timestamp = '2026-01-02T00:00:00Z'
+    core.list_namespaced_pod.return_value = SimpleNamespace(
+        items=[older, newer])
+    core.read_namespaced_pod_log.return_value = 'line one\nline two\n'
+
+    assert lb_k8s.stream_lb_logs('svc', follow=False, tail=2) == ''
+
+    assert capsys.readouterr().out == 'line one\nline two\n'
+    assert core.read_namespaced_pod_log.call_args.kwargs['name'] == 'lb-new'
+    assert core.read_namespaced_pod_log.call_args.kwargs['tail_lines'] == 2
+
+
+def test_delete_is_idempotent(monkeypatch):
     apps = mock.MagicMock()
     core = mock.MagicMock()
     apps.delete_namespaced_deployment.side_effect = _ApiException(404)
     core.delete_namespaced_service.side_effect = _ApiException(404)
     _install(monkeypatch, apps_api=apps, core_api=core)
-
-    lb_k8s.delete_lb_objects('svc-a')  # Must not raise.
+    lb_k8s.delete_lb_objects('svc')
     apps.delete_namespaced_deployment.assert_called_once()
     core.delete_namespaced_service.assert_called_once()
 
 
-def test_delete_reraises_non_404(monkeypatch):
-    apps = mock.MagicMock()
-    apps.delete_namespaced_deployment.side_effect = _ApiException(500)
-    _install(monkeypatch, apps_api=apps)
-    with pytest.raises(_ApiException):
-        lb_k8s.delete_lb_objects('svc-a')
-
-
-# --------------------------------------------------------------------------- #
-# reconcile_lb_objects
-# --------------------------------------------------------------------------- #
-def _deployment_with_service_label(service_name):
-    dep = mock.MagicMock()
-    dep.metadata.labels = {lb_k8s.SERVE_LB_LABEL_KEY: service_name}
-    return dep
-
-
-def test_reconcile_deletes_only_orphans(monkeypatch):
+def test_cleanup_uses_service_account_namespace_when_feature_disabled(
+        monkeypatch):
     apps = mock.MagicMock()
     core = mock.MagicMock()
-    listed = mock.MagicMock()
-    listed.items = [
-        _deployment_with_service_label('A'),
-        _deployment_with_service_label('B'),
-    ]
-    apps.list_namespaced_deployment.return_value = listed
+    apps.list_namespaced_deployment.return_value = SimpleNamespace(items=[])
+    core.list_namespaced_service.return_value = SimpleNamespace(items=[])
+    _install(monkeypatch,
+             apps_api=apps,
+             core_api=core,
+             external=False,
+             namespace='workloads',
+             pod_namespace=None)
+
+    with mock.patch('builtins.open',
+                    mock.mock_open(read_data='control-plane\n')):
+        lb_k8s.delete_lb_objects('svc')
+        lb_k8s.reconcile_lb_objects(set())
+
+    assert core.delete_namespaced_service.call_args.args[1] == 'control-plane'
+    assert apps.delete_namespaced_deployment.call_args.args[
+        1] == 'control-plane'
+    assert apps.list_namespaced_deployment.call_args.args[0] == 'control-plane'
+    assert core.list_namespaced_service.call_args.args[0] == 'control-plane'
+
+
+def test_reconcile_reaps_only_db_confirmed_orphans(monkeypatch):
+    apps = mock.MagicMock()
+    core = mock.MagicMock()
+    apps.list_namespaced_deployment.return_value = SimpleNamespace(items=[
+        SimpleNamespace(metadata=SimpleNamespace(
+            labels={lb_k8s.SERVE_LB_LABEL_KEY: 'live'})),
+        SimpleNamespace(metadata=SimpleNamespace(
+            labels={lb_k8s.SERVE_LB_LABEL_KEY: 'gone'})),
+    ])
+    core.list_namespaced_service.return_value = SimpleNamespace(items=[])
+    _install(monkeypatch,
+             apps_api=apps,
+             core_api=core,
+             db_service_names=('live',))
+    with mock.patch.object(lb_k8s, 'delete_lb_objects') as delete:
+        lb_k8s.reconcile_lb_objects(set())
+    delete.assert_called_once_with('gone')
+
+
+def test_reconcile_reaps_service_only_orphan(monkeypatch):
+    apps = mock.MagicMock()
+    core = mock.MagicMock()
+    apps.list_namespaced_deployment.return_value = SimpleNamespace(items=[])
+    core.list_namespaced_service.return_value = SimpleNamespace(items=[
+        SimpleNamespace(metadata=SimpleNamespace(
+            labels={lb_k8s.SERVE_LB_LABEL_KEY: 'service-only'})),
+    ])
     _install(monkeypatch, apps_api=apps, core_api=core)
 
-    lb_k8s.reconcile_lb_objects({'A'})
+    with mock.patch.object(lb_k8s, 'delete_lb_objects') as delete:
+        lb_k8s.reconcile_lb_objects(set())
 
-    # B is orphaned -> deleted; A is live -> untouched.
-    deleted = [
-        c.args[0] for c in apps.delete_namespaced_deployment.call_args_list
-    ]
-    assert deleted == [lb_k8s.lb_deployment_name('B')]
-
-
-def test_reconcile_no_orphans_deletes_nothing(monkeypatch):
-    apps = mock.MagicMock()
-    listed = mock.MagicMock()
-    listed.items = [
-        _deployment_with_service_label('A'),
-        _deployment_with_service_label('B'),
-    ]
-    apps.list_namespaced_deployment.return_value = listed
-    _install(monkeypatch, apps_api=apps)
-
-    lb_k8s.reconcile_lb_objects({'A', 'B'})
-    apps.delete_namespaced_deployment.assert_not_called()
-
-
-def test_reconcile_rechecks_db_before_deleting(monkeypatch):
-    apps = mock.MagicMock()
-    listed = mock.MagicMock()
-    listed.items = [
-        _deployment_with_service_label('A'),
-        _deployment_with_service_label('B'),
-    ]
-    apps.list_namespaced_deployment.return_value = listed
-    # B is absent from the stale snapshot but STILL present in the DB (created
-    # after the snapshot was taken) -> must NOT be reaped. A is in the snapshot.
-    _install(monkeypatch, apps_api=apps, db_service_names={'B'})
-
-    lb_k8s.reconcile_lb_objects({'A'})
-    apps.delete_namespaced_deployment.assert_not_called()
-
-
-def test_reconcile_deletes_when_db_confirms_gone(monkeypatch):
-    apps = mock.MagicMock()
-    listed = mock.MagicMock()
-    listed.items = [_deployment_with_service_label('B')]
-    apps.list_namespaced_deployment.return_value = listed
-    # B absent from both the snapshot and the DB -> genuinely gone -> reaped.
-    _install(monkeypatch, apps_api=apps, db_service_names=set())
-
-    lb_k8s.reconcile_lb_objects({'A'})
-    deleted = [
-        c.args[0] for c in apps.delete_namespaced_deployment.call_args_list
-    ]
-    assert deleted == [lb_k8s.lb_deployment_name('B')]
-
-
-# --------------------------------------------------------------------------- #
-# Guards: no-op unless external-LB + in-cluster
-# --------------------------------------------------------------------------- #
-def test_not_external_mode_noop(monkeypatch):
-    apps, core = _install(monkeypatch, external=False)
-    lb_k8s.create_lb_deployment_and_service('svc-a', 20005)
-    lb_k8s.delete_lb_objects('svc-a')
-    lb_k8s.reconcile_lb_objects({'svc-a'})
-    assert lb_k8s.lb_service_endpoint_or_none('svc-a') is None
-    apps.create_namespaced_deployment.assert_not_called()
-    apps.delete_namespaced_deployment.assert_not_called()
-    apps.list_namespaced_deployment.assert_not_called()
-    core.create_namespaced_service.assert_not_called()
-
-
-def test_not_in_cluster_noop(monkeypatch):
-    apps, core = _install(monkeypatch, incluster=False)
-    lb_k8s.create_lb_deployment_and_service('svc-a', 20005)
-    lb_k8s.delete_lb_objects('svc-a')
-    lb_k8s.reconcile_lb_objects({'svc-a'})
-    assert lb_k8s.lb_service_endpoint_or_none('svc-a') is None
-    apps.create_namespaced_deployment.assert_not_called()
-    apps.delete_namespaced_deployment.assert_not_called()
-    apps.list_namespaced_deployment.assert_not_called()
-    core.create_namespaced_service.assert_not_called()
-
-
-def test_endpoint_or_none_active(monkeypatch):
-    _install(monkeypatch)
-    ep = lb_k8s.lb_service_endpoint_or_none('svc-a')
-    assert ep == lb_k8s.lb_service_endpoint('svc-a', 'skypilot')
-
-
-class TestLbImagePullPolicyMirror(unittest.TestCase):
-    """The LB must mirror the controller pod's imagePullPolicy.
-
-    The platform deploys a moving tag with Always; an LB hardcoding
-    IfNotPresent pins whatever digest its node cached — controller and LB
-    then run DIFFERENT code from the SAME tag (observed live: the LB
-    lacked /_lb/capacity and proxied it to the model server).
-    """
-
-    def _pod(self,
-             image='ecr/skypilot:tag',
-             pull_policy='Always',
-             image_id='ecr/skypilot@sha256:abc123'):
-        container = mock.Mock()
-        container.image = image
-        container.image_pull_policy = pull_policy
-        status = mock.Mock()
-        status.image_id = image_id
-        pod = mock.Mock()
-        pod.spec.containers = [container]
-        pod.status.container_statuses = [status] if image_id else []
-        return pod
-
-    def test_mirrors_always_and_digest_from_controller(self):
-        with mock.patch.dict(lb_k8s.os.environ,
-                             {constants.POD_NAME_ENV_VAR: 'ctrl-pod'}), \
-             mock.patch.object(lb_k8s.kubernetes, 'core_api') as mock_api:
-            mock_api.return_value.read_namespaced_pod.return_value = (self._pod(
-                pull_policy='Always'))
-            image, policy, digest = lb_k8s._resolve_lb_image('ns', 'ctx')
-        self.assertEqual(image, 'ecr/skypilot:tag')
-        self.assertEqual(policy, 'Always')
-        self.assertEqual(digest, 'ecr/skypilot@sha256:abc123')
-
-    def test_defaults_when_controller_policy_and_status_unset(self):
-        with mock.patch.dict(lb_k8s.os.environ,
-                             {constants.POD_NAME_ENV_VAR: 'ctrl-pod'}), \
-             mock.patch.object(lb_k8s.kubernetes, 'core_api') as mock_api:
-            mock_api.return_value.read_namespaced_pod.return_value = (self._pod(
-                pull_policy=None, image_id=None))
-            _, policy, digest = lb_k8s._resolve_lb_image('ns', 'ctx')
-        self.assertEqual(policy, 'IfNotPresent')
-        self.assertIsNone(digest)
-
-    def test_deployment_dict_carries_policy_and_rollout_annotation(self):
-        deployment = lb_k8s._build_deployment_dict('svc', 'dep', 'img', 'ns',
-                                                   30001, [], 'Always',
-                                                   'img@sha256:abc')
-        template = deployment['spec']['template']
-        container = template['spec']['containers'][0]
-        self.assertEqual(container['imagePullPolicy'], 'Always')
-        # The digest annotation is the rollout trigger: a controller roll on
-        # the same tag changes it, and the 409-patch makes k8s roll the LB.
-        self.assertEqual(
-            template['metadata']['annotations'][
-                lb_k8s.CONTROLLER_DIGEST_ANNOTATION], 'img@sha256:abc')
-
-    def test_unknown_digest_omits_annotation(self):
-        deployment = lb_k8s._build_deployment_dict('svc', 'dep', 'img', 'ns',
-                                                   30001, [], 'Always', None)
-        template = deployment['spec']['template']
-        self.assertNotIn('annotations', template['metadata'])
-
-
-# --------------------------------------------------------------------------- #
-# ensure_lb_objects_exist (periodic self-heal)
-# --------------------------------------------------------------------------- #
-class TestEnsureLbObjectsExist:
-
-    def test_noop_outside_lb_mode(self, monkeypatch):
-        apps, core = _install(monkeypatch, external=False)
-        with mock.patch.object(lb_k8s,
-                               'create_lb_deployment_and_service') as create:
-            lb_k8s.ensure_lb_objects_exist('svc', 20001)
-        create.assert_not_called()
-        apps.read_namespaced_deployment.assert_not_called()
-        core.read_namespaced_service.assert_not_called()
-
-    def test_both_present_reads_only(self, monkeypatch):
-        apps, core = _install(monkeypatch)
-        with mock.patch.object(lb_k8s,
-                               'create_lb_deployment_and_service') as create:
-            lb_k8s.ensure_lb_objects_exist('svc', 20001)
-        create.assert_not_called()
-        apps.read_namespaced_deployment.assert_called_once()
-        core.read_namespaced_service.assert_called_once()
-
-    def test_missing_deployment_recreates(self, monkeypatch):
-        apps = mock.MagicMock()
-        apps.read_namespaced_deployment.side_effect = _ApiException(404)
-        _install(monkeypatch, apps_api=apps, db_service_names=('svc',))
-        with mock.patch.object(lb_k8s,
-                               'create_lb_deployment_and_service') as create:
-            lb_k8s.ensure_lb_objects_exist('svc', 20001)
-        create.assert_called_once_with('svc', 20001)
-
-    def test_missing_service_recreates(self, monkeypatch):
-        core = mock.MagicMock()
-        core.read_namespaced_service.side_effect = _ApiException(404)
-        _install(monkeypatch, core_api=core, db_service_names=('svc',))
-        with mock.patch.object(lb_k8s,
-                               'create_lb_deployment_and_service') as create:
-            lb_k8s.ensure_lb_objects_exist('svc', 20001)
-        create.assert_called_once_with('svc', 20001)
-
-    def test_missing_objects_but_row_owned_elsewhere_skips(self, monkeypatch):
-        # Ownership fence: a same-name successor / HA takeover owns the row
-        # (different controller_pid) -- the stale process must not recreate,
-        # or a 409-patch could point the successor's LB at a stale port.
-        apps = mock.MagicMock()
-        apps.read_namespaced_deployment.side_effect = _ApiException(404)
-        _install(monkeypatch, apps_api=apps)
-        monkeypatch.setattr(
-            lb_k8s.serve_state, 'get_service_from_name', lambda name: {
-                'name': name,
-                'controller_pid': os.getpid() + 1,
-            })
-        with mock.patch.object(lb_k8s,
-                               'create_lb_deployment_and_service') as create:
-            lb_k8s.ensure_lb_objects_exist('svc', 20001)
-        create.assert_not_called()
-
-    def test_missing_objects_but_service_row_gone_skips(self, monkeypatch):
-        # The create-time DB fence: objects missing because the service is
-        # being torn down concurrently must NOT be resurrected.
-        apps = mock.MagicMock()
-        apps.read_namespaced_deployment.side_effect = _ApiException(404)
-        _install(monkeypatch, apps_api=apps)  # 'svc' absent from the DB.
-        with mock.patch.object(lb_k8s,
-                               'create_lb_deployment_and_service') as create:
-            lb_k8s.ensure_lb_objects_exist('svc', 20001)
-        create.assert_not_called()
-
-    def test_non_404_read_error_raises(self, monkeypatch):
-        apps = mock.MagicMock()
-        apps.read_namespaced_deployment.side_effect = _ApiException(500)
-        _install(monkeypatch, apps_api=apps)
-        with mock.patch.object(lb_k8s,
-                               'create_lb_deployment_and_service') as create:
-            with pytest.raises(_ApiException):
-                lb_k8s.ensure_lb_objects_exist('svc', 20001)
-        create.assert_not_called()
+    delete.assert_called_once_with('service-only')
+    assert core.list_namespaced_service.call_args.args[0] == 'skypilot'
+    assert core.list_namespaced_service.call_args.kwargs[
+        'label_selector'] == lb_k8s.LB_SELECTOR_LABEL

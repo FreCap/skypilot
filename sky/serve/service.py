@@ -1,6 +1,8 @@
-"""Main entrypoint to start a service.
+"""Main entrypoint for a service controller.
 
-This including the controller and load balancer.
+Inference traffic is served only by the controller-owned external load
+balancer Deployment.  This process owns and supervises the per-service
+controller child; it never starts an in-pod load balancer.
 """
 import argparse
 import multiprocessing
@@ -12,6 +14,7 @@ import sys
 import time
 import traceback
 from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
+import uuid
 
 import filelock
 
@@ -25,7 +28,6 @@ from sky.data import data_utils
 from sky.serve import constants
 from sky.serve import controller
 from sky.serve import lb_k8s
-from sky.serve import load_balancer
 from sky.serve import replica_managers
 from sky.serve import serve_state
 from sky.serve import serve_utils
@@ -33,7 +35,6 @@ from sky.skylet import constants as skylet_constants
 from sky.utils import auth_utils
 from sky.utils import common_utils
 from sky.utils import controller_utils
-from sky.utils import locks
 from sky.utils import subprocess_utils
 from sky.utils import thread_utils
 from sky.utils import ux_utils
@@ -339,33 +340,26 @@ def _wait_for_controller_ready(
                        f'{probe_host}:{port} within {timeout}s')
 
 
-def _orphan_exit(
-        controller_process: Optional[multiprocessing.Process],
-        load_balancer_process: Optional[multiprocessing.Process]) -> None:
+def _orphan_exit(controller_process: Optional[multiprocessing.Process]) -> None:
     """Quick exit path for an orphan sky.serve.service.
 
-    Triggered when our self-check sees DB `controller_pid` no longer matches
-    our own pid (a newer instance on another pod has taken over) or when the
-    services row has been removed (down completed). DB state is now owned by
-    that new instance — we must NOT call _cleanup, which would teardown
-    replicas and delete versions, racing with the new owner.
+    Triggered when our self-check sees the DB owner tuple (service hash, PID,
+    pod IP) no longer match ours, or when the services row has been removed
+    (down completed). DB state is now owned by that new instance — we must NOT
+    call _cleanup, which would teardown replicas and delete versions, racing
+    with the new owner.
 
-    Just kill our own forked subprocesses and exit immediately.
+    Just kill our own controller child and exit immediately.  The external LB
+    is a Kubernetes object reconciled by the authoritative owner, not a child
+    of this process.
     """
-    logger.info(
-        f'_orphan_exit invoked: own_pid={os.getpid()} '
-        f'controller_process_pid='
-        f'{controller_process.pid if controller_process else None} '
-        f'load_balancer_process_pid='
-        f'{load_balancer_process.pid if load_balancer_process else None}')
-    process_to_kill = [
-        proc for proc in [load_balancer_process, controller_process]
-        if proc is not None
-    ]
-    if process_to_kill:
+    logger.info(f'_orphan_exit invoked: own_pid={os.getpid()} '
+                f'controller_process_pid='
+                f'{controller_process.pid if controller_process else None}')
+    if controller_process is not None:
         try:
             subprocess_utils.kill_children_processes(
-                parent_pids=[p.pid for p in process_to_kill], force=True)
+                parent_pids=[controller_process.pid], force=True)
         except Exception:  # pylint: disable=broad-except
             logger.warning('Failed to kill children during orphan exit; '
                            'proceeding with os._exit anyway')
@@ -373,12 +367,24 @@ def _orphan_exit(
     os._exit(0)  # pylint: disable=protected-access
 
 
+def _exit_on_ownership_loss(
+        updated: bool, service_name: str, operation: str,
+        controller_process: Optional[multiprocessing.Process]) -> None:
+    """Discard our controller and bypass cleanup after a failed owner CAS."""
+    if updated:
+        return
+    logger.warning(f'Lost ownership of service {service_name} while '
+                   f'{operation}; discarding our controller and exiting '
+                   'without cleanup.')
+    _orphan_exit(controller_process)
+
+
 def _bail_on_boot_failure(service_name: str,
                           controller_process: Optional[multiprocessing.Process],
                           timeout_seconds: int,
-                          boot_err: BaseException) -> None:
-    """Exit path when the freshly-spawned controller subprocess failed
-    to bind within SERVICE_REGISTER_TIMEOUT_SECONDS.
+                          boot_err: BaseException,
+                          component: str = 'Controller subprocess') -> None:
+    """Retryable exit when a service component cannot finish booting.
 
     Critical contract: must NOT fall through to `_start`'s outer
     `try/finally`. That finally calls `_cleanup`, which on its very
@@ -390,7 +396,7 @@ def _bail_on_boot_failure(service_name: str,
     bypass everything. The daemon's next ha_recovery iteration sees
     the (preserved) recovery script and retries with a fresh _start.
     """
-    logger.error(f'Controller subprocess failed to bind within '
+    logger.error(f'{component} failed to become ready within '
                  f'{timeout_seconds}s for {service_name}: {boot_err}. '
                  f'Killing controller subprocess and exiting WITHOUT '
                  f'cleanup so the daemon can retry. DB state and HA '
@@ -427,7 +433,7 @@ def _spawn_controller(service_name: str,
     """Spawn (and start) the controller server subprocess for a service.
 
     Factored out of `_start` so the supervision loop can re-create the
-    controller (on a fresh port) if it dies. See `_respawn_controller_and_lb`.
+    controller (on a fresh port) if it dies. See `_respawn_controller`.
     """
     process = multiprocessing.Process(target=controller.run_controller,
                                       args=(service_name, service_spec, version,
@@ -437,85 +443,16 @@ def _spawn_controller(service_name: str,
 
 
 def _select_controller_port(service_name: str) -> int:
-    """Choose the controller port for a (re)spawn.
+    """Choose a free controller port on this API pod.
 
-    Default (in-pod load balancer) behavior is unchanged: an ephemeral free
-    port is chosen locally on every spawn. This deliberately does NOT reuse
-    the DB port, because on a different recovery pod that port may be held by
-    another service's controller (see the NOTE in `_start`).
-
-    In external load balancer mode, each service instead gets a STABLE port
-    from [CONTROLLER_PORT_START, +CONTROLLER_PORT_RANGE_SIZE), assigned once
-    and persisted, so a load balancer outside the pod has a fixed controller
-    address across respawns and pod rolls. Uniqueness across services makes
-    reuse safe against the shared-port hazard above: a service's assigned port
-    is never held by any other service, so it is always free on any pod.
-
-    The default path is called while holding the node-local port-selection
-    file lock. External-mode assignment additionally takes a CROSS-POD lock
-    (Postgres advisory lock under an HA deployment), because the file lock
-    cannot serialize two api-server pods scanning the shared DB for the same
-    free port.
+    The external LB talks to the stable API-service proxy, which resolves the
+    current owner IP and port from the service row for every sync.  Controller
+    ports therefore do not need to be stable, globally allocated, or exposed
+    through a Kubernetes Service.  The caller holds the node-local port lock,
+    which is the only serialization required for a local socket.
     """
-    if not serve_utils.is_external_load_balancer_mode():
-        return common_utils.find_free_port(constants.CONTROLLER_PORT_START)
-
-    base = constants.CONTROLLER_PORT_START
-    end = base + constants.CONTROLLER_PORT_RANGE_SIZE
-    assigned = serve_state.get_service_controller_port(service_name)
-    if assigned is not None and base <= assigned < end:
-        return assigned
-    # Assigning a new stable port: serialize across pods so two concurrent
-    # up()s cannot pick the same free port. Re-read inside the lock in case a
-    # peer already assigned this service's port while we waited.
-    with locks.get_lock(
-            constants.CONTROLLER_PORT_ASSIGNMENT_LOCK_ID,
-            timeout=constants.CONTROLLER_PORT_ASSIGNMENT_LOCK_TIMEOUT_SECONDS):
-        assigned = serve_state.get_service_controller_port(service_name)
-        if assigned is not None and base <= assigned < end:
-            return assigned
-        # Terminal services (dying or already broken) no longer hold their
-        # controller port -- excluding them lets the stable-port range be
-        # reclaimed under churn instead of leaking one port per dead service.
-        terminal = serve_state.ServiceStatus.terminal_statuses()
-        in_use = {
-            svc['controller_port']
-            for svc in serve_state.get_services()
-            if svc['name'] != service_name and svc['controller_port']
-            is not None and svc.get('status') not in terminal
-        }
-        for port in range(base, end):
-            if port not in in_use:
-                serve_state.set_service_controller_port(service_name, port)
-                return port
-    raise RuntimeError(
-        f'No free controller port in the external load balancer range '
-        f'[{base}, {end}) for service {service_name}; increase '
-        f'serve.constants.CONTROLLER_PORT_RANGE_SIZE.')
-
-
-def _spawn_load_balancer(
-        controller_addr: str, load_balancer_port: int,
-        service_spec: 'service_spec_lib.SkyServiceSpec',
-        load_balancer_log_file: str) -> multiprocessing.Process:
-    """Spawn (and start) the load balancer subprocess.
-
-    It serves the public `load_balancer_port` and syncs with the controller at
-    `controller_addr`. Factored out so the controller respawn can restart the
-    LB pointing at the new controller addr, and a dead LB can be restarted.
-    """
-    process = multiprocessing.Process(
-        target=ux_utils.RedirectOutputForProcess(
-            load_balancer.run_load_balancer, load_balancer_log_file).run,
-        args=(controller_addr, load_balancer_port,
-              service_spec.load_balancing_policy, service_spec.tls_credential,
-              service_spec.target_qps_per_replica,
-              service_spec.lb_stream_timeout_seconds,
-              service_spec.lb_retriable_status_codes,
-              service_spec.lb_max_retries,
-              service_spec.lb_retry_initial_backoff_seconds))
-    process.start()
-    return process
+    del service_name
+    return common_utils.find_free_port(constants.CONTROLLER_PORT_START)
 
 
 def _kill_process(process: Optional[multiprocessing.Process]) -> None:
@@ -529,19 +466,15 @@ def _kill_process(process: Optional[multiprocessing.Process]) -> None:
         pass
 
 
-# Supervision of the controller/LB children in _start's keep-alive loop:
-# after this many consecutive failed respawn/bind attempts, the service is
+# Supervision of the controller child in _start's keep-alive loop: after this
+# many consecutive failed respawn attempts, the service is
 # flagged CONTROLLER_FAILED in the DB so `sky serve status` stops advertising
 # a dead endpoint as healthy. Respawn attempts continue with exponential
-# backoff, and the flag is cleared if the children recover.
+# backoff, and the flag is cleared if the child recovers.
 _CHILD_FAILURES_BEFORE_FLAG = 3
 _CHILD_RESPAWN_BACKOFF_BASE_SECONDS = 5
 _CHILD_RESPAWN_BACKOFF_CAP_SECONDS = 300
-# Time allowed for a freshly spawned load balancer child to bind its port
-# before the spawn is considered failed. The bind happens inside the child
-# (uvicorn), so a child that is alive but never binds (e.g., the port is held
-# by another process) would otherwise look healthy forever.
-_LB_BIND_TIMEOUT_SECONDS = 30
+_CHILD_UNRESPONSIVE_CHECKS_BEFORE_RESPAWN = 3
 
 
 def _child_respawn_backoff_seconds(consecutive_failures: int) -> float:
@@ -552,15 +485,20 @@ def _child_respawn_backoff_seconds(consecutive_failures: int) -> float:
         _CHILD_RESPAWN_BACKOFF_CAP_SECONDS)
 
 
-def _lb_port_is_bound(port: int) -> bool:
-    """Whether something accepts TCP connections on the LB port locally."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(1)
-        try:
-            s.connect(('127.0.0.1', port))
-            return True
-        except OSError:
-            return False
+def _controller_child_responding(service_name: str,
+                                 controller_port: int) -> bool:
+    """Bounded health check for a live-but-hung controller child."""
+    try:
+        response = serve_utils._get_to_controller_with_retry(  # pylint: disable=protected-access
+            service_name,
+            controller_port,
+            '/autoscaler/info',
+            timeout=(0.5, 1.0))
+        return response.status_code == 200
+    except Exception as e:  # pylint: disable=broad-except
+        logger.warning(f'Controller health check failed for {service_name}: '
+                       f'{common_utils.format_exception(e)}')
+        return False
 
 
 def _flag_service_degraded(service_name: str) -> None:
@@ -577,8 +515,8 @@ def _flag_service_degraded(service_name: str) -> None:
             return
         if record['status'] != serve_state.ServiceStatus.CONTROLLER_FAILED:
             logger.error(f'Flagging service {service_name} as '
-                         'CONTROLLER_FAILED after repeated controller/load '
-                         'balancer failures.')
+                         'CONTROLLER_FAILED after repeated controller or '
+                         'external load balancer failures.')
             serve_state.set_service_status_and_active_versions(
                 service_name, serve_state.ServiceStatus.CONTROLLER_FAILED)
     except Exception as e:  # pylint: disable=broad-except
@@ -605,7 +543,7 @@ def _heal_service_degraded(service_name: str) -> bool:
         record = serve_state.get_service_from_name(service_name)
         if (record is not None and record['status']
                 == serve_state.ServiceStatus.CONTROLLER_FAILED):
-            logger.info(f'Service {service_name} controller/load balancer '
+            logger.info(f'Service {service_name} controller/data plane '
                         'recovered; clearing CONTROLLER_FAILED.')
             serve_state.set_service_status_and_active_versions(
                 service_name, serve_state.ServiceStatus.REPLICA_INIT)
@@ -616,63 +554,16 @@ def _heal_service_degraded(service_name: str) -> bool:
         return False
 
 
-def _has_in_pod_load_balancer(
-        service_spec: 'service_spec_lib.SkyServiceSpec') -> bool:
-    """Whether this service runs a load balancer subprocess inside this pod.
-
-    False for pool services (no LB) and in external-LB mode (the LB runs as a
-    separate controller-owned k8s Deployment outside this pod). Single source of
-    truth so the LB-spawn path (_ensure_load_balancer) and the supervision
-    loop's health check agree -- a mismatch made external-LB services look like
-    they had a dead in-pod LB and flagged them CONTROLLER_FAILED.
-    """
-    return not service_spec.pool and not (
-        serve_utils.is_external_load_balancer_mode())
-
-
-def _ensure_load_balancer(
-        lb_process: Optional[multiprocessing.Process], controller_addr: str,
-        load_balancer_port: int,
-        service_spec: 'service_spec_lib.SkyServiceSpec',
-        load_balancer_log_file: str) -> Optional[multiprocessing.Process]:
-    """Ensure the load balancer is running for a non-pool service.
-
-    Restarts it -- on the same public `load_balancer_port`, pointing at
-    `controller_addr` -- if it is missing or dead. Pool services have no LB.
-    Contained: never raises into _start's destructive cleanup.
-
-    In external load balancer mode the load balancer runs as a separate
-    Deployment outside this pod, so the controller neither spawns nor
-    supervises an in-pod one.
-    """
-    if not _has_in_pod_load_balancer(service_spec):
-        return lb_process
-    if lb_process is not None and lb_process.is_alive():
-        return lb_process
-    _kill_process(lb_process)
-    try:
-        return _spawn_load_balancer(controller_addr, load_balancer_port,
-                                    service_spec, load_balancer_log_file)
-    except Exception as e:  # pylint: disable=broad-except
-        logger.error(f'Failed to (re)start the load balancer: '
-                     f'{common_utils.format_exception(e)}; will retry.')
-        return None
-
-
-def _respawn_controller_and_lb(
-    service_name: str, service_spec: 'service_spec_lib.SkyServiceSpec',
-    version: int, controller_host: str, load_balancer_port: int,
-    load_balancer_log_file: str,
+def _respawn_controller(
+    service_name: str,
+    service_spec: 'service_spec_lib.SkyServiceSpec',
+    version: int,
+    controller_host: str,
     dead_controller: Optional[multiprocessing.Process],
-    old_lb: Optional[multiprocessing.Process]
-) -> Optional[Tuple[multiprocessing.Process, Optional[multiprocessing.Process],
-                    int]]:
-    """Re-create the controller and restart the LB after the controller child
-    died while the _start parent is still alive.
-
-    The controller port is chosen by `_select_controller_port`: a fresh free
-    port in the default (in-pod LB) mode, or the service's stable assigned
-    port in external load balancer mode.
+    service_hash: Optional[str] = None,
+    controller_ip: Optional[str] = None
+) -> Optional[Tuple[multiprocessing.Process, int]]:
+    """Re-create a controller child that died while its parent is alive.
 
     HA recovery only re-creates a controller when the parent `controller_pid`
     row disappears / a pod moves; it does NOT cover the controller child dying
@@ -680,21 +571,18 @@ def _respawn_controller_and_lb(
     probing and reconciliation would otherwise stop permanently.
 
     A fresh controller port, chosen free under the port-selection lock, avoids
-    the cross-wiring a same-port reuse risks when services share a controller
-    pod: another service cannot already hold a port we just found free and hold
-    the lock for. The LB is restarted pointing at the new controller addr but on
-    the SAME public `load_balancer_port`, so the service endpoint is stable. The
-    DB controller_port write is guarded by row ownership (compare-and-swap on
-    `controller_pid`): HA recovery on another pod may have taken the row over
-    since our last (30s-cadence) orphan check, and an unconditional write would
-    cross-wire the new owner's atomically-flipped pid/ip/port with our stale
-    port. controller_pid/ip (the live parent) and the public load_balancer_port
-    are unchanged.
+    cross-wiring when services share a controller pod. The stable API-service
+    proxy resolves the new address from the DB, so no LB restart or Deployment
+    patch is needed. The DB controller_port write is guarded by the full row
+    owner tuple (service hash, PID, pod IP): HA recovery on another pod may have
+    taken the row over since our last orphan check, and an unconditional write
+    would cross-wire the new owner's atomically-flipped pid/ip/port with our
+    stale port. controller_pid/ip (the live parent) are unchanged.
 
-    Returns (controller_process, lb_process, controller_port) on success, or
-    None on failure (retry next tick). Never raises into _start's destructive
-    cleanup. The OLD load balancer is left running until the new controller is
-    confirmed, so the data plane is not dropped during retries.
+    Returns (controller_process, controller_port) on success, or None on
+    failure (retry next tick). Never raises into _start's destructive cleanup.
+    The external LB continues serving its last routing view while the proxy
+    reports 503 during the controller gap.
     """
     # Reload the latest COMMITTED version + spec so a respawn after
     # /update_service uses the current config. Use the committed version, not
@@ -715,7 +603,7 @@ def _respawn_controller_and_lb(
         logger.error(f'Failed to reload the latest committed version/spec for '
                      f'{service_name}: {common_utils.format_exception(e)}; '
                      f'will retry on the next tick.')
-        return None  # old LB left running -> data plane preserved during retry
+        return None
 
     new_controller = None
     try:
@@ -737,11 +625,12 @@ def _respawn_controller_and_lb(
                 raise RuntimeError(
                     'replacement controller exited during startup')
             if not serve_state.set_service_controller_port_if_owner(
-                    service_name, os.getpid(), controller_port):
+                    service_name, service_hash, os.getpid(), controller_ip,
+                    controller_port):
                 # Another instance (HA recovery on a different pod) took over
-                # the row while we were bringing up the replacement. Discard it
-                # and keep the old LB; the orphan check in _start's loop will
-                # exit this parent shortly.
+                # the row while we were bringing up the replacement. Discard
+                # it; the orphan check in _start's loop will exit this parent
+                # shortly.
                 logger.warning(
                     f'Lost ownership of service {service_name} during the '
                     'controller respawn; discarding the replacement '
@@ -753,19 +642,14 @@ def _respawn_controller_and_lb(
                      f'{service_name}: {common_utils.format_exception(e)}; '
                      f'will retry on the next tick.')
         _kill_process(new_controller)
-        return None  # old LB left running -> data plane preserved during retry
+        return None
 
-    # Controller is up on the new port. Reap the dead controller's leftovers,
-    # then restart the LB (it targeted the dead controller's addr) on the same
-    # public port. The brief LB gap is unavoidable for an addr change.
+    # Controller is up and its new port is authoritative in the DB. Reap the
+    # dead child's leftovers; the proxy picks up the new tuple on the next sync.
     _kill_process(dead_controller)
-    _kill_process(old_lb)
-    controller_addr = f'http://{controller_host}:{controller_port}'
-    new_lb = _ensure_load_balancer(None, controller_addr, load_balancer_port,
-                                   service_spec, load_balancer_log_file)
     logger.info(f'Controller for {service_name} respawned on port '
-                f'{controller_port}; load balancer restarted.')
-    return new_controller, new_lb, controller_port
+                f'{controller_port}; the stable proxy now routes to it.')
+    return new_controller, controller_port
 
 
 def _should_resume_teardown(is_recovery: bool,
@@ -794,7 +678,17 @@ def _run_cleanup_and_finalize(service_name: str,
     FAILED_CLEANUP so an operator can ``--purge``; on success the service row
     and working dir are removed.
     """
+    lb_quiesced = service_spec.pool
     try:
+        if not service_spec.pool:
+            # Quiesce the public data plane BEFORE touching replicas. The
+            # external LB retains its last routing view when controller sync
+            # stops; leaving its Service up during a long cloud teardown would
+            # accept new requests and route them to replicas being destroyed.
+            # A deletion failure aborts cleanup fail-closed and is retried via
+            # FAILED_CLEANUP rather than exposing a half-torn-down service.
+            lb_k8s.delete_lb_objects(service_name)
+            lb_quiesced = True
         failed = _cleanup(service_name, service_spec.pool)
     except Exception as e:  # pylint: disable=broad-except
         logger.error(f'Failed to clean up service {service_name}: {e}')
@@ -816,19 +710,17 @@ def _run_cleanup_and_finalize(service_name: str,
         serve_state.set_service_status_and_active_versions(
             service_name, serve_state.ServiceStatus.FAILED_CLEANUP)
         logger.error(f'Service {service_name} failed to clean up.')
-        # A FAILED_CLEANUP service is no longer serving, and its controller
-        # port is reclaimable by a new service (FAILED_CLEANUP is a terminal
-        # status excluded from `_select_controller_port`'s in-use set). If we
-        # kept the dead service's LB, a new service reusing that port would
-        # receive the dead LB's traffic -- so tear the data-plane LB down here.
+        # A FAILED_CLEANUP service is no longer serving, so tear the data-plane
+        # LB down here.
         # The DB row is intentionally kept for `--purge`; if the service is
         # ever retried, up() recreates the LB idempotently. Best-effort so a
         # delete failure does not worsen cleanup.
-        try:
-            lb_k8s.delete_lb_objects(service_name)
-        except Exception as e:  # pylint: disable=broad-except
-            logger.error(f'Failed to delete external LB objects for '
-                         f'{service_name} during failed cleanup: {e}')
+        if not lb_quiesced:
+            try:
+                lb_k8s.delete_lb_objects(service_name)
+            except Exception as e:  # pylint: disable=broad-except
+                logger.error(f'Failed to delete external LB objects for '
+                             f'{service_name} during failed cleanup: {e}')
     else:
         serve_state.remove_service_completely(service_name)
         # Real teardown: the service row is gone for good. Delete the
@@ -836,7 +728,8 @@ def _run_cleanup_and_finalize(service_name: str,
         # in-cluster mode). This runs only on the success/removal path -- the
         # FAILED_CLEANUP branch above keeps the row (and its LB) for --purge,
         # and orphan-exit/respawn bypass this function entirely via os._exit.
-        lb_k8s.delete_lb_objects(service_name)
+        if not lb_quiesced:
+            lb_k8s.delete_lb_objects(service_name)
         try:
             shutil.rmtree(service_dir)
         except FileNotFoundError:
@@ -849,9 +742,7 @@ def _run_cleanup_and_finalize(service_name: str,
 
 
 def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
-    """Starts the service.
-    This including the controller and load balancer.
-    """
+    """Start the service controller and reconcile its external LB."""
     # Generate ssh key pair to avoid race condition when multiple sky.launch
     # are executed at the same time.
     auth_utils.get_or_generate_keys()
@@ -859,6 +750,22 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
     service = serve_state.get_service_from_name(service_name)
     is_recovery = service is not None
     logger.info(f'It is a {"first" if not is_recovery else "recovery"} run')
+    # Fence every boot-time DB publication to this exact row incarnation. A
+    # service name can be purged and reused while controller/LB startup waits
+    # for up to several minutes; PID alone is not globally unique across pods.
+    service_incarnation: Optional[str]
+    recovery_expected_controller_pid: Optional[int] = None
+    recovery_expected_controller_ip: Optional[str] = None
+    if is_recovery:
+        assert service is not None
+        service_incarnation = service.get('hash')
+        recovery_expected_controller_pid = service.get('controller_pid')
+        recovery_expected_controller_ip = service.get('controller_ip')
+    else:
+        # add_service accepts the caller-generated UUID while preserving its
+        # historical bool return, so this process knows the committed hash
+        # without a racy name-only read after insertion.
+        service_incarnation = str(uuid.uuid4())
 
     def _read_yaml_content(yaml_path: str) -> str:
         with open(os.path.expanduser(yaml_path), 'r', encoding='utf-8') as f:
@@ -912,6 +819,25 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
                                   job_id)
         return
 
+    # Pools intentionally have no inference endpoint. Every real SkyServe
+    # service, however, uses the controller-owned Kubernetes LB; there is no
+    # in-pod fallback. Validate the platform contract before creating a fresh
+    # DB row (and before a recovery claims an existing row) so a configuration
+    # error fails clearly instead of publishing an unreachable endpoint.
+    external_lb = not service_spec.pool
+    lb_termination_grace_seconds = 0
+    if external_lb:
+        # Re-check persisted specs on every fresh start and HA recovery. Older
+        # rows (or an interrupted update from a mixed-version deployment) may
+        # predate the API-side guard; advertising HTTPS for this HTTP-only LB
+        # would otherwise create a durable dead endpoint.
+        serve_utils.validate_external_lb_service_spec(service_spec)
+        lb_k8s.require_external_lb_runtime()
+        lb_termination_grace_seconds = (
+            lb_k8s.lb_termination_grace_period_seconds(
+                service_spec.lb_stream_timeout_seconds,
+                service_spec.graceful_drain_seconds))
+
     # Pod IP for HA leader-aware routing.
     pod_ip: Optional[str] = os.environ.get('POD_IP')
 
@@ -946,7 +872,8 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
                 controller_ip=pod_ip,
                 spec=service_spec,
                 yaml_content=yaml_content,
-                entrypoint=entrypoint)
+                entrypoint=entrypoint,
+                service_hash=service_incarnation)
         # Directly throw an error here. See sky/serve/api.py::up
         # for more details.
         if not success:
@@ -989,20 +916,26 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
         # ha_recovery_for_consolidation_mode iteration sees our _start
         # process as the live controller and does NOT fire a duplicate
         # recovery script while we are still booting (the controller boot
-        # window is up to SERVICE_REGISTER_TIMEOUT_SECONDS = 60s, but the
+        # window is up to SERVICE_REGISTER_TIMEOUT_SECONDS, but the
         # daemon retries every ~20s). _controller_process_alive matches by
         # `--service-name <name>` in cmdline, which our _start process has.
         #
-        # We deliberately do NOT update controller_ip / controller_port
-        # here — those still flip atomically after _wait_for_controller_ready
-        # succeeds, so clients routing by (ip, port) keep using the prior
-        # endpoint (or hit ECONNREFUSED, handled by
-        # _request_to_controller_with_retry) until the new subprocess is
-        # actually listening.
-        serve_state.update_service_controller_pid(service_name, os.getpid())
+        # Atomically move PID+IP ownership now and clear controller_port. This
+        # makes the stable proxy fail closed with 503 during boot instead of
+        # routing to the dead prior owner. The ready port is published only
+        # after _wait_for_controller_ready succeeds below.
+        claimed = serve_state.update_service_controller_pid_if_owner(
+            service_name,
+            expected_service_hash=service_incarnation,
+            expected_controller_pid=recovery_expected_controller_pid,
+            expected_controller_ip=recovery_expected_controller_ip,
+            controller_pid=os.getpid(),
+            controller_ip=pod_ip)
+        _exit_on_ownership_loss(claimed, service_name, 'preclaiming recovery',
+                                None)
 
     controller_process = None
-    load_balancer_process = None
+    external_lb_healthy = not external_lb
     # Tracks whether we exited the main loop via the user-initiated
     # SHUTTING_DOWN signal. We can't recover this from sys.exc_info() in
     # the finally block — Python clears the active exception when the
@@ -1012,19 +945,10 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
     try:
         with filelock.FileLock(
                 os.path.expanduser(constants.PORT_SELECTION_FILE_LOCK_PATH)):
-            # Start the controller.
-            # NOTE: in the default (in-pod LB) mode, pick a fresh free port on
-            # recovery — do NOT reuse the port from DB. The port in DB was
-            # chosen on the previous controller's pod (e.g. Pod A); on a
-            # different recovery pod (Pod B), that port may be in use by
-            # another service's controller, in which case our subprocess would
-            # fail to bind → _wait_for_controller_ready times out → daemon
-            # retries forever. Picking locally guarantees the port is free *on
-            # this pod*, and the post-bind atomic flip writes the new port to
-            # DB together with pid/ip so clients route correctly. In external
-            # load balancer mode the port is instead a STABLE per-service
-            # assignment that is unique across services, so it is always free
-            # on any pod and safe to reuse (see _select_controller_port).
+            # Pick a fresh free port on this pod. The stable API-service proxy
+            # resolves the current owner tuple from DB, so the port itself is
+            # deliberately ephemeral and never exposed by a Kubernetes
+            # Service.
             controller_port = _select_controller_port(service_name)
 
             def _get_controller_host():
@@ -1058,9 +982,10 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
 
             # Wait for the uvicorn server inside the controller subprocess to
             # be listening before we (potentially) flip DB to point at us.
-            # This makes the recovery's DB update atomic from the client's
-            # perspective: DB either still points at the previous controller
-            # (which is alive) or it points at us (which is now ready).
+            # Recovery preclaim already made the proxy fail closed by clearing
+            # the port. This publication moves it atomically from unavailable
+            # to our ready controller; fresh up moves from an unpublished row
+            # to the same ready tuple.
             try:
                 _wait_for_controller_ready(
                     controller_host,
@@ -1076,34 +1001,32 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
                     service_name, controller_process,
                     constants.SERVICE_REGISTER_TIMEOUT_SECONDS, boot_err)
 
-            # Now we know the subprocess is bound on `controller_port`. Write
-            # DB.
-            if is_recovery:
-                # Atomic flip: DB now points at us; clients route here. We're
-                # ready to serve.
-                logger.debug(f'is_recovery: flipping DB controller_pid '
-                             f'-> {os.getpid()}, controller_ip -> {pod_ip}, '
-                             f'controller_port -> {controller_port}')
-                serve_state.update_service_controller_pid_ip_and_port(
-                    service_name,
-                    controller_pid=os.getpid(),
-                    controller_ip=pod_ip,
-                    controller_port=controller_port)
-            else:
-                # Fresh up: add_service already wrote pid/ip with the row.
-                # Only the port needs to land in DB now (after bind).
-                serve_state.set_service_controller_port(service_name,
-                                                        controller_port)
+            # Now we know the subprocess is bound on `controller_port`.
+            # Publish the complete owner tuple only if the exact row inserted
+            # or preclaimed above still belongs to this process. This protects
+            # both recovery and fresh-up from a purge + same-name re-up during
+            # the readiness wait (including equal PIDs on different pods).
+            logger.debug(f'Publishing DB controller_pid -> {os.getpid()}, '
+                         f'controller_ip -> {pod_ip}, controller_port -> '
+                         f'{controller_port}, service_hash -> '
+                         f'{service_incarnation}')
+            published = serve_state.update_service_controller_pid_ip_and_port(
+                service_name,
+                controller_pid=os.getpid(),
+                controller_ip=pod_ip,
+                controller_port=controller_port,
+                expected_service_hash=service_incarnation,
+                expected_controller_pid=os.getpid(),
+                expected_controller_ip=pod_ip)
+            _exit_on_ownership_loss(published, service_name,
+                                    'publishing the ready controller',
+                                    controller_process)
 
-            controller_addr = f'http://{controller_host}:{controller_port}'
-
-            # Start the load balancer. In external load balancer mode the LB
-            # runs as a separate Deployment (not in this pod), so we bind the
-            # port that the external LB listens on -- fixed and known so the
-            # platform can configure the LB Deployment/Service consistently --
-            # and still record it in DB so up()'s registration wait completes
-            # and the endpoint is reported, but we do not spawn an in-pod LB.
-            external_lb = serve_utils.is_external_load_balancer_mode()
+            # Keep the historical load_balancer_port field as the registration
+            # sentinel/API compatibility value. Real services always expose
+            # the fixed port on their per-service Kubernetes Service. Pools
+            # have no endpoint but still need a non-null sentinel for the
+            # existing registration protocol.
             if external_lb:
                 load_balancer_port = constants.LOAD_BALANCER_PORT_START
             elif not is_recovery:
@@ -1112,19 +1035,6 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
             else:
                 load_balancer_port = serve_state.get_service_load_balancer_port(
                     service_name)
-            load_balancer_log_file = os.path.expanduser(
-                serve_utils.generate_remote_load_balancer_log_file_name(
-                    service_name))
-
-            # TODO(tian): Probably we could enable multiple ports specified in
-            # service spec and we could start multiple load balancers.
-            # After that, we will have a mapping from replica port to endpoint.
-            # NOTE(tian): We don't need the load balancer for pool.
-            # Skip the load balancer process for pool, and in external LB mode.
-            if not service_spec.pool and not external_lb:
-                load_balancer_process = _spawn_load_balancer(
-                    controller_addr, load_balancer_port, service_spec,
-                    load_balancer_log_file)
 
         # In external load balancer mode, ensure the controller-owned per-
         # service LB Deployment + Service exist BEFORE the load_balancer_port
@@ -1135,25 +1045,40 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
         # already exists), so it is safe on the recovery path too. No-op outside
         # external-LB + in-cluster mode. Done outside the port-selection
         # filelock to avoid holding a host-global lock across k8s API calls;
-        # controller_port is already recorded in DB.
+        # controller owner tuple is already recorded in DB.
         if external_lb:
-            lb_k8s.create_lb_deployment_and_service(service_name,
-                                                    controller_port)
+            try:
+                lb_k8s.create_lb_deployment_and_service(
+                    service_name,
+                    lb_termination_grace_seconds,
+                    service_hash=service_incarnation)
+                external_lb_healthy = True
+            except Exception as boot_err:  # pylint: disable=broad-except
+                _bail_on_boot_failure(
+                    service_name,
+                    controller_process,
+                    constants.LB_DEPLOYMENT_READY_TIMEOUT_SECONDS,
+                    boot_err,
+                    component='External load balancer')
 
-        # Publish load_balancer_port only now -- after the LB objects exist (in
-        # external mode) or the in-pod LB has been spawned -- so registration
-        # unblocks once the data plane is actually reachable.
+        # Publish load_balancer_port only after the external LB objects exist,
+        # so registration unblocks once the data plane has been materialized.
+        # Pools use the field only as the legacy registration sentinel.
         if not is_recovery:
-            serve_state.set_service_load_balancer_port(service_name,
-                                                       load_balancer_port)
+            registered = serve_state.set_service_load_balancer_port_if_owner(
+                service_name, service_incarnation, os.getpid(), pod_ip,
+                load_balancer_port)
+            _exit_on_ownership_loss(registered, service_name,
+                                    'publishing registration',
+                                    controller_process)
         # On recovery in external mode, re-publish the (constant) external
         # port. This heals two stale-row shapes: a service migrated from
         # in-pod mode still records its legacy in-pod port, and an up() that
         # crashed between row creation and registration left the port NULL
         # (registration would starve on recovery without this). Compare-and-
-        # swap on controller_pid -- pre-claimed by this process above -- so a
-        # stale recovery racing a purge + same-name re-up cannot write to the
-        # successor's row and prematurely unblock its registration. A
+        # swap on the preclaimed hash/PID/IP owner tuple so a stale recovery
+        # racing a purge + same-name re-up cannot write to the successor's row
+        # and prematurely unblock its registration. A
         # transient DB error must not reach _start's destructive cleanup and
         # must not starve the NULL case either, so the attempt is retried
         # from the supervision loop until the CAS resolves (True: written;
@@ -1161,8 +1086,13 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
         lb_port_republish_pending = is_recovery and external_lb
         if lb_port_republish_pending:
             try:
-                serve_state.set_service_load_balancer_port_if_owner(
-                    service_name, os.getpid(), load_balancer_port)
+                registered = (
+                    serve_state.set_service_load_balancer_port_if_owner(
+                        service_name, service_incarnation, os.getpid(), pod_ip,
+                        load_balancer_port))
+                _exit_on_ownership_loss(registered, service_name,
+                                        're-publishing registration',
+                                        controller_process)
                 lb_port_republish_pending = False
             except Exception as e:  # pylint: disable=broad-except
                 logger.warning(
@@ -1188,12 +1118,11 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
         external_lb_ensure_interval_seconds = 60
         own_pid = os.getpid()
         loop_count = 0
-        # Consecutive controller-respawn/LB-bind failures (shared counter: one
-        # degradation flag), the earliest time the next respawn may run, and
-        # when the current LB child was spawned (for the bind grace period).
+        # Consecutive controller-respawn failures and the earliest time the
+        # next respawn may run.
         child_failures = 0
         child_retry_at = 0.0
-        lb_spawned_at = time.time()
+        controller_unresponsive_checks = 0
         # Whether the DB status may need healing on the next confirmed-healthy
         # check. Starts True: an HA-recovered service may carry
         # CONTROLLER_FAILED from the status refresh daemon (set while the old
@@ -1219,16 +1148,22 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
                     logger.warning(
                         f'Service {service_name} row no longer present in '
                         'DB. Exiting as orphan without running cleanup.')
-                    _orphan_exit(controller_process, load_balancer_process)
+                    _orphan_exit(controller_process)
                 elif (record is not None and
-                      record.get('controller_pid') is not None and
-                      record.get('controller_pid') != own_pid):
+                      (record.get('hash') != service_incarnation or
+                       (record.get('controller_pid') is not None and
+                        record.get('controller_pid') != own_pid) or
+                       record.get('controller_ip') != pod_ip)):
                     logger.warning(
-                        f'Service {service_name} controller_pid in DB is '
-                        f'{record.get("controller_pid")} but our pid is '
-                        f'{own_pid}; another instance has taken over. '
+                        f'Service {service_name} owner in DB is '
+                        f'(hash={record.get("hash")}, '
+                        f'pid={record.get("controller_pid")}, '
+                        f'ip={record.get("controller_ip")}) but ours is '
+                        f'(hash={service_incarnation}, pid={own_pid}, '
+                        f'ip={pod_ip}); '
+                        'another instance has taken over. '
                         'Exiting as orphan without running cleanup.')
-                    _orphan_exit(controller_process, load_balancer_process)
+                    _orphan_exit(controller_process)
             # Self-heal the external LB objects. Best-effort: a k8s API error
             # must never reach _start's destructive cleanup.
             if (external_lb and
@@ -1238,8 +1173,13 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
                         # Either outcome resolves the retry: True means the
                         # row is healed, False means ownership was lost and
                         # the write is no longer ours to make.
-                        serve_state.set_service_load_balancer_port_if_owner(
-                            service_name, os.getpid(), load_balancer_port)
+                        registered = (
+                            serve_state.set_service_load_balancer_port_if_owner(
+                                service_name, service_incarnation, os.getpid(),
+                                pod_ip, load_balancer_port))
+                        _exit_on_ownership_loss(registered, service_name,
+                                                'retrying registration',
+                                                controller_process)
                         lb_port_republish_pending = False
                     except Exception as e:  # pylint: disable=broad-except
                         logger.warning(
@@ -1247,84 +1187,70 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
                             f'{service_name}: '
                             f'{common_utils.format_exception(e)}; will retry.')
                 try:
-                    lb_k8s.ensure_lb_objects_exist(service_name,
-                                                   controller_port)
+                    latest_version = serve_state.get_latest_committed_version(
+                        service_name)
+                    if latest_version is not None:
+                        latest_spec = serve_state.get_spec(
+                            service_name, latest_version)
+                        if latest_spec is not None:
+                            lb_termination_grace_seconds = (
+                                lb_k8s.lb_termination_grace_period_seconds(
+                                    latest_spec.lb_stream_timeout_seconds,
+                                    latest_spec.graceful_drain_seconds))
+                    external_lb_healthy = lb_k8s.ensure_lb_objects_exist(
+                        service_name,
+                        lb_termination_grace_seconds,
+                        service_hash=service_incarnation,
+                        controller_ip=pod_ip)
                 except Exception as e:  # pylint: disable=broad-except
+                    external_lb_healthy = False
                     logger.warning(
                         f'Failed to ensure external LB objects for '
                         f'{service_name}: {common_utils.format_exception(e)}; '
                         'will retry.')
-            # Keep the serve subprocesses alive while we (the parent) own the
-            # DB row. HA recovery does not cover a child dying while the parent
-            # stays alive, and in VM mode nothing does -- the service would
-            # otherwise stop autoscaling / probing / reconciling permanently.
-            # A dead controller is re-created on a FRESH port (avoiding cross-
-            # wiring) and the LB restarted to point at it; otherwise the LB is
-            # ensured up (it may have died on its own, or a prior respawn's LB
-            # restart may have failed). Runs after the orphan-exit above.
+            # Keep the controller child alive while we own the DB row. HA
+            # recovery does not cover a child dying while its parent remains
+            # alive; without this, autoscaling/probing/reconciliation stop
+            # permanently. The LB itself is owned by Kubernetes.
             if loop_count % controller_respawn_check_interval_seconds == 0:
                 now = time.time()
                 healthy = False
-                if (controller_process is not None and
-                        not controller_process.is_alive()):
+                controller_responding = False
+                controller_needs_respawn = (controller_process is None or
+                                            not controller_process.is_alive())
+                if not controller_needs_respawn:
+                    controller_responding = _controller_child_responding(
+                        service_name, controller_port)
+                    if controller_responding:
+                        controller_unresponsive_checks = 0
+                    else:
+                        controller_unresponsive_checks += 1
+                        controller_needs_respawn = (
+                            controller_unresponsive_checks >=
+                            _CHILD_UNRESPONSIVE_CHECKS_BEFORE_RESPAWN)
+                if controller_needs_respawn:
                     if now >= child_retry_at:
-                        result = _respawn_controller_and_lb(
-                            service_name, service_spec, version,
-                            controller_host, load_balancer_port,
-                            load_balancer_log_file, controller_process,
-                            load_balancer_process)
+                        result = _respawn_controller(
+                            service_name,
+                            service_spec,
+                            version,
+                            controller_host,
+                            controller_process,
+                            service_hash=service_incarnation,
+                            controller_ip=pod_ip)
                         if result is not None:
-                            (controller_process, load_balancer_process,
-                             controller_port) = result
-                            lb_spawned_at = now
-                            # Do NOT reset the failure streak here: the
-                            # replacement's LB is not proven yet (it may have
-                            # failed to spawn or may never bind). Only the
-                            # `healthy` branch below resets, so a mixed
-                            # controller/LB crash loop cannot dodge the
-                            # CONTROLLER_FAILED flag by alternating failure
-                            # modes.
+                            controller_process, controller_port = result
+                            controller_unresponsive_checks = 0
+                            controller_responding = True
+                            healthy = external_lb_healthy
                         else:
                             child_failures += 1
-                            child_retry_at = now + _child_respawn_backoff_seconds(
-                                child_failures)
-                elif not _has_in_pod_load_balancer(service_spec):
-                    # No in-pod LB to supervise: pool services have none, and
-                    # external-LB services run a controller-owned k8s LB
-                    # outside this pod (its Deployment respawns the LB pod;
-                    # the ensure above recreates deleted objects). A live
-                    # controller is therefore healthy; falling through to the
-                    # in-pod-LB branch below would count the (correctly) absent
-                    # load_balancer_process as a dead LB and flag the service
-                    # CONTROLLER_FAILED after _CHILD_FAILURES_BEFORE_FLAG ticks.
-                    healthy = True
+                            child_retry_at = (
+                                now +
+                                _child_respawn_backoff_seconds(child_failures))
                 else:
-                    lb_alive = (load_balancer_process is not None and
-                                load_balancer_process.is_alive())
-                    if lb_alive and _lb_port_is_bound(load_balancer_port):
-                        healthy = True
-                    elif (lb_alive and
-                          now - lb_spawned_at < _LB_BIND_TIMEOUT_SECONDS):
-                        # Fresh child still starting up; not a failure yet.
-                        pass
-                    elif now >= child_retry_at:
-                        # Dead, or alive without ever binding its port (e.g.,
-                        # the port is held by another process): kill and
-                        # respawn with backoff. A never-bound LB serves no
-                        # traffic even though the child looks alive.
-                        if lb_alive:
-                            logger.error(
-                                f'Load balancer for {service_name} did not '
-                                f'bind port {load_balancer_port} within '
-                                f'{_LB_BIND_TIMEOUT_SECONDS}s; restarting.')
-                            _kill_process(load_balancer_process)
-                            load_balancer_process = None
-                        load_balancer_process = _ensure_load_balancer(
-                            load_balancer_process,
-                            f'http://{controller_host}:{controller_port}',
-                            load_balancer_port, service_spec,
-                            load_balancer_log_file)
-                        lb_spawned_at = now
+                    healthy = controller_responding and external_lb_healthy
+                    if not healthy and now >= child_retry_at:
                         child_failures += 1
                         child_retry_at = now + _child_respawn_backoff_seconds(
                             child_failures)
@@ -1376,17 +1302,10 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
                 f'unexpected exception {exc_type.__name__}: {exc_value}. '
                 f'_cleanup will delete HA recovery script and may remove '
                 f'the service row.')
-        # Kill load balancer process first since it will raise errors if failed
-        # to connect to the controller. Then the controller process.
-        process_to_kill = [
-            proc for proc in [load_balancer_process, controller_process]
-            if proc is not None
-        ]
-        subprocess_utils.kill_children_processes(
-            parent_pids=[process.pid for process in process_to_kill],
-            force=True)
-        for process in process_to_kill:
-            process.join()
+        if controller_process is not None:
+            subprocess_utils.kill_children_processes(
+                parent_pids=[controller_process.pid], force=True)
+            controller_process.join()
 
         # Run cleanup + finalize. _run_cleanup_and_finalize catches any error
         # from _cleanup and sets FAILED_CLEANUP instead, so the service can

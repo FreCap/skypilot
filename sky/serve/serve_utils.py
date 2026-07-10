@@ -16,7 +16,7 @@ import time
 import traceback
 import typing
 from typing import (Any, Callable, DefaultDict, Deque, Dict, Iterator, List,
-                    Optional, Set, TextIO, Type, Union)
+                    Optional, Set, TextIO, Tuple, Type, Union)
 import uuid
 
 import colorama
@@ -54,6 +54,7 @@ if typing.TYPE_CHECKING:
 
     import sky
     from sky.serve import replica_managers
+    from sky.serve import service_spec as service_spec_lib
 else:
     psutil = adaptors_common.LazyImport('psutil')
     requests = adaptors_common.LazyImport('requests')
@@ -90,6 +91,13 @@ _CONTROLLER_HTTP_TIMEOUT_SECONDS = (1.0, 10.0)
 _STATUS_FANOUT_MAX_WORKERS = 8
 
 
+class AuthTokenConfigurationError(ValueError):
+    """A required Serve auth ring is absent or cannot be parsed safely."""
+
+
+_AUTH_TOKEN_PATTERN = re.compile(r'[A-Za-z0-9._~+/=-]+')
+
+
 def _get_controller_url(service_name: str, controller_port: int) -> str:
     """Resolve the controller HTTP URL.
 
@@ -119,17 +127,32 @@ def _request_to_controller_with_retry(method: str, service_name: str,
     # Force a bounded timeout.
     if 'timeout' not in kwargs:
         kwargs['timeout'] = _CONTROLLER_HTTP_TIMEOUT_SECONDS
-    # Attach the shared bearer token so the controller's authenticated
-    # (destructive) endpoints accept this trusted caller. Harmless on the
-    # unauthenticated read paths. No-op when auth is disabled (token unset).
-    auth_token = get_controller_auth_token()
-    if auth_token is not None:
-        headers = kwargs.setdefault('headers', {})
-        headers.setdefault('Authorization', f'Bearer {auth_token}')
+    # Controller callers use the admin ring, independent of the credential the
+    # LB uses for sync. During rotation, retry with the next overlap credential
+    # only after a 401: transport failures retry the SAME credential, while a
+    # 403/5xx is an application result and must not replay the request.
+    admin_tokens = get_controller_admin_auth_tokens()
+    base_headers = dict(kwargs.pop('headers', {}) or {})
+    caller_supplied_auth = any(
+        str(name).lower() == 'authorization' for name in base_headers)
+    token_index = 0
     for attempt in range(_CONTROLLER_HTTP_RETRY_ATTEMPTS):
         url = _get_controller_url(service_name, controller_port) + path
         try:
-            return request_fn(url, **kwargs)
+            while True:
+                headers = dict(base_headers)
+                if admin_tokens and not caller_supplied_auth:
+                    headers['Authorization'] = (
+                        f'Bearer {admin_tokens[token_index]}')
+                request_kwargs = dict(kwargs)
+                if headers:
+                    request_kwargs['headers'] = headers
+                response = request_fn(url, **request_kwargs)
+                if (response.status_code == 401 and not caller_supplied_auth and
+                        token_index + 1 < len(admin_tokens)):
+                    token_index += 1
+                    continue
+                return response
         except (requests.exceptions.ConnectionError,
                 requests.exceptions.Timeout):
             if attempt < _CONTROLLER_HTTP_RETRY_ATTEMPTS - 1:
@@ -398,8 +421,17 @@ def is_consolidation_mode(pool: bool = False) -> bool:
         # because the jobs validator only knows about leftover jobs.
         return controller_utils.is_jobs_consolidation_mode(
             extra_validator=_pool_consolidation_extra_validator)
-    # Serve (pool=False) runs on its own controller cluster, independent of
-    # the jobs controller, and keeps a config-driven consolidation flag.
+    # The external-only Helm topology necessarily runs service controllers in
+    # the API pod. Treat its explicit capability signal as authoritative so
+    # enabling the chart cannot accidentally launch an obsolete, billable
+    # dedicated controller VM because an old persisted config omitted the
+    # consolidation flag.
+    if (os.environ.get(constants.EXTERNAL_LB_ENABLED_ENV_VAR,
+                       '').lower() == 'true'):
+        return True
+    # Serve (pool=False) otherwise runs on its own controller cluster,
+    # independent of the jobs controller, and keeps a config-driven
+    # consolidation flag for compatibility outside the Helm topology.
     if os.environ.get(skylet_constants.OVERRIDE_CONSOLIDATION_MODE) is not None:
         # if we are in the serve controller, we must always be in
         # consolidation mode.
@@ -421,13 +453,12 @@ _external_lb_mode_cache: Optional[bool] = None
 
 
 def is_external_load_balancer_mode() -> bool:
-    """Whether the load balancer runs outside the controller pod.
+    """Whether the external-LB platform capability is enabled.
 
-    In external load balancer mode the controller binds a stable per-service
-    port (reused across respawns and pod rolls) and does not spawn an in-pod
-    load balancer, so a separate load balancer Deployment can target the
-    controller at a fixed address. Off by default; the in-pod load balancer
-    behavior is unchanged.
+    Real services have one supported topology: a per-service Kubernetes LB
+    Deployment syncing through the stable API-service proxy. False therefore
+    means service startup is unsupported (pools remain valid because they have
+    no inference endpoint); it no longer selects an in-pod implementation.
 
     TOPOLOGY, NOT PER-SERVICE CONFIG: consolidation-mode controllers run
     under a per-service SKYPILOT_CONFIG snapshot frozen at `serve up` (never
@@ -435,15 +466,17 @@ def is_external_load_balancer_mode() -> bool:
     loaded config let a pre-flag service's controller answer False while
     the API server (live DB config) answered True — the server advertised
     the external-LB DNS endpoint and ran the orphan reaper while the
-    controller kept an in-pod LB and never created the LB objects: a
-    permanently dangling endpoint (observed live). In any consolidation-pod
-    process, resolve from the SAME live server config the API server uses.
-    Flipping the flag OFF with external-LB services running reverts each
-    service to an in-pod LB on its next recovery; the LB objects stay until
-    the service is downed (the reaper only reaps services that no longer
-    exist).
+    controller never created the LB objects: a permanently dangling endpoint
+    (observed live). In any consolidation-pod process, resolve from the SAME
+    live server config the API server uses.
     """
     global _external_lb_mode_cache
+    platform_enabled = os.environ.get(constants.EXTERNAL_LB_ENABLED_ENV_VAR)
+    if platform_enabled is not None:
+        # The Helm capability gate must win over persisted/per-service config:
+        # it is what actually renders the RBAC, projected Secrets, and pod
+        # identity needed by this topology.
+        return platform_enabled.lower() == 'true'
     if os.environ.get(skylet_constants.ENV_VAR_IS_SKYPILOT_SERVER) is None:
         # VM-mode / client processes: unchanged.
         return skypilot_config.get_nested(
@@ -472,24 +505,87 @@ def is_external_load_balancer_mode() -> bool:
     return _external_lb_mode_cache
 
 
-def get_controller_auth_token() -> Optional[str]:
-    """Shared bearer token guarding the controller's control-plane endpoints.
+def _get_auth_tokens(file_env_var: str,
+                     legacy_token_env_var: str,
+                     ring_name: str,
+                     required: bool = False) -> Tuple[str, ...]:
+    """Read a newline-delimited bearer-token ring without caching it.
 
-    Read from ``CONTROLLER_AUTH_TOKEN_ENV_VAR``; None (auth disabled) when
-    unset. See the constant for the security rationale.
+    The configured file is authoritative and is read fresh on every call so a
+    projected Secret rotation is live. A final newline is accepted; blank
+    lines, whitespace-bearing/non-ASCII tokens, an empty file, and I/O/UTF-8
+    errors are rejected instead of silently falling back to the legacy env
+    token. The legacy single-token env is consulted only when no file is
+    configured, which keeps rolling upgrades backwards compatible.
     """
-    return os.environ.get(constants.CONTROLLER_AUTH_TOKEN_ENV_VAR) or None
+    token_file = os.environ.get(file_env_var)
+    if token_file:
+        try:
+            contents = pathlib.Path(token_file).expanduser().read_text(
+                encoding='utf-8')
+        except (OSError, UnicodeError) as e:
+            raise AuthTokenConfigurationError(
+                f'Cannot read {ring_name} token ring from {token_file!r}: '
+                f'{common_utils.format_exception(e)}') from e
+        tokens = tuple(contents.splitlines())
+        if not tokens:
+            raise AuthTokenConfigurationError(
+                f'{ring_name} token ring {token_file!r} is empty.')
+        for token in tokens:
+            if _AUTH_TOKEN_PATTERN.fullmatch(token) is None:
+                raise AuthTokenConfigurationError(
+                    f'{ring_name} token ring {token_file!r} contains an '
+                    'empty or malformed token.')
+        return tokens
+
+    legacy_token = os.environ.get(legacy_token_env_var)
+    if legacy_token:
+        if _AUTH_TOKEN_PATTERN.fullmatch(legacy_token) is None:
+            raise AuthTokenConfigurationError(
+                f'{legacy_token_env_var} contains a malformed token.')
+        return (legacy_token,)
+    if required:
+        raise AuthTokenConfigurationError(
+            f'{ring_name} authentication is required, but neither '
+            f'{file_env_var} nor {legacy_token_env_var} is configured.')
+    return ()
+
+
+def get_lb_sync_auth_tokens(required: bool = False) -> Tuple[str, ...]:
+    """Credentials accepted on, and presented to, the LB sync endpoint."""
+    return _get_auth_tokens(constants.LB_SYNC_AUTH_TOKENS_FILE_ENV_VAR,
+                            constants.CONTROLLER_AUTH_TOKEN_ENV_VAR,
+                            'load-balancer sync', required)
+
+
+def get_controller_admin_auth_tokens(required: bool = False) -> Tuple[str, ...]:
+    """Credentials accepted by trusted controller administration callers."""
+    return _get_auth_tokens(constants.CONTROLLER_ADMIN_AUTH_TOKENS_FILE_ENV_VAR,
+                            constants.CONTROLLER_AUTH_TOKEN_ENV_VAR,
+                            'controller admin', required)
+
+
+def get_lb_auth_tokens(required: bool = False) -> Tuple[str, ...]:
+    """Credentials accepted by the external LB inference data plane."""
+    return _get_auth_tokens(constants.LB_AUTH_TOKENS_FILE_ENV_VAR,
+                            constants.LB_AUTH_TOKEN_ENV_VAR,
+                            'load-balancer data plane', required)
+
+
+def get_controller_auth_token() -> Optional[str]:
+    """Legacy single-token view of the controller-admin ring.
+
+    New code should consume the complete, purpose-specific ring. This wrapper
+    remains for backwards-compatible callers during the migration.
+    """
+    tokens = get_controller_admin_auth_tokens()
+    return tokens[0] if tokens else None
 
 
 def get_lb_auth_token() -> Optional[str]:
-    """Shared bearer token guarding INBOUND inference requests to the external
-    load balancer (data-plane auth).
-
-    Read from ``LB_AUTH_TOKEN_ENV_VAR``; None (auth disabled) when unset. Kept
-    distinct from :func:`get_controller_auth_token` (control-plane) on purpose;
-    see the constant for the security rationale.
-    """
-    return os.environ.get(constants.LB_AUTH_TOKEN_ENV_VAR) or None
+    """Legacy single-token view of the inbound LB data-plane ring."""
+    tokens = get_lb_auth_tokens()
+    return tokens[0] if tokens else None
 
 
 def external_lb_socket_endpoint(
@@ -715,6 +811,24 @@ def _start_in_flight(service_name: str) -> bool:
     snapshot helper directly and reuses the set across services.
     """
     return service_name in _snapshot_in_flight_start_service_names()
+
+
+def validate_external_lb_service_spec(
+        service_spec: 'service_spec_lib.SkyServiceSpec') -> None:
+    """Validate service fields implemented by the external-only LB.
+
+    Task-level TLS used to terminate inside the in-pod load balancer. The
+    external LB intentionally serves HTTP behind the platform ingress, so
+    accepting that field would persist ``tls_encrypted=True`` and advertise an
+    HTTPS endpoint that does not exist.
+    """
+    if service_spec.tls_credential is not None:
+        with ux_utils.print_exception_no_traceback():
+            raise ValueError(
+                'Task-level service.tls_credential is not supported by the '
+                'external SkyServe load balancer. Terminate TLS at the '
+                'platform ingress/load balancer and remove tls_credential '
+                'from the service specification.')
 
 
 def validate_service_task(task: 'sky.Task', pool: bool) -> None:
@@ -1627,9 +1741,10 @@ def get_next_cluster_name(
         return replica_info.cluster_name
 
 
-def _terminate_failed_services(
-        service_name: str,
-        service_status: Optional[serve_state.ServiceStatus]) -> Optional[str]:
+def _terminate_failed_services(service_name: str,
+                               service_status: Optional[
+                                   serve_state.ServiceStatus],
+                               pool: bool = False) -> Optional[str]:
     """Terminate service in failed status.
 
     Services included in ServiceStatus.failed_statuses() do not have an
@@ -1683,9 +1798,30 @@ def _terminate_failed_services(
             f'{name!r}' for name in termination_failures if name is not None
         ]
 
-    # Purge semantics: clear every replica row even if its cluster failed to
-    # terminate -- the user explicitly traded a possible leak (reported
-    # below) for a clean record.
+    # Quiesce the external data plane before dropping the service row. If the
+    # delete fails, retaining the row makes purge retryable and prevents a
+    # same-name re-up from reusing a still-Ready LB with cached routes to the
+    # old replicas. The failed replica termination work above is idempotent on
+    # the next attempt.
+    # Imported here to break the circular dependency: lb_k8s imports
+    # serve_utils at module load.
+    from sky.serve import lb_k8s  # pylint: disable=import-outside-toplevel
+    if not pool:
+        try:
+            lb_k8s.delete_lb_objects(service_name)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.error(
+                f'Failed to delete external LB objects for failed service '
+                f'{service_name!r}; retaining purge state for retry: '
+                f'{common_utils.format_exception(e)}')
+            return (f'{colorama.Fore.YELLOW}failed service {service_name!r} '
+                    'could not be purged because its external load balancer '
+                    'could not be deleted; retry purge after fixing '
+                    f'Kubernetes access.{colorama.Style.RESET_ALL}')
+
+    # Purge semantics: clear every replica row after the data-plane quiesce,
+    # even if a replica cluster failed to terminate -- the user explicitly
+    # traded a possible compute leak (reported below) for a clean record.
     for replica_info in replica_infos:
         serve_state.remove_replica(service_name, replica_info.replica_id)
 
@@ -1695,18 +1831,6 @@ def _terminate_failed_services(
     # DB state in one transaction so an interrupted purge doesn't leave
     # stragglers.
     serve_state.remove_service_completely(service_name)
-    # Delete the controller-owned external LB objects too (no-op outside
-    # external-LB + in-cluster mode). The failed-service controller never ran
-    # its own success-path teardown, so the LB Deployment + Service would
-    # otherwise leak. Best-effort: a purge must still complete even if the k8s
-    # delete fails. Lazy import: lb_k8s imports serve_utils at module level, so
-    # a top-level import here would be circular.
-    from sky.serve import lb_k8s  # pylint: disable=import-outside-toplevel
-    try:
-        lb_k8s.delete_lb_objects(service_name)
-    except Exception as e:  # pylint: disable=broad-except
-        logger.error(f'Failed to delete external LB objects for failed service '
-                     f'{service_name!r}: {common_utils.format_exception(e)}')
     try:
         shutil.rmtree(service_dir)
     except FileNotFoundError:
@@ -1731,6 +1855,15 @@ def terminate_services(service_names: Optional[List[str]], purge: bool,
     service_names = serve_state.get_glob_service_names(service_names)
     terminated_service_names: List[str] = []
     messages: List[str] = []
+
+    def _purge_completed(message: Optional[str]) -> bool:
+        """Whether a failed-service purge removed its service row."""
+        # Replica termination failures are reported but the row is still
+        # removed. An external-LB deletion failure is different: the helper
+        # deliberately retains the row to prevent same-name re-up from
+        # inheriting a cached old LB, and marks that case explicitly.
+        return message is None or 'could not be purged because' not in message
+
     for service_name in service_names:
         service_status = _get_service_status(service_name,
                                              pool=pool,
@@ -1751,10 +1884,13 @@ def terminate_services(service_names: Optional[List[str]], purge: bool,
             if purge:
                 raw_pool = serve_state.get_service_pool_from_db(service_name)
                 if raw_pool is not None and raw_pool == pool:
-                    message = _terminate_failed_services(service_name, None)
+                    message = _terminate_failed_services(service_name,
+                                                         None,
+                                                         pool=pool)
                     if message is not None:
                         messages.append(message)
-                    terminated_service_names.append(f'{service_name!r}')
+                    if _purge_completed(message):
+                        terminated_service_names.append(f'{service_name!r}')
             continue
         if (service_status is not None and service_status['status']
                 == serve_state.ServiceStatus.SHUTTING_DOWN):
@@ -1770,10 +1906,13 @@ def terminate_services(service_names: Optional[List[str]], purge: bool,
                 # explicitly accepts a possible cluster-resource leak in
                 # exchange for clearing the row.
                 message = _terminate_failed_services(
-                    service_name, serve_state.ServiceStatus.SHUTTING_DOWN)
+                    service_name,
+                    serve_state.ServiceStatus.SHUTTING_DOWN,
+                    pool=pool)
                 if message is not None:
                     messages.append(message)
-                terminated_service_names.append(service_name)
+                if _purge_completed(message):
+                    terminated_service_names.append(service_name)
             # Without --purge, treat as already scheduled to terminate.
             continue
         if pool:
@@ -1798,9 +1937,12 @@ def terminate_services(service_names: Optional[List[str]], purge: bool,
             failed_status = service_status['status']
             if purge:
                 message = _terminate_failed_services(service_name,
-                                                     failed_status)
+                                                     failed_status,
+                                                     pool=pool)
                 if message is not None:
                     messages.append(message)
+                if _purge_completed(message):
+                    terminated_service_names.append(f'{service_name!r}')
             else:
                 messages.append(
                     f'{colorama.Fore.YELLOW}{capnoun} {service_name!r} is in '
@@ -1823,7 +1965,14 @@ def terminate_services(service_names: Optional[List[str]], purge: bool,
                 with signal_file.open(mode='w', encoding='utf-8') as f:
                     f.write(UserSignal.TERMINATE.value)
                     f.flush()
-        terminated_service_names.append(f'{service_name!r}')
+        # Failed-service purge branches append only after confirming the row
+        # was removed; normal signal-based down always reaches this point.
+        if (service_status is None or
+            (service_status['status']
+             not in serve_state.ServiceStatus.failed_statuses() and
+             service_status['status'] != serve_state.ServiceStatus.SHUTTING_DOWN
+            ) or not purge):
+            terminated_service_names.append(f'{service_name!r}')
     if not terminated_service_names:
         messages.append(f'No {noun} to terminate.')
     else:
@@ -2250,10 +2399,15 @@ def stream_serve_process_logs(service_name: str, stream_controller: bool,
     msg = _check_service_status_healthy(service_name, pool)
     if msg is not None:
         return msg
-    if stream_controller:
-        log_file = generate_remote_controller_log_file_name(service_name)
-    else:
-        log_file = generate_remote_load_balancer_log_file_name(service_name)
+    if not stream_controller:
+        if pool:
+            return 'Pools do not have a load balancer.'
+        # Lazy import avoids the lb_k8s -> serve_utils module cycle. External-
+        # only SkyServe writes LB output to the Kubernetes Pod log, never the
+        # legacy controller-local load_balancer.log file.
+        from sky.serve import lb_k8s  # pylint: disable=import-outside-toplevel
+        return lb_k8s.stream_lb_logs(service_name, follow, tail)
+    log_file = generate_remote_controller_log_file_name(service_name)
 
     def _service_is_terminal() -> bool:
         record = _get_service_status(service_name,

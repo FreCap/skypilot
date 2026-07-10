@@ -1,0 +1,373 @@
+"""Tests for the stable external-LB to SkyServe-controller proxy."""
+
+import asyncio
+from typing import List, Optional, Tuple
+
+import aiohttp
+import fastapi
+from fastapi import testclient
+import pytest
+
+from sky.serve import serve_state
+from sky.serve.server import controller_proxy
+from sky.server import server
+
+
+def _request(path: str,
+             authorization: Optional[str] = 'Bearer sync-token',
+             body: bytes = b'{"request_aggregator": {}}') -> fastapi.Request:
+    headers = [(b'content-type', b'application/json')]
+    if authorization is not None:
+        headers.append((b'authorization', authorization.encode('utf-8')))
+    sent = False
+
+    async def receive():
+        nonlocal sent
+        if sent:
+            return {'type': 'http.disconnect'}
+        sent = True
+        return {
+            'type': 'http.request',
+            'body': body,
+            'more_body': False,
+        }
+
+    return fastapi.Request(
+        {
+            'type': 'http',
+            'http_version': '1.1',
+            'method': 'POST',
+            'scheme': 'http',
+            'path': path,
+            'raw_path': path.encode('ascii'),
+            'query_string': b'',
+            'headers': headers,
+            'client': ('10.0.0.1', 1234),
+            'server': ('api', 80),
+        },
+        receive=receive)
+
+
+class _FakeControllerResponse:
+    """Minimal aiohttp response context manager for proxy tests."""
+
+    def __init__(self,
+                 body: bytes = b'{"replica_info": {}}',
+                 status: int = 200,
+                 content_type: str = 'application/json'):
+        self._body = body
+        self.status = status
+        self.headers = {'Content-Type': content_type}
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        del exc_type, exc, traceback
+
+    async def read(self):
+        return self._body
+
+
+class _FakeClientSession:
+    """Record the proxy's outbound requests without network I/O."""
+
+    def __init__(self, calls: List[dict], response=None):
+        self._calls = calls
+        self._response = response or _FakeControllerResponse()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        del exc_type, exc, traceback
+
+    def post(self, url, **kwargs):
+        self._calls.append({'url': url, **kwargs})
+        return self._response
+
+
+def _patch_owner_reads(monkeypatch, owners: List[Optional[Tuple[str, int, str,
+                                                                int]]]):
+    remaining = list(owners)
+
+    async def read_owner(service_name):
+        assert service_name == 'svc'
+        return remaining.pop(0)
+
+    monkeypatch.setattr(controller_proxy, '_read_controller_owner', read_owner)
+
+
+def _owner(controller_pid=1234,
+           controller_ip='10.2.3.4',
+           controller_port=20001,
+           service_hash='service-incarnation-a'):
+    return service_hash, controller_pid, controller_ip, controller_port
+
+
+def _owner_record(**overrides):
+    record = {
+        'hash': 'service-incarnation-a',
+        'status': serve_state.ServiceStatus.READY,
+        'controller_pid': 1234,
+        'controller_ip': '10.2.3.4',
+        'controller_port': 20001,
+    }
+    record.update(overrides)
+    return record
+
+
+def test_proxy_forwards_raw_body_once_and_preserves_response(monkeypatch):
+    owner = _owner()
+    _patch_owner_reads(monkeypatch, [owner, owner])
+    calls = []
+    upstream = _FakeControllerResponse(body=b'{"ok": true}', status=202)
+    monkeypatch.setattr(controller_proxy.aiohttp, 'ClientSession',
+                        lambda: _FakeClientSession(calls, response=upstream))
+    body = b'{"request_aggregator":{"timestamps":[1,2]}}'
+
+    response = asyncio.run(
+        controller_proxy.proxy_load_balancer_sync(
+            'svc',
+            _request('/api/internal/serve/svc/controller/load_balancer_sync',
+                     body=body)))
+
+    assert response.status_code == 202
+    assert response.body == b'{"ok": true}'
+    assert response.headers['content-type'] == 'application/json'
+    assert len(calls) == 1
+    assert calls[0]['url'] == (
+        'http://10.2.3.4:20001/controller/load_balancer_sync')
+    assert calls[0]['data'] == body
+    assert calls[0]['headers']['Authorization'] == 'Bearer sync-token'
+    assert calls[0]['headers']['Content-Type'] == 'application/json'
+    assert calls[0]['allow_redirects'] is False
+    assert calls[0]['timeout'].total == 25
+
+
+def test_proxy_rejects_response_if_owner_changes(monkeypatch):
+    _patch_owner_reads(monkeypatch, [
+        _owner(),
+        _owner(controller_pid=5678, controller_ip='10.2.3.5'),
+    ])
+    calls = []
+    monkeypatch.setattr(controller_proxy.aiohttp, 'ClientSession',
+                        lambda: _FakeClientSession(calls))
+
+    response = asyncio.run(
+        controller_proxy.proxy_load_balancer_sync(
+            'svc',
+            _request('/api/internal/serve/svc/controller/load_balancer_sync')))
+
+    assert response.status_code == 503
+    assert b'ownership changed' in response.body
+    assert len(calls) == 1
+
+
+def test_proxy_detects_same_address_reused_by_new_owner(monkeypatch):
+    _patch_owner_reads(monkeypatch, [_owner(), _owner(controller_pid=5678)])
+    calls = []
+    monkeypatch.setattr(controller_proxy.aiohttp, 'ClientSession',
+                        lambda: _FakeClientSession(calls))
+    response = asyncio.run(
+        controller_proxy.proxy_load_balancer_sync(
+            'svc',
+            _request('/api/internal/serve/svc/controller/load_balancer_sync')))
+    assert response.status_code == 503
+
+
+def test_proxy_detects_same_endpoint_reused_by_new_service_row(monkeypatch):
+    _patch_owner_reads(monkeypatch, [
+        _owner(service_hash='service-incarnation-a'),
+        _owner(service_hash='service-incarnation-b'),
+    ])
+    calls = []
+    monkeypatch.setattr(controller_proxy.aiohttp, 'ClientSession',
+                        lambda: _FakeClientSession(calls))
+    response = asyncio.run(
+        controller_proxy.proxy_load_balancer_sync(
+            'svc',
+            _request('/api/internal/serve/svc/controller/load_balancer_sync')))
+    assert response.status_code == 503
+    assert b'ownership changed' in response.body
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize('record', [
+    None,
+    _owner_record(controller_ip=None),
+    _owner_record(controller_port=None),
+    _owner_record(controller_ip='not-an-ip'),
+    _owner_record(controller_pid=None),
+    _owner_record(hash=None),
+    _owner_record(status=serve_state.ServiceStatus.SHUTTING_DOWN),
+    _owner_record(status=serve_state.ServiceStatus.FAILED_CLEANUP),
+])
+def test_proxy_rejects_missing_owner_without_forward(monkeypatch, record):
+    monkeypatch.setattr(controller_proxy.serve_state,
+                        'get_service_controller_owner',
+                        lambda service_name: record)
+
+    def unexpected_session():
+        raise AssertionError('must not connect without a complete owner')
+
+    monkeypatch.setattr(controller_proxy.aiohttp, 'ClientSession',
+                        unexpected_session)
+    response = asyncio.run(
+        controller_proxy.proxy_load_balancer_sync(
+            'svc',
+            _request('/api/internal/serve/svc/controller/load_balancer_sync')))
+    assert response.status_code == 503
+
+
+def test_controller_failed_owner_remains_routable_for_lb_recovery(monkeypatch):
+    record = _owner_record(status=serve_state.ServiceStatus.CONTROLLER_FAILED)
+    monkeypatch.setattr(controller_proxy.serve_state,
+                        'get_service_controller_owner',
+                        lambda service_name: record)
+
+    assert controller_proxy._get_controller_owner('svc') == _owner()
+
+
+def test_proxy_connection_failure_is_503_without_retry(monkeypatch):
+    owner = _owner()
+    _patch_owner_reads(monkeypatch, [owner])
+    calls = []
+
+    class FailingRequest:
+
+        async def __aenter__(self):
+            raise aiohttp.ClientConnectionError('refused')
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            del exc_type, exc, traceback
+
+    monkeypatch.setattr(
+        controller_proxy.aiohttp, 'ClientSession',
+        lambda: _FakeClientSession(calls, response=FailingRequest()))
+    response = asyncio.run(
+        controller_proxy.proxy_load_balancer_sync(
+            'svc',
+            _request('/api/internal/serve/svc/controller/load_balancer_sync')))
+    assert response.status_code == 503
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize('path,expected', [
+    ('/api/internal/serve/svc/controller/load_balancer_sync', True),
+    ('/api/internal/serve//controller/load_balancer_sync', False),
+    ('/api/internal/serve/a/b/controller/load_balancer_sync', False),
+    ('/api/internal/serve/svc/controller/load_balancer_sync/more', False),
+    ('/api/internal/serve/svc/controller/update_service', False),
+])
+def test_internal_route_match_is_exact(path, expected):
+    assert controller_proxy.is_controller_sync_path(path) is expected
+
+
+def test_internal_route_is_hidden_from_openapi():
+    app = fastapi.FastAPI()
+    app.include_router(controller_proxy.router)
+    assert controller_proxy.CONTROLLER_SYNC_ROUTE_PATH not in app.openapi(
+    )['paths']
+
+
+def test_api_server_route_authenticates_and_proxies(monkeypatch):
+    monkeypatch.setattr(server.serve_utils,
+                        'get_lb_sync_auth_tokens',
+                        lambda required=False: ('sync-token',))
+    owner = _owner()
+    _patch_owner_reads(monkeypatch, [owner, owner])
+    calls = []
+    monkeypatch.setattr(controller_proxy.aiohttp, 'ClientSession',
+                        lambda: _FakeClientSession(calls))
+
+    client = testclient.TestClient(server.app)
+    rejected = client.post(
+        '/api/internal/serve/svc/controller/load_balancer_sync',
+        headers={'Authorization': 'Bearer wrong'},
+        json={'request_aggregator': {}})
+    assert rejected.status_code == 401
+    assert not calls
+
+    response = client.post(
+        '/api/internal/serve/svc/controller/load_balancer_sync',
+        headers={'Authorization': 'Bearer sync-token'},
+        json={'request_aggregator': {}})
+
+    assert response.status_code == 200
+    assert response.json() == {'replica_info': {}}
+    assert len(calls) == 1
+
+
+def _run_auth_middleware(monkeypatch, authorization, tokens):
+    reads = []
+
+    def get_tokens(required=False):
+        reads.append(required)
+        if isinstance(tokens, Exception):
+            raise tokens
+        return tokens
+
+    monkeypatch.setattr(server.serve_utils,
+                        'get_lb_sync_auth_tokens',
+                        get_tokens,
+                        raising=False)
+    middleware = server.InternalServeControllerSyncAuthMiddleware(
+        app=lambda scope, receive, send: None)
+    request = _request('/api/internal/serve/svc/controller/load_balancer_sync',
+                       authorization)
+    request.state.auth_user = None
+    downstream_users = []
+
+    async def call_next(inner_request):
+        downstream_users.append(inner_request.state.auth_user)
+        return fastapi.responses.Response(status_code=204)
+
+    response = asyncio.run(middleware.dispatch(request, call_next))
+    return response, reads, downstream_users
+
+
+@pytest.mark.parametrize(
+    'authorization',
+    [None, '', 'Basic current', 'Bearer wrong', 'Bearer current extra'])
+def test_internal_auth_rejects_missing_or_bad_bearer(monkeypatch,
+                                                     authorization):
+    response, reads, downstream_users = _run_auth_middleware(
+        monkeypatch, authorization, ('current', 'previous'))
+    assert response.status_code == 401
+    assert reads == [True]
+    assert not downstream_users
+
+
+@pytest.mark.parametrize('token', ['current', 'previous'])
+def test_internal_auth_accepts_any_overlap_token(monkeypatch, token):
+    response, reads, downstream_users = _run_auth_middleware(
+        monkeypatch, f'Bearer {token}', ('current', 'previous'))
+    assert response.status_code == 204
+    assert reads == [True]
+    assert len(downstream_users) == 1
+    assert downstream_users[0].user_type == 'system'
+
+
+@pytest.mark.parametrize('tokens', [(), RuntimeError('secret unavailable')])
+def test_internal_auth_fails_closed_when_token_ring_unavailable(
+        monkeypatch, tokens):
+    response, reads, downstream_users = _run_auth_middleware(
+        monkeypatch, 'Bearer token', tokens)
+    assert response.status_code == 503
+    assert reads == [True]
+    assert not downstream_users
+
+
+def test_internal_auth_middleware_wraps_normal_auth():
+    middleware_names = [
+        middleware.cls.__name__ for middleware in server.app.user_middleware
+    ]
+    initialize_index = middleware_names.index(
+        'InitializeRequestAuthUserMiddleware')
+    internal_index = middleware_names.index(
+        'InternalServeControllerSyncAuthMiddleware')
+    bearer_index = middleware_names.index('BearerTokenMiddleware')
+    oauth_index = middleware_names.index('OAuth2ProxyMiddleware')
+    assert initialize_index < internal_index < bearer_index
+    assert internal_index < oauth_index

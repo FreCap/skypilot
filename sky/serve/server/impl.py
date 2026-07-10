@@ -26,6 +26,7 @@ from sky.backends import backend_utils
 from sky.catalog import common as service_catalog_common
 from sky.data import storage as storage_lib
 from sky.serve import constants as serve_constants
+from sky.serve import lb_k8s
 from sky.serve import runner as serve_runner
 from sky.serve import serve_rpc_utils
 from sky.serve import serve_state
@@ -52,6 +53,8 @@ else:
     grpc = adaptors_common.LazyImport('grpc')
 
 logger = sky_logging.init_logger(__name__)
+
+_KUBERNETES_LABEL_VALUE_MAX_LENGTH = 63
 
 
 def _rewrite_tls_credential_paths_and_get_tls_env_vars(
@@ -242,6 +245,53 @@ def _maybe_display_run_warning(task: 'task_lib.Task') -> None:
             f'`run` section.{colorama.Style.RESET_ALL}')
 
 
+def _validate_service_name(service_name: str, pool: bool) -> None:
+    """Validate every downstream use of a service/pool name."""
+    noun = 'pool' if pool else 'service'
+    capnoun = noun.capitalize()
+    if re.fullmatch(constants.CLUSTER_NAME_VALID_REGEX, service_name) is None:
+        with ux_utils.print_exception_no_traceback():
+            raise ValueError(f'{capnoun} name {service_name!r} is invalid: '
+                             f'ensure it is fully matched by regex (e.g., '
+                             'only contains lower letters, numbers and dash): '
+                             f'{constants.CLUSTER_NAME_VALID_REGEX}')
+    # External-LB objects retain the service name as an ownership label so the
+    # orphan reaper can map them back to the DB row. Kubernetes label values
+    # are capped at 63 characters; reject before mounts/provisioning rather
+    # than letting Deployment creation fail late.
+    if not pool and len(service_name) > _KUBERNETES_LABEL_VALUE_MAX_LENGTH:
+        with ux_utils.print_exception_no_traceback():
+            raise ValueError(
+                f'Service name {service_name!r} is too long for the external '
+                'SkyServe load balancer: use at most '
+                f'{_KUBERNETES_LABEL_VALUE_MAX_LENGTH} characters.')
+
+
+def _require_supported_service_topology(task: 'task_lib.Task',
+                                        pool: bool) -> None:
+    """Reject unsupported service topologies before any provisioning work.
+
+    Pools have no inference endpoint and therefore do not need a load
+    balancer. Real services have one supported topology: an in-cluster,
+    consolidated controller plus a per-service external Kubernetes LB.
+    """
+    if pool:
+        return
+    service_spec = task.service
+    assert service_spec is not None
+    serve_utils.validate_external_lb_service_spec(service_spec)
+    # Validate the platform (Kubernetes identity, stable proxy address, and
+    # all three projected auth rings) before syncing mounts or launching a
+    # dedicated controller VM that can never host the external-only topology.
+    lb_k8s.require_external_lb_runtime()
+    if not serve_utils.is_consolidation_mode(pool=False):
+        raise RuntimeError(
+            'External-only SkyServe requires '
+            'serve.controller.consolidation_mode=true so the controller runs '
+            'inside the Kubernetes API-server pod; dedicated controller VMs '
+            'are no longer supported.')
+
+
 def up(
     task: 'task_lib.Task',
     service_name: Optional[str] = None,
@@ -253,20 +303,12 @@ def up(
     assert task.service is not None
     assert task.service.pool == pool, 'Inconsistent pool flag.'
     noun = 'pool' if pool else 'service'
-    capnoun = noun.capitalize()
     if service_name is None:
         service_name = serve_utils.generate_service_name(pool)
 
-    # The service name will be used as:
-    # 1. controller cluster name: 'sky-serve-controller-<service_name>'
-    # 2. replica cluster name: '<service_name>-<replica_id>'
-    # In both cases, service name shares the same regex with cluster name.
-    if re.fullmatch(constants.CLUSTER_NAME_VALID_REGEX, service_name) is None:
-        with ux_utils.print_exception_no_traceback():
-            raise ValueError(f'{capnoun} name {service_name!r} is invalid: '
-                             f'ensure it is fully matched by regex (e.g., '
-                             'only contains lower letters, numbers and dash): '
-                             f'{constants.CLUSTER_NAME_VALID_REGEX}')
+    # The name becomes a controller/replica cluster name and, for services, a
+    # Kubernetes LB ownership label.
+    _validate_service_name(service_name, pool)
 
     dag = dag_utils.convert_entrypoint_to_dag(task)
     # Always apply the policy again here, even though it might have been applied
@@ -274,10 +316,11 @@ def up(
     # and get the mutated config.
     dag, mutated_user_config = admin_policy_utils.apply(
         dag, request_name=request_names.AdminPolicyRequestName.SERVE_UP)
-    dag.resolve_and_validate_volumes()
-    dag.pre_mount_volumes()
     task = dag.tasks[0]
     assert task.service is not None
+    _require_supported_service_topology(task, pool)
+    dag.resolve_and_validate_volumes()
+    dag.pre_mount_volumes()
     if pool:
         _maybe_display_run_warning(task)
         # Use dummy run script for pool.
@@ -358,15 +401,6 @@ def up(
                                    vars_to_fill,
                                    output_path=controller_file.name)
         controller_task = task_lib.Task.from_yaml(controller_file.name)
-        # TODO(tian): Probably run another sky.launch after we get the load
-        # balancer port from the controller? So we don't need to open so many
-        # ports here. Or, we should have a nginx traffic control to refuse
-        # any connection to the unregistered ports.
-        if not pool:
-            controller_resources = {
-                r.copy(ports=[serve_constants.LOAD_BALANCER_PORT_RANGE])
-                for r in controller_resources
-            }
         controller_task.set_resources(controller_resources)
 
         # # Set service_name so the backend will know to modify default ray
@@ -533,6 +567,7 @@ def up(
         else:
             external_endpoint = serve_utils.external_lb_socket_endpoint(
                 service_name, lb_port)
+            socket_endpoint: Optional[str]
             if external_endpoint is not None:
                 socket_endpoint = external_endpoint
             elif not serve_utils.is_consolidation_mode(pool) and not pool:
@@ -611,12 +646,11 @@ def up(
 
 def _reject_external_lb_mode_flip(
         mutated_config: 'config_utils.Config') -> None:
-    """Reject an update that would flip a service's external_load_balancer mode.
+    """Reject an update that disables the required external-LB capability.
 
-    ``external_load_balancer`` selects between an in-pod load balancer and an
-    out-of-pod (external) one. The two topologies have no supported live
-    migration -- switching binds/unbinds the stable controller port and
-    starts/stops the in-pod LB -- so it is an up/down-only choice.
+    SkyServe no longer has an in-pod LB topology. The flag is a server/platform
+    capability gate, not a per-service setting, so a task update cannot change
+    it.
 
     The mode is SERVER TOPOLOGY (``serve_utils.is_external_load_balancer_mode``
     resolves it from the live server config in consolidation mode, immune to
@@ -636,10 +670,9 @@ def _reject_external_lb_mode_flip(
         with ux_utils.print_exception_no_traceback():
             raise ValueError(
                 'Cannot change the external_load_balancer mode of a running '
-                'service via update: the mode is server topology (resolved '
-                'from the server config, not per-service config) and has no '
-                'live migration. Change the server config and tear down / '
-                're-create the service instead.')
+                'service via update: external LB support is a required server '
+                'capability resolved from server config, not per-service '
+                'config.')
 
 
 def update(
@@ -745,11 +778,7 @@ def _update_impl(
         task.run = serve_constants.POOL_DUMMY_RUN_COMMAND
 
     assert task.service is not None
-    if not pool and task.service.tls_credential is not None:
-        logger.warning('Updating TLS keyfile and certfile is not supported. '
-                       'Any updates to the keyfile and certfile will not take '
-                       'effect. To update TLS keyfile and certfile, please '
-                       'tear down the service and spin up a new one.')
+    _require_supported_service_topology(task, pool)
 
     prompt = None
     if (service_record['status'] == serve_state.ServiceStatus.CONTROLLER_FAILED
@@ -1104,6 +1133,7 @@ def status(
         if pool:
             continue
         if service_record['load_balancer_port'] is not None:
+            endpoint: Optional[str] = None
             try:
                 lb_port = service_record['load_balancer_port']
                 external_endpoint = serve_utils.external_lb_socket_endpoint(

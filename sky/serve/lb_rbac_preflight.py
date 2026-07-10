@@ -16,6 +16,7 @@ from typing import List, Tuple
 from sky import sky_logging
 from sky.adaptors import kubernetes
 from sky.provision.kubernetes import utils as kubernetes_utils
+from sky.serve import lb_k8s
 from sky.serve import serve_utils
 
 logger = sky_logging.init_logger(__name__)
@@ -25,11 +26,20 @@ logger = sky_logging.init_logger(__name__)
 # Deployments/services span the full create/reconcile/teardown lifecycle; pods
 # only need `get`, because image resolution reads the controller pod
 # (read_namespaced_pod) to mirror its image onto the LB Deployment.
-_LIFECYCLE_VERBS: List[str] = ['create', 'get', 'list', 'delete']
+_DEPLOYMENT_LIFECYCLE_VERBS: List[str] = [
+    'create', 'get', 'list', 'patch', 'delete'
+]
+_SERVICE_LIFECYCLE_VERBS: List[str] = [
+    'create', 'get', 'list', 'patch', 'delete'
+]
 _REQUIRED_CHECKS: List[Tuple[str, str, List[str]]] = [
-    ('apps', 'deployments', _LIFECYCLE_VERBS),
-    ('', 'services', _LIFECYCLE_VERBS),
-    ('', 'pods', ['get']),
+    ('apps', 'deployments', _DEPLOYMENT_LIFECYCLE_VERBS),
+    ('', 'services', _SERVICE_LIFECYCLE_VERBS),
+    # get: mirror the API pod image/auth projections; list: derive the
+    # authoritative live LB Pod UID set used to block unsafe drain proofs
+    # during rolling-update overlap.
+    ('', 'pods', ['get', 'list']),
+    ('', 'pods/log', ['get']),
 ]
 
 
@@ -56,7 +66,10 @@ def check_lb_rbac_preflight() -> None:
         return
 
     context = kubernetes.in_cluster_context_name()
-    namespace = kubernetes_utils.get_kube_config_context_namespace(context)
+    # LB objects and their projected Secrets live beside the API pod, which
+    # may differ from SKYPILOT_IN_CLUSTER_NAMESPACE (the workload namespace).
+    # Preflight the exact namespace create/reconcile will use.
+    namespace = lb_k8s.get_lb_namespace()
 
     missing: List[Tuple[str, str]] = []
     for group, resource, verbs in _REQUIRED_CHECKS:
@@ -92,5 +105,5 @@ def check_lb_rbac_preflight() -> None:
             'External load balancer RBAC preflight failed: the in-cluster '
             f'ServiceAccount is missing the following permissions in namespace '
             f'{namespace!r}: {missing_str}. Grant these verbs on '
-            "'apps/deployments', 'services' and 'pods' via the helm chart "
-            "'namespaceRules' and redeploy.")
+            '\'apps/deployments\', \'services\', \'pods\', and \'pods/log\' '
+            'via the helm chart \'namespaceRules\' and redeploy.')

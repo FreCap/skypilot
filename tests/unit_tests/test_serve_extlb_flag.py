@@ -12,6 +12,7 @@ import unittest
 from unittest import mock
 
 from sky import skypilot_config
+from sky.serve import constants
 from sky.serve import serve_utils
 from sky.skylet import constants as skylet_constants
 from sky.utils import config_utils
@@ -69,3 +70,38 @@ class TestExtlbFlagSource(unittest.TestCase):
             self.assertTrue(serve_utils.is_external_load_balancer_mode())
             self.assertTrue(serve_utils.is_external_load_balancer_mode())
         server_read.assert_called_once()
+
+    def test_platform_env_is_single_source_of_truth(self):
+        with mock.patch.dict(
+                serve_utils.os.environ, {
+                    constants.EXTERNAL_LB_ENABLED_ENV_VAR: 'true',
+                    skylet_constants.ENV_VAR_IS_SKYPILOT_SERVER: 'true',
+                }), \
+             mock.patch.object(
+                 skypilot_config,
+                 'get_effective_server_config') as server_read:
+            self.assertTrue(serve_utils.is_external_load_balancer_mode())
+        server_read.assert_not_called()
+
+    def test_platform_env_forces_serve_consolidation(self):
+        # External-only mode cannot provision a dedicated controller VM. The
+        # Helm capability signal therefore implies consolidation even when an
+        # older persisted config omitted the separate setting.
+        with mock.patch.dict(
+                serve_utils.os.environ,
+                {constants.EXTERNAL_LB_ENABLED_ENV_VAR: 'true'}), \
+             mock.patch.object(skypilot_config,
+                               'get_nested') as config_read:
+            self.assertTrue(serve_utils.is_consolidation_mode(pool=False))
+        config_read.assert_not_called()
+
+    def test_platform_env_does_not_change_pool_consolidation(self):
+        with mock.patch.dict(
+                serve_utils.os.environ,
+                {constants.EXTERNAL_LB_ENABLED_ENV_VAR: 'true'}), \
+             mock.patch.object(
+                 serve_utils.controller_utils,
+                 'is_jobs_consolidation_mode',
+                 return_value=False) as jobs_consolidation:
+            self.assertFalse(serve_utils.is_consolidation_mode(pool=True))
+        jobs_consolidation.assert_called_once()

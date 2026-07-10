@@ -41,7 +41,10 @@ def _mock_serve_db(tmp_path, monkeypatch):
     yield engine
 
 
-def _add_minimal_service(name: str, controller_ip=None):
+def _add_minimal_service(name: str,
+                         controller_ip=None,
+                         controller_pid=12345,
+                         service_hash=None):
     """Add a service row with all-required-args defaults so individual tests
     only need to specify what they care about."""
     return serve_state.add_service(
@@ -53,7 +56,7 @@ def _add_minimal_service(name: str, controller_ip=None):
         status=serve_state.ServiceStatus.CONTROLLER_INIT,
         tls_encrypted=False,
         pool=False,
-        controller_pid=12345,
+        controller_pid=controller_pid,
         entrypoint='entry',
         # A None spec is stored as pickled None (like `add_version` does), so
         # the read path (`_get_service_from_row`) skips the spec-dependent
@@ -61,6 +64,7 @@ def _add_minimal_service(name: str, controller_ip=None):
         spec=None,
         yaml_content='yaml: v1',
         controller_ip=controller_ip,
+        service_hash=service_hash,
     )
 
 
@@ -112,6 +116,12 @@ class TestAddServiceWritesControllerIp:
         # And the row is unchanged.
         record = _read_row(_mock_serve_db, 'svc3')
         assert record['controller_ip'] == '10.0.0.7'
+
+    def test_persists_caller_generated_incarnation(self, _mock_serve_db):
+        assert _add_minimal_service(
+            'svc-known-hash', service_hash='caller-generated-hash') is True
+        assert _read_row(_mock_serve_db,
+                         'svc-known-hash')['hash'] == 'caller-generated-hash'
 
 
 class TestAddServiceAtomicRegistration:
@@ -217,6 +227,39 @@ class TestGetServiceFromNameReturnsControllerIp:
             assert key in record, f'missing key: {key}'
 
 
+class TestGetServiceControllerOwner:
+    """The proxy hot path reads one narrow services-table record."""
+
+    def test_returns_only_routing_identity_without_loading_spec(
+            self, _mock_serve_db, monkeypatch):
+        _add_minimal_service('svc-owner', controller_ip='10.4.10.8')
+        serve_state.set_service_controller_port('svc-owner', 20007)
+
+        def fail_if_spec_loaded(*args, **kwargs):
+            del args, kwargs
+            raise AssertionError('owner lookup must not deserialize a spec')
+
+        monkeypatch.setattr(serve_state, 'get_spec', fail_if_spec_loaded)
+        record = serve_state.get_service_controller_owner('svc-owner')
+
+        assert record is not None
+        assert set(record) == {
+            'hash',
+            'status',
+            'controller_pid',
+            'controller_ip',
+            'controller_port',
+        }
+        assert record['hash']
+        assert record['status'] == serve_state.ServiceStatus.CONTROLLER_INIT
+        assert record['controller_pid'] == 12345
+        assert record['controller_ip'] == '10.4.10.8'
+        assert record['controller_port'] == 20007
+
+    def test_missing_row_returns_none(self, _mock_serve_db):
+        assert serve_state.get_service_controller_owner('missing') is None
+
+
 class TestUpdateServiceControllerPidIpAndPort:
     """The atomic update is the core of the HA-recovery DB flip — it must
     write pid, ip, AND port in a single transaction so clients never
@@ -232,12 +275,16 @@ class TestUpdateServiceControllerPidIpAndPort:
     def test_updates_all_three_fields(self, _mock_serve_db):
         _add_minimal_service('svc', controller_ip='10.0.0.7')
         serve_state.set_service_controller_port('svc', 20001)
+        service_hash = _read_row(_mock_serve_db, 'svc')['hash']
 
-        serve_state.update_service_controller_pid_ip_and_port(
+        assert serve_state.update_service_controller_pid_ip_and_port(
             'svc',
             controller_pid=99999,
             controller_ip='10.0.0.8',
-            controller_port=20007)
+            controller_port=20007,
+            expected_service_hash=service_hash,
+            expected_controller_pid=12345,
+            expected_controller_ip='10.0.0.7') is True
 
         record = _read_row(_mock_serve_db, 'svc')
         assert record['controller_pid'] == 99999
@@ -249,11 +296,15 @@ class TestUpdateServiceControllerPidIpAndPort:
         # in a hybrid deploy), the column must accept NULL. Port is still
         # required (it's an int column, no NULL).
         _add_minimal_service('svc', controller_ip='10.0.0.7')
-        serve_state.update_service_controller_pid_ip_and_port(
+        service_hash = _read_row(_mock_serve_db, 'svc')['hash']
+        assert serve_state.update_service_controller_pid_ip_and_port(
             'svc',
             controller_pid=99999,
             controller_ip=None,
-            controller_port=20007)
+            controller_port=20007,
+            expected_service_hash=service_hash,
+            expected_controller_pid=12345,
+            expected_controller_ip='10.0.0.7') is True
         record = _read_row(_mock_serve_db, 'svc')
         assert record['controller_pid'] == 99999
         assert record['controller_ip'] is None
@@ -262,11 +313,14 @@ class TestUpdateServiceControllerPidIpAndPort:
     def test_no_op_when_service_missing(self, _mock_serve_db):
         # Should not raise if the row was deleted between read and write
         # (e.g. a `down` raced our recovery).
-        serve_state.update_service_controller_pid_ip_and_port(
+        assert serve_state.update_service_controller_pid_ip_and_port(
             'never-existed',
             controller_pid=1,
             controller_ip='10.0.0.7',
-            controller_port=20001)
+            controller_port=20001,
+            expected_service_hash='missing-incarnation',
+            expected_controller_pid=12345,
+            expected_controller_ip='10.0.0.7') is False
         assert _read_row(_mock_serve_db, 'never-existed') is None
 
     def test_does_not_touch_other_fields(self, _mock_serve_db):
@@ -276,12 +330,16 @@ class TestUpdateServiceControllerPidIpAndPort:
         _add_minimal_service('svc', controller_ip='10.0.0.7')
         serve_state.set_service_controller_port('svc', 20001)
         serve_state.set_service_load_balancer_port('svc', 30000)
+        service_hash = _read_row(_mock_serve_db, 'svc')['hash']
 
-        serve_state.update_service_controller_pid_ip_and_port(
+        assert serve_state.update_service_controller_pid_ip_and_port(
             'svc',
             controller_pid=99999,
             controller_ip='10.0.0.8',
-            controller_port=20007)
+            controller_port=20007,
+            expected_service_hash=service_hash,
+            expected_controller_pid=12345,
+            expected_controller_ip='10.0.0.7') is True
 
         record = _read_row(_mock_serve_db, 'svc')
         assert record['controller_pid'] == 99999
@@ -289,39 +347,155 @@ class TestUpdateServiceControllerPidIpAndPort:
         assert record['controller_port'] == 20007
         assert record['load_balancer_port'] == 30000  # untouched
 
+    def test_rejects_purge_and_same_name_successor_with_same_pid(
+            self, _mock_serve_db):
+        _add_minimal_service('svc',
+                             controller_ip='10.0.0.7',
+                             controller_pid=777)
+        old_hash = _read_row(_mock_serve_db, 'svc')['hash']
+        assert serve_state.update_service_controller_pid_if_owner(
+            'svc', old_hash, 777, '10.0.0.7', 888, '10.0.0.8') is True
+
+        serve_state.remove_service_completely('svc')
+        _add_minimal_service('svc',
+                             controller_ip='10.9.0.1',
+                             controller_pid=888)
+        successor = _read_row(_mock_serve_db, 'svc')
+        assert successor['hash'] != old_hash
+
+        assert serve_state.update_service_controller_pid_ip_and_port(
+            'svc',
+            controller_pid=888,
+            controller_ip='10.0.0.8',
+            controller_port=20007,
+            expected_service_hash=old_hash,
+            expected_controller_pid=888,
+            expected_controller_ip='10.0.0.8') is False
+        record = _read_row(_mock_serve_db, 'svc')
+        assert record['hash'] == successor['hash']
+        assert record['controller_ip'] == '10.9.0.1'
+        assert record['controller_port'] is None
+
+    def test_publish_requires_preclaimed_ip_when_pid_collides(
+            self, _mock_serve_db):
+        _add_minimal_service('svc',
+                             controller_ip='10.0.0.1',
+                             controller_pid=777,
+                             service_hash='same-incarnation')
+        assert serve_state.update_service_controller_pid_if_owner(
+            'svc', 'same-incarnation', 777, '10.0.0.1', 777, '10.0.0.2') is True
+
+        assert serve_state.update_service_controller_pid_ip_and_port(
+            'svc',
+            controller_pid=777,
+            controller_ip='10.0.0.1',
+            controller_port=20001,
+            expected_service_hash='same-incarnation',
+            expected_controller_pid=777,
+            expected_controller_ip='10.0.0.1') is False
+        assert serve_state.update_service_controller_pid_ip_and_port(
+            'svc',
+            controller_pid=777,
+            controller_ip='10.0.0.2',
+            controller_port=20002,
+            expected_service_hash='same-incarnation',
+            expected_controller_pid=777,
+            expected_controller_ip='10.0.0.2') is True
+        record = _read_row(_mock_serve_db, 'svc')
+        assert record['controller_ip'] == '10.0.0.2'
+        assert record['controller_port'] == 20002
+
+
+class TestUpdateServiceControllerPidIfOwner:
+
+    def test_preclaim_requires_original_hash_and_pid(self, _mock_serve_db):
+        _add_minimal_service('svc', controller_pid=111)
+        serve_state.set_service_controller_port('svc', 20001)
+        service_hash = _read_row(_mock_serve_db, 'svc')['hash']
+        assert serve_state.update_service_controller_pid_if_owner(
+            'svc', service_hash, 111, None, 222, '10.0.0.2') is True
+        record = _read_row(_mock_serve_db, 'svc')
+        assert record['controller_pid'] == 222
+        assert record['controller_ip'] == '10.0.0.2'
+        assert record['controller_port'] is None
+        # A second recovery that read owner 111 before the first claim loses.
+        assert serve_state.update_service_controller_pid_if_owner(
+            'svc', service_hash, 111, None, 333, '10.0.0.3') is False
+        assert _read_row(_mock_serve_db, 'svc')['controller_pid'] == 222
+
+    def test_preclaim_rejects_same_name_successor(self, _mock_serve_db):
+        _add_minimal_service('svc', controller_pid=111)
+        old_hash = _read_row(_mock_serve_db, 'svc')['hash']
+        serve_state.remove_service_completely('svc')
+        # Deliberately reuse the same PID to model distinct Kubernetes pods.
+        _add_minimal_service('svc', controller_pid=111)
+        successor_hash = _read_row(_mock_serve_db, 'svc')['hash']
+
+        assert serve_state.update_service_controller_pid_if_owner(
+            'svc', old_hash, 111, None, 222, '10.0.0.2') is False
+        record = _read_row(_mock_serve_db, 'svc')
+        assert record['hash'] == successor_hash
+        assert record['controller_pid'] == 111
+
+    def test_ip_fences_equal_pids_within_same_incarnation(self, _mock_serve_db):
+        _add_minimal_service('svc',
+                             controller_pid=111,
+                             controller_ip='10.0.0.1',
+                             service_hash='same-incarnation')
+        assert serve_state.update_service_controller_pid_if_owner(
+            'svc', 'same-incarnation', 111, '10.0.0.1', 111, '10.0.0.2') is True
+        # A stale parent on the old pod can have the same namespace-local PID,
+        # but its old IP is no longer authoritative.
+        assert serve_state.update_service_controller_pid_if_owner(
+            'svc', 'same-incarnation', 111, '10.0.0.1', 111,
+            '10.0.0.3') is False
+        assert _read_row(_mock_serve_db, 'svc')['controller_ip'] == '10.0.0.2'
+
 
 class TestSetServiceControllerPortIfOwner:
     """Compare-and-swap port write for the in-place controller respawn: the
-    UPDATE must be filtered on controller_pid so a parent whose row was taken
-    over by HA recovery cannot clobber the new owner's port."""
+    UPDATE must be filtered on hash/PID/IP so a parent whose row was taken over
+    by HA recovery cannot clobber the new owner's port."""
 
     def test_owner_updates_port(self, _mock_serve_db):
         _add_minimal_service('svc')  # seeds controller_pid=12345
+        service_hash = _read_row(_mock_serve_db, 'svc')['hash']
         assert serve_state.set_service_controller_port_if_owner(
-            'svc', 12345, 20123) is True
+            'svc', service_hash, 12345, None, 20123) is True
         assert _read_row(_mock_serve_db, 'svc')['controller_port'] == 20123
 
     def test_non_owner_is_rejected(self, _mock_serve_db):
         _add_minimal_service('svc')
         serve_state.set_service_controller_port('svc', 20123)
+        service_hash = _read_row(_mock_serve_db, 'svc')['hash']
         assert serve_state.set_service_controller_port_if_owner(
-            'svc', 99999, 20999) is False
+            'svc', service_hash, 99999, None, 20999) is False
         assert _read_row(_mock_serve_db, 'svc')['controller_port'] == 20123
 
     def test_missing_service_returns_false(self, _mock_serve_db):
         assert serve_state.set_service_controller_port_if_owner(
-            'never-existed', 12345, 20123) is False
+            'never-existed', 'missing-hash', 12345, None, 20123) is False
+
+    def test_same_pid_successor_is_rejected_by_hash(self, _mock_serve_db):
+        _add_minimal_service('svc', controller_pid=12345)
+        old_hash = _read_row(_mock_serve_db, 'svc')['hash']
+        serve_state.remove_service_completely('svc')
+        _add_minimal_service('svc', controller_pid=12345)
+        assert serve_state.set_service_controller_port_if_owner(
+            'svc', old_hash, 12345, None, 20123) is False
+        assert _read_row(_mock_serve_db, 'svc')['controller_port'] is None
 
 
 class TestSetServiceLoadBalancerPortIfOwner:
     """CAS port write for recovery's external-LB republish: the UPDATE is
-    filtered on controller_pid so a stale recovery cannot write to a
+    filtered on hash/PID/IP so a stale recovery cannot write to a
     same-name successor's row."""
 
     def test_owner_updates_port(self, _mock_serve_db):
         _add_minimal_service('svc')  # seeds controller_pid=12345
+        service_hash = _read_row(_mock_serve_db, 'svc')['hash']
         assert serve_state.set_service_load_balancer_port_if_owner(
-            'svc', 12345, 30001) is True
+            'svc', service_hash, 12345, None, 30001) is True
         assert _read_row(_mock_serve_db, 'svc')['load_balancer_port'] == 30001
 
     def test_owner_updates_null_port(self, _mock_serve_db):
@@ -329,20 +503,31 @@ class TestSetServiceLoadBalancerPortIfOwner:
         # crashed before registration is the case this setter exists for.
         _add_minimal_service('svc')
         assert _read_row(_mock_serve_db, 'svc')['load_balancer_port'] is None
+        service_hash = _read_row(_mock_serve_db, 'svc')['hash']
         assert serve_state.set_service_load_balancer_port_if_owner(
-            'svc', 12345, 30001) is True
+            'svc', service_hash, 12345, None, 30001) is True
         assert _read_row(_mock_serve_db, 'svc')['load_balancer_port'] == 30001
 
     def test_non_owner_is_rejected(self, _mock_serve_db):
         _add_minimal_service('svc')
         serve_state.set_service_load_balancer_port('svc', 30002)
+        service_hash = _read_row(_mock_serve_db, 'svc')['hash']
         assert serve_state.set_service_load_balancer_port_if_owner(
-            'svc', 99999, 30001) is False
+            'svc', service_hash, 99999, None, 30001) is False
         assert _read_row(_mock_serve_db, 'svc')['load_balancer_port'] == 30002
 
     def test_missing_service_returns_false(self, _mock_serve_db):
         assert serve_state.set_service_load_balancer_port_if_owner(
-            'never-existed', 12345, 30001) is False
+            'never-existed', 'missing-hash', 12345, None, 30001) is False
+
+    def test_same_pid_successor_is_rejected_by_hash(self, _mock_serve_db):
+        _add_minimal_service('svc', controller_pid=12345)
+        old_hash = _read_row(_mock_serve_db, 'svc')['hash']
+        serve_state.remove_service_completely('svc')
+        _add_minimal_service('svc', controller_pid=12345)
+        assert serve_state.set_service_load_balancer_port_if_owner(
+            'svc', old_hash, 12345, None, 30001) is False
+        assert _read_row(_mock_serve_db, 'svc')['load_balancer_port'] is None
 
 
 class TestSetServiceControllerIp:

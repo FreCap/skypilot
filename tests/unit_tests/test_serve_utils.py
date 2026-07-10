@@ -8,6 +8,7 @@ import requests.exceptions as requests_exceptions
 
 from sky import clouds
 from sky.resources import Resources
+from sky.serve import constants
 from sky.serve import serve_state
 from sky.serve import serve_utils
 
@@ -15,6 +16,17 @@ from sky.serve import serve_utils
 # mock.patch needs the dotted path to the attribute being patched.
 _SIGNAL_FILE_CONST = (
     'sky.jobs.constants.JOBS_CONSOLIDATION_RELOADED_SIGNAL_FILE')
+
+
+def test_external_lb_service_spec_rejects_task_tls():
+    spec = mock.Mock(tls_credential=mock.Mock())
+    with pytest.raises(ValueError, match='Terminate TLS at the'):
+        serve_utils.validate_external_lb_service_spec(spec)
+
+
+def test_external_lb_service_spec_accepts_ingress_terminated_tls():
+    spec = mock.Mock(tls_credential=None)
+    serve_utils.validate_external_lb_service_spec(spec)
 
 
 def test_task_fits():
@@ -244,6 +256,57 @@ class TestControllerHttpRetry:
                     'svc', 20001, '/controller/update_service', json={})
                 assert resp.status_code == 200
                 assert m.call_count == 1
+
+    def test_admin_ring_falls_back_only_after_401(self, monkeypatch, tmp_path):
+        ring = tmp_path / 'admin.tokens'
+        ring.write_text('primary\noverlap\n', encoding='utf-8')
+        monkeypatch.setenv(constants.CONTROLLER_ADMIN_AUTH_TOKENS_FILE_ENV_VAR,
+                           str(ring))
+        responses = [mock.Mock(status_code=401), mock.Mock(status_code=200)]
+        with self._patch_record(None), \
+             mock.patch('sky.serve.serve_utils.requests.post',
+                        side_effect=responses) as request:
+            response = serve_utils._post_to_controller_with_retry(
+                'svc', 20001, '/controller/update_service', json={})
+
+        assert response.status_code == 200
+        assert [
+            call.kwargs['headers']['Authorization']
+            for call in request.call_args_list
+        ] == ['Bearer primary', 'Bearer overlap']
+
+    def test_admin_ring_does_not_fallback_on_non_401(self, monkeypatch,
+                                                     tmp_path):
+        ring = tmp_path / 'admin.tokens'
+        ring.write_text('primary\noverlap\n', encoding='utf-8')
+        monkeypatch.setenv(constants.CONTROLLER_ADMIN_AUTH_TOKENS_FILE_ENV_VAR,
+                           str(ring))
+        with self._patch_record(None), \
+             mock.patch('sky.serve.serve_utils.requests.post',
+                        return_value=mock.Mock(status_code=500)) as request:
+            response = serve_utils._post_to_controller_with_retry(
+                'svc', 20001, '/controller/update_service', json={})
+
+        assert response.status_code == 500
+        request.assert_called_once()
+        assert request.call_args.kwargs['headers']['Authorization'] == (
+            'Bearer primary')
+
+    def test_internal_request_never_uses_lb_sync_ring(self, monkeypatch,
+                                                      tmp_path):
+        sync_ring = tmp_path / 'sync.tokens'
+        sync_ring.write_text('sync-only\n', encoding='utf-8')
+        monkeypatch.setenv(constants.LB_SYNC_AUTH_TOKENS_FILE_ENV_VAR,
+                           str(sync_ring))
+        monkeypatch.delenv(constants.CONTROLLER_AUTH_TOKEN_ENV_VAR,
+                           raising=False)
+        with self._patch_record(None), \
+             mock.patch('sky.serve.serve_utils.requests.get',
+                        return_value=mock.Mock(status_code=200)) as request:
+            serve_utils._get_to_controller_with_retry('svc', 20001,
+                                                      '/autoscaler/info')
+
+        assert 'headers' not in request.call_args.kwargs
 
     def test_post_retries_then_succeeds(self):
         # First 2 calls raise, 3rd succeeds. The default attempt count is
@@ -1206,6 +1269,26 @@ class TestTerminateFailedServices:
             serve_utils._terminate_failed_services('svc', None)
         mock_delete_lb.assert_called_once_with('svc')
 
+    def test_lb_delete_failure_retains_purge_row(self):
+        # Never drop the service row while an old Ready LB may still hold
+        # cached routes; same-name re-up must remain blocked until deletion is
+        # retried successfully.
+        with mock.patch(
+                'sky.serve.serve_utils.serve_state.get_replica_infos',
+                return_value=[]), \
+             mock.patch('sky.serve.lb_k8s.delete_lb_objects',
+                        side_effect=RuntimeError('forbidden')), \
+             mock.patch('sky.serve.serve_utils.serve_state.remove_replica'
+                       ) as remove_replica, \
+             mock.patch('sky.serve.serve_utils.serve_state.'
+                        'remove_service_completely') as remove_service, \
+             mock.patch('sky.serve.serve_utils.shutil.rmtree'):
+            message = serve_utils._terminate_failed_services('svc', None)
+        assert message is not None
+        assert 'could not be purged' in message
+        remove_replica.assert_not_called()
+        remove_service.assert_not_called()
+
 
 class TestHaRecoveryFencesOnLeadershipLoss:
     """`ha_recovery_for_consolidation_mode` must re-check `still_leader`
@@ -1345,9 +1428,8 @@ def _patch_lb_mode(external, incluster=True, namespace='skypilot'):
         mock.patch.object(lb_k8s.kubernetes_utils,
                           'is_incluster_config_available',
                           return_value=incluster),
-        mock.patch.object(lb_k8s.kubernetes_utils,
-                          'get_kube_config_context_namespace',
-                          return_value=namespace),
+        mock.patch.dict(serve_utils.os.environ,
+                        {constants.POD_NAMESPACE_ENV_VAR: namespace}),
         mock.patch.object(lb_k8s.kubernetes,
                           'in_cluster_context_name',
                           return_value='in-cluster'),

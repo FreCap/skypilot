@@ -32,6 +32,13 @@ logger = sky_logging.init_logger(__name__)
 # must not share a counter.
 _INFLIGHT_ATTR = '_sky_inflight_requests'
 
+# HTTP semantics define these methods as idempotent: replay after an ambiguous
+# transport failure cannot create a second logical operation. POST/PATCH are
+# deliberately absent. A configured retriable response status remains an
+# explicit per-service opt-in even for those methods.
+_IDEMPOTENT_METHODS = frozenset(
+    {'GET', 'HEAD', 'PUT', 'DELETE', 'OPTIONS', 'TRACE'})
+
 
 class _RetriableStatusError(Exception):
     """A replica answered with a status the service marked retriable.
@@ -47,6 +54,10 @@ class _RetriableStatusError(Exception):
         super().__init__(
             f'replica {url} answered retriable status {status_code}')
         self.status_code = status_code
+
+
+class _PreDispatchError(RuntimeError):
+    """A proxy attempt failed before an upstream request could be sent."""
 
 
 class _ReleasingStreamingResponse(fastapi.responses.StreamingResponse):
@@ -84,6 +95,23 @@ def _is_dead_connection_error(exc: Exception) -> bool:
     return isinstance(exc, (httpx.NetworkError, httpx.ProtocolError))
 
 
+def _can_retry_proxy_failure(method: str, exc: Exception) -> bool:
+    """Whether replaying a failed proxy attempt preserves request semantics.
+
+    A configured retriable status is an explicit service-level opt-in. An
+    idempotent method is inherently replay-safe. For non-idempotent methods,
+    only failures that prove no connection/request dispatch occurred are safe;
+    read, write, protocol, and generic timeout failures have an ambiguous
+    outcome and must be returned without replaying the operation.
+    """
+    if isinstance(exc, _RetriableStatusError):
+        return True
+    if method.upper() in _IDEMPOTENT_METHODS:
+        return True
+    return isinstance(exc, (_PreDispatchError, httpx.ConnectError,
+                            httpx.ConnectTimeout, httpx.PoolTimeout))
+
+
 class _DrainableServer(uvicorn.Server):
     """A uvicorn Server that drains gracefully on SIGTERM.
 
@@ -103,6 +131,22 @@ class _DrainableServer(uvicorn.Server):
         super().__init__(config)
         self._on_drain = on_drain
         self._own_signals = False
+        self._drain_started = False
+
+    def _force_exit(self) -> None:
+        """Skip uvicorn's connection wait after a second termination signal."""
+        self.should_exit = True
+        self.force_exit = True
+
+    def _handle_sigterm(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Drain on first SIGTERM; force shutdown on the second."""
+        if self._drain_started:
+            self._force_exit()
+            return
+        self._drain_started = True
+        self._on_drain()
+        loop.call_later(constants.LB_DRAIN_GRACE_SECONDS,
+                        lambda: setattr(self, 'should_exit', True))
 
     @contextlib.contextmanager
     def capture_signals(self):
@@ -118,15 +162,11 @@ class _DrainableServer(uvicorn.Server):
     async def serve_with_drain(self) -> None:
         loop = asyncio.get_running_loop()
 
-        def _on_sigterm() -> None:
-            self._on_drain()
-            loop.call_later(constants.LB_DRAIN_GRACE_SECONDS,
-                            lambda: setattr(self, 'should_exit', True))
-
         try:
-            loop.add_signal_handler(signal.SIGTERM, _on_sigterm)
-            loop.add_signal_handler(signal.SIGINT,
-                                    lambda: setattr(self, 'should_exit', True))
+            loop.add_signal_handler(signal.SIGTERM, self._handle_sigterm, loop)
+            # SIGINT is the operator's immediate escape hatch, including
+            # during an already-started SIGTERM drain.
+            loop.add_signal_handler(signal.SIGINT, self._force_exit)
             self._own_signals = True
         except NotImplementedError:
             # add_signal_handler is unavailable (e.g. Windows); let uvicorn
@@ -145,31 +185,46 @@ class _InboundAuthMiddleware:
     (generator ``finally`` + ``BackgroundTask``) pass through untouched, and the
     hot path takes no per-request task/memory-stream overhead.
 
-    No-op when ``LB_AUTH_TOKEN_ENV_VAR`` is unset (dev / in-pod). Exempts ONLY
-    GET/HEAD on the readiness route -- any other method there falls through to
-    the (authenticated) catch-all proxy. Constant-time compare, ASCII-guarded so
-    a malformed header is a clean 401 rather than a 500.
+    In external-LB mode, missing or unreadable auth material fails closed.
+    Exempts ONLY GET/HEAD on the readiness route -- any other method there
+    falls through to the (authenticated) catch-all proxy. All overlap tokens
+    are accepted during rotation. Constant-time compare, ASCII-guarded so a
+    malformed header is a clean 401 rather than a 500.
     """
 
     def __init__(self, app) -> None:
         self._app = app
 
     async def __call__(self, scope, receive, send) -> None:
-        if scope['type'] == 'http' and not self._authorized(scope):
-            await fastapi.responses.JSONResponse(status_code=401,
-                                                 content={
-                                                     'detail': 'Unauthorized.'
-                                                 })(scope, receive, send)
-            return
+        if scope['type'] == 'http':
+            try:
+                authorized = self._authorized(scope)
+            except serve_utils.AuthTokenConfigurationError as e:
+                logger.error(
+                    'Load-balancer authentication is unavailable: '
+                    '%s', e)
+                await fastapi.responses.JSONResponse(
+                    status_code=503,
+                    content={
+                        'detail': 'Load-balancer authentication is unavailable.'
+                    })(scope, receive, send)
+                return
+            if not authorized:
+                await fastapi.responses.JSONResponse(
+                    status_code=401,
+                    content={'detail': 'Unauthorized.'})(scope, receive, send)
+                return
         await self._app(scope, receive, send)
 
     @staticmethod
     def _authorized(scope) -> bool:
-        expected_token = serve_utils.get_lb_auth_token()
-        if expected_token is None:
-            return True
         if (scope['method'] in ('GET', 'HEAD') and
-                scope['path'] == constants.LB_HEALTH_ENDPOINT_PATH):
+                scope['path'] in (constants.LB_HEALTH_ENDPOINT_PATH,
+                                  constants.LB_LIVENESS_ENDPOINT_PATH)):
+            return True
+        expected_tokens = serve_utils.get_lb_auth_tokens(
+            required=serve_utils.is_external_load_balancer_mode())
+        if not expected_tokens:
             return True
         authorization = None
         for name, value in scope.get('headers', []):
@@ -178,7 +233,11 @@ class _InboundAuthMiddleware:
                 break
         if authorization is None or not authorization.isascii():
             return False
-        return hmac.compare_digest(authorization, f'Bearer {expected_token}')
+        authorized = False
+        for expected_token in expected_tokens:
+            authorized |= hmac.compare_digest(authorization,
+                                              f'Bearer {expected_token}')
+        return authorized
 
 
 class SkyServeLoadBalancer:
@@ -558,11 +617,35 @@ class SkyServeLoadBalancer:
                         'deregistering from the controller sync.')
         self._draining = True
 
+    def _get_lb_session_id(self) -> str:
+        """Return the durable external LB identity, failing closed if absent."""
+        if serve_utils.is_external_load_balancer_mode():
+            pod_uid = os.environ.get(constants.LB_POD_UID_ENV_VAR, '').strip()
+            if not pod_uid:
+                raise RuntimeError(
+                    'External load balancer mode requires the Kubernetes '
+                    f'Downward API environment variable '
+                    f'{constants.LB_POD_UID_ENV_VAR}.')
+            # Read the Downward API value on every sync. It is immutable for a
+            # Pod, but a missing/corrupt runtime environment must never fall
+            # back to a process UUID that the controller cannot validate.
+            self._session_id = pod_uid
+        elif self._session_id is None:
+            # Compatibility for the legacy in-process topology and unit tests.
+            self._session_id = str(uuid.uuid4())
+        assert self._session_id is not None
+        return self._session_id
+
     async def _health(self,
                       request: fastapi.Request) -> fastapi.responses.Response:
         del request  # Unused.
         return fastapi.responses.Response(
             status_code=200 if self._is_ready_to_serve() else 503)
+
+    async def _liveness(self,
+                        request: fastapi.Request) -> fastapi.responses.Response:
+        del request  # Unused; liveness is independent of controller sync.
+        return fastapi.responses.Response(status_code=200)
 
     def _in_flight_with_draining(
         self,
@@ -1138,12 +1221,10 @@ class SkyServeLoadBalancer:
         num_ready_replicas: Optional[int] = None
         capacity_hint = None
 
-        # Present the control-plane bearer token so the (now-authenticated)
-        # sync path accepts this LB. No-op header when auth is disabled.
-        controller_token = serve_utils.get_controller_auth_token()
-        sync_headers = ({
-            'Authorization': f'Bearer {controller_token}'
-        } if controller_token is not None else None)
+        # Read the purpose-specific ring fresh for every sync. The primary is
+        # tried first; overlap credentials are replayed only after a 401.
+        sync_tokens = serve_utils.get_lb_sync_auth_tokens(
+            required=serve_utils.is_external_load_balancer_mode())
 
         # [boltz fork] Demand gauges ride alongside the timestamp
         # aggregator so the concurrency autoscaler sees outstanding work,
@@ -1154,13 +1235,12 @@ class SkyServeLoadBalancer:
         # map may be None (policy without load accounting): sent as-is,
         # the controller treats it as unknown rather than an idle fleet.
         # NOTE: gauges remain last-writer-wins per LB (unlike additive
-        # timestamps). During maxSurge overlap the controller detects multiple
-        # session ids, treats every live replica as unknown, and suppresses
-        # early drain proofs until only one reporter remains.
+        # timestamps). The controller compares the reporting Pod UID with the
+        # complete live LB Pod set on every sync, so maxSurge overlap and
+        # Kubernetes-query failure both suppress early drain proofs.
         in_flight, routing_urls, unknown_urls, occupancy_sampled_urls = (
             self._in_flight_with_draining())
-        if self._session_id is None:
-            self._session_id = str(uuid.uuid4())
+        session_id = self._get_lb_session_id()
         async with aiohttp.ClientSession() as session:
             # Remove exactly the batch being sent BEFORE awaiting the
             # controller. Requests arriving during the await accumulate in the
@@ -1179,43 +1259,60 @@ class SkyServeLoadBalancer:
                 # mistaking an envelope zero for known-idle async occupancy.
                 'occupancy_sampled_urls': occupancy_sampled_urls,
                 'draining_urls': list(self._draining_clients or {}),
-                'lb_session_id': self._session_id,
+                'lb_session_id': session_id,
                 'queue_depth': self._queue_depth,
                 'rejected_in_window': self._rejected_in_window(),
             }
             try:
-                # Send request information
-                async with session.post(
-                        self._controller_url + '/controller/load_balancer_sync',
-                        json=sync_payload,
-                        headers=sync_headers,
-                        timeout=aiohttp.ClientTimeout(
-                            constants.LB_CONTROLLER_SYNC_TIMEOUT_SECONDS),
-                ) as response:
-                    response.raise_for_status()
-                    # A 2xx acknowledges this exact drained batch. Mark it
-                    # accepted before decoding the response: the controller has
-                    # already collected the timestamps even if its response body
-                    # is malformed. The inverse partial-failure case (controller
-                    # counted it but the LB never receives 2xx) restores and
-                    # re-sends the batch, conservatively over-counting.
-                    request_batch_accepted = True
-                    response_json = await response.json()
-                    replica_info = response_json.get('replica_info', {})
-                    # Count of READY, active replicas the controller has, which
-                    # can exceed len(replica_info) when endpoints are briefly
-                    # unresolvable. None from an older controller that omits it.
-                    num_ready_replicas = response_json.get('num_ready_replicas')
-                    # [boltz fork] The controller ships the routing config
-                    # (policy/target-qps/stream-timeout) alongside replica_info
-                    # so `sky serve update` changes reach this LB without a
-                    # re-roll. Older controllers omit the key -> None -> the LB
-                    # keeps its launch-seeded policy.
-                    routing_spec = response_json.get('routing_spec')
-                    # [boltz fork] Provisioning/target counts for the
-                    # /_lb/capacity read; absent on older controllers.
-                    capacity_hint = response_json.get('capacity_hint')
-                    ready_replica_urls = list(replica_info.keys())
+                # Send request information. Drain the aggregator once for the
+                # entire credential sequence: a rejected primary must not
+                # restore/re-drain the batch before the overlap retry.
+                token_attempts: Tuple[Optional[str],
+                                      ...] = (sync_tokens if sync_tokens else
+                                              (None,))
+                for token_index, controller_token in enumerate(token_attempts):
+                    sync_headers = ({
+                        'Authorization': f'Bearer {controller_token}'
+                    } if controller_token is not None else None)
+                    async with session.post(
+                            self._controller_url +
+                            '/controller/load_balancer_sync',
+                            json=sync_payload,
+                            headers=sync_headers,
+                            timeout=aiohttp.ClientTimeout(
+                                constants.LB_CONTROLLER_SYNC_TIMEOUT_SECONDS),
+                    ) as response:
+                        if (getattr(response, 'status', None) == 401 and
+                                token_index + 1 < len(token_attempts)):
+                            continue
+                        response.raise_for_status()
+                        # A 2xx acknowledges this exact drained batch. Mark it
+                        # accepted before decoding the response: the controller
+                        # has already collected the timestamps even if its
+                        # response body is malformed. The inverse
+                        # partial-failure case (controller counted it but the LB
+                        # never receives 2xx) restores and re-sends the batch,
+                        # conservatively over-counting.
+                        request_batch_accepted = True
+                        response_json = await response.json()
+                        replica_info = response_json.get('replica_info', {})
+                        # Count of READY, active replicas the controller has,
+                        # which can exceed len(replica_info) when endpoints are
+                        # briefly unresolvable. None from an older controller
+                        # that omits it.
+                        num_ready_replicas = response_json.get(
+                            'num_ready_replicas')
+                        # [boltz fork] The controller ships the routing config
+                        # (policy/target-qps/stream-timeout) alongside
+                        # replica_info so `sky serve update` changes reach this
+                        # LB without a re-roll. Older controllers omit the key
+                        # -> None -> the LB keeps its launch-seeded policy.
+                        routing_spec = response_json.get('routing_spec')
+                        # [boltz fork] Provisioning/target counts for the
+                        # /_lb/capacity read; absent on older controllers.
+                        capacity_hint = response_json.get('capacity_hint')
+                        ready_replica_urls = list(replica_info.keys())
+                        break
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 logger.error(f'An error occurred when syncing with '
                              f'the controller: {e}'
@@ -1416,6 +1513,9 @@ class SkyServeLoadBalancer:
         """
         # Sleep for a while to wait the controller bootstrap.
         await asyncio.sleep(5)
+        failure_backoff = common_utils.Backoff(
+            initial_backoff=1,
+            max_backoff_factor=constants.LB_CONTROLLER_SYNC_INTERVAL_SECONDS)
 
         while True:
             # Once draining, stop POSTing load_balancer_sync so the controller
@@ -1426,12 +1526,25 @@ class SkyServeLoadBalancer:
                 return
             try:
                 await self._sync_with_controller_once()
+                # A successful round ends the failure streak. A later outage
+                # should retry promptly instead of inheriting a stale maximum
+                # delay from an earlier incident.
+                failure_backoff = common_utils.Backoff(
+                    initial_backoff=1,
+                    max_backoff_factor=(
+                        constants.LB_CONTROLLER_SYNC_INTERVAL_SECONDS))
                 await asyncio.sleep(
                     constants.LB_CONTROLLER_SYNC_INTERVAL_SECONDS)
             except Exception as e:  # pylint: disable=broad-except
+                retry_delay = min(failure_backoff.current_backoff(),
+                                  constants.LB_CONTROLLER_SYNC_INTERVAL_SECONDS)
                 logger.error(f'An error occurred when syncing with '
                              f'the controller: {e}'
+                             f'; retrying in {retry_delay:.1f}s'
                              f'\nTraceback: {traceback.format_exc()}')
+                # Without a delay, a bad token, unavailable proxy, or failed
+                # controller creates a CPU/network/log hot loop.
+                await asyncio.sleep(retry_delay)
 
     async def _proxy_request_to(
         self, url: str, request: fastapi.Request
@@ -1464,7 +1577,7 @@ class SkyServeLoadBalancer:
             with self._client_pool_lock:
                 client = self._client_pool.get(url, None)
             if client is None:
-                return RuntimeError(f'Client for {url} not found.')
+                return _PreDispatchError(f'Client for {url} not found.')
             # Counted on the CLIENT object so a pruned client is closed
             # only after its in-flight work drains (a re-added URL gets a
             # fresh client with its own counter). Decremented exactly once
@@ -1566,6 +1679,16 @@ class SkyServeLoadBalancer:
     async def _proxy_with_retries(
             self, request: fastapi.Request) -> fastapi.responses.Response:
         """Try to proxy the request to the endpoint replica with retries."""
+        if getattr(self, '_draining', False):
+            # The readiness change needs time to propagate through the
+            # Kubernetes Service/ingress. Reject requests that arrive in that
+            # window instead of starting new work while this Pod terminates.
+            raise fastapi.HTTPException(
+                status_code=503,
+                detail='Load balancer is draining; retry another endpoint.',
+                headers={
+                    'Retry-After': str(constants.LB_503_RETRY_AFTER_SECONDS)
+                })
         # Queue-depth gauge: requests currently inside the retry handler
         # but NOT dispatched to a replica (selecting, in retry backoff).
         # The dispatched phase is deliberately excluded: the dispatch
@@ -1688,10 +1811,21 @@ class SkyServeLoadBalancer:
                 # 499 means a client terminates the connection
                 # before the server is able to respond.
                 return fastapi.responses.Response(status_code=499)
-            # Transport failures retry for every method, including POST.
-            # SkyServe uses at-least-once delivery: an ambiguous failure may
-            # replay accepted work, but availability takes precedence and the
-            # loop remains bounded by max_retries below.
+            if not _can_retry_proxy_failure(request.method,
+                                            response_or_exception):
+                # A POST/PATCH may already have been accepted before a read,
+                # write, timeout, or protocol failure became visible. Replaying
+                # it can create a duplicate job. Surface the ambiguous outcome
+                # immediately; callers that own an idempotency key can make
+                # their own retry decision.
+                exception = common_utils.remove_color(
+                    common_utils.format_exception(response_or_exception,
+                                                  use_bracket=True))
+                raise fastapi.HTTPException(
+                    status_code=502,
+                    detail='Upstream outcome is unknown; the non-idempotent '
+                    'request was not replayed. '
+                    f'Last error encountered: {exception}.')
             if (all_ready_tried and
                     isinstance(response_or_exception, _RetriableStatusError)):
                 # Every ready replica already shed THIS request with a
@@ -1722,6 +1856,13 @@ class SkyServeLoadBalancer:
             await asyncio.sleep(current_backoff)
 
     def run(self):
+        if serve_utils.is_external_load_balancer_mode():
+            # Refuse to expose the external data plane before both of its trust
+            # boundaries are configured. Subsequent reads remain live and
+            # fail closed if a projected Secret becomes unreadable.
+            serve_utils.get_lb_sync_auth_tokens(required=True)
+            serve_utils.get_lb_auth_tokens(required=True)
+            self._get_lb_session_id()
         # Gate inbound inference requests on the shared bearer token (no-op when
         # unset). Pure-ASGI so it wraps the catch-all proxy without buffering
         # streaming responses; exempts the readiness probe by method+path.
@@ -1731,6 +1872,9 @@ class SkyServeLoadBalancer:
         # being proxied to a replica.
         self._app.add_api_route(constants.LB_HEALTH_ENDPOINT_PATH,
                                 self._health,
+                                methods=['GET'])
+        self._app.add_api_route(constants.LB_LIVENESS_ENDPOINT_PATH,
+                                self._liveness,
                                 methods=['GET'])
         # /_lb/capacity is a data-plane read for external admission systems, so
         # it stays behind the inbound bearer (unlike the readiness probe): the

@@ -6,6 +6,7 @@ gpu_type is expensive (cluster handle fetch + endpoint query), so both must
 be resolved at most once per replica lifetime and cached; the cache must be
 pruned when a replica leaves the ready set.
 """
+import asyncio
 import threading
 import types
 from typing import Dict, Optional
@@ -537,33 +538,67 @@ class TestUnknownAsyncOccupancy:
             [info], {1: True}, ['http://1.1.1.1:8080'], ['http://1.1.1.1:8080'])
         assert unknown == {1}
 
-    def test_overlapping_lb_sessions_force_declared_replica_unknown(self):
+    def test_lb_pod_report_has_independent_demand_and_drain_authority(self):
         ctrl = _make_controller()
         info = _FakeReplicaInfo(1,
                                 serve_state.ReplicaStatus.READY,
                                 url='http://1.1.1.1:8080',
                                 accelerators={'L4': 1})
         _sync(ctrl, [info])
-        assert not ctrl._record_lb_session_heartbeat(  # pylint: disable=protected-access
-            'lb-a', current_time=100)
-        overlap = ctrl._record_lb_session_heartbeat(  # pylint: disable=protected-access
-            'lb-b', current_time=101)
-        assert overlap
+        # One Kubernetes snapshot distinguishes the Pod receiving new traffic
+        # from every Pod that may still own a long-running stream.
+        cases = [
+            (controller.lb_k8s.LbPodAuthority(set(), set()), 'lb-a',
+             (False, False, False)),
+            (controller.lb_k8s.LbPodAuthority({'lb-a', 'lb-b'},
+                                              {'lb-a', 'lb-b'}), 'lb-a',
+             (True, False, False)),
+            (controller.lb_k8s.LbPodAuthority({'lb-b'}, {'lb-a', 'lb-b'}),
+             'lb-a', (True, False, False)),
+            (None, 'lb-a', (False, False, False)),
+            (controller.lb_k8s.LbPodAuthority({'lb-a'}, {'lb-a'}), None,
+             (False, False, False)),
+            # Normal steady state: one reporter owns both authority levels.
+            (controller.lb_k8s.LbPodAuthority({'lb-a'}, {'lb-a'}), 'lb-a',
+             (True, True, True)),
+            # New Ready Pod plus an old terminating Pod: demand stays live,
+            # but neither zero gauges nor drain metadata are service-wide.
+            (controller.lb_k8s.LbPodAuthority({'lb-a'}, {'lb-a', 'lb-old'}),
+             'lb-a', (True, True, False)),
+            # The sole terminating Pod can finish proving its streams drained,
+            # but it no longer owns new demand.
+            (controller.lb_k8s.LbPodAuthority(set(), {'lb-a'}), 'lb-a',
+             (True, False, True)),
+        ]
+        for pod_authority, reporter, expected in cases:
+            with mock.patch.object(controller.lb_k8s,
+                                   'get_lb_pod_authority',
+                                   return_value=pod_authority):
+                assert ctrl._lb_report_authority(  # pylint: disable=protected-access
+                    reporter) == expected
+        with mock.patch.object(controller.lb_k8s,
+                               'get_lb_pod_authority',
+                               side_effect=RuntimeError('adapter failed')):
+            assert ctrl._lb_report_authority(  # pylint: disable=protected-access
+                'lb-a') == (False, False, False)
+
+        report_is_authoritative = False
         unknown = ctrl._unknown_async_replica_ids(  # pylint: disable=protected-access
             [info], {1: None}, ['http://1.1.1.1:8080'], [],
-            force_all_live_unknown=overlap)
+            force_all_live_unknown=not report_is_authoritative)
         assert unknown == {1}
 
-        # LB-A's zero/off-route view must not complete a drain while LB-B is
-        # also active. routing_urls=None makes the drain tracker fall back to
-        # its bounded deadline regardless of the clean-looking gauge.
+        # A zero/off-route view must not complete a drain while another Pod is
+        # live, the UID mismatches, or Kubernetes liveness is unknown.
+        # routing_urls=None makes the drain tracker fall back to its bounded
+        # deadline regardless of the clean-looking gauge.
         in_flight, routing_urls = ctrl._lb_drain_report_view(  # pylint: disable=protected-access
             {
                 'in_flight': {
                     'http://1.1.1.1:8080': 0
                 },
                 'routing_urls': [],
-            }, overlap)
+            }, report_is_authoritative)
         manager = types.SimpleNamespace(_lb_in_flight_report=None)
         controller.replica_managers.ReplicaManager.update_lb_in_flight(
             manager,
@@ -578,18 +613,219 @@ class TestUnknownAsyncOccupancy:
             drain_started=0)
         assert not tracker()
 
-        after_stale = (
-            101 +
-            3 * controller.serve_constants.LB_CONTROLLER_SYNC_INTERVAL_SECONDS +
-            1)
-        overlap = ctrl._record_lb_session_heartbeat(  # pylint: disable=protected-access
-            'lb-b',
-            current_time=after_stale)
-        assert not overlap
+        # Once Kubernetes reports the sole matching Pod, occupancy and drain
+        # proofs are accepted immediately; no arbitrary heartbeat TTL applies.
+        report_is_authoritative = True
         unknown = ctrl._unknown_async_replica_ids(  # pylint: disable=protected-access
             [info], {1: None}, ['http://1.1.1.1:8080'], [],
-            force_all_live_unknown=overlap)
+            force_all_live_unknown=not report_is_authoritative)
         assert unknown == set()
+        in_flight, routing_urls = ctrl._lb_drain_report_view(  # pylint: disable=protected-access
+            {
+                'in_flight': {
+                    'http://1.1.1.1:8080': 0
+                },
+                'routing_urls': [],
+            }, report_is_authoritative)
+        assert in_flight == {'http://1.1.1.1:8080': 0}
+        assert routing_urls == []
+
+
+class _StatefulDemandAutoscaler:
+    """Small stateful collector exposing every LB-controlled demand field."""
+
+    def __init__(self) -> None:
+        self.request_timestamps = [101]
+        self.in_flight_by_replica_id = {1: 9}
+        self.unknown_in_flight_replica_ids = {1}
+        self.queue_depth = 7
+        self.rejected_in_window = 5
+        self.collect_calls = 0
+
+    def collect_request_information(self, report) -> None:
+        self.collect_calls += 1
+        self.request_timestamps.extend(report['timestamps'])
+        self.in_flight_by_replica_id = report['in_flight_by_replica_id']
+        self.unknown_in_flight_replica_ids = set(
+            report['unknown_in_flight_replica_ids'])
+        self.queue_depth = report['queue_depth']
+        self.rejected_in_window = report['rejected_in_window']
+
+    def snapshot(self):
+        return (list(self.request_timestamps),
+                dict(self.in_flight_by_replica_id),
+                set(self.unknown_in_flight_replica_ids), self.queue_depth,
+                self.rejected_in_window, self.collect_calls)
+
+
+class _StatefulReplicaManager:
+    """Small stateful drain-report sink used to detect any mutation."""
+
+    def __init__(self) -> None:
+        self.report = ({
+            'http://trusted:8080': 4
+        }, ['http://trusted:8080'], ['http://trusted:8080'],
+                       ['http://trusted:8080'], 'trusted-session')
+        self.update_calls = 0
+
+    def update_lb_in_flight(self, in_flight, routing_urls, unknown_urls,
+                            draining_urls, lb_session_id) -> None:
+        self.update_calls += 1
+        self.report = (in_flight, routing_urls, unknown_urls, draining_urls,
+                       lb_session_id)
+
+    def snapshot(self):
+        return self.report, self.update_calls
+
+
+class TestAuthoritativeLbReportIngestion:
+    """Demand and drain mutate only at their respective authority levels."""
+
+    _URL = 'http://1.1.1.1:8080'
+
+    def _controller_and_report(self):
+        ctrl = _make_controller()
+        ctrl._autoscaler = _StatefulDemandAutoscaler()  # pylint: disable=protected-access
+        ctrl._replica_manager = _StatefulReplicaManager()  # pylint: disable=protected-access
+        ctrl._lb_translation_cache = {  # pylint: disable=protected-access
+            1: (self._URL, 'L4', 1)
+        }
+        info = _FakeReplicaInfo(1,
+                                serve_state.ReplicaStatus.READY,
+                                url=self._URL,
+                                accelerators={'L4': 1})
+        report = {
+            'lb_session_id': 'lb-a',
+            'request_aggregator': {
+                'timestamps': [201, 202]
+            },
+            'in_flight': {
+                self._URL: 2
+            },
+            'occupancy_sampled_urls': [],
+            'unknown_in_flight_urls': [self._URL],
+            'queue_depth': 11,
+            'rejected_in_window': 13,
+            'routing_urls': [self._URL],
+            'draining_urls': [self._URL],
+        }
+        return ctrl, info, report
+
+    def test_wrong_ambiguous_and_unavailable_reporters_change_nothing(self):
+        outcomes = [
+            (controller.lb_k8s.LbPodAuthority({'lb-other'},
+                                              {'lb-other'}), False),
+            # Multiple Ready Pods make even demand last-writer-wins.
+            (controller.lb_k8s.LbPodAuthority({'lb-a', 'lb-other'},
+                                              {'lb-a', 'lb-other'}), True),
+            (controller.lb_k8s.LbPodAuthority(set(), set()), False),
+            (None, False),  # Kubernetes lookup failed closed.
+            (RuntimeError('adapter failed'),
+             False),  # Unexpected adapter failure.
+        ]
+        for outcome, expected_accepted in outcomes:
+            ctrl, info, report = self._controller_and_report()
+            autoscaler_before = ctrl._autoscaler.snapshot()  # pylint: disable=protected-access
+            drain_before = ctrl._replica_manager.snapshot()  # pylint: disable=protected-access
+            kwargs = ({
+                'side_effect': outcome
+            } if isinstance(outcome, Exception) else {
+                'return_value': outcome
+            })
+            with mock.patch.object(controller.lb_k8s, 'get_lb_pod_authority',
+                                   **kwargs):
+                accepted = asyncio.run(
+                    ctrl._ingest_load_balancer_report(  # pylint: disable=protected-access
+                        report, [info], {1: True}))
+
+            assert accepted is expected_accepted
+            # Timestamps, in-flight/occupancy, queue depth, and rejected
+            # demand retain the last trusted snapshot.
+            assert ctrl._autoscaler.snapshot() == autoscaler_before  # pylint: disable=protected-access
+            # Routing, unknown/draining sets, and LB session retain the last
+            # trusted drain snapshot (even its freshness is not advanced).
+            assert ctrl._replica_manager.snapshot() == drain_before  # pylint: disable=protected-access
+
+    def test_wrong_service_uid_cannot_enumerate_replica_urls(self):
+        ctrl, _, report = self._controller_and_report()
+        with mock.patch.object(
+                controller.lb_k8s,
+                'get_lb_pod_authority',
+                return_value=controller.lb_k8s.LbPodAuthority(
+                    {'other-service-pod'},
+                    {'other-service-pod'})), mock.patch.object(
+                        controller.serve_state,
+                        'get_replica_infos') as get_replica_infos:
+            response = asyncio.run(
+                ctrl._handle_load_balancer_sync(  # pylint: disable=protected-access
+                    report))
+
+        assert response.status_code == 503
+        assert response.body == b''
+        # Membership is checked before even reading/resolving replica records.
+        get_replica_infos.assert_not_called()
+
+    def test_sole_matching_reporter_updates_all_demand_and_drain_state(self):
+        ctrl, info, report = self._controller_and_report()
+        with mock.patch.object(controller.lb_k8s,
+                               'get_lb_pod_authority',
+                               return_value=controller.lb_k8s.LbPodAuthority(
+                                   {'lb-a'}, {'lb-a'})):
+            accepted = asyncio.run(
+                ctrl._ingest_load_balancer_report(  # pylint: disable=protected-access
+                    report, [info], {1: True}))
+
+        assert accepted is True
+        assert ctrl._autoscaler.snapshot() == (  # pylint: disable=protected-access
+            [101, 201, 202], {
+                1: 2
+            }, {1}, 11, 13, 1)
+        assert ctrl._replica_manager.snapshot() == (  # pylint: disable=protected-access
+            ({
+                self._URL: 2
+            }, [self._URL], [self._URL], [self._URL], 'lb-a'), 1)
+
+    def test_sole_ready_reporter_keeps_demand_during_terminating_overlap(self):
+        ctrl, info, report = self._controller_and_report()
+        with mock.patch.object(controller.lb_k8s,
+                               'get_lb_pod_authority',
+                               return_value=controller.lb_k8s.LbPodAuthority(
+                                   {'lb-a'}, {'lb-a', 'lb-old'})):
+            accepted = asyncio.run(
+                ctrl._ingest_load_balancer_report(  # pylint: disable=protected-access
+                    report, [info], {1: True}))
+
+        assert accepted is True
+        # QPS and positive demand continue through an arbitrarily long old-Pod
+        # termination, while all live replicas are fail-closed as busy.
+        assert ctrl._autoscaler.snapshot() == (  # pylint: disable=protected-access
+            [101, 201, 202], {
+                1: 2
+            }, {1}, 11, 13, 1)
+        # The reporter's clean-looking drain fields are not copied. A blocking
+        # view also invalidates any still-fresh proof from before the rollout.
+        assert ctrl._replica_manager.snapshot() == (  # pylint: disable=protected-access
+            ({}, None, [], [], 'lb-a'), 1)
+
+    def test_sole_terminating_reporter_updates_drain_but_not_demand(self):
+        ctrl, info, report = self._controller_and_report()
+        # If demand parsing accidentally runs, this malformed block would fail.
+        report['request_aggregator'] = None
+        autoscaler_before = ctrl._autoscaler.snapshot()  # pylint: disable=protected-access
+        with mock.patch.object(controller.lb_k8s,
+                               'get_lb_pod_authority',
+                               return_value=controller.lb_k8s.LbPodAuthority(
+                                   set(), {'lb-a'})):
+            accepted = asyncio.run(
+                ctrl._ingest_load_balancer_report(  # pylint: disable=protected-access
+                    report, [info], {1: True}))
+
+        assert accepted is True
+        assert ctrl._autoscaler.snapshot() == autoscaler_before  # pylint: disable=protected-access
+        assert ctrl._replica_manager.snapshot() == (  # pylint: disable=protected-access
+            ({
+                self._URL: 2
+            }, [self._URL], [self._URL], [self._URL], 'lb-a'), 1)
 
 
 class _FakeAutoscaler:

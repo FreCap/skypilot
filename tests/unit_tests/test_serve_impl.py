@@ -20,6 +20,70 @@ def _backend_mock():
     return mock.MagicMock(spec=backends.CloudVmRayBackend)
 
 
+class TestExternalOnlyTopologyPreflight:
+    """Unsupported service layouts fail before mounts or cloud provisioning."""
+
+    @staticmethod
+    def _task(tls_credential=None):
+        task = mock.Mock()
+        task.service = mock.Mock(tls_credential=tls_credential)
+        return task
+
+    def test_pool_bypasses_lb_runtime(self):
+        with mock.patch.object(
+                impl.lb_k8s,
+                'require_external_lb_runtime') as runtime_check, \
+             mock.patch.object(impl.serve_utils,
+                               'is_consolidation_mode') as consolidation:
+            impl._require_supported_service_topology(self._task(), pool=True)
+        runtime_check.assert_not_called()
+        consolidation.assert_not_called()
+
+    def test_task_level_tls_is_rejected_before_runtime_work(self):
+        with mock.patch.object(
+                impl.lb_k8s,
+                'require_external_lb_runtime') as runtime_check, \
+             pytest.raises(ValueError, match='Terminate TLS at the'):
+            impl._require_supported_service_topology(
+                self._task(tls_credential=mock.Mock()), pool=False)
+        runtime_check.assert_not_called()
+
+    def test_dedicated_controller_vm_is_rejected(self):
+        with mock.patch.object(impl.lb_k8s,
+                               'require_external_lb_runtime'), \
+             mock.patch.object(impl.serve_utils,
+                               'is_consolidation_mode',
+                               return_value=False), \
+             pytest.raises(RuntimeError, match='dedicated controller VMs'):
+            impl._require_supported_service_topology(self._task(), pool=False)
+
+    def test_consolidated_external_runtime_is_accepted(self):
+        with mock.patch.object(
+                impl.lb_k8s,
+                'require_external_lb_runtime') as runtime_check, \
+             mock.patch.object(impl.serve_utils,
+                               'is_consolidation_mode',
+                               return_value=True) as consolidation:
+            impl._require_supported_service_topology(self._task(), pool=False)
+        runtime_check.assert_called_once_with()
+        consolidation.assert_called_once_with(pool=False)
+
+
+class TestServiceNameValidation:
+
+    def test_external_service_label_boundary(self):
+        impl._validate_service_name('s' * 63, pool=False)
+        with pytest.raises(ValueError, match='at most 63 characters'):
+            impl._validate_service_name('s' * 64, pool=False)
+
+    def test_pool_is_not_limited_by_lb_label_boundary(self):
+        impl._validate_service_name('p' * 64, pool=True)
+
+    def test_cluster_name_grammar_still_applies(self):
+        with pytest.raises(ValueError, match='is invalid'):
+            impl._validate_service_name('bad/service', pool=False)
+
+
 class TestApplyRefusesTerminalStates:
     """`apply` should refuse to update a row that's in a terminal state.
     The previous behavior was to call `update()` regardless, which would
