@@ -282,6 +282,7 @@ serve:
     enabled: false
     # Resources for each per-service LB container. Explicit requests keep LBs
     # out of the BestEffort QoS class and make fleet-scale scheduling visible.
+    # Set this to null to omit resource requests and limits.
     # @schema type: [object, null]
     resources:
       requests:

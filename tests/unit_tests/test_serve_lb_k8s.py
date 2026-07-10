@@ -800,6 +800,11 @@ def test_lb_resources_are_configurable(monkeypatch):
     }
 
 
+def test_lb_resources_accept_legacy_json_null(monkeypatch):
+    monkeypatch.setenv(constants.LB_RESOURCES_ENV_VAR, 'null')
+    assert lb_k8s._lb_resources() == {}
+
+
 @pytest.mark.parametrize(('declared_image', 'image_id', 'expected'), [
     ('repo/skypilot:moving',
      f'docker-pullable://registry.example/repo/skypilot@{_DIGEST_A}',

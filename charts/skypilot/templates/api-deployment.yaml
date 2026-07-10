@@ -1,7 +1,7 @@
 {{- $fullName := include "skypilot.fullname" . -}}
 {{- $externalLB := .Values.serve.externalLoadBalancer | default (dict) -}}
 {{- $externalLBEnabled := get $externalLB "enabled" | default false -}}
-{{- $externalLBResources := get $externalLB "resources" -}}
+{{- $externalLBResources := get $externalLB "resources" | default (dict) -}}
 {{- $externalLBAuth := get $externalLB "auth" | default (dict) -}}
 {{- $lbSyncAuth := get $externalLBAuth "lbSync" | default (dict) -}}
 {{- $controllerAdminAuth := get $externalLBAuth "controllerAdmin" | default (dict) -}}

@@ -795,6 +795,11 @@ def _lb_resources() -> dict:
     except json.JSONDecodeError as e:
         raise RuntimeError(
             f'{constants.LB_RESOURCES_ENV_VAR} must contain JSON: {e}') from e
+    # Older chart versions rendered an explicitly allowed ``resources: null``
+    # value as JSON null. Treat that the same as the new chart's empty object
+    # so an image-first upgrade remains compatible.
+    if resources is None:
+        return {}
     if not isinstance(resources, dict):
         raise RuntimeError(
             f'{constants.LB_RESOURCES_ENV_VAR} must contain a JSON object.')
