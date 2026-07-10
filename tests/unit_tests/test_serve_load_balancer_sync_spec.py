@@ -203,10 +203,13 @@ class TestKeepReadySetOnEmptySync:
 class _FakeResp:
     """Async-context-manager stub for aiohttp's response."""
 
-    def __init__(self, body) -> None:
+    def __init__(self, body, on_enter=None) -> None:
         self._body = body
+        self._on_enter = on_enter
 
     async def __aenter__(self):
+        if self._on_enter is not None:
+            self._on_enter()
         return self
 
     async def __aexit__(self, *exc) -> bool:
@@ -235,16 +238,18 @@ class _FakeSession:
         return self._resp
 
 
-def _run_one_sync(lb: load_balancer.SkyServeLoadBalancer, body) -> None:
+def _run_one_sync(lb: load_balancer.SkyServeLoadBalancer,
+                  body,
+                  on_response_enter=None) -> None:
     """Drive a single _sync_with_controller_once with a mocked controller
     response carrying `body`."""
-    session = _FakeSession(_FakeResp(body))
+    session = _FakeSession(_FakeResp(body, on_enter=on_response_enter))
     with mock.patch.object(load_balancer.aiohttp,
                            'ClientSession',
                            return_value=session), \
          mock.patch.object(load_balancer.serve_utils,
-                           'get_controller_auth_token',
-                           return_value=None):
+                           'get_lb_sync_auth_tokens',
+                           return_value=()):
         asyncio.new_event_loop().run_until_complete(
             lb._sync_with_controller_once())
 
@@ -257,12 +262,21 @@ class TestSyncOnceEmptyMapWiring:
     def test_empty_map_with_ready_count_preserves_set(self):
         lb = _make_lb()
         urls = ['http://a:8080', 'http://b:8080']
-        lb._load_balancing_policy.set_ready_replicas(urls)
-        _run_one_sync(lb, {
-            'replica_info': {},
-            'num_ready_replicas': 2,
-            'routing_spec': None,
+        lb._apply_routing_spec({
+            'load_balancing_policy_name': 'least_load',
+            'stream_timeout_seconds': 90,
         })
+        lb._load_balancing_policy.set_ready_replicas(urls)
+        lb._ready = True
+        _run_one_sync(
+            lb, {
+                'replica_info': {},
+                'num_ready_replicas': 2,
+                'routing_spec': {
+                    'load_balancing_policy_name': 'least_load',
+                    'stream_timeout_seconds': 90,
+                },
+            })
         # Spurious empty sync: the healthy set survives...
         assert set(lb._load_balancing_policy.ready_replicas) == set(urls)
         # ...and the LB still marks itself synced.
@@ -271,11 +285,99 @@ class TestSyncOnceEmptyMapWiring:
     def test_empty_map_authoritative_zero_blanks_set(self):
         lb = _make_lb()
         lb._load_balancing_policy.set_ready_replicas(['http://a:8080'])
-        _run_one_sync(lb, {
-            'replica_info': {},
-            'num_ready_replicas': 0,
-            'routing_spec': None,
-        })
+        _run_one_sync(
+            lb, {
+                'replica_info': {},
+                'num_ready_replicas': 0,
+                'routing_spec': {
+                    'load_balancing_policy_name': 'least_load',
+                    'stream_timeout_seconds': 90,
+                },
+            })
         # Genuine zero -> the set is blanked (prior behavior).
-        assert lb._load_balancing_policy.ready_replicas == []
+        assert not lb._load_balancing_policy.ready_replicas
         assert lb._ready is True
+
+
+class TestMissingRoutingSpecReadiness:
+    """A route snapshot is publishable only with its matching routing spec."""
+
+    def test_cold_lb_stays_unready_and_acknowledges_batch(self):
+        lb = _make_lb()
+        lb._request_aggregator.timestamps.extend([1, 2, 3])
+
+        _run_one_sync(lb, {
+            'replica_info': {
+                'http://a:8080': {}
+            },
+            'num_ready_replicas': 1,
+            'routing_spec': None,
+        },
+                      on_response_enter=lambda: lb._request_aggregator.
+                      timestamps.append(4))
+
+        assert lb._ready is False
+        assert lb._last_sync_time is None
+        assert not lb._load_balancing_policy.ready_replicas
+        # The controller returned 2xx and has already ingested [1, 2, 3]. An
+        # incomplete response must not replay that batch or clear the concurrent
+        # arrival recorded while the response was in flight.
+        assert lb._request_aggregator.to_dict()['timestamps'] == [4]
+
+    def test_next_complete_spec_makes_cold_lb_ready(self):
+        lb = _make_lb()
+        incomplete = {
+            'replica_info': {
+                'http://a:8080': {}
+            },
+            'num_ready_replicas': 1,
+            'routing_spec': None,
+        }
+        _run_one_sync(lb, incomplete)
+
+        _run_one_sync(
+            lb, {
+                'replica_info': {
+                    'http://a:8080': {}
+                },
+                'num_ready_replicas': 1,
+                'routing_spec': {
+                    'load_balancing_policy_name': 'round_robin',
+                    'stream_timeout_seconds': 90,
+                },
+            })
+
+        assert lb._ready is True
+        assert lb._load_balancing_policy_name == 'round_robin'
+        assert lb._stream_timeout_seconds == 90
+        assert lb._load_balancing_policy.ready_replicas == ['http://a:8080']
+
+    def test_warm_lb_keeps_last_valid_spec_routes_and_readiness(self):
+        lb = _make_lb()
+        _run_one_sync(
+            lb, {
+                'replica_info': {
+                    'http://old:8080': {}
+                },
+                'num_ready_replicas': 1,
+                'routing_spec': {
+                    'load_balancing_policy_name': 'round_robin',
+                    'stream_timeout_seconds': 90,
+                },
+            })
+        last_complete_sync = lb._last_sync_time
+
+        _run_one_sync(
+            lb, {
+                'replica_info': {
+                    'http://new:8080': {}
+                },
+                'num_ready_replicas': 1,
+                'routing_spec': None,
+            })
+
+        assert lb._ready is True
+        assert lb._last_sync_time == last_complete_sync
+        assert lb._load_balancing_policy_name == 'round_robin'
+        assert lb._stream_timeout_seconds == 90
+        assert lb._load_balancing_policy.ready_replicas == ['http://old:8080']
