@@ -617,12 +617,11 @@ class SkyServeController:
         args, so a `sky serve update` that only changes these fields reaches
         a running LB without re-rolling it. Sourced from the latest service
         version's spec (the same version the replica manager/autoscaler are
-        advanced to on update). TLS is deliberately NOT synced -- it is
-        bound to uvicorn at launch and a private key must not stream over
-        this channel -- so it stays a launch/mounted-secret concern.
-        Returns None when the spec cannot be loaded yet (mid-init); the LB
-        tolerates a missing routing_spec and keeps its default policy until
-        the next sync.
+        advanced to on update). TLS terminates at the platform ingress and is
+        not part of the per-service LB contract.
+        Returns None when the spec cannot be loaded yet (mid-init). A cold LB
+        remains unready until a complete spec arrives; a warm LB retains its
+        last coherent routing configuration.
         """
         record = serve_state.get_service_from_name(self._service_name)
         if record is None:

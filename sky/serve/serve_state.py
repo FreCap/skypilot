@@ -1222,18 +1222,6 @@ def get_latest_committed_version(service_name: str) -> Optional[int]:
     return result[0] if result else None
 
 
-def get_service_load_balancer_port(service_name: str) -> int:
-    """Gets the load balancer port of a service."""
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        result = session.execute(
-            sqlalchemy.select(services_table.c.load_balancer_port).where(
-                services_table.c.name == service_name)).fetchone()
-        if result is None:
-            raise ValueError(f'Service {service_name} does not exist.')
-        return result[0]
-
-
 def get_ha_recovery_script(service_name: str) -> Optional[str]:
     """Gets the HA recovery script for a service."""
     engine = _db_manager.get_engine()

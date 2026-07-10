@@ -20,10 +20,10 @@ from sky.serve import load_balancing_policies as lb_policies
 
 
 def _make_lb(policy_name='least_load'):
-    return lb_module.SkyServeLoadBalancer(
-        controller_url='http://controller:8001',
-        load_balancer_port=30001,
-        load_balancing_policy_name=policy_name)
+    lb = lb_module.SkyServeLoadBalancer(controller_url='http://controller:8001',
+                                        load_balancer_port=30001)
+    lb._apply_routing_spec({'load_balancing_policy_name': policy_name})
+    return lb
 
 
 def _request(job_id=None, method='POST'):

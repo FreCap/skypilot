@@ -18,7 +18,6 @@ Run manually (not collected by pytest — this spawns servers):
 
     python tests/lb_local_e2e.py
 """
-import asyncio
 import json
 import multiprocessing
 import os
@@ -89,7 +88,7 @@ def run_fake_replica(port: int) -> None:
 
 
 # ----------------------------------------------------------------------
-# Fake controller: static ready set, no routing_spec (LB keeps its seed).
+# Fake controller: static ready set plus the routing spec an external LB needs.
 # ----------------------------------------------------------------------
 def run_fake_controller(port: int, replica_ports) -> None:
 
@@ -101,6 +100,13 @@ def run_fake_controller(port: int, replica_ports) -> None:
                     'gpu_type': 'L4',
                     'gpu_count': '1'
                 } for p in replica_ports
+            },
+            'routing_spec': {
+                'load_balancing_policy_name': 'instance_aware_least_load',
+                'target_qps_per_replica': {
+                    'L4': 0.1
+                },
+                'retriable_status_codes': [429, 503],
             },
         })
 
@@ -115,9 +121,6 @@ def run_lb(controller_port: int, lb_port: int) -> None:
     load_balancer.run_load_balancer(
         controller_addr=f'http://127.0.0.1:{controller_port}',
         load_balancer_port=lb_port,
-        load_balancing_policy_name='instance_aware_least_load',
-        target_qps_per_replica={'L4': 0.1},
-        retriable_status_codes=[429, 503],
     )
 
 

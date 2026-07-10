@@ -49,10 +49,6 @@ file_mounts:
   {{remote_plugins_config_path}}.tmp: {{local_plugins_config_path}}
   {%- endif %}
   {%- endif %}
-{%- if use_tls %}
-  {{remote_tls_keyfile}}: {{local_tls_keyfile}}
-  {{remote_tls_certfile}}: {{local_tls_certfile}}
-{%- endif %}
 
 run: |
   # Activate the Python environment, so that cloud SDKs can be found in the

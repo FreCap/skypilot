@@ -116,6 +116,10 @@ def test_lb_process_starts_without_optional_data_auth(monkeypatch):
     monkeypatch.setattr(serve_utils, 'get_lb_sync_auth_tokens', sync_tokens)
     monkeypatch.setattr(serve_utils, 'get_lb_auth_tokens', data_tokens)
     monkeypatch.setattr(load_balancer, '_DrainableServer', _NoopDrainableServer)
+    config_args = []
+    monkeypatch.setattr(
+        load_balancer.uvicorn, 'Config',
+        lambda *args, **kwargs: config_args.append((args, kwargs)) or object())
     lb = _make_lb()
     monkeypatch.setattr(lb, '_get_lb_session_id', lambda: 'pod-uid')
 
@@ -123,6 +127,10 @@ def test_lb_process_starts_without_optional_data_auth(monkeypatch):
 
     sync_tokens.assert_called_once_with(required=True)
     data_tokens.assert_not_called()
+    assert config_args == [((lb._app,), {
+        'host': '0.0.0.0',
+        'port': 8890,
+    })]
 
 
 def test_lb_process_requires_data_ring_when_enabled(monkeypatch):
