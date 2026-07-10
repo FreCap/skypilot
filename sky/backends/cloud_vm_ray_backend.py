@@ -48,6 +48,7 @@ from sky.clouds.utils import gcp_utils
 from sky.dag import DEFAULT_EXECUTION
 from sky.data import data_utils
 from sky.data import storage as storage_lib
+from sky.provision import capacity_cache
 from sky.provision import common as provision_common
 from sky.provision import constants as provision_constants
 from sky.provision import instance_setup
@@ -803,6 +804,88 @@ class FailoverCloudErrorHandlerV2:
         handler(blocked_resources, launchable_resources, region, zones, error)
 
 
+# AWS error codes used to distinguish physical capacity from regional quota.
+_CAPACITY_ERROR_CODES = frozenset({'InsufficientInstanceCapacity'})
+_QUOTA_ERROR_CODES = frozenset({
+    'VcpuLimitExceeded',
+    'MaxSpotInstanceCountExceeded',
+    'InstanceLimitExceeded',
+})
+
+
+def _iter_error_chain(error: BaseException) -> Iterable[BaseException]:
+    """Yields explicit exception causes, excluding implicit context."""
+    seen: Set[int] = set()
+    exc: Optional[BaseException] = error
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        yield exc
+        exc = exc.__cause__
+
+
+def _classify_capacity_error(cloud: 'clouds.Cloud',
+                             error: BaseException) -> Optional[str]:
+    """Classifies an AWS failure using structured codes only.
+
+    AWS's provisioner records every failed RunInstances attempt on a
+    ``ProvisionerError``. A batch is classified only when all of its codes agree
+    on capacity or quota; mixed failures take the normal failover path.
+    """
+    if not isinstance(cloud, clouds.AWS):
+        return None
+    codes: List[str] = []
+    for exc in _iter_error_chain(error):
+        errors = getattr(exc, 'errors', None)
+        if isinstance(errors, list):
+            codes.extend(
+                str(item['code'])
+                for item in errors
+                if isinstance(item, dict) and item.get('code') is not None)
+        response = getattr(exc, 'response', None)
+        if isinstance(response, dict):
+            code = response.get('Error', {}).get('Code')
+            if code is not None:
+                codes.append(str(code))
+    if codes and all(code in _CAPACITY_ERROR_CODES for code in codes):
+        return 'capacity'
+    if codes and all(code in _QUOTA_ERROR_CODES for code in codes):
+        return 'quota'
+    return None
+
+
+def _capacity_cache_key(
+        to_provision: 'resources_lib.Resources', region: 'clouds.Region',
+        zones: Optional[List['clouds.Zone']], num_nodes: int,
+        account: Optional[str]) -> Optional['capacity_cache.ResourceKey']:
+    """Returns a key only for the exact, safe-to-cache incident path."""
+    if (not isinstance(to_provision.cloud, clouds.AWS) or
+            not to_provision.use_spot or zones is None or len(zones) != 1 or
+            not account or not to_provision.instance_type):
+        return None
+    return capacity_cache.ResourceKey(account=account,
+                                      region=region.name,
+                                      zone=zones[0].name,
+                                      instance_type=to_provision.instance_type,
+                                      num_nodes=num_nodes)
+
+
+def _capacity_cache_exhausted_zone_names(
+        to_provision: 'resources_lib.Resources', region: 'clouds.Region',
+        zones: Optional[List['clouds.Zone']], num_nodes: int,
+        account: Optional[str]) -> Set[str]:
+    """Returns the attempted zone when its short-lived hint is active."""
+    key = _capacity_cache_key(to_provision, region, zones, num_nodes, account)
+    if key is None:
+        return set()
+    try:
+        active = capacity_cache.active_exhausted_keys([key])
+    except Exception as e:  # pylint: disable=broad-except
+        logger.debug('Capacity-cache read failed: '
+                     f'{common_utils.format_exception(e)}')
+        return set()
+    return {active_key.zone for active_key in active}
+
+
 class RetryingVmProvisioner(object):
     """A provisioner that retries different cloud/regions/zones."""
 
@@ -1098,6 +1181,9 @@ class RetryingVmProvisioner(object):
 
         insufficient_resources = None
         last_error_reason: Optional[str] = None
+        capacity_cache_account = None
+        if (isinstance(to_provision.cloud, clouds.AWS) and cloud_user_identity):
+            capacity_cache_account = str(cloud_user_identity[-1])
         for zones in self._yield_zones(to_provision, num_nodes, cluster_name,
                                        prev_cluster_status,
                                        prev_cluster_ever_up):
@@ -1118,6 +1204,19 @@ class RetryingVmProvisioner(object):
                                     blocked_resources):
                             remaining_unblocked_zones.remove(zone)
                             break
+                if (not cluster_exists and not dryrun and
+                        remaining_unblocked_zones):
+                    exhausted_zone_names = _capacity_cache_exhausted_zone_names(
+                        to_provision, region, remaining_unblocked_zones,
+                        num_nodes, capacity_cache_account)
+                    if exhausted_zone_names:
+                        logger.info(
+                            'Skipping a recently capacity-exhausted AWS spot '
+                            f'attempt in {sorted(exhausted_zone_names)}.')
+                        remaining_unblocked_zones = [
+                            zone for zone in remaining_unblocked_zones
+                            if zone.name not in exhausted_zone_names
+                        ]
                 if not remaining_unblocked_zones:
                     # Skip the region if all zones are blocked.
                     continue
@@ -1368,6 +1467,21 @@ class RetryingVmProvisioner(object):
                             zones, e)
                         continue
                     except Exception as e:  # pylint: disable=broad-except
+                        capacity_reason = _classify_capacity_error(
+                            to_provision.cloud, e)
+                        capacity_key = None
+                        if capacity_reason == 'capacity' and not cluster_exists:
+                            capacity_key = _capacity_cache_key(
+                                to_provision, region, zones, num_nodes,
+                                capacity_cache_account)
+                            if capacity_key is not None:
+                                try:
+                                    capacity_cache.mark_exhausted(capacity_key)
+                                except Exception as cache_error:  # pylint: disable=broad-except
+                                    logger.debug(
+                                        'Capacity-cache write failed: '
+                                        f'{common_utils.format_exception(cache_error)}'
+                                    )
                         # NOTE: We try to cleanup the cluster even if the previous
                         # cluster does not exist. Also we are fast at
                         # cleaning up clusters now if there is no existing node..
@@ -1382,6 +1496,14 @@ class RetryingVmProvisioner(object):
                         FailoverCloudErrorHandlerV2.update_blocklist_on_error(
                             self._blocked_resources, to_provision, region,
                             zones, e)
+                        if capacity_key is not None:
+                            break
+                        if capacity_reason == 'quota':
+                            _add_to_blocked_resources(
+                                self._blocked_resources,
+                                to_provision.copy(region=region.name,
+                                                  zone=None))
+                            break
                         continue
                     # NOTE: The code below in the loop should not be reachable
                     # with the new provisioner.
