@@ -2730,7 +2730,7 @@ async def health(request: fastapi.Request) -> responses.APIHealthResponse:
         # commit. The internal sky.__version__ (with its -dev0 marker) keeps
         # flowing through the version-compatibility headers.
         version=sky.__display_version__,
-        version_on_disk=common.get_skypilot_version_on_disk(),
+        version_on_disk=common.get_skypilot_display_version_on_disk(),
         commit=sky.__commit__,
         # Build number that auto-increments with every commit.
         build=sky.__build__,
