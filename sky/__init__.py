@@ -44,8 +44,32 @@ def _get_git_commit():
         return _SKYPILOT_COMMIT_SHA
 
 
+# Replaced with the commit count when building the wheels, producing a build
+# number that auto-increments with every commit.
+_SKYPILOT_COMMIT_COUNT = '{{SKYPILOT_COMMIT_COUNT}}'
+
+
+def _get_commit_count() -> Optional[str]:
+    if 'SKYPILOT_COMMIT_COUNT' not in _SKYPILOT_COMMIT_COUNT:
+        # This is a release build, the count has already been set.
+        return _SKYPILOT_COMMIT_COUNT
+
+    # This is a development build (pip install -e .), so we need to get the
+    # commit count from git.
+    try:
+        cwd = os.path.dirname(__file__)
+        return subprocess.check_output(['git', 'rev-list', '--count', 'HEAD'],
+                                       cwd=cwd,
+                                       universal_newlines=True,
+                                       stderr=subprocess.DEVNULL).strip()
+    except Exception:  # pylint: disable=broad-except
+        return None
+
+
 __commit__ = _get_git_commit()
 __version__ = '1.0.0-dev0'
+# Monotonic build number (git commit count); None when unknown.
+__build__ = _get_commit_count()
 __root_dir__ = directory_utils.get_sky_dir()
 
 
@@ -175,6 +199,7 @@ Yotta = clouds.Yotta
 Verda = clouds.Verda
 
 __all__ = [
+    '__build__',
     '__version__',
     'AWS',
     'Azure',

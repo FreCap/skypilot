@@ -77,6 +77,9 @@ class APIHealthResponse(ResponseBaseModel):
     version: str = ''
     version_on_disk: str = ''
     commit: str = ''
+    # Monotonic build number (git commit count); auto-increments with every
+    # commit. None when unknown (e.g. no git metadata at build time).
+    build: Optional[str] = None
     # Whether basic auth on api server is enabled
     basic_auth_enabled: bool = False
     user: Optional[models.User] = None
