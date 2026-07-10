@@ -66,10 +66,27 @@ def _get_commit_count() -> Optional[str]:
         return None
 
 
+def _compose_display_version(version: str, build: Optional[str]) -> str:
+    """Product version shown to users: '<major>.<build>.0'.
+
+    The minor version number auto-increments with every commit. Falls back to
+    the internal version when the build number is unknown.
+    """
+    if not build or not build.isdigit():
+        return version
+    major = version.split('.', 1)[0]
+    return f'{major}.{build}.0'
+
+
 __commit__ = _get_git_commit()
+# Internal version, also sent in the X-SkyPilot-Version wire header. Keep the
+# -dev0 marker: upstream clients skip their version-upgrade nagging and PyPI
+# latest-version checks only for dev versions.
 __version__ = '1.0.0-dev0'
 # Monotonic build number (git commit count); None when unknown.
 __build__ = _get_commit_count()
+# User-facing version, e.g. '1.891.0'; the minor number is the build number.
+__display_version__ = _compose_display_version(__version__, __build__)
 __root_dir__ = directory_utils.get_sky_dir()
 
 
@@ -200,6 +217,7 @@ Verda = clouds.Verda
 
 __all__ = [
     '__build__',
+    '__display_version__',
     '__version__',
     'AWS',
     'Azure',
