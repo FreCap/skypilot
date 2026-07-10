@@ -2162,7 +2162,7 @@ class RetryingVmProvisioner(object):
                 # Resource-dependent feature failure (e.g. non-down
                 # autostop on a one-time spot candidate).
                 cause = e.__cause__
-                assert cause is not None, e
+                assert isinstance(cause, exceptions.NotSupportedError), e
                 init_never_up = (prev_cluster_status
                                  == status_lib.ClusterStatus.INIT and
                                  not prev_cluster_ever_up)
