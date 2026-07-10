@@ -246,8 +246,8 @@ def require_external_lb_runtime() -> None:
     if not serve_utils.is_external_load_balancer_mode():
         raise RuntimeError(
             'SkyServe services require the external load balancer. Enable '
-            'serve.controller.external_load_balancer in the API-server '
-            'configuration; the in-pod load balancer is no longer supported.')
+            'serve.externalLoadBalancer.enabled in the SkyPilot Helm release; '
+            'the in-pod load balancer is no longer supported.')
     if not kubernetes_utils.is_incluster_config_available():
         raise RuntimeError(
             'SkyServe services require an in-cluster Kubernetes API server '

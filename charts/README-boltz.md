@@ -20,6 +20,9 @@ SkyServe itself is external-LB-only in this fork: a deployment that starts servi
 must enable this chart capability. The chart injects
 `SKYPILOT_SERVE_EXTERNAL_LB_ENABLED=true`, which is the runtime source of truth;
 operators do not need to maintain a second copy of the flag in SkyPilot config.
+The legacy `serve.controller.external_load_balancer` config key remains accepted
+only so persisted configs survive this rolling upgrade; it is ignored and should
+be removed from operator config before that compatibility shim is deleted.
 That capability signal also forces service-controller consolidation in the API
 pod (pools retain their independent jobs-controller setting), so enabling the
 chart cannot accidentally launch an obsolete dedicated controller VM.
