@@ -328,23 +328,25 @@ def test_probe_started_before_async_dispatch_cannot_revalidate_zero():
     lb._replica_free_slots = {url: 1}
     lb._occupancy_dispatch_generation = {url: 0}
     lb._occupancy_sample_generation = {url: 0}
-    probe_started = asyncio.Event()
-    finish_probe = asyncio.Event()
-
-    async def _fetch(session, selected_url):
-        del session, selected_url
-        probe_started.set()
-        await finish_probe.wait()
-        return (0, 1)
-
-    async def _fake_proxy(selected_url, forwarded_request):
-        del selected_url, forwarded_request
-        return fastapi.responses.Response(status_code=202)
-
-    lb._fetch_replica_occupancy = _fetch
-    lb._proxy_request_to = _fake_proxy
 
     async def _race():
+        # Construct synchronization primitives inside asyncio.run() so they
+        # bind to the running loop on Python 3.9 as well as newer versions.
+        probe_started = asyncio.Event()
+        finish_probe = asyncio.Event()
+
+        async def _fetch(session, selected_url):
+            del session, selected_url
+            probe_started.set()
+            await finish_probe.wait()
+            return (0, 1)
+
+        async def _fake_proxy(selected_url, forwarded_request):
+            del selected_url, forwarded_request
+            return fastapi.responses.Response(status_code=202)
+
+        lb._fetch_replica_occupancy = _fetch
+        lb._proxy_request_to = _fake_proxy
         probe_task = asyncio.create_task(lb._probe_replica_occupancy_once())
         await probe_started.wait()
         await lb._proxy_with_retries(_request(job_id='job-1'))
@@ -368,23 +370,24 @@ def test_probe_during_async_dispatch_cannot_publish_idle_after_accept():
     lb._replica_occupancy = {url: 0}
     lb._occupancy_dispatch_generation = {url: 0}
     lb._occupancy_sample_generation = {url: 0}
-    proxy_started = asyncio.Event()
-    finish_proxy = asyncio.Event()
-
-    async def _fetch_zero(session, selected_url):
-        del session, selected_url
-        return (0, 1)
-
-    async def _held_proxy(selected_url, forwarded_request):
-        del selected_url, forwarded_request
-        proxy_started.set()
-        await finish_proxy.wait()
-        return fastapi.responses.Response(status_code=202)
-
-    lb._fetch_replica_occupancy = _fetch_zero
-    lb._proxy_request_to = _held_proxy
 
     async def _race():
+        # Python 3.9 eagerly binds Event objects to the current loop.
+        proxy_started = asyncio.Event()
+        finish_proxy = asyncio.Event()
+
+        async def _fetch_zero(session, selected_url):
+            del session, selected_url
+            return (0, 1)
+
+        async def _held_proxy(selected_url, forwarded_request):
+            del selected_url, forwarded_request
+            proxy_started.set()
+            await finish_proxy.wait()
+            return fastapi.responses.Response(status_code=202)
+
+        lb._fetch_replica_occupancy = _fetch_zero
+        lb._proxy_request_to = _held_proxy
         proxy_task = asyncio.create_task(lb._proxy_with_retries(_request()))
         await proxy_started.wait()
         # This probe captures the post-start generation, then overtakes the

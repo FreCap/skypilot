@@ -190,9 +190,9 @@ async def test_clean_finished_requests_with_retention(isolated_database):
     # Verify old running request was NOT deleted
     assert requests.get_request('old-running-1') is not None
 
-    # Verify log file unlink was called for current, legacy, and debug paths
-    # (3 calls per deleted request: current path + legacy path + debug log)
-    assert mock_unlink.call_count == 3
+    # Verify cleanup covers current, legacy, and debug logs plus the request
+    # lock file.
+    assert mock_unlink.call_count == 4
 
     # Verify logging
     mock_logger.info.assert_called_once()
@@ -283,9 +283,8 @@ async def test_clean_finished_requests_with_retention_batch_size_functionality(
     assert call_counts[1] == 10  # Second batch
     assert call_counts[2] == 5  # Third batch (remaining)
 
-    # Verify log file unlink was called for each deleted request
-    # (3 calls per request: current path + legacy path + debug log)
-    assert mock_unlink.call_count == 75
+    # Four paths per request: current, legacy, and debug logs plus lock file.
+    assert mock_unlink.call_count == 100
 
     # Verify logging shows correct total
     mock_logger.info.assert_called_once()
@@ -671,13 +670,16 @@ async def test_clean_finished_requests_cleans_both_paths(
                 await requests.clean_finished_requests_with_retention(
                     retention_seconds)
 
-    # Verify that unlink was called for current, legacy, and debug log paths
-    assert len(unlinked_paths) == 3
+    # Verify that unlink was called for current, legacy, and debug log paths,
+    # plus the request lock file.
+    assert len(unlinked_paths) == 4
 
     # All paths should contain the request ID
     current_path_count = sum(
         1 for p in unlinked_paths if 'legacy-test-req-1.log' in p)
-    assert current_path_count == 3  # All paths should have the request ID
+    assert current_path_count == 3
+    assert any(
+        path.endswith('.legacy-test-req-1.lock') for path in unlinked_paths)
 
     # Verify the request was deleted
     assert requests.get_request('legacy-test-req-1') is None

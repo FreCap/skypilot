@@ -20,7 +20,6 @@ from sky import skypilot_config
 from sky.server import versions
 from sky.server.requests import request_names
 from sky.utils import admin_policy_utils
-from sky.utils import common_utils
 from sky.utils import config_utils
 
 logger = sky_logging.init_logger(__name__)
@@ -680,8 +679,7 @@ def test_restful_policy(add_example_policy_paths, task):
 
 
 @contextlib.contextmanager
-def _policy_server(policy: str) -> Iterator[str]:
-    port = common_utils.find_free_port(start_port=8080)
+def _policy_server(policy: str, port: int) -> Iterator[str]:
     env = os.environ.copy()
     # Clear the SKYPILOT_CONFIG to avoid conflicts with the test environment
     env.pop('SKYPILOT_CONFIG', None)
@@ -690,10 +688,23 @@ def _policy_server(policy: str) -> Iterator[str]:
     if env.get('PYTHONPATH'):
         pypath = pypath + ':' + env['PYTHONPATH']
     env['PYTHONPATH'] = pypath
-    proc = subprocess.Popen(
-        f'python {POLICY_PATH}/example_server/dynamic_policy_server.py --port {port} --policy {policy}',
-        shell=True,
-        env=env)
+    proc = subprocess.Popen([
+        sys.executable,
+        f'{POLICY_PATH}/example_server/dynamic_policy_server.py', '--port',
+        str(port), '--policy', policy
+    ],
+                            env=env)
+
+    def _stop_server() -> None:
+        if proc.poll() is not None:
+            return
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+
     start_time = time.time()
     server_ready = False
     # 30s budget: cold-start of a uvicorn subprocess (interpreter + fastapi
@@ -711,25 +722,26 @@ def _policy_server(policy: str) -> Iterator[str]:
         time.sleep(0.1)
 
     if not server_ready:
-        proc.terminate()
+        _stop_server()
         raise RuntimeError(
             f'Policy server on port {port} failed to start within '
             f'{timeout_s:.0f} seconds')
     try:
         yield f'http://localhost:{port}'
     finally:
-        proc.terminate()
+        _stop_server()
 
 
-def test_restful_policy_server(add_example_policy_paths, task):
-    with _policy_server('DoNothingPolicy') as url, \
+def test_restful_policy_server(add_example_policy_paths, task,
+                               unused_tcp_port_factory):
+    with _policy_server('DoNothingPolicy', unused_tcp_port_factory()) as url, \
         tempfile.NamedTemporaryFile() as temp_file:
         temp_file.write(f'admin_policy: {url}'.encode('utf-8'))
         temp_file.flush()
 
         _load_task_and_apply_policy(task, temp_file.name)
 
-    with _policy_server('AddLabelsPolicy') as url, \
+    with _policy_server('AddLabelsPolicy', unused_tcp_port_factory()) as url, \
         tempfile.NamedTemporaryFile() as temp_file:
         temp_file.write(f'admin_policy: {url}'.encode('utf-8'))
         temp_file.flush()
@@ -739,7 +751,7 @@ def test_restful_policy_server(add_example_policy_paths, task):
             ('kubernetes', 'custom_metadata', 'labels'),
             {}), ('label should be set')
 
-    with _policy_server('DoNothingPolicy') as url, \
+    with _policy_server('DoNothingPolicy', unused_tcp_port_factory()) as url, \
         tempfile.NamedTemporaryFile() as temp_file:
         temp_file.write(f'admin_policy: {url}/set_autostop'.encode('utf-8'))
         temp_file.flush()
@@ -750,7 +762,7 @@ def test_restful_policy_server(add_example_policy_paths, task):
             assert r.autostop_config.enabled is True
             assert r.autostop_config.idle_minutes == 10
 
-    with _policy_server('RejectAllPolicy') as url, \
+    with _policy_server('RejectAllPolicy', unused_tcp_port_factory()) as url, \
         tempfile.NamedTemporaryFile() as temp_file:
         temp_file.write(f'admin_policy: {url}/'.encode('utf-8'))
         temp_file.flush()

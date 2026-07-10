@@ -1008,7 +1008,8 @@ def _run_round_locked(service_name: str, pool_key: str,
         assert names == [service_name], (names, service_name)
         free = 0
         if query_ok:
-            assert observation is not None and observation.free_slots is not None
+            assert (observation is not None and
+                    observation.free_slots is not None)
             free = max(0, int(observation.free_slots))
             last_free, last_free_ts = free, snapshot_time
         grants = {service_name: None}
@@ -1074,7 +1075,8 @@ def _run_round_locked(service_name: str, pool_key: str,
         prev_shrink_baseline = (round_row['shrink_baseline']
                                 if round_row is not None else None)
         if query_ok:
-            assert observation is not None and observation.free_slots is not None
+            assert (observation is not None and
+                    observation.free_slots is not None)
             measured = max(0, int(observation.free_slots))
             last_free, last_free_ts = measured, snapshot_time
             observed_free = max(0, measured - feed_debit)

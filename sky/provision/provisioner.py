@@ -464,7 +464,9 @@ def wait_for_ssh(cluster_info: provision_common.ClusterInfo,
             credentials = ssh_credentials
             if attempted_direct:
                 credentials = dict(ssh_credentials)
-                credentials['ssh_proxy_command'] = None
+                # Omitting the optional proxy argument is equivalent to
+                # passing None and keeps this Dict[str, str] type-accurate.
+                credentials.pop('ssh_proxy_command', None)
             success, stderr = waiter(ip,
                                      ssh_port,
                                      **credentials,

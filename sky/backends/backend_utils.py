@@ -87,6 +87,7 @@ if typing.TYPE_CHECKING:
     from sky.backends import cloud_vm_ray_backend
     from sky.backends import local_docker_backend
     from sky.provision.kubernetes.instance import NodeHealthInfo
+    from sky.schemas.generated import healthv1_pb2
 else:
     yaml = adaptors_common.LazyImport('yaml')
     requests = adaptors_common.LazyImport('requests')
@@ -96,6 +97,8 @@ else:
         'requests.packages.urllib3.util.retry')
     # To avoid requiring grpcio to be installed on the client side.
     grpc = adaptors_common.LazyImport('grpc')
+    healthv1_pb2 = adaptors_common.LazyImport(
+        'sky.schemas.generated.healthv1_pb2')
 
 logger = sky_logging.init_logger(__name__)
 
@@ -1590,11 +1593,6 @@ def _ray_status_via_skylet_grpc(handle) -> Optional[Tuple[int, str, str]]:
             return None
     except Exception:  # pylint: disable=broad-except
         return None
-    # pylint: disable=import-outside-toplevel
-    # Circular import: cloud_vm_ray_backend imports backend_utils at module
-    # load, so the client/proto are imported at call time.
-    from sky import backends
-    from sky.schemas.generated import healthv1_pb2
     try:
         response = backends.SkyletClient(
             handle.get_grpc_channel()).get_ray_status(

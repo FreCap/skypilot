@@ -164,7 +164,8 @@ def _get_controller_url(service_name: str,
     controller_port = record.get('controller_port')
     controller_ip = record.get('controller_ip')
     owner_fingerprint = make_controller_owner_fingerprint(
-        service_hash, controller_pid, controller_ip, controller_port)
+        service_hash, typing.cast(int, controller_pid), controller_ip,
+        typing.cast(int, controller_port))
     self_ip = os.environ.get('POD_IP')
     normalized_self_ip = None
     if self_ip is not None:

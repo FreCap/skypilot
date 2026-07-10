@@ -314,6 +314,9 @@ class SSHCommandRunner(CommandRunner):
             ssh_mode: SshMode = SshMode.INTERACTIVE) -> List[str]:
         ...
 
+    def note_transport_failure(self, returncode: int) -> bool:
+        ...
+
 
 class KubernetesCommandRunner(CommandRunner):
 

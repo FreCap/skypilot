@@ -29,6 +29,8 @@ import urllib.request
 
 from aiohttp import web
 
+from sky.serve import load_balancer
+
 LB_PORT = 18080
 CONTROLLER_PORT = 18000
 REPLICA_PORTS = [18101, 18102, 18103]
@@ -110,8 +112,6 @@ def run_fake_controller(port: int, replica_ports) -> None:
 def run_lb(controller_port: int, lb_port: int) -> None:
     os.environ['SKYPILOT_LB_OCCUPANCY_PROBE_INTERVAL_SECONDS'] = str(
         PROBE_INTERVAL_SECONDS)
-    from sky.serve import (
-        load_balancer)  # pylint: disable=import-outside-toplevel
     load_balancer.run_load_balancer(
         controller_addr=f'http://127.0.0.1:{controller_port}',
         load_balancer_port=lb_port,
