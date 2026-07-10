@@ -1,9 +1,10 @@
 """Tests for external-LB auth: inbound data-plane bearer + control-plane sync.
 
 Independent tokens:
-  - LB_AUTH_TOKEN_ENV_VAR gates INBOUND inference requests (data plane) via a
-    dedicated header consumed by the LB. The readiness route is exempt so the
-    k8s probe still works; no-op when unset.
+  - LB_DATA_PLANE_AUTH_ENABLED_ENV_VAR gates INBOUND inference requests (data
+    plane) via a dedicated header consumed by the LB. Legacy deployments fall
+    back to token presence when the capability env is absent. The readiness
+    route is exempt so the k8s probe still works.
   - CONTROLLER_AUTH_TOKEN_ENV_VAR is presented by the LB on every sync so the
     (now-authenticated) controller accepts it. The request aggregator must be
     cleared only after a SUCCESSFUL sync -- a failed sync (e.g. 401) must not
@@ -29,7 +30,8 @@ from sky.serve import serve_utils
 def _clear_token_file_envs(monkeypatch):
     for env_var in (constants.LB_SYNC_AUTH_TOKENS_FILE_ENV_VAR,
                     constants.CONTROLLER_ADMIN_AUTH_TOKENS_FILE_ENV_VAR,
-                    constants.LB_AUTH_TOKENS_FILE_ENV_VAR):
+                    constants.LB_AUTH_TOKENS_FILE_ENV_VAR,
+                    constants.LB_DATA_PLANE_AUTH_ENABLED_ENV_VAR):
         monkeypatch.delenv(env_var, raising=False)
 
 
@@ -64,6 +66,34 @@ def _edge_auth(token: str):
 def test_inbound_auth_disabled_authorizes_all(monkeypatch):
     monkeypatch.delenv(constants.LB_AUTH_TOKEN_ENV_VAR, raising=False)
     assert _authorized(_scope('/predict'))
+
+
+def test_explicit_disabled_overrides_stale_auth_material(monkeypatch, tmp_path):
+    ring = tmp_path / 'stale.tokens'
+    ring.write_text('stale\n', encoding='utf-8')
+    monkeypatch.setenv(constants.LB_AUTH_TOKENS_FILE_ENV_VAR, str(ring))
+    monkeypatch.setenv(constants.LB_AUTH_TOKEN_ENV_VAR, 'also-stale')
+    monkeypatch.setenv(constants.LB_DATA_PLANE_AUTH_ENABLED_ENV_VAR, 'false')
+
+    assert not serve_utils.is_lb_data_plane_auth_enabled()
+    assert _authorized(_scope('/predict'))
+
+
+def test_explicit_enabled_requires_auth_material(monkeypatch):
+    monkeypatch.delenv(constants.LB_AUTH_TOKEN_ENV_VAR, raising=False)
+    monkeypatch.setenv(constants.LB_DATA_PLANE_AUTH_ENABLED_ENV_VAR, 'true')
+
+    assert serve_utils.is_lb_data_plane_auth_enabled()
+    with pytest.raises(serve_utils.AuthTokenConfigurationError):
+        _authorized(_scope('/predict'))
+
+
+def test_malformed_data_plane_capability_fails_closed(monkeypatch):
+    monkeypatch.setenv(constants.LB_DATA_PLANE_AUTH_ENABLED_ENV_VAR, 'TRUE')
+
+    with pytest.raises(serve_utils.AuthTokenConfigurationError,
+                       match='exactly'):
+        _authorized(_scope('/predict'))
 
 
 def test_inbound_health_get_head_exempt(monkeypatch):
@@ -376,8 +406,7 @@ def test_stack_non_get_health_path_still_requires_auth(monkeypatch):
 def test_external_stack_missing_auth_fails_closed_but_health_is_exempt(
         monkeypatch):
     monkeypatch.delenv(constants.LB_AUTH_TOKEN_ENV_VAR, raising=False)
-    monkeypatch.setattr(serve_utils, 'is_external_load_balancer_mode',
-                        lambda: True)
+    monkeypatch.setenv(constants.LB_DATA_PLANE_AUTH_ENABLED_ENV_VAR, 'true')
     client = _client_with_routes(_make_lb())
 
     assert client.get('/predict').status_code == 503

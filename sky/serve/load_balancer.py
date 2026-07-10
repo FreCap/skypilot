@@ -185,7 +185,9 @@ class _InboundAuthMiddleware:
     middleware NEVER buffers or re-relays the response body, so streaming/SSE
     responses and the catch-all proxy's slot-release pass through untouched.
 
-    In external-LB mode, missing or unreadable auth material fails closed.
+    When data-plane auth is enabled, missing or unreadable material fails
+    closed. It is disabled by default until the platform has a real inference
+    caller that can inject the dedicated credential.
     Exempts ONLY GET/HEAD on the readiness route -- any other method there
     falls through to the (authenticated) catch-all proxy. All overlap tokens
     are accepted during rotation. Constant-time compare, ASCII-guarded so a
@@ -223,10 +225,9 @@ class _InboundAuthMiddleware:
                 scope['path'] in (constants.LB_HEALTH_ENDPOINT_PATH,
                                   constants.LB_LIVENESS_ENDPOINT_PATH)):
             return True
-        expected_tokens = serve_utils.get_lb_auth_tokens(
-            required=serve_utils.is_external_load_balancer_mode())
-        if not expected_tokens:
+        if not serve_utils.is_lb_data_plane_auth_enabled():
             return True
+        expected_tokens = serve_utils.get_lb_auth_tokens(required=True)
         authorization = None
         for name, value in scope.get('headers', []):
             if name.lower() == constants.LB_AUTHORIZATION_HEADER_BYTES:

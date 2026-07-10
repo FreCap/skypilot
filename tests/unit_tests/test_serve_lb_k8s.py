@@ -67,6 +67,7 @@ def _install(monkeypatch,
              image_pull_secrets=({
                  'name': 'registry-credentials'
              },),
+             data_auth=True,
              db_service_names=()):
     monkeypatch.setattr(lb_k8s.serve_utils, 'is_external_load_balancer_mode',
                         lambda: external)
@@ -93,8 +94,13 @@ def _install(monkeypatch,
         'SKYPILOT_SERVE_API_SERVICE_URL': 'http://sky-api.skypilot.svc.cluster.local',
         constants.LB_SYNC_AUTH_TOKENS_FILE_ENV_VAR: '/etc/skypilot/serve-auth/lb-sync/tokens',
         constants.CONTROLLER_ADMIN_AUTH_TOKENS_FILE_ENV_VAR: '/etc/skypilot/serve-auth/controller-admin/tokens',
-        constants.LB_AUTH_TOKENS_FILE_ENV_VAR: '/etc/skypilot/serve-auth/lb-data-plane/tokens',
+        constants.LB_DATA_PLANE_AUTH_ENABLED_ENV_VAR: str(data_auth).lower(),
     }
+    if data_auth:
+        env[constants.LB_AUTH_TOKENS_FILE_ENV_VAR] = (
+            '/etc/skypilot/serve-auth/lb-data-plane/tokens')
+    else:
+        monkeypatch.delenv(constants.LB_AUTH_TOKENS_FILE_ENV_VAR, raising=False)
     for name, value in env.items():
         monkeypatch.setenv(name, value)
     if pod_name is None:
@@ -135,19 +141,27 @@ def _install(monkeypatch,
                         'core_api',
                         lambda unused_context=None: core_api)
 
-    container = SimpleNamespace(
-        image=image,
-        image_pull_policy=image_policy,
-        security_context=container_security_context,
-        resources=resources,
-        volume_mounts=[
-            _mount(lb_k8s.LB_SYNC_AUTH_VOLUME_NAME,
-                   '/etc/skypilot/serve-auth/lb-sync'),
-            _mount('skypilot-serve-controller-admin-auth',
-                   '/etc/skypilot/serve-auth/controller-admin'),
+    volume_mounts = [
+        _mount(lb_k8s.LB_SYNC_AUTH_VOLUME_NAME,
+               '/etc/skypilot/serve-auth/lb-sync'),
+        _mount('skypilot-serve-controller-admin-auth',
+               '/etc/skypilot/serve-auth/controller-admin'),
+    ]
+    volumes = [
+        _volume(lb_k8s.LB_SYNC_AUTH_VOLUME_NAME, 'sync-secret'),
+        _volume('skypilot-serve-controller-admin-auth', 'admin-secret'),
+    ]
+    if data_auth:
+        volume_mounts.append(
             _mount(lb_k8s.LB_DATA_PLANE_AUTH_VOLUME_NAME,
-                   '/etc/skypilot/serve-auth/lb-data-plane'),
-        ])
+                   '/etc/skypilot/serve-auth/lb-data-plane'))
+        volumes.append(
+            _volume(lb_k8s.LB_DATA_PLANE_AUTH_VOLUME_NAME, 'data-secret'))
+    container = SimpleNamespace(image=image,
+                                image_pull_policy=image_policy,
+                                security_context=container_security_context,
+                                resources=resources,
+                                volume_mounts=volume_mounts)
     status = SimpleNamespace(image_id=image_id)
     pod = SimpleNamespace(
         spec=SimpleNamespace(containers=[container],
@@ -159,14 +173,7 @@ def _install(monkeypatch,
                              priority_class_name=priority_class_name,
                              scheduler_name=scheduler_name,
                              image_pull_secrets=list(image_pull_secrets),
-                             volumes=[
-                                 _volume(lb_k8s.LB_SYNC_AUTH_VOLUME_NAME,
-                                         'sync-secret'),
-                                 _volume('skypilot-serve-controller-admin-auth',
-                                         'admin-secret'),
-                                 _volume(lb_k8s.LB_DATA_PLANE_AUTH_VOLUME_NAME,
-                                         'data-secret'),
-                             ]),
+                             volumes=volumes),
         status=SimpleNamespace(container_statuses=[status] if image_id else []))
     core_api.read_namespaced_pod.return_value = pod
 
@@ -241,6 +248,7 @@ def test_create_builds_proxy_deployment_and_service(monkeypatch):
     assert constants.LB_SYNC_AUTH_TOKENS_FILE_ENV_VAR in env
     assert constants.LB_AUTH_TOKENS_FILE_ENV_VAR in env
     assert constants.CONTROLLER_ADMIN_AUTH_TOKENS_FILE_ENV_VAR not in env
+    assert env[constants.LB_DATA_PLANE_AUTH_ENABLED_ENV_VAR]['value'] == 'true'
     assert env[constants.EXTERNAL_LB_ENABLED_ENV_VAR]['value'] == 'true'
     assert env[constants.LB_POD_UID_ENV_VAR]['valueFrom']['fieldRef'][
         'fieldPath'] == 'metadata.uid'
@@ -423,6 +431,51 @@ def test_create_409_patches_legacy_deployment(monkeypatch):
     patched = apps.patch_namespaced_deployment.call_args.args[2]
     args = patched['spec']['template']['spec']['containers'][0]['args']
     assert '/api/internal/serve/svc' in args[1]
+
+
+def test_data_plane_auth_disabled_omits_projection(monkeypatch):
+    apps, _ = _install(monkeypatch, data_auth=False)
+
+    lb_k8s.require_external_lb_runtime()
+    lb_k8s.create_lb_deployment_and_service('svc', 225, 'incarnation')
+
+    deployment = apps.create_namespaced_deployment.call_args.args[1]
+    pod_spec = deployment['spec']['template']['spec']
+    container = pod_spec['containers'][0]
+    env = {entry['name']: entry for entry in container['env']}
+    assert env[constants.LB_DATA_PLANE_AUTH_ENABLED_ENV_VAR]['value'] == 'false'
+    assert constants.LB_AUTH_TOKENS_FILE_ENV_VAR not in env
+    assert lb_k8s.LB_DATA_PLANE_AUTH_VOLUME_NAME not in {
+        mount['name'] for mount in container['volumeMounts']
+    }
+    assert lb_k8s.LB_DATA_PLANE_AUTH_VOLUME_NAME not in {
+        volume['name'] for volume in pod_spec['volumes']
+    }
+    assert '$patch' not in repr(deployment)
+
+
+def test_data_plane_auth_disable_patch_deletes_stale_projection(monkeypatch):
+    apps = mock.MagicMock()
+    apps.create_namespaced_deployment.side_effect = _ApiException(409)
+    _install(monkeypatch, apps_api=apps, data_auth=False)
+
+    lb_k8s.create_lb_deployment_and_service('svc', 225, 'incarnation')
+
+    patch = apps.patch_namespaced_deployment.call_args.args[2]
+    pod_spec = patch['spec']['template']['spec']
+    container = pod_spec['containers'][0]
+    assert {
+        'name': constants.LB_AUTH_TOKENS_FILE_ENV_VAR,
+        '$patch': 'delete',
+    } in container['env']
+    assert {
+        'mountPath': lb_k8s._LB_DATA_PLANE_AUTH_MOUNT_PATH,
+        '$patch': 'delete',
+    } in container['volumeMounts']
+    assert {
+        'name': lb_k8s.LB_DATA_PLANE_AUTH_VOLUME_NAME,
+        '$patch': 'delete',
+    } in pod_spec['volumes']
 
 
 def test_same_name_recreation_fences_old_service_before_reconcile(monkeypatch):

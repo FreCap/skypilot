@@ -57,6 +57,14 @@ logger = sky_logging.init_logger(__name__)
 _KUBERNETES_LABEL_VALUE_MAX_LENGTH = 63
 
 
+def _service_test_request_command(endpoint: str) -> str:
+    """Return a copyable request example for the installed LB contract."""
+    if not serve_utils.is_lb_data_plane_auth_enabled():
+        return f'curl {endpoint}'
+    return (f"curl -H '{serve_constants.LB_AUTHORIZATION_HEADER}: "
+            f"Bearer <token>' {endpoint}")
+
+
 def _rewrite_tls_credential_paths_and_get_tls_env_vars(
         service_name: str, task: 'task_lib.Task') -> Dict[str, Any]:
     """Rewrite the paths of TLS credentials in the task.
@@ -611,6 +619,7 @@ def up(
                 '\n\n' + ux_utils.finishing_message('Successfully created pool '
                                                     f'{service_name!r}.'))
         else:
+            test_request_command = _service_test_request_command(endpoint)
             logger.info(
                 f'{fore.CYAN}Service name: '
                 f'{style.BRIGHT}{service_name}{style.RESET_ALL}'
@@ -636,7 +645,7 @@ def up(
                 f'{ux_utils.BOLD}watch -n10 sky serve status {service_name}'
                 f'{ux_utils.RESET_BOLD}'
                 f'\n{ux_utils.INDENT_LAST_SYMBOL}To send a test request:\t'
-                f'{ux_utils.BOLD}curl {endpoint}'
+                f'{ux_utils.BOLD}{test_request_command}'
                 f'{ux_utils.RESET_BOLD}'
                 '\n\n' + ux_utils.finishing_message(
                     'Service is spinning up and replicas '

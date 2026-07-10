@@ -273,10 +273,12 @@ serve:
   # from the database without rolling the LB during controller failover.
   externalLoadBalancer:
     # Enable/disable external load balancer support. Inert by default. Enabling
-    # this requires all three auth rings below; rendering fails closed if any
-    # Secret name or key is omitted. Before changing true -> false, down every
-    # SkyServe service and verify no skypilot-serve-lb labeled Deployment or
-    # Service remains in the Helm release namespace.
+    # this requires the LB-sync and controller-admin rings below. Data-plane
+    # auth is optional: set both of its fields to enable it, or leave both empty
+    # to allow inference requests through without the SkyServe-specific header.
+    # Rendering fails if only one data-plane field is set. Before changing true
+    # -> false, down every SkyServe service and verify no skypilot-serve-lb
+    # labeled Deployment or Service remains in the Helm release namespace.
     enabled: false
     # Resources for each per-service LB container. Explicit requests keep LBs
     # out of the BestEffort QoS class and make fleet-scale scheduling visible.
@@ -291,6 +293,7 @@ serve:
     # or LB compromise cannot grant controller-administration privileges.
     # Each Secret value is a newline-delimited token ring. Keep the current and
     # previous token during rotation; projected Secret volumes update in place.
+    # @schema type: [object, null]
     auth:
       # Tokens presented by an external LB when syncing replica/load state.
       lbSync:
@@ -304,8 +307,11 @@ serve:
         existingSecret: ""
         # Key containing the newline-delimited token ring.
         key: ""
-      # Tokens accepted from inference clients by the external LB.
+      # Optional tokens accepted from inference clients by the external LB.
+      # @schema type: [object, null]
       lbDataPlane:
+        # Set both fields to enable data-plane auth. Leave both empty to disable
+        # it. A partial pair is rejected during Helm rendering.
         # Clients send the selected token as:
         # X-SkyPilot-Serve-Authorization: Bearer <token>
         # The LB consumes this header, preserving Authorization for the model.

@@ -618,6 +618,28 @@ def is_external_load_balancer_mode() -> bool:
     return _external_lb_mode_cache
 
 
+def is_lb_data_plane_auth_enabled() -> bool:
+    """Whether inference requests require the LB-only bearer credential.
+
+    New charts inject an explicit capability value. If it is absent during a
+    mixed-version rollout, preserve the legacy behavior by treating configured
+    data-plane token material as enabled. An explicit false is authoritative
+    even while stale Secret files are being removed from an existing pod.
+    """
+    configured = os.environ.get(constants.LB_DATA_PLANE_AUTH_ENABLED_ENV_VAR)
+    if configured is None:
+        return bool(
+            os.environ.get(constants.LB_AUTH_TOKENS_FILE_ENV_VAR) or
+            os.environ.get(constants.LB_AUTH_TOKEN_ENV_VAR))
+    if configured == 'true':
+        return True
+    if configured == 'false':
+        return False
+    raise AuthTokenConfigurationError(
+        f'{constants.LB_DATA_PLANE_AUTH_ENABLED_ENV_VAR} must be exactly '
+        '"true" or "false".')
+
+
 def _get_auth_tokens(file_env_var: str,
                      legacy_token_env_var: str,
                      ring_name: str,
