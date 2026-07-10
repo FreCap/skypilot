@@ -230,22 +230,58 @@ def test_setstate_pre_object_bool_pickles_expose_default_knobs():
     assert restored.reserved_fill_weight == 1.0
 
 
-@pytest.mark.parametrize('bad_obj', [
-    {
-        'floor_replicas': -1
-    },
-    {
-        'weight': 0
-    },
-    {
-        'weight': -2
-    },
-])
+@pytest.mark.parametrize(
+    'bad_obj',
+    [
+        {
+            'floor_replicas': -1
+        },
+        {
+            'weight': 0
+        },
+        {
+            'weight': -2
+        },
+        # Non-finite weights pass naive sign checks (inf > 0; NaN compares
+        # False to everything) and would poison the broker's weighted
+        # water-fill (inf/inf -> NaN) every round for the whole pool.
+        {
+            'weight': float('inf')
+        },
+        {
+            'weight': float('nan')
+        },
+        # Finite is not enough: 1e308 passes isfinite yet overflows the
+        # broker's water-fill arithmetic (remaining*weight / sum(weights)
+        # -> inf -> NaN in rounding), crashing every multi-claimant round.
+        {
+            'weight': 1e308
+        },
+        {
+            'weight': 2_000_000
+        },
+    ])
 def test_object_form_rejects_bad_knobs_at_constructor(bad_obj):
     # The schema guards the YAML path; the constructor guards programmatic
     # construction.
     with pytest.raises(ValueError):
         _make_spec(min_replicas=2, reserved_capacity_fill=bad_obj)
+
+
+def test_weight_at_documented_bound_accepted():
+    spec = _make_spec(min_replicas=2,
+                      reserved_capacity_fill={'weight': 1_000_000})
+    assert spec.reserved_fill_weight == 1e6
+
+
+def test_weight_above_bound_rejected_on_yaml_path():
+    # The JSON schema must mirror the constructor bound so the YAML path
+    # rejects out-of-bound weights too.
+    spec = _make_spec(min_replicas=2, reserved_capacity_fill={'weight': 2.0})
+    config = spec.to_yaml_config()
+    config['replica_policy']['reserved_capacity_fill']['weight'] = 1e308
+    with pytest.raises(ValueError):
+        service_spec_lib.SkyServiceSpec.from_yaml_config(config)
 
 
 def test_floor_above_max_replicas_rejected():

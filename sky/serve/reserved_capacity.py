@@ -94,12 +94,17 @@ def query_pool_observation(
     thread (or the broker round it drives), never from the autoscaler
     decision tick.
 
-    Unknown availability (-1, e.g. missing list-pods permission) counts as
-    0 free: fill must never launch on guessed capacity. A FAILED query
-    returns free_slots=None (measurement blackout) -- distinct from a
-    successful 0. gpu_names carries the canonical accelerator names the
-    query saw, the broker's phantom-pool signal (empty = the claimed GPU
-    resolves to no labeled nodes).
+    Unknown availability (any negative count, e.g. a swallowed pod-list
+    403 surfacing as {'A100': -1}) is a MEASUREMENT BLACKOUT
+    (free_slots=None), exactly like a raised query error: converting it
+    to an authoritative 0 would let a new claimant or weight change
+    redistribute grants and drain existing holdings while availability is
+    unknown -- precisely what the broker's blackout semantics prohibit.
+    (Single-claimant observable behavior is unchanged: a blackout feeds 0,
+    same as a 0 measurement.) A FAILED/unknown query is distinct from a
+    successful 0 (full pool). gpu_names carries the canonical accelerator
+    names the query saw, the broker's phantom-pool signal (empty = the
+    claimed GPU resolves to no labeled nodes).
     """
     try:
         _, _, available = kubernetes_catalog.list_accelerators_realtime(
@@ -114,6 +119,13 @@ def query_pool_observation(
                        f'{context!r} gpu {gpu_name!r}: '
                        f'{common_utils.format_exception(e)}')
         return reserved_capacity_broker.PoolObservation(free_slots=None)
+    if any(count < 0 for count in available.values()):
+        logger.warning('Reserved-capacity poll: availability unknown for '
+                       f'context {context!r} gpu {gpu_name!r} '
+                       f'({available}); treating as a measurement blackout.')
+        return reserved_capacity_broker.PoolObservation(free_slots=None,
+                                                        gpu_names=tuple(
+                                                            available.keys()))
     free_gpus = sum(count for count in available.values() if count > 0)
     return reserved_capacity_broker.PoolObservation(
         free_slots=free_gpus // max(1, per_replica),
@@ -254,8 +266,8 @@ def poller_loop(get_autoscaler: Callable[[], 'autoscalers.Autoscaler'],
     """
     # Whether a broker claim of ours may exist. Starts True: a previous
     # incarnation of this controller may have left one behind (respawn),
-    # so the first disabled observation still clears it. Reset to True by
-    # every broker cycle (which upserts the claim).
+    # so the first disabled observation still clears it. Reset to True
+    # BEFORE every broker cycle (which upserts the claim).
     claim_may_exist = service_name is not None
     while True:
         try:
@@ -274,9 +286,15 @@ def poller_loop(get_autoscaler: Callable[[], 'autoscalers.Autoscaler'],
                 if service_name is None:
                     _standalone_cycle(autoscaler, zero_cost, keys)
                 else:
+                    # Set BEFORE the cycle: it upserts the claim partway
+                    # through, and an exception after that upsert (e.g.
+                    # the round query) must still leave the flag true --
+                    # otherwise a subsequent disable would skip
+                    # remove_claim and leave a ghost claim absorbing
+                    # entitlement for the whole claim TTL.
+                    claim_may_exist = True
                     _broker_cycle(autoscaler, placer, service_name, zero_cost,
                                   keys)
-                    claim_may_exist = True
             elif service_name is not None and claim_may_exist:
                 # Fill turned off (or the placer is gone): withdraw the
                 # claim NOW instead of leaving peers arbitrating around a

@@ -32,6 +32,7 @@ shared serve DB every controller in the api-server pod already uses).
 """
 import dataclasses
 import json
+import math
 import os
 import time
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
@@ -154,6 +155,12 @@ def get_cached_grant(service_name: str,
     return grant
 
 
+# Sentinel returned by current_epoch while a pool's fence_pending marker
+# is set: published epochs start at 1, so no launch ever carries it and
+# the launch-path comparison fails closed (skip) without a special case.
+_FENCE_PENDING_EPOCH = -1
+
+
 def current_epoch(pool_key: str) -> Optional[int]:
     """The POOL's current fencing epoch (cheap single-row DB read).
 
@@ -163,11 +170,56 @@ def current_epoch(pool_key: str) -> Optional[int]:
     fence pool B's unrelated fill launches for up to two poll intervals.
     None (no round published yet) fails open at the fence: there is no
     newer allocation to defer to.
+
+    A set fence_pending marker fails CLOSED: every grant issued before a
+    lease-dead gap is suspect until an epoch-bumping publish clears the
+    marker, so the sentinel returned here mismatches any carried epoch
+    and the launch skips -- even for a pool that will never publish again
+    (claims gone). add_replica_if_round_epoch enforces the same predicate
+    atomically at persist time.
     """
     round_row = serve_state.get_reserved_fill_round(pool_key)
     if round_row is None:
         return None
+    if bool(round_row['fence_pending']):
+        return _FENCE_PENDING_EPOCH
     return int(round_row['epoch'])
+
+
+def persist_fill_replica(service_name: str, replica_id: int, replica_info: Any,
+                         *, pool_key: str, expected_epoch: int) -> bool:
+    """Atomically persists a fill replica row, excluded from broker rounds.
+
+    Ordering invariant (the other half lives on run_round_if_stale): a
+    fill row must never become durable INSIDE a round's scan->publish
+    window. The round's debit scan cannot see a row persisted after it
+    ran, and the epoch fence cannot see a round that has not published
+    yet -- a persist landing between the two is counted by neither, and
+    the round re-feeds the just-taken slot to a peer. The round holds the
+    cross-process broker lock for its whole body (scan through publish),
+    so taking the same lock here leaves exactly two outcomes: the persist
+    lands BEFORE the round's scan (the row is counted by the debit) or
+    AFTER its publish (a superseded decision is fenced by the bumped
+    epoch / fence_pending inside add_replica_if_round_epoch).
+
+    Non-blocking on purpose: a round in flight holds the lock across its
+    whole cluster query, and blocking a scale-up batch that long is worse
+    than skipping -- contention degrades into a fence-skip (False) and
+    the autoscaler re-emits the launch on its next tick. The persist
+    itself is one quick DB write, so a round waiting behind it is never
+    delayed noticeably.
+    """
+    try:
+        lock = locks.get_lock(constants.RESERVED_FILL_BROKER_LOCK_ID)
+        with lock.acquire(blocking=False):
+            return serve_state.add_replica_if_round_epoch(
+                service_name,
+                replica_id,
+                replica_info,
+                pool_key=pool_key,
+                expected_epoch=expected_epoch)
+    except locks.LockTimeout:
+        return False
 
 
 # =========================== Pure allocation math ===========================
@@ -227,9 +279,17 @@ def water_fill(amount: int, weights: Mapping[str, float],
         (caps.get(name) is None or (caps[name] or 0) > 0)
     ]
     while remaining > 0 and active:
-        weight_sum = sum(weights[name] for name in active)
+        # Normalize by the largest active weight before summing or
+        # multiplying: finite-but-huge weights (isfinite passes 1e308)
+        # would overflow remaining*weight or sum(weights) into inf, and
+        # inf/inf -> NaN crashes the integer rounding -- every round, for
+        # the whole pool. After normalization each term is <= remaining;
+        # fsum keeps the sum exact across wide magnitude spreads.
+        max_weight = max(weights[name] for name in active)
+        normalized = {name: weights[name] / max_weight for name in active}
+        weight_sum = math.fsum(normalized.values())
         shares = {
-            name: remaining * weights[name] / weight_sum for name in active
+            name: remaining * normalized[name] / weight_sum for name in active
         }
         rounded = _largest_remainder_round(shares, remaining)
         capped_any = False
@@ -460,8 +520,29 @@ def remove_claim(service_name: str) -> None:
 
 def _claim_input(row: Dict[str, Any]) -> ClaimInput:
     effective_cap = row.get('effective_cap')
+    weight = float(row['weight'] or 1.0)
+    if not math.isfinite(weight):
+        # Defensive: SkyServiceSpec rejects non-finite weights, but a
+        # poisoned DB row (older writer, manual surgery) must not crash
+        # water-filling (inf/inf -> NaN in rounding) EVERY round for the
+        # pool while the claim stays live. Clamp loudly to the default.
+        logger.warning(
+            f'Reserved-fill broker: claim of {row["service_name"]!r} '
+            f'carries a non-finite weight {weight!r}; clamping to 1.0.')
+        weight = 1.0
+    elif weight > constants.RESERVED_FILL_MAX_WEIGHT:
+        # Same defense for finite-but-out-of-bound weights (the spec
+        # rejects them at construction): clamp to the documented bound so
+        # a poisoned row degrades to an extreme-but-finite share instead
+        # of crashing rounds (the water-fill normalization above is the
+        # second layer).
+        logger.warning(
+            f'Reserved-fill broker: claim of {row["service_name"]!r} '
+            f'carries weight {weight!r} above the supported maximum; '
+            f'clamping to {constants.RESERVED_FILL_MAX_WEIGHT}.')
+        weight = float(constants.RESERVED_FILL_MAX_WEIGHT)
     return ClaimInput(floor=int(row['floor_replicas'] or 0),
-                      weight=float(row['weight'] or 1.0),
+                      weight=weight,
                       holdings_fill=int(row['holdings_fill'] or 0),
                       launchable=bool(row['launchable']),
                       effective_cap=(int(effective_cap)
@@ -523,13 +604,38 @@ def _replica_row_on_pool(info: Any, context: str, gpu_name: str) -> bool:
     return any(name.lower() == gpu_name for name in accelerators)
 
 
-def _occupying_debit(claim_names: List[str], pool_key: str,
-                     snapshot_time: float) -> Tuple[int, int, Dict[str, int]]:
-    """Pool slots claimed by rows the snapshot may still have counted free.
+def _row_was_launched(info: Any) -> bool:
+    """Whether the row's sky.launch completed (a cluster was provisioned).
 
-    Mirrors the #108 occupied-slot subtraction at broker level, across ALL
-    claimants, returning (feed_debit, entitlement_debit,
-    fill_holdings_extra):
+    SHUTTING_DOWN is broader than "bound graceful drainer": a
+    launch-cancelled row (sky.launch INTERRUPTED mid-run) maps to
+    SHUTTING_DOWN too, yet may never have bound a pod -- the measured
+    free still counts its slot. Only sky_launch_status == SUCCEEDED
+    means a pod was actually provisioned and keeps occupying the pool
+    through the drain. Rows failing this signal are counted nowhere,
+    matching physical reality (no pod); an interrupted launch whose pod
+    DID partially bind reads as free-side undercount for its short
+    cleanup window -- the conservative direction (never over-grant).
+    """
+    status_property = getattr(info, 'status_property', None)
+    return (getattr(status_property, 'sky_launch_status',
+                    None) == common_utils.ProcessStatus.SUCCEEDED)
+
+
+def _occupying_debit(
+        claim_names: List[str], pool_key: str,
+        snapshot_time: float) -> Tuple[int, int, Dict[str, int], int]:
+    """Row-consistent scan of every service's replica rows on the pool.
+
+    Mirrors the #108 occupied-slot subtraction at broker level. The scan
+    covers ALL services with replica rows, not just current claimants: a
+    FORMER claimant (disabled, pruned, or moved to another pool) can
+    leave nonterminal fill rows behind -- a queued launch not yet bound
+    (invisible to the cluster query: its slot still reads free) or a live
+    pod riding out its lifetime. Scanning only claimants would feed those
+    slots to a peer while the orphaned launch can still start. Rows are a
+    local DB read, so the wider scan costs no cluster traffic. Returns
+    (feed_debit, entitlement_debit, live_fill, unclaimed_fill):
 
     - feed_debit (rows not READY, or created after the snapshot): applied
       to the observed free the FEED split spends. A launching pod may be
@@ -548,37 +654,117 @@ def _occupying_debit(claim_names: List[str], pool_key: str,
       below the owner's holdings and culling exactly the pods that are
       booting (a broker-generated churn wave). Only the mid-query bind
       race (created_at > snapshot) still needs the debit.
-    - fill_holdings_extra (per-owner count of post-snapshot rows with
-      reserved_fill=True): folded back into the owner's holdings for the
-      entitlement total. A FILL bind persisted mid-query IS arbitrated
-      capacity -- just newer than its owner's (stale) claim row, which
-      still reports it as holdings 0. Debiting it from free WITHOUT
-      re-attributing it would undercount the whole-pool total, drop the
-      owner's grant below its real holdings, and cull the replica the
-      previous round's feed just launched. Post-snapshot DEMAND rows keep
-      the plain debit: they are an external mid-query race, not
-      arbitrated capacity.
+    - live_fill (per-CLAIMANT CURRENT count of nonterminal pool-matched
+      rows with reserved_fill=True; an entry for EVERY claimant whose
+      rows were readable, 0 included): the row-consistent replacement for
+      the owner's claimed holdings_fill. A claim's holdings are only as
+      fresh as its owner's last heartbeat, while unclaimed_fill below is
+      a live row scan; mixing the two views double-counts every replica
+      that turned SHUTTING_DOWN after its owner's last poll. This is the
+      same quantity the owner itself reports (nonterminal fill rows on
+      its zero-cost location), just read from the rows NOW. It inherently
+      includes post-snapshot fill binds, so a mid-query FILL bind stays
+      attributed to its owner (the entitlement debit subtracts it from
+      free; counting it here keeps the whole-pool total conserved and
+      the owner's grant covering the replica the previous round's feed
+      just launched). Post-snapshot DEMAND rows keep the plain debit:
+      they are an external mid-query race, not arbitrated capacity.
+    - unclaimed_fill (pool-wide count of fill rows occupying the pool
+      that belong to NO current claimant's holdings): added to the
+      ENTITLEMENT total. Two populations, same conservation reasoning:
+
+      * Graceful drainers -- SHUTTING_DOWN rows with reserved_fill=True
+        (any service) whose sky.launch SUCCEEDED (see _row_was_launched).
+        A culled fill replica leaves its owner's holdings the moment it
+        turns terminal, but its pod stays bound for the whole graceful
+        drain (multiple broker rounds), so the measured free does not
+        see the slot either; without this term the round total
+        undercounts by every drainer and the shrunken Sum(holdings)
+        reads as "pods physically gone", triggering immediate down-moves
+        that cull warm replicas below the allocation fixpoint.
+      * FORMER claimants' nonterminal pool-matched fill rows. Their
+        service holds no claim, so live_fill cannot attribute them, yet
+        the rows occupy (or are about to occupy) the pool exactly like a
+        drainer mid-drain: conserved in the total, granted to nobody's
+        holdings, and their unbound window feed-debited below so the
+        slot is never fed to a peer while the orphaned launch can still
+        start (the atomic persist additionally refuses new orphan rows
+        -- see add_replica_if_round_epoch's live-claim predicate).
+
+      Counted pool-wide (never re-attributed to any claimant's
+      holdings): these slots back no live claim, so they must not lower
+      anyone's feed need or raise a blind-round holdings floor. Draining
+      DEMAND rows are deliberately NOT counted: a demand row was never
+      in holdings and its bound pod was already excluded from the
+      measured free while it was LIVE, so the total's view of it is
+      unchanged by the drain -- demand capacity is not fill-arbitrable,
+      before or during its drain (the pre-existing steady-state
+      undercount by live demand pods is by design; non-claimants'
+      nonterminal DEMAND rows stay invisible for the same reason).
+      FAILED_CLEANUP rows are also left out on purpose: they persist
+      indefinitely, and counting them forever would over-count the pool
+      once the pod eventually dies (accepted: rare and launch-gated).
     """
     context, gpu_name = parse_pool_key(pool_key)
     feed_debit = 0
     entitlement_debit = 0
-    fill_holdings_extra: Dict[str, int] = {}
-    for name in sorted(claim_names):
+    live_fill: Dict[str, int] = {}
+    unclaimed_fill = 0
+    scan_names = set(claim_names)
+    try:
+        scan_names.update(serve_state.get_replica_service_names())
+    except Exception as e:  # pylint: disable=broad-except
+        logger.warning(
+            'Reserved-fill broker: could not enumerate replica-owning '
+            'services for the round debit (scanning claimants only): '
+            f'{common_utils.format_exception(e)}')
+    claimants = set(claim_names)
+    for name in sorted(scan_names):
+        is_claimant = name in claimants
         try:
             infos = serve_state.get_replica_infos(name)
         except Exception as e:  # pylint: disable=broad-except
             # Failing to read one service's rows must not sink the round;
-            # skipping the debit for it is the OPTIMISTIC direction, but
-            # bounded (one service, one round) and self-healing.
+            # skipping its debit (and, for a claimant, falling back to its
+            # possibly-stale claim holdings: no live_fill entry) is the
+            # OPTIMISTIC direction, but bounded (one service, one round)
+            # and self-healing.
             logger.warning(
                 f'Reserved-fill broker: could not read replicas of {name!r} '
                 f'for the round debit: {common_utils.format_exception(e)}')
             continue
+        if is_claimant:
+            live_fill[name] = 0
         for info in infos:
             if info.is_terminal:
+                # Draining FILL rows still occupy their pool slot for the
+                # whole graceful drain; count them into the entitlement
+                # total (any service, SHUTTING_DOWN only, and only when
+                # the launch actually provisioned a pod -- see the
+                # unclaimed_fill docstring above for the demand-drain,
+                # FAILED_CLEANUP and unbound-launch reasoning).
+                if (getattr(info, 'status',
+                            None) == serve_state.ReplicaStatus.SHUTTING_DOWN and
+                        bool(getattr(info, 'reserved_fill', False)) and
+                        _replica_row_on_pool(info, context, gpu_name) and
+                        _row_was_launched(info)):
+                    unclaimed_fill += 1
                 continue
             if not _replica_row_on_pool(info, context, gpu_name):
                 continue
+            is_fill = bool(getattr(info, 'reserved_fill', False))
+            if not is_claimant and not is_fill:
+                # Non-claimants' demand rows stay invisible by design
+                # (demand capacity is not fill-arbitrable); only their
+                # fill rows are the broker's business.
+                continue
+            if is_fill:
+                if is_claimant:
+                    live_fill[name] += 1
+                else:
+                    # Former claimant's fill row: unclaimed occupancy,
+                    # conserved like a drainer (see docstring).
+                    unclaimed_fill += 1
             created_at = getattr(info, 'created_at', None)
             post_snapshot = (created_at is not None and
                              created_at > snapshot_time)
@@ -586,10 +772,7 @@ def _occupying_debit(claim_names: List[str], pool_key: str,
                 feed_debit += 1
             if post_snapshot:
                 entitlement_debit += 1
-                if bool(getattr(info, 'reserved_fill', False)):
-                    fill_holdings_extra[name] = (
-                        fill_holdings_extra.get(name, 0) + 1)
-    return feed_debit, entitlement_debit, fill_holdings_extra
+    return feed_debit, entitlement_debit, live_fill, unclaimed_fill
 
 
 def _allocation_from_round(service_name: str,
@@ -637,9 +820,17 @@ def run_round_if_stale(service_name: str, pool_key: str,
     first. Under the cross-process broker lock: if the published round is
     younger than ~one poll interval, return the caller's slice of it (no
     cluster query -- this is what collapses N per-interval queries to one);
-    otherwise drive a new round: snapshot time BEFORE the slow query, read
-    all live claims, validate, debit, allocate, publish atomically under a
-    CAS-advanced lease epoch.
+    otherwise drive a new round: CAS-advance the global lease FIRST to
+    take an ownership token (the round's entry point), then read all live
+    claims and the previous round (reads-after-token), snapshot time
+    BEFORE the slow query, validate, debit, allocate, publish atomically
+    conditional on the lease still holding that exact token.
+
+    The broker lock also excludes fill-row persists (see
+    persist_fill_replica): the round holds it from its debit scan through
+    its publish, so a launch's row lands either before the scan (counted)
+    or after the publish (fenced by the bumped epoch) -- never inside the
+    scan->publish window where it would be counted by neither.
 
     Returns None when the caller holds no live claim (expired, or rejected
     by a validation) or the round could not be driven; the caller then
@@ -682,7 +873,51 @@ def _run_round_locked(service_name: str, pool_key: str,
             _ROUND_FRESH_FRACTION * poll_interval_seconds):
         return _allocation_from_round(service_name, round_row)
 
-    # ---- Drive a new round. ----
+    # ---- Drive a new round: ownership token FIRST. ----
+    # TOKEN-FIRST ordering invariant (the other half lives in
+    # serve_state.acquire_reserved_fill_lease_token): the token is the
+    # round's entry point, CAS-advanced and committed before ANY state
+    # that feeds the publish is read -- the claims, the previous round row
+    # and the slow cluster query all come after it. The advisory round
+    # lock can die mid-round (e.g. a PostgreSQL advisory-lock session
+    # drop), letting a replacement writer drive and publish a newer round
+    # while this writer is suspended anywhere below; because the publish
+    # CASes on this exact token and the replacement's own advance
+    # invalidates it, a writer resuming with pre-replacement state can
+    # never publish it (rowcount 0 -> rollback -> observation discarded)
+    # -- no per-pool epoch regress, no clearing of a peer's fence_pending
+    # marker. The claims/round reads ABOVE this line serve only the read
+    # path (freshness gate) and are re-read below.
+    lease_ttl_seconds = (constants.RESERVED_FILL_LEASE_TTL_INTERVALS *
+                         poll_interval_seconds)
+    # A post-expiry acquisition (dead gap: no rounds at all for a lease
+    # TTL) also stamps the persistent per-pool fence_pending marker in the
+    # same transaction; see acquire_reserved_fill_lease_token for the
+    # crash-window reasoning and the epoch computation below for the bump
+    # it forces.
+    acquired = serve_state.acquire_reserved_fill_lease_token(now=now,
+                                                             expires_at=now +
+                                                             lease_ttl_seconds)
+    if acquired is None:
+        logger.error(
+            'Reserved-fill broker: lost the lease-token race before the '
+            f'round query (pool {pool_key}); a writer bypassed the round '
+            'lock. Skipping this cycle.')
+        return None
+    lease_token, lease_expired = acquired
+    # Reads-after-token: the claim set and the previous round feeding the
+    # publish below.
+    claim_rows = {
+        row['service_name']: row
+        for row in serve_state.get_reserved_fill_claims(pool_key=pool_key)
+    }
+    claim_rows = _reject_mixed_gpus_per_replica(pool_key, claim_rows)
+    if service_name not in claim_rows:
+        # Our claim vanished between the pre-token check and here (only
+        # possible when the round lock was bypassed); same reaction as
+        # the pre-token miss.
+        return None
+    round_row = serve_state.get_reserved_fill_round(pool_key)
     # Snapshot time BEFORE the slow cluster query: a zero-cost row created
     # while the query runs already occupies a slot the query may still have
     # counted free, and the created_at > snapshot_time debit only catches it
@@ -724,19 +959,33 @@ def _run_round_locked(service_name: str, pool_key: str,
                     f'context, {phantom_streak} consecutive rounds). '
                     'Rejecting all claims on it.')
                 serve_state.remove_reserved_fill_claims_for_pool(pool_key)
-                return None
-            logger.warning(
-                f'Reserved-fill broker: pool {pool_key} looks phantom '
-                f'({phantom_streak} consecutive observation(s), need '
-                f'{constants.RESERVED_FILL_PHANTOM_CONFIRM_ROUNDS} to '
-                'reject claims); treating the round as a measurement '
-                'blackout.')
+                # Fall through and PUBLISH an empty (blackout) round
+                # instead of returning here: without a published round
+                # the freshness gate never engages, so every claimant's
+                # poller re-drives the full cluster query each interval
+                # forever (N x duplication) with the pinned streak
+                # re-confirming each time. With the claim rows emptied
+                # the round below computes empty grants/feeds; readers
+                # then get no allocation (feed 0) WITHOUT driving a query
+                # for the rest of the interval. Grants going from
+                # something to nothing is an allocation change, so the
+                # transition bumps the fencing epoch once
+                # (re-confirmations republish identical empty grants and
+                # keep it stable); a later healthy observation still
+                # resets the streak, and the re-upserted claims resume
+                # normal rounds.
+                claim_rows = {}
+            else:
+                logger.warning(
+                    f'Reserved-fill broker: pool {pool_key} looks phantom '
+                    f'({phantom_streak} consecutive observation(s), need '
+                    f'{constants.RESERVED_FILL_PHANTOM_CONFIRM_ROUNDS} to '
+                    'reject claims); treating the round as a measurement '
+                    'blackout.')
             query_ok = False
 
     claims = {name: _claim_input(row) for name, row in claim_rows.items()}
     names = sorted(claims)
-    lease = serve_state.get_reserved_fill_lease()
-    prev_epoch = int(lease['epoch']) if lease is not None else None
     prev_grants_json: Dict[str, Any] = (json.loads(round_row['grants'] or '{}')
                                         if round_row is not None else {})
     prev_raw: Dict[str, int] = (json.loads(round_row['raw_grants'] or '{}')
@@ -766,53 +1015,51 @@ def _run_round_locked(service_name: str, pool_key: str,
         feeds = {service_name: free}
         raw_grants: Dict[str, int] = {}
         new_sticky: Dict[str, Dict[str, Any]] = {}
+        # No debit scan on the fast path (#108 identity), so no draining
+        # term either; harmless -- a single-claimant round's stored sum is
+        # never a damping baseline (its None grant carries no integer
+        # baseline into the next multi-claimant round). Any pending shrink
+        # candidate is dropped for the same reason: with the peers gone
+        # there is no damping bypass left to confirm.
+        published_sum_holdings = sum_holdings
+        new_shrink_baseline: Optional[int] = None
     else:
-        if query_ok:
-            assert observation is not None and observation.free_slots is not None
-            measured = max(0, int(observation.free_slots))
-            last_free, last_free_ts = measured, snapshot_time
-            feed_debit, entitlement_debit, fill_extra = _occupying_debit(
-                names, pool_key, snapshot_time)
-            observed_free = max(0, measured - feed_debit)
-            # The entitlement total only debits the mid-query bind race:
-            # bound not-READY pods are already excluded from the measured
-            # free AND counted in their owner's fill holdings, so the full
-            # feed debit here would double-subtract them for the whole
-            # bind->READY window and cull the booting pods (see
-            # _occupying_debit).
-            entitlement_free = max(0, measured - entitlement_debit)
-            if fill_extra:
-                # Post-snapshot FILL binds are arbitrated capacity newer
-                # than their owner's claim row: fold them back into the
-                # owner's holdings so the whole-pool total never
-                # undercounts and the grant keeps covering the replica the
-                # previous round's feed just launched (see
-                # _occupying_debit). Also reflected in the ClaimInputs so
-                # the feed split does not re-feed a slot the owner already
-                # holds.
-                claims = {
-                    name:
-                    (dataclasses.replace(claim,
-                                         holdings_fill=claim.holdings_fill +
-                                         fill_extra[name])
-                     if name in fill_extra else claim)
-                    for name, claim in claims.items()
-                }
-                sum_holdings += sum(fill_extra.values())
-        else:
-            # Measurement blackout: staleness-decayed last-known free, never
-            # a raw 0 -- a blackout must not trigger releases. Past the
-            # staleness window the decayed value IS 0, but the holdings
-            # floor below still prevents any release while blind.
-            stale_after = (poll_interval_seconds *
-                           constants.RESERVED_CAPACITY_STALE_AFTER_INTERVALS)
-            observed_free = 0
-            if (last_free is not None and last_free_ts is not None and
-                    now - float(last_free_ts) <= stale_after):
-                observed_free = int(last_free)
-            entitlement_free = observed_free
-        total = entitlement_free + sum_holdings
-        raw_grants = compute_entitlements(total, claims)
+        # The debit scan runs on blind rounds too (replica rows are DB
+        # reads, not cluster queries): draining rows keep occupying the
+        # pool regardless of whether this round's measurement succeeded,
+        # the live-holdings correction below must apply while blind, and
+        # the conservation bookkeeping must not flip on a blackout.
+        (feed_debit, entitlement_debit, live_fill,
+         unclaimed_fill) = _occupying_debit(names, pool_key, snapshot_time)
+        # One row-consistent view: a claim's holdings_fill is only as
+        # fresh as its owner's last heartbeat, while unclaimed_fill comes
+        # from the live row scan above -- summing the two double-counts
+        # every replica that turned SHUTTING_DOWN after its owner's last
+        # poll (the stale claim still holds it AND the scan counts it
+        # draining), inflating the pool total (over-grants, too-permissive
+        # demand gate) until the owner re-heartbeats. For every claimant
+        # whose rows were readable the scan-derived CURRENT nonterminal
+        # fill count REPLACES the claim's holdings for all round math
+        # (grants, feeds, the holdings-shrank bypass, the blind-round
+        # floor); the claim value is only the fallback when the scan
+        # could not cover that service (see _occupying_debit).
+        if live_fill:
+            claims = {
+                name: (dataclasses.replace(claim, holdings_fill=live_fill[name])
+                       if name in live_fill else claim)
+                for name, claim in claims.items()
+            }
+            sum_holdings = sum(claim.holdings_fill for claim in claims.values())
+        # Conservation invariant: the whole-pool total is observed free +
+        # live fill holdings + unclaimed fill rows (drainers and former
+        # claimants' orphaned rows). A drainer has left its owner's
+        # holdings but its pod still occupies the pool (excluded from the
+        # measured free), so without the unclaimed term every in-flight
+        # cull shrinks the total below the pool's real capacity and the
+        # round reclaims slots that are not actually gone; an orphaned
+        # fill row occupies its slot the same way, just with no claim
+        # left to ever re-adopt it.
+        conserved_holdings = sum_holdings + unclaimed_fill
         # Previous single-claimant None grants carry no integer baseline:
         # drop them so damping treats the service as newly-baselined.
         prev_published: Optional[Dict[str, int]] = None
@@ -824,11 +1071,59 @@ def _run_round_locked(service_name: str, pool_key: str,
             }
         prev_sum_holdings = (round_row['sum_holdings']
                              if round_row is not None else None)
-        holdings_shrank = (prev_sum_holdings is not None and
-                           sum_holdings < int(prev_sum_holdings))
-        damped = damp_grants(raw_grants, prev_published, prev_raw,
-                             holdings_shrank)
+        prev_shrink_baseline = (round_row['shrink_baseline']
+                                if round_row is not None else None)
         if query_ok:
+            assert observation is not None and observation.free_slots is not None
+            measured = max(0, int(observation.free_slots))
+            last_free, last_free_ts = measured, snapshot_time
+            observed_free = max(0, measured - feed_debit)
+            # The entitlement total only debits the mid-query bind race:
+            # bound not-READY pods are already excluded from the measured
+            # free AND counted in their owner's fill holdings, so the full
+            # feed debit here would double-subtract them for the whole
+            # bind->READY window and cull the booting pods (see
+            # _occupying_debit). A mid-query FILL bind stays attributed to
+            # its owner through the live_fill holdings above, keeping the
+            # total conserved.
+            entitlement_free = max(0, measured - entitlement_debit)
+            total = entitlement_free + conserved_holdings
+            raw_grants = compute_entitlements(total, claims)
+            # The immediate-down bypass keys on (holdings + draining): a
+            # holdings drop whose slots merely moved into a graceful drain
+            # is NOT capacity that physically vanished -- the drainers'
+            # pods are still bound. And a one-round conserved shrink can
+            # be a pure observation artifact: a drain completing between
+            # the cluster query and the row scan leaves the slot counted
+            # occupied by the query (not free) yet already deleted from
+            # the rows (not held, not draining), so BOTH terms omit it for
+            # exactly this round; firing the bypass on that phantom culls
+            # a warm replica the next query would have vindicated. The
+            # bypass therefore requires CONFIRMATION: a shrink below the
+            # previous round's conserved sum only records that sum as a
+            # pending baseline (this round takes the normal two-round
+            # damped path), and only a next round still below the baseline
+            # treats the capacity as physically gone. A legitimate fast
+            # reclaim (pods really deleted) loses at most one round of
+            # down-speed to this -- acceptable, and the ordinary two-round
+            # damped down usually lands the same round anyway.
+            new_shrink_baseline = None
+            if (prev_shrink_baseline is not None and
+                    conserved_holdings < int(prev_shrink_baseline)):
+                # Confirmed: the shrink persisted across two consecutive
+                # row-consistent scans -- pods are physically gone.
+                holdings_shrank = True
+            elif (prev_sum_holdings is not None and
+                  conserved_holdings < int(prev_sum_holdings)):
+                # First observation of this shrink: could be the
+                # query-then-scan gap; damp normally and remember the
+                # pre-shrink baseline for next round's confirmation.
+                holdings_shrank = False
+                new_shrink_baseline = int(prev_sum_holdings)
+            else:
+                holdings_shrank = False
+            damped = damp_grants(raw_grants, prev_published, prev_raw,
+                                 holdings_shrank)
             # raw_grants clamps each feed need to min(damped, raw): a
             # service inside a down-move's damping window must not be fed
             # above its raw entitlement -- the damped grant catches down
@@ -842,38 +1137,81 @@ def _run_round_locked(service_name: str, pool_key: str,
                 constants.RESERVED_FILL_STICKY_FEED_INTERVALS *
                 poll_interval_seconds,
                 raw_grants=raw_grants)
+            published_sum_holdings = conserved_holdings
         else:
-            # Blind round: never grant BELOW current holdings (no release
-            # on blackout) and launch nothing new (feeds 0). Sticky state
-            # is carried unchanged; its window is wall-clock, so a short
-            # blackout does not break an in-progress streak.
-            damped = {
-                name: max(grant, claims[name].holdings_fill)
-                for name, grant in damped.items()
-            }
+            # Measurement blackout: a failed query is not an observation,
+            # so it must not CHANGE the allocation -- the previous round's
+            # grants are carried forward as-is (floored at each claimant's
+            # CURRENT holdings so a blackout never strips a live replica's
+            # shelter), never recomputed. Recomputing from a synthesized
+            # total (stale last-known free + current holdings) double-
+            # counts every slot consumed since the last good measurement:
+            # 10 free observed -> 10 launched -> blackout would read
+            # 10 + 10 = 20 and the inflated grants would reopen the
+            # demand-placement gate on a ten-slot pool. Feeds are 0 (never
+            # launch blind), sticky state is carried unchanged (its window
+            # is wall-clock, so a short blackout does not break an
+            # in-progress streak), and the raw-grant damping baselines,
+            # sum_holdings and any pending shrink baseline are carried too
+            # -- the blackout is fully transparent to the shrink
+            # confirmation, which then compares the last measured round
+            # directly against the next one (no bypass evaluation happens
+            # on a carried round: grants are not recomputed at all). A
+            # claimant with no previous grant (joined during the blackout)
+            # gets its holdings floor: nothing new, nothing stripped.
+            raw_grants = {name: int(value) for name, value in prev_raw.items()}
+            damped = {}
+            for name, claim in claims.items():
+                base = (prev_published.get(name)
+                        if prev_published is not None else None)
+                damped[name] = max(base if base is not None else 0,
+                                   claim.holdings_fill)
             feeds = {name: 0 for name in claims}
             new_sticky = dict(sticky)
+            published_sum_holdings = (int(prev_sum_holdings)
+                                      if prev_sum_holdings is not None else
+                                      conserved_holdings)
+            new_shrink_baseline = (int(prev_shrink_baseline) if
+                                   prev_shrink_baseline is not None else None)
         grants = dict(damped)
 
     grants_changed = round_row is None or prev_grants_json != grants
-    lease_expired = (lease is None or lease['expires_at'] is None or
-                     float(lease['expires_at']) < now)
-    # Two epoch streams: the ROUND epoch is per-pool (the fencing token the
-    # launch path compares against -- pool A's grant churn must not fence
-    # pool B's launches), the LEASE epoch is global and exists only for the
-    # publish CAS. Both bump only when THIS pool's allocation changes (or
-    # after a lease-dead gap where every outstanding grant is suspect), not
-    # on every round: per-round bumps would fence out nearly every fill
-    # launch in steady state (each service's carried epoch is refreshed
-    # only on its own poll), while the fencing intent is precisely "never
-    # actuate a superseded allocation".
+    # Feeds are part of the allocation the fence protects: a feed-only
+    # redistribution (grants damped in place while the launchable-now
+    # split moved to a peer) or a positive-feed round giving way to a
+    # blackout must fence launch batches queued under the previous round
+    # -- their slots may now be fed to someone else, or unmeasurable.
+    # Multi-claimant rounds only: the single-claimant fast-path feed is
+    # the raw measured free (fluctuates every round, redistributes to
+    # nobody), and bumping on it would fence steady-state fill launches
+    # the pre-broker #108 path never fenced.
+    feeds_changed = (len(claims) != 1 and round_row is not None and
+                     json.loads(round_row['feeds'] or '{}') != feeds)
+    # The ROUND epoch is per-pool (the fencing token the launch path
+    # compares against -- pool A's grant churn must not fence pool B's
+    # launches). It bumps only when THIS pool's allocation (grants OR
+    # feeds) changes, or after a lease-dead gap where every outstanding
+    # grant is suspect -- not on every round: per-round bumps would fence
+    # out nearly every fill launch in steady state (each service's carried
+    # epoch is refreshed only on its own poll), while the fencing intent
+    # is precisely "never actuate a superseded allocation". The LEASE
+    # epoch is a separate global stream advanced unconditionally per
+    # driven round (the pre-query ownership token above).
     prev_round_epoch = (int(round_row['epoch'])
                         if round_row is not None else None)
     new_epoch = prev_round_epoch if prev_round_epoch is not None else 0
-    new_lease_epoch = prev_epoch if prev_epoch is not None else 0
-    if grants_changed or lease_expired:
+    # lease_expired covers the writer that OBSERVED the dead gap;
+    # fence_pending covers its crash window: a post-expiry writer's token
+    # acquisition already refreshed expires_at, so if it died before
+    # publishing, the next writer reads an unexpired lease and only the
+    # persisted per-pool marker still demands the bump. The successful
+    # publish below clears the marker in the same transaction (safe: any
+    # concurrent marker-setter advanced the lease, so this publish would
+    # CAS-fail instead of clearing).
+    fence_pending = (bool(round_row['fence_pending'])
+                     if round_row is not None else False)
+    if grants_changed or feeds_changed or lease_expired or fence_pending:
         new_epoch += 1
-        new_lease_epoch += 1
     round_id = int(round_row['round_id']) + 1 if round_row is not None else 1
     published = serve_state.publish_reserved_fill_round(
         pool_key,
@@ -884,24 +1222,30 @@ def _run_round_locked(service_name: str, pool_key: str,
         feeds=json.dumps(feeds, sort_keys=True),
         raw_grants=json.dumps(raw_grants, sort_keys=True),
         feed_state=json.dumps(new_sticky, sort_keys=True),
-        sum_holdings=sum_holdings,
+        sum_holdings=published_sum_holdings,
         last_observed_free=last_free,
         last_observed_free_ts=last_free_ts,
         phantom_streak=phantom_streak,
-        prev_epoch=prev_epoch,
-        lease_epoch=new_lease_epoch,
-        lease_expires_at=now +
-        constants.RESERVED_FILL_LEASE_TTL_INTERVALS * poll_interval_seconds)
+        shrink_baseline=new_shrink_baseline,
+        lease_token=lease_token,
+        lease_expires_at=now + lease_ttl_seconds)
     if not published:
         logger.error(
-            'Reserved-fill broker: lease CAS failed while publishing round '
-            f'{round_id} for pool {pool_key} (lease epoch {prev_epoch} -> '
-            f'{new_lease_epoch}); a writer bypassed the round lock. Skipping.')
+            'Reserved-fill broker: lease token superseded while publishing '
+            f'round {round_id} for pool {pool_key} (token {lease_token}); a '
+            'replacement writer took over mid-query. Discarding this '
+            'observation.')
         return None
     logger.info(
         f'Reserved-fill broker: round {round_id} (epoch {new_epoch}) for '
         f'pool {pool_key}: grants={grants} feeds={feeds} '
         f'claimants={names}.')
+    if service_name not in grants:
+        # Confirmed-phantom blackout round: our claim was just rejected
+        # along with everyone else's, so there is no allocation to hand
+        # back (the caller feeds its autoscaler 0 free slots). Every
+        # normal round grants exactly its claimants.
+        return None
     allocation = Allocation(grant=grants.get(service_name),
                             feed=int(feeds.get(service_name, 0)),
                             round_id=round_id,

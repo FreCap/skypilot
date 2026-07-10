@@ -38,7 +38,7 @@ SPOT_JOBS_VERSION = '021'  # add status_override column to spot table
 SPOT_JOBS_LOCK_PATH = f'~/.sky/locks/.{SPOT_JOBS_DB_NAME}.lock'
 
 SERVE_DB_NAME = 'serve_db'
-SERVE_VERSION = '005'  # reserved-fill rounds phantom_streak column
+SERVE_VERSION = '007'  # reserved-fill rounds fence_pending column
 SERVE_LOCK_PATH = f'~/.sky/locks/.{SERVE_DB_NAME}.lock'
 
 SKYPILOT_CONFIG_DB_NAME = 'sky_config_db'

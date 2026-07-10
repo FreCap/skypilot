@@ -1098,6 +1098,11 @@ def get_service_schema():
                                     'weight': {
                                         'type': 'number',
                                         'exclusiveMinimum': 0,
+                                        # Keep in sync with serve.constants
+                                        # RESERVED_FILL_MAX_WEIGHT: larger
+                                        # finite weights overflow the
+                                        # broker's water-fill arithmetic.
+                                        'maximum': 1e6,
                                     },
                                 },
                             },

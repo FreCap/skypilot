@@ -147,6 +147,35 @@ class TestEpochFencingPG(sqlite_suite.TestEpochFencing):
     pass
 
 
+class TestStaleWriterFencePG(sqlite_suite.TestStaleWriterFence):
+    pass
+
+
+class TestAtomicPersistFencePG(sqlite_suite.TestAtomicPersistFence):
+    pass
+
+
+class TestRoundPersistExclusionPG(sqlite_suite.TestRoundPersistExclusion):
+    pass
+
+
+class TestFencePendingFailsClosedPG(sqlite_suite.TestFencePendingFailsClosed):
+    pass
+
+
+class TestOrphanFillRowDebitPG(sqlite_suite.TestOrphanFillRowDebit):
+    pass
+
+
+# TestSqliteFenceBusySkip is deliberately not re-collected here: it pins
+# sqlite-only busy-degradation semantics (the PG fence blocks on the FOR
+# SHARE row lock instead of returning False).
+
+
+class TestExpiredLeaseFenceMarkerPG(sqlite_suite.TestExpiredLeaseFenceMarker):
+    pass
+
+
 class TestMidQueryDemandBindDebitPG(sqlite_suite.TestMidQueryDemandBindDebit):
     pass
 
@@ -157,6 +186,10 @@ class TestMidQueryFillBindAttributionPG(
 
 
 class TestFedLaunchBootSurvivalPG(sqlite_suite.TestFedLaunchBootSurvival):
+    pass
+
+
+class TestDrainWindowConservationPG(sqlite_suite.TestDrainWindowConservation):
     pass
 
 
@@ -193,6 +226,8 @@ class TestMigrationChainPG:
                     for column in inspector.get_columns('reserved_fill_rounds')
                 }
                 assert 'phantom_streak' in columns, columns
+                assert 'shrink_baseline' in columns, columns
+                assert 'fence_pending' in columns, columns
         finally:
             engine.dispose()
 

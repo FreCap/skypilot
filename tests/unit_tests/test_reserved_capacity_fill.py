@@ -772,6 +772,49 @@ class TestPollerClaimLifecycle(unittest.TestCase):
         # on every subsequent disabled cycle.
         remove_claim.assert_called_once_with('svc')
 
+    def test_cycle_failure_after_enable_still_withdraws_on_disable(self):
+        # A broker cycle can die AFTER upserting its claim (e.g. the
+        # round query raises), so the claim-may-exist flag must be set
+        # BEFORE the cycle runs -- otherwise a subsequent disable would
+        # skip remove_claim and leave a ghost claim absorbing entitlement
+        # for the whole claim TTL.
+        autoscaler = _make_autoscaler(fill=False)
+        placer = mock.Mock()
+        placer.zero_cost_locations.return_value = []
+        cycles = {'n': 0}
+
+        def _sleep(_seconds):
+            cycles['n'] += 1
+            if cycles['n'] == 1:
+                # The first disabled cycle consumed the initial flag; an
+                # update now re-enables fill.
+                autoscaler.reserved_capacity_fill = True
+            elif cycles['n'] == 2:
+                # The (failed) enabled cycle ran; disable again.
+                autoscaler.reserved_capacity_fill = False
+            elif cycles['n'] >= 3:
+                raise self._Stop()
+
+        with mock.patch.object(
+                reserved_capacity,
+                '_broker_cycle',
+                side_effect=RuntimeError('cycle died')) as broker_cycle, \
+             mock.patch.object(reserved_capacity.reserved_capacity_broker,
+                               'remove_claim') as remove_claim, \
+             mock.patch.object(reserved_capacity.time,
+                               'sleep',
+                               side_effect=_sleep):
+            with self.assertRaises(self._Stop):
+                reserved_capacity.poller_loop(lambda: autoscaler,
+                                              lambda: placer,
+                                              service_name='svc')
+        broker_cycle.assert_called_once()
+        # Once for the initial disabled observation, and AGAIN after the
+        # failed enabled cycle: the possibly-upserted claim is withdrawn
+        # instead of ghosting until the TTL.
+        self.assertEqual(remove_claim.call_count, 2)
+        remove_claim.assert_called_with('svc')
+
 
 class TestStaleSnapshot(unittest.TestCase):
     """Stale snapshot: 0 free contribution, existing fill still protected."""
@@ -998,7 +1041,9 @@ class TestFillLaunchPath(unittest.TestCase):
 
 
 class TestQueryFreeSlots(unittest.TestCase):
-    """Poller free-slot math: -1 is 0 free, slots are per-replica GPUs."""
+    """Poller free-slot math: slots are per-replica GPUs; unknown (-1)
+    availability is a measurement blackout (the standalone sum reads it
+    as 0 free for the cycle, but it is never a *successful* 0)."""
 
     def _k8s_location(self, region='research-ctx', gpu='A100', count=1):
         return spot_placer.Location.from_pickleable({
@@ -1029,6 +1074,39 @@ class TestQueryFreeSlots(unittest.TestCase):
                                })):
             self.assertEqual(
                 reserved_capacity.query_free_slots([self._k8s_location()]), 0)
+
+    def test_unknown_availability_is_measurement_blackout(self):
+        # A swallowed cluster-wide failure (e.g. pod-list 403) surfaces
+        # as {'A100': -1}: that is NOT an authoritative 0-free
+        # measurement. It must read as a blackout (free_slots=None) so
+        # the broker's blind-round semantics engage -- grants floored at
+        # holdings, feed 0 -- instead of letting a new claimant or
+        # weight change redistribute grants while availability is
+        # unknown. gpu_names still carries the seen names: an unknown
+        # reading is not a phantom pool either.
+        with mock.patch.object(reserved_capacity.kubernetes_catalog,
+                               'list_accelerators_realtime',
+                               return_value=({}, {}, {
+                                   'A100': -1
+                               })):
+            observation = reserved_capacity.query_pool_observation(
+                'research-ctx', 'A100', 1)
+        self.assertIsNone(observation.free_slots)
+        self.assertEqual(observation.gpu_names, ('A100',))
+
+    def test_any_negative_availability_blacks_out_the_whole_pool(self):
+        # Partial unknowns poison the sum the same way: one -1 among
+        # positive counts means the pool's free level is not measurable.
+        with mock.patch.object(reserved_capacity.kubernetes_catalog,
+                               'list_accelerators_realtime',
+                               return_value=({}, {}, {
+                                   'A100': 3,
+                                   'A100-80GB': -1
+                               })):
+            observation = reserved_capacity.query_pool_observation(
+                'research-ctx', 'A100', 1)
+        self.assertIsNone(observation.free_slots)
+        self.assertEqual(set(observation.gpu_names), {'A100', 'A100-80GB'})
 
     def test_same_shape_different_counts_use_largest_deterministically(self):
         # A100:1 and A100:8 entries over one pool draw from the same
@@ -1238,10 +1316,25 @@ class TestGrantEpochPlumbing(unittest.TestCase):
 
 
 class TestEpochFencedLaunch(unittest.TestCase):
-    """A fill launch carrying a superseded epoch skips, leaking nothing."""
+    """A fill launch carrying a superseded epoch skips, leaking nothing.
 
-    def _launch(self, pool_epochs, carried_epoch=7, carried_pool='pool-b'):
-        """pool_epochs: pool_key -> current round epoch (the fence read)."""
+    Broker-stamped launches persist through the broker's
+    persist_fill_replica (the epoch recheck atomic with the row upsert
+    and mutually excluded with in-flight rounds -- the pre-check alone is
+    TOCTOU); un-stamped launches keep the plain persist.
+    """
+
+    def _launch(self,
+                pool_epochs,
+                carried_epoch=7,
+                carried_pool='pool-b',
+                persist_epoch_current=True):
+        """pool_epochs: pool_key -> current round epoch (the fence read).
+
+        persist_epoch_current: what the atomic persist-time recheck
+        reports (False = a new round published between the pre-check and
+        the persist).
+        """
         location = _make_location('research-ctx', 'free')
         placer = mock.Mock()
         placer.select_next_zero_cost_location.return_value = location
@@ -1262,22 +1355,32 @@ class TestEpochFencedLaunch(unittest.TestCase):
                                'get_replica_infos',
                                return_value=[]), \
              mock.patch.object(replica_managers.serve_state,
-                               'add_or_update_replica') as add_mock:
+                               'add_or_update_replica') as add_mock, \
+             mock.patch.object(replica_managers.reserved_capacity_broker,
+                               'persist_fill_replica',
+                               return_value=persist_epoch_current
+                              ) as fenced_add_mock:
             launched = manager._launch_replica(7, override)
-        return launched, add_mock, epoch_mock
+        return launched, add_mock, epoch_mock, fenced_add_mock
 
     def test_stale_epoch_skips_without_persisting_a_row(self):
-        launched, add_mock, epoch_mock = self._launch({'pool-b': 8})
+        launched, add_mock, epoch_mock, fenced_add = self._launch({'pool-b': 8})
         self.assertFalse(launched)
         add_mock.assert_not_called()
+        fenced_add.assert_not_called()
         # The fence reads the CARRIED pool's round epoch, not a global one.
         epoch_mock.assert_called_once_with('pool-b')
 
     def test_current_epoch_launches_and_strips_the_keys(self):
-        launched, add_mock, _ = self._launch({'pool-b': 7})
+        launched, add_mock, _, fenced_add = self._launch({'pool-b': 7})
         self.assertTrue(launched)
-        add_mock.assert_called_once()
-        info = add_mock.call_args[0][2]
+        # Broker-stamped: persisted through the atomic epoch-rechecking
+        # path, carrying the pool key and the carried epoch.
+        add_mock.assert_not_called()
+        fenced_add.assert_called_once()
+        self.assertEqual(fenced_add.call_args.kwargs['pool_key'], 'pool-b')
+        self.assertEqual(fenced_add.call_args.kwargs['expected_epoch'], 7)
+        info = fenced_add.call_args[0][2]
         self.assertNotIn(_EPOCH_KEY, info.resources_override)
         self.assertNotIn(_POOL_KEY, info.resources_override)
         self.assertNotIn(_FILL_KEY, info.resources_override)
@@ -1287,34 +1390,49 @@ class TestEpochFencedLaunch(unittest.TestCase):
         # Cross-pool isolation at the fence: pool A's epoch moved (8) but
         # this launch carries pool B's still-current epoch (7) -- it must
         # launch. Pool B's own stale epoch (6 vs 7) still fences.
-        launched, add_mock, _ = self._launch({'pool-a': 8, 'pool-b': 7})
+        launched, _, _, fenced_add = self._launch({'pool-a': 8, 'pool-b': 7})
         self.assertTrue(launched)
-        add_mock.assert_called_once()
-        fenced, fenced_add, _ = self._launch({
+        fenced_add.assert_called_once()
+        fenced, _, _, fenced_persist = self._launch({
             'pool-a': 8,
             'pool-b': 7
         },
-                                             carried_epoch=6)
+                                                    carried_epoch=6)
         self.assertFalse(fenced)
-        fenced_add.assert_not_called()
+        fenced_persist.assert_not_called()
 
     def test_missing_round_fails_open(self):
         # No round row for the pool (current_epoch None): there is no
         # newer allocation to defer to -- proceed rather than deadlock
-        # fill forever.
-        launched, add_mock, _ = self._launch({})
+        # fill forever (add_replica_if_round_epoch fails open the same
+        # way at persist time).
+        launched, add_mock, _, fenced_add = self._launch({})
         self.assertTrue(launched)
-        add_mock.assert_called_once()
+        add_mock.assert_not_called()
+        fenced_add.assert_called_once()
 
     def test_epoch_without_pool_key_fails_open(self):
         # Defensive: the epoch is only meaningful against its pool's
         # round; a sentinel missing the pool key (never emitted by the
-        # autoscaler) must not fence.
-        launched, add_mock, epoch_mock = self._launch({'pool-b': 8},
-                                                      carried_pool=None)
+        # autoscaler) must not fence -- and without a pool to recheck it
+        # takes the plain persist.
+        launched, add_mock, epoch_mock, fenced_add = self._launch(
+            {'pool-b': 8}, carried_pool=None)
         self.assertTrue(launched)
         add_mock.assert_called_once()
+        fenced_add.assert_not_called()
         epoch_mock.assert_not_called()
+
+    def test_round_published_between_precheck_and_persist_skips(self):
+        # TOCTOU closed: the pre-check passed (carried epoch 7 is
+        # current) but a new round published before the persist; the
+        # atomic recheck reports stale and the launch must skip without
+        # leaking a row or a launch thread.
+        launched, add_mock, _, fenced_add = self._launch(
+            {'pool-b': 7}, persist_epoch_current=False)
+        self.assertFalse(launched)
+        add_mock.assert_not_called()
+        fenced_add.assert_called_once()
 
 
 class TestDemandPlacementGate(unittest.TestCase):

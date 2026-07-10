@@ -1,5 +1,6 @@
 """Service specification for SkyServe."""
 import json
+import math
 import os
 import textwrap
 from typing import Any, Dict, List, Optional, Union
@@ -133,11 +134,28 @@ class SkyServiceSpec:
                         'reserved_capacity_fill.floor_replicas must be an '
                         f'integer >= 0. Got: {fill_floor}')
             fill_weight = reserved_capacity_fill.get('weight', 1)
-            if (not isinstance(fill_weight, (int, float)) or
-                    isinstance(fill_weight, bool) or fill_weight <= 0):
+            # isfinite: float('inf') passes a plain > 0 check (and NaN
+            # passes a plain <= 0 rejection), and either poisons the
+            # broker's weighted water-fill (inf/inf -> NaN in rounding)
+            # every round for the whole pool while the claim stays live.
+            if (not isinstance(fill_weight,
+                               (int, float)) or isinstance(fill_weight, bool) or
+                    fill_weight <= 0 or not math.isfinite(fill_weight)):
                 with ux_utils.print_exception_no_traceback():
                     raise ValueError('reserved_capacity_fill.weight must be '
-                                     f'a number > 0. Got: {fill_weight}')
+                                     f'a finite number > 0. Got: {fill_weight}')
+            # Finite is not enough: 1e308 passes isfinite yet overflows the
+            # broker's weighted water-fill (remaining*weight / sum(weights)
+            # -> inf -> NaN in rounding). The documented bound keeps every
+            # sane priority ratio expressible while staying far from float
+            # overflow; the broker additionally clamps out-of-bound DB rows
+            # so a poisoned row cannot crash rounds either.
+            if fill_weight > constants.RESERVED_FILL_MAX_WEIGHT:
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        'reserved_capacity_fill.weight must not exceed '
+                        f'{constants.RESERVED_FILL_MAX_WEIGHT:g}. '
+                        f'Got: {fill_weight}')
             # A floor above max_replicas can never be materialized: the fill
             # target is clamped to max_replicas, so the excess would sit as
             # a permanent phantom claim on the broker (absorbing entitlement
