@@ -463,6 +463,13 @@ class ReplicaStatusProperty:
     # This is only possible when spot placer is enabled, so the retry until up
     # is set to True and it can fail immediately due to spot availability.
     failed_spot_availability: bool = False
+    # [boltz fork] The graceful-drain cap resolved when this replica's
+    # retirement was scheduled, persisted so a recovery re-drive reuses
+    # it exactly instead of re-resolving (the spec lookup can fail after
+    # a crash and silently substitute the 120s default). None on purge
+    # and failure teardowns, and on rows written before this field
+    # existed (read via getattr for unpickle back-compat).
+    drain_cap_seconds: Optional[int] = None
 
     def unrecoverable_failure(self) -> bool:
         """Whether the replica fails and cannot be recovered.
@@ -1215,8 +1222,15 @@ class SkyPilotReplicaManager(ReplicaManager):
                 status_property = replica_info.status_property
                 if (status_property.is_scale_down and
                         not status_property.purged):
-                    drain_cap = self._resolve_drain_cap_seconds(
-                        replica_info.replica_id)
+                    # Prefer the cap persisted when the retirement was
+                    # scheduled (exact reuse across the restart); legacy
+                    # rows predating the field re-resolve. getattr: the
+                    # row may be an unpickled pre-field instance.
+                    drain_cap = getattr(status_property, 'drain_cap_seconds',
+                                        None)
+                    if drain_cap is None:
+                        drain_cap = self._resolve_drain_cap_seconds(
+                            replica_info.replica_id)
                 # Failure teardowns stay in the record
                 # (left_in_record=True), and _terminate_replica asserts
                 # such rows sync logs down for debuggability -- re-driving
@@ -1673,6 +1687,11 @@ class SkyPilotReplicaManager(ReplicaManager):
             # as a left-in-record failure teardown and strands the row).
             info.status_property.is_scale_down = is_scale_down
             info.status_property.purged = purge
+            # The drain cap too: this INTERRUPTED row already derives
+            # SHUTTING_DOWN, so a crash before the SCHEDULED write below
+            # must leave recovery the resolved cap, not the resolver.
+            info.status_property.drain_cap_seconds = (
+                in_flight_drain_cap_seconds)
             serve_state.add_or_update_replica(self._service_name, replica_id,
                                               info)
             launch_thread = self._launch_thread_pool[replica_id]
@@ -1806,6 +1825,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         # budget instead of extending the terminate-slot hold.
         info.status_property.sky_down_status = (
             common_utils.ProcessStatus.SCHEDULED)
+        info.status_property.drain_cap_seconds = in_flight_drain_cap_seconds
         serve_state.add_or_update_replica(self._service_name, replica_id, info)
         drain_deadline: Optional[float] = None
         drain_complete: Optional[Callable[[], bool]] = None

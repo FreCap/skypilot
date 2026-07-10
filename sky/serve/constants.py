@@ -152,7 +152,13 @@ LB_OCCUPANCY_PROBE_INTERVAL_SECONDS = 10
 # it read the replica as idle and kill live async work. Also the upper
 # bound for the service-spec `graceful_drain_seconds` (a drain longer
 # than the retention would lose the unknown protection partway through).
-LB_OFF_READY_OCCUPANCY_RETENTION_SECONDS = 3600
+# 7200 so hour-scale async jobs fit under the cap with margin: a job
+# admitted the instant retirement starts runs its full duration into the
+# drain, so a fleet with 3600s jobs needs a cap strictly above 3600.
+# Cost of the longer retention is only probing/retaining non-answering
+# off-ready urls for up to 2h -- entries answering 'torn down' or probed
+# successfully resolve well before that.
+LB_OFF_READY_OCCUPANCY_RETENTION_SECONDS = 7200
 LB_OCCUPANCY_PROBE_INTERVAL_ENV_VAR = (
     'SKYPILOT_LB_OCCUPANCY_PROBE_INTERVAL_SECONDS')
 
