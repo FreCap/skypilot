@@ -1882,15 +1882,17 @@ class SkyServeLoadBalancer:
 
     def run(self):
         if serve_utils.is_external_load_balancer_mode():
-            # Refuse to expose the external data plane before both of its trust
-            # boundaries are configured. Subsequent reads remain live and
-            # fail closed if a projected Secret becomes unreadable.
+            # Refuse to start before every enabled trust boundary is ready.
+            # Data-plane authentication is optional; sync authentication is
+            # not. Subsequent reads remain live and fail closed if an enabled
+            # projected Secret becomes unreadable.
             serve_utils.get_lb_sync_auth_tokens(required=True)
-            serve_utils.get_lb_auth_tokens(required=True)
+            if serve_utils.is_lb_data_plane_auth_enabled():
+                serve_utils.get_lb_auth_tokens(required=True)
             self._get_lb_session_id()
-        # Gate inbound inference requests on the shared bearer token (no-op when
-        # unset). Pure-ASGI so it wraps the catch-all proxy without buffering
-        # streaming responses; exempts the readiness probe by method+path.
+        # Gate inbound inference requests when data-plane auth is enabled.
+        # Pure-ASGI so it wraps the catch-all proxy without buffering streaming
+        # responses; exempts the readiness probe by method+path.
         self._app.add_middleware(_InboundAuthMiddleware)
         # Register the readiness route BEFORE the catch-all proxy route so it
         # is matched first (Starlette matches in registration order) instead of

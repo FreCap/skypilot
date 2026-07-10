@@ -96,6 +96,52 @@ def test_malformed_data_plane_capability_fails_closed(monkeypatch):
         _authorized(_scope('/predict'))
 
 
+class _NoopDrainableServer:
+
+    def __init__(self, *args, **kwargs):
+        del args, kwargs
+
+    async def serve_with_drain(self):
+        return
+
+
+def test_lb_process_starts_without_optional_data_auth(monkeypatch):
+    monkeypatch.setattr(serve_utils, 'is_external_load_balancer_mode',
+                        lambda: True)
+    monkeypatch.setenv(constants.LB_DATA_PLANE_AUTH_ENABLED_ENV_VAR, 'false')
+    sync_tokens = mock.Mock(return_value=('sync',))
+    data_tokens = mock.Mock(
+        side_effect=AssertionError('disabled data auth must not be required'))
+    monkeypatch.setattr(serve_utils, 'get_lb_sync_auth_tokens', sync_tokens)
+    monkeypatch.setattr(serve_utils, 'get_lb_auth_tokens', data_tokens)
+    monkeypatch.setattr(load_balancer, '_DrainableServer', _NoopDrainableServer)
+    lb = _make_lb()
+    monkeypatch.setattr(lb, '_get_lb_session_id', lambda: 'pod-uid')
+
+    lb.run()
+
+    sync_tokens.assert_called_once_with(required=True)
+    data_tokens.assert_not_called()
+
+
+def test_lb_process_requires_data_ring_when_enabled(monkeypatch):
+    monkeypatch.setattr(serve_utils, 'is_external_load_balancer_mode',
+                        lambda: True)
+    monkeypatch.setenv(constants.LB_DATA_PLANE_AUTH_ENABLED_ENV_VAR, 'true')
+    sync_tokens = mock.Mock(return_value=('sync',))
+    data_tokens = mock.Mock(return_value=('data',))
+    monkeypatch.setattr(serve_utils, 'get_lb_sync_auth_tokens', sync_tokens)
+    monkeypatch.setattr(serve_utils, 'get_lb_auth_tokens', data_tokens)
+    monkeypatch.setattr(load_balancer, '_DrainableServer', _NoopDrainableServer)
+    lb = _make_lb()
+    monkeypatch.setattr(lb, '_get_lb_session_id', lambda: 'pod-uid')
+
+    lb.run()
+
+    sync_tokens.assert_called_once_with(required=True)
+    data_tokens.assert_called_once_with(required=True)
+
+
 def test_inbound_health_get_head_exempt(monkeypatch):
     # The readiness probe must reach /_lb/health even with auth enabled, or k8s
     # would never mark the pod Ready.
