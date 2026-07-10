@@ -1033,18 +1033,12 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
                                     controller_process)
 
             # Keep the historical load_balancer_port field as the registration
-            # sentinel/API compatibility value. Real services always expose
-            # the fixed port on their per-service Kubernetes Service. Pools
-            # have no endpoint but still need a non-null sentinel for the
-            # existing registration protocol.
-            if external_lb:
-                load_balancer_port = constants.LOAD_BALANCER_PORT_START
-            elif not is_recovery:
-                load_balancer_port = common_utils.find_free_port(
-                    constants.LOAD_BALANCER_PORT_START)
-            else:
-                load_balancer_port = serve_state.get_service_load_balancer_port(
-                    service_name)
+            # sentinel/API compatibility value. Real services expose this
+            # fixed port on their per-service Kubernetes Service; pools have
+            # no endpoint but still need a non-null registration sentinel.
+            # Nothing binds an in-pod LB port anymore, so probing for a free
+            # local port (or restoring one from an old row) is meaningless.
+            load_balancer_port = constants.LOAD_BALANCER_PORT_START
 
         # In external load balancer mode, ensure the controller-owned per-
         # service LB Deployment + Service exist BEFORE the load_balancer_port

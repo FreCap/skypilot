@@ -19,9 +19,7 @@ from sky.serve import load_balancer
 
 def _make_lb():
     return load_balancer.SkyServeLoadBalancer(
-        controller_url='http://controller:8001',
-        load_balancer_port=30001,
-        load_balancing_policy_name='least_load')
+        controller_url='http://controller:8001', load_balancer_port=30001)
 
 
 def test_not_ready_before_first_sync():

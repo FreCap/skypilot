@@ -66,38 +66,6 @@ def _service_test_request_command(endpoint: str) -> str:
     return f'curl -H {header} {endpoint}'
 
 
-def _rewrite_tls_credential_paths_and_get_tls_env_vars(
-        service_name: str, task: 'task_lib.Task') -> Dict[str, Any]:
-    """Rewrite the paths of TLS credentials in the task.
-
-    Args:
-        service_name: Name of the service.
-        task: sky.Task to rewrite.
-
-    Returns:
-        The generated template variables for TLS.
-    """
-    service_spec = task.service
-    # Already checked by validate_service_task
-    assert service_spec is not None
-    if service_spec.tls_credential is None:
-        return {'use_tls': False}
-    remote_tls_keyfile = (
-        serve_utils.generate_remote_tls_keyfile_name(service_name))
-    remote_tls_certfile = (
-        serve_utils.generate_remote_tls_certfile_name(service_name))
-    tls_template_vars = {
-        'use_tls': True,
-        'remote_tls_keyfile': remote_tls_keyfile,
-        'remote_tls_certfile': remote_tls_certfile,
-        'local_tls_keyfile': service_spec.tls_credential.keyfile,
-        'local_tls_certfile': service_spec.tls_credential.certfile,
-    }
-    service_spec.tls_credential = serve_utils.TLSCredential(
-        remote_tls_keyfile, remote_tls_certfile)
-    return tls_template_vars
-
-
 def _get_service_record(
         service_name: str, pool: bool,
         handle: backends.CloudVmRayResourceHandle,
@@ -357,9 +325,6 @@ def up(
             local_to_controller_file_mounts = (
                 controller_utils.translate_local_file_mounts_to_two_hop(task))
 
-    tls_template_vars = _rewrite_tls_credential_paths_and_get_tls_env_vars(
-        service_name, task)
-
     with tempfile.NamedTemporaryFile(
             prefix=f'service-task-{service_name}-',
             mode='w',
@@ -399,7 +364,6 @@ def up(
                 service_catalog_common.get_modified_catalog_file_mounts(),
             'consolidation_mode_job_id': controller_job_id,
             'entrypoint': shlex.quote(common_utils.get_current_command()),
-            **tls_template_vars,
             **controller_utils.shared_controller_vars_to_fill(
                 controller=controller_utils.Controllers.SKY_SERVE_CONTROLLER,
                 remote_user_config_path=remote_config_yaml_path,

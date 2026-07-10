@@ -382,12 +382,6 @@ class TLSCredential:
     keyfile: str
     certfile: str
 
-    def dump_uvicorn_kwargs(self) -> Dict[str, str]:
-        return {
-            'ssl_keyfile': os.path.expanduser(self.keyfile),
-            'ssl_certfile': os.path.expanduser(self.certfile),
-        }
-
 
 DEFAULT_UPDATE_MODE = UpdateMode.ROLLING
 
@@ -1141,12 +1135,6 @@ def generate_remote_controller_log_file_name(service_name: str) -> str:
     return os.path.join(dir_name, 'controller.log')
 
 
-def generate_remote_load_balancer_log_file_name(service_name: str) -> str:
-    dir_name = generate_remote_service_dir_name(service_name)
-    # Don't expand here since it is used for remote machine.
-    return os.path.join(dir_name, 'load_balancer.log')
-
-
 def generate_remote_batch_controller_log_file_name(service_name: str) -> str:
     dir_name = generate_remote_service_dir_name(service_name)
     # Don't expand here since it is used for remote machine.
@@ -1164,18 +1152,6 @@ def generate_replica_log_file_name(service_name: str, replica_id: int) -> str:
     dir_name = generate_remote_service_dir_name(service_name)
     dir_name = os.path.expanduser(dir_name)
     return os.path.join(dir_name, f'replica_{replica_id}.log')
-
-
-def generate_remote_tls_keyfile_name(service_name: str) -> str:
-    dir_name = generate_remote_service_dir_name(service_name)
-    # Don't expand here since it is used for remote machine.
-    return os.path.join(dir_name, 'tls_keyfile')
-
-
-def generate_remote_tls_certfile_name(service_name: str) -> str:
-    dir_name = generate_remote_service_dir_name(service_name)
-    # Don't expand here since it is used for remote machine.
-    return os.path.join(dir_name, 'tls_certfile')
 
 
 def generate_replica_cluster_name(service_name: str, replica_id: int) -> str:

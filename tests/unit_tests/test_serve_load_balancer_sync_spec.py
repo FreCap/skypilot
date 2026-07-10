@@ -16,15 +16,16 @@ from sky.serve import load_balancing_policies as lb_policies
 
 
 def _make_lb(policy_name=None) -> load_balancer.SkyServeLoadBalancer:
-    return load_balancer.SkyServeLoadBalancer(
-        controller_url='http://ctrl:8001',
-        load_balancer_port=8890,
-        load_balancing_policy_name=policy_name)
+    lb = load_balancer.SkyServeLoadBalancer(controller_url='http://ctrl:8001',
+                                            load_balancer_port=8890)
+    if policy_name is not None:
+        lb._apply_routing_spec({'load_balancing_policy_name': policy_name})
+    return lb
 
 
 def test_defaults_until_synced():
-    # A standalone LB seeds None -> the default policy and the built-in stream
-    # timeout, until the first sync populates the real spec.
+    # The external LB uses safe defaults until controller sync supplies the
+    # real routing spec; there is no launch-time seed.
     lb = _make_lb()
     assert (lb._load_balancing_policy_name == lb_policies.DEFAULT_LB_POLICY)
     assert (lb._stream_timeout_seconds == constants.DEFAULT_LB_STREAM_TIMEOUT)
