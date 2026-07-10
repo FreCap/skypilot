@@ -385,6 +385,15 @@ REPLICA_ID_ENV_VAR = 'SKYPILOT_SERVE_REPLICA_ID'
 # (metadata.name). It is a hard contract: without it the controller cannot
 # resolve the LB image.
 POD_NAME_ENV_VAR = 'SKYPILOT_POD_NAME'
+# Helm-rendered name of the stable API Deployment that owns generated external
+# LB objects. Unlike the API Pod/ReplicaSet identities, this Deployment UID is
+# stable across ordinary rollouts and gives Kubernetes garbage collection the
+# correct release-lifetime anchor.
+API_DEPLOYMENT_NAME_ENV_VAR = 'SKYPILOT_API_DEPLOYMENT_NAME'
+# Existing Helm release identity, retained as the mixed-version fallback for
+# charts that predate API_DEPLOYMENT_NAME_ENV_VAR. The API Deployment rendered
+# by those charts is always named ``<release>-api-server``.
+RELEASE_NAME_ENV_VAR = 'SKYPILOT_RELEASE_NAME'
 # Downward-API-injected namespace of the API/controller pod. Controller-owned
 # LB objects and their projected Secrets live beside that pod even when the
 # configured Kubernetes workload namespace is different.

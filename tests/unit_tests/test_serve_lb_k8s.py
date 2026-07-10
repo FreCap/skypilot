@@ -68,6 +68,9 @@ def _install(monkeypatch,
                  'name': 'registry-credentials'
              },),
              data_auth=True,
+             api_deployment_name='skypilot-api-server',
+             api_deployment_uid='api-deployment-uid',
+             release_name='skypilot',
              db_service_names=()):
     monkeypatch.setattr(lb_k8s.serve_utils, 'is_external_load_balancer_mode',
                         lambda: external)
@@ -107,6 +110,15 @@ def _install(monkeypatch,
         monkeypatch.delenv(constants.POD_NAME_ENV_VAR, raising=False)
     else:
         monkeypatch.setenv(constants.POD_NAME_ENV_VAR, pod_name)
+    if api_deployment_name is None:
+        monkeypatch.delenv(constants.API_DEPLOYMENT_NAME_ENV_VAR, raising=False)
+    else:
+        monkeypatch.setenv(constants.API_DEPLOYMENT_NAME_ENV_VAR,
+                           api_deployment_name)
+    if release_name is None:
+        monkeypatch.delenv(constants.RELEASE_NAME_ENV_VAR, raising=False)
+    else:
+        monkeypatch.setenv(constants.RELEASE_NAME_ENV_VAR, release_name)
     if pod_namespace is None:
         monkeypatch.delenv(constants.POD_NAMESPACE_ENV_VAR, raising=False)
     else:
@@ -114,26 +126,60 @@ def _install(monkeypatch,
 
     apps_api = apps_api or mock.MagicMock()
     core_api = core_api or mock.MagicMock()
+    effective_api_deployment_name = (
+        api_deployment_name or
+        (f'{release_name}-api-server' if release_name else None))
     read_service = core_api.read_namespaced_service
     if (read_service.side_effect is None and
             isinstance(read_service.return_value, mock.MagicMock)):
-        read_service.return_value = SimpleNamespace(spec=SimpleNamespace(
-            selector={'app': lb_k8s.lb_deployment_name('svc')},
-            ports=[
-                SimpleNamespace(port=constants.LOAD_BALANCER_PORT_START,
-                                target_port=constants.LOAD_BALANCER_PORT_START,
-                                protocol='TCP')
-            ]))
+        read_service.return_value = SimpleNamespace(
+            metadata=SimpleNamespace(resource_version='lb-service-rv',
+                                     owner_references=[
+                                         SimpleNamespace(
+                                             api_version='apps/v1',
+                                             kind='Deployment',
+                                             name=effective_api_deployment_name,
+                                             uid=api_deployment_uid,
+                                             controller=False,
+                                             block_owner_deletion=False)
+                                     ]),
+            spec=SimpleNamespace(
+                selector={'app': lb_k8s.lb_deployment_name('svc')},
+                ports=[
+                    SimpleNamespace(
+                        port=constants.LOAD_BALANCER_PORT_START,
+                        target_port=constants.LOAD_BALANCER_PORT_START,
+                        protocol='TCP')
+                ]))
     read_deployment = apps_api.read_namespaced_deployment
-    if (read_deployment.side_effect is None and
-            isinstance(read_deployment.return_value, mock.MagicMock)):
-        read_deployment.return_value = SimpleNamespace(
-            metadata=SimpleNamespace(generation=1),
-            spec=SimpleNamespace(replicas=1),
-            status=SimpleNamespace(observed_generation=1,
-                                   updated_replicas=1,
-                                   available_replicas=1,
-                                   unavailable_replicas=0))
+    if read_deployment.side_effect is None:
+        existing_deployment = read_deployment.return_value
+        if isinstance(existing_deployment, mock.MagicMock):
+            existing_deployment = SimpleNamespace(
+                metadata=SimpleNamespace(
+                    generation=1,
+                    resource_version='lb-deployment-rv',
+                    owner_references=[
+                        SimpleNamespace(api_version='apps/v1',
+                                        kind='Deployment',
+                                        name=effective_api_deployment_name,
+                                        uid=api_deployment_uid,
+                                        controller=False,
+                                        block_owner_deletion=False)
+                    ]),
+                spec=SimpleNamespace(replicas=1),
+                status=SimpleNamespace(observed_generation=1,
+                                       updated_replicas=1,
+                                       available_replicas=1,
+                                       unavailable_replicas=0))
+
+        def _read_deployment(name, unused_namespace):
+            if name == effective_api_deployment_name:
+                return SimpleNamespace(metadata=SimpleNamespace(
+                    uid=api_deployment_uid))
+            return existing_deployment
+
+        read_deployment.side_effect = _read_deployment
     monkeypatch.setattr(lb_k8s.kubernetes,
                         'apps_api',
                         lambda unused_context=None: apps_api)
@@ -218,12 +264,61 @@ def test_external_runtime_requires_pod_namespace(monkeypatch):
         lb_k8s.require_external_lb_runtime()
 
 
+def test_external_runtime_requires_owner_or_release_name(monkeypatch):
+    _install(monkeypatch, api_deployment_name=None, release_name=None)
+    with pytest.raises(RuntimeError, match=constants.RELEASE_NAME_ENV_VAR):
+        lb_k8s.require_external_lb_runtime()
+
+
+def test_legacy_release_name_supports_preflight_and_owner_resolution(
+        monkeypatch):
+    apps, _ = _install(monkeypatch,
+                       api_deployment_name=None,
+                       release_name='legacy-release')
+
+    lb_k8s.require_external_lb_runtime()
+    lb_k8s.create_lb_deployment_and_service('svc', 225, 'incarnation')
+
+    deployment = apps.create_namespaced_deployment.call_args.args[1]
+    assert deployment['metadata']['ownerReferences'][0][
+        'name'] == 'legacy-release-api-server'
+    owner_reads = [
+        call.args[:2]
+        for call in apps.read_namespaced_deployment.call_args_list
+        if call.args[0] == 'legacy-release-api-server'
+    ]
+    assert owner_reads == [('legacy-release-api-server', 'skypilot')]
+
+
+def test_explicit_api_deployment_name_precedes_legacy_release_name(monkeypatch):
+    apps, _ = _install(monkeypatch,
+                       api_deployment_name='explicit-api-owner',
+                       release_name='legacy-release')
+
+    lb_k8s.create_lb_deployment_and_service('svc', 225, 'incarnation')
+
+    deployment = apps.create_namespaced_deployment.call_args.args[1]
+    assert deployment['metadata']['ownerReferences'][0][
+        'name'] == 'explicit-api-owner'
+    assert apps.read_namespaced_deployment.call_args_list[0].args[:2] == (
+        'explicit-api-owner', 'skypilot')
+
+
 def test_create_builds_proxy_deployment_and_service(monkeypatch):
     apps, core = _install(monkeypatch)
     lb_k8s.create_lb_deployment_and_service('svc-a', 225, 'incarnation')
 
     namespace, deployment = apps.create_namespaced_deployment.call_args.args
     assert namespace == 'skypilot'
+    expected_owner = [{
+        'apiVersion': 'apps/v1',
+        'kind': 'Deployment',
+        'name': 'skypilot-api-server',
+        'uid': 'api-deployment-uid',
+        'controller': False,
+        'blockOwnerDeletion': False,
+    }]
+    assert deployment['metadata']['ownerReferences'] == expected_owner
     pod_spec = deployment['spec']['template']['spec']
     container = pod_spec['containers'][0]
     assert container['image'] == f'repo/skypilot@{_DIGEST_A}'
@@ -264,6 +359,7 @@ def test_create_builds_proxy_deployment_and_service(monkeypatch):
     assert 'data-current' not in serialized
 
     _, service = core.create_namespaced_service.call_args.args
+    assert service['metadata']['ownerReferences'] == expected_owner
     assert service['spec']['ports'][0]['port'] == \
         constants.LOAD_BALANCER_PORT_START
 
@@ -433,6 +529,147 @@ def test_create_409_patches_legacy_deployment(monkeypatch):
     assert '/api/internal/serve/svc' in args[1]
 
 
+def test_create_409_adopts_objects_with_metadata_only_patch(monkeypatch):
+    apps = mock.MagicMock()
+    apps.create_namespaced_deployment.side_effect = _ApiException(409)
+    apps.read_namespaced_deployment.return_value = SimpleNamespace(
+        metadata=SimpleNamespace(generation=1,
+                                 resource_version='deployment-rv',
+                                 owner_references=[]),
+        spec=SimpleNamespace(replicas=1),
+        status=SimpleNamespace(observed_generation=1,
+                               updated_replicas=1,
+                               available_replicas=1,
+                               unavailable_replicas=0))
+    core = mock.MagicMock()
+    core.create_namespaced_service.side_effect = _ApiException(409)
+    core.read_namespaced_service.return_value = SimpleNamespace(
+        metadata=SimpleNamespace(resource_version='service-rv',
+                                 owner_references=[]),
+        spec=SimpleNamespace(
+            selector={
+                'app': lb_k8s.lb_deployment_name('svc'),
+                lb_k8s.SERVICE_HASH_LABEL_KEY: 'incarnation',
+            },
+            ports=[
+                SimpleNamespace(port=constants.LOAD_BALANCER_PORT_START,
+                                target_port=constants.LOAD_BALANCER_PORT_START,
+                                protocol='TCP')
+            ]))
+    _install(monkeypatch, apps_api=apps, core_api=core)
+
+    lb_k8s.create_lb_deployment_and_service('svc', 225, 'incarnation')
+
+    assert apps.patch_namespaced_deployment.call_count == 2
+    deployment_adoption = apps.patch_namespaced_deployment.call_args_list[0]
+    assert deployment_adoption.args[2] == [{
+        'op': 'test',
+        'path': '/metadata/resourceVersion',
+        'value': 'deployment-rv',
+    }, {
+        'op': 'add',
+        'path': '/metadata/ownerReferences',
+        'value': [{
+            'apiVersion': 'apps/v1',
+            'kind': 'Deployment',
+            'name': 'skypilot-api-server',
+            'uid': 'api-deployment-uid',
+            'controller': False,
+            'blockOwnerDeletion': False,
+        }],
+    }]
+    deployment_reconcile = apps.patch_namespaced_deployment.call_args_list[1]
+    assert 'spec' in deployment_reconcile.args[2]
+    assert 'ownerReferences' not in deployment_reconcile.args[2]['metadata']
+
+    assert core.patch_namespaced_service.call_count == 2
+    service_adoption = core.patch_namespaced_service.call_args_list[0]
+    assert all(operation['path'].startswith('/metadata/')
+               for operation in service_adoption.args[2])
+    service_reconcile = core.patch_namespaced_service.call_args_list[1]
+    assert service_reconcile.args[2]['spec']['selector'][
+        lb_k8s.SERVICE_HASH_LABEL_KEY] == 'incarnation'
+
+
+def test_create_refuses_unguarded_adoption_without_resource_version(
+        monkeypatch):
+    apps = mock.MagicMock()
+    apps.create_namespaced_deployment.side_effect = _ApiException(409)
+    apps.read_namespaced_deployment.return_value = SimpleNamespace(
+        metadata=SimpleNamespace(owner_references=[]))
+    _, core = _install(monkeypatch, apps_api=apps)
+
+    with pytest.raises(RuntimeError, match='no resourceVersion'):
+        lb_k8s.create_lb_deployment_and_service('svc', 225, 'incarnation')
+
+    apps.patch_namespaced_deployment.assert_not_called()
+    core.create_namespaced_service.assert_not_called()
+
+
+def test_create_refuses_adoption_when_api_deployment_uid_changes(monkeypatch):
+    apps = mock.MagicMock()
+    apps.create_namespaced_deployment.side_effect = _ApiException(409)
+    _, core = _install(monkeypatch, apps_api=apps)
+    generated_name = lb_k8s.lb_deployment_name('svc')
+    owner_uids = iter(('api-deployment-uid', 'replacement-api-uid'))
+
+    def _read_deployment(name, unused_namespace):
+        if name == 'skypilot-api-server':
+            return SimpleNamespace(metadata=SimpleNamespace(
+                uid=next(owner_uids)))
+        if name == generated_name:
+            return SimpleNamespace(metadata=SimpleNamespace(
+                resource_version='lb-rv',
+                owner_references=[
+                    SimpleNamespace(api_version='apps/v1',
+                                    kind='Deployment',
+                                    name='skypilot-api-server',
+                                    uid='old-api-uid')
+                ]))
+        raise AssertionError(name)
+
+    apps.read_namespaced_deployment.side_effect = _read_deployment
+
+    with pytest.raises(RuntimeError, match='changed from UID'):
+        lb_k8s.create_lb_deployment_and_service('svc', 225, 'incarnation')
+
+    apps.patch_namespaced_deployment.assert_not_called()
+    core.create_namespaced_service.assert_not_called()
+
+
+def test_create_refuses_deployment_owned_by_another_live_release(monkeypatch):
+    apps = mock.MagicMock()
+    apps.create_namespaced_deployment.side_effect = _ApiException(409)
+    _, core = _install(monkeypatch, apps_api=apps)
+    generated_name = lb_k8s.lb_deployment_name('svc')
+
+    def _read_deployment(name, unused_namespace):
+        if name == 'skypilot-api-server':
+            return SimpleNamespace(metadata=SimpleNamespace(
+                uid='api-deployment-uid'))
+        if name == generated_name:
+            return SimpleNamespace(metadata=SimpleNamespace(
+                resource_version='lb-rv',
+                owner_references=[
+                    SimpleNamespace(api_version='apps/v1',
+                                    kind='Deployment',
+                                    name='other-release-api-server',
+                                    uid='other-live-uid')
+                ]))
+        if name == 'other-release-api-server':
+            return SimpleNamespace(metadata=SimpleNamespace(
+                uid='other-live-uid'))
+        raise AssertionError(name)
+
+    apps.read_namespaced_deployment.side_effect = _read_deployment
+
+    with pytest.raises(RuntimeError, match='owned by live Deployment'):
+        lb_k8s.create_lb_deployment_and_service('svc', 225, 'incarnation')
+
+    apps.patch_namespaced_deployment.assert_not_called()
+    core.create_namespaced_service.assert_not_called()
+
+
 def test_data_plane_auth_disabled_omits_projection(monkeypatch):
     apps, _ = _install(monkeypatch, data_auth=False)
 
@@ -483,6 +720,7 @@ def test_same_name_recreation_fences_old_service_before_reconcile(monkeypatch):
     core = mock.MagicMock()
     core.create_namespaced_service.side_effect = _ApiException(409)
     core.read_namespaced_service.return_value = SimpleNamespace(
+        metadata=SimpleNamespace(resource_version='old-service-rv'),
         spec=SimpleNamespace(
             selector={
                 'app': lb_k8s.lb_deployment_name('svc'),
@@ -494,15 +732,18 @@ def test_same_name_recreation_fences_old_service_before_reconcile(monkeypatch):
                                             225,
                                             service_hash='new-incarnation')
 
-    assert core.patch_namespaced_service.call_count == 2
-    fence = core.patch_namespaced_service.call_args_list[0].args[2]
+    assert core.patch_namespaced_service.call_count == 3
+    adoption = core.patch_namespaced_service.call_args_list[0]
+    assert all(operation['path'].startswith('/metadata/')
+               for operation in adoption.args[2])
+    fence = core.patch_namespaced_service.call_args_list[1].args[2]
     assert fence['spec'] == {
         'selector': {
             'app': lb_k8s.lb_deployment_name('svc'),
             lb_k8s.SERVICE_HASH_LABEL_KEY: 'new-incarnation',
         }
     }
-    final = core.patch_namespaced_service.call_args_list[1].args[2]
+    final = core.patch_namespaced_service.call_args_list[2].args[2]
     assert final['spec']['ports'][0][
         'targetPort'] == constants.LOAD_BALANCER_PORT_START
 
