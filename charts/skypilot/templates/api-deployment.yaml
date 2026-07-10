@@ -12,6 +12,9 @@
 {{- $controllerAdminKey := get $controllerAdminAuth "key" | default "" -}}
 {{- $lbDataPlaneSecret := get $lbDataPlaneAuth "existingSecret" | default "" -}}
 {{- $lbDataPlaneKey := get $lbDataPlaneAuth "key" | default "" -}}
+{{- if and $externalLBEnabled (not (empty $lbSyncSecret)) (not (empty $lbSyncKey)) (eq $lbSyncSecret $controllerAdminSecret) (eq $lbSyncKey $controllerAdminKey) -}}
+{{- fail "serve.externalLoadBalancer.auth.lbSync and serve.externalLoadBalancer.auth.controllerAdmin must reference different Secret keys" -}}
+{{- end -}}
 {{- if and $externalLBEnabled (ne (empty $lbDataPlaneSecret) (empty $lbDataPlaneKey)) -}}
 {{- fail "serve.externalLoadBalancer.auth.lbDataPlane.existingSecret and serve.externalLoadBalancer.auth.lbDataPlane.key must either both be set or both be empty when serve.externalLoadBalancer.enabled=true" -}}
 {{- end -}}

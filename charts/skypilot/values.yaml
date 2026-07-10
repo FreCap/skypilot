@@ -292,7 +292,9 @@ serve:
     # Authentication rings are intentionally separate so an inference client
     # or LB compromise cannot grant controller-administration privileges.
     # Each Secret value is a newline-delimited token ring. Keep the current and
-    # previous token during rotation; projected Secret volumes update in place.
+    # previous token during rotation within ONE ring; projected Secret volumes
+    # update in place. The lbSync and controllerAdmin rings must remain
+    # disjoint in content, and cannot reference the same Secret key.
     # @schema type: [object, null]
     auth:
       # Tokens presented by an external LB when syncing replica/load state.
