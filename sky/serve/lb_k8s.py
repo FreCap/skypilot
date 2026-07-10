@@ -21,6 +21,7 @@ Lifecycle/reaper helpers remain no-ops when the platform feature is disabled;
 starting a real service calls :func:`require_external_lb_runtime` and fails
 closed instead of falling back to an in-pod LB.
 """
+import copy
 import hashlib
 import json
 import math
@@ -74,8 +75,7 @@ _LB_TERMINATION_MARGIN_SECONDS = 30
 # copied into this lower-trust pod.
 LB_SYNC_AUTH_VOLUME_NAME = 'skypilot-serve-lb-sync-auth'
 LB_DATA_PLANE_AUTH_VOLUME_NAME = 'skypilot-serve-lb-auth'
-_LB_AUTH_VOLUME_NAMES = (LB_SYNC_AUTH_VOLUME_NAME,
-                         LB_DATA_PLANE_AUTH_VOLUME_NAME)
+_LB_DATA_PLANE_AUTH_MOUNT_PATH = ('/etc/skypilot/serve-auth/lb-data-plane')
 
 _SHA256_DIGEST_RE = re.compile(r'^sha256:[0-9a-fA-F]{64}$')
 _RUNTIME_IMAGE_ID_PREFIXES = ('docker-pullable://', 'containerd://',
@@ -262,13 +262,18 @@ def require_external_lb_runtime() -> None:
     get_lb_namespace()
     # File contents are read afresh on every request; this boot-time check only
     # prevents publishing a service that cannot authenticate its first sync or
-    # inference request.
+    # (when enabled) inference request.
     serve_utils.get_lb_sync_auth_tokens(required=True)
     serve_utils.get_controller_admin_auth_tokens(required=True)
-    serve_utils.get_lb_auth_tokens(required=True)
-    for env_name in (constants.LB_SYNC_AUTH_TOKENS_FILE_ENV_VAR,
-                     constants.CONTROLLER_ADMIN_AUTH_TOKENS_FILE_ENV_VAR,
-                     constants.LB_AUTH_TOKENS_FILE_ENV_VAR):
+    data_plane_auth_enabled = serve_utils.is_lb_data_plane_auth_enabled()
+    required_file_env_names = [
+        constants.LB_SYNC_AUTH_TOKENS_FILE_ENV_VAR,
+        constants.CONTROLLER_ADMIN_AUTH_TOKENS_FILE_ENV_VAR,
+    ]
+    if data_plane_auth_enabled:
+        serve_utils.get_lb_auth_tokens(required=True)
+        required_file_env_names.append(constants.LB_AUTH_TOKENS_FILE_ENV_VAR)
+    for env_name in required_file_env_names:
         if not os.environ.get(env_name):
             raise RuntimeError(
                 'External load balancer mode requires projected Secret '
@@ -540,7 +545,7 @@ def _portable_lb_runtime_contract(pod_spec,
 def _resolve_lb_auth_projection(
         namespace: str,
         context: str,
-        pod=None) -> Tuple[list, list, list, list, dict, dict]:
+        pod=None) -> Tuple[list, list, list, list, dict, dict, bool]:
     """Return LB auth, image-pull, and portable API-Pod runtime fields.
 
     The controller-admin projection is deliberately not copied. Projected
@@ -550,9 +555,13 @@ def _resolve_lb_auth_projection(
     for the LB to pull the controller's digest from a private registry.
     """
     serve_utils.get_lb_sync_auth_tokens(required=True)
-    serve_utils.get_lb_auth_tokens(required=True)
-    file_env_names = (constants.LB_SYNC_AUTH_TOKENS_FILE_ENV_VAR,
-                      constants.LB_AUTH_TOKENS_FILE_ENV_VAR)
+    data_plane_auth_enabled = serve_utils.is_lb_data_plane_auth_enabled()
+    file_env_names = [constants.LB_SYNC_AUTH_TOKENS_FILE_ENV_VAR]
+    auth_volume_names = [LB_SYNC_AUTH_VOLUME_NAME]
+    if data_plane_auth_enabled:
+        serve_utils.get_lb_auth_tokens(required=True)
+        file_env_names.append(constants.LB_AUTH_TOKENS_FILE_ENV_VAR)
+        auth_volume_names.append(LB_DATA_PLANE_AUTH_VOLUME_NAME)
     envs = []
     for env_name in file_env_names:
         path = os.environ.get(env_name)
@@ -561,6 +570,10 @@ def _resolve_lb_auth_projection(
                 f'External load balancer mode requires file-backed auth: '
                 f'{env_name} is not set.')
         envs.append({'name': env_name, 'value': path})
+    envs.append({
+        'name': constants.LB_DATA_PLANE_AUTH_ENABLED_ENV_VAR,
+        'value': str(data_plane_auth_enabled).lower(),
+    })
 
     pod_name = os.environ.get(constants.POD_NAME_ENV_VAR)
     if pod is None:
@@ -571,7 +584,7 @@ def _resolve_lb_auth_projection(
     controller_container = _controller_container(pod)
     volumes = []
     mounts = []
-    for volume_name in _LB_AUTH_VOLUME_NAMES:
+    for volume_name in auth_volume_names:
         volume = _find_named(pod.spec.volumes, volume_name)
         mount = _find_named(controller_container.volume_mounts, volume_name)
         if volume is None or mount is None:
@@ -596,7 +609,7 @@ def _resolve_lb_auth_projection(
     pod_runtime_fields, container_runtime_fields = (
         _portable_lb_runtime_contract(pod.spec, controller_container))
     return (envs, volumes, mounts, image_pull_secrets, pod_runtime_fields,
-            container_runtime_fields)
+            container_runtime_fields, data_plane_auth_enabled)
 
 
 def _lb_resources() -> dict:
@@ -887,10 +900,10 @@ def create_lb_deployment_and_service(service_name: str,
     image, image_pull_policy, controller_digest = _resolve_lb_image(
         namespace, context, pod=controller_pod)
     (auth_envs, auth_volumes, auth_mounts, image_pull_secrets,
-     pod_runtime_fields,
-     container_runtime_fields) = _resolve_lb_auth_projection(namespace,
-                                                             context,
-                                                             pod=controller_pod)
+     pod_runtime_fields, container_runtime_fields,
+     data_plane_auth_enabled) = _resolve_lb_auth_projection(namespace,
+                                                            context,
+                                                            pod=controller_pod)
 
     deployment_dict = _build_deployment_dict(
         service_name, deployment_name, image, auth_envs, auth_volumes,
@@ -913,8 +926,30 @@ def create_lb_deployment_and_service(service_name: str,
         # is Ready.
         logger.debug(f'LB Deployment {deployment_name} already exists; '
                      'patching it to the desired spec.')
+        deployment_patch = deployment_dict
+        if not data_plane_auth_enabled:
+            # Strategic-merge omission does not delete named list entries.
+            # Explicitly remove projections left by a prior auth-enabled
+            # Deployment while keeping the create body valid Kubernetes.
+            deployment_patch = copy.deepcopy(deployment_dict)
+            container = deployment_patch['spec']['template']['spec'][
+                'containers'][0]
+            container['env'].append({
+                'name': constants.LB_AUTH_TOKENS_FILE_ENV_VAR,
+                '$patch': 'delete',
+            })
+            container['volumeMounts'].append({
+                # volumeMounts uses mountPath (not name) as its strategic
+                # merge key. Omitting it makes the API reject the patch.
+                'mountPath': _LB_DATA_PLANE_AUTH_MOUNT_PATH,
+                '$patch': 'delete',
+            })
+            deployment_patch['spec']['template']['spec']['volumes'].append({
+                'name': LB_DATA_PLANE_AUTH_VOLUME_NAME,
+                '$patch': 'delete',
+            })
         kubernetes.apps_api(context).patch_namespaced_deployment(
-            deployment_name, namespace, deployment_dict)
+            deployment_name, namespace, deployment_patch)
     service_existed = False
     service_was_fenced = False
     try:

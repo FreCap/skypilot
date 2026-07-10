@@ -2,11 +2,11 @@ name: Helm Unit Tests
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ main, master, improvements ]
     paths:
       - 'charts/**'
   pull_request:
-    branches: [ main, master ]
+    branches: [ main, master, improvements ]
     paths:
       - 'charts/**'
   workflow_dispatch:

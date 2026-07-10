@@ -11,6 +11,7 @@ from unittest import mock
 import pytest
 
 from sky import backends
+from sky.serve import constants
 from sky.serve import serve_state
 from sky.serve.server import impl
 
@@ -18,6 +19,24 @@ from sky.serve.server import impl
 def _backend_mock():
     """A mock that passes `isinstance(_, backends.CloudVmRayBackend)`."""
     return mock.MagicMock(spec=backends.CloudVmRayBackend)
+
+
+def test_service_request_example_is_plain_when_data_auth_disabled():
+    with mock.patch.object(impl.serve_utils,
+                           'is_lb_data_plane_auth_enabled',
+                           return_value=False):
+        assert impl._service_test_request_command(
+            'http://service') == 'curl http://service'
+
+
+def test_service_request_example_shows_dedicated_header_when_enabled():
+    with mock.patch.object(impl.serve_utils,
+                           'is_lb_data_plane_auth_enabled',
+                           return_value=True):
+        command = impl._service_test_request_command('http://service')
+    assert constants.LB_AUTHORIZATION_HEADER in command
+    assert 'Bearer <token>' in command
+    assert command.endswith('http://service')
 
 
 class TestExternalOnlyTopologyPreflight:
