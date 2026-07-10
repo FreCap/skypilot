@@ -28,6 +28,7 @@ from packaging import version as version_lib
 from passlib import context as passlib_context
 from typing_extensions import ParamSpec
 
+import sky
 from sky import exceptions
 from sky import sky_logging
 from sky import skypilot_config
@@ -876,17 +877,32 @@ def check_server_healthy(
 
 # Keep in sync with sky/setup_files/setup.py find_version()
 def get_skypilot_version_on_disk() -> str:
-    """Get the version of the SkyPilot code on disk."""
+    """Get the display version of the SkyPilot code on disk.
+
+    Composed the same way as sky.__display_version__ so that the running
+    process and the code on disk compare equal unless the code actually
+    changed (new commits bump the build number, hinting a server restart).
+    """
     current_file_path = pathlib.Path(__file__)
     assert str(current_file_path).endswith(
         'server/common.py'), current_file_path
     sky_root = current_file_path.parent.parent
     with open(sky_root / '__init__.py', 'r', encoding='utf-8') as fp:
-        version_match = re.search(r'^__version__ = [\'"]([^\'"]*)[\'"]',
-                                  fp.read(), re.M)
-        if version_match:
-            return version_match.group(1)
+        content = fp.read()
+    version_match = re.search(r'^__version__ = [\'"]([^\'"]*)[\'"]', content,
+                              re.M)
+    if not version_match:
         raise RuntimeError('Unable to find version string.')
+    version = version_match.group(1)
+    count_match = re.search(r'^_SKYPILOT_COMMIT_COUNT = [\'"]([^\'"]*)[\'"]',
+                            content, re.M)
+    build = count_match.group(1) if count_match else None
+    if build is not None and 'SKYPILOT_COMMIT_COUNT' in build:
+        # Development build: the placeholder is not stamped, so the code on
+        # disk is the git checkout; get the count the same way the runtime
+        # does.
+        build = sky._get_commit_count()  # pylint: disable=protected-access
+    return sky._compose_display_version(version, build)  # pylint: disable=protected-access
 
 
 def check_server_healthy_or_start_fn(deploy: bool = False,

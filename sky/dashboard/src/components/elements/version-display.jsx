@@ -184,7 +184,6 @@ export function VersionDisplay() {
       <div className="inline-flex items-center justify-center transition-colors duration-150 cursor-help">
         <div className="text-sm text-gray-500 border-b border-dotted border-gray-400 hover:text-blue-600 hover:border-blue-600">
           Version: {version}
-          {build ? ` (build ${build})` : ''}
         </div>
       </div>
     </VersionTooltip>
