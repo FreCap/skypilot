@@ -435,11 +435,11 @@ def up(
             # identity (live incident: replica ops failed with
             # ClusterOwnerIdentityMismatchError until the full merged config
             # was restored). Deliberately NOT the full file_mounts: the task
-            # yaml carries the service's `secrets:` and TLS mounts carry
-            # private keys — none of which belong in a durable DB row. The
-            # remaining mounts stay a known pod-replacement gap (two-hop
-            # user mounts; tmp task yaml is only a legacy fallback, since
-            # recovery boots from the DB-committed yaml).
+            # yaml may carry service secrets, and other user mounts may contain
+            # credentials — none of which belong in a durable DB row. The
+            # remaining mounts stay a known pod-replacement gap (two-hop user
+            # mounts; tmp task yaml is only a legacy fallback, since recovery
+            # boots from the DB-committed yaml).
             # The config is additionally sanitized of known
             # credential-capable subtrees before the embed.
             config_files: Dict[str, bytes] = {}
