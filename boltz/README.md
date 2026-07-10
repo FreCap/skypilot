@@ -13,14 +13,16 @@ deploy).
 
 - **Build/verify locally:** `./boltz/build-overlay.sh` (add `PUSH=true TAG=<ref>` to push). Requires
   **node/npm (Node 20+)** for the dashboard build, e.g. `mise x node@24 -- ./boltz/build-overlay.sh`.
-- **Publish:** `.github/workflows/boltz-overlay-publish.yml` builds on every `improvements` push and
-  pushes to `255203429798.dkr.ecr.us-east-1.amazonaws.com/skypilot-nightly-boltz`, tagged
-  `<sky.__version__>-g<sha>` (immutable) and `<sky.__version__>-improvements` (moving).
-- **Consume:** the platform repo pins `apiService.image` to the immutable tag in the
-  skypilot-control-plane terragrunt.
+- **Publish:** `.github/workflows/boltz-overlay-publish.yml` computes the next deterministic patch
+  release for each relevant `improvements` merge and publishes the image as that exact version
+  (for example, `1.1.1`). The chart publisher follows the successful image run and publishes the
+  same version before marking it with a Git tag. Commit identity stays in artifact metadata.
+- **Consume:** the platform repo pins one release version and derives both the chart and image from
+  it in the skypilot-control-plane terragrunt.
 
-The upstream nightly tag is only a runtime dependency. The product version comes exclusively from
-`sky.__version__` and is shared by Python metadata, CLI/API/dashboard output, image tags, and charts.
+The upstream nightly tag is only a runtime dependency. `boltz/release_version.py` derives the
+release patch from relevant first-parent merges after the `1.1.0` epoch. The publisher stamps that
+version consistently into Python metadata, CLI/API/dashboard output, the image, and the chart.
 
 ### Enabling pushes (one-time)
 
