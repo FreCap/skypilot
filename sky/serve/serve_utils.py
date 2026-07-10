@@ -489,7 +489,55 @@ def get_service_filelock_path(pool: str) -> str:
     return str(path)
 
 
-def get_service_lifecycle_lock(service_name: str) -> locks.DistributedLock:
+class ServiceLifecycleLock:
+    """Advisory/file lock paired with a durable monotonically increasing token.
+
+    Mutual exclusion handles the normal case; the epoch handles silent
+    PostgreSQL session loss.  Resource mutations additionally use
+    incarnation-scoped identities, while authoritative DB commits validate
+    this token under a row lock.
+    """
+
+    def __init__(self, service_name: str, lock: locks.DistributedLock) -> None:
+        self.service_name = service_name
+        self.lock = lock
+        self.epoch: Optional[int] = None
+
+    def acquire(self) -> 'ServiceLifecycleLock':
+        self.lock.acquire()
+        try:
+            if isinstance(self.lock, locks.PostgresLock):
+                self.epoch = self.lock.run_in_lock_session(
+                    lambda connection:
+                    serve_state.claim_service_lifecycle_epoch(
+                        self.service_name, connection))
+            else:
+                self.epoch = serve_state.claim_service_lifecycle_epoch(
+                    self.service_name)
+            if not self.session_is_valid():
+                raise RuntimeError('Lifecycle lock session was lost while '
+                                   f'claiming {self.service_name!r}.')
+        except Exception:
+            self.lock.release()
+            raise
+        return self
+
+    def release(self) -> None:
+        self.lock.release()
+
+    def session_is_valid(self) -> bool:
+        if isinstance(self.lock, locks.PostgresLock):
+            return self.lock.is_session_alive()
+        return self.lock.is_locked()
+
+    def __enter__(self) -> 'ServiceLifecycleLock':
+        return self.acquire()
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.release()
+
+
+def get_service_lifecycle_lock(service_name: str) -> ServiceLifecycleLock:
     """Return the cross-pod lock serializing destructive service lifecycles.
 
     The lock ID is outside the service working directory: deleting or
@@ -497,6 +545,10 @@ def get_service_lifecycle_lock(service_name: str) -> locks.DistributedLock:
     PostgreSQL deployments this resolves to an advisory lock shared by every
     API pod; local/SQLite deployments use the runtime-global lock directory.
     """
+    # The PostgreSQL epoch claim executes raw SQL on the advisory-lock session,
+    # so ensure migration 008 has created its table before acquiring that
+    # session and attempting the claim.
+    serve_state.ensure_tables_initialized()
     # Generic lock auto-detection intentionally falls back to a local FileLock
     # when DB initialization raises. That is acceptable for best-effort
     # callers, but unsafe here: a transient PostgreSQL/config outage would let
@@ -511,14 +563,28 @@ def get_service_lifecycle_lock(service_name: str) -> locks.DistributedLock:
         raise RuntimeError('Unsupported database dialect for service '
                            f'lifecycle lock: {engine.dialect.name!r}.')
     digest = hashlib.sha256(service_name.encode('utf-8')).hexdigest()
-    return locks.get_lock(f'skyserve-lifecycle-{digest}', lock_type=lock_type)
+    lock = locks.get_lock(f'skyserve-lifecycle-{digest}', lock_type=lock_type)
+    return ServiceLifecycleLock(service_name, lock)
 
 
-def lifecycle_lock_is_valid(lock: locks.DistributedLock) -> bool:
-    """Whether a held lifecycle lock still provides mutual exclusion."""
-    if isinstance(lock, locks.PostgresLock):
-        return lock.is_session_alive()
-    return lock.is_locked()
+def lifecycle_lock_is_valid(lock: ServiceLifecycleLock) -> bool:
+    """Whether a lifecycle lease still owns both session and durable token."""
+    if lock.epoch is None or not lock.session_is_valid():
+        return False
+    try:
+        return serve_state.service_lifecycle_epoch_matches(
+            lock.service_name, lock.epoch)
+    except Exception:  # pylint: disable=broad-except
+        # A DB outage makes the durable fence unverifiable.  Destructive work
+        # must stop rather than degrading to a process-local assumption.
+        return False
+
+
+def get_service_lifecycle_epoch(lock: ServiceLifecycleLock) -> int:
+    """Return an acquired lifecycle lease's durable token."""
+    if lock.epoch is None:
+        raise RuntimeError('Service lifecycle lock has not been acquired.')
+    return lock.epoch
 
 
 def quarantine_service_directory(service_dir: str,
@@ -574,6 +640,24 @@ def remove_quarantined_service_directory(
                 shutil.rmtree(quarantine_dir)
         except FileNotFoundError:
             pass
+
+
+def remove_service_directory(service_dir: str) -> None:
+    """Remove one already-fenced incarnation directory.
+
+    New service directories are derived from the durable resource scope, so
+    they can be deleted after the service row is removed without any rename or
+    canonical-path TOCTOU.  A legacy directory is also safe here: every
+    successor created by this version uses a scoped path and therefore cannot
+    occupy the old name-only location.
+    """
+    try:
+        if os.path.islink(service_dir):
+            os.unlink(service_dir)
+        else:
+            shutil.rmtree(service_dir)
+    except FileNotFoundError:
+        pass
 
 
 def _validate_consolidation_mode_config(current_is_consolidation_mode: bool,
@@ -824,7 +908,8 @@ def ha_recovery_for_consolidation_mode(pool: bool,
     # so we don't walk /proc N times for N services. This also gives all
     # services a consistent view (no torn read where service A is checked
     # before service B's _start spawns, and B is checked after).
-    in_flight_service_names = _snapshot_in_flight_start_service_names()
+    in_flight_service_incarnations = (
+        _snapshot_in_flight_start_service_incarnations())
     with open(skylet_constants.HA_PERSISTENT_RECOVERY_LOG_PATH.format(prefix),
               'w',
               encoding='utf-8') as f:
@@ -865,8 +950,11 @@ def ha_recovery_for_consolidation_mode(pool: bool,
                     f'status={status_dbg}\n')
             if controller_pid is not None:
                 try:
-                    alive = _controller_process_alive(controller_pid,
-                                                      service_name)
+                    alive = _controller_process_alive(
+                        controller_pid,
+                        service_name,
+                        svc.get('hash'),
+                        allow_legacy=(svc.get('resource_scope') is None))
                 except Exception as e:  # pylint: disable=broad-except
                     # _controller_process_alive may raise if psutil fails
                     # (transient AccessDenied / cmdline read race / etc).
@@ -891,7 +979,14 @@ def ha_recovery_for_consolidation_mode(pool: bool,
             # top of the iteration). Otherwise the daemon's ~20s
             # iteration repeatedly fires recovery during the 0-60s
             # controller boot window, piling up multiple _start instances.
-            if service_name in in_flight_service_names:
+            service_hash = svc.get('hash')
+            resource_scope = svc.get('resource_scope')
+            exact_start_running = ((service_name, service_hash)
+                                   in in_flight_service_incarnations)
+            legacy_start_running = (resource_scope is None and
+                                    (service_name, None)
+                                    in in_flight_service_incarnations)
+            if exact_start_running or legacy_start_running:
                 f.write(f'{capnoun} {service_name}: _start process already '
                         f'running on this pod; skipping recovery this '
                         f'round.\n')
@@ -926,7 +1021,8 @@ def ha_recovery_for_consolidation_mode(pool: bool,
             # recovery, so the empty directory is all that is needed.
             try:
                 os.makedirs(os.path.expanduser(
-                    generate_remote_service_dir_name(service_name)),
+                    generate_remote_service_dir_name(
+                        service_name, svc.get('resource_scope'))),
                             exist_ok=True)
             except OSError as e:
                 f.write(f'Failed to recreate the service dir for '
@@ -953,21 +1049,38 @@ def ha_recovery_for_consolidation_mode(pool: bool,
         f.write(f'Total recovery time: {time.time() - start} seconds\n')
 
 
-def _controller_process_alive(pid: int, service_name: str) -> bool:
-    """Check if the controller process is alive."""
+def _controller_process_alive(pid: int,
+                              service_name: str,
+                              service_incarnation: Optional[str] = None,
+                              allow_legacy: bool = True) -> bool:
+    """Check exact local controller identity, not pod-local PID alone."""
     try:
         process = psutil.Process(pid)
-        cmd_str = ' '.join(process.cmdline())
-        return process.is_running(
-        ) and f'--service-name {service_name}' in cmd_str
+        cmdline = process.cmdline()
+        if not process.is_running():
+            return False
+        try:
+            name_idx = cmdline.index('--service-name')
+        except ValueError:
+            return False
+        if name_idx + 1 >= len(cmdline) or cmdline[name_idx +
+                                                   1] != service_name:
+            return False
+        try:
+            incarnation_idx = cmdline.index('--service-incarnation')
+        except ValueError:
+            return allow_legacy
+        if incarnation_idx + 1 >= len(cmdline):
+            return False
+        return (service_incarnation is not None and
+                cmdline[incarnation_idx + 1] == service_incarnation)
     except psutil.NoSuchProcess:
         return False
 
 
-def _snapshot_in_flight_start_service_names() -> Set[str]:
-    """Walk `/proc` once and return the set of service names that have an
-    active (non-zombie) `python -m sky.serve.service --service-name <name>`
-    process on this pod.
+def _snapshot_in_flight_start_service_incarnations(
+) -> Set[Tuple[str, Optional[str]]]:
+    """Return active ``(service name, requested incarnation)`` processes.
 
     Used by ha_recovery_for_consolidation_mode to deduplicate recovery
     launches: while a previously-spawned _start is still in its 0-60s
@@ -987,7 +1100,7 @@ def _snapshot_in_flight_start_service_names() -> Set[str]:
     Matching is on the argv LIST (not a joined string), so
     `--service-name pool-a` does not falsely match `--service-name pool-abc`.
     """
-    in_flight: Set[str] = set()
+    in_flight: Set[Tuple[str, Optional[str]]] = set()
     for proc in psutil.process_iter(['cmdline', 'status']):
         try:
             if proc.info.get('status') == psutil.STATUS_ZOMBIE:
@@ -1000,20 +1113,30 @@ def _snapshot_in_flight_start_service_names() -> Set[str]:
             except ValueError:
                 continue
             if idx + 1 < len(cmdline):
-                in_flight.add(cmdline[idx + 1])
+                service_name = cmdline[idx + 1]
+                incarnation = None
+                try:
+                    incarnation_idx = cmdline.index('--service-incarnation')
+                except ValueError:
+                    pass
+                else:
+                    if incarnation_idx + 1 < len(cmdline):
+                        incarnation = cmdline[incarnation_idx + 1]
+                in_flight.add((service_name, incarnation))
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
     return in_flight
 
 
 def _start_in_flight(service_name: str) -> bool:
-    """Thin wrapper around `_snapshot_in_flight_start_service_names` for
+    """Thin wrapper around the process snapshot for
     one-off checks (e.g. tests, ad-hoc callers).
 
     The hot path in `ha_recovery_for_consolidation_mode` calls the
     snapshot helper directly and reuses the set across services.
     """
-    return service_name in _snapshot_in_flight_start_service_names()
+    return any(name == service_name
+               for name, _ in _snapshot_in_flight_start_service_incarnations())
 
 
 def validate_external_lb_service_spec(
@@ -1176,66 +1299,116 @@ def generate_service_name(pool: bool = False):
     return f'sky-{noun}-{uuid.uuid4().hex[:4]}'
 
 
-def generate_remote_service_dir_name(service_name: str) -> str:
-    service_name = service_name.replace('-', '_')
-    return os.path.join(constants.SKYSERVE_METADATA_DIR, service_name)
+def _resource_scope_tag(resource_scope: str, length: int = 20) -> str:
+    """Filesystem/cloud-safe digest for an incarnation resource scope."""
+    return hashlib.sha256(resource_scope.encode('utf-8')).hexdigest()[:length]
 
 
-def generate_remote_tmp_task_yaml_file_name(service_name: str) -> str:
-    dir_name = generate_remote_service_dir_name(service_name)
+def generate_remote_service_dir_name(service_name: str,
+                                     resource_scope: Optional[str] = None
+                                    ) -> str:
+    legacy_name = service_name.replace('-', '_')
+    if resource_scope is None:
+        # Compatibility only for rows created before resource_scope existed.
+        # New incarnations never use this lossy name.
+        return os.path.join(constants.SKYSERVE_METADATA_DIR, legacy_name)
+    # The readable prefix is deliberately non-authoritative: validation has
+    # historically admitted names whose normalized forms collide (`svc-a`,
+    # `svc_a`, `Svc.A`).  Hash the exact original spelling as well as the
+    # incarnation so the path identity remains injective across both service
+    # names and same-name successors.
+    readable_name = re.sub(r'[^A-Za-z0-9]+', '_', service_name).strip('_')
+    if not readable_name:
+        readable_name = 'service'
+    name_tag = _resource_scope_tag(service_name, length=16)
+    scope_tag = _resource_scope_tag(resource_scope)
+    scoped_name = f'{readable_name}_name_{name_tag}_inc_{scope_tag}'
+    return os.path.join(constants.SKYSERVE_METADATA_DIR, scoped_name)
+
+
+def generate_remote_tmp_task_yaml_file_name(service_name: str,
+                                            resource_scope: Optional[str] = None
+                                           ) -> str:
+    dir_name = generate_remote_service_dir_name(service_name, resource_scope)
     # Don't expand here since it is used for remote machine.
     return os.path.join(dir_name, 'task.yaml.tmp')
 
 
 def generate_task_yaml_file_name(service_name: str,
                                  version: int,
-                                 expand_user: bool = True) -> str:
-    dir_name = generate_remote_service_dir_name(service_name)
+                                 expand_user: bool = True,
+                                 resource_scope: Optional[str] = None) -> str:
+    dir_name = generate_remote_service_dir_name(service_name, resource_scope)
     if expand_user:
         dir_name = os.path.expanduser(dir_name)
     return os.path.join(dir_name, f'task_v{version}.yaml')
 
 
-def generate_remote_config_yaml_file_name(service_name: str) -> str:
-    dir_name = generate_remote_service_dir_name(service_name)
+def generate_remote_config_yaml_file_name(service_name: str,
+                                          resource_scope: Optional[str] = None
+                                         ) -> str:
+    dir_name = generate_remote_service_dir_name(service_name, resource_scope)
     # Don't expand here since it is used for remote machine.
     return os.path.join(dir_name, 'config.yaml')
 
 
-def generate_remote_controller_log_file_name(service_name: str) -> str:
-    dir_name = generate_remote_service_dir_name(service_name)
+def generate_remote_controller_log_file_name(
+        service_name: str, resource_scope: Optional[str] = None) -> str:
+    dir_name = generate_remote_service_dir_name(service_name, resource_scope)
     # Don't expand here since it is used for remote machine.
     return os.path.join(dir_name, 'controller.log')
 
 
-def generate_remote_batch_controller_log_file_name(service_name: str) -> str:
-    dir_name = generate_remote_service_dir_name(service_name)
+def generate_remote_batch_controller_log_file_name(
+        service_name: str, resource_scope: Optional[str] = None) -> str:
+    dir_name = generate_remote_service_dir_name(service_name, resource_scope)
     # Don't expand here since it is used for remote machine.
     return os.path.join(dir_name, 'batch_controller.log')
 
 
-def generate_replica_launch_log_file_name(service_name: str,
-                                          replica_id: int) -> str:
-    dir_name = generate_remote_service_dir_name(service_name)
+def generate_replica_launch_log_file_name(
+        service_name: str,
+        replica_id: int,
+        resource_scope: Optional[str] = None) -> str:
+    dir_name = generate_remote_service_dir_name(service_name, resource_scope)
     dir_name = os.path.expanduser(dir_name)
     return os.path.join(dir_name, f'replica_{replica_id}_launch.log')
 
 
-def generate_replica_log_file_name(service_name: str, replica_id: int) -> str:
-    dir_name = generate_remote_service_dir_name(service_name)
+def generate_replica_log_file_name(service_name: str,
+                                   replica_id: int,
+                                   resource_scope: Optional[str] = None) -> str:
+    dir_name = generate_remote_service_dir_name(service_name, resource_scope)
     dir_name = os.path.expanduser(dir_name)
     return os.path.join(dir_name, f'replica_{replica_id}.log')
 
 
-def generate_replica_cluster_name(service_name: str, replica_id: int) -> str:
+def generate_replica_cluster_name(service_name: str,
+                                  replica_id: int,
+                                  resource_scope: Optional[str] = None) -> str:
     # NOTE(dev): This format is used in sky/serve/service.py::_cleanup, for
     # checking replica cluster existence. Be careful when changing it.
-    return f'{service_name}-{replica_id}'
+    if resource_scope is None:
+        return f'{service_name}-{replica_id}'
+    identity = json.dumps([service_name, resource_scope], separators=(',', ':'))
+    scope_tag = _resource_scope_tag(identity, length=10)
+    suffix = f'-{replica_id}-{scope_tag}'
+    # Keep Kubernetes/cloud-derived names within the common 63-character
+    # ceiling even when the user service name itself occupies that budget.
+    prefix = service_name[:63 - len(suffix)].rstrip('-')
+    if not prefix:
+        prefix = 'skyserve'
+    return f'{prefix}{suffix}'
 
 
 def set_service_status_and_active_versions_from_replica(
-        service_name: str, replica_infos: List['replica_managers.ReplicaInfo'],
-        update_mode: UpdateMode) -> None:
+    service_name: str,
+    replica_infos: List['replica_managers.ReplicaInfo'],
+    update_mode: UpdateMode,
+    expected_service_hash: Optional[str] = None,
+    expected_controller_owner: Optional[Tuple[Optional[int],
+                                              Optional[str]]] = None
+) -> None:
     record = serve_state.get_service_from_name(service_name)
     if record is None:
         with ux_utils.print_exception_no_traceback():
@@ -1243,6 +1416,22 @@ def set_service_status_and_active_versions_from_replica(
                 'The service is up-ed in an old version and does not '
                 'support update. Please `sky serve down` '
                 'it first and relaunch the service.')
+    record_hash = record.get('hash')
+    if (expected_service_hash is not None and
+            record_hash != expected_service_hash):
+        logger.debug(f'Refusing replica-driven status write from stale '
+                     f'incarnation {expected_service_hash!r} for '
+                     f'{service_name!r}; current incarnation is '
+                     f'{record_hash!r}.')
+        return
+    record_owner = (record.get('controller_pid'), record.get('controller_ip'))
+    if (expected_controller_owner is not None and
+            record_owner != expected_controller_owner):
+        logger.debug(f'Refusing replica-driven status write from stale '
+                     f'controller {expected_controller_owner!r} for '
+                     f'{service_name!r}; current controller is '
+                     f'{record_owner!r}.')
+        return
     observed_status = record['status']
     if observed_status in serve_state.ServiceStatus.terminal_statuses():
         # A controller child can briefly keep probing after its parent has
@@ -1265,16 +1454,18 @@ def set_service_status_and_active_versions_from_replica(
     # NO_REPLICA, so a service whose replicas all failed would show the
     # benign-looking NO_REPLICA. `active_versions` above intentionally stays
     # on the ready replicas (the versions actually serving traffic).
-    service_hash = record.get('hash')
+    service_hash = (expected_service_hash
+                    if expected_service_hash is not None else record_hash)
     if not isinstance(service_hash, str) or not service_hash:
         logger.warning(f'Refusing replica-driven status write for '
                        f'{service_name!r} without a durable incarnation.')
         return
     updated = serve_state.set_service_status_and_active_versions_if_owner(
         service_name,
-        service_hash,
-        record.get('controller_pid'),
-        record.get('controller_ip'),
+        service_hash, (expected_controller_owner[0] if expected_controller_owner
+                       is not None else record.get('controller_pid')),
+        (expected_controller_owner[1] if expected_controller_owner is not None
+         else record.get('controller_ip')),
         serve_state.ServiceStatus.from_replica_statuses(
             [info.status for info in replica_infos]),
         active_versions=active_versions,
@@ -1322,7 +1513,11 @@ def update_service_status(pool: bool) -> None:
                         f'SkyPilot job status: {controller_status}. '
                         'Set to failure.')
         else:
-            if _controller_process_alive(controller_pid, service_name):
+            if _controller_process_alive(
+                    controller_pid,
+                    service_name,
+                    record.get('hash'),
+                    allow_legacy=record.get('resource_scope') is None):
                 # The controller is still running.
                 continue
             logger.info(f'{capnoun} {service_name!r} controller pid '
@@ -1338,22 +1533,37 @@ def update_service_status(pool: bool) -> None:
             expected_status=service_status)
 
 
-def update_service_encoded(service_name: str, version: int, mode: str,
-                           pool: bool) -> str:
+def update_service_encoded(
+        service_name: str,
+        version: int,
+        mode: str,
+        pool: bool,
+        expected_service_hash: Optional[str] = None,
+        expected_lifecycle_epoch: Optional[int] = None) -> str:
     noun = 'pool' if pool else 'service'
     capnoun = noun.capitalize()
     service_status = _get_service_status(service_name, pool=pool)
     if service_status is None:
         with ux_utils.print_exception_no_traceback():
             raise ValueError(f'{capnoun} {service_name!r} does not exist.')
+    service_hash = service_status['hash']
+    if (expected_service_hash is not None and
+            service_hash != expected_service_hash):
+        raise RuntimeError(f'{capnoun} {service_name!r} was replaced before '
+                           'the update was submitted.')
+    request_body = {
+        'version': version,
+        'mode': mode,
+    }
+    if expected_service_hash is not None:
+        request_body['service_hash'] = expected_service_hash
+    if expected_lifecycle_epoch is not None:
+        request_body['lifecycle_epoch'] = expected_lifecycle_epoch
     resp = _post_to_controller_with_retry(
         service_name,
-        service_status['hash'],
+        service_hash,
         '/controller/update_service',
-        json={
-            'version': version,
-            'mode': mode,
-        },
+        json=request_body,
         # See UPDATE_SERVICE_TIMEOUT_SECONDS: the handler may wait on the
         # replica-manager lock behind a slow probe round, so the default 10s
         # read timeout would spuriously fail the update. If even this
@@ -1371,6 +1581,9 @@ def update_service_encoded(service_name: str, version: int, mode: str,
     elif resp.status_code == 400:
         with ux_utils.print_exception_no_traceback():
             raise ValueError(f'Client error during {noun} update: {resp.text}')
+    elif resp.status_code == 409:
+        with ux_utils.print_exception_no_traceback():
+            raise RuntimeError(f'Stale {noun} update rejected: {resp.text}')
     elif resp.status_code == 500:
         with ux_utils.print_exception_no_traceback():
             raise RuntimeError(
@@ -1413,14 +1626,20 @@ def terminate_replica(service_name: str, replica_id: int, purge: bool) -> str:
     return message
 
 
-def get_yaml_content(service_name: str, version: int) -> str:
+def get_yaml_content(service_name: str,
+                     version: int,
+                     resource_scope: Optional[str] = None) -> str:
     yaml_content = serve_state.get_yaml_content(service_name, version)
     if yaml_content is not None:
         return yaml_content
     # Backward compatibility for old service records that
     # does not dump the yaml content to version database.
     # TODO(tian): Remove this after 2 minor releases, i.e. 0.13.0.
-    latest_yaml_path = generate_task_yaml_file_name(service_name, version)
+    if resource_scope is None:
+        record = serve_state.get_service_from_name(service_name)
+        resource_scope = record.get('resource_scope') if record else None
+    latest_yaml_path = generate_task_yaml_file_name(
+        service_name, version, resource_scope=resource_scope)
     with open(latest_yaml_path, 'r', encoding='utf-8') as f:
         return f.read()
 
@@ -1455,7 +1674,8 @@ def _get_service_status(
     if record['pool']:
         version = record['version']
         try:
-            yaml_content = get_yaml_content(service_name, version)
+            yaml_content = get_yaml_content(service_name, version,
+                                            record.get('resource_scope'))
             raw_yaml_config = yaml_utils.read_yaml_str(yaml_content)
         except Exception as e:  # pylint: disable=broad-except
             # If this is a consolidation mode running without an PVC, the file
@@ -1973,7 +2193,7 @@ def _terminate_failed_services(service_name: str,
 
 def _terminate_failed_services_locked(
         service_name: str, expected_service_hash: str, pool: bool,
-        lifecycle_lock: locks.DistributedLock) -> Optional[str]:
+        lifecycle_lock: ServiceLifecycleLock) -> Optional[str]:
     """Locked implementation of failed-service purge."""
 
     def _still_owns() -> bool:
@@ -1981,12 +2201,16 @@ def _terminate_failed_services_locked(
                 serve_state.service_owner_matches(service_name,
                                                   expected_service_hash))
 
+    lifecycle_epoch = get_service_lifecycle_epoch(lifecycle_lock)
+
     if not _still_owns():
         return _purge_ownership_failure(service_name,
                                         'ownership lost before cleanup')
     if not serve_state.set_service_status_and_active_versions_if_hash(
-            service_name, expected_service_hash,
-            serve_state.ServiceStatus.SHUTTING_DOWN):
+            service_name,
+            expected_service_hash,
+            serve_state.ServiceStatus.SHUTTING_DOWN,
+            expected_lifecycle_epoch=lifecycle_epoch):
         return _purge_ownership_failure(
             service_name, 'could not claim durable teardown state')
 
@@ -1999,6 +2223,7 @@ def _terminate_failed_services_locked(
     if owner is None or owner.get('hash') != expected_service_hash:
         return _purge_ownership_failure(service_name,
                                         'owner disappeared before teardown')
+    resource_scope = owner.get('resource_scope')
     if owner.get('controller_port') != constants.CONTROLLER_TEARDOWN_ACK_PORT:
         recovery_script = serve_state.get_ha_recovery_script(service_name)
         if recovery_script is None:
@@ -2008,7 +2233,8 @@ def _terminate_failed_services_locked(
             claimed = serve_state.claim_orphaned_service_teardown(
                 service_name, expected_service_hash,
                 owner.get('controller_pid'), owner.get('controller_ip'),
-                os.getpid(), os.environ.get('POD_IP'))
+                os.getpid(), os.environ.get('POD_IP'),
+                expected_lifecycle_epoch=lifecycle_epoch)
         elif serve_state.get_latest_committed_version(service_name) is None:
             # A partial-registration row may retain a script but no committed
             # YAML. The script can never boot, so consume it atomically while
@@ -2045,6 +2271,38 @@ def _terminate_failed_services_locked(
             service_name, 'lifecycle lock or ownership lost after controller '
             'acknowledgement')
 
+    # Fence the public data plane before *any* replica teardown.  The LB keeps
+    # its last coherent routing view when controller sync stops, so reversing
+    # this order accepts requests for clusters already being destroyed.  A
+    # failed delete retains the exact row/name and aborts all cloud teardown.
+    from sky.serve import lb_k8s  # pylint: disable=import-outside-toplevel
+    if not pool:
+        try:
+            if resource_scope is None:
+                lb_k8s.delete_lb_objects(
+                    service_name,
+                    expected_service_hash=expected_service_hash,
+                    require_runtime=True)
+            else:
+                lb_k8s.delete_lb_objects(
+                    service_name,
+                    expected_service_hash=expected_service_hash,
+                    resource_scope=resource_scope,
+                    require_runtime=True)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.error(
+                f'Failed to delete external LB objects for failed service '
+                f'{service_name!r}; retaining purge state for retry: '
+                f'{common_utils.format_exception(e)}')
+            return (f'{colorama.Fore.YELLOW}failed service {service_name!r} '
+                    'could not be purged because its external load balancer '
+                    'could not be deleted; retry purge after fixing '
+                    f'Kubernetes access.{colorama.Style.RESET_ALL}')
+
+    if not _still_owns():
+        return _purge_ownership_failure(
+            service_name, 'ownership lost after load balancer cleanup')
+
     remaining_replica_clusters: List[str] = []
     replica_infos = serve_state.get_replica_infos(service_name)
     # The controller is dead (CONTROLLER_FAILED / FAILED_CLEANUP / zombie
@@ -2079,7 +2337,7 @@ def _terminate_failed_services_locked(
             # Reuse the normal replica down path (sdk.down with retries);
             # logs go to the replica's log file like a regular teardown.
             log_file_name = generate_replica_log_file_name(
-                service_name, info.replica_id)
+                service_name, info.replica_id, resource_scope)
             try:
                 replica_managers.terminate_cluster(
                     info.cluster_name,
@@ -2103,45 +2361,18 @@ def _terminate_failed_services_locked(
         return _purge_ownership_failure(service_name,
                                         'ownership lost after replica cleanup')
 
-    # Quiesce the external data plane before dropping the service row. If the
-    # delete fails, retaining the row makes purge retryable and prevents a
-    # same-name re-up from reusing a still-Ready LB with cached routes to the
-    # old replicas. The failed replica termination work above is idempotent on
-    # the next attempt.
-    # Imported here to break the circular dependency: lb_k8s imports
-    # serve_utils at module load.
-    from sky.serve import lb_k8s  # pylint: disable=import-outside-toplevel
-    if not pool:
-        try:
-            lb_k8s.delete_lb_objects(
-                service_name, expected_service_hash=expected_service_hash)
-        except Exception as e:  # pylint: disable=broad-except
-            logger.error(
-                f'Failed to delete external LB objects for failed service '
-                f'{service_name!r}; retaining purge state for retry: '
-                f'{common_utils.format_exception(e)}')
-            return (f'{colorama.Fore.YELLOW}failed service {service_name!r} '
-                    'could not be purged because its external load balancer '
-                    'could not be deleted; retry purge after fixing '
-                    f'Kubernetes access.{colorama.Style.RESET_ALL}')
-
-    if not _still_owns():
-        return _purge_ownership_failure(
-            service_name, 'ownership lost after load balancer cleanup')
-
     if remaining_replica_clusters:
-        # Internal replica cluster names are still name-scoped
-        # (<service>-<id>). Releasing the service name while one survives lets
-        # a same-name successor collide with or adopt that billable cluster.
-        # Keep every durable row/file and the name, but leave the external LB
-        # quiesced; a later --purge retries the remaining downs idempotently.
+        # Keep every durable row/file and the name even though new replica
+        # names are incarnation-scoped.  This preserves an authoritative,
+        # retryable inventory for any billable cluster that survived down.
         if not serve_state.set_service_status_and_active_versions_if_owner(
                 service_name,
                 expected_service_hash,
                 owner.get('controller_pid'),
                 owner.get('controller_ip'),
                 serve_state.ServiceStatus.FAILED_CLEANUP,
-                expected_status=serve_state.ServiceStatus.SHUTTING_DOWN):
+                expected_status=serve_state.ServiceStatus.SHUTTING_DOWN,
+                expected_lifecycle_epoch=lifecycle_epoch):
             return _purge_ownership_failure(
                 service_name, 'ownership lost while retaining failed cleanup')
         remaining_identity = ', '.join(remaining_replica_clusters)
@@ -2152,31 +2383,23 @@ def _terminate_failed_services_locked(
                 f'{remaining_identity}{colorama.Style.RESET_ALL}')
 
     service_dir = os.path.expanduser(
-        generate_remote_service_dir_name(service_name))
-    quarantine_dir = quarantine_service_directory(service_dir,
-                                                  expected_service_hash)
-    if not _still_owns():
-        # Never restore a name-scoped path after ownership is lost. A DB hash
-        # check followed by rename cannot be atomic with a same-name successor
-        # creating its canonical directory. Keep this incarnation's files in
-        # hash-owned quarantine; the authoritative retry will collect them.
-        return _purge_ownership_failure(
-            service_name, 'ownership lost while quarantining service files')
-
-    # Claim the exact incarnation first inside one transaction, then remove
-    # every name-keyed child row. A same-name successor cannot insert until
-    # the transaction commits, and all later filesystem work targets only the
-    # hash-owned quarantine.
-    removed = serve_state.remove_service_completely(service_name,
-                                                    expected_service_hash)
+        generate_remote_service_dir_name(service_name, resource_scope))
+    # A legacy name-only directory has no injective owner identity. Keep it;
+    # new scoped directories are safe to delete after the final DB CAS.
+    remove_directory = resource_scope is not None
+    # Claim the exact incarnation + lifecycle epoch first inside one
+    # transaction, then remove every name-keyed child row.  All later
+    # filesystem work targets the old incarnation's disjoint path.
+    removed = serve_state.remove_service_completely(
+        service_name,
+        expected_service_hash,
+        expected_lifecycle_epoch=lifecycle_epoch)
     if not removed:
-        # The compare-delete failure is itself proof that this process may no
-        # longer own the name. Leave the old files hash-scoped rather than
-        # racing a successor's canonical directory.
         return _purge_ownership_failure(
             service_name, 'final database compare-and-delete '
             'lost ownership')
-    remove_quarantined_service_directory(quarantine_dir)
+    if remove_directory:
+        remove_service_directory(service_dir)
     return None
 
 
@@ -2418,8 +2641,10 @@ def wait_service_registration(service_name: str, job_id: int,
         elapsed = time.time() - start_time
         if elapsed > constants.SERVICE_REGISTER_TIMEOUT_SECONDS:
             # Print the controller log to help user debug.
-            controller_log_path = (
-                generate_remote_controller_log_file_name(service_name))
+            resource_scope = (record.get('resource_scope')
+                              if record is not None else None)
+            controller_log_path = (generate_remote_controller_log_file_name(
+                service_name, resource_scope))
             with open(os.path.expanduser(controller_log_path),
                       'r',
                       encoding='utf-8') as f:
@@ -2627,7 +2852,10 @@ def stream_replica_logs(service_name: str, replica_id: int, follow: bool,
     caprepnoun = repnoun.capitalize()
     print(f'{colorama.Fore.YELLOW}Start streaming logs for launching process '
           f'of {repnoun} {replica_id}.{colorama.Style.RESET_ALL}')
-    log_file_name = generate_replica_log_file_name(service_name, replica_id)
+    record = serve_state.get_service_from_name(service_name)
+    resource_scope = record.get('resource_scope') if record else None
+    log_file_name = generate_replica_log_file_name(service_name, replica_id,
+                                                   resource_scope)
     # The replica_<id>.log file is the post-mortem archive: it's only
     # populated on the teardown path (terminate_cluster's redirect_log,
     # or _download_and_stream_logs writing launch_log + ssh'd job logs
@@ -2651,17 +2879,22 @@ def stream_replica_logs(service_name: str, replica_id: int, follow: bool,
         return ''
 
     launch_log_file_name = generate_replica_launch_log_file_name(
-        service_name, replica_id)
+        service_name, replica_id, resource_scope)
     if not os.path.exists(launch_log_file_name):
         return (f'{colorama.Fore.RED}{caprepnoun} {replica_id} doesn\'t exist.'
                 f'{colorama.Style.RESET_ALL}')
 
-    replica_cluster_name = generate_replica_cluster_name(
-        service_name, replica_id)
+    replica_infos = serve_state.get_replica_infos(service_name)
+    matching_info = next(
+        (info for info in replica_infos if info.replica_id == replica_id), None)
+    recorded_cluster_name = (getattr(matching_info, 'cluster_name', None)
+                             if matching_info is not None else None)
+    replica_cluster_name = (recorded_cluster_name if isinstance(
+        recorded_cluster_name, str) else generate_replica_cluster_name(
+            service_name, replica_id, resource_scope))
 
     def _get_replica_status() -> serve_state.ReplicaStatus:
-        replica_info = serve_state.get_replica_infos(service_name)
-        for info in replica_info:
+        for info in serve_state.get_replica_infos(service_name):
             if info.replica_id == replica_id:
                 return info.status
         with ux_utils.print_exception_no_traceback():
@@ -2763,7 +2996,10 @@ def stream_serve_process_logs(service_name: str, stream_controller: bool,
         # legacy controller-local load_balancer.log file.
         from sky.serve import lb_k8s  # pylint: disable=import-outside-toplevel
         return lb_k8s.stream_lb_logs(service_name, follow, tail)
-    log_file = generate_remote_controller_log_file_name(service_name)
+    record = serve_state.get_service_from_name(service_name)
+    resource_scope = record.get('resource_scope') if record else None
+    log_file = generate_remote_controller_log_file_name(service_name,
+                                                        resource_scope)
 
     def _service_is_terminal() -> bool:
         record = _get_service_status(service_name,

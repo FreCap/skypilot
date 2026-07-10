@@ -186,8 +186,17 @@ def current_epoch(pool_key: str) -> Optional[int]:
     return int(round_row['epoch'])
 
 
-def persist_fill_replica(service_name: str, replica_id: int, replica_info: Any,
-                         *, pool_key: str, expected_epoch: int) -> bool:
+def persist_fill_replica(
+    service_name: str,
+    replica_id: int,
+    replica_info: Any,
+    *,
+    pool_key: str,
+    expected_epoch: int,
+    expected_service_hash: Optional[str] = None,
+    expected_controller_owner: Optional[Tuple[Optional[int],
+                                              Optional[str]]] = None
+) -> bool:
     """Atomically persists a fill replica row, excluded from broker rounds.
 
     Ordering invariant (the other half lives on run_round_if_stale): a
@@ -217,7 +226,9 @@ def persist_fill_replica(service_name: str, replica_id: int, replica_info: Any,
                 replica_id,
                 replica_info,
                 pool_key=pool_key,
-                expected_epoch=expected_epoch)
+                expected_epoch=expected_epoch,
+                expected_service_hash=expected_service_hash,
+                expected_controller_owner=expected_controller_owner)
     except locks.LockTimeout:
         return False
 
@@ -492,30 +503,48 @@ def compute_feeds(
 # ============================== Round driver ================================
 
 
-def upsert_claim(service_name: str,
-                 *,
-                 pool_key: str,
-                 weight: float,
-                 floor_replicas: int,
-                 gpus_per_replica: int,
-                 holdings_fill: int,
-                 launchable: bool,
-                 effective_cap: Optional[int] = None) -> None:
+def upsert_claim(
+    service_name: str,
+    *,
+    pool_key: str,
+    weight: float,
+    floor_replicas: int,
+    gpus_per_replica: int,
+    holdings_fill: int,
+    launchable: bool,
+    effective_cap: Optional[int] = None,
+    expected_service_hash: Optional[str] = None,
+    expected_controller_owner: Optional[Tuple[Optional[int],
+                                              Optional[str]]] = None
+) -> bool:
     """Upserts this service's claim (the per-poll heartbeat)."""
-    serve_state.upsert_reserved_fill_claim(service_name,
-                                           pool_key=pool_key,
-                                           weight=weight,
-                                           floor_replicas=floor_replicas,
-                                           gpus_per_replica=gpus_per_replica,
-                                           holdings_fill=holdings_fill,
-                                           effective_cap=effective_cap,
-                                           launchable=launchable,
-                                           heartbeat_ts=time.time())
+    return serve_state.upsert_reserved_fill_claim(
+        service_name,
+        pool_key=pool_key,
+        weight=weight,
+        floor_replicas=floor_replicas,
+        gpus_per_replica=gpus_per_replica,
+        holdings_fill=holdings_fill,
+        effective_cap=effective_cap,
+        launchable=launchable,
+        heartbeat_ts=time.time(),
+        expected_service_hash=expected_service_hash,
+        expected_controller_owner=expected_controller_owner)
 
 
-def remove_claim(service_name: str) -> None:
-    serve_state.remove_reserved_fill_claim(service_name)
-    _GRANT_CACHE.pop(service_name, None)
+def remove_claim(
+    service_name: str,
+    expected_service_hash: Optional[str] = None,
+    expected_controller_owner: Optional[Tuple[Optional[int],
+                                              Optional[str]]] = None
+) -> bool:
+    removed = serve_state.remove_reserved_fill_claim(
+        service_name,
+        expected_service_hash=expected_service_hash,
+        expected_controller_owner=expected_controller_owner)
+    if removed or expected_service_hash is None:
+        _GRANT_CACHE.pop(service_name, None)
+    return removed
 
 
 def _claim_input(row: Dict[str, Any]) -> ClaimInput:

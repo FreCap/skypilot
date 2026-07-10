@@ -32,7 +32,7 @@ class TestSkyPilotReplicaManagerInitOrdering:
     scratch: a controller crash-loop, observed live at ~860 rows / ~520
     interrupted launches)."""
 
-    def _build(self, recovery_body, started_records):
+    def _build(self, recovery_body, started_records, resource_scope=None):
         import threading as threading_mod
 
         with mock.patch.object(
@@ -70,12 +70,20 @@ class TestSkyPilotReplicaManagerInitOrdering:
                 self_.latest_version = version
                 self_._update_mode = None
                 self_._is_pool = False
+                self_._resource_scope = None
 
             with mock.patch.object(replica_managers.ReplicaManager, '__init__',
                                    _patched_base_init):
                 mgr = replica_managers.SkyPilotReplicaManager(
-                    service_name='svc', spec=mock.MagicMock(), version=1)
+                    service_name='svc',
+                    spec=mock.MagicMock(),
+                    version=1,
+                    resource_scope=resource_scope)
             return mgr
+
+    def test_incarnation_scope_survives_base_initialization(self):
+        mgr = self._build(lambda self_: None, [], 'incarnation-a')
+        assert mgr._resource_scope == 'incarnation-a'
 
     def test_lock_is_held_by_recovery_when_daemons_start(self):
         import threading as threading_mod

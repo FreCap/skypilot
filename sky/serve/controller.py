@@ -4,6 +4,7 @@ Responsible for autoscaling and replica management.
 """
 import asyncio
 import contextlib
+import functools
 import hmac
 import logging
 import os
@@ -106,16 +107,40 @@ class SkyServeController:
         - Providing the HTTP Server API for SkyServe to communicate with.
     """
 
-    def __init__(self, service_name: str, service_spec: serve.SkyServiceSpec,
-                 version: int, host: str, port: int,
-                 controller_owner_fingerprint: str) -> None:
+    def __init__(self,
+                 service_name: str,
+                 service_spec: serve.SkyServiceSpec,
+                 version: int,
+                 host: str,
+                 port: int,
+                 controller_owner_fingerprint: str,
+                 resource_scope: Optional[str] = None,
+                 service_hash: Optional[str] = None,
+                 controller_pid: Optional[int] = None,
+                 controller_ip: Optional[str] = None) -> None:
         self._service_name = service_name
+        self._resource_scope = resource_scope
+        self._service_hash = service_hash
+        self._controller_owner = ((controller_pid,
+                                   controller_ip) if service_hash is not None or
+                                  controller_pid is not None or
+                                  controller_ip is not None else None)
+        # Serialize the DB commit and in-memory manager/autoscaler transition.
+        # The lifecycle epoch rejects an older request that arrives after a
+        # newer one; this lock prevents two accepted handlers from interleaving
+        # between their durable commit and runtime application.
+        self._update_lock = threading.Lock()
         self._controller_owner_fingerprint = controller_owner_fingerprint
         self._is_pool = service_spec.pool
         self._replica_manager: replica_managers.ReplicaManager = (
-            replica_managers.SkyPilotReplicaManager(service_name=service_name,
-                                                    spec=service_spec,
-                                                    version=version))
+            replica_managers.SkyPilotReplicaManager(
+                service_name=service_name,
+                spec=service_spec,
+                version=version,
+                resource_scope=resource_scope,
+                service_hash=service_hash,
+                controller_pid=controller_pid,
+                controller_ip=controller_ip))
         # Pass `version` so a controller rebuilt on restart/respawn starts the
         # autoscaler at the recovered latest version (matching the replica
         # manager above), not INITIAL_VERSION. Otherwise a service updated past
@@ -240,6 +265,14 @@ class SkyServeController:
         record = serve_state.get_service_from_name(self._service_name)
         assert record is not None, ('No service record found for '
                                     f'{self._service_name}')
+        service_hash = getattr(self, '_service_hash', None)
+        controller_owner = getattr(self, '_controller_owner', None)
+        if (service_hash is not None and
+            (record.get('hash') != service_hash or
+             (record.get('controller_pid'), record.get('controller_ip')) !=
+             controller_owner)):
+            raise RuntimeError('Controller ownership changed while building '
+                               'the load balancer routing snapshot.')
         active_versions = set(record['active_versions'])
         replica_cache: Dict[int, Tuple[str, str, int]] = {}
         replica_info: Dict[str, Dict[str, str]] = {}
@@ -534,6 +567,8 @@ class SkyServeController:
     async def _handle_load_balancer_sync(
             self, request_data: Dict[str, Any]) -> fastapi.Response:
         """Validate LB membership before disclosing confidential routing."""
+        if not self._owns_current_service():
+            return fastapi.Response(status_code=503)
         loop = asyncio.get_running_loop()
         authority = await loop.run_in_executor(
             None, self._lb_report_authority, request_data.get('lb_session_id'))
@@ -541,6 +576,8 @@ class SkyServeController:
             # The sync token authenticates the shared LB workload, not
             # membership in this service. Do not reveal replica URLs, capacity,
             # or routing policy to another service's Pod.
+            return fastapi.Response(status_code=503)
+        if not self._owns_current_service():
             return fastapi.Response(status_code=503)
 
         replica_infos = serve_state.get_replica_infos(self._service_name)
@@ -553,10 +590,14 @@ class SkyServeController:
                     version_spec, 'graceful_drain_async_occupancy', None))
         lb_replica_info, num_ready = self._get_lb_replica_info(
             replica_infos, async_occupancy_by_version)
+        if not self._owns_current_service():
+            return fastapi.Response(status_code=503)
         await self._ingest_load_balancer_report(request_data,
                                                 replica_infos,
                                                 async_occupancy_by_version,
                                                 authority=authority)
+        if not self._owns_current_service():
+            return fastapi.Response(status_code=503)
         return responses.JSONResponse(content={
             'replica_info': lb_replica_info,
             'num_ready_replicas': num_ready,
@@ -564,6 +605,18 @@ class SkyServeController:
             'capacity_hint': self._get_capacity_hint(replica_infos),
         },
                                       status_code=200)
+
+    def _owns_current_service(self) -> bool:
+        """Whether this controller parent still owns the exact DB row."""
+        service_hash = getattr(self, '_service_hash', None)
+        controller_owner = getattr(self, '_controller_owner', None)
+        if service_hash is None:
+            # Compatibility for direct/legacy controller construction.
+            return True
+        owner = serve_state.get_service_controller_owner(self._service_name)
+        return (owner is not None and owner.get('hash') == service_hash and
+                (owner.get('controller_pid'), owner.get('controller_ip'))
+                == controller_owner)
 
     def _get_capacity_hint(
             self, replica_infos: List['replica_managers.ReplicaInfo']
@@ -679,7 +732,8 @@ class SkyServeController:
         thread_utils.start_supervised_thread(
             lambda: reserved_capacity.poller_loop(
                 lambda: self._autoscaler, lambda: self._replica_manager.
-                spot_placer, self._service_name), 'reserved-capacity-poller')
+                spot_placer, self._service_name, self._service_hash, self.
+                _controller_owner), 'reserved-capacity-poller')
 
     def _run_autoscaler(self):
         logger.info('Starting autoscaler.')
@@ -780,9 +834,21 @@ class SkyServeController:
         # round can hold it for tens of seconds when replicas are unreachable)
         # never stalls the event loop — /controller/load_balancer_sync must
         # keep serving while an update waits its turn.
+        def _serialize_update(
+            handler: Callable[..., fastapi.Response]
+        ) -> Callable[..., fastapi.Response]:
+
+            @functools.wraps(handler)
+            def _wrapped(*args: Any, **kwargs: Any) -> fastapi.Response:
+                with self._update_lock:
+                    return handler(*args, **kwargs)
+
+            return _wrapped
+
         @self._app.post(
             '/controller/update_service',
             dependencies=[admin_auth_dependency, controller_owner_dependency])
+        @_serialize_update
         def update_service(request_data: Dict[str, Any] = fastapi.Body(
             ...)) -> fastapi.Response:
             try:
@@ -799,16 +865,35 @@ class SkyServeController:
                 # The yaml with the name latest_task_yaml will be synced
                 # See sky/serve/core.py::update
                 latest_task_yaml = serve_utils.generate_task_yaml_file_name(
-                    self._service_name, version)
+                    self._service_name,
+                    version,
+                    resource_scope=self._resource_scope)
                 with open(latest_task_yaml, 'r', encoding='utf-8') as f:
                     yaml_content = f.read()
                 service = serve.SkyServiceSpec.from_yaml_str(yaml_content)
-                committed = serve_state.add_or_update_version(
-                    self._service_name, version, service, yaml_content)
-                if not committed:
+                requested_service_hash = request_data.get('service_hash')
+                lifecycle_epoch = request_data.get('lifecycle_epoch')
+                if (requested_service_hash is not None and
+                        requested_service_hash != self._service_hash):
                     return responses.JSONResponse(content={
-                        'message': 'Service entered terminal status before the '
-                                   'update could be committed.'
+                        'message': 'Service incarnation changed before '
+                                   'the update was applied.'
+                    },
+                                                  status_code=409)
+                persisted = serve_state.add_or_update_version(
+                    self._service_name,
+                    version,
+                    service,
+                    yaml_content,
+                    expected_service_hash=(requested_service_hash or
+                                           self._service_hash),
+                    expected_lifecycle_epoch=lifecycle_epoch,
+                    expected_controller_owner=self._controller_owner)
+                if persisted is False:
+                    return responses.JSONResponse(content={
+                        'message': 'Service lifecycle ownership changed or '
+                                   'entered terminal status before the update '
+                                   'was applied.'
                     },
                                                   status_code=409)
                 logger.info(
@@ -976,13 +1061,22 @@ class SkyServeController:
 
 # TODO(tian): Probably we should support service that will stop the VM in
 # specific time period.
-def run_controller(service_name: str, service_spec: serve.SkyServiceSpec,
-                   version: int, controller_host: str, controller_port: int,
-                   controller_owner_fingerprint: str):
+def run_controller(service_name: str,
+                   service_spec: serve.SkyServiceSpec,
+                   version: int,
+                   controller_host: str,
+                   controller_port: int,
+                   controller_owner_fingerprint: str,
+                   resource_scope: Optional[str] = None,
+                   service_hash: Optional[str] = None,
+                   controller_pid: Optional[int] = None,
+                   controller_ip: Optional[str] = None):
     os.environ[constants.OVERRIDE_CONSOLIDATION_MODE] = 'true'
     # Hijack sys.stdout/stderr to be context aware.
     context_utils.hijack_sys_attrs()
     controller = SkyServeController(service_name, service_spec, version,
                                     controller_host, controller_port,
-                                    controller_owner_fingerprint)
+                                    controller_owner_fingerprint,
+                                    resource_scope, service_hash,
+                                    controller_pid, controller_ip)
     controller.run()

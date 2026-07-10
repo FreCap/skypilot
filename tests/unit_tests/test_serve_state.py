@@ -44,7 +44,9 @@ def _mock_serve_db(tmp_path, monkeypatch):
 def _add_minimal_service(name: str,
                          controller_ip=None,
                          controller_pid=12345,
-                         service_hash=None):
+                         service_hash=None,
+                         lifecycle_epoch=None,
+                         resource_scope=None):
     """Add a service row with all-required-args defaults so individual tests
     only need to specify what they care about."""
     return serve_state.add_service(
@@ -65,6 +67,8 @@ def _add_minimal_service(name: str,
         yaml_content='yaml: v1',
         controller_ip=controller_ip,
         service_hash=service_hash,
+        lifecycle_epoch=lifecycle_epoch,
+        resource_scope=resource_scope,
     )
 
 
@@ -180,6 +184,160 @@ class TestAddServiceAtomicRegistration:
         assert serve_state.get_service_pool_from_db('never-existed') is None
 
 
+class TestServiceLifecycleEpoch:
+    """A durable name epoch fences work after advisory-session loss."""
+
+    def test_epoch_survives_delete_and_recreate(self, _mock_serve_db):
+        epoch_a = serve_state.claim_service_lifecycle_epoch('svc')
+        assert epoch_a == 1
+        assert _add_minimal_service('svc',
+                                    service_hash='incarnation-a',
+                                    lifecycle_epoch=epoch_a,
+                                    resource_scope='incarnation-a')
+
+        epoch_teardown = serve_state.claim_service_lifecycle_epoch('svc')
+        assert epoch_teardown == 2
+        assert not serve_state.remove_service_completely(
+            'svc', 'incarnation-a', expected_lifecycle_epoch=epoch_a)
+        assert serve_state.remove_service_completely(
+            'svc', 'incarnation-a', expected_lifecycle_epoch=epoch_teardown)
+
+        epoch_b = serve_state.claim_service_lifecycle_epoch('svc')
+        assert epoch_b == 3
+        assert _add_minimal_service('svc',
+                                    service_hash='incarnation-b',
+                                    lifecycle_epoch=epoch_b,
+                                    resource_scope='incarnation-b')
+        row = _read_row(_mock_serve_db, 'svc')
+        assert row['hash'] == 'incarnation-b'
+        assert row['lifecycle_epoch'] == epoch_b
+        assert row['resource_scope'] == 'incarnation-b'
+
+    def test_stale_child_row_mutations_cannot_touch_successor(
+            self, _mock_serve_db):
+        epoch_a = serve_state.claim_service_lifecycle_epoch('svc')
+        assert _add_minimal_service('svc',
+                                    service_hash='incarnation-a',
+                                    lifecycle_epoch=epoch_a,
+                                    resource_scope='incarnation-a')
+        assert serve_state.add_or_update_replica(
+            'svc',
+            1,
+            'replica-a',
+            expected_service_hash='incarnation-a',
+            expected_lifecycle_epoch=epoch_a)
+
+        epoch_delete = serve_state.claim_service_lifecycle_epoch('svc')
+        assert serve_state.remove_service_completely(
+            'svc', 'incarnation-a', expected_lifecycle_epoch=epoch_delete)
+        epoch_b = serve_state.claim_service_lifecycle_epoch('svc')
+        assert _add_minimal_service('svc',
+                                    service_hash='incarnation-b',
+                                    lifecycle_epoch=epoch_b,
+                                    resource_scope='incarnation-b')
+        assert serve_state.add_or_update_replica(
+            'svc',
+            1,
+            'replica-b',
+            expected_service_hash='incarnation-b',
+            expected_lifecycle_epoch=epoch_b)
+
+        assert not serve_state.remove_replica(
+            'svc',
+            1,
+            expected_service_hash='incarnation-a',
+            expected_lifecycle_epoch=epoch_delete)
+        assert serve_state.get_replica_info_from_id('svc', 1) == 'replica-b'
+
+    def test_exact_owner_cleanup_is_idempotent_when_children_are_absent(
+            self, _mock_serve_db):
+        epoch = serve_state.claim_service_lifecycle_epoch('svc')
+        assert _add_minimal_service('svc',
+                                    service_hash='incarnation-a',
+                                    lifecycle_epoch=epoch,
+                                    resource_scope='incarnation-a')
+
+        assert serve_state.remove_replica('svc',
+                                          99,
+                                          expected_service_hash='incarnation-a',
+                                          expected_lifecycle_epoch=epoch)
+        assert serve_state.delete_version('svc',
+                                          99,
+                                          expected_service_hash='incarnation-a')
+
+    def test_stale_version_delete_cannot_touch_successor(self, _mock_serve_db):
+        epoch_a = serve_state.claim_service_lifecycle_epoch('svc')
+        assert _add_minimal_service('svc',
+                                    service_hash='incarnation-a',
+                                    lifecycle_epoch=epoch_a,
+                                    resource_scope='incarnation-a')
+
+        epoch_delete = serve_state.claim_service_lifecycle_epoch('svc')
+        assert serve_state.remove_service_completely(
+            'svc', 'incarnation-a', expected_lifecycle_epoch=epoch_delete)
+        epoch_b = serve_state.claim_service_lifecycle_epoch('svc')
+        assert _add_minimal_service('svc',
+                                    service_hash='incarnation-b',
+                                    lifecycle_epoch=epoch_b,
+                                    resource_scope='incarnation-b')
+
+        assert not serve_state.delete_version(
+            'svc',
+            serve_constants.INITIAL_VERSION,
+            expected_service_hash='incarnation-a')
+        assert serve_state.get_yaml_content(
+            'svc', serve_constants.INITIAL_VERSION) == 'yaml: v1'
+
+    def test_stale_recovery_script_and_version_claims_fail(
+            self, _mock_serve_db):
+        epoch_a = serve_state.claim_service_lifecycle_epoch('svc')
+        assert _add_minimal_service('svc',
+                                    service_hash='incarnation-a',
+                                    lifecycle_epoch=epoch_a,
+                                    resource_scope='incarnation-a')
+        assert serve_state.set_ha_recovery_script('svc', 'script-a', epoch_a)
+
+        epoch_b = serve_state.claim_service_lifecycle_epoch('svc')
+        assert not serve_state.set_ha_recovery_script('svc', 'stale-script',
+                                                      epoch_a)
+        assert serve_state.get_ha_recovery_script('svc') == 'script-a'
+        with pytest.raises(RuntimeError, match='lifecycle ownership'):
+            serve_state.add_version('svc',
+                                    expected_service_hash='incarnation-a',
+                                    expected_lifecycle_epoch=epoch_a)
+        assert serve_state.add_version('svc',
+                                       expected_service_hash='incarnation-a',
+                                       expected_lifecycle_epoch=epoch_b) == 2
+
+        assert not serve_state.add_or_update_version(
+            'svc',
+            2,
+            None,
+            'stale: yaml',
+            expected_service_hash='incarnation-a',
+            expected_lifecycle_epoch=epoch_a)
+        assert serve_state.get_yaml_content('svc', 2) is None
+
+    def test_stale_controller_cannot_write_current_incarnation_children(
+            self, _mock_serve_db):
+        assert _add_minimal_service('svc',
+                                    controller_pid=200,
+                                    controller_ip='10.0.0.2',
+                                    service_hash='incarnation-a')
+        stale_owner = (100, '10.0.0.1')
+        assert not serve_state.add_or_update_replica(
+            'svc',
+            1,
+            'stale-single',
+            expected_service_hash='incarnation-a',
+            expected_controller_owner=stale_owner)
+        assert not serve_state.add_or_update_replicas(
+            'svc', [(1, 'stale-batch')],
+            expected_service_hash='incarnation-a',
+            expected_controller_owner=stale_owner)
+        assert serve_state.get_replica_info_from_id('svc', 1) is None
+
+
 class TestGetServiceFromNameReturnsControllerIp:
 
     def _add_with_version(self, service_name, controller_ip):
@@ -249,6 +407,8 @@ class TestGetServiceControllerOwner:
             'controller_pid',
             'controller_ip',
             'controller_port',
+            'lifecycle_epoch',
+            'resource_scope',
         }
         assert record['hash']
         assert record['status'] == serve_state.ServiceStatus.CONTROLLER_INIT

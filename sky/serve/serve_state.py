@@ -65,6 +65,19 @@ services_table = sqlalchemy.Table(
     sqlalchemy.Column('controller_pid', sqlalchemy.Integer,
                       server_default=None),
     sqlalchemy.Column('hash', sqlalchemy.Text, server_default=None),
+    # Monotonic name-fence token claimed by the lifecycle operation that most
+    # recently owns this row.  Unlike ``hash`` (which changes only when the
+    # service is recreated), this advances on every up/update/down/purge lock
+    # acquisition.  Destructive commits validate both values.
+    sqlalchemy.Column('lifecycle_epoch',
+                      sqlalchemy.Integer,
+                      server_default=None),
+    # External resource namespace for this incarnation.  New rows store their
+    # service hash here; NULL identifies a legacy row whose files, clusters,
+    # and LB objects predate incarnation-scoped names.  Keeping the distinction
+    # durable lets a same-name successor use a disjoint namespace without
+    # moving live legacy resources during a rolling upgrade.
+    sqlalchemy.Column('resource_scope', sqlalchemy.Text, server_default=None),
     sqlalchemy.Column('entrypoint', sqlalchemy.Text, server_default=None),
     # Pod IP where the controller process is running.
     # Written by the sky.serve.service process at startup.
@@ -93,6 +106,17 @@ serve_ha_recovery_script_table = sqlalchemy.Table(
     Base.metadata,
     sqlalchemy.Column('service_name', sqlalchemy.Text, primary_key=True),
     sqlalchemy.Column('script', sqlalchemy.Text),
+)
+
+# Per-name fencing token.  This row deliberately outlives the corresponding
+# service row: deleting and recreating a name must advance, never reset, the
+# token so an operation whose PostgreSQL advisory-lock session died cannot
+# commit after a successor has acquired the name.
+service_lifecycle_fences_table = sqlalchemy.Table(
+    'service_lifecycle_fences',
+    Base.metadata,
+    sqlalchemy.Column('name', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('epoch', sqlalchemy.Integer, nullable=False),
 )
 
 # [boltz fork] Reserved-fill broker state (multi-service arbitration of the
@@ -239,14 +263,110 @@ def create_table(engine: sqlalchemy.engine.Engine):
                                          migration_utils.SERVE_VERSION)
 
 
-_db_manager = db_utils.DatabaseManager('serve/services', create_table)
+def claim_service_lifecycle_epoch(service_name: str,
+                                  lock_connection: Optional[Any] = None) -> int:
+    """Advance and return the durable fencing token for ``service_name``.
+
+    PostgreSQL callers pass the DBAPI connection that owns the name's
+    advisory lock.  Advancing the token on that exact session is essential:
+    if the session was lost, the statement fails instead of allowing a stale
+    holder to mint a token after a replacement acquired the lock.  SQLite
+    callers hold the process-global FileLock and use a normal ORM session.
+
+    Existing rows are stamped with the new epoch in the same transaction.
+    The fence row itself is never deleted, so same-name recreation cannot
+    reset the epoch.
+    """
+    if lock_connection is not None:
+        cursor = lock_connection.cursor()
+        try:
+            cursor.execute(
+                'INSERT INTO service_lifecycle_fences (name, epoch) '
+                'VALUES (%s, 1) ON CONFLICT (name) DO UPDATE SET '
+                'epoch = service_lifecycle_fences.epoch + 1 '
+                'RETURNING epoch', (service_name,))
+            row = cursor.fetchone()
+            if row is None:
+                raise RuntimeError('Lifecycle epoch claim returned no row.')
+            epoch = int(row[0])
+            cursor.execute(
+                'UPDATE services SET lifecycle_epoch = %s WHERE name = %s',
+                (epoch, service_name))
+            lock_connection.commit()
+            return epoch
+        except Exception:
+            lock_connection.rollback()
+            raise
+        finally:
+            cursor.close()
+
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        row = session.execute(
+            sqlalchemy.select(service_lifecycle_fences_table.c.epoch).where(
+                service_lifecycle_fences_table.c.name ==
+                service_name)).fetchone()
+        if row is None:
+            epoch = 1
+            session.execute(
+                sqlalchemy.insert(service_lifecycle_fences_table).values(
+                    name=service_name, epoch=epoch))
+        else:
+            epoch = int(row[0]) + 1
+            session.execute(
+                sqlalchemy.update(service_lifecycle_fences_table).where(
+                    service_lifecycle_fences_table.c.name ==
+                    service_name).values(epoch=epoch))
+        session.execute(
+            sqlalchemy.update(services_table).where(
+                services_table.c.name == service_name).values(
+                    lifecycle_epoch=epoch))
+        session.commit()
+    return epoch
+
+
+def service_lifecycle_epoch_matches(service_name: str, epoch: int) -> bool:
+    """Whether ``epoch`` is still the latest token for ``service_name``."""
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        row = session.execute(
+            sqlalchemy.select(service_lifecycle_fences_table.c.epoch).where(
+                service_lifecycle_fences_table.c.name ==
+                service_name)).fetchone()
+    return row is not None and int(row[0]) == epoch
+
+
+def _lifecycle_epoch_matches_in_session(session: orm.Session, service_name: str,
+                                        epoch: Optional[int]) -> bool:
+    """Lock and validate a lifecycle fence row inside a mutation txn."""
+    if epoch is None:
+        # Compatibility for old direct/unit-test callers. Production lifecycle
+        # entrypoints always supply an epoch.
+        return True
+    stmt = sqlalchemy.select(service_lifecycle_fences_table.c.epoch).where(
+        service_lifecycle_fences_table.c.name == service_name)
+    if session.bind is not None and session.bind.dialect.name == (
+            db_utils.SQLAlchemyDialect.POSTGRESQL.value):
+        stmt = stmt.with_for_update()
+    row = session.execute(stmt).fetchone()
+    return row is not None and int(row[0]) == epoch
 
 
 def _begin_immediate_if_sqlite(session: orm.Session,
-                               engine: sqlalchemy.engine.Engine) -> None:
-    """Make a SQLite read-then-write lifecycle check one writer transaction."""
-    if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
+                               engine: sqlalchemy.engine.Engine,
+                               enabled: bool = True) -> None:
+    """Make a SQLite read-then-write fence one atomic writer transaction."""
+    if (enabled and
+            engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value):
         session.execute(sqlalchemy.text('BEGIN IMMEDIATE'))
+
+
+_db_manager = db_utils.DatabaseManager('serve/services', create_table)
+
+
+def ensure_tables_initialized() -> None:
+    """Run pending Serve DB migrations before raw lock-session SQL."""
+    _db_manager.get_engine()
 
 
 _UNIQUE_CONSTRAINT_FAILED_ERROR_MSGS = [
@@ -436,7 +556,9 @@ def add_service(name: str,
                 spec: Optional['service_spec.SkyServiceSpec'],
                 yaml_content: str,
                 controller_ip: Optional[str] = None,
-                service_hash: Optional[str] = None) -> bool:
+                service_hash: Optional[str] = None,
+                lifecycle_epoch: Optional[int] = None,
+                resource_scope: Optional[str] = None) -> bool:
     """Atomically add a service and its initial version to the database.
 
     The `services` row and the initial `version_specs` row (at
@@ -455,6 +577,12 @@ def add_service(name: str,
     engine = _db_manager.get_engine()
     try:
         with orm.Session(engine) as session:
+            _begin_immediate_if_sqlite(session, engine, lifecycle_epoch
+                                       is not None)
+            if not _lifecycle_epoch_matches_in_session(session, name,
+                                                       lifecycle_epoch):
+                session.rollback()
+                return False
             if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
                 insert_func = sqlite.insert
             elif (engine.dialect.name ==
@@ -477,6 +605,8 @@ def add_service(name: str,
                     controller_ip=controller_ip,
                     hash=(str(uuid.uuid4())
                           if service_hash is None else service_hash),
+                    lifecycle_epoch=lifecycle_epoch,
+                    resource_scope=resource_scope,
                     entrypoint=entrypoint))
             version_insert_stmt = insert_func(version_specs_table).values(
                 service_name=name,
@@ -623,7 +753,8 @@ def remove_service_completely(
     service_name: str,
     expected_service_hash: str,
     expected_controller_owner: Optional[Tuple[Optional[int],
-                                              Optional[str]]] = None
+                                              Optional[str]]] = None,
+    expected_lifecycle_epoch: Optional[int] = None,
 ) -> bool:
     """Atomically remove one exact service incarnation and all child rows.
 
@@ -648,10 +779,19 @@ def remove_service_completely(
         return False
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
+        _begin_immediate_if_sqlite(session, engine, expected_lifecycle_epoch
+                                   is not None)
+        if not _lifecycle_epoch_matches_in_session(session, service_name,
+                                                   expected_lifecycle_epoch):
+            session.rollback()
+            return False
         predicates = [
             services_table.c.name == service_name,
             services_table.c.hash == expected_service_hash,
         ]
+        if expected_lifecycle_epoch is not None:
+            predicates.append(
+                services_table.c.lifecycle_epoch == expected_lifecycle_epoch)
         if expected_controller_owner is not None:
             expected_pid, expected_ip = expected_controller_owner
             predicates.extend([
@@ -679,14 +819,29 @@ def remove_service_completely(
     return True
 
 
-def set_service_uptime(service_name: str, uptime: int) -> None:
-    """Sets the uptime of a service."""
+def set_service_uptime(
+    service_name: str,
+    uptime: int,
+    expected_service_hash: Optional[str] = None,
+    expected_controller_owner: Optional[Tuple[Optional[int],
+                                              Optional[str]]] = None
+) -> bool:
+    """Set uptime, optionally fenced to one service incarnation."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
-        session.query(services_table).filter(
-            services_table.c.name == service_name).update(
-                {services_table.c.uptime: uptime})
+        predicates = [services_table.c.name == service_name]
+        if expected_service_hash is not None:
+            predicates.append(services_table.c.hash == expected_service_hash)
+        if expected_controller_owner is not None:
+            expected_pid, expected_ip = expected_controller_owner
+            predicates.extend([
+                services_table.c.controller_pid == expected_pid,
+                services_table.c.controller_ip == expected_ip,
+            ])
+        count = session.query(services_table).filter(*predicates).update(
+            {services_table.c.uptime: uptime})
         session.commit()
+    return count > 0
 
 
 def set_service_status_and_active_versions(
@@ -713,7 +868,8 @@ def set_service_status_and_active_versions_if_owner(
         expected_controller_ip: Optional[str],
         status: ServiceStatus,
         active_versions: Optional[List[int]] = None,
-        expected_status: Optional[ServiceStatus] = None) -> bool:
+        expected_status: Optional[ServiceStatus] = None,
+        expected_lifecycle_epoch: Optional[int] = None) -> bool:
     """CAS a status write on the exact hash/PID/IP controller owner."""
     update_dict = {services_table.c.status: status.value}
     if active_versions is not None:
@@ -727,6 +883,9 @@ def set_service_status_and_active_versions_if_owner(
     ]
     if expected_status is not None:
         predicates.append(services_table.c.status == expected_status.value)
+    if expected_lifecycle_epoch is not None:
+        predicates.append(
+            services_table.c.lifecycle_epoch == expected_lifecycle_epoch)
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         count = session.query(services_table).filter(
@@ -740,7 +899,8 @@ def set_service_status_and_active_versions_if_hash(
         expected_service_hash: str,
         status: ServiceStatus,
         active_versions: Optional[List[int]] = None,
-        expected_status: Optional[ServiceStatus] = None) -> bool:
+        expected_status: Optional[ServiceStatus] = None,
+        expected_lifecycle_epoch: Optional[int] = None) -> bool:
     """CAS a status write on a durable service incarnation."""
     update_dict = {services_table.c.status: status.value}
     if active_versions is not None:
@@ -752,6 +912,9 @@ def set_service_status_and_active_versions_if_hash(
     ]
     if expected_status is not None:
         predicates.append(services_table.c.status == expected_status.value)
+    if expected_lifecycle_epoch is not None:
+        predicates.append(
+            services_table.c.lifecycle_epoch == expected_lifecycle_epoch)
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         count = session.query(services_table).filter(
@@ -825,12 +988,14 @@ def acknowledge_service_controller_teardown_if_owner(
     return count > 0
 
 
-def claim_orphaned_service_teardown(service_name: str,
-                                    expected_service_hash: str,
-                                    expected_controller_pid: Optional[int],
-                                    expected_controller_ip: Optional[str],
-                                    controller_pid: int,
-                                    controller_ip: Optional[str]) -> bool:
+def claim_orphaned_service_teardown(
+        service_name: str,
+        expected_service_hash: str,
+        expected_controller_pid: Optional[int],
+        expected_controller_ip: Optional[str],
+        controller_pid: int,
+        controller_ip: Optional[str],
+        expected_lifecycle_epoch: Optional[int] = None) -> bool:
     """Claim a terminal row that has no recovery script or live child.
 
     Callers must establish the absence of a recovery script while holding the
@@ -845,6 +1010,8 @@ def claim_orphaned_service_teardown(service_name: str,
             services_table.c.controller_pid == expected_controller_pid,
             services_table.c.controller_ip == expected_controller_ip,
             services_table.c.status == ServiceStatus.SHUTTING_DOWN.value,
+            *([services_table.c.lifecycle_epoch == expected_lifecycle_epoch]
+              if expected_lifecycle_epoch is not None else []),
         ).update({
             services_table.c.controller_pid: controller_pid,
             services_table.c.controller_ip: controller_ip,
@@ -992,6 +1159,8 @@ def _get_service_from_row(r: 'row.RowMapping') -> Dict[str, Any]:
         'controller_pid': r['controller_pid'],
         'controller_ip': r['controller_ip'],
         'hash': r['hash'],
+        'lifecycle_epoch': r['lifecycle_epoch'],
+        'resource_scope': r['resource_scope'],
         'entrypoint': r['entrypoint'],
         'yaml_content': r.get('yaml_content'),
     }
@@ -1087,6 +1256,8 @@ def get_service_controller_owner(service_name: str) -> Optional[Dict[str, Any]]:
                 services_table.c.controller_pid,
                 services_table.c.controller_ip,
                 services_table.c.controller_port,
+                services_table.c.lifecycle_epoch,
+                services_table.c.resource_scope,
             ).where(services_table.c.name == service_name)).fetchone()
     if row is None:
         return None
@@ -1097,6 +1268,8 @@ def get_service_controller_owner(service_name: str) -> Optional[Dict[str, Any]]:
         'controller_pid': mapping['controller_pid'],
         'controller_ip': mapping['controller_ip'],
         'controller_port': mapping['controller_port'],
+        'lifecycle_epoch': mapping['lifecycle_epoch'],
+        'resource_scope': mapping['resource_scope'],
     }
 
 
@@ -1184,11 +1357,41 @@ def get_service_pool_from_db(service_name: str) -> Optional[bool]:
 _REPLICA_UPSERT_CHUNK_SIZE = 300
 
 
-def add_or_update_replica(service_name: str, replica_id: int,
-                          replica_info: 'replica_managers.ReplicaInfo') -> None:
+def add_or_update_replica(
+    service_name: str,
+    replica_id: int,
+    replica_info: 'replica_managers.ReplicaInfo',
+    expected_service_hash: Optional[str] = None,
+    expected_lifecycle_epoch: Optional[int] = None,
+    expected_controller_owner: Optional[Tuple[Optional[int],
+                                              Optional[str]]] = None
+) -> bool:
     """Adds a replica to the database."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
+        _begin_immediate_if_sqlite(
+            session, engine, expected_service_hash is not None or
+            expected_lifecycle_epoch is not None or
+            expected_controller_owner is not None)
+        if not _lifecycle_epoch_matches_in_session(session, service_name,
+                                                   expected_lifecycle_epoch):
+            session.rollback()
+            return False
+        if expected_service_hash is not None:
+            owner = session.execute(
+                sqlalchemy.select(
+                    services_table.c.hash, services_table.c.lifecycle_epoch,
+                    services_table.c.controller_pid,
+                    services_table.c.controller_ip).where(
+                        services_table.c.name ==
+                        service_name).with_for_update()).fetchone()
+            if (owner is None or owner[0] != expected_service_hash or
+                (expected_lifecycle_epoch is not None and
+                 owner[1] != expected_lifecycle_epoch) or
+                (expected_controller_owner is not None and
+                 (owner[2], owner[3]) != expected_controller_owner)):
+                session.rollback()
+                return False
         if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
             insert_func = sqlite.insert
         elif (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value
@@ -1208,12 +1411,17 @@ def add_or_update_replica(service_name: str, replica_id: int,
 
         session.execute(insert_stmt)
         session.commit()
+    return True
 
 
 def add_or_update_replicas(
-        service_name: str,
-        replica_infos: List[Tuple[int,
-                                  'replica_managers.ReplicaInfo']]) -> None:
+    service_name: str,
+    replica_infos: List[Tuple[int, 'replica_managers.ReplicaInfo']],
+    expected_service_hash: Optional[str] = None,
+    expected_lifecycle_epoch: Optional[int] = None,
+    expected_controller_owner: Optional[Tuple[Optional[int],
+                                              Optional[str]]] = None
+) -> bool:
     """Upserts a batch of replicas in one statement/transaction.
 
     The probe round persists per-replica bookkeeping for every probed
@@ -1223,9 +1431,32 @@ def add_or_update_replicas(
     ON CONFLICT upsert keeps the round O(1) in round-trips.
     """
     if not replica_infos:
-        return
+        return True
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
+        _begin_immediate_if_sqlite(
+            session, engine, expected_service_hash is not None or
+            expected_lifecycle_epoch is not None or
+            expected_controller_owner is not None)
+        if not _lifecycle_epoch_matches_in_session(session, service_name,
+                                                   expected_lifecycle_epoch):
+            session.rollback()
+            return False
+        if expected_service_hash is not None:
+            owner = session.execute(
+                sqlalchemy.select(
+                    services_table.c.hash, services_table.c.lifecycle_epoch,
+                    services_table.c.controller_pid,
+                    services_table.c.controller_ip).where(
+                        services_table.c.name ==
+                        service_name).with_for_update()).fetchone()
+            if (owner is None or owner[0] != expected_service_hash or
+                (expected_lifecycle_epoch is not None and
+                 owner[1] != expected_lifecycle_epoch) or
+                (expected_controller_owner is not None and
+                 (owner[2], owner[3]) != expected_controller_owner)):
+                session.rollback()
+                return False
         if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
             insert_func = sqlite.insert
         elif (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value
@@ -1252,17 +1483,53 @@ def add_or_update_replicas(
 
             session.execute(insert_stmt)
         session.commit()
+    return True
 
 
-def remove_replica(service_name: str, replica_id: int) -> None:
-    """Removes a replica from the database."""
+def remove_replica(
+    service_name: str,
+    replica_id: int,
+    expected_service_hash: Optional[str] = None,
+    expected_lifecycle_epoch: Optional[int] = None,
+    expected_controller_owner: Optional[Tuple[Optional[int],
+                                              Optional[str]]] = None
+) -> bool:
+    """Remove a replica, optionally fenced to one lifecycle/incarnation."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
-        session.execute(
-            sqlalchemy.delete(replicas_table).where(
-                sqlalchemy.and_(replicas_table.c.service_name == service_name,
-                                replicas_table.c.replica_id == replica_id)))
+        _begin_immediate_if_sqlite(
+            session, engine, expected_service_hash is not None or
+            expected_lifecycle_epoch is not None or
+            expected_controller_owner is not None)
+        if not _lifecycle_epoch_matches_in_session(session, service_name,
+                                                   expected_lifecycle_epoch):
+            session.rollback()
+            return False
+        predicates = [
+            replicas_table.c.service_name == service_name,
+            replicas_table.c.replica_id == replica_id,
+        ]
+        if expected_service_hash is not None:
+            owner = session.execute(
+                sqlalchemy.select(
+                    services_table.c.hash, services_table.c.lifecycle_epoch,
+                    services_table.c.controller_pid,
+                    services_table.c.controller_ip).where(
+                        services_table.c.name ==
+                        service_name).with_for_update()).fetchone()
+            if (owner is None or owner[0] != expected_service_hash or
+                (expected_lifecycle_epoch is not None and
+                 owner[1] != expected_lifecycle_epoch) or
+                (expected_controller_owner is not None and
+                 (owner[2], owner[3]) != expected_controller_owner)):
+                session.rollback()
+                return False
+        result = session.execute(
+            sqlalchemy.delete(replicas_table).where(*predicates))
         session.commit()
+    # Once exact ownership is proven, an already-absent child is the desired
+    # idempotent cleanup state, not evidence of ownership loss.
+    return expected_service_hash is not None or result.rowcount > 0
 
 
 def get_replica_info_from_id(
@@ -1361,8 +1628,10 @@ def _lock_service_for_version_mutation(session: orm.Session,
     return ServiceStatus[row[0]] not in ServiceStatus.terminal_statuses()
 
 
-def add_version(service_name: str) -> int:
-    """Adds a version to the database."""
+def add_version(service_name: str,
+                expected_service_hash: Optional[str] = None,
+                expected_lifecycle_epoch: Optional[int] = None) -> int:
+    """Add a version, optionally fenced to one lifecycle/incarnation."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         _begin_immediate_if_sqlite(session, engine)
@@ -1370,6 +1639,24 @@ def add_version(service_name: str) -> int:
             session.rollback()
             raise RuntimeError(f'Service {service_name!r} entered terminal '
                                'status before adding a version.')
+        if not _lifecycle_epoch_matches_in_session(session, service_name,
+                                                   expected_lifecycle_epoch):
+            session.rollback()
+            raise RuntimeError('Service lifecycle ownership was lost before '
+                               'adding a version.')
+        if expected_service_hash is not None:
+            row = session.execute(
+                sqlalchemy.select(
+                    services_table.c.hash,
+                    services_table.c.lifecycle_epoch).where(
+                        services_table.c.name ==
+                        service_name).with_for_update()).fetchone()
+            if (row is None or row[0] != expected_service_hash or
+                (expected_lifecycle_epoch is not None and
+                 row[1] != expected_lifecycle_epoch)):
+                session.rollback()
+                raise RuntimeError('Service incarnation changed before '
+                                   'adding a version.')
         # Insert new version with MAX(version) + 1 in a single atomic operation
         max_version_subquery = sqlalchemy.select(
             sqlalchemy.func.coalesce(
@@ -1389,15 +1676,41 @@ def add_version(service_name: str) -> int:
     return new_version
 
 
-def add_or_update_version(service_name: str, version: int,
-                          spec: 'service_spec.SkyServiceSpec',
-                          yaml_content: str) -> bool:
+def add_or_update_version(
+    service_name: str,
+    version: int,
+    spec: 'service_spec.SkyServiceSpec',
+    yaml_content: str,
+    expected_service_hash: Optional[str] = None,
+    expected_lifecycle_epoch: Optional[int] = None,
+    expected_controller_owner: Optional[Tuple[Optional[int],
+                                              Optional[str]]] = None
+) -> bool:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         _begin_immediate_if_sqlite(session, engine)
         if not _lock_service_for_version_mutation(session, service_name):
             session.rollback()
             return False
+        if not _lifecycle_epoch_matches_in_session(session, service_name,
+                                                   expected_lifecycle_epoch):
+            session.rollback()
+            return False
+        if expected_service_hash is not None:
+            owner = session.execute(
+                sqlalchemy.select(
+                    services_table.c.hash, services_table.c.lifecycle_epoch,
+                    services_table.c.controller_pid,
+                    services_table.c.controller_ip).where(
+                        services_table.c.name ==
+                        service_name).with_for_update()).fetchone()
+            if (owner is None or owner[0] != expected_service_hash or
+                (expected_lifecycle_epoch is not None and
+                 owner[1] != expected_lifecycle_epoch) or
+                (expected_controller_owner is not None and
+                 (owner[2], owner[3]) != expected_controller_owner)):
+                session.rollback()
+                return False
         if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
             insert_func = sqlite.insert
         elif (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value
@@ -1449,16 +1762,40 @@ def get_yaml_content(service_name: str, version: int) -> Optional[str]:
     return result[0] if result else None
 
 
-def delete_version(service_name: str, version: int) -> None:
-    """Deletes a version from the database."""
+def delete_version(
+    service_name: str,
+    version: int,
+    expected_service_hash: Optional[str] = None,
+    expected_controller_owner: Optional[Tuple[Optional[int],
+                                              Optional[str]]] = None
+) -> bool:
+    """Delete a version, optionally fenced to one service incarnation."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
-        session.execute(
+        _begin_immediate_if_sqlite(
+            session, engine, expected_service_hash is not None or
+            expected_controller_owner is not None)
+        if expected_service_hash is not None:
+            owner = session.execute(
+                sqlalchemy.select(
+                    services_table.c.hash, services_table.c.controller_pid,
+                    services_table.c.controller_ip).where(
+                        services_table.c.name ==
+                        service_name).with_for_update()).fetchone()
+            if (owner is None or owner[0] != expected_service_hash or
+                (expected_controller_owner is not None and
+                 (owner[1], owner[2]) != expected_controller_owner)):
+                session.rollback()
+                return False
+        result = session.execute(
             sqlalchemy.delete(version_specs_table).where(
                 sqlalchemy.and_(
                     version_specs_table.c.service_name == service_name,
                     version_specs_table.c.version == version)))
         session.commit()
+    # Exact owner validation above distinguishes staleness. Missing metadata
+    # is idempotent success so storage cleanup/retry can continue.
+    return expected_service_hash is not None or result.rowcount > 0
 
 
 def delete_all_versions(service_name: str) -> None:
@@ -1516,10 +1853,19 @@ def get_ha_recovery_script(service_name: str) -> Optional[str]:
     return result[0] if result else None
 
 
-def set_ha_recovery_script(service_name: str, script: str) -> None:
-    """Sets the HA recovery script for a service."""
+def set_ha_recovery_script(
+        service_name: str,
+        script: str,
+        expected_lifecycle_epoch: Optional[int] = None) -> bool:
+    """Set the recovery script only for the current lifecycle epoch."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
+        _begin_immediate_if_sqlite(session, engine, expected_lifecycle_epoch
+                                   is not None)
+        if not _lifecycle_epoch_matches_in_session(session, service_name,
+                                                   expected_lifecycle_epoch):
+            session.rollback()
+            return False
         if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
             insert_func = sqlite.insert
         elif (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value
@@ -1537,6 +1883,7 @@ def set_ha_recovery_script(service_name: str, script: str) -> None:
 
         session.execute(insert_stmt)
         session.commit()
+    return True
 
 
 def remove_ha_recovery_script(service_name: str) -> None:
@@ -1584,11 +1931,21 @@ def _upsert_insert_func(engine: sqlalchemy.engine.Engine):
     raise ValueError('Unsupported database dialect')
 
 
-def upsert_reserved_fill_claim(service_name: str, *, pool_key: str,
-                               weight: float, floor_replicas: int,
-                               gpus_per_replica: int, holdings_fill: int,
-                               effective_cap: Optional[int], launchable: bool,
-                               heartbeat_ts: float) -> None:
+def upsert_reserved_fill_claim(
+    service_name: str,
+    *,
+    pool_key: str,
+    weight: float,
+    floor_replicas: int,
+    gpus_per_replica: int,
+    holdings_fill: int,
+    effective_cap: Optional[int],
+    launchable: bool,
+    heartbeat_ts: float,
+    expected_service_hash: Optional[str] = None,
+    expected_controller_owner: Optional[Tuple[Optional[int],
+                                              Optional[str]]] = None
+) -> bool:
     """Upserts a service's reserved-fill claim (the per-poll heartbeat)."""
     engine = _db_manager.get_engine()
     values = {
@@ -1603,6 +1960,20 @@ def upsert_reserved_fill_claim(service_name: str, *, pool_key: str,
         'heartbeat_ts': heartbeat_ts,
     }
     with orm.Session(engine) as session:
+        if expected_service_hash is not None:
+            if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
+                session.execute(sqlalchemy.text('BEGIN IMMEDIATE'))
+            owner = session.execute(
+                sqlalchemy.select(
+                    services_table.c.hash, services_table.c.controller_pid,
+                    services_table.c.controller_ip).where(
+                        services_table.c.name ==
+                        service_name).with_for_update()).fetchone()
+            if (owner is None or owner[0] != expected_service_hash or
+                (expected_controller_owner is not None and
+                 (owner[1], owner[2]) != expected_controller_owner)):
+                session.rollback()
+                return False
         insert_stmt = _upsert_insert_func(engine)(
             reserved_fill_claims_table).values(**values)
         insert_stmt = insert_stmt.on_conflict_do_update(
@@ -1614,15 +1985,36 @@ def upsert_reserved_fill_claim(service_name: str, *, pool_key: str,
             })
         session.execute(insert_stmt)
         session.commit()
+    return True
 
 
-def remove_reserved_fill_claim(service_name: str) -> None:
+def remove_reserved_fill_claim(
+    service_name: str,
+    expected_service_hash: Optional[str] = None,
+    expected_controller_owner: Optional[Tuple[Optional[int],
+                                              Optional[str]]] = None
+) -> bool:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
-        session.execute(
+        if expected_service_hash is not None:
+            if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
+                session.execute(sqlalchemy.text('BEGIN IMMEDIATE'))
+            owner = session.execute(
+                sqlalchemy.select(
+                    services_table.c.hash, services_table.c.controller_pid,
+                    services_table.c.controller_ip).where(
+                        services_table.c.name ==
+                        service_name).with_for_update()).fetchone()
+            if (owner is None or owner[0] != expected_service_hash or
+                (expected_controller_owner is not None and
+                 (owner[1], owner[2]) != expected_controller_owner)):
+                session.rollback()
+                return False
+        result = session.execute(
             sqlalchemy.delete(reserved_fill_claims_table).where(
                 reserved_fill_claims_table.c.service_name == service_name))
         session.commit()
+    return result.rowcount > 0
 
 
 def remove_reserved_fill_claims_for_pool(pool_key: str) -> None:
@@ -1860,9 +2252,17 @@ def _is_sqlite_busy_error(error: sqlalchemy_exc.OperationalError) -> bool:
     return 'locked' in message or 'busy' in message
 
 
-def add_replica_if_round_epoch(service_name: str, replica_id: int,
-                               replica_info: 'replica_managers.ReplicaInfo', *,
-                               pool_key: str, expected_epoch: int) -> bool:
+def add_replica_if_round_epoch(
+    service_name: str,
+    replica_id: int,
+    replica_info: 'replica_managers.ReplicaInfo',
+    *,
+    pool_key: str,
+    expected_epoch: int,
+    expected_service_hash: Optional[str] = None,
+    expected_controller_owner: Optional[Tuple[Optional[int],
+                                              Optional[str]]] = None
+) -> bool:
     """Persists a fill replica row iff the launch's allocation is current.
 
     Three predicates, all evaluated atomically with the row upsert:
@@ -1922,6 +2322,18 @@ def add_replica_if_round_epoch(service_name: str, replica_id: int,
     pickled_info = pickle.dumps(replica_info)
     if engine.dialect.name != db_utils.SQLAlchemyDialect.SQLITE.value:
         with orm.Session(engine) as session:
+            if expected_service_hash is not None:
+                owner = session.execute(
+                    sqlalchemy.select(services_table.c.hash,
+                                      services_table.c.controller_pid,
+                                      services_table.c.controller_ip).where(
+                                          services_table.c.name == service_name
+                                      ).with_for_update(read=True)).fetchone()
+                if (owner is None or owner[0] != expected_service_hash or
+                    (expected_controller_owner is not None and
+                     (owner[1], owner[2]) != expected_controller_owner)):
+                    session.rollback()
+                    return False
             row = session.execute(
                 sqlalchemy.select(
                     reserved_fill_rounds_table.c.epoch,
@@ -1962,11 +2374,25 @@ def add_replica_if_round_epoch(service_name: str, replica_id: int,
         reserved_fill_claims_table.c.service_name).where(
             reserved_fill_claims_table.c.service_name == service_name,
             reserved_fill_claims_table.c.pool_key == pool_key).exists()
+    current_incarnation = sqlalchemy.true()
+    if expected_service_hash is not None:
+        owner_predicates = [
+            services_table.c.name == service_name,
+            services_table.c.hash == expected_service_hash,
+        ]
+        if expected_controller_owner is not None:
+            expected_pid, expected_ip = expected_controller_owner
+            owner_predicates.extend([
+                services_table.c.controller_pid == expected_pid,
+                services_table.c.controller_ip == expected_ip,
+            ])
+        current_incarnation = sqlalchemy.select(
+            services_table.c.name).where(*owner_predicates).exists()
     select_stmt = sqlalchemy.select(
         sqlalchemy.literal(service_name),
         sqlalchemy.literal(replica_id),
         sqlalchemy.literal(pickled_info, sqlalchemy.LargeBinary()),
-    ).where(sqlalchemy.not_(stale_round), live_claim)
+    ).where(sqlalchemy.not_(stale_round), live_claim, current_incarnation)
     insert_stmt = sqlite.insert(replicas_table).from_select(
         ['service_name', 'replica_id', 'replica_info'], select_stmt)
     insert_stmt = insert_stmt.on_conflict_do_update(

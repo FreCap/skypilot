@@ -38,7 +38,7 @@ SPOT_JOBS_VERSION = '023'  # add Batch coordinator ownership fence
 SPOT_JOBS_LOCK_PATH = f'~/.sky/locks/.{SPOT_JOBS_DB_NAME}.lock'
 
 SERVE_DB_NAME = 'serve_db'
-SERVE_VERSION = '007'  # reserved-fill rounds fence_pending column
+SERVE_VERSION = '008'  # durable Serve lifecycle fencing/resource scopes
 SERVE_LOCK_PATH = f'~/.sky/locks/.{SERVE_DB_NAME}.lock'
 
 SKYPILOT_CONFIG_DB_NAME = 'sky_config_db'

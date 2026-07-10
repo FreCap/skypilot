@@ -257,6 +257,16 @@ def test_name_helpers_are_unique_rfc1123():
         _RFC1123.fullmatch(name) and len(name) <= 63 for name in rendered)
 
 
+def test_lb_names_are_incarnation_scoped():
+    legacy = lb_k8s.lb_base_name('svc')
+    incarnation_a = lb_k8s.lb_base_name('svc', 'hash-a')
+    incarnation_b = lb_k8s.lb_base_name('svc', 'hash-b')
+    assert len({legacy, incarnation_a, incarnation_b}) == 3
+    assert all(
+        _RFC1123.fullmatch(name) and len(name) <= 63
+        for name in (incarnation_a, incarnation_b))
+
+
 def test_external_runtime_fails_closed(monkeypatch):
     _install(monkeypatch, external=False)
     with pytest.raises(RuntimeError, match='external load balancer'):
@@ -1027,6 +1037,20 @@ def test_delete_is_idempotent(monkeypatch):
     core.delete_namespaced_service.assert_not_called()
 
 
+def test_required_delete_fails_without_incluster_identity(monkeypatch):
+    monkeypatch.setattr(lb_k8s.kubernetes_utils,
+                        'is_incluster_config_available', lambda: False)
+    with pytest.raises(RuntimeError, match='in-cluster Kubernetes'):
+        lb_k8s.delete_lb_objects('svc', 'incarnation-a', require_runtime=True)
+
+
+def test_required_delete_fails_without_namespace(monkeypatch):
+    _install(monkeypatch)
+    monkeypatch.setattr(lb_k8s, '_cleanup_lb_namespace', lambda: None)
+    with pytest.raises(RuntimeError, match='namespace'):
+        lb_k8s.delete_lb_objects('svc', 'incarnation-a', require_runtime=True)
+
+
 def test_delete_is_hash_uid_and_resource_version_fenced(monkeypatch):
     apps = mock.MagicMock()
     core = mock.MagicMock()
@@ -1052,6 +1076,21 @@ def test_delete_is_hash_uid_and_resource_version_fenced(monkeypatch):
         'uid': 'deployment-a',
         'resourceVersion': '11'
     }
+    assert deployment_body['propagationPolicy'] == 'Foreground'
+
+
+def test_foreground_delete_timeout_covers_long_pod_drain_grace():
+    deployment = {
+        'spec': {
+            'template': {
+                'spec': {
+                    'terminationGracePeriodSeconds': 300,
+                },
+            },
+        },
+    }
+    assert lb_k8s._lb_object_deletion_timeout_seconds(  # pylint: disable=protected-access
+        deployment, 'Deployment') >= 330
 
 
 def test_stale_a_delete_refuses_successor_b_objects(monkeypatch):
@@ -1279,6 +1318,8 @@ def test_reconcile_reaps_only_db_confirmed_orphans(monkeypatch):
              apps_api=apps,
              core_api=core,
              db_service_names=('live',))
+    monkeypatch.setattr(lb_k8s.serve_state, 'get_service_hash',
+                        lambda name: 'live-hash' if name == 'live' else None)
     with mock.patch.object(lb_k8s, 'delete_lb_objects') as delete:
         lb_k8s.reconcile_lb_objects(set())
     delete.assert_called_once_with('gone', 'gone-hash')
@@ -1304,3 +1345,27 @@ def test_reconcile_reaps_service_only_orphan(monkeypatch):
     assert core.list_namespaced_service.call_args.args[0] == 'skypilot'
     assert core.list_namespaced_service.call_args.kwargs[
         'label_selector'] == lb_k8s.LB_SELECTOR_LABEL
+
+
+def test_reconcile_reaps_scoped_predecessor_beside_live_successor(monkeypatch):
+    apps = mock.MagicMock()
+    core = mock.MagicMock()
+    apps.list_namespaced_deployment.return_value = SimpleNamespace(items=[
+        SimpleNamespace(metadata=SimpleNamespace(
+            name=lb_k8s.lb_deployment_name('svc', 'incarnation-a'),
+            labels={
+                lb_k8s.SERVE_LB_LABEL_KEY: 'svc',
+                lb_k8s.SERVICE_HASH_LABEL_KEY: 'incarnation-a',
+            }))
+    ])
+    core.list_namespaced_service.return_value = SimpleNamespace(items=[])
+    _install(monkeypatch, apps_api=apps, core_api=core)
+    monkeypatch.setattr(lb_k8s.serve_state, 'get_service_hash',
+                        lambda name: 'incarnation-b')
+
+    with mock.patch.object(lb_k8s, 'delete_lb_objects') as delete:
+        lb_k8s.reconcile_lb_objects({'svc'})
+
+    delete.assert_called_once_with('svc',
+                                   'incarnation-a',
+                                   resource_scope='incarnation-a')

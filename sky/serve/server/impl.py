@@ -64,9 +64,17 @@ def _service_test_request_command(endpoint: str) -> str:
     return f'curl -H {header} {endpoint}'
 
 
-def _external_service_endpoint_url(service_name: str) -> Optional[str]:
+def _external_service_endpoint_url(
+        service_name: str,
+        resource_scope: Optional[str] = None) -> Optional[str]:
     """Return the HTTP-only in-cluster LB endpoint, or None if unavailable."""
-    socket_endpoint = lb_k8s.lb_service_endpoint_or_none(service_name)
+    if resource_scope is None:
+        # Preserve the legacy call shape for NULL-scope rows and embedders
+        # whose endpoint hook predates incarnation-scoped LB names.
+        socket_endpoint = lb_k8s.lb_service_endpoint_or_none(service_name)
+    else:
+        socket_endpoint = lb_k8s.lb_service_endpoint_or_none(
+            service_name, resource_scope)
     if socket_endpoint is None:
         return None
     # TLS terminates at the platform ingress. The per-service LB Deployment
@@ -306,6 +314,15 @@ def _up_impl(task: 'task_lib.Task', service_name: str, pool: bool,
         noun = 'pool' if pool else 'service'
         raise RuntimeError(f'{noun.capitalize()} {service_name!r} already '
                            'exists; choose a new name or update it.')
+    # Allocate the incarnation before creating *any* file or external child.
+    # The same value becomes the durable DB hash and every child-resource
+    # namespace, so work already in flight after lock loss remains confined to
+    # this incarnation and cannot collide with a same-name successor.
+    service_incarnation = str(uuid.uuid4())
+    resource_scope = service_incarnation
+    lifecycle_epoch = serve_utils.get_service_lifecycle_epoch(lifecycle_lock)
+    controller_lifecycle_epoch = (
+        lifecycle_epoch if serve_utils.is_consolidation_mode(pool) else None)
     task.validate()
     serve_utils.validate_service_task(task, pool=pool)
     assert task.service is not None
@@ -365,11 +382,14 @@ def _up_impl(task: 'task_lib.Task', service_name: str, pool: bool,
         task_config = task.to_yaml_config()
         yaml_utils.dump_yaml(service_file.name, task_config)
         remote_tmp_task_yaml_path = (
-            serve_utils.generate_remote_tmp_task_yaml_file_name(service_name))
+            serve_utils.generate_remote_tmp_task_yaml_file_name(
+                service_name, resource_scope))
         remote_config_yaml_path = (
-            serve_utils.generate_remote_config_yaml_file_name(service_name))
+            serve_utils.generate_remote_config_yaml_file_name(
+                service_name, resource_scope))
         controller_log_file = (
-            serve_utils.generate_remote_controller_log_file_name(service_name))
+            serve_utils.generate_remote_controller_log_file_name(
+                service_name, resource_scope))
         controller_resources = controller_utils.get_controller_resources(
             controller=controller, task_resources=task.resources)
         controller_job_id = None
@@ -385,6 +405,8 @@ def _up_impl(task: 'task_lib.Task', service_name: str, pool: bool,
             'remote_task_yaml_path': remote_tmp_task_yaml_path,
             'local_task_yaml_path': service_file.name,
             'service_name': service_name,
+            'service_incarnation': service_incarnation,
+            'lifecycle_epoch': controller_lifecycle_epoch,
             'controller_log_file': controller_log_file,
             'remote_user_config_path': remote_config_yaml_path,
             'local_to_controller_file_mounts': local_to_controller_file_mounts,
@@ -485,7 +507,13 @@ def _up_impl(task: 'task_lib.Task', service_name: str, pool: bool,
             run_script = '\n'.join(env_cmds + restore_cmds + [run_script])
             # Dump script for high availability recovery.
             _assert_lifecycle_lock('publishing the recovery script')
-            serve_state.set_ha_recovery_script(service_name, run_script)
+            if not serve_state.set_ha_recovery_script(
+                    service_name,
+                    run_script,
+                    expected_lifecycle_epoch=lifecycle_epoch):
+                raise RuntimeError(
+                    f'Lost lifecycle ownership while publishing recovery '
+                    f'script for {service_name!r}.')
             self_pod_ip_dbg = os.environ.get('POD_IP', '<unset>')
             logger.debug(f'Serve up() run_on_head: spawning controller '
                          f'subprocess locally on {self_pod_ip_dbg}')
@@ -580,7 +608,8 @@ def _up_impl(task: 'task_lib.Task', service_name: str, pool: bool,
                 # but does not
                 # participate in endpoint construction: every external LB
                 # Service exposes the fixed Kubernetes Service port.
-                external_endpoint = _external_service_endpoint_url(service_name)
+                external_endpoint = _external_service_endpoint_url(
+                    service_name, resource_scope)
                 if external_endpoint is None:
                     raise RuntimeError(
                         'The external load balancer endpoint is unavailable '
@@ -808,43 +837,59 @@ def _update_impl(
 
     use_legacy = not handle.is_grpc_enabled_with_flag
 
-    if not use_legacy:
+    if serve_utils.is_consolidation_mode(pool):
+        # The API pod shares the durable Serve DB with the local controller.
+        # Allocate the placeholder directly under the lifecycle epoch instead
+        # of sending a name-only skylet RPC that could complete after lock
+        # loss and add a version to a same-name successor.
         _assert_service_update_fence(service_name, pool, handle, backend,
                                      expected_service_hash, lifecycle_lock,
                                      'adding a version')
-        try:
-            current_version = serve_rpc_utils.RpcRunner.add_version(
-                handle, service_name)
-        except exceptions.SkyletMethodNotImplementedError:
-            use_legacy = True
+        current_version = serve_state.add_version(
+            service_name,
+            expected_service_hash=expected_service_hash,
+            expected_lifecycle_epoch=serve_utils.get_service_lifecycle_epoch(
+                lifecycle_lock))
+    else:
+        if not use_legacy:
+            _assert_service_update_fence(service_name, pool, handle, backend,
+                                         expected_service_hash, lifecycle_lock,
+                                         'adding a version')
+            try:
+                current_version = serve_rpc_utils.RpcRunner.add_version(
+                    handle, service_name)
+            except exceptions.SkyletMethodNotImplementedError:
+                use_legacy = True
 
-    if use_legacy:
-        _assert_service_update_fence(service_name, pool, handle, backend,
-                                     expected_service_hash, lifecycle_lock,
-                                     'adding a version')
-        code = serve_utils.ServeCodeGen.add_version(service_name)
-        returncode, version_string_payload, stderr = backend.run_on_head(
-            handle,
-            code,
-            require_outputs=True,
-            stream_logs=False,
-            separate_stderr=True)
-        try:
-            subprocess_utils.handle_returncode(returncode,
-                                               code,
-                                               'Failed to add version',
-                                               stderr,
-                                               stream_logs=True)
-        except exceptions.CommandError as e:
-            raise RuntimeError(e.error_msg) from e
+        if use_legacy:
+            _assert_service_update_fence(service_name, pool, handle, backend,
+                                         expected_service_hash, lifecycle_lock,
+                                         'adding a version')
+            code = serve_utils.ServeCodeGen.add_version(service_name)
+            returncode, version_string_payload, stderr = backend.run_on_head(
+                handle,
+                code,
+                require_outputs=True,
+                stream_logs=False,
+                separate_stderr=True)
+            try:
+                subprocess_utils.handle_returncode(returncode,
+                                                   code,
+                                                   'Failed to add version',
+                                                   stderr,
+                                                   stream_logs=True)
+            except exceptions.CommandError as e:
+                raise RuntimeError(e.error_msg) from e
 
-        version_string = serve_utils.load_version_string(version_string_payload)
-        try:
-            current_version = int(version_string)
-        except ValueError as e:
-            with ux_utils.print_exception_no_traceback():
-                raise ValueError(f'Failed to parse version: {version_string}; '
-                                 f'Returncode: {returncode}') from e
+            version_string = serve_utils.load_version_string(
+                version_string_payload)
+            try:
+                current_version = int(version_string)
+            except ValueError as e:
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        f'Failed to parse version: {version_string}; '
+                        f'Returncode: {returncode}') from e
 
     with tempfile.NamedTemporaryFile(
             prefix=f'{service_name}-v{current_version}',
@@ -852,7 +897,10 @@ def _update_impl(
         task_config = task.to_yaml_config()
         yaml_utils.dump_yaml(service_file.name, task_config)
         remote_task_yaml_path = serve_utils.generate_task_yaml_file_name(
-            service_name, current_version, expand_user=False)
+            service_name,
+            current_version,
+            expand_user=False,
+            resource_scope=service_record.get('resource_scope'))
 
         with sky_logging.silent():
             _assert_service_update_fence(service_name, pool, handle, backend,
@@ -862,39 +910,60 @@ def _update_impl(
                                      {remote_task_yaml_path: service_file.name},
                                      storage_mounts=None)
 
-        use_legacy = not handle.is_grpc_enabled_with_flag
-
-        if not use_legacy:
+        if serve_utils.is_consolidation_mode(pool):
+            # Route directly through the shared Serve DB/controller proxy so
+            # the accepted request carries the exact lifecycle epoch. A
+            # name-only skylet RPC could resume after this lock session died
+            # and roll the same incarnation back behind a newer update.
             _assert_service_update_fence(service_name, pool, handle, backend,
                                          expected_service_hash, lifecycle_lock,
                                          'submitting the update')
-            try:
-                serve_rpc_utils.RpcRunner.update_service(
-                    handle, service_name, current_version, mode, pool)
-            except exceptions.SkyletMethodNotImplementedError:
-                use_legacy = True
+            serve_utils.update_service_encoded(
+                service_name,
+                current_version,
+                mode=mode.value,
+                pool=pool,
+                expected_service_hash=expected_service_hash,
+                expected_lifecycle_epoch=(
+                    serve_utils.get_service_lifecycle_epoch(lifecycle_lock)))
+        else:
+            use_legacy = not handle.is_grpc_enabled_with_flag
 
-        if use_legacy:
-            _assert_service_update_fence(service_name, pool, handle, backend,
-                                         expected_service_hash, lifecycle_lock,
-                                         'submitting the update')
-            code = serve_utils.ServeCodeGen.update_service(service_name,
-                                                           current_version,
-                                                           mode=mode.value,
-                                                           pool=pool)
-            returncode, _, stderr = backend.run_on_head(handle,
-                                                        code,
-                                                        require_outputs=True,
-                                                        stream_logs=False,
-                                                        separate_stderr=True)
-            try:
-                subprocess_utils.handle_returncode(returncode,
-                                                   code,
-                                                   f'Failed to update {noun}s',
-                                                   stderr,
-                                                   stream_logs=True)
-            except exceptions.CommandError as e:
-                raise RuntimeError(e.error_msg) from e
+            if not use_legacy:
+                _assert_service_update_fence(service_name, pool, handle,
+                                             backend, expected_service_hash,
+                                             lifecycle_lock,
+                                             'submitting the update')
+                try:
+                    serve_rpc_utils.RpcRunner.update_service(
+                        handle, service_name, current_version, mode, pool)
+                except exceptions.SkyletMethodNotImplementedError:
+                    use_legacy = True
+
+            if use_legacy:
+                _assert_service_update_fence(service_name, pool, handle,
+                                             backend, expected_service_hash,
+                                             lifecycle_lock,
+                                             'submitting the update')
+                code = serve_utils.ServeCodeGen.update_service(service_name,
+                                                               current_version,
+                                                               mode=mode.value,
+                                                               pool=pool)
+                returncode, _, stderr = backend.run_on_head(
+                    handle,
+                    code,
+                    require_outputs=True,
+                    stream_logs=False,
+                    separate_stderr=True)
+                try:
+                    subprocess_utils.handle_returncode(
+                        returncode,
+                        code,
+                        f'Failed to update {noun}s',
+                        stderr,
+                        stream_logs=True)
+                except exceptions.CommandError as e:
+                    raise RuntimeError(e.error_msg) from e
 
     cmd = 'sky jobs pool status' if pool else 'sky serve status'
     logger.info(
@@ -1164,7 +1233,7 @@ def status(
             # external per-service Kubernetes Service is the only supported
             # endpoint, and an unavailable external runtime stays unavailable.
             service_record['endpoint'] = _external_service_endpoint_url(
-                service_record['name'])
+                service_record['name'], service_record.get('resource_scope'))
 
     return service_records
 

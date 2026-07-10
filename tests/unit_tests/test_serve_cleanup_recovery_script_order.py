@@ -24,6 +24,7 @@ import pytest
 from sky import exceptions
 from sky.serve import replica_managers
 from sky.serve import serve_state
+from sky.serve import serve_utils
 from sky.serve import service
 from sky.utils import controller_utils
 
@@ -48,9 +49,9 @@ def _patch_common(monkeypatch, events, replicas):
                         lambda lock: True)
     monkeypatch.setattr(serve_state, 'get_replica_infos',
                         lambda svc: list(replicas))
-    monkeypatch.setattr(service.global_user_state,
-                        'get_cluster_names_start_with',
-                        lambda prefix: [r.cluster_name for r in replicas])
+    cluster_names = {replica.cluster_name for replica in replicas}
+    monkeypatch.setattr(service.global_user_state, 'cluster_with_name_exists',
+                        lambda name: name in cluster_names)
     monkeypatch.setattr(serve_state, 'add_or_update_replica',
                         lambda *a, **k: None)
     monkeypatch.setattr(serve_state, 'remove_replica', lambda *a, **k: None)
@@ -80,6 +81,34 @@ def test_cleanup_preserves_recovery_script_through_replica_teardown(
 
     assert failed is False
     assert events == ['teardown:c1']
+
+
+def test_cleanup_uses_exact_scoped_cluster_identity_for_long_name(monkeypatch):
+    """Truncating a scoped cluster prefix must not make cleanup miss it."""
+    events = []
+    service_name = 's' * 63
+    info = _replica(1)
+    info.cluster_name = serve_utils.generate_replica_cluster_name(
+        service_name, 1, 'incarnation-a')
+    assert not info.cluster_name.startswith(service_name)
+
+    def _terminate(cluster_name, unused_log_file_name, continue_guard=None):
+        assert continue_guard is not None and continue_guard()
+        events.append(f'teardown:{cluster_name}')
+
+    monkeypatch.setattr(replica_managers, 'terminate_cluster', _terminate)
+    _patch_common(monkeypatch, events, [info])
+
+    failed = service._cleanup(service_name,
+                              False,
+                              'incarnation-a',
+                              123,
+                              None,
+                              mock.Mock(),
+                              resource_scope='incarnation-a')
+
+    assert failed is False
+    assert events == [f'teardown:{info.cluster_name}']
 
 
 # --- recovery must resume teardown, not resurrect a torn-down service ---
@@ -244,6 +273,26 @@ def test_handle_signal_retries_status_cas_db_error_without_cleanup(
         service._handle_signal('svc', 'incarnation-a', 123, None)
     assert not sig.exists()
     assert persist.call_count == 2
+
+
+def test_scoped_successor_discards_legacy_name_only_terminate(
+        monkeypatch, tmp_path):
+    sig = tmp_path / 'svc.signal'
+    sig.write_text('terminate')
+    monkeypatch.setattr(service.constants, 'SIGNAL_FILE_PATH',
+                        str(tmp_path / '{}.signal'))
+    set_status = mock.Mock()
+    monkeypatch.setattr(serve_state,
+                        'set_service_status_and_active_versions_if_owner',
+                        set_status)
+
+    assert service._handle_signal('svc',
+                                  'incarnation-b',
+                                  123,
+                                  None,
+                                  resource_scope='incarnation-b')
+    assert not sig.exists()
+    set_status.assert_not_called()
 
 
 @pytest.mark.parametrize('malformed', ['not-a-signal', '{'])

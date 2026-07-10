@@ -16,7 +16,6 @@ import threading
 import time
 import traceback
 from typing import Any, Dict, NoReturn, Optional, Tuple, TYPE_CHECKING
-import uuid
 
 import filelock
 
@@ -54,8 +53,11 @@ class ServiceOwnershipLostError(RuntimeError):
     """Raised when teardown no longer owns the exact service incarnation."""
 
 
-def _handle_signal(service_name: str, service_hash: str, controller_pid: int,
-                   controller_ip: Optional[str]) -> bool:
+def _handle_signal(service_name: str,
+                   service_hash: str,
+                   controller_pid: int,
+                   controller_ip: Optional[str],
+                   resource_scope: Optional[str] = None) -> bool:
     """Handles the signal user sent to controller."""
     signal_file = pathlib.Path(
         constants.SIGNAL_FILE_PATH.format(service_name)).expanduser()
@@ -71,9 +73,15 @@ def _handle_signal(service_name: str, service_hash: str, controller_pid: int,
                     signal_payload = json.loads(user_signal_text)
                 except (json.JSONDecodeError, TypeError):
                     # Backward compatibility for a signal written by an older
-                    # API process. The supervision tick fenced exact ownership
-                    # before calling this helper, so only the current
-                    # controller can consume this name-only payload.
+                    # API process is safe only while the row itself is legacy.
+                    # A leftover name-only TERMINATE from predecessor A must
+                    # never tear down scoped same-name successor B.
+                    if resource_scope is not None:
+                        logger.warning(
+                            f'Discarding legacy name-only signal for scoped '
+                            f'service {service_name!r}/{service_hash!r}.')
+                        signal_file.unlink()
+                        return True
                     signal_value = user_signal_text
                 else:
                     if not isinstance(signal_payload, dict):
@@ -208,11 +216,16 @@ def cleanup_storage(yaml_content: str) -> bool:
 # NOTE(dev): We don't need to acquire the `with_lock` in replica manager here
 # because we killed all the processes (controller & replica manager) before
 # calling this function.
-def _cleanup(service_name: str, pool: bool, service_hash: str,
-             controller_pid: int, controller_ip: Optional[str],
-             lifecycle_lock: Any) -> bool:
+def _cleanup(service_name: str,
+             pool: bool,
+             service_hash: str,
+             controller_pid: int,
+             controller_ip: Optional[str],
+             lifecycle_lock: Any,
+             resource_scope: Optional[str] = None) -> bool:
     """Clean up all service related resources, i.e. replicas and storage."""
     expected_owner = (controller_pid, controller_ip)
+    lifecycle_epoch = serve_utils.get_service_lifecycle_epoch(lifecycle_lock)
     ownership_probe_lock = threading.Lock()
 
     def _still_owns() -> bool:
@@ -230,6 +243,28 @@ def _cleanup(service_name: str, pool: bool, service_hash: str,
             raise ServiceOwnershipLostError(
                 f'Lost ownership of {service_name!r}/{service_hash!r} '
                 f'{phase}; aborting destructive cleanup.')
+
+    def _persist_replica(info: replica_managers.ReplicaInfo) -> None:
+        persisted = serve_state.add_or_update_replica(
+            service_name,
+            info.replica_id,
+            info,
+            expected_service_hash=service_hash,
+            expected_lifecycle_epoch=lifecycle_epoch)
+        if persisted is False:
+            raise ServiceOwnershipLostError(
+                f'Lost lifecycle epoch while updating replica '
+                f'{info.replica_id}.')
+
+    def _remove_replica(replica_id: int) -> None:
+        removed = serve_state.remove_replica(
+            service_name,
+            replica_id,
+            expected_service_hash=service_hash,
+            expected_lifecycle_epoch=lifecycle_epoch)
+        if removed is False:
+            raise ServiceOwnershipLostError(
+                f'Lost lifecycle epoch while removing replica {replica_id}.')
 
     _assert_owner('before replica cleanup')
     # Log who we are and what DB state we're cleaning up, so post-mortems
@@ -262,18 +297,18 @@ def _cleanup(service_name: str, pool: bool, service_hash: str,
     replica_infos = serve_state.get_replica_infos(service_name)
     info2thr: Dict[replica_managers.ReplicaInfo,
                    thread_utils.SafeThread] = dict()
-    # NOTE(dev): This relies on `sky/serve/serve_utils.py::
-    # generate_replica_cluster_name`. Change it if you change the function.
-    existing_cluster_names = global_user_state.get_cluster_names_start_with(
-        service_name)
     for info in replica_infos:
         _assert_owner(f'before scheduling replica {info.replica_id} cleanup')
-        if info.cluster_name not in existing_cluster_names:
+        # Use the durable exact cluster identity from the replica row. New
+        # incarnation-scoped names truncate long service prefixes to stay
+        # within the 63-character cloud/Kubernetes ceiling, so a prefix query
+        # with the full service name can miss a live, billable cluster.
+        if not global_user_state.cluster_with_name_exists(info.cluster_name):
             logger.info(f'Cluster {info.cluster_name} for replica '
                         f'{info.replica_id} not found. Might be a failed '
                         'cluster. Removing replica from database.')
             try:
-                serve_state.remove_replica(service_name, info.replica_id)
+                _remove_replica(info.replica_id)
             except Exception as e:  # pylint: disable=broad-except
                 logger.warning(f'Failed to remove replica {info.replica_id} '
                                f'from database: {e}')
@@ -281,7 +316,7 @@ def _cleanup(service_name: str, pool: bool, service_hash: str,
             continue
 
         log_file_name = serve_utils.generate_replica_log_file_name(
-            service_name, info.replica_id)
+            service_name, info.replica_id, resource_scope)
         t = thread_utils.SafeThread(target=replica_managers.terminate_cluster,
                                     args=(info.cluster_name, log_file_name),
                                     kwargs={'continue_guard': _still_owns})
@@ -291,7 +326,7 @@ def _cleanup(service_name: str, pool: bool, service_hash: str,
             replica_managers.common_utils.ProcessStatus.SUCCEEDED)
         info.status_property.sky_down_status = (
             replica_managers.common_utils.ProcessStatus.SCHEDULED)
-        serve_state.add_or_update_replica(service_name, info.replica_id, info)
+        _persist_replica(info)
         logger.info(f'Scheduling to terminate replica {info.replica_id} ...')
 
     def _set_to_failed_cleanup(info: replica_managers.ReplicaInfo) -> None:
@@ -299,7 +334,7 @@ def _cleanup(service_name: str, pool: bool, service_hash: str,
         # Set replica status to `FAILED_CLEANUP`
         info.status_property.sky_down_status = (
             replica_managers.common_utils.ProcessStatus.FAILED)
-        serve_state.add_or_update_replica(service_name, info.replica_id, info)
+        _persist_replica(info)
         failed = True
         logger.error(f'Replica {info.replica_id} failed to terminate.')
 
@@ -324,15 +359,14 @@ def _cleanup(service_name: str, pool: bool, service_hash: str,
                     else:
                         info.status_property.sky_down_status = (
                             common_utils.ProcessStatus.RUNNING)
-                        serve_state.add_or_update_replica(
-                            service_name, info.replica_id, info)
+                        _persist_replica(info)
             else:
                 logger.info('Terminate thread for replica '
                             f'{info.replica_id} finished.')
                 t.join()
                 del info2thr[info]
                 if t.format_exc is None:
-                    serve_state.remove_replica(service_name, info.replica_id)
+                    _remove_replica(info.replica_id)
                     logger.info(
                         f'Replica {info.replica_id} terminated successfully.')
                 else:
@@ -505,11 +539,15 @@ def _bail_on_boot_failure(service_name: str,
     os._exit(1)  # pylint: disable=protected-access
 
 
-def _spawn_controller(service_name: str,
-                      service_spec: 'service_spec_lib.SkyServiceSpec',
-                      version: int, controller_host: str, controller_port: int,
-                      service_hash: str,
-                      controller_ip: Optional[str]) -> multiprocessing.Process:
+def _spawn_controller(
+        service_name: str,
+        service_spec: 'service_spec_lib.SkyServiceSpec',
+        version: int,
+        controller_host: str,
+        controller_port: int,
+        service_hash: str,
+        controller_ip: Optional[str],
+        resource_scope: Optional[str] = None) -> multiprocessing.Process:
     """Spawn (and start) the controller server subprocess for a service.
 
     Factored out of `_start` so the supervision loop can re-create the
@@ -517,10 +555,11 @@ def _spawn_controller(service_name: str,
     """
     owner_fingerprint = serve_utils.make_controller_owner_fingerprint(
         service_hash, os.getpid(), controller_ip, controller_port)
-    process = multiprocessing.Process(target=controller.run_controller,
-                                      args=(service_name, service_spec, version,
-                                            controller_host, controller_port,
-                                            owner_fingerprint))
+    process = multiprocessing.Process(
+        target=controller.run_controller,
+        args=(service_name, service_spec, version, controller_host,
+              controller_port, owner_fingerprint, resource_scope, service_hash,
+              os.getpid(), controller_ip))
     process.start()
     return process
 
@@ -659,7 +698,8 @@ def _respawn_controller(
     controller_host: str,
     dead_controller: Optional[multiprocessing.Process],
     service_hash: str,
-    controller_ip: Optional[str] = None
+    controller_ip: Optional[str] = None,
+    resource_scope: Optional[str] = None,
 ) -> Optional[Tuple[multiprocessing.Process, int]]:
     """Re-create a controller child that died while its parent is alive.
 
@@ -708,10 +748,13 @@ def _respawn_controller(
         with filelock.FileLock(
                 os.path.expanduser(constants.PORT_SELECTION_FILE_LOCK_PATH)):
             controller_port = _select_controller_port(service_name)
-            new_controller = _spawn_controller(service_name, service_spec,
-                                               version, controller_host,
-                                               controller_port, service_hash,
-                                               controller_ip)
+            spawn_args = (service_name, service_spec, version, controller_host,
+                          controller_port, service_hash, controller_ip)
+            if resource_scope is None:
+                new_controller = _spawn_controller(*spawn_args)
+            else:
+                new_controller = _spawn_controller(
+                    *spawn_args, resource_scope=resource_scope)
             # `process=` fails this wait fast if the replacement dies at boot,
             # instead of holding the port-selection lock for the full timeout
             # on every retry of a crash-looping controller.
@@ -769,9 +812,12 @@ def _should_resume_teardown(is_recovery: bool,
 
 def _run_cleanup_and_finalize(service_name: str,
                               service_spec: 'service_spec_lib.SkyServiceSpec',
-                              service_dir: str, job_id: int, service_hash: str,
+                              service_dir: str,
+                              job_id: int,
+                              service_hash: str,
                               controller_pid: int,
-                              controller_ip: Optional[str]) -> None:
+                              controller_ip: Optional[str],
+                              resource_scope: Optional[str] = None) -> None:
     """Run ``_cleanup`` and finalize the service's DB / dir state.
 
     Shared by ``_start``'s teardown ``finally`` and the recovery-resume path (a
@@ -794,15 +840,22 @@ def _run_cleanup_and_finalize(service_name: str,
         _run_cleanup_and_finalize_locked(service_name, service_spec,
                                          service_dir, job_id, service_hash,
                                          controller_pid, controller_ip,
-                                         lifecycle_lock)
+                                         lifecycle_lock, resource_scope)
 
 
 def _run_cleanup_and_finalize_locked(
-        service_name: str, service_spec: 'service_spec_lib.SkyServiceSpec',
-        service_dir: str, job_id: int, service_hash: str, controller_pid: int,
-        controller_ip: Optional[str], lifecycle_lock: Any) -> None:
+        service_name: str,
+        service_spec: 'service_spec_lib.SkyServiceSpec',
+        service_dir: str,
+        job_id: int,
+        service_hash: str,
+        controller_pid: int,
+        controller_ip: Optional[str],
+        lifecycle_lock: Any,
+        resource_scope: Optional[str] = None) -> None:
     """Owner-fenced cleanup while holding the service lifecycle lock."""
     expected_owner = (controller_pid, controller_ip)
+    lifecycle_epoch = serve_utils.get_service_lifecycle_epoch(lifecycle_lock)
 
     def _still_owns() -> bool:
         return (serve_utils.lifecycle_lock_is_valid(lifecycle_lock) and
@@ -823,14 +876,22 @@ def _run_cleanup_and_finalize_locked(
             # accept new requests and route them to replicas being destroyed.
             # A deletion failure aborts cleanup fail-closed and is retried via
             # FAILED_CLEANUP rather than exposing a half-torn-down service.
-            lb_k8s.delete_lb_objects(service_name,
-                                     expected_service_hash=service_hash)
+            if resource_scope is None:
+                lb_k8s.delete_lb_objects(service_name,
+                                         expected_service_hash=service_hash,
+                                         require_runtime=True)
+            else:
+                lb_k8s.delete_lb_objects(service_name,
+                                         expected_service_hash=service_hash,
+                                         resource_scope=resource_scope,
+                                         require_runtime=True)
             lb_quiesced = True
         if not _still_owns():
             raise ServiceOwnershipLostError(
                 'Ownership lost after load balancer quiesce.')
         failed = _cleanup(service_name, service_spec.pool, service_hash,
-                          controller_pid, controller_ip, lifecycle_lock)
+                          controller_pid, controller_ip, lifecycle_lock,
+                          resource_scope)
     except ServiceOwnershipLostError as e:
         # Another owner or a lost PG advisory-lock session means this process
         # must stop immediately. Preserve DB state and the recovery script;
@@ -847,8 +908,12 @@ def _run_cleanup_and_finalize_locked(
 
     if failed:
         if not serve_state.set_service_status_and_active_versions_if_owner(
-                service_name, service_hash, controller_pid, controller_ip,
-                serve_state.ServiceStatus.FAILED_CLEANUP):
+                service_name,
+                service_hash,
+                controller_pid,
+                controller_ip,
+                serve_state.ServiceStatus.FAILED_CLEANUP,
+                expected_lifecycle_epoch=lifecycle_epoch):
             logger.warning(f'Lost ownership before publishing '
                            f'FAILED_CLEANUP for {service_name!r}.')
             return
@@ -866,8 +931,13 @@ def _run_cleanup_and_finalize_locked(
         # delete failure does not worsen cleanup.
         if not lb_quiesced:
             try:
-                lb_k8s.delete_lb_objects(service_name,
-                                         expected_service_hash=service_hash)
+                if resource_scope is None:
+                    lb_k8s.delete_lb_objects(service_name,
+                                             expected_service_hash=service_hash)
+                else:
+                    lb_k8s.delete_lb_objects(service_name,
+                                             expected_service_hash=service_hash,
+                                             resource_scope=resource_scope)
             except Exception as e:  # pylint: disable=broad-except
                 logger.error(f'Failed to delete external LB objects for '
                              f'{service_name} during failed cleanup: {e}')
@@ -876,28 +946,32 @@ def _run_cleanup_and_finalize_locked(
             logger.warning(f'Lost ownership before final removal of '
                            f'{service_name!r}.')
             return
-        quarantine_dir = serve_utils.quarantine_service_directory(
-            service_dir, service_hash)
-        if not _still_owns():
-            # Never recreate a name-scoped path after ownership is lost. The
-            # hash-owned quarantine remains retryable without risking a
-            # same-name successor's canonical directory.
-            return
+        # Legacy name-only directories cannot be proven exclusive: valid
+        # names such as `svc-a` and `svc_a` mapped to the same path. Leak that
+        # bounded legacy directory rather than deleting a peer's files.
+        remove_directory = resource_scope is not None
         removed = serve_state.remove_service_completely(
             service_name,
             service_hash,
-            expected_controller_owner=expected_owner)
+            expected_controller_owner=expected_owner,
+            expected_lifecycle_epoch=lifecycle_epoch)
         if not removed:
             logger.warning(f'Lost ownership during final removal of '
                            f'{service_name!r}.')
             return
-        serve_utils.remove_quarantined_service_directory(quarantine_dir)
+        if remove_directory:
+            serve_utils.remove_service_directory(service_dir)
         logger.info(f'Service {service_name} terminated successfully.')
 
     _cleanup_task_run_script(job_id)
 
 
-def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
+def _start(service_name: str,
+           tmp_task_yaml: str,
+           job_id: int,
+           entrypoint: str,
+           requested_incarnation: Optional[str] = None,
+           lifecycle_epoch: Optional[int] = None):
     """Start the service controller and reconcile its external LB."""
     # Generate ssh key pair to avoid race condition when multiple sky.launch
     # are executed at the same time.
@@ -906,6 +980,14 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
     service = serve_state.get_service_from_name(service_name)
     is_recovery = service is not None
     logger.info(f'It is a {"first" if not is_recovery else "recovery"} run')
+    if not is_recovery and requested_incarnation is None:
+        # Fresh controllers created by this version always carry an API-
+        # preallocated incarnation. A name-only process with no current row is
+        # necessarily an old/delayed recovery script; letting it invent a new
+        # identity can race and block the real same-name successor up.
+        raise RuntimeError(
+            f'Refusing legacy name-only controller bootstrap for absent '
+            f'service {service_name!r}.')
     # Fence every boot-time DB publication to this exact row incarnation. A
     # service name can be purged and reused while controller/LB startup waits
     # for up to several minutes; PID alone is not globally unique across pods.
@@ -915,13 +997,33 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
     if is_recovery:
         assert service is not None
         service_incarnation = service.get('hash')
+        if (requested_incarnation is not None and
+                requested_incarnation != service_incarnation):
+            raise RuntimeError(
+                f'Refusing stale controller bootstrap for {service_name!r} '
+                f'incarnation {requested_incarnation!r}; current incarnation '
+                f'is {service_incarnation!r}.')
+        if (requested_incarnation is None and
+                serve_utils.is_consolidation_mode(bool(service.get('pool'))) and
+                service.get('controller_job_id') != job_id):
+            # Recovery scripts produced before --service-incarnation was
+            # introduced still carry the original controller job ID.  Fence
+            # those legacy scripts too: an already-spawned recovery must not
+            # adopt a same-name successor merely because it has no explicit
+            # incarnation argument.
+            raise RuntimeError(
+                f'Refusing stale controller bootstrap for {service_name!r} '
+                f'controller job {job_id!r}; current controller job is '
+                f'{service.get("controller_job_id")!r}.')
         recovery_expected_controller_pid = service.get('controller_pid')
         recovery_expected_controller_ip = service.get('controller_ip')
+        resource_scope = service.get('resource_scope')
     else:
         # add_service accepts the caller-generated UUID while preserving its
         # historical bool return, so this process knows the committed hash
         # without a racy name-only read after insertion.
-        service_incarnation = str(uuid.uuid4())
+        service_incarnation = requested_incarnation
+        resource_scope = service_incarnation
     if not isinstance(service_incarnation, str) or not service_incarnation:
         raise RuntimeError(
             f'Service {service_name!r} has no durable incarnation hash.')
@@ -965,7 +1067,8 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
     service_spec = task.service
 
     service_dir = os.path.expanduser(
-        serve_utils.generate_remote_service_dir_name(service_name))
+        serve_utils.generate_remote_service_dir_name(service_name,
+                                                     resource_scope))
 
     # If the previous controller died mid-teardown, its HA recovery script was
     # preserved throughout _cleanup. Bringing the controller + LB back up here
@@ -987,7 +1090,7 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
                     'serving.')
         _run_cleanup_and_finalize(service_name, service_spec,
                                   service_dir, job_id, service_incarnation,
-                                  os.getpid(), pod_ip)
+                                  os.getpid(), pod_ip, resource_scope)
         return
 
     # Pools intentionally have no inference endpoint. Every real SkyServe
@@ -1041,7 +1144,9 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
                 spec=service_spec,
                 yaml_content=yaml_content,
                 entrypoint=entrypoint,
-                service_hash=service_incarnation)
+                service_hash=service_incarnation,
+                lifecycle_epoch=lifecycle_epoch,
+                resource_scope=resource_scope)
         # Directly throw an error here. See sky/serve/api.py::up
         # for more details.
         if not success:
@@ -1138,7 +1243,8 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
             controller_process = _spawn_controller(service_name, service_spec,
                                                    version, controller_host,
                                                    controller_port,
-                                                   service_incarnation, pod_ip)
+                                                   service_incarnation, pod_ip,
+                                                   resource_scope)
             logger.debug(f'_start() spawned controller_process pid='
                          f'{controller_process.pid} host={controller_host} '
                          f'port={controller_port}')
@@ -1220,6 +1326,7 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
                     service_name,
                     lb_termination_grace_seconds,
                     service_hash=service_incarnation,
+                    resource_scope=resource_scope,
                     continue_guard=_still_owns_lb)
                 external_lb_healthy = True
             except Exception as boot_err:  # pylint: disable=broad-except
@@ -1319,7 +1426,7 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
                 raise exceptions.ServeUserTerminatedError(
                     'Durable SHUTTING_DOWN state observed.')
             if not _handle_signal(service_name, service_incarnation, own_pid,
-                                  pod_ip):
+                                  pod_ip, resource_scope):
                 _orphan_exit(controller_process)
             loop_count += 1
             # Self-heal the external LB objects. Best-effort: a k8s API error
@@ -1359,6 +1466,7 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
                         service_name,
                         lb_termination_grace_seconds,
                         service_hash=service_incarnation,
+                        resource_scope=resource_scope,
                         controller_ip=pod_ip)
                 except Exception as e:  # pylint: disable=broad-except
                     external_lb_healthy = False
@@ -1396,7 +1504,8 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
                             controller_host,
                             controller_process,
                             service_hash=service_incarnation,
-                            controller_ip=pod_ip)
+                            controller_ip=pod_ip,
+                            resource_scope=resource_scope)
                         if result is not None:
                             controller_process, controller_port = result
                             controller_unresponsive_checks = 0
@@ -1472,7 +1581,7 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
         # path above.
         _run_cleanup_and_finalize(service_name, service_spec,
                                   service_dir, job_id, service_incarnation,
-                                  os.getpid(), pod_ip)
+                                  os.getpid(), pod_ip, resource_scope)
 
 
 if __name__ == '__main__':
@@ -1483,6 +1592,12 @@ if __name__ == '__main__':
                         type=str,
                         help='Name of the service',
                         required=True)
+    parser.add_argument('--service-incarnation',
+                        type=str,
+                        help='Preallocated service incarnation/resource scope')
+    parser.add_argument('--lifecycle-epoch',
+                        type=int,
+                        help='Durable lifecycle fencing token for fresh add')
     parser.add_argument('--task-yaml',
                         type=str,
                         help='Task YAML file',
@@ -1499,4 +1614,5 @@ if __name__ == '__main__':
     # We start process with 'spawn', because 'fork' could result in weird
     # behaviors; 'spawn' is also cross-platform.
     multiprocessing.set_start_method('spawn', force=True)
-    _start(args.service_name, args.task_yaml, args.job_id, args.entrypoint)
+    _start(args.service_name, args.task_yaml, args.job_id, args.entrypoint,
+           args.service_incarnation, args.lifecycle_epoch)
