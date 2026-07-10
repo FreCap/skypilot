@@ -554,63 +554,18 @@ def is_consolidation_mode(pool: bool = False) -> bool:
     return consolidation_mode
 
 
-# Per-process cache for the extlb topology flag resolved from the LIVE
-# server config (one DB read per process; topology only changes with a pod
-# restart, which resets the cache by construction).
-_external_lb_mode_cache: Optional[bool] = None
-
-
 def is_external_load_balancer_mode() -> bool:
     """Whether the external-LB platform capability is enabled.
 
-    Real services have one supported topology: a per-service Kubernetes LB
-    Deployment syncing through the stable API-service proxy. False therefore
-    means service startup is unsupported (pools remain valid because they have
-    no inference endpoint); it no longer selects an in-pod implementation.
-
-    TOPOLOGY, NOT PER-SERVICE CONFIG: consolidation-mode controllers run
-    under a per-service SKYPILOT_CONFIG snapshot frozen at `serve up` (never
-    refreshed, not even by `serve update`). Reading this flag from the
-    loaded config let a pre-flag service's controller answer False while
-    the API server (live DB config) answered True — the server advertised
-    the external-LB DNS endpoint and ran the orphan reaper while the
-    controller never created the LB objects: a permanently dangling endpoint
-    (observed live). In any consolidation-pod process, resolve from the SAME
-    live server config the API server uses.
+    Helm injects the same explicit capability into the API pod and every
+    generated LB pod. Consolidated controller children inherit the API pod's
+    environment. No persisted or per-service config participates, so all
+    processes in the topology necessarily agree. False/unset means service
+    startup is unsupported (pools remain valid because they have no inference
+    endpoint); it no longer selects an in-pod implementation.
     """
-    global _external_lb_mode_cache
-    platform_enabled = os.environ.get(constants.EXTERNAL_LB_ENABLED_ENV_VAR)
-    if platform_enabled is not None:
-        # The Helm capability gate must win over persisted/per-service config:
-        # it is what actually renders the RBAC, projected Secrets, and pod
-        # identity needed by this topology.
-        return platform_enabled.lower() == 'true'
-    if os.environ.get(skylet_constants.ENV_VAR_IS_SKYPILOT_SERVER) is None:
-        # VM-mode / client processes: unchanged.
-        return skypilot_config.get_nested(
-            ('serve', 'controller', 'external_load_balancer'),
-            default_value=False)
-    if _external_lb_mode_cache is None:
-        try:
-            _external_lb_mode_cache = bool(
-                skypilot_config.get_effective_server_config().get_nested(
-                    ('serve', 'controller', 'external_load_balancer'),
-                    default_value=False))
-        except Exception as e:  # pylint: disable=broad-except
-            # Fail-soft to the loaded-config read: this is called from
-            # _start, whose failure path is DESTRUCTIVE service cleanup —
-            # a transient DB blip at controller boot must degrade to the
-            # snapshot value (pre-fix behavior for one evaluation), not
-            # tear the service down. Deliberately NOT cached, so the next
-            # evaluation retries the live read.
-            logger.warning(
-                'Failed to resolve external_load_balancer from the live '
-                f'server config; falling back to the loaded config: '
-                f'{common_utils.format_exception(e)}')
-            return skypilot_config.get_nested(
-                ('serve', 'controller', 'external_load_balancer'),
-                default_value=False)
-    return _external_lb_mode_cache
+    return (os.environ.get(constants.EXTERNAL_LB_ENABLED_ENV_VAR,
+                           '').lower() == 'true')
 
 
 def is_lb_data_plane_auth_enabled() -> bool:
@@ -636,7 +591,7 @@ def is_lb_data_plane_auth_enabled() -> bool:
 
 
 def _get_auth_tokens(file_env_var: str,
-                     legacy_token_env_var: str,
+                     legacy_token_env_var: Optional[str],
                      ring_name: str,
                      required: bool = False) -> Tuple[str, ...]:
     """Read a newline-delimited bearer-token ring without caching it.
@@ -645,8 +600,9 @@ def _get_auth_tokens(file_env_var: str,
     projected Secret rotation is live. A final newline is accepted; blank
     lines, whitespace-bearing/non-ASCII tokens, an empty file, and I/O/UTF-8
     errors are rejected instead of silently falling back to the legacy env
-    token. The legacy single-token env is consulted only when no file is
-    configured, which keeps rolling upgrades backwards compatible.
+    token. When a legacy singleton env name is supplied, it is consulted only
+    when no file is configured. Callers can omit that fallback for trust
+    domains where sharing the legacy credential would be unsafe.
     """
     token_file = os.environ.get(file_env_var)
     if token_file:
@@ -668,31 +624,73 @@ def _get_auth_tokens(file_env_var: str,
                     'empty or malformed token.')
         return tokens
 
-    legacy_token = os.environ.get(legacy_token_env_var)
+    legacy_token = (os.environ.get(legacy_token_env_var)
+                    if legacy_token_env_var is not None else None)
     if legacy_token:
         if _AUTH_TOKEN_PATTERN.fullmatch(legacy_token) is None:
+            assert legacy_token_env_var is not None
             raise AuthTokenConfigurationError(
                 f'{legacy_token_env_var} contains a malformed token.')
         return (legacy_token,)
     if required:
+        if legacy_token_env_var is not None:
+            missing_sources = (f'neither {file_env_var} nor '
+                               f'{legacy_token_env_var} is configured')
+        else:
+            missing_sources = f'{file_env_var} is not configured'
         raise AuthTokenConfigurationError(
-            f'{ring_name} authentication is required, but neither '
-            f'{file_env_var} nor {legacy_token_env_var} is configured.')
+            f'{ring_name} authentication is required, but '
+            f'{missing_sources}.')
     return ()
+
+
+def _get_controller_auth_token_rings(
+        sync_required: bool = False,
+        admin_required: bool = False
+) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+    """Read both controller rings and reject any cross-domain credential.
+
+    Each ring may contain multiple credentials for an overlap rotation within
+    that trust domain. A credential may never appear in both rings: otherwise
+    an external LB holding the sync ring could invoke destructive controller
+    administration routes. Both files are read on every call so an unsafe
+    Secret rotation fails closed immediately, not only at process startup.
+
+    The legacy singleton remains an admin-only fallback. In particular, it is
+    never returned as an LB-sync credential.
+    """
+    sync_tokens = _get_auth_tokens(constants.LB_SYNC_AUTH_TOKENS_FILE_ENV_VAR,
+                                   None,
+                                   'load-balancer sync',
+                                   required=sync_required)
+    admin_tokens = _get_auth_tokens(
+        constants.CONTROLLER_ADMIN_AUTH_TOKENS_FILE_ENV_VAR,
+        constants.CONTROLLER_AUTH_TOKEN_ENV_VAR,
+        'controller admin',
+        required=admin_required)
+    if not set(sync_tokens).isdisjoint(admin_tokens):
+        raise AuthTokenConfigurationError(
+            'Load-balancer sync and controller-admin token rings must be '
+            'disjoint.')
+    return sync_tokens, admin_tokens
+
+
+def validate_controller_auth_token_isolation(required: bool = False) -> None:
+    """Validate the controller trust-domain boundary without exposing tokens."""
+    _get_controller_auth_token_rings(sync_required=required,
+                                     admin_required=required)
 
 
 def get_lb_sync_auth_tokens(required: bool = False) -> Tuple[str, ...]:
     """Credentials accepted on, and presented to, the LB sync endpoint."""
-    return _get_auth_tokens(constants.LB_SYNC_AUTH_TOKENS_FILE_ENV_VAR,
-                            constants.CONTROLLER_AUTH_TOKEN_ENV_VAR,
-                            'load-balancer sync', required)
+    sync_tokens, _ = _get_controller_auth_token_rings(sync_required=required)
+    return sync_tokens
 
 
 def get_controller_admin_auth_tokens(required: bool = False) -> Tuple[str, ...]:
     """Credentials accepted by trusted controller administration callers."""
-    return _get_auth_tokens(constants.CONTROLLER_ADMIN_AUTH_TOKENS_FILE_ENV_VAR,
-                            constants.CONTROLLER_AUTH_TOKEN_ENV_VAR,
-                            'controller admin', required)
+    _, admin_tokens = _get_controller_auth_token_rings(admin_required=required)
+    return admin_tokens
 
 
 def get_lb_auth_tokens(required: bool = False) -> Tuple[str, ...]:

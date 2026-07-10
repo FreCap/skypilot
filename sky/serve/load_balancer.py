@@ -1308,6 +1308,19 @@ class SkyServeLoadBalancer:
                              f'the controller: {e}'
                              f'\nTraceback: {traceback.format_exc()}')
             else:
+                if routing_spec is None:
+                    # A successful response can temporarily omit the routing
+                    # spec while an update's placeholder version is being
+                    # committed. The controller has already accepted this
+                    # sync's request batch, so do not restore/replay it. A cold
+                    # LB, however, must not publish controller-supplied routes
+                    # under constructor defaults; and a warm LB must keep its
+                    # last coherent spec+route snapshot until a complete one
+                    # arrives.
+                    logger.warning(
+                        'Controller sync omitted the routing spec; retaining '
+                        'the last applied routes and readiness state.')
+                    return
                 logger.info(f'Available Replica URLs: {ready_replica_urls}')
                 if self._should_keep_ready_set_on_empty_sync(
                         ready_replica_urls, num_ready_replicas):

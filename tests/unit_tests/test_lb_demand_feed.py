@@ -471,6 +471,18 @@ class _FakeSession:
 
 
 def _run_sync(lb, response_payload):
+    # These demand-feed tests exercise a complete modern-controller sync.
+    # Keep that contract explicit: routing_spec=None is now intentionally an
+    # incomplete snapshot that must not publish replica or capacity state.
+    response_payload = dict(response_payload)
+    response_payload.setdefault(
+        'routing_spec', {
+            'load_balancing_policy_name': lb._load_balancing_policy_name,
+            'stream_timeout_seconds': lb._stream_timeout_seconds,
+            'retriable_status_codes': list(lb._retriable_status_codes),
+            'max_retries': lb._max_retries,
+            'retry_initial_backoff_seconds': lb._retry_initial_backoff_seconds,
+        })
     captured = {}
     with mock.patch.object(lb_module.aiohttp, 'ClientSession',
                            lambda: _FakeSession(response_payload, captured)):

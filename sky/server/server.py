@@ -834,6 +834,13 @@ async def lifespan(app: fastapi.FastAPI):  # pylint: disable=redefined-outer-nam
     """FastAPI lifespan context manager."""
     del app  # unused
 
+    # Refuse to publish any API route if the external LB's sync credential can
+    # also authenticate destructive controller-admin routes. The same check is
+    # repeated on every purpose-specific token read so projected Secret
+    # rotations remain fail-closed after startup.
+    if serve_utils.is_external_load_balancer_mode():
+        serve_utils.validate_controller_auth_token_isolation(required=True)
+
     # LB RBAC is namespace-wide, not service-specific. Run this once in the
     # API process instead of issuing 11 identical access reviews in every
     # per-service controller child during a large recovery.

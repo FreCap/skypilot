@@ -2,6 +2,7 @@
 
 import asyncio
 from typing import List, Optional, Tuple
+from unittest import mock
 
 import aiohttp
 import fastapi
@@ -386,6 +387,48 @@ def test_internal_auth_fails_closed_when_token_ring_unavailable(
     assert response.status_code == 503
     assert reads == [True]
     assert not downstream_users
+
+
+def test_internal_auth_fails_closed_on_cross_domain_overlap(
+        monkeypatch, tmp_path):
+    sync_ring = tmp_path / 'sync.tokens'
+    sync_ring.write_text('sync\nshared\n', encoding='utf-8')
+    admin_ring = tmp_path / 'admin.tokens'
+    admin_ring.write_text('admin\nshared\n', encoding='utf-8')
+    monkeypatch.setenv(constants.LB_SYNC_AUTH_TOKENS_FILE_ENV_VAR,
+                       str(sync_ring))
+    monkeypatch.setenv(constants.CONTROLLER_ADMIN_AUTH_TOKENS_FILE_ENV_VAR,
+                       str(admin_ring))
+    monkeypatch.delenv(constants.CONTROLLER_AUTH_TOKEN_ENV_VAR, raising=False)
+    middleware = server.InternalServeControllerSyncAuthMiddleware(
+        app=lambda scope, receive, send: None)
+    request = _request('/api/internal/serve/svc/controller/load_balancer_sync',
+                       'Bearer shared')
+    request.state.auth_user = None
+    downstream_called = False
+
+    async def call_next(unused_request):
+        nonlocal downstream_called
+        downstream_called = True
+        return fastapi.responses.Response(status_code=204)
+
+    response = asyncio.run(middleware.dispatch(request, call_next))
+    assert response.status_code == 503
+    assert not downstream_called
+
+
+def test_api_server_startup_validates_controller_auth_isolation(monkeypatch):
+    monkeypatch.setattr(server.serve_utils, 'is_external_load_balancer_mode',
+                        lambda: True)
+    validate = mock.Mock(
+        side_effect=serve_utils.AuthTokenConfigurationError('rings overlap'))
+    monkeypatch.setattr(server.serve_utils,
+                        'validate_controller_auth_token_isolation', validate)
+
+    with pytest.raises(serve_utils.AuthTokenConfigurationError,
+                       match='rings overlap'):
+        asyncio.run(server.lifespan(None).__aenter__())
+    validate.assert_called_once_with(required=True)
 
 
 def test_internal_auth_middleware_wraps_normal_auth():

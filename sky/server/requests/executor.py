@@ -585,6 +585,11 @@ def override_request_env_and_config(
             # running in a Kubernetes pod.
             request_body.env_vars.pop(
                 kubernetes_adaptor.IN_CLUSTER_CONTEXT_NAME_ENV_VAR, None)
+            # Treat request bodies as untrusted even if the normal client
+            # serializer already omits deployment-owned environment variables.
+            # This prevents a hand-crafted body from changing platform
+            # capabilities for one request.
+            payloads.remove_server_owned_env_vars(request_body.env_vars)
             os.environ.update(request_body.env_vars)
             # Note: may be overridden by AuthProxyMiddleware.
             # TODO(zhwu): we need to make the entire request a context

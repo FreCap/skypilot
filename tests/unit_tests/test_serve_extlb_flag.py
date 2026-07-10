@@ -1,107 +1,66 @@
-"""The extlb topology flag must come from the LIVE server config.
-
-Consolidation-mode controllers run under a per-service SKYPILOT_CONFIG
-snapshot frozen at `serve up`. Reading the flag from the loaded config
-split-brained pre-flag services: the server (live DB config) advertised
-the external-LB DNS while the controller (snapshot) kept an in-pod LB and
-never created the LB objects — a permanently dangling endpoint (observed
-live on boltz-l4-fleet).
-"""
-# pylint: disable=protected-access
-import unittest
+"""External-LB capability is a process environment contract."""
 from unittest import mock
+
+import jsonschema
+import pytest
 
 from sky import skypilot_config
 from sky.serve import constants
 from sky.serve import serve_utils
-from sky.skylet import constants as skylet_constants
-from sky.utils import config_utils
+from sky.utils import schemas
 
 
-def _config(flag):
-    return config_utils.Config(
-        {'serve': {
-            'controller': {
-                'external_load_balancer': flag
-            }
-        }})
+@pytest.mark.parametrize(
+    ('value', 'expected'),
+    [('true', True), ('TRUE', True), ('false', False), (None, False)],
+)
+def test_external_lb_capability_uses_only_environment(value, expected):
+    env = ({
+        constants.EXTERNAL_LB_ENABLED_ENV_VAR: value
+    } if value is not None else {})
+    # Persisted snapshot and live-server config must never participate, even
+    # when they would disagree with the explicit platform capability.
+    with mock.patch.dict(serve_utils.os.environ, env, clear=True), \
+         mock.patch.object(skypilot_config,
+                           'get_nested',
+                           side_effect=AssertionError('snapshot read')), \
+         mock.patch.object(
+             skypilot_config,
+             'get_effective_server_config',
+             side_effect=AssertionError('live server config read')):
+        assert serve_utils.is_external_load_balancer_mode() is expected
 
 
-class TestExtlbFlagSource(unittest.TestCase):
+def test_platform_env_forces_serve_consolidation():
+    # External-only mode cannot provision a dedicated controller VM. The API
+    # pod's capability therefore implies consolidation without another knob.
+    with mock.patch.dict(
+            serve_utils.os.environ,
+            {constants.EXTERNAL_LB_ENABLED_ENV_VAR: 'true'}), \
+         mock.patch.object(skypilot_config, 'get_nested') as config_read:
+        assert serve_utils.is_consolidation_mode(pool=False)
+    config_read.assert_not_called()
 
-    def setUp(self):
-        serve_utils._external_lb_mode_cache = None
 
-    def tearDown(self):
-        serve_utils._external_lb_mode_cache = None
+def test_platform_env_does_not_change_pool_consolidation():
+    with mock.patch.dict(
+            serve_utils.os.environ,
+            {constants.EXTERNAL_LB_ENABLED_ENV_VAR: 'true'}), \
+         mock.patch.object(
+             serve_utils.controller_utils,
+             'is_jobs_consolidation_mode',
+             return_value=False) as jobs_consolidation:
+        assert not serve_utils.is_consolidation_mode(pool=True)
+    jobs_consolidation.assert_called_once()
 
-    def test_server_env_reads_live_server_config_not_snapshot(self):
-        # Loaded (snapshot) config says OFF; live server config says ON.
-        with mock.patch.dict(
-                serve_utils.os.environ,
-                {skylet_constants.ENV_VAR_IS_SKYPILOT_SERVER: 'true'}), \
-             mock.patch.object(skypilot_config, 'get_nested',
-                               return_value=False) as snapshot_read, \
-             mock.patch.object(skypilot_config, 'get_effective_server_config',
-                               return_value=_config(True)):
-            self.assertTrue(serve_utils.is_external_load_balancer_mode())
-        snapshot_read.assert_not_called()
 
-    def test_client_env_unchanged(self):
-        with mock.patch.dict(serve_utils.os.environ, {}, clear=False):
-            serve_utils.os.environ.pop(
-                skylet_constants.ENV_VAR_IS_SKYPILOT_SERVER, None)
-            with mock.patch.object(
-                    skypilot_config, 'get_nested',
-                    return_value=True) as snapshot_read, \
-                 mock.patch.object(
-                    skypilot_config,
-                    'get_effective_server_config') as server_read:
-                self.assertTrue(serve_utils.is_external_load_balancer_mode())
-        snapshot_read.assert_called_once()
-        server_read.assert_not_called()
-
-    def test_server_value_cached_per_process(self):
-        with mock.patch.dict(
-                serve_utils.os.environ,
-                {skylet_constants.ENV_VAR_IS_SKYPILOT_SERVER: 'true'}), \
-             mock.patch.object(skypilot_config, 'get_effective_server_config',
-                               return_value=_config(True)) as server_read:
-            self.assertTrue(serve_utils.is_external_load_balancer_mode())
-            self.assertTrue(serve_utils.is_external_load_balancer_mode())
-        server_read.assert_called_once()
-
-    def test_platform_env_is_single_source_of_truth(self):
-        with mock.patch.dict(
-                serve_utils.os.environ, {
-                    constants.EXTERNAL_LB_ENABLED_ENV_VAR: 'true',
-                    skylet_constants.ENV_VAR_IS_SKYPILOT_SERVER: 'true',
-                }), \
-             mock.patch.object(
-                 skypilot_config,
-                 'get_effective_server_config') as server_read:
-            self.assertTrue(serve_utils.is_external_load_balancer_mode())
-        server_read.assert_not_called()
-
-    def test_platform_env_forces_serve_consolidation(self):
-        # External-only mode cannot provision a dedicated controller VM. The
-        # Helm capability signal therefore implies consolidation even when an
-        # older persisted config omitted the separate setting.
-        with mock.patch.dict(
-                serve_utils.os.environ,
-                {constants.EXTERNAL_LB_ENABLED_ENV_VAR: 'true'}), \
-             mock.patch.object(skypilot_config,
-                               'get_nested') as config_read:
-            self.assertTrue(serve_utils.is_consolidation_mode(pool=False))
-        config_read.assert_not_called()
-
-    def test_platform_env_does_not_change_pool_consolidation(self):
-        with mock.patch.dict(
-                serve_utils.os.environ,
-                {constants.EXTERNAL_LB_ENABLED_ENV_VAR: 'true'}), \
-             mock.patch.object(
-                 serve_utils.controller_utils,
-                 'is_jobs_consolidation_mode',
-                 return_value=False) as jobs_consolidation:
-            self.assertFalse(serve_utils.is_consolidation_mode(pool=True))
-        jobs_consolidation.assert_called_once()
+def test_legacy_flag_is_serve_only_schema_compatibility():
+    schema = schemas.get_config_schema()
+    legacy_value = {'controller': {'external_load_balancer': True}}
+    # Existing persisted Serve configs remain readable across the rollout,
+    # although the value is ignored at runtime.
+    jsonschema.validate(legacy_value, schema['properties']['serve'])
+    # The shared controller-schema helper must not accidentally expose a
+    # nonsensical jobs.controller.external_load_balancer setting.
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(legacy_value, schema['properties']['jobs'])

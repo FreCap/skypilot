@@ -15,6 +15,10 @@ tests:
           content:
             name: SKYPILOT_SERVE_API_SERVICE_URL
       - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_API_DEPLOYMENT_NAME
+      - notContains:
           path: spec.template.spec.volumes
           content:
             name: skypilot-serve-lb-sync-auth
@@ -59,6 +63,28 @@ tests:
     asserts:
       - failedTemplate:
           errorMessage: "serve.externalLoadBalancer.auth.controllerAdmin.key is required when serve.externalLoadBalancer.enabled=true"
+
+  - it: should reject the same Secret key for LB sync and controller admin
+    set:
+      serve.externalLoadBalancer.enabled: true
+      serve.externalLoadBalancer.auth.lbSync.existingSecret: shared-auth
+      serve.externalLoadBalancer.auth.lbSync.key: tokens
+      serve.externalLoadBalancer.auth.controllerAdmin.existingSecret: shared-auth
+      serve.externalLoadBalancer.auth.controllerAdmin.key: tokens
+    asserts:
+      - failedTemplate:
+          errorMessage: "serve.externalLoadBalancer.auth.lbSync and serve.externalLoadBalancer.auth.controllerAdmin must reference different Secret keys"
+
+  - it: should allow different keys in one Secret for runtime content checks
+    set:
+      serve.externalLoadBalancer.enabled: true
+      serve.externalLoadBalancer.auth.lbSync.existingSecret: shared-auth
+      serve.externalLoadBalancer.auth.lbSync.key: sync-tokens
+      serve.externalLoadBalancer.auth.controllerAdmin.existingSecret: shared-auth
+      serve.externalLoadBalancer.auth.controllerAdmin.key: admin-tokens
+    asserts:
+      - isKind:
+          of: Deployment
 
   - it: should render with data-plane auth disabled when both references are empty
     set:
@@ -158,6 +184,11 @@ tests:
       - contains:
           path: spec.template.spec.containers[0].env
           content:
+            name: SKYPILOT_API_DEPLOYMENT_NAME
+            value: test-release-api-server
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
             name: SKYPILOT_SERVE_LB_RESOURCES_JSON
             value: '{"limits":{"memory":"512Mi"},"requests":{"cpu":"100m","memory":"128Mi"}}'
       - contains:
@@ -234,3 +265,18 @@ tests:
                     items:
                       - key: data-tokens
                         path: tokens
+
+  - it: should render explicitly null resources as an empty object
+    set:
+      serve.externalLoadBalancer.enabled: true
+      serve.externalLoadBalancer.resources: null
+      serve.externalLoadBalancer.auth.lbSync.existingSecret: serve-lb-sync
+      serve.externalLoadBalancer.auth.lbSync.key: sync-tokens
+      serve.externalLoadBalancer.auth.controllerAdmin.existingSecret: serve-controller-admin
+      serve.externalLoadBalancer.auth.controllerAdmin.key: admin-tokens
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_SERVE_LB_RESOURCES_JSON
+            value: '{}'

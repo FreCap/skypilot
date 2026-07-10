@@ -1,10 +1,12 @@
 """Controller-owned external load balancer lifecycle (in-cluster k8s).
 
 The SkyServe controller runs in-cluster (inside an API-server pod) and owns a
-per-service Kubernetes Deployment + Service for the load balancer. Each LB
-syncs through a route implemented by every API-server pod. That stable proxy
-reads the authoritative controller owner tuple from the database and forwards
-once, so controller failover never changes or rolls the LB Deployment.
+per-service Kubernetes Deployment + Service for the load balancer. Kubernetes
+owner references tie both objects to the stable Helm API Deployment, never its
+rotating Pod or ReplicaSet. Each LB syncs through a route implemented by every
+API-server pod. That stable proxy reads the authoritative controller owner
+tuple from the database and forwards once, so controller failover never changes
+or rolls the LB Deployment.
 
 This module builds and reconciles those per-service objects:
 
@@ -29,7 +31,7 @@ import os
 import re
 import sys
 import time
-from typing import Any, Dict, NamedTuple, Optional, Set, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple
 import urllib.parse
 
 from sky import sky_logging
@@ -57,6 +59,9 @@ SERVICE_HASH_LABEL_KEY = 'skypilot-serve-incarnation'
 APP_LABEL_KEY = 'app'
 # Label-key selector used by reconcile to list all LB Deployments.
 LB_SELECTOR_LABEL = SERVE_LB_LABEL_KEY
+
+_OWNER_API_VERSION = 'apps/v1'
+_OWNER_KIND = 'Deployment'
 
 # RFC1123 name constraints for k8s object names.
 _MAX_NAME_LEN = 63
@@ -214,6 +219,21 @@ def get_lb_namespace() -> str:
     return namespace
 
 
+def _api_deployment_name() -> str:
+    """Resolve the stable owner name across old and new Helm charts."""
+    deployment_name = os.environ.get(constants.API_DEPLOYMENT_NAME_ENV_VAR)
+    if deployment_name:
+        return deployment_name
+    release_name = os.environ.get(constants.RELEASE_NAME_ENV_VAR)
+    if release_name:
+        return f'{release_name}-api-server'
+    raise RuntimeError(
+        'External load balancer mode requires either '
+        f'{constants.API_DEPLOYMENT_NAME_ENV_VAR} or '
+        f'{constants.RELEASE_NAME_ENV_VAR}. Install/upgrade the SkyPilot Helm '
+        'chart with serve.externalLoadBalancer.enabled=true.')
+
+
 def _cleanup_lb_namespace() -> Optional[str]:
     """Resolve the owner namespace even after external LB is disabled.
 
@@ -246,8 +266,8 @@ def require_external_lb_runtime() -> None:
     if not serve_utils.is_external_load_balancer_mode():
         raise RuntimeError(
             'SkyServe services require the external load balancer. Enable '
-            'serve.controller.external_load_balancer in the API-server '
-            'configuration; the in-pod load balancer is no longer supported.')
+            'serve.externalLoadBalancer.enabled in the SkyPilot Helm release; '
+            'the in-pod load balancer is no longer supported.')
     if not kubernetes_utils.is_incluster_config_available():
         raise RuntimeError(
             'SkyServe services require an in-cluster Kubernetes API server '
@@ -259,6 +279,7 @@ def require_external_lb_runtime() -> None:
             f'External load balancer mode requires '
             f'{constants.POD_NAME_ENV_VAR}. Install/upgrade the SkyPilot Helm '
             'chart with serve.externalLoadBalancer.enabled=true.')
+    _api_deployment_name()
     get_lb_namespace()
     # File contents are read afresh on every request; this boot-time check only
     # prevents publishing a service that cannot authenticate its first sync or
@@ -432,6 +453,158 @@ def _serialize_k8s_object(obj):
         return [_serialize_k8s_object(item) for item in obj]
     return kubernetes.kubernetes.client.ApiClient().sanitize_for_serialization(
         obj)
+
+
+def _metadata_value(obj, dict_key: str, attr_name: str):
+    """Read one metadata field from a Kubernetes model or response dict."""
+    metadata = (obj.get('metadata') if isinstance(obj, dict) else getattr(
+        obj, 'metadata', None))
+    if metadata is None:
+        return None
+    if isinstance(metadata, dict):
+        return metadata.get(dict_key)
+    return getattr(metadata, attr_name, None)
+
+
+def _owner_reference_value(owner_reference, dict_key: str, attr_name: str):
+    if isinstance(owner_reference, dict):
+        return owner_reference.get(dict_key)
+    return getattr(owner_reference, attr_name, None)
+
+
+def _api_deployment_owner_reference(context: str, namespace: str) -> dict:
+    """Resolve the stable Helm Deployment identity used for LB ownership."""
+    deployment_name = _api_deployment_name()
+    try:
+        deployment = kubernetes.apps_api(context).read_namespaced_deployment(
+            deployment_name, namespace)
+    except kubernetes.api_exception() as e:
+        raise RuntimeError(
+            f'Cannot resolve external load balancer owner Deployment '
+            f'{namespace}/{deployment_name}: {e}') from e
+    uid = _metadata_value(deployment, 'uid', 'uid')
+    if not uid:
+        raise RuntimeError(
+            f'Cannot resolve external load balancer owner Deployment '
+            f'{namespace}/{deployment_name}: Kubernetes returned no UID.')
+    return {
+        'apiVersion': _OWNER_API_VERSION,
+        'kind': _OWNER_KIND,
+        'name': deployment_name,
+        'uid': str(uid),
+        'controller': False,
+        'blockOwnerDeletion': False,
+    }
+
+
+def _owner_reference_identity(owner_reference) -> Tuple[Any, Any, Any, Any]:
+    return (
+        _owner_reference_value(owner_reference, 'apiVersion', 'api_version'),
+        _owner_reference_value(owner_reference, 'kind', 'kind'),
+        _owner_reference_value(owner_reference, 'name', 'name'),
+        str(_owner_reference_value(owner_reference, 'uid', 'uid') or ''),
+    )
+
+
+def _live_deployment_owner_uid(context: str, namespace: str,
+                               deployment_name: str) -> Optional[str]:
+    """Return a referenced Deployment's live UID, or None after deletion."""
+    try:
+        deployment = kubernetes.apps_api(context).read_namespaced_deployment(
+            deployment_name, namespace)
+    except kubernetes.api_exception() as e:
+        if getattr(e, 'status', None) == 404:
+            return None
+        raise RuntimeError(
+            f'Cannot verify owner Deployment {namespace}/{deployment_name}: '
+            f'{e}') from e
+    uid = _metadata_value(deployment, 'uid', 'uid')
+    if not uid:
+        raise RuntimeError(
+            f'Cannot verify owner Deployment {namespace}/{deployment_name}: '
+            'Kubernetes returned no UID.')
+    return str(uid)
+
+
+def _adopt_existing_lb_object(context: str, namespace: str, object_name: str,
+                              existing, owner_reference: dict,
+                              patch_method) -> None:
+    """Adopt an existing LB object without changing its workload spec.
+
+    Owner references are replaced exactly through JSON Patch. Before doing so,
+    every foreign reference is proven stale; a reference whose Deployment and
+    UID still exist belongs to another live release and fails closed. The
+    desired owner is re-read so an API Deployment replacement cannot race the
+    initial owner lookup and leave a newly adopted object pointing at a dead
+    UID.
+    """
+    desired_owner_uid = str(owner_reference['uid'])
+    live_desired_owner_uid = _live_deployment_owner_uid(context, namespace,
+                                                        owner_reference['name'])
+    if live_desired_owner_uid != desired_owner_uid:
+        raise RuntimeError(
+            f'Refusing to adopt external load balancer object '
+            f'{namespace}/{object_name}: desired owner Deployment '
+            f'{namespace}/{owner_reference["name"]} changed from UID '
+            f'{desired_owner_uid} to {live_desired_owner_uid!r}.')
+
+    resource_version = _metadata_value(existing, 'resourceVersion',
+                                       'resource_version')
+    if not resource_version:
+        raise RuntimeError(f'Refusing to adopt external load balancer object '
+                           f'{namespace}/{object_name}: Kubernetes returned no '
+                           'resourceVersion for the existing object.')
+    owner_references = _metadata_value(existing, 'ownerReferences',
+                                       'owner_references') or []
+    desired_identity = _owner_reference_identity(owner_reference)
+    for existing_reference in owner_references:
+        identity = _owner_reference_identity(existing_reference)
+        if identity == desired_identity:
+            continue
+        api_version, kind, name, uid = identity
+        if (api_version != _OWNER_API_VERSION or kind != _OWNER_KIND or
+                not name or not uid):
+            raise RuntimeError(
+                f'Refusing to adopt external load balancer object '
+                f'{namespace}/{object_name}: it has an unverifiable owner '
+                f'reference {identity!r}.')
+        # A same-name, old-UID reference is stale: resolving the desired owner
+        # immediately before this check already proved the current UID.
+        live_uid = (live_desired_owner_uid if name == owner_reference['name']
+                    else _live_deployment_owner_uid(context, namespace, name))
+        if live_uid == uid:
+            raise RuntimeError(
+                f'Refusing to adopt external load balancer object '
+                f'{namespace}/{object_name}: it is owned by live Deployment '
+                f'{namespace}/{name} (UID {uid}).')
+
+    # A single semantically identical owner already has the desired lifetime.
+    # Missing false-valued flags are equivalent Kubernetes representations.
+    if (len(owner_references) == 1 and _owner_reference_identity(
+            owner_references[0]) == desired_identity and
+            not _owner_reference_value(owner_references[0], 'controller',
+                                       'controller') and
+            not _owner_reference_value(owner_references[0],
+                                       'blockOwnerDeletion',
+                                       'block_owner_deletion')):
+        return
+
+    # Prevent a concurrent release from changing ownership after the live
+    # owner check but before this metadata-only adoption patch.
+    patch: List[dict] = [{
+        'op': 'test',
+        'path': '/metadata/resourceVersion',
+        'value': str(resource_version),
+    }]
+    patch.append({
+        'op': 'add',
+        'path': '/metadata/ownerReferences',
+        'value': [owner_reference],
+    })
+    # The generated Kubernetes PATCH methods choose JSON Patch for a list body
+    # across the supported clients. Do not pass an undocumented content-type
+    # override: kubernetes-python 35 rejects that keyword before the request.
+    patch_method(object_name, namespace, patch)
 
 
 def _find_named(items, name: str):
@@ -622,6 +795,11 @@ def _lb_resources() -> dict:
     except json.JSONDecodeError as e:
         raise RuntimeError(
             f'{constants.LB_RESOURCES_ENV_VAR} must contain JSON: {e}') from e
+    # Older chart versions rendered an explicitly allowed ``resources: null``
+    # value as JSON null. Treat that the same as the new chart's empty object
+    # so an image-first upgrade remains compatible.
+    if resources is None:
+        return {}
     if not isinstance(resources, dict):
         raise RuntimeError(
             f'{constants.LB_RESOURCES_ENV_VAR} must contain a JSON object.')
@@ -649,7 +827,8 @@ def _build_deployment_dict(service_name: str,
                            termination_grace_period_seconds: int,
                            controller_image_digest: Optional[str] = None,
                            service_hash: Optional[str] = None,
-                           resources: Optional[dict] = None) -> dict:
+                           resources: Optional[dict] = None,
+                           owner_reference: Optional[dict] = None) -> dict:
     container = {
         'name': 'load-balancer',
         'image': image,
@@ -748,6 +927,9 @@ def _build_deployment_dict(service_name: str,
         'metadata': {
             'name': deployment_name,
             'labels': _object_labels(service_name, service_hash),
+            **({
+                'ownerReferences': [owner_reference]
+            } if owner_reference else {}),
         },
         'spec': {
             'replicas': 1,
@@ -779,13 +961,17 @@ def _build_deployment_dict(service_name: str,
 def _build_service_dict(service_name: str,
                         service_name_k8s: str,
                         deployment_name: str,
-                        service_hash: Optional[str] = None) -> dict:
+                        service_hash: Optional[str] = None,
+                        owner_reference: Optional[dict] = None) -> dict:
     return {
         'apiVersion': 'v1',
         'kind': 'Service',
         'metadata': {
             'name': service_name_k8s,
             'labels': _object_labels(service_name, service_hash),
+            **({
+                'ownerReferences': [owner_reference]
+            } if owner_reference else {}),
         },
         'spec': {
             'type': 'ClusterIP',
@@ -884,9 +1070,11 @@ def create_lb_deployment_and_service(service_name: str,
                                      service_hash: str) -> None:
     """Create the per-service LB Deployment + Service (idempotent).
 
-    A 409 (already exists) patches the Deployment to the desired proxy/auth/
-    shutdown contract, making the call safe for recovery and upgrades from the
-    old direct-IP/shared-Service topology.
+    New objects are created with the stable Helm API Deployment as their
+    Kubernetes owner. On a 409, the same owner UID is revalidated and legacy
+    objects are adopted with a resourceVersion-guarded metadata-only patch
+    before normal desired-spec reconciliation. The adoption itself never
+    changes the LB Pod template or triggers a rollout.
     """
     if not _lb_mode_active():
         return
@@ -896,6 +1084,7 @@ def create_lb_deployment_and_service(service_name: str,
     namespace = get_lb_namespace()
     deployment_name = lb_deployment_name(service_name)
     service_name_k8s = lb_service_name(service_name)
+    owner_reference = _api_deployment_owner_reference(context, namespace)
     controller_pod = _read_controller_pod(namespace, context)
     image, image_pull_policy, controller_digest = _resolve_lb_image(
         namespace, context, pod=controller_pod)
@@ -910,9 +1099,10 @@ def create_lb_deployment_and_service(service_name: str,
         auth_mounts, image_pull_secrets, pod_runtime_fields,
         container_runtime_fields, image_pull_policy,
         termination_grace_period_seconds, controller_digest, service_hash,
-        _lb_resources())
+        _lb_resources(), owner_reference)
     service_dict = _build_service_dict(service_name, service_name_k8s,
-                                       deployment_name, service_hash)
+                                       deployment_name, service_hash,
+                                       owner_reference)
 
     try:
         kubernetes.apps_api(context).create_namespaced_deployment(
@@ -926,12 +1116,21 @@ def create_lb_deployment_and_service(service_name: str,
         # is Ready.
         logger.debug(f'LB Deployment {deployment_name} already exists; '
                      'patching it to the desired spec.')
-        deployment_patch = deployment_dict
+        existing_deployment = kubernetes.apps_api(
+            context).read_namespaced_deployment(deployment_name, namespace)
+        _adopt_existing_lb_object(
+            context, namespace, deployment_name, existing_deployment,
+            owner_reference,
+            kubernetes.apps_api(context).patch_namespaced_deployment)
+        deployment_patch = copy.deepcopy(deployment_dict)
+        # Owner adoption is deliberately a separate metadata-only JSON Patch.
+        # Do not couple ownership to this desired-spec reconciliation, which
+        # may legitimately roll the LB for an image or auth contract change.
+        deployment_patch['metadata'].pop('ownerReferences', None)
         if not data_plane_auth_enabled:
             # Strategic-merge omission does not delete named list entries.
             # Explicitly remove projections left by a prior auth-enabled
             # Deployment while keeping the create body valid Kubernetes.
-            deployment_patch = copy.deepcopy(deployment_dict)
             container = deployment_patch['spec']['template']['spec'][
                 'containers'][0]
             container['env'].append({
@@ -961,6 +1160,10 @@ def create_lb_deployment_and_service(service_name: str,
         service_existed = True
         existing_service = kubernetes.core_api(context).read_namespaced_service(
             service_name_k8s, namespace)
+        _adopt_existing_lb_object(
+            context, namespace, service_name_k8s, existing_service,
+            owner_reference,
+            kubernetes.core_api(context).patch_namespaced_service)
         if isinstance(existing_service, dict):
             existing_selector = existing_service.get('spec', {}).get(
                 'selector', {}) or {}
