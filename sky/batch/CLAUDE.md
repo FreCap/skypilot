@@ -46,7 +46,7 @@ Workers use a **long-running service + notify pattern**:
 2. For each batch, coordinator sends a lightweight notify script (also via `sky.exec()`) that `curl`s `/feed_batch`.
 3. `/feed_batch` downloads the batch from cloud storage using the `InputReader`, puts it on an internal queue, and blocks until `save_results()` signals completion.
 4. The notify `sky.exec()` job exits with SUCCEEDED, which the coordinator detects via `sdk.job_status()` polling.
-5. On completion or cancellation, coordinator sends `/shutdown` to stop the worker service.
+5. On completion or cancellation, coordinator sends a token-scoped `/shutdown` to stop only the worker service started by that coordinator incarnation.
 
 Worker service listens on `127.0.0.1:8290` (localhost only, not exposed to cloud).
 
@@ -56,7 +56,7 @@ Readers and writers are defined in `io_formats.py`:
 
 **Base classes:**
 - `InputReader(ABC)` — Abstract dataclass with `__len__()` and `download_batch(start_idx, end_idx, cache_dir)` methods
-- `OutputWriter(ABC)` — Abstract dataclass with `upload_batch()`, `reduce_results()`, and `cleanup()` methods
+- `OutputWriter(ABC)` — Abstract dataclass with legacy `upload_batch()` / `reduce_results()`, restart-safe `upload_batch_attempt()` / `reduce_attempt_results()`, and `cleanup()` methods
 
 **Built-in readers/writers:**
 - `JsonReader(path)` — JSONL input; downloads full file, caches locally per job, extracts line ranges
@@ -89,12 +89,12 @@ Readers and writers are defined in `io_formats.py`:
 1. `ds.map()` launches managed job → gets `managed_job_id`
 2. Jobs controller passes `job_id` to `BatchCoordinator(job_id=self._job_id)`
 3. Coordinator passes `str(managed_job_id)` as `SKY_BATCH_JOB_ID` env var to workers
-4. Workers use it for temp paths: `.sky_batch_tmp/{managed_job_id}/batch_XXXXX-YYYYY.jsonl`
+4. Workers use it with the attempt token for immutable temp paths: `.sky_batch_tmp/{managed_job_id}/attempts/{attempt_id}/batch_XXXXX-YYYYY.jsonl`
 5. Client uses same `managed_job_id` to poll progress from DB
 
 ## Progress Reporting
 
-- Coordinator writes per-batch records to `batch_state` table via `managed_job_state.save_batch_states()` and `set_batch_status()`
+- Coordinator writes per-batch records to `batch_state` via atomic claim, lease-renewal, and attempt-fenced transition helpers in `sky.jobs.state`
 - `batch_total_batches` and `batch_completed_batches` are derived by a SQL aggregation subquery on the `batch_state` table (not denormalized columns)
 - Client reads these derived fields from `ManagedJobRecord` via `sky.jobs.queue_v2()`
 - No HTTP roundtrip for progress — coordinator runs in the same process as the DB
@@ -102,7 +102,7 @@ Readers and writers are defined in `io_formats.py`:
 
 ## Database Schema
 
-`batch_state` table (defined in `sky/schemas/db/spot_jobs/018_add_batch_state.py`):
+`batch_state` table (created in migration 018 and extended with attempt leases in migration 022):
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -113,27 +113,35 @@ Readers and writers are defined in `io_formats.py`:
 | `status` | Text | PENDING, DISPATCHED, COMPLETED, or FAILED |
 | `worker_cluster` | Text | Which worker processed this batch |
 | `retry_count` | Integer | Number of retries for this batch |
+| `attempt_id` | Integer | Monotonic fencing token assigned on each claim |
+| `lease_expires_at` | Float | Time after which an abandoned DISPATCHED attempt can be reclaimed |
+| `next_retry_at` | Float | Earliest time a retried PENDING batch is eligible |
 | `updated_at` | Float | Last update timestamp |
 
 **State functions** in `sky/jobs/state.py`:
 - `save_batch_states(job_id, batches)` — Bulk insert all batches atomically
 - `get_batch_states(job_id)` — Read all batch records
-- `set_batch_status(job_id, batch_idx, status, worker_cluster, retry_count)` — Update single batch
-- `reset_dispatched_batches(job_id)` — Reset DISPATCHED → PENDING for crash recovery
+- `claim_batch(...)` — Atomically claim an eligible PENDING batch and return its attempt token
+- `renew_batch_lease(...)` — Extend a lease only for the current attempt token
+- `set_batch_attempt_status(...)` — Attempt-fenced transition to PENDING, COMPLETED, or FAILED
+- `requeue_expired_batch_attempts(...)` — Reclaim only expired DISPATCHED attempts
 - `is_batch_job(job_id)` — Check if job has batch state records
 
 ## HA Recovery
 
 - Batch states are persisted to DB with statuses: PENDING → DISPATCHED → COMPLETED (or FAILED)
-- On controller crash, `_resume_from_db()` resets DISPATCHED batches back to PENDING
-- Retry counts are persisted across resumes so batches cannot retry indefinitely
-- `_shutdown_stale_workers()` cleans up old worker services that may hold the port after a crash
+- Every dispatch receives an `attempt_id`; stale controllers cannot complete, fail, or requeue a newer attempt
+- Dispatchers renew a short lease while SDK calls or worker jobs are active; expired attempts are reclaimed after a crash
+- Retry counts and `next_retry_at` are persisted, so retry limits and exponential backoff survive restarts
+- Worker startup kills only a stale listener on the dedicated worker port. It never cancels every job on a shared pool replica
+- Worker health/feed/shutdown requests carry a per-coordinator token so an older controller cannot control a replacement service
+- Workers write immutable attempt-scoped objects; reduction publishes only the attempt token stored on each COMPLETED row
 - Max retries per batch: `MAX_RETRIES = 3` with exponential backoff (`RETRY_BACKOFF_BASE = 2`)
 
 ## Cancellation
 
-- `sky jobs cancel` sends SIGTERM to the controller process
-- Coordinator's `_handle_sigterm()` calls `cancel()` then `sys.exit(1)`
+- The inline jobs-controller task calls `cancel()` when the managed job is cancelled; it does not replace the shared process's SIGTERM handler
+- The legacy standalone coordinator retains `_handle_sigterm()` for process-level cancellation
 - `cancel()` sets `_cancelled = True` flag and shuts down active worker **services** (the HTTP process on port 8290) via `/shutdown`
 - The dispatch loop checks `_cancelled` to break early
 - The pool clusters themselves are **not** terminated — they are a shared resource managed separately via `sky jobs pool`
@@ -156,21 +164,23 @@ Readers and writers are defined in `io_formats.py`:
 
 1. `_launch_worker_service(cluster_name)` — Submit long-running job, wait for `/health` 200
 2. While pending batches exist:
-   a. Pop batch index from `pending_batches` deque
-   b. Generate notify script (`curl /feed_batch`) and submit via `sdk.exec()`
-   c. Poll `sdk.job_status()` until terminal state
-   d. Update DB: DISPATCHED → COMPLETED (or FAILED → PENDING for retry)
-   e. Increment `completed_count`
+   a. Pop an eligible batch from the retry-aware local queue
+   b. Atomically claim it in the DB and start its lease heartbeat
+   c. Generate a token-scoped notify script (`curl /feed_batch`) and submit via `sdk.exec()`
+   d. Poll `sdk.job_status()` until terminal state
+   e. Use the attempt token to transition DISPATCHED → COMPLETED, FAILED, or delayed PENDING
+   f. Increment `completed_count` only if the fenced completion succeeds
 3. Finally: `_shutdown_worker()` via `/shutdown` endpoint
 
 Error tolerance: up to 12 consecutive `None` status polls (~60s) before treating as failure.
 
 ## Result Merging
 
-`_reduce_results_and_cleanup()` runs after all batches complete:
-1. For each output writer: `writer.reduce_results(job_id)` — merge batch files into final output
-2. For each output writer: `writer.cleanup(job_id)` — delete temp batch files
-3. `_print_partial_results_instructions()` provides recovery code if merging fails
+`_reduce_results()` runs after all batches complete:
+1. Reload COMPLETED rows and their winning `attempt_id` values from durable state
+2. For each output writer: `writer.reduce_attempt_results(job_id, batch_attempts)` — publish only winning objects. JSON reduction streams through local temporary files instead of holding the full output in controller RAM
+3. The jobs controller durably marks the managed job SUCCEEDED
+4. Only then, `BatchCoordinator.cleanup()` best-effort deletes temp attempt files; cleanup failure cannot fail the completed job
 
 Temp batch files stored in: `{output_base}/.sky_batch_tmp/{job_id}/batch_XXXXX-YYYYY.jsonl`
 
@@ -204,4 +214,4 @@ bash examples/batch/custom_formats/run.sh
 - Worker service uses fixed port 8290 on localhost — only one batch job per worker at a time
 - Batch indices are inclusive: `[start_idx, end_idx]`
 - Batch file names are zero-padded to 8 digits for proper lexicographic sorting
-- Result merging is not atomic at the file level — partial results can be recovered manually
+- Custom output writers must implement the two attempt-fencing hooks; direct-to-final retry writes are rejected because they are not restart-safe

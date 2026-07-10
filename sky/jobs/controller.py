@@ -745,6 +745,15 @@ class JobController:
                 task_id=task_id,
                 end_time=time.time(),
                 callback_func=callback_func)
+            try:
+                await asyncio.to_thread(coordinator.cleanup)
+            except Exception as e:  # pylint: disable=broad-except
+                # Output publication is complete and SUCCEEDED is durable.
+                # Temp-file cleanup must never turn a successful batch into a
+                # failed job; a later GC can remove leftovers.
+                logger.warning('Failed to clean up batch attempt files: %s',
+                               e,
+                               exc_info=True)
             return True
         except asyncio.CancelledError:
             coordinator.cancel()

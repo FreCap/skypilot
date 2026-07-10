@@ -20,12 +20,14 @@ import io
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from sky.batch import utils
 from sky.utils import registry
 
 logger = logging.getLogger(__name__)
+
+BatchAttempt = Tuple[int, int, int]
 
 
 @dataclass
@@ -193,9 +195,42 @@ class OutputWriter(ABC):
                      end_idx: int, job_id: str) -> str:
         """Upload results for a specific batch."""
 
+    def upload_batch_attempt(self, results: List[Dict[str,
+                                                      Any]], start_idx: int,
+                             end_idx: int, job_id: str, attempt_id: int) -> str:
+        """Upload an immutable result for one fenced batch attempt.
+
+        Custom writers must implement this method.  Writing retries directly
+        to a final path cannot be made safe by the coordinator.
+        """
+        del results, start_idx, end_idx, job_id, attempt_id
+        raise NotImplementedError(
+            f'{type(self).__name__} must implement upload_batch_attempt() '
+            'for restart-safe Sky Batch execution.')
+
     @abstractmethod
     def reduce_results(self, job_id: str) -> None:
         """Reduce all result batches into final output."""
+
+    def reduce_attempt_results(self, job_id: str,
+                               batch_attempts: List[BatchAttempt]) -> None:
+        """Publish only the attempt selected by durable batch state."""
+        del job_id, batch_attempts
+        raise NotImplementedError(
+            f'{type(self).__name__} must implement reduce_attempt_results() '
+            'for restart-safe Sky Batch execution.')
+
+    def validate_attempt_fencing(self) -> None:
+        """Fail before dispatch if a custom writer lacks fencing hooks."""
+        writer_type = type(self)
+        if (writer_type.upload_batch_attempt is
+                OutputWriter.upload_batch_attempt or
+                writer_type.reduce_attempt_results is
+                OutputWriter.reduce_attempt_results):
+            raise ValueError(
+                f'{writer_type.__name__} must implement '
+                'upload_batch_attempt() and reduce_attempt_results() for '
+                'restart-safe Sky Batch execution.')
 
     @abstractmethod
     def cleanup(self, job_id: str) -> None:
@@ -291,18 +326,37 @@ class JsonWriter(OutputWriter):
     def upload_batch(self, results: List[Dict[str, Any]], start_idx: int,
                      end_idx: int, job_id: str) -> str:
         batch_path = utils.get_batch_path(self.path, start_idx, end_idx, job_id)
+        return self._upload_batch_to_path(results, batch_path)
+
+    def _upload_batch_to_path(self, results: List[Dict[str, Any]],
+                              batch_path: str) -> str:
         if self.column is not None:
             results = [{k: r[k] for k in self.column if k in r} for r in results
                       ]
         utils.save_jsonl_to_cloud(results, batch_path)
         return batch_path
 
+    def upload_batch_attempt(self, results: List[Dict[str,
+                                                      Any]], start_idx: int,
+                             end_idx: int, job_id: str, attempt_id: int) -> str:
+        batch_path = utils.get_attempt_batch_path(self.path, start_idx, end_idx,
+                                                  job_id, attempt_id)
+        return self._upload_batch_to_path(results, batch_path)
+
     def reduce_results(self, job_id: str) -> None:
         utils.concatenate_batches_to_output(self.path, job_id)
 
+    def reduce_attempt_results(self, job_id: str,
+                               batch_attempts: List[BatchAttempt]) -> None:
+        batch_paths = [
+            utils.get_attempt_batch_path(self.path, start_idx, end_idx, job_id,
+                                         attempt_id)
+            for start_idx, end_idx, attempt_id in batch_attempts
+        ]
+        utils.concatenate_batch_files_to_output(self.path, batch_paths)
+
     def cleanup(self, job_id: str) -> None:
-        utils.delete_batch_files(self.path, job_id)
-        utils.delete_input_batch_files(self.path, job_id)
+        utils.delete_cloud_prefix(utils.get_job_temp_prefix(self.path, job_id))
 
 
 @registry.OUTPUT_WRITER_REGISTRY.type_register(name='image')
@@ -359,8 +413,43 @@ class ImageWriter(OutputWriter):
                     end_idx)
         return output_dir
 
+    def upload_batch_attempt(self, results: List[Dict[str,
+                                                      Any]], start_idx: int,
+                             end_idx: int, job_id: str, attempt_id: int) -> str:
+        for i, result in enumerate(results):
+            global_idx = start_idx + i
+            value = result.get(self.column)
+            if value is None or not hasattr(value, 'save'):
+                raise ValueError(
+                    f'Result {global_idx} is missing a PIL Image in column '
+                    f'{self.column!r}.')
+
+            image_cloud_path = utils.get_attempt_image_path(
+                self.path, global_idx, job_id, attempt_id)
+            buf = io.BytesIO()
+            value.save(buf, format='PNG')
+            utils.upload_bytes_to_cloud(buf.getvalue(), image_cloud_path)
+            logger.debug('Uploaded image attempt %s', image_cloud_path)
+
+        logger.info('Uploaded %d attempt-scoped images [%d-%d]', len(results),
+                    start_idx, end_idx)
+        return self.path.rstrip('/')
+
     def reduce_results(self, job_id: str) -> None:
         """No-op -- images are already in their final location."""
 
+    def reduce_attempt_results(self, job_id: str,
+                               batch_attempts: List[BatchAttempt]) -> None:
+        output_dir = self.path.rstrip('/')
+        for start_idx, end_idx, attempt_id in batch_attempts:
+            if attempt_id == 0:
+                # Pre-fencing workers wrote directly to the final path.
+                continue
+            for global_idx in range(start_idx, end_idx + 1):
+                source_path = utils.get_attempt_image_path(
+                    self.path, global_idx, job_id, attempt_id)
+                destination_path = f'{output_dir}/{global_idx:08d}.png'
+                utils.copy_cloud_file(source_path, destination_path)
+
     def cleanup(self, job_id: str) -> None:
-        """No-op -- no temp files to clean up."""
+        utils.delete_cloud_prefix(utils.get_job_temp_prefix(self.path, job_id))

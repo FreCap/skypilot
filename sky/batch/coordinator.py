@@ -25,18 +25,21 @@ import contextvars
 import json
 import logging
 import os
+import shlex
 import signal
 import sys
 import textwrap
 import threading
 import time
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Tuple
+import uuid
 
 import sky
 from sky.batch import constants
 from sky.batch import io_formats
 from sky.client import sdk
 from sky.jobs import state as managed_job_state
+from sky.server import constants as server_constants
 from sky.skylet import constants as skylet_constants
 
 logger = logging.getLogger(__name__)
@@ -174,7 +177,10 @@ class BatchCoordinator:
         # Batch metadata: list of [start_idx, end_idx] tuples.
         self.batches: List[List[int]] = []
         self.pending_batches: Deque[int] = collections.deque()
+        self._pending_ready_at: Dict[int, float] = {}
+        self._pending_lock = threading.Lock()
         self.completed_count: int = 0
+        self._state_lock = threading.Lock()
 
         # Retry tracking: batch_idx -> retry count.  Persisted across
         # resume so that a batch cannot be retried indefinitely.
@@ -187,8 +193,17 @@ class BatchCoordinator:
         # Cancellation flag for inline (controller) mode.
         self._cancelled = False
 
-        # Register SIGTERM handler for graceful cancellation.
-        signal.signal(signal.SIGTERM, self._handle_sigterm)
+        # Identifies worker services started by this coordinator incarnation.
+        # It prevents an older controller from feeding or shutting down a
+        # replacement service after an API-server/controller restart.
+        self._worker_token = uuid.uuid4().hex
+
+        # Inline coordinators share a process with unrelated managed jobs and
+        # must not replace the controller's process-wide SIGTERM handler.
+        # Keep the handler only for the legacy standalone entrypoint.
+        if job_id is None:
+            if threading.current_thread() is threading.main_thread():
+                signal.signal(signal.SIGTERM, self._handle_sigterm)
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -213,13 +228,15 @@ class BatchCoordinator:
                 # Crash happened after all batches done but before merge.
                 logger.info('All batches already completed, skipping '
                             'to merge.')
-                self._reduce_results_and_cleanup()
+                managed_job_state.set_winding_down(self._managed_job_id,
+                                                   task_id=0)
+                self._reduce_results()
                 return
 
             self._discover_workers()
-            self._shutdown_stale_workers()
             self._dispatch_all()
-            self._reduce_results_and_cleanup()
+            managed_job_state.set_winding_down(self._managed_job_id, task_id=0)
+            self._reduce_results()
             logger.info('Batch job completed successfully.')
         except Exception:
             self._print_partial_results_instructions()
@@ -254,6 +271,60 @@ class BatchCoordinator:
     # Dataset counting & splitting
     # ------------------------------------------------------------------
 
+    def _reset_pending_batches(self) -> None:
+        with self._pending_lock:
+            self.pending_batches = collections.deque()
+            self._pending_ready_at = {}
+
+    def _enqueue_batch(self, batch_idx: int, ready_at: float = 0) -> None:
+        """Add a batch to the local queue without creating duplicates."""
+        with self._pending_lock:
+            existing_ready_at = self._pending_ready_at.get(batch_idx)
+            if existing_ready_at is not None:
+                self._pending_ready_at[batch_idx] = max(existing_ready_at,
+                                                        ready_at)
+                return
+            self.pending_batches.append(batch_idx)
+            self._pending_ready_at[batch_idx] = ready_at
+
+    def _pop_ready_batch(self) -> Tuple[Optional[int], Optional[float]]:
+        """Pop an eligible batch and return a wait time for delayed work.
+
+        ``(None, None)`` means the queue is empty.  ``(None, seconds)`` means
+        work exists but is still in persisted retry backoff.
+        """
+        now = time.time()
+        with self._pending_lock:
+            if not self.pending_batches:
+                return None, None
+            min_wait: Optional[float] = None
+            for _ in range(len(self.pending_batches)):
+                batch_idx = self.pending_batches.popleft()
+                ready_at = self._pending_ready_at[batch_idx]
+                if ready_at <= now:
+                    self._pending_ready_at.pop(batch_idx)
+                    return batch_idx, 0
+                self.pending_batches.append(batch_idx)
+                wait = ready_at - now
+                min_wait = wait if min_wait is None else min(min_wait, wait)
+            return None, min_wait
+
+    def _pending_count(self) -> int:
+        with self._pending_lock:
+            return len(self._pending_ready_at)
+
+    def _has_pending_batches(self) -> bool:
+        return self._pending_count() > 0
+
+    def _get_completed_count(self) -> int:
+        with self._state_lock:
+            return self.completed_count
+
+    def _increment_completed_count(self) -> int:
+        with self._state_lock:
+            self.completed_count += 1
+            return self.completed_count
+
     def _resolve_formats(self) -> None:
         """Resolve typed input/output format handlers from dicts."""
         self._input_format = io_formats.InputReader.from_dict(
@@ -262,6 +333,8 @@ class BatchCoordinator:
             io_formats.OutputWriter.from_dict(d)
             for d in self._output_formats_dict
         ]
+        for output_format in self._output_formats:
+            output_format.validate_attempt_fencing()
 
     def _count_and_split(self) -> None:
         """Count dataset items and create batch index ranges."""
@@ -275,7 +348,9 @@ class BatchCoordinator:
             end_idx = min(i + self.batch_size - 1, total_items - 1)
             self.batches.append([start_idx, end_idx])
 
-        self.pending_batches = collections.deque(range(len(self.batches)))
+        self._reset_pending_batches()
+        for batch_idx in range(len(self.batches)):
+            self._enqueue_batch(batch_idx)
         logger.info(f'Created {len(self.batches)} batches '
                     f'(total_items: {total_items}, '
                     f'batch_size: {self.batch_size})')
@@ -292,10 +367,13 @@ class BatchCoordinator:
     def _resume_from_db(self) -> None:
         """Restore coordinator state from DB after a controller crash.
 
-        Resets any DISPATCHED (in-flight) batches back to PENDING, then
-        rebuilds in-memory state from the persisted records.
+        Reclaims expired attempts, then rebuilds in-memory state from the
+        persisted records.  Live attempts keep their leases until they expire.
         """
-        managed_job_state.reset_dispatched_batches(self._managed_job_id)
+        reclaimed = managed_job_state.requeue_expired_batch_attempts(
+            self._managed_job_id)
+        if reclaimed:
+            logger.info('Reclaimed expired batch attempts: %s', reclaimed)
         records = managed_job_state.get_batch_states(self._managed_job_id)
         if not records:
             raise RuntimeError(
@@ -303,9 +381,11 @@ class BatchCoordinator:
                 'during resume. The job may need to be re-submitted.')
 
         self.batches = []
-        self.pending_batches = collections.deque()
+        self._reset_pending_batches()
         self.completed_count = 0
         self._retry_counts = {}
+        failed_batches = []
+        leased_batches = 0
 
         for i, rec in enumerate(records):
             batch_idx = rec['batch_idx']
@@ -315,45 +395,90 @@ class BatchCoordinator:
             self.batches.append([rec['start_idx'], rec['end_idx']])
             status = rec['status']
             if status == 'PENDING':
-                self.pending_batches.append(batch_idx)
+                self._enqueue_batch(batch_idx, rec.get('next_retry_at') or 0)
             elif status == 'COMPLETED':
                 self.completed_count += 1
-            # FAILED batches stay failed — not re-queued.
+            elif status == 'DISPATCHED':
+                leased_batches += 1
+            elif status == 'FAILED':
+                failed_batches.append(batch_idx)
             self._retry_counts[batch_idx] = rec['retry_count']
+
+        if failed_batches:
+            raise RuntimeError('Cannot resume batch job with terminally failed '
+                               f'batches: {failed_batches}')
 
         logger.info(f'Resumed from DB: {len(self.batches)} batches, '
                     f'{self.completed_count} completed, '
-                    f'{len(self.pending_batches)} pending')
+                    f'{self._pending_count()} pending, '
+                    f'{leased_batches} leased')
         logger.info(f'BATCH_RESUME total={len(self.batches)} '
                     f'completed={self.completed_count} '
-                    f'pending={len(self.pending_batches)}')
+                    f'pending={self._pending_count()} '
+                    f'leased={leased_batches}')
 
-    def _shutdown_stale_workers(self) -> None:
-        """Shut down any stale worker services on discovered workers.
+    def _reclaim_expired_batches(self) -> int:
+        reclaimed = managed_job_state.requeue_expired_batch_attempts(
+            self._managed_job_id)
+        for batch_idx in reclaimed:
+            self._enqueue_batch(batch_idx)
+        if reclaimed:
+            logger.warning('Reclaimed %d expired batch attempt(s): %s',
+                           len(reclaimed), reclaimed)
+        return len(reclaimed)
 
-        After a controller crash the old worker SkyPilot jobs are still
-        running and hold port 8290.  We cancel **all** jobs on each
-        worker cluster so the port is guaranteed to be free before we
-        launch fresh services.  ``sdk.cancel`` returns once the cancel
-        request is accepted, but the underlying processes need a moment
-        to actually terminate and release the socket.  Give them a grace
-        period before we start launching replacements, otherwise the new
-        worker service will fail to bind port 8290 and the coordinator
-        will spin retrying indefinitely.
-        """
-        cancelled_any = False
-        for cluster_name in self._workers:
-            try:
-                cancel_req_id = sdk.cancel(cluster_name, all=True)
-                sdk.get(cancel_req_id)
-                logger.info(f'Cancelled all stale jobs on {cluster_name}')
-                cancelled_any = True
-            except Exception:  # pylint: disable=broad-except
-                logger.debug(f'No stale jobs to cancel on '
-                             f'{cluster_name}')
-        if cancelled_any:
-            logger.info('Waiting for stale worker processes to exit...')
-            time.sleep(constants.STALE_WORKER_GRACE_PERIOD)
+    def _sync_batch_progress_from_db(self) -> Tuple[int, List[int]]:
+        """Refresh progress and discover PENDING work from another owner."""
+        records = managed_job_state.get_batch_states(self._managed_job_id)
+        completed_count = 0
+        leased_count = 0
+        failed_batches = []
+        for rec in records:
+            batch_idx = rec['batch_idx']
+            status = rec['status']
+            if status == 'PENDING':
+                self._enqueue_batch(batch_idx, rec.get('next_retry_at') or 0)
+            elif status == 'COMPLETED':
+                completed_count += 1
+            elif status == 'DISPATCHED':
+                leased_count += 1
+            elif status == 'FAILED':
+                failed_batches.append(batch_idx)
+            self._retry_counts[batch_idx] = rec['retry_count']
+        with self._state_lock:
+            self.completed_count = completed_count
+        return leased_count, failed_batches
+
+    def _start_batch_lease_renewer(
+        self, batch_idx: int, attempt_id: int
+    ) -> Tuple[threading.Event, threading.Event, threading.Thread]:
+        """Keep a batch lease alive while SDK calls may be blocking."""
+        stop_event = threading.Event()
+        lost_event = threading.Event()
+
+        def _renew() -> None:
+            while not stop_event.wait(constants.BATCH_LEASE_RENEW_INTERVAL):
+                try:
+                    owned = managed_job_state.renew_batch_lease(
+                        self._managed_job_id, batch_idx, attempt_id,
+                        constants.BATCH_LEASE_DURATION)
+                except Exception as e:  # pylint: disable=broad-except
+                    logger.warning('Failed to renew batch lease %d/%d: %s',
+                                   batch_idx, attempt_id, e)
+                    continue
+                if not owned:
+                    lost_event.set()
+                    return
+
+        renewer = threading.Thread(target=_renew, daemon=True)
+        renewer.start()
+        return stop_event, lost_event, renewer
+
+    @staticmethod
+    def _stop_batch_lease_renewer(stop_event: threading.Event,
+                                  renewer: threading.Thread) -> None:
+        stop_event.set()
+        renewer.join(timeout=1)
 
     # ------------------------------------------------------------------
     # Worker discovery
@@ -422,6 +547,14 @@ class BatchCoordinator:
                               else str(raw_status))
             name = info.get('name')
             if replica_status == 'READY':
+                replica_info_version = info.get('replica_info_version')
+                if (replica_info_version is None or replica_info_version <
+                        server_constants.MIN_BATCH_REPLICA_INFO_VERSION):
+                    raise RuntimeError(
+                        f'Pool replica {name!r} uses worker runtime version '
+                        f'{replica_info_version}; Sky Batch requires version '
+                        f'{server_constants.MIN_BATCH_REPLICA_INFO_VERSION}. '
+                        f'Recreate pool {self.pool_name!r} before retrying.')
                 if name:
                     ready.append(name)
             elif name:
@@ -487,13 +620,13 @@ class BatchCoordinator:
             export SKY_BATCH_SERIALIZED_FN='{self.serialized_fn}'
             export SKY_BATCH_OUTPUT_PATH='{self.output_path}'
             export SKY_BATCH_JOB_ID='{job_id}'
+            export SKY_BATCH_WORKER_TOKEN='{self._worker_token}'
             export SKY_BATCH_INPUT_FORMAT='{input_format_json}'
             export SKY_BATCH_OUTPUT_FORMATS='{output_formats_json}'
 
-            # On HA resume the previous worker service may still be
-            # holding port {port} even after sdk.cancel has returned.
-            # Free the port before we try to bind; best-effort and
-            # portable across container images (no fuser/lsof/ss).
+            # On HA resume the previous worker service may still hold port
+            # {port}. Free only that listener before binding a replacement;
+            # do not cancel unrelated jobs that share this pool replica.
             echo '{port_cleanup_b64}' | base64 -d | {sky_runtime}/bin/python -
 
             # Make sky.batch visible to the user's python.
@@ -512,27 +645,37 @@ class BatchCoordinator:
                 serialized_fn=os.environ["SKY_BATCH_SERIALIZED_FN"],
                 output_path=os.environ["SKY_BATCH_OUTPUT_PATH"],
                 job_id=os.environ["SKY_BATCH_JOB_ID"],
+                worker_token=os.environ["SKY_BATCH_WORKER_TOKEN"],
             )
             ' 2>&1 | tee /tmp/sky_batch_worker.log
             """)
 
-    def _generate_notify_code(self, batch_idx: int) -> str:
+    def _generate_notify_code(self, batch_idx: int, attempt_id: int) -> str:
         """Generate lightweight notify script for a single batch."""
         start_idx, end_idx = self.batches[batch_idx]
         port = constants.WORKER_SERVICE_PORT
+        payload = json.dumps({
+            'dataset_path': self.dataset_path,
+            'start_idx': start_idx,
+            'end_idx': end_idx,
+            'batch_idx': batch_idx,
+            'attempt_id': attempt_id,
+        })
 
         return textwrap.dedent(f"""\
             set -e
             curl -sf -X POST http://127.0.0.1:{port}/feed_batch \\
                 -H 'Content-Type: application/json' \\
-                -d '{{"dataset_path": "{self.dataset_path}", "start_idx": {start_idx}, "end_idx": {end_idx}, "batch_idx": {batch_idx}}}'
+                -H 'X-Sky-Batch-Worker-Token: {self._worker_token}' \\
+                -d {shlex.quote(payload)}
             """)
 
     def _generate_shutdown_code(self) -> str:
         """Generate a script that shuts down the worker service."""
         port = constants.WORKER_SERVICE_PORT
         return textwrap.dedent(f"""\
-            curl -sf -X POST http://127.0.0.1:{port}/shutdown || true
+            curl -sf -X POST http://127.0.0.1:{port}/shutdown \\
+                -H 'X-Sky-Batch-Worker-Token: {self._worker_token}' || true
             """)
 
     # ------------------------------------------------------------------
@@ -574,7 +717,9 @@ class BatchCoordinator:
         health_code = textwrap.dedent(f"""\
             set -e
             for i in $(seq 1 {timeout}); do
-                if curl -s http://127.0.0.1:{port}/health > /dev/null 2>&1; then
+                if curl -sf http://127.0.0.1:{port}/health \\
+                    -H 'X-Sky-Batch-Worker-Token: {self._worker_token}' \\
+                    > /dev/null 2>&1; then
                     echo "Worker service ready after $i seconds"
                     exit 0
                 fi
@@ -639,26 +784,36 @@ class BatchCoordinator:
 
         try:
             while not self._cancelled:
-                try:
-                    batch_idx = self.pending_batches.popleft()
-                except IndexError:
+                batch_idx, wait_seconds = self._pop_ready_batch()
+                if batch_idx is None:
+                    if wait_seconds is not None:
+                        time.sleep(min(wait_seconds, 1))
+                        continue
                     return
 
                 retries = self._retry_counts.get(batch_idx, 0)
-
-                # Mark batch as dispatched in DB.
-                managed_job_state.set_batch_status(self._managed_job_id,
-                                                   batch_idx,
-                                                   'DISPATCHED',
-                                                   worker_cluster=cluster_name)
+                attempt_id = managed_job_state.claim_batch(
+                    self._managed_job_id, batch_idx, cluster_name,
+                    constants.BATCH_LEASE_DURATION)
+                if attempt_id is None:
+                    # Another coordinator/thread won the claim, or persisted
+                    # retry backoff has not elapsed yet.
+                    continue
+                lease_stop, lease_lost, lease_renewer = (
+                    self._start_batch_lease_renewer(batch_idx, attempt_id))
 
                 try:
-                    notify_code = self._generate_notify_code(batch_idx)
+                    notify_code = self._generate_notify_code(
+                        batch_idx, attempt_id)
                     task = sky.Task(name=f'batch-notify-{job_id}-{batch_idx}',
                                     run=notify_code)
                     request_id = sdk.exec(task, cluster_name=cluster_name)
                     job_id_on_cluster, _ = sdk.get(request_id)
                     assert job_id_on_cluster is not None
+                    if lease_lost.is_set():
+                        raise RuntimeError(
+                            f'Batch {batch_idx}: attempt {attempt_id} lost '
+                            'its lease during submission')
 
                     logger.info(f'Batch {batch_idx} running as '
                                 f'job {job_id_on_cluster} on {cluster_name}')
@@ -671,6 +826,10 @@ class BatchCoordinator:
                     max_none = 12  # ~60s at 5s poll interval
                     while True:
                         time.sleep(constants.BATCH_POLL_INTERVAL)
+                        if lease_lost.is_set():
+                            raise RuntimeError(
+                                f'Batch {batch_idx}: attempt {attempt_id} '
+                                'lost its lease')
                         req_id = sdk.job_status(cluster_name,
                                                 [job_id_on_cluster])
                         statuses = sdk.get(req_id)
@@ -694,43 +853,60 @@ class BatchCoordinator:
                                         f'on {cluster_name}')
                             break
 
-                    # Mark batch as completed in DB.
-                    managed_job_state.set_batch_status(self._managed_job_id,
-                                                       batch_idx, 'COMPLETED')
-                    self.completed_count += 1
-                    if self.completed_count == len(self.batches):
-                        managed_job_state.set_winding_down(self._managed_job_id,
-                                                           task_id=0)
+                    # Only the current attempt may publish completion.
+                    self._stop_batch_lease_renewer(lease_stop, lease_renewer)
+                    completed = managed_job_state.set_batch_attempt_status(
+                        self._managed_job_id, batch_idx, attempt_id,
+                        'COMPLETED')
+                    if not completed:
+                        logger.warning(
+                            'Ignoring completion from stale batch attempt '
+                            '%d/%d', batch_idx, attempt_id)
+                        continue
+                    completed_count = self._increment_completed_count()
                     logger.info(
                         f'Batch {batch_idx} completed on {cluster_name} '
-                        f'({self.completed_count}/{len(self.batches)})')
+                        f'({completed_count}/{len(self.batches)})')
                 except Exception as e:  # pylint: disable=broad-except
+                    self._stop_batch_lease_renewer(lease_stop, lease_renewer)
                     logger.error(f'Batch {batch_idx} failed on '
                                  f'{cluster_name}: {e}')
                     if retries < constants.MAX_RETRIES:
-                        self._retry_counts[batch_idx] = retries + 1
-                        managed_job_state.set_batch_status(
+                        retry_count = retries + 1
+                        backoff = constants.RETRY_BACKOFF_BASE**retry_count
+                        ready_at = time.time() + backoff
+                        requeued = managed_job_state.set_batch_attempt_status(
                             self._managed_job_id,
                             batch_idx,
+                            attempt_id,
                             'PENDING',
-                            retry_count=self._retry_counts[batch_idx])
-                        self.pending_batches.append(batch_idx)
-                        backoff = (constants.RETRY_BACKOFF_BASE**
-                                   self._retry_counts[batch_idx])
-                        logger.info(
-                            f'Re-queued batch {batch_idx} '
-                            f'(retry {self._retry_counts[batch_idx]}/'
-                            f'{constants.MAX_RETRIES}), backoff {backoff}s')
-                        time.sleep(backoff)
+                            retry_count=retry_count,
+                            next_retry_at=ready_at)
+                        if requeued:
+                            self._retry_counts[batch_idx] = retry_count
+                            self._enqueue_batch(batch_idx, ready_at)
+                            logger.info(f'Re-queued batch {batch_idx} '
+                                        f'(retry {retry_count}/'
+                                        f'{constants.MAX_RETRIES}), '
+                                        f'eligible in {backoff}s')
+                        else:
+                            logger.warning(
+                                'Ignoring failure from stale batch attempt '
+                                '%d/%d', batch_idx, attempt_id)
                     else:
-                        managed_job_state.set_batch_status(self._managed_job_id,
-                                                           batch_idx,
-                                                           'FAILED',
-                                                           retry_count=retries +
-                                                           1)
-                        raise RuntimeError(
-                            f'Batch {batch_idx} failed after '
-                            f'{constants.MAX_RETRIES} retries: {e}') from e
+                        failed = managed_job_state.set_batch_attempt_status(
+                            self._managed_job_id,
+                            batch_idx,
+                            attempt_id,
+                            'FAILED',
+                            retry_count=retries)
+                        if failed:
+                            raise RuntimeError(
+                                f'Batch {batch_idx} failed after '
+                                f'{constants.MAX_RETRIES} retries: {e}') from e
+                        logger.warning(
+                            'Ignoring terminal failure from stale batch '
+                            'attempt %d/%d', batch_idx, attempt_id)
         finally:
             self._shutdown_worker(cluster_name, worker_job_id=worker_job_id)
             with self._active_workers_lock:
@@ -777,13 +953,26 @@ class BatchCoordinator:
         # Monitor until all batches complete, periodically discovering
         # new workers and spawning threads for them.
         while not self._cancelled:
-            if self.completed_count >= len(self.batches):
+            self._reclaim_expired_batches()
+            leased_count, failed_batches = self._sync_batch_progress_from_db()
+            completed_count = self._get_completed_count()
+            if completed_count >= len(self.batches):
+                break
+            if failed_batches:
+                errors.append(
+                    RuntimeError('Batch job has terminally failed batches: '
+                                 f'{failed_batches}'))
                 break
 
             alive = any(t.is_alive() for t in active_threads.values())
+            has_pending = self._has_pending_batches()
 
-            if not alive and not self.pending_batches:
-                # No threads running and no pending work — done.
+            if not alive and not has_pending:
+                if leased_count:
+                    # A previous coordinator incarnation still owns a live
+                    # lease.  Wait for either its completion or expiry.
+                    time.sleep(10)
+                    continue
                 break
 
             # Re-discover workers and start threads for idle ones.
@@ -793,7 +982,7 @@ class BatchCoordinator:
                 for w in current_workers:
                     already_active = (w in active_threads and
                                       active_threads[w].is_alive())
-                    if not already_active and self.pending_batches:
+                    if not already_active and self._has_pending_batches():
                         logger.info(f'Discovered new/idle worker: {w}')
                         try:
                             self._shutdown_worker(w)
@@ -806,7 +995,7 @@ class BatchCoordinator:
 
             # If all threads are dead, work remains, and we couldn't
             # start any new threads, there's nothing more we can do.
-            if not alive and self.pending_batches and not started_new:
+            if (not alive and self._has_pending_batches() and not started_new):
                 break
 
             time.sleep(10)
@@ -815,25 +1004,47 @@ class BatchCoordinator:
         for t in active_threads.values():
             t.join(timeout=60)
 
-        if self.completed_count != len(self.batches):
+        completed_count = self._get_completed_count()
+        if completed_count != len(self.batches):
             if errors:
                 raise errors[0]
             raise RuntimeError(
                 f'Expected {len(self.batches)} completed batches, '
-                f'got {self.completed_count}')
+                f'got {completed_count}')
 
     # ------------------------------------------------------------------
     # Result merging
     # ------------------------------------------------------------------
 
-    def _reduce_results_and_cleanup(self) -> None:
-        """Reduce per-batch results into the final output and clean up."""
+    def _get_completed_batch_attempts(self) -> List[io_formats.BatchAttempt]:
+        records = managed_job_state.get_batch_states(self._managed_job_id)
+        attempts = []
+        for rec in records:
+            if rec['status'] != 'COMPLETED':
+                raise RuntimeError(
+                    f'Cannot reduce batch {rec["batch_idx"]} in state '
+                    f'{rec["status"]}.')
+            attempts.append((rec['start_idx'], rec['end_idx'],
+                             int(rec.get('attempt_id') or 0)))
+        if len(attempts) != len(self.batches):
+            raise RuntimeError(f'Expected {len(self.batches)} completed batch '
+                               f'attempts, found {len(attempts)}.')
+        return attempts
+
+    def _reduce_results(self) -> None:
+        """Publish outputs from only the durably completed attempts."""
         job_id = str(self._managed_job_id)
+        batch_attempts = self._get_completed_batch_attempts()
         logger.info('Reducing results...')
         for fmt in self._output_formats:
             logger.info(f'Handling output format: {type(fmt).__name__}')
-            fmt.reduce_results(job_id)
+            fmt.reduce_attempt_results(job_id, batch_attempts)
             logger.info(f'Results written to {fmt.path}')
+
+    def cleanup(self) -> None:
+        """Best-effort cleanup after the managed job is durably SUCCEEDED."""
+        job_id = str(self._managed_job_id)
+        for fmt in self._output_formats:
             fmt.cleanup(job_id)
             logger.info(f'Cleaned up temp files for {fmt.path}')
 
@@ -846,21 +1057,11 @@ class BatchCoordinator:
         output_formats = getattr(self, '_output_formats', [])
         if not output_formats:
             return
-        job_id = str(self._managed_job_id)
         logger.info(
             '\n'
             '============================================================\n'
-            'Partial results are preserved. To merge completed batches\n'
-            'into the final output, run:\n'
-            '\n'
-            '    import sky.batch\n'
-            '\n')
-        for fmt in output_formats:
-            fmt_name = type(fmt).__name__
-            fields = ', '.join(f'{k}={v!r}' for k, v in fmt.to_dict().items()
-                               if k not in ('format', '_class_source'))
-            logger.info(f'    writer = sky.batch.{fmt_name}({fields})\n'
-                        f'    writer.reduce_results({job_id!r})\n'
-                        f'    writer.cleanup({job_id!r})\n')
+            'Attempt-scoped partial results are preserved. Resume the managed\n'
+            'job to publish only the attempts selected by durable batch '
+            'state.\n')
         logger.info(
             '============================================================')

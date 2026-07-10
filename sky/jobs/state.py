@@ -243,6 +243,17 @@ batch_state_table = sqlalchemy.Table(
                       sqlalchemy.Integer,
                       nullable=False,
                       server_default='0'),
+    # Monotonically increasing fencing token.  Every successful claim gets a
+    # new value; state transitions from an older controller incarnation are
+    # rejected once a newer attempt has claimed the batch.
+    sqlalchemy.Column('attempt_id',
+                      sqlalchemy.Integer,
+                      nullable=False,
+                      server_default='0'),
+    sqlalchemy.Column('lease_expires_at', sqlalchemy.Float),
+    # Earliest wall-clock time at which a failed batch may be claimed again.
+    # Persisting this makes retry backoff survive controller restarts.
+    sqlalchemy.Column('next_retry_at', sqlalchemy.Float),
     sqlalchemy.Column('updated_at', sqlalchemy.Float),
     sqlalchemy.PrimaryKeyConstraint('job_id', 'batch_idx'),
 )
@@ -2307,12 +2318,14 @@ def is_batch_job(job_id: int) -> bool:
         return row is not None and bool(row[0])
 
 
+@db_retries.retry
 def get_batch_states(job_id: int) -> List[Dict[str, Any]]:
     """Read all batch records ordered by batch_idx.
 
     Returns:
         List of dicts with keys: batch_idx, start_idx, end_idx, status,
-        worker_cluster, retry_count, updated_at.
+        worker_cluster, retry_count, attempt_id, lease_expires_at,
+        next_retry_at, updated_at.
     """
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
@@ -2324,49 +2337,164 @@ def get_batch_states(job_id: int) -> List[Dict[str, Any]]:
         return [dict(r) for r in rows]
 
 
-def set_batch_status(job_id: int,
-                     batch_idx: int,
-                     status: str,
-                     worker_cluster: Optional[str] = None,
-                     retry_count: Optional[int] = None) -> None:
-    """Update a single batch record's status.
+def claim_batch(job_id: int,
+                batch_idx: int,
+                worker_cluster: str,
+                lease_duration: float,
+                now: Optional[float] = None) -> Optional[int]:
+    """Atomically claim an eligible PENDING batch.
 
-    Args:
-        job_id: Managed job ID.
-        batch_idx: 0-based batch index.
-        status: New status (PENDING, DISPATCHED, COMPLETED, FAILED).
-        worker_cluster: Cluster processing this batch (optional).
-        retry_count: Current retry count (optional).
+    Returns the new attempt ID, or ``None`` if another dispatcher owns the
+    batch or its retry backoff has not elapsed.
     """
+    if lease_duration <= 0:
+        raise ValueError('lease_duration must be positive')
+    if now is None:
+        now = time.time()
+
     engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        result = session.execute(
+            sqlalchemy.update(batch_state_table).where(
+                sqlalchemy.and_(
+                    batch_state_table.c.job_id == job_id,
+                    batch_state_table.c.batch_idx == batch_idx,
+                    batch_state_table.c.status == 'PENDING',
+                    sqlalchemy.or_(batch_state_table.c.next_retry_at.is_(None),
+                                   batch_state_table.c.next_retry_at <= now),
+                )).values(status='DISPATCHED',
+                          worker_cluster=worker_cluster,
+                          attempt_id=batch_state_table.c.attempt_id + 1,
+                          lease_expires_at=now + lease_duration,
+                          next_retry_at=None,
+                          updated_at=now))
+        if result.rowcount != 1:
+            session.commit()
+            return None
+        attempt_id = session.execute(
+            sqlalchemy.select(batch_state_table.c.attempt_id).where(
+                sqlalchemy.and_(
+                    batch_state_table.c.job_id == job_id,
+                    batch_state_table.c.batch_idx == batch_idx))).scalar_one()
+        session.commit()
+        return int(attempt_id)
+
+
+def renew_batch_lease(job_id: int,
+                      batch_idx: int,
+                      attempt_id: int,
+                      lease_duration: float,
+                      now: Optional[float] = None) -> bool:
+    """Extend a lease only if ``attempt_id`` still owns the batch."""
+    if lease_duration <= 0:
+        raise ValueError('lease_duration must be positive')
+    if now is None:
+        now = time.time()
+
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        result = session.execute(
+            sqlalchemy.update(batch_state_table).where(
+                sqlalchemy.and_(
+                    batch_state_table.c.job_id == job_id,
+                    batch_state_table.c.batch_idx == batch_idx,
+                    batch_state_table.c.status == 'DISPATCHED',
+                    batch_state_table.c.attempt_id == attempt_id,
+                )).values(lease_expires_at=now + lease_duration,
+                          updated_at=now))
+        session.commit()
+        return result.rowcount == 1
+
+
+@db_retries.retry
+def set_batch_attempt_status(job_id: int,
+                             batch_idx: int,
+                             attempt_id: int,
+                             status: str,
+                             retry_count: Optional[int] = None,
+                             next_retry_at: Optional[float] = None,
+                             now: Optional[float] = None) -> bool:
+    """Transition the currently leased attempt using an attempt-token CAS.
+
+    Stale controllers get ``False`` instead of overwriting a newer attempt.
+    Only transitions out of ``DISPATCHED`` are supported here.
+    """
+    if status not in ('PENDING', 'COMPLETED', 'FAILED'):
+        raise ValueError(f'Unsupported batch attempt status: {status}')
+    if status != 'PENDING' and next_retry_at is not None:
+        raise ValueError('next_retry_at is only valid for PENDING batches')
+    if now is None:
+        now = time.time()
+
     values: Dict[str, Any] = {
         'status': status,
-        'updated_at': time.time(),
+        'worker_cluster': None,
+        'lease_expires_at': None,
+        'next_retry_at': next_retry_at if status == 'PENDING' else None,
+        'updated_at': now,
     }
-    if worker_cluster is not None:
-        values['worker_cluster'] = worker_cluster
     if retry_count is not None:
         values['retry_count'] = retry_count
-    with orm.Session(engine) as session:
-        session.execute(
-            sqlalchemy.update(batch_state_table).where(
-                sqlalchemy.and_(
-                    batch_state_table.c.job_id == job_id,
-                    batch_state_table.c.batch_idx == batch_idx)).values(values))
-        session.commit()
 
-
-def reset_dispatched_batches(job_id: int) -> None:
-    """Reset all DISPATCHED batches to PENDING for crash recovery."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
-        session.execute(
+        result = session.execute(
             sqlalchemy.update(batch_state_table).where(
                 sqlalchemy.and_(
                     batch_state_table.c.job_id == job_id,
-                    batch_state_table.c.status == 'DISPATCHED')).values(
-                        status='PENDING', updated_at=time.time()))
+                    batch_state_table.c.batch_idx == batch_idx,
+                    batch_state_table.c.status == 'DISPATCHED',
+                    batch_state_table.c.attempt_id == attempt_id,
+                )).values(values))
         session.commit()
+        return result.rowcount == 1
+
+
+@db_retries.retry
+def requeue_expired_batch_attempts(job_id: int,
+                                   now: Optional[float] = None) -> List[int]:
+    """Atomically return expired DISPATCHED attempts to PENDING.
+
+    The compare-and-set includes each candidate's attempt ID, so concurrent
+    coordinator incarnations cannot both reclaim the same attempt.
+    """
+    if now is None:
+        now = time.time()
+
+    engine = _db_manager.get_engine()
+    reclaimed: List[int] = []
+    with orm.Session(engine) as session:
+        candidates = session.execute(
+            sqlalchemy.select(
+                batch_state_table.c.batch_idx,
+                batch_state_table.c.attempt_id).where(
+                    sqlalchemy.and_(
+                        batch_state_table.c.job_id == job_id,
+                        batch_state_table.c.status == 'DISPATCHED',
+                        sqlalchemy.or_(
+                            batch_state_table.c.lease_expires_at.is_(None),
+                            batch_state_table.c.lease_expires_at <= now,
+                        ))).order_by(batch_state_table.c.batch_idx)).all()
+        for batch_idx, attempt_id in candidates:
+            result = session.execute(
+                sqlalchemy.update(batch_state_table).where(
+                    sqlalchemy.and_(
+                        batch_state_table.c.job_id == job_id,
+                        batch_state_table.c.batch_idx == batch_idx,
+                        batch_state_table.c.status == 'DISPATCHED',
+                        batch_state_table.c.attempt_id == attempt_id,
+                        sqlalchemy.or_(
+                            batch_state_table.c.lease_expires_at.is_(None),
+                            batch_state_table.c.lease_expires_at <= now),
+                    )).values(status='PENDING',
+                              worker_cluster=None,
+                              lease_expires_at=None,
+                              next_retry_at=now,
+                              updated_at=now))
+            if result.rowcount == 1:
+                reclaimed.append(int(batch_idx))
+        session.commit()
+    return reclaimed
 
 
 def update_job_full_resources(job_id: int,

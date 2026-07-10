@@ -10,7 +10,7 @@ from sky.skylet import constants
 # based on version info is needed.
 # For more details and code guidelines, refer to:
 # https://docs.skypilot.co/en/latest/developers/CONTRIBUTING.html#backward-compatibility-guidelines
-API_VERSION = 55  # WAITING request status
+API_VERSION = 57  # Restart-safe Sky Batch attempt outputs
 
 # The minimum peer API version that the code should still work with.
 # Notes (dev):
@@ -45,6 +45,10 @@ MIN_SSH_REDIRECT_PROTOCOL_VERSION = 47
 # Minimum API version that supports Sky Batch (sky.batch module).
 MIN_BATCH_API_VERSION = 49
 
+# Minimum server API version that supports immutable attempt-scoped Batch
+# outputs and winner-only reduction.
+MIN_BATCH_ATTEMPT_FENCING_API_VERSION = 57
+
 # Minimum API version that supports bundling cluster credentials with the
 # launch response. Lets the CLI skip the follow-up /status round-trip that
 # only exists to fetch credentials for SSH config setup.
@@ -58,7 +62,7 @@ MIN_LAUNCH_CREDENTIALS_API_VERSION = 50
 MIN_LAZY_REPLICA_HANDLE_API_VERSION = 51
 
 # Minimum ReplicaInfo._VERSION that supports Sky Batch workers.
-MIN_BATCH_REPLICA_INFO_VERSION = 3
+MIN_BATCH_REPLICA_INFO_VERSION = 6
 
 # Minimum server API version that exposes /users/me/workspace and runs the
 # server-side launch-path resolver when the client does not specify an
