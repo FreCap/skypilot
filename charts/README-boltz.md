@@ -129,9 +129,13 @@ The chart also injects
 `SKYPILOT_SERVE_API_SERVICE_URL=http://<fullname>-api-service.<namespace>.svc`
 and the downward-API `SKYPILOT_POD_NAME` / `SKYPILOT_POD_NAMESPACE` values. Helm
 validates that the four mandatory reference strings are non-empty and that the
-optional data-plane references are either both set or both empty. Kubernetes
-enforces that referenced Secrets and keys actually exist when it mounts the API
-pod. Disabling data-plane auth does not alter a model server's own
+LB-sync and controller-admin roles do not reference the same Secret key. The API
+server also requires the parsed token rings to be content-disjoint at startup
+and on every live read. Rotation overlap is supported within each ring, but a
+token must never move between both rings in one step. The optional data-plane
+references must be either both set or both empty. Kubernetes enforces that
+referenced Secrets and keys actually exist when it mounts the API pod. Disabling
+data-plane auth does not alter a model server's own
 `Authorization` handling; the external LB continues to preserve that header.
 
 Note: `Chart.yaml` `version`/`appVersion` are `0.0.0` / `"0.0"` placeholders in git;

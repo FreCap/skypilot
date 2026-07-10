@@ -64,6 +64,28 @@ tests:
       - failedTemplate:
           errorMessage: "serve.externalLoadBalancer.auth.controllerAdmin.key is required when serve.externalLoadBalancer.enabled=true"
 
+  - it: should reject the same Secret key for LB sync and controller admin
+    set:
+      serve.externalLoadBalancer.enabled: true
+      serve.externalLoadBalancer.auth.lbSync.existingSecret: shared-auth
+      serve.externalLoadBalancer.auth.lbSync.key: tokens
+      serve.externalLoadBalancer.auth.controllerAdmin.existingSecret: shared-auth
+      serve.externalLoadBalancer.auth.controllerAdmin.key: tokens
+    asserts:
+      - failedTemplate:
+          errorMessage: "serve.externalLoadBalancer.auth.lbSync and serve.externalLoadBalancer.auth.controllerAdmin must reference different Secret keys"
+
+  - it: should allow different keys in one Secret for runtime content checks
+    set:
+      serve.externalLoadBalancer.enabled: true
+      serve.externalLoadBalancer.auth.lbSync.existingSecret: shared-auth
+      serve.externalLoadBalancer.auth.lbSync.key: sync-tokens
+      serve.externalLoadBalancer.auth.controllerAdmin.existingSecret: shared-auth
+      serve.externalLoadBalancer.auth.controllerAdmin.key: admin-tokens
+    asserts:
+      - isKind:
+          of: Deployment
+
   - it: should render with data-plane auth disabled when both references are empty
     set:
       serve.externalLoadBalancer.enabled: true

@@ -35,11 +35,10 @@ SERVICE_REGISTER_TIMEOUT_SECONDS = 180
 LB_DEPLOYMENT_READY_TIMEOUT_SECONDS = 120
 LB_DEPLOYMENT_READY_POLL_SECONDS = 1
 
-# Legacy env var holding one shared controller bearer token. New deployments
-# should use the two independent file-backed rings below: sharing the LB sync
-# credential with the controller-admin credential needlessly lets a compromised
-# LB invoke destructive controller endpoints. This remains as a fallback for
-# rolling upgrades from deployments that supplied one token to both callers.
+# Legacy env var holding one controller-admin bearer token. New deployments
+# should use the independent file-backed rings below. It deliberately is NOT a
+# fallback for LB sync: letting one legacy credential authenticate both domains
+# would allow a compromised LB to invoke destructive controller endpoints.
 CONTROLLER_AUTH_TOKEN_ENV_VAR = 'SKYPILOT_SERVE_CONTROLLER_AUTH_TOKEN'
 
 # Newline-delimited token-ring files. The first line is the primary credential;

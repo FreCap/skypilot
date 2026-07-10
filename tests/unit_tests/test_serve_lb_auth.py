@@ -5,10 +5,11 @@ Independent tokens:
     plane) via a dedicated header consumed by the LB. Legacy deployments fall
     back to token presence when the capability env is absent. The readiness
     route is exempt so the k8s probe still works.
-  - CONTROLLER_AUTH_TOKEN_ENV_VAR is presented by the LB on every sync so the
-    (now-authenticated) controller accepts it. The request aggregator must be
-    cleared only after a SUCCESSFUL sync -- a failed sync (e.g. 401) must not
-    drop the load signal the controller never received.
+  - LB_SYNC_AUTH_TOKENS_FILE_ENV_VAR is presented by the LB on every sync so
+    the controller accepts it. The legacy controller-admin singleton never
+    grants sync access. The request aggregator must be cleared only after a
+    SUCCESSFUL sync -- a failed sync (e.g. 401) must not drop the load signal
+    the controller never received.
 
 Logic-only: no assertions on log or exception message text.
 """
@@ -314,8 +315,10 @@ def _sync_once(monkeypatch, lb, status, captured):
     _run(lb._sync_with_controller_once())
 
 
-def test_sync_sends_control_plane_bearer(monkeypatch):
-    monkeypatch.setenv(constants.CONTROLLER_AUTH_TOKEN_ENV_VAR, 'ctrl-tok')
+def test_sync_sends_control_plane_bearer(monkeypatch, tmp_path):
+    ring = tmp_path / 'sync.tokens'
+    ring.write_text('ctrl-tok\n', encoding='utf-8')
+    monkeypatch.setenv(constants.LB_SYNC_AUTH_TOKENS_FILE_ENV_VAR, str(ring))
     lb = _make_lb()
     captured = {}
     _sync_once(monkeypatch, lb, 200, captured)
@@ -326,7 +329,6 @@ def test_sync_sends_control_plane_bearer(monkeypatch):
 
 
 def test_sync_without_token_still_fences_service_incarnation(monkeypatch):
-    monkeypatch.delenv(constants.CONTROLLER_AUTH_TOKEN_ENV_VAR, raising=False)
     lb = _make_lb()
     captured = {}
     _sync_once(monkeypatch, lb, 200, captured)
