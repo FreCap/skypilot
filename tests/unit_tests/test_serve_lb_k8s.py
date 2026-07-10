@@ -251,6 +251,14 @@ def test_external_runtime_fails_closed(monkeypatch):
         lb_k8s.require_external_lb_runtime()
 
 
+@pytest.mark.parametrize(('external', 'incluster'), [(False, True),
+                                                     (True, False)])
+def test_lb_service_endpoint_unavailable_without_external_runtime(
+        monkeypatch, external, incluster):
+    _install(monkeypatch, external=external, incluster=incluster)
+    assert lb_k8s.lb_service_endpoint_or_none('svc') is None
+
+
 def test_external_runtime_requires_projected_files(monkeypatch):
     _install(monkeypatch)
     monkeypatch.delenv(constants.LB_SYNC_AUTH_TOKENS_FILE_ENV_VAR)
