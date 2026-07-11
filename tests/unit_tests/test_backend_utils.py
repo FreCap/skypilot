@@ -1,3 +1,7 @@
+"""Unit tests for backend utility helpers."""
+
+# pylint: disable=protected-access,unused-argument
+
 import os
 import pathlib
 from unittest import mock
@@ -14,6 +18,7 @@ from sky.exceptions import ClusterNotUpError
 from sky.resources import Resources
 from sky.utils import common
 from sky.utils import common_utils
+from sky.utils import controller_utils
 from sky.utils import status_lib
 from sky.utils import yaml_utils
 
@@ -54,7 +59,7 @@ def test_write_cluster_config_w_remote_identity(mock_fill_template,
         to_provision=resource,
         num_nodes=2,
         cluster_config_template=cluster_config_template,
-        cluster_name="display",
+        cluster_name='display',
         local_wheel_path=pathlib.Path('/tmp/fake'),
         wheel_hash='b1bd84059bc0342f7843fcbe04ab563e',
         region=region,
@@ -78,9 +83,9 @@ def test_write_cluster_config_w_remote_identity(mock_fill_template,
 
     mock_fill_template.assert_called_once()
     assert mock_fill_template.call_args[0][
-        0] == cluster_config_template, "config template incorrect"
+        0] == cluster_config_template, 'config template incorrect'
     assert mock_fill_template.call_args[0][1].items() >= expected_subset.items(
-    ), "config fill values incorrect"
+    ), 'config fill values incorrect'
 
     # test using cluster matches regex, top
     mock_fill_template.reset_mock()
@@ -93,7 +98,7 @@ def test_write_cluster_config_w_remote_identity(mock_fill_template,
         to_provision=resource,
         num_nodes=2,
         cluster_config_template=cluster_config_template,
-        cluster_name="sky-serve-fake1-1234",
+        cluster_name='sky-serve-fake1-1234',
         local_wheel_path=pathlib.Path('/tmp/fake'),
         wheel_hash='b1bd84059bc0342f7843fcbe04ab563e',
         region=region,
@@ -102,10 +107,10 @@ def test_write_cluster_config_w_remote_identity(mock_fill_template,
         keep_launch_fields_in_existing_config=True)
 
     mock_fill_template.assert_called_once()
-    assert (mock_fill_template.call_args[0][0] == cluster_config_template,
-            "config template incorrect")
-    assert (mock_fill_template.call_args[0][1].items() >=
-            expected_subset.items(), "config fill values incorrect")
+    assert mock_fill_template.call_args[0][0] == cluster_config_template, (
+        'config template incorrect')
+    assert mock_fill_template.call_args[0][1].items() >= expected_subset.items(
+    ), 'config fill values incorrect'
 
     # test using cluster matches regex, middle
     mock_fill_template.reset_mock()
@@ -118,7 +123,7 @@ def test_write_cluster_config_w_remote_identity(mock_fill_template,
         to_provision=resource,
         num_nodes=2,
         cluster_config_template=cluster_config_template,
-        cluster_name="sky-serve-fake2-1234",
+        cluster_name='sky-serve-fake2-1234',
         local_wheel_path=pathlib.Path('/tmp/fake'),
         wheel_hash='b1bd84059bc0342f7843fcbe04ab563e',
         region=region,
@@ -127,10 +132,10 @@ def test_write_cluster_config_w_remote_identity(mock_fill_template,
         keep_launch_fields_in_existing_config=True)
 
     mock_fill_template.assert_called_once()
-    assert (mock_fill_template.call_args[0][0] == cluster_config_template,
-            "config template incorrect")
-    assert (mock_fill_template.call_args[0][1].items() >=
-            expected_subset.items(), "config fill values incorrect")
+    assert mock_fill_template.call_args[0][0] == cluster_config_template, (
+        'config template incorrect')
+    assert mock_fill_template.call_args[0][1].items() >= expected_subset.items(
+    ), 'config fill values incorrect'
 
 
 @mock.patch.object(skypilot_config, '_global_config_context',
@@ -145,9 +150,8 @@ def test_write_cluster_config_w_remote_identity(mock_fill_template,
 @mock.patch('sky.utils.common_utils.fill_template')
 def test_write_cluster_config_w_post_provision_runcmd_aws(
         mock_fill_template, *mocks):
-    os.environ[
-        skypilot_config.
-        ENV_VAR_SKYPILOT_CONFIG] = './tests/test_yamls/test_aws_config_runcmd.yaml'
+    os.environ[skypilot_config.ENV_VAR_SKYPILOT_CONFIG] = (
+        './tests/test_yamls/test_aws_config_runcmd.yaml')
     skypilot_config.reload_config()
 
     cloud = clouds.AWS()
@@ -160,7 +164,7 @@ def test_write_cluster_config_w_post_provision_runcmd_aws(
         to_provision=resource,
         num_nodes=2,
         cluster_config_template=cluster_config_template,
-        cluster_name="display",
+        cluster_name='display',
         local_wheel_path=pathlib.Path('/tmp/fake'),
         wheel_hash='b1bd84059bc0342f7843fcbe04ab563e',
         region=region,
@@ -174,9 +178,9 @@ def test_write_cluster_config_w_post_provision_runcmd_aws(
     ]
     mock_fill_template.assert_called_once()
     assert mock_fill_template.call_args[0][
-        0] == cluster_config_template, "config template incorrect"
+        0] == cluster_config_template, 'config template incorrect'
     assert mock_fill_template.call_args[0][1][
-        'runcmd'] == expected_runcmd, "runcmd not passed correctly"
+        'runcmd'] == expected_runcmd, 'runcmd not passed correctly'
 
 
 @mock.patch.object(skypilot_config, '_global_config_context',
@@ -187,9 +191,8 @@ def test_write_cluster_config_w_post_provision_runcmd_aws(
             wraps=common_utils.fill_template)
 def test_write_cluster_config_w_post_provision_runcmd_kubernetes(
         mock_fill_template, *mocks):
-    os.environ[
-        skypilot_config.
-        ENV_VAR_SKYPILOT_CONFIG] = './tests/test_yamls/test_k8s_config_runcmd.yaml'
+    os.environ[skypilot_config.ENV_VAR_SKYPILOT_CONFIG] = (
+        './tests/test_yamls/test_k8s_config_runcmd.yaml')
     skypilot_config.reload_config()
 
     cloud = clouds.Kubernetes()
@@ -200,7 +203,7 @@ def test_write_cluster_config_w_post_provision_runcmd_kubernetes(
         to_provision=resource,
         num_nodes=2,
         cluster_config_template=cluster_config_template,
-        cluster_name="display",
+        cluster_name='display',
         local_wheel_path=pathlib.Path('/tmp/fake'),
         wheel_hash='b1bd84059bc0342f7843fcbe04ab563e',
         region=region,
@@ -209,9 +212,9 @@ def test_write_cluster_config_w_post_provision_runcmd_kubernetes(
     expected_runcmd = ['echo "hello world!"']
     mock_fill_template.assert_called_once()
     assert mock_fill_template.call_args[0][
-        0] == cluster_config_template, "config template incorrect"
+        0] == cluster_config_template, 'config template incorrect'
     assert mock_fill_template.call_args[0][1][
-        'runcmd'] == expected_runcmd, "runcmd not passed correctly"
+        'runcmd'] == expected_runcmd, 'runcmd not passed correctly'
 
 
 def test_get_clusters_launch_refresh(monkeypatch):
@@ -290,6 +293,170 @@ def test_get_clusters_launch_refresh(monkeypatch):
 
     assert len(
         backend_utils.get_clusters(refresh=common.StatusRefreshMode.FORCE)) == 2
+
+
+def test_get_clusters_refresh_enriches_only_final_records(monkeypatch):
+    """Refreshed clusters should be enriched from their final records once."""
+
+    def _mock_cluster(name, status, cluster_name_on_cloud):
+        handle = mock.MagicMock()
+        handle.cluster_name_on_cloud = cluster_name_on_cloud
+        handle.launched_nodes = 1
+        handle.launched_resources = None
+        return {
+            'name': name,
+            'launched_at': '0',
+            'handle': handle,
+            'last_use': 'sky launch',
+            'status': status,
+            'autostop': 0,
+            'to_down': False,
+            'cluster_hash': '00000',
+            'cluster_ever_up': status != status_lib.ClusterStatus.INIT,
+            'status_updated_at': 0,
+            'user_hash': '00000',
+            'user_name': 'pilot',
+            'workspace': 'default',
+            'is_managed': False,
+            'nodes': 0,
+        }
+
+    cached_records = [
+        _mock_cluster('up-cluster', status_lib.ClusterStatus.UP,
+                      'up-cluster-stale-cloud'),
+        _mock_cluster('launch-cluster', status_lib.ClusterStatus.INIT,
+                      'launch-cluster-cloud'),
+        _mock_cluster('gone-cluster', status_lib.ClusterStatus.UP,
+                      'gone-cluster-cloud'),
+    ]
+
+    resource_calls = []
+
+    def get_readable_resources_repr(handle, simplified_only):
+        assert simplified_only is False
+        resource_calls.append(handle.cluster_name_on_cloud)
+        cloud_name = handle.cluster_name_on_cloud
+        return cloud_name, f'{cloud_name}-full'
+
+    def refresh_cluster(cluster_name, force_refresh_statuses, include_user_info,
+                        summary_response):
+        del force_refresh_statuses, include_user_info, summary_response
+        if cluster_name == 'up-cluster':
+            return _mock_cluster('up-cluster', status_lib.ClusterStatus.UP,
+                                 'up-cluster-fresh-cloud')
+        if cluster_name == 'gone-cluster':
+            return None
+        raise AssertionError(f'unexpected refresh for {cluster_name!r}')
+
+    def get_request_tasks(*args, **kwargs):
+        del args, kwargs
+        launch_request = mock.MagicMock()
+        launch_request.cluster_name = 'launch-cluster'
+        return [launch_request]
+
+    monkeypatch.setattr('sky.global_user_state.get_clusters',
+                        lambda *args, **kwargs: cached_records)
+    monkeypatch.setattr('sky.utils.resources_utils.get_readable_resources_repr',
+                        get_readable_resources_repr)
+    monkeypatch.setattr(
+        'sky.backends.backend_utils.ssh_credentials_from_handles',
+        lambda handles: [{} for _ in handles])
+    monkeypatch.setattr('sky.backends.backend_utils._refresh_cluster',
+                        refresh_cluster)
+    monkeypatch.setattr('sky.server.requests.requests.get_request_tasks',
+                        get_request_tasks)
+
+    records = backend_utils.get_clusters(refresh=common.StatusRefreshMode.FORCE)
+
+    assert [record['name'] for record in records
+           ] == ['up-cluster', 'launch-cluster']
+    assert records[0]['resources_str'] == 'up-cluster-fresh-cloud'
+    assert records[0]['resources_str_full'] == 'up-cluster-fresh-cloud-full'
+    assert records[1]['resources_str'] == 'launch-cluster-cloud'
+    assert records[1]['resources_str_full'] == 'launch-cluster-cloud-full'
+    assert resource_calls == ['up-cluster-fresh-cloud', 'launch-cluster-cloud']
+
+
+def test_get_clusters_refresh_credentials_only_final_handles(monkeypatch):
+    """Credential lookup should only touch final returned handles once."""
+
+    def _mock_cluster(name, status, cluster_name_on_cloud):
+        handle = mock.MagicMock()
+        handle.cluster_name_on_cloud = cluster_name_on_cloud
+        handle.launched_nodes = 1
+        handle.launched_resources = None
+        return {
+            'name': name,
+            'launched_at': '0',
+            'handle': handle,
+            'last_use': 'sky launch',
+            'status': status,
+            'autostop': 0,
+            'to_down': False,
+            'cluster_hash': '00000',
+            'cluster_ever_up': status != status_lib.ClusterStatus.INIT,
+            'status_updated_at': 0,
+            'user_hash': '00000',
+            'user_name': 'pilot',
+            'workspace': 'default',
+            'is_managed': False,
+            'nodes': 0,
+        }
+
+    cached_records = [
+        _mock_cluster('up-cluster', status_lib.ClusterStatus.UP,
+                      'up-cluster-stale-cloud'),
+        _mock_cluster('launch-cluster', status_lib.ClusterStatus.INIT,
+                      'launch-cluster-cloud'),
+        _mock_cluster('gone-cluster', status_lib.ClusterStatus.UP,
+                      'gone-cluster-cloud'),
+    ]
+
+    credential_calls = []
+
+    def ssh_credentials_from_handles(handles):
+        credential_calls.append(
+            [handle.cluster_name_on_cloud for handle in handles])
+        return [{} for _ in handles]
+
+    def refresh_cluster(cluster_name, force_refresh_statuses, include_user_info,
+                        summary_response):
+        del force_refresh_statuses, include_user_info, summary_response
+        if cluster_name == 'up-cluster':
+            return _mock_cluster('up-cluster', status_lib.ClusterStatus.UP,
+                                 'up-cluster-fresh-cloud')
+        if cluster_name == 'gone-cluster':
+            return None
+        raise AssertionError(f'unexpected refresh for {cluster_name!r}')
+
+    def get_request_tasks(*args, **kwargs):
+        del args, kwargs
+        launch_request = mock.MagicMock()
+        launch_request.cluster_name = 'launch-cluster'
+        return [launch_request]
+
+    monkeypatch.setattr('sky.global_user_state.get_clusters',
+                        lambda *args, **kwargs: cached_records)
+    monkeypatch.setattr('sky.utils.resources_utils.get_readable_resources_repr',
+                        lambda handle, simplified_only: ('', ''))
+    monkeypatch.setattr(
+        'sky.backends.backend_utils.ssh_credentials_from_handles',
+        ssh_credentials_from_handles)
+    monkeypatch.setattr('sky.backends.backend_utils._refresh_cluster',
+                        refresh_cluster)
+    monkeypatch.setattr('sky.server.requests.requests.get_request_tasks',
+                        get_request_tasks)
+    monkeypatch.setattr('sky.backends.backend_utils._caller_is_viewer',
+                        lambda: False)
+
+    records = backend_utils.get_clusters(refresh=common.StatusRefreshMode.FORCE,
+                                         include_credentials=True)
+
+    assert [record['name'] for record in records
+           ] == ['up-cluster', 'launch-cluster']
+    assert credential_calls == [[
+        'up-cluster-fresh-cloud', 'launch-cluster-cloud'
+    ]]
 
 
 def test_kubeconfig_upload_with_kubernetes_exclusion():
@@ -506,7 +673,6 @@ def test_check_owner_identity_k8s_scope_does_not_overmatch(monkeypatch):
 def test_is_controller_accessible_accepts_autostopping(mock_refresh,
                                                        monkeypatch):
     """Verify is_controller_accessible accepts AUTOSTOPPING status."""
-    from sky.utils import controller_utils
 
     mock_handle = mock.MagicMock()
     mock_handle.head_ip = '1.2.3.4'
@@ -564,7 +730,7 @@ def test_replace_yaml_dicts_restores_new_nested_field_for_legacy_cluster():
 
 
 def test_replace_yaml_dicts_preserves_old_subfield_on_restart():
-    """Existing cluster restart keeps old sibling subfields, takes new GroupName."""
+    """Existing cluster restart keeps old sibling subfields, new GroupName."""
     new_yaml = ('cluster_name: c\n'
                 'provider:\n'
                 '  type: external\n'
@@ -652,4 +818,4 @@ def test_make_safe_symlink_command_leaves_target_unquoted():
     cmd = backend_utils.FileMountHelper.make_safe_symlink_command(
         source='/etc/config', target='~/.sky/file_mounts/etc/config')
     assert 'ln -s ~/.sky/file_mounts/etc/config /etc/config' in cmd
-    assert "'~/.sky/file_mounts/etc/config'" not in cmd
+    assert '\'~/.sky/file_mounts/etc/config\'' not in cmd

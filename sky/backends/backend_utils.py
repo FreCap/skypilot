@@ -4276,12 +4276,11 @@ def get_clusters(
             if not include_handle:
                 record.pop('handle', None)
 
-    # Add handle info to the records
-    _update_records_with_handle_info(_get_records_with_handle(records),
-                                     summary_response=summary_response)
-    if include_credentials:
-        _update_records_with_credentials(records)
     if refresh == common.StatusRefreshMode.NONE:
+        _update_records_with_handle_info(_get_records_with_handle(records),
+                                         summary_response=summary_response)
+        if include_credentials:
+            _update_records_with_credentials(records)
         # Add resources to the records
         _update_records_with_resources(records)
         return records
@@ -4308,11 +4307,6 @@ def get_clusters(
         # e.g. all the Pods of a cluster on Kubernetes have been
         # deleted before refresh.
         if record is not None and 'error' not in record:
-            if record['handle'] is not None:
-                _update_records_with_handle_info(
-                    [record], summary_response=summary_response)
-            if include_credentials:
-                _update_records_with_credentials([record])
             progress.update(task, advance=1)
         return record
 
@@ -4390,6 +4384,10 @@ def get_clusters(
         for cluster_name, e in failed_clusters:
             logger.warning(f'  {bright}{cluster_name}{reset}: {e}')
 
+    _update_records_with_handle_info(_get_records_with_handle(kept_records),
+                                     summary_response=summary_response)
+    if include_credentials:
+        _update_records_with_credentials(kept_records)
     # Add resources to the records
     _update_records_with_resources(kept_records)
     return kept_records
