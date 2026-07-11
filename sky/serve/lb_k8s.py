@@ -78,6 +78,7 @@ _LB_OBJECT_DELETION_TIMEOUT_SECONDS = 60
 _LB_FOREGROUND_GC_MARGIN_SECONDS = 30
 _LB_OBJECT_RECONCILIATION_TIMEOUT_SECONDS = 60
 _LB_OBJECT_RECONCILIATION_POLL_SECONDS = 0.2
+_STRATEGIC_MERGE_PATCH_CONTENT_TYPE = ('application/strategic-merge-patch+json')
 
 # Stable projected-volume names rendered by the Helm chart. The LB receives
 # only the sync and data-plane rings; the controller-admin ring must never be
@@ -114,6 +115,41 @@ class LbPodAuthority(NamedTuple):
 
     ready_nonterminating_uids: Set[str]
     live_uids: Set[str]
+
+
+def _strategic_merge_patch(context: str, resource_path: str, response_type: str,
+                           name: str, namespace: str, body: Dict[str,
+                                                                 Any]) -> Any:
+    """Patch a Kubernetes object with an explicit strategic-merge type.
+
+    kubernetes-python 35.0.0 selects the first advertised PATCH content type,
+    JSON Patch, even when the typed client's body is a dict.  The LB
+    reconciliation bodies use strategic-merge directives and named-list merge
+    keys, so issue the same generated-client call explicitly with the required
+    content type.
+    """
+    return kubernetes.api_client(context).call_api(
+        resource_path,
+        'PATCH',
+        path_params={
+            'name': name,
+            'namespace': namespace,
+        },
+        query_params=[],
+        header_params={
+            'Accept': 'application/json',
+            'Content-Type': _STRATEGIC_MERGE_PATCH_CONTENT_TYPE,
+        },
+        body=body,
+        post_params=[],
+        files={},
+        response_type=response_type,
+        auth_settings=['BearerToken'],
+        async_req=False,
+        _return_http_data_only=True,
+        collection_formats={},
+        _preload_content=True,
+        _request_timeout=None)
 
 
 def lb_termination_grace_period_seconds(
@@ -1177,8 +1213,10 @@ def create_lb_deployment_and_service(
             desired_patch = copy.deepcopy(deployment_patch)
             desired_patch['metadata'].pop('ownerReferences', None)
             desired_patch['metadata']['resourceVersion'] = resource_version
-            apps_api.patch_namespaced_deployment(deployment_name, namespace,
-                                                 desired_patch)
+            _strategic_merge_patch(
+                context,
+                '/apis/apps/v1/namespaces/{namespace}/deployments/{name}',
+                'V1Deployment', deployment_name, namespace, desired_patch)
             break
         except kubernetes.api_exception() as e:
             if getattr(e, 'status', None) not in (404, 409):
@@ -1240,8 +1278,9 @@ def create_lb_deployment_and_service(
             # incarnation endpoints while the new LB rolls out.
             _assert_continues('fencing the old LB Service')
             try:
-                core_api.patch_namespaced_service(
-                    service_name_k8s, namespace, {
+                _strategic_merge_patch(
+                    context, '/api/v1/namespaces/{namespace}/services/{name}',
+                    'V1Service', service_name_k8s, namespace, {
                         'metadata': {
                             'labels': service_dict['metadata']['labels'],
                             'resourceVersion': resource_version,
@@ -1295,8 +1334,9 @@ def create_lb_deployment_and_service(
                 resource_version = _require_existing_lb_object_ownership(
                     context, namespace, service_name_k8s, existing_service,
                     owner_reference, service_hash)
-                core_api.patch_namespaced_service(
-                    service_name_k8s, namespace, {
+                _strategic_merge_patch(
+                    context, '/api/v1/namespaces/{namespace}/services/{name}',
+                    'V1Service', service_name_k8s, namespace, {
                         'metadata': {
                             'labels': service_dict['metadata']['labels'],
                             'resourceVersion': resource_version,
