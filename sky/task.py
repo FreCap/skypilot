@@ -1650,12 +1650,18 @@ class Task:
         store_type = storage_lib.StoreType.from_cloud(storage_cloud_str)
         return store_type, storage_region
 
-    def sync_storage_mounts(self) -> None:
+    def sync_storage_mounts(
+        self,
+        on_storage_plan_prepared: Optional[Callable[['Task'], None]] = None,
+    ) -> None:
         """(INTERNAL) Eagerly syncs storage mounts to cloud storage.
 
         After syncing up, COPY-mode storage mounts are translated into regular
         file_mounts of the form ``{ /remote/path: {s3,gs,..}://<bucket path>
         }``.
+
+        ``on_storage_plan_prepared`` runs after an implicit store provider and
+        region are recorded on the task, but before that store is created.
         """
         # The same storage can be used multiple times, and we should construct
         # the storage with stores first, so that the storage will be created on
@@ -1675,6 +1681,14 @@ class Task:
                 if not storage.stores:
                     store_type, store_region = self._get_preferred_store()
                     self.storage_plans[storage] = store_type
+                    # Publish an exactly reconstructable plan before the first
+                    # remote mutation. A crash after the store constructor
+                    # creates a bucket but before its handle reaches local
+                    # state must still leave provider+region cleanup inventory.
+                    storage.stores[store_type] = None
+                    storage._store_region = store_region  # pylint: disable=protected-access
+                    if on_storage_plan_prepared is not None:
+                        on_storage_plan_prepared(self)
                     storage.add_store(store_type, store_region)
                 else:
                     # We don't need to sync the storage here as if the stores

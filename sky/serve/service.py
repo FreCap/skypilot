@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 import traceback
-from typing import Any, Dict, NoReturn, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Callable, Dict, NoReturn, Optional, Tuple, TYPE_CHECKING
 
 import filelock
 
@@ -147,21 +147,61 @@ def _handle_signal(service_name: str,
     raise error_type(f'User signal received: {user_signal.value}')
 
 
-def cleanup_storage(yaml_content: str) -> bool:
-    """Clean up the storage for the service.
+def cleanup_storage(yaml_content: str,
+                    resource_scope: Optional[str] = None) -> bool:
+    """Delete only ephemeral storage owned by ``resource_scope``.
 
     Args:
         yaml_content: The yaml content of the service.
 
     Returns:
-        True if the storage is cleaned up successfully, False otherwise.
+        True if owned storage is cleaned up successfully (unowned resources
+        are deliberately retained), False otherwise.
     """
     failed = False
     task = None
+    scope_id: Optional[str] = None
 
     try:
         task = task_lib.Task.from_yaml_str(yaml_content)
-        backend = cloud_vm_ray_backend.CloudVmRayBackend()
+        if not isinstance(resource_scope, str) or not resource_scope:
+            logger.info('Retaining task storage without a durable resource '
+                        'scope.')
+            return True
+        scope_metadata = task.metadata.get(
+            constants.EPHEMERAL_STORAGE_SCOPE_METADATA_KEY)
+        storage_generation = (scope_metadata.get('storage_generation')
+                              if isinstance(scope_metadata, dict) else None)
+        if not isinstance(storage_generation, str):
+            logger.info('Retaining task storage without a scoped storage '
+                        'generation.')
+            return True
+        scope_id = serve_utils.generate_ephemeral_storage_scope_id(
+            resource_scope, storage_generation)
+        if (not isinstance(scope_metadata, dict) or
+                scope_metadata.get('resource_scope') != resource_scope or
+                scope_metadata.get('scope_id') != scope_id):
+            logger.info('Retaining task storage without matching '
+                        'incarnation-scoped ownership metadata.')
+            return True
+        raw_owned_mounts = scope_metadata.get('storage_mounts', [])
+        if not isinstance(raw_owned_mounts, list):
+            logger.warning('Retaining task storage with malformed scoped '
+                           'ownership metadata.')
+            return True
+        owned_mounts = {
+            mount for mount in raw_owned_mounts if isinstance(mount, str)
+        }
+        safe_storage_mounts = {}
+        for mount_path, storage in task.storage_mounts.items():
+            if (mount_path in owned_mounts and not storage.persistent and
+                    serve_utils.ephemeral_storage_identity_matches_scope(
+                        storage, scope_id)):
+                safe_storage_mounts[mount_path] = storage
+            elif not storage.persistent:
+                logger.info('Retaining unowned ephemeral storage mounted at '
+                            f'{mount_path!r}.')
+        task.storage_mounts = safe_storage_mounts
         # Need to re-construct storage object in the controller process
         # because when SkyPilot API server machine sends the yaml config to the
         # controller machine, only storage metadata is sent, not the storage
@@ -178,13 +218,20 @@ def cleanup_storage(yaml_content: str) -> bool:
         for storage_name in list(task.storage_mounts.keys()):
             storage = task.storage_mounts[storage_name]
             try:
+                # Cleanup reconstruction must never re-upload a local source.
+                # Pre-upload intents deliberately preserve that source so the
+                # remote identity is recoverable after a crash, but construct()
+                # defaults to syncing it again when a handle already exists.
+                storage.sync_on_reconstruction = False
                 storage.construct()
             except exceptions.StorageBucketGetError as e:
                 logger.debug(f'cleanup_storage: bucket for storage '
                              f'{storage_name!r} already gone, treating as '
                              f'already cleaned: {e}')
                 del task.storage_mounts[storage_name]
-        backend.teardown_ephemeral_storage(task)
+        if task.storage_mounts:
+            backend = cloud_vm_ray_backend.CloudVmRayBackend()
+            backend.teardown_ephemeral_storage(task)
     except Exception as e:  # pylint: disable=broad-except
         logger.error('Failed to clean up storage: '
                      f'{common_utils.format_exception(e)}')
@@ -192,18 +239,34 @@ def cleanup_storage(yaml_content: str) -> bool:
             logger.error(f'  Traceback: {traceback.format_exc()}')
         failed = True
 
-    # Clean up any files mounted from the local disk, such as two-hop file
-    # mounts. Guard against `task` being unbound if from_yaml_str raised above.
+    # Clean up only two-hop staging paths whose root includes this scope ID.
+    # User local paths and legacy random paths remain untouched.
     file_mount_values = (list(
         (task.file_mounts or {}).values()) if task else [])
+    scoped_file_mount_root = None
+    if task is not None and scope_id is not None:
+        scoped_file_mount_root = os.path.realpath(
+            os.path.expanduser(
+                os.path.join(
+                    skylet_constants.FILE_MOUNTS_CONTROLLER_TMP_BASE_PATH,
+                    scope_id)))
     for file_mount in file_mount_values:
         try:
             if not data_utils.is_cloud_store_url(file_mount):
                 path = os.path.expanduser(file_mount)
+                real_path = os.path.realpath(path)
+                if (scoped_file_mount_root is None or
+                        os.path.commonpath([real_path, scoped_file_mount_root
+                                           ]) != scoped_file_mount_root):
+                    logger.info('Retaining unowned local file mount source '
+                                f'{file_mount!r}.')
+                    continue
                 if os.path.isdir(path):
                     shutil.rmtree(path)
                 else:
                     os.remove(path)
+        except FileNotFoundError:
+            pass
         except Exception as e:  # pylint: disable=broad-except
             logger.error(f'Failed to clean up file mount {file_mount}: {e}')
             with ux_utils.enable_traceback():
@@ -211,6 +274,51 @@ def cleanup_storage(yaml_content: str) -> bool:
             failed = True
 
     return not failed
+
+
+def cleanup_storage_intents(
+        service_name: str,
+        resource_scope: Optional[str],
+        ownership_guard: Optional[Callable[[], bool]] = None) -> bool:
+    """Clean every durable storage generation owned by one incarnation."""
+    if not isinstance(resource_scope, str) or not resource_scope:
+        logger.info('Retaining storage for legacy service without a durable '
+                    'resource scope.')
+        return True
+    intents = serve_state.get_ephemeral_storage_cleanup_intents(
+        service_name, resource_scope=resource_scope)
+    results = []
+    cleaned_generations = set()
+    for intent in intents:
+        if ownership_guard is not None and not ownership_guard():
+            raise ServiceOwnershipLostError(
+                'Lifecycle ownership lost before scoped storage cleanup.')
+        results.append(cleanup_storage(intent['yaml_content'], resource_scope))
+        generation = intent.get('storage_generation')
+        if isinstance(generation, str):
+            cleaned_generations.add(generation)
+
+    # Rolling compatibility: a service can contain surviving pre-migration
+    # version YAMLs plus newer intent-backed generations. Clean their union,
+    # deduplicating only generations already covered by an exact intent.
+    for version in serve_state.get_service_versions(service_name):
+        if ownership_guard is not None and not ownership_guard():
+            raise ServiceOwnershipLostError(
+                'Lifecycle ownership lost before scoped storage cleanup.')
+        yaml_content = serve_state.get_yaml_content(service_name, version)
+        if yaml_content is not None:
+            try:
+                version_task = task_lib.Task.from_yaml_str(yaml_content)
+                scope_metadata = version_task.metadata.get(
+                    constants.EPHEMERAL_STORAGE_SCOPE_METADATA_KEY)
+                generation = (scope_metadata.get('storage_generation')
+                              if isinstance(scope_metadata, dict) else None)
+            except Exception:  # pylint: disable=broad-except
+                generation = None
+            if generation in cleaned_generations:
+                continue
+            results.append(cleanup_storage(yaml_content, resource_scope))
+    return all(results)
 
 
 # NOTE(dev): We don't need to acquire the `with_lock` in replica manager here
@@ -373,20 +481,9 @@ def _cleanup(service_name: str,
                     _set_to_failed_cleanup(info)
         time.sleep(3)
 
-    _assert_owner('before storage cleanup')
+    _assert_owner('before scoped storage cleanup')
 
-    def cleanup_version_storage(version: int) -> bool:
-        _assert_owner(f'before cleaning version {version} storage')
-        yaml_content = serve_state.get_yaml_content(service_name, version)
-        if yaml_content is None:
-            logger.warning(f'No yaml content found for version {version}')
-            return True
-        logger.info(f'Cleaning up storage for version {version}, '
-                    f'yaml_content: {yaml_content}')
-        return cleanup_storage(yaml_content)
-
-    versions = serve_state.get_service_versions(service_name)
-    if not all(map(cleanup_version_storage, versions)):
+    if not cleanup_storage_intents(service_name, resource_scope, _still_owns):
         failed = True
 
     # Do not delete the recovery script here. The success path removes it in
@@ -547,7 +644,8 @@ def _spawn_controller(
         controller_port: int,
         service_hash: str,
         controller_ip: Optional[str],
-        resource_scope: Optional[str] = None) -> multiprocessing.Process:
+        resource_scope: Optional[str] = None,
+        enforce_launch_fence: bool = False) -> multiprocessing.Process:
     """Spawn (and start) the controller server subprocess for a service.
 
     Factored out of `_start` so the supervision loop can re-create the
@@ -559,7 +657,7 @@ def _spawn_controller(
         target=controller.run_controller,
         args=(service_name, service_spec, version, controller_host,
               controller_port, owner_fingerprint, resource_scope, service_hash,
-              os.getpid(), controller_ip))
+              os.getpid(), controller_ip, enforce_launch_fence))
     process.start()
     return process
 
@@ -700,6 +798,7 @@ def _respawn_controller(
     service_hash: str,
     controller_ip: Optional[str] = None,
     resource_scope: Optional[str] = None,
+    enforce_launch_fence: bool = False,
 ) -> Optional[Tuple[multiprocessing.Process, int]]:
     """Re-create a controller child that died while its parent is alive.
 
@@ -751,10 +850,13 @@ def _respawn_controller(
             spawn_args = (service_name, service_spec, version, controller_host,
                           controller_port, service_hash, controller_ip)
             if resource_scope is None:
-                new_controller = _spawn_controller(*spawn_args)
+                new_controller = _spawn_controller(
+                    *spawn_args, enforce_launch_fence=enforce_launch_fence)
             else:
                 new_controller = _spawn_controller(
-                    *spawn_args, resource_scope=resource_scope)
+                    *spawn_args,
+                    resource_scope=resource_scope,
+                    enforce_launch_fence=enforce_launch_fence)
             # `process=` fails this wait fast if the replacement dies at boot,
             # instead of holding the port-selection lock for the full timeout
             # on every retry of a crash-looping controller.
@@ -825,11 +927,41 @@ def _run_cleanup_and_finalize(service_name: str,
     FAILED_CLEANUP so an operator can ``--purge``; on success the service row
     and working dir are removed.
     """
+    # Publish the durable terminal fence BEFORE scanning launch requests. The
+    # API scheduler and the persisted execution entrypoint both reject a Serve
+    # launch whose owner is terminal, so an HTTP request appearing after an
+    # empty scan cannot begin provisioning. The controller-port
+    # acknowledgement remains later: purge may only proceed after every
+    # already-persisted request is terminal.
+    if not serve_state.set_service_status_and_active_versions_if_owner(
+            service_name, service_hash, controller_pid, controller_ip,
+            serve_state.ServiceStatus.SHUTTING_DOWN):
+        logger.warning(
+            f'Lost ownership before fencing new replica launches for '
+            f'{service_name!r}.')
+        return
+
     # The caller has killed/joined the controller child before entering here.
-    # Atomically mark the exact owner SHUTTING_DOWN and publish that fact before
-    # waiting on the distributed lifecycle lock. This rejects new updates and
-    # tells a concurrent force-purge there can be no lingering replica-manager
-    # writes into a future same-name successor.
+    # A sky.launch request runs in an API-server worker, not in that child, so
+    # killing the child alone does not prove launch quiescence. Every request is
+    # backed by a replica row created before sdk.launch is submitted.
+    try:
+        replica_infos = serve_state.get_replica_infos(service_name)
+    except Exception as e:  # pylint: disable=broad-except
+        logger.warning(f'Could not read replica launch inventory before '
+                       f'teardown of {service_name!r}: '
+                       f'{common_utils.format_exception(e)}')
+        return
+    if not serve_utils.quiesce_service_replica_launch_requests(
+            service_name,
+            replica_infos,
+            continue_guard=lambda: serve_state.service_owner_matches(
+                service_name, service_hash, (controller_pid, controller_ip))):
+        logger.warning(f'Refusing to acknowledge teardown of {service_name!r} '
+                       'until all replica launch requests are terminal.')
+        return
+    # Publish the child-teardown acknowledgement only after launch requests are
+    # terminal. A concurrent purge can now safely proceed to replica cleanup.
     if not serve_state.acknowledge_service_controller_teardown_if_owner(
             service_name, service_hash, controller_pid, controller_ip):
         logger.warning(f'Lost ownership before acknowledging teardown of '
@@ -876,15 +1008,21 @@ def _run_cleanup_and_finalize_locked(
             # accept new requests and route them to replicas being destroyed.
             # A deletion failure aborts cleanup fail-closed and is retried via
             # FAILED_CLEANUP rather than exposing a half-torn-down service.
+            api_deployment_uid = lb_k8s.get_api_deployment_owner_uid(
+                require_runtime=True)
             if resource_scope is None:
-                lb_k8s.delete_lb_objects(service_name,
-                                         expected_service_hash=service_hash,
-                                         require_runtime=True)
+                lb_k8s.delete_lb_objects(
+                    service_name,
+                    expected_service_hash=service_hash,
+                    require_runtime=True,
+                    expected_api_deployment_uid=(api_deployment_uid))
             else:
-                lb_k8s.delete_lb_objects(service_name,
-                                         expected_service_hash=service_hash,
-                                         resource_scope=resource_scope,
-                                         require_runtime=True)
+                lb_k8s.delete_lb_objects(
+                    service_name,
+                    expected_service_hash=service_hash,
+                    resource_scope=resource_scope,
+                    require_runtime=True,
+                    expected_api_deployment_uid=(api_deployment_uid))
             lb_quiesced = True
         if not _still_owns():
             raise ServiceOwnershipLostError(
@@ -931,13 +1069,18 @@ def _run_cleanup_and_finalize_locked(
         # delete failure does not worsen cleanup.
         if not lb_quiesced:
             try:
+                api_deployment_uid = lb_k8s.get_api_deployment_owner_uid()
                 if resource_scope is None:
-                    lb_k8s.delete_lb_objects(service_name,
-                                             expected_service_hash=service_hash)
+                    lb_k8s.delete_lb_objects(
+                        service_name,
+                        expected_service_hash=service_hash,
+                        expected_api_deployment_uid=(api_deployment_uid))
                 else:
-                    lb_k8s.delete_lb_objects(service_name,
-                                             expected_service_hash=service_hash,
-                                             resource_scope=resource_scope)
+                    lb_k8s.delete_lb_objects(
+                        service_name,
+                        expected_service_hash=service_hash,
+                        resource_scope=resource_scope,
+                        expected_api_deployment_uid=(api_deployment_uid))
             except Exception as e:  # pylint: disable=broad-except
                 logger.error(f'Failed to delete external LB objects for '
                              f'{service_name} during failed cleanup: {e}')
@@ -978,6 +1121,10 @@ def _start(service_name: str,
     auth_utils.get_or_generate_keys()
 
     service = serve_state.get_service_from_name(service_name)
+    # This bit comes from the API-side topology that allocated the lifecycle
+    # epoch. It cannot be re-derived in the controller child: run_controller
+    # sets OVERRIDE_CONSOLIDATION_MODE for unrelated controller behavior.
+    enforce_launch_fence = lifecycle_epoch is not None
     is_recovery = service is not None
     logger.info(f'It is a {"first" if not is_recovery else "recovery"} run')
     if not is_recovery and requested_incarnation is None:
@@ -1115,7 +1262,7 @@ def _start(service_name: str,
     if not is_recovery:
         with filelock.FileLock(controller_utils.get_resources_lock_path()):
             if not controller_utils.can_start_new_process(task.service.pool):
-                cleanup_storage(yaml_content)
+                cleanup_storage(yaml_content, resource_scope)
                 with ux_utils.print_exception_no_traceback():
                     raise RuntimeError(
                         controller_utils.get_max_services_error_message(
@@ -1129,28 +1276,37 @@ def _start(service_name: str,
             # recovery and teardown, and which blocks re-`up` of the name.
             os.makedirs(service_dir, exist_ok=True)
             version = constants.INITIAL_VERSION
-            success = serve_state.add_service(
-                service_name,
-                controller_job_id=job_id,
-                policy=service_spec.autoscaling_policy_str(),
-                requested_resources_str=backend_utils.get_task_resources_str(
-                    task),
-                load_balancing_policy=service_spec.load_balancing_policy,
-                status=serve_state.ServiceStatus.CONTROLLER_INIT,
-                tls_encrypted=service_spec.tls_credential is not None,
-                pool=service_spec.pool,
-                controller_pid=os.getpid(),
-                controller_ip=pod_ip,
-                spec=service_spec,
-                yaml_content=yaml_content,
-                entrypoint=entrypoint,
-                service_hash=service_incarnation,
-                lifecycle_epoch=lifecycle_epoch,
-                resource_scope=resource_scope)
+            try:
+                success = serve_state.add_service(
+                    service_name,
+                    controller_job_id=job_id,
+                    policy=service_spec.autoscaling_policy_str(),
+                    requested_resources_str=(
+                        backend_utils.get_task_resources_str(task)),
+                    load_balancing_policy=service_spec.load_balancing_policy,
+                    status=serve_state.ServiceStatus.CONTROLLER_INIT,
+                    tls_encrypted=service_spec.tls_credential is not None,
+                    pool=service_spec.pool,
+                    controller_pid=os.getpid(),
+                    controller_ip=pod_ip,
+                    spec=service_spec,
+                    yaml_content=yaml_content,
+                    entrypoint=entrypoint,
+                    service_hash=service_incarnation,
+                    lifecycle_epoch=lifecycle_epoch,
+                    resource_scope=resource_scope)
+            except (serve_state.OrphanedReplicaRecordsError,
+                    serve_state.OrphanedStorageCleanupIntentsError,
+                    serve_state.OrphanedVersionRecordsError):
+                cleanup_storage(yaml_content, resource_scope)
+                raise
         # Directly throw an error here. See sky/serve/api.py::up
         # for more details.
         if not success:
-            cleanup_storage(yaml_content)
+            # The task manifest permits deletion only for the preallocated
+            # incarnation's disjoint storage generation. A same-name winner
+            # has a different scope and cannot be touched here.
+            cleanup_storage(yaml_content, resource_scope)
             with ux_utils.print_exception_no_traceback():
                 raise ValueError(f'Service {service_name} already exists.')
     else:
@@ -1244,7 +1400,8 @@ def _start(service_name: str,
                                                    version, controller_host,
                                                    controller_port,
                                                    service_incarnation, pod_ip,
-                                                   resource_scope)
+                                                   resource_scope,
+                                                   enforce_launch_fence)
             logger.debug(f'_start() spawned controller_process pid='
                          f'{controller_process.pid} host={controller_host} '
                          f'port={controller_port}')
@@ -1505,7 +1662,8 @@ def _start(service_name: str,
                             controller_process,
                             service_hash=service_incarnation,
                             controller_ip=pod_ip,
-                            resource_scope=resource_scope)
+                            resource_scope=resource_scope,
+                            enforce_launch_fence=enforce_launch_fence)
                         if result is not None:
                             controller_process, controller_port = result
                             controller_unresponsive_checks = 0

@@ -957,8 +957,9 @@ def _generate_run_uuid() -> str:
     return common_utils.base36_encode(uuid.uuid4().hex)[:8]
 
 
-def translate_local_file_mounts_to_two_hop(
-        task: 'task_lib.Task') -> Dict[str, str]:
+def translate_local_file_mounts_to_two_hop(task: 'task_lib.Task',
+                                           run_id: Optional[str] = None
+                                          ) -> Dict[str, str]:
     """Translates local->VM mounts into two-hop file mounts.
 
     This strategy will upload the local files to the controller first, using a
@@ -978,7 +979,8 @@ def translate_local_file_mounts_to_two_hop(
     first_hop_file_mounts = {}
     second_hop_file_mounts = {}
 
-    run_id = _generate_run_uuid()
+    if run_id is None:
+        run_id = _generate_run_uuid()
     base_tmp_dir = os.path.join(constants.FILE_MOUNTS_CONTROLLER_TMP_BASE_PATH,
                                 run_id)
 
@@ -1012,8 +1014,13 @@ def translate_local_file_mounts_to_two_hop(
 
 
 # (maybe translate local file mounts) and (sync up)
-def maybe_translate_local_file_mounts_and_sync_up(task: 'task_lib.Task',
-                                                  task_type: str) -> None:
+def maybe_translate_local_file_mounts_and_sync_up(
+    task: 'task_lib.Task',
+    task_type: str,
+    run_id: Optional[str] = None,
+    on_storage_mounts_prepared: Optional[Callable[['task_lib.Task'],
+                                                  None]] = None
+) -> None:
     """Translates local->VM mounts into Storage->VM, then syncs up any Storage.
 
     Eagerly syncing up local->Storage ensures Storage->VM would work at task
@@ -1029,6 +1036,11 @@ def maybe_translate_local_file_mounts_and_sync_up(task: 'task_lib.Task',
     between jobs, because jobs might have different resources requirements, and
     sharing storage between jobs may cause egress costs or slower transfer
     speeds.
+
+    ``on_storage_mounts_prepared`` runs after every generated storage identity
+    has been added to ``task`` but before ``sync_storage_mounts()`` performs an
+    external write. Serve uses this boundary to persist crash-safe cleanup
+    inventory; other callers retain the existing behavior by leaving it unset.
     """
 
     # ================================================================
@@ -1042,7 +1054,8 @@ def maybe_translate_local_file_mounts_and_sync_up(task: 'task_lib.Task',
 
     # We use uuid to generate a unique run id for the job, so that the bucket/
     # subdirectory name is unique across different jobs/services.
-    run_id = _generate_run_uuid()
+    if run_id is None:
+        run_id = _generate_run_uuid()
     user_hash = common_utils.get_user_hash()
     original_file_mounts = task.file_mounts if task.file_mounts else {}
     original_storage_mounts = task.storage_mounts if task.storage_mounts else {}
@@ -1127,6 +1140,11 @@ def maybe_translate_local_file_mounts_and_sync_up(task: 'task_lib.Task',
             # but only the sub path is deleted.
             _is_sky_managed=bucket_wth_prefix is None,
             _bucket_sub_path=bucket_sub_path)
+        # This generated storage is owned by the operation even when it uses a
+        # configured shared bucket. In that case teardown must remove its
+        # unique scoped subpath (not the bucket). Persist this before the
+        # pre-upload callback so a crash after upload remains cleanable.
+        storage_obj.force_delete = True
         new_storage_mounts[constants.SKY_REMOTE_WORKDIR] = storage_obj
         # Check of the existence of the workdir in file_mounts is done in
         # the task construction.
@@ -1157,6 +1175,7 @@ def maybe_translate_local_file_mounts_and_sync_up(task: 'task_lib.Task',
                                           stores=stores,
                                           _is_sky_managed=not bucket_wth_prefix,
                                           _bucket_sub_path=bucket_sub_path)
+        storage_obj.force_delete = True
         new_storage_mounts[dst] = storage_obj
         logger.info(f'  {colorama.Style.DIM}Folder : {src!r} '
                     f'-> storage: {bucket_name!r}.{colorama.Style.RESET_ALL}')
@@ -1190,6 +1209,7 @@ def maybe_translate_local_file_mounts_and_sync_up(task: 'task_lib.Task',
                 stores=stores,
                 _is_sky_managed=not bucket_wth_prefix,
                 _bucket_sub_path=file_mounts_tmp_subpath)
+            storage_obj.force_delete = True
 
             new_storage_mounts[file_mount_remote_tmp_dir] = storage_obj
             if file_mount_remote_tmp_dir in original_storage_mounts:
@@ -1209,6 +1229,9 @@ def maybe_translate_local_file_mounts_and_sync_up(task: 'task_lib.Task',
                 'Uploading translated local files/folders'))
         task.update_storage_mounts(new_storage_mounts)
 
+        if on_storage_mounts_prepared is not None:
+            on_storage_mounts_prepared(task)
+
         # Step 4: Upload storage from sources
         # Upload the local source to a bucket. The task will not be executed
         # locally, so we need to upload the files/folders to the bucket manually
@@ -1225,7 +1248,8 @@ def maybe_translate_local_file_mounts_and_sync_up(task: 'task_lib.Task',
                     'Uploading local sources to storage[/]  '
                     '[dim]View storages: sky storage ls'))
         try:
-            task.sync_storage_mounts()
+            task.sync_storage_mounts(
+                on_storage_plan_prepared=on_storage_mounts_prepared)
         except (ValueError, exceptions.NoCloudAccessError) as e:
             if 'No enabled cloud for storage' in str(e) or isinstance(
                     e, exceptions.NoCloudAccessError):

@@ -900,6 +900,8 @@ class Storage(object):
         _is_sky_managed: Optional[bool] = None,
         # pylint: disable=invalid-name
         _bucket_sub_path: Optional[str] = None,
+        # pylint: disable=invalid-name
+        _store_region: Optional[str] = None,
         mount_cached_config: Optional[MountCachedConfig] = None,
         file_mount_type: Optional[FileMountType] = None,
         mount_config: Optional[MountConfig] = None,
@@ -953,6 +955,10 @@ class Storage(object):
             sub-path, assuming is_sky_managed is False.
           _bucket_sub_path: Optional[str]; The subdirectory to use for the
             storage object.
+          _store_region: Optional[str]; Internal pre-creation store region.
+            This makes a planned store exactly reconstructable if the process
+            exits after creating the remote bucket but before persisting its
+            normal store handle.
         """
         self.name = name
         self.source = source
@@ -966,6 +972,7 @@ class Storage(object):
         self.sync_on_reconstruction = sync_on_reconstruction
         self._is_sky_managed = _is_sky_managed
         self._bucket_sub_path = _bucket_sub_path
+        self._store_region = _store_region
 
         self._constructed = False
         # TODO(romilb, zhwu): This is a workaround to support storage deletion
@@ -1101,7 +1108,7 @@ class Storage(object):
                 mount_config=self.mount_config)
 
             for store_type in input_stores:
-                self.add_store(store_type)
+                self.add_store(store_type, self._store_region)
 
             if self.source is not None:
                 # If source is a pre-existing bucket, connect to the bucket
@@ -1704,6 +1711,8 @@ class Storage(object):
         _is_sky_managed = config.pop('_is_sky_managed', None)
         # pylint: disable=invalid-name
         _bucket_sub_path = config.pop('_bucket_sub_path', None)
+        # pylint: disable=invalid-name
+        _store_region = config.pop('_store_region', None)
         if force_delete is None:
             force_delete = False
 
@@ -1752,6 +1761,7 @@ class Storage(object):
                           stores=stores,
                           _is_sky_managed=_is_sky_managed,
                           _bucket_sub_path=_bucket_sub_path,
+                          _store_region=_store_region,
                           mount_cached_config=mount_cached_config,
                           file_mount_type=file_mount_type,
                           mount_config=mount_config)
@@ -1792,6 +1802,8 @@ class Storage(object):
             config['_force_delete'] = True
         if self._bucket_sub_path is not None:
             config['_bucket_sub_path'] = self._bucket_sub_path
+        if self._store_region is not None:
+            config['_store_region'] = self._store_region
         storage_config_dict: Dict[str, Any] = {}
         if self.mount_cached_config is not None:
             mount_cached_dict = self.mount_cached_config.to_yaml_config()

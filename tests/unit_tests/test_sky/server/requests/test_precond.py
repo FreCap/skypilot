@@ -3,19 +3,25 @@ import unittest
 from unittest import mock
 
 from sky import exceptions
+from sky import execution
+from sky.serve import constants as serve_constants
+from sky.serve import serve_state
 from sky.server.requests import preconditions
+from sky.server.requests import request_names
 from sky.server.requests import requests as api_requests
 from sky.utils import status_lib
 
 
-class TestPrecondition(unittest.TestCase):
+class TestPrecondition(unittest.IsolatedAsyncioTestCase):
     """Unit tests for Precondition class."""
 
     def setUp(self):
         self.request_id = 'test-request'
 
+    @mock.patch('sky.server.requests.requests.set_request_failed_async')
     @mock.patch('sky.server.requests.requests.get_request_async')
-    async def test_precondition_timeout(self, mock_get_request):
+    async def test_precondition_timeout(self, mock_get_request,
+                                        mock_set_failed):
         """Test Precondition timeout behavior."""
 
         class Timeouted(preconditions.Precondition):
@@ -26,12 +32,12 @@ class TestPrecondition(unittest.TestCase):
         mock_get_request.return_value = mock.MagicMock(
             status=api_requests.RequestStatus.PENDING)
 
-        p = Timeouted(self.request_id, timeout=0.1)
+        p = Timeouted(self.request_id, check_interval=0.01, timeout=0.02)
         result = await p
 
         self.assertFalse(result)
-        api_requests.set_request_failed.assert_called_once()
-        self.assertIsInstance(api_requests.set_request_failed.call_args[0][1],
+        mock_set_failed.assert_awaited_once()
+        self.assertIsInstance(mock_set_failed.call_args[0][1],
                               exceptions.RequestCancelled)
 
     @mock.patch('sky.server.requests.requests.get_request_async')
@@ -51,8 +57,10 @@ class TestPrecondition(unittest.TestCase):
 
         self.assertFalse(result)
 
+    @mock.patch('sky.server.requests.requests.set_request_failed_async')
     @mock.patch('sky.server.requests.requests.get_request_async')
-    async def test_precondition_check_exception(self, mock_get_request):
+    async def test_precondition_check_exception(self, mock_get_request,
+                                                mock_set_failed):
         """Test Precondition behavior when check raises exception."""
 
         class Errored(preconditions.Precondition):
@@ -67,10 +75,10 @@ class TestPrecondition(unittest.TestCase):
         result = await p
 
         self.assertFalse(result)
-        api_requests.set_request_failed.assert_called_once()
+        mock_set_failed.assert_awaited_once()
 
 
-class TestClusterStartCompletePrecondition(unittest.TestCase):
+class TestClusterStartCompletePrecondition(unittest.IsolatedAsyncioTestCase):
     """Unit tests for ClusterStartCompletePrecondition class."""
 
     def setUp(self):
@@ -78,11 +86,12 @@ class TestClusterStartCompletePrecondition(unittest.TestCase):
         self.request_id = 'test-request'
         self.cluster_name = 'test-cluster'
 
-    @mock.patch('sky.global_user_state.get_cluster_from_name')
-    @mock.patch('sky.server.requests.requests.get_request_tasks')
-    async def test_cluster_up(self, mock_get_tasks, mock_get_cluster):
+    @mock.patch('sky.global_user_state.get_status_from_cluster_name_async',
+                new_callable=mock.AsyncMock)
+    @mock.patch('sky.server.requests.requests.get_request_tasks_async')
+    async def test_cluster_up(self, mock_get_tasks, mock_get_status):
         """Test when cluster is UP."""
-        mock_get_cluster.return_value = {'status': status_lib.ClusterStatus.UP}
+        mock_get_status.return_value = status_lib.ClusterStatus.UP
         mock_get_tasks.return_value = []
 
         p = preconditions.ClusterStartCompletePrecondition(
@@ -92,13 +101,14 @@ class TestClusterStartCompletePrecondition(unittest.TestCase):
         self.assertTrue(met)
         self.assertIsNone(msg)
         # Should not check tasks when cluster is UP
-        mock_get_tasks.assert_not_called()
+        mock_get_tasks.assert_not_awaited()
 
-    @mock.patch('sky.global_user_state.get_cluster_from_name')
-    @mock.patch('sky.server.requests.requests.get_request_tasks')
-    async def test_cluster_not_found(self, mock_get_tasks, mock_get_cluster):
+    @mock.patch('sky.global_user_state.get_status_from_cluster_name_async',
+                new_callable=mock.AsyncMock)
+    @mock.patch('sky.server.requests.requests.get_request_tasks_async')
+    async def test_cluster_not_found(self, mock_get_tasks, mock_get_status):
         """Test when cluster is not found and no tasks are running."""
-        mock_get_cluster.return_value = None
+        mock_get_status.return_value = None
         mock_get_tasks.return_value = []
 
         p = preconditions.ClusterStartCompletePrecondition(
@@ -108,13 +118,12 @@ class TestClusterStartCompletePrecondition(unittest.TestCase):
         self.assertTrue(met)
         self.assertIsNone(msg)
 
-    @mock.patch('sky.global_user_state.get_cluster_from_name')
-    @mock.patch('sky.server.requests.requests.get_request_tasks')
-    async def test_cluster_starting(self, mock_get_tasks, mock_get_cluster):
+    @mock.patch('sky.global_user_state.get_status_from_cluster_name_async',
+                new_callable=mock.AsyncMock)
+    @mock.patch('sky.server.requests.requests.get_request_tasks_async')
+    async def test_cluster_starting(self, mock_get_tasks, mock_get_status):
         """Test when cluster is being started and there are tasks running."""
-        mock_get_cluster.return_value = {
-            'status': status_lib.ClusterStatus.INIT
-        }
+        mock_get_status.return_value = status_lib.ClusterStatus.INIT
         mock_get_tasks.return_value = [mock.MagicMock()]
 
         p = preconditions.ClusterStartCompletePrecondition(
@@ -124,19 +133,118 @@ class TestClusterStartCompletePrecondition(unittest.TestCase):
         self.assertFalse(met)
         self.assertIn('Waiting for cluster', msg)
 
-    @mock.patch('sky.global_user_state.get_cluster_from_name')
-    @mock.patch('sky.server.requests.requests.get_request_tasks')
+    @mock.patch('sky.global_user_state.get_status_from_cluster_name_async',
+                new_callable=mock.AsyncMock)
+    @mock.patch('sky.server.requests.requests.get_request_tasks_async')
     async def test_cluster_not_found_but_tasks_running(self, mock_get_tasks,
-                                                       mock_get_cluster):
-        """Test when cluster is not found but there are tasks running."""
-        mock_get_cluster.return_value = None
+                                                       mock_get_status):
+        """Test when cluster is not found but tasks are running."""
+        mock_get_status.return_value = None
         mock_get_tasks.return_value = [mock.MagicMock()]
 
         p = preconditions.ClusterStartCompletePrecondition(
             self.request_id, self.cluster_name)
-        met, msg = await p.check()
+        met, _ = await p.check()
 
         self.assertFalse(met)
+
+
+class TestServiceReplicaLaunchPrecondition(unittest.IsolatedAsyncioTestCase):
+    """A persisted launch request must revalidate its Serve owner."""
+
+    @mock.patch('sky.serve.serve_state.get_service_controller_owner')
+    async def test_exact_owner_is_authorized(self, mock_get_owner):
+        mock_get_owner.return_value = {
+            'hash': 'incarnation-a',
+            'controller_pid': 123,
+            'controller_ip': '10.0.0.1',
+            'status': serve_state.ServiceStatus.READY,
+        }
+        condition = preconditions.ServiceReplicaLaunchPrecondition(
+            'request-id', 'svc', 'incarnation-a', 123, '10.0.0.1')
+
+        met, message = await condition.check()
+
+        self.assertTrue(met)
+        self.assertIsNone(message)
+
+    @mock.patch('sky.serve.serve_state.get_service_controller_owner')
+    async def test_teardown_owner_is_rejected(self, mock_get_owner):
+        mock_get_owner.return_value = {
+            'hash': 'incarnation-a',
+            'controller_pid': 123,
+            'controller_ip': '10.0.0.1',
+            'status': serve_state.ServiceStatus.SHUTTING_DOWN,
+        }
+        condition = preconditions.ServiceReplicaLaunchPrecondition(
+            'request-id', 'svc', 'incarnation-a', 123, '10.0.0.1')
+
+        with self.assertRaises(exceptions.RequestCancelled):
+            await condition.check()
+
+    @mock.patch('sky.serve.serve_state.get_service_controller_owner')
+    async def test_recovering_controller_failed_owner_is_authorized(
+            self, mock_get_owner):
+        mock_get_owner.return_value = {
+            'hash': 'incarnation-a',
+            'controller_pid': 123,
+            'controller_ip': '10.0.0.1',
+            'status': serve_state.ServiceStatus.CONTROLLER_FAILED,
+        }
+        condition = preconditions.ServiceReplicaLaunchPrecondition(
+            'request-id', 'svc', 'incarnation-a', 123, '10.0.0.1')
+
+        met, message = await condition.check()
+
+        self.assertTrue(met)
+        self.assertIsNone(message)
+
+        launch_context = {
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY: 'svc',
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY: 'incarnation-a',
+            serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_PID_KEY: 123,
+            serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY: '10.0.0.1',
+        }
+        execution._validate_service_replica_launch_fence(  # pylint: disable=protected-access
+            launch_context)
+
+    @mock.patch('sky.execution.dag_utils.convert_entrypoint_to_dag')
+    @mock.patch('sky.serve.serve_state.get_service_controller_owner')
+    def test_replayed_request_rechecks_fence_before_execution(
+            self, mock_get_owner, mock_convert_dag):
+        """Restart replay cannot bypass the in-memory precondition."""
+        mock_get_owner.return_value = None
+        launch_context = {
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY: 'svc',
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY: 'incarnation-a',
+            serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_PID_KEY: 123,
+            serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY: '10.0.0.1',
+        }
+
+        with self.assertRaises(exceptions.RequestCancelled):
+            execution._execute(  # pylint: disable=protected-access
+                mock.MagicMock(),
+                _request_name=request_names.AdminPolicyRequestName.
+                CLUSTER_LAUNCH,
+                _is_launched_by_sky_serve_controller=True,
+                _extra_launch_context=launch_context)
+
+        mock_convert_dag.assert_not_called()
+
+    @mock.patch('sky.execution.serve_utils.is_external_load_balancer_mode',
+                return_value=False)
+    @mock.patch('sky.execution.dag_utils.convert_entrypoint_to_dag',
+                side_effect=RuntimeError('reached legacy execution'))
+    def test_legacy_remote_db_request_skips_api_local_fence(
+            self, mock_convert_dag, mock_external_mode):
+        del mock_convert_dag, mock_external_mode
+        with self.assertRaisesRegex(RuntimeError, 'reached legacy execution'):
+            execution._execute(  # pylint: disable=protected-access
+                mock.MagicMock(),
+                _request_name=request_names.AdminPolicyRequestName.
+                CLUSTER_LAUNCH,
+                _is_launched_by_sky_serve_controller=True,
+                _extra_launch_context={})
 
 
 if __name__ == '__main__':

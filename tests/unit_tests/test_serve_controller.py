@@ -16,6 +16,24 @@ from sky.serve import controller
 from sky.serve import serve_state
 
 
+def test_run_controller_preserves_authoritative_launch_fence_bit(monkeypatch):
+    """The child override must not turn a remote-DB fence into a local one."""
+    monkeypatch.delenv(controller.constants.OVERRIDE_CONSOLIDATION_MODE,
+                       raising=False)
+    controller_instance = mock.Mock()
+    constructor = mock.Mock(return_value=controller_instance)
+    monkeypatch.setattr(controller, 'SkyServeController', constructor)
+    monkeypatch.setattr(controller.context_utils, 'hijack_sys_attrs',
+                        mock.Mock())
+
+    controller.run_controller('pool', mock.Mock(), 1, '127.0.0.1', 20001,
+                              'fingerprint', None, 'incarnation-a', 123,
+                              '10.0.0.1', False)
+
+    assert constructor.call_args.args[-1] is False
+    controller_instance.run.assert_called_once_with()
+
+
 class _FakeHandle:
     """Stub for the resource handle returned by ReplicaInfo.handle()."""
 

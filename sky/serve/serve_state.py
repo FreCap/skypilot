@@ -5,7 +5,7 @@ import json
 import pickle
 import time
 import typing
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 import uuid
 
 import colorama
@@ -18,6 +18,7 @@ from sqlalchemy.ext import declarative
 
 from sky.serve import constants
 from sky.utils import common_utils
+from sky.utils import yaml_utils
 from sky.utils.db import db_utils
 from sky.utils.db import migration_utils
 
@@ -99,6 +100,27 @@ version_specs_table = sqlalchemy.Table(
     sqlalchemy.Column('version', sqlalchemy.Integer, primary_key=True),
     sqlalchemy.Column('spec', sqlalchemy.LargeBinary),
     sqlalchemy.Column('yaml_content', sqlalchemy.Text, server_default=None),
+)
+
+# Durable cleanup inventory is intentionally separate from ``version_specs``.
+# ReplicaManager retires old version rows while a service is live, and a fresh
+# up can upload storage before the controller has created the service row.  An
+# exact, incarnation/generation-scoped manifest must therefore exist before the
+# first external mutation and outlive version metadata until teardown succeeds.
+ephemeral_storage_cleanup_intents_table = sqlalchemy.Table(
+    'ephemeral_storage_cleanup_intents',
+    Base.metadata,
+    sqlalchemy.Column('service_name', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('resource_scope', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('storage_generation', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('yaml_content', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('pool', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.Column('lifecycle_epoch', sqlalchemy.Integer, nullable=False),
+    # True only until the operation has handed the generation to a committed
+    # service/version. Ordinary exceptions may eagerly clean these rows;
+    # committed generations remain until full service teardown.
+    sqlalchemy.Column('provisional', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.Column('created_at', sqlalchemy.Float, nullable=False),
 )
 
 serve_ha_recovery_script_table = sqlalchemy.Table(
@@ -511,6 +533,16 @@ class ServiceStatus(enum.Enum):
         mid-flight, leaving a zombie row — see _cleanup)."""
         return [cls.CONTROLLER_FAILED, cls.FAILED_CLEANUP, cls.SHUTTING_DOWN]
 
+    @classmethod
+    def replica_launch_blocking_statuses(cls) -> List['ServiceStatus']:
+        """States that durably fence new replica provisioning.
+
+        CONTROLLER_FAILED is intentionally excluded: it is a recoverable data
+        plane/controller degradation under the same live owner, which may need
+        to launch replacement replicas before the parent heals the status.
+        """
+        return [cls.FAILED_CLEANUP, cls.SHUTTING_DOWN]
+
     def colored_str(self) -> str:
         color = _SERVICE_STATUS_TO_COLOR[self]
         return f'{color}{self.value}{colorama.Style.RESET_ALL}'
@@ -541,6 +573,40 @@ _SERVICE_STATUS_TO_COLOR = {
     ServiceStatus.FAILED_CLEANUP: colorama.Fore.RED,
     ServiceStatus.NO_REPLICA: colorama.Fore.MAGENTA,
 }
+
+
+class OrphanedReplicaRecordsError(RuntimeError):
+    """Fresh registration found replica inventory without a service row."""
+
+
+class OrphanedStorageCleanupIntentsError(RuntimeError):
+    """Fresh registration found predecessor storage awaiting cleanup."""
+
+
+class OrphanedVersionRecordsError(RuntimeError):
+    """Fresh registration found predecessor version cleanup inventory."""
+
+
+def _ephemeral_storage_generation_from_yaml(
+        yaml_content: Optional[str]) -> Optional[str]:
+    """Read the scoped storage generation without constructing a Task."""
+    if yaml_content is None:
+        return None
+    try:
+        config = yaml_utils.safe_load(yaml_content)
+    except Exception:  # pylint: disable=broad-except
+        return None
+    if not isinstance(config, dict):
+        return None
+    metadata = config.get('metadata')
+    if not isinstance(metadata, dict):
+        return None
+    scope_metadata = metadata.get(
+        constants.EPHEMERAL_STORAGE_SCOPE_METADATA_KEY)
+    if not isinstance(scope_metadata, dict):
+        return None
+    storage_generation = scope_metadata.get('storage_generation')
+    return storage_generation if isinstance(storage_generation, str) else None
 
 
 def add_service(name: str,
@@ -575,12 +641,20 @@ def add_service(name: str,
         exists.
     """
     engine = _db_manager.get_engine()
+    storage_generation = _ephemeral_storage_generation_from_yaml(yaml_content)
     try:
         with orm.Session(engine) as session:
             _begin_immediate_if_sqlite(session, engine, lifecycle_epoch
                                        is not None)
             if not _lifecycle_epoch_matches_in_session(session, name,
                                                        lifecycle_epoch):
+                session.rollback()
+                return False
+            existing_service = session.execute(
+                sqlalchemy.select(services_table.c.name).where(
+                    services_table.c.name ==
+                    name).with_for_update()).fetchone()
+            if existing_service is not None:
                 session.rollback()
                 return False
             if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
@@ -590,6 +664,70 @@ def add_service(name: str,
                 insert_func = postgresql.insert
             else:
                 raise ValueError('Unsupported database dialect')
+
+            # Upserting only v1 leaves orphan v2+ rows behind; MAX(version)
+            # then exposes the predecessor's spec/yaml. Replica rows may be
+            # the last inventory of live billable clusters. These resource
+            # checks apply in both topologies: the remote controller DB is the
+            # authority for non-consolidated pools even though it has no API-
+            # local lifecycle epoch.
+            orphan_replica_rows = session.execute(
+                sqlalchemy.select(
+                    replicas_table.c.replica_id,
+                    replicas_table.c.replica_info).where(
+                        replicas_table.c.service_name == name)).fetchall()
+            if orphan_replica_rows:
+                identities = []
+                for replica_id, replica_info_bytes in orphan_replica_rows:
+                    try:
+                        replica_info = pickle.loads(replica_info_bytes)
+                        cluster_name = getattr(replica_info, 'cluster_name',
+                                               None)
+                    except Exception:  # pylint: disable=broad-except
+                        cluster_name = None
+                    identities.append(
+                        str(cluster_name
+                           ) if cluster_name else f'replica-id:{replica_id}')
+                session.rollback()
+                raise OrphanedReplicaRecordsError(
+                    f'Cannot safely reuse service name {name!r}: orphan '
+                    'replica records may still identify live clusters: '
+                    f'{", ".join(identities)}. Terminate or reconcile '
+                    'those clusters before retrying.')
+            orphan_versions = session.execute(
+                sqlalchemy.select(version_specs_table.c.version).where(
+                    version_specs_table.c.service_name == name).order_by(
+                        version_specs_table.c.version)).scalars().all()
+            if orphan_versions:
+                session.rollback()
+                raise OrphanedVersionRecordsError(
+                    f'Cannot safely reuse service name {name!r}: orphan '
+                    'version metadata may be the only cleanup inventory '
+                    f'for predecessor storage (versions {orphan_versions}). '
+                    'Run down --purge for this name before retrying.')
+            orphan_storage_scopes = session.execute(
+                sqlalchemy.select(
+                    ephemeral_storage_cleanup_intents_table.c.resource_scope).
+                where(
+                    ephemeral_storage_cleanup_intents_table.c.service_name ==
+                    name,
+                    ephemeral_storage_cleanup_intents_table.c.resource_scope !=
+                    resource_scope).distinct()).scalars().all()
+            if orphan_storage_scopes:
+                session.rollback()
+                raise OrphanedStorageCleanupIntentsError(
+                    f'Cannot safely reuse service name {name!r}: scoped '
+                    'storage from predecessor incarnation(s) still awaits '
+                    f'cleanup: {", ".join(sorted(orphan_storage_scopes))}. '
+                    'Run down --purge for this name before retrying.')
+            if lifecycle_epoch is not None:
+                # The lifecycle lock makes it safe to clear non-resource
+                # script/claim leftovers before publishing the successor.
+                for table in (serve_ha_recovery_script_table,
+                              reserved_fill_claims_table):
+                    session.execute(
+                        sqlalchemy.delete(table).where(
+                            table.c.service_name == name))
 
             session.execute(
                 insert_func(services_table).values(
@@ -613,17 +751,32 @@ def add_service(name: str,
                 version=constants.INITIAL_VERSION,
                 spec=pickle.dumps(spec),
                 yaml_content=yaml_content)
-            # Upsert (like `add_or_update_version`): a stale version row with
-            # no `services` row, left behind by an interrupted teardown on an
-            # older controller, must not block re-registration of the name.
-            session.execute(
-                version_insert_stmt.on_conflict_do_update(
+            if lifecycle_epoch is None:
+                # Compatibility for legacy callers without the distributed
+                # name fence: overwrite v1 only, but never delete arbitrary
+                # child rows when absence cannot be serialized.
+                version_insert_stmt = version_insert_stmt.on_conflict_do_update(
                     index_elements=['service_name', 'version'],
                     set_={
                         'spec': version_insert_stmt.excluded.spec,
                         'yaml_content':
                             version_insert_stmt.excluded.yaml_content
-                    }))
+                    })
+            session.execute(version_insert_stmt)
+            if resource_scope is not None and storage_generation is not None:
+                session.query(ephemeral_storage_cleanup_intents_table).filter(
+                    ephemeral_storage_cleanup_intents_table.c.service_name ==
+                    name,
+                    ephemeral_storage_cleanup_intents_table.c.resource_scope ==
+                    resource_scope,
+                    ephemeral_storage_cleanup_intents_table.c.storage_generation
+                    == storage_generation,
+                    *([
+                        ephemeral_storage_cleanup_intents_table.c.
+                        lifecycle_epoch == lifecycle_epoch
+                    ] if lifecycle_epoch is not None else []),
+                ).update(
+                    {ephemeral_storage_cleanup_intents_table.c.provisional: 0})
             session.commit()
 
     except sqlalchemy_exc.IntegrityError as e:
@@ -759,8 +912,9 @@ def remove_service_completely(
     """Atomically remove one exact service incarnation and all child rows.
 
     Deletes from `services`, `replicas`, `version_specs`,
-    `serve_ha_recovery_script`, and `reserved_fill_claims` in a single
-    transaction. These were the tables whose sequential
+    `serve_ha_recovery_script`, `reserved_fill_claims`, and the exact
+    incarnation's storage cleanup intents in a single transaction. These were
+    the tables whose sequential
     teardown left orphan rows when a subprocess died mid-cleanup; the
     claim row must go too, or a torn-down fill-enabled service keeps
     absorbing broker entitlement until its claim TTL expires.
@@ -798,11 +952,14 @@ def remove_service_completely(
                 services_table.c.controller_pid == expected_pid,
                 services_table.c.controller_ip == expected_ip,
             ])
-        result = session.execute(
-            sqlalchemy.delete(services_table).where(*predicates))
-        if result.rowcount == 0:
+        service_row = session.execute(
+            sqlalchemy.select(services_table.c.resource_scope).where(
+                *predicates).with_for_update()).fetchone()
+        if service_row is None:
             session.rollback()
             return False
+        resource_scope = service_row[0]
+        session.execute(sqlalchemy.delete(services_table).where(*predicates))
         session.execute(
             sqlalchemy.delete(replicas_table).where(
                 replicas_table.c.service_name == service_name))
@@ -815,6 +972,14 @@ def remove_service_completely(
         session.execute(
             sqlalchemy.delete(reserved_fill_claims_table).where(
                 reserved_fill_claims_table.c.service_name == service_name))
+        if resource_scope is not None:
+            session.execute(
+                sqlalchemy.delete(
+                    ephemeral_storage_cleanup_intents_table).where(
+                        ephemeral_storage_cleanup_intents_table.c.service_name
+                        == service_name,
+                        ephemeral_storage_cleanup_intents_table.c.resource_scope
+                        == resource_scope))
         session.commit()
     return True
 
@@ -888,6 +1053,12 @@ def set_service_status_and_active_versions_if_owner(
             services_table.c.lifecycle_epoch == expected_lifecycle_epoch)
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
+        _begin_immediate_if_sqlite(session, engine, expected_lifecycle_epoch
+                                   is not None)
+        if not _lifecycle_epoch_matches_in_session(session, service_name,
+                                                   expected_lifecycle_epoch):
+            session.rollback()
+            return False
         count = session.query(services_table).filter(
             *predicates).update(update_dict)
         session.commit()
@@ -917,6 +1088,12 @@ def set_service_status_and_active_versions_if_hash(
             services_table.c.lifecycle_epoch == expected_lifecycle_epoch)
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
+        _begin_immediate_if_sqlite(session, engine, expected_lifecycle_epoch
+                                   is not None)
+        if not _lifecycle_epoch_matches_in_session(session, service_name,
+                                                   expected_lifecycle_epoch):
+            session.rollback()
+            return False
         count = session.query(services_table).filter(
             *predicates).update(update_dict)
         session.commit()
@@ -1004,6 +1181,12 @@ def claim_orphaned_service_teardown(
     """
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
+        _begin_immediate_if_sqlite(session, engine, expected_lifecycle_epoch
+                                   is not None)
+        if not _lifecycle_epoch_matches_in_session(session, service_name,
+                                                   expected_lifecycle_epoch):
+            session.rollback()
+            return False
         count = session.query(services_table).filter(
             services_table.c.name == service_name,
             services_table.c.hash == expected_service_hash,
@@ -1022,33 +1205,45 @@ def claim_orphaned_service_teardown(
     return count > 0
 
 
-def claim_unrecoverable_service_teardown(service_name: str,
-                                         expected_service_hash: str,
-                                         expected_controller_pid: Optional[int],
-                                         expected_controller_ip: Optional[str],
-                                         controller_pid: int,
-                                         controller_ip: Optional[str]) -> bool:
-    """Claim a terminal service whose recovery script cannot boot.
+def claim_unrecoverable_service_teardown(
+        service_name: str,
+        expected_service_hash: str,
+        expected_controller_pid: Optional[int],
+        expected_controller_ip: Optional[str],
+        controller_pid: int,
+        controller_ip: Optional[str],
+        expected_lifecycle_epoch: Optional[int] = None) -> bool:
+    """Claim a terminal service that has no bootable version.
 
-    A legacy partial-registration row can retain a recovery script without any
-    committed YAML version. Such a script can never acknowledge teardown.
-    Atomically prove that invariant, move ownership to the purge process, and
-    consume the unusable script so cleanup can make progress.
+    A recovery script cannot make progress without a committed yaml version.
+    Atomically require that invariant, move controller ownership to the purge
+    process, publish the teardown acknowledgement, and delete the now-useless
+    recovery script.  This lets purge recover old partial-registration rows
+    without treating the mere presence of an impossible script as evidence of
+    a controller that may still come back.
     """
     committed_version_exists = sqlalchemy.exists().where(
         version_specs_table.c.service_name == service_name,
         version_specs_table.c.yaml_content.isnot(None))
+    predicates = [
+        services_table.c.name == service_name,
+        services_table.c.hash == expected_service_hash,
+        services_table.c.controller_pid == expected_controller_pid,
+        services_table.c.controller_ip == expected_controller_ip,
+        services_table.c.status == ServiceStatus.SHUTTING_DOWN.value,
+        ~committed_version_exists,
+    ]
+    if expected_lifecycle_epoch is not None:
+        predicates.append(
+            services_table.c.lifecycle_epoch == expected_lifecycle_epoch)
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
-        _begin_immediate_if_sqlite(session, engine)
-        count = session.query(services_table).filter(
-            services_table.c.name == service_name,
-            services_table.c.hash == expected_service_hash,
-            services_table.c.controller_pid == expected_controller_pid,
-            services_table.c.controller_ip == expected_controller_ip,
-            services_table.c.status == ServiceStatus.SHUTTING_DOWN.value,
-            ~committed_version_exists,
-        ).update({
+        _begin_immediate_if_sqlite(session, engine, True)
+        if not _lifecycle_epoch_matches_in_session(session, service_name,
+                                                   expected_lifecycle_epoch):
+            session.rollback()
+            return False
+        count = session.query(services_table).filter(*predicates).update({
             services_table.c.controller_pid: controller_pid,
             services_table.c.controller_ip: controller_ip,
             services_table.c.controller_port:
@@ -1067,19 +1262,45 @@ def claim_unrecoverable_service_teardown(service_name: str,
 def mark_unrecoverable_service_for_cleanup(service_name: str,
                                            expected_service_hash: str,
                                            pool: bool) -> bool:
-    """Retire an HA recovery script that has no committed YAML version."""
-    committed_version_exists = sqlalchemy.exists().where(
-        version_specs_table.c.service_name == service_name,
-        version_specs_table.c.yaml_content.isnot(None))
+    """Retire an HA recovery script that can never boot a controller.
+
+    The status transition and script removal are conditional on there still
+    being no committed yaml version.  A concurrent version commit therefore
+    wins atomically; otherwise future recovery sweeps stop launching an
+    impossible script and ``down --purge`` can claim the orphan immediately.
+    """
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
-        _begin_immediate_if_sqlite(session, engine)
+        _begin_immediate_if_sqlite(session, engine, True)
+        # Lock the authoritative service row before checking for committed
+        # versions.  On PostgreSQL an UPDATE whose WHERE includes NOT EXISTS
+        # can take its statement snapshot before it waits on a concurrent
+        # version writer's service-row lock.  That stale snapshot can then
+        # miss the just-committed yaml and incorrectly retire a bootable
+        # service.  A separate post-lock SELECT gets a fresh READ COMMITTED
+        # snapshot after the writer has committed.
+        service_row = session.execute(
+            sqlalchemy.select(services_table.c.hash, services_table.c.pool,
+                              services_table.c.status).where(
+                                  services_table.c.name ==
+                                  service_name).with_for_update()).fetchone()
+        if (service_row is None or service_row.hash != expected_service_hash or
+                bool(service_row.pool) != pool or
+                service_row.status == ServiceStatus.SHUTTING_DOWN.value):
+            session.rollback()
+            return False
+        committed_version_exists = session.execute(
+            sqlalchemy.select(sqlalchemy.exists().where(
+                version_specs_table.c.service_name == service_name,
+                version_specs_table.c.yaml_content.isnot(None)))).scalar()
+        if committed_version_exists:
+            session.rollback()
+            return False
         count = session.query(services_table).filter(
             services_table.c.name == service_name,
             services_table.c.hash == expected_service_hash,
             services_table.c.pool == int(pool),
             services_table.c.status != ServiceStatus.SHUTTING_DOWN.value,
-            ~committed_version_exists,
         ).update({
             services_table.c.status: ServiceStatus.FAILED_CLEANUP.value,
         })
@@ -1295,6 +1516,290 @@ def get_service_mode_and_hash(
     if row is None:
         return None
     return bool(row[0]), row[1]
+
+
+def add_ephemeral_storage_cleanup_intent(service_name: str, resource_scope: str,
+                                         storage_generation: str,
+                                         yaml_content: str, pool: bool,
+                                         lifecycle_epoch: int,
+                                         provisional: bool) -> bool:
+    """Persist exact scoped cleanup inventory before external storage writes.
+
+    The lifecycle fence is locked before the optional service row.  A missing
+    service row is valid for fresh ``up``; an existing row must belong to this
+    exact resource scope.  Existing generations are never re-owned by a later
+    operation (notably workers-only updates which intentionally reuse storage).
+    """
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        _begin_immediate_if_sqlite(session, engine, True)
+        if not _lifecycle_epoch_matches_in_session(session, service_name,
+                                                   lifecycle_epoch):
+            session.rollback()
+            return False
+        service_row = session.execute(
+            sqlalchemy.select(services_table.c.resource_scope).where(
+                services_table.c.name ==
+                service_name).with_for_update()).fetchone()
+        if (service_row is not None and
+                service_row.resource_scope != resource_scope):
+            session.rollback()
+            return False
+        if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
+            insert_func = sqlite.insert
+        elif (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value
+             ):
+            insert_func = postgresql.insert
+        else:
+            raise ValueError('Unsupported database dialect')
+        stmt = insert_func(ephemeral_storage_cleanup_intents_table).values(
+            service_name=service_name,
+            resource_scope=resource_scope,
+            storage_generation=storage_generation,
+            yaml_content=yaml_content,
+            pool=int(pool),
+            lifecycle_epoch=lifecycle_epoch,
+            provisional=int(provisional),
+            created_at=time.time())
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[
+                'service_name', 'resource_scope', 'storage_generation'
+            ],
+            # A second call after sync enriches the pre-mutation manifest with
+            # resolved store handles. Never transfer lifecycle/provisional
+            # ownership on conflict: workers-only updates reuse a committed
+            # generation created by an earlier operation.
+            set_={'yaml_content': stmt.excluded.yaml_content})
+        session.execute(stmt)
+        session.commit()
+    return True
+
+
+def ensure_committed_ephemeral_storage_intent_for_version(
+        service_name: str, yaml_content: str, expected_service_hash: str,
+        expected_controller_owner: Tuple[Optional[int], Optional[str]]) -> bool:
+    """Backfill cleanup inventory before retiring its only version YAML."""
+    storage_generation = _ephemeral_storage_generation_from_yaml(yaml_content)
+    if storage_generation is None:
+        return False
+    try:
+        config = yaml_utils.safe_load(yaml_content)
+        metadata = config['metadata'][
+            constants.EPHEMERAL_STORAGE_SCOPE_METADATA_KEY]
+        yaml_resource_scope = metadata['resource_scope']
+    except (KeyError, TypeError):
+        return False
+    if not isinstance(yaml_resource_scope, str):
+        return False
+
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        _begin_immediate_if_sqlite(session, engine, True)
+        fence_stmt = sqlalchemy.select(
+            service_lifecycle_fences_table.c.epoch).where(
+                service_lifecycle_fences_table.c.name == service_name)
+        if engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+            fence_stmt = fence_stmt.with_for_update()
+        fence_row = session.execute(fence_stmt).fetchone()
+        service_row = session.execute(
+            sqlalchemy.select(services_table.c.hash,
+                              services_table.c.controller_pid,
+                              services_table.c.controller_ip,
+                              services_table.c.resource_scope,
+                              services_table.c.lifecycle_epoch,
+                              services_table.c.pool).where(
+                                  services_table.c.name ==
+                                  service_name).with_for_update()).fetchone()
+        if (fence_row is None or service_row is None or
+                service_row.hash != expected_service_hash or
+            (service_row.controller_pid,
+             service_row.controller_ip) != expected_controller_owner or
+                service_row.resource_scope != yaml_resource_scope or
+                service_row.lifecycle_epoch != fence_row.epoch):
+            session.rollback()
+            return False
+        if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
+            insert_func = sqlite.insert
+        elif (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value
+             ):
+            insert_func = postgresql.insert
+        else:
+            raise ValueError('Unsupported database dialect')
+        stmt = insert_func(ephemeral_storage_cleanup_intents_table).values(
+            service_name=service_name,
+            resource_scope=yaml_resource_scope,
+            storage_generation=storage_generation,
+            yaml_content=yaml_content,
+            pool=int(bool(service_row.pool)),
+            lifecycle_epoch=int(fence_row.epoch),
+            provisional=0,
+            created_at=time.time())
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[
+                'service_name', 'resource_scope', 'storage_generation'
+            ],
+            set_={
+                'yaml_content': stmt.excluded.yaml_content,
+                'provisional': 0,
+            })
+        session.execute(stmt)
+        session.commit()
+    return True
+
+
+def get_ephemeral_storage_cleanup_intents(
+        service_name: str,
+        resource_scope: Optional[str] = None,
+        lifecycle_epoch: Optional[int] = None,
+        provisional: Optional[bool] = None) -> List[Dict[str, Any]]:
+    """Return durable scoped storage cleanup manifests."""
+    predicates = [
+        ephemeral_storage_cleanup_intents_table.c.service_name == service_name
+    ]
+    if resource_scope is not None:
+        predicates.append(ephemeral_storage_cleanup_intents_table.c.
+                          resource_scope == resource_scope)
+    if lifecycle_epoch is not None:
+        predicates.append(ephemeral_storage_cleanup_intents_table.c.
+                          lifecycle_epoch == lifecycle_epoch)
+    if provisional is not None:
+        predicates.append(ephemeral_storage_cleanup_intents_table.c.provisional
+                          == int(provisional))
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        rows = session.execute(
+            sqlalchemy.select(ephemeral_storage_cleanup_intents_table).where(
+                *predicates).order_by(ephemeral_storage_cleanup_intents_table.c.
+                                      created_at)).mappings().all()
+    return [dict(row) for row in rows]
+
+
+def remove_provisional_ephemeral_storage_cleanup_intents(
+        service_name: str, resource_scope: str, intent_lifecycle_epoch: int,
+        current_lifecycle_epoch: int) -> bool:
+    """Forget successfully cleaned provisional intents under the owner fence."""
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        _begin_immediate_if_sqlite(session, engine, True)
+        if not _lifecycle_epoch_matches_in_session(session, service_name,
+                                                   current_lifecycle_epoch):
+            session.rollback()
+            return False
+        session.execute(
+            sqlalchemy.delete(ephemeral_storage_cleanup_intents_table).where(
+                ephemeral_storage_cleanup_intents_table.c.service_name ==
+                service_name,
+                ephemeral_storage_cleanup_intents_table.c.resource_scope ==
+                resource_scope,
+                ephemeral_storage_cleanup_intents_table.c.lifecycle_epoch ==
+                intent_lifecycle_epoch,
+                ephemeral_storage_cleanup_intents_table.c.provisional == 1))
+        session.commit()
+    return True
+
+
+def get_orphaned_service_child_names(
+        service_names: Optional[List[str]] = None) -> List[str]:
+    """Get resource-bearing child names with no authoritative service row.
+
+    HA scripts and reserved-capacity claims carry no external resource or
+    service/pool mode. They are intentionally excluded: fenced registration
+    clears those rows atomically, while exposing them to mode-scoped purge
+    would create an unresolvable ambiguous-mode orphan.
+    """
+    child_name_queries = [
+        sqlalchemy.select(table.c.service_name.label('service_name'))
+        for table in (replicas_table, version_specs_table,
+                      ephemeral_storage_cleanup_intents_table)
+    ]
+    child_names = sqlalchemy.union(*child_name_queries).subquery()
+    query = sqlalchemy.select(
+        child_names.c.service_name).where(~sqlalchemy.exists().where(
+            services_table.c.name == child_names.c.service_name))
+    if service_names is not None:
+        patterns = [name.replace('*', '%') for name in service_names]
+        query = query.where(
+            sqlalchemy.or_(*[
+                child_names.c.service_name.like(pattern) for pattern in patterns
+            ]))
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        rows = session.execute(query).scalars().all()
+    return sorted(set(rows))
+
+
+def get_orphaned_service_child_mode(service_name: str) -> Optional[bool]:
+    """Infer a child-only name's pool bit, failing closed on ambiguity."""
+    modes: Set[bool] = set()
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        intent_modes = session.execute(
+            sqlalchemy.select(
+                ephemeral_storage_cleanup_intents_table.c.pool).where(
+                    ephemeral_storage_cleanup_intents_table.c.service_name ==
+                    service_name)).scalars().all()
+        modes.update(bool(mode) for mode in intent_modes)
+        replica_rows = session.execute(
+            sqlalchemy.select(replicas_table.c.replica_info).where(
+                replicas_table.c.service_name == service_name)).scalars().all()
+        version_rows = session.execute(
+            sqlalchemy.select(version_specs_table.c.spec,
+                              version_specs_table.c.yaml_content).where(
+                                  version_specs_table.c.service_name ==
+                                  service_name)).fetchall()
+    for replica_info_bytes in replica_rows:
+        try:
+            replica_info = pickle.loads(replica_info_bytes)
+            modes.add(getattr(replica_info, 'replica_port', None) == '-')
+        except Exception:  # pylint: disable=broad-except
+            return None
+    for spec_bytes, yaml_content in version_rows:
+        try:
+            spec = pickle.loads(spec_bytes)
+            if spec is not None and hasattr(spec, 'pool'):
+                modes.add(bool(spec.pool))
+                continue
+        except Exception:  # pylint: disable=broad-except
+            pass
+        try:
+            config = yaml_utils.safe_load(yaml_content)
+        except Exception:  # pylint: disable=broad-except
+            return None
+        if not isinstance(config, dict) or not isinstance(
+                config.get('service'), dict):
+            return None
+        modes.add(bool(config['service'].get('pool', False)))
+    if len(modes) != 1:
+        return None
+    return modes.pop()
+
+
+def remove_orphaned_service_children(service_name: str,
+                                     lifecycle_epoch: int) -> bool:
+    """Delete child-only metadata after its external resources are confirmed."""
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        _begin_immediate_if_sqlite(session, engine, True)
+        if not _lifecycle_epoch_matches_in_session(session, service_name,
+                                                   lifecycle_epoch):
+            session.rollback()
+            return False
+        service_row = session.execute(
+            sqlalchemy.select(services_table.c.name).where(
+                services_table.c.name ==
+                service_name).with_for_update()).fetchone()
+        if service_row is not None:
+            session.rollback()
+            return False
+        for table in (replicas_table, version_specs_table,
+                      serve_ha_recovery_script_table,
+                      reserved_fill_claims_table,
+                      ephemeral_storage_cleanup_intents_table):
+            session.execute(
+                sqlalchemy.delete(table).where(
+                    table.c.service_name == service_name))
+        session.commit()
+    return True
 
 
 def get_service_versions(service_name: str) -> List[int]:
@@ -1644,18 +2149,27 @@ def add_version(service_name: str,
             session.rollback()
             raise RuntimeError('Service lifecycle ownership was lost before '
                                'adding a version.')
-        if expected_service_hash is not None:
+        if (expected_service_hash is not None or
+                expected_lifecycle_epoch is not None):
             row = session.execute(
                 sqlalchemy.select(
-                    services_table.c.hash,
-                    services_table.c.lifecycle_epoch).where(
+                    services_table.c.hash, services_table.c.lifecycle_epoch,
+                    services_table.c.status).where(
                         services_table.c.name ==
                         service_name).with_for_update()).fetchone()
-            if (row is None or row[0] != expected_service_hash or
-                (expected_lifecycle_epoch is not None and
-                 row[1] != expected_lifecycle_epoch)):
+            if (row is None or (expected_lifecycle_epoch is not None and
+                                row[1] != expected_lifecycle_epoch)):
+                session.rollback()
+                raise RuntimeError('Service lifecycle ownership was lost '
+                                   'before adding a version.')
+            if (expected_service_hash is not None and
+                    row[0] != expected_service_hash):
                 session.rollback()
                 raise RuntimeError('Service incarnation changed before '
+                                   'adding a version.')
+            if ServiceStatus[row[2]] in ServiceStatus.terminal_statuses():
+                session.rollback()
+                raise RuntimeError('Service entered terminal status before '
                                    'adding a version.')
         # Insert new version with MAX(version) + 1 in a single atomic operation
         max_version_subquery = sqlalchemy.select(
@@ -1687,6 +2201,8 @@ def add_or_update_version(
                                               Optional[str]]] = None
 ) -> bool:
     engine = _db_manager.get_engine()
+    storage_generation = _ephemeral_storage_generation_from_yaml(yaml_content)
+    resource_scope: Optional[str] = None
     with orm.Session(engine) as session:
         _begin_immediate_if_sqlite(session, engine)
         if not _lock_service_for_version_mutation(session, service_name):
@@ -1696,21 +2212,29 @@ def add_or_update_version(
                                                    expected_lifecycle_epoch):
             session.rollback()
             return False
-        if expected_service_hash is not None:
+        if (expected_service_hash is not None or
+                expected_lifecycle_epoch is not None or
+                expected_controller_owner is not None):
             owner = session.execute(
                 sqlalchemy.select(
                     services_table.c.hash, services_table.c.lifecycle_epoch,
                     services_table.c.controller_pid,
-                    services_table.c.controller_ip).where(
+                    services_table.c.controller_ip, services_table.c.status,
+                    services_table.c.resource_scope).where(
                         services_table.c.name ==
                         service_name).with_for_update()).fetchone()
-            if (owner is None or owner[0] != expected_service_hash or
+            if (owner is None or (expected_service_hash is not None and
+                                  owner[0] != expected_service_hash) or
                 (expected_lifecycle_epoch is not None and
                  owner[1] != expected_lifecycle_epoch) or
                 (expected_controller_owner is not None and
                  (owner[2], owner[3]) != expected_controller_owner)):
                 session.rollback()
                 return False
+            if ServiceStatus[owner[4]] in ServiceStatus.terminal_statuses():
+                session.rollback()
+                return False
+            resource_scope = owner[5]
         if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
             insert_func = sqlite.insert
         elif (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value
@@ -1733,6 +2257,19 @@ def add_or_update_version(
             })
 
         session.execute(insert_stmt)
+        if resource_scope is not None and storage_generation is not None:
+            session.query(ephemeral_storage_cleanup_intents_table).filter(
+                ephemeral_storage_cleanup_intents_table.c.service_name ==
+                service_name,
+                ephemeral_storage_cleanup_intents_table.c.resource_scope ==
+                resource_scope,
+                ephemeral_storage_cleanup_intents_table.c.storage_generation ==
+                storage_generation,
+                *([
+                    ephemeral_storage_cleanup_intents_table.c.lifecycle_epoch
+                    == expected_lifecycle_epoch
+                ] if expected_lifecycle_epoch is not None else []),
+            ).update({ephemeral_storage_cleanup_intents_table.c.provisional: 0})
         session.commit()
     return True
 
@@ -1794,7 +2331,7 @@ def delete_version(
                     version_specs_table.c.version == version)))
         session.commit()
     # Exact owner validation above distinguishes staleness. Missing metadata
-    # is idempotent success so storage cleanup/retry can continue.
+    # is idempotent success so version retirement can continue.
     return expected_service_hash is not None or result.rowcount > 0
 
 

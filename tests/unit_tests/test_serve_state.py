@@ -7,6 +7,8 @@ leader-aware routing.
 # underscore is the standard convention for fixtures injected for side
 # effects). Disable for the file.
 # pylint: disable=invalid-name,protected-access
+import types
+
 import pytest
 import sqlalchemy
 from sqlalchemy import create_engine
@@ -46,7 +48,9 @@ def _add_minimal_service(name: str,
                          controller_pid=12345,
                          service_hash=None,
                          lifecycle_epoch=None,
-                         resource_scope=None):
+                         resource_scope=None,
+                         yaml_content='yaml: v1',
+                         pool=False):
     """Add a service row with all-required-args defaults so individual tests
     only need to specify what they care about."""
     return serve_state.add_service(
@@ -57,14 +61,14 @@ def _add_minimal_service(name: str,
         load_balancing_policy='round_robin',
         status=serve_state.ServiceStatus.CONTROLLER_INIT,
         tls_encrypted=False,
-        pool=False,
+        pool=pool,
         controller_pid=controller_pid,
         entrypoint='entry',
         # A None spec is stored as pickled None (like `add_version` does), so
         # the read path (`_get_service_from_row`) skips the spec-dependent
         # fields instead of calling SkyServiceSpec methods on it.
         spec=None,
-        yaml_content='yaml: v1',
+        yaml_content=yaml_content,
         controller_ip=controller_ip,
         service_hash=service_hash,
         lifecycle_epoch=lifecycle_epoch,
@@ -159,20 +163,109 @@ class TestAddServiceAtomicRegistration:
                         'svc-dup')).fetchall()
         assert len(versions) == 1
 
-    def test_overwrites_stale_version_row(self, _mock_serve_db):
-        # A stale initial version row with no services row (left behind by an
-        # interrupted teardown on an older controller) must not block
-        # re-registration of the name: the initial version write is an upsert,
-        # matching the old add_or_update_version semantics.
+    def test_legacy_registration_preserves_stale_version_inventory(
+            self, _mock_serve_db):
+        # A non-consolidated controller has no API-local lifecycle epoch, but
+        # its own Serve DB is still authoritative. Never overwrite the last
+        # cleanup inventory merely because this registration is legacy-shaped.
         serve_state.add_or_update_version('svc-stale',
                                           serve_constants.INITIAL_VERSION, None,
                                           'yaml: stale')
         assert _read_row(_mock_serve_db, 'svc-stale') is None  # no svc row
 
-        assert _add_minimal_service('svc-stale') is True
-        assert serve_state.get_service_from_name('svc-stale') is not None
+        with pytest.raises(serve_state.OrphanedVersionRecordsError):
+            _add_minimal_service('svc-stale')
+        assert serve_state.get_service_from_name('svc-stale') is None
         assert serve_state.get_yaml_content(
-            'svc-stale', serve_constants.INITIAL_VERSION) == 'yaml: v1'
+            'svc-stale', serve_constants.INITIAL_VERSION) == 'yaml: stale'
+
+    def test_fenced_registration_preserves_orphan_version_inventory(
+            self, _mock_serve_db):
+        # An older interrupted teardown can leave v1 AND v2+ without the
+        # parent services row. Replacing v1 alone makes MAX(version)=v2 and
+        # leaks the predecessor's spec/yaml into the new incarnation.
+        serve_state.add_or_update_version('svc-stale', 1, 'old-spec-1',
+                                          'yaml: old-v1')
+        serve_state.add_or_update_version('svc-stale', 2, 'old-spec-2',
+                                          'yaml: old-v2')
+        assert serve_state.set_ha_recovery_script('svc-stale', 'old-script')
+        with orm.Session(_mock_serve_db) as session:
+            session.execute(
+                serve_state.reserved_fill_claims_table.insert().values(
+                    service_name='svc-stale',
+                    pool_key='old-pool',
+                    weight=1,
+                    floor_replicas=1,
+                    gpus_per_replica=1,
+                    holdings_fill=1,
+                    heartbeat_ts=1))
+            session.commit()
+
+        epoch = serve_state.claim_service_lifecycle_epoch('svc-stale')
+        with pytest.raises(serve_state.OrphanedVersionRecordsError,
+                           match=r'versions \[1, 2\]'):
+            _add_minimal_service('svc-stale',
+                                 service_hash='new-incarnation',
+                                 lifecycle_epoch=epoch)
+
+        assert _read_row(_mock_serve_db, 'svc-stale') is None
+        assert serve_state.get_service_versions('svc-stale') == [1, 2]
+        assert serve_state.get_ha_recovery_script('svc-stale') == 'old-script'
+        with orm.Session(_mock_serve_db) as session:
+            claim = session.execute(
+                sqlalchemy.select(
+                    serve_state.reserved_fill_claims_table.c.service_name).
+                where(serve_state.reserved_fill_claims_table.c.service_name ==
+                      'svc-stale')).fetchone()
+        assert claim is not None
+
+    def test_fenced_registration_preserves_orphan_replica_inventory(
+            self, _mock_serve_db):
+        orphan = types.SimpleNamespace(replica_id=9,
+                                       cluster_name='billable-cluster-9')
+        serve_state.add_or_update_replica('svc-stale', 9, orphan)
+        epoch = serve_state.claim_service_lifecycle_epoch('svc-stale')
+
+        with pytest.raises(serve_state.OrphanedReplicaRecordsError,
+                           match='billable-cluster-9'):
+            _add_minimal_service('svc-stale',
+                                 service_hash='new-incarnation',
+                                 lifecycle_epoch=epoch)
+
+        assert _read_row(_mock_serve_db, 'svc-stale') is None
+        replicas = serve_state.get_replica_infos('svc-stale')
+        assert len(replicas) == 1
+        assert replicas[0].cluster_name == 'billable-cluster-9'
+
+    def test_script_and_claim_only_leftovers_do_not_block_registration(
+            self, _mock_serve_db):
+        assert serve_state.set_ha_recovery_script('svc-stale', 'old-script')
+        with orm.Session(_mock_serve_db) as session:
+            session.execute(
+                serve_state.reserved_fill_claims_table.insert().values(
+                    service_name='svc-stale',
+                    pool_key='old-pool',
+                    weight=1,
+                    floor_replicas=1,
+                    gpus_per_replica=1,
+                    holdings_fill=1,
+                    heartbeat_ts=1))
+            session.commit()
+
+        assert 'svc-stale' not in (serve_state.get_orphaned_service_child_names(
+            ['svc-stale']))
+        epoch = serve_state.claim_service_lifecycle_epoch('svc-stale')
+        assert _add_minimal_service('svc-stale',
+                                    service_hash='new-incarnation',
+                                    lifecycle_epoch=epoch)
+        assert serve_state.get_ha_recovery_script('svc-stale') is None
+        with orm.Session(_mock_serve_db) as session:
+            claim = session.execute(
+                sqlalchemy.select(
+                    serve_state.reserved_fill_claims_table.c.service_name).
+                where(serve_state.reserved_fill_claims_table.c.service_name ==
+                      'svc-stale')).fetchone()
+        assert claim is None
 
     def test_get_service_pool_from_db_sees_orphan_row(self, _mock_serve_db):
         # The raw-pool accessor must read a version-less row (the orphan case)
@@ -318,6 +411,80 @@ class TestServiceLifecycleEpoch:
             expected_lifecycle_epoch=epoch_a)
         assert serve_state.get_yaml_content('svc', 2) is None
 
+    def test_version_cas_checks_authoritative_fence_before_service_row(
+            self, _mock_serve_db):
+        epoch = serve_state.claim_service_lifecycle_epoch('svc')
+        assert _add_minimal_service('svc',
+                                    service_hash='incarnation-a',
+                                    lifecycle_epoch=epoch)
+        # Model a new lifecycle claimant that advanced the authoritative fence
+        # but has not yet stamped services.lifecycle_epoch (it may be blocked
+        # on that row behind this update transaction in PostgreSQL).
+        with orm.Session(_mock_serve_db) as session:
+            session.execute(
+                sqlalchemy.update(
+                    serve_state.service_lifecycle_fences_table).where(
+                        serve_state.service_lifecycle_fences_table.c.name ==
+                        'svc').values(epoch=epoch + 1))
+            session.commit()
+        assert _read_row(_mock_serve_db, 'svc')['lifecycle_epoch'] == epoch
+
+        with pytest.raises(RuntimeError, match='lifecycle ownership'):
+            serve_state.add_version('svc',
+                                    expected_service_hash='incarnation-a',
+                                    expected_lifecycle_epoch=epoch)
+        assert not serve_state.add_or_update_version(
+            'svc',
+            2,
+            None,
+            'yaml: stale',
+            expected_service_hash='incarnation-a',
+            expected_lifecycle_epoch=epoch)
+        assert serve_state.get_latest_version('svc') == 1
+
+    def test_status_and_teardown_claims_check_authoritative_fence(
+            self, _mock_serve_db):
+        epoch = serve_state.claim_service_lifecycle_epoch('svc')
+        assert _add_minimal_service('svc',
+                                    controller_pid=200,
+                                    controller_ip='10.0.0.2',
+                                    service_hash='incarnation-a',
+                                    lifecycle_epoch=epoch)
+        serve_state.set_service_status_and_active_versions(
+            'svc', serve_state.ServiceStatus.SHUTTING_DOWN)
+        with orm.Session(_mock_serve_db) as session:
+            session.execute(
+                sqlalchemy.update(
+                    serve_state.service_lifecycle_fences_table).where(
+                        serve_state.service_lifecycle_fences_table.c.name ==
+                        'svc').values(epoch=epoch + 1))
+            session.commit()
+
+        assert not serve_state.set_service_status_and_active_versions_if_hash(
+            'svc',
+            'incarnation-a',
+            serve_state.ServiceStatus.FAILED_CLEANUP,
+            expected_lifecycle_epoch=epoch)
+        assert not serve_state.claim_orphaned_service_teardown(
+            'svc',
+            'incarnation-a',
+            200,
+            '10.0.0.2',
+            999,
+            '10.0.0.9',
+            expected_lifecycle_epoch=epoch)
+        assert not serve_state.claim_unrecoverable_service_teardown(
+            'svc',
+            'incarnation-a',
+            200,
+            '10.0.0.2',
+            999,
+            '10.0.0.9',
+            expected_lifecycle_epoch=epoch)
+        row = _read_row(_mock_serve_db, 'svc')
+        assert row['status'] == serve_state.ServiceStatus.SHUTTING_DOWN.value
+        assert row['controller_pid'] == 200
+
     def test_stale_controller_cannot_write_current_incarnation_children(
             self, _mock_serve_db):
         assert _add_minimal_service('svc',
@@ -336,6 +503,67 @@ class TestServiceLifecycleEpoch:
             expected_service_hash='incarnation-a',
             expected_controller_owner=stale_owner)
         assert serve_state.get_replica_info_from_id('svc', 1) is None
+
+
+class TestEphemeralStorageCleanupIntents:
+    """Storage ownership is durable before upload and adopted atomically."""
+
+    @staticmethod
+    def _yaml(resource_scope: str, generation: str) -> str:
+        return f'''\
+metadata:
+  {serve_constants.EPHEMERAL_STORAGE_SCOPE_METADATA_KEY}:
+    resource_scope: {resource_scope}
+    scope_id: svscope
+    storage_generation: {generation}
+    storage_mounts: []
+service:
+  readiness_probe: /
+'''
+
+    def test_initial_registration_adopts_intent_in_same_transaction(
+            self, _mock_serve_db):
+        epoch = serve_state.claim_service_lifecycle_epoch('svc')
+        yaml_content = self._yaml('incarnation-a', 'generation-1')
+        assert serve_state.add_ephemeral_storage_cleanup_intent(
+            'svc', 'incarnation-a', 'generation-1', yaml_content, False, epoch,
+            True)
+        assert _add_minimal_service('svc',
+                                    service_hash='incarnation-a',
+                                    lifecycle_epoch=epoch,
+                                    resource_scope='incarnation-a',
+                                    yaml_content=yaml_content)
+
+        intents = serve_state.get_ephemeral_storage_cleanup_intents('svc')
+        assert len(intents) == 1
+        assert intents[0]['provisional'] == 0
+
+    def test_version_commit_adopts_new_generation_atomically(
+            self, _mock_serve_db):
+        first_epoch = serve_state.claim_service_lifecycle_epoch('svc')
+        assert _add_minimal_service('svc',
+                                    controller_pid=200,
+                                    controller_ip='10.0.0.2',
+                                    service_hash='incarnation-a',
+                                    lifecycle_epoch=first_epoch,
+                                    resource_scope='incarnation-a')
+        update_epoch = serve_state.claim_service_lifecycle_epoch('svc')
+        yaml_content = self._yaml('incarnation-a', 'generation-2')
+        assert serve_state.add_ephemeral_storage_cleanup_intent(
+            'svc', 'incarnation-a', 'generation-2', yaml_content, False,
+            update_epoch, True)
+
+        assert serve_state.add_or_update_version(
+            'svc',
+            2,
+            None,
+            yaml_content,
+            expected_service_hash='incarnation-a',
+            expected_lifecycle_epoch=update_epoch,
+            expected_controller_owner=(200, '10.0.0.2'))
+        intent = serve_state.get_ephemeral_storage_cleanup_intents('svc')[0]
+        assert intent['storage_generation'] == 'generation-2'
+        assert intent['provisional'] == 0
 
 
 class TestGetServiceFromNameReturnsControllerIp:
@@ -888,6 +1116,92 @@ class TestRemoveServiceCompletely:
                 assert session.execute(
                     sqlalchemy.select(column).where(
                         column == 'svc')).first() is not None, table.name
+
+
+class TestTerminalVersionFences:
+    """A down/purge winner must prevent both phases of update commit."""
+
+    def test_terminal_status_rejects_placeholder_and_yaml_commit(
+            self, _mock_serve_db):
+        epoch = serve_state.claim_service_lifecycle_epoch('svc')
+        assert _add_minimal_service('svc',
+                                    controller_pid=200,
+                                    controller_ip='10.0.0.2',
+                                    service_hash='incarnation-a',
+                                    lifecycle_epoch=epoch)
+        serve_state.set_service_status_and_active_versions(
+            'svc', serve_state.ServiceStatus.SHUTTING_DOWN)
+
+        with pytest.raises(RuntimeError, match='terminal status'):
+            serve_state.add_version('svc',
+                                    expected_service_hash='incarnation-a',
+                                    expected_lifecycle_epoch=epoch)
+        assert not serve_state.add_or_update_version(
+            'svc',
+            2,
+            None,
+            'yaml: v2',
+            expected_service_hash='incarnation-a',
+            expected_lifecycle_epoch=epoch,
+            expected_controller_owner=(200, '10.0.0.2'))
+        assert serve_state.get_latest_version('svc') == 1
+
+
+class TestUnrecoverableServiceRows:
+    """No-yaml rows make HA recovery impossible and must stay purgeable."""
+
+    def test_ha_retirement_marks_terminal_and_removes_script(
+            self, _mock_serve_db):
+        _insert_orphan_service_row(_mock_serve_db, 'svc')
+        assert serve_state.set_ha_recovery_script('svc', 'impossible script')
+
+        assert serve_state.mark_unrecoverable_service_for_cleanup('svc',
+                                                                  'orphan',
+                                                                  pool=False)
+        assert _read_row(
+            _mock_serve_db,
+            'svc')['status'] == serve_state.ServiceStatus.FAILED_CLEANUP.value
+        assert serve_state.get_ha_recovery_script('svc') is None
+
+    def test_purge_claim_consumes_impossible_script(self, _mock_serve_db):
+        _insert_orphan_service_row(_mock_serve_db, 'svc')
+        serve_state.set_service_status_and_active_versions(
+            'svc', serve_state.ServiceStatus.SHUTTING_DOWN)
+        assert serve_state.set_ha_recovery_script('svc', 'impossible script')
+
+        assert serve_state.claim_unrecoverable_service_teardown(
+            'svc', 'orphan', 12345, None, 999, '10.0.0.9')
+        owner = serve_state.get_service_controller_owner('svc')
+        assert owner is not None
+        assert owner['controller_pid'] == 999
+        assert owner['controller_ip'] == '10.0.0.9'
+        assert (owner['controller_port'] ==
+                serve_constants.CONTROLLER_TEARDOWN_ACK_PORT)
+        assert serve_state.get_ha_recovery_script('svc') is None
+
+    def test_ha_retirement_cannot_overwrite_active_purge(self, _mock_serve_db):
+        _insert_orphan_service_row(_mock_serve_db, 'svc')
+        serve_state.set_service_status_and_active_versions(
+            'svc', serve_state.ServiceStatus.SHUTTING_DOWN)
+        assert serve_state.set_ha_recovery_script('svc', 'impossible script')
+
+        assert not serve_state.mark_unrecoverable_service_for_cleanup(
+            'svc', 'orphan', pool=False)
+        assert _read_row(
+            _mock_serve_db,
+            'svc')['status'] == serve_state.ServiceStatus.SHUTTING_DOWN.value
+        assert (
+            serve_state.get_ha_recovery_script('svc') == 'impossible script')
+
+    def test_purge_claim_refuses_committed_version(self, _mock_serve_db):
+        assert _add_minimal_service('svc', service_hash='incarnation-a')
+        serve_state.set_service_status_and_active_versions(
+            'svc', serve_state.ServiceStatus.SHUTTING_DOWN)
+        assert serve_state.set_ha_recovery_script('svc', 'valid script')
+
+        assert not serve_state.claim_unrecoverable_service_teardown(
+            'svc', 'incarnation-a', 12345, None, 999, '10.0.0.9')
+        assert serve_state.get_ha_recovery_script('svc') == 'valid script'
 
 
 class TestRecoveryVersionSelection:

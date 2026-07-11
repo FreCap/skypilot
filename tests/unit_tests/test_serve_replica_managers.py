@@ -355,6 +355,43 @@ class TestLaunchClusterRetry:
         assert raised is not None
         assert mock_sdk.launch.call_count == 3
 
+    def test_authoritative_prelaunch_guard_rejects_cloud_mutation(
+            self, tmp_path):
+        mock_sdk, mock_terminate, raised = self._run_launch_cluster(
+            tmp_path, [None], pre_launch_guard=lambda: False)
+        assert raised is not None
+        assert 'ownership was lost' in str(raised)
+        mock_sdk.launch.assert_not_called()
+        mock_terminate.assert_not_called()
+
+    def test_inflight_owner_watchdog_cancels_request(self, tmp_path):
+        allowed = threading.Event()
+        watchdog_observed_loss = threading.Event()
+        allowed.set()
+
+        def _continue_guard():
+            if allowed.is_set():
+                return True
+            watchdog_observed_loss.set()
+            return False
+
+        def _block_while_watchdog_runs(_request_id):
+            allowed.clear()
+            assert watchdog_observed_loss.wait(timeout=5)
+            raise RuntimeError('request cancelled')
+
+        with mock.patch(
+                'sky.serve.replica_managers.'
+                '_LAUNCH_OWNER_WATCH_INTERVAL_SECONDS', 0.01):
+            mock_sdk, _, raised = self._run_launch_cluster(
+                tmp_path,
+                _block_while_watchdog_runs,
+                continue_guard=_continue_guard)
+
+        assert raised is not None
+        assert 'ownership loss' in str(raised)
+        mock_sdk.api_cancel.assert_called_once_with('request-id')
+
 
 class TestLaunchReplicaAvailabilityMaxRetry:
     """`_launch_replica` must cap availability failures at one attempt only
@@ -400,20 +437,22 @@ class TestLaunchReplicaAvailabilityMaxRetry:
 
     def test_spot_with_placer_fails_fast_on_availability(self):
         call = self._launch_replica(use_spot=True, with_placer=True)
-        assert call.kwargs['kwargs'] == {'availability_max_retry': 1}
+        assert call.kwargs['kwargs']['availability_max_retry'] == 1
+        assert callable(call.kwargs['kwargs']['pre_launch_guard'])
+        assert callable(call.kwargs['kwargs']['continue_guard'])
         # retry_until_up must be False: failover is owned by the placer.
         assert call.kwargs['args'][-1] is False
 
     def test_spot_without_placer_keeps_default_retries(self):
         call = self._launch_replica(use_spot=True, with_placer=False)
-        assert call.kwargs['kwargs'] == {'availability_max_retry': None}
+        assert call.kwargs['kwargs']['availability_max_retry'] is None
         assert call.kwargs['args'][-1] is True
 
     def test_non_spot_with_placer_keeps_default_retries(self):
         """A non-spot (on-demand fallback) replica keeps the default
         retries even when the service has a spot placer."""
         call = self._launch_replica(use_spot=False, with_placer=True)
-        assert call.kwargs['kwargs'] == {'availability_max_retry': None}
+        assert call.kwargs['kwargs']['availability_max_retry'] is None
         assert call.kwargs['args'][-1] is True
 
 
@@ -449,6 +488,243 @@ class TestUpdateVersionHoldsManagerLock:
             assert not done.wait(timeout=0.5)
         assert done.wait(timeout=5)
         thread.join(timeout=5)
+
+
+class TestLaunchOwnershipFence:
+    """A stale manager must never start work that was only queued locally."""
+
+    @staticmethod
+    def _pending_info():
+        info = mock.Mock()
+        info.status = replica_managers.serve_state.ReplicaStatus.PENDING
+        return info
+
+    @staticmethod
+    def _owned_manager():
+        mgr = _make_manager()
+        mgr._service_hash = 'incarnation-a'
+        mgr._controller_owner = (101, '10.0.0.1')
+        mgr._ownership_lost = threading.Event()
+        return mgr
+
+    def test_recovering_exact_owner_may_launch_from_controller_failed(self):
+        mgr = self._owned_manager()
+        owner = {
+            'hash': 'incarnation-a',
+            'controller_pid': 101,
+            'controller_ip': '10.0.0.1',
+            'status':
+                replica_managers.serve_state.ServiceStatus.CONTROLLER_FAILED,
+        }
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_service_controller_owner',
+                               return_value=owner):
+            assert mgr._service_is_launch_authorized()
+        assert not mgr._ownership_lost.is_set()
+
+    def test_shutting_down_exact_owner_is_fenced(self):
+        mgr = self._owned_manager()
+        owner = {
+            'hash': 'incarnation-a',
+            'controller_pid': 101,
+            'controller_ip': '10.0.0.1',
+            'status': replica_managers.serve_state.ServiceStatus.SHUTTING_DOWN,
+        }
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_service_controller_owner',
+                               return_value=owner):
+            assert not mgr._service_is_launch_authorized()
+        assert mgr._ownership_lost.is_set()
+
+    def test_nonconsolidated_controller_omits_api_local_fence(self):
+        mgr = self._owned_manager()
+        mgr._enforce_launch_fence = False
+        assert mgr._replica_launch_fence_context() is None
+
+    def test_transient_owner_lookup_fails_attempt_without_latching_loss(self):
+        mgr = self._owned_manager()
+        owner = {
+            'hash': 'incarnation-a',
+            'controller_pid': 101,
+            'controller_ip': '10.0.0.1',
+            'status': replica_managers.serve_state.ServiceStatus.READY,
+        }
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_service_controller_owner',
+                side_effect=[RuntimeError('database restarting'), owner]):
+            # The current launch fails closed, but the manager remains able to
+            # prove ownership and recover on the next check.
+            assert not mgr._service_is_launch_authorized()
+            assert not mgr._ownership_lost.is_set()
+            assert mgr._service_is_launch_authorized()
+        assert not mgr._ownership_lost.is_set()
+
+    def test_owner_watchdog_retries_transient_lookup(self):
+        mgr = self._owned_manager()
+        current_owner = {
+            'hash': 'incarnation-a',
+            'controller_pid': 101,
+            'controller_ip': '10.0.0.1',
+            'status': replica_managers.serve_state.ServiceStatus.READY,
+        }
+        replacement_owner = {
+            **current_owner,
+            'controller_pid': 202,
+        }
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_service_controller_owner',
+                side_effect=[
+                    RuntimeError('database restarting'), current_owner,
+                    replacement_owner
+                ]) as get_owner, \
+             mock.patch.object(
+                 replica_managers,
+                 '_SERVICE_OWNER_WATCH_INTERVAL_SECONDS',
+                 0):
+            mgr._service_owner_watchdog()
+
+        assert get_owner.call_count == 3
+        assert mgr._ownership_lost.is_set()
+
+    def test_transient_lookup_defers_queued_launch_instead_of_discarding(self):
+        mgr = _make_manager()
+        mgr._is_pool = False
+        mgr.least_recent_version = 1
+        mgr._spot_placer = None
+        mgr._replica_to_request_id = thread_utils.ThreadSafeDict()
+        mgr._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
+        mgr._launch_thread_pool = thread_utils.ThreadSafeDict()
+        mgr._down_thread_pool = thread_utils.ThreadSafeDict()
+        launch_thread = mock.Mock()
+        launch_thread.is_alive.return_value = False
+        mgr._launch_thread_pool[1] = launch_thread
+        info = self._pending_info()
+
+        with mock.patch.object(mgr,
+                               '_service_launch_authorization',
+                               return_value=None), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_info_from_id',
+                               return_value=info), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(mgr, '_persist_replica') as persist:
+            mgr._refresh_thread_pool()
+
+        launch_thread.start.assert_not_called()
+        assert mgr._launch_thread_pool[1] is launch_thread
+        persist.assert_not_called()
+
+    def test_stale_queued_launch_is_discarded_without_deleting_row(self):
+        mgr = _make_manager()
+        mgr._is_pool = False
+        mgr.least_recent_version = 1
+        mgr._spot_placer = None
+        mgr._replica_to_request_id = thread_utils.ThreadSafeDict()
+        mgr._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
+        mgr._launch_thread_pool = thread_utils.ThreadSafeDict()
+        mgr._down_thread_pool = thread_utils.ThreadSafeDict()
+        launch_thread = mock.Mock()
+        launch_thread.is_alive.return_value = False
+        mgr._launch_thread_pool[1] = launch_thread
+        info = self._pending_info()
+
+        with mock.patch.object(mgr,
+                               '_service_launch_authorization',
+                               return_value=False), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_info_from_id',
+                               return_value=info), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(mgr, '_persist_replica') as persist:
+            mgr._refresh_thread_pool()
+
+        launch_thread.start.assert_not_called()
+        assert 1 not in mgr._launch_thread_pool
+        persist.assert_not_called()
+
+    def test_old_version_retirement_leaves_storage_to_durable_intents(self):
+        mgr = _make_manager()
+        mgr._is_pool = False
+        mgr.least_recent_version = 1
+        mgr._spot_placer = None
+        mgr._replica_to_request_id = thread_utils.ThreadSafeDict()
+        mgr._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
+        mgr._launch_thread_pool = thread_utils.ThreadSafeDict()
+        mgr._down_thread_pool = thread_utils.ThreadSafeDict()
+        info = mock.Mock(version=2)
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[info]), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_service_versions',
+                               return_value=[1, 2]), \
+             mock.patch.object(replica_managers.serve_utils,
+                               'get_yaml_content',
+                               ) as get_yaml_content, \
+             mock.patch.object(replica_managers.serve_state,
+                               'delete_version',
+                               return_value=True) as delete_version:
+            mgr._refresh_thread_pool()
+
+        delete_version.assert_called_once_with('svc', 1)
+        get_yaml_content.assert_not_called()
+
+    def test_old_version_scoped_storage_is_not_deleted_during_retirement(self):
+        mgr = _make_manager()
+        mgr._is_pool = False
+        mgr._resource_scope = 'incarnation-a'
+        mgr.least_recent_version = 1
+        mgr._spot_placer = None
+        mgr._replica_to_request_id = thread_utils.ThreadSafeDict()
+        mgr._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
+        mgr._launch_thread_pool = thread_utils.ThreadSafeDict()
+        mgr._down_thread_pool = thread_utils.ThreadSafeDict()
+        info = mock.Mock(version=2)
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos', return_value=[info]), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_service_versions', return_value=[1, 2]), \
+             mock.patch.object(replica_managers.serve_utils,
+                               'get_yaml_content') as get_yaml_content, \
+             mock.patch.object(replica_managers.serve_state,
+                               'delete_version', return_value=True) as delete:
+            mgr._refresh_thread_pool()
+
+        get_yaml_content.assert_not_called()
+        delete.assert_called_once_with('svc', 1)
+        assert mgr.least_recent_version == 2
+
+    def test_old_version_metadata_delete_failure_keeps_retry_pointer(self):
+        mgr = _make_manager()
+        mgr._is_pool = False
+        mgr._resource_scope = 'incarnation-a'
+        mgr.least_recent_version = 1
+        mgr._spot_placer = None
+        mgr._replica_to_request_id = thread_utils.ThreadSafeDict()
+        mgr._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
+        mgr._launch_thread_pool = thread_utils.ThreadSafeDict()
+        mgr._down_thread_pool = thread_utils.ThreadSafeDict()
+        info = mock.Mock(version=2)
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos', return_value=[info]), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_service_versions', return_value=[1, 2]), \
+             mock.patch.object(replica_managers.serve_state,
+                               'delete_version', return_value=False) as delete, \
+             pytest.raises(RuntimeError, match='incarnation changed'):
+            mgr._refresh_thread_pool()
+
+        delete.assert_called_once_with('svc', 1)
+        assert mgr.least_recent_version == 1
 
 
 class TestCloudInstanceLooksAlive:
@@ -712,6 +988,48 @@ class TestRecoveryRetryAndIsolation:
     failed the boot and the HA daemon retried via respawn; the recovery
     thread must not die silently and strand un-redriven replicas), and one
     bad replica must not abort re-driving the rest."""
+
+    def test_orphaned_spot_intent_persist_is_owner_fenced(self):
+        mgr = _make_manager()
+        mgr._service_hash = 'incarnation-a'
+        mgr._controller_owner = (123, '10.0.0.1')
+        mgr._spot_placer = None
+
+        info = mock.MagicMock()
+        info.replica_id = 1
+        info.cluster_name = 'svc-1-incarnation'
+        info.is_spot = True
+        info.status = replica_managers.serve_state.ReplicaStatus.READY
+        info.status_property.preempted = False
+        info.status_property.is_scale_down = False
+        info.status_property.purged = False
+        info.get_spot_location.return_value = None
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos',
+                return_value=[info]), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_replicas_at_status',
+                 return_value=[]), \
+             mock.patch.object(
+                 replica_managers.global_user_state,
+                 'get_cluster_status_fields',
+                 return_value={}), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'add_or_update_replica',
+                 return_value=True) as persist, \
+             mock.patch.object(mgr, '_terminate_replica'):
+            mgr._recover_replica_operations()
+
+        persist.assert_called_once_with('svc',
+                                        1,
+                                        info,
+                                        expected_service_hash='incarnation-a',
+                                        expected_controller_owner=(123,
+                                                                   '10.0.0.1'))
 
     def test_one_bad_launch_does_not_strand_the_rest(self):
         mgr = _make_manager(next_replica_id=1)

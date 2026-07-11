@@ -117,7 +117,8 @@ class SkyServeController:
                  resource_scope: Optional[str] = None,
                  service_hash: Optional[str] = None,
                  controller_pid: Optional[int] = None,
-                 controller_ip: Optional[str] = None) -> None:
+                 controller_ip: Optional[str] = None,
+                 enforce_launch_fence: bool = False) -> None:
         self._service_name = service_name
         self._resource_scope = resource_scope
         self._service_hash = service_hash
@@ -140,7 +141,8 @@ class SkyServeController:
                 resource_scope=resource_scope,
                 service_hash=service_hash,
                 controller_pid=controller_pid,
-                controller_ip=controller_ip))
+                controller_ip=controller_ip,
+                enforce_launch_fence=enforce_launch_fence))
         # Pass `version` so a controller rebuilt on restart/respawn starts the
         # autoscaler at the recovered latest version (matching the replica
         # manager above), not INITIAL_VERSION. Otherwise a service updated past
@@ -1070,7 +1072,8 @@ def run_controller(service_name: str,
                    resource_scope: Optional[str] = None,
                    service_hash: Optional[str] = None,
                    controller_pid: Optional[int] = None,
-                   controller_ip: Optional[str] = None):
+                   controller_ip: Optional[str] = None,
+                   enforce_launch_fence: bool = False):
     os.environ[constants.OVERRIDE_CONSOLIDATION_MODE] = 'true'
     # Hijack sys.stdout/stderr to be context aware.
     context_utils.hijack_sys_attrs()
@@ -1078,5 +1081,6 @@ def run_controller(service_name: str,
                                     controller_host, controller_port,
                                     controller_owner_fingerprint,
                                     resource_scope, service_hash,
-                                    controller_pid, controller_ip)
+                                    controller_pid, controller_ip,
+                                    enforce_launch_fence)
     controller.run()

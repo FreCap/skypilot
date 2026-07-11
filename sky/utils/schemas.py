@@ -831,6 +831,9 @@ def get_storage_schema():
             '_bucket_sub_path': {
                 'type': 'string',
             },
+            '_store_region': {
+                'type': 'string',
+            },
             '_force_delete': {
                 'type': 'boolean',
             }

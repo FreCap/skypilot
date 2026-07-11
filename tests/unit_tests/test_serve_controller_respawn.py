@@ -59,13 +59,14 @@ def _setup(monkeypatch,
     spawn_calls = []
 
     def _spawn_controller(unused_name, spec, version, unused_host, port,
-                          service_hash, controller_ip):
+                          service_hash, controller_ip, **kwargs):
         spawn_calls.append({
             'spec': spec,
             'version': version,
             'port': port,
             'service_hash': service_hash,
             'controller_ip': controller_ip,
+            'enforce_launch_fence': kwargs.get('enforce_launch_fence', False),
         })
         if isinstance(new_controller, BaseException):
             raise new_controller
@@ -143,6 +144,20 @@ def test_respawn_reloads_latest_committed_spec(monkeypatch):
 
     assert spawn_calls[0]['version'] == 7
     assert spawn_calls[0]['spec'] is latest_spec
+
+
+def test_respawn_preserves_authoritative_launch_fence_bit(monkeypatch):
+    spawn_calls, _ = _setup(monkeypatch, new_controller=_FakeProc(True, 333))
+
+    service._respawn_controller('svc',
+                                _spec(),
+                                1,
+                                '127.0.0.1',
+                                _FakeProc(False, 111),
+                                service_hash=_HASH,
+                                enforce_launch_fence=True)
+
+    assert spawn_calls[0]['enforce_launch_fence'] is True
 
 
 def test_respawn_db_error_retries_without_stale_spec(monkeypatch):

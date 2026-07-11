@@ -24,6 +24,7 @@ from sky import task as task_lib
 from sky.adaptors import common as adaptors_common
 from sky.backends import backend_utils
 from sky.catalog import common as service_catalog_common
+from sky.data import data_utils
 from sky.data import storage as storage_lib
 from sky.serve import constants as serve_constants
 from sky.serve import lb_k8s
@@ -47,12 +48,174 @@ from sky.utils import yaml_utils
 
 if typing.TYPE_CHECKING:
     import grpc
+
+    from sky.serve import service as service_lib
 else:
     grpc = adaptors_common.LazyImport('grpc')
+    service_lib = adaptors_common.LazyImport('sky.serve.service')
 
 logger = sky_logging.init_logger(__name__)
 
 _KUBERNETES_LABEL_VALUE_MAX_LENGTH = 63
+_STORAGE_NAME_MAX_LENGTH = 63
+
+
+def _prepare_scoped_ephemeral_storage(
+        task: 'task_lib.Task',
+        resource_scope: str,
+        reuse_existing_scope: bool = False) -> Tuple[str, str, Set[str]]:
+    """Namespace deletable storage and return remote mounts to retain."""
+    existing_scope = task.metadata.get(
+        serve_constants.EPHEMERAL_STORAGE_SCOPE_METADATA_KEY)
+    storage_generation = uuid.uuid4().hex
+    if (reuse_existing_scope and isinstance(existing_scope, dict) and
+            existing_scope.get('resource_scope') == resource_scope and
+            isinstance(existing_scope.get('storage_generation'), str)):
+        storage_generation = existing_scope['storage_generation']
+    scope_id = serve_utils.generate_ephemeral_storage_scope_id(
+        resource_scope, storage_generation)
+    unowned_remote_mounts: Set[str] = set()
+    existing_owned_mounts: Set[str] = set()
+    if (reuse_existing_scope and isinstance(existing_scope, dict) and
+            existing_scope.get('resource_scope') == resource_scope and
+            existing_scope.get('scope_id') == scope_id):
+        raw_owned_mounts = existing_scope.get('storage_mounts', [])
+        if isinstance(raw_owned_mounts, list):
+            existing_owned_mounts = {
+                mount for mount in raw_owned_mounts if isinstance(mount, str)
+            }
+    seen_storage_ids: Set[int] = set()
+    for mount_path, storage in task.storage_mounts.items():
+        if storage.persistent:
+            continue
+        source = storage.source
+        if (isinstance(source, str) and
+            (data_utils.is_cloud_store_url(source) or '://' in source)):
+            # A user-supplied remote bucket cannot be renamed without changing
+            # the data being mounted. Keep it outside the owned manifest and
+            # retain it on teardown even if persistent:false was requested.
+            if mount_path not in existing_owned_mounts:
+                unowned_remote_mounts.add(mount_path)
+            continue
+        if id(storage) in seen_storage_ids:
+            continue
+        seen_storage_ids.add(id(storage))
+        if storage.name is None:
+            continue
+        suffix = f'-{scope_id}'
+        if storage.name.endswith(suffix):
+            continue
+        prefix_length = _STORAGE_NAME_MAX_LENGTH - len(suffix)
+        prefix = storage.name[:prefix_length].rstrip('-') or 'skyserve'
+        storage.name = f'{prefix}{suffix}'
+    return scope_id, storage_generation, unowned_remote_mounts
+
+
+def _record_scoped_ephemeral_storage(task: 'task_lib.Task', resource_scope: str,
+                                     scope_id: str, storage_generation: str,
+                                     unowned_remote_mounts: Set[str]) -> None:
+    """Persist the exact mount paths whose external resources we own."""
+    owned_mounts = sorted(
+        mount_path for mount_path, storage in task.storage_mounts.items()
+        if (not storage.persistent and
+            mount_path not in unowned_remote_mounts and serve_utils.
+            ephemeral_storage_identity_matches_scope(storage, scope_id)))
+    task.metadata[serve_constants.EPHEMERAL_STORAGE_SCOPE_METADATA_KEY] = {
+        'resource_scope': resource_scope,
+        'scope_id': scope_id,
+        'storage_generation': storage_generation,
+        'storage_mounts': owned_mounts,
+    }
+
+
+def _persist_scoped_ephemeral_storage_intent(task: 'task_lib.Task',
+                                             service_name: str,
+                                             resource_scope: str,
+                                             storage_generation: str,
+                                             pool: bool, lifecycle_epoch: int,
+                                             provisional: bool) -> None:
+    """Persist already-recorded cleanup inventory in the local Serve DB."""
+    yaml_content = yaml_utils.dump_yaml_str(task.to_yaml_config())
+    if not serve_state.add_ephemeral_storage_cleanup_intent(
+            service_name, resource_scope, storage_generation, yaml_content,
+            pool, lifecycle_epoch, provisional):
+        raise RuntimeError(f'Lost lifecycle ownership before publishing '
+                           f'scoped storage cleanup intent for '
+                           f'{service_name!r}.')
+
+
+def _cleanup_provisional_storage_intents(service_name: str,
+                                         failed_lifecycle_epoch: int,
+                                         lifecycle_lock: Any) -> None:
+    """Best-effort eager cleanup for one failed up/update operation."""
+    try:
+        intents = serve_state.get_ephemeral_storage_cleanup_intents(
+            service_name,
+            lifecycle_epoch=failed_lifecycle_epoch,
+            provisional=True)
+        if not intents:
+            return
+        # Fence the failed submitter before deciding a generation is
+        # unreferenced. A controller carrying the old epoch can no longer
+        # commit after this point; a commit that won before us is visible in
+        # the version scan below.
+        cleanup_epoch = serve_utils.advance_service_lifecycle_epoch(
+            lifecycle_lock)
+
+        def _generation_is_committed(intent: Dict[str, Any]) -> bool:
+            for version in serve_state.get_service_versions(service_name):
+                yaml_content = serve_state.get_yaml_content(
+                    service_name, version)
+                if yaml_content is None:
+                    continue
+                try:
+                    version_task = task_lib.Task.from_yaml_str(yaml_content)
+                except Exception:  # pylint: disable=broad-except
+                    # Unreadable committed metadata is not proof that a resource
+                    # is unowned. Keep the durable cleanup intent fail-closed.
+                    return True
+                metadata = version_task.metadata.get(
+                    serve_constants.EPHEMERAL_STORAGE_SCOPE_METADATA_KEY)
+                if (isinstance(metadata, dict) and
+                        metadata.get('resource_scope')
+                        == intent['resource_scope'] and
+                        metadata.get('storage_generation')
+                        == intent['storage_generation']):
+                    return True
+            return False
+
+        cleanable = [
+            intent for intent in intents if not _generation_is_committed(intent)
+        ]
+        if not cleanable:
+            logger.info('Retaining provisional storage cleanup intent(s) for '
+                        f'{service_name!r}: their generation is referenced by '
+                        'committed service metadata.')
+            return
+        cleaned = all(
+            service_lib.cleanup_storage(intent['yaml_content'],
+                                        intent['resource_scope'])
+            for intent in cleanable)
+        if cleaned:
+            scopes = {intent['resource_scope'] for intent in cleanable}
+            remove_cleanup_intents = (
+                serve_state.remove_provisional_ephemeral_storage_cleanup_intents
+            )
+            for resource_scope in scopes:
+                removed = remove_cleanup_intents(service_name, resource_scope,
+                                                 failed_lifecycle_epoch,
+                                                 cleanup_epoch)
+                if not removed:
+                    logger.warning(
+                        f'Cleaned provisional storage for {service_name!r} but '
+                        'lost the lifecycle fence before removing its durable '
+                        'cleanup intent; a later purge will retry idempotently.'
+                    )
+    except Exception as e:  # pylint: disable=broad-except
+        logger.warning(
+            f'Failed to eagerly clean provisional storage for '
+            f'{service_name!r}; durable cleanup intent was retained: '
+            f'{common_utils.format_exception(e)}')
 
 
 def _service_test_request_command(endpoint: str) -> str:
@@ -81,6 +244,44 @@ def _external_service_endpoint_url(
     # and Service are deliberately HTTP-only, including for legacy rows whose
     # persisted tls_encrypted bit predates the external-only topology.
     return f'http://{socket_endpoint}'
+
+
+def _wait_for_service_registration(handle: backends.CloudVmRayResourceHandle,
+                                   backend: backends.CloudVmRayBackend,
+                                   service_name: str, controller_job_id: int,
+                                   pool: bool, resource_scope: str) -> None:
+    """Wait for registration while preserving a fresh incarnation's scope."""
+    if serve_utils.is_consolidation_mode(pool):
+        # The API process shares the Serve DB and scoped controller files.
+        # Calling directly carries the preallocated scope even when the
+        # controller failed before inserting its row; the legacy gRPC request
+        # has no field for that identity.
+        lb_port_payload = serve_utils.wait_service_registration(
+            service_name,
+            controller_job_id,
+            pool,
+            expected_resource_scope=resource_scope)
+        serve_utils.load_service_initialization_result(lb_port_payload)
+        return
+
+    use_legacy = not handle.is_grpc_enabled_with_flag
+    if handle.is_grpc_enabled_with_flag:
+        try:
+            serve_rpc_utils.RpcRunner.wait_service_registration(
+                handle, service_name, controller_job_id, pool)
+        except exceptions.SkyletMethodNotImplementedError:
+            use_legacy = True
+
+    if use_legacy:
+        code = serve_utils.ServeCodeGen.wait_service_registration(
+            service_name, controller_job_id, pool)
+        returncode, lb_port_payload, _ = backend.run_on_head(
+            handle, code, require_outputs=True, stream_logs=False)
+        noun = 'pool' if pool else 'service'
+        subprocess_utils.handle_returncode(
+            returncode, code, f'Failed to wait for {noun} initialization',
+            lb_port_payload)
+        serve_utils.load_service_initialization_result(lb_port_payload)
 
 
 def _get_service_record(
@@ -270,6 +471,12 @@ def _require_supported_service_topology(task: 'task_lib.Task',
     consolidated controller plus a per-service external Kubernetes LB.
     """
     if pool:
+        if (serve_utils.is_external_load_balancer_mode() and
+                not serve_utils.is_consolidation_mode(pool=True)):
+            raise RuntimeError(
+                'The external-only deployment requires '
+                'jobs.controller.consolidation_mode=true for pools so replica '
+                'launch ownership can be validated by the API-server DB.')
         return
     service_spec = task.service
     assert service_spec is not None
@@ -301,6 +508,22 @@ def up(
 
 def _up_impl(task: 'task_lib.Task', service_name: str, pool: bool,
              lifecycle_lock: Any) -> Tuple[str, str]:
+    """Run up and eagerly clean only this operation's uncommitted storage."""
+    lifecycle_epoch = serve_utils.get_service_lifecycle_epoch(lifecycle_lock)
+    try:
+        return _up_impl_body(task, service_name, pool, lifecycle_lock)
+    except BaseException:
+        # Non-consolidated pools keep their authoritative Serve DB on the
+        # remote jobs controller. Never interpret API-local intents as owners
+        # of resources committed in that other database.
+        if serve_utils.is_consolidation_mode(pool):
+            _cleanup_provisional_storage_intents(service_name, lifecycle_epoch,
+                                                 lifecycle_lock)
+        raise
+
+
+def _up_impl_body(task: 'task_lib.Task', service_name: str, pool: bool,
+                  lifecycle_lock: Any) -> Tuple[str, str]:
     """Spins up a service or a pool."""
 
     def _assert_lifecycle_lock(phase: str) -> None:
@@ -309,11 +532,27 @@ def _up_impl(task: 'task_lib.Task', service_name: str, pool: bool,
                                f'{service_name!r}; retry creation.')
 
     _assert_lifecycle_lock('starting creation')
-    if (serve_utils.is_consolidation_mode(pool) and
+    consolidation_mode = serve_utils.is_consolidation_mode(pool)
+    if (consolidation_mode and
             serve_state.get_service_hash(service_name) is not None):
         noun = 'pool' if pool else 'service'
         raise RuntimeError(f'{noun.capitalize()} {service_name!r} already '
                            'exists; choose a new name or update it.')
+    if (consolidation_mode and service_name
+            in serve_state.get_orphaned_service_child_names([service_name])):
+        predecessor_pool = serve_state.get_orphaned_service_child_mode(
+            service_name)
+        if predecessor_pool is None:
+            purge_guidance = ('inspect its mixed or unreadable predecessor '
+                              'metadata and purge it in the original mode')
+        else:
+            purge_cmd = (f'sky jobs pool down {service_name} --purge'
+                         if predecessor_pool else
+                         f'sky serve down {service_name} --purge')
+            purge_guidance = f'run `{purge_cmd}`'
+        raise RuntimeError(
+            f'Cannot safely reuse {service_name!r}: predecessor cleanup '
+            f'inventory still exists. Please {purge_guidance} before retrying.')
     # Allocate the incarnation before creating *any* file or external child.
     # The same value becomes the durable DB hash and every child-resource
     # namespace, so work already in flight after lock loss remains confined to
@@ -321,8 +560,8 @@ def _up_impl(task: 'task_lib.Task', service_name: str, pool: bool,
     service_incarnation = str(uuid.uuid4())
     resource_scope = service_incarnation
     lifecycle_epoch = serve_utils.get_service_lifecycle_epoch(lifecycle_lock)
-    controller_lifecycle_epoch = (
-        lifecycle_epoch if serve_utils.is_consolidation_mode(pool) else None)
+    controller_lifecycle_epoch = (lifecycle_epoch
+                                  if consolidation_mode else None)
     task.validate()
     serve_utils.validate_service_task(task, pool=pool)
     assert task.service is not None
@@ -348,6 +587,24 @@ def _up_impl(task: 'task_lib.Task', service_name: str, pool: bool,
         # Use dummy run script for pool.
         task.run = serve_constants.POOL_DUMMY_RUN_COMMAND
 
+    (storage_scope_id, storage_generation,
+     unowned_remote_storage_mounts) = (_prepare_scoped_ephemeral_storage(
+         task, resource_scope))
+
+    def _persist_storage_intent(prepared_task: 'task_lib.Task') -> None:
+        _record_scoped_ephemeral_storage(prepared_task, resource_scope,
+                                         storage_scope_id, storage_generation,
+                                         unowned_remote_storage_mounts)
+        if not consolidation_mode:
+            return
+        _persist_scoped_ephemeral_storage_intent(prepared_task,
+                                                 service_name,
+                                                 resource_scope,
+                                                 storage_generation,
+                                                 pool,
+                                                 lifecycle_epoch,
+                                                 provisional=True)
+
     with rich_utils.safe_status(
             ux_utils.spinner_message(f'Initializing {noun}')):
         # Handle file mounts using two-hop approach when cloud storage
@@ -358,7 +615,10 @@ def _up_impl(task: 'task_lib.Task', service_name: str, pool: bool,
             ('serve', 'force_disable_cloud_bucket'), False)
         if storage_clouds and not force_disable_cloud_bucket:
             controller_utils.maybe_translate_local_file_mounts_and_sync_up(
-                task, task_type='serve')
+                task,
+                task_type='serve',
+                run_id=storage_scope_id,
+                on_storage_mounts_prepared=_persist_storage_intent)
             local_to_controller_file_mounts = {}
         else:
             # Fall back to two-hop file_mount uploading when no cloud storage
@@ -368,7 +628,11 @@ def _up_impl(task: 'task_lib.Task', service_name: str, pool: bool,
                     'storage is available. Please specify local '
                     'file_mounts only.')
             local_to_controller_file_mounts = (
-                controller_utils.translate_local_file_mounts_to_two_hop(task))
+                controller_utils.translate_local_file_mounts_to_two_hop(
+                    task, run_id=storage_scope_id))
+    # Refresh the pre-upload record with resolved store handles. On a crash
+    # inside sync, the earlier deterministic manifest remains available.
+    _persist_storage_intent(task)
 
     with tempfile.NamedTemporaryFile(
             prefix=f'service-task-{service_name}-',
@@ -541,30 +805,9 @@ def _up_impl(task: 'task_lib.Task', service_name: str, pool: bool,
                 # This checks the controller job id in the database and waits
                 # for the historical registration-port sentinel. The actual
                 # endpoint is always derived from the Kubernetes LB Service.
-                use_legacy = not controller_handle.is_grpc_enabled_with_flag
-
-                if controller_handle.is_grpc_enabled_with_flag:
-                    try:
-                        serve_rpc_utils.RpcRunner.wait_service_registration(  # pylint: disable=line-too-long
-                            controller_handle, service_name, controller_job_id,
-                            pool)
-                    except exceptions.SkyletMethodNotImplementedError:
-                        use_legacy = True
-
-                if use_legacy:
-                    code = serve_utils.ServeCodeGen.wait_service_registration(
-                        service_name, controller_job_id, pool)
-                    returncode, lb_port_payload, _ = backend.run_on_head(
-                        controller_handle,
-                        code,
-                        require_outputs=True,
-                        stream_logs=False)
-                    subprocess_utils.handle_returncode(
-                        returncode, code,
-                        f'Failed to wait for {noun} initialization',
-                        lb_port_payload)
-                    serve_utils.load_service_initialization_result(
-                        lb_port_payload)
+                _wait_for_service_registration(controller_handle, backend,
+                                               service_name, controller_job_id,
+                                               pool, resource_scope)
         except (exceptions.CommandError, grpc.FutureTimeoutError,
                 grpc.RpcError):
             if serve_utils.is_consolidation_mode(pool):
@@ -731,6 +974,28 @@ def _update_impl(
     workers: Optional[int] = None,
     lifecycle_lock: Optional[Any] = None,
 ) -> None:
+    """Run update and eagerly clean only uncommitted storage generations."""
+    if lifecycle_lock is None:
+        raise RuntimeError('Service update requires lifecycle ownership.')
+    lifecycle_epoch = serve_utils.get_service_lifecycle_epoch(lifecycle_lock)
+    try:
+        _update_impl_body(task, service_name, mode, pool, workers,
+                          lifecycle_lock)
+    except BaseException:
+        if serve_utils.is_consolidation_mode(pool):
+            _cleanup_provisional_storage_intents(service_name, lifecycle_epoch,
+                                                 lifecycle_lock)
+        raise
+
+
+def _update_impl_body(
+    task: Optional['task_lib.Task'],
+    service_name: str,
+    mode: serve_utils.UpdateMode = serve_utils.DEFAULT_UPDATE_MODE,
+    pool: bool = False,
+    workers: Optional[int] = None,
+    lifecycle_lock: Optional[Any] = None,
+) -> None:
     noun = 'pool' if pool else 'service'
     capnoun = noun.capitalize()
 
@@ -764,7 +1029,10 @@ def _update_impl(
                            'without a durable service incarnation.')
     if lifecycle_lock is None:
         raise RuntimeError('Service update requires lifecycle ownership.')
+    lifecycle_epoch = serve_utils.get_service_lifecycle_epoch(lifecycle_lock)
+    consolidation_mode = serve_utils.is_consolidation_mode(pool)
 
+    reuse_existing_storage_scope = task is None
     # If task is None and workers is specified, load existing configuration
     # and update replica count.
     if task is None:
@@ -830,14 +1098,47 @@ def _update_impl(
                                  expected_service_hash, lifecycle_lock,
                                  'preparing the update')
 
+    resource_scope = service_record.get('resource_scope')
+    storage_scope_id: Optional[str] = None
+    storage_generation: Optional[str] = None
+    unowned_remote_storage_mounts: Set[str] = set()
+    if isinstance(resource_scope, str) and resource_scope:
+        (storage_scope_id, storage_generation,
+         unowned_remote_storage_mounts) = (_prepare_scoped_ephemeral_storage(
+             task,
+             resource_scope,
+             reuse_existing_scope=reuse_existing_storage_scope))
+
+    def _persist_storage_intent(prepared_task: 'task_lib.Task') -> None:
+        if (storage_scope_id is None or storage_generation is None or
+                not isinstance(resource_scope, str)):
+            return
+        _record_scoped_ephemeral_storage(prepared_task, resource_scope,
+                                         storage_scope_id, storage_generation,
+                                         unowned_remote_storage_mounts)
+        if not consolidation_mode:
+            return
+        _persist_scoped_ephemeral_storage_intent(
+            prepared_task,
+            service_name,
+            resource_scope,
+            storage_generation,
+            pool,
+            lifecycle_epoch,
+            provisional=not reuse_existing_storage_scope)
+
     with rich_utils.safe_status(
             ux_utils.spinner_message(f'Initializing {noun}')):
         controller_utils.maybe_translate_local_file_mounts_and_sync_up(
-            task, task_type='serve')
+            task,
+            task_type='serve',
+            run_id=storage_scope_id,
+            on_storage_mounts_prepared=_persist_storage_intent)
+    _persist_storage_intent(task)
 
     use_legacy = not handle.is_grpc_enabled_with_flag
 
-    if serve_utils.is_consolidation_mode(pool):
+    if consolidation_mode:
         # The API pod shares the durable Serve DB with the local controller.
         # Allocate the placeholder directly under the lifecycle epoch instead
         # of sending a name-only skylet RPC that could complete after lock
@@ -1105,8 +1406,10 @@ def down(
         # teardown cannot interleave with an in-flight update that would
         # launch replicas mid-teardown (orphaned clusters). Sorted so two
         # concurrent multi-service downs cannot deadlock on lock order.
-        # `--all` resolves names on the controller side and keeps the
-        # previous (unserialized) semantics.
+        # `--all` resolves names on the controller side. The authoritative
+        # distributed lifecycle fence is acquired there for every resolved
+        # name; these local locks only preserve legacy same-process ordering
+        # for explicitly named services.
         with contextlib.ExitStack() as stack:
             for name in sorted(set(service_names or [])):
                 stack.enter_context(

@@ -61,6 +61,7 @@ from sky.provision.kubernetes import utils as kubernetes_utils
 from sky.provision.slurm import utils as slurm_utils
 from sky.recipes import server as recipes_rest
 from sky.schemas.api import responses
+from sky.serve import constants as serve_constants
 from sky.serve import lb_rbac_preflight
 from sky.serve import serve_utils
 from sky.serve.server import controller_proxy as serve_controller_proxy
@@ -1883,6 +1884,37 @@ async def launch(launch_body: payloads.LaunchBody,
     """Launches a cluster or task."""
     request_id = request.state.request_id
     logger.info(f'Launching request: {request_id}')
+    launch_precondition = None
+    if launch_body.is_launched_by_sky_serve_controller:
+        launch_context = launch_body.extra_launch_context
+        has_launch_fence = any(
+            key in launch_context
+            for key in serve_constants.REPLICA_LAUNCH_FENCE_KEYS)
+        service_name = launch_context.get(
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY)
+        service_hash = launch_context.get(
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY)
+        controller_pid = launch_context.get(
+            serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_PID_KEY)
+        controller_ip = launch_context.get(
+            serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY)
+        if ((has_launch_fence or
+             serve_utils.is_external_load_balancer_mode()) and
+            (not isinstance(service_name, str) or not service_name or
+             not isinstance(service_hash, str) or not service_hash or
+             not (controller_pid is None or isinstance(controller_pid, int)) or
+             not (controller_ip is None or isinstance(controller_ip, str)))):
+            raise fastapi.HTTPException(
+                status_code=409,
+                detail='SkyServe replica launches require a complete durable '
+                'service-owner fence.')
+        if has_launch_fence:
+            assert isinstance(service_name, str)
+            assert isinstance(service_hash, str)
+            launch_precondition = (
+                preconditions.ServiceReplicaLaunchPrecondition(
+                    request_id, service_name, service_hash, controller_pid,
+                    controller_ip))
     await executor.schedule_request_async(
         request_id,
         request_name=request_names.RequestName.CLUSTER_LAUNCH,
@@ -1890,6 +1922,7 @@ async def launch(launch_body: payloads.LaunchBody,
         func=execution.launch,
         schedule_type=requests_lib.ScheduleType.LONG,
         request_cluster_name=launch_body.cluster_name,
+        precondition=launch_precondition,
         retryable=launch_body.retry_until_up,
         auth_user=request.state.auth_user,
     )
