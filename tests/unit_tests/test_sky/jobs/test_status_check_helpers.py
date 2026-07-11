@@ -1,5 +1,9 @@
 """Tests for slim managed-job status-refresh helpers."""
 
+# pylint: disable=invalid-name,unused-import
+# Fixture imports are referenced indirectly by pytest, and the fixture names
+# intentionally mirror the shared helpers they exercise.
+
 from sky.jobs import state
 from tests.unit_tests.test_sky.jobs.test_jobs_state import (
     _mock_managed_jobs_db_conn)
@@ -26,6 +30,7 @@ class TestGetJobsStatusCheckInfoLaunchIdentity:
 
 
 class TestGetJobStatusCheckState:
+    """Coverage for the one-row destructive recheck helper."""
 
     def test_missing_job_returns_none(self, _mock_managed_jobs_db_conn):
         assert state.get_job_status_check_state(999999) is None

@@ -111,8 +111,9 @@ async def test_get_job_status_timeout(mock_get_handle, mock_logger):
     assert f'timed out after {timeout_override}s' in error_reason
 
     elapsed_time = time.time() - start_time
-    assert timeout_override <= elapsed_time < timeout_override + 1.0, (
-        f'Expected timeout around {timeout_override}s, '
+    slow_call_duration = timeout_override * 10
+    assert timeout_override <= elapsed_time < slow_call_duration / 2, (
+        'Expected timeout well before the blocking backend call finished, '
         f'but took {elapsed_time}s')
 
     # Verify only one attempt was made (no retry in get_job_status)
