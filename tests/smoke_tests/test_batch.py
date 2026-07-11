@@ -403,7 +403,7 @@ def test_batch_ha_kill_running(generic_cloud: str):
 
     name = smoke_tests_utils.get_cluster_name()
     bucket = f'sky-batch-ha-{name}'
-    pool_name = 'test-batch-pool'
+    pool_name = f'test-batch-pool-{smoke_tests_utils.test_id}'
     sentinel_job_name = f'{name}-sentinel'
     url, create_bkt, delete_bkt, cp, rm, _, rm_r = _storage_cmds(
         generic_cloud, bucket)
@@ -436,6 +436,7 @@ def test_batch_ha_kill_running(generic_cloud: str):
     test_env = {
         'SKY_BATCH_BUCKET': bucket,
         'SKY_BATCH_STORE': store,
+        'BATCH_POOL_NAME': pool_name,
     }
     if skypilot_config_path is not None:
         test_env[skypilot_config.ENV_VAR_SKYPILOT_CONFIG] = (

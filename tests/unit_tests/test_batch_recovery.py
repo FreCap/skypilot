@@ -179,6 +179,32 @@ def test_coordinator_rejects_pool_with_old_worker_runtime(monkeypatch):
         batch_coordinator._get_ready_workers()
 
 
+def test_coordinator_skips_pool_workers_used_by_other_jobs(monkeypatch):
+    batch_coordinator = _make_coordinator(job_id=7)
+    monkeypatch.setattr(
+        batch_coordinator, '_fetch_pool_status', lambda: {
+            'replica_info': [{
+                'name': 'available-worker',
+                'status': 'READY',
+                'replica_info_version': 6,
+                'used_by': [7],
+            }, {
+                'name': 'busy-worker',
+                'status': 'READY',
+                'replica_info_version': 6,
+                'used_by': [7, 42],
+            }, {
+                'name': 'legacy-worker',
+                'status': 'READY',
+                'replica_info_version': 6,
+            }]
+        })
+
+    assert batch_coordinator._get_ready_workers() == [
+        'available-worker', 'legacy-worker'
+    ]
+
+
 def test_pending_queue_honors_retry_time(monkeypatch):
     batch_coordinator = _make_coordinator()
     batch_coordinator._enqueue_batch(3, ready_at=120)

@@ -539,7 +539,7 @@ class BatchCoordinator:
             return []
         replica_infos = status.get('replica_info', [])
         ready = []
-        non_ready_summary: List[str] = []
+        unavailable_summary: List[str] = []
         for info in replica_infos:
             raw_status = info.get('status', '')
             # status may be a ReplicaStatus enum or a string; normalise.
@@ -555,15 +555,27 @@ class BatchCoordinator:
                         f'{replica_info_version}; Sky Batch requires version '
                         f'{server_constants.MIN_BATCH_REPLICA_INFO_VERSION}. '
                         f'Recreate pool {self.pool_name!r} before retrying.')
+                used_by = info.get('used_by') or []
+                if not isinstance(used_by, (list, tuple, set)):
+                    used_by = [used_by]
+                other_job_ids = [
+                    job_id for job_id in used_by
+                    if str(job_id) != str(self._managed_job_id)
+                ]
+                if other_job_ids:
+                    if name:
+                        jobs = ','.join(str(job_id) for job_id in other_job_ids)
+                        unavailable_summary.append(f'{name}=BUSY({jobs})')
+                    continue
                 if name:
                     ready.append(name)
             elif name:
-                non_ready_summary.append(f'{name}={replica_status}')
-        if not ready and non_ready_summary:
-            # Help diagnose flaky resume cases where the pool exists but
-            # no replica is READY yet — log what states we did see.
-            logger.info('Pool %s has %d non-READY replicas: %s', self.pool_name,
-                        len(non_ready_summary), ', '.join(non_ready_summary))
+                unavailable_summary.append(f'{name}={replica_status}')
+        if not ready and unavailable_summary:
+            # Help diagnose cases where the pool exists but no replica can
+            # accept a Batch worker service yet.
+            logger.info('Pool %s has no dispatchable replicas: %s',
+                        self.pool_name, ', '.join(unavailable_summary))
         return ready
 
     # ------------------------------------------------------------------
