@@ -4591,49 +4591,12 @@ def check_stale_runtime_on_remote(returncode: int, stderr: str,
                     f'\n--- Details ---\n{stderr.strip()}\n') from None
 
 
-def get_endpoints(cluster: str,
-                  port: Optional[Union[int, str]] = None,
-                  skip_status_check: bool = False) -> Dict[int, str]:
-    """Gets the endpoint for a given cluster and port number (endpoint).
-
-    Args:
-        cluster: The name of the cluster.
-        port: The port number to get the endpoint for. If None, endpoints
-            for all ports are returned.
-        skip_status_check: Whether to skip the status check for the cluster.
-            This is useful when the cluster is known to be in a INIT state
-            and the caller wants to query the endpoints. Used by serve
-            controller to query endpoints during cluster launch when multiple
-            services may be getting launched in parallel (and as a result,
-            the controller may be in INIT status due to a concurrent launch).
-
-    Returns: A dictionary of port numbers to endpoints. If endpoint is None,
-        the dictionary will contain all ports:endpoints exposed on the cluster.
-        If the endpoint is not exposed yet (e.g., during cluster launch or
-        waiting for cloud provider to expose the endpoint), an empty dictionary
-        is returned.
-
-    Raises:
-        ValueError: if the port is invalid or the cloud provider does not
-            support querying endpoints.
-        exceptions.ClusterNotUpError: if the cluster is not in UP status.
-    """
-    # Cast endpoint to int if it is not None
-    if port is not None:
-        try:
-            port = int(port)
-        except ValueError:
-            with ux_utils.print_exception_no_traceback():
-                raise ValueError(f'Invalid endpoint {port!r}.') from None
-    cluster_records = get_clusters(refresh=common.StatusRefreshMode.NONE,
-                                   cluster_names=[cluster],
-                                   _include_is_managed=True)
-    if not cluster_records:
-        with ux_utils.print_exception_no_traceback():
-            raise exceptions.ClusterNotUpError(
-                f'Cluster {cluster!r} not found.', cluster_status=None)
-    assert len(cluster_records) == 1, cluster_records
-    cluster_record = cluster_records[0]
+def _get_endpoints_from_cluster_record(
+        cluster: str,
+        cluster_record: Dict[str, Any],
+        port: Optional[int] = None,
+        skip_status_check: bool = False) -> Dict[int, str]:
+    """Gets endpoints for a cluster from an already-fetched cluster record."""
     if (not skip_status_check and cluster_record['status']
             not in (status_lib.ClusterStatus.UP,
                     status_lib.ClusterStatus.AUTOSTOPPING)):
@@ -4721,6 +4684,59 @@ def get_endpoints(cluster: str,
         return {
             port_num: urls[0].url() for port_num, urls in port_details.items()
         }
+
+
+def get_endpoints(
+        cluster: str,
+        port: Optional[Union[int, str]] = None,
+        skip_status_check: bool = False,
+        cluster_record: Optional[Dict[str, Any]] = None) -> Dict[int, str]:
+    """Gets the endpoint for a given cluster and port number (endpoint).
+
+    Args:
+        cluster: The name of the cluster.
+        port: The port number to get the endpoint for. If None, endpoints
+            for all ports are returned.
+        skip_status_check: Whether to skip the status check for the cluster.
+            This is useful when the cluster is known to be in a INIT state
+            and the caller wants to query the endpoints. Used by serve
+            controller to query endpoints during cluster launch when multiple
+            services may be getting launched in parallel (and as a result,
+            the controller may be in INIT status due to a concurrent launch).
+        cluster_record: Optional pre-fetched cluster record to reuse instead
+            of looking it up again.
+
+    Returns: A dictionary of port numbers to endpoints. If endpoint is None,
+        the dictionary will contain all ports:endpoints exposed on the cluster.
+        If the endpoint is not exposed yet (e.g., during cluster launch or
+        waiting for cloud provider to expose the endpoint), an empty dictionary
+        is returned.
+
+    Raises:
+        ValueError: if the port is invalid or the cloud provider does not
+            support querying endpoints.
+        exceptions.ClusterNotUpError: if the cluster is not in UP status.
+    """
+    # Cast endpoint to int if it is not None
+    if port is not None:
+        try:
+            port = int(port)
+        except ValueError:
+            with ux_utils.print_exception_no_traceback():
+                raise ValueError(f'Invalid endpoint {port!r}.') from None
+    if cluster_record is None:
+        cluster_records = get_clusters(refresh=common.StatusRefreshMode.NONE,
+                                       cluster_names=[cluster],
+                                       _include_is_managed=True)
+        if not cluster_records:
+            with ux_utils.print_exception_no_traceback():
+                raise exceptions.ClusterNotUpError(
+                    f'Cluster {cluster!r} not found.', cluster_status=None)
+        assert len(cluster_records) == 1, cluster_records
+        cluster_record = cluster_records[0]
+
+    return _get_endpoints_from_cluster_record(
+        cluster, cluster_record, port=port, skip_status_check=skip_status_check)
 
 
 def cluster_status_lock_id(cluster_name: str) -> str:

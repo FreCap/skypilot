@@ -783,9 +783,18 @@ class ReplicaInfo:
     def is_ready(self) -> bool:
         return self.status == serve_state.ReplicaStatus.READY
 
-    @property
-    def url(self) -> Optional[str]:
-        handle = self.handle()
+    def _resolve_url(
+        self,
+        cluster_record: Any = _NOT_PROVIDED,
+        handle: Optional[backends.CloudVmRayResourceHandle] = None,
+    ) -> Optional[str]:
+        if handle is None:
+            if cluster_record is _NOT_PROVIDED:
+                handle = self.handle()
+            elif cluster_record is None:
+                return None
+            else:
+                handle = self.handle(cluster_record)
         if handle is None:
             return None
         if self.replica_port == '-':
@@ -796,8 +805,13 @@ class ReplicaInfo:
             return None
         replica_port_int = int(self.replica_port)
         try:
-            endpoint_dict = backend_utils.get_endpoints(handle.cluster_name,
-                                                        replica_port_int)
+            endpoint_kwargs = {}
+            if (cluster_record is not _NOT_PROVIDED and
+                    cluster_record is not None):
+                endpoint_kwargs['cluster_record'] = cluster_record
+            endpoint_dict = backend_utils.get_endpoints(self.cluster_name,
+                                                        replica_port_int,
+                                                        **endpoint_kwargs)
         except exceptions.ClusterNotUpError:
             return None
         endpoint = endpoint_dict.get(replica_port_int, None)
@@ -808,6 +822,10 @@ class ReplicaInfo:
         if not endpoint.startswith('http'):
             endpoint = 'http://' + endpoint
         return endpoint
+
+    @property
+    def url(self) -> Optional[str]:
+        return self._resolve_url()
 
     @property
     def status(self) -> serve_state.ReplicaStatus:
@@ -841,17 +859,6 @@ class ReplicaInfo:
                 self.cluster_name,
                 include_user_info=False,
                 summary_response=True)
-        info_dict = {
-            'replica_id': self.replica_id,
-            'name': self.cluster_name,
-            'status': self.status,
-            'version': self.version,
-            'replica_info_version': self._version,
-            'endpoint': self.url if with_url else None,
-            'is_spot': self.is_spot,
-            'launched_at': (cluster_record['launched_at']
-                            if cluster_record is not None else None),
-        }
         # Resolve the handle once. When the cluster row is missing, the
         # handle is also missing (they live in the same row), so
         # short-circuit to avoid an extra DB lookup.
@@ -859,6 +866,19 @@ class ReplicaInfo:
             handle = None
         else:
             handle = self.handle(cluster_record)
+        info_dict = {
+            'replica_id': self.replica_id,
+            'name': self.cluster_name,
+            'status': self.status,
+            'version': self.version,
+            'replica_info_version': self._version,
+            'endpoint':
+                (self._resolve_url(cluster_record=cluster_record, handle=handle)
+                 if with_url else None),
+            'is_spot': self.is_spot,
+            'launched_at': (cluster_record['launched_at']
+                            if cluster_record is not None else None),
+        }
         # Always populate the small derived strings — new clients read
         # these instead of touching the handle, and the cost is just a
         # dict lookup + isinstance on a cluster_record we already have.

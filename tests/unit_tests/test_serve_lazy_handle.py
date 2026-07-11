@@ -25,6 +25,7 @@ from unittest import mock
 import orjson
 import pytest
 
+from sky import exceptions
 from sky.serve import replica_managers
 from sky.serve import serve_state
 from sky.serve import serve_utils
@@ -139,6 +140,66 @@ class TestToInfoDictPreComputedFields:
         for key in ('cloud', 'region', 'infra', 'resources_str',
                     'resources_str_full'):
             assert key not in result
+
+
+class TestToInfoDictEndpointSnapshot:
+    """Replica endpoint serialization should reuse the supplied cluster row."""
+
+    def test_endpoint_uses_supplied_cluster_record_once(self):
+        info = _make_replica_info(cluster_name='r-1')
+        handle, simple, full = _make_handle()
+        cluster_record = {
+            'launched_at': 42,
+            'handle': handle,
+        }
+        endpoint_calls = []
+
+        def _get_endpoints(cluster, port, **kwargs):
+            endpoint_calls.append((cluster, port, kwargs))
+            return {8080: '1.2.3.4:8080'}
+
+        with mock.patch.object(info, 'handle',
+                               return_value=handle) as handle_call, \
+             mock.patch(
+                 'sky.serve.replica_managers.resources_utils.'
+                 'get_readable_resources_repr',
+                 return_value=(simple, full)), \
+             mock.patch('sky.serve.replica_managers.backend_utils.'
+                        'get_endpoints',
+                        side_effect=_get_endpoints):
+            result = info.to_info_dict(with_handle=False,
+                                       with_url=True,
+                                       cluster_record=cluster_record)
+
+        handle_call.assert_called_once_with(cluster_record)
+        assert endpoint_calls == [('r-1', 8080, {
+            'cluster_record': cluster_record
+        })]
+        assert result['endpoint'] == 'http://1.2.3.4:8080'
+
+    def test_endpoint_none_on_cluster_not_up_from_snapshot(self):
+        info = _make_replica_info(cluster_name='r-1')
+        handle, simple, full = _make_handle()
+        cluster_record = {
+            'launched_at': 42,
+            'handle': handle,
+        }
+
+        with mock.patch.object(info, 'handle',
+                               return_value=handle), \
+             mock.patch(
+                 'sky.serve.replica_managers.resources_utils.'
+                 'get_readable_resources_repr',
+                 return_value=(simple, full)), \
+             mock.patch('sky.serve.replica_managers.backend_utils.'
+                        'get_endpoints',
+                        side_effect=exceptions.ClusterNotUpError(
+                            'cluster not ready')):
+            result = info.to_info_dict(with_handle=False,
+                                       with_url=True,
+                                       cluster_record=cluster_record)
+
+        assert result['endpoint'] is None
 
 
 class TestDecodeServeStatusTolerantHandle:
