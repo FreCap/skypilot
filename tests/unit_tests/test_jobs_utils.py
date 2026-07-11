@@ -1,4 +1,5 @@
 import asyncio
+import os
 import pathlib
 import tempfile
 import time
@@ -20,9 +21,12 @@ _SIGNAL_FILE_CONST = (
 @pytest.fixture(autouse=True)
 def _clear_consolidation_mode_caches():
     """Keep request-scoped consolidation state from leaking across tests."""
+    override_env = controller_utils.constants.OVERRIDE_CONSOLIDATION_MODE
+    os.environ.pop(override_env, None)
     utils.is_consolidation_mode.cache_clear()
     controller_utils._effective_jobs_consolidation_with_warnings.cache_clear()
     yield
+    os.environ.pop(override_env, None)
     utils.is_consolidation_mode.cache_clear()
     controller_utils._effective_jobs_consolidation_with_warnings.cache_clear()
 
