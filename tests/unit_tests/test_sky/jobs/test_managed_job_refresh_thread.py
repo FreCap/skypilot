@@ -13,6 +13,7 @@ not the full daemon loop:
   semantics now that the daemon no longer lives in
   ``INTERNAL_REQUEST_DAEMONS``.
 """
+# pylint: disable=protected-access
 import signal
 from unittest import mock
 
@@ -20,6 +21,13 @@ import pytest
 
 from sky.jobs import managed_job_refresh_thread as mjrt
 from sky.utils import locks
+
+
+@pytest.fixture(autouse=True)
+def _default_recovery_wait_needed(monkeypatch):
+    """Default thread tests to the historical 'wait is needed' branch."""
+    monkeypatch.setattr(mjrt.managed_job_state,
+                        'has_jobs_requiring_recovery_grace_wait', lambda: True)
 
 
 class TestLockStillHeld:
@@ -85,7 +93,8 @@ class TestSuicideOnLockLoss:
                 side_effect=lambda: call_order.append('kill_controllers')), \
                 mock.patch.object(
                     mjrt.os, 'kill',
-                    side_effect=lambda *a, **kw: call_order.append('sigterm')), \
+                    side_effect=lambda *_a, **_kw: call_order.append(
+                        'sigterm')), \
                 mock.patch.object(mjrt.os, 'getpid', return_value=12345):
             thread._suicide_on_lock_loss()
         assert call_order == ['kill_controllers', 'sigterm']
@@ -127,7 +136,7 @@ class TestSuicideOnLockLoss:
                 side_effect=lambda: order.append('kill')), \
                 mock.patch.object(
                     mjrt.os, 'kill',
-                    side_effect=lambda *a, **kw: order.append('sigterm')), \
+                    side_effect=lambda *_a, **_kw: order.append('sigterm')), \
                 mock.patch.object(mjrt.os, 'getpid', return_value=12345):
             thread._suicide_on_lock_loss()
 
@@ -137,8 +146,7 @@ class TestSuicideOnLockLoss:
         # kill could still spawn a controller.
         assert order == ['kill', 'sigterm']
 
-    def test_signal_file_touch_failure_does_not_block_sigterm(
-            self, monkeypatch):
+    def test_signal_file_touch_failure_does_not_block_sigterm(self):
         """If the FS refuses the touch (read-only, full, etc.), proceed
         with kill + SIGTERM anyway. Better than blocking shutdown."""
 
@@ -178,7 +186,7 @@ class TestOuterLoopStopsAfterSuicide:
         # the test if that happens.
         call_count = {'n': 0}
 
-        def normal_return(self):
+        def normal_return(thread_obj):  # pylint: disable=unused-argument
             call_count['n'] += 1
 
         with mock.patch('sky.utils.locks.get_lock', return_value=lock), \
@@ -212,7 +220,7 @@ class TestOuterLoopExceptionHandling:
         """Acquired the lock, then recovery threw because the underlying
         PG session died — running again would race the new leader."""
         thread = mjrt.ManagedJobRefreshDaemonThread()
-        get_lock_p, lock = self._patches(is_locked=True, session_alive=False)
+        get_lock_p, _ = self._patches(is_locked=True, session_alive=False)
         with get_lock_p, \
                 mock.patch.object(
                     mjrt.ManagedJobRefreshDaemonThread,
@@ -229,7 +237,7 @@ class TestOuterLoopExceptionHandling:
         """acquire() itself failed (e.g. another replica holds the lock,
         or transient PG hiccup); is_locked stays False, just retry."""
         thread = mjrt.ManagedJobRefreshDaemonThread()
-        get_lock_p, lock = self._patches(is_locked=False, session_alive=False)
+        get_lock_p, _ = self._patches(is_locked=False, session_alive=False)
         with get_lock_p, \
                 mock.patch.object(
                     mjrt.ManagedJobRefreshDaemonThread,
@@ -249,7 +257,7 @@ class TestOuterLoopExceptionHandling:
         """Recovery threw on transient error but our lock session is
         still alive — keep retrying as leader."""
         thread = mjrt.ManagedJobRefreshDaemonThread()
-        get_lock_p, lock = self._patches(is_locked=True, session_alive=True)
+        get_lock_p, _ = self._patches(is_locked=True, session_alive=True)
         with get_lock_p, \
                 mock.patch.object(
                     mjrt.ManagedJobRefreshDaemonThread,
@@ -299,7 +307,7 @@ class TestBecomeLeaderOrdering:
 
         order = []
 
-        def on_acquire(*args, **kwargs):
+        def on_acquire(*_args, **_kwargs):
             # The gate file must already be in place by the time we start
             # blocking on acquire — that is the whole point of the fix.
             assert signal_file.exists(), (
@@ -308,7 +316,7 @@ class TestBecomeLeaderOrdering:
 
         lock.acquire.side_effect = on_acquire
 
-        def on_sleep(*args, **kwargs):
+        def on_sleep(*_args, **_kwargs):
             order.append('sleep')
 
         def recovery_and_stop():
@@ -326,6 +334,54 @@ class TestBecomeLeaderOrdering:
         # Recovery runs only after the lock is acquired AND after the wait.
         assert order == ['acquire', 'sleep', 'recovery']
         # The finally block removes the gate file even when recovery fails.
+        assert not signal_file.exists()
+
+    def test_skips_wait_when_no_jobs_require_grace_period(
+            self, tmp_path, monkeypatch):
+        """Uncontended empty/pending-only backlogs should recover immediately.
+        """
+        signal_file = tmp_path / 'restart_signal'
+        monkeypatch.setattr(mjrt.constants,
+                            'PERSISTENT_RUN_RESTARTING_SIGNAL_FILE',
+                            str(signal_file))
+        monkeypatch.setattr(mjrt.managed_job_state,
+                            'has_jobs_requiring_recovery_grace_wait',
+                            lambda: False)
+
+        thread = mjrt.ManagedJobRefreshDaemonThread()
+        lock = mock.create_autospec(locks.PostgresLock,
+                                    instance=True,
+                                    spec_set=True)
+        lock.is_locked.return_value = False
+        lock.is_session_alive.return_value = True
+        thread._lock = lock
+
+        slept = []
+        order = []
+
+        def on_acquire(*_args, **_kwargs):
+            assert signal_file.exists()
+            order.append('acquire')
+
+        lock.acquire.side_effect = on_acquire
+
+        def on_sleep(seconds, *_args, **_kwargs):
+            slept.append(seconds)
+
+        def recovery_and_stop():
+            order.append('recovery')
+            raise RuntimeError('stop before event loop')
+
+        with mock.patch.object(mjrt.time, 'sleep', side_effect=on_sleep), \
+                mock.patch.object(
+                    mjrt.managed_job_utils,
+                    'ha_recovery_for_consolidation_mode',
+                    side_effect=recovery_and_stop):
+            with pytest.raises(RuntimeError, match='stop before event loop'):
+                thread._become_leader_and_run()
+
+        assert not slept
+        assert order == ['acquire', 'recovery']
         assert not signal_file.exists()
 
     def test_waits_for_configured_duration_before_recovery(
@@ -349,7 +405,7 @@ class TestBecomeLeaderOrdering:
 
         slept = []
 
-        def on_sleep(seconds, *args, **kwargs):
+        def on_sleep(seconds, *_args, **_kwargs):
             # The gate file must still be in place during the wait.
             assert signal_file.exists(), (
                 'signal file must persist through the post-acquire wait')

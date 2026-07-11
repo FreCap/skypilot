@@ -10,6 +10,7 @@ from typing import Optional
 from sky import sky_logging
 from sky.jobs import constants as managed_job_constants
 from sky.jobs import scheduler as managed_job_scheduler
+from sky.jobs import state as managed_job_state
 from sky.jobs import utils as managed_job_utils
 from sky.skylet import constants
 from sky.skylet import events
@@ -110,16 +111,21 @@ class ManagedJobRefreshDaemonThread(threading.Thread):
             self._lock.acquire()
             logger.info('Consolidation mode lock acquired')
 
-        # Wait before recovery so a prior leader (e.g. the old pod during a
-        # rolling update) is fully gone first; see the comment on
-        # _RECOVERY_WAIT_AFTER_ACQUIRE_SECONDS. The signal file touched above
-        # stays in place, gating controller starts and the FAILED_CONTROLLER
-        # sweep until recovery completes.
-        logger.info(
-            f'Waiting {_RECOVERY_WAIT_AFTER_ACQUIRE_SECONDS}s after acquiring '
-            'the consolidation mode lock before running recovery, to let any '
-            'previous leader finish shutting down')
-        time.sleep(_RECOVERY_WAIT_AFTER_ACQUIRE_SECONDS)
+        # Wait before recovery only when some job is already claimed by a
+        # controller, or otherwise past the pure backlog states. In those
+        # cases a prior leader may still have detached controllers alive for a
+        # moment after lock release (e.g. rolling update), so recovery must not
+        # race them. Empty or pending-only backlogs can recover immediately.
+        if managed_job_state.has_jobs_requiring_recovery_grace_wait():
+            logger.info(
+                f'Waiting {_RECOVERY_WAIT_AFTER_ACQUIRE_SECONDS}s after '
+                'acquiring the consolidation mode lock before running '
+                'recovery, to let any previous leader finish shutting down')
+            time.sleep(_RECOVERY_WAIT_AFTER_ACQUIRE_SECONDS)
+        else:
+            logger.info('No controller-owned managed jobs require a '
+                        'post-acquire grace wait; running recovery '
+                        'immediately')
 
         # The wait above widens the window between acquiring the lock and
         # running recovery, during which the lock's underlying session could go
