@@ -1,5 +1,5 @@
 import React, { useState, useEffect, createContext, useContext } from 'react';
-import { ArrowUpCircle, Bell } from 'lucide-react';
+import { ArrowUpCircle } from 'lucide-react';
 import { NonCapitalizedTooltip } from '@/components/utils';
 import { apiClient } from '@/data/connectors/client';
 
@@ -81,6 +81,7 @@ export function VersionTooltip({
   version,
   latestVersion,
   commit,
+  build,
   plugins,
   showUpdateInfo = true,
   showCommit = true,
@@ -100,6 +101,7 @@ export function VersionTooltip({
           {plugins.length > 0 ? 'Core commit' : 'Commit'}: {commit}
         </div>
       )}
+      {build && <div>Build: {build}</div>}
       {plugins
         .filter((plugin) => !plugin.hidden_from_display)
         .map((plugin, index) => {
@@ -131,26 +133,35 @@ export function VersionTooltip({
   );
 }
 
-export function UpgradeHint() {
-  const { version, latestVersion, commit, plugins } = useVersionInfo();
-
-  if (!version || !latestVersion) return null;
-
+export function DeploymentVersionContent({
+  version,
+  latestVersion,
+  commit,
+  build,
+  plugins,
+}) {
+  if (!version) return null;
   return (
     <VersionTooltip
       version={version}
       latestVersion={latestVersion}
       commit={commit}
+      build={build}
       plugins={plugins}
-      showCommit={false}
     >
       <div className="inline-flex items-center justify-center transition-colors duration-150 cursor-help">
-        <div className="p-2 rounded-full text-gray-600 hover:bg-gray-100 hover:text-blue-600">
-          <Bell className="w-5 h-5" />
+        <div className="px-2 py-1 text-xs font-medium text-gray-600 border border-gray-200 rounded-md hover:bg-gray-100 hover:text-blue-600">
+          v{version}
+          {build && ` · build ${build}`}
         </div>
       </div>
     </VersionTooltip>
   );
+}
+
+export function DeploymentVersion() {
+  const versionInfo = useVersionInfo();
+  return <DeploymentVersionContent {...versionInfo} />;
 }
 
 export function NewVersionAvailable() {
@@ -178,12 +189,14 @@ export function VersionDisplay() {
       version={version}
       latestVersion={latestVersion}
       commit={commit}
+      build={build}
       plugins={plugins}
       showUpdateInfo={false}
     >
       <div className="inline-flex items-center justify-center transition-colors duration-150 cursor-help">
         <div className="text-sm text-gray-500 border-b border-dotted border-gray-400 hover:text-blue-600 hover:border-blue-600">
           Version: {version}
+          {build && ` · build ${build}`}
         </div>
       </div>
     </VersionTooltip>
