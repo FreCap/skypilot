@@ -50,6 +50,70 @@ def patched_state(monkeypatch):
 class TestGetServiceStatusSummary:
     """_get_service_status summary contract."""
 
+    def test_pool_status_keeps_yaml_by_default(self, monkeypatch):
+        record = {
+            'name': 'pool-a',
+            'pool': True,
+            'controller_port': 30001,
+            'version': 1,
+            'hash': 'incarnation-a',
+        }
+        monkeypatch.setattr(serve_state, 'get_service_from_name',
+                            lambda name: dict(record))
+        yaml_dump = mock.Mock(return_value='rendered-pool-yaml')
+        monkeypatch.setattr(serve_utils, 'get_yaml_content',
+                            lambda *a, **k: 'pool: yaml')
+        monkeypatch.setattr(
+            serve_utils.yaml_utils, 'read_yaml_str', lambda content: {
+                'resources': {
+                    'cpus': 1
+                },
+                'service': {
+                    'pool': {
+                        'replicas': 2
+                    }
+                },
+                'run': 'echo hi',
+            })
+        monkeypatch.setattr(serve_utils.yaml_utils, 'dump_yaml_str', yaml_dump)
+
+        result = serve_utils._get_service_status(  # pylint: disable=protected-access
+            'pool-a',
+            pool=True,
+            with_replica_info=False,
+            with_target_num_replicas=False)
+
+        assert result is not None
+        assert result['pool_yaml'] == 'rendered-pool-yaml'
+        yaml_dump.assert_called_once()
+
+    def test_pool_status_can_skip_yaml_when_not_requested(self, monkeypatch):
+        record = {
+            'name': 'pool-a',
+            'pool': True,
+            'controller_port': 30001,
+            'version': 1,
+            'hash': 'incarnation-a',
+        }
+        monkeypatch.setattr(serve_state, 'get_service_from_name',
+                            lambda name: dict(record))
+        get_yaml = mock.Mock(return_value='pool: yaml')
+        read_yaml = mock.Mock()
+        monkeypatch.setattr(serve_utils, 'get_yaml_content', get_yaml)
+        monkeypatch.setattr(serve_utils.yaml_utils, 'read_yaml_str', read_yaml)
+
+        result = serve_utils._get_service_status(  # pylint: disable=protected-access
+            'pool-a',
+            pool=True,
+            with_replica_info=False,
+            with_pool_yaml=False,
+            with_target_num_replicas=False)
+
+        assert result is not None
+        assert 'pool_yaml' not in result
+        get_yaml.assert_not_called()
+        read_yaml.assert_not_called()
+
     def test_summary_returns_counts_without_replica_info(self, patched_state):
         record = serve_utils._get_service_status(  # pylint: disable=protected-access
             'svc',
