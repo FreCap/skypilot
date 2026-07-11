@@ -94,30 +94,21 @@ def _parse_controller_pid_entry(
         return None
     # The entry should be like <pid>,<started_at>
     # pid is an integer, started_at is a float
-    # For backwards compatibility, we also support just <pid>
     entry_parts = entry.split(',')
-    if len(entry_parts) == 2:
-        [raw_pid, raw_started_at] = entry_parts
-    elif len(entry_parts) == 1:
-        # Backwards compatibility, pre-#7847
-        # TODO(cooperc): Remove for 0.13.0
-        raw_pid = entry_parts[0]
-        raw_started_at = None
-    else:
+    if len(entry_parts) != 2:
         # Unknown format
         return None
+    raw_pid, raw_started_at = entry_parts
 
     try:
         pid = int(raw_pid)
     except ValueError:
         return None
 
-    started_at: Optional[float] = None
-    if raw_started_at:
-        try:
-            started_at = float(raw_started_at)
-        except ValueError:
-            started_at = None
+    try:
+        started_at = float(raw_started_at)
+    except ValueError:
+        return None
     return state.ControllerPidRecord(pid=pid, started_at=started_at)
 
 
@@ -142,12 +133,11 @@ def get_controller_process_records(
     return records
 
 
-def _append_controller_pid_record(pid: int,
-                                  started_at: Optional[float]) -> None:
+def _append_controller_pid_record(pid: int, started_at: float) -> None:
     # Note: started_at is a float, but converting to a string will not lose any
     # precision. See https://docs.python.org/3/tutorial/floatingpoint.html and
     # https://github.com/python/cpython/issues/53583
-    entry = str(pid) if started_at is None else f'{pid},{started_at}'
+    entry = f'{pid},{started_at}'
     with open(JOB_CONTROLLER_PID_PATH, 'a', encoding='utf-8') as f:
         f.write(entry + '\n')
 
@@ -319,8 +309,7 @@ def submit_jobs(job_ids: List[int],
         if controller_process is not None:
             # why? TODO(cooperc): figure out why this is needed, fix it, and
             # remove
-            if managed_job_utils.controller_process_alive(
-                    controller_process, job_id):
+            if managed_job_utils.controller_process_alive(controller_process):
                 # This can happen when HA recovery runs for some reason but the
                 # job controller is still alive.
                 logger.warning(f'Job {job_id} is still alive with controller '

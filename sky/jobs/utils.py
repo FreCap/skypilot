@@ -395,13 +395,10 @@ def ha_recovery_for_consolidation_mode() -> None:
             # running across API server restarts for consistency.
             if controller_pid is not None:
                 try:
-                    # Note: We provide the legacy job id to the
-                    # controller_process_alive just in case, but we shouldn't
-                    # have a running legacy job controller process at this point
                     if controller_process_alive(
                             managed_job_state.ControllerPidRecord(
                                 pid=controller_pid,
-                                started_at=controller_pid_started_at), job_id):
+                                started_at=controller_pid_started_at)):
                         message = (f'Controller pid {controller_pid} for '
                                    f'job {job_id} is still running. '
                                    'Skipping recovery.\n')
@@ -539,59 +536,26 @@ async def get_job_status(
 
 
 def controller_process_alive(record: managed_job_state.ControllerPidRecord,
-                             legacy_job_id: Optional[int] = None,
                              quiet: bool = True) -> bool:
     """Check if the controller process is alive.
 
-    If legacy_job_id is provided, this will also return True for a legacy
-    single-job controller process with that job id, based on the cmdline. This
-    is how the old check worked before #7051.
+    Controller PID records must include ``started_at`` so pid reuse cannot
+    resurrect an unrelated process as a live controller.
     """
+    if record.started_at is None:
+        if not quiet:
+            logger.debug(f'Controller process {record.pid} is missing '
+                         'started_at; treating it as dead.')
+        return False
+
     try:
         process = psutil.Process(record.pid)
-
-        if record.started_at is not None:
-            if process.create_time() != record.started_at:
-                if not quiet:
-                    logger.debug(f'Controller process {record.pid} has started '
-                                 f'at {record.started_at} but process has '
-                                 f'started at {process.create_time()}')
-                return False
-        else:
-            # If we can't check the create_time try to check the cmdline instead
-            cmd_str = ' '.join(process.cmdline())
-            # pylint: disable=line-too-long
-            # Pre-#7051 cmdline: /path/to/python -u -m sky.jobs.controller <dag.yaml_path> --job-id <job_id>
-            # Post-#7051 cmdline: /path/to/python -u -msky.jobs.controller
-            # pylint: enable=line-too-long
-            if ('-m sky.jobs.controller' not in cmd_str and
-                    '-msky.jobs.controller' not in cmd_str):
-                if not quiet:
-                    logger.debug(f'Process {record.pid} is not a controller '
-                                 'process - missing "-m sky.jobs.controller" '
-                                 f'from cmdline: {cmd_str}')
-                return False
-            if (legacy_job_id is not None and '--job-id' in cmd_str and
-                    f'--job-id {legacy_job_id}' not in cmd_str):
-                if not quiet:
-                    logger.debug(f'Controller process {record.pid} has the '
-                                 f'wrong --job-id (expected {legacy_job_id}) '
-                                 f'in cmdline: {cmd_str}')
-                return False
-
-            # On linux, psutil.Process(pid) will return a valid process object
-            # even if the pid is actually a thread ID within the process. This
-            # hugely inflates the number of valid-looking pids, increasing the
-            # chance that we will falsely believe a controller is alive. The pid
-            # file should never contain thread IDs, just process IDs. We can
-            # check this with psutil.pid_exists(pid), which is false for TIDs.
-            # See pid_exists in psutil/_pslinux.py
-            if not psutil.pid_exists(record.pid):
-                if not quiet:
-                    logger.debug(
-                        f'Controller process {record.pid} is not a valid '
-                        'process id.')
-                return False
+        if process.create_time() != record.started_at:
+            if not quiet:
+                logger.debug(f'Controller process {record.pid} has started '
+                             f'at {record.started_at} but process has '
+                             f'started at {process.create_time()}')
+            return False
 
         return process.is_running()
 
@@ -758,7 +722,7 @@ def update_managed_jobs_statuses(job_id: Optional[int] = None):
             logger.debug(f'Checking controller pid {pid}')
             if controller_process_alive(
                     managed_job_state.ControllerPidRecord(
-                        pid=pid, started_at=pid_started_at), job_id):
+                        pid=pid, started_at=pid_started_at)):
                 # The controller is still running, so this job is fine.
                 continue
 
