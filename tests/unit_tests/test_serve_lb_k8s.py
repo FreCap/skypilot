@@ -106,6 +106,7 @@ def _install(monkeypatch,
                  'name': 'registry-credentials'
              },),
              data_auth=True,
+             wait_for_endpoint=False,
              api_deployment_name='skypilot-api-server',
              api_deployment_uid='api-deployment-uid',
              release_name='skypilot',
@@ -181,6 +182,7 @@ def _install(monkeypatch,
         read_service.return_value = SimpleNamespace(
             metadata=SimpleNamespace(
                 resource_version='lb-service-rv',
+                annotations={},
                 labels={
                     lb_k8s.SERVE_LB_LABEL_KEY: 'svc',
                     lb_k8s.SERVICE_HASH_LABEL_KEY: 'incarnation',
@@ -194,13 +196,16 @@ def _install(monkeypatch,
                                     block_owner_deletion=False)
                 ]),
             spec=SimpleNamespace(
+                type='LoadBalancer',
                 selector={'app': lb_k8s.lb_deployment_name('svc')},
                 ports=[
                     SimpleNamespace(
                         port=constants.LOAD_BALANCER_PORT_START,
                         target_port=constants.LOAD_BALANCER_PORT_START,
                         protocol='TCP')
-                ]))
+                ]),
+            status=SimpleNamespace(load_balancer=SimpleNamespace(
+                ingress=[SimpleNamespace(hostname='lb.example', ip=None)])))
     read_deployment = apps_api.read_namespaced_deployment
     original_side_effect = read_deployment.side_effect
     existing_deployment = read_deployment.return_value
@@ -252,6 +257,9 @@ def _install(monkeypatch,
     monkeypatch.setattr(lb_k8s.kubernetes,
                         'api_client',
                         lambda unused_context=None: patch_api)
+    if not wait_for_endpoint:
+        monkeypatch.setattr(lb_k8s, '_wait_for_lb_service_endpoint',
+                            lambda *unused_args, **unused_kwargs: None)
 
     volume_mounts = [
         _mount(lb_k8s.LB_SYNC_AUTH_VOLUME_NAME,
@@ -340,6 +348,42 @@ def test_lb_service_endpoint_unavailable_without_external_runtime(
         monkeypatch, external, incluster):
     _install(monkeypatch, external=external, incluster=incluster)
     assert lb_k8s.lb_service_endpoint_or_none('svc') is None
+
+
+def test_load_balancer_service_requires_data_plane_auth(monkeypatch):
+    _install(monkeypatch, data_auth=False)
+    with pytest.raises(RuntimeError, match='require.*lbDataPlane'):
+        lb_k8s.require_external_lb_runtime()
+
+
+def test_load_balancer_endpoint_resolves_published_hostname(monkeypatch):
+    core = mock.MagicMock()
+    core.read_namespaced_service.return_value = SimpleNamespace(
+        status=SimpleNamespace(load_balancer=SimpleNamespace(
+            ingress=[SimpleNamespace(hostname='lb.example', ip=None)])))
+    _install(monkeypatch, core_api=core)
+
+    assert lb_k8s.lb_service_endpoint_or_none('svc') == 'lb.example:30001'
+    core.read_namespaced_service.assert_called_once_with(
+        lb_k8s.lb_service_name('svc'), 'skypilot')
+
+
+def test_load_balancer_endpoint_is_unavailable_before_publication(monkeypatch):
+    core = mock.MagicMock()
+    core.read_namespaced_service.return_value = {
+        'status': {
+            'loadBalancer': {
+                'ingress': []
+            }
+        }
+    }
+    _install(monkeypatch, core_api=core)
+    assert lb_k8s.lb_service_endpoint_or_none('svc') is None
+
+
+def test_load_balancer_endpoint_brackets_ipv6():
+    service = {'status': {'loadBalancer': {'ingress': [{'ip': 'fd00::1'}]}}}
+    assert lb_k8s._service_load_balancer_address(service) == '[fd00::1]'
 
 
 def test_external_runtime_requires_projected_files(monkeypatch):
@@ -451,8 +495,56 @@ def test_create_builds_proxy_deployment_and_service(monkeypatch):
 
     _, service = core.create_namespaced_service.call_args.args
     assert service['metadata']['ownerReferences'] == expected_owner
+    assert service['spec']['type'] == 'LoadBalancer'
     assert service['spec']['ports'][0]['port'] == \
         constants.LOAD_BALANCER_PORT_START
+
+
+def test_create_builds_provider_default_load_balancer_and_waits(monkeypatch):
+    core = mock.MagicMock()
+    core.read_namespaced_service.return_value = {
+        'status': {
+            'loadBalancer': {
+                'ingress': [{
+                    'hostname': 'lb.example'
+                }]
+            }
+        }
+    }
+    _install(monkeypatch, core_api=core, wait_for_endpoint=True)
+
+    lb_k8s.create_lb_deployment_and_service('svc', 225, 'incarnation')
+
+    _, service = core.create_namespaced_service.call_args.args
+    assert 'annotations' not in service['metadata']
+    assert service['spec']['type'] == 'LoadBalancer'
+    assert 'loadBalancerSourceRanges' not in service['spec']
+    core.read_namespaced_service.assert_called_once_with(
+        lb_k8s.lb_service_name('svc'), 'skypilot')
+
+
+def test_create_times_out_until_load_balancer_endpoint_is_published(
+        monkeypatch):
+    core = mock.MagicMock()
+    core.read_namespaced_service.return_value = {
+        'status': {
+            'loadBalancer': {
+                'ingress': []
+            }
+        }
+    }
+    _install(monkeypatch, core_api=core, wait_for_endpoint=True)
+    clock = [0.0]
+
+    def _advance_clock(seconds):
+        clock[0] += seconds
+
+    monkeypatch.setattr(lb_k8s.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(lb_k8s.time, 'sleep', _advance_clock)
+    monkeypatch.setattr(constants, 'LB_SERVICE_ENDPOINT_READY_TIMEOUT_SECONDS',
+                        2)
+    with pytest.raises(RuntimeError, match='did not publish an endpoint'):
+        lb_k8s.create_lb_deployment_and_service('svc', 225, 'incarnation')
 
 
 def test_create_mirrors_only_safe_nonroot_volume_access(monkeypatch):
@@ -570,8 +662,7 @@ def test_api_pod_namespace_wins_over_workload_context(monkeypatch):
         0] == 'control-plane'
     assert core.create_namespaced_service.call_args.args[0] == 'control-plane'
     assert core.read_namespaced_pod.call_args_list[0].args[1] == 'control-plane'
-    assert (lb_k8s.lb_service_endpoint_or_none('svc-a') ==
-            f'{lb_k8s.lb_service_name("svc-a")}.control-plane.svc:30001')
+    assert lb_k8s.lb_service_endpoint_or_none('svc-a') == 'lb.example:30001'
 
 
 def test_image_pull_secret_refs_are_name_only(monkeypatch):
@@ -693,6 +784,7 @@ def test_create_409_reconciles_exactly_owned_objects_without_adoption(
         'application/strategic-merge-patch+json')
     assert service_reconcile_call.kwargs['response_type'] == 'V1Service'
     service_reconcile = service_reconcile_call.kwargs['body']
+    assert service_reconcile['spec']['type'] == 'LoadBalancer'
     assert service_reconcile['spec']['selector'][
         lb_k8s.SERVICE_HASH_LABEL_KEY] == 'incarnation'
     assert service_reconcile['metadata']['resourceVersion'] == 'service-rv'
@@ -796,10 +888,9 @@ def test_create_refuses_foreign_service_collision(monkeypatch, owner_references,
     patch_api.call_api.assert_not_called()
 
 
-def test_data_plane_auth_disabled_omits_projection(monkeypatch):
+def test_legacy_data_plane_auth_disabled_omits_projection(monkeypatch):
     apps, _ = _install(monkeypatch, data_auth=False)
 
-    lb_k8s.require_external_lb_runtime()
     lb_k8s.create_lb_deployment_and_service('svc', 225, 'incarnation')
 
     deployment = apps.create_namespaced_deployment.call_args.args[1]
@@ -1052,6 +1143,7 @@ def test_ensure_reports_existing_crashloop_as_unhealthy(monkeypatch):
     _, core = _install(monkeypatch, apps_api=apps, db_service_names=('svc',))
     core.read_namespaced_service.return_value = SimpleNamespace(
         spec=SimpleNamespace(
+            type='LoadBalancer',
             selector={
                 'app': lb_k8s.lb_deployment_name('svc'),
                 lb_k8s.SERVICE_HASH_LABEL_KEY: 'incarnation',

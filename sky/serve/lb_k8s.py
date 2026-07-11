@@ -16,8 +16,8 @@ This module builds and reconciles those per-service objects:
 - ``delete_lb_objects`` — called on real teardown (down/TERMINATE).
 - ``reconcile_lb_objects`` — called from HA recovery to reap orphaned LB
   objects whose service no longer exists.
-- ``lb_service_endpoint`` — the W4 endpoint: the LB Service's in-cluster DNS
-  ``host:port`` (no scheme; the caller adds http/https).
+- ``lb_service_endpoint_or_none`` — the W4 endpoint published by the cloud
+  provider for the LB Service.
 
 Lifecycle/reaper helpers remain no-ops when the platform feature is disabled;
 starting a real service calls :func:`require_external_lb_runtime` and fails
@@ -25,6 +25,7 @@ closed instead of falling back to an in-pod LB.
 """
 import copy
 import hashlib
+import ipaddress
 import json
 import math
 import os
@@ -226,12 +227,31 @@ def lb_service_name(service_name: str,
     return lb_base_name(service_name, resource_scope)
 
 
-def lb_service_endpoint(service_name: str,
-                        namespace: str,
-                        resource_scope: Optional[str] = None) -> str:
-    """In-cluster DNS ``host:port`` of the LB Service (no scheme)."""
-    return (f'{lb_service_name(service_name, resource_scope)}.{namespace}.svc'
-            f':{constants.LOAD_BALANCER_PORT_START}')
+def _service_load_balancer_address(service: Any) -> Optional[str]:
+    """Return the first hostname/IP published on a LoadBalancer Service."""
+    if isinstance(service, dict):
+        status = service.get('status', {}) or {}
+        load_balancer = status.get('loadBalancer', {}) or {}
+        ingress = load_balancer.get('ingress', []) or []
+    else:
+        status = getattr(service, 'status', None)
+        load_balancer = getattr(status, 'load_balancer', None)
+        ingress = getattr(load_balancer, 'ingress', None) or []
+
+    for entry in ingress:
+        if isinstance(entry, dict):
+            address = entry.get('hostname') or entry.get('ip')
+        else:
+            address = (getattr(entry, 'hostname', None) or
+                       getattr(entry, 'ip', None))
+        if not isinstance(address, str) or not address:
+            continue
+        try:
+            parsed_ip = ipaddress.ip_address(address)
+        except ValueError:
+            return address
+        return f'[{address}]' if parsed_ip.version == 6 else address
+    return None
 
 
 def _controller_addr(service_name: str) -> str:
@@ -351,12 +371,16 @@ def require_external_lb_runtime() -> None:
                 'External load balancer mode requires projected Secret '
                 f'files; {env_name} is not set. Legacy inline token env vars '
                 'are accepted only for compatibility outside this topology.')
+    if not data_plane_auth_enabled:
+        raise RuntimeError(
+            'External SkyServe load balancers require '
+            'serve.externalLoadBalancer.auth.lbDataPlane to be configured.')
 
 
 def lb_service_endpoint_or_none(
         service_name: str,
         resource_scope: Optional[str] = None) -> Optional[str]:
-    """The LB Service endpoint (host:port, no scheme), or None if inactive.
+    """The LB Service endpoint (host:port, no scheme), or None if unavailable.
 
     Returns None outside the installed external-LB platform. Real service
     startup fails closed through :func:`require_external_lb_runtime`; this
@@ -364,7 +388,20 @@ def lb_service_endpoint_or_none(
     """
     if not _lb_mode_active():
         return None
-    return lb_service_endpoint(service_name, get_lb_namespace(), resource_scope)
+    namespace = get_lb_namespace()
+    context = kubernetes.in_cluster_context_name()
+    service_name_k8s = lb_service_name(service_name, resource_scope)
+    try:
+        service = kubernetes.core_api(context).read_namespaced_service(
+            service_name_k8s, namespace)
+    except kubernetes.api_exception() as e:
+        if getattr(e, 'status', None) == 404:
+            return None
+        raise
+    address = _service_load_balancer_address(service)
+    if address is None:
+        return None
+    return f'{address}:{constants.LOAD_BALANCER_PORT_START}'
 
 
 def _object_labels(service_name: str,
@@ -996,7 +1033,7 @@ def _build_service_dict(service_name: str,
             } if owner_reference else {}),
         },
         'spec': {
-            'type': 'ClusterIP',
+            'type': 'LoadBalancer',
             'selector': {
                 APP_LABEL_KEY: deployment_name,
                 **({
@@ -1018,10 +1055,12 @@ def _service_has_desired_routing(service, desired: dict) -> bool:
         spec = service.get('spec', {})
         selector = spec.get('selector', {}) or {}
         ports = spec.get('ports', []) or []
+        service_type = spec.get('type') or 'ClusterIP'
     else:
         spec = getattr(service, 'spec', None)
         selector = getattr(spec, 'selector', {}) or {}
         ports = getattr(spec, 'ports', None) or []
+        service_type = getattr(spec, 'type', None) or 'ClusterIP'
 
     def _port_tuple(port) -> Tuple[Any, Any, Any]:
         if isinstance(port, dict):
@@ -1031,7 +1070,8 @@ def _service_has_desired_routing(service, desired: dict) -> bool:
                 getattr(port, 'protocol', None) or 'TCP')
 
     desired_spec = desired['spec']
-    return (selector == desired_spec['selector'] and
+    return (service_type == desired_spec['type'] and
+            selector == desired_spec['selector'] and
             [_port_tuple(port) for port in ports
             ] == [_port_tuple(port) for port in desired_spec['ports']])
 
@@ -1092,6 +1132,36 @@ def _wait_for_lb_deployment_ready(
         f'{constants.LB_DEPLOYMENT_READY_TIMEOUT_SECONDS}s. Check '
         f'`kubectl describe deployment/{deployment_name} -n {namespace}` and '
         'the LB Pod logs.')
+
+
+def _wait_for_lb_service_endpoint(
+        core_api: Any,
+        namespace: str,
+        service_name: str,
+        continue_guard: Optional[Callable[[], bool]] = None) -> None:
+    """Wait until a LoadBalancer Service publishes a routable address."""
+    deadline = (time.monotonic() +
+                constants.LB_SERVICE_ENDPOINT_READY_TIMEOUT_SECONDS)
+    while time.monotonic() < deadline:
+        if continue_guard is not None and not continue_guard():
+            raise RuntimeError(
+                f'Lost service ownership while waiting for LB Service '
+                f'{service_name!r}.')
+        try:
+            service = core_api.read_namespaced_service(service_name, namespace)
+        except kubernetes.api_exception() as e:
+            if getattr(e, 'status', None) != 404:
+                raise
+        else:
+            if _service_load_balancer_address(service) is not None:
+                return
+        time.sleep(constants.LB_SERVICE_ENDPOINT_READY_POLL_SECONDS)
+    raise RuntimeError(
+        f'External load balancer Service {service_name!r} did not publish an '
+        f'endpoint within '
+        f'{constants.LB_SERVICE_ENDPOINT_READY_TIMEOUT_SECONDS}s. Check '
+        f'`kubectl describe service/{service_name} -n {namespace}` and the '
+        'cloud load balancer controller logs.')
 
 
 def create_lb_deployment_and_service(
@@ -1342,6 +1412,7 @@ def create_lb_deployment_and_service(
                             'resourceVersion': resource_version,
                         },
                         'spec': {
+                            'type': service_dict['spec']['type'],
                             'selector': service_dict['spec']['selector'],
                             'ports': service_dict['spec']['ports'],
                         },
@@ -1367,6 +1438,11 @@ def create_lb_deployment_and_service(
                         e = create_error
                 _retry_reconciliation_or_raise('Service', service_name_k8s,
                                                final_deadline, e)
+
+    _wait_for_lb_service_endpoint(core_api,
+                                  namespace,
+                                  service_name_k8s,
+                                  continue_guard=continue_guard)
 
 
 def ensure_lb_objects_exist(service_name: str,
