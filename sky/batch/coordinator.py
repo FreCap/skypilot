@@ -533,7 +533,7 @@ class BatchCoordinator:
         return None
 
     def _get_ready_workers(self) -> List[str]:
-        """Return cluster names for ready replicas via SDK."""
+        """Return cluster names for dispatchable replicas via SDK."""
         status = self._fetch_pool_status()
         if status is None:
             return []
@@ -555,9 +555,16 @@ class BatchCoordinator:
                         f'{replica_info_version}; Sky Batch requires version '
                         f'{server_constants.MIN_BATCH_REPLICA_INFO_VERSION}. '
                         f'Recreate pool {self.pool_name!r} before retrying.')
-                used_by = info.get('used_by') or []
-                if not isinstance(used_by, (list, tuple, set)):
-                    used_by = [used_by]
+                used_by = info.get('used_by')
+                # `used_by` is an advisory status snapshot, not a reservation:
+                # occupancy may change after this check.  Still fail closed if
+                # the server does not satisfy the current list contract, since
+                # dispatching with unknown occupancy can queue behind other
+                # managed jobs.
+                if not isinstance(used_by, list):
+                    if name:
+                        unavailable_summary.append(f'{name}=USAGE_UNKNOWN')
+                    continue
                 other_job_ids = [
                     job_id for job_id in used_by
                     if str(job_id) != str(self._managed_job_id)
