@@ -2,8 +2,10 @@
 
 import asyncio
 import collections
+import fcntl
+import os
 import pathlib
-from typing import AsyncGenerator, Deque, List, Optional
+from typing import AsyncGenerator, Deque, List, Optional, Tuple
 
 import aiofiles
 import aiofiles.os
@@ -13,6 +15,7 @@ from sky import global_user_state
 from sky import sky_logging
 from sky.server.requests import requests as requests_lib
 from sky.utils import common_utils
+from sky.utils import context as sky_context
 from sky.utils import message_utils
 from sky.utils import rich_utils
 from sky.utils import status_lib
@@ -60,8 +63,102 @@ async def _rewind_if_log_truncated(
         return False
     if current_size >= position:
         return False
+    # Seeking directly to 0 can reuse BufferedReader bytes cached before the
+    # external truncate. Seeking to the current EOF first invalidates that
+    # read-ahead buffer, then the rewind sees the replacement generation.
+    await log_file.seek(0, os.SEEK_END)
     await log_file.seek(0)
     return True
+
+
+def _request_log_marker(
+    log_file: aiofiles.threadpool.binary.AsyncBufferedReader,
+) -> Optional[sky_context.RequestLogTruncationMarker]:
+    """Read a bounded request log's marker without buffered read-ahead."""
+    # BufferedReader can retain bytes from before an in-place truncate, even
+    # after seek(0). pread() bypasses that user-space buffer and leaves the
+    # follower's cursor unchanged. This fixed-size local read is intentionally
+    # synchronous: it is one small syscall, not filesystem traversal.
+    prefix = os.pread(log_file.fileno(),
+                      sky_context.REQUEST_LOG_TRUNCATION_MARKER_MAX_BYTES, 0)
+    return sky_context.parse_request_log_truncation_marker(prefix)
+
+
+async def _rewind_if_log_generation_changed(
+    log_file: aiofiles.threadpool.binary.AsyncBufferedReader,
+    previous_marker: Optional[sky_context.RequestLogTruncationMarker],
+) -> Tuple[Optional[sky_context.RequestLogTruncationMarker], bool, bool]:
+    """Map a follower across rollover, including truncate-and-regrow races.
+
+    Returns the current marker, whether the generation changed, and whether
+    the follower lost an unread prefix because it fell behind the retained
+    window.
+    """
+    marker = _request_log_marker(log_file)
+    if marker is None or marker == previous_marker:
+        return previous_marker, False, False
+    if (previous_marker is not None and
+            marker.generation == previous_marker.generation):
+        return previous_marker, False, False
+
+    position = await log_file.tell()
+    if previous_marker is None:
+        logical_position = position
+    else:
+        logical_position = previous_marker.logical_start + max(
+            0, position - previous_marker.byte_length)
+    current_size = os.fstat(log_file.fileno()).st_size
+    lost_prefix = logical_position < marker.logical_start
+    if lost_prefix:
+        target_position = 0
+    else:
+        target_position = marker.byte_length + (logical_position -
+                                                marker.logical_start)
+        target_position = min(target_position, current_size)
+
+    # Visit EOF first to invalidate BufferedReader data cached before the
+    # external truncate, then seek to the equivalent logical stream offset.
+    await log_file.seek(0, os.SEEK_END)
+    await log_file.seek(target_position)
+    return marker, True, lost_prefix
+
+
+async def _acquire_shared_file_lock(fd: int) -> None:
+    """Acquire a cancellation-safe shared flock without blocking the loop."""
+    # A blocking flock offloaded with asyncio.to_thread() can leak a lock if
+    # the tail task is cancelled while the worker thread is waiting: the
+    # thread may later acquire the lock after the coroutine's finally block is
+    # gone. Poll non-blockingly so cancellation can never strand a lock.
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            await asyncio.sleep(0.01)
+
+
+async def _read_request_log_chunk(
+    log_file: aiofiles.threadpool.binary.AsyncBufferedReader,
+    previous_marker: Optional[sky_context.RequestLogTruncationMarker],
+    log_path: pathlib.Path,
+) -> Tuple[bytes, Optional[sky_context.RequestLogTruncationMarker], bool]:
+    """Read one chunk atomically with respect to bounded-log rollover."""
+    fd = log_file.fileno()
+    await _acquire_shared_file_lock(fd)
+    try:
+        marker, _, lost_prefix = (await _rewind_if_log_generation_changed(
+            log_file, previous_marker))
+        if marker is None and await _rewind_if_log_truncated(
+                log_file, log_path):
+            # Legacy/unbounded writers have no generation marker. Keep their
+            # physical truncate handling inside the same shared-lock window as
+            # the following read so a cooperative bounded writer cannot race
+            # between the size check and cursor reset.
+            lost_prefix = True
+        chunk = await log_file.read(_READ_CHUNK_SIZE)
+        return chunk, marker, lost_prefix
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
 
 
 async def wait_for_request_to_start(
@@ -242,6 +339,7 @@ async def _tail_log_file(
 ) -> AsyncGenerator[str, None]:
     """Tail the opened log file, buffer the lines and flush in chunks."""
 
+    log_marker = _request_log_marker(f) if log_path is not None else None
     if tail is not None:
         # Find last n lines of the log file. Do not read the whole file into
         # memory.
@@ -249,8 +347,18 @@ async def _tail_log_file(
         # which may not lead to exact tail lines when showing on the client
         # side.
         lines: Deque[str] = collections.deque(maxlen=tail)
-        async for line_str in _yield_log_file_with_payloads_skipped(f):
-            lines.append(line_str)
+        if log_path is not None:
+            fd = f.fileno()
+            await _acquire_shared_file_lock(fd)
+            try:
+                log_marker = _request_log_marker(f)
+                async for line_str in _yield_log_file_with_payloads_skipped(f):
+                    lines.append(line_str)
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        else:
+            async for line_str in _yield_log_file_with_payloads_skipped(f):
+                lines.append(line_str)
         for line_str in lines:
             yield line_str
 
@@ -286,16 +394,20 @@ async def _tail_log_file(
             async for chunk in flush_buffer():
                 yield chunk
 
-        # Read file in chunks for better I/O performance
-        file_chunk: bytes = await f.read(_READ_CHUNK_SIZE)
-        if not file_chunk:
-            # Bounded streaming logs are truncated in place. Rewind a reader
-            # parked beyond the new EOF so it can keep following the file.
-            if (log_path is not None and
-                    await _rewind_if_log_truncated(f, log_path)):
+        if log_path is not None:
+            file_chunk, log_marker, lost_prefix = (await
+                                                   _read_request_log_chunk(
+                                                       f, log_marker, log_path))
+            if lost_prefix:
+                # Preserve complete output before the gap, but never join a
+                # partial discarded line to the retained generation.
+                async for chunk in flush_buffer():
+                    yield chunk
                 incomplete_line = b''
-                continue
-
+        else:
+            # Read file in chunks for better I/O performance.
+            file_chunk = await f.read(_READ_CHUNK_SIZE)
+        if not file_chunk:
             # Process any remaining incomplete line
             if incomplete_line:
                 line_str = incomplete_line.decode('utf-8')
@@ -324,70 +436,85 @@ async def _tail_log_file(
                 req_status = await requests_lib.get_request_status_async(
                     request_id)
                 if req_status.status > requests_lib.RequestStatus.RUNNING:
-                    if (req_status.status ==
-                            requests_lib.RequestStatus.CANCELLED):
-                        request_task = await requests_lib.get_request_async(
-                            request_id, fields=['name', 'should_retry'])
-                        if request_task.should_retry:
-                            buffer.append(
-                                message_utils.encode_payload(
-                                    rich_utils.Control.RETRY.encode('')))
-                        else:
-                            buffer.append(
-                                f'{request_task.name!r} request {request_id}'
-                                ' cancelled\n')
-                        del request_task
+                    # Status can become terminal after our EOF read but before
+                    # the producer's final write becomes visible. Drain once
+                    # more under the same lock/generation protocol before
+                    # deciding the stream is complete.
+                    if log_path is not None:
+                        file_chunk, log_marker, lost_prefix = (
+                            await
+                            _read_request_log_chunk(f, log_marker, log_path))
+                        if lost_prefix:
+                            async for chunk in flush_buffer():
+                                yield chunk
+                            incomplete_line = b''
+                    else:
+                        file_chunk = await f.read(_READ_CHUNK_SIZE)
+                    if not file_chunk:
+                        if (req_status.status ==
+                                requests_lib.RequestStatus.CANCELLED):
+                            request_task = await requests_lib.get_request_async(
+                                request_id, fields=['name', 'should_retry'])
+                            if request_task.should_retry:
+                                buffer.append(
+                                    message_utils.encode_payload(
+                                        rich_utils.Control.RETRY.encode('')))
+                            else:
+                                buffer.append(f'{request_task.name!r} request '
+                                              f'{request_id} cancelled\n')
+                            del request_task
+                        break
+            if not file_chunk:
+                if not follow:
+                    # The below checks (cluster status, heartbeat) are not
+                    # needed for non-follow logs.
                     break
-            if not follow:
-                # The below checks (cluster status, heartbeat) are not needed
-                # for non-follow logs.
-                break
-            # Provision logs pass in cluster_name, check cluster status
-            # periodically to see if provisioning is done.
-            if cluster_name is not None:
-                if should_check_status:
-                    last_status_check_time = current_time
-                    cluster_status = await (
-                        global_user_state.get_status_from_cluster_name_async(
-                            cluster_name))
-                    if cluster_status is None:
-                        logger.debug(
-                            'Stop tailing provision logs for cluster'
-                            f' status for cluster {cluster_name} not found')
-                        break
-                    # if the cluster is not in INIT state (UP or STOPPED),
-                    # stop tailing provision logs
-                    if cluster_status != status_lib.ClusterStatus.INIT:
-                        logger.debug(
-                            f'Stop tailing provision logs for cluster'
-                            f' {cluster_name} has status {cluster_status} '
-                            '(not in INIT state)')
-                        break
-                    req_filter = requests_lib.RequestTaskFilter(
-                        status=[requests_lib.RequestStatus.RUNNING],
-                        cluster_names=[cluster_name],
-                        include_request_names=['sky.launch'],
-                        fields=['cluster_name'])
-                    req_tasks = await requests_lib.get_request_tasks_async(
-                        req_filter)
-                    # if the cluster is in INIT state and there is no ongoing
-                    # launch request, stop tailing provision logs
-                    if len(req_tasks) == 0:
-                        break
-            if current_time - last_heartbeat_time >= _HEARTBEAT_INTERVAL:
-                # Currently just used to keep the connection busy, refer to
-                # https://github.com/skypilot-org/skypilot/issues/5750 for
-                # more details.
-                buffer.append(
-                    message_utils.encode_payload(
-                        rich_utils.Control.HEARTBEAT.encode('')))
-                last_heartbeat_time = current_time
+                # Provision logs pass in cluster_name, check cluster status
+                # periodically to see if provisioning is done.
+                if cluster_name is not None:
+                    if should_check_status:
+                        last_status_check_time = current_time
+                        cluster_status = await (
+                            global_user_state.
+                            get_status_from_cluster_name_async(cluster_name))
+                        if cluster_status is None:
+                            logger.debug(
+                                'Stop tailing provision logs for cluster'
+                                f' status for cluster {cluster_name} not found')
+                            break
+                        # if the cluster is not in INIT state (UP or STOPPED),
+                        # stop tailing provision logs
+                        if cluster_status != status_lib.ClusterStatus.INIT:
+                            logger.debug(
+                                f'Stop tailing provision logs for cluster'
+                                f' {cluster_name} has status {cluster_status} '
+                                '(not in INIT state)')
+                            break
+                        req_filter = requests_lib.RequestTaskFilter(
+                            status=[requests_lib.RequestStatus.RUNNING],
+                            cluster_names=[cluster_name],
+                            include_request_names=['sky.launch'],
+                            fields=['cluster_name'])
+                        req_tasks = await requests_lib.get_request_tasks_async(
+                            req_filter)
+                        # If the cluster is INIT with no ongoing launch request,
+                        # stop tailing provision logs.
+                        if len(req_tasks) == 0:
+                            break
+                if current_time - last_heartbeat_time >= _HEARTBEAT_INTERVAL:
+                    # Currently just used to keep the connection busy, refer to
+                    # https://github.com/skypilot-org/skypilot/issues/5750 for
+                    # more details.
+                    buffer.append(
+                        message_utils.encode_payload(
+                            rich_utils.Control.HEARTBEAT.encode('')))
+                    last_heartbeat_time = current_time
 
-            # Sleep shortly to avoid storming the DB and CPU, this has
-            # little impact on the responsivness here since we are waiting
-            # for a new line to come in.
-            await asyncio.sleep(0.1)
-            continue
+                # Sleep shortly to avoid storming the DB and CPU, this has
+                # little impact on the responsivness here since we are waiting
+                # for a new line to come in.
+                await asyncio.sleep(0.1)
+                continue
 
         # Refresh the heartbeat time, this is a trivial optimization for
         # performance but it helps avoid unnecessary heartbeat strings

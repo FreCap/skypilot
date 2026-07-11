@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Mapping
 import contextvars
 import copy
+import fcntl
 import functools
 import logging
 import os
@@ -11,8 +12,10 @@ import pathlib
 import subprocess
 import sys
 import threading
-from typing import (Any, Callable, Coroutine, Dict, Iterator, List,
-                    MutableMapping, Optional, TextIO, TYPE_CHECKING, TypeVar)
+from typing import (Any, Callable, Coroutine, Dict, Iterable, Iterator, List,
+                    MutableMapping, NamedTuple, Optional, TextIO, TYPE_CHECKING,
+                    TypeVar)
+import uuid
 
 from typing_extensions import ParamSpec
 
@@ -23,20 +26,77 @@ _PROCESS_GLOBAL_VARS = {}
 
 _logger = logging.getLogger(__name__)
 
+REQUEST_LOG_TRUNCATION_MARKER_PREFIX = (
+    '[SkyPilot] Earlier request output was truncated; generation=')
+_REQUEST_LOG_TRUNCATION_GENERATION_LENGTH = 32
+_REQUEST_LOG_TRUNCATION_START_SEPARATOR = '; start='
+_REQUEST_LOG_TRUNCATION_START_LENGTH = 16
+REQUEST_LOG_TRUNCATION_MARKER_MAX_BYTES = len(
+    REQUEST_LOG_TRUNCATION_MARKER_PREFIX.encode('utf-8')) + (
+        _REQUEST_LOG_TRUNCATION_GENERATION_LENGTH +
+        len(_REQUEST_LOG_TRUNCATION_START_SEPARATOR.encode('utf-8')) +
+        _REQUEST_LOG_TRUNCATION_START_LENGTH + 1)
+
+
+class RequestLogTruncationMarker(NamedTuple):
+    """Metadata needed to map a follower across an in-place rollover."""
+
+    generation: str
+    logical_start: int
+    byte_length: int
+
+
+def parse_request_log_truncation_marker(
+        prefix: bytes) -> Optional[RequestLogTruncationMarker]:
+    """Parse a bounded request-log marker, if present."""
+    marker_prefix = REQUEST_LOG_TRUNCATION_MARKER_PREFIX.encode('utf-8')
+    if not prefix.startswith(marker_prefix):
+        return None
+    marker_line, separator, _ = prefix.partition(b'\n')
+    if not separator:
+        return None
+    encoded_metadata = marker_line[len(marker_prefix):]
+    start_separator = _REQUEST_LOG_TRUNCATION_START_SEPARATOR.encode('utf-8')
+    encoded_generation, separator, encoded_start = encoded_metadata.partition(
+        start_separator)
+    if not separator:
+        return None
+    if len(encoded_generation) != _REQUEST_LOG_TRUNCATION_GENERATION_LENGTH:
+        return None
+    if len(encoded_start) != _REQUEST_LOG_TRUNCATION_START_LENGTH:
+        return None
+    try:
+        generation = encoded_generation.decode('ascii')
+        int(generation, 16)
+        logical_start = int(encoded_start, 16)
+    except (UnicodeDecodeError, ValueError):
+        return None
+    return RequestLogTruncationMarker(generation, logical_start,
+                                      len(marker_line) + 1)
+
+
+def _format_request_log_truncation_marker(logical_start: int) -> str:
+    if logical_start < 0 or logical_start >= 1 << 64:
+        raise ValueError('request log logical offset is out of range')
+    return (REQUEST_LOG_TRUNCATION_MARKER_PREFIX + uuid.uuid4().hex +
+            _REQUEST_LOG_TRUNCATION_START_SEPARATOR + f'{logical_start:016x}\n')
+
 
 class _TruncatingLogFile:
     """Append-only text stream that bounds an actively streamed log file."""
 
-    _TRUNCATION_MARKER = ('[SkyPilot] Earlier request output was truncated to '
-                          'protect API server storage.\n')
-
     def __init__(self, path: pathlib.Path, max_bytes: int):
-        marker_bytes = len(self._TRUNCATION_MARKER.encode('utf-8'))
-        if max_bytes <= marker_bytes:
+        if max_bytes <= REQUEST_LOG_TRUNCATION_MARKER_MAX_BYTES:
             raise ValueError('max_bytes must be larger than the truncation '
                              'marker')
-        self._file = open(path, 'a', encoding='utf-8')
+        self._file = open(path, 'a+', encoding='utf-8')
         self._max_bytes = max_bytes
+        # Leave substantial headroom after a rollover. Retaining all the way
+        # back to the cap would make every subsequent small write rewrite the
+        # entire production-sized log while holding the file lock.
+        minimum_rollover_bytes = min(
+            max_bytes, REQUEST_LOG_TRUNCATION_MARKER_MAX_BYTES * 2)
+        self._rollover_bytes = max(minimum_rollover_bytes, max_bytes // 2)
         self._size_bytes = path.stat().st_size
         self._lock = threading.Lock()
 
@@ -44,25 +104,75 @@ class _TruncatingLogFile:
         original_length = len(content)
         encoded_content = content.encode('utf-8')
         with self._lock:
-            if self._size_bytes + len(encoded_content) > self._max_bytes:
-                self._file.seek(0)
-                self._file.truncate()
-                self._file.write(self._TRUNCATION_MARKER)
-                self._size_bytes = len(self._TRUNCATION_MARKER.encode('utf-8'))
+            fd = self._file.fileno()
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                # File locks coordinate copied contexts and active followers.
+                # Refresh from the kernel so a second writer cannot use a
+                # stale per-handle size and exceed the cap.
+                self._file.flush()
+                self._size_bytes = os.fstat(fd).st_size
+                if self._size_bytes + len(encoded_content) > self._max_bytes:
+                    prefix = os.pread(fd,
+                                      REQUEST_LOG_TRUNCATION_MARKER_MAX_BYTES,
+                                      0)
+                    previous_marker = parse_request_log_truncation_marker(
+                        prefix)
+                    payload_offset = (previous_marker.byte_length
+                                      if previous_marker is not None else 0)
+                    logical_start = (previous_marker.logical_start
+                                     if previous_marker is not None else 0)
+                    payload_size = self._size_bytes - payload_offset
+                    logical_end = logical_start + payload_size
 
-                # A single write can itself exceed the cap. Retain its latest
-                # complete UTF-8 characters and report the full input as
-                # consumed so callers do not retry the discarded prefix.
-                available_bytes = self._max_bytes - self._size_bytes
-                if len(encoded_content) > available_bytes:
-                    encoded_content = encoded_content[-available_bytes:]
-                    content = encoded_content.decode('utf-8', errors='ignore')
-                    encoded_content = content.encode('utf-8')
-            written = self._file.write(content)
-            self._size_bytes += len(encoded_content)
+                    # Retain the newest complete UTF-8 window across the old
+                    # payload and this write. A few extra old bytes let a slice
+                    # beginning inside a multibyte character recover at the
+                    # next complete character.
+                    available_bytes = (self._rollover_bytes -
+                                       REQUEST_LOG_TRUNCATION_MARKER_MAX_BYTES)
+                    desired_old_bytes = max(
+                        0, available_bytes - len(encoded_content))
+                    old_tail_size = min(payload_size, desired_old_bytes + 3)
+                    old_tail = os.pread(
+                        fd, old_tail_size,
+                        payload_offset + payload_size - old_tail_size)
+                    combined = old_tail + encoded_content
+                    slice_offset = max(0, len(combined) - available_bytes)
+                    retained_bytes = combined[slice_offset:]
+                    retained_content = retained_bytes.decode('utf-8',
+                                                             errors='ignore')
+                    encoded_content = retained_content.encode('utf-8')
+                    # The only invalid bytes can be a partial character at the
+                    # beginning of the byte slice.
+                    dropped_partial_bytes = (len(retained_bytes) -
+                                             len(encoded_content))
+                    retained_logical_start = (logical_end - len(old_tail) +
+                                              slice_offset +
+                                              dropped_partial_bytes)
+                    marker = _format_request_log_truncation_marker(
+                        retained_logical_start)
+                    marker_bytes = marker.encode('utf-8')
+                    self._file.seek(0)
+                    self._file.truncate()
+                    self._file.write(marker)
+                    self._size_bytes = len(marker_bytes)
+                    content = retained_content
+                written = self._file.write(content)
+                self._size_bytes += len(encoded_content)
+                # Publish the marker and replacement bytes before readers can
+                # acquire their shared lock.
+                self._file.flush()
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
             if written != original_length:
                 return original_length
             return written
+
+    def writelines(self, lines: Iterable[str]) -> None:
+        """Write every line through the same byte cap as :meth:`write`."""
+        for line in lines:
+            self.write(line)
 
     def flush(self) -> None:
         with self._lock:
