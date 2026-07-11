@@ -1156,6 +1156,44 @@ def test_ensure_reports_existing_crashloop_as_unhealthy(monkeypatch):
     assert not lb_k8s.ensure_lb_objects_exist('svc', 225, 'incarnation')
 
 
+@pytest.mark.parametrize(
+    ('ingress', 'expected_healthy'),
+    [([], False), ([SimpleNamespace(hostname='lb.example', ip=None)], True)])
+def test_ensure_requires_published_provider_endpoint(monkeypatch, ingress,
+                                                     expected_healthy):
+    apps = mock.MagicMock()
+    apps.read_namespaced_deployment.return_value = SimpleNamespace(
+        metadata=SimpleNamespace(generation=1),
+        spec=SimpleNamespace(
+            replicas=1,
+            template=SimpleNamespace(
+                metadata=SimpleNamespace(
+                    labels={lb_k8s.SERVICE_HASH_LABEL_KEY: 'incarnation'}),
+                spec=SimpleNamespace(termination_grace_period_seconds=225))),
+        status=SimpleNamespace(observed_generation=1,
+                               replicas=1,
+                               updated_replicas=1,
+                               available_replicas=1,
+                               unavailable_replicas=0))
+    _, core = _install(monkeypatch, apps_api=apps, db_service_names=('svc',))
+    core.read_namespaced_service.return_value = SimpleNamespace(
+        spec=SimpleNamespace(
+            type='LoadBalancer',
+            selector={
+                'app': lb_k8s.lb_deployment_name('svc'),
+                lb_k8s.SERVICE_HASH_LABEL_KEY: 'incarnation',
+            },
+            ports=[
+                SimpleNamespace(port=constants.LOAD_BALANCER_PORT_START,
+                                target_port=constants.LOAD_BALANCER_PORT_START,
+                                protocol='TCP')
+            ]),
+        status=SimpleNamespace(load_balancer=SimpleNamespace(ingress=ingress)))
+
+    assert (lb_k8s.ensure_lb_objects_exist('svc', 225, 'incarnation') is
+            expected_healthy)
+
+
 def _lb_pod(uid, phase='Running', deleting=False, ready=True):
     return SimpleNamespace(metadata=SimpleNamespace(
         uid=uid, deletion_timestamp='now' if deleting else None),

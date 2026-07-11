@@ -1515,7 +1515,10 @@ def ensure_lb_objects_exist(service_name: str,
     if (not deployment_missing and not service_missing and not grace_drifted and
             not hash_drifted and not routing_drifted):
         assert deployment is not None
-        return _lb_deployment_is_ready(deployment)
+        assert service is not None
+        deployment_ready = _lb_deployment_is_ready(deployment)
+        endpoint_ready = _service_load_balancer_address(service) is not None
+        return deployment_ready and endpoint_ready
     # The objects may be missing because the service is being torn down or
     # taken over concurrently. Re-check OWNERSHIP (not mere row existence)
     # right before mutating -- the create-time mirror of reconcile's
