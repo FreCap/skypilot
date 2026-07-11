@@ -102,8 +102,7 @@ def test_bounded_log_redirection_caps_writelines(ctx, tmp_path):
         encoding='utf-8')
 
 
-def test_bounded_log_redirection_retains_latest_window(
-        ctx, tmp_path):
+def test_bounded_log_redirection_retains_latest_window(ctx, tmp_path):
     log_path = tmp_path / 'request.log'
     max_bytes = 512
     ctx.redirect_log(log_path, max_bytes=max_bytes)

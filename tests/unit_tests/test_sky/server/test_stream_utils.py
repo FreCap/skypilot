@@ -86,8 +86,8 @@ async def test_rollover_retains_window_without_replaying_consumed_bytes(
         bounded_log.write('Q' * 10)
         bounded_log.close()
         marker, rewound, lost_prefix = (
-            await stream_utils._rewind_if_log_generation_changed(
-                log_file, marker))
+            await
+            stream_utils._rewind_if_log_generation_changed(log_file, marker))
         assert marker is not None
         assert rewound
         assert not lost_prefix
