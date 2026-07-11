@@ -60,8 +60,10 @@ def _safe_unpickle(value: Any) -> Any:
         return None
     try:
         return pickle.loads(value)
-    except (pickle.PickleError, AttributeError, EOFError, TypeError,
-            ValueError):
+    # Legacy resource classes may move or disappear between server versions,
+    # and custom reducers can raise exceptions outside pickle.PickleError. A
+    # single history row must not prevent the durable watermark from advancing.
+    except Exception:  # pylint: disable=broad-except
         return None
 
 

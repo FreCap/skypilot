@@ -48,7 +48,7 @@ import { BASE_PATH, ENDPOINT } from '@/data/connectors/constants';
 import { CustomTooltip } from '@/components/utils';
 import { useMobile } from '@/hooks/useMobile';
 import { ThemeToggle } from '@/components/elements/ThemeToggle';
-import { UpgradeHint } from '@/components/elements/version-display';
+import { DeploymentVersion } from '@/components/elements/version-display';
 import { useGroupedNavLinks, usePluginRoutes } from '@/plugins/PluginProvider';
 import { PluginSlot } from '@/plugins/PluginSlot';
 
@@ -672,8 +672,8 @@ export function TopBar() {
                 {/* Theme Toggle */}
                 <ThemeToggle />
 
-                {/* Version Display */}
-                <UpgradeHint />
+                {/* Deployed server version */}
+                <DeploymentVersion />
 
                 {/* Config Button */}
                 <CustomTooltip

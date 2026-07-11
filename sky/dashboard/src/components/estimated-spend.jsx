@@ -1,6 +1,12 @@
 'use client';
 
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import PropTypes from 'prop-types';
 import {
   BarElement,
@@ -124,12 +130,15 @@ export function EstimatedSpend() {
   const [error, setError] = useState(null);
   const [forbidden, setForbidden] = useState(false);
   const [lastFetchedAt, setLastFetchedAt] = useState(null);
+  const requestGeneration = useRef(0);
 
   const fetchData = useCallback(async () => {
+    const generation = ++requestGeneration.current;
     setLoading(true);
     setError(null);
     try {
       const role = await getCurrentRole();
+      if (generation !== requestGeneration.current) return;
       if (role.role !== 'admin') {
         setForbidden(true);
         setData(null);
@@ -137,23 +146,30 @@ export function EstimatedSpend() {
       }
       setForbidden(false);
       const estimate = await getEstimatedSpend(rangeDays);
+      if (generation !== requestGeneration.current) return;
       setData(estimate);
       setLastFetchedAt(new Date());
     } catch (fetchError) {
+      if (generation !== requestGeneration.current) return;
       if (fetchError.status === 403) {
         setForbidden(true);
       } else {
         setError(fetchError);
       }
     } finally {
-      setLoading(false);
+      if (generation === requestGeneration.current) {
+        setLoading(false);
+      }
     }
   }, [rangeDays]);
 
   useEffect(() => {
     fetchData();
     const timer = setInterval(fetchData, AUTO_REFRESH_MS);
-    return () => clearInterval(timer);
+    return () => {
+      clearInterval(timer);
+      requestGeneration.current += 1;
+    };
   }, [fetchData]);
 
   const chartData = useMemo(() => {

@@ -132,6 +132,37 @@ def test_kubernetes_is_excluded_not_zero_priced():
     assert rows[0]['machine_seconds'] == 3600
 
 
+def test_corrupt_resource_pickle_does_not_block_rollup(tmp_path, monkeypatch):
+    engine = _fresh_db(tmp_path, monkeypatch)
+    day = 1_700_006_400
+    as_of = day + estimated_spend.SECONDS_PER_DAY
+    corrupt = _source(start=day, end=day + 3600, cluster_hash='corrupt')
+    corrupt['launched_resources'] = b'cmissing_resource_module\nResources\n.'
+    healthy = _source(start=day,
+                      end=day + 3600,
+                      hourly_cost=3.0,
+                      cluster_hash='healthy')
+    with engine.begin() as connection:
+        _insert_source(connection, corrupt, usage_updated_at=as_of - 1)
+        _insert_source(connection, healthy, usage_updated_at=as_of - 1)
+
+    result = estimated_spend.run_rollup_once(now=as_of)
+
+    assert result['rows_processed'] == 2
+    with engine.connect() as connection:
+        rows = connection.execute(
+            sqlalchemy.select(global_user_state.estimated_spend_daily_table)
+        ).mappings().all()
+        state = connection.execute(
+            sqlalchemy.select(global_user_state.estimated_spend_state_table)
+        ).mappings().one()
+    rows_by_hash = {row['cluster_hash']: row for row in rows}
+    assert rows_by_hash['corrupt']['exclusion_reason'] == 'unknown_price'
+    assert rows_by_hash['corrupt']['estimated_cost'] is None
+    assert rows_by_hash['healthy']['estimated_cost'] == 3.0
+    assert state['last_success_at'] == as_of
+
+
 def test_workload_attribution_is_persisted(tmp_path, monkeypatch):
     engine = _fresh_db(tmp_path, monkeypatch)
     global_user_state.add_or_update_cluster(
