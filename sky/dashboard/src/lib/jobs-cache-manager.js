@@ -28,8 +28,36 @@ class JobsCacheManager {
     this.pendingRequests = new Map();
     // Track background prefetch jobs for full datasets
     this.backgroundPrefetching = new Map();
+    // Fence stale async completions after invalidation.
+    this.cacheGeneration = 0;
+    this.filterGenerations = new Map();
     // TTL for cache entries (2 minutes)
     this.cacheTTL = 2 * 60 * 1000;
+  }
+
+  _getFilterGeneration(filterKey) {
+    return this.filterGenerations.get(filterKey) || 0;
+  }
+
+  _snapshotWriteFence(filterKey) {
+    return {
+      cacheGeneration: this.cacheGeneration,
+      filterGeneration: this._getFilterGeneration(filterKey),
+    };
+  }
+
+  _canWriteCache(filterKey, fence) {
+    return (
+      this.cacheGeneration === fence.cacheGeneration &&
+      this._getFilterGeneration(filterKey) === fence.filterGeneration
+    );
+  }
+
+  _bumpFilterGeneration(filterKey) {
+    this.filterGenerations.set(
+      filterKey,
+      this._getFilterGeneration(filterKey) + 1
+    );
   }
 
   /**
@@ -138,6 +166,8 @@ class JobsCacheManager {
       ...filterOptions
     } = options;
     const cacheKey = this._generateCacheKey(options);
+    const filterKey = this._generateFilterKey(filterOptions);
+    const writeFence = this._snapshotWriteFence(filterKey);
 
     console.log('[JobsCacheManager] Default path: fetching single page', page);
 
@@ -177,17 +207,19 @@ class JobsCacheManager {
     const statusCounts = pageResponse.statusCounts || {};
 
     // Cache this single page
-    this.pageCache.set(cacheKey, {
-      jobs,
-      total,
-      totalNoFilter,
-      totalPages,
-      hasNext,
-      hasPrev,
-      controllerStopped: false,
-      statusCounts,
-      timestamp: Date.now(),
-    });
+    if (this._canWriteCache(filterKey, writeFence)) {
+      this.pageCache.set(cacheKey, {
+        jobs,
+        total,
+        totalNoFilter,
+        totalPages,
+        hasNext,
+        hasPrev,
+        controllerStopped: false,
+        statusCounts,
+        timestamp: Date.now(),
+      });
+    }
 
     return {
       jobs,
@@ -216,6 +248,7 @@ class JobsCacheManager {
       ...filterOptions
     } = options;
     const filterKey = this._generateFilterKey(filterOptions);
+    const writeFence = this._snapshotWriteFence(filterKey);
 
     console.log('[JobsCacheManager] Background: fetching full dataset');
 
@@ -233,6 +266,10 @@ class JobsCacheManager {
     const totalJobs = jobOrder.length;
 
     // Store the full dataset for future page calculations
+    if (!this._canWriteCache(filterKey, writeFence)) {
+      return;
+    }
+
     this.fullDataCache.set(filterKey, {
       jobs: allJobs,
       jobMap,
@@ -292,6 +329,8 @@ class JobsCacheManager {
       ...filterOptions
     } = options;
     const cacheKey = this._generateCacheKey(options);
+    const filterKey = this._generateFilterKey(filterOptions);
+    const writeFence = this._snapshotWriteFence(filterKey);
 
     console.log('[JobsCacheManager] Plugin path: fetching page', page);
 
@@ -336,17 +375,19 @@ class JobsCacheManager {
     const statusCounts = result.statusCounts || {};
 
     // Cache this specific page
-    this.pageCache.set(cacheKey, {
-      jobs,
-      total,
-      totalNoFilter,
-      totalPages,
-      hasNext,
-      hasPrev,
-      controllerStopped: false,
-      statusCounts,
-      timestamp: Date.now(),
-    });
+    if (this._canWriteCache(filterKey, writeFence)) {
+      this.pageCache.set(cacheKey, {
+        jobs,
+        total,
+        totalNoFilter,
+        totalPages,
+        hasNext,
+        hasPrev,
+        controllerStopped: false,
+        statusCounts,
+        timestamp: Date.now(),
+      });
+    }
 
     return {
       jobs,
@@ -461,7 +502,9 @@ class JobsCacheManager {
 
         return result;
       } finally {
-        this.pendingRequests.delete(cacheKey);
+        if (this.pendingRequests.get(cacheKey) === populatePromise) {
+          this.pendingRequests.delete(cacheKey);
+        }
       }
     } catch (error) {
       console.error('[JobsCacheManager] Error in getPaginatedJobs:', error);
@@ -475,15 +518,18 @@ class JobsCacheManager {
   _kickOffBackgroundPrefetch(options, filterKey) {
     console.log('[JobsCacheManager] Kicking off background prefetch');
 
-    const prefetchPromise = this._loadFullDatasetAndCacheAllPages(options)
-      .catch((err) => {
-        console.warn('[JobsCacheManager] Background prefetch failed:', err);
-      })
-      .finally(() => {
-        this.backgroundPrefetching.delete(filterKey);
-      });
+    const prefetchPromise = this._loadFullDatasetAndCacheAllPages(
+      options
+    ).catch((err) => {
+      console.warn('[JobsCacheManager] Background prefetch failed:', err);
+    });
 
     this.backgroundPrefetching.set(filterKey, prefetchPromise);
+    prefetchPromise.finally(() => {
+      if (this.backgroundPrefetching.get(filterKey) === prefetchPromise) {
+        this.backgroundPrefetching.delete(filterKey);
+      }
+    });
   }
 
   /**
@@ -567,12 +613,15 @@ class JobsCacheManager {
       const filterKey = this._generateFilterKey(options);
       this.fullDataCache.delete(filterKey);
       this.backgroundPrefetching.delete(filterKey);
+      this._bumpFilterGeneration(filterKey);
     } else {
       // Clear all cache
+      this.cacheGeneration += 1;
       this.pageCache.clear();
       this.fullDataCache.clear();
       this.pendingRequests.clear();
       this.backgroundPrefetching.clear();
+      this.filterGenerations.clear();
     }
 
     // Also invalidate the underlying dashboard cache
@@ -585,6 +634,7 @@ class JobsCacheManager {
    */
   invalidateFilteredPages(filterOptions) {
     const filterKey = this._generateFilterKey(filterOptions);
+    this._bumpFilterGeneration(filterKey);
 
     // Remove all page cache entries that match this filter
     for (const [key] of this.pageCache.entries()) {
