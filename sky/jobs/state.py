@@ -1565,6 +1565,37 @@ def get_job_status_check_state(job_id: int) -> Optional[Dict[str, Any]]:
     }
 
 
+def has_jobs_requiring_recovery_grace_wait() -> bool:
+    """Whether HA leader handoff should pause before managed-job recovery.
+
+    The post-acquire grace wait only matters when a prior leader may still have
+    detached controllers alive long enough to race recovery. That requires a
+    job which is already claimed by a controller (``controller_pid`` set) or is
+    otherwise beyond the pure backlog states (``INACTIVE``/``WAITING``).
+
+    Empty, terminal, or pending-only backlogs can recover immediately without
+    paying the fixed sleep.
+    """
+    engine = _db_manager.get_engine()
+    pending_only_states = [
+        ManagedJobScheduleState.INACTIVE.value,
+        ManagedJobScheduleState.WAITING.value,
+    ]
+    query = sqlalchemy.select(sqlalchemy.literal(True)).where(
+        sqlalchemy.and_(
+            job_info_table.c.schedule_state.is_not(None),
+            job_info_table.c.schedule_state !=
+            ManagedJobScheduleState.DONE.value,
+            sqlalchemy.or_(
+                job_info_table.c.controller_pid.is_not(None),
+                sqlalchemy.not_(
+                    job_info_table.c.schedule_state.in_(pending_only_states)),
+            ),
+        )).limit(1)
+    with orm.Session(engine) as session:
+        return session.execute(query).first() is not None
+
+
 def _map_response_field_to_db_column(field: str):
     """Map the response field name to an actual SQLAlchemy ColumnElement.
 

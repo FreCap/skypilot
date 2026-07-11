@@ -44,3 +44,63 @@ class TestGetJobStatusCheckState:
             assert info['controller_pid'] == tasks[0]['controller_pid']
             assert info['controller_pid_started_at'] == tasks[0].get(
                 'controller_pid_started_at')
+
+
+class TestHasJobsRequiringRecoveryGraceWait:
+    """Coverage for the leader handoff grace-wait classifier."""
+
+    def test_empty_database_returns_false(self, _mock_managed_jobs_db_conn):
+        assert state.has_jobs_requiring_recovery_grace_wait() is False
+
+    def test_active_job_returns_true(self, _mock_managed_jobs_db_conn):
+        job_id = state.set_job_info_without_job_id(name='active-job',
+                                                   workspace='ws1',
+                                                   entrypoint='ep',
+                                                   pool=None,
+                                                   pool_hash=None,
+                                                   user_hash='user1')
+        state.set_pending(job_id, 0, 'task0', '{}', '{}')
+        state.scheduler_set_waiting([job_id], '/tmp/dag.yaml', '/tmp/user.yaml',
+                                    '/tmp/env', None, 100)
+
+        with state.orm.Session(_mock_managed_jobs_db_conn) as session:
+            session.execute(state.job_info_table.update().where(
+                state.job_info_table.c.spot_job_id == job_id).values(
+                    schedule_state=state.ManagedJobScheduleState.ALIVE.value))
+            session.commit()
+
+        assert state.has_jobs_requiring_recovery_grace_wait() is True
+
+    def test_pending_only_backlog_returns_false(self,
+                                                _mock_managed_jobs_db_conn):
+        job_id = state.set_job_info_without_job_id(name='pending-only',
+                                                   workspace='ws1',
+                                                   entrypoint='ep',
+                                                   pool=None,
+                                                   pool_hash=None,
+                                                   user_hash='user1')
+        state.set_pending(job_id, 0, 'task0', '{}', '{}')
+        state.scheduler_set_waiting([job_id], '/tmp/dag.yaml', '/tmp/user.yaml',
+                                    '/tmp/env', None, 100)
+
+        assert state.has_jobs_requiring_recovery_grace_wait() is False
+
+    def test_waiting_job_with_controller_claim_returns_true(
+            self, _mock_managed_jobs_db_conn):
+        job_id = state.set_job_info_without_job_id(name='claimed-waiting',
+                                                   workspace='ws1',
+                                                   entrypoint='ep',
+                                                   pool=None,
+                                                   pool_hash=None,
+                                                   user_hash='user1')
+        state.set_pending(job_id, 0, 'task0', '{}', '{}')
+        state.scheduler_set_waiting([job_id], '/tmp/dag.yaml', '/tmp/user.yaml',
+                                    '/tmp/env', None, 100)
+
+        with state.orm.Session(_mock_managed_jobs_db_conn) as session:
+            session.execute(state.job_info_table.update().where(
+                state.job_info_table.c.spot_job_id == job_id).values(
+                    controller_pid=1234))
+            session.commit()
+
+        assert state.has_jobs_requiring_recovery_grace_wait() is True
