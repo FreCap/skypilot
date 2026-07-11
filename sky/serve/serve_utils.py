@@ -841,6 +841,21 @@ def ha_recovery_for_consolidation_mode(pool: bool,
                                       pool=pool,
                                       with_replica_info=False)
             if svc is None:
+                # A raw service row without committed YAML is invisible to the
+                # latest-version join and its recovery script cannot possibly
+                # boot. Retire that script atomically instead of retrying an
+                # immortal partial registration forever.
+                raw_identity = serve_state.get_service_mode_and_hash(
+                    service_name)
+                if (raw_identity is not None and raw_identity[0] == pool and
+                        isinstance(raw_identity[1], str) and raw_identity[1]):
+                    retired = (
+                        serve_state.mark_unrecoverable_service_for_cleanup(
+                            service_name, raw_identity[1], pool))
+                    if retired:
+                        f.write(f'{capnoun} {service_name} has no committed '
+                                'version; retired its unusable recovery '
+                                'script and marked it for purge.\n')
                 continue
             controller_pid = svc['controller_pid']
             controller_ip = svc.get('controller_ip')
@@ -1984,16 +1999,27 @@ def _terminate_failed_services_locked(
     if owner is None or owner.get('hash') != expected_service_hash:
         return _purge_ownership_failure(service_name,
                                         'owner disappeared before teardown')
-    if (owner.get('controller_port') != constants.CONTROLLER_TEARDOWN_ACK_PORT
-            and serve_state.get_ha_recovery_script(service_name) is None):
-        # Legacy orphan/FAILED_CLEANUP rows may have no parent left to write
-        # the new acknowledgement. Absence of the recovery script is the
-        # durable proof that no controller can be (re)spawned for this row;
-        # claim it atomically before destructive work.
-        claimed = serve_state.claim_orphaned_service_teardown(
-            service_name, expected_service_hash, owner.get('controller_pid'),
-            owner.get('controller_ip'), os.getpid(), os.environ.get('POD_IP'))
-        if not claimed:
+    if owner.get('controller_port') != constants.CONTROLLER_TEARDOWN_ACK_PORT:
+        recovery_script = serve_state.get_ha_recovery_script(service_name)
+        if recovery_script is None:
+            # Legacy orphan/FAILED_CLEANUP rows may have no parent left to
+            # acknowledge teardown. Absence of the recovery script is durable
+            # proof that no controller can be (re)spawned for this row.
+            claimed = serve_state.claim_orphaned_service_teardown(
+                service_name, expected_service_hash,
+                owner.get('controller_pid'), owner.get('controller_ip'),
+                os.getpid(), os.environ.get('POD_IP'))
+        elif serve_state.get_latest_committed_version(service_name) is None:
+            # A partial-registration row may retain a script but no committed
+            # YAML. The script can never boot, so consume it atomically while
+            # taking teardown ownership rather than waiting forever.
+            claimed = serve_state.claim_unrecoverable_service_teardown(
+                service_name, expected_service_hash,
+                owner.get('controller_pid'), owner.get('controller_ip'),
+                os.getpid(), os.environ.get('POD_IP'))
+        else:
+            claimed = None
+        if claimed is False:
             return _purge_ownership_failure(
                 service_name, 'orphan teardown claim lost ownership')
 

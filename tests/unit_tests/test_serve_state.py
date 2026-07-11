@@ -754,6 +754,69 @@ class TestRecoveryVersionSelection:
         assert serve_state.get_latest_committed_version('svc') is None
 
 
+class TestUnrecoverableServiceCleanup:
+    """Rows without committed YAML must not wait on impossible recovery."""
+
+    def test_ha_retirement_marks_failed_and_removes_script(
+            self, _mock_serve_db):
+        _insert_orphan_service_row(_mock_serve_db, 'svc')
+        serve_state.set_ha_recovery_script('svc', 'unbootable script')
+
+        assert serve_state.mark_unrecoverable_service_for_cleanup('svc',
+                                                                  'orphan',
+                                                                  pool=False)
+        assert (_read_row(
+            _mock_serve_db,
+            'svc')['status'] == serve_state.ServiceStatus.FAILED_CLEANUP.value)
+        assert serve_state.get_ha_recovery_script('svc') is None
+
+    def test_purge_claim_consumes_unbootable_script(self, _mock_serve_db):
+        _insert_orphan_service_row(_mock_serve_db, 'svc')
+        assert serve_state.set_service_status_and_active_versions_if_hash(
+            'svc', 'orphan', serve_state.ServiceStatus.SHUTTING_DOWN)
+        serve_state.set_ha_recovery_script('svc', 'unbootable script')
+
+        assert serve_state.claim_unrecoverable_service_teardown(
+            'svc', 'orphan', 12345, None, 67890, '10.0.0.2')
+        row = _read_row(_mock_serve_db, 'svc')
+        assert row['controller_pid'] == 67890
+        assert row['controller_ip'] == '10.0.0.2'
+        assert (row['controller_port'] ==
+                serve_constants.CONTROLLER_TEARDOWN_ACK_PORT)
+        assert serve_state.get_ha_recovery_script('svc') is None
+
+    def test_committed_version_prevents_unrecoverable_claim(
+            self, _mock_serve_db):
+        assert _add_minimal_service('svc',
+                                    controller_pid=12345,
+                                    service_hash='incarnation-a')
+        assert serve_state.set_service_status_and_active_versions_if_hash(
+            'svc', 'incarnation-a', serve_state.ServiceStatus.SHUTTING_DOWN)
+        serve_state.set_ha_recovery_script('svc', 'bootable script')
+
+        assert not serve_state.claim_unrecoverable_service_teardown(
+            'svc', 'incarnation-a', 12345, None, 67890, '10.0.0.2')
+        assert serve_state.get_ha_recovery_script('svc') == 'bootable script'
+
+
+class TestTerminalServiceRejectsVersionWrites:
+
+    def test_down_winner_blocks_placeholder_and_yaml_commit(
+            self, _mock_serve_db):
+        assert _add_minimal_service('svc',
+                                    controller_pid=12345,
+                                    service_hash='incarnation-a')
+        assert serve_state.set_service_status_and_active_versions_if_hash(
+            'svc', 'incarnation-a', serve_state.ServiceStatus.SHUTTING_DOWN)
+
+        with pytest.raises(RuntimeError, match='terminal status'):
+            serve_state.add_version('svc')
+        assert not serve_state.add_or_update_version('svc', 2, 'spec-2',
+                                                     'yaml: v2')
+        assert serve_state.get_latest_version('svc') == 1
+        assert serve_state.get_yaml_content('svc', 1) == 'yaml: v1'
+
+
 class TestBatchReplicaUpsert:
     """add_or_update_replicas: one statement for a probe round's writes."""
 

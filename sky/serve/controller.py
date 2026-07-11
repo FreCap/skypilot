@@ -803,8 +803,14 @@ class SkyServeController:
                 with open(latest_task_yaml, 'r', encoding='utf-8') as f:
                     yaml_content = f.read()
                 service = serve.SkyServiceSpec.from_yaml_str(yaml_content)
-                serve_state.add_or_update_version(self._service_name, version,
-                                                  service, yaml_content)
+                committed = serve_state.add_or_update_version(
+                    self._service_name, version, service, yaml_content)
+                if not committed:
+                    return responses.JSONResponse(content={
+                        'message': 'Service entered terminal status before the '
+                                   'update could be committed.'
+                    },
+                                                  status_code=409)
                 logger.info(
                     f'Update to new version version {version}: {service}')
 

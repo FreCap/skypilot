@@ -1199,6 +1199,40 @@ class TestHaRecoverySkipsWhenStartInFlight:
             mock_runner_cls.return_value.run.assert_not_called()
 
 
+class TestHaRecoveryRetiresUnbootableRows:
+
+    def test_missing_committed_version_is_marked_for_purge(
+            self, tmp_path, monkeypatch):
+        monkeypatch.setenv('POD_IP', '10.4.0.1')
+        with mock.patch(
+                'sky.serve.serve_utils.serve_state.get_glob_service_names',
+                return_value=['svc']), \
+             mock.patch('sky.serve.serve_utils._get_service_status',
+                        return_value=None), \
+             mock.patch(
+                 'sky.serve.serve_utils.serve_state.get_service_mode_and_hash',
+                 return_value=(False, 'incarnation-a')), \
+             mock.patch(
+                 'sky.serve.serve_utils.serve_state.'
+                 'mark_unrecoverable_service_for_cleanup',
+                 return_value=True) as mark, \
+             mock.patch(
+                 'sky.serve.serve_utils.'
+                 '_snapshot_in_flight_start_service_names',
+                 return_value=set()), \
+             mock.patch(
+                 'sky.serve.serve_utils.command_runner.'
+                 'LocalProcessCommandRunner') as runner_cls, \
+             mock.patch(
+                 'sky.serve.serve_utils.skylet_constants.'
+                 'HA_PERSISTENT_RECOVERY_LOG_PATH',
+                 str(tmp_path / 'recovery_log_{}.log')):
+            serve_utils.ha_recovery_for_consolidation_mode(pool=False)
+
+        mark.assert_called_once_with('svc', 'incarnation-a', False)
+        runner_cls.return_value.run.assert_not_called()
+
+
 class TestHaRecoveryDefensiveOnAliveCheckException:
     """`ha_recovery_for_consolidation_mode` calls `_controller_process_alive`
     to decide whether to respawn the controller. If that call raises a
@@ -1680,6 +1714,9 @@ class TestTerminateFailedServices:
              mock.patch.object(serve_state,
                                'get_ha_recovery_script',
                                return_value='recovery command'), \
+             mock.patch.object(serve_state,
+                               'get_latest_committed_version',
+                               return_value=1), \
              mock.patch.object(serve_utils.time,
                                'time',
                                side_effect=[0, 11]), \
@@ -1752,6 +1789,66 @@ class TestTerminateFailedServices:
         assert message is None
         claim.assert_called_once_with('svc', 'incarnation-a', 101, '10.0.0.1',
                                       os.getpid(), os.environ.get('POD_IP'))
+
+    def test_orphan_with_unbootable_script_can_claim_teardown(self):
+        lifecycle_lock = mock.MagicMock()
+        old_owner = {
+            'hash': 'incarnation-a',
+            'controller_pid': 101,
+            'controller_ip': '10.0.0.1',
+            'controller_port': None,
+        }
+        claimed_owner = {
+            **old_owner,
+            'controller_pid': os.getpid(),
+            'controller_ip': os.environ.get('POD_IP'),
+            'controller_port': constants.CONTROLLER_TEARDOWN_ACK_PORT,
+        }
+        with mock.patch.object(serve_utils,
+                               'lifecycle_lock_is_valid',
+                               return_value=True), \
+             mock.patch.object(serve_state,
+                               'service_owner_matches',
+                               return_value=True), \
+             mock.patch.object(
+                 serve_state,
+                 'set_service_status_and_active_versions_if_hash',
+                 return_value=True), \
+             mock.patch.object(
+                 serve_state,
+                 'get_service_controller_owner',
+                 side_effect=[old_owner, claimed_owner]), \
+             mock.patch.object(serve_state,
+                               'get_ha_recovery_script',
+                               return_value='unbootable script'), \
+             mock.patch.object(serve_state,
+                               'get_latest_committed_version',
+                               return_value=None), \
+             mock.patch.object(
+                 serve_state,
+                 'claim_unrecoverable_service_teardown',
+                 return_value=True) as claim, \
+             mock.patch.object(serve_state,
+                               'claim_orphaned_service_teardown') as legacy, \
+             mock.patch.object(serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(serve_utils,
+                               'quarantine_service_directory',
+                               return_value=[]), \
+             mock.patch.object(serve_utils,
+                               'remove_quarantined_service_directory'), \
+             mock.patch.object(serve_state,
+                               'remove_service_completely',
+                               return_value=True), \
+             mock.patch('sky.serve.lb_k8s.delete_lb_objects'):
+            message = serve_utils._terminate_failed_services_locked(
+                'svc', 'incarnation-a', False, lifecycle_lock)
+
+        assert message is None
+        claim.assert_called_once_with('svc', 'incarnation-a', 101, '10.0.0.1',
+                                      os.getpid(), os.environ.get('POD_IP'))
+        legacy.assert_not_called()
 
 
 class TestHaRecoveryFencesOnLeadershipLoss:

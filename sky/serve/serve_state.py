@@ -241,6 +241,14 @@ def create_table(engine: sqlalchemy.engine.Engine):
 
 _db_manager = db_utils.DatabaseManager('serve/services', create_table)
 
+
+def _begin_immediate_if_sqlite(session: orm.Session,
+                               engine: sqlalchemy.engine.Engine) -> None:
+    """Make a SQLite read-then-write lifecycle check one writer transaction."""
+    if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
+        session.execute(sqlalchemy.text('BEGIN IMMEDIATE'))
+
+
 _UNIQUE_CONSTRAINT_FAILED_ERROR_MSGS = [
     # sqlite
     'UNIQUE constraint failed: services.name',
@@ -847,6 +855,77 @@ def claim_orphaned_service_teardown(service_name: str,
     return count > 0
 
 
+def claim_unrecoverable_service_teardown(service_name: str,
+                                         expected_service_hash: str,
+                                         expected_controller_pid: Optional[int],
+                                         expected_controller_ip: Optional[str],
+                                         controller_pid: int,
+                                         controller_ip: Optional[str]) -> bool:
+    """Claim a terminal service whose recovery script cannot boot.
+
+    A legacy partial-registration row can retain a recovery script without any
+    committed YAML version. Such a script can never acknowledge teardown.
+    Atomically prove that invariant, move ownership to the purge process, and
+    consume the unusable script so cleanup can make progress.
+    """
+    committed_version_exists = sqlalchemy.exists().where(
+        version_specs_table.c.service_name == service_name,
+        version_specs_table.c.yaml_content.isnot(None))
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        _begin_immediate_if_sqlite(session, engine)
+        count = session.query(services_table).filter(
+            services_table.c.name == service_name,
+            services_table.c.hash == expected_service_hash,
+            services_table.c.controller_pid == expected_controller_pid,
+            services_table.c.controller_ip == expected_controller_ip,
+            services_table.c.status == ServiceStatus.SHUTTING_DOWN.value,
+            ~committed_version_exists,
+        ).update({
+            services_table.c.controller_pid: controller_pid,
+            services_table.c.controller_ip: controller_ip,
+            services_table.c.controller_port:
+                constants.CONTROLLER_TEARDOWN_ACK_PORT,
+        })
+        if count == 0:
+            session.rollback()
+            return False
+        session.execute(
+            sqlalchemy.delete(serve_ha_recovery_script_table).where(
+                serve_ha_recovery_script_table.c.service_name == service_name))
+        session.commit()
+    return True
+
+
+def mark_unrecoverable_service_for_cleanup(service_name: str,
+                                           expected_service_hash: str,
+                                           pool: bool) -> bool:
+    """Retire an HA recovery script that has no committed YAML version."""
+    committed_version_exists = sqlalchemy.exists().where(
+        version_specs_table.c.service_name == service_name,
+        version_specs_table.c.yaml_content.isnot(None))
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        _begin_immediate_if_sqlite(session, engine)
+        count = session.query(services_table).filter(
+            services_table.c.name == service_name,
+            services_table.c.hash == expected_service_hash,
+            services_table.c.pool == int(pool),
+            services_table.c.status != ServiceStatus.SHUTTING_DOWN.value,
+            ~committed_version_exists,
+        ).update({
+            services_table.c.status: ServiceStatus.FAILED_CLEANUP.value,
+        })
+        if count == 0:
+            session.rollback()
+            return False
+        session.execute(
+            sqlalchemy.delete(serve_ha_recovery_script_table).where(
+                serve_ha_recovery_script_table.c.service_name == service_name))
+        session.commit()
+    return True
+
+
 def set_service_load_balancer_port_if_owner(
         service_name: str, expected_service_hash: Optional[str],
         controller_pid: int, controller_ip: Optional[str],
@@ -1265,10 +1344,32 @@ def get_replicas_at_status(
 
 
 # === Version functions ===
+def _lock_service_for_version_mutation(session: orm.Session,
+                                       service_name: str) -> bool:
+    """Lock the parent row and return whether version writes are allowed.
+
+    A missing parent is kept as a legacy/test-compatible case. Production
+    updates always have a service row; once that row is terminal, teardown has
+    won and no placeholder or YAML commit may be written behind it.
+    """
+    row = session.execute(
+        sqlalchemy.select(services_table.c.status).where(
+            services_table.c.name ==
+            service_name).with_for_update()).fetchone()
+    if row is None:
+        return True
+    return ServiceStatus[row[0]] not in ServiceStatus.terminal_statuses()
+
+
 def add_version(service_name: str) -> int:
     """Adds a version to the database."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
+        _begin_immediate_if_sqlite(session, engine)
+        if not _lock_service_for_version_mutation(session, service_name):
+            session.rollback()
+            raise RuntimeError(f'Service {service_name!r} entered terminal '
+                               'status before adding a version.')
         # Insert new version with MAX(version) + 1 in a single atomic operation
         max_version_subquery = sqlalchemy.select(
             sqlalchemy.func.coalesce(
@@ -1290,9 +1391,13 @@ def add_version(service_name: str) -> int:
 
 def add_or_update_version(service_name: str, version: int,
                           spec: 'service_spec.SkyServiceSpec',
-                          yaml_content: str) -> None:
+                          yaml_content: str) -> bool:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
+        _begin_immediate_if_sqlite(session, engine)
+        if not _lock_service_for_version_mutation(session, service_name):
+            session.rollback()
+            return False
         if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
             insert_func = sqlite.insert
         elif (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value
@@ -1316,6 +1421,7 @@ def add_or_update_version(service_name: str, version: int,
 
         session.execute(insert_stmt)
         session.commit()
+    return True
 
 
 def get_spec(service_name: str,

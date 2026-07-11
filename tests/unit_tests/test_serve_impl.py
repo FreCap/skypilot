@@ -133,7 +133,10 @@ class TestExternalCapabilityMutationPaths:
         legacy_config = mock.MagicMock()
         legacy_config.get_nested.side_effect = AssertionError(
             'legacy capability config read')
-        service_record = {'status': serve_state.ServiceStatus.READY}
+        service_record = {
+            'status': serve_state.ServiceStatus.READY,
+            'hash': 'incarnation-a',
+        }
         with mock.patch.object(impl.controller_utils,
                                'get_controller_for_pool'), \
              mock.patch.object(impl.backend_utils,
@@ -154,7 +157,9 @@ class TestExternalCapabilityMutationPaths:
                  '_require_supported_service_topology',
                  side_effect=RuntimeError('capability gate')) as preflight, \
              pytest.raises(RuntimeError, match='capability gate'):
-            impl._update_impl(task, 'svc')
+            impl._update_impl(task,
+                              'svc',
+                              lifecycle_lock=mock.sentinel.lifecycle_lock)
         legacy_config.get_nested.assert_not_called()
         preflight.assert_called_once_with(task, False)
 
