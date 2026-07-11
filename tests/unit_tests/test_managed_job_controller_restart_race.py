@@ -35,11 +35,15 @@ def _make_status_check_info():
     }
 
 
-def _make_job_status_check_state(schedule_state, pid=123, started_at=None):
+def _make_job_status_check_state(schedule_state,
+                                 pid=123,
+                                 started_at=None,
+                                 all_tasks_terminal=False):
     return {
         'schedule_state': schedule_state,
         'controller_pid': pid,
         'controller_pid_started_at': started_at,
+        'all_tasks_terminal': all_tasks_terminal,
     }
 
 
@@ -105,6 +109,52 @@ def test_marks_failed_controller_when_no_restart(monkeypatch):
 
     assert len(set_failed_calls) == 1, (
         'a genuinely dead controller (no restart) must still fail the job')
+    assert len(job_done_calls) == 1
+
+
+def test_terminal_job_preserves_status_when_controller_dies_during_cleanup(
+        monkeypatch):
+    """A terminal job should be finalized, not rewritten to FAILED_CONTROLLER.
+
+    Controllers can die during post-terminal cleanup (log streaming, teardown,
+    etc.). The refresh loop must preserve the already-terminal task outcome and
+    only finalize the scheduler state.
+    """
+    set_failed_calls, job_done_calls = [], []
+    _wire_dead_controller(monkeypatch,
+                          set_failed_calls,
+                          job_done_calls,
+                          fresh_state=_make_job_status_check_state(
+                              managed_job_state.ManagedJobScheduleState.ALIVE,
+                              all_tasks_terminal=True))
+    monkeypatch.setattr(
+        managed_job_state, 'get_managed_job_tasks', lambda job_id:
+        (_ for _ in
+         ()).throw(AssertionError('must stay on the slim recheck path')))
+    monkeypatch.setattr(utils, '_controller_is_restarting', lambda: False)
+    cleanup_reads = []
+
+    def _record_cluster_name(task_name, job_id):
+        cleanup_reads.append((task_name, job_id))
+        return f'{task_name}-{job_id}'
+
+    monkeypatch.setattr(utils, 'generate_managed_job_cluster_name',
+                        _record_cluster_name)
+    terminated_clusters = []
+
+    def _record_termination(cluster_name):
+        terminated_clusters.append(cluster_name)
+
+    monkeypatch.setattr(utils.global_user_state, 'get_handle_from_cluster_name',
+                        lambda name: object())
+    monkeypatch.setattr(utils, 'terminate_cluster', _record_termination)
+
+    utils.update_managed_jobs_statuses(job_id=1)
+
+    assert cleanup_reads == [('job', 1)]
+    assert terminated_clusters == ['job-1']
+    assert not set_failed_calls, (
+        'terminal task outcomes must survive controller death during cleanup')
     assert len(job_done_calls) == 1
 
 
