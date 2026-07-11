@@ -121,6 +121,7 @@ def _make_manager(service_name='svc', next_replica_id=1):
     mgr._launch_thread_pool = {}
     mgr._down_thread_pool = {}
     mgr._tick_version_spec_cache = {}
+    mgr._spot_placer = None
     return mgr
 
 
@@ -600,6 +601,61 @@ class TestScaleUpBatch:
                                side_effect=_record_launch(launched)):
             mgr.scale_up_batch([None, None])
         assert launched == [1, 3]
+
+    def test_spot_batch_reuses_one_replica_snapshot(self):
+        """K placer launches must scan/unpickle the N-row table once.
+
+        The shared list must also accumulate each newly enqueued replica so
+        later placements in the wave see the same in-wave load that the old
+        per-launch committed DB scans exposed.
+        """
+        mgr = _make_manager(next_replica_id=1)
+        mgr.lock = self._CountingLock()
+        mgr._spot_placer = mock.Mock()
+        mgr.yaml_content = 'dummy: yaml'
+        initial = [_fake_replica_info(40), _fake_replica_info(41)]
+        snapshots = []
+
+        def _launch(replica_id,
+                    _resources_override,
+                    existing_replica_infos=None):
+            assert existing_replica_infos is not None
+            snapshots.append(
+                (existing_replica_infos, len(existing_replica_infos)))
+            existing_replica_infos.append(_fake_replica_info(replica_id))
+            return True
+
+        with mock.patch(
+                'sky.serve.replica_managers.serve_state.'
+                'get_replica_info_from_id', return_value=None), \
+             mock.patch(
+                 'sky.serve.replica_managers.serve_state.get_replica_infos',
+                 return_value=list(initial)) as scan, \
+             mock.patch.object(mgr, '_launch_replica', side_effect=_launch):
+            mgr.scale_up_batch([{'use_spot': True}] * 3)
+
+        scan.assert_called_once_with('svc')
+        assert [size for _, size in snapshots] == [2, 3, 4]
+        assert all(snapshot is snapshots[0][0] for snapshot, _ in snapshots)
+
+    def test_on_demand_batch_does_not_add_replica_scan(self):
+        """Explicit on-demand pins do not ask the placer for a location."""
+        mgr = _make_manager(next_replica_id=1)
+        mgr.lock = self._CountingLock()
+        mgr._spot_placer = mock.Mock()
+        mgr.yaml_content = 'dummy: yaml'
+        launched = []
+        with mock.patch(
+                'sky.serve.replica_managers.serve_state.'
+                'get_replica_info_from_id', return_value=None), \
+             mock.patch(
+                 'sky.serve.replica_managers.serve_state.get_replica_infos'
+             ) as scan, \
+             mock.patch.object(mgr, '_launch_replica',
+                               side_effect=_record_launch(launched)):
+            mgr.scale_up_batch([{'use_spot': False}] * 3)
+        assert launched == [1, 2, 3]
+        scan.assert_not_called()
 
 
 class TestLaunchReplicaSnapshotAccumulation:

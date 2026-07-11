@@ -1635,16 +1635,15 @@ def _get_request_parallelism(pool: bool) -> int:
 def in_flight_launch_count() -> float:
     """Launch-budget occupancy: provisioning + terminating / SERVE_LAUNCH_RATIO.
 
-    NOTE: this scans the whole replica table twice and unpickles every row
+    NOTE: this scans the whole replica table once and unpickles every row
     (O(N)). Callers that evaluate the launch budget for many replicas in a
     single pass (e.g. ``ReplicaManager._refresh_thread_pool``) MUST compute this
     once and track the delta locally -- passing it as ``in_flight`` to
     ``can_provision``/``can_terminate`` -- rather than calling those per
     replica, otherwise the cost is O(K*N) pickle.loads per refresh tick.
     """
-    return (
-        serve_state.total_number_provisioning_replicas() +
-        serve_state.total_number_terminating_replicas() / SERVE_LAUNCH_RATIO)
+    provisioning, terminating = serve_state.get_replica_launch_budget_counts()
+    return provisioning + terminating / SERVE_LAUNCH_RATIO
 
 
 def can_provision(pool: bool, in_flight: Optional[float] = None) -> bool:
