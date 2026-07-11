@@ -230,7 +230,7 @@ def _service_test_request_command(endpoint: str) -> str:
 def _external_service_endpoint_url(
         service_name: str,
         resource_scope: Optional[str] = None) -> Optional[str]:
-    """Return the HTTP-only in-cluster LB endpoint, or None if unavailable."""
+    """Return the HTTP-only provider LB endpoint, or None if unavailable."""
     if resource_scope is None:
         # Preserve the legacy call shape for NULL-scope rows and embedders
         # whose endpoint hook predates incarnation-scoped LB names.

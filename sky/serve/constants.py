@@ -49,8 +49,10 @@ CONTROLLER_SETUP_TIMEOUT_SECONDS = 300
 # Time to wait for controller + external-LB registration. The LB image may need
 # a cold pull and must pass its sync-backed readiness probe before ``serve up``
 # can truthfully publish the endpoint.
-SERVICE_REGISTER_TIMEOUT_SECONDS = 180
+SERVICE_REGISTER_TIMEOUT_SECONDS = 420
 LB_DEPLOYMENT_READY_TIMEOUT_SECONDS = 120
+LB_SERVICE_ENDPOINT_READY_TIMEOUT_SECONDS = 240
+LB_SERVICE_ENDPOINT_READY_POLL_SECONDS = 1
 LB_DEPLOYMENT_READY_POLL_SECONDS = 1
 
 # Legacy env var holding one controller-admin bearer token. New deployments

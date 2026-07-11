@@ -868,10 +868,7 @@
                                     }
                                 },
                                 "lbDataPlane": {
-                                    "type": [
-                                        "object",
-                                        "null"
-                                    ],
+                                    "type": "object",
                                     "properties": {
                                         "existingSecret": {
                                             "type": "string"

@@ -19,6 +19,9 @@
 {{- fail "serve.externalLoadBalancer.auth.lbDataPlane.existingSecret and serve.externalLoadBalancer.auth.lbDataPlane.key must either both be set or both be empty when serve.externalLoadBalancer.enabled=true" -}}
 {{- end -}}
 {{- $lbDataPlaneAuthEnabled := and $externalLBEnabled (not (empty $lbDataPlaneSecret)) (not (empty $lbDataPlaneKey)) -}}
+{{- if and $externalLBEnabled (not (empty $lbSyncSecret)) (not (empty $lbSyncKey)) (not (empty $controllerAdminSecret)) (not (empty $controllerAdminKey)) (not $lbDataPlaneAuthEnabled) -}}
+{{- fail "serve.externalLoadBalancer.auth.lbDataPlane is required when serve.externalLoadBalancer.enabled=true" -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:

@@ -82,11 +82,13 @@ tests:
       serve.externalLoadBalancer.auth.lbSync.key: sync-tokens
       serve.externalLoadBalancer.auth.controllerAdmin.existingSecret: shared-auth
       serve.externalLoadBalancer.auth.controllerAdmin.key: admin-tokens
+      serve.externalLoadBalancer.auth.lbDataPlane.existingSecret: data-auth
+      serve.externalLoadBalancer.auth.lbDataPlane.key: data-tokens
     asserts:
       - isKind:
           of: Deployment
 
-  - it: should render with data-plane auth disabled when both references are empty
+  - it: should require data-plane auth
     set:
       serve.externalLoadBalancer.enabled: true
       serve.externalLoadBalancer.auth.lbSync.existingSecret: serve-lb-sync
@@ -94,23 +96,8 @@ tests:
       serve.externalLoadBalancer.auth.controllerAdmin.existingSecret: serve-controller-admin
       serve.externalLoadBalancer.auth.controllerAdmin.key: tokens
     asserts:
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: SKYPILOT_SERVE_LB_DATA_PLANE_AUTH_ENABLED
-            value: "false"
-      - notContains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: SKYPILOT_SERVE_LB_AUTH_TOKENS_FILE
-      - notContains:
-          path: spec.template.spec.containers[0].volumeMounts
-          content:
-            name: skypilot-serve-lb-auth
-      - notContains:
-          path: spec.template.spec.volumes
-          content:
-            name: skypilot-serve-lb-auth
+      - failedTemplate:
+          errorMessage: "serve.externalLoadBalancer.auth.lbDataPlane is required when serve.externalLoadBalancer.enabled=true"
 
   - it: should reject a data-plane Secret name without a key
     set:
@@ -136,7 +123,7 @@ tests:
       - failedTemplate:
           errorMessage: "serve.externalLoadBalancer.auth.lbDataPlane.existingSecret and serve.externalLoadBalancer.auth.lbDataPlane.key must either both be set or both be empty when serve.externalLoadBalancer.enabled=true"
 
-  - it: should treat a null data-plane auth subtree as disabled
+  - it: should reject a null data-plane auth subtree
     set:
       serve.externalLoadBalancer.enabled: true
       serve.externalLoadBalancer.auth.lbSync.existingSecret: serve-lb-sync
@@ -145,15 +132,8 @@ tests:
       serve.externalLoadBalancer.auth.controllerAdmin.key: tokens
       serve.externalLoadBalancer.auth.lbDataPlane: null
     asserts:
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: SKYPILOT_SERVE_LB_DATA_PLANE_AUTH_ENABLED
-            value: "false"
-      - notContains:
-          path: spec.template.spec.volumes
-          content:
-            name: skypilot-serve-lb-auth
+      - failedTemplate:
+          errorMessage: "serve.externalLoadBalancer.auth.lbDataPlane is required when serve.externalLoadBalancer.enabled=true"
 
   - it: should fail with the mandatory-ring error when auth is null
     set:
@@ -274,6 +254,8 @@ tests:
       serve.externalLoadBalancer.auth.lbSync.key: sync-tokens
       serve.externalLoadBalancer.auth.controllerAdmin.existingSecret: serve-controller-admin
       serve.externalLoadBalancer.auth.controllerAdmin.key: admin-tokens
+      serve.externalLoadBalancer.auth.lbDataPlane.existingSecret: serve-lb-data-plane
+      serve.externalLoadBalancer.auth.lbDataPlane.key: data-tokens
     asserts:
       - contains:
           path: spec.template.spec.containers[0].env
