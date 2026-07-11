@@ -707,12 +707,10 @@ class TestJobGroupRecovery:
 class TestTaskCleanup:
     """Tests for file mount cleanup in ControllerManager._cleanup().
 
-    The cleanup code in task_cleanup() deletes local file mounts after a
-    managed job completes. This includes two-hop file mounts under
-    ~/.sky/tmp/controller/{run_id}/. Cloud URL file mounts are skipped.
-
-    Previously, cleanup was incorrectly skipped in consolidation mode,
-    causing ~/.sky/tmp/controller/ to grow unbounded.
+    In non-consolidation mode, task_cleanup() deletes two-hop local file
+    mounts under ~/.sky/tmp/controller/{run_id}/ after a managed job
+    completes. Cloud URL file mounts are skipped. Consolidated jobs reuse
+    API-server-managed blobs and intentionally keep those shared mounts.
     """
 
     @pytest.fixture
@@ -735,6 +733,8 @@ class TestTaskCleanup:
             'status': patch('sky.core.status', return_value=[]),
             'backend': patch('sky.backends.cloud_vm_ray_backend.'
                              'CloudVmRayBackend'),
+            'consolidation': patch('sky.jobs.utils.is_consolidation_mode',
+                                   return_value=False),
         }
         mocks = {}
         for name, p in patches.items():
@@ -746,6 +746,7 @@ class TestTaskCleanup:
     def _make_task(self, file_mounts=None):
         task = MagicMock()
         task.name = 'test-task'
+        task.metadata = {}
         task.file_mounts = file_mounts
         task.storage_mounts = {}
         return task
