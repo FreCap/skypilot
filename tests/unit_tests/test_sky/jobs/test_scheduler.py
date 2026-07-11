@@ -19,6 +19,24 @@ def _record(pid: int, started_at: float = 0.0):
 
 class TestKillLocalConsolidationControllers:
 
+    def test_pid_reader_ignores_legacy_and_malformed_entries(
+            self, monkeypatch, tmp_path):
+        pid_file = tmp_path / 'job_controller_pid'
+        pid_file.write_text('\n'.join([
+            '101,1700000000.0',
+            '202',
+            'bad,1700000001.0',
+            '303,not-a-float',
+            '404,1700000002.5',
+        ]),
+                            encoding='utf-8')
+        monkeypatch.setattr(scheduler, 'JOB_CONTROLLER_PID_PATH', str(pid_file))
+
+        assert scheduler.get_controller_process_records() == [
+            _record(101, 1700000000.0),
+            _record(404, 1700000002.5),
+        ]
+
     def test_no_pid_file_returns_zero(self):
         with mock.patch.object(scheduler,
                                'get_controller_process_records',

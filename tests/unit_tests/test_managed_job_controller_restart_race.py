@@ -67,8 +67,7 @@ def _wire_dead_controller(monkeypatch,
             managed_job_state.ManagedJobScheduleState.ALIVE)
     monkeypatch.setattr(managed_job_state, 'get_job_status_check_state',
                         lambda job_id: fresh_state)
-    monkeypatch.setattr(utils, 'controller_process_alive',
-                        lambda record, job_id: False)
+    monkeypatch.setattr(utils, 'controller_process_alive', lambda record: False)
     monkeypatch.setattr(utils.global_user_state, 'get_handle_from_cluster_name',
                         lambda name: None)
     monkeypatch.setattr(managed_job_state, 'set_failed',
@@ -259,8 +258,7 @@ def test_cleanup_uses_task_name_identity_for_multi_task_jobs(monkeypatch):
             'task_name': 'transform',
             'pool': None,
         }])
-    monkeypatch.setattr(utils, 'controller_process_alive',
-                        lambda record, job_id: False)
+    monkeypatch.setattr(utils, 'controller_process_alive', lambda record: False)
     monkeypatch.setattr(utils, '_controller_is_restarting', lambda: False)
     seen_task_names = []
     monkeypatch.setattr(
