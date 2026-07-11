@@ -754,7 +754,12 @@ class TestClaimLifecycle:
         # entitlement until the TTL expires.
         _upsert('svc-a')
         _upsert('svc-b')
-        serve_state.remove_service_completely('svc-a')
+        engine = serve_state._db_manager.get_engine()
+        with orm.Session(engine) as session:
+            session.execute(serve_state.services_table.insert().values(
+                name='svc-a', hash='incarnation-a'))
+            session.commit()
+        assert serve_state.remove_service_completely('svc-a', 'incarnation-a')
         live = {
             row['service_name']
             for row in serve_state.get_reserved_fill_claims(pool_key=_POOL)

@@ -31,7 +31,7 @@ import os
 import re
 import sys
 import time
-from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set, Tuple
 import urllib.parse
 
 from sky import sky_logging
@@ -74,6 +74,9 @@ _HASH_LEN = 8
 # the pod terminates -- no traffic to a pod that is going away.
 _LB_HEALTH_PATH = constants.LB_HEALTH_ENDPOINT_PATH
 _LB_TERMINATION_MARGIN_SECONDS = 30
+_LB_OBJECT_DELETION_TIMEOUT_SECONDS = 60
+_LB_OBJECT_RECONCILIATION_TIMEOUT_SECONDS = 60
+_LB_OBJECT_RECONCILIATION_POLL_SECONDS = 0.2
 
 # Stable projected-volume names rendered by the Helm chart. The LB receives
 # only the sync and data-plane rings; the controller-admin ring must never be
@@ -1047,11 +1050,18 @@ def _lb_deployment_is_ready(deployment) -> bool:
             available >= desired and unavailable == 0)
 
 
-def _wait_for_lb_deployment_ready(context: str, namespace: str,
-                                  deployment_name: str) -> None:
+def _wait_for_lb_deployment_ready(
+        context: str,
+        namespace: str,
+        deployment_name: str,
+        continue_guard: Optional[Callable[[], bool]] = None) -> None:
     """Wait until the desired LB rollout has an available updated Pod."""
     deadline = time.monotonic() + constants.LB_DEPLOYMENT_READY_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
+        if continue_guard is not None and not continue_guard():
+            raise RuntimeError(
+                f'Lost service ownership while waiting for LB Deployment '
+                f'{deployment_name!r}.')
         deployment = kubernetes.apps_api(context).read_namespaced_deployment(
             deployment_name, namespace)
         if _lb_deployment_is_ready(deployment):
@@ -1065,9 +1075,11 @@ def _wait_for_lb_deployment_ready(context: str, namespace: str,
         'the LB Pod logs.')
 
 
-def create_lb_deployment_and_service(service_name: str,
-                                     termination_grace_period_seconds: int,
-                                     service_hash: str) -> None:
+def create_lb_deployment_and_service(
+        service_name: str,
+        termination_grace_period_seconds: int,
+        service_hash: str,
+        continue_guard: Optional[Callable[[], bool]] = None) -> None:
     """Create the per-service LB Deployment + Service (idempotent).
 
     New objects are created with the stable Helm API Deployment as their
@@ -1080,6 +1092,12 @@ def create_lb_deployment_and_service(service_name: str,
         return
     if not service_hash:
         raise RuntimeError('External load balancer requires a service hash.')
+
+    def _assert_continues(phase: str) -> None:
+        if continue_guard is not None and not continue_guard():
+            raise RuntimeError(f'Lost service ownership before {phase} for '
+                               f'{service_name!r}; aborting LB reconciliation.')
+
     context = kubernetes.in_cluster_context_name()
     namespace = get_lb_namespace()
     deployment_name = lb_deployment_name(service_name)
@@ -1104,66 +1122,129 @@ def create_lb_deployment_and_service(service_name: str,
                                        deployment_name, service_hash,
                                        owner_reference)
 
-    try:
-        kubernetes.apps_api(context).create_namespaced_deployment(
-            namespace, deployment_dict)
-    except kubernetes.api_exception() as e:
-        if getattr(e, 'status', None) != 409:
-            raise
-        # Already exists: patch it to the desired spec so image/arg bumps (e.g.
-        # a service update or a controller image roll) actually roll out. The
-        # RollingUpdate strategy keeps the old LB pod serving until the new one
-        # is Ready.
+    deployment_patch = deployment_dict
+    if not data_plane_auth_enabled:
+        # Strategic-merge omission does not delete named list entries.
+        # Explicitly remove projections left by a prior auth-enabled
+        # Deployment while keeping the create body valid Kubernetes.
+        deployment_patch = copy.deepcopy(deployment_dict)
+        container = deployment_patch['spec']['template']['spec']['containers'][
+            0]
+        container['env'].append({
+            'name': constants.LB_AUTH_TOKENS_FILE_ENV_VAR,
+            '$patch': 'delete',
+        })
+        container['volumeMounts'].append({
+            # volumeMounts uses mountPath (not name) as its strategic merge
+            # key. Omitting it makes the API reject the patch.
+            'mountPath': _LB_DATA_PLANE_AUTH_MOUNT_PATH,
+            '$patch': 'delete',
+        })
+        deployment_patch['spec']['template']['spec']['volumes'].append({
+            'name': LB_DATA_PLANE_AUTH_VOLUME_NAME,
+            '$patch': 'delete',
+        })
+
+    def _retry_reconciliation_or_raise(kind: str, name: str, deadline: float,
+                                       error: Exception) -> None:
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f'LB {kind} {name!r} stayed terminating or disappearing '
+                'during reconciliation.') from error
+        time.sleep(_LB_OBJECT_RECONCILIATION_POLL_SECONDS)
+
+    apps_api = kubernetes.apps_api(context)
+    deployment_deadline = (time.monotonic() +
+                           _LB_OBJECT_RECONCILIATION_TIMEOUT_SECONDS)
+    while True:
+        _assert_continues('creating the LB Deployment')
+        try:
+            apps_api.create_namespaced_deployment(namespace, deployment_dict)
+            break
+        except kubernetes.api_exception() as e:
+            if getattr(e, 'status', None) != 409:
+                raise
+        # The orphan reaper can win after our create gets 409 but before this
+        # patch. A 404 means retry CREATE. A 409 means the old UID is commonly
+        # still terminating and cannot be patched; wait for it to disappear
+        # instead of failing same-name up.
         logger.debug(f'LB Deployment {deployment_name} already exists; '
                      'patching it to the desired spec.')
-        existing_deployment = kubernetes.apps_api(
-            context).read_namespaced_deployment(deployment_name, namespace)
-        _adopt_existing_lb_object(
-            context, namespace, deployment_name, existing_deployment,
-            owner_reference,
-            kubernetes.apps_api(context).patch_namespaced_deployment)
-        deployment_patch = copy.deepcopy(deployment_dict)
-        # Owner adoption is deliberately a separate metadata-only JSON Patch.
-        # Do not couple ownership to this desired-spec reconciliation, which
-        # may legitimately roll the LB for an image or auth contract change.
-        deployment_patch['metadata'].pop('ownerReferences', None)
-        if not data_plane_auth_enabled:
-            # Strategic-merge omission does not delete named list entries.
-            # Explicitly remove projections left by a prior auth-enabled
-            # Deployment while keeping the create body valid Kubernetes.
-            container = deployment_patch['spec']['template']['spec'][
-                'containers'][0]
-            container['env'].append({
-                'name': constants.LB_AUTH_TOKENS_FILE_ENV_VAR,
-                '$patch': 'delete',
-            })
-            container['volumeMounts'].append({
-                # volumeMounts uses mountPath (not name) as its strategic
-                # merge key. Omitting it makes the API reject the patch.
-                'mountPath': _LB_DATA_PLANE_AUTH_MOUNT_PATH,
-                '$patch': 'delete',
-            })
-            deployment_patch['spec']['template']['spec']['volumes'].append({
-                'name': LB_DATA_PLANE_AUTH_VOLUME_NAME,
-                '$patch': 'delete',
-            })
-        kubernetes.apps_api(context).patch_namespaced_deployment(
-            deployment_name, namespace, deployment_patch)
+        _assert_continues('patching the LB Deployment')
+        try:
+            existing_deployment = apps_api.read_namespaced_deployment(
+                deployment_name, namespace)
+            metadata = (existing_deployment.get('metadata', {})
+                        if isinstance(existing_deployment, dict) else getattr(
+                            existing_deployment, 'metadata', None))
+            deletion_timestamp = (metadata.get('deletionTimestamp')
+                                  if isinstance(metadata, dict) else getattr(
+                                      metadata, 'deletion_timestamp', None))
+            if deletion_timestamp is not None:
+                _retry_reconciliation_or_raise(
+                    'Deployment', deployment_name, deployment_deadline,
+                    RuntimeError('existing Deployment is terminating'))
+                continue
+            _adopt_existing_lb_object(context, namespace, deployment_name,
+                                      existing_deployment, owner_reference,
+                                      apps_api.patch_namespaced_deployment)
+            # Ownership is reconciled separately with a resourceVersion-guarded
+            # metadata-only JSON Patch. Exclude it from the workload patch so
+            # normal image/auth reconciliation cannot accidentally overwrite a
+            # concurrent release's owner metadata.
+            desired_patch = copy.deepcopy(deployment_patch)
+            desired_patch['metadata'].pop('ownerReferences', None)
+            apps_api.patch_namespaced_deployment(deployment_name, namespace,
+                                                 desired_patch)
+            break
+        except kubernetes.api_exception() as e:
+            if getattr(e, 'status', None) not in (404, 409):
+                raise
+            _retry_reconciliation_or_raise('Deployment', deployment_name,
+                                           deployment_deadline, e)
     service_existed = False
     service_was_fenced = False
-    try:
-        kubernetes.core_api(context).create_namespaced_service(
-            namespace, service_dict)
-    except kubernetes.api_exception() as e:
-        if getattr(e, 'status', None) != 409:
-            raise
-        service_existed = True
-        existing_service = kubernetes.core_api(context).read_namespaced_service(
-            service_name_k8s, namespace)
-        _adopt_existing_lb_object(
-            context, namespace, service_name_k8s, existing_service,
-            owner_reference,
-            kubernetes.core_api(context).patch_namespaced_service)
+    core_api = kubernetes.core_api(context)
+    service_deadline = (time.monotonic() +
+                        _LB_OBJECT_RECONCILIATION_TIMEOUT_SECONDS)
+    while True:
+        _assert_continues('creating the LB Service')
+        try:
+            core_api.create_namespaced_service(namespace, service_dict)
+            break
+        except kubernetes.api_exception() as e:
+            if getattr(e, 'status', None) != 409:
+                raise
+        try:
+            existing_service = core_api.read_namespaced_service(
+                service_name_k8s, namespace)
+        except kubernetes.api_exception() as e:
+            if getattr(e, 'status', None) != 404:
+                raise
+            _retry_reconciliation_or_raise('Service', service_name_k8s,
+                                           service_deadline, e)
+            continue
+        metadata = (existing_service.get('metadata', {})
+                    if isinstance(existing_service, dict) else getattr(
+                        existing_service, 'metadata', None))
+        deletion_timestamp = (metadata.get('deletionTimestamp') if isinstance(
+            metadata, dict) else getattr(metadata, 'deletion_timestamp', None))
+        if deletion_timestamp is not None:
+            _retry_reconciliation_or_raise(
+                'Service', service_name_k8s, service_deadline,
+                RuntimeError('existing Service is terminating'))
+            continue
+        _assert_continues('adopting the LB Service')
+        try:
+            _adopt_existing_lb_object(context, namespace, service_name_k8s,
+                                      existing_service, owner_reference,
+                                      core_api.patch_namespaced_service)
+        except kubernetes.api_exception() as e:
+            if getattr(e, 'status', None) not in (404, 409):
+                raise
+            _retry_reconciliation_or_raise('Service', service_name_k8s,
+                                           service_deadline, e)
+            continue
         if isinstance(existing_service, dict):
             existing_selector = existing_service.get('spec', {}).get(
                 'selector', {}) or {}
@@ -1174,38 +1255,77 @@ def create_lb_deployment_and_service(service_name: str,
                 existing_selector.get(SERVICE_HASH_LABEL_KEY) != service_hash):
             # Same-name recreation must fail closed immediately: withdraw old
             # incarnation endpoints while the new LB rolls out.
-            kubernetes.core_api(context).patch_namespaced_service(
-                service_name_k8s, namespace, {
-                    'metadata': {
-                        'labels': service_dict['metadata']['labels']
-                    },
-                    'spec': {
-                        'selector': service_dict['spec']['selector'],
-                    },
-                })
+            _assert_continues('fencing the old LB Service')
+            try:
+                core_api.patch_namespaced_service(
+                    service_name_k8s, namespace, {
+                        'metadata': {
+                            'labels': service_dict['metadata']['labels']
+                        },
+                        'spec': {
+                            'selector': service_dict['spec']['selector'],
+                        },
+                    })
+            except kubernetes.api_exception() as e:
+                if getattr(e, 'status', None) not in (404, 409):
+                    raise
+                _retry_reconciliation_or_raise('Service', service_name_k8s,
+                                               service_deadline, e)
+                continue
             service_was_fenced = True
+        service_existed = True
+        break
 
     # Object existence is not endpoint readiness. Do not let service.py publish
     # load_balancer_port (which unblocks `sky serve up`) until the desired
     # rollout has an updated Pod that passed the LB's sync-backed readiness
     # probe. Bad image/Secret/runtime contracts now fail startup visibly rather
     # than advertising a dead endpoint.
-    _wait_for_lb_deployment_ready(context, namespace, deployment_name)
+    _wait_for_lb_deployment_ready(context,
+                                  namespace,
+                                  deployment_name,
+                                  continue_guard=continue_guard)
     if service_existed:
         logger.debug(f'LB Service {service_name_k8s} already exists; '
                      f'reconciling it after the desired rollout is ready '
                      f'(fenced={service_was_fenced}).')
         # Patch only mutable fields, preserving the allocated ClusterIP.
-        kubernetes.core_api(context).patch_namespaced_service(
-            service_name_k8s, namespace, {
-                'metadata': {
-                    'labels': service_dict['metadata']['labels']
-                },
-                'spec': {
-                    'selector': service_dict['spec']['selector'],
-                    'ports': service_dict['spec']['ports'],
-                },
-            })
+        final_deadline = (time.monotonic() +
+                          _LB_OBJECT_RECONCILIATION_TIMEOUT_SECONDS)
+        while True:
+            _assert_continues('finalizing the LB Service')
+            try:
+                core_api.patch_namespaced_service(
+                    service_name_k8s, namespace, {
+                        'metadata': {
+                            'labels': service_dict['metadata']['labels']
+                        },
+                        'spec': {
+                            'selector': service_dict['spec']['selector'],
+                            'ports': service_dict['spec']['ports'],
+                        },
+                    })
+                break
+            except kubernetes.api_exception() as e:
+                status = getattr(e, 'status', None)
+                if status not in (404, 409):
+                    raise
+                if status == 404:
+                    # Reaper deletion won after readiness. Recreate the
+                    # mutable Service; the Deployment is already Ready. A 409
+                    # here means the terminating old UID is still present, so
+                    # fall back to the bounded patch/create loop.
+                    try:
+                        _assert_continues('recreating the LB Service')
+                        core_api.create_namespaced_service(
+                            namespace, service_dict)
+                        break
+                    except kubernetes.api_exception() as create_error:
+                        if getattr(create_error, 'status', None) != 409:
+                            raise
+                        e = create_error
+                _retry_reconciliation_or_raise('Service', service_name_k8s,
+                                               final_deadline, e)
 
 
 def ensure_lb_objects_exist(service_name: str,
@@ -1309,9 +1429,15 @@ def ensure_lb_objects_exist(service_name: str,
                    f'hash_drifted={hash_drifted}, '
                    f'routing_drifted={routing_drifted}); applying desired '
                    'state.')
+
+    def _still_owns() -> bool:
+        return serve_state.service_owner_matches(service_name, service_hash,
+                                                 (os.getpid(), controller_ip))
+
     create_lb_deployment_and_service(service_name,
                                      termination_grace_period_seconds,
-                                     service_hash)
+                                     service_hash,
+                                     continue_guard=_still_owns)
     return True
 
 
@@ -1439,15 +1565,90 @@ def stream_lb_logs(service_name: str, follow: bool, tail: Optional[int]) -> str:
     return ''
 
 
-def delete_lb_objects(service_name: str) -> None:
-    """Delete the per-service LB Deployment + Service (idempotent).
+def _lb_object_metadata_value(obj: Any, field: str) -> Any:
+    """Read one Kubernetes metadata field from a model or dict."""
+    if isinstance(obj, dict):
+        return (obj.get('metadata') or {}).get(field)
+    metadata = getattr(obj, 'metadata', None)
+    attr = 'resource_version' if field == 'resourceVersion' else field
+    return getattr(metadata, attr, None)
+
+
+def _delete_lb_object_if_owned(read_fn, delete_fn, name: str, namespace: str,
+                               expected_service_hash: str, kind: str) -> None:
+    """GET then UID/resourceVersion-precondition DELETE one owned object."""
+    try:
+        obj = read_fn(name, namespace)
+    except kubernetes.api_exception() as e:
+        if getattr(e, 'status', None) == 404:
+            logger.debug(f'LB {kind} {name} already deleted.')
+            return
+        raise
+    labels = _lb_object_metadata_value(obj, 'labels') or {}
+    actual_hash = labels.get(SERVICE_HASH_LABEL_KEY)
+    if actual_hash != expected_service_hash:
+        raise RuntimeError(
+            f'Refusing to delete LB {kind} {name!r}: expected incarnation '
+            f'{expected_service_hash!r}, found {actual_hash!r}.')
+    uid = _lb_object_metadata_value(obj, 'uid')
+    resource_version = _lb_object_metadata_value(obj, 'resourceVersion')
+    if not uid or not resource_version:
+        raise RuntimeError(
+            f'Refusing to delete LB {kind} {name!r} without Kubernetes UID '
+            'and resourceVersion preconditions.')
+    body = {
+        'apiVersion': 'v1',
+        'kind': 'DeleteOptions',
+        'preconditions': {
+            'uid': str(uid),
+            'resourceVersion': str(resource_version),
+        },
+    }
+    try:
+        delete_fn(name, namespace, body=body)
+    except kubernetes.api_exception() as e:
+        if getattr(e, 'status', None) != 404:
+            raise
+        logger.debug(f'LB {kind} {name} already deleted.')
+        return
+
+    # Kubernetes DELETE success means accepted, not necessarily disappeared.
+    # Keep the service DB row (and therefore the same-name up guard) until the
+    # exact UID is gone; otherwise a successor can 409 against a terminating
+    # object and accidentally adopt or patch the old incarnation.
+    deadline = time.time() + _LB_OBJECT_DELETION_TIMEOUT_SECONDS
+    while True:
+        try:
+            remaining = read_fn(name, namespace)
+        except kubernetes.api_exception() as e:
+            if getattr(e, 'status', None) == 404:
+                return
+            raise
+        remaining_uid = _lb_object_metadata_value(remaining, 'uid')
+        if remaining_uid != uid:
+            raise RuntimeError(
+                f'LB {kind} {name!r} was replaced while waiting for exact '
+                f'UID {uid!r} to disappear (found {remaining_uid!r}).')
+        if time.time() >= deadline:
+            raise TimeoutError(
+                f'Timed out waiting for LB {kind} {name!r} UID {uid!r} to '
+                'be deleted.')
+        time.sleep(0.2)
+
+
+def delete_lb_objects(service_name: str, expected_service_hash: str) -> None:
+    """Delete one incarnation's LB objects with Kubernetes preconditions.
 
     No-op outside in-cluster mode. Cleanup deliberately does not consult the
     feature flag, so a process that retains in-cluster credentials can remove
     residual objects after a configuration change. The Helm contract still
     requires all services to be downed before disabling the capability. A 404
-    (already gone) is ignored.
+    (already gone) is ignored. A hash mismatch, missing object identity, or
+    UID/resourceVersion conflict fails closed so a delayed A teardown cannot
+    delete replacement B's same-name objects.
     """
+    if not expected_service_hash:
+        raise ValueError('LB deletion requires an expected service hash.')
     if not kubernetes_utils.is_incluster_config_available():
         return
     context = kubernetes.in_cluster_context_name()
@@ -1461,21 +1662,21 @@ def delete_lb_objects(service_name: str) -> None:
     # Remove the Service first. Once this succeeds, no new inference request
     # can reach cached replica routes while controller/replica teardown runs.
     try:
-        kubernetes.core_api(context).delete_namespaced_service(
-            service_name_k8s, namespace)
-    except kubernetes.api_exception() as e:
-        if getattr(e, 'status', None) != 404:
-            errors.append(e)
-        else:
-            logger.debug(f'LB Service {service_name_k8s} already deleted.')
+        core_api = kubernetes.core_api(context)
+        _delete_lb_object_if_owned(core_api.read_namespaced_service,
+                                   core_api.delete_namespaced_service,
+                                   service_name_k8s, namespace,
+                                   expected_service_hash, 'Service')
+    except Exception as e:  # pylint: disable=broad-except
+        errors.append(e)
     try:
-        kubernetes.apps_api(context).delete_namespaced_deployment(
-            deployment_name, namespace)
-    except kubernetes.api_exception() as e:
-        if getattr(e, 'status', None) != 404:
-            errors.append(e)
-        else:
-            logger.debug(f'LB Deployment {deployment_name} already deleted.')
+        apps_api = kubernetes.apps_api(context)
+        _delete_lb_object_if_owned(apps_api.read_namespaced_deployment,
+                                   apps_api.delete_namespaced_deployment,
+                                   deployment_name, namespace,
+                                   expected_service_hash, 'Deployment')
+    except Exception as e:  # pylint: disable=broad-except
+        errors.append(e)
     if errors:
         raise errors[0]
 
@@ -1512,15 +1713,19 @@ def reconcile_lb_objects(live_service_names: Set[str]) -> None:
     for lb_object in list(deployments.items) + list(services.items):
         labels = lb_object.metadata.labels or {}
         owning_service = labels.get(SERVE_LB_LABEL_KEY)
-        if owning_service is not None:
-            owning_services.add(owning_service)
+        service_hash = labels.get(SERVICE_HASH_LABEL_KEY)
+        if owning_service is not None and service_hash:
+            owning_services.add((owning_service, service_hash))
+        elif owning_service is not None:
+            logger.warning(f'Refusing to reap legacy LB objects for '
+                           f'{owning_service!r} without an incarnation label.')
 
-    for owning_service in owning_services:
+    for owning_service, expected_service_hash in owning_services:
         if owning_service in live_service_names:
             continue
         # Not in the stale snapshot -- confirm the service is truly gone at
         # delete time before reaping its LB (the snapshot predates any service
         # created during recovery).
-        if serve_state.get_service_from_name(owning_service) is not None:
+        if serve_state.get_service_hash(owning_service) is not None:
             continue
-        delete_lb_objects(owning_service)
+        delete_lb_objects(owning_service, expected_service_hash)

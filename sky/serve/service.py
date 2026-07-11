@@ -5,15 +5,17 @@ balancer Deployment.  This process owns and supervises the per-service
 controller child; it never starts an in-pod load balancer.
 """
 import argparse
+import json
 import multiprocessing
 import os
 import pathlib
 import shutil
 import socket
 import sys
+import threading
 import time
 import traceback
-from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Dict, NoReturn, Optional, Tuple, TYPE_CHECKING
 import uuid
 
 import filelock
@@ -48,7 +50,12 @@ if TYPE_CHECKING:
 logger = sky_logging.init_logger('sky.serve.service')
 
 
-def _handle_signal(service_name: str) -> None:
+class ServiceOwnershipLostError(RuntimeError):
+    """Raised when teardown no longer owns the exact service incarnation."""
+
+
+def _handle_signal(service_name: str, service_hash: str, controller_pid: int,
+                   controller_ip: Optional[str]) -> bool:
     """Handles the signal user sent to controller."""
     signal_file = pathlib.Path(
         constants.SIGNAL_FILE_PATH.format(service_name)).expanduser()
@@ -59,12 +66,42 @@ def _handle_signal(service_name: str) -> None:
         with filelock.FileLock(str(signal_file) + '.lock'):
             with signal_file.open(mode='r', encoding='utf-8') as f:
                 user_signal_text = f.read().strip()
+                signal_value: object
                 try:
-                    user_signal = serve_utils.UserSignal(user_signal_text)
+                    signal_payload = json.loads(user_signal_text)
+                except (json.JSONDecodeError, TypeError):
+                    # Backward compatibility for a signal written by an older
+                    # API process. The supervision tick fenced exact ownership
+                    # before calling this helper, so only the current
+                    # controller can consume this name-only payload.
+                    signal_value = user_signal_text
+                else:
+                    if not isinstance(signal_payload, dict):
+                        signal_value = None
+                    else:
+                        target_hash = signal_payload.get('service_hash')
+                        signal_value = signal_payload.get('signal')
+                        if target_hash != service_hash:
+                            logger.warning(
+                                f'Discarding stale signal for service '
+                                f'{service_name!r} incarnation '
+                                f'{target_hash!r}; current incarnation is '
+                                f'{service_hash!r}.')
+                            signal_file.unlink()
+                            return True
+                try:
+                    user_signal = serve_utils.UserSignal(signal_value)
+                except (TypeError, ValueError):
+                    # Preserve the historical unknown-signal behavior below.
+                    user_signal = None
+                try:
+                    if user_signal is None:
+                        raise ValueError('unknown signal')
                     logger.info(f'User signal received: {user_signal}')
                 except ValueError:
                     logger.warning(
-                        f'Unknown signal received: {user_signal}. Ignoring.')
+                        f'Unknown signal received: {user_signal_text}. '
+                        'Ignoring.')
                     user_signal = None
             if user_signal is serve_utils.UserSignal.TERMINATE:
                 # Persist the teardown intent BEFORE consuming the signal so a
@@ -72,12 +109,31 @@ def _handle_signal(service_name: str) -> None:
                 # then sees either SHUTTING_DOWN (and resumes teardown) or the
                 # still-present signal (and re-fires terminate) -- never a
                 # downed service that comes back up serving.
-                serve_state.set_service_status_and_active_versions(
-                    service_name, serve_state.ServiceStatus.SHUTTING_DOWN)
+                set_status_if_owner = (
+                    serve_state.set_service_status_and_active_versions_if_owner)
+                try:
+                    persisted = set_status_if_owner(
+                        service_name, service_hash, controller_pid,
+                        controller_ip, serve_state.ServiceStatus.SHUTTING_DOWN)
+                except Exception as e:  # pylint: disable=broad-except
+                    # A DB blip must not escape into _start's destructive
+                    # unexpected-exception finalizer. Keep the signal durable
+                    # and retry the exact-owner CAS on the next tick.
+                    logger.warning(f'Failed to persist terminate signal for '
+                                   f'{service_name!r}: '
+                                   f'{common_utils.format_exception(e)}; '
+                                   'will retry without consuming it.')
+                    return True
+                if not persisted:
+                    logger.warning(
+                        f'Refusing to consume terminate signal for stale '
+                        f'service incarnation {service_name!r}/'
+                        f'{service_hash!r}.')
+                    return False
             # Remove the signal file, after reading it.
             signal_file.unlink()
     if user_signal is None:
-        return
+        return True
     assert isinstance(user_signal, serve_utils.UserSignal)
     error_type = user_signal.error_type()
     raise error_type(f'User signal received: {user_signal.value}')
@@ -152,13 +208,35 @@ def cleanup_storage(yaml_content: str) -> bool:
 # NOTE(dev): We don't need to acquire the `with_lock` in replica manager here
 # because we killed all the processes (controller & replica manager) before
 # calling this function.
-def _cleanup(service_name: str, pool: bool) -> bool:
+def _cleanup(service_name: str, pool: bool, service_hash: str,
+             controller_pid: int, controller_ip: Optional[str],
+             lifecycle_lock: Any) -> bool:
     """Clean up all service related resources, i.e. replicas and storage."""
+    expected_owner = (controller_pid, controller_ip)
+    ownership_probe_lock = threading.Lock()
+
+    def _still_owns() -> bool:
+        # The PostgreSQL advisory-lock liveness probe uses the lock-owning
+        # connection. Serialize it across the cleanup coordinator and replica
+        # workers; DB connections/cursors are not a concurrent ownership
+        # oracle.
+        with ownership_probe_lock:
+            return (serve_utils.lifecycle_lock_is_valid(lifecycle_lock) and
+                    serve_state.service_owner_matches(
+                        service_name, service_hash, expected_owner))
+
+    def _assert_owner(phase: str) -> None:
+        if not _still_owns():
+            raise ServiceOwnershipLostError(
+                f'Lost ownership of {service_name!r}/{service_hash!r} '
+                f'{phase}; aborting destructive cleanup.')
+
+    _assert_owner('before replica cleanup')
     # Log who we are and what DB state we're cleaning up, so post-mortems
     # can correlate this with concurrent ha_recovery activity. _cleanup is
-    # destructive (it tears down replicas and, at the very end, deletes the
-    # HA recovery script and may delete the entire service row), so an audit
-    # trail is worth a few WARN lines.
+    # destructive (it tears down replicas before the caller conditionally
+    # finalizes the recovery script and service row), so an audit trail is
+    # worth a few WARN lines.
     own_pid = os.getpid()
     try:
         svc_dbg = serve_state.get_service_from_name(service_name)
@@ -174,14 +252,12 @@ def _cleanup(service_name: str, pool: bool) -> bool:
         logger.warning(
             f'_cleanup entered for service {service_name} '
             f'(own_pid={own_pid}, db row not found — already removed?)')
-    # NOTE: the HA recovery script is removed at the END of _cleanup (after
-    # replica teardown), NOT here. Removing it up-front opened a window where a
-    # controller-pod kill mid-teardown (HA pod move / node drain) left a durable
-    # service row with NO recovery script — ha_recovery_for_consolidation_mode
-    # then logs 'recovery script does not exist. Skipping recovery' forever and
-    # strands the service with replicas still consuming resources. Keeping the
-    # script until all destructive teardown finishes lets recovery re-run
-    # _cleanup if we die partway. See the removal at the end of this function.
+    # NOTE: retain the HA recovery script throughout _cleanup. Removing it
+    # up-front opened a window where a controller-pod kill mid-teardown (HA pod
+    # move / node drain) left a durable service row with no recovery path and
+    # stranded replicas. The caller either removes the script in the same
+    # owner-fenced transaction as a successful service-row deletion, or only
+    # after it has durably published FAILED_CLEANUP.
     failed = False
     replica_infos = serve_state.get_replica_infos(service_name)
     info2thr: Dict[replica_managers.ReplicaInfo,
@@ -191,6 +267,7 @@ def _cleanup(service_name: str, pool: bool) -> bool:
     existing_cluster_names = global_user_state.get_cluster_names_start_with(
         service_name)
     for info in replica_infos:
+        _assert_owner(f'before scheduling replica {info.replica_id} cleanup')
         if info.cluster_name not in existing_cluster_names:
             logger.info(f'Cluster {info.cluster_name} for replica '
                         f'{info.replica_id} not found. Might be a failed '
@@ -206,7 +283,8 @@ def _cleanup(service_name: str, pool: bool) -> bool:
         log_file_name = serve_utils.generate_replica_log_file_name(
             service_name, info.replica_id)
         t = thread_utils.SafeThread(target=replica_managers.terminate_cluster,
-                                    args=(info.cluster_name, log_file_name))
+                                    args=(info.cluster_name, log_file_name),
+                                    kwargs={'continue_guard': _still_owns})
         info2thr[info] = t
         # Set replica status to `SHUTTING_DOWN`
         info.status_property.sky_launch_status = (
@@ -228,6 +306,7 @@ def _cleanup(service_name: str, pool: bool) -> bool:
     # Please reference to sky/serve/replica_managers.py::_refresh_process_pool.
     # TODO(tian): Refactor to use the same logic and code.
     while info2thr:
+        _assert_owner('while waiting for replica cleanup')
         snapshot = list(info2thr.items())
         for info, t in snapshot:
             if t.is_alive():
@@ -260,7 +339,10 @@ def _cleanup(service_name: str, pool: bool) -> bool:
                     _set_to_failed_cleanup(info)
         time.sleep(3)
 
+    _assert_owner('before storage cleanup')
+
     def cleanup_version_storage(version: int) -> bool:
+        _assert_owner(f'before cleaning version {version} storage')
         yaml_content = serve_state.get_yaml_content(service_name, version)
         if yaml_content is None:
             logger.warning(f'No yaml content found for version {version}')
@@ -273,17 +355,14 @@ def _cleanup(service_name: str, pool: bool) -> bool:
     if not all(map(cleanup_version_storage, versions)):
         failed = True
 
-    # All destructive teardown above is done; only now is it safe to drop the
-    # HA recovery script. If we had been killed partway through teardown the
-    # script would have survived, letting ha_recovery_for_consolidation_mode
-    # respawn the controller and re-run _cleanup instead of stranding the
-    # service. On the success path the caller's remove_service_completely also
-    # deletes it (idempotent); on the FAILED_CLEANUP path removing it here
-    # avoids a recovery loop on a cleanup that already ran to completion.
-    serve_state.remove_ha_recovery_script(service_name)
-
-    # NOTE: do not delete version_specs here. The success path in `_start`
-    # deletes them along with `remove_service`. Deleting them on failure
+    # Do not delete the recovery script here. The success path removes it in
+    # the same owner-fenced transaction as the service row; the failed path
+    # removes it only after conditionally publishing FAILED_CLEANUP. Keeping
+    # it through this boundary means a lost lifecycle-lock session cannot
+    # strand a teardown between script deletion and final DB removal.
+    #
+    # NOTE: do not delete version_specs here. The final success transaction
+    # deletes them with the service. Deleting them on failure
     # makes the `services` row invisible to `get_service_from_name` (it
     # uses an INNER JOIN with `version_specs`), so `sky ... status` /
     # `sky ... down --purge` can no longer locate the FAILED_CLEANUP row,
@@ -340,7 +419,8 @@ def _wait_for_controller_ready(
                        f'{probe_host}:{port} within {timeout}s')
 
 
-def _orphan_exit(controller_process: Optional[multiprocessing.Process]) -> None:
+def _orphan_exit(
+        controller_process: Optional[multiprocessing.Process]) -> NoReturn:
     """Quick exit path for an orphan sky.serve.service.
 
     Triggered when our self-check sees the DB owner tuple (service hash, PID,
@@ -387,10 +467,9 @@ def _bail_on_boot_failure(service_name: str,
     """Retryable exit when a service component cannot finish booting.
 
     Critical contract: must NOT fall through to `_start`'s outer
-    `try/finally`. That finally calls `_cleanup`, which on its very
-    first line removes the HA recovery script and on a pool with no
-    replicas proceeds to `remove_service_completely` — turning a
-    transient boot failure into permanent data loss for the service.
+    `try/finally`. That finally runs destructive teardown and may conditionally
+    remove the service row, turning a transient boot failure into permanent
+    data loss for the service.
 
     Kill the controller subprocess we spawned, then os._exit(1) to
     bypass everything. The daemon's next ha_recovery iteration sees
@@ -506,7 +585,9 @@ def _controller_child_responding(service_name: str, service_hash: str,
         return False
 
 
-def _flag_service_degraded(service_name: str) -> None:
+def _flag_service_degraded(service_name: str, service_hash: str,
+                           controller_pid: int,
+                           controller_ip: Optional[str]) -> None:
     """Mark the service CONTROLLER_FAILED after repeated child failures.
 
     Never overrides a teardown in progress. Best-effort: a DB failure here
@@ -522,14 +603,21 @@ def _flag_service_degraded(service_name: str) -> None:
             logger.error(f'Flagging service {service_name} as '
                          'CONTROLLER_FAILED after repeated controller or '
                          'external load balancer failures.')
-            serve_state.set_service_status_and_active_versions(
-                service_name, serve_state.ServiceStatus.CONTROLLER_FAILED)
+            serve_state.set_service_status_and_active_versions_if_owner(
+                service_name,
+                service_hash,
+                controller_pid,
+                controller_ip,
+                serve_state.ServiceStatus.CONTROLLER_FAILED,
+                expected_status=record['status'])
     except Exception as e:  # pylint: disable=broad-except
         logger.error(f'Failed to flag service {service_name} as degraded: '
                      f'{common_utils.format_exception(e)}')
 
 
-def _heal_service_degraded(service_name: str) -> bool:
+def _heal_service_degraded(service_name: str, service_hash: str,
+                           controller_pid: int,
+                           controller_ip: Optional[str]) -> bool:
     """Clear CONTROLLER_FAILED once the children are confirmed healthy.
 
     Resets to REPLICA_INIT; the controller's next probe round recomputes the
@@ -550,8 +638,13 @@ def _heal_service_degraded(service_name: str) -> bool:
                 == serve_state.ServiceStatus.CONTROLLER_FAILED):
             logger.info(f'Service {service_name} controller/data plane '
                         'recovered; clearing CONTROLLER_FAILED.')
-            serve_state.set_service_status_and_active_versions(
-                service_name, serve_state.ServiceStatus.REPLICA_INIT)
+            return serve_state.set_service_status_and_active_versions_if_owner(
+                service_name,
+                service_hash,
+                controller_pid,
+                controller_ip,
+                serve_state.ServiceStatus.REPLICA_INIT,
+                expected_status=serve_state.ServiceStatus.CONTROLLER_FAILED)
         return True
     except Exception as e:  # pylint: disable=broad-except
         logger.error(f'Failed to heal degraded service {service_name}: '
@@ -676,7 +769,9 @@ def _should_resume_teardown(is_recovery: bool,
 
 def _run_cleanup_and_finalize(service_name: str,
                               service_spec: 'service_spec_lib.SkyServiceSpec',
-                              service_dir: str, job_id: int) -> None:
+                              service_dir: str, job_id: int, service_hash: str,
+                              controller_pid: int,
+                              controller_ip: Optional[str]) -> None:
     """Run ``_cleanup`` and finalize the service's DB / dir state.
 
     Shared by ``_start``'s teardown ``finally`` and the recovery-resume path (a
@@ -684,6 +779,41 @@ def _run_cleanup_and_finalize(service_name: str,
     FAILED_CLEANUP so an operator can ``--purge``; on success the service row
     and working dir are removed.
     """
+    # The caller has killed/joined the controller child before entering here.
+    # Atomically mark the exact owner SHUTTING_DOWN and publish that fact before
+    # waiting on the distributed lifecycle lock. This rejects new updates and
+    # tells a concurrent force-purge there can be no lingering replica-manager
+    # writes into a future same-name successor.
+    if not serve_state.acknowledge_service_controller_teardown_if_owner(
+            service_name, service_hash, controller_pid, controller_ip):
+        logger.warning(f'Lost ownership before acknowledging teardown of '
+                       f'{service_name!r}.')
+        return
+    lifecycle_lock = serve_utils.get_service_lifecycle_lock(service_name)
+    with lifecycle_lock:
+        _run_cleanup_and_finalize_locked(service_name, service_spec,
+                                         service_dir, job_id, service_hash,
+                                         controller_pid, controller_ip,
+                                         lifecycle_lock)
+
+
+def _run_cleanup_and_finalize_locked(
+        service_name: str, service_spec: 'service_spec_lib.SkyServiceSpec',
+        service_dir: str, job_id: int, service_hash: str, controller_pid: int,
+        controller_ip: Optional[str], lifecycle_lock: Any) -> None:
+    """Owner-fenced cleanup while holding the service lifecycle lock."""
+    expected_owner = (controller_pid, controller_ip)
+
+    def _still_owns() -> bool:
+        return (serve_utils.lifecycle_lock_is_valid(lifecycle_lock) and
+                serve_state.service_owner_matches(service_name, service_hash,
+                                                  expected_owner))
+
+    if not _still_owns():
+        logger.warning(f'Skipping cleanup for stale service owner '
+                       f'{service_name!r}/{service_hash!r}.')
+        return
+
     lb_quiesced = service_spec.pool
     try:
         if not service_spec.pool:
@@ -693,28 +823,41 @@ def _run_cleanup_and_finalize(service_name: str,
             # accept new requests and route them to replicas being destroyed.
             # A deletion failure aborts cleanup fail-closed and is retried via
             # FAILED_CLEANUP rather than exposing a half-torn-down service.
-            lb_k8s.delete_lb_objects(service_name)
+            lb_k8s.delete_lb_objects(service_name,
+                                     expected_service_hash=service_hash)
             lb_quiesced = True
-        failed = _cleanup(service_name, service_spec.pool)
+        if not _still_owns():
+            raise ServiceOwnershipLostError(
+                'Ownership lost after load balancer quiesce.')
+        failed = _cleanup(service_name, service_spec.pool, service_hash,
+                          controller_pid, controller_ip, lifecycle_lock)
+    except ServiceOwnershipLostError as e:
+        # Another owner or a lost PG advisory-lock session means this process
+        # must stop immediately. Preserve DB state and the recovery script;
+        # the authoritative owner will finish teardown.
+        logger.warning(f'Aborting stale cleanup for {service_name}: {e}')
+        return
     except Exception as e:  # pylint: disable=broad-except
         logger.error(f'Failed to clean up service {service_name}: {e}')
         with ux_utils.enable_traceback():
             logger.error(f'  Traceback: {traceback.format_exc()}')
         failed = True
-        # _cleanup raised before its own end-of-function script removal, so the
-        # HA recovery script is still present. Remove it here: FAILED_CLEANUP is
-        # a teardown status that _should_resume_teardown resumes, so leaving the
-        # script would make HA recovery re-run cleanup and hit the same error
-        # forever. (A PROCESS death before this handler never runs this line, so
-        # the script is preserved for that case -- which is what we want.)
-        try:
-            serve_state.remove_ha_recovery_script(service_name)
-        except Exception:  # pylint: disable=broad-except
-            pass
+        # Publish FAILED_CLEANUP below before removing the recovery script.
+        # Reversing that order creates a crash window with no recovery path.
 
     if failed:
-        serve_state.set_service_status_and_active_versions(
-            service_name, serve_state.ServiceStatus.FAILED_CLEANUP)
+        if not serve_state.set_service_status_and_active_versions_if_owner(
+                service_name, service_hash, controller_pid, controller_ip,
+                serve_state.ServiceStatus.FAILED_CLEANUP):
+            logger.warning(f'Lost ownership before publishing '
+                           f'FAILED_CLEANUP for {service_name!r}.')
+            return
+        try:
+            serve_state.remove_ha_recovery_script_if_owner(
+                service_name, service_hash, controller_pid, controller_ip)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning(f'Failed to remove recovery script for '
+                           f'{service_name!r}: {e}')
         logger.error(f'Service {service_name} failed to clean up.')
         # A FAILED_CLEANUP service is no longer serving, so tear the data-plane
         # LB down here.
@@ -723,25 +866,32 @@ def _run_cleanup_and_finalize(service_name: str,
         # delete failure does not worsen cleanup.
         if not lb_quiesced:
             try:
-                lb_k8s.delete_lb_objects(service_name)
+                lb_k8s.delete_lb_objects(service_name,
+                                         expected_service_hash=service_hash)
             except Exception as e:  # pylint: disable=broad-except
                 logger.error(f'Failed to delete external LB objects for '
                              f'{service_name} during failed cleanup: {e}')
     else:
-        serve_state.remove_service_completely(service_name)
-        # Real teardown: the service row is gone for good. Delete the
-        # controller-owned external LB objects (no-op outside external-LB +
-        # in-cluster mode). This runs only on the success/removal path -- the
-        # FAILED_CLEANUP branch above keeps the row (and its LB) for --purge,
-        # and orphan-exit/respawn bypass this function entirely via os._exit.
-        if not lb_quiesced:
-            lb_k8s.delete_lb_objects(service_name)
-        try:
-            shutil.rmtree(service_dir)
-        except FileNotFoundError:
-            # The service_dir may already be gone (e.g. the controller's own
-            # success path raced with a purge).
-            pass
+        if not _still_owns():
+            logger.warning(f'Lost ownership before final removal of '
+                           f'{service_name!r}.')
+            return
+        quarantine_dir = serve_utils.quarantine_service_directory(
+            service_dir, service_hash)
+        if not _still_owns():
+            # Never recreate a name-scoped path after ownership is lost. The
+            # hash-owned quarantine remains retryable without risking a
+            # same-name successor's canonical directory.
+            return
+        removed = serve_state.remove_service_completely(
+            service_name,
+            service_hash,
+            expected_controller_owner=expected_owner)
+        if not removed:
+            logger.warning(f'Lost ownership during final removal of '
+                           f'{service_name!r}.')
+            return
+        serve_utils.remove_quarantined_service_directory(quarantine_dir)
         logger.info(f'Service {service_name} terminated successfully.')
 
     _cleanup_task_run_script(job_id)
@@ -775,6 +925,8 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
     if not isinstance(service_incarnation, str) or not service_incarnation:
         raise RuntimeError(
             f'Service {service_name!r} has no durable incarnation hash.')
+    # Pod IP for full controller-owner fencing, including teardown recovery.
+    pod_ip: Optional[str] = os.environ.get('POD_IP')
 
     def _read_yaml_content(yaml_path: str) -> str:
         with open(os.path.expanduser(yaml_path), 'r', encoding='utf-8') as f:
@@ -816,16 +968,26 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
         serve_utils.generate_remote_service_dir_name(service_name))
 
     # If the previous controller died mid-teardown, its HA recovery script was
-    # preserved (see _cleanup, which now removes the script only AFTER
-    # teardown). Bringing the controller + LB back up here would resurrect a
-    # service the user tore down -- so resume the unfinished cleanup instead.
+    # preserved throughout _cleanup. Bringing the controller + LB back up here
+    # would resurrect a service the user tore down -- so resume the unfinished
+    # cleanup instead.
     if _should_resume_teardown(is_recovery, service):
         assert service is not None
+        claimed = serve_state.update_service_controller_pid_if_owner(
+            service_name,
+            expected_service_hash=service_incarnation,
+            expected_controller_pid=recovery_expected_controller_pid,
+            expected_controller_ip=recovery_expected_controller_ip,
+            controller_pid=os.getpid(),
+            controller_ip=pod_ip)
+        _exit_on_ownership_loss(claimed, service_name,
+                                'claiming teardown recovery', None)
         logger.info(f'Recovering service {service_name} in status '
                     f'{service["status"].value}: resuming teardown instead of '
                     'serving.')
-        _run_cleanup_and_finalize(service_name, service_spec, service_dir,
-                                  job_id)
+        _run_cleanup_and_finalize(service_name, service_spec,
+                                  service_dir, job_id, service_incarnation,
+                                  os.getpid(), pod_ip)
         return
 
     # Pools intentionally have no inference endpoint. Every real SkyServe
@@ -846,9 +1008,6 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
             lb_k8s.lb_termination_grace_period_seconds(
                 service_spec.lb_stream_timeout_seconds,
                 service_spec.graceful_drain_seconds))
-
-    # Pod IP for HA leader-aware routing.
-    pod_ip: Optional[str] = os.environ.get('POD_IP')
 
     if not is_recovery:
         with filelock.FileLock(controller_utils.get_resources_lock_path()):
@@ -1004,9 +1163,8 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
                     process=controller_process)
             except RuntimeError as boot_err:
                 # Bail without falling through to the outer try/finally,
-                # which would call _cleanup → remove_ha_recovery_script
-                # and possibly remove_service_completely. See helper for
-                # details.
+                # which would enter destructive cleanup and possibly remove
+                # the service incarnation. See helper for details.
                 _bail_on_boot_failure(
                     service_name, controller_process,
                     constants.SERVICE_REGISTER_TIMEOUT_SECONDS, boot_err)
@@ -1052,10 +1210,17 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
         # controller owner tuple is already recorded in DB.
         if external_lb:
             try:
+
+                def _still_owns_lb() -> bool:
+                    return serve_state.service_owner_matches(
+                        service_name, service_incarnation,
+                        (os.getpid(), pod_ip))
+
                 lb_k8s.create_lb_deployment_and_service(
                     service_name,
                     lb_termination_grace_seconds,
-                    service_hash=service_incarnation)
+                    service_hash=service_incarnation,
+                    continue_guard=_still_owns_lb)
                 external_lb_healthy = True
             except Exception as boot_err:  # pylint: disable=broad-except
                 _bail_on_boot_failure(
@@ -1104,11 +1269,6 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
                     f'{service_name}: {common_utils.format_exception(e)}; '
                     'will retry from the supervision loop.')
 
-        # Self-check cadence (seconds): how often we re-read DB to confirm
-        # we're still the authoritative controller. Ghost detection only
-        # matters in HA deployments and is checked once per
-        # interval to avoid DB load.
-        orphan_check_interval_seconds = 30
         # How often to check that the controller child is still alive and
         # respawn it if it died (a cheap local is_alive() poll). Capped at this
         # cadence so a controller that crash-loops on boot is respawned at most
@@ -1133,41 +1293,35 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
         # parent was dead), which the replica-driven writer never clears.
         needs_status_heal = True
         while True:
-            _handle_signal(service_name)
+            # Resolve exact ownership before consuming the name-scoped wakeup
+            # file or allowing another child tick. SHUTTING_DOWN in the DB is
+            # the durable, cross-pod terminate signal; the file only reduces
+            # latency for legacy/local controllers.
+            try:
+                owner = serve_state.get_service_controller_owner(service_name)
+            except Exception as e:  # pylint: disable=broad-except
+                logger.warning(f'Failed to verify service owner before '
+                               f'supervision tick: '
+                               f'{common_utils.format_exception(e)}')
+                time.sleep(1)
+                continue
+            if owner is None:
+                logger.warning(f'Service {service_name!r} disappeared before '
+                               'supervision tick; exiting as orphan.')
+                _orphan_exit(controller_process)
+            if (owner.get('hash') != service_incarnation or
+                    owner.get('controller_pid') != own_pid or
+                    owner.get('controller_ip') != pod_ip):
+                logger.warning(f'Service {service_name!r} ownership changed '
+                               'before supervision tick; exiting as orphan.')
+                _orphan_exit(controller_process)
+            if owner['status'] == serve_state.ServiceStatus.SHUTTING_DOWN:
+                raise exceptions.ServeUserTerminatedError(
+                    'Durable SHUTTING_DOWN state observed.')
+            if not _handle_signal(service_name, service_incarnation, own_pid,
+                                  pod_ip):
+                _orphan_exit(controller_process)
             loop_count += 1
-            # Periodically check whether we still own the row in DB. If
-            # another instance on a different pod has taken over (HA recovery
-            # raced us to the row), or if down has removed the row entirely,
-            # exit immediately without running cleanup — that work belongs to
-            # the new owner / has already happened.
-            if loop_count % orphan_check_interval_seconds == 0:
-                db_read_failed = False
-                record: Optional[Dict[str, Any]] = None
-                try:
-                    record = serve_state.get_service_from_name(service_name)
-                except Exception:  # pylint: disable=broad-except
-                    # DB transient failure — keep running, retry next tick.
-                    db_read_failed = True
-                if not db_read_failed and record is None:
-                    logger.warning(
-                        f'Service {service_name} row no longer present in '
-                        'DB. Exiting as orphan without running cleanup.')
-                    _orphan_exit(controller_process)
-                elif (record is not None and
-                      (record.get('hash') != service_incarnation or
-                       (record.get('controller_pid') is not None and
-                        record.get('controller_pid') != own_pid) or
-                       record.get('controller_ip') != pod_ip)):
-                    logger.warning(
-                        f'Service {service_name} owner in DB is '
-                        f'(hash={record.get("hash")}, '
-                        f'pid={record.get("controller_pid")}, '
-                        f'ip={record.get("controller_ip")}) but ours is '
-                        f'(hash={service_incarnation}, pid={own_pid}, '
-                        f'ip={pod_ip}); '
-                        'another instance has taken over. '
-                        'Exiting as orphan without running cleanup.')
-                    _orphan_exit(controller_process)
             # Self-heal the external LB objects. Best-effort: a k8s API error
             # must never reach _start's destructive cleanup.
             if (external_lb and
@@ -1263,27 +1417,26 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
                     child_failures = 0
                     child_retry_at = 0.0
                     if needs_status_heal and _heal_service_degraded(
-                            service_name):
+                            service_name, service_incarnation, own_pid, pod_ip):
                         # Only stop retrying once the heal is confirmed; a
                         # transient DB failure during the heal would
                         # otherwise leave the service stuck CONTROLLER_FAILED
                         # (the replica-driven writer is blocked on it).
                         needs_status_heal = False
                 elif child_failures >= _CHILD_FAILURES_BEFORE_FLAG:
-                    _flag_service_degraded(service_name)
+                    _flag_service_degraded(service_name, service_incarnation,
+                                           own_pid, pod_ip)
                     needs_status_heal = True
             time.sleep(1)
     except exceptions.ServeUserTerminatedError:
         logger.debug(f'Caught ServeUserTerminatedError for '
                      f'{service_name}; setting status=SHUTTING_DOWN')
         shutdown_via_user_signal = True
-        serve_state.set_service_status_and_active_versions(
-            service_name, serve_state.ServiceStatus.SHUTTING_DOWN)
     finally:
-        # Log why we're entering the destructive cleanup path. _cleanup
-        # deletes the HA recovery script and may remove the entire
-        # service row, so an audit line (especially with the active
-        # exception type if any) is worth it for future post-mortems.
+        # Log why we're entering the destructive cleanup path. Finalization
+        # can remove the HA recovery script and the entire service row, so an
+        # audit line (especially with the active exception type if any) is
+        # worth it for future post-mortems.
         # The path (`_wait_for_controller_ready` timeout) and
         # `_orphan_exit` both bypass this finally entirely via
         # os._exit; anything else reaching here is either the user
@@ -1305,8 +1458,8 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
             logger.warning(
                 f'_start for {service_name} entering cleanup path due to '
                 f'unexpected exception {exc_type.__name__}: {exc_value}. '
-                f'_cleanup will delete HA recovery script and may remove '
-                f'the service row.')
+                f'finalization may delete the HA recovery script and service '
+                f'row.')
         if controller_process is not None:
             subprocess_utils.kill_children_processes(
                 parent_pids=[controller_process.pid], force=True)
@@ -1317,8 +1470,9 @@ def _start(service_name: str, tmp_task_yaml: str, job_id: int, entrypoint: str):
         # still be terminated later (a crash here would otherwise leave no
         # process to handle the user signal). Shared with the recovery-resume
         # path above.
-        _run_cleanup_and_finalize(service_name, service_spec, service_dir,
-                                  job_id)
+        _run_cleanup_and_finalize(service_name, service_spec,
+                                  service_dir, job_id, service_incarnation,
+                                  os.getpid(), pod_ip)
 
 
 if __name__ == '__main__':

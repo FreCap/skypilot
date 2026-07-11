@@ -241,6 +241,14 @@ def create_table(engine: sqlalchemy.engine.Engine):
 
 _db_manager = db_utils.DatabaseManager('serve/services', create_table)
 
+
+def _begin_immediate_if_sqlite(session: orm.Session,
+                               engine: sqlalchemy.engine.Engine) -> None:
+    """Make a SQLite read-then-write lifecycle check one writer transaction."""
+    if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
+        session.execute(sqlalchemy.text('BEGIN IMMEDIATE'))
+
+
 _UNIQUE_CONSTRAINT_FAILED_ERROR_MSGS = [
     # sqlite
     'UNIQUE constraint failed: services.name',
@@ -584,27 +592,80 @@ def remove_service(service_name: str) -> None:
         session.commit()
 
 
-def remove_service_completely(service_name: str) -> None:
-    """Atomically remove the service-level DB state for a service.
+def service_owner_matches(
+    service_name: str,
+    expected_service_hash: str,
+    expected_controller_owner: Optional[Tuple[Optional[int],
+                                              Optional[str]]] = None
+) -> bool:
+    """Whether the exact service incarnation (and optional owner) exists."""
+    if not expected_service_hash:
+        return False
+    predicates = [
+        services_table.c.name == service_name,
+        services_table.c.hash == expected_service_hash,
+    ]
+    if expected_controller_owner is not None:
+        expected_pid, expected_ip = expected_controller_owner
+        predicates.extend([
+            services_table.c.controller_pid == expected_pid,
+            services_table.c.controller_ip == expected_ip,
+        ])
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        row = session.execute(
+            sqlalchemy.select(
+                services_table.c.name).where(*predicates)).fetchone()
+    return row is not None
 
-    Deletes from `services`, `version_specs`,
+
+def remove_service_completely(
+    service_name: str,
+    expected_service_hash: str,
+    expected_controller_owner: Optional[Tuple[Optional[int],
+                                              Optional[str]]] = None
+) -> bool:
+    """Atomically remove one exact service incarnation and all child rows.
+
+    Deletes from `services`, `replicas`, `version_specs`,
     `serve_ha_recovery_script`, and `reserved_fill_claims` in a single
-    transaction. The first three were the tables whose sequential
+    transaction. These were the tables whose sequential
     teardown left orphan rows when a subprocess died mid-cleanup; the
     claim row must go too, or a torn-down fill-enabled service keeps
     absorbing broker entitlement until its claim TTL expires.
 
-    Replicas are intentionally NOT touched here. Both callers
-    (`_cleanup` success path in `_start`, and `_terminate_failed_services`
-    on the `--purge` path) iterate replicas one-by-one before this call
-    so they can run per-replica logic (cluster-existence probes for
-    leak reporting, terminate-thread join, failure marking).
+    The service row is conditionally deleted first inside the transaction.
+    If its durable hash (and, for a live controller, PID/IP owner) no longer
+    matches, no child table is touched. Once that delete succeeds, a same-name
+    successor cannot insert until this transaction commits, so deleting the
+    child rows cannot cross an A-to-B reuse boundary.
+
+    Returns:
+        True when the expected incarnation was removed; False when ownership
+        was already lost and nothing was changed.
     """
+    if not expected_service_hash:
+        return False
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
+        predicates = [
+            services_table.c.name == service_name,
+            services_table.c.hash == expected_service_hash,
+        ]
+        if expected_controller_owner is not None:
+            expected_pid, expected_ip = expected_controller_owner
+            predicates.extend([
+                services_table.c.controller_pid == expected_pid,
+                services_table.c.controller_ip == expected_ip,
+            ])
+        result = session.execute(
+            sqlalchemy.delete(services_table).where(*predicates))
+        if result.rowcount == 0:
+            session.rollback()
+            return False
         session.execute(
-            sqlalchemy.delete(services_table).where(
-                services_table.c.name == service_name))
+            sqlalchemy.delete(replicas_table).where(
+                replicas_table.c.service_name == service_name))
         session.execute(
             sqlalchemy.delete(version_specs_table).where(
                 version_specs_table.c.service_name == service_name))
@@ -615,6 +676,7 @@ def remove_service_completely(service_name: str) -> None:
             sqlalchemy.delete(reserved_fill_claims_table).where(
                 reserved_fill_claims_table.c.service_name == service_name))
         session.commit()
+    return True
 
 
 def set_service_uptime(service_name: str, uptime: int) -> None:
@@ -642,6 +704,60 @@ def set_service_status_and_active_versions(
         session.query(services_table).filter(
             services_table.c.name == service_name).update(update_dict)
         session.commit()
+
+
+def set_service_status_and_active_versions_if_owner(
+        service_name: str,
+        expected_service_hash: str,
+        expected_controller_pid: Optional[int],
+        expected_controller_ip: Optional[str],
+        status: ServiceStatus,
+        active_versions: Optional[List[int]] = None,
+        expected_status: Optional[ServiceStatus] = None) -> bool:
+    """CAS a status write on the exact hash/PID/IP controller owner."""
+    update_dict = {services_table.c.status: status.value}
+    if active_versions is not None:
+        update_dict[services_table.c.active_versions] = json.dumps(
+            active_versions)
+    predicates = [
+        services_table.c.name == service_name,
+        services_table.c.hash == expected_service_hash,
+        services_table.c.controller_pid == expected_controller_pid,
+        services_table.c.controller_ip == expected_controller_ip,
+    ]
+    if expected_status is not None:
+        predicates.append(services_table.c.status == expected_status.value)
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        count = session.query(services_table).filter(
+            *predicates).update(update_dict)
+        session.commit()
+    return count > 0
+
+
+def set_service_status_and_active_versions_if_hash(
+        service_name: str,
+        expected_service_hash: str,
+        status: ServiceStatus,
+        active_versions: Optional[List[int]] = None,
+        expected_status: Optional[ServiceStatus] = None) -> bool:
+    """CAS a status write on a durable service incarnation."""
+    update_dict = {services_table.c.status: status.value}
+    if active_versions is not None:
+        update_dict[services_table.c.active_versions] = json.dumps(
+            active_versions)
+    predicates = [
+        services_table.c.name == service_name,
+        services_table.c.hash == expected_service_hash,
+    ]
+    if expected_status is not None:
+        predicates.append(services_table.c.status == expected_status.value)
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        count = session.query(services_table).filter(
+            *predicates).update(update_dict)
+        session.commit()
+    return count > 0
 
 
 def set_service_controller_port(service_name: str,
@@ -682,6 +798,132 @@ def set_service_controller_port_if_owner(service_name: str,
                 {services_table.c.controller_port: controller_port})
         session.commit()
     return count > 0
+
+
+def acknowledge_service_controller_teardown_if_owner(
+        service_name: str, expected_service_hash: str, controller_pid: int,
+        controller_ip: Optional[str]) -> bool:
+    """Atomically enter teardown and publish that the child is gone.
+
+    Unexpected parent failures can reach finalization from a routable status
+    such as READY. Publishing SHUTTING_DOWN in the same exact-owner write as
+    the child-teardown sentinel prevents update/apply from starting new work
+    while cleanup waits for the lifecycle lock.
+    """
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        count = session.query(services_table).filter(
+            services_table.c.name == service_name,
+            services_table.c.hash == expected_service_hash,
+            services_table.c.controller_pid == controller_pid,
+            services_table.c.controller_ip == controller_ip).update({
+                services_table.c.status: ServiceStatus.SHUTTING_DOWN.value,
+                services_table.c.controller_port:
+                    constants.CONTROLLER_TEARDOWN_ACK_PORT
+            })
+        session.commit()
+    return count > 0
+
+
+def claim_orphaned_service_teardown(service_name: str,
+                                    expected_service_hash: str,
+                                    expected_controller_pid: Optional[int],
+                                    expected_controller_ip: Optional[str],
+                                    controller_pid: int,
+                                    controller_ip: Optional[str]) -> bool:
+    """Claim a terminal row that has no recovery script or live child.
+
+    Callers must establish the absence of a recovery script while holding the
+    per-service lifecycle lock. The status predicate prevents claiming a
+    healthy incarnation.
+    """
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        count = session.query(services_table).filter(
+            services_table.c.name == service_name,
+            services_table.c.hash == expected_service_hash,
+            services_table.c.controller_pid == expected_controller_pid,
+            services_table.c.controller_ip == expected_controller_ip,
+            services_table.c.status == ServiceStatus.SHUTTING_DOWN.value,
+        ).update({
+            services_table.c.controller_pid: controller_pid,
+            services_table.c.controller_ip: controller_ip,
+            services_table.c.controller_port:
+                constants.CONTROLLER_TEARDOWN_ACK_PORT,
+        })
+        session.commit()
+    return count > 0
+
+
+def claim_unrecoverable_service_teardown(service_name: str,
+                                         expected_service_hash: str,
+                                         expected_controller_pid: Optional[int],
+                                         expected_controller_ip: Optional[str],
+                                         controller_pid: int,
+                                         controller_ip: Optional[str]) -> bool:
+    """Claim a terminal service whose recovery script cannot boot.
+
+    A legacy partial-registration row can retain a recovery script without any
+    committed YAML version. Such a script can never acknowledge teardown.
+    Atomically prove that invariant, move ownership to the purge process, and
+    consume the unusable script so cleanup can make progress.
+    """
+    committed_version_exists = sqlalchemy.exists().where(
+        version_specs_table.c.service_name == service_name,
+        version_specs_table.c.yaml_content.isnot(None))
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        _begin_immediate_if_sqlite(session, engine)
+        count = session.query(services_table).filter(
+            services_table.c.name == service_name,
+            services_table.c.hash == expected_service_hash,
+            services_table.c.controller_pid == expected_controller_pid,
+            services_table.c.controller_ip == expected_controller_ip,
+            services_table.c.status == ServiceStatus.SHUTTING_DOWN.value,
+            ~committed_version_exists,
+        ).update({
+            services_table.c.controller_pid: controller_pid,
+            services_table.c.controller_ip: controller_ip,
+            services_table.c.controller_port:
+                constants.CONTROLLER_TEARDOWN_ACK_PORT,
+        })
+        if count == 0:
+            session.rollback()
+            return False
+        session.execute(
+            sqlalchemy.delete(serve_ha_recovery_script_table).where(
+                serve_ha_recovery_script_table.c.service_name == service_name))
+        session.commit()
+    return True
+
+
+def mark_unrecoverable_service_for_cleanup(service_name: str,
+                                           expected_service_hash: str,
+                                           pool: bool) -> bool:
+    """Retire an HA recovery script that has no committed YAML version."""
+    committed_version_exists = sqlalchemy.exists().where(
+        version_specs_table.c.service_name == service_name,
+        version_specs_table.c.yaml_content.isnot(None))
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        _begin_immediate_if_sqlite(session, engine)
+        count = session.query(services_table).filter(
+            services_table.c.name == service_name,
+            services_table.c.hash == expected_service_hash,
+            services_table.c.pool == int(pool),
+            services_table.c.status != ServiceStatus.SHUTTING_DOWN.value,
+            ~committed_version_exists,
+        ).update({
+            services_table.c.status: ServiceStatus.FAILED_CLEANUP.value,
+        })
+        if count == 0:
+            session.rollback()
+            return False
+        session.execute(
+            sqlalchemy.delete(serve_ha_recovery_script_table).where(
+                serve_ha_recovery_script_table.c.service_name == service_name))
+        session.commit()
+    return True
 
 
 def set_service_load_balancer_port_if_owner(
@@ -866,6 +1108,20 @@ def get_service_hash(service_name: str) -> Optional[str]:
             sqlalchemy.select(services_table.c.hash).where(
                 services_table.c.name == service_name)).fetchone()
     return result[0] if result else None
+
+
+def get_service_mode_and_hash(
+        service_name: str) -> Optional[Tuple[bool, Optional[str]]]:
+    """Read the raw mode/hash identity without joining version metadata."""
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        row = session.execute(
+            sqlalchemy.select(
+                services_table.c.pool, services_table.c.hash).where(
+                    services_table.c.name == service_name)).fetchone()
+    if row is None:
+        return None
+    return bool(row[0]), row[1]
 
 
 def get_service_versions(service_name: str) -> List[int]:
@@ -1088,10 +1344,32 @@ def get_replicas_at_status(
 
 
 # === Version functions ===
+def _lock_service_for_version_mutation(session: orm.Session,
+                                       service_name: str) -> bool:
+    """Lock the parent row and return whether version writes are allowed.
+
+    A missing parent is kept as a legacy/test-compatible case. Production
+    updates always have a service row; once that row is terminal, teardown has
+    won and no placeholder or YAML commit may be written behind it.
+    """
+    row = session.execute(
+        sqlalchemy.select(services_table.c.status).where(
+            services_table.c.name ==
+            service_name).with_for_update()).fetchone()
+    if row is None:
+        return True
+    return ServiceStatus[row[0]] not in ServiceStatus.terminal_statuses()
+
+
 def add_version(service_name: str) -> int:
     """Adds a version to the database."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
+        _begin_immediate_if_sqlite(session, engine)
+        if not _lock_service_for_version_mutation(session, service_name):
+            session.rollback()
+            raise RuntimeError(f'Service {service_name!r} entered terminal '
+                               'status before adding a version.')
         # Insert new version with MAX(version) + 1 in a single atomic operation
         max_version_subquery = sqlalchemy.select(
             sqlalchemy.func.coalesce(
@@ -1113,9 +1391,13 @@ def add_version(service_name: str) -> int:
 
 def add_or_update_version(service_name: str, version: int,
                           spec: 'service_spec.SkyServiceSpec',
-                          yaml_content: str) -> None:
+                          yaml_content: str) -> bool:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
+        _begin_immediate_if_sqlite(session, engine)
+        if not _lock_service_for_version_mutation(session, service_name):
+            session.rollback()
+            return False
         if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
             insert_func = sqlite.insert
         elif (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value
@@ -1139,6 +1421,7 @@ def add_or_update_version(service_name: str, version: int,
 
         session.execute(insert_stmt)
         session.commit()
+    return True
 
 
 def get_spec(service_name: str,
@@ -1264,6 +1547,26 @@ def remove_ha_recovery_script(service_name: str) -> None:
             sqlalchemy.delete(serve_ha_recovery_script_table).where(
                 serve_ha_recovery_script_table.c.service_name == service_name))
         session.commit()
+
+
+def remove_ha_recovery_script_if_owner(
+        service_name: str, expected_service_hash: str,
+        expected_controller_pid: Optional[int],
+        expected_controller_ip: Optional[str]) -> bool:
+    """Delete a recovery script only while the exact controller owns DB."""
+    owner_exists = sqlalchemy.exists().where(
+        services_table.c.name == service_name,
+        services_table.c.hash == expected_service_hash,
+        services_table.c.controller_pid == expected_controller_pid,
+        services_table.c.controller_ip == expected_controller_ip)
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        result = session.execute(
+            sqlalchemy.delete(serve_ha_recovery_script_table).where(
+                serve_ha_recovery_script_table.c.service_name == service_name,
+                owner_exists))
+        session.commit()
+    return result.rowcount > 0
 
 
 # === Reserved-fill broker state (see sky/serve/reserved_capacity_broker.py).

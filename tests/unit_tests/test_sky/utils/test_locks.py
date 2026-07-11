@@ -342,6 +342,22 @@ class TestPostgresLock:
         assert not lock._acquired
         assert lock._connection is None
 
+    def test_postgres_lock_release_invalidates_closed_session(
+            self, mock_connection):
+        connection, _ = mock_connection
+        connection.cursor.side_effect = locks.psycopg2.InterfaceError(
+            'connection already closed')
+        lock = locks.PostgresLock('test_lock')
+        lock._acquired = True
+        lock._connection = connection
+
+        lock.release()
+
+        connection.invalidate.assert_called_once()
+        connection.close.assert_not_called()
+        assert not lock.is_locked()
+        assert lock._connection is None
+
     @mock.patch.object(locks.PostgresLock, '_get_connection')
     def test_postgres_lock_force_unlock(self, mock_get_connection,
                                         mock_connection):
@@ -555,6 +571,7 @@ class TestPostgresLock:
         assert lock.is_session_alive() is True
         cursor.execute.assert_called_with('SELECT 1')
         cursor.close.assert_called_once()
+        connection.commit.assert_called_once()
 
     def test_is_session_alive_probe_raises(self, mock_connection):
         """is_session_alive returns False on any probe exception.

@@ -15,6 +15,7 @@ import pickle
 import re
 import shlex
 import shutil
+import threading
 import time
 import traceback
 import typing
@@ -42,6 +43,7 @@ from sky.utils import annotations
 from sky.utils import command_runner
 from sky.utils import common_utils
 from sky.utils import controller_utils
+from sky.utils import locks
 from sky.utils import log_utils
 from sky.utils import message_utils
 from sky.utils import resources_utils
@@ -49,6 +51,7 @@ from sky.utils import status_lib
 from sky.utils import subprocess_utils
 from sky.utils import ux_utils
 from sky.utils import yaml_utils
+from sky.utils.db import db_utils
 
 if typing.TYPE_CHECKING:
     import fastapi
@@ -107,9 +110,10 @@ _AUTH_TOKEN_PATTERN = re.compile(r'[A-Za-z0-9._~+/=-]+')
 _ControllerOwner = Tuple[str, int, Optional[str], int]
 
 
-def make_controller_owner_fingerprint(service_hash: str, controller_pid: int,
-                                      controller_ip: Optional[str],
-                                      controller_port: int) -> str:
+def make_controller_owner_fingerprint(service_hash: object,
+                                      controller_pid: object,
+                                      controller_ip: object,
+                                      controller_port: object) -> str:
     """Return a stable fingerprint for one exact controller owner tuple."""
     if not isinstance(service_hash, str) or not service_hash:
         raise ControllerOwnerError('Controller service hash is missing.')
@@ -474,10 +478,102 @@ class RequestTimestamp(RequestsAggregator):
 
 
 def get_service_filelock_path(pool: str) -> str:
-    path = pathlib.Path(generate_remote_service_dir_name(pool)) / 'pool.lock'
-    path = path.expanduser().absolute()
-    path.parents[0].mkdir(parents=True, exist_ok=True)
+    # Request serialization must not use an inode inside the canonical service
+    # directory. Teardown atomically quarantines that directory; a waiter
+    # creating ``<service>/pool.lock`` afterward would both bypass the old
+    # lock inode and prevent a failed teardown from restoring its directory.
+    digest = hashlib.sha256(pool.encode('utf-8')).hexdigest()
+    path = (pathlib.Path(locks.SKY_LOCKS_DIR) /
+            f'.skyserve-request-{digest}.lock').expanduser().absolute()
+    path.parent.mkdir(parents=True, exist_ok=True)
     return str(path)
+
+
+def get_service_lifecycle_lock(service_name: str) -> locks.DistributedLock:
+    """Return the cross-pod lock serializing destructive service lifecycles.
+
+    The lock ID is outside the service working directory: deleting or
+    quarantining that directory must never create a fresh lock inode. In
+    PostgreSQL deployments this resolves to an advisory lock shared by every
+    API pod; local/SQLite deployments use the runtime-global lock directory.
+    """
+    # Generic lock auto-detection intentionally falls back to a local FileLock
+    # when DB initialization raises. That is acceptable for best-effort
+    # callers, but unsafe here: a transient PostgreSQL/config outage would let
+    # multiple HA pods concurrently destroy the same name. Detect explicitly
+    # and fail closed instead.
+    engine = global_user_state.initialize_and_get_db()
+    if engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        lock_type = 'postgres'
+    elif engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
+        lock_type = 'filelock'
+    else:
+        raise RuntimeError('Unsupported database dialect for service '
+                           f'lifecycle lock: {engine.dialect.name!r}.')
+    digest = hashlib.sha256(service_name.encode('utf-8')).hexdigest()
+    return locks.get_lock(f'skyserve-lifecycle-{digest}', lock_type=lock_type)
+
+
+def lifecycle_lock_is_valid(lock: locks.DistributedLock) -> bool:
+    """Whether a held lifecycle lock still provides mutual exclusion."""
+    if isinstance(lock, locks.PostgresLock):
+        return lock.is_session_alive()
+    return lock.is_locked()
+
+
+def quarantine_service_directory(service_dir: str,
+                                 service_hash: str) -> List[str]:
+    """Atomically move a canonical working directory to hash-owned storage.
+
+    The deterministic sibling path makes teardown retryable after a process
+    death. It is never reused by another incarnation because its name derives
+    from the durable service hash.
+    """
+    digest = hashlib.sha256(service_hash.encode('utf-8')).hexdigest()[:20]
+    quarantine_dir = f'{service_dir}.teardown-{digest}'
+    parent_dir = os.path.dirname(quarantine_dir)
+    retry_prefix = f'{os.path.basename(quarantine_dir)}-retry-'
+    existing_quarantines = []
+    if os.path.lexists(quarantine_dir):
+        existing_quarantines.append(quarantine_dir)
+    try:
+        existing_quarantines.extend(
+            os.path.join(parent_dir, entry)
+            for entry in sorted(os.listdir(parent_dir))
+            if entry.startswith(retry_prefix) and
+            os.path.lexists(os.path.join(parent_dir, entry)))
+    except FileNotFoundError:
+        pass
+    if existing_quarantines:
+        if os.path.lexists(service_dir):
+            # Expected after a crash between quarantine and DB CAS: HA startup
+            # recreates the canonical directory before resuming teardown.
+            # Move that new same-incarnation directory too, so nothing at the
+            # canonical path can be deleted after the name is released.
+            retry_dir = f'{quarantine_dir}-retry-{uuid.uuid4().hex}'
+            os.rename(service_dir, retry_dir)
+            return existing_quarantines + [retry_dir]
+        return existing_quarantines
+    try:
+        os.rename(service_dir, quarantine_dir)
+    except FileNotFoundError:
+        return []
+    return [quarantine_dir]
+
+
+def remove_quarantined_service_directory(
+        quarantine_dirs: Optional[List[str]]) -> None:
+    """Remove only a hash-owned quarantine, never the canonical path."""
+    if not quarantine_dirs:
+        return
+    for quarantine_dir in quarantine_dirs:
+        try:
+            if os.path.islink(quarantine_dir):
+                os.unlink(quarantine_dir)
+            else:
+                shutil.rmtree(quarantine_dir)
+        except FileNotFoundError:
+            pass
 
 
 def _validate_consolidation_mode_config(current_is_consolidation_mode: bool,
@@ -745,6 +841,21 @@ def ha_recovery_for_consolidation_mode(pool: bool,
                                       pool=pool,
                                       with_replica_info=False)
             if svc is None:
+                # A raw service row without committed YAML is invisible to the
+                # latest-version join and its recovery script cannot possibly
+                # boot. Retire that script atomically instead of retrying an
+                # immortal partial registration forever.
+                raw_identity = serve_state.get_service_mode_and_hash(
+                    service_name)
+                if (raw_identity is not None and raw_identity[0] == pool and
+                        isinstance(raw_identity[1], str) and raw_identity[1]):
+                    retired = (
+                        serve_state.mark_unrecoverable_service_for_cleanup(
+                            service_name, raw_identity[1], pool))
+                    if retired:
+                        f.write(f'{capnoun} {service_name} has no committed '
+                                'version; retired its unusable recovery '
+                                'script and marked it for purge.\n')
                 continue
             controller_pid = svc['controller_pid']
             controller_ip = svc.get('controller_ip')
@@ -1132,19 +1243,11 @@ def set_service_status_and_active_versions_from_replica(
                 'The service is up-ed in an old version and does not '
                 'support update. Please `sky serve down` '
                 'it first and relaunch the service.')
-    if record['status'] == serve_state.ServiceStatus.SHUTTING_DOWN:
-        # When the service is shutting down, there is a period of time which the
-        # controller still responds to the request, and the replica is not
-        # terminated, the service status will still be READY, but we don't want
-        # change service status to READY.
-        return
-    if record['status'] == serve_state.ServiceStatus.CONTROLLER_FAILED:
-        # The _start supervisor flagged a dead or unbound controller/load
-        # balancer. The controller child may still be alive and probing
-        # replicas (e.g., only the LB failed to bind its port), and must not
-        # flap the status back to READY while the endpoint is down. The
-        # supervisor clears the flag itself once the children are confirmed
-        # healthy (see service.py `_heal_service_degraded`).
+    observed_status = record['status']
+    if observed_status in serve_state.ServiceStatus.terminal_statuses():
+        # A controller child can briefly keep probing after its parent has
+        # durably entered teardown or marked it failed. Terminal state belongs
+        # to the parent/finalizer and must never be healed by replica probes.
         return
 
     ready_replicas = list(filter(lambda info: info.is_ready, replica_infos))
@@ -1162,11 +1265,23 @@ def set_service_status_and_active_versions_from_replica(
     # NO_REPLICA, so a service whose replicas all failed would show the
     # benign-looking NO_REPLICA. `active_versions` above intentionally stays
     # on the ready replicas (the versions actually serving traffic).
-    serve_state.set_service_status_and_active_versions(
+    service_hash = record.get('hash')
+    if not isinstance(service_hash, str) or not service_hash:
+        logger.warning(f'Refusing replica-driven status write for '
+                       f'{service_name!r} without a durable incarnation.')
+        return
+    updated = serve_state.set_service_status_and_active_versions_if_owner(
         service_name,
+        service_hash,
+        record.get('controller_pid'),
+        record.get('controller_ip'),
         serve_state.ServiceStatus.from_replica_statuses(
             [info.status for info in replica_infos]),
-        active_versions=active_versions)
+        active_versions=active_versions,
+        expected_status=observed_status)
+    if not updated:
+        logger.debug(f'Skipped stale replica-driven status write for '
+                     f'{service_name!r}; owner or status changed.')
 
 
 def update_service_status(pool: bool) -> None:
@@ -1214,8 +1329,13 @@ def update_service_status(pool: bool) -> None:
                         f'{controller_pid} is not alive. Set to failure.')
 
         # If controller job is not running, set it as controller failed.
-        serve_state.set_service_status_and_active_versions(
-            service_name, serve_state.ServiceStatus.CONTROLLER_FAILED)
+        serve_state.set_service_status_and_active_versions_if_owner(
+            service_name,
+            record['hash'],
+            record['controller_pid'],
+            record['controller_ip'],
+            serve_state.ServiceStatus.CONTROLLER_FAILED,
+            expected_status=service_status)
 
 
 def update_service_encoded(service_name: str, version: int, mode: str,
@@ -1813,22 +1933,118 @@ def get_next_cluster_name(
         return replica_info.cluster_name
 
 
+def _purge_ownership_failure(service_name: str, detail: str) -> str:
+    return (f'{colorama.Fore.YELLOW}failed service {service_name!r} could not '
+            'be purged because its service incarnation changed during '
+            f'teardown ({detail}); retry against the current service state.'
+            f'{colorama.Style.RESET_ALL}')
+
+
 def _terminate_failed_services(service_name: str,
+                               expected_service_hash: Optional[str],
                                service_status: Optional[
                                    serve_state.ServiceStatus],
                                pool: bool = False) -> Optional[str]:
     """Terminate service in failed status.
 
-    Services included in ServiceStatus.failed_statuses() do not have an
-    active controller process, so we can't send a file terminate signal
-    to the controller. Instead, terminate any replica clusters that still
-    exist, then clean up the database record for the service. Clusters
-    that fail to terminate are reported as a potential resource leak.
+    Failed-status services may still have a parent or recovering controller,
+    so a file signal alone is not authoritative. Claim durable SHUTTING_DOWN,
+    wait for an exact-owner child-teardown acknowledgement (or atomically claim
+    a proven orphan), then terminate any remaining replicas and conditionally
+    remove the exact service incarnation. Clusters that fail to terminate are
+    reported as a potential resource leak.
 
     Returns:
         A message indicating potential resource leak (if any). If no
         resource leak is detected, return None.
     """
+    if not expected_service_hash:
+        return _purge_ownership_failure(service_name,
+                                        'missing durable service hash')
+    lifecycle_lock = get_service_lifecycle_lock(service_name)
+    # Kept in the outer helper's compatibility signature for existing callers;
+    # cleanup behavior is now fully determined by durable DB state.
+    del service_status
+    with lifecycle_lock:
+        return _terminate_failed_services_locked(service_name,
+                                                 expected_service_hash, pool,
+                                                 lifecycle_lock)
+
+
+def _terminate_failed_services_locked(
+        service_name: str, expected_service_hash: str, pool: bool,
+        lifecycle_lock: locks.DistributedLock) -> Optional[str]:
+    """Locked implementation of failed-service purge."""
+
+    def _still_owns() -> bool:
+        return (lifecycle_lock_is_valid(lifecycle_lock) and
+                serve_state.service_owner_matches(service_name,
+                                                  expected_service_hash))
+
+    if not _still_owns():
+        return _purge_ownership_failure(service_name,
+                                        'ownership lost before cleanup')
+    if not serve_state.set_service_status_and_active_versions_if_hash(
+            service_name, expected_service_hash,
+            serve_state.ServiceStatus.SHUTTING_DOWN):
+        return _purge_ownership_failure(
+            service_name, 'could not claim durable teardown state')
+
+    # A CONTROLLER_FAILED row may still have a live parent/child (for example,
+    # a transient LB failure). The parent polls durable SHUTTING_DOWN at the
+    # top of every tick, kills and joins its child, then clears controller_port
+    # before waiting for this same lifecycle lock. Do not down name-reused
+    # replica clusters until that acknowledgement arrives.
+    owner = serve_state.get_service_controller_owner(service_name)
+    if owner is None or owner.get('hash') != expected_service_hash:
+        return _purge_ownership_failure(service_name,
+                                        'owner disappeared before teardown')
+    if owner.get('controller_port') != constants.CONTROLLER_TEARDOWN_ACK_PORT:
+        recovery_script = serve_state.get_ha_recovery_script(service_name)
+        if recovery_script is None:
+            # Legacy orphan/FAILED_CLEANUP rows may have no parent left to
+            # acknowledge teardown. Absence of the recovery script is durable
+            # proof that no controller can be (re)spawned for this row.
+            claimed = serve_state.claim_orphaned_service_teardown(
+                service_name, expected_service_hash,
+                owner.get('controller_pid'), owner.get('controller_ip'),
+                os.getpid(), os.environ.get('POD_IP'))
+        elif serve_state.get_latest_committed_version(service_name) is None:
+            # A partial-registration row may retain a script but no committed
+            # YAML. The script can never boot, so consume it atomically while
+            # taking teardown ownership rather than waiting forever.
+            claimed = serve_state.claim_unrecoverable_service_teardown(
+                service_name, expected_service_hash,
+                owner.get('controller_pid'), owner.get('controller_ip'),
+                os.getpid(), os.environ.get('POD_IP'))
+        else:
+            claimed = None
+        if claimed is False:
+            return _purge_ownership_failure(
+                service_name, 'orphan teardown claim lost ownership')
+
+    owner_ack_deadline = time.time() + 10
+    while True:
+        owner = serve_state.get_service_controller_owner(service_name)
+        if owner is None or owner.get('hash') != expected_service_hash:
+            return _purge_ownership_failure(
+                service_name, 'ownership changed while awaiting controller')
+        if (owner.get('controller_port') ==
+                constants.CONTROLLER_TEARDOWN_ACK_PORT):
+            break
+        if time.time() >= owner_ack_deadline:
+            return (f'{colorama.Fore.YELLOW}failed service '
+                    f'{service_name!r} could not be purged because its '
+                    'controller has not yet acknowledged durable teardown; '
+                    'cleanup remains scheduled and can be retried.'
+                    f'{colorama.Style.RESET_ALL}')
+        time.sleep(0.2)
+
+    if not _still_owns():
+        return _purge_ownership_failure(
+            service_name, 'lifecycle lock or ownership lost after controller '
+            'acknowledgement')
+
     remaining_replica_clusters: List[str] = []
     replica_infos = serve_state.get_replica_infos(service_name)
     # The controller is dead (CONTROLLER_FAILED / FAILED_CLEANUP / zombie
@@ -1847,6 +2063,17 @@ def _terminate_failed_services(service_name: str,
         # pylint: disable=import-outside-toplevel
         from sky.serve import replica_managers
 
+        # DistributedLock's PostgreSQL liveness probe uses the lock-owning
+        # connection.  Multiple replica workers must not use that connection
+        # concurrently: psycopg connections/cursors are not a thread-safe
+        # ownership oracle.  Serialize guard probes while keeping the actual
+        # cluster termination requests parallel.
+        ownership_guard_lock = threading.Lock()
+
+        def _worker_still_owns() -> bool:
+            with ownership_guard_lock:
+                return _still_owns()
+
         def _terminate_replica_cluster(
                 info: 'replica_managers.ReplicaInfo') -> Optional[str]:
             # Reuse the normal replica down path (sdk.down with retries);
@@ -1854,8 +2081,10 @@ def _terminate_failed_services(service_name: str,
             log_file_name = generate_replica_log_file_name(
                 service_name, info.replica_id)
             try:
-                replica_managers.terminate_cluster(info.cluster_name,
-                                                   log_file_name)
+                replica_managers.terminate_cluster(
+                    info.cluster_name,
+                    log_file_name,
+                    continue_guard=(_worker_still_owns))
                 return None
             except Exception as e:  # pylint: disable=broad-except
                 logger.error(f'Failed to terminate replica cluster '
@@ -1870,6 +2099,10 @@ def _terminate_failed_services(service_name: str,
             f'{name!r}' for name in termination_failures if name is not None
         ]
 
+    if not _still_owns():
+        return _purge_ownership_failure(service_name,
+                                        'ownership lost after replica cleanup')
+
     # Quiesce the external data plane before dropping the service row. If the
     # delete fails, retaining the row makes purge retryable and prevents a
     # same-name re-up from reusing a still-Ready LB with cached routes to the
@@ -1880,7 +2113,8 @@ def _terminate_failed_services(service_name: str,
     from sky.serve import lb_k8s  # pylint: disable=import-outside-toplevel
     if not pool:
         try:
-            lb_k8s.delete_lb_objects(service_name)
+            lb_k8s.delete_lb_objects(
+                service_name, expected_service_hash=expected_service_hash)
         except Exception as e:  # pylint: disable=broad-except
             logger.error(
                 f'Failed to delete external LB objects for failed service '
@@ -1891,33 +2125,59 @@ def _terminate_failed_services(service_name: str,
                     'could not be deleted; retry purge after fixing '
                     f'Kubernetes access.{colorama.Style.RESET_ALL}')
 
-    # Purge semantics: clear every replica row after the data-plane quiesce,
-    # even if a replica cluster failed to terminate -- the user explicitly
-    # traded a possible compute leak (reported below) for a clean record.
-    for replica_info in replica_infos:
-        serve_state.remove_replica(service_name, replica_info.replica_id)
+    if not _still_owns():
+        return _purge_ownership_failure(
+            service_name, 'ownership lost after load balancer cleanup')
+
+    if remaining_replica_clusters:
+        # Internal replica cluster names are still name-scoped
+        # (<service>-<id>). Releasing the service name while one survives lets
+        # a same-name successor collide with or adopt that billable cluster.
+        # Keep every durable row/file and the name, but leave the external LB
+        # quiesced; a later --purge retries the remaining downs idempotently.
+        if not serve_state.set_service_status_and_active_versions_if_owner(
+                service_name,
+                expected_service_hash,
+                owner.get('controller_pid'),
+                owner.get('controller_ip'),
+                serve_state.ServiceStatus.FAILED_CLEANUP,
+                expected_status=serve_state.ServiceStatus.SHUTTING_DOWN):
+            return _purge_ownership_failure(
+                service_name, 'ownership lost while retaining failed cleanup')
+        remaining_identity = ', '.join(remaining_replica_clusters)
+        return (f'{colorama.Fore.YELLOW}failed service {service_name!r} '
+                'could not be purged because some replica clusters could not '
+                'be terminated. The service name and cleanup metadata remain '
+                'reserved; retry purge after checking: '
+                f'{remaining_identity}{colorama.Style.RESET_ALL}')
 
     service_dir = os.path.expanduser(
         generate_remote_service_dir_name(service_name))
-    # Same atomicity argument as the success path in `_start`: remove all
-    # DB state in one transaction so an interrupted purge doesn't leave
-    # stragglers.
-    serve_state.remove_service_completely(service_name)
-    try:
-        shutil.rmtree(service_dir)
-    except FileNotFoundError:
-        # The service_dir may already be gone (e.g. the controller's own
-        # success path raced with a purge).
-        pass
+    quarantine_dir = quarantine_service_directory(service_dir,
+                                                  expected_service_hash)
+    if not _still_owns():
+        # Never restore a name-scoped path after ownership is lost. A DB hash
+        # check followed by rename cannot be atomic with a same-name successor
+        # creating its canonical directory. Keep this incarnation's files in
+        # hash-owned quarantine; the authoritative retry will collect them.
+        return _purge_ownership_failure(
+            service_name, 'ownership lost while quarantining service files')
 
-    if not remaining_replica_clusters:
-        return None
-    remaining_identity = ', '.join(remaining_replica_clusters)
-    return (f'{colorama.Fore.YELLOW}terminate service {service_name!r} with '
-            f'failed status ({service_status}). Some replica clusters could '
-            'not be terminated and may leak resources. Please check the '
-            'following SkyPilot clusters on the controller: '
-            f'{remaining_identity}{colorama.Style.RESET_ALL}')
+    # Claim the exact incarnation first inside one transaction, then remove
+    # every name-keyed child row. A same-name successor cannot insert until
+    # the transaction commits, and all later filesystem work targets only the
+    # hash-owned quarantine.
+    removed = serve_state.remove_service_completely(service_name,
+                                                    expected_service_hash)
+    if not removed:
+        # The compare-delete failure is itself proof that this process may no
+        # longer own the name. Leave the old files hash-scoped rather than
+        # racing a successor's canonical directory.
+        return _purge_ownership_failure(
+            service_name, 'final database compare-and-delete '
+            'lost ownership')
+    remove_quarantined_service_directory(quarantine_dir)
+    return None
 
 
 def terminate_services(service_names: Optional[List[str]], purge: bool,
@@ -1930,10 +2190,10 @@ def terminate_services(service_names: Optional[List[str]], purge: bool,
 
     def _purge_completed(message: Optional[str]) -> bool:
         """Whether a failed-service purge removed its service row."""
-        # Replica termination failures are reported but the row is still
-        # removed. An external-LB deletion failure is different: the helper
-        # deliberately retains the row to prevent same-name re-up from
-        # inheriting a cached old LB, and marks that case explicitly.
+        # Every fail-closed condition (owner/lock loss, cluster-down failure,
+        # controller acknowledgement timeout, or LB deletion failure) retains
+        # the exact row/name and marks that case explicitly. Only a completed
+        # atomic removal counts as done.
         return message is None or 'could not be purged because' not in message
 
     for service_name in service_names:
@@ -1954,9 +2214,11 @@ def terminate_services(service_names: Optional[List[str]], purge: bool,
             # mode, so a serve `down --purge` never removes a jobs-pool's row
             # (or vice versa).
             if purge:
-                raw_pool = serve_state.get_service_pool_from_db(service_name)
-                if raw_pool is not None and raw_pool == pool:
+                raw_identity = serve_state.get_service_mode_and_hash(
+                    service_name)
+                if raw_identity is not None and raw_identity[0] == pool:
                     message = _terminate_failed_services(service_name,
+                                                         raw_identity[1],
                                                          None,
                                                          pool=pool)
                     if message is not None:
@@ -1967,18 +2229,13 @@ def terminate_services(service_names: Optional[List[str]], purge: bool,
         if (service_status is not None and service_status['status']
                 == serve_state.ServiceStatus.SHUTTING_DOWN):
             if purge:
-                # Force-clean a zombie SHUTTING_DOWN row. This happens when
-                # the controller subprocess died mid-`_cleanup` (pod
-                # restart / OOM / SIGKILL) before it could remove the
-                # services row. The row is then unrecoverable: HA recovery
-                # can't relaunch (ha_recovery_script was deleted in
-                # cleanup's first step before the move to success-path),
-                # plain `down` skips it ("already scheduled"), and `apply`
-                # tries to update a dead controller. With --purge the user
-                # explicitly accepts a possible cluster-resource leak in
-                # exchange for clearing the row.
+                # Resume exact-owner cleanup for a zombie or a prior
+                # fail-closed purge attempt. The first purge durably CASes the
+                # row to SHUTTING_DOWN before touching replicas/LB/files; any
+                # later failure deliberately keeps that row retryable here.
                 message = _terminate_failed_services(
                     service_name,
+                    service_status.get('hash'),
                     serve_state.ServiceStatus.SHUTTING_DOWN,
                     pool=pool)
                 if message is not None:
@@ -2009,6 +2266,7 @@ def terminate_services(service_names: Optional[List[str]], purge: bool,
             failed_status = service_status['status']
             if purge:
                 message = _terminate_failed_services(service_name,
+                                                     service_status.get('hash'),
                                                      failed_status,
                                                      pool=pool)
                 if message is not None:
@@ -2027,6 +2285,19 @@ def terminate_services(service_names: Optional[List[str]], purge: bool,
                 continue
         else:
             # Send the terminate signal to controller.
+            expected_service_hash = service_status.get('hash')
+            marked_for_teardown = (
+                isinstance(expected_service_hash, str) and
+                bool(expected_service_hash) and
+                serve_state.set_service_status_and_active_versions_if_hash(
+                    service_name, expected_service_hash,
+                    serve_state.ServiceStatus.SHUTTING_DOWN))
+            if not marked_for_teardown:
+                messages.append(
+                    f'{colorama.Fore.YELLOW}{capnoun} {service_name!r} '
+                    'changed incarnation before termination could be '
+                    f'signaled; retry the command.{colorama.Style.RESET_ALL}')
+                continue
             signal_file = pathlib.Path(
                 constants.SIGNAL_FILE_PATH.format(service_name)).expanduser()
             # Make sure parent directory exists.
@@ -2035,7 +2306,13 @@ def terminate_services(service_names: Optional[List[str]], purge: bool,
             # check/removal and signal writing.
             with filelock.FileLock(str(signal_file) + '.lock'):
                 with signal_file.open(mode='w', encoding='utf-8') as f:
-                    f.write(UserSignal.TERMINATE.value)
+                    json.dump(
+                        {
+                            'signal': UserSignal.TERMINATE.value,
+                            'service_hash': expected_service_hash,
+                        },
+                        f,
+                        separators=(',', ':'))
                     f.flush()
         # Failed-service purge branches append only after confirming the row
         # was removed; normal signal-based down always reaches this point.
@@ -2116,6 +2393,13 @@ def wait_service_registration(service_name: str, job_id: int,
                         f'Please specify a different name for your {noun}. '
                         f'To update an existing {noun}, run: {command_to_run}'
                         f' {service_name} <new-{noun}-yaml>')
+            status = record['status']
+            if status in serve_state.ServiceStatus.terminal_statuses():
+                with ux_utils.print_exception_no_traceback():
+                    raise RuntimeError(
+                        f'The {noun} {service_name!r} entered terminal status '
+                        f'{status.value} during registration; cleanup is in '
+                        'progress or required.')
             lb_port = record['load_balancer_port']
             if lb_port is not None:
                 return message_utils.encode_payload(lb_port)

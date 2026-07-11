@@ -82,6 +82,30 @@ class TestWaitForDrain:
             replica_managers.terminate_cluster.__name__ == 'terminate_cluster')
         assert hasattr(replica_managers.terminate_cluster, '__wrapped__')
 
+    def test_terminate_retry_stops_when_cleanup_loses_ownership(self):
+        context = mock.MagicMock()
+        ownership = iter([True, False])
+        with mock.patch.object(replica_managers.context,
+                               'get',
+                               return_value=context), \
+             mock.patch.object(replica_managers.usage_lib.messages.usage,
+                               'set_internal'), \
+             mock.patch.object(replica_managers.sdk,
+                               'down',
+                               side_effect=RuntimeError('first request failed')) \
+                 as down, \
+             mock.patch.object(replica_managers.common_utils.Backoff,
+                               'current_backoff',
+                               return_value=0), \
+             mock.patch.object(replica_managers.time, 'sleep'):
+            with pytest.raises(RuntimeError, match='ownership was lost'):
+                replica_managers.terminate_cluster.__wrapped__(
+                    'svc-1',
+                    '/tmp/replica.log',
+                    continue_guard=lambda: next(ownership))
+
+        down.assert_called_once_with('svc-1')
+
 
 def _manager(is_pool=False):
     rm = replica_managers.ReplicaManager.__new__(

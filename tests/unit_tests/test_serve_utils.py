@@ -1,5 +1,8 @@
+import contextlib
+import os
 import pathlib
 import tempfile
+import threading
 from unittest import mock
 
 import pytest
@@ -15,6 +18,38 @@ from sky.serve import serve_utils
 # mock.patch needs the dotted path to the attribute being patched.
 _SIGNAL_FILE_CONST = (
     'sky.jobs.constants.JOBS_CONSOLIDATION_RELOADED_SIGNAL_FILE')
+
+
+def test_lifecycle_lock_detection_failure_is_fail_closed():
+    with mock.patch.object(serve_utils.global_user_state,
+                           'initialize_and_get_db',
+                           side_effect=RuntimeError('postgres unavailable')), \
+         mock.patch.object(serve_utils.locks, 'get_lock') as get_lock:
+        with pytest.raises(RuntimeError, match='postgres unavailable'):
+            serve_utils.get_service_lifecycle_lock('svc')
+    get_lock.assert_not_called()
+
+
+@pytest.mark.parametrize('status', [
+    serve_state.ServiceStatus.SHUTTING_DOWN,
+    serve_state.ServiceStatus.FAILED_CLEANUP,
+])
+def test_wait_registration_aborts_terminal_service_without_polling(status):
+    record = {
+        'controller_job_id': 7,
+        'status': status,
+        'load_balancer_port': None,
+    }
+    with mock.patch.object(serve_utils,
+                           'is_consolidation_mode',
+                           return_value=True), \
+         mock.patch.object(serve_utils,
+                           '_get_service_status',
+                           return_value=record), \
+         mock.patch.object(serve_utils.time, 'sleep') as sleep, \
+         pytest.raises(RuntimeError, match='terminal status'):
+        serve_utils.wait_service_registration('svc', 7, pool=False)
+    sleep.assert_not_called()
 
 
 def test_external_lb_service_spec_rejects_task_tls():
@@ -73,6 +108,62 @@ def test_task_fits():
     task_resources = Resources(cpus=1, memory=1, cloud=clouds.AWS())
     free_resources = Resources(cpus=None, memory=None, cloud=clouds.AWS())
     assert serve_utils._task_fits(task_resources, free_resources) is False
+
+
+def test_service_directory_quarantine_recovers_crash_and_ha_mkdir(tmp_path):
+    canonical = tmp_path / 'svc'
+    canonical.mkdir()
+    (canonical / 'old').write_text('a', encoding='utf-8')
+
+    first = serve_utils.quarantine_service_directory(str(canonical),
+                                                     'incarnation-a')
+    assert len(first) == 1 and not canonical.exists()
+
+    # Model process death after rename, followed by HA startup recreating the
+    # canonical directory before it resumes teardown.
+    canonical.mkdir()
+    (canonical / 'recovery').write_text('b', encoding='utf-8')
+    second = serve_utils.quarantine_service_directory(str(canonical),
+                                                      'incarnation-a')
+    assert len(second) == 2
+    assert set(second) >= set(first)
+    assert not canonical.exists()
+
+    # A second crash must not leak the retry quarantine created above.
+    canonical.mkdir()
+    third = serve_utils.quarantine_service_directory(str(canonical),
+                                                     'incarnation-a')
+    assert len(third) == 3
+    assert set(third) >= set(second)
+
+    serve_utils.remove_quarantined_service_directory(third)
+    assert not any(tmp_path.iterdir())
+
+
+def test_request_lock_and_quarantine_cleanup_do_not_touch_successor(
+        tmp_path, monkeypatch):
+    canonical = tmp_path / 'svc'
+    canonical.mkdir()
+    (canonical / 'owned-by-a').write_text('a', encoding='utf-8')
+    quarantines = serve_utils.quarantine_service_directory(
+        str(canonical), 'incarnation-a')
+    assert not canonical.exists()
+
+    runtime_locks = tmp_path / 'runtime-locks'
+    monkeypatch.setattr(serve_utils.locks, 'SKY_LOCKS_DIR', str(runtime_locks))
+    request_lock = pathlib.Path(serve_utils.get_service_filelock_path('svc'))
+    request_lock.touch()
+    assert request_lock.parent == runtime_locks
+    assert not canonical.exists()
+
+    # A same-name successor may create its canonical directory after A loses
+    # the lifecycle lock. A's only safe file operation is removal of its
+    # hash-owned quarantine; it must never restore/rename over B's directory.
+    canonical.mkdir()
+    (canonical / 'owned-by-b').write_text('b', encoding='utf-8')
+    serve_utils.remove_quarantined_service_directory(quarantines)
+    assert (canonical / 'owned-by-b').read_text(encoding='utf-8') == 'b'
+    assert not any(tmp_path.glob('svc.teardown-*'))
 
 
 def test_serve_preemption_skips_autostopping():
@@ -551,6 +642,7 @@ class TestTerminateShuttingDownPurge:
             'controller_port': 20001,
             'controller_ip': None,
             'pool': True,
+            'hash': 'incarnation-a',
         }
 
     def test_purge_calls_terminate_failed_services_for_shutting_down(self):
@@ -572,7 +664,8 @@ class TestTerminateShuttingDownPurge:
             mock_purge.assert_called_once()
             args = mock_purge.call_args[0]
             assert args[0] == 'svc'
-            assert args[1] == serve_state.ServiceStatus.SHUTTING_DOWN
+            assert args[1] == 'incarnation-a'
+            assert args[2] == serve_state.ServiceStatus.SHUTTING_DOWN
 
     def test_no_purge_skips_shutting_down_unchanged(self):
         # pylint: disable=import-outside-toplevel
@@ -607,8 +700,9 @@ class TestTerminateOrphanedServiceRowPurge:
              mock.patch('sky.serve.serve_utils._get_service_status',
                         return_value=None), \
              mock.patch('sky.serve.serve_utils.serve_state.'
-                        'get_service_pool_from_db',
-                        return_value=raw_pool), \
+                        'get_service_mode_and_hash',
+                        return_value=(raw_pool, 'orphan-hash')
+                        if raw_pool is not None else None), \
              mock.patch('sky.serve.serve_utils._terminate_failed_services',
                         return_value=None) as mock_purge:
             serve_utils.terminate_services(['svc'],
@@ -620,7 +714,7 @@ class TestTerminateOrphanedServiceRowPurge:
         mock_purge = self._run(purge=True, raw_pool=False, requested_pool=False)
         mock_purge.assert_called_once()
         # Called with a None status (no version row -> no real status).
-        assert mock_purge.call_args[0] == ('svc', None)
+        assert mock_purge.call_args[0] == ('svc', 'orphan-hash', None)
 
     def test_does_not_purge_wrong_mode_row(self):
         # raw row is a jobs-pool (pool=True) but the command is `serve down`
@@ -1105,6 +1199,40 @@ class TestHaRecoverySkipsWhenStartInFlight:
             mock_runner_cls.return_value.run.assert_not_called()
 
 
+class TestHaRecoveryRetiresUnbootableRows:
+
+    def test_missing_committed_version_is_marked_for_purge(
+            self, tmp_path, monkeypatch):
+        monkeypatch.setenv('POD_IP', '10.4.0.1')
+        with mock.patch(
+                'sky.serve.serve_utils.serve_state.get_glob_service_names',
+                return_value=['svc']), \
+             mock.patch('sky.serve.serve_utils._get_service_status',
+                        return_value=None), \
+             mock.patch(
+                 'sky.serve.serve_utils.serve_state.get_service_mode_and_hash',
+                 return_value=(False, 'incarnation-a')), \
+             mock.patch(
+                 'sky.serve.serve_utils.serve_state.'
+                 'mark_unrecoverable_service_for_cleanup',
+                 return_value=True) as mark, \
+             mock.patch(
+                 'sky.serve.serve_utils.'
+                 '_snapshot_in_flight_start_service_names',
+                 return_value=set()), \
+             mock.patch(
+                 'sky.serve.serve_utils.command_runner.'
+                 'LocalProcessCommandRunner') as runner_cls, \
+             mock.patch(
+                 'sky.serve.serve_utils.skylet_constants.'
+                 'HA_PERSISTENT_RECOVERY_LOG_PATH',
+                 str(tmp_path / 'recovery_log_{}.log')):
+            serve_utils.ha_recovery_for_consolidation_mode(pool=False)
+
+        mark.assert_called_once_with('svc', 'incarnation-a', False)
+        runner_cls.return_value.run.assert_not_called()
+
+
 class TestHaRecoveryDefensiveOnAliveCheckException:
     """`ha_recovery_for_consolidation_mode` calls `_controller_process_alive`
     to decide whether to respawn the controller. If that call raises a
@@ -1194,16 +1322,24 @@ def test_set_service_status_from_replica_uses_all_replicas(
     replica_infos = [
         _FakeReplicaInfo(status, version=1) for status in replica_statuses
     ]
-    record = {'status': serve_state.ServiceStatus.READY}
+    record = {
+        'status': serve_state.ServiceStatus.READY,
+        'hash': 'incarnation-a',
+        'controller_pid': 123,
+        'controller_ip': '10.0.0.1',
+    }
     with mock.patch.object(serve_state,
                            'get_service_from_name',
                            return_value=record), \
-         mock.patch.object(serve_state,
-                           'set_service_status_and_active_versions') as set_st:
+         mock.patch.object(
+             serve_state,
+             'set_service_status_and_active_versions_if_owner') as set_st:
         serve_utils.set_service_status_and_active_versions_from_replica(
             'svc', replica_infos, serve_utils.UpdateMode.ROLLING)
     set_st.assert_called_once()
-    assert set_st.call_args.args[1] == expected_service_status
+    assert set_st.call_args.args[4] == expected_service_status
+    assert set_st.call_args.kwargs['expected_status'] == (
+        serve_state.ServiceStatus.READY)
 
 
 def test_set_service_status_from_replica_active_versions_ready_only():
@@ -1212,38 +1348,95 @@ def test_set_service_status_from_replica_active_versions_ready_only():
         _FakeReplicaInfo(serve_state.ReplicaStatus.READY, version=2),
         _FakeReplicaInfo(serve_state.ReplicaStatus.PROVISIONING, version=3),
     ]
-    record = {'status': serve_state.ServiceStatus.READY}
+    record = {
+        'status': serve_state.ServiceStatus.READY,
+        'hash': 'incarnation-a',
+        'controller_pid': 123,
+        'controller_ip': '10.0.0.1',
+    }
     with mock.patch.object(serve_state,
                            'get_service_from_name',
                            return_value=record), \
-         mock.patch.object(serve_state,
-                           'set_service_status_and_active_versions') as set_st:
+         mock.patch.object(
+             serve_state,
+             'set_service_status_and_active_versions_if_owner') as set_st:
         serve_utils.set_service_status_and_active_versions_from_replica(
             'svc', replica_infos, serve_utils.UpdateMode.ROLLING)
     set_st.assert_called_once()
-    assert set_st.call_args.args[1] == serve_state.ServiceStatus.READY
+    assert set_st.call_args.args[4] == serve_state.ServiceStatus.READY
     assert set_st.call_args.kwargs['active_versions'] == [2]
+
+
+def test_replica_status_writer_cannot_erase_interleaved_shutdown():
+    db_record = {
+        'status': serve_state.ServiceStatus.READY,
+        'hash': 'incarnation-a',
+        'controller_pid': 123,
+        'controller_ip': '10.0.0.1',
+    }
+    read_complete = threading.Event()
+    resume = threading.Event()
+
+    def _read(_service_name):
+        snapshot = dict(db_record)
+        read_complete.set()
+        assert resume.wait(timeout=2)
+        return snapshot
+
+    def _cas(_name, expected_hash, expected_pid, expected_ip, status, **kwargs):
+        if (db_record['hash'] != expected_hash or
+                db_record['controller_pid'] != expected_pid or
+                db_record['controller_ip'] != expected_ip or
+                db_record['status'] != kwargs['expected_status']):
+            return False
+        db_record['status'] = status
+        return True
+
+    with mock.patch.object(serve_state,
+                           'get_service_from_name',
+                           side_effect=_read), \
+         mock.patch.object(
+             serve_state,
+             'set_service_status_and_active_versions_if_owner',
+             side_effect=_cas):
+        writer = threading.Thread(
+            target=serve_utils.
+            set_service_status_and_active_versions_from_replica,
+            args=('svc', [], serve_utils.UpdateMode.ROLLING))
+        writer.start()
+        assert read_complete.wait(timeout=2)
+        db_record['status'] = serve_state.ServiceStatus.SHUTTING_DOWN
+        resume.set()
+        writer.join(timeout=2)
+
+    assert not writer.is_alive()
+    assert db_record['status'] == serve_state.ServiceStatus.SHUTTING_DOWN
 
 
 class TestTerminateFailedServices:
     """`_terminate_failed_services` must terminate replica clusters that
-    still exist BEFORE deleting their DB rows.
+    still exist only after exact-owner controller teardown acknowledgement and
+    BEFORE deleting their DB rows.
 
-    The controller of a failed service is dead, so no down thread will ever
-    run for its replicas. Deleting the rows without terminating the clusters
-    (the old behavior) permanently orphaned them: nothing referenced the
-    clusters anymore, so they kept billing until manually downed.
+    Once the child is durably gone, no down thread will run for its replicas.
+    Deleting the rows without terminating the clusters permanently orphaned
+    them: nothing referenced the clusters anymore, so they kept billing until
+    manually downed.
     """
 
-    def _run(self, replica_infos, exists, terminate_side_effect=None):
+    def _run(self,
+             replica_infos,
+             exists,
+             terminate_side_effect=None,
+             lb_side_effect=None):
         terminated = []
 
-        def _terminate(cluster_name, _log_file):
+        def _terminate(cluster_name, _log_file, **_kwargs):
             terminated.append(cluster_name)
             if terminate_side_effect is not None:
                 terminate_side_effect(cluster_name)
 
-        removed = []
+        lifecycle_lock = mock.MagicMock()
         with mock.patch(
                 'sky.serve.serve_utils.serve_state.get_replica_infos',
                 return_value=replica_infos), \
@@ -1253,14 +1446,40 @@ class TestTerminateFailedServices:
                  side_effect=exists), \
              mock.patch('sky.serve.replica_managers.terminate_cluster',
                         side_effect=_terminate), \
-             mock.patch('sky.serve.serve_utils.serve_state.remove_replica',
-                        side_effect=lambda _svc, rid: removed.append(rid)), \
+             mock.patch('sky.serve.serve_utils.get_service_lifecycle_lock',
+                        return_value=lifecycle_lock), \
+             mock.patch('sky.serve.serve_utils.lifecycle_lock_is_valid',
+                        return_value=True), \
+             mock.patch('sky.serve.serve_utils.serve_state.'
+                        'service_owner_matches', return_value=True), \
+             mock.patch('sky.serve.serve_utils.serve_state.'
+                        'set_service_status_and_active_versions_if_hash',
+                        return_value=True), \
+             mock.patch('sky.serve.serve_utils.serve_state.'
+                        'set_service_status_and_active_versions_if_owner',
+                        return_value=True) as set_owner_status, \
+             mock.patch('sky.serve.serve_utils.serve_state.'
+                        'get_service_controller_owner',
+                        return_value={
+                            'hash': 'incarnation-a',
+                            'controller_port':
+                                constants.CONTROLLER_TEARDOWN_ACK_PORT,
+                        }), \
              mock.patch(
                  'sky.serve.serve_utils.serve_state.'
-                 'remove_service_completely') as remove_service, \
-             mock.patch('sky.serve.serve_utils.shutil.rmtree'):
-            message = serve_utils._terminate_failed_services('svc', None)
-        return terminated, removed, remove_service, message
+                 'remove_service_completely', return_value=True
+             ) as remove_service, \
+             mock.patch('sky.serve.serve_utils.'
+                        'quarantine_service_directory',
+                        return_value=None) as quarantine, \
+             mock.patch('sky.serve.serve_utils.'
+                        'remove_quarantined_service_directory'), \
+             mock.patch('sky.serve.lb_k8s.delete_lb_objects',
+                        side_effect=lb_side_effect) as delete_lb:
+            message = serve_utils._terminate_failed_services(
+                'svc', 'incarnation-a', None)
+        return (terminated, remove_service, delete_lb, message,
+                set_owner_status, quarantine)
 
     @staticmethod
     def _replica(replica_id, cluster_name):
@@ -1271,78 +1490,365 @@ class TestTerminateFailedServices:
 
     def test_existing_clusters_are_terminated_before_row_removal(self):
         infos = [self._replica(1, 'svc-1'), self._replica(2, 'svc-2')]
-        terminated, removed, remove_service, message = self._run(
+        terminated, remove_service, _, message, _, _ = self._run(
             infos, exists=lambda name: name == 'svc-1')
         # Only the still-existing cluster is downed; both rows are removed
         # and the service row is cleared.
         assert terminated == ['svc-1']
-        assert removed == [1, 2]
-        remove_service.assert_called_once_with('svc')
+        remove_service.assert_called_once_with('svc', 'incarnation-a')
         assert message is None
 
-    def test_termination_failure_is_reported_and_rows_still_cleared(self):
+    def test_termination_failure_retains_name_and_cleanup_metadata(self):
         infos = [self._replica(1, 'svc-1'), self._replica(2, 'svc-2')]
 
         def _fail_svc_2(cluster_name):
             if cluster_name == 'svc-2':
                 raise RuntimeError('down failed')
 
-        terminated, removed, remove_service, message = self._run(
+        terminated, remove_service, _, message, _, _ = self._run(
             infos, exists=lambda name: True, terminate_side_effect=_fail_svc_2)
         assert sorted(terminated) == ['svc-1', 'svc-2']
-        # Purge semantics: rows cleared even for the failed termination,
-        # but the failure is surfaced to the user.
-        assert removed == [1, 2]
-        remove_service.assert_called_once_with('svc')
-        assert message is not None
+        remove_service.assert_not_called()
+        assert message is not None and 'could not be purged' in message
+
+    def test_cluster_down_failure_blocks_name_until_retry_succeeds(self):
+        infos = [self._replica(1, 'svc-1')]
+        attempts = 0
+
+        def _fail_once(_cluster_name):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError('down failed')
+
+        (_, first_remove, first_lb, first_message, first_status,
+         first_quarantine) = self._run(infos,
+                                       exists=lambda name: True,
+                                       terminate_side_effect=_fail_once)
+        assert first_message is not None and 'could not be purged' in (
+            first_message)
+        first_remove.assert_not_called()
+        first_lb.assert_called_once_with('svc',
+                                         expected_service_hash='incarnation-a')
+        first_status.assert_called_once()
+        assert (first_status.call_args.args[4] ==
+                serve_state.ServiceStatus.FAILED_CLEANUP)
+        assert first_status.call_args.kwargs['expected_status'] == (
+            serve_state.ServiceStatus.SHUTTING_DOWN)
+        first_quarantine.assert_not_called()
+
+        _, second_remove, _, second_message, _, second_quarantine = self._run(
+            infos, exists=lambda name: True, terminate_side_effect=_fail_once)
+        assert second_message is None
+        second_remove.assert_called_once_with('svc', 'incarnation-a')
+        second_quarantine.assert_called_once()
 
     def test_no_existing_clusters_skips_termination(self):
         infos = [self._replica(1, 'svc-1')]
-        terminated, removed, remove_service, message = self._run(
+        terminated, remove_service, _, message, _, _ = self._run(
             infos, exists=lambda name: False)
         assert not terminated
-        assert removed == [1]
-        remove_service.assert_called_once_with('svc')
+        remove_service.assert_called_once_with('svc', 'incarnation-a')
         assert message is None
+
+    def test_failed_final_cas_never_restores_over_successor(self, tmp_path):
+        canonical = tmp_path / 'svc'
+        canonical.mkdir()
+        (canonical / 'owned-by-a').write_text('a', encoding='utf-8')
+        lifecycle_lock = mock.MagicMock()
+
+        def _lose_final_cas(*_args, **_kwargs):
+            # Model the authoritative actor winning after A quarantined its
+            # files: B now owns the canonical name before A learns its final
+            # compare-delete failed.
+            canonical.mkdir()
+            (canonical / 'owned-by-b').write_text('b', encoding='utf-8')
+            return False
+
+        owner = {
+            'hash': 'incarnation-a',
+            'controller_pid': 101,
+            'controller_ip': '10.0.0.1',
+            'controller_port': constants.CONTROLLER_TEARDOWN_ACK_PORT,
+        }
+        with mock.patch.object(serve_utils,
+                               'lifecycle_lock_is_valid',
+                               return_value=True), \
+             mock.patch.object(serve_state,
+                               'service_owner_matches',
+                               return_value=True), \
+             mock.patch.object(
+                 serve_state,
+                 'set_service_status_and_active_versions_if_hash',
+                 return_value=True), \
+             mock.patch.object(serve_state,
+                               'get_service_controller_owner',
+                               return_value=owner), \
+             mock.patch.object(serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(serve_utils,
+                               'generate_remote_service_dir_name',
+                               return_value=str(canonical)), \
+             mock.patch.object(serve_state,
+                               'remove_service_completely',
+                               side_effect=_lose_final_cas):
+            message = serve_utils._terminate_failed_services_locked(
+                'svc', 'incarnation-a', True, lifecycle_lock)
+
+        assert message is not None and 'compare-and-delete' in message
+        assert (canonical / 'owned-by-b').read_text(encoding='utf-8') == 'b'
+        quarantines = list(tmp_path.glob('svc.teardown-*'))
+        assert len(quarantines) == 1
+        assert (quarantines[0] /
+                'owned-by-a').read_text(encoding='utf-8') == 'a'
 
     def test_deletes_external_lb_objects(self):
         # The failed-service purge path must also reap the controller-owned
         # external LB (Deployment + Service); otherwise it leaks.
         infos = [self._replica(1, 'svc-1')]
-        with mock.patch(
-                'sky.serve.serve_utils.serve_state.get_replica_infos',
-                return_value=infos), \
-             mock.patch(
-                 'sky.serve.serve_utils.global_user_state.'
-                 'cluster_with_name_exists', return_value=False), \
-             mock.patch('sky.serve.serve_utils.serve_state.remove_replica'), \
-             mock.patch('sky.serve.serve_utils.serve_state.'
-                        'remove_service_completely'), \
-             mock.patch('sky.serve.serve_utils.shutil.rmtree'), \
-             mock.patch('sky.serve.lb_k8s.delete_lb_objects'
-                       ) as mock_delete_lb:
-            serve_utils._terminate_failed_services('svc', None)
-        mock_delete_lb.assert_called_once_with('svc')
+        _, _, mock_delete_lb, message, _, _ = self._run(
+            infos, exists=lambda name: False)
+        assert message is None
+        mock_delete_lb.assert_called_once_with(
+            'svc', expected_service_hash='incarnation-a')
 
     def test_lb_delete_failure_retains_purge_row(self):
         # Never drop the service row while an old Ready LB may still hold
         # cached routes; same-name re-up must remain blocked until deletion is
         # retried successfully.
-        with mock.patch(
-                'sky.serve.serve_utils.serve_state.get_replica_infos',
-                return_value=[]), \
-             mock.patch('sky.serve.lb_k8s.delete_lb_objects',
-                        side_effect=RuntimeError('forbidden')), \
-             mock.patch('sky.serve.serve_utils.serve_state.remove_replica'
-                       ) as remove_replica, \
-             mock.patch('sky.serve.serve_utils.serve_state.'
-                        'remove_service_completely') as remove_service, \
-             mock.patch('sky.serve.serve_utils.shutil.rmtree'):
-            message = serve_utils._terminate_failed_services('svc', None)
+        _, remove_service, _, message, _, _ = self._run(
+            [],
+            exists=lambda name: False,
+            lb_side_effect=RuntimeError('forbidden'))
         assert message is not None
         assert 'could not be purged' in message
-        remove_replica.assert_not_called()
         remove_service.assert_not_called()
+
+    def test_failed_lb_delete_is_retryable_from_shutting_down(self):
+        lifecycle_lock = mock.MagicMock()
+        owner = {
+            'hash': 'incarnation-a',
+            'controller_pid': 101,
+            'controller_ip': '10.0.0.1',
+            'controller_port': None,
+        }
+
+        def _claim(*_args, **_kwargs):
+            owner.update({
+                'controller_pid': os.getpid(),
+                'controller_ip': os.environ.get('POD_IP'),
+                'controller_port': constants.CONTROLLER_TEARDOWN_ACK_PORT,
+            })
+            return True
+
+        with mock.patch.object(serve_utils,
+                               'lifecycle_lock_is_valid',
+                               return_value=True), \
+             mock.patch.object(serve_state,
+                               'service_owner_matches',
+                               return_value=True), \
+             mock.patch.object(
+                 serve_state,
+                 'set_service_status_and_active_versions_if_hash',
+                 return_value=True), \
+             mock.patch.object(serve_state,
+                               'get_service_controller_owner',
+                               side_effect=lambda _name: dict(owner)), \
+             mock.patch.object(serve_state,
+                               'get_ha_recovery_script',
+                               return_value=None), \
+             mock.patch.object(serve_state,
+                               'claim_orphaned_service_teardown',
+                               side_effect=_claim) as claim, \
+             mock.patch.object(serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(serve_utils,
+                               'quarantine_service_directory',
+                               return_value=[]), \
+             mock.patch.object(serve_utils,
+                               'remove_quarantined_service_directory'), \
+             mock.patch.object(serve_state,
+                               'remove_service_completely',
+                               return_value=True) as remove_service, \
+             mock.patch(
+                 'sky.serve.lb_k8s.delete_lb_objects',
+                 side_effect=[RuntimeError('apiserver unavailable'), None]
+             ) as delete_lb:
+            first = serve_utils._terminate_failed_services_locked(
+                'svc', 'incarnation-a', False, lifecycle_lock)
+            second = serve_utils._terminate_failed_services_locked(
+                'svc', 'incarnation-a', False, lifecycle_lock)
+
+        assert first is not None and 'could not be purged' in first
+        assert second is None
+        claim.assert_called_once()
+        assert delete_lb.call_count == 2
+        remove_service.assert_called_once_with('svc', 'incarnation-a')
+
+    def test_recovery_preclaim_none_port_is_not_teardown_ack(self):
+        # HA recovery deliberately clears controller_port before the new
+        # controller child is ready. Treating None as acknowledgement lets a
+        # purger race that boot and down its clusters.
+        lifecycle_lock = mock.MagicMock()
+        owner = {
+            'hash': 'incarnation-a',
+            'controller_pid': 101,
+            'controller_ip': '10.0.0.1',
+            'controller_port': None,
+        }
+        with mock.patch.object(serve_utils,
+                               'lifecycle_lock_is_valid',
+                               return_value=True), \
+             mock.patch.object(serve_state,
+                               'service_owner_matches',
+                               return_value=True), \
+             mock.patch.object(
+                 serve_state,
+                 'set_service_status_and_active_versions_if_hash',
+                 return_value=True), \
+             mock.patch.object(serve_state,
+                               'get_service_controller_owner',
+                               return_value=owner), \
+             mock.patch.object(serve_state,
+                               'get_ha_recovery_script',
+                               return_value='recovery command'), \
+             mock.patch.object(serve_state,
+                               'get_latest_committed_version',
+                               return_value=1), \
+             mock.patch.object(serve_utils.time,
+                               'time',
+                               side_effect=[0, 11]), \
+             mock.patch.object(serve_utils.time, 'sleep'), \
+             mock.patch.object(serve_state,
+                               'get_replica_infos') as get_replicas, \
+             mock.patch.object(serve_state,
+                               'remove_service_completely') as remove_service:
+            message = serve_utils._terminate_failed_services_locked(
+                'svc', 'incarnation-a', False, lifecycle_lock)
+
+        assert message is not None
+        assert 'has not yet acknowledged' in message
+        get_replicas.assert_not_called()
+        remove_service.assert_not_called()
+
+    def test_orphan_without_recovery_script_can_claim_teardown(self):
+        # Legacy FAILED_CLEANUP rows have no live/recoverable controller to
+        # write the new sentinel. Under the lifecycle lock, absence of the HA
+        # script permits an exact-owner claim so the orphan stays purgeable.
+        lifecycle_lock = mock.MagicMock()
+        old_owner = {
+            'hash': 'incarnation-a',
+            'controller_pid': 101,
+            'controller_ip': '10.0.0.1',
+            'controller_port': None,
+        }
+        claimed_owner = {
+            **old_owner,
+            'controller_pid': os.getpid(),
+            'controller_ip': os.environ.get('POD_IP'),
+            'controller_port': constants.CONTROLLER_TEARDOWN_ACK_PORT,
+        }
+        with mock.patch.object(serve_utils,
+                               'lifecycle_lock_is_valid',
+                               return_value=True), \
+             mock.patch.object(serve_state,
+                               'service_owner_matches',
+                               return_value=True), \
+             mock.patch.object(
+                 serve_state,
+                 'set_service_status_and_active_versions_if_hash',
+                 return_value=True), \
+             mock.patch.object(
+                 serve_state,
+                 'get_service_controller_owner',
+                 side_effect=[old_owner, claimed_owner]), \
+             mock.patch.object(serve_state,
+                               'get_ha_recovery_script',
+                               return_value=None), \
+             mock.patch.object(
+                 serve_state,
+                 'claim_orphaned_service_teardown',
+                 return_value=True) as claim, \
+             mock.patch.object(serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(serve_utils,
+                               'quarantine_service_directory',
+                               return_value=[]), \
+             mock.patch.object(serve_utils,
+                               'remove_quarantined_service_directory'), \
+             mock.patch.object(serve_state,
+                               'remove_service_completely',
+                               return_value=True), \
+             mock.patch('sky.serve.lb_k8s.delete_lb_objects'):
+            message = serve_utils._terminate_failed_services_locked(
+                'svc', 'incarnation-a', False, lifecycle_lock)
+
+        assert message is None
+        claim.assert_called_once_with('svc', 'incarnation-a', 101, '10.0.0.1',
+                                      os.getpid(), os.environ.get('POD_IP'))
+
+    def test_orphan_with_unbootable_script_can_claim_teardown(self):
+        lifecycle_lock = mock.MagicMock()
+        old_owner = {
+            'hash': 'incarnation-a',
+            'controller_pid': 101,
+            'controller_ip': '10.0.0.1',
+            'controller_port': None,
+        }
+        claimed_owner = {
+            **old_owner,
+            'controller_pid': os.getpid(),
+            'controller_ip': os.environ.get('POD_IP'),
+            'controller_port': constants.CONTROLLER_TEARDOWN_ACK_PORT,
+        }
+        with mock.patch.object(serve_utils,
+                               'lifecycle_lock_is_valid',
+                               return_value=True), \
+             mock.patch.object(serve_state,
+                               'service_owner_matches',
+                               return_value=True), \
+             mock.patch.object(
+                 serve_state,
+                 'set_service_status_and_active_versions_if_hash',
+                 return_value=True), \
+             mock.patch.object(
+                 serve_state,
+                 'get_service_controller_owner',
+                 side_effect=[old_owner, claimed_owner]), \
+             mock.patch.object(serve_state,
+                               'get_ha_recovery_script',
+                               return_value='unbootable script'), \
+             mock.patch.object(serve_state,
+                               'get_latest_committed_version',
+                               return_value=None), \
+             mock.patch.object(
+                 serve_state,
+                 'claim_unrecoverable_service_teardown',
+                 return_value=True) as claim, \
+             mock.patch.object(serve_state,
+                               'claim_orphaned_service_teardown') as legacy, \
+             mock.patch.object(serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(serve_utils,
+                               'quarantine_service_directory',
+                               return_value=[]), \
+             mock.patch.object(serve_utils,
+                               'remove_quarantined_service_directory'), \
+             mock.patch.object(serve_state,
+                               'remove_service_completely',
+                               return_value=True), \
+             mock.patch('sky.serve.lb_k8s.delete_lb_objects'):
+            message = serve_utils._terminate_failed_services_locked(
+                'svc', 'incarnation-a', False, lifecycle_lock)
+
+        assert message is None
+        claim.assert_called_once_with('svc', 'incarnation-a', 101, '10.0.0.1',
+                                      os.getpid(), os.environ.get('POD_IP'))
+        legacy.assert_not_called()
 
 
 class TestHaRecoveryFencesOnLeadershipLoss:

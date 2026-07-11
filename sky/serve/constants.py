@@ -375,6 +375,10 @@ DEFAULT_MIN_REPLICAS = 1
 # port. Controller ports stay pod-local; only each Kubernetes LB Service
 # exposes its own port 30001.
 CONTROLLER_PORT_START = 20001
+# Durable acknowledgement written only after the parent has killed and joined
+# its controller child. None is not sufficient: recovery preclaim deliberately
+# clears the port while a replacement child is still booting.
+CONTROLLER_TEARDOWN_ACK_PORT = -1
 LOAD_BALANCER_PORT_START = 30001
 
 # Initial version of service.

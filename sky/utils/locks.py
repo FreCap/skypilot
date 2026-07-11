@@ -273,19 +273,20 @@ class PostgresLock(DistributedLock):
             cursor.execute(f'SELECT {unlock_func}(%s)', (self._lock_key,))
             self._connection.commit()
             self._acquired = False
-        except psycopg2.DatabaseError as e:
+        except psycopg2.Error as e:
             # Lost connection to the database, likely the lock is force unlocked
-            # by other routines. Catch `DatabaseError` (parent of
-            # `OperationalError`) — psycopg2 raises bare `DatabaseError` for
-            # some connection-closed cases (`server closed the connection
-            # unexpectedly`) which a narrower `OperationalError` catch would
-            # miss.
+            # by other routines. A killed backend can surface as InterfaceError
+            # before a cursor exists, while network/server failures commonly
+            # surface as DatabaseError/OperationalError.
             logger.debug(f'Failed to release postgres lock {self.lock_id}: {e}')
             connection_lost = True
         finally:
             # Invalidate if connection was lost to prevent SQLAlchemy from
             # trying to reset a dead connection
             self._close_connection(invalidate=connection_lost)
+            # Closing/invalidation releases any session advisory lock. Keep the
+            # local flag consistent even if the unlock statement could not run.
+            self._acquired = False
 
     def force_unlock(self) -> None:
         """Force unlock the postgres advisory lock."""
@@ -388,6 +389,11 @@ class PostgresLock(DistributedLock):
             try:
                 cursor.execute('SELECT 1')
                 cursor.fetchone()
+                # psycopg2 starts a transaction even for SELECT 1. Do not leave
+                # a slow lifecycle teardown idle in transaction: the server may
+                # kill that session and silently release its advisory lock.
+                # Session-level advisory locks survive commit.
+                self._connection.commit()
             finally:
                 cursor.close()
             return True

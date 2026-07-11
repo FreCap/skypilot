@@ -133,7 +133,10 @@ class TestExternalCapabilityMutationPaths:
         legacy_config = mock.MagicMock()
         legacy_config.get_nested.side_effect = AssertionError(
             'legacy capability config read')
-        service_record = {'status': serve_state.ServiceStatus.READY}
+        service_record = {
+            'status': serve_state.ServiceStatus.READY,
+            'hash': 'incarnation-a',
+        }
         with mock.patch.object(impl.controller_utils,
                                'get_controller_for_pool'), \
              mock.patch.object(impl.backend_utils,
@@ -154,7 +157,9 @@ class TestExternalCapabilityMutationPaths:
                  '_require_supported_service_topology',
                  side_effect=RuntimeError('capability gate')) as preflight, \
              pytest.raises(RuntimeError, match='capability gate'):
-            impl._update_impl(task, 'svc')
+            impl._update_impl(task,
+                              'svc',
+                              lifecycle_lock=mock.sentinel.lifecycle_lock)
         legacy_config.get_nested.assert_not_called()
         preflight.assert_called_once_with(task, False)
 
@@ -195,6 +200,10 @@ class TestApplyRefusesTerminalStates:
         # is_controller_accessible is essentially a no-op anyway).
         return [
             mock.patch(
+                'sky.serve.server.impl.serve_utils.'
+                'get_service_lifecycle_lock',
+                return_value=mock.MagicMock()),
+            mock.patch(
                 'sky.serve.server.impl.serve_utils.get_service_filelock_path',
                 return_value='/tmp/test_apply_lock'),
             mock.patch('sky.serve.server.impl.controller_utils.'
@@ -214,7 +223,7 @@ class TestApplyRefusesTerminalStates:
     def _run_apply_with_status(self, status, pool):
         patches = self._common_patches(status)
         with mock.patch('sky.serve.server.impl._update_impl') as mock_update, \
-             mock.patch('sky.serve.server.impl.up') as mock_up:
+             mock.patch('sky.serve.server.impl._up_impl') as mock_up:
             for p in patches:
                 p.start()
             try:
@@ -269,6 +278,10 @@ class TestApplyRefusesTerminalStates:
         not raise."""
         patches = [
             mock.patch(
+                'sky.serve.server.impl.serve_utils.'
+                'get_service_lifecycle_lock',
+                return_value=mock.MagicMock()),
+            mock.patch(
                 'sky.serve.server.impl.serve_utils.get_service_filelock_path',
                 return_value='/tmp/test_apply_lock'),
             mock.patch('sky.serve.server.impl.controller_utils.'
@@ -285,7 +298,7 @@ class TestApplyRefusesTerminalStates:
                        return_value=None),
         ]
         with mock.patch('sky.serve.server.impl._update_impl') as mock_update, \
-             mock.patch('sky.serve.server.impl.up') as mock_up:
+             mock.patch('sky.serve.server.impl._up_impl') as mock_up:
             for p in patches:
                 p.start()
             try:
@@ -404,17 +417,26 @@ class TestSanitizedConfigBytes:
 
 
 class TestLifecycleLocking:
-    """update()/down() must serialize on the same per-service filelock as
-    apply(): an update racing a down on the same service can launch
-    replicas mid-teardown, leaving orphaned (billable) clusters."""
+    """Updates use the cross-pod lifecycle lock; named down dispatch does not
+    hold it because controller-side purge/finalization acquires it itself."""
 
     def test_update_locks_before_impl(self):
         calls = []
-        lock = mock.MagicMock()
-        lock.__enter__ = mock.Mock(side_effect=lambda *a: calls.append('lock'))
-        lock.__exit__ = mock.Mock(side_effect=lambda *a: calls.append('unlock'))
+        lifecycle_lock = mock.MagicMock()
+        lifecycle_lock.__enter__ = mock.Mock(
+            side_effect=lambda *a: calls.append('lifecycle-lock'))
+        lifecycle_lock.__exit__ = mock.Mock(
+            side_effect=lambda *a: calls.append('lifecycle-unlock'))
+        file_lock = mock.MagicMock()
+        file_lock.__enter__ = mock.Mock(
+            side_effect=lambda *a: calls.append('file-lock'))
+        file_lock.__exit__ = mock.Mock(
+            side_effect=lambda *a: calls.append('file-unlock'))
         with mock.patch('sky.serve.server.impl.filelock.FileLock',
-                        return_value=lock) as mock_lock_cls, \
+                        return_value=file_lock) as mock_lock_cls, \
+             mock.patch('sky.serve.server.impl.serve_utils.'
+                        'get_service_lifecycle_lock',
+                        return_value=lifecycle_lock), \
              mock.patch('sky.serve.server.impl.serve_utils.'
                         'get_service_filelock_path',
                         return_value='/tmp/svc.lock'), \
@@ -422,7 +444,64 @@ class TestLifecycleLocking:
                         side_effect=lambda *a, **k: calls.append('impl')):
             impl.update(task=mock.Mock(), service_name='svc')
         mock_lock_cls.assert_called_once_with('/tmp/svc.lock')
+        assert calls == [
+            'file-lock', 'lifecycle-lock', 'impl', 'lifecycle-unlock',
+            'file-unlock'
+        ]
+
+    def test_up_locks_before_any_name_scoped_work(self):
+        calls = []
+        lifecycle_lock = mock.MagicMock()
+        lifecycle_lock.__enter__ = mock.Mock(
+            side_effect=lambda *a: calls.append('lock'))
+        lifecycle_lock.__exit__ = mock.Mock(
+            side_effect=lambda *a: calls.append('unlock'))
+        with mock.patch.object(impl.serve_utils,
+                               'get_service_lifecycle_lock',
+                               return_value=lifecycle_lock), \
+             mock.patch.object(
+                 impl,
+                 '_up_impl',
+                 side_effect=lambda *a, **k: calls.append('impl') or
+                 ('svc', 'endpoint')):
+            assert impl.up(mock.Mock(), 'svc') == ('svc', 'endpoint')
         assert calls == ['lock', 'impl', 'unlock']
+
+    def test_second_same_name_up_fails_before_canonical_mutation(self):
+        task = mock.MagicMock()
+        lifecycle_lock = mock.MagicMock()
+        with mock.patch.object(impl.serve_utils,
+                               'lifecycle_lock_is_valid',
+                               return_value=True), \
+             mock.patch.object(impl.serve_utils,
+                               'is_consolidation_mode',
+                               return_value=True), \
+             mock.patch.object(impl.serve_state,
+                               'get_service_hash',
+                               return_value='incarnation-a'), \
+             pytest.raises(RuntimeError, match='already exists'):
+            impl._up_impl(task, 'svc', False, lifecycle_lock)
+        task.validate.assert_not_called()
+
+    def test_update_fence_rejects_same_name_successor(self):
+        handle = mock.MagicMock(spec=backends.CloudVmRayResourceHandle)
+        backend = _backend_mock()
+        lifecycle_lock = mock.MagicMock()
+        successor = {
+            'name': 'svc',
+            'hash': 'incarnation-b',
+            'status': serve_state.ServiceStatus.READY,
+        }
+        with mock.patch.object(impl.serve_utils,
+                               'lifecycle_lock_is_valid',
+                               return_value=True), \
+             mock.patch.object(impl,
+                               '_get_service_record',
+                               return_value=successor), \
+             pytest.raises(RuntimeError, match='changed incarnation'):
+            impl._assert_service_update_fence('svc', False, handle, backend,
+                                              'incarnation-a', lifecycle_lock,
+                                              'adding a version')
 
     def _run_down(self, service_names, all=False):  # pylint: disable=redefined-builtin
         locked = []
