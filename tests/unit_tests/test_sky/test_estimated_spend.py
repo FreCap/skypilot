@@ -67,17 +67,15 @@ def _source(*,
 
 def _fresh_db(tmp_path, monkeypatch):
     monkeypatch.setenv(constants.SKY_RUNTIME_DIR_ENV_VAR_KEY, str(tmp_path))
-    monkeypatch.setattr(
-        global_user_state,
-        '_db_manager',
-        db_utils.DatabaseManager(
-            'state',
-            global_user_state.create_table,
-            post_init_fn=lambda _: global_user_state._sqlite_supports_returning(
-            ),
-        ),
+    manager = db_utils.DatabaseManager(
+        'state',
+        global_user_state.create_table,
+        post_init_fn=lambda _: global_user_state._sqlite_supports_returning(),
     )
-    return global_user_state.initialize_and_get_db()
+    monkeypatch.setattr(global_user_state, '_db_manager', manager)
+    monkeypatch.setattr(global_user_state, 'initialize_and_get_db',
+                        manager.get_engine)
+    return manager.get_engine()
 
 
 def _insert_source(connection, source, *, usage_updated_at: int):

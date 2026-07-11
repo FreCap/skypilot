@@ -104,6 +104,8 @@ _KNOWN_VIEWER_DENIED: set = {
     ('/users/service-account-tokens/update-role', 'POST'),
     ('/users/service-account-tokens/get-role', 'POST'),
     ('/users/service-account-tokens/rotate', 'POST'),
+    # --- Admin-only estimates ---
+    ('/estimated_spend', 'GET'),
     # --- Workspaces writes (incl. sensitive config read) ---
     ('/workspaces/create', 'POST'),
     ('/workspaces/update', 'POST'),
