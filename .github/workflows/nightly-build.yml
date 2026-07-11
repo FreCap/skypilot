@@ -1,7 +1,6 @@
 name: nightly-build
 on:
-  schedule:
-    - cron: '0 0 * * *' # 00:00 UTC
+  # Scheduled nightlies run upstream; this fork keeps manual dispatch available.
   workflow_dispatch:
     inputs:
       skip_buildkite:
@@ -434,6 +433,9 @@ jobs:
     needs: [check-date, nightly-build-pypi, smoke-tests-aws, smoke-tests-kubernetes-resource-heavy, smoke-tests-kubernetes-no-resource-heavy, smoke-tests-kubernetes-no-resource-heavy-limit-deps, smoke-tests-remote-server-kubernetes, smoke-tests-kubernetes-jobs-consolidation, smoke-tests-shared-gke-api-server, smoke-tests-slurm-minimal, backward-compat-test-nightly, backward-compat-test-stable, publish-and-validate-both, trigger-docker-and-helm-release]
     # Only run this job if any of the previous jobs failed
     if: failure()
+    env:
+      SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+      SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
     steps:
       - name: Prepare failure message
         id: message_content
@@ -516,13 +518,14 @@ jobs:
           echo "message_block=${MARKDOWN_TEXT}" >> $GITHUB_OUTPUT
 
       - name: Notify Slack channel on failure
+        if: ${{ env.SLACK_BOT_TOKEN != '' && env.SLACK_CHANNEL_ID != '' }}
         uses: slackapi/slack-github-action@485a9d42d3a73031f12ec201c457e2162c45d02d # v2.0.0
         with:
           method: chat.postMessage
-          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          token: ${{ env.SLACK_BOT_TOKEN }}
           payload: |
             {
-              "channel": "${{ secrets.SLACK_CHANNEL_ID }}",
+              "channel": "${{ env.SLACK_CHANNEL_ID }}",
               "text": "${{ steps.message_content.outputs.message_text }}",
               "blocks": [
                 {
