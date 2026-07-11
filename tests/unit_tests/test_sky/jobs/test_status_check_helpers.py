@@ -4,11 +4,11 @@
 # Fixture imports are referenced indirectly by pytest, and the fixture names
 # intentionally mirror the shared helpers they exercise.
 
+from test_jobs_state import _mock_managed_jobs_db_conn
+from test_jobs_state import _seed_multi_task_job
+from test_jobs_state import _seed_test_jobs
+
 from sky.jobs import state
-from tests.unit_tests.test_sky.jobs.test_jobs_state import (
-    _mock_managed_jobs_db_conn)
-from tests.unit_tests.test_sky.jobs.test_jobs_state import _seed_multi_task_job
-from tests.unit_tests.test_sky.jobs.test_jobs_state import _seed_test_jobs
 
 
 class TestGetJobsStatusCheckInfoLaunchIdentity:
