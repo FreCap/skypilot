@@ -1308,31 +1308,41 @@ def get_replica_service_names() -> List[str]:
 
 def total_number_provisioning_replicas() -> int:
     """Returns the total number of provisioning replicas."""
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        rows = session.execute(sqlalchemy.select(
-            replicas_table.c.replica_info)).fetchall()
-    provisioning_count = 0
-    for row in rows:
-        replica_info: 'replica_managers.ReplicaInfo' = pickle.loads(row[0])
-        if replica_info.status == ReplicaStatus.PROVISIONING:
-            provisioning_count += 1
+    provisioning_count, _ = get_replica_launch_budget_counts()
     return provisioning_count
 
 
 def total_number_terminating_replicas() -> int:
     """Returns the total number of terminating replicas."""
+    _, terminating_count = get_replica_launch_budget_counts()
+    return terminating_count
+
+
+def get_replica_launch_budget_counts() -> Tuple[int, int]:
+    """Returns provisioning and terminating replica counts in one scan.
+
+    Replica state is stored as a pickled object, so neither count can be
+    computed by SQL.  The launch admission loop needs both values together;
+    reading them through the two legacy helpers above would query and unpickle
+    the entire global replica table twice per admission tick.
+
+    Returns:
+        A ``(provisioning_count, terminating_count)`` tuple.
+    """
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         rows = session.execute(sqlalchemy.select(
             replicas_table.c.replica_info)).fetchall()
+    provisioning_count = 0
     terminating_count = 0
     for row in rows:
         replica_info: 'replica_managers.ReplicaInfo' = pickle.loads(row[0])
+        if replica_info.status == ReplicaStatus.PROVISIONING:
+            provisioning_count += 1
         if (replica_info.status_property.sky_down_status ==
                 common_utils.ProcessStatus.RUNNING):
             terminating_count += 1
-    return terminating_count
+    return provisioning_count, terminating_count
 
 
 def get_replicas_at_status(

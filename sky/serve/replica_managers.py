@@ -1637,7 +1637,10 @@ class SkyPilotReplicaManager(ReplicaManager):
             logger.debug(f'Reserved-capacity fill launch skipped: {reason}.')
 
     def _scale_up_one_locked(
-            self, resources_override: Optional[Dict[str, Any]]) -> None:
+            self,
+            resources_override: Optional[Dict[str, Any]],
+            existing_replica_infos: Optional[List['ReplicaInfo']] = None
+    ) -> None:
         """Allocate an id and enqueue one replica launch. Lock must be held."""
         # Defensive: never hand `_launch_replica` an id that still has a
         # durable replica row. `add_or_update_replica` is an upsert keyed on
@@ -1655,7 +1658,15 @@ class SkyPilotReplicaManager(ReplicaManager):
         # An aborted launch (zero-cost-only fill with no ACTIVE zero-cost
         # location) consumed nothing: keep the id free for the next
         # scale-up.
-        if self._launch_replica(self._next_replica_id, resources_override):
+        if existing_replica_infos is None:
+            launched = self._launch_replica(self._next_replica_id,
+                                            resources_override)
+        else:
+            launched = self._launch_replica(
+                self._next_replica_id,
+                resources_override,
+                existing_replica_infos=existing_replica_infos)
+        if launched:
             self._next_replica_id += 1
 
     @with_lock
@@ -1677,9 +1688,40 @@ class SkyPilotReplicaManager(ReplicaManager):
         autoscaler tick into one acquisition makes the enqueue O(1) lock
         waits per tick; the launch budget in `_refresh_thread_pool` then
         paces actual `sky.launch` concurrency as intended.
+
+        Placement also shares one replica snapshot across the wave. Without
+        it, every placer-managed replica calls `get_replica_infos`, querying
+        and unpickling all N existing rows K times for a K-replica wave. The
+        launch path appends each successfully enqueued replica to this shared
+        snapshot, so later decisions preserve the existing in-wave spreading
+        and reserved-capacity accounting semantics.
         """
+        existing_replica_infos = None
+        if self._batch_needs_placement_snapshot(resources_overrides):
+            existing_replica_infos = serve_state.get_replica_infos(
+                self._service_name)
         for resources_override in resources_overrides:
-            self._scale_up_one_locked(resources_override)
+            self._scale_up_one_locked(resources_override,
+                                      existing_replica_infos)
+
+    def _batch_needs_placement_snapshot(
+            self, resources_overrides: List[Optional[Dict[str, Any]]]) -> bool:
+        """Whether any launch in a batch will ask the placer for a location."""
+        if self._spot_placer is None or not resources_overrides:
+            return False
+        uses_task_default = False
+        for resources_override in resources_overrides:
+            if (resources_override is not None and
+                    serve_constants.RESERVED_CAPACITY_FILL_OVERRIDE_KEY
+                    in resources_override):
+                return True
+            use_spot_override = (resources_override or {}).get('use_spot')
+            if use_spot_override is None:
+                uses_task_default = True
+            elif use_spot_override:
+                return True
+        return (uses_task_default and
+                _should_use_spot(self.yaml_content, resource_override=None))
 
     def _handle_sky_down_finish(self, info: ReplicaInfo,
                                 format_exc: Optional[str]) -> None:

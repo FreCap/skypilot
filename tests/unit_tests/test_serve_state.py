@@ -13,7 +13,9 @@ from sqlalchemy import create_engine
 from sqlalchemy import orm
 
 from sky.serve import constants as serve_constants
+from sky.serve import replica_managers
 from sky.serve import serve_state
+from sky.utils import common_utils
 
 
 def _read_row(engine, name):
@@ -85,6 +87,49 @@ def _insert_orphan_service_row(engine, name: str, pool: bool = False):
             hash='orphan',
             entrypoint='entry'))
         session.commit()
+
+
+def test_launch_budget_counts_share_one_replica_scan(_mock_serve_db,
+                                                     monkeypatch):
+    """Provisioning and termination occupancy are counted in one unpickle pass.
+
+    A row can satisfy both predicates while a launched replica is being
+    terminated; preserve the historical independent-count semantics.
+    """
+    provisioning = replica_managers.ReplicaInfo(replica_id=1,
+                                                cluster_name='svc-1',
+                                                replica_port='8080',
+                                                is_spot=False,
+                                                location=None,
+                                                version=1,
+                                                resources_override=None)
+    provisioning.status_property.sky_launch_status = (
+        common_utils.ProcessStatus.RUNNING)
+    terminating = replica_managers.ReplicaInfo(replica_id=2,
+                                               cluster_name='svc-2',
+                                               replica_port='8080',
+                                               is_spot=False,
+                                               location=None,
+                                               version=1,
+                                               resources_override=None)
+    terminating.status_property.sky_launch_status = (
+        common_utils.ProcessStatus.RUNNING)
+    terminating.status_property.sky_down_status = (
+        common_utils.ProcessStatus.RUNNING)
+    serve_state.add_or_update_replica('svc', 1, provisioning)
+    serve_state.add_or_update_replica('svc', 2, terminating)
+
+    original_loads = serve_state.pickle.loads
+    unpickles = 0
+
+    def _counting_loads(value):
+        nonlocal unpickles
+        unpickles += 1
+        return original_loads(value)
+
+    monkeypatch.setattr(serve_state.pickle, 'loads', _counting_loads)
+    assert serve_state.get_replica_launch_budget_counts() == (2, 1)
+    assert unpickles == 2
 
 
 class TestAddServiceWritesControllerIp:
