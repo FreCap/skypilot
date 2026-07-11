@@ -104,3 +104,90 @@ def test_get_next_cluster_name_uses_grouped_pool_counts_in_fallback():
     assert selected == 'replica-idle'
     set_cluster.assert_called_once_with(17, 'replica-idle')
     set_infra.assert_not_called()
+
+
+@pytest.mark.parametrize('task_resources', [None, Resources()])
+def test_get_next_cluster_name_skips_resource_scan_without_constraints(
+        task_resources):
+    busy = _mock_pool_replica(1, 'replica-busy')
+    idle = _mock_pool_replica(2, 'replica-idle')
+    with mock.patch.object(serve_utils,
+                           '_get_service_status',
+                           return_value={
+                               'pool': True,
+                           }), \
+         mock.patch.object(serve_utils,
+                           'get_service_filelock_path',
+                           return_value='/tmp/pool.lock'), \
+         mock.patch.object(serve_utils.filelock,
+                           'FileLock',
+                           side_effect=lambda _path: contextlib.
+                           nullcontext()), \
+         mock.patch.object(serve_utils,
+                           'get_ready_replicas',
+                           return_value=[busy, idle]), \
+         mock.patch.object(
+             serve_utils,
+             'get_free_worker_resources',
+             side_effect=AssertionError('resource scan should be skipped')
+         ), \
+         mock.patch.object(
+             serve_utils.managed_job_state,
+             'get_nonterminal_job_counts_by_pool',
+             return_value={
+                 'replica-busy': 1,
+             }) as grouped_counts, \
+         mock.patch.object(serve_utils.managed_job_state,
+                           'set_current_cluster_name') as set_cluster, \
+         mock.patch.object(serve_utils.managed_job_state,
+                           'set_job_infra') as set_infra:
+        selected = serve_utils.get_next_cluster_name(
+            'pool-a', job_id=17, task_resources=task_resources)
+
+    grouped_counts.assert_called_once_with('pool-a')
+    assert selected == 'replica-idle'
+    set_cluster.assert_called_once_with(17, 'replica-idle')
+    set_infra.assert_not_called()
+
+
+def test_get_next_cluster_name_uses_resource_scan_for_constrained_task():
+    constrained = _mock_pool_replica(1, 'replica-constrained')
+    roomy = _mock_pool_replica(2, 'replica-roomy')
+    with mock.patch.object(serve_utils,
+                           '_get_service_status',
+                           return_value={
+                               'pool': True,
+                           }), \
+         mock.patch.object(serve_utils,
+                           'get_service_filelock_path',
+                           return_value='/tmp/pool.lock'), \
+         mock.patch.object(serve_utils.filelock,
+                           'FileLock',
+                           side_effect=lambda _path: contextlib.
+                           nullcontext()), \
+         mock.patch.object(serve_utils,
+                           'get_ready_replicas',
+                           return_value=[constrained, roomy]), \
+         mock.patch.object(
+             serve_utils,
+             'get_free_worker_resources',
+             return_value={
+                 'replica-constrained': Resources(cpus='1'),
+                 'replica-roomy': Resources(cpus='4'),
+             }) as free_resources, \
+         mock.patch.object(
+             serve_utils.managed_job_state,
+             'get_nonterminal_job_counts_by_pool',
+             side_effect=AssertionError('fallback counts should not run')
+         ), \
+         mock.patch.object(serve_utils.managed_job_state,
+                           'set_current_cluster_name') as set_cluster, \
+         mock.patch.object(serve_utils.managed_job_state,
+                           'set_job_infra') as set_infra:
+        selected = serve_utils.get_next_cluster_name(
+            'pool-a', job_id=23, task_resources=Resources(cpus='2'))
+
+    free_resources.assert_called_once_with('pool-a')
+    assert selected == 'replica-roomy'
+    set_cluster.assert_called_once_with(23, 'replica-roomy')
+    set_infra.assert_not_called()
