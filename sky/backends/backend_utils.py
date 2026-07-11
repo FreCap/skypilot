@@ -4057,7 +4057,7 @@ def refresh_cluster_records() -> None:
     # We force to exclude managed clusters to avoid multiple sources
     # manipulating them. For example, SkyServe assumes the replica manager
     # is the only source of truth for the cluster status.
-    cluster_names = set(
+    cluster_names = list(
         global_user_state.get_cluster_names(exclude_managed_clusters=True))
 
     # TODO(syang): we should try not to leak
@@ -4071,8 +4071,10 @@ def refresh_cluster_records() -> None:
                 include_request_names=['sky.launch'],
                 fields=['cluster_name']))
     }
-    cluster_names_without_launch_request = (cluster_names -
-                                            cluster_names_with_launch_request)
+    cluster_names_without_launch_request = [
+        cluster_name for cluster_name in cluster_names
+        if cluster_name not in cluster_names_with_launch_request
+    ]
 
     def _refresh_cluster_record(cluster_name):
         return _refresh_cluster(cluster_name,
@@ -4081,12 +4083,11 @@ def refresh_cluster_records() -> None:
                                 include_user_info=False,
                                 summary_response=True)
 
-    if len(cluster_names_without_launch_request) > 0:
+    if cluster_names_without_launch_request:
         # Do not refresh the clusters that have an active launch request.
         subprocess_utils.run_in_parallel(
             _refresh_cluster_record,
-            _sort_clusters_for_refresh(
-                list(cluster_names_without_launch_request)),
+            _sort_clusters_for_refresh(cluster_names_without_launch_request),
             num_threads=_get_cluster_refresh_parallelism())
 
 

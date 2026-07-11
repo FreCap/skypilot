@@ -93,6 +93,41 @@ class TestRefreshFaultIsolation:
         backend_utils.refresh_cluster_records()
         assert sorted(attempted) == sorted(cluster_names)
 
+    def test_sweep_preserves_source_order_when_ordering_fails(
+            self, monkeypatch):
+        """The fallback path keeps DB/source order after launch filtering."""
+        cluster_names = ['c-2', 'c-1', 'c-3', 'launching']
+        attempted = []
+        attempted_lock = threading.Lock()
+
+        class _Request:
+
+            def __init__(self, cluster_name):
+                self.cluster_name = cluster_name
+
+        def _fake_refresh_cluster_record(cluster_name, **kwargs):
+            del kwargs
+            with attempted_lock:
+                attempted.append(cluster_name)
+            return _record(status_lib.ClusterStatus.UP, 1)
+
+        def _raise(names):
+            del names
+            raise RuntimeError('corrupt row')
+
+        monkeypatch.setattr(backend_utils, 'refresh_cluster_record',
+                            _fake_refresh_cluster_record)
+        monkeypatch.setattr(backend_utils.global_user_state,
+                            'get_cluster_names',
+                            lambda exclude_managed_clusters: cluster_names)
+        monkeypatch.setattr(backend_utils.global_user_state,
+                            'get_cluster_status_fields', _raise)
+        monkeypatch.setattr(backend_utils.requests_lib, 'get_request_tasks',
+                            lambda req_filter: [_Request('launching')])
+
+        backend_utils.refresh_cluster_records()
+        assert attempted == ['c-2', 'c-1', 'c-3']
+
 
 class TestRefreshParallelismKnob:
     """Env override for the sweep's thread count."""
