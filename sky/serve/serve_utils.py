@@ -1987,6 +1987,12 @@ def get_free_worker_resources(
 
     free_resources: Dict[str, Optional[resources_lib.Resources]] = {}
     replicas = serve_state.get_replica_infos(pool)
+    used_resources_by_cluster = (
+        managed_job_state.get_pool_worker_used_resources_by_cluster(pool))
+    if used_resources_by_cluster is None:
+        logger.warning('Failed to get used resources for pool '
+                       f'{pool!r}; disabling resource-aware scheduling')
+        return None
 
     for replica_info in replicas:
         cluster_name = replica_info.cluster_name
@@ -1999,33 +2005,16 @@ def get_free_worker_resources(
 
         total_resources = handle.launched_resources
 
-        # Get job IDs running on this worker
-        job_ids = managed_job_state.get_nonterminal_job_ids_by_pool(
-            pool, cluster_name)
-
-        if len(job_ids) == 0:
+        used_resources = used_resources_by_cluster.get(cluster_name)
+        if used_resources is None:
             free_resources[cluster_name] = total_resources
             continue
 
-        # Get used resources
-        # TODO(lloyd): We should batch the database calls here so that we
-        # make a single call to get all the used resources for all the jobs.
-        used_resources = managed_job_state.get_pool_worker_used_resources(
-            set(job_ids))
-        if used_resources is None:
-            # We failed to get the used resources. We should return None since
-            # we can't make any guarantees about what resources are being used.
-            logger.warning(
-                f'Failed to get used resources for cluster {cluster_name!r}')
-            return None
-
         if _is_empty_resource(used_resources):
-            # We encountered a job that has no resources specified. We
-            # will not consider it for resource-aware scheduling so it must
-            # be scheduled on its own. To do this we will set the free
-            # worker resources to nothing by returning an empty resource
-            # object.
-            logger.debug(f'Job {job_ids} has no resources specified. '
+            # At least one job on this worker has no explicit resource request.
+            # Treat the worker as fully occupied for resource-aware placement.
+            logger.debug('Some jobs on cluster '
+                         f'{cluster_name!r} have no resources specified. '
                          'Skipping resource-aware scheduling for cluster '
                          f'{cluster_name!r}')
             free_resources[cluster_name] = resources_lib.Resources()
@@ -2146,13 +2135,13 @@ def get_next_cluster_name(
         # not schedule another.
         if len(idle_replicas) == 0:
             logger.debug('Falling back to resource unaware scheduling')
+            jobs_per_replica = (
+                managed_job_state.get_nonterminal_job_counts_by_pool(
+                    service_name))
             # Fall back to resource unaware scheduling if no task resources
             # are provided.
             for replica_info in ready_replicas:
-                jobs_on_replica = (
-                    managed_job_state.get_nonterminal_job_ids_by_pool(
-                        service_name, replica_info.cluster_name))
-                if not jobs_on_replica:
+                if jobs_per_replica.get(replica_info.cluster_name, 0) == 0:
                     idle_replicas.append(replica_info)
 
         if not idle_replicas:

@@ -3183,6 +3183,20 @@ def _is_any_of_or_ordered(resource_config: Dict[str, Any]) -> bool:
     return 'any_of' in resource_config or 'ordered' in resource_config
 
 
+def _parse_job_full_resources(
+    resource_config: Optional[Dict[str, Any]]
+) -> Optional['resources_lib.Resources']:
+    """Parse one persisted full_resources payload."""
+    if resource_config is None:
+        return None
+    if _is_any_of_or_ordered(resource_config):
+        return None
+    resources_set = resources_lib.Resources.from_yaml_config(resource_config)
+    if len(resources_set) == 0:
+        return None
+    return next(iter(resources_set))
+
+
 def get_pool_worker_used_resources(
         job_ids: Set[int]) -> Optional['resources_lib.Resources']:
     """Get the total used resources by running jobs.
@@ -3205,43 +3219,87 @@ def get_pool_worker_used_resources(
         # may have just been scheduled. The job_ids come from
         # get_nonterminal_job_ids_by_pool anyway so we don't need to worry
         # about removing old jobs.
-        query = sqlalchemy.select(spot_table.c.full_resources).where(
+        query = sqlalchemy.select(
+            spot_table.c.spot_job_id,
+            spot_table.c.full_resources,
+        ).distinct().where(
             sqlalchemy.and_(spot_table.c.spot_job_id.in_(job_ids)))
         rows = session.execute(query).fetchall()
 
         resource_configs = []
         for row in rows:
-            if row[0] is None:
+            if row[1] is None:
                 # We don't have full_resources for this job. We should return
                 # none since we can't make any guarantees about what resources
                 # are being used.
                 return None
-            resource_configs.append(row[0])
+            resource_configs.append(row[1])
 
-    # Parse resources dicts into Resources objects and sum them using +
+    # Parse resources dicts into Resources objects and sum them using +.
+    # If any job on the worker has an empty resource request, fail closed for
+    # resource-aware scheduling by treating the worker as fully occupied.
     total_resources = None
-    # full_resources is now stored as JSON dict from to_yaml_config()
+    saw_empty_request = False
     for resource_config in resource_configs:
-        # Check if this is an unresolved heterogeneous config (any_of/ordered)
-        if _is_any_of_or_ordered(resource_config):
-            # Can't determine usage for heterogeneous unresolved configs.
-            # Return None to fall back to non-resource-aware scheduling.
+        parsed = _parse_job_full_resources(resource_config)
+        if parsed is None:
             return None
-
-        resources_set = resources_lib.Resources.from_yaml_config(
-            resource_config)
-        if len(resources_set) == 0:
-            # We couldn't parse the resources JSON. We should return
-            # none since we can't make any guarantees about what resources
-            # are being used.
-            return None
-        # Get the first Resources object from the set/list
-        parsed = next(iter(resources_set))
+        if parsed.is_empty():
+            saw_empty_request = True
+            continue
         if total_resources is None:
             total_resources = parsed
         else:
             total_resources = total_resources + parsed
+    if saw_empty_request:
+        return resources_lib.Resources()
     return total_resources
+
+
+def get_pool_worker_used_resources_by_cluster(
+        pool: str) -> Optional[Dict[Optional[str], 'resources_lib.Resources']]:
+    """Get used resources for all nonterminal jobs in a pool in one query."""
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        query = sqlalchemy.select(
+            job_info_table.c.current_cluster_name,
+            spot_table.c.spot_job_id,
+            spot_table.c.full_resources,
+        ).distinct().select_from(
+            spot_table.outerjoin(
+                job_info_table, spot_table.c.spot_job_id ==
+                job_info_table.c.spot_job_id)).where(
+                    sqlalchemy.and_(
+                        ~spot_table.c.status.in_([
+                            status.value
+                            for status in ManagedJobStatus.terminal_statuses()
+                        ]),
+                        job_info_table.c.pool == pool,
+                    ))
+        rows = session.execute(query).fetchall()
+
+    totals: Dict[Optional[str], resources_lib.Resources] = {}
+    clusters_with_empty_request: Set[Optional[str]] = set()
+    for cluster_name, _, resource_config in rows:
+        parsed = _parse_job_full_resources(resource_config)
+        if parsed is None:
+            return None
+        if parsed.is_empty():
+            clusters_with_empty_request.add(cluster_name)
+            continue
+        if cluster_name in clusters_with_empty_request:
+            continue
+        total = totals.get(cluster_name)
+        if total is None:
+            totals[cluster_name] = parsed
+        else:
+            combined = total + parsed
+            assert combined is not None
+            totals[cluster_name] = combined
+
+    for cluster_name in clusters_with_empty_request:
+        totals[cluster_name] = resources_lib.Resources()
+    return totals
 
 
 @db_retries.retry_async
