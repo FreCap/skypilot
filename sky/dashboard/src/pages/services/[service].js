@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { CircularProgress } from '@mui/material';
 import { useRouter } from 'next/router';
 import Link from 'next/link';
@@ -24,10 +24,11 @@ import {
 import { EndpointCell, formatUptime } from '@/components/services';
 import { useMobile } from '@/hooks/useMobile';
 
-function useServiceDetails({ serviceName }) {
+export function useServiceDetails({ serviceName }) {
   const [serviceData, setServiceData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [replicasLoading, setReplicasLoading] = useState(true);
+  const requestVersionRef = useRef(0);
 
   // Two-phase load, both scoped to THIS service (the old implementation
   // fetched every service with full replica info just to display one):
@@ -36,8 +37,11 @@ function useServiceDetails({ serviceName }) {
   //      fills in when it lands.
   const fetchData = useCallback(async () => {
     if (!serviceName) return;
+    const requestVersion = requestVersionRef.current + 1;
+    requestVersionRef.current = requestVersion;
     setLoading(true);
     setReplicasLoading(true);
+    const isCurrentRequest = () => requestVersionRef.current === requestVersion;
     // Ordering within THIS invocation only: once the full result has
     // landed, a later-resolving summary must not overwrite it — but a
     // fresh summary must still replace whatever an earlier invocation
@@ -52,27 +56,34 @@ function useServiceDetails({ serviceName }) {
         },
       ])
       .then(({ services }) => {
-        if (fullLanded) return;
+        if (!isCurrentRequest() || fullLanded) return;
         const found = (services || []).find((s) => s.name === serviceName);
         setServiceData(found || null);
       })
       .catch((error) => {
         console.error('Failed to fetch service summary:', error);
       })
-      .finally(() => setLoading(false));
+      .finally(() => {
+        if (isCurrentRequest()) {
+          setLoading(false);
+        }
+      });
     const fullPromise = dashboardCache
       .get(getServices, [{ serviceNames: [serviceName] }])
       .then(({ services }) => {
+        if (!isCurrentRequest()) return;
         const found = (services || []).find((s) => s.name === serviceName);
-        if (found) {
-          fullLanded = true;
-          setServiceData(found);
-        }
+        fullLanded = true;
+        setServiceData(found || null);
       })
       .catch((error) => {
         console.error('Failed to fetch service replicas:', error);
       })
-      .finally(() => setReplicasLoading(false));
+      .finally(() => {
+        if (isCurrentRequest()) {
+          setReplicasLoading(false);
+        }
+      });
     await Promise.allSettled([summaryPromise, fullPromise]);
   }, [serviceName]);
 
