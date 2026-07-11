@@ -43,15 +43,25 @@ def _make_job_status_check_state(schedule_state, pid=123, started_at=None):
     }
 
 
+def _forbid_split_snapshot_helpers(monkeypatch):
+    monkeypatch.setattr(
+        managed_job_state, 'get_jobs_to_check_status', lambda *a, **k:
+        (_ for _ in ()).throw(
+            AssertionError('refresh must use get_jobs_to_check_status_info')))
+    monkeypatch.setattr(
+        managed_job_state, 'get_jobs_status_check_info', lambda *a, **k:
+        (_ for _ in ()).throw(
+            AssertionError('refresh must use get_jobs_to_check_status_info')))
+
+
 def _wire_dead_controller(monkeypatch,
                           set_failed_calls,
                           job_done_calls,
                           fresh_state=None):
+    _forbid_split_snapshot_helpers(monkeypatch)
     monkeypatch.setattr(managed_job_state,
-                        'get_jobs_to_check_status',
-                        lambda job_id=None: [1])
-    monkeypatch.setattr(managed_job_state, 'get_jobs_status_check_info',
-                        lambda job_ids: _make_status_check_info())
+                        'get_jobs_to_check_status_info',
+                        lambda job_id=None: _make_status_check_info())
     if fresh_state is None:
         fresh_state = _make_job_status_check_state(
             managed_job_state.ManagedJobScheduleState.ALIVE)
@@ -192,12 +202,11 @@ def test_pending_job_skips_controller_status_read(monkeypatch, schedule_state):
         get_status_calls.append(job_id)
         return job_lib.JobStatus.FAILED_SETUP
 
-    monkeypatch.setattr(managed_job_state,
-                        'get_jobs_to_check_status',
-                        lambda job_id=None: [1])
+    _forbid_split_snapshot_helpers(monkeypatch)
     monkeypatch.setattr(
-        managed_job_state, 'get_jobs_status_check_info',
-        lambda job_ids: _make_pending_status_check_info(schedule_state))
+        managed_job_state,
+        'get_jobs_to_check_status_info',
+        lambda job_id=None: _make_pending_status_check_info(schedule_state))
     monkeypatch.setattr(job_lib, 'get_status', _record_get_status)
     monkeypatch.setattr(managed_job_state, 'set_failed',
                         lambda *a, **k: set_failed_calls.append((a, k)))
@@ -232,11 +241,10 @@ def test_cleanup_uses_task_name_identity_for_multi_task_jobs(monkeypatch):
             }],
         }
     }
+    _forbid_split_snapshot_helpers(monkeypatch)
     monkeypatch.setattr(managed_job_state,
-                        'get_jobs_to_check_status',
-                        lambda job_id=None: [1])
-    monkeypatch.setattr(managed_job_state, 'get_jobs_status_check_info',
-                        lambda job_ids: snapshot)
+                        'get_jobs_to_check_status_info',
+                        lambda job_id=None: snapshot)
     monkeypatch.setattr(
         managed_job_state, 'get_job_status_check_state',
         lambda job_id: _make_job_status_check_state(
