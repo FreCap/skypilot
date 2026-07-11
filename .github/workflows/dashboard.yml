@@ -23,7 +23,7 @@ jobs:
     - name: Install dependencies and check
       run: |
         npm --prefix sky/dashboard install
-        npm --prefix sky/dashboard test -- --runInBand src/components/services.test.jsx src/data/connectors/services.test.jsx src/tests/service-details.test.jsx
+        npm --prefix sky/dashboard test -- --runInBand src/components/services.test.jsx src/data/connectors/services.test.jsx src/tests/service-details.test.jsx src/lib/jobs-cache-manager.test.js
         npm --prefix sky/dashboard run lint
         npm --prefix sky/dashboard run format:check
         npm --prefix sky/dashboard run build
