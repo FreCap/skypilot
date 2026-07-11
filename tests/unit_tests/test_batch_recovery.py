@@ -179,6 +179,62 @@ def test_coordinator_rejects_pool_with_old_worker_runtime(monkeypatch):
         batch_coordinator._get_ready_workers()
 
 
+def test_coordinator_uses_only_workers_with_valid_available_usage(monkeypatch):
+    batch_coordinator = _make_coordinator(job_id=7)
+    monkeypatch.setattr(
+        batch_coordinator, '_fetch_pool_status', lambda: {
+            'replica_info': [{
+                'name': 'available-worker-int-id',
+                'status': 'READY',
+                'replica_info_version': 6,
+                'used_by': [7],
+            }, {
+                'name': 'available-worker-string-id',
+                'status': 'READY',
+                'replica_info_version': 6,
+                'used_by': ['7'],
+            }, {
+                'name': 'unrelated-worker',
+                'status': 'READY',
+                'replica_info_version': 6,
+                'used_by': [42],
+            }, {
+                'name': 'mixed-use-worker',
+                'status': 'READY',
+                'replica_info_version': 6,
+                'used_by': [7, '42'],
+            }]
+        })
+
+    assert batch_coordinator._get_ready_workers() == [
+        'available-worker-int-id', 'available-worker-string-id'
+    ]
+
+
+@pytest.mark.parametrize('replica_info', [
+    pytest.param({}, id='missing-used-by'),
+    pytest.param({'used_by': None}, id='null-used-by'),
+    pytest.param({'used_by': {
+        'job_id': 7
+    }}, id='object-used-by'),
+    pytest.param({'used_by': '7'}, id='string-used-by'),
+    pytest.param({'used_by': 7}, id='own-scalar-used-by'),
+])
+def test_coordinator_fails_closed_for_invalid_worker_usage(
+        monkeypatch, replica_info):
+    batch_coordinator = _make_coordinator(job_id=7)
+    info = {
+        'name': 'worker',
+        'status': 'READY',
+        'replica_info_version': 6,
+    }
+    info.update(replica_info)
+    monkeypatch.setattr(batch_coordinator, '_fetch_pool_status',
+                        lambda: {'replica_info': [info]})
+
+    assert not batch_coordinator._get_ready_workers()
+
+
 def test_pending_queue_honors_retry_time(monkeypatch):
     batch_coordinator = _make_coordinator()
     batch_coordinator._enqueue_batch(3, ready_at=120)
