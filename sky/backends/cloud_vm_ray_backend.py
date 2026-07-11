@@ -958,6 +958,32 @@ def _failure_requested_full_demand(error: BaseException,
         count == num_nodes for count in requested_counts)
 
 
+def _get_workload_attribution(task: task_lib.Task, cluster_name: str,
+                              workload_type: str) -> Tuple[str, Optional[int]]:
+    """Returns scalar workload attribution without any external lookup."""
+    workload_id = cluster_name
+    workload_task_id = None
+    task_envs = task.envs or {}
+    if workload_type in ('service', 'pool'):
+        replica_id = task_envs.get(serve_constants.REPLICA_ID_ENV_VAR)
+        replica_suffix = f'-{replica_id}' if replica_id is not None else None
+        if replica_suffix and cluster_name.endswith(replica_suffix):
+            workload_id = cluster_name[:-len(replica_suffix)]
+        return workload_id, workload_task_id
+    if workload_type != 'managed_job':
+        return workload_id, workload_task_id
+
+    managed_job_id = task_envs.get(constants.MANAGED_JOB_ID_ENV_VAR)
+    if managed_job_id:
+        workload_id = str(managed_job_id)
+
+    global_task_id = task_envs.get(constants.TASK_ID_ENV_VAR, '')
+    task_id_match = re.search(r'-(\d+)$', global_task_id)
+    if task_id_match is not None:
+        workload_task_id = int(task_id_match.group(1))
+    return workload_id, workload_task_id
+
+
 class RetryingVmProvisioner(object):
     """A provisioner that retries different cloud/regions/zones."""
 
@@ -995,7 +1021,8 @@ class RetryingVmProvisioner(object):
                  is_managed: Optional[bool] = None,
                  *,
                  extra_launch_context: Dict[str, Any],
-                 is_launched_by_jobs_controller: bool = False):
+                 is_launched_by_jobs_controller: bool = False,
+                 workload_type: str = 'cluster'):
         self._blocked_resources: Set[resources_lib.Resources] = set()
         if blocked_resources:
             # blocked_resources is not None and not empty.
@@ -1010,6 +1037,7 @@ class RetryingVmProvisioner(object):
         self._is_managed = is_managed
         self._extra_launch_context: Dict[str, Any] = extra_launch_context
         self._is_launched_by_jobs_controller = is_launched_by_jobs_controller
+        self._workload_type = workload_type
 
     def _yield_zones(
             self, to_provision: resources_lib.Resources, num_nodes: int,
@@ -1434,6 +1462,8 @@ class RetryingVmProvisioner(object):
                     status_lib.ClusterStatus.INIT)
 
                 # This sets the status to INIT (even for a normal, UP cluster).
+                workload_id, workload_task_id = _get_workload_attribution(
+                    task, cluster_name, self._workload_type)
                 global_user_state.add_or_update_cluster(
                     cluster_name,
                     cluster_handle=handle,
@@ -1441,6 +1471,9 @@ class RetryingVmProvisioner(object):
                     ready=False,
                     is_managed=self._is_managed,
                     provision_log_path=log_abs_path,
+                    workload_type=self._workload_type,
+                    workload_id=workload_id,
+                    workload_task_id=workload_task_id,
                 )
 
                 # Add cluster event for actual provisioning start.
@@ -3511,6 +3544,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         self._is_managed = False
         self._extra_launch_context: Dict[str, Any] = {}
         self._is_launched_by_jobs_controller = False
+        self._workload_type = 'cluster'
         # Optional planner (via register_info): used under the per-cluster lock
         # to produce a fresh concrete plan when neither a reusable snapshot nor
         # a caller plan is available.
@@ -3535,6 +3569,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         self._extra_launch_context = kwargs.pop('extra_launch_context', {})
         self._is_launched_by_jobs_controller = kwargs.pop(
             'is_launched_by_jobs_controller', False)
+        self._workload_type = kwargs.pop('workload_type', 'cluster')
         # Optional planner callback for a fresh plan under lock when no
         # reusable snapshot/caller plan exists. Keeps optimizer in upper layer.
         self._planner = kwargs.pop('planner', self._planner)
@@ -3807,7 +3842,8 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                         is_managed=self._is_managed,
                         extra_launch_context=self._extra_launch_context,
                         is_launched_by_jobs_controller=(
-                            self._is_launched_by_jobs_controller))
+                            self._is_launched_by_jobs_controller),
+                        workload_type=self._workload_type)
                     log_path = os.path.join(self.log_dir, 'provision.log')
                     rich_utils.force_update_status(
                         ux_utils.spinner_message('Launching',

@@ -580,6 +580,17 @@ export function TopBar() {
                 <UsersIcon className="w-4 h-4" />
                 <span>Users</span>
               </Link>
+
+              {userRole === 'admin' && (
+                <Link
+                  href="/spend"
+                  className={getLinkClasses('/spend')}
+                  prefetch={false}
+                >
+                  <PieChartIcon className="w-4 h-4" />
+                  <span>Cost estimate</span>
+                </Link>
+              )}
             </div>
           )}
 
@@ -888,6 +899,22 @@ export function TopBar() {
                   <UsersIcon className="w-5 h-5 mr-3" />
                   Users
                 </Link>
+
+                {userRole === 'admin' && (
+                  <Link
+                    href="/spend"
+                    className={`flex items-center px-4 py-3 text-sm font-medium rounded-md transition-colors ${
+                      isActivePath('/spend')
+                        ? 'bg-blue-50 text-blue-600'
+                        : 'text-gray-700 hover:bg-gray-100 hover:text-blue-600'
+                    }`}
+                    onClick={toggleMobileSidebar}
+                    prefetch={false}
+                  >
+                    <PieChartIcon className="w-5 h-5 mr-3" />
+                    Estimated cost
+                  </Link>
+                )}
 
                 <div className="border-t border-gray-200 my-4"></div>
 
