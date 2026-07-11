@@ -88,6 +88,76 @@ def test_bounded_log_redirection_caps_single_write(ctx, tmp_path):
     assert log_path.read_text(encoding='utf-8').endswith('α')
 
 
+def test_bounded_log_redirection_caps_writelines(ctx, tmp_path):
+    log_path = tmp_path / 'request.log'
+    max_bytes = 128
+    ctx.redirect_log(log_path, max_bytes=max_bytes)
+    stream = ctx.output_stream(None)
+
+    stream.writelines(['X' * (max_bytes * 2)])
+    stream.flush()
+
+    assert log_path.stat().st_size <= max_bytes
+    assert 'Earlier request output was truncated' in log_path.read_text(
+        encoding='utf-8')
+
+
+def test_bounded_log_redirection_retains_latest_window(
+        ctx, tmp_path):
+    log_path = tmp_path / 'request.log'
+    max_bytes = 512
+    ctx.redirect_log(log_path, max_bytes=max_bytes)
+    stream = ctx.output_stream(None)
+
+    stream.write('O' * 450)
+    stream.write('N' * 100)
+    stream.flush()
+
+    content = log_path.read_text(encoding='utf-8')
+    assert log_path.stat().st_size <= max_bytes
+    assert log_path.stat().st_size == max_bytes // 2
+    assert content.endswith('O' * 39 + 'N' * 100)
+    first_marker = context.parse_request_log_truncation_marker(
+        log_path.read_bytes()[:context.REQUEST_LOG_TRUNCATION_MARKER_MAX_BYTES])
+    assert first_marker is not None
+
+    stream.write('P' * 100)
+    stream.flush()
+    second_marker = context.parse_request_log_truncation_marker(
+        log_path.read_bytes()[:context.REQUEST_LOG_TRUNCATION_MARKER_MAX_BYTES])
+    assert second_marker == first_marker
+    assert log_path.stat().st_size == max_bytes // 2 + 100
+
+
+def test_bounded_log_multiple_handles_share_cap(tmp_path):
+    log_path = tmp_path / 'request.log'
+    max_bytes = 512
+    first = context._TruncatingLogFile(log_path, max_bytes)
+    second = context._TruncatingLogFile(log_path, max_bytes)
+    barrier = threading.Barrier(2)
+
+    def write_many(stream, character):
+        barrier.wait()
+        for _ in range(50):
+            stream.write(character * 50)
+
+    threads = [
+        threading.Thread(target=write_many, args=(first, 'A')),
+        threading.Thread(target=write_many, args=(second, 'B')),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+    first.close()
+    second.close()
+
+    assert log_path.stat().st_size <= max_bytes
+    assert 'Earlier request output was truncated' in log_path.read_text(
+        encoding='utf-8')
+
+
 def test_env_overrides(ctx):
     """Test environment variable overrides."""
     # Setup env overrides
