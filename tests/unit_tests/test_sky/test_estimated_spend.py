@@ -205,8 +205,9 @@ def test_changed_rows_with_same_timestamp_make_keyset_progress(
 
     with engine.connect() as connection:
         count = connection.scalar(
-            sqlalchemy.select(sqlalchemy.func.count()).select_from(
-                global_user_state.estimated_spend_daily_table))
+            sqlalchemy.select(sqlalchemy.func.count()  # pylint: disable=not-callable
+                             ).select_from(
+                                 global_user_state.estimated_spend_daily_table))
     assert count == 3
 
 
