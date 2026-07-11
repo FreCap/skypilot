@@ -503,7 +503,8 @@ def test_check_owner_identity_k8s_scope_does_not_overmatch(monkeypatch):
 
 
 @mock.patch('sky.backends.backend_utils.refresh_cluster_status_handle')
-def test_is_controller_accessible_accepts_autostopping(mock_refresh):
+def test_is_controller_accessible_accepts_autostopping(mock_refresh,
+                                                       monkeypatch):
     """Verify is_controller_accessible accepts AUTOSTOPPING status."""
     from sky.utils import controller_utils
 
@@ -511,12 +512,17 @@ def test_is_controller_accessible_accepts_autostopping(mock_refresh):
     mock_handle.head_ip = '1.2.3.4'
     mock_refresh.return_value = (status_lib.ClusterStatus.AUTOSTOPPING,
                                  mock_handle)
+    monkeypatch.setattr(backend_utils.managed_job_utils,
+                        'is_consolidation_mode', lambda: False)
+    monkeypatch.setattr(backend_utils.serve_utils, 'is_consolidation_mode',
+                        lambda: False)
 
     # Should not raise for AUTOSTOPPING controller
     result = backend_utils.is_controller_accessible(
         controller_utils.Controllers.JOBS_CONTROLLER,
         stopped_message='Test stopped',
         exit_if_not_accessible=False)
+    mock_refresh.assert_called_once()
     assert result == mock_handle
 
 
