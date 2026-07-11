@@ -4,6 +4,8 @@
 
 import importlib
 import shutil
+import threading
+import time
 import types
 from unittest import mock
 
@@ -31,35 +33,78 @@ def batch_state_db(tmp_path, monkeypatch):
     engine.dispose()
 
 
+def _create_batch_job(job_id: int, owner_token: str) -> None:
+    engine = state._db_manager.get_engine()
+    with engine.begin() as connection:
+        connection.execute(state.job_info_table.insert().values(
+            spot_job_id=job_id, is_batch=True))
+    assert state.acquire_batch_coordinator(job_id, owner_token) is None
+
+
+def _create_running_batch_task(job_id: int) -> None:
+    engine = state._db_manager.get_engine()
+    with engine.begin() as connection:
+        connection.execute(state.spot_table.insert().values(
+            spot_job_id=job_id,
+            task_id=0,
+            status=state.ManagedJobStatus.RUNNING.value,
+            end_at=None))
+
+
 def test_batch_attempt_fences_stale_transitions_and_persists_backoff(
         batch_state_db):
     del batch_state_db
-    state.save_batch_states(7, [[0, 9]])
+    _create_batch_job(7, 'owner-a')
+    assert state.save_batch_states(7, [[0, 9]], 'owner-a')
 
-    attempt_1 = state.claim_batch(7, 0, 'worker-a', lease_duration=10, now=100)
-    assert attempt_1 == 1
-    assert state.claim_batch(7, 0, 'worker-b', lease_duration=10,
-                             now=100) is None
-    assert not state.set_batch_attempt_status(7, 0, 2, 'COMPLETED', now=101)
-    assert state.renew_batch_lease(7, 0, 1, lease_duration=10, now=105)
+    claim_1 = state.claim_batch(7,
+                                0,
+                                'owner-a',
+                                'worker-a',
+                                lease_duration=10,
+                                now=100)
+    assert claim_1 == (1, 0)
+    assert state.claim_batch(
+        7, 0, 'owner-a', 'worker-b', lease_duration=10, now=100) is None
+    assert not state.set_batch_attempt_status(
+        7, 0, 2, 'owner-a', 'COMPLETED', now=101)
+    assert state.renew_batch_lease(7,
+                                   0,
+                                   1,
+                                   'owner-a',
+                                   lease_duration=10,
+                                   now=105)
 
     assert state.set_batch_attempt_status(7,
                                           0,
                                           1,
+                                          'owner-a',
                                           'PENDING',
                                           retry_count=1,
                                           next_retry_at=120,
                                           now=106)
-    assert state.claim_batch(7, 0, 'worker-b', lease_duration=10,
-                             now=119) is None
-    attempt_2 = state.claim_batch(7, 0, 'worker-b', lease_duration=10, now=120)
-    assert attempt_2 == 2
-    assert not state.set_batch_attempt_status(7, 0, 1, 'COMPLETED', now=121)
-    assert state.set_batch_attempt_status(7, 0, 2, 'COMPLETED', now=121)
+    assert state.claim_batch(
+        7, 0, 'owner-a', 'worker-b', lease_duration=10, now=119) is None
+    claim_2 = state.claim_batch(7,
+                                0,
+                                'owner-a',
+                                'worker-b',
+                                lease_duration=10,
+                                now=120)
+    assert claim_2 == (2, 1)
+    assert not state.set_batch_attempt_status(
+        7, 0, 1, 'owner-a', 'COMPLETED', now=121)
+    assert state.set_batch_attempt_status(7,
+                                          0,
+                                          2,
+                                          'owner-a',
+                                          'COMPLETED',
+                                          now=121)
 
     record = state.get_batch_states(7)[0]
     assert record['status'] == 'COMPLETED'
     assert record['attempt_id'] == 2
+    assert record['attempt_owner_token'] == 'owner-a'
     assert record['retry_count'] == 1
     assert record['lease_expires_at'] is None
     assert record['next_retry_at'] is None
@@ -67,13 +112,187 @@ def test_batch_attempt_fences_stale_transitions_and_persists_backoff(
 
 def test_expired_batch_attempt_is_reclaimed_once(batch_state_db):
     del batch_state_db
-    state.save_batch_states(8, [[0, 4]])
-    assert state.claim_batch(8, 0, 'worker-a', lease_duration=10, now=100) == 1
+    _create_batch_job(8, 'owner-a')
+    assert state.save_batch_states(8, [[0, 4]], 'owner-a')
+    assert state.claim_batch(8,
+                             0,
+                             'owner-a',
+                             'worker-a',
+                             lease_duration=10,
+                             now=100) == (1, 0)
 
-    assert not state.requeue_expired_batch_attempts(8, now=109)
-    assert state.requeue_expired_batch_attempts(8, now=110) == [0]
-    assert not state.requeue_expired_batch_attempts(8, now=110)
-    assert state.claim_batch(8, 0, 'worker-b', lease_duration=10, now=110) == 2
+    assert not state.requeue_expired_batch_attempts(8, 'owner-a', now=109)
+    assert state.requeue_expired_batch_attempts(8, 'owner-a', now=110) == [0]
+    assert not state.requeue_expired_batch_attempts(8, 'owner-a', now=110)
+    assert state.claim_batch(8,
+                             0,
+                             'owner-a',
+                             'worker-b',
+                             lease_duration=10,
+                             now=110) == (2, 0)
+
+
+def test_coordinator_takeover_fences_all_old_owner_mutations(batch_state_db):
+    del batch_state_db
+    _create_batch_job(9, 'old-owner')
+    assert state.save_batch_states(9, [[0, 4], [5, 9]], 'old-owner')
+    assert state.claim_batch(9, 0, 'old-owner', 'worker-a', 10,
+                             now=100) == (1, 0)
+
+    assert state.acquire_batch_coordinator(9, 'new-owner') == 'old-owner'
+    assert not state.is_batch_coordinator_owner(9, 'old-owner')
+    assert state.is_batch_coordinator_owner(9, 'new-owner')
+
+    # Takeover is a job-wide fence: the old owner cannot claim untouched work
+    # or mutate the attempt it claimed before takeover.
+    assert state.claim_batch(9, 1, 'old-owner', 'worker-b', 10, now=101) is None
+    assert not state.renew_batch_lease(9, 0, 1, 'old-owner', 10, now=101)
+    assert not state.set_batch_attempt_status(
+        9, 0, 1, 'old-owner', 'COMPLETED', now=101)
+    assert not state.requeue_expired_batch_attempts(9, 'old-owner', now=110)
+
+    # The new owner honors the old lease, then reclaims and owns the next
+    # attempt with a new attempt token.
+    assert not state.requeue_expired_batch_attempts(9, 'new-owner', now=109)
+    assert state.requeue_expired_batch_attempts(9, 'new-owner', now=110) == [0]
+    assert state.claim_batch(9, 0, 'new-owner', 'worker-b', 10,
+                             now=110) == (2, 0)
+
+
+def test_new_launch_waits_for_paused_old_owner_transaction(
+        batch_state_db, monkeypatch):
+    del batch_state_db
+    _create_batch_job(10, 'old-owner')
+    assert state.save_batch_states(10, [[0, 4]], 'old-owner')
+    owner_locked = threading.Event()
+    release_old = threading.Event()
+    takeover_done = threading.Event()
+    new_launch = mock.Mock()
+    errors = []
+    order = []
+    original_lock = state._lock_batch_coordinator_owner
+
+    def _pause_old_owner(session, job_id, owner_token):
+        owned = original_lock(session, job_id, owner_token)
+        if threading.current_thread().name == 'old-owner-claim':
+            owner_locked.set()
+            if not release_old.wait(timeout=5):
+                raise RuntimeError('test timed out releasing old owner')
+        return owned
+
+    monkeypatch.setattr(state, '_lock_batch_coordinator_owner',
+                        _pause_old_owner)
+
+    def _old_claim():
+        try:
+            assert state.claim_batch(10,
+                                     0,
+                                     'old-owner',
+                                     'worker-a',
+                                     10,
+                                     now=100) == (1, 0)
+            order.append('old-commit')
+        except Exception as e:  # pylint: disable=broad-except
+            errors.append(e)
+
+    def _new_takeover():
+        try:
+            assert state.acquire_batch_coordinator(10,
+                                                   'new-owner') == 'old-owner'
+            order.append('takeover-return')
+            new_launch()
+        except Exception as e:  # pylint: disable=broad-except
+            errors.append(e)
+        finally:
+            takeover_done.set()
+
+    old_thread = threading.Thread(target=_old_claim, name='old-owner-claim')
+    old_thread.start()
+    assert owner_locked.wait(timeout=5)
+    takeover_thread = threading.Thread(target=_new_takeover)
+    takeover_thread.start()
+
+    assert not takeover_done.wait(timeout=0.2)
+    new_launch.assert_not_called()
+    release_old.set()
+    old_thread.join(timeout=5)
+    takeover_thread.join(timeout=5)
+
+    assert not errors
+    assert order == ['old-commit', 'takeover-return']
+    new_launch.assert_called_once_with()
+    assert state.is_batch_coordinator_owner(10, 'new-owner')
+
+
+def test_triple_takeover_retains_only_durable_stale_generations(batch_state_db):
+    del batch_state_db
+    _create_batch_job(11, 'owner-a')
+    assert state.save_batch_states(11, [[0, 4]], 'owner-a')
+    assert state.claim_batch(11, 0, 'owner-a', 'worker-a', 10,
+                             now=100) == (1, 0)
+    assert state.acquire_batch_coordinator(11, 'owner-b') == 'owner-a'
+    assert state.acquire_batch_coordinator(11, 'owner-c') == 'owner-b'
+
+    batch_coordinator = _make_coordinator(job_id=11)
+    batch_coordinator._worker_token = 'owner-c'
+    batch_coordinator._stale_worker_tokens.add('owner-b')
+    batch_coordinator._resume_from_db()
+
+    assert batch_coordinator._stale_worker_tokens == {'owner-a', 'owner-b'}
+    assert not state.renew_batch_lease(11, 0, 1, 'owner-a', 10, now=101)
+    assert state.requeue_expired_batch_attempts(11, 'owner-c', now=110) == [0]
+
+
+def test_batch_lifecycle_transitions_are_owner_fenced(batch_state_db):
+    del batch_state_db
+    _create_batch_job(12, 'old-owner')
+    _create_running_batch_task(12)
+    assert state.acquire_batch_coordinator(12, 'new-owner') == 'old-owner'
+
+    assert state.set_batch_winding_down(
+        12, 0, 'old-owner') == state.BatchLifecycleTransition.OWNER_LOST
+    assert state.set_batch_failed(
+        12, 0, 'old-owner',
+        'stale failure') == state.BatchLifecycleTransition.OWNER_LOST
+    assert state.set_batch_winding_down(
+        12, 0, 'new-owner') == state.BatchLifecycleTransition.APPLIED
+    assert state.set_batch_succeeded(
+        12, 0, 'new-owner',
+        end_time=123) == state.BatchLifecycleTransition.APPLIED
+
+    engine = state._db_manager.get_engine()
+    with engine.connect() as connection:
+        row = connection.execute(
+            sqlalchemy.select(state.spot_table.c.status,
+                              state.spot_table.c.failure_reason,
+                              state.spot_table.c.end_at).where(
+                                  state.spot_table.c.spot_job_id == 12)).one()
+    assert row.status == state.ManagedJobStatus.SUCCEEDED.value
+    assert row.failure_reason is None
+    assert row.end_at == 123
+
+
+def test_batch_failure_covers_starting_and_reports_invalid_state(
+        batch_state_db):
+    del batch_state_db
+    _create_batch_job(13, 'owner-a')
+    engine = state._db_manager.get_engine()
+    with engine.begin() as connection:
+        connection.execute(state.spot_table.insert().values(
+            spot_job_id=13,
+            task_id=0,
+            status=state.ManagedJobStatus.STARTING.value,
+            end_at=None))
+
+    assert state.set_batch_failed(
+        13, 0, 'owner-a',
+        'startup failed') == state.BatchLifecycleTransition.APPLIED
+    assert state.set_batch_failed(
+        13, 0, 'owner-a',
+        'same result') == state.BatchLifecycleTransition.ALREADY_TARGET
+    assert state.set_batch_succeeded(
+        13, 0, 'owner-a',
+        end_time=123) == state.BatchLifecycleTransition.INVALID_STATE
 
 
 def test_schema_022_upgrades_existing_batch_state_table(tmp_path):
@@ -107,6 +326,44 @@ def test_schema_022_upgrades_existing_batch_state_table(tmp_path):
     assert attempt_id == 0
 
 
+def test_schema_023_adds_batch_coordinator_ownership_tokens(tmp_path):
+    engine = sqlalchemy.create_engine(f'sqlite:///{tmp_path / "owner.db"}')
+    old_metadata = sqlalchemy.MetaData()
+    sqlalchemy.Table(
+        'job_info', old_metadata,
+        sqlalchemy.Column('spot_job_id', sqlalchemy.Integer, primary_key=True))
+    sqlalchemy.Table(
+        'batch_state', old_metadata,
+        sqlalchemy.Column('job_id', sqlalchemy.Integer, primary_key=True),
+        sqlalchemy.Column('batch_idx', sqlalchemy.Integer, primary_key=True))
+    old_metadata.create_all(engine)
+
+    schema_023 = importlib.import_module(
+        'sky.schemas.db.spot_jobs.023_add_batch_coordinator_fence')
+    with engine.connect() as connection:
+        context = migration.MigrationContext.configure(connection)
+        with operations.Operations.context(context):
+            schema_023.upgrade()
+
+    inspector = sqlalchemy.inspect(engine)
+    job_columns = {
+        column['name'] for column in inspector.get_columns('job_info')
+    }
+    batch_columns = {
+        column['name'] for column in inspector.get_columns('batch_state')
+    }
+    assert 'batch_coordinator_token' in job_columns
+    assert 'attempt_owner_token' in batch_columns
+    assert inspector.has_table('batch_worker')
+    worker_columns = {
+        column['name'] for column in inspector.get_columns('batch_worker')
+    }
+    assert {
+        'coordinator_token', 'worker_cluster', 'worker_job_name',
+        'launch_request_id', 'worker_job_id'
+    } <= worker_columns
+
+
 def test_spot_jobs_database_targets_batch_attempt_migration(
         tmp_path, monkeypatch):
     engine = sqlalchemy.create_engine(f'sqlite:///{tmp_path / "target.db"}')
@@ -116,8 +373,8 @@ def test_spot_jobs_database_targets_batch_attempt_migration(
     state.create_table(engine)
 
     upgrade.assert_called_once_with(engine, migration_utils.SPOT_JOBS_DB_NAME,
-                                    '022')
-    assert migration_utils.SPOT_JOBS_VERSION == '022'
+                                    '023')
+    assert migration_utils.SPOT_JOBS_VERSION == '023'
     engine.dispose()
 
 
@@ -245,6 +502,53 @@ def test_pending_queue_honors_retry_time(monkeypatch):
     assert batch_coordinator._pop_ready_batch() == (3, 0)
 
 
+def test_resume_rejects_pre_fence_attempt_state(monkeypatch):
+    batch_coordinator = _make_coordinator()
+    monkeypatch.setattr(
+        coordinator.managed_job_state, 'get_batch_states',
+        mock.Mock(return_value=[{
+            'batch_idx': 0,
+            'start_idx': 0,
+            'end_idx': 3,
+            'status': 'DISPATCHED',
+            'attempt_id': 0,
+            'attempt_owner_token': None,
+            'worker_cluster': 'worker-a',
+            'retry_count': 0,
+        }]))
+
+    with pytest.raises(RuntimeError, match='pre-fence attempt state'):
+        batch_coordinator._resume_from_db()
+
+
+def test_dispatch_waits_for_live_lease_and_uses_db_completion(monkeypatch):
+    batch_coordinator = _make_coordinator()
+    batch_coordinator.batches = [[0, 3]]
+    batch_coordinator._workers = ['worker-a']
+    batch_coordinator._enqueue_batch(0)
+    monkeypatch.setattr(batch_coordinator, '_reclaim_expired_batches',
+                        mock.Mock(return_value=0))
+    monkeypatch.setattr(batch_coordinator, '_assert_coordinator_owner',
+                        mock.Mock())
+    progress = mock.Mock(side_effect=[
+        (0, {'worker-a'}, []),
+        (1, set(), []),
+        (1, set(), []),
+    ])
+    monkeypatch.setattr(batch_coordinator, '_sync_batch_progress_from_db',
+                        progress)
+    monkeypatch.setattr(batch_coordinator, '_get_ready_workers',
+                        mock.Mock(return_value=['worker-a']))
+    dispatch = mock.Mock()
+    monkeypatch.setattr(batch_coordinator, '_worker_dispatch_loop', dispatch)
+    monkeypatch.setattr(coordinator.time, 'sleep', mock.Mock())
+
+    batch_coordinator._dispatch_all()
+
+    dispatch.assert_not_called()
+    assert progress.call_count == 3
+
+
 def test_worker_commands_are_scoped_to_coordinator_token():
     batch_coordinator = _make_coordinator()
     batch_coordinator.batches = [[0, 3]]
@@ -256,6 +560,34 @@ def test_worker_commands_are_scoped_to_coordinator_token():
     assert token_header in notify_code
     assert token_header in shutdown_code
     assert '"attempt_id": 4' in notify_code
+    assert '--connect-timeout 2' in shutdown_code
+    assert '--max-time 5' in shutdown_code
+
+
+def test_completed_resume_cleans_workers_before_reduction(monkeypatch):
+    batch_coordinator = _make_coordinator()
+    batch_coordinator._is_resume = True
+    events = []
+    monkeypatch.setattr(batch_coordinator, '_resolve_formats', mock.Mock())
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'acquire_batch_coordinator',
+                        mock.Mock(return_value='old-token'))
+
+    def _resume():
+        batch_coordinator.batches = [[0, 3]]
+        return 1
+
+    monkeypatch.setattr(batch_coordinator, '_resume_from_db', _resume)
+    monkeypatch.setattr(batch_coordinator, '_cleanup_stale_worker_services',
+                        lambda: events.append('cleanup'))
+    monkeypatch.setattr(batch_coordinator, '_set_winding_down',
+                        lambda: events.append('winding_down'))
+    monkeypatch.setattr(batch_coordinator, '_reduce_results',
+                        lambda: events.append('reduce'))
+
+    batch_coordinator.run()
+
+    assert events == ['cleanup', 'winding_down', 'reduce']
 
 
 def test_worker_rejects_control_from_stale_coordinator(monkeypatch):
@@ -276,10 +608,264 @@ def test_worker_shutdown_cancels_only_owned_job(monkeypatch):
     cancel = mock.Mock(return_value='cancel')
     monkeypatch.setattr(coordinator.sdk, 'cancel', cancel)
     monkeypatch.setattr(coordinator.time, 'sleep', mock.Mock())
+    remove = mock.Mock(return_value=True)
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'remove_batch_worker_record', remove)
 
     batch_coordinator._shutdown_worker('worker-a', worker_job_id=17)
 
     cancel.assert_called_once_with('worker-a', job_ids=[17])
+    remove.assert_called_once_with(1,
+                                   batch_coordinator._worker_token,
+                                   'worker-a',
+                                   worker_job_id=17)
+
+
+def test_durable_worker_id_ignores_duplicate_or_spoofed_names(
+        batch_state_db, monkeypatch):
+    del batch_state_db
+    _create_batch_job(1, 'old-token')
+    assert state.register_batch_worker_launch(1, 'old-token', 'worker-a',
+                                              'batch-worker-1-old-token')
+    assert state.record_batch_worker_job_id(1, 'old-token', 'worker-a', 17)
+    assert state.acquire_batch_coordinator(1, 'new-token') == 'old-token'
+    batch_coordinator = _make_coordinator(job_id=1)
+    batch_coordinator._worker_token = 'new-token'
+    batch_coordinator._stale_worker_tokens.add('old-token')
+    batch_coordinator._stale_attempt_leases_drained = True
+    batch_coordinator._resolve_formats()
+    queue = mock.Mock()
+    monkeypatch.setattr(coordinator.sdk, 'queue', queue)
+    get = mock.Mock(return_value=None)
+    monkeypatch.setattr(coordinator.sdk, 'get', get)
+    cancel = mock.Mock(return_value='cancel-request')
+    monkeypatch.setattr(coordinator.sdk, 'cancel', cancel)
+
+    batch_coordinator._cancel_stale_worker_jobs('worker-a', 'old-token')
+
+    cancel.assert_called_once_with('worker-a', job_ids=[17])
+    queue.assert_not_called()
+    with pytest.raises(ValueError, match='durably captured'):
+        batch_coordinator._cancel_stale_worker_jobs('worker-a', 'spoof-token')
+    startup_code = batch_coordinator._generate_worker_startup_code()
+    assert '/proc/net/tcp' not in startup_code
+    assert 'os.kill' not in startup_code
+
+
+def test_unresolved_duplicate_worker_names_are_never_bulk_cancelled(
+        batch_state_db, monkeypatch):
+    del batch_state_db
+    _create_batch_job(2, 'old-token')
+    assert state.register_batch_worker_launch(2, 'old-token', 'worker-a',
+                                              'batch-worker-2-old-token')
+    assert state.acquire_batch_coordinator(2, 'new-token') == 'old-token'
+    batch_coordinator = _make_coordinator(job_id=2)
+    batch_coordinator._worker_token = 'new-token'
+    batch_coordinator._stale_worker_tokens.add('old-token')
+    batch_coordinator._stale_attempt_leases_drained = True
+    queued = [
+        types.SimpleNamespace(job_id=17, job_name='batch-worker-2-old-token'),
+        types.SimpleNamespace(job_id=18, job_name='batch-worker-2-old-token'),
+    ]
+    monkeypatch.setattr(coordinator.sdk, 'queue',
+                        mock.Mock(return_value='queue-request'))
+    monkeypatch.setattr(coordinator.sdk, 'get', mock.Mock(return_value=queued))
+    cancel = mock.Mock()
+    monkeypatch.setattr(coordinator.sdk, 'cancel', cancel)
+
+    batch_coordinator._cancel_stale_worker_jobs('worker-a', 'old-token')
+
+    cancel.assert_not_called()
+    assert state.get_batch_worker_records(2)[0]['worker_job_id'] is None
+
+
+def test_takeover_waits_for_old_lease_before_exact_cleanup(monkeypatch):
+    batch_coordinator = _make_coordinator(job_id=1)
+    batch_coordinator._worker_token = 'new-token'
+    batch_coordinator._workers = ['worker-a']
+    events = []
+    monkeypatch.setattr(batch_coordinator, '_assert_coordinator_owner',
+                        mock.Mock())
+    monkeypatch.setattr(batch_coordinator, '_reclaim_expired_batches',
+                        mock.Mock(return_value=0))
+    get_states = mock.Mock(side_effect=[
+        [{
+            'status': 'DISPATCHED',
+            'attempt_owner_token': 'old-token',
+            'lease_expires_at': 105,
+        }],
+        [{
+            'status': 'PENDING',
+            'attempt_owner_token': 'old-token',
+            'lease_expires_at': None,
+        }],
+    ])
+    monkeypatch.setattr(coordinator.managed_job_state, 'get_batch_states',
+                        get_states)
+    monkeypatch.setattr(coordinator.time, 'time', lambda: 100)
+    monkeypatch.setattr(coordinator.time, 'sleep',
+                        lambda seconds: events.append(('sleep', seconds)))
+    monkeypatch.setattr(batch_coordinator,
+                        '_cleanup_worker_services_for_token',
+                        lambda token, workers=None: events.append(
+                            ('cancel', workers, token)))
+
+    batch_coordinator._wait_for_stale_attempt_leases()
+
+    assert events == [('sleep', 5.0), ('cancel', None, 'old-token')]
+
+
+def test_triple_takeover_recovers_worker_launched_before_first_claim(
+        batch_state_db, monkeypatch):
+    del batch_state_db
+    _create_batch_job(15, 'owner-a')
+    # A persists and launches a service but dies before claiming any batch.
+    assert state.register_batch_worker_launch(15, 'owner-a', 'worker-a',
+                                              'batch-worker-15-owner-a')
+    assert state.record_batch_worker_launch_request(15, 'owner-a', 'worker-a',
+                                                    'request-a')
+    assert state.record_batch_worker_job_id(15, 'owner-a', 'worker-a', 17)
+    # B takes ownership and dies without launching or claiming.  C must still
+    # discover A through durable launch history, not just the predecessor token.
+    assert state.acquire_batch_coordinator(15, 'owner-b') == 'owner-a'
+    assert state.acquire_batch_coordinator(15, 'owner-c') == 'owner-b'
+
+    batch_coordinator = _make_coordinator(job_id=15)
+    batch_coordinator._worker_token = 'owner-c'
+    batch_coordinator._stale_attempt_leases_drained = True
+    cancel = mock.Mock(return_value='cancel-request')
+    monkeypatch.setattr(coordinator.sdk, 'cancel', cancel)
+    monkeypatch.setattr(coordinator.sdk, 'get', mock.Mock(return_value=None))
+
+    batch_coordinator._cleanup_stale_worker_services(strict=True)
+
+    assert batch_coordinator._stale_worker_tokens == {'owner-a'}
+    cancel.assert_called_once_with('worker-a', job_ids=[17])
+    assert state.get_batch_worker_records(15) == []
+
+
+def test_worker_launch_intent_commits_before_external_exec(monkeypatch):
+    batch_coordinator = _make_coordinator(job_id=1)
+    batch_coordinator._worker_token = 'owner-token'
+    batch_coordinator._stale_attempt_leases_drained = True
+    batch_coordinator._resolve_formats()
+    monkeypatch.setattr(batch_coordinator, '_assert_coordinator_owner',
+                        mock.Mock())
+    monkeypatch.setattr(batch_coordinator, '_get_pool_resources',
+                        mock.Mock(return_value=None))
+    monkeypatch.setattr(batch_coordinator, '_cleanup_stale_worker_services',
+                        mock.Mock())
+    execute = mock.Mock()
+    monkeypatch.setattr(coordinator.sdk, 'exec', execute)
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'register_batch_worker_launch',
+                        mock.Mock(return_value=False))
+
+    with pytest.raises(coordinator.SupersededCoordinator,
+                       match='before worker launch'):
+        batch_coordinator._launch_worker_service('worker-a')
+
+    execute.assert_not_called()
+
+
+def test_worker_launch_crossing_takeover_cancels_exact_job_id(monkeypatch):
+    batch_coordinator = _make_coordinator(job_id=1)
+    batch_coordinator._worker_token = 'old-token'
+    batch_coordinator._resolve_formats()
+    monkeypatch.setattr(batch_coordinator, '_assert_coordinator_owner',
+                        mock.Mock())
+    monkeypatch.setattr(batch_coordinator, '_get_pool_resources',
+                        mock.Mock(return_value=None))
+    register = mock.Mock(return_value=True)
+    record_request = mock.Mock(return_value=True)
+    record_job_id = mock.Mock(return_value=True)
+    remove_record = mock.Mock(return_value=True)
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'register_batch_worker_launch', register)
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'record_batch_worker_launch_request', record_request)
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'record_batch_worker_job_id', record_job_id)
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'remove_batch_worker_record', remove_record)
+    execute = mock.Mock(return_value='launch-request')
+    monkeypatch.setattr(coordinator.sdk, 'exec', execute)
+    get = mock.Mock(side_effect=[(17, None), None])
+    monkeypatch.setattr(coordinator.sdk, 'get', get)
+    cancel = mock.Mock(return_value='cancel-request')
+    monkeypatch.setattr(coordinator.sdk, 'cancel', cancel)
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'is_batch_coordinator_owner',
+                        mock.Mock(return_value=False))
+
+    with pytest.raises(RuntimeError, match='lost ownership while launching'):
+        batch_coordinator._launch_worker_service('worker-a')
+
+    launched_task = execute.call_args.args[0]
+    assert launched_task.name == 'batch-worker-1-old-token'
+    register.assert_called_once_with(1, 'old-token', 'worker-a',
+                                     'batch-worker-1-old-token')
+    record_request.assert_called_once_with(1, 'old-token', 'worker-a',
+                                           'launch-request')
+    record_job_id.assert_called_once_with(1, 'old-token', 'worker-a', 17)
+    cancel.assert_called_once_with('worker-a', job_ids=[17])
+
+
+def test_worker_health_failure_cancels_exact_launched_job_id(monkeypatch):
+    batch_coordinator = _make_coordinator(job_id=1)
+    batch_coordinator._worker_token = 'owner-token'
+    batch_coordinator._resolve_formats()
+    monkeypatch.setattr(batch_coordinator, '_assert_coordinator_owner',
+                        mock.Mock())
+    monkeypatch.setattr(batch_coordinator, '_get_pool_resources',
+                        mock.Mock(return_value=None))
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'register_batch_worker_launch',
+                        mock.Mock(return_value=True))
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'record_batch_worker_launch_request',
+                        mock.Mock(return_value=True))
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'record_batch_worker_job_id',
+                        mock.Mock(return_value=True))
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'remove_batch_worker_record',
+                        mock.Mock(return_value=True))
+    execute = mock.Mock(side_effect=['launch-request', 'health-request'])
+    monkeypatch.setattr(coordinator.sdk, 'exec', execute)
+    get = mock.Mock(side_effect=[(17, None), RuntimeError('unhealthy'), None])
+    monkeypatch.setattr(coordinator.sdk, 'get', get)
+    cancel = mock.Mock(return_value='cancel-request')
+    monkeypatch.setattr(coordinator.sdk, 'cancel', cancel)
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'is_batch_coordinator_owner',
+                        mock.Mock(return_value=True))
+
+    with pytest.raises(RuntimeError, match='failed to start'):
+        batch_coordinator._launch_worker_service('worker-a')
+
+    cancel.assert_called_once_with('worker-a', job_ids=[17])
+
+
+def test_worker_uses_threaded_http_server(monkeypatch):
+    server = mock.Mock()
+    server.serve_forever = mock.Mock()
+    server.shutdown = mock.Mock()
+    server_factory = mock.Mock(return_value=server)
+    monkeypatch.setattr(worker.http_server, 'ThreadingHTTPServer',
+                        server_factory)
+    monkeypatch.setattr(worker, '_resolve_input_format', mock.Mock())
+    monkeypatch.setattr(worker, '_resolve_output_formats',
+                        mock.Mock(return_value=[]))
+    monkeypatch.setattr(worker.utils, 'deserialize_function',
+                        mock.Mock(return_value=lambda: None))
+
+    worker.start_worker('serialized', 's3://bucket/output', 'job-1', 'token')
+
+    server_factory.assert_called_once_with(
+        ('127.0.0.1', worker.constants.WORKER_SERVICE_PORT),
+        worker._WorkerHandler)
+    server.shutdown.assert_called_once_with()
 
 
 def test_expired_worker_batch_rejects_late_save(monkeypatch):
@@ -315,19 +901,34 @@ def test_json_writer_reduces_only_completed_attempts(monkeypatch):
     monkeypatch.setattr(utils, 'save_jsonl_to_cloud', save)
 
     attempt_path = writer.upload_batch_attempt([{'value': 1}], 0, 3, 'job-1', 4)
-    assert attempt_path == ('s3://bucket/.sky_batch_tmp/job-1/attempts/4/'
-                            'batch_00000000-00000003.jsonl')
+    assert attempt_path == utils.get_attempt_batch_path(writer.path, 0, 3,
+                                                        'job-1', 4)
+    assert '/outputs/' in attempt_path
     save.assert_called_once_with([{'value': 1}], attempt_path)
 
     concatenate = mock.Mock()
     monkeypatch.setattr(utils, 'concatenate_batch_files_to_output', concatenate)
     writer.reduce_attempt_results('job-1', [(0, 3, 4), (4, 5, 2)])
     concatenate.assert_called_once_with('s3://bucket/output.jsonl', [
-        ('s3://bucket/.sky_batch_tmp/job-1/attempts/4/'
-         'batch_00000000-00000003.jsonl'),
-        ('s3://bucket/.sky_batch_tmp/job-1/attempts/2/'
-         'batch_00000004-00000005.jsonl'),
+        utils.get_attempt_batch_path(writer.path, 0, 3, 'job-1', 4),
+        utils.get_attempt_batch_path(writer.path, 4, 5, 'job-1', 2),
     ])
+
+
+def test_json_writers_in_same_directory_use_distinct_attempt_paths(monkeypatch):
+    first = io_formats.JsonWriter('s3://bucket/first.jsonl', column='first')
+    second = io_formats.JsonWriter('s3://bucket/second.jsonl', column='second')
+    save = mock.Mock()
+    monkeypatch.setattr(utils, 'save_jsonl_to_cloud', save)
+
+    first_path = first.upload_batch_attempt([{'first': 1}], 0, 0, 'job-1', 1)
+    second_path = second.upload_batch_attempt([{'second': 2}], 0, 0, 'job-1', 1)
+
+    assert first_path != second_path
+    assert first_path == utils.get_attempt_batch_path(first.path, 0, 0, 'job-1',
+                                                      1)
+    assert second_path == utils.get_attempt_batch_path(second.path, 0, 0,
+                                                       'job-1', 1)
 
 
 def test_image_writer_promotes_only_winning_attempt(monkeypatch):
@@ -351,11 +952,20 @@ def test_image_writer_promotes_only_winning_attempt(monkeypatch):
                     '00000003.png')
     upload.assert_called_once_with(b'png', attempt_path)
 
-    writer.reduce_attempt_results('job-1', [(3, 3, 5), (4, 4, 0)])
+    writer.reduce_attempt_results('job-1', [(3, 3, 5)])
     copy.assert_called_once_with(attempt_path,
                                  's3://bucket/images/00000003.png')
     writer.cleanup('job-1')
     delete.assert_called_once_with('s3://bucket/images/.sky_batch_tmp/job-1/')
+
+
+def test_image_cleanup_prefix_is_rooted_inside_output_directory():
+    assert utils.get_directory_job_temp_prefix(
+        's3://bucket/nested/images/',
+        'job-1') == ('s3://bucket/nested/images/.sky_batch_tmp/job-1/')
+    assert utils.get_directory_job_temp_prefix(
+        'gs://bucket/images/',
+        'job-2') == ('gs://bucket/images/.sky_batch_tmp/job-2/')
 
 
 def test_coordinator_reduces_winners_before_separate_cleanup(monkeypatch):
@@ -364,6 +974,8 @@ def test_coordinator_reduces_winners_before_separate_cleanup(monkeypatch):
     output_writer = mock.Mock()
     output_writer.path = 's3://bucket/output.jsonl'
     batch_coordinator._output_formats = [output_writer]
+    monkeypatch.setattr(batch_coordinator, '_assert_coordinator_owner',
+                        mock.Mock())
     monkeypatch.setattr(
         coordinator.managed_job_state, 'get_batch_states',
         mock.Mock(return_value=[{
@@ -372,12 +984,14 @@ def test_coordinator_reduces_winners_before_separate_cleanup(monkeypatch):
             'end_idx': 3,
             'status': 'COMPLETED',
             'attempt_id': 4,
+            'attempt_owner_token': 'owner-a',
         }, {
             'batch_idx': 1,
             'start_idx': 4,
             'end_idx': 5,
             'status': 'COMPLETED',
             'attempt_id': 2,
+            'attempt_owner_token': 'owner-a',
         }]))
 
     batch_coordinator._reduce_results()
@@ -395,6 +1009,8 @@ async def test_batch_cleanup_runs_after_durable_success(monkeypatch):
     events = []
     batch_coordinator = mock.Mock()
     batch_coordinator.run.side_effect = lambda: events.append('run')
+    batch_coordinator.mark_succeeded.side_effect = (
+        lambda end_time: events.append('succeeded'))
     batch_coordinator.cleanup.side_effect = lambda: events.append('cleanup')
     monkeypatch.setattr(jobs_controller.batch_coordinator, 'BatchCoordinator',
                         mock.Mock(return_value=batch_coordinator))
@@ -402,12 +1018,6 @@ async def test_batch_cleanup_runs_after_durable_success(monkeypatch):
         jobs_controller.managed_job_state, 'get_latest_task_id_status_async',
         mock.AsyncMock(return_value=(0, state.ManagedJobStatus.RUNNING)))
 
-    async def _set_succeeded(**kwargs):
-        del kwargs
-        events.append('succeeded')
-
-    monkeypatch.setattr(jobs_controller.managed_job_state,
-                        'set_succeeded_async', _set_succeeded)
     task = mock.Mock()
     task.metadata = {
         'batch_dataset_path': 's3://bucket/input.jsonl',
@@ -424,11 +1034,144 @@ async def test_batch_cleanup_runs_after_durable_success(monkeypatch):
         controller_instance,
         task_id=0,
         task=task,
-        callback_func=mock.Mock(),
+        callback_func=mock.AsyncMock(),
         is_resume=True)
 
     assert succeeded
     assert events == ['run', 'succeeded', 'cleanup']
+
+
+@pytest.mark.asyncio
+async def test_superseded_coordinator_never_marks_batch_failed(monkeypatch):
+    batch_coordinator = mock.Mock()
+    batch_coordinator.run.side_effect = coordinator.SupersededCoordinator(
+        'new owner')
+    batch_coordinator.handle_superseded = mock.AsyncMock()
+    monkeypatch.setattr(jobs_controller.batch_coordinator, 'BatchCoordinator',
+                        mock.Mock(return_value=batch_coordinator))
+    monkeypatch.setattr(
+        jobs_controller.managed_job_state, 'get_latest_task_id_status_async',
+        mock.AsyncMock(return_value=(0, state.ManagedJobStatus.RUNNING)))
+    task = mock.Mock()
+    task.metadata = {
+        'batch_dataset_path': 's3://bucket/input.jsonl',
+        'batch_output_path': 's3://bucket/output.jsonl',
+        'batch_size': 4,
+        'batch_pool_name': 'pool',
+        'batch_serialized_fn': 'serialized',
+        'batch_input_format': {},
+        'batch_output_formats': [],
+    }
+    controller_instance = types.SimpleNamespace(_job_id=1)
+
+    with pytest.raises(coordinator.SupersededCoordinator):
+        await jobs_controller.JobController._run_batch_coordinator_task(
+            controller_instance,
+            task_id=0,
+            task=task,
+            callback_func=mock.AsyncMock(),
+            is_resume=True)
+
+    batch_coordinator.handle_superseded.assert_awaited_once_with()
+    batch_coordinator.mark_failed.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_superseded_cleanup_has_one_global_deadline(monkeypatch):
+    batch_coordinator = _make_coordinator()
+    with batch_coordinator._active_workers_lock:
+        batch_coordinator._active_workers['worker-a'] = 17
+    release = threading.Event()
+    entered = threading.Event()
+
+    def _slow_exec(task, cluster_name):
+        del task, cluster_name
+        entered.set()
+        release.wait(timeout=5)
+        return 'shutdown-request'
+
+    monkeypatch.setattr(coordinator.sdk, 'exec', _slow_exec)
+    get = mock.Mock()
+    cancel = mock.Mock()
+    monkeypatch.setattr(coordinator.sdk, 'get', get)
+    monkeypatch.setattr(coordinator.sdk, 'cancel', cancel)
+    started = time.monotonic()
+    try:
+        await batch_coordinator.handle_superseded(timeout=0.05)
+    finally:
+        release.set()
+
+    assert entered.is_set()
+    assert time.monotonic() - started < 0.5
+    # The timed-out exec may finish, but no subsequent get/cancel is started.
+    get.assert_not_called()
+    cancel.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_superseded_jobs_controller_skips_terminal_finalizers(
+        monkeypatch):
+    task = mock.Mock()
+    task.name = 'batch-task'
+    dag = mock.Mock()
+    dag.is_job_group.return_value = False
+    dag.tasks = [task]
+    controller_instance = object.__new__(jobs_controller.JobController)
+    controller_instance._job_id = 1
+    controller_instance._dag = dag
+    controller_instance._run_one_task = mock.AsyncMock(
+        side_effect=coordinator.SupersededCoordinator('new owner'))
+    cancelling = mock.AsyncMock()
+    cancelled = mock.AsyncMock()
+    monkeypatch.setattr(jobs_controller.managed_job_state,
+                        'set_cancelling_async', cancelling)
+    monkeypatch.setattr(jobs_controller.managed_job_state,
+                        'set_cancelled_async', cancelled)
+
+    with pytest.raises(coordinator.SupersededCoordinator):
+        await jobs_controller.JobController.run(controller_instance)
+
+    cancelling.assert_not_awaited()
+    cancelled.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_run_job_loop_superseded_skips_all_durable_finalizers(
+        tmp_path, monkeypatch):
+    manager = jobs_controller.ControllerManager('old-controller')
+    manager.starting.add(1)
+    old_controller = mock.Mock()
+    old_controller.run = mock.AsyncMock(
+        side_effect=coordinator.SupersededCoordinator('replacement owns job'))
+    monkeypatch.setattr(jobs_controller, 'JobController',
+                        mock.Mock(return_value=old_controller))
+    monkeypatch.setattr(jobs_controller.file_content_utils,
+                        'get_job_env_content', mock.Mock(return_value=None))
+    monkeypatch.setattr(jobs_controller.usage_lib,
+                        'install_fresh_messages_for_current_context',
+                        mock.Mock())
+    cleanup = mock.AsyncMock()
+    monkeypatch.setattr(manager, '_cleanup', cleanup)
+    get_status = mock.AsyncMock()
+    set_failed = mock.AsyncMock()
+    job_done = mock.AsyncMock()
+    monkeypatch.setattr(jobs_controller.managed_job_state, 'get_status_async',
+                        get_status)
+    monkeypatch.setattr(jobs_controller.managed_job_state, 'set_failed_async',
+                        set_failed)
+    monkeypatch.setattr(jobs_controller.scheduler, 'job_done_async', job_done)
+
+    with pytest.raises(coordinator.SupersededCoordinator):
+        await manager.run_job_loop(1, str(tmp_path / 'controller.log'))
+
+    # External/durable finalization belongs only to the replacement process.
+    cleanup.assert_not_awaited()
+    get_status.assert_not_awaited()
+    set_failed.assert_not_awaited()
+    job_done.assert_not_awaited()
+    # Old-process-local scheduler bookkeeping is still released.
+    assert 1 not in manager.starting
+    assert 1 not in manager.job_tasks
 
 
 def test_json_reduction_streams_files_without_loading_rows(

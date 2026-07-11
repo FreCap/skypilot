@@ -3,6 +3,7 @@
 Includes function serialization and cloud storage helpers.
 """
 import base64
+import hashlib
 import inspect
 import json
 import os
@@ -501,13 +502,11 @@ def get_batch_path(output_path: str,
 def get_attempt_job_id(job_id: str, attempt_id: int) -> str:
     """Return the temp namespace for an immutable batch attempt.
 
-    Attempt zero is reserved for outputs produced before attempt fencing was
-    introduced and therefore keeps the legacy job namespace.
+    Batch attempt IDs are strictly positive; zero means the row was never
+    claimed by the fenced runtime.
     """
-    if attempt_id < 0:
-        raise ValueError('attempt_id must be non-negative')
-    if attempt_id == 0:
-        return job_id
+    if attempt_id <= 0:
+        raise ValueError('attempt_id must be positive')
     return f'{job_id}/attempts/{attempt_id}'
 
 
@@ -525,11 +524,46 @@ def get_job_temp_prefix(output_path: str, job_id: str) -> str:
     raise ValueError(f'Unsupported provider: {provider}')
 
 
+def get_directory_job_temp_prefix(output_dir: str, job_id: str) -> str:
+    """Return a temp prefix rooted inside an output directory.
+
+    Unlike :func:`get_job_temp_prefix`, this treats the final path component
+    as a directory rather than taking its parent.  ImageWriter attempt paths
+    live at ``<output_dir>/.sky_batch_tmp/...``.
+    """
+    provider, bucket, key = parse_cloud_path(output_dir)
+    directory = key.rstrip('/')
+    prefix = (f'{directory}/' if directory else '')
+    prefix += f'{constants.TEMP_DIR_NAME}/{job_id}/'
+    if provider == 's3':
+        return f's3://{bucket}/{prefix}'
+    if provider == 'gs':
+        return f'gs://{bucket}/{prefix}'
+    raise ValueError(f'Unsupported provider: {provider}')
+
+
 def get_attempt_batch_path(output_path: str, start_idx: int, end_idx: int,
                            job_id: str, attempt_id: int) -> str:
     """Generate the immutable result path for one batch attempt."""
-    return get_batch_path(output_path, start_idx, end_idx,
-                          get_attempt_job_id(job_id, attempt_id))
+    if attempt_id <= 0:
+        raise ValueError('attempt-fenced batch paths require attempt_id > 0')
+    provider, bucket, key = parse_cloud_path(output_path)
+    base_dir = os.path.dirname(key)
+    if base_dir:
+        base_dir += '/'
+    # Two output writers may target different files in the same directory.
+    # Include the complete output path in the namespace so their immutable
+    # attempts cannot overwrite one another.
+    output_id = hashlib.sha256(output_path.encode('utf-8')).hexdigest()[:16]
+    batch_name = constants.BATCH_NAME_PATTERN.format(start=start_idx,
+                                                     end=end_idx)
+    batch_key = (f'{base_dir}{constants.TEMP_DIR_NAME}/{job_id}/outputs/'
+                 f'{output_id}/attempts/{attempt_id}/{batch_name}')
+    if provider == 's3':
+        return f's3://{bucket}/{batch_key}'
+    if provider == 'gs':
+        return f'gs://{bucket}/{batch_key}'
+    raise ValueError(f'Unsupported provider: {provider}')
 
 
 def get_attempt_image_path(output_path: str, global_idx: int, job_id: str,
