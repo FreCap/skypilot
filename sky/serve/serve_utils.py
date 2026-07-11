@@ -2058,8 +2058,6 @@ def get_next_cluster_name(
         return None
 
     with filelock.FileLock(get_service_filelock_path(service_name)):
-        free_resources = get_free_worker_resources(service_name)
-        logger.debug(f'Free resources: {free_resources!r}')
         logger.debug(f'Get next cluster name for pool {service_name!r}')
         ready_replicas = get_ready_replicas(service_name)
 
@@ -2084,16 +2082,19 @@ def get_next_cluster_name(
         resource_aware = len(task_resources_list) > 0
         resource_aware = (resource_aware and
                           not _is_empty_resource(task_resources_list[0]))
-        resource_aware = resource_aware and free_resources is not None
-        if free_resources is not None:
+
+        free_resources = None
+        if resource_aware:
+            free_resources = get_free_worker_resources(service_name)
+            logger.debug(f'Free resources: {free_resources!r}')
+            resource_aware = free_resources is not None
+        if resource_aware and free_resources is not None:
             for free_resource in free_resources.values():
                 if free_resource is not None and not _is_empty_resource(
                         free_resource):
                     break
             else:
                 resource_aware = False
-        else:
-            resource_aware = False
 
         if resource_aware:
             logger.debug('Doing resource aware scheduling')
