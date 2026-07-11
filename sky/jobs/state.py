@@ -3213,17 +3213,21 @@ def get_pool_worker_used_resources(
 
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
-        # Query spot_table for full_resources. Use full_resources if available,
-        # otherwise fall back to resources for backward compatibility.
-        # Don't check for running status because we want to include jobs that
-        # may have just been scheduled. The job_ids come from
-        # get_nonterminal_job_ids_by_pool anyway so we don't need to worry
-        # about removing old jobs.
+        # Count only live task rows for each job. Multi-task managed jobs keep
+        # terminal task history in spot_table, and those historical rows can
+        # retain older full_resources values that should not contribute to the
+        # worker's active resource usage.
         query = sqlalchemy.select(
             spot_table.c.spot_job_id,
             spot_table.c.full_resources,
         ).distinct().where(
-            sqlalchemy.and_(spot_table.c.spot_job_id.in_(job_ids)))
+            sqlalchemy.and_(
+                spot_table.c.spot_job_id.in_(job_ids),
+                ~spot_table.c.status.in_([
+                    status.value
+                    for status in ManagedJobStatus.terminal_statuses()
+                ]),
+            ))
         rows = session.execute(query).fetchall()
 
         resource_configs = []

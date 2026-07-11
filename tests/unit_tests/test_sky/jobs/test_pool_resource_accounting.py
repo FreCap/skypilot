@@ -110,3 +110,35 @@ def test_grouped_pool_resource_accounting_fails_closed_on_empty_job(
     assert float(grouped['replica-2'].cpus) == pytest.approx(1.0)
     assert replica_2_resources is not None
     assert float(replica_2_resources.cpus) == pytest.approx(1.0)
+
+
+def test_pool_worker_used_resources_ignores_terminal_task_history(
+        managed_jobs_db):
+    """Only the current nonterminal task should count for a job."""
+    job_id = state.set_job_info_without_job_id(name='job-pool-a',
+                                               workspace='ws',
+                                               entrypoint='entry',
+                                               pool='pool-a',
+                                               pool_hash=None,
+                                               user_hash='u')
+    _insert_task(managed_jobs_db,
+                 job_id,
+                 0,
+                 status=ManagedJobStatus.SUCCEEDED,
+                 full_resources=Resources(cpus='1').to_yaml_config())
+    _insert_task(managed_jobs_db,
+                 job_id,
+                 1,
+                 status=ManagedJobStatus.RUNNING,
+                 full_resources=Resources(cpus='2').to_yaml_config())
+    state.set_current_cluster_name(job_id, 'replica-1')
+
+    grouped = state.get_pool_worker_used_resources_by_cluster('pool-a')
+    replica_1_ids = set(
+        state.get_nonterminal_job_ids_by_pool('pool-a', 'replica-1'))
+    replica_1_resources = state.get_pool_worker_used_resources(replica_1_ids)
+
+    assert grouped is not None
+    assert float(grouped['replica-1'].cpus) == pytest.approx(2.0)
+    assert replica_1_resources is not None
+    assert float(replica_1_resources.cpus) == pytest.approx(2.0)
