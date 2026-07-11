@@ -8,7 +8,7 @@ import hashlib
 import logging
 import os
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional, TypeVar
 
 import filelock
 import psycopg2
@@ -21,6 +21,8 @@ from sky.utils.db import db_utils
 from sky.utils.db import retries as db_retries
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar('_T')
 
 # The directory for file locks.
 SKY_LOCKS_DIR = runtime_utils.get_runtime_dir_path('.sky/locks')
@@ -275,17 +277,19 @@ class PostgresLock(DistributedLock):
             self._acquired = False
         except psycopg2.Error as e:
             # Lost connection to the database, likely the lock is force unlocked
-            # by other routines. A killed backend can surface as InterfaceError
-            # before a cursor exists, while network/server failures commonly
-            # surface as DatabaseError/OperationalError.
+            # by other routines. Catch the psycopg2 root Error: a killed
+            # backend can surface as InterfaceError (`connection already
+            # closed`) before a cursor exists, while server/network failures
+            # commonly surface as DatabaseError/OperationalError.
             logger.debug(f'Failed to release postgres lock {self.lock_id}: {e}')
             connection_lost = True
         finally:
             # Invalidate if connection was lost to prevent SQLAlchemy from
             # trying to reset a dead connection
             self._close_connection(invalidate=connection_lost)
-            # Closing/invalidation releases any session advisory lock. Keep the
-            # local flag consistent even if the unlock statement could not run.
+            # Closing/invalidation releases any session-level advisory lock.
+            # Keep the local flag consistent even when the unlock statement
+            # itself could not run on a killed session.
             self._acquired = False
 
     def force_unlock(self) -> None:
@@ -389,16 +393,35 @@ class PostgresLock(DistributedLock):
             try:
                 cursor.execute('SELECT 1')
                 cursor.fetchone()
-                # psycopg2 starts a transaction even for SELECT 1. Do not leave
-                # a slow lifecycle teardown idle in transaction: the server may
-                # kill that session and silently release its advisory lock.
-                # Session-level advisory locks survive commit.
+                # psycopg2 starts a transaction even for SELECT 1. Leaving the
+                # advisory-lock session idle in that transaction across a
+                # slow cloud/LB teardown lets idle_in_transaction_session_
+                # timeout kill the very lock this probe is meant to protect.
+                # Session advisory locks survive commit.
                 self._connection.commit()
             finally:
                 cursor.close()
             return True
         except Exception:  # pylint: disable=broad-except
             return False
+
+    def run_in_lock_session(self, operation: Callable[[Any], _T]) -> _T:
+        """Run ``operation`` on the connection holding this advisory lock.
+
+        Fencing-token acquisition must use the *same PostgreSQL session* as
+        the advisory lock.  A separate engine connection leaves a fatal gap:
+        the lock session can die, a replacement can acquire the lock, and the
+        stale process can then advance the token on its unrelated healthy
+        connection.  Executing the token transaction here makes a dead lock
+        session fail the operation instead.
+
+        ``operation`` owns transaction commit/rollback but must not close the
+        supplied connection; session-level advisory locks survive commits.
+        """
+        if not self._acquired or self._connection is None:
+            raise RuntimeError(
+                f'Postgres lock {self.lock_id!r} is not acquired.')
+        return operation(self._connection)
 
 
 def get_lock(lock_id: str,

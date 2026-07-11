@@ -344,6 +344,13 @@ class TestPostgresLock:
 
     def test_postgres_lock_release_invalidates_closed_session(
             self, mock_connection):
+        """A killed lock session must not make context cleanup raise.
+
+        psycopg2 reports a connection killed between the last probe and
+        ``release()`` as ``InterfaceError`` before it can create a cursor.
+        Treat that the same as other connection-loss errors and invalidate the
+        dead pooled connection.
+        """
         connection, _ = mock_connection
         connection.cursor.side_effect = locks.psycopg2.InterfaceError(
             'connection already closed')

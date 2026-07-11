@@ -427,6 +427,84 @@ async def test_launch_endpoint_passes_auth_user():
         assert args[0] == 'launch-request-id'
 
 
+@pytest.mark.asyncio
+async def test_serve_launch_endpoint_attaches_owner_precondition():
+    """An exact Serve owner fence is attached before the request is enqueued."""
+    from sky.serve import constants as serve_constants
+    from sky.server.requests import payloads
+    from sky.server.requests import preconditions
+
+    request = mock.MagicMock()
+    request.state.request_id = 'launch-request-id'
+    request.state.auth_user = None
+    launch_body = payloads.LaunchBody(
+        task='test_task_yaml',
+        cluster_name='svc-replica',
+        is_launched_by_sky_serve_controller=True,
+        extra_launch_context={
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY: 'svc',
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY: 'incarnation-a',
+            serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_PID_KEY: 123,
+            serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY: '10.0.0.1',
+        })
+
+    with mock.patch('sky.server.server.executor.schedule_request_async',
+                    new_callable=mock.AsyncMock) as mock_schedule:
+        await server.launch(launch_body, request)
+
+    condition = mock_schedule.call_args.kwargs['precondition']
+    assert isinstance(condition, preconditions.ServiceReplicaLaunchPrecondition)
+    assert condition.service_name == 'svc'
+    assert condition.service_hash == 'incarnation-a'
+
+
+@pytest.mark.asyncio
+async def test_serve_launch_endpoint_rejects_missing_owner_context():
+    """Legacy/internal Serve launches cannot bypass the durable fence."""
+    from sky.server.requests import payloads
+
+    request = mock.MagicMock()
+    request.state.request_id = 'launch-request-id'
+    request.state.auth_user = None
+    launch_body = payloads.LaunchBody(task='test_task_yaml',
+                                      cluster_name='svc-replica',
+                                      is_launched_by_sky_serve_controller=True,
+                                      extra_launch_context={})
+
+    with mock.patch('sky.server.server.executor.schedule_request_async',
+                    new_callable=mock.AsyncMock) as mock_schedule, \
+         mock.patch.object(server.serve_utils,
+                           'is_external_load_balancer_mode',
+                           return_value=True), \
+         pytest.raises(fastapi.HTTPException, match='owner fence'):
+        await server.launch(launch_body, request)
+
+    mock_schedule.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_legacy_serve_launch_without_owner_context_remains_compatible():
+    """A remote legacy Serve DB cannot be validated by API-local state."""
+    from sky.server.requests import payloads
+
+    request = mock.MagicMock()
+    request.state.request_id = 'launch-request-id'
+    request.state.auth_user = None
+    launch_body = payloads.LaunchBody(task='test_task_yaml',
+                                      cluster_name='svc-replica',
+                                      is_launched_by_sky_serve_controller=True,
+                                      extra_launch_context={})
+
+    with mock.patch('sky.server.server.executor.schedule_request_async',
+                    new_callable=mock.AsyncMock) as mock_schedule, \
+         mock.patch.object(server.serve_utils,
+                           'is_external_load_balancer_mode',
+                           return_value=False):
+        await server.launch(launch_body, request)
+
+    assert mock_schedule.await_args.kwargs['precondition'] is None
+
+
 # --- Tests for cleanup_unreferenced_file_mounts ---
 
 # A deterministic 64-char hex string used as a blob ID in tests.

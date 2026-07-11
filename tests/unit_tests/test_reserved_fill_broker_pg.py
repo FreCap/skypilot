@@ -217,10 +217,29 @@ class TestMigrationChainPG:
                 inspector = sqlalchemy.inspect(engine)
                 tables = set(inspector.get_table_names())
                 assert {
+                    'ephemeral_storage_cleanup_intents',
                     'reserved_fill_claims',
                     'reserved_fill_rounds',
                     'reserved_fill_lease',
+                    'service_lifecycle_fences',
                 }.issubset(tables), tables
+                service_columns = {
+                    column['name']
+                    for column in inspector.get_columns('services')
+                }
+                assert {'lifecycle_epoch',
+                        'resource_scope'}.issubset(service_columns)
+                cleanup_intent_columns = {
+                    column['name'] for column in inspector.get_columns(
+                        'ephemeral_storage_cleanup_intents')
+                }
+                assert {
+                    'lifecycle_epoch',
+                    'provisional',
+                    'resource_scope',
+                    'storage_generation',
+                    'yaml_content',
+                }.issubset(cleanup_intent_columns)
                 columns = {
                     column['name']
                     for column in inspector.get_columns('reserved_fill_rounds')

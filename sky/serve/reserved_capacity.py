@@ -174,11 +174,22 @@ def _placer_can_launch_zero_cost(placer: 'spot_placer_lib.SpotPlacer') -> bool:
     return any(location in active for location in placer.zero_cost_locations())
 
 
-def _broker_cycle(autoscaler: 'autoscalers.Autoscaler',
-                  placer: 'spot_placer_lib.SpotPlacer', service_name: str,
-                  zero_cost: List['spot_placer_lib.Location'],
-                  keys: List[Dict[str, Any]]) -> None:
+def _broker_cycle(
+    autoscaler: 'autoscalers.Autoscaler',
+    placer: 'spot_placer_lib.SpotPlacer',
+    service_name: str,
+    zero_cost: List['spot_placer_lib.Location'],
+    keys: List[Dict[str, Any]],
+    expected_service_hash: Optional[str] = None,
+    expected_controller_owner: Optional[Tuple[Optional[int],
+                                              Optional[str]]] = None
+) -> None:
     """Broker-arbitrated cycle: claim heartbeat -> round -> feed+grant."""
+    fence_kwargs: Dict[str, Any] = {}
+    if expected_service_hash is not None:
+        fence_kwargs['expected_service_hash'] = expected_service_hash
+    if expected_controller_owner is not None:
+        fence_kwargs['expected_controller_owner'] = expected_controller_owner
     shapes = zero_cost_pool_shapes(zero_cost)
     if len(shapes) != 1:
         # v1 restriction: all zero-cost shapes must resolve into ONE pool
@@ -191,7 +202,7 @@ def _broker_cycle(autoscaler: 'autoscalers.Autoscaler',
             'Reserved-fill broker: service zero-cost shapes resolve to '
             f'{len(shapes)} pools ({sorted(shapes)}); v1 supports exactly '
             'one. Fill is inactive for this service.')
-        reserved_capacity_broker.remove_claim(service_name)
+        reserved_capacity_broker.remove_claim(service_name, **fence_kwargs)
         autoscaler.collect_reserved_capacity(0, keys, time.time())
         return
     (context, gpu_name), per_replica = next(iter(shapes.items()))
@@ -215,7 +226,7 @@ def _broker_cycle(autoscaler: 'autoscalers.Autoscaler',
     # absorbs entitlement and feed the service never launches.
     effective_cap = max(
         0, autoscaler.max_replicas - autoscaler.get_final_target_num_replicas())
-    reserved_capacity_broker.upsert_claim(
+    claim_persisted = reserved_capacity_broker.upsert_claim(
         service_name,
         pool_key=pool_key,
         weight=autoscaler.reserved_fill_weight,
@@ -223,7 +234,13 @@ def _broker_cycle(autoscaler: 'autoscalers.Autoscaler',
         gpus_per_replica=per_replica,
         holdings_fill=holdings_fill,
         effective_cap=effective_cap,
-        launchable=_placer_can_launch_zero_cost(placer))
+        launchable=_placer_can_launch_zero_cost(placer),
+        **fence_kwargs)
+    if claim_persisted is False:
+        autoscaler.collect_reserved_capacity(0, keys, time.time())
+        logger.info(f'Reserved-fill broker: stale controller for '
+                    f'{service_name!r}; skipping claim and feeding 0 slots.')
+        return
     allocation = reserved_capacity_broker.run_round_if_stale(
         service_name, pool_key,
         lambda: query_pool_observation(context, gpu_name, per_replica),
@@ -248,10 +265,14 @@ def _broker_cycle(autoscaler: 'autoscalers.Autoscaler',
                 f'(round {allocation.round_id}, epoch {allocation.epoch}).')
 
 
-def poller_loop(get_autoscaler: Callable[[], 'autoscalers.Autoscaler'],
-                get_spot_placer: Callable[
-                    [], Optional['spot_placer_lib.SpotPlacer']],
-                service_name: Optional[str] = None) -> None:
+def poller_loop(
+    get_autoscaler: Callable[[], 'autoscalers.Autoscaler'],
+    get_spot_placer: Callable[[], Optional['spot_placer_lib.SpotPlacer']],
+    service_name: Optional[str] = None,
+    expected_service_hash: Optional[str] = None,
+    expected_controller_owner: Optional[Tuple[Optional[int],
+                                              Optional[str]]] = None
+) -> None:
     """Poll free zero-cost capacity forever, feeding the autoscaler.
 
     Runs as a supervised thread started by the controller (only when the
@@ -269,8 +290,26 @@ def poller_loop(get_autoscaler: Callable[[], 'autoscalers.Autoscaler'],
     # so the first disabled observation still clears it. Reset to True
     # BEFORE every broker cycle (which upserts the claim).
     claim_may_exist = service_name is not None
+    fence_kwargs: Dict[str, Any] = {}
+    if expected_service_hash is not None:
+        fence_kwargs['expected_service_hash'] = expected_service_hash
+    if expected_controller_owner is not None:
+        fence_kwargs['expected_controller_owner'] = expected_controller_owner
     while True:
         try:
+            if service_name is not None and expected_service_hash is not None:
+                owner = serve_state.get_service_controller_owner(service_name)
+                current_owner = (owner.get('controller_pid'),
+                                 owner.get('controller_ip')) if owner else None
+                if (owner is None or
+                        owner.get('hash') != expected_service_hash or
+                    (expected_controller_owner is not None and
+                     current_owner != expected_controller_owner)):
+                    logger.info(
+                        f'Reserved-capacity poller for stale service owner '
+                        f'{service_name!r}/{expected_service_hash!r}/'
+                        f'{expected_controller_owner!r} is exiting.')
+                    return
             placer = get_spot_placer()
             # An update can turn the flag off on the live autoscaler; the
             # thread stays alive (a later update can re-enable it) but
@@ -294,14 +333,16 @@ def poller_loop(get_autoscaler: Callable[[], 'autoscalers.Autoscaler'],
                     # entitlement for the whole claim TTL.
                     claim_may_exist = True
                     _broker_cycle(autoscaler, placer, service_name, zero_cost,
-                                  keys)
+                                  keys, expected_service_hash,
+                                  expected_controller_owner)
             elif service_name is not None and claim_may_exist:
                 # Fill turned off (or the placer is gone): withdraw the
                 # claim NOW instead of leaving peers arbitrating around a
                 # ghost for the whole claim TTL. Once per disable
                 # transition (idempotent; also drops our cached
                 # allocation), not re-spammed every cycle.
-                reserved_capacity_broker.remove_claim(service_name)
+                reserved_capacity_broker.remove_claim(service_name,
+                                                      **fence_kwargs)
                 claim_may_exist = False
         except Exception as e:  # pylint: disable=broad-except
             logger.error('Error in reserved-capacity poller: '

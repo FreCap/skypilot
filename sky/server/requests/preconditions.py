@@ -15,6 +15,7 @@ from typing import Any, Awaitable, Callable, Optional, Tuple, Union
 from sky import exceptions
 from sky import global_user_state
 from sky import sky_logging
+from sky.serve import serve_state
 from sky.server.requests import requests as api_requests
 from sky.utils import common_utils
 from sky.utils import status_lib
@@ -189,3 +190,37 @@ class ClusterStartCompletePrecondition(Precondition):
             # No running or pending tasks, the start process is done.
             return True, None
         return False, f'Waiting for cluster {self.cluster_name} to be UP.'
+
+
+class ServiceReplicaLaunchPrecondition(Precondition):
+    """Fence a Serve replica request to the exact durable controller owner.
+
+    The request row is persisted before this check runs. Therefore teardown
+    either observes and cancels the active row, or removes/changes the service
+    first and this precondition permanently rejects provisioning. This is the
+    hard barrier that an arbitrary number of empty status snapshots cannot
+    provide for an HTTP request still being accepted.
+    """
+
+    def __init__(self, request_id: str, service_name: str, service_hash: str,
+                 controller_pid: Optional[int],
+                 controller_ip: Optional[str]) -> None:
+        super().__init__(request_id=request_id, timeout=0)
+        self.service_name = service_name
+        self.service_hash = service_hash
+        self.controller_pid = controller_pid
+        self.controller_ip = controller_ip
+
+    async def check(self) -> Tuple[bool, Optional[str]]:
+        owner = await asyncio.to_thread(
+            serve_state.get_service_controller_owner, self.service_name)
+        authorized = (
+            owner is not None and owner.get('hash') == self.service_hash and
+            (owner.get('controller_pid'), owner.get('controller_ip'))
+            == (self.controller_pid, self.controller_ip) and owner.get('status')
+            not in serve_state.ServiceStatus.replica_launch_blocking_statuses())
+        if not authorized:
+            raise exceptions.RequestCancelled(
+                f'Refusing replica launch for stale service owner '
+                f'{self.service_name!r}/{self.service_hash!r}.')
+        return True, None

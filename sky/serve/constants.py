@@ -19,6 +19,24 @@ PORT_SELECTION_FILE_LOCK_PATH = '~/.sky/skyserve_port_selection.lock'
 # Signal file path for controller to handle signals.
 SIGNAL_FILE_PATH = '~/.sky/signals/sky_serve_controller_signal_{}'
 
+# Task metadata proving which ephemeral storage/file-mount resources were
+# rewritten into one service incarnation's disjoint namespace.
+EPHEMERAL_STORAGE_SCOPE_METADATA_KEY = 'sky_serve_ephemeral_storage_scope'
+
+# Internal launch context carried into the API request row. The API executor
+# validates this durable owner tuple before a Serve replica launch can enter the
+# worker queue, closing the HTTP-acceptance gap during teardown quiescence.
+REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY = 'sky_serve_service_name'
+REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY = 'sky_serve_service_hash'
+REPLICA_LAUNCH_FENCE_CONTROLLER_PID_KEY = 'sky_serve_controller_pid'
+REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY = 'sky_serve_controller_ip'
+REPLICA_LAUNCH_FENCE_KEYS = (
+    REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY,
+    REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY,
+    REPLICA_LAUNCH_FENCE_CONTROLLER_PID_KEY,
+    REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY,
+)
+
 # The consolidation mode lock ensures that if multiple API servers are running
 # at the same time (e.g. during a rolling update), recovery can only happen once
 # the previous API server has exited.

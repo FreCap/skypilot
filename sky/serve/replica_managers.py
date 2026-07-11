@@ -27,7 +27,6 @@ from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_broker
 from sky.serve import serve_state
 from sky.serve import serve_utils
-from sky.serve import service
 from sky.serve import spot_placer
 from sky.skylet import constants
 from sky.skylet import job_lib
@@ -64,6 +63,8 @@ _DRAIN_POLL_SECONDS = 2
 # not reporting): the drain wait then falls back to the full cap.
 _IN_FLIGHT_REPORT_STALENESS_SECONDS = (
     3 * serve_constants.LB_CONTROLLER_SYNC_INTERVAL_SECONDS)
+_SERVICE_OWNER_WATCH_INTERVAL_SECONDS = 1
+_LAUNCH_OWNER_WATCH_INTERVAL_SECONDS = 0.5
 # Rate limit for the "fill launch skipped" log (see _log_fill_skip).
 _FILL_SKIP_LOG_INTERVAL_SECONDS = 60
 _WAIT_LAUNCH_THREAD_TIMEOUT_SECONDS = 15
@@ -83,6 +84,10 @@ _NOT_PROVIDED: Any = object()
 ProcessStatus = common_utils.ProcessStatus
 
 
+class _ReplicaLaunchOwnershipLostError(RuntimeError):
+    """The controller lost authority while a replica launch was in flight."""
+
+
 # TODO(tian): Combine this with
 # sky/spot/recovery_strategy.py::StrategyExecutor::launch
 # Use context.contextual to enable per-launch output redirection.
@@ -97,7 +102,10 @@ def launch_cluster(replica_id: int,
                    resources_override: Optional[Dict[str, Any]] = None,
                    retry_until_up: bool = True,
                    max_retry: int = _DEFAULT_LAUNCH_MAX_RETRY,
-                   availability_max_retry: Optional[int] = None) -> None:
+                   availability_max_retry: Optional[int] = None,
+                   pre_launch_guard: Optional[Callable[[], bool]] = None,
+                   continue_guard: Optional[Callable[[], bool]] = None,
+                   launch_fence: Optional[Dict[str, Any]] = None) -> None:
     """Launch a sky serve replica cluster.
 
     This function will not wait for the job starts running. It will return
@@ -151,6 +159,69 @@ def launch_cluster(replica_id: int,
             replica_to_launch_cancelled.pop(replica_id)
         return is_cancelled
 
+    ownership_lost = threading.Event()
+
+    def _guard_allows(guard: Optional[Callable[[], bool]]) -> bool:
+        if guard is None:
+            return True
+        try:
+            return guard()
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning('Failed to verify replica launch ownership; '
+                           'failing closed: '
+                           f'{common_utils.format_exception(e)}')
+            return False
+
+    def _cancel_request_for_ownership_loss() -> None:
+        ownership_lost.set()
+        replica_to_launch_cancelled[replica_id] = True
+        request_id = replica_to_request_id.get(replica_id)
+        if request_id is None:
+            return
+        try:
+            sdk.api_cancel(request_id)
+        except Exception as e:  # pylint: disable=broad-except
+            # The successor still owns the durable replica row and can
+            # recover/garbage-collect the incarnation-scoped cluster. Never
+            # let a cancellation transport error authorize more stale work.
+            logger.warning(f'Failed to cancel stale replica {replica_id} '
+                           f'launch request {request_id}: '
+                           f'{common_utils.format_exception(e)}')
+
+    def _assert_launch_authorized() -> None:
+        if (ownership_lost.is_set() or not _guard_allows(pre_launch_guard) or
+                not _guard_allows(continue_guard)):
+            _cancel_request_for_ownership_loss()
+            raise _ReplicaLaunchOwnershipLostError(
+                f'Refusing to launch replica {replica_id} after service '
+                'controller ownership was lost.')
+
+    def _stream_with_owner_watchdog(request_id: Any) -> None:
+        """Cancel an async launch promptly when the shared owner fence trips."""
+        if continue_guard is None:
+            sdk.stream_and_get(request_id)
+            return
+        stop_watchdog = threading.Event()
+
+        def _watch_ownership() -> None:
+            while not stop_watchdog.wait(_LAUNCH_OWNER_WATCH_INTERVAL_SECONDS):
+                if not _guard_allows(continue_guard):
+                    logger.warning(
+                        f'Cancelling replica {replica_id} launch after '
+                        'controller ownership loss.')
+                    _cancel_request_for_ownership_loss()
+                    return
+
+        watchdog = threading.Thread(target=_watch_ownership,
+                                    name=f'replica-{replica_id}-launch-owner',
+                                    daemon=True)
+        watchdog.start()
+        try:
+            sdk.stream_and_get(request_id)
+        finally:
+            stop_watchdog.set()
+            watchdog.join(timeout=1)
+
     if availability_max_retry is None:
         availability_max_retry = max_retry
     retry_cnt = 0
@@ -161,16 +232,32 @@ def launch_cluster(replica_id: int,
         try:
             if _check_is_cancelled():
                 return
+            # This is the authoritative DB-backed check immediately before
+            # every cloud mutation. The shared watchdog event is a second,
+            # cheap fence for an already-running request.
+            _assert_launch_authorized()
             usage_lib.messages.usage.set_internal()
+            launch_kwargs: Dict[str, Any] = {}
+            if launch_fence is not None:
+                launch_kwargs['_extra_launch_context'] = launch_fence
             request_id = sdk.launch(task,
                                     cluster_name,
                                     retry_until_up=retry_until_up,
-                                    _is_launched_by_sky_serve_controller=True)
+                                    _is_launched_by_sky_serve_controller=True,
+                                    **launch_kwargs)
             logger.info(f'Replica cluster {cluster_name} launch requested '
                         f'with request_id: {request_id}.')
             replica_to_request_id[replica_id] = request_id
-            sdk.stream_and_get(request_id)
+            _stream_with_owner_watchdog(request_id)
+            _assert_launch_authorized()
             logger.info(f'Replica cluster {cluster_name} launched.')
+        except _ReplicaLaunchOwnershipLostError:
+            # In-memory request/cancellation entries belong to this stale
+            # manager only. Keep the durable replica row for the successor to
+            # re-drive or garbage-collect; discard local bookkeeping.
+            replica_to_request_id.pop(replica_id)
+            replica_to_launch_cancelled.pop(replica_id)
+            raise
         except (exceptions.InvalidClusterNameError,
                 exceptions.NoCloudAccessError,
                 exceptions.ResourcesMismatchError) as e:
@@ -179,6 +266,12 @@ def launch_cluster(replica_id: int,
             raise RuntimeError('Failed to launch the sky serve replica '
                                f'cluster {cluster_name}.') from e
         except exceptions.ResourcesUnavailableError as e:
+            if ownership_lost.is_set():
+                replica_to_request_id.pop(replica_id)
+                replica_to_launch_cancelled.pop(replica_id)
+                raise _ReplicaLaunchOwnershipLostError(
+                    f'Replica {replica_id} launch was cancelled after '
+                    'controller ownership loss.') from e
             if not any(
                     isinstance(err, exceptions.ResourcesUnavailableError)
                     for err in e.failover_history):
@@ -188,6 +281,12 @@ def launch_cluster(replica_id: int,
             logger.info('Failed to launch the sky serve replica cluster with '
                         f'error: {common_utils.format_exception(e)})')
         except Exception as e:  # pylint: disable=broad-except
+            if ownership_lost.is_set():
+                replica_to_request_id.pop(replica_id)
+                replica_to_launch_cancelled.pop(replica_id)
+                raise _ReplicaLaunchOwnershipLostError(
+                    f'Replica {replica_id} launch was cancelled after '
+                    'controller ownership loss.') from e
             logger.info('Failed to launch the sky serve replica cluster with '
                         f'error: {common_utils.format_exception(e)})')
             with ux_utils.enable_traceback():
@@ -920,11 +1019,25 @@ class ReplicaInfo:
 class ReplicaManager:
     """Each replica manager monitors one service."""
 
-    def __init__(self, service_name: str, spec: 'service_spec.SkyServiceSpec',
-                 version: int) -> None:
+    def __init__(self,
+                 service_name: str,
+                 spec: 'service_spec.SkyServiceSpec',
+                 version: int,
+                 resource_scope: Optional[str] = None,
+                 service_hash: Optional[str] = None,
+                 controller_pid: Optional[int] = None,
+                 controller_ip: Optional[str] = None,
+                 enforce_launch_fence: bool = True) -> None:
         self.lock = threading.Lock()
         self._next_replica_id: int = 1
         self._service_name: str = service_name
+        self._resource_scope = resource_scope
+        self._service_hash = service_hash
+        self._controller_owner = ((controller_pid,
+                                   controller_ip) if service_hash is not None or
+                                  controller_pid is not None or
+                                  controller_ip is not None else None)
+        self._enforce_launch_fence = enforce_launch_fence
         self._uptime: Optional[float] = None
         self._update_mode = serve_utils.DEFAULT_UPDATE_MODE
         self._is_pool: bool = spec.pool
@@ -1037,9 +1150,143 @@ class SkyPilotReplicaManager(ReplicaManager):
             whether it is still responding to requests.
     """
 
-    def __init__(self, service_name: str, spec: 'service_spec.SkyServiceSpec',
-                 version: int) -> None:
+    def _db_fence_kwargs(self) -> Dict[str, Any]:
+        """Exact owner predicates, omitted for legacy/direct test managers."""
+        kwargs: Dict[str, Any] = {}
+        service_hash = getattr(self, '_service_hash', None)
+        if service_hash is not None:
+            kwargs['expected_service_hash'] = service_hash
+        controller_owner = getattr(self, '_controller_owner', None)
+        if controller_owner is not None:
+            kwargs['expected_controller_owner'] = controller_owner
+        return kwargs
+
+    def _service_launch_authorization(self) -> Optional[bool]:
+        """Return True/False for proven authority/loss, None if unverifiable."""
+        service_hash = getattr(self, '_service_hash', None)
+        if service_hash is None:
+            # Compatibility for direct/legacy managers without durable owner
+            # identity. New controllers always supply the full tuple.
+            return True
+        ownership_lost = getattr(self, '_ownership_lost', None)
+        if ownership_lost is not None and ownership_lost.is_set():
+            return False
+        controller_owner = getattr(self, '_controller_owner', None)
+        try:
+            owner = serve_state.get_service_controller_owner(self._service_name)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning('Failed to verify controller ownership before '
+                           f'launching a replica: '
+                           f'{common_utils.format_exception(e)}')
+            # A transient DB error is not evidence that another controller
+            # owns the row. Fail this attempt closed, but do not trip the
+            # permanent loss event: queued replicas and the owner watchdog
+            # must retry once the DB is reachable again.
+            return None
+        authorized = (
+            owner is not None and owner.get('hash') == service_hash and
+            (owner.get('controller_pid'), owner.get('controller_ip'))
+            == controller_owner and owner.get('status')
+            not in serve_state.ServiceStatus.replica_launch_blocking_statuses())
+        if not authorized and ownership_lost is not None:
+            ownership_lost.set()
+        return authorized
+
+    def _service_is_launch_authorized(self) -> bool:
+        """Fail one launch closed unless ownership is currently proven."""
+        return self._service_launch_authorization() is True
+
+    def _launch_owner_watchdog_allows_continue(self) -> bool:
+        """Cheap shared fence polled by every in-flight launch request."""
+        ownership_lost = getattr(self, '_ownership_lost', None)
+        return ownership_lost is None or not ownership_lost.is_set()
+
+    def _replica_launch_fence_context(self) -> Optional[Dict[str, Any]]:
+        """Owner tuple validated by the API executor before provisioning."""
+        if not getattr(self, '_enforce_launch_fence', True):
+            # A legacy/non-consolidated controller owns a different Serve DB;
+            # the API server cannot validate that tuple against its local DB.
+            return None
+        service_hash = getattr(self, '_service_hash', None)
+        controller_owner = getattr(self, '_controller_owner', None)
+        if service_hash is None or controller_owner is None:
+            return None
+        controller_pid, controller_ip = controller_owner
+        service_name_key = (
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY)
+        service_hash_key = (
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY)
+        controller_pid_key = (
+            serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_PID_KEY)
+        controller_ip_key = (
+            serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY)
+        return {
+            service_name_key: self._service_name,
+            service_hash_key: service_hash,
+            controller_pid_key: controller_pid,
+            controller_ip_key: controller_ip,
+        }
+
+    def _service_owner_watchdog(self) -> None:
+        """Trip one shared launch-cancellation fence on ownership loss."""
+        if getattr(self, '_service_hash', None) is None:
+            return
+        ownership_lost = self._ownership_lost
+        while not ownership_lost.wait(_SERVICE_OWNER_WATCH_INTERVAL_SECONDS):
+            authorization = self._service_launch_authorization()
+            if authorization is False:
+                logger.warning(
+                    f'Service {self._service_name!r} controller ownership '
+                    'was lost; cancelling in-flight replica launches and '
+                    'refusing queued launches.')
+                return
+
+    def _persist_replica(self, replica_id: int, info: ReplicaInfo) -> None:
+        persisted = serve_state.add_or_update_replica(self._service_name,
+                                                      replica_id, info,
+                                                      **self._db_fence_kwargs())
+        if persisted is False:
+            raise RuntimeError(
+                f'Service {self._service_name!r} incarnation changed while '
+                f'persisting replica {replica_id}.')
+
+    def _persist_replicas(self,
+                          replica_infos: List[Tuple[int, ReplicaInfo]]) -> None:
+        persisted = serve_state.add_or_update_replicas(
+            self._service_name, replica_infos, **self._db_fence_kwargs())
+        if persisted is False:
+            raise RuntimeError(
+                f'Service {self._service_name!r} incarnation changed while '
+                'persisting replica probe results.')
+
+    def _remove_replica(self, replica_id: int) -> None:
+        removed = serve_state.remove_replica(self._service_name, replica_id,
+                                             **self._db_fence_kwargs())
+        if removed is False:
+            raise RuntimeError(
+                f'Service {self._service_name!r} incarnation changed while '
+                f'removing replica {replica_id}.')
+
+    def __init__(self,
+                 service_name: str,
+                 spec: 'service_spec.SkyServiceSpec',
+                 version: int,
+                 resource_scope: Optional[str] = None,
+                 service_hash: Optional[str] = None,
+                 controller_pid: Optional[int] = None,
+                 controller_ip: Optional[str] = None,
+                 enforce_launch_fence: bool = True) -> None:
+        # Keep the historical three-argument base-init call for embedders that
+        # replace it, then restore the scope it initializes to the legacy
+        # default.  Setting this before super() would be silently overwritten.
         super().__init__(service_name, spec, version)
+        self._resource_scope = resource_scope
+        self._service_hash = service_hash
+        self._controller_owner = ((controller_pid,
+                                   controller_ip) if service_hash is not None or
+                                  controller_pid is not None or
+                                  controller_ip is not None else None)
+        self._enforce_launch_fence = enforce_launch_fence
         yaml_content = serve_state.get_yaml_content(service_name, version)
         assert yaml_content is not None, (
             f'yaml content not found for {service_name} version {version}')
@@ -1056,6 +1303,10 @@ class SkyPilotReplicaManager(ReplicaManager):
             int, str] = thread_utils.ThreadSafeDict()
         self._replica_to_launch_cancelled: thread_utils.ThreadSafeDict[
             int, bool] = thread_utils.ThreadSafeDict()
+        # One DB-backed owner watcher per manager fans out through this event;
+        # individual launch watchdogs poll the event rather than multiplying
+        # ownership queries by the number of in-flight replicas.
+        self._ownership_lost = threading.Event()
         self._down_thread_pool: thread_utils.ThreadSafeDict[
             int, thread_utils.SafeThread] = thread_utils.ThreadSafeDict()
 
@@ -1131,6 +1382,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                          name='replica-recovery',
                          daemon=True).start()
         recovery_lock_acquired.wait()
+
+        threading.Thread(target=self._service_owner_watchdog,
+                         name='replica-service-owner-watchdog',
+                         daemon=True).start()
 
         # Supervised so a BaseException escaping any of these loops (or the
         # loop returning) does not silently freeze replica reconciliation /
@@ -1280,9 +1535,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                     status_property.preempted = True
                     # Persist the recovered intent before scheduling cleanup;
                     # another crash is then caught by the raw preempted scan.
-                    serve_state.add_or_update_replica(self._service_name,
-                                                      replica_info.replica_id,
-                                                      replica_info)
+                    self._persist_replica(replica_info.replica_id, replica_info)
                 is_preempted = status_property.preempted
                 # SpotPlacer is reconstructed with every location ACTIVE on a
                 # controller restart. Rebuild the preemption bench before the
@@ -1378,9 +1631,11 @@ class SkyPilotReplicaManager(ReplicaManager):
             zero_cost_only = True
         logger.info(f'Launching replica {replica_id}...')
         cluster_name = serve_utils.generate_replica_cluster_name(
-            self._service_name, replica_id)
+            self._service_name, replica_id,
+            getattr(self, '_resource_scope', None))
         log_file_name = serve_utils.generate_replica_launch_log_file_name(
-            self._service_name, replica_id)
+            self._service_name, replica_id,
+            getattr(self, '_resource_scope', None))
         use_spot = _should_use_spot(self.yaml_content, resources_override)
         retry_until_up = True
         location = None
@@ -1520,7 +1775,12 @@ class SkyPilotReplicaManager(ReplicaManager):
                   self._replica_to_request_id,
                   self._replica_to_launch_cancelled, resources_override,
                   retry_until_up),
-            kwargs={'availability_max_retry': availability_max_retry},
+            kwargs={
+                'availability_max_retry': availability_max_retry,
+                'pre_launch_guard': self._service_is_launch_authorized,
+                'continue_guard': self._launch_owner_watchdog_allows_continue,
+                'launch_fence': self._replica_launch_fence_context(),
+            },
         )
         replica_port = _get_resources_ports(self.yaml_content)
 
@@ -1552,7 +1812,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     replica_id,
                     info,
                     pool_key=fill_pool_key,
-                    expected_epoch=fill_grant_epoch):
+                    expected_epoch=fill_grant_epoch,
+                    **self._db_fence_kwargs()):
                 # No row was written and the launch thread was never
                 # registered/started: same leak-nothing contract as the
                 # pre-check fence.
@@ -1561,8 +1822,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                     'in flight at persist')
                 return False
         else:
-            serve_state.add_or_update_replica(self._service_name, replica_id,
-                                              info)
+            self._persist_replica(replica_id, info)
         if existing_replica_infos is not None:
             # Bulk callers (recovery re-drive) reuse one snapshot across a
             # whole wave of launches. Append the replica we just placed so
@@ -1764,10 +2024,9 @@ class SkyPilotReplicaManager(ReplicaManager):
             logger.info(f'Termination of replica {info.replica_id} '
                         'finished. Replica info is kept since some '
                         'failure detected.')
-            serve_state.add_or_update_replica(self._service_name,
-                                              info.replica_id, info)
+            self._persist_replica(info.replica_id, info)
         if removal_reason is not None:
-            serve_state.remove_replica(self._service_name, info.replica_id)
+            self._remove_replica(info.replica_id)
             logger.info(f'Replica {info.replica_id} removed from the '
                         f'replica table {removal_reason}.')
 
@@ -1805,8 +2064,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             # must leave recovery the resolved cap, not the resolver.
             info.status_property.drain_cap_seconds = (
                 in_flight_drain_cap_seconds)
-            serve_state.add_or_update_replica(self._service_name, replica_id,
-                                              info)
+            self._persist_replica(replica_id, info)
             launch_thread = self._launch_thread_pool[replica_id]
             if launch_thread.is_alive():
                 self._replica_to_launch_cancelled[replica_id] = True
@@ -1852,12 +2110,14 @@ class SkyPilotReplicaManager(ReplicaManager):
             return
 
         log_file_name = serve_utils.generate_replica_log_file_name(
-            self._service_name, replica_id)
+            self._service_name, replica_id,
+            getattr(self, '_resource_scope', None))
 
         def _download_and_stream_logs(info: ReplicaInfo):
             launch_log_file_name = (
                 serve_utils.generate_replica_launch_log_file_name(
-                    self._service_name, replica_id))
+                    self._service_name, replica_id,
+                    getattr(self, '_resource_scope', None)))
             # Write launch log to replica log file. Tolerate a missing
             # launch log: a recovery re-drive re-enters this after a prior
             # pass already consumed it, and crashing here would strand the
@@ -1939,7 +2199,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         info.status_property.sky_down_status = (
             common_utils.ProcessStatus.SCHEDULED)
         info.status_property.drain_cap_seconds = in_flight_drain_cap_seconds
-        serve_state.add_or_update_replica(self._service_name, replica_id, info)
+        self._persist_replica(replica_id, info)
         drain_deadline: Optional[float] = None
         drain_complete: Optional[Callable[[], bool]] = None
         if (in_flight_drain_cap_seconds is not None and
@@ -2100,8 +2360,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             spot_location = info.get_spot_location()
             assert spot_location is not None
             self._spot_placer.set_preemptive(spot_location)
-        serve_state.add_or_update_replica(self._service_name, info.replica_id,
-                                          info)
+        self._persist_replica(info.replica_id, info)
         self._terminate_replica(info.replica_id,
                                 sync_down_logs=False,
                                 replica_drain_delay_seconds=0,
@@ -2139,6 +2398,24 @@ class SkyPilotReplicaManager(ReplicaManager):
             if info.status == serve_state.ReplicaStatus.PENDING:
                 # sky.launch not started yet; admitted below under the
                 # resources lock.
+                authorization = self._service_launch_authorization()
+                if authorization is None:
+                    logger.warning(
+                        f'Deferring queued launch for replica {replica_id}: '
+                        'controller ownership is temporarily unverifiable.')
+                    continue
+                if not authorization:
+                    # Do not delete the durable PENDING row: the successor
+                    # owns it and recovery will either re-drive its
+                    # incarnation-scoped cluster or garbage-collect it. Only
+                    # discard this stale manager's never-started thread.
+                    logger.warning(
+                        f'Discarding queued launch for replica {replica_id} '
+                        'after controller ownership loss.')
+                    self._launch_thread_pool.pop(replica_id)
+                    self._replica_to_request_id.pop(replica_id)
+                    self._replica_to_launch_cancelled.pop(replica_id)
+                    continue
                 launch_to_admit.append((replica_id, t, info))
                 continue
             # sky.launch finished
@@ -2179,8 +2456,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                     info.status_property.failed_spot_availability = True
                 else:
                     self._spot_placer.set_active(location)
-            serve_state.add_or_update_replica(self._service_name, replica_id,
-                                              info)
+            self._persist_replica(replica_id, info)
             if error_in_sky_launch:
                 # Teardown after update replica info since
                 # _terminate_replica will update the replica info too.
@@ -2232,8 +2508,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                     in_flight += 1
                     info.status_property.sky_launch_status = (
                         common_utils.ProcessStatus.RUNNING)
-                    serve_state.add_or_update_replica(self._service_name,
-                                                      replica_id, info)
+                    self._persist_replica(replica_id, info)
                 for replica_id, t, info in down_to_admit:
                     if not controller_utils.can_terminate(self._is_pool,
                                                           in_flight=in_flight):
@@ -2245,8 +2520,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                     in_flight += 1.0 / controller_utils.SERVE_LAUNCH_RATIO
                     info.status_property.sky_down_status = (
                         common_utils.ProcessStatus.RUNNING)
-                    serve_state.add_or_update_replica(self._service_name,
-                                                      replica_id, info)
+                    self._persist_replica(replica_id, info)
 
         # Clean old version
         replica_infos = serve_state.get_replica_infos(self._service_name)
@@ -2256,18 +2530,36 @@ class SkyPilotReplicaManager(ReplicaManager):
         if self.least_recent_version < current_least_recent_version:
             for version in range(self.least_recent_version,
                                  current_least_recent_version):
-                yaml_content = serve_utils.get_yaml_content(
+                # Cleanup inventory is durable and generation-scoped outside
+                # version_specs. Retiring metadata must never delete storage:
+                # a newer version may intentionally reference the same bucket
+                # or subpath. Full service teardown consumes every intent only
+                # after all replicas are gone.
+                yaml_content = serve_state.get_yaml_content(
                     self._service_name, version)
-                # Delete old version metadata.
-                serve_state.delete_version(self._service_name, version)
-                # Delete storage buckets of older versions.
-                if not self._is_pool:
-                    # For pools, we don't clean up the storage, because the
-                    # storage is shared between all replicas. We clean up the
-                    # storage in sky/serve/service.py when the pool is
-                    # terminated so storage will not be leaked.
-                    service.cleanup_storage(yaml_content)
-            # newest version will be cleaned in serve down
+                if yaml_content is not None:
+                    service_hash = getattr(self, '_service_hash', None)
+                    controller_owner = getattr(self, '_controller_owner', None)
+                    ensure_storage_intent = (
+                        serve_state.
+                        ensure_committed_ephemeral_storage_intent_for_version)
+                    if (service_hash is None or controller_owner is None or
+                            not ensure_storage_intent(
+                                self._service_name, yaml_content, service_hash,
+                                controller_owner)):
+                        logger.warning(
+                            f'Retaining version {version} metadata for service '
+                            f'{self._service_name!r}: no owner-fenced scoped '
+                            'storage cleanup intent could be proven.')
+                        continue
+                deleted = serve_state.delete_version(self._service_name,
+                                                     version,
+                                                     **self._db_fence_kwargs())
+                if deleted is False:
+                    raise RuntimeError(
+                        f'Service {self._service_name!r} incarnation changed '
+                        f'while deleting version {version}.')
+            # The newest version metadata is removed with the service row.
             self.least_recent_version = current_least_recent_version
 
     def _thread_pool_refresher(self) -> None:
@@ -2361,8 +2653,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                     if not fresh.status_property.should_track_service_status():
                         continue
                     fresh.status_property.user_app_failed = True
-                    serve_state.add_or_update_replica(self._service_name,
-                                                      fresh.replica_id, fresh)
+                    self._persist_replica(fresh.replica_id, fresh)
                     logger.warning(
                         f'Service job for replica {fresh.replica_id} FAILED. '
                         'Terminating...')
@@ -2480,8 +2771,13 @@ class SkyPilotReplicaManager(ReplicaManager):
                         logger.info(
                             f'Replica {info.replica_id} is the first ready '
                             f'replica. Setting uptime to {self._uptime}.')
-                        serve_state.set_service_uptime(self._service_name,
-                                                       int(self._uptime))
+                        persisted = serve_state.set_service_uptime(
+                            self._service_name, int(self._uptime),
+                            **self._db_fence_kwargs())
+                        if persisted is False:
+                            raise RuntimeError(
+                                f'Service {self._service_name!r} incarnation '
+                                'changed while publishing uptime.')
                     info.consecutive_failure_times.clear()
                     if info.status_property.first_ready_time is None:
                         info.status_property.first_ready_time = probe_time
@@ -2547,8 +2843,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             # the teardowns: _terminate_replica re-reads the replica row,
             # and the probe mutations (e.g. first_ready_time=-1.0, which
             # drives the failure classification) must be visible to it.
-            serve_state.add_or_update_replicas(self._service_name,
-                                               pending_writes)
+            self._persist_replicas(pending_writes)
             for replica_id in replicas_to_teardown:
                 self._terminate_replica(replica_id,
                                         sync_down_logs=True,
@@ -2566,7 +2861,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # to make sure the active_versions are the union of all
                 # versions of all load balancers.
                 serve_utils.set_service_status_and_active_versions_from_replica(
-                    self._service_name, replica_infos, self._update_mode)
+                    self._service_name, replica_infos, self._update_mode,
+                    **self._db_fence_kwargs())
 
             except Exception as e:  # pylint: disable=broad-except
                 # No matter what error happens, we should keep the
@@ -2673,8 +2969,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                         f'{old_config} is the same as '
                         f'latest version\'s {new_config}.')
                     info.version = version
-                    serve_state.add_or_update_replica(self._service_name,
-                                                      info.replica_id, info)
+                    self._persist_replica(info.replica_id, info)
                 else:
                     logger.info('Replica config changed (rest), skipping. '
                                 f'old: {old_config}, '

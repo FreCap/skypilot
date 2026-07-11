@@ -12,6 +12,7 @@ import pytest
 from sky import clouds
 from sky import exceptions
 from sky import resources as resources_lib
+from sky import task as task_lib
 from sky.jobs import constants as managed_job_constants
 from sky.serve import constants as serve_constants
 from sky.skylet import constants
@@ -24,6 +25,43 @@ _DEFAULT_AUTOSTOP = {
     'down': False,
     'idle_minutes': 10,
 }
+
+
+def test_configured_bucket_cleanup_manifest_precedes_upload(tmp_path):
+    """A crash after upload retains permission to delete the scoped subpath."""
+    workdir = tmp_path / 'workdir'
+    workdir.mkdir()
+    task = task_lib.Task(workdir=str(workdir))
+    prepared_storage = {}
+
+    def _capture_pre_upload_manifest(prepared_task):
+        prepared_storage.update(prepared_task.to_yaml_config()['file_mounts'][
+            constants.SKY_REMOTE_WORKDIR])
+        raise RuntimeError('simulated crash before post-upload rewrite')
+
+    blob_storage = mock.Mock()
+    blob_storage.file_mounts_tmp_dir.return_value = str(tmp_path)
+    with mock.patch.object(controller_utils.skypilot_config,
+                           'get_nested',
+                           return_value='s3://shared-bucket/base'), \
+         mock.patch.object(
+             controller_utils.storage_lib,
+             'get_cached_enabled_storage_cloud_names_or_refresh',
+             return_value=[
+                 controller_utils.storage_lib.StoreType.S3.to_cloud()
+             ]), \
+         mock.patch.object(controller_utils.bs,
+                           'get_blob_storage', return_value=blob_storage), \
+         pytest.raises(RuntimeError, match='simulated crash'):
+        controller_utils.maybe_translate_local_file_mounts_and_sync_up(
+            task,
+            task_type='serve',
+            run_id='scope-id',
+            on_storage_mounts_prepared=_capture_pre_upload_manifest)
+
+    assert prepared_storage['_is_sky_managed'] is False
+    assert prepared_storage['_force_delete'] is True
+    assert prepared_storage['_bucket_sub_path'].startswith('base/')
 
 
 @pytest.mark.parametrize(

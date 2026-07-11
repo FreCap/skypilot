@@ -23,6 +23,9 @@ from sky import sky_logging
 from sky import skypilot_config
 from sky import task as task_lib
 from sky.backends import backend_utils
+from sky.serve import constants as serve_constants
+from sky.serve import serve_state
+from sky.serve import serve_utils
 from sky.server.requests import request_names
 from sky.skylet import autostop_lib
 from sky.usage import usage_lib
@@ -57,6 +60,40 @@ class Stage(enum.Enum):
     PRE_EXEC = enum.auto()
     EXEC = enum.auto()
     DOWN = enum.auto()
+
+
+def _validate_service_replica_launch_fence(
+        launch_context: Dict[str, Any]) -> None:
+    """Reject stale Serve replica launches before any execution-side mutation.
+
+    This validation lives in the persisted request entrypoint, not only the
+    scheduler precondition: API restart recovery deliberately re-enqueues
+    pending requests without reconstructing in-memory preconditions.
+    """
+    service_name = launch_context.get(
+        serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY)
+    service_hash = launch_context.get(
+        serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY)
+    controller_pid = launch_context.get(
+        serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_PID_KEY)
+    controller_ip = launch_context.get(
+        serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY)
+    if (not isinstance(service_name, str) or not service_name or
+            not isinstance(service_hash, str) or not service_hash or
+            not (controller_pid is None or isinstance(controller_pid, int)) or
+            not (controller_ip is None or isinstance(controller_ip, str))):
+        raise exceptions.RequestCancelled(
+            'SkyServe replica launch is missing its durable owner fence.')
+    owner = serve_state.get_service_controller_owner(service_name)
+    authorized = (
+        owner is not None and owner.get('hash') == service_hash and
+        (owner.get('controller_pid'), owner.get('controller_ip'))
+        == (controller_pid, controller_ip) and owner.get('status')
+        not in serve_state.ServiceStatus.replica_launch_blocking_statuses())
+    if not authorized:
+        raise exceptions.RequestCancelled(
+            f'Refusing replica launch for stale service owner '
+            f'{service_name!r}/{service_hash!r}.')
 
 
 def _maybe_clone_disk_from_cluster(clone_disk_from: Optional[str],
@@ -341,6 +378,11 @@ def _execute(
                 request_names.AdminPolicyRequestName.SERVE_LAUNCH_REPLICA)
     if _extra_launch_context is None:
         _extra_launch_context = {}
+    has_launch_fence = any(key in _extra_launch_context
+                           for key in serve_constants.REPLICA_LAUNCH_FENCE_KEYS)
+    if (_is_launched_by_sky_serve_controller and
+        (has_launch_fence or serve_utils.is_external_load_balancer_mode())):
+        _validate_service_replica_launch_fence(_extra_launch_context)
     dag = dag_utils.convert_entrypoint_to_dag(entrypoint)
     for task in dag.tasks:
         for resource in task.resources:

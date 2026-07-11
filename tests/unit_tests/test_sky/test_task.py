@@ -10,6 +10,7 @@ import pytest
 from sky import exceptions
 from sky import resources as resources_lib
 from sky import task
+from sky.data import storage as storage_lib
 from sky.utils import git
 from sky.utils import registry
 
@@ -98,6 +99,51 @@ def test_validate_file_mounts():
         task_obj.file_mounts = {'/remote/': d}
         with pytest.raises(ValueError, match='cannot end with a slash'):
             task_obj.expand_and_validate_file_mounts()
+
+
+def test_implicit_storage_plan_is_durable_before_bucket_creation():
+    """A no-store mount records provider+region before its first cloud write."""
+    storage = storage_lib.Storage(name='scoped-storage',
+                                  source='/tmp/source',
+                                  persistent=False,
+                                  _is_sky_managed=True)
+    task_obj = task.Task()
+    task_obj.storage_mounts = {'/data': storage}
+
+    def _construct_without_remote_write():
+        storage._constructed = True  # pylint: disable=protected-access
+
+    storage.construct = mock.Mock(side_effect=_construct_without_remote_write)
+    storage.add_store = mock.Mock()
+    planned_storage = {}
+
+    def _crash_after_plan(prepared_task):
+        nonlocal planned_storage
+        planned_storage = prepared_task.to_yaml_config()['file_mounts']['/data']
+        raise RuntimeError('simulated process exit before bucket creation')
+
+    with mock.patch.object(task_obj,
+                           '_get_preferred_store',
+                           return_value=(storage_lib.StoreType.AZURE,
+                                         'westus2')):
+        with pytest.raises(RuntimeError, match='simulated process exit'):
+            task_obj.sync_storage_mounts(
+                on_storage_plan_prepared=_crash_after_plan)
+
+    storage.add_store.assert_not_called()
+    assert planned_storage
+    assert planned_storage['store'] == storage_lib.StoreType.AZURE.value
+    assert planned_storage['_store_region'] == 'westus2'
+
+    # The cleanup-side round trip must feed the same region back into store
+    # reconstruction rather than silently falling back to Azure's eastus.
+    reconstructed = storage_lib.Storage.from_yaml_config(dict(planned_storage))
+    with mock.patch.object(reconstructed, '_validate_storage_spec'), \
+         mock.patch('sky.data.storage.global_user_state.'
+                    'get_handle_from_storage_name', return_value=None), \
+         mock.patch.object(reconstructed, 'add_store') as add_store:
+        reconstructed.construct()
+    add_store.assert_called_once_with(storage_lib.StoreType.AZURE, 'westus2')
 
 
 def test_to_yaml_config_without_envs():

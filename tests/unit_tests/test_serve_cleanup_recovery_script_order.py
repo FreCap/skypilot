@@ -24,6 +24,7 @@ import pytest
 from sky import exceptions
 from sky.serve import replica_managers
 from sky.serve import serve_state
+from sky.serve import serve_utils
 from sky.serve import service
 from sky.utils import controller_utils
 
@@ -48,9 +49,9 @@ def _patch_common(monkeypatch, events, replicas):
                         lambda lock: True)
     monkeypatch.setattr(serve_state, 'get_replica_infos',
                         lambda svc: list(replicas))
-    monkeypatch.setattr(service.global_user_state,
-                        'get_cluster_names_start_with',
-                        lambda prefix: [r.cluster_name for r in replicas])
+    cluster_names = {replica.cluster_name for replica in replicas}
+    monkeypatch.setattr(service.global_user_state, 'cluster_with_name_exists',
+                        lambda name: name in cluster_names)
     monkeypatch.setattr(serve_state, 'add_or_update_replica',
                         lambda *a, **k: None)
     monkeypatch.setattr(serve_state, 'remove_replica', lambda *a, **k: None)
@@ -82,6 +83,34 @@ def test_cleanup_preserves_recovery_script_through_replica_teardown(
     assert events == ['teardown:c1']
 
 
+def test_cleanup_uses_exact_scoped_cluster_identity_for_long_name(monkeypatch):
+    """Truncating a scoped cluster prefix must not make cleanup miss it."""
+    events = []
+    service_name = 's' * 63
+    info = _replica(1)
+    info.cluster_name = serve_utils.generate_replica_cluster_name(
+        service_name, 1, 'incarnation-a')
+    assert not info.cluster_name.startswith(service_name)
+
+    def _terminate(cluster_name, unused_log_file_name, continue_guard=None):
+        assert continue_guard is not None and continue_guard()
+        events.append(f'teardown:{cluster_name}')
+
+    monkeypatch.setattr(replica_managers, 'terminate_cluster', _terminate)
+    _patch_common(monkeypatch, events, [info])
+
+    failed = service._cleanup(service_name,
+                              False,
+                              'incarnation-a',
+                              123,
+                              None,
+                              mock.Mock(),
+                              resource_scope='incarnation-a')
+
+    assert failed is False
+    assert events == [f'teardown:{info.cluster_name}']
+
+
 # --- recovery must resume teardown, not resurrect a torn-down service ---
 
 
@@ -105,6 +134,10 @@ def test_should_resume_teardown():
 
 
 def _patch_finalize(monkeypatch, calls):
+    monkeypatch.setattr(serve_state, 'get_replica_infos', lambda _svc: [])
+    monkeypatch.setattr(
+        service.serve_utils, 'quiesce_service_replica_launch_requests',
+        lambda *a, **k: calls.append(('quiesce_launches', a[0])) or True)
     monkeypatch.setattr(
         serve_state, 'acknowledge_service_controller_teardown_if_owner',
         lambda *a, **k: calls.append(('begin_teardown', a[0])) or True)
@@ -114,18 +147,16 @@ def _patch_finalize(monkeypatch, calls):
                         lambda lock: True)
     monkeypatch.setattr(serve_state, 'service_owner_matches',
                         lambda *a, **k: True)
-    monkeypatch.setattr(
-        serve_state, 'set_service_status_and_active_versions_if_owner',
-        lambda *a, **k: calls.append(('failed_cleanup', a)) or True)
+    monkeypatch.setattr(serve_state,
+                        'set_service_status_and_active_versions_if_owner',
+                        lambda *a, **k: calls.append(('status', a[4])) or True)
     monkeypatch.setattr(serve_state, 'remove_service_completely',
                         lambda *a, **k: calls.append(('removed', a[0])) or True)
     monkeypatch.setattr(
         serve_state, 'remove_ha_recovery_script_if_owner',
         lambda *a, **k: calls.append(('remove_script', a[0])) or True)
-    monkeypatch.setattr(service.serve_utils, 'quarantine_service_directory',
-                        lambda *a: None)
-    monkeypatch.setattr(service.serve_utils,
-                        'remove_quarantined_service_directory', lambda *a: None)
+    monkeypatch.setattr(service.lb_k8s, 'get_api_deployment_owner_uid',
+                        lambda **_kwargs: 'api-deployment-uid')
     monkeypatch.setattr(service.lb_k8s, 'delete_lb_objects',
                         lambda *a, **k: calls.append(('delete_lb', a[0])))
     monkeypatch.setattr(service, '_cleanup_task_run_script', lambda jid: None)
@@ -140,12 +171,40 @@ def test_finalize_removes_service_on_clean_teardown(monkeypatch):
                                       '/tmp/svc', 1, 'incarnation-a', 123, None)
 
     assert ('removed', 'svc') in calls
-    assert not any(c[0] == 'failed_cleanup' for c in calls)
+    assert ('status', serve_state.ServiceStatus.FAILED_CLEANUP) not in calls
     # The clean finalizer removes the script atomically with the service row,
     # not through a separate name-keyed delete.
     assert not any(c[0] == 'remove_script' for c in calls)
+    assert calls.index(
+        ('status', serve_state.ServiceStatus.SHUTTING_DOWN)) < (calls.index(
+            ('quiesce_launches', 'svc')))
+    assert calls.index(('quiesce_launches', 'svc')) < calls.index(
+        ('begin_teardown', 'svc'))
     assert calls.index(('begin_teardown', 'svc')) < calls.index(
         ('delete_lb', 'svc'))
+
+
+def test_finalize_does_not_ack_or_delete_until_launches_quiesce(monkeypatch):
+    calls = []
+    monkeypatch.setattr(serve_state, 'get_replica_infos',
+                        lambda _svc: [_replica(1)])
+    monkeypatch.setattr(
+        service.serve_utils, 'quiesce_service_replica_launch_requests',
+        lambda *a, **k: calls.append(('quiesce_failed', a[0])) or False)
+    monkeypatch.setattr(
+        serve_state, 'acknowledge_service_controller_teardown_if_owner',
+        lambda *a, **k: calls.append(('begin_teardown', a[0])) or True)
+    monkeypatch.setattr(serve_state,
+                        'set_service_status_and_active_versions_if_owner',
+                        lambda *a, **k: calls.append(('status', a[4])) or True)
+    monkeypatch.setattr(service, '_cleanup', lambda *a, **k: calls.append(
+        ('cleanup', a[0])))
+
+    service._run_cleanup_and_finalize('svc', types.SimpleNamespace(pool=False),
+                                      '/tmp/svc', 1, 'incarnation-a', 123, None)
+
+    assert calls == [('status', serve_state.ServiceStatus.SHUTTING_DOWN),
+                     ('quiesce_failed', 'svc')]
 
 
 def test_finalize_marks_failed_cleanup_when_teardown_fails(monkeypatch):
@@ -156,7 +215,7 @@ def test_finalize_marks_failed_cleanup_when_teardown_fails(monkeypatch):
     service._run_cleanup_and_finalize('svc', types.SimpleNamespace(pool=False),
                                       '/tmp/svc', 1, 'incarnation-a', 123, None)
 
-    assert any(c[0] == 'failed_cleanup' for c in calls)
+    assert ('status', serve_state.ServiceStatus.FAILED_CLEANUP) in calls
     assert not any(c[0] == 'removed' for c in calls)
     # FAILED_CLEANUP is published first, then the recovery script is removed
     # so a persistent cleanup failure cannot loop forever.
@@ -180,7 +239,7 @@ def test_finalize_contains_cleanup_exception_and_breaks_recovery_loop(
     service._run_cleanup_and_finalize('svc', types.SimpleNamespace(pool=False),
                                       '/tmp/svc', 1, 'incarnation-a', 123, None)
 
-    assert any(c[0] == 'failed_cleanup' for c in calls)
+    assert ('status', serve_state.ServiceStatus.FAILED_CLEANUP) in calls
     assert ('remove_script', 'svc') in calls, (
         'a caught cleanup exception must remove the HA script to avoid a '
         'recovery loop')
@@ -244,6 +303,26 @@ def test_handle_signal_retries_status_cas_db_error_without_cleanup(
         service._handle_signal('svc', 'incarnation-a', 123, None)
     assert not sig.exists()
     assert persist.call_count == 2
+
+
+def test_scoped_successor_discards_legacy_name_only_terminate(
+        monkeypatch, tmp_path):
+    sig = tmp_path / 'svc.signal'
+    sig.write_text('terminate')
+    monkeypatch.setattr(service.constants, 'SIGNAL_FILE_PATH',
+                        str(tmp_path / '{}.signal'))
+    set_status = mock.Mock()
+    monkeypatch.setattr(serve_state,
+                        'set_service_status_and_active_versions_if_owner',
+                        set_status)
+
+    assert service._handle_signal('svc',
+                                  'incarnation-b',
+                                  123,
+                                  None,
+                                  resource_scope='incarnation-b')
+    assert not sig.exists()
+    set_status.assert_not_called()
 
 
 @pytest.mark.parametrize('malformed', ['not-a-signal', '{'])

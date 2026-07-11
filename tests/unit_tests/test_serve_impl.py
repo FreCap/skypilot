@@ -11,6 +11,7 @@ from unittest import mock
 import pytest
 
 from sky import backends
+from sky.data import storage as storage_lib
 from sky.serve import constants
 from sky.serve import serve_state
 from sky.serve.server import impl
@@ -39,6 +40,55 @@ def test_service_request_example_shows_dedicated_header_when_enabled():
     assert command.endswith('http://service')
 
 
+def test_consolidated_registration_wait_carries_resource_scope():
+    handle = mock.MagicMock(spec=backends.CloudVmRayResourceHandle)
+    backend = _backend_mock()
+    with mock.patch.object(impl.serve_utils,
+                           'is_consolidation_mode',
+                           return_value=True), \
+         mock.patch.object(
+             impl.serve_utils,
+             'wait_service_registration',
+             return_value='encoded-port') as wait_registration, \
+         mock.patch.object(
+             impl.serve_utils,
+             'load_service_initialization_result') as load_result, \
+         mock.patch.object(
+             impl.serve_rpc_utils.RpcRunner,
+             'wait_service_registration') as rpc_wait:
+        impl._wait_for_service_registration(handle, backend, 'svc', 7, False,
+                                            'incarnation-a')
+
+    wait_registration.assert_called_once_with(
+        'svc', 7, False, expected_resource_scope='incarnation-a')
+    load_result.assert_called_once_with('encoded-port')
+    rpc_wait.assert_not_called()
+    backend.run_on_head.assert_not_called()
+
+
+def test_scoped_storage_metadata_is_independent_of_local_intent_db():
+    resource_scope = 'incarnation-a'
+    generation = 'generation-a'
+    scope_id = impl.serve_utils.generate_ephemeral_storage_scope_id(
+        resource_scope, generation)
+    storage = storage_lib.Storage(name=f'bucket-{scope_id}',
+                                  persistent=False,
+                                  _is_sky_managed=True)
+    task = mock.MagicMock()
+    task.metadata = {}
+    task.storage_mounts = {'/data': storage}
+
+    impl._record_scoped_ephemeral_storage(task, resource_scope, scope_id,
+                                          generation, set())
+
+    assert task.metadata[constants.EPHEMERAL_STORAGE_SCOPE_METADATA_KEY] == {
+        'resource_scope': resource_scope,
+        'scope_id': scope_id,
+        'storage_generation': generation,
+        'storage_mounts': ['/data'],
+    }
+
+
 class TestExternalOnlyTopologyPreflight:
     """Unsupported service layouts fail before mounts or cloud provisioning."""
 
@@ -53,10 +103,24 @@ class TestExternalOnlyTopologyPreflight:
                 impl.lb_k8s,
                 'require_external_lb_runtime') as runtime_check, \
              mock.patch.object(impl.serve_utils,
+                               'is_external_load_balancer_mode',
+                               return_value=False), \
+             mock.patch.object(impl.serve_utils,
                                'is_consolidation_mode') as consolidation:
             impl._require_supported_service_topology(self._task(), pool=True)
         runtime_check.assert_not_called()
         consolidation.assert_not_called()
+
+    def test_external_deployment_rejects_nonconsolidated_pool(self):
+        with mock.patch.object(impl.serve_utils,
+                               'is_external_load_balancer_mode',
+                               return_value=True), \
+             mock.patch.object(impl.serve_utils,
+                               'is_consolidation_mode',
+                               return_value=False), \
+             pytest.raises(RuntimeError,
+                           match='jobs.controller.consolidation_mode=true'):
+            impl._require_supported_service_topology(self._task(), pool=True)
 
     def test_task_level_tls_is_rejected_before_runtime_work(self):
         with mock.patch.object(
@@ -137,6 +201,7 @@ class TestExternalCapabilityMutationPaths:
             'status': serve_state.ServiceStatus.READY,
             'hash': 'incarnation-a',
         }
+        lifecycle_lock = mock.MagicMock(epoch=1)
         with mock.patch.object(impl.controller_utils,
                                'get_controller_for_pool'), \
              mock.patch.object(impl.backend_utils,
@@ -157,9 +222,7 @@ class TestExternalCapabilityMutationPaths:
                  '_require_supported_service_topology',
                  side_effect=RuntimeError('capability gate')) as preflight, \
              pytest.raises(RuntimeError, match='capability gate'):
-            impl._update_impl(task,
-                              'svc',
-                              lifecycle_lock=mock.sentinel.lifecycle_lock)
+            impl._update_impl(task, 'svc', lifecycle_lock=lifecycle_lock)
         legacy_config.get_nested.assert_not_called()
         preflight.assert_called_once_with(task, False)
 
@@ -467,6 +530,22 @@ class TestLifecycleLocking:
             assert impl.up(mock.Mock(), 'svc') == ('svc', 'endpoint')
         assert calls == ['lock', 'impl', 'unlock']
 
+    def test_nonconsolidated_pool_failure_never_cleans_api_local_intents(self):
+        lifecycle_lock = mock.MagicMock()
+        lifecycle_lock.epoch = 7
+        with mock.patch.object(impl,
+                               '_up_impl_body',
+                               side_effect=RuntimeError('remote failure')), \
+             mock.patch.object(impl.serve_utils,
+                               'is_consolidation_mode',
+                               return_value=False), \
+             mock.patch.object(
+                 impl,
+                 '_cleanup_provisional_storage_intents') as cleanup_intents, \
+             pytest.raises(RuntimeError, match='remote failure'):
+            impl._up_impl(mock.MagicMock(), 'pool', True, lifecycle_lock)
+        cleanup_intents.assert_not_called()
+
     def test_second_same_name_up_fails_before_canonical_mutation(self):
         task = mock.MagicMock()
         lifecycle_lock = mock.MagicMock()
@@ -482,6 +561,32 @@ class TestLifecycleLocking:
              pytest.raises(RuntimeError, match='already exists'):
             impl._up_impl(task, 'svc', False, lifecycle_lock)
         task.validate.assert_not_called()
+
+    def test_orphan_children_fail_before_task_or_storage_mutation(self):
+        task = mock.MagicMock()
+        lifecycle_lock = mock.MagicMock()
+        with mock.patch.object(impl.serve_utils,
+                               'lifecycle_lock_is_valid',
+                               return_value=True), \
+             mock.patch.object(impl.serve_utils,
+                               'is_consolidation_mode',
+                               return_value=True), \
+             mock.patch.object(impl.serve_state,
+                               'get_service_hash', return_value=None), \
+             mock.patch.object(impl.serve_state,
+                               'get_orphaned_service_child_names',
+                               return_value=['svc']), \
+             mock.patch.object(impl.serve_state,
+                               'get_orphaned_service_child_mode',
+                               return_value=True), \
+             mock.patch.object(
+                 impl,
+                 '_prepare_scoped_ephemeral_storage') as prepare_storage, \
+             pytest.raises(RuntimeError,
+                           match='sky jobs pool down svc --purge'):
+            impl._up_impl_body(task, 'svc', False, lifecycle_lock)
+        task.validate.assert_not_called()
+        prepare_storage.assert_not_called()
 
     def test_update_fence_rejects_same_name_successor(self):
         handle = mock.MagicMock(spec=backends.CloudVmRayResourceHandle)
