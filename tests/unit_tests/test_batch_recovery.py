@@ -18,6 +18,7 @@ from sky.batch import utils
 from sky.batch import worker
 from sky.jobs import controller as jobs_controller
 from sky.jobs import state
+from sky.utils.db import migration_utils
 
 
 @pytest.fixture
@@ -104,6 +105,20 @@ def test_schema_022_upgrades_existing_batch_state_table(tmp_path):
         attempt_id = connection.execute(
             sqlalchemy.text('SELECT attempt_id FROM batch_state')).scalar_one()
     assert attempt_id == 0
+
+
+def test_spot_jobs_database_targets_batch_attempt_migration(
+        tmp_path, monkeypatch):
+    engine = sqlalchemy.create_engine(f'sqlite:///{tmp_path / "target.db"}')
+    upgrade = mock.Mock()
+    monkeypatch.setattr(migration_utils, 'safe_alembic_upgrade', upgrade)
+
+    state.create_table(engine)
+
+    upgrade.assert_called_once_with(engine, migration_utils.SPOT_JOBS_DB_NAME,
+                                    '022')
+    assert migration_utils.SPOT_JOBS_VERSION == '022'
+    engine.dispose()
 
 
 def _make_coordinator(job_id=1):
