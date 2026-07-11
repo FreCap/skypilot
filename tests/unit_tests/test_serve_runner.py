@@ -80,7 +80,10 @@ class TestDefaultRunnerRpcPath:
                                                service_names=['p1'],
                                                pool=True)
         assert result == expected
-        rpc.assert_called_once_with(handle, ['p1'], True, summary_only=False)
+        rpc.assert_called_once_with(handle, ['p1'],
+                                    True,
+                                    summary_only=False,
+                                    include_target_num_replicas=None)
         codegen.assert_not_called()
         # RPC path must not even materialize a backend.
         get_backend.assert_not_called()
@@ -111,7 +114,10 @@ class TestDefaultRunnerRpcPath:
                                                service_names=None,
                                                pool=False)
         assert result == legacy_records
-        codegen.assert_called_once_with(None, pool=False, summary_only=False)
+        codegen.assert_called_once_with(None,
+                                        pool=False,
+                                        summary_only=False,
+                                        include_target_num_replicas=None)
         backend.run_on_head.assert_called_once()
         load.assert_called_once_with(b'PAYLOAD')
 
@@ -193,11 +199,18 @@ class TestStatusDelegatesToRunner:
     def test_calls_registered_runner_with_normalized_args(self):
         captured = {}
 
-        def fake_get(*, handle, service_names, pool, summary_only=False):
+        def fake_get(*,
+                     handle,
+                     service_names,
+                     pool,
+                     summary_only=False,
+                     include_target_num_replicas=None):
             captured['handle'] = handle
             captured['service_names'] = service_names
             captured['pool'] = pool
             captured['summary_only'] = summary_only
+            captured['include_target_num_replicas'] = (
+                include_target_num_replicas)
             # Pool path: skip the endpoint-augmentation loop.
             return []
 
@@ -212,6 +225,7 @@ class TestStatusDelegatesToRunner:
         assert captured['service_names'] == ['single']
         assert captured['pool'] is True
         assert captured['summary_only'] is False
+        assert captured['include_target_num_replicas'] is None
 
     def test_rpc_then_legacy_fallback_end_to_end_via_status(self):
         """status() -> default runner -> RPC raises NotImplemented -> legacy.

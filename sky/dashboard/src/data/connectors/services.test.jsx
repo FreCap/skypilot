@@ -235,6 +235,30 @@ describe('getServices', () => {
     expect(services[0].replicasFailed).toBe(1);
   });
 
+  it('passes include_target_num_replicas through when requested', async () => {
+    apiClient.post.mockResolvedValue(mockDispatchResponse());
+    apiClient.get.mockResolvedValue(
+      mockResultResponse([
+        rawServiceRecord({
+          target_num_replicas: 7,
+        }),
+      ])
+    );
+
+    const { services } = await getServices({
+      serviceNames: ['boltz-l4-fleet'],
+      summaryOnly: true,
+      includeTargetReplicas: true,
+    });
+
+    expect(apiClient.post).toHaveBeenCalledWith('/serve/status', {
+      service_names: ['boltz-l4-fleet'],
+      summary_only: true,
+      include_target_num_replicas: true,
+    });
+    expect(services[0].targetReplicas).toBe(7);
+  });
+
   it('reports controllerStopped when the serve controller is not up', async () => {
     apiClient.post.mockResolvedValue(mockDispatchResponse());
     apiClient.get.mockResolvedValue({

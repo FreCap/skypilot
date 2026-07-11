@@ -1685,7 +1685,8 @@ def _get_service_status(
         service_name: str,
         pool: bool,
         with_replica_info: bool = True,
-        with_replica_counts: bool = False) -> Optional[Dict[str, Any]]:
+        with_replica_counts: bool = False,
+        with_target_num_replicas: bool = True) -> Optional[Dict[str, Any]]:
     """Get the status dict of the service.
 
     Args:
@@ -1735,18 +1736,19 @@ def _get_service_status(
                 original_config = yaml_utils.safe_load(original_config)
             record['pool_yaml'] = yaml_utils.dump_yaml_str(original_config)
 
-    record['target_num_replicas'] = 0
-    try:
-        resp = _get_to_controller_with_retry(service_name, record['hash'],
-                                             '/autoscaler/info')
-        record['target_num_replicas'] = resp.json()['target_num_replicas']
-    except requests.exceptions.RequestException:
-        record['target_num_replicas'] = None
-    except Exception as e:  # pylint: disable=broad-except
-        record['target_num_replicas'] = None
-        logger.error(f'Failed to get autoscaler info for {service_name}: '
-                     f'{common_utils.format_exception(e)}\n'
-                     f'Traceback: {traceback.format_exc()}')
+    if with_target_num_replicas:
+        record['target_num_replicas'] = 0
+        try:
+            resp = _get_to_controller_with_retry(service_name, record['hash'],
+                                                 '/autoscaler/info')
+            record['target_num_replicas'] = resp.json()['target_num_replicas']
+        except requests.exceptions.RequestException:
+            record['target_num_replicas'] = None
+        except Exception as e:  # pylint: disable=broad-except
+            record['target_num_replicas'] = None
+            logger.error(f'Failed to get autoscaler info for {service_name}: '
+                         f'{common_utils.format_exception(e)}\n'
+                         f'Traceback: {traceback.format_exc()}')
 
     if with_replica_counts and not with_replica_info:
         # Summary mode: give callers (the dashboard header, list views)
@@ -1839,12 +1841,16 @@ def resolve_target_qps_for_gpu_shape(
 def get_service_status_pickled(
         service_names: Optional[List[str]],
         pool: bool,
-        summary_only: bool = False) -> List[Dict[str, str]]:
+        summary_only: bool = False,
+        include_target_num_replicas: Optional[bool] = None
+) -> List[Dict[str, str]]:
     if service_names is None:
         # Get all service names
         service_names = serve_state.get_glob_service_names(None)
     if not service_names:
         return []
+    if include_target_num_replicas is None:
+        include_target_num_replicas = not summary_only
     # Fan out across services. Each `_get_service_status` is dominated by
     # I/O (controller HTTP + DB reads) so threads parallelize well; the
     # cap on max_workers keeps memory and DB-connection pressure bounded.
@@ -1857,11 +1863,14 @@ def get_service_status_pickled(
     parent_ctx = contextvars.copy_context()
 
     def _run_in_context(name: str) -> Optional[Dict[str, Any]]:
-        return parent_ctx.copy().run(_get_service_status,
-                                     name,
-                                     pool=pool,
-                                     with_replica_info=not summary_only,
-                                     with_replica_counts=summary_only)
+        kwargs = {
+            'pool': pool,
+            'with_replica_info': not summary_only,
+            'with_replica_counts': summary_only,
+        }
+        if not include_target_num_replicas:
+            kwargs['with_target_num_replicas'] = False
+        return parent_ctx.copy().run(_get_service_status, name, **kwargs)
 
     max_workers = min(len(service_names), _STATUS_FANOUT_MAX_WORKERS)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -1876,15 +1885,19 @@ def get_service_status_pickled(
 
 
 # TODO (kyuds): remove when serve codegen is removed
-def get_service_status_encoded(service_names: Optional[List[str]],
-                               pool: bool,
-                               summary_only: bool = False) -> str:
+def get_service_status_encoded(
+        service_names: Optional[List[str]],
+        pool: bool,
+        summary_only: bool = False,
+        include_target_num_replicas: Optional[bool] = None) -> str:
     # We have to use payload_type here to avoid the issue of
     # message_utils.decode_payload() not being able to correctly decode the
     # message with <sky-payload> tags.
-    service_statuses = get_service_status_pickled(service_names,
-                                                  pool,
-                                                  summary_only=summary_only)
+    service_statuses = get_service_status_pickled(
+        service_names,
+        pool,
+        summary_only=summary_only,
+        include_target_num_replicas=include_target_num_replicas)
     return message_utils.encode_payload(service_statuses,
                                         payload_type='service_status')
 
@@ -3547,10 +3560,12 @@ class ServeCodeGen:
     ]
 
     @classmethod
-    def get_service_status(cls,
-                           service_names: Optional[List[str]],
-                           pool: bool,
-                           summary_only: bool = False) -> str:
+    def get_service_status(
+            cls,
+            service_names: Optional[List[str]],
+            pool: bool,
+            summary_only: bool = False,
+            include_target_num_replicas: Optional[bool] = None) -> str:
         # summary_only is only forwarded to controllers whose lib version
         # understands it (v6+); older controllers just return the full
         # payload — a graceful degradation, never an error.
@@ -3558,10 +3573,13 @@ class ServeCodeGen:
             f'kwargs={{}} if serve_version < 3 else {{"pool": {pool}}}',
             ('kwargs.update({"summary_only": '
              f'{summary_only}}}) if serve_version >= 6 else None'),
+            ('kwargs.update({"include_target_num_replicas": '
+             f'{include_target_num_replicas}}}) if serve_version >= 7 else '
+             'None') if include_target_num_replicas is not None else None,
             f'msg = serve_utils.get_service_status_encoded({service_names!r}, '
             '**kwargs)', 'print(msg, end="", flush=True)'
         ]
-        return cls._build(code)
+        return cls._build([line for line in code if line is not None])
 
     @classmethod
     def add_version(cls, service_name: str) -> str:

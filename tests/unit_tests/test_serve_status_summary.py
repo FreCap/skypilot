@@ -28,6 +28,7 @@ def patched_state(monkeypatch):
         'pool': False,
         'controller_port': 30001,
         'version': 1,
+        'hash': 'incarnation-a',
     }
     monkeypatch.setattr(serve_state, 'get_service_from_name',
                         lambda name: dict(record))
@@ -47,21 +48,54 @@ def patched_state(monkeypatch):
 
 
 class TestGetServiceStatusSummary:
-    """_get_service_status with_replica_counts contract."""
+    """_get_service_status summary contract."""
 
     def test_summary_returns_counts_without_replica_info(self, patched_state):
         record = serve_utils._get_service_status(  # pylint: disable=protected-access
             'svc',
             pool=False,
             with_replica_info=False,
-            with_replica_counts=True)
+            with_replica_counts=True,
+            with_target_num_replicas=False)
         assert record is not None
         assert 'replica_info' not in record
+        assert 'target_num_replicas' not in record
         assert record['replica_status_counts'] == {
             'READY': 2,
             'PROVISIONING': 1,
             'FAILED_PROBING': 1,
         }
+
+    def test_summary_skips_target_fetch_when_not_requested(
+            self, patched_state, monkeypatch):
+        autoscaler = mock.Mock()
+        monkeypatch.setattr(serve_utils, '_get_to_controller_with_retry',
+                            autoscaler)
+        record = serve_utils._get_service_status(  # pylint: disable=protected-access
+            'svc',
+            pool=False,
+            with_replica_info=False,
+            with_replica_counts=True,
+            with_target_num_replicas=False)
+        assert record is not None
+        autoscaler.assert_not_called()
+        assert 'target_num_replicas' not in record
+
+    def test_summary_can_opt_in_target_fetch(self, patched_state, monkeypatch):
+        autoscaler_resp = mock.MagicMock()
+        autoscaler_resp.json.return_value = {'target_num_replicas': 4}
+        autoscaler = mock.Mock(return_value=autoscaler_resp)
+        monkeypatch.setattr(serve_utils, '_get_to_controller_with_retry',
+                            autoscaler)
+        record = serve_utils._get_service_status(  # pylint: disable=protected-access
+            'svc',
+            pool=False,
+            with_replica_info=False,
+            with_replica_counts=True,
+            with_target_num_replicas=True)
+        assert record is not None
+        autoscaler.assert_called_once()
+        assert record['target_num_replicas'] == 4
 
     def test_default_call_has_no_counts(self, patched_state, monkeypatch):
         # Internal callers that only want the service row
@@ -99,9 +133,13 @@ class TestGetServiceStatusSummary:
 class TestGetServiceStatusPickledSummary:
     """summary_only propagation through the pickled path."""
 
-    def test_summary_only_flag_propagates(self, patched_state, monkeypatch):
+    def test_summary_only_defaults_to_no_target_fetch(self, patched_state,
+                                                      monkeypatch):
         monkeypatch.setattr(serve_state, 'get_glob_service_names',
                             lambda names: ['svc'])
+        autoscaler = mock.Mock()
+        monkeypatch.setattr(serve_utils, '_get_to_controller_with_retry',
+                            autoscaler)
         statuses = serve_utils.get_service_status_pickled(None,
                                                           pool=False,
                                                           summary_only=True)
@@ -109,6 +147,20 @@ class TestGetServiceStatusPickledSummary:
         decoded = serve_utils.unpickle_service_status(statuses)[0]
         assert 'replica_info' not in decoded
         assert decoded['replica_status_counts']['READY'] == 2
+        assert 'target_num_replicas' not in decoded
+        autoscaler.assert_not_called()
+
+    def test_summary_only_can_opt_in_target_fetch(self, patched_state,
+                                                  monkeypatch):
+        monkeypatch.setattr(serve_state, 'get_glob_service_names',
+                            lambda names: ['svc'])
+        statuses = serve_utils.get_service_status_pickled(
+            None,
+            pool=False,
+            summary_only=True,
+            include_target_num_replicas=True)
+        decoded = serve_utils.unpickle_service_status(statuses)[0]
+        assert decoded['target_num_replicas'] == 4
 
     def test_default_is_full(self, patched_state, monkeypatch):
         monkeypatch.setattr(serve_state, 'get_glob_service_names',
@@ -121,7 +173,7 @@ class TestGetServiceStatusPickledSummary:
 
 
 class TestCodegenVersionGating:
-    """ServeCodeGen gates summary_only on SERVE_VERSION >= 6."""
+    """ServeCodeGen gates status kwargs on the matching SERVE_VERSION."""
 
     def test_summary_only_gated_on_serve_version_6(self):
         code = serve_utils.ServeCodeGen.get_service_status(['svc'],
@@ -132,9 +184,19 @@ class TestCodegenVersionGating:
         assert ('kwargs.update({"summary_only": True}) '
                 'if serve_version >= 6 else None') in code
 
+    def test_target_fetch_override_gated_on_serve_version_7(self):
+        code = serve_utils.ServeCodeGen.get_service_status(
+            ['svc'],
+            pool=False,
+            summary_only=True,
+            include_target_num_replicas=False)
+        assert ('kwargs.update({"include_target_num_replicas": False}) '
+                'if serve_version >= 7 else None') in code
+
     def test_default_summary_only_false(self):
         code = serve_utils.ServeCodeGen.get_service_status(['svc'], pool=False)
         assert 'summary_only": False' in code
+        assert 'include_target_num_replicas' not in code
 
 
 class TestServeStatusBodyDefault:
@@ -145,3 +207,4 @@ class TestServeStatusBodyDefault:
         # to the full payload.
         body = payloads.ServeStatusBody(service_names=None)
         assert body.summary_only is False
+        assert body.include_target_num_replicas is None

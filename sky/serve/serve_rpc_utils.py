@@ -22,14 +22,17 @@ class GetServiceStatusRequestConverter:
 
     @classmethod
     def to_proto(
-            cls,
-            service_names: Optional[List[str]],
-            pool: bool,
-            summary_only: bool = False
+        cls,
+        service_names: Optional[List[str]],
+        pool: bool,
+        summary_only: bool = False,
+        include_target_num_replicas: Optional[bool] = None,
     ) -> 'servev1_pb2.GetServiceStatusRequest':
         request = servev1_pb2.GetServiceStatusRequest()
         request.pool = pool
         request.summary_only = summary_only
+        if include_target_num_replicas is not None:
+            request.include_target_num_replicas = include_target_num_replicas
         if service_names is not None:
             request.service_names.names.extend(service_names)
         return request
@@ -37,13 +40,18 @@ class GetServiceStatusRequestConverter:
     @classmethod
     def from_proto(
         cls, proto: 'servev1_pb2.GetServiceStatusRequest'
-    ) -> Tuple[Optional[List[str]], bool, bool]:
+    ) -> Tuple[Optional[List[str]], bool, bool, Optional[bool]]:
         pool = proto.pool
         if proto.HasField('service_names'):
             service_names = list(proto.service_names.names)
         else:
             service_names = None
-        return service_names, pool, proto.summary_only
+        if proto.HasField('include_target_num_replicas'):
+            include_target_num_replicas = proto.include_target_num_replicas
+        else:
+            include_target_num_replicas = None
+        return (service_names, pool, proto.summary_only,
+                include_target_num_replicas)
 
 
 class GetServiceStatusResponseConverter:
@@ -112,14 +120,20 @@ class RpcRunner:
     """
 
     @classmethod
-    def get_service_status(cls,
-                           handle: backends.CloudVmRayResourceHandle,
-                           service_names: Optional[List[str]],
-                           pool: bool,
-                           summary_only: bool = False) -> List[Dict[str, Any]]:
+    def get_service_status(
+        cls,
+        handle: backends.CloudVmRayResourceHandle,
+        service_names: Optional[List[str]],
+        pool: bool,
+        summary_only: bool = False,
+        include_target_num_replicas: Optional[bool] = None
+    ) -> List[Dict[str, Any]]:
         assert handle.is_grpc_enabled_with_flag
         request = GetServiceStatusRequestConverter.to_proto(
-            service_names, pool, summary_only)
+            service_names,
+            pool,
+            summary_only,
+            include_target_num_replicas=include_target_num_replicas)
         response = backend_utils.invoke_skylet_with_retries(
             lambda: backends.SkyletClient(handle.get_grpc_channel()
                                          ).get_service_status(request))

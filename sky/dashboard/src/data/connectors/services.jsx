@@ -99,12 +99,20 @@ export async function getServices(options = {}) {
   // replicas) the full query takes tens of seconds while the summary is
   // near-instant, so list views and page headers should always use it.
   // serviceNames narrows the query to specific services (null = all).
-  const { serviceNames = null, summaryOnly = false } = options;
+  const {
+    serviceNames = null,
+    summaryOnly = false,
+    includeTargetReplicas,
+  } = options;
   try {
-    const response = await apiClient.post(`/serve/status`, {
+    const requestBody = {
       service_names: serviceNames,
       summary_only: summaryOnly,
-    });
+    };
+    if (includeTargetReplicas !== undefined) {
+      requestBody.include_target_num_replicas = includeTargetReplicas;
+    }
+    const response = await apiClient.post(`/serve/status`, requestBody);
     if (!response.ok) {
       const msg = `Initial API request to get services failed with status ${response.status}`;
       throw new Error(msg);

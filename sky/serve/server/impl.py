@@ -1447,6 +1447,7 @@ class _DefaultServiceStatusRunner:
         service_names: Optional[List[str]],
         pool: bool,
         summary_only: bool = False,
+        include_target_num_replicas: Optional[bool] = None,
     ) -> List[Dict[str, Any]]:
         noun = 'pool' if pool else 'service'
         use_legacy = not handle.is_grpc_enabled_with_flag
@@ -1455,7 +1456,11 @@ class _DefaultServiceStatusRunner:
         if not use_legacy:
             try:
                 service_records = serve_rpc_utils.RpcRunner.get_service_status(
-                    handle, service_names, pool, summary_only=summary_only)
+                    handle,
+                    service_names,
+                    pool,
+                    summary_only=summary_only,
+                    include_target_num_replicas=include_target_num_replicas)
             except exceptions.SkyletMethodNotImplementedError:
                 use_legacy = True
 
@@ -1464,7 +1469,10 @@ class _DefaultServiceStatusRunner:
             assert isinstance(backend, backends.CloudVmRayBackend)
 
             code = serve_utils.ServeCodeGen.get_service_status(
-                service_names, pool=pool, summary_only=summary_only)
+                service_names,
+                pool=pool,
+                summary_only=summary_only,
+                include_target_num_replicas=include_target_num_replicas)
             returncode, serve_status_payload, stderr = backend.run_on_head(
                 handle,
                 code,
@@ -1491,12 +1499,14 @@ def status(
     service_names: Optional[Union[str, List[str]]] = None,
     pool: bool = False,
     summary_only: bool = False,
+    include_target_num_replicas: Optional[bool] = None,
 ) -> List[Dict[str, Any]]:
     """Gets statuses of services or pools.
 
     summary_only skips per-replica info (returns replica_status_counts
-    instead) — the cheap path for dashboard list/header rendering at
-    fleet scale.
+    instead). `include_target_num_replicas` can opt summaries back into
+    autoscaler target fetches; when omitted, full status keeps target counts
+    while summary-only requests stay on the cheap DB-only path.
     """
     noun = 'pool' if pool else 'service'
     if service_names is not None:
@@ -1522,7 +1532,8 @@ def status(
         handle=handle,
         service_names=service_names,
         pool=pool,
-        summary_only=summary_only)
+        summary_only=summary_only,
+        include_target_num_replicas=include_target_num_replicas)
 
     # Get the endpoint for each service
     for service_record in service_records:

@@ -792,6 +792,10 @@ class ServeStatusBody(RequestBody):
     # Skip per-replica info; return cheap replica_status_counts instead.
     # Used by the dashboard for fast list/header rendering at fleet scale.
     summary_only: bool = False
+    # Optional override for target_num_replicas. If unset, the server keeps
+    # full status behavior (include targets) but leaves summary-only requests
+    # on the cheap DB-only path.
+    include_target_num_replicas: Optional[bool] = None
 
 
 class RealtimeGpuAvailabilityRequestBody(RequestBody):

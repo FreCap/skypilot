@@ -50,6 +50,7 @@ class ServiceStatusRunner(Protocol):
         service_names: Optional[List[str]],
         pool: bool,
         summary_only: bool = False,
+        include_target_num_replicas: Optional[bool] = None,
     ) -> List[Dict[str, Any]]:
         ...
 

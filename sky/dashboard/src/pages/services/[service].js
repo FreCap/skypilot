@@ -44,7 +44,13 @@ function useServiceDetails({ serviceName }) {
     // left behind.
     let fullLanded = false;
     const summaryPromise = dashboardCache
-      .get(getServices, [{ serviceNames: [serviceName], summaryOnly: true }])
+      .get(getServices, [
+        {
+          serviceNames: [serviceName],
+          summaryOnly: true,
+          includeTargetReplicas: true,
+        },
+      ])
       .then(({ services }) => {
         if (fullLanded) return;
         const found = (services || []).find((s) => s.name === serviceName);

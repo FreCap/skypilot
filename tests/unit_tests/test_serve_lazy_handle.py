@@ -13,9 +13,11 @@ Coverage:
 4. ``_format_replica_table`` prefers pre-computed fields and falls back to
    computing from the handle when those are absent (old server).
 """
+# pylint: disable=protected-access
 import base64
 import contextvars
 import pickle
+import threading
 import time
 from typing import List, Optional
 from unittest import mock
@@ -60,6 +62,7 @@ def _make_replica_info(replica_id=1, cluster_name='r-1'):
 
 
 class TestToInfoDictPreComputedFields:
+    """ReplicaInfo serialization should precompute lightweight fields."""
 
     def test_populates_strings_when_handle_present(self):
         """Even with ``with_handle=False`` the small string fields are set
@@ -425,24 +428,29 @@ class TestGetServiceStatusPickledParallel:
         m.assert_not_called()
 
     def test_runs_concurrently_not_serial(self):
-        """Workers run in parallel: 4 services each sleeping 100ms must
-        finish in well under the 400ms serial bound. Tolerant threshold
-        (200ms) avoids flakes on slow CI but still proves parallelism."""
+        """Workers run in parallel: all four calls must reach a barrier
+        together before they can continue.
+
+        A serial implementation would strand the first call on the barrier
+        and time out instead of letting all four proceed.
+        """
+
+        barrier = threading.Barrier(4)
 
         def slow(name, pool, *, with_replica_info, with_replica_counts):
             del pool, with_replica_info, with_replica_counts
+            try:
+                barrier.wait(timeout=2)
+            except threading.BrokenBarrierError as e:
+                raise AssertionError('expected parallel execution') from e
             time.sleep(0.1)
             return self._fake_status(name)
 
         with mock.patch('sky.serve.serve_utils._get_service_status',
                         side_effect=slow):
-            t0 = time.perf_counter()
             out = serve_utils.get_service_status_pickled(
                 ['s1', 's2', 's3', 's4'], pool=False)
-            elapsed = time.perf_counter() - t0
         assert len(out) == 4
-        # Serial would be ~0.4s; parallel with 4 workers should be ~0.1s.
-        assert elapsed < 0.25, f'expected parallel execution, took {elapsed:.2f}s'
 
     def test_contextvars_propagated(self):
         """request_id / user_id contextvars must be visible inside worker

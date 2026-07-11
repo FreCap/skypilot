@@ -438,7 +438,9 @@ POD_NAMESPACE_ENV_VAR = 'SKYPILOT_POD_NAMESPACE'
 # v5.0 - Added pool argument to stream_serve_process_logs & stream_replica_logs.
 # v6.0 - Added summary_only argument to get_service_status (cheap dashboard
 #        summaries: replica_status_counts instead of full replica_info).
-SERVE_VERSION = 6
+# v7.0 - Added include_target_num_replicas override so summary-only callers
+#        can skip per-service autoscaler HTTP fetches unless they render it.
+SERVE_VERSION = 7
 
 TERMINATE_REPLICA_VERSION_MISMATCH_ERROR = (
     'The version of service is outdated and does not support manually '

@@ -25,14 +25,16 @@ class ServiceStatus(_message.Message):
     def __init__(self, status: _Optional[_Mapping[str, str]] = ...) -> None: ...
 
 class GetServiceStatusRequest(_message.Message):
-    __slots__ = ("service_names", "pool", "summary_only")
+    __slots__ = ("service_names", "pool", "summary_only", "include_target_num_replicas")
     SERVICE_NAMES_FIELD_NUMBER: _ClassVar[int]
     POOL_FIELD_NUMBER: _ClassVar[int]
     SUMMARY_ONLY_FIELD_NUMBER: _ClassVar[int]
+    INCLUDE_TARGET_NUM_REPLICAS_FIELD_NUMBER: _ClassVar[int]
     service_names: ServiceNames
     pool: bool
     summary_only: bool
-    def __init__(self, service_names: _Optional[_Union[ServiceNames, _Mapping]] = ..., pool: bool = ..., summary_only: bool = ...) -> None: ...
+    include_target_num_replicas: bool
+    def __init__(self, service_names: _Optional[_Union[ServiceNames, _Mapping]] = ..., pool: bool = ..., summary_only: bool = ..., include_target_num_replicas: bool = ...) -> None: ...
 
 class GetServiceStatusResponse(_message.Message):
     __slots__ = ("statuses",)

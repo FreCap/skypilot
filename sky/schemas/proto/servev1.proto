@@ -32,6 +32,9 @@ message GetServiceStatusRequest {
     // skylets ignore this field and return the full payload (graceful
     // degradation).
     bool summary_only = 3;
+    // Optional override for target_num_replicas. Unset keeps full status
+    // behavior but lets summary-only callers stay on the cheap DB-only path.
+    optional bool include_target_num_replicas = 4;
 }
 
 message GetServiceStatusResponse {
