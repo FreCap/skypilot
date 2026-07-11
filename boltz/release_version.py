@@ -3,8 +3,8 @@
 
 The source tree intentionally keeps ``sky.__version__`` at the release-series
 version (1.1.0).  Published image and chart versions use a patch number derived
-from Git history instead: every release-relevant commit on the ref's
-first-parent history after the epoch advances the patch once.
+from Git history instead: every commit on the integration branch's first-parent
+history after the epoch advances the patch once.
 """
 
 import argparse
@@ -14,23 +14,11 @@ import sys
 import typing
 
 VERSION_PREFIX = '1.1'
-EPOCH_COMMIT = '67cf7a5f0e3e5cc7247a3fb213d58012a8f23bf0'
+# v1.1.19 is the last release from the legacy path-filtered counter. From this
+# point forward, every first-parent commit consumes exactly one patch version.
+EPOCH_COMMIT = '931e89d768075bc58773cd97e25cec9e4aaa032a'
+EPOCH_PATCH = 19
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-
-# Union of the paths that can trigger the Boltz image and chart publishers.
-# Keep this aligned with the workflow path filter when release inputs change.
-RELEASE_PATHS = (
-    '.github/workflows/boltz-chart-publish.yml',
-    '.github/workflows/boltz-overlay-publish.yml',
-    'MANIFEST.in',
-    'README.md',
-    'boltz/**',
-    'charts/**',
-    'pyproject.toml',
-    'setup.py',
-    'sky/**',
-    'sky_templates/**',
-)
 
 
 class ReleaseVersionError(RuntimeError):
@@ -60,12 +48,12 @@ def _resolve_commit(repo_root: pathlib.Path, ref: str) -> str:
     return result.stdout.strip()
 
 
-def calculate_release_version(
-        ref: str = 'HEAD',
-        *,
-        repo_root: typing.Union[str, pathlib.Path] = REPO_ROOT,
-        epoch_commit: str = EPOCH_COMMIT,
-        release_paths: typing.Sequence[str] = RELEASE_PATHS) -> str:
+def calculate_release_version(ref: str = 'HEAD',
+                              *,
+                              repo_root: typing.Union[str,
+                                                      pathlib.Path] = REPO_ROOT,
+                              epoch_commit: str = EPOCH_COMMIT,
+                              epoch_patch: int = EPOCH_PATCH) -> str:
     """Return the deterministic ``1.1.N`` artifact version for ``ref``."""
     root = pathlib.Path(repo_root)
     resolved_epoch = _resolve_commit(root, epoch_commit)
@@ -90,10 +78,9 @@ def calculate_release_version(
             f' (git exited {ancestry.returncode}){detail}')
 
     count = _run_git(root, 'rev-list', '--first-parent', '--count',
-                     f'{resolved_epoch}..{resolved_ref}', '--',
-                     *release_paths).stdout.strip()
+                     f'{resolved_epoch}..{resolved_ref}').stdout.strip()
     try:
-        patch = int(count)
+        patch = epoch_patch + int(count)
     except ValueError as exc:
         raise ReleaseVersionError(
             f'Git returned an invalid release commit count: {count!r}') from exc

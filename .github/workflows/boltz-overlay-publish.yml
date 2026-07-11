@@ -2,7 +2,7 @@ name: Publish boltz overlay image
 
 # Builds the boltz image (the full fork wheel plus a freshly built dashboard,
 # installed on the pinned upstream runtime) and pushes it to the gitops-hub
-# ECR. Each relevant improvements commit has one deterministic patch version;
+# ECR. Each improvements commit has one deterministic patch version;
 # source provenance remains in the OCI revision label and sky.__commit__.
 #
 # One-time setup to enable pushes: create an OIDC role in the gitops-hub account
@@ -15,19 +15,6 @@ name: Publish boltz overlay image
 on:
   push:
     branches: [improvements]
-    # Keep this union in sync with boltz/release_version.py. Application and
-    # chart changes are one release family and must never publish separately.
-    paths:
-      - 'sky/**'
-      - 'sky_templates/**'
-      - 'charts/**'
-      - 'boltz/**'
-      - 'setup.py'
-      - 'pyproject.toml'
-      - 'MANIFEST.in'
-      - 'README.md'
-      - '.github/workflows/boltz-overlay-publish.yml'
-      - '.github/workflows/boltz-chart-publish.yml'
   workflow_dispatch: {}
 
 # Do not let two improvements releases race on the moving tag or registry

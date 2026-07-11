@@ -14,15 +14,16 @@ deploy).
 - **Build/verify locally:** `./boltz/build-overlay.sh` (add `PUSH=true TAG=<ref>` to push). Requires
   **node/npm (Node 20+)** for the dashboard build, e.g. `mise x node@24 -- ./boltz/build-overlay.sh`.
 - **Publish:** `.github/workflows/boltz-overlay-publish.yml` computes the next deterministic patch
-  release for each relevant `improvements` merge and publishes the image as that exact version
+  release for every `improvements` merge and publishes the image as that exact version
   (for example, `1.1.1`). The chart publisher follows the successful image run and publishes the
   same version before marking it with a Git tag. Commit identity stays in artifact metadata.
 - **Consume:** the platform repo pins one release version and derives both the chart and image from
   it in the skypilot-control-plane terragrunt.
 
 The upstream nightly tag is only a runtime dependency. `boltz/release_version.py` derives the
-release patch from relevant first-parent merges after the `1.1.0` epoch. The publisher stamps that
-version consistently into Python metadata, CLI/API/dashboard output, the image, and the chart.
+release patch from every first-parent commit after the recorded `1.1.19` epoch. The publisher
+stamps that version consistently into Python metadata, CLI/API/dashboard output, the image, and the
+chart.
 
 ### Enabling pushes (one-time)
 
