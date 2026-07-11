@@ -53,21 +53,22 @@ def _git_repo(tmp_path: pathlib.Path):
 def _version(repo: pathlib.Path, epoch: str, ref: str = 'HEAD') -> str:
     return release_version.calculate_release_version(ref,
                                                      repo_root=repo,
-                                                     epoch_commit=epoch)
+                                                     epoch_commit=epoch,
+                                                     epoch_patch=0)
 
 
-def test_counts_only_release_paths_on_first_parent(git_repo):
+def test_counts_every_first_parent_commit(git_repo):
     repo, _, epoch, _ = git_repo
 
     _commit(repo, 'tests/unit_tests/test_unrelated.py', 'irrelevant\n',
             'test-only change')
-    assert _version(repo, epoch) == '1.1.0'
-
-    _commit(repo, 'boltz/build-overlay.sh', 'image input\n', 'image change')
     assert _version(repo, epoch) == '1.1.1'
 
-    _commit(repo, 'charts/skypilot/Chart.yaml', 'chart input\n', 'chart change')
+    _commit(repo, 'boltz/build-overlay.sh', 'image input\n', 'image change')
     assert _version(repo, epoch) == '1.1.2'
+
+    _commit(repo, 'charts/skypilot/Chart.yaml', 'chart input\n', 'chart change')
+    assert _version(repo, epoch) == '1.1.3'
 
 
 def test_feature_commit_and_merge_have_same_version(git_repo):
@@ -84,6 +85,20 @@ def test_feature_commit_and_merge_have_same_version(git_repo):
     merge_commit = _git(repo, 'rev-parse', 'HEAD')
 
     assert _version(repo, epoch, merge_commit) == '1.1.1'
+
+
+def test_continues_from_epoch_patch(git_repo):
+    repo, _, epoch, _ = git_repo
+
+    assert release_version.calculate_release_version('HEAD',
+                                                     repo_root=repo,
+                                                     epoch_commit=epoch,
+                                                     epoch_patch=19) == '1.1.19'
+    _commit(repo, 'docs/release.md', 'merged\n', 'next merge')
+    assert release_version.calculate_release_version('HEAD',
+                                                     repo_root=repo,
+                                                     epoch_commit=epoch,
+                                                     epoch_patch=19) == '1.1.20'
 
 
 def test_rejects_ref_before_epoch(git_repo):
