@@ -6,6 +6,7 @@ gpu_type is expensive (cluster handle fetch + endpoint query), so both must
 be resolved at most once per replica lifetime and cached; the cache must be
 pruned when a replica leaves the ready set.
 """
+# pylint: disable=missing-class-docstring,protected-access
 import asyncio
 import threading
 import types
@@ -87,6 +88,8 @@ def _make_controller() -> controller.SkyServeController:
     ctrl._service_name = 'svc'  # pylint: disable=protected-access
     ctrl._lb_replica_cache = {}  # pylint: disable=protected-access
     ctrl._lb_translation_cache = {}  # pylint: disable=protected-access
+    ctrl._routing_spec = None  # pylint: disable=protected-access
+    ctrl._reserved_capacity_fill_enabled = False  # pylint: disable=protected-access
     return ctrl
 
 
@@ -113,7 +116,7 @@ class TestGetRoutingSpec:
     """The load_balancer_sync response ships the routing config so a running
     external LB picks up `sky serve update` changes without a re-roll."""
 
-    def test_routing_spec_sourced_from_latest_version_spec(self):
+    def test_routing_spec_sourced_from_controller_memory(self):
         ctrl = _make_controller()
         spec = _FakeSpec(load_balancing_policy='instance_aware_least_load',
                          target_qps_per_replica={'L4': 2.5},
@@ -121,15 +124,8 @@ class TestGetRoutingSpec:
                          lb_retriable_status_codes=[503],
                          lb_max_retries=3,
                          lb_retry_initial_backoff_seconds=0.5)
-        with mock.patch.object(controller.serve_state,
-                               'get_service_from_name',
-                               return_value={'version': 7}), \
-             mock.patch.object(controller.serve_state,
-                               'get_spec',
-                               return_value=spec) as get_spec:
-            routing_spec = ctrl._get_routing_spec()  # pylint: disable=protected-access
-        # Sourced from the latest (current) version's spec.
-        get_spec.assert_called_once_with('svc', 7)
+        ctrl._routing_spec = ctrl._build_routing_spec(spec)  # pylint: disable=protected-access
+        routing_spec = ctrl._get_routing_spec()  # pylint: disable=protected-access
         assert routing_spec == {
             'load_balancing_policy_name': 'instance_aware_least_load',
             'target_qps_per_replica': {
@@ -143,15 +139,89 @@ class TestGetRoutingSpec:
             'retry_initial_backoff_seconds': 0.5,
         }
 
-    def test_routing_spec_none_when_spec_unavailable(self):
+    def test_routing_spec_repeated_calls_do_not_hit_db(self):
         ctrl = _make_controller()
+        ctrl._routing_spec = ctrl._build_routing_spec(  # pylint: disable=protected-access
+            _FakeSpec(load_balancing_policy='round_robin',
+                      target_qps_per_replica=None,
+                      lb_stream_timeout_seconds=30))
+        with mock.patch.object(controller.serve_state,
+                               'get_service_from_name') as get_service, \
+             mock.patch.object(controller.serve_state, 'get_spec') as get_spec:
+            assert ctrl._get_routing_spec() is not None  # pylint: disable=protected-access
+            assert ctrl._get_routing_spec() is not None  # pylint: disable=protected-access
+        get_service.assert_not_called()
+        get_spec.assert_not_called()
+
+    def test_routing_spec_none_when_uninitialized(self):
+        ctrl = _make_controller()
+        assert ctrl._get_routing_spec() is None  # pylint: disable=protected-access
+
+    def test_apply_service_update_keeps_old_spec_until_runtime_transition(self):
+        ctrl = _make_controller()
+        old_spec = _FakeSpec(load_balancing_policy='round_robin',
+                             target_qps_per_replica=None,
+                             lb_stream_timeout_seconds=30)
+        new_spec = _FakeSpec(load_balancing_policy='instance_aware_least_load',
+                             target_qps_per_replica={'L4': 2.5},
+                             lb_stream_timeout_seconds=90)
+        ctrl._routing_spec = ctrl._build_routing_spec(old_spec)  # pylint: disable=protected-access
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._autoscaler = mock.MagicMock()  # pylint: disable=protected-access
+        ctrl._seed_fill_zero_cost_locations = mock.Mock()  # pylint: disable=protected-access
+        ctrl._start_reserved_capacity_poller_if_needed = mock.Mock()  # pylint: disable=protected-access
+
+        entered_runtime_transition = threading.Event()
+        resume_runtime_transition = threading.Event()
+
+        def _block_runtime_transition(*_args, **_kwargs):
+            entered_runtime_transition.set()
+            assert resume_runtime_transition.wait(timeout=5)
+
+        ctrl._replica_manager.update_version.side_effect = (  # pylint: disable=protected-access
+            _block_runtime_transition)
+
+        new_autoscaler = mock.MagicMock()
         with mock.patch.object(controller.serve_state,
                                'get_service_from_name',
-                               return_value={'version': 3}), \
+                               return_value={'version': 2}), \
              mock.patch.object(controller.serve_state,
                                'get_spec',
-                               return_value=None):
-            assert ctrl._get_routing_spec() is None  # pylint: disable=protected-access
+                               return_value=new_spec), \
+             mock.patch.object(controller.autoscalers.Autoscaler,
+                               'from_spec',
+                               return_value=new_autoscaler):
+            updater = threading.Thread(target=ctrl._apply_service_update,
+                                       args=(2, new_spec, mock.sentinel.mode))
+            updater.start()
+            assert entered_runtime_transition.wait(timeout=5)
+            # The DB already points at the new version, but the controller has
+            # not finished applying it locally yet. Syncs must keep serving the
+            # old routing spec until the runtime transition completes.
+            assert ctrl._get_routing_spec() == {  # pylint: disable=protected-access
+                'load_balancing_policy_name': 'round_robin',
+                'target_qps_per_replica': None,
+                'target_concurrency_per_replica': None,
+                'stream_timeout_seconds': 30,
+                'retriable_status_codes': None,
+                'max_retries': None,
+                'retry_initial_backoff_seconds': None,
+            }
+            resume_runtime_transition.set()
+            updater.join(timeout=5)
+
+        assert not updater.is_alive()
+        assert ctrl._get_routing_spec() == {  # pylint: disable=protected-access
+            'load_balancing_policy_name': 'instance_aware_least_load',
+            'target_qps_per_replica': {
+                'L4': 2.5
+            },
+            'target_concurrency_per_replica': None,
+            'stream_timeout_seconds': 90,
+            'retriable_status_codes': None,
+            'max_retries': None,
+            'retry_initial_backoff_seconds': None,
+        }
 
 
 def _sync_full(ctrl: controller.SkyServeController, infos,
