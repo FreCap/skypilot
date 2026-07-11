@@ -1211,46 +1211,14 @@ def get_jobs_to_check_status(job_id: Optional[int] = None) -> List[int]:
     - Jobs have schedule_state DONE but are in a non-terminal status
     - Legacy jobs (that is, no schedule state) that are in non-terminal status
     """
+    where_condition = _get_jobs_to_check_status_condition(job_id)
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
-        terminal_status_values = [
-            status.value for status in ManagedJobStatus.terminal_statuses()
-        ]
-
         query = sqlalchemy.select(
             spot_table.c.spot_job_id.distinct()).select_from(
                 spot_table.outerjoin(
                     job_info_table,
                     spot_table.c.spot_job_id == job_info_table.c.spot_job_id))
-
-        # Get jobs that are either:
-        # 1. Have schedule state that is not DONE, or
-        # 2. Have schedule state DONE AND are in non-terminal status (unexpected
-        #    inconsistent state), or
-        # 3. Have no schedule state (legacy) AND are in non-terminal status
-
-        # non-legacy jobs that are not DONE
-        condition1 = sqlalchemy.and_(
-            job_info_table.c.schedule_state.is_not(None),
-            job_info_table.c.schedule_state !=
-            ManagedJobScheduleState.DONE.value)
-        # legacy or that are in non-terminal status or
-        # DONE jobs that are in non-terminal status
-        condition2 = sqlalchemy.and_(
-            sqlalchemy.or_(
-                # legacy jobs
-                job_info_table.c.schedule_state.is_(None),
-                # non-legacy DONE jobs
-                job_info_table.c.schedule_state ==
-                ManagedJobScheduleState.DONE.value),
-            # non-terminal
-            ~spot_table.c.status.in_(terminal_status_values),
-        )
-        where_condition = sqlalchemy.or_(condition1, condition2)
-        if job_id is not None:
-            where_condition = sqlalchemy.and_(
-                where_condition, spot_table.c.spot_job_id == job_id)
-
         query = query.where(where_condition).order_by(
             spot_table.c.spot_job_id.desc())
 
@@ -1463,6 +1431,110 @@ def get_managed_job_tasks(job_id: int) -> List[Dict[str, Any]]:
 _STATUS_CHECK_JOB_ID_CHUNK = 500
 
 
+def _get_jobs_to_check_status_condition(job_id: Optional[int] = None):
+    """Build the filter for jobs that need controller-process checking."""
+    terminal_status_values = [
+        status.value for status in ManagedJobStatus.terminal_statuses()
+    ]
+
+    # Get jobs that are either:
+    # 1. Have schedule state that is not DONE, or
+    # 2. Have schedule state DONE AND are in non-terminal status (unexpected
+    #    inconsistent state), or
+    # 3. Have no schedule state (legacy) AND are in non-terminal status
+    condition1 = sqlalchemy.and_(
+        job_info_table.c.schedule_state.is_not(None),
+        job_info_table.c.schedule_state != ManagedJobScheduleState.DONE.value)
+    condition2 = sqlalchemy.and_(
+        sqlalchemy.or_(
+            job_info_table.c.schedule_state.is_(None),
+            job_info_table.c.schedule_state ==
+            ManagedJobScheduleState.DONE.value),
+        ~spot_table.c.status.in_(terminal_status_values),
+    )
+    where_condition = sqlalchemy.or_(condition1, condition2)
+    if job_id is not None:
+        where_condition = sqlalchemy.and_(where_condition,
+                                          spot_table.c.spot_job_id == job_id)
+    return where_condition
+
+
+def _merge_jobs_status_check_rows(result: Dict[int, Dict[str, Any]],
+                                  rows: List[Any]) -> None:
+    """Decode slim status-check rows into the per-job refresh snapshot."""
+    for row in rows:
+        mapping = row._mapping  # pylint: disable=protected-access
+        job_id = mapping['spot_job_id']
+        info = result.get(job_id)
+        # WARNING: Keep this decode (enum conversion + job_name fallback)
+        # in sync with get_managed_job_tasks.
+        if info is None:
+            info = {
+                'schedule_state': ManagedJobScheduleState(
+                    mapping['schedule_state']),
+                'controller_pid': mapping['controller_pid'],
+                'controller_pid_started_at':
+                    mapping['controller_pid_started_at'],
+                'pool': mapping['pool'],
+                'tasks': [],
+            }
+            result[job_id] = info
+        job_name = mapping['job_info_name']
+        if job_name is None:
+            job_name = mapping['task_name']
+        info['tasks'].append({
+            'task_id': mapping['task_id'],
+            'status': ManagedJobStatus(mapping['status']),
+            'job_name': job_name,
+            'task_name': mapping['task_name'],
+        })
+
+
+def get_jobs_to_check_status_info(
+        job_id: Optional[int] = None) -> Dict[int, Dict[str, Any]]:
+    """One-query slim snapshot for jobs needing controller-process checking.
+
+    The status-refresh sweep needs two things from the same tables:
+    1. identify which jobs require checking; and
+    2. fetch the slim per-task fields it actually consumes.
+
+    The old path did those as two round trips. This helper keeps the same
+    per-job/per-task shape as ``get_jobs_status_check_info`` but does the
+    "which jobs?" filter in a subquery and returns the full slim snapshot in
+    one SQL statement.
+    """
+    engine = _db_manager.get_engine()
+    jobs_to_check = sqlalchemy.select(
+        spot_table.c.spot_job_id.label('spot_job_id')).select_from(
+            spot_table.outerjoin(
+                job_info_table,
+                spot_table.c.spot_job_id == job_info_table.c.spot_job_id)
+        ).where(
+            _get_jobs_to_check_status_condition(job_id)).distinct().subquery()
+    query = sqlalchemy.select(
+        spot_table.c.spot_job_id,
+        spot_table.c.task_id,
+        spot_table.c.status,
+        spot_table.c.task_name,
+        job_info_table.c.name.label('job_info_name'),
+        job_info_table.c.schedule_state,
+        job_info_table.c.controller_pid,
+        job_info_table.c.controller_pid_started_at,
+        job_info_table.c.pool,
+    ).select_from(
+        spot_table.outerjoin(
+            job_info_table,
+            spot_table.c.spot_job_id == job_info_table.c.spot_job_id).join(
+                jobs_to_check, spot_table.c.spot_job_id ==
+                jobs_to_check.c.spot_job_id)).order_by(
+                    spot_table.c.spot_job_id.desc(), spot_table.c.task_id.asc())
+    with orm.Session(engine) as session:
+        rows = session.execute(query).fetchall()
+    result: Dict[int, Dict[str, Any]] = {}
+    _merge_jobs_status_check_rows(result, rows)
+    return result
+
+
 def get_jobs_status_check_info(job_ids: List[int]) -> Dict[int, Dict[str, Any]]:
     """Batched, slim fetch of the fields the status-refresh tick needs.
 
@@ -1511,32 +1583,7 @@ def get_jobs_status_check_info(job_ids: List[int]) -> Dict[int, Dict[str, Any]]:
                         spot_table.c.task_id.asc())
         with orm.Session(engine) as session:
             rows = session.execute(query).fetchall()
-        for row in rows:
-            mapping = row._mapping  # pylint: disable=protected-access
-            job_id = mapping['spot_job_id']
-            info = result.get(job_id)
-            # WARNING: Keep this decode (enum conversion + job_name fallback)
-            # in sync with get_managed_job_tasks.
-            if info is None:
-                info = {
-                    'schedule_state': ManagedJobScheduleState(
-                        mapping['schedule_state']),
-                    'controller_pid': mapping['controller_pid'],
-                    'controller_pid_started_at':
-                        mapping['controller_pid_started_at'],
-                    'pool': mapping['pool'],
-                    'tasks': [],
-                }
-                result[job_id] = info
-            job_name = mapping['job_info_name']
-            if job_name is None:
-                job_name = mapping['task_name']
-            info['tasks'].append({
-                'task_id': mapping['task_id'],
-                'status': ManagedJobStatus(mapping['status']),
-                'job_name': job_name,
-                'task_name': mapping['task_name'],
-            })
+        _merge_jobs_status_check_rows(result, rows)
     return result
 
 

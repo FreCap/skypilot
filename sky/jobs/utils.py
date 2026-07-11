@@ -644,8 +644,8 @@ def update_managed_jobs_statuses(job_id: Optional[int] = None):
         capture the error message, and log/return it.
 
         ``tasks`` is the launch-identity snapshot already fetched by
-        ``get_jobs_status_check_info``. Reusing it avoids a second task join on
-        the failure path and keeps cleanup keyed off ``task_name``, which is
+        ``get_jobs_to_check_status_info``. Reusing it avoids a second task join
+        on the failure path and keeps cleanup keyed off ``task_name``, which is
         what the controller uses to name task clusters.
         """
         error_msg = None
@@ -668,31 +668,21 @@ def update_managed_jobs_statuses(job_id: Optional[int] = None):
                     logger.exception(error_msg, exc_info=e)
         return error_msg
 
-    # Get jobs that need checking (non-terminal or not DONE)
-    job_ids = managed_job_state.get_jobs_to_check_status(job_id)
-    if not job_ids:
+    # Fetch the jobs that need checking together with the small per-job fields
+    # the loop consumes. This keeps the refresh tick on a single slim query
+    # instead of a filtered job-id query followed by a second detail query.
+    jobs_info = managed_job_state.get_jobs_to_check_status_info(job_id)
+    if not jobs_info:
         # job_id is already terminal, or if job_id is None, there are no jobs
         # that need to be checked.
         return
 
-    # Fetch the small per-job fields the loop needs for ALL jobs in one slim
-    # query instead of a heavyweight get_managed_job_tasks() join per job (a
-    # 1+N pattern that pulled large YAML/metadata blobs + json.loads on every
-    # refresh tick -- this sweep runs from ManagedJobEvent, i.e. roughly every
-    # EVENT_INTERVAL_SECONDS=300s).
-    jobs_info = managed_job_state.get_jobs_status_check_info(job_ids)
-    for job_id in job_ids:
-        assert job_id is not None
-        info = jobs_info.get(job_id)
-        if info is None:
-            # No task rows for this job (e.g. it was removed between
-            # get_jobs_to_check_status and now); nothing to check.
-            continue
+    for job_id, info in jobs_info.items():
         tasks = info['tasks']
         # Note: controller_pid and schedule_state are in the job_info table
         # which is joined to the spot table, so all tasks with the same job_id
-        # share these columns. get_jobs_status_check_info returns them once per
-        # job.
+        # share these columns. get_jobs_to_check_status_info returns them once
+        # per job.
         schedule_state = info['schedule_state']
 
         # Handle jobs with schedule state (non-legacy jobs):
@@ -700,16 +690,15 @@ def update_managed_jobs_statuses(job_id: Optional[int] = None):
         pid_started_at = info['controller_pid_started_at']
         if schedule_state == managed_job_state.ManagedJobScheduleState.DONE:
             # There are two cases where we could get a job that is DONE.
-            # 1. At query time (get_jobs_to_check_status), the job was not yet
-            #    DONE, but since then it has hit a terminal status, marked
-            #    itself done, and exited.
-            #    This is fine.
+            # 1. At snapshot time (get_jobs_to_check_status_info), the job was
+            #    not yet DONE, but since then it has hit a terminal status,
+            #    marked itself done, and exited. This is fine.
             # 2. The job is DONE, but in a non-terminal status. This is
             #    unexpected. For instance, the task status is RUNNING, but the
             #    job schedule_state is DONE.
             if all(task['status'].is_terminal() for task in tasks):
                 # Turns out this job is fine, even though it got pulled by
-                # get_jobs_to_check_status. Probably case #1 above.
+                # get_jobs_to_check_status_info. Probably case #1 above.
                 continue
 
             logger.error(f'Job {job_id} has DONE schedule state, but some '
