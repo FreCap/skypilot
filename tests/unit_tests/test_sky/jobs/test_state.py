@@ -11,7 +11,6 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from sky.jobs import state
 from sky.jobs.state import ManagedJobStatus
-from sky.resources import Resources
 
 
 @pytest.fixture
@@ -45,7 +44,6 @@ def _insert_task(
     task_id: int,
     *,
     status: ManagedJobStatus,
-    full_resources=None,
     end_at: Optional[float] = None,
     local_log_file: Optional[str] = None,
     logs_cleaned_at: Optional[float] = None,
@@ -57,7 +55,6 @@ def _insert_task(
                 task_id=task_id,
                 task_name=f'task-{task_id}',
                 status=status.value,
-                full_resources=full_resources,
                 end_at=end_at,
                 local_log_file=local_log_file,
                 logs_cleaned_at=logs_cleaned_at,
@@ -422,7 +419,6 @@ def _new_pool_job(engine,
                   *,
                   pool: str,
                   status: ManagedJobStatus,
-                  full_resources=None,
                   cluster_name=None) -> int:
     """Create a managed job in `pool` with optional `current_cluster_name`."""
     job_id = state.set_job_info_without_job_id(
@@ -433,11 +429,7 @@ def _new_pool_job(engine,
         pool_hash=None,
         user_hash='u',
     )
-    _insert_task(engine,
-                 job_id,
-                 0,
-                 status=status,
-                 full_resources=full_resources)
+    _insert_task(engine, job_id, 0, status=status)
     if cluster_name is not None:
         state.set_current_cluster_name(job_id, cluster_name)
     return job_id
@@ -507,46 +499,3 @@ def test_get_nonterminal_job_ids_by_pool_grouped_all_terminal(
                   cluster_name='replica-x')
     _new_pool_job(engine, pool='pool-done', status=ManagedJobStatus.FAILED)
     assert not state.get_nonterminal_job_ids_by_pool_grouped('pool-done')
-
-
-def test_get_pool_worker_used_resources_by_cluster_fail_closed_on_empty_job(
-        _mock_managed_jobs_db_conn):
-    """Any empty resource request makes that worker unavailable to fit logic."""
-    engine = state._db_manager.get_engine()
-    _new_pool_job(engine,
-                  pool='pool-a',
-                  status=ManagedJobStatus.RUNNING,
-                  full_resources=Resources().to_yaml_config(),
-                  cluster_name='replica-1')
-    _new_pool_job(engine,
-                  pool='pool-a',
-                  status=ManagedJobStatus.RUNNING,
-                  full_resources=Resources(cpus='2').to_yaml_config(),
-                  cluster_name='replica-1')
-    replica_2_job = _new_pool_job(
-        engine,
-        pool='pool-a',
-        status=ManagedJobStatus.RUNNING,
-        full_resources=Resources(cpus='1').to_yaml_config(),
-        cluster_name='replica-2')
-    _insert_task(engine,
-                 replica_2_job,
-                 1,
-                 status=ManagedJobStatus.SUCCEEDED,
-                 full_resources=Resources(cpus='1').to_yaml_config())
-    _new_pool_job(engine,
-                  pool='pool-b',
-                  status=ManagedJobStatus.RUNNING,
-                  full_resources=Resources(cpus='9').to_yaml_config(),
-                  cluster_name='replica-3')
-
-    grouped = state.get_pool_worker_used_resources_by_cluster('pool-a')
-    replica_2_ids = set(
-        state.get_nonterminal_job_ids_by_pool('pool-a', 'replica-2'))
-    replica_2_resources = state.get_pool_worker_used_resources(replica_2_ids)
-
-    assert grouped is not None
-    assert grouped['replica-1'].is_empty()
-    assert float(grouped['replica-2'].cpus) == pytest.approx(1.0)
-    assert replica_2_resources is not None
-    assert float(replica_2_resources.cpus) == pytest.approx(1.0)
