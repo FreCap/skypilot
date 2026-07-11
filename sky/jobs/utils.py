@@ -636,32 +636,31 @@ def update_managed_jobs_statuses(job_id: Optional[int] = None):
     if _controller_is_restarting():
         return
 
-    def _cleanup_job_clusters(job_id: int) -> Optional[str]:
+    def _cleanup_job_clusters(job_id: int, tasks: List[Dict[str, Any]],
+                              pool: Optional[str]) -> Optional[str]:
         """Clean up clusters for a job. Returns error message if any.
 
         This function should not throw any exception. If it fails, it will
         capture the error message, and log/return it.
+
+        ``tasks`` is the launch-identity snapshot already fetched by
+        ``get_jobs_status_check_info``. Reusing it avoids a second task join on
+        the failure path and keeps cleanup keyed off ``task_name``, which is
+        what the controller uses to name task clusters.
         """
         error_msg = None
-        tasks = managed_job_state.get_managed_job_tasks(job_id)
+        if pool is not None:
+            return None
         for task in tasks:
-            pool = task.get('pool', None)
-            cluster_name: Optional[str] = None
-            if pool is None:
-                task_name = task['job_name']
-                cluster_name = generate_managed_job_cluster_name(
-                    task_name, job_id)
-            else:
-                cluster_name, _ = (
-                    managed_job_state.get_pool_submit_info(job_id))
+            cluster_name = generate_managed_job_cluster_name(
+                task['task_name'], job_id)
             if cluster_name is None:
                 continue
             handle = global_user_state.get_handle_from_cluster_name(
                 cluster_name)
             if handle is not None:
                 try:
-                    if pool is None:
-                        terminate_cluster(cluster_name)
+                    terminate_cluster(cluster_name)
                 except Exception as e:  # pylint: disable=broad-except
                     error_msg = (
                         f'Failed to terminate cluster {cluster_name}: '
@@ -702,8 +701,8 @@ def update_managed_jobs_statuses(job_id: Optional[int] = None):
         if schedule_state == managed_job_state.ManagedJobScheduleState.DONE:
             # There are two cases where we could get a job that is DONE.
             # 1. At query time (get_jobs_to_check_status), the job was not yet
-            #    DONE, but since then (before get_managed_job_tasks is called)
-            #    it has hit a terminal status, marked itself done, and exited.
+            #    DONE, but since then it has hit a terminal status, marked
+            #    itself done, and exited.
             #    This is fine.
             # 2. The job is DONE, but in a non-terminal status. This is
             #    unexpected. For instance, the task status is RUNNING, but the
@@ -763,19 +762,6 @@ def update_managed_jobs_statuses(job_id: Optional[int] = None):
                 # The controller is still running, so this job is fine.
                 continue
 
-            # Double check job is not already DONE before marking as failed, to
-            # avoid the race where the controller marked itself as DONE and
-            # exited between the state check and the pid check. Since the job
-            # controller process will mark itself DONE _before_ exiting, if it
-            # has exited and it's still not DONE now, it is abnormal.
-            if (managed_job_state.get_job_schedule_state(job_id) ==
-                    managed_job_state.ManagedJobScheduleState.DONE):
-                # Never mind, the job is DONE now. This is fine.
-                continue
-
-            logger.error(f'Controller process for {job_id} seems to be dead.')
-            failure_reason = 'Controller process is dead'
-
         # At this point, either pid is None or process is dead.
 
         # The judgment above was made from the batched snapshot taken before
@@ -787,8 +773,12 @@ def update_managed_jobs_statuses(job_id: Optional[int] = None):
         # confirms the exact values the judgment was based on; otherwise defer
         # to the next status-update cycle, which will re-judge the job from
         # fresh state.
-        fresh_infos = managed_job_state.get_jobs_status_check_info([job_id])
-        fresh_info = fresh_infos.get(job_id)
+        fresh_info = managed_job_state.get_job_status_check_state(job_id)
+        if (fresh_info is not None and fresh_info['schedule_state']
+                == managed_job_state.ManagedJobScheduleState.DONE):
+            # The controller marked the job done and exited between the batched
+            # snapshot and the destructive path. This is fine.
+            continue
         if (fresh_info is None or
                 fresh_info['schedule_state'] != schedule_state or
                 fresh_info['controller_pid'] != pid or
@@ -797,6 +787,10 @@ def update_managed_jobs_statuses(job_id: Optional[int] = None):
                         'changed since the status snapshot was taken; '
                         'deferring to the next status update cycle.')
             continue
+
+        if pid is not None:
+            logger.error(f'Controller process for {job_id} seems to be dead.')
+            failure_reason = 'Controller process is dead'
 
         # The controller process for this managed job is not running: it must
         # have exited abnormally, and we should set the job status to
@@ -818,7 +812,7 @@ def update_managed_jobs_statuses(job_id: Optional[int] = None):
             continue
 
         # Cleanup clusters and capture any errors.
-        cleanup_error = _cleanup_job_clusters(job_id)
+        cleanup_error = _cleanup_job_clusters(job_id, tasks, info['pool'])
         cleanup_error_msg = ''
         if cleanup_error:
             cleanup_error_msg = f'Also, cleanup failed: {cleanup_error}. '

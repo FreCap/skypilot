@@ -1,4 +1,4 @@
-"""Regression test: don't FAILED_CONTROLLER a job whose controller is restarting.
+"""Regression tests for controller-restart races in managed-job refresh.
 
 ``update_managed_jobs_statuses`` checks the controller-restart signal file once
 at the TOP, then iterates jobs and, for any whose controller pid is dead,
@@ -18,17 +18,6 @@ from sky.jobs import utils
 from sky.skylet import job_lib
 
 
-def _make_task():
-    return {
-        'schedule_state': managed_job_state.ManagedJobScheduleState.ALIVE,
-        'controller_pid': 123,
-        'controller_pid_started_at': None,
-        'status': managed_job_state.ManagedJobStatus.RUNNING,
-        'job_name': 'job',
-        'pool': None,
-    }
-
-
 def _make_status_check_info():
     """The slim per-job shape update_managed_jobs_statuses now reads."""
     return {
@@ -40,26 +29,36 @@ def _make_status_check_info():
             'tasks': [{
                 'task_id': 0,
                 'status': managed_job_state.ManagedJobStatus.RUNNING,
-                'job_name': 'job',
+                'task_name': 'job',
             }],
         }
     }
 
 
-def _wire_dead_controller(monkeypatch, set_failed_calls, job_done_calls):
+def _make_job_status_check_state(schedule_state, pid=123, started_at=None):
+    return {
+        'schedule_state': schedule_state,
+        'controller_pid': pid,
+        'controller_pid_started_at': started_at,
+    }
+
+
+def _wire_dead_controller(monkeypatch,
+                          set_failed_calls,
+                          job_done_calls,
+                          fresh_state=None):
     monkeypatch.setattr(managed_job_state,
                         'get_jobs_to_check_status',
                         lambda job_id=None: [1])
     monkeypatch.setattr(managed_job_state, 'get_jobs_status_check_info',
                         lambda job_ids: _make_status_check_info())
-    # _cleanup_job_clusters still re-fetches full task rows in this change.
-    monkeypatch.setattr(managed_job_state, 'get_managed_job_tasks',
-                        lambda job_id: [_make_task()])
+    if fresh_state is None:
+        fresh_state = _make_job_status_check_state(
+            managed_job_state.ManagedJobScheduleState.ALIVE)
+    monkeypatch.setattr(managed_job_state, 'get_job_status_check_state',
+                        lambda job_id: fresh_state)
     monkeypatch.setattr(utils, 'controller_process_alive',
                         lambda record, job_id: False)
-    monkeypatch.setattr(
-        managed_job_state, 'get_job_schedule_state',
-        lambda job_id: managed_job_state.ManagedJobScheduleState.ALIVE)
     monkeypatch.setattr(utils.global_user_state, 'get_handle_from_cluster_name',
                         lambda name: None)
     monkeypatch.setattr(managed_job_state, 'set_failed',
@@ -78,15 +77,19 @@ def test_defers_failed_controller_when_restart_begins_midcycle(monkeypatch):
 
     utils.update_managed_jobs_statuses(job_id=1)
 
-    assert set_failed_calls == [], (
+    assert not set_failed_calls, (
         'a job must not be FAILED_CONTROLLER while its controller is restarting'
     )
-    assert job_done_calls == []
+    assert not job_done_calls
 
 
 def test_marks_failed_controller_when_no_restart(monkeypatch):
     set_failed_calls, job_done_calls = [], []
     _wire_dead_controller(monkeypatch, set_failed_calls, job_done_calls)
+    monkeypatch.setattr(
+        managed_job_state, 'get_managed_job_tasks', lambda job_id:
+        (_ for _ in ()).throw(
+            AssertionError('must reuse the sweep snapshot, not refetch tasks')))
     monkeypatch.setattr(utils, '_controller_is_restarting', lambda: False)
 
     utils.update_managed_jobs_statuses(job_id=1)
@@ -110,14 +113,15 @@ def test_defers_terminal_write_when_restart_begins_during_cleanup(monkeypatch):
     monkeypatch.setattr(utils, '_controller_is_restarting', lambda: next(seq))
     cleanup_reads = []
     monkeypatch.setattr(
-        managed_job_state, 'get_managed_job_tasks',
-        lambda job_id: cleanup_reads.append(job_id) or [_make_task()])
+        utils, 'generate_managed_job_cluster_name',
+        lambda task_name, job_id: cleanup_reads.append(
+            (task_name, job_id)) or f'{task_name}-{job_id}')
 
     utils.update_managed_jobs_statuses(job_id=1)
 
-    assert cleanup_reads == [1], 'cluster cleanup should have started'
-    assert set_failed_calls == []
-    assert job_done_calls == []
+    assert cleanup_reads == [('job', 1)], 'cluster cleanup should have started'
+    assert not set_failed_calls
+    assert not job_done_calls
 
 
 def test_defers_when_job_reset_for_recovery_midcycle(monkeypatch):
@@ -129,37 +133,25 @@ def test_defers_when_job_reset_for_recovery_midcycle(monkeypatch):
     set_failed may run; the next sweep re-judges the job from fresh state.
     """
     set_failed_calls, job_done_calls = [], []
-    _wire_dead_controller(monkeypatch, set_failed_calls, job_done_calls)
-    reset_info = {
-        1: {
-            'schedule_state': managed_job_state.ManagedJobScheduleState.WAITING,
-            'controller_pid': None,
-            'controller_pid_started_at': None,
-            'pool': None,
-            'tasks': [{
-                'task_id': 0,
-                'status': managed_job_state.ManagedJobStatus.PENDING,
-                'job_name': 'job',
-            }],
-        }
-    }
-    # First call: the sweep-wide snapshot (dead controller). Second call: the
-    # fresh per-job re-read, showing the job was reset for recovery.
-    snapshots = iter([_make_status_check_info(), reset_info])
-    monkeypatch.setattr(managed_job_state, 'get_jobs_status_check_info',
-                        lambda job_ids: next(snapshots))
+    _wire_dead_controller(monkeypatch,
+                          set_failed_calls,
+                          job_done_calls,
+                          fresh_state=_make_job_status_check_state(
+                              managed_job_state.ManagedJobScheduleState.WAITING,
+                              pid=None))
     cleanup_reads = []
     monkeypatch.setattr(
-        managed_job_state, 'get_managed_job_tasks',
-        lambda job_id: cleanup_reads.append(job_id) or [_make_task()])
+        utils, 'generate_managed_job_cluster_name',
+        lambda task_name, job_id: cleanup_reads.append(
+            (task_name, job_id)) or f'{task_name}-{job_id}')
     monkeypatch.setattr(utils, '_controller_is_restarting', lambda: False)
 
     utils.update_managed_jobs_statuses(job_id=1)
 
-    assert cleanup_reads == [], (
+    assert not cleanup_reads, (
         'cluster cleanup must not start for a job reset for recovery')
-    assert set_failed_calls == []
-    assert job_done_calls == []
+    assert not set_failed_calls
+    assert not job_done_calls
 
 
 def _make_pending_status_check_info(schedule_state):
@@ -173,7 +165,7 @@ def _make_pending_status_check_info(schedule_state):
             'tasks': [{
                 'task_id': 0,
                 'status': managed_job_state.ManagedJobStatus.PENDING,
-                'job_name': 'job',
+                'task_name': 'job',
             }],
         }
     }
@@ -213,8 +205,69 @@ def test_pending_job_skips_controller_status_read(monkeypatch, schedule_state):
 
     utils.update_managed_jobs_statuses(job_id=1)
 
-    assert get_status_calls == [], (
+    assert not get_status_calls, (
         'controller status must not be read for a pid-None pending job')
-    assert set_failed_calls == [], (
+    assert not set_failed_calls, (
         'a pending (pre-controller) job must not be FAILED_CONTROLLER, even if '
         'a stale skylet status would read FAILED_SETUP')
+
+
+def test_cleanup_uses_task_name_identity_for_multi_task_jobs(monkeypatch):
+    """Cleanup must derive cluster names from task_name, not public job_name."""
+    set_failed_calls, job_done_calls = [], []
+    snapshot = {
+        1: {
+            'schedule_state': managed_job_state.ManagedJobScheduleState.ALIVE,
+            'controller_pid': 123,
+            'controller_pid_started_at': None,
+            'pool': None,
+            'tasks': [{
+                'task_id': 0,
+                'status': managed_job_state.ManagedJobStatus.SUCCEEDED,
+                'task_name': 'extract',
+            }, {
+                'task_id': 1,
+                'status': managed_job_state.ManagedJobStatus.RUNNING,
+                'task_name': 'transform',
+            }],
+        }
+    }
+    monkeypatch.setattr(managed_job_state,
+                        'get_jobs_to_check_status',
+                        lambda job_id=None: [1])
+    monkeypatch.setattr(managed_job_state, 'get_jobs_status_check_info',
+                        lambda job_ids: snapshot)
+    monkeypatch.setattr(
+        managed_job_state, 'get_job_status_check_state',
+        lambda job_id: _make_job_status_check_state(
+            managed_job_state.ManagedJobScheduleState.ALIVE))
+    monkeypatch.setattr(
+        managed_job_state, 'get_managed_job_tasks', lambda job_id: [{
+            'job_name': 'pipeline-job',
+            'task_name': 'extract',
+            'pool': None,
+        }, {
+            'job_name': 'pipeline-job',
+            'task_name': 'transform',
+            'pool': None,
+        }])
+    monkeypatch.setattr(utils, 'controller_process_alive',
+                        lambda record, job_id: False)
+    monkeypatch.setattr(utils, '_controller_is_restarting', lambda: False)
+    seen_task_names = []
+    monkeypatch.setattr(
+        utils, 'generate_managed_job_cluster_name', lambda task_name, job_id:
+        seen_task_names.append(task_name) or f'{task_name}-{job_id}')
+    monkeypatch.setattr(utils.global_user_state, 'get_handle_from_cluster_name',
+                        lambda name: object())
+    monkeypatch.setattr(utils, 'terminate_cluster', lambda cluster_name: None)
+    monkeypatch.setattr(managed_job_state, 'set_failed',
+                        lambda *a, **k: set_failed_calls.append((a, k)))
+    monkeypatch.setattr(utils.scheduler, 'job_done',
+                        lambda *a, **k: job_done_calls.append((a, k)))
+
+    utils.update_managed_jobs_statuses(job_id=1)
+
+    assert seen_task_names == ['extract', 'transform']
+    assert len(set_failed_calls) == 1
+    assert len(job_done_calls) == 1

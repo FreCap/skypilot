@@ -1469,7 +1469,7 @@ def get_jobs_status_check_info(job_ids: List[int]) -> Dict[int, Dict[str, Any]]:
     ``update_managed_jobs_statuses`` only consumes a handful of small scalar
     columns per job (the per-job ``schedule_state`` / ``controller_pid`` /
     ``controller_pid_started_at`` / ``pool`` from ``job_info``, plus each
-    task's ``status`` and resolved name from ``spot``). The old path calls
+    task's ``status`` and identity from ``spot``). The old path calls
     ``get_managed_job_tasks`` once per job -- N heavyweight ``SELECT *`` 3-way
     joins that also pull large text blobs (``dag_yaml_content`` etc.),
     ``json.loads`` the metadata, and may read YAML files, all per refresh tick.
@@ -1477,15 +1477,14 @@ def get_jobs_status_check_info(job_ids: List[int]) -> Dict[int, Dict[str, Any]]:
     ``WHERE spot_job_id IN (...)`` query (chunked).
 
     Returns a mapping ``job_id -> {schedule_state, controller_pid,
-    controller_pid_started_at, pool, tasks: [{task_id, status, job_name}]}``
+    controller_pid_started_at, pool, tasks: [{task_id, status, job_name,
+    task_name}]}``
     with ``tasks`` ordered by ``task_id``. Job ids with no task rows are absent
     from the result.
 
-    ``job_name`` mirrors get_managed_job_tasks exactly: the public job name
-    (``job_info.name``) with a fall back to ``spot.task_name`` -- NOT the
-    deprecated ``spot.job_name`` column (which holds the task name). This is
-    the value cleanup feeds to generate_managed_job_cluster_name, so it must
-    match.
+    ``job_name`` mirrors ``get_managed_job_tasks`` (public display name with a
+    fallback to ``task_name``); ``task_name`` preserves the controller launch
+    identity for teardown/recovery logic.
     """
     if not job_ids:
         return {}
@@ -1529,8 +1528,6 @@ def get_jobs_status_check_info(job_ids: List[int]) -> Dict[int, Dict[str, Any]]:
                     'tasks': [],
                 }
                 result[job_id] = info
-            # Mirror get_managed_job_tasks: prefer the public job name, fall
-            # back to task_name when it is unset.
             job_name = mapping['job_info_name']
             if job_name is None:
                 job_name = mapping['task_name']
@@ -1538,8 +1535,34 @@ def get_jobs_status_check_info(job_ids: List[int]) -> Dict[int, Dict[str, Any]]:
                 'task_id': mapping['task_id'],
                 'status': ManagedJobStatus(mapping['status']),
                 'job_name': job_name,
+                'task_name': mapping['task_name'],
             })
     return result
+
+
+def get_job_status_check_state(job_id: int) -> Optional[Dict[str, Any]]:
+    """Fetch the minimal fresh job_info state for a destructive recheck.
+
+    ``update_managed_jobs_statuses`` reuses its sweep-wide task snapshot for
+    cleanup, but before any destructive action it must confirm the job still
+    has the same controller ownership fields.  That safety recheck only needs
+    the authoritative ``job_info`` row, not task rows.
+    """
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        row = session.execute(
+            sqlalchemy.select(
+                job_info_table.c.schedule_state,
+                job_info_table.c.controller_pid,
+                job_info_table.c.controller_pid_started_at,
+            ).where(job_info_table.c.spot_job_id == job_id)).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return {
+        'schedule_state': ManagedJobScheduleState(row[0]),
+        'controller_pid': row[1],
+        'controller_pid_started_at': row[2],
+    }
 
 
 def _map_response_field_to_db_column(field: str):
