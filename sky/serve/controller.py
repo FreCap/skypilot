@@ -195,6 +195,12 @@ class SkyServeController:
         # replica's running job stays attributed to it (see
         # _get_lb_replica_info / _translate_in_flight).
         self._lb_translation_cache: Dict[int, Tuple[str, str, int]] = {}
+        # Immutable routing configuration shipped to the external load
+        # balancer. Stored in-memory and updated only after the controller's
+        # live autoscaler / replica-manager state transitions, so syncs never
+        # advertise a newer routing policy than the runtime has actually
+        # applied.
+        self._routing_spec = self._build_routing_spec(service_spec)
         self._app = fastapi.FastAPI(lifespan=self.lifespan)
 
     @contextlib.asynccontextmanager
@@ -663,43 +669,99 @@ class SkyServeController:
             'max_replicas': self._autoscaler.max_replicas,
         }
 
+    @staticmethod
+    def _build_routing_spec(service_spec: Any) -> Optional[Dict[str, Any]]:
+        """Build the immutable routing config shipped on LB syncs."""
+        if service_spec is None:
+            return None
+        target_qps = service_spec.target_qps_per_replica
+        retriable_status_codes = service_spec.lb_retriable_status_codes
+        return {
+            # `load_balancing_policy` resolves None to the default policy
+            # name, so the LB always receives a concrete policy to build.
+            'load_balancing_policy_name': service_spec.load_balancing_policy,
+            'target_qps_per_replica':
+                (dict(target_qps) if target_qps is not None else None),
+            # Lets an instance-aware LB weight replicas per-GPU when the
+            # service sizes on concurrency (no QPS dict to weight by) --
+            # and clear stale QPS weights after an update switches modes.
+            'target_concurrency_per_replica': getattr(
+                service_spec, 'target_concurrency_per_replica', None),
+            'stream_timeout_seconds': service_spec.lb_stream_timeout_seconds,
+            'retriable_status_codes':
+                (list(retriable_status_codes)
+                 if retriable_status_codes is not None else None),
+            'max_retries': service_spec.lb_max_retries,
+            'retry_initial_backoff_seconds':
+                (service_spec.lb_retry_initial_backoff_seconds),
+        }
+
     def _get_routing_spec(self) -> Optional[Dict[str, Any]]:
-        """Build the routing spec for the load_balancer_sync response.
+        """Return the routing spec for the load_balancer_sync response.
 
         [boltz fork] The external load balancer fetches its routing
         configuration -- load-balancing policy, per-replica target QPS, and
         stream timeout -- over the sync channel instead of static launch
         args, so a `sky serve update` that only changes these fields reaches
-        a running LB without re-rolling it. Sourced from the latest service
-        version's spec (the same version the replica manager/autoscaler are
-        advanced to on update). TLS terminates at the platform ingress and is
-        not part of the per-service LB contract.
-        Returns None when the spec cannot be loaded yet (mid-init). A cold LB
-        remains unready until a complete spec arrives; a warm LB retains its
-        last coherent routing configuration.
+        a running LB without re-rolling it. The source of truth is the
+        controller's in-memory runtime state, not a per-sync DB reread: the
+        update handler commits the new version row before transitioning the
+        live autoscaler/replica-manager, so reading the DB here can expose a
+        newer routing spec than the runtime has actually applied. Keeping an
+        immutable in-memory snapshot removes that mismatch window and avoids
+        steady-state DB reads on the hottest serve control-plane path.
         """
-        record = serve_state.get_service_from_name(self._service_name)
-        if record is None:
-            return None
-        spec = serve_state.get_spec(self._service_name, record['version'])
-        if spec is None:
-            return None
-        return {
-            # `load_balancing_policy` resolves None to the default policy
-            # name, so the LB always receives a concrete policy to build.
-            'load_balancing_policy_name': spec.load_balancing_policy,
-            'target_qps_per_replica': spec.target_qps_per_replica,
-            # Lets an instance-aware LB weight replicas per-GPU when the
-            # service sizes on concurrency (no QPS dict to weight by) --
-            # and clear stale QPS weights after an update switches modes.
-            'target_concurrency_per_replica':
-                (getattr(spec, 'target_concurrency_per_replica', None)),
-            'stream_timeout_seconds': spec.lb_stream_timeout_seconds,
-            'retriable_status_codes': spec.lb_retriable_status_codes,
-            'max_retries': spec.lb_max_retries,
-            'retry_initial_backoff_seconds':
-                (spec.lb_retry_initial_backoff_seconds),
-        }
+        return getattr(self, '_routing_spec', None)
+
+    def _apply_service_update(self, version: int, service: Any,
+                              update_mode: serve_utils.UpdateMode) -> None:
+        """Apply a persisted update to the live controller state."""
+        self._replica_manager.update_version(version,
+                                             service,
+                                             update_mode=update_mode)
+        new_autoscaler = autoscalers.Autoscaler.from_spec(
+            self._service_name, service)
+        if not isinstance(self._autoscaler, type(new_autoscaler)):
+            logger.info('Autoscaler type changed to '
+                        f'{type(new_autoscaler)}, updating autoscaler.')
+            old_autoscaler = self._autoscaler
+            new_autoscaler.load_dynamic_states(
+                old_autoscaler.dump_dynamic_states())
+            # Initialize the replacement to the update version BEFORE
+            # publishing it, so the autoscaler thread never observes a
+            # transient INITIAL_VERSION autoscaler (which would treat
+            # every live replica as outdated and churn).
+            new_autoscaler.update_version(version,
+                                          service,
+                                          update_mode=update_mode)
+            # Seed BEFORE publishing: if the old autoscaler's dump
+            # carried no fill state (build predating the feature,
+            # or fill just enabled), the replacement would
+            # otherwise take decision ticks with an empty zero-cost
+            # set until the next poll -- one tick with suppression
+            # off can terminate the whole fill fleet. A dump that
+            # did carry locations wins (the seed never overwrites).
+            self._seed_fill_zero_cost_locations(new_autoscaler)
+            self._autoscaler = new_autoscaler
+        else:
+            self._autoscaler.update_version(version,
+                                            service,
+                                            update_mode=update_mode)
+        self._reserved_capacity_fill_enabled = bool(
+            getattr(service, 'reserved_capacity_fill', False))
+        if self._reserved_capacity_fill_enabled:
+            # An update can enable fill on a live service: give
+            # the (retained or replaced) autoscaler the location
+            # set so suppression works immediately (no-op when
+            # already populated), and make sure the poller
+            # exists -- without it fill would sit half-active
+            # (flag on, no free-slot feed) until a respawn.
+            self._seed_fill_zero_cost_locations(self._autoscaler)
+            self._start_reserved_capacity_poller_if_needed()
+        # Publish the new routing spec only after the live runtime has
+        # transitioned, so load_balancer_sync never advertises settings ahead
+        # of the controller's own autoscaler / replica-manager state.
+        self._routing_spec = self._build_routing_spec(service)
 
     def _start_reserved_capacity_poller_if_needed(self) -> None:
         """Start the reserved-capacity poller (idempotent).
@@ -900,47 +962,7 @@ class SkyServeController:
                                                   status_code=409)
                 logger.info(
                     f'Update to new version version {version}: {service}')
-
-                self._replica_manager.update_version(version,
-                                                     service,
-                                                     update_mode=update_mode)
-                new_autoscaler = autoscalers.Autoscaler.from_spec(
-                    self._service_name, service)
-                if not isinstance(self._autoscaler, type(new_autoscaler)):
-                    logger.info('Autoscaler type changed to '
-                                f'{type(new_autoscaler)}, updating autoscaler.')
-                    old_autoscaler = self._autoscaler
-                    new_autoscaler.load_dynamic_states(
-                        old_autoscaler.dump_dynamic_states())
-                    # Initialize the replacement to the update version BEFORE
-                    # publishing it, so the autoscaler thread never observes a
-                    # transient INITIAL_VERSION autoscaler (which would treat
-                    # every live replica as outdated and churn).
-                    new_autoscaler.update_version(version,
-                                                  service,
-                                                  update_mode=update_mode)
-                    # Seed BEFORE publishing: if the old autoscaler's dump
-                    # carried no fill state (build predating the feature,
-                    # or fill just enabled), the replacement would
-                    # otherwise take decision ticks with an empty zero-cost
-                    # set until the next poll -- one tick with suppression
-                    # off can terminate the whole fill fleet. A dump that
-                    # did carry locations wins (the seed never overwrites).
-                    self._seed_fill_zero_cost_locations(new_autoscaler)
-                    self._autoscaler = new_autoscaler
-                else:
-                    self._autoscaler.update_version(version,
-                                                    service,
-                                                    update_mode=update_mode)
-                if getattr(service, 'reserved_capacity_fill', False):
-                    # An update can enable fill on a live service: give
-                    # the (retained or replaced) autoscaler the location
-                    # set so suppression works immediately (no-op when
-                    # already populated), and make sure the poller
-                    # exists -- without it fill would sit half-active
-                    # (flag on, no free-slot feed) until a respawn.
-                    self._seed_fill_zero_cost_locations(self._autoscaler)
-                    self._start_reserved_capacity_poller_if_needed()
+                self._apply_service_update(version, service, update_mode)
                 return responses.JSONResponse(content={'message': 'Success'},
                                               status_code=200)
             except Exception as e:  # pylint: disable=broad-except
