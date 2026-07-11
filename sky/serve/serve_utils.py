@@ -898,7 +898,8 @@ def ha_recovery_for_consolidation_mode(pool: bool,
         for service_name in all_service_names:
             svc = _get_service_status(service_name,
                                       pool=pool,
-                                      with_replica_info=False)
+                                      with_replica_info=False,
+                                      with_pool_yaml=not pool)
             # A row with no version_specs row is invisible to the joined
             # status query.  A row whose latest version is a NULL-yaml
             # placeholder is visible, but is equally unbootable when it has
@@ -1519,7 +1520,8 @@ def update_service_status(pool: bool) -> None:
     for service_name in service_names:
         record = _get_service_status(service_name,
                                      pool=pool,
-                                     with_replica_info=False)
+                                     with_replica_info=False,
+                                     with_pool_yaml=not pool)
         if record is None:
             continue
         service_status = record['status']
@@ -1686,6 +1688,7 @@ def _get_service_status(
         pool: bool,
         with_replica_info: bool = True,
         with_replica_counts: bool = False,
+        with_pool_yaml: bool = True,
         with_target_num_replicas: bool = True) -> Optional[Dict[str, Any]]:
     """Get the status dict of the service.
 
@@ -1697,6 +1700,9 @@ def _get_service_status(
             ``with_replica_info`` but not free (one pass over the replica
             rows), so internal callers that only need the service row
             should leave both off.
+        with_pool_yaml: Whether to include the rendered pool YAML. Liveness
+            callers can skip the storage read when they only need controller
+            metadata.
 
     Returns:
         A dictionary describing the status of the service if the service exists.
@@ -1708,8 +1714,8 @@ def _get_service_status(
     if record['pool'] != pool:
         return None
 
-    record['pool_yaml'] = ''
-    if record['pool']:
+    if record['pool'] and with_pool_yaml:
+        record['pool_yaml'] = ''
         version = record['version']
         try:
             yaml_content = get_yaml_content(service_name, version,
