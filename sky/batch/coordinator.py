@@ -19,7 +19,7 @@ Lifecycle::
                      ├─ Merge results
                      └─ Return (success) or raise (failure)
 """
-import base64
+import asyncio
 import collections
 import contextvars
 import json
@@ -31,7 +31,7 @@ import sys
 import textwrap
 import threading
 import time
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 import uuid
 
 import sky
@@ -44,92 +44,9 @@ from sky.skylet import constants as skylet_constants
 
 logger = logging.getLogger(__name__)
 
-# Runs on the worker node before we start a fresh worker service: if
-# port {port} (the WORKER_SERVICE_PORT) is still bound by a stale
-# worker from the previous controller incarnation, SIGTERM/SIGKILL its
-# holder and wait up to 30s for the port to free.  Plain-format string
-# (single ``{port}`` placeholder) so it can be injected into shell code
-# via ``str.format``/``shlex.quote`` without f-string/heredoc issues.
-_PORT_CLEANUP_PY = """
-import errno, os, signal, socket, time
 
-PORT = {port}
-
-def port_in_use(port):
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            s.bind(("127.0.0.1", port))
-            return False
-        except OSError as e:
-            return e.errno == errno.EADDRINUSE
-
-
-def kill_listeners(port):
-    hex_port = f"{{port:04X}}"
-    listener_inodes = set()
-    try:
-        with open("/proc/net/tcp", "r") as f:
-            next(f, None)
-            for line in f:
-                parts = line.split()
-                if len(parts) < 10:
-                    continue
-                local, state, inode = parts[1], parts[3], parts[9]
-                if state == "0A" and local.endswith(f":{{hex_port}}"):
-                    listener_inodes.add(inode)
-    except FileNotFoundError:
-        return
-    if not listener_inodes:
-        return
-    my_pid = os.getpid()
-    for entry in os.listdir("/proc"):
-        if not entry.isdigit():
-            continue
-        pid = int(entry)
-        if pid == my_pid:
-            continue
-        fd_dir = f"/proc/{{pid}}/fd"
-        try:
-            fds = os.listdir(fd_dir)
-        except (FileNotFoundError, PermissionError):
-            continue
-        matched = False
-        for fd in fds:
-            try:
-                target = os.readlink(os.path.join(fd_dir, fd))
-            except (FileNotFoundError, PermissionError):
-                continue
-            if target.startswith("socket:["):
-                inode = target[len("socket:["):-1]
-                if inode in listener_inodes:
-                    matched = True
-                    break
-        if matched:
-            for sig in (signal.SIGTERM, signal.SIGKILL):
-                try:
-                    os.kill(pid, sig)
-                except ProcessLookupError:
-                    break
-                time.sleep(1)
-                try:
-                    os.kill(pid, 0)
-                except ProcessLookupError:
-                    break
-
-
-if port_in_use(PORT):
-    print(f"Port {{PORT}} is in use; killing stale holder(s)...", flush=True)
-    kill_listeners(PORT)
-    deadline = time.monotonic() + 30
-    while time.monotonic() < deadline and port_in_use(PORT):
-        time.sleep(1)
-    if port_in_use(PORT):
-        print(f"WARNING: port {{PORT}} still in use after cleanup",
-              flush=True)
-    else:
-        print(f"Port {{PORT}} is now free", flush=True)
-"""
+class SupersededCoordinator(RuntimeError):
+    """Raised when a newer coordinator owns the same managed Batch job."""
 
 
 class BatchCoordinator:
@@ -179,12 +96,6 @@ class BatchCoordinator:
         self.pending_batches: Deque[int] = collections.deque()
         self._pending_ready_at: Dict[int, float] = {}
         self._pending_lock = threading.Lock()
-        self.completed_count: int = 0
-        self._state_lock = threading.Lock()
-
-        # Retry tracking: batch_idx -> retry count.  Persisted across
-        # resume so that a batch cannot be retried indefinitely.
-        self._retry_counts: Dict[int, int] = {}
 
         # Worker tracking: cluster_name → worker_job_id
         self._active_workers: Dict[str, int] = {}
@@ -192,11 +103,14 @@ class BatchCoordinator:
 
         # Cancellation flag for inline (controller) mode.
         self._cancelled = False
+        self._superseded_cleanup_started = False
 
         # Identifies worker services started by this coordinator incarnation.
         # It prevents an older controller from feeding or shutting down a
         # replacement service after an API-server/controller restart.
         self._worker_token = uuid.uuid4().hex
+        self._stale_worker_tokens: Set[str] = set()
+        self._stale_attempt_leases_drained = False
 
         # Inline coordinators share a process with unrelated managed jobs and
         # must not replace the controller's process-wide SIGTERM handler.
@@ -213,31 +127,42 @@ class BatchCoordinator:
         """Main entry point.  Returns on success, raises on failure."""
         try:
             logger.info(f'managed_job_id={self._managed_job_id}')
+            previous_token = managed_job_state.acquire_batch_coordinator(
+                self._managed_job_id, self._worker_token)
+            if previous_token and previous_token != self._worker_token:
+                self._stale_worker_tokens.add(previous_token)
+            self._refresh_stale_worker_tokens()
             self._resolve_formats()
 
             if self._is_resume:
-                self._resume_from_db()
+                completed_count = self._resume_from_db()
             else:
                 self._count_and_split()
                 if not self.batches:
                     logger.info('No items in dataset — nothing to do.')
                     return
                 self._save_batches_to_db()
+                completed_count = 0
 
-            if self.completed_count == len(self.batches):
+            if completed_count == len(self.batches):
                 # Crash happened after all batches done but before merge.
                 logger.info('All batches already completed, skipping '
                             'to merge.')
-                managed_job_state.set_winding_down(self._managed_job_id,
-                                                   task_id=0)
+                self._stale_attempt_leases_drained = True
+                self._cleanup_stale_worker_services()
+                self._set_winding_down()
                 self._reduce_results()
                 return
 
             self._discover_workers()
+            self._wait_for_stale_attempt_leases()
             self._dispatch_all()
-            managed_job_state.set_winding_down(self._managed_job_id, task_id=0)
+            self._cleanup_stale_worker_services()
+            self._set_winding_down()
             self._reduce_results()
             logger.info('Batch job completed successfully.')
+        except SupersededCoordinator:
+            raise
         except Exception:
             self._print_partial_results_instructions()
             raise
@@ -266,6 +191,193 @@ class BatchCoordinator:
                 self._shutdown_worker(cluster_name, worker_job_id)
             except Exception:  # pylint: disable=broad-except
                 logger.warning(f'Failed to shutdown worker on {cluster_name}')
+
+    async def handle_superseded(self, timeout: float = 60) -> None:
+        """Bound cleanup of only this superseded incarnation's workers.
+
+        SDK calls are synchronous and may hang.  Each cleanup segment runs in
+        ``to_thread`` under the one global deadline; after it expires this
+        coroutine returns without starting any additional external action.
+        A timed-out in-flight call can still finish in its worker thread, but
+        it targets only this incarnation's token or exact durable job ID.
+        """
+        self._superseded_cleanup_started = True
+        self._cancelled = True
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0, timeout)
+
+        async def _run_call(label, func, *args,
+                            **kwargs) -> Tuple[bool, bool, Any]:
+            """Return (within_deadline, succeeded, result)."""
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False, False, None
+            try:
+                result = await asyncio.wait_for(asyncio.to_thread(
+                    func, *args, **kwargs),
+                                                timeout=remaining)
+                return True, True, result
+            except asyncio.TimeoutError:
+                logger.warning('Timed out during superseded Batch %s', label)
+                return False, False, None
+            except Exception as e:  # pylint: disable=broad-except
+                logger.warning('Superseded Batch %s failed: %s', label, e)
+                return True, False, None
+
+        async def _cancel_exact(cluster_name: str, worker_job_id: int,
+                                worker_token: str) -> bool:
+            within_deadline, succeeded, request_id = await _run_call(
+                'cancel request',
+                sdk.cancel,
+                cluster_name,
+                job_ids=[worker_job_id])
+            if not within_deadline:
+                return False
+            if not succeeded:
+                return True
+            within_deadline, succeeded, _ = await _run_call(
+                'cancel completion', sdk.get, request_id)
+            if not within_deadline:
+                return False
+            if succeeded:
+                within_deadline, _, _ = await _run_call(
+                    'worker record removal',
+                    managed_job_state.remove_batch_worker_record,
+                    self._managed_job_id,
+                    worker_token,
+                    cluster_name,
+                    worker_job_id=worker_job_id)
+            return within_deadline
+
+        with self._active_workers_lock:
+            workers_snapshot = list(self._active_workers.items())
+        for cluster_name, worker_job_id in workers_snapshot:
+            shutdown_code = self._generate_shutdown_code()
+            shutdown_task = sky.Task(
+                name=(f'batch-shutdown-{self._managed_job_id}-'
+                      f'{self._worker_token}'),
+                run=shutdown_code)
+            within_deadline, succeeded, request_id = await _run_call(
+                'shutdown request',
+                sdk.exec,
+                shutdown_task,
+                cluster_name=cluster_name)
+            if not within_deadline:
+                return
+            if succeeded:
+                within_deadline, _, _ = await _run_call('shutdown completion',
+                                                        sdk.get, request_id)
+                if not within_deadline:
+                    return
+            if not await _cancel_exact(cluster_name, worker_job_id,
+                                       self._worker_token):
+                return
+
+        within_deadline, succeeded, records = await _run_call(
+            'worker record read', managed_job_state.get_batch_worker_records,
+            self._managed_job_id)
+        if not within_deadline:
+            return
+        if succeeded:
+            for record in records:
+                if record['coordinator_token'] != self._worker_token:
+                    continue
+                worker_job_id = record.get('worker_job_id')
+                if worker_job_id is None and record.get('launch_request_id'):
+                    within_deadline, request_succeeded, result = (
+                        await _run_call('launch request recovery', sdk.get,
+                                        record['launch_request_id']))
+                    if not within_deadline:
+                        return
+                    if request_succeeded:
+                        if isinstance(result, tuple) and result:
+                            worker_job_id = result[0]
+                        elif isinstance(result, int):
+                            worker_job_id = result
+
+                if worker_job_id is None:
+                    within_deadline, queue_succeeded, queue_request_id = (
+                        await _run_call('worker queue request',
+                                        sdk.queue,
+                                        record['worker_cluster'],
+                                        skip_finished=True))
+                    if not within_deadline:
+                        return
+                    if queue_succeeded:
+                        within_deadline, queue_succeeded, queued_jobs = (
+                            await _run_call('worker queue result', sdk.get,
+                                            queue_request_id))
+                    if not within_deadline:
+                        return
+                    if queue_succeeded:
+                        matching_ids = []
+                        for queued_job in queued_jobs:
+                            if isinstance(queued_job, dict):
+                                name = queued_job.get('job_name')
+                                queued_job_id = queued_job.get('job_id')
+                            else:
+                                name = queued_job.job_name
+                                queued_job_id = queued_job.job_id
+                            if (name == record['worker_job_name'] and
+                                    queued_job_id is not None):
+                                matching_ids.append(int(queued_job_id))
+                        matching_ids = sorted(set(matching_ids))
+                        if len(matching_ids) == 1:
+                            worker_job_id = matching_ids[0]
+                        elif len(matching_ids) > 1:
+                            logger.error(
+                                'Refusing ambiguous superseded Batch cleanup '
+                                'for %s: exact IDs %s',
+                                record['worker_job_name'], matching_ids)
+
+                if worker_job_id is None:
+                    continue
+                worker_job_id = int(worker_job_id)
+                within_deadline, _, _ = await _run_call(
+                    'worker job ID persistence',
+                    managed_job_state.record_batch_worker_job_id,
+                    self._managed_job_id, record['coordinator_token'],
+                    record['worker_cluster'], worker_job_id)
+                if not within_deadline:
+                    return
+                if not await _cancel_exact(record['worker_cluster'],
+                                           worker_job_id,
+                                           record['coordinator_token']):
+                    return
+
+        while loop.time() < deadline:
+            with self._active_workers_lock:
+                if not self._active_workers:
+                    return
+            await asyncio.sleep(min(0.2, max(0, deadline - loop.time())))
+        with self._active_workers_lock:
+            remaining_workers = sorted(self._active_workers)
+        logger.warning('Timed out waiting for superseded Batch workers: %s',
+                       remaining_workers)
+
+    def mark_succeeded(self, end_time: float) -> None:
+        """Durably succeed only if this coordinator still owns the job."""
+        outcome = managed_job_state.set_batch_succeeded(self._managed_job_id, 0,
+                                                        self._worker_token,
+                                                        end_time)
+        if outcome == managed_job_state.BatchLifecycleTransition.OWNER_LOST:
+            raise SupersededCoordinator(
+                'Batch coordinator lost ownership before SUCCEEDED')
+        if outcome == managed_job_state.BatchLifecycleTransition.INVALID_STATE:
+            raise RuntimeError('Cannot mark Batch job SUCCEEDED from its '
+                               'current lifecycle state')
+
+    def mark_failed(self, failure_reason: str) -> None:
+        """Durably fail only if this coordinator still owns the job."""
+        outcome = managed_job_state.set_batch_failed(self._managed_job_id, 0,
+                                                     self._worker_token,
+                                                     failure_reason)
+        if outcome == managed_job_state.BatchLifecycleTransition.OWNER_LOST:
+            raise SupersededCoordinator(
+                'Batch coordinator lost ownership before FAILED')
+        if outcome == managed_job_state.BatchLifecycleTransition.INVALID_STATE:
+            raise RuntimeError('Cannot mark Batch job FAILED from its current '
+                               'lifecycle state')
 
     # ------------------------------------------------------------------
     # Dataset counting & splitting
@@ -316,15 +428,6 @@ class BatchCoordinator:
     def _has_pending_batches(self) -> bool:
         return self._pending_count() > 0
 
-    def _get_completed_count(self) -> int:
-        with self._state_lock:
-            return self.completed_count
-
-    def _increment_completed_count(self) -> int:
-        with self._state_lock:
-            self.completed_count += 1
-            return self.completed_count
-
     def _resolve_formats(self) -> None:
         """Resolve typed input/output format handlers from dicts."""
         self._input_format = io_formats.InputReader.from_dict(
@@ -361,19 +464,21 @@ class BatchCoordinator:
 
     def _save_batches_to_db(self) -> None:
         """Write all batch records to DB with PENDING status."""
-        managed_job_state.save_batch_states(self._managed_job_id, self.batches)
+        saved = managed_job_state.save_batch_states(self._managed_job_id,
+                                                    self.batches,
+                                                    self._worker_token)
+        if not saved:
+            raise SupersededCoordinator(
+                'Batch coordinator lost ownership before state initialization')
         logger.info(f'Saved {len(self.batches)} batch records to DB')
 
-    def _resume_from_db(self) -> None:
+    def _resume_from_db(self) -> int:
         """Restore coordinator state from DB after a controller crash.
 
-        Reclaims expired attempts, then rebuilds in-memory state from the
-        persisted records.  Live attempts keep their leases until they expire.
+        Rebuilds in-memory state from persisted records.  The new coordinator
+        has already fenced the previous owner; stale live attempts retain their
+        leases until :meth:`_wait_for_stale_attempt_leases` reclaims them.
         """
-        reclaimed = managed_job_state.requeue_expired_batch_attempts(
-            self._managed_job_id)
-        if reclaimed:
-            logger.info('Reclaimed expired batch attempts: %s', reclaimed)
         records = managed_job_state.get_batch_states(self._managed_job_id)
         if not records:
             raise RuntimeError(
@@ -382,8 +487,7 @@ class BatchCoordinator:
 
         self.batches = []
         self._reset_pending_batches()
-        self.completed_count = 0
-        self._retry_counts = {}
+        completed_count = 0
         failed_batches = []
         leased_batches = 0
 
@@ -394,32 +498,41 @@ class BatchCoordinator:
                 f'got {batch_idx}. DB may be corrupted.')
             self.batches.append([rec['start_idx'], rec['end_idx']])
             status = rec['status']
+            attempt_owner_token = rec.get('attempt_owner_token')
+            attempt_id = int(rec.get('attempt_id') or 0)
+            if (not attempt_owner_token and
+                (status != 'PENDING' or attempt_id > 0)):
+                raise RuntimeError(
+                    f'Batch {batch_idx} has pre-fence attempt state. Batch '
+                    'state must be recreated with the current schema.')
+            if (attempt_owner_token and
+                    attempt_owner_token != self._worker_token):
+                self._stale_worker_tokens.add(attempt_owner_token)
             if status == 'PENDING':
                 self._enqueue_batch(batch_idx, rec.get('next_retry_at') or 0)
             elif status == 'COMPLETED':
-                self.completed_count += 1
+                completed_count += 1
             elif status == 'DISPATCHED':
                 leased_batches += 1
             elif status == 'FAILED':
                 failed_batches.append(batch_idx)
-            self._retry_counts[batch_idx] = rec['retry_count']
-
         if failed_batches:
             raise RuntimeError('Cannot resume batch job with terminally failed '
                                f'batches: {failed_batches}')
 
         logger.info(f'Resumed from DB: {len(self.batches)} batches, '
-                    f'{self.completed_count} completed, '
+                    f'{completed_count} completed, '
                     f'{self._pending_count()} pending, '
                     f'{leased_batches} leased')
         logger.info(f'BATCH_RESUME total={len(self.batches)} '
-                    f'completed={self.completed_count} '
+                    f'completed={completed_count} '
                     f'pending={self._pending_count()} '
                     f'leased={leased_batches}')
+        return completed_count
 
     def _reclaim_expired_batches(self) -> int:
         reclaimed = managed_job_state.requeue_expired_batch_attempts(
-            self._managed_job_id)
+            self._managed_job_id, self._worker_token)
         for batch_idx in reclaimed:
             self._enqueue_batch(batch_idx)
         if reclaimed:
@@ -427,11 +540,79 @@ class BatchCoordinator:
                            len(reclaimed), reclaimed)
         return len(reclaimed)
 
-    def _sync_batch_progress_from_db(self) -> Tuple[int, List[int]]:
-        """Refresh progress and discover PENDING work from another owner."""
+    def _assert_coordinator_owner(self) -> None:
+        """Raise when a newer controller incarnation has taken ownership."""
+        if not managed_job_state.is_batch_coordinator_owner(
+                self._managed_job_id, self._worker_token):
+            raise SupersededCoordinator(
+                f'Batch coordinator {self._worker_token} no longer owns '
+                f'managed job {self._managed_job_id}')
+
+    def _set_winding_down(self) -> None:
+        outcome = managed_job_state.set_batch_winding_down(
+            self._managed_job_id, 0, self._worker_token)
+        if outcome == managed_job_state.BatchLifecycleTransition.OWNER_LOST:
+            raise SupersededCoordinator(
+                'Batch coordinator lost ownership before WINDING_DOWN')
+        if outcome == managed_job_state.BatchLifecycleTransition.INVALID_STATE:
+            raise RuntimeError('Cannot mark Batch job WINDING_DOWN from its '
+                               'current lifecycle state')
+
+    def _wait_for_stale_attempt_leases(self) -> None:
+        """Wait for fenced attempts before cleaning their worker services.
+
+        Takeover prevents the old owner from renewing or completing an
+        attempt.  We nevertheless honor the lease it acquired before takeover,
+        then reclaim it.  Only after no old live lease remains may the caller
+        cancel token-scoped worker jobs and start replacement services.
+        """
+        while True:
+            self._assert_coordinator_owner()
+            self._reclaim_expired_batches()
+            records = managed_job_state.get_batch_states(self._managed_job_id)
+            old_live_attempts = []
+            for rec in records:
+                attempt_owner_token = rec.get('attempt_owner_token')
+                if (rec['status'] == 'DISPATCHED' and not attempt_owner_token):
+                    raise RuntimeError(
+                        f'Batch {rec["batch_idx"]} has a live attempt without '
+                        'an owner token; recreate the unused Batch job.')
+                if (attempt_owner_token and
+                        attempt_owner_token != self._worker_token):
+                    self._stale_worker_tokens.add(attempt_owner_token)
+                if (rec['status'] == 'DISPATCHED' and
+                        attempt_owner_token != self._worker_token):
+                    old_live_attempts.append(rec)
+            if not old_live_attempts:
+                self._stale_attempt_leases_drained = True
+                self._cleanup_stale_worker_services(strict=True)
+                return
+
+            now = time.time()
+            expirations = [
+                float(rec['lease_expires_at'])
+                for rec in old_live_attempts
+                if rec.get('lease_expires_at') is not None
+            ]
+            wait_seconds = 1.0
+            if expirations:
+                wait_seconds = min(10.0, max(0.1, min(expirations) - now))
+            logger.info('Waiting %.1fs for %d fenced Batch attempt lease(s)',
+                        wait_seconds, len(old_live_attempts))
+            time.sleep(wait_seconds)
+
+    def _sync_batch_progress_from_db(self) -> Tuple[int, Set[str], List[int]]:
+        """Return durable progress and discover PENDING work.
+
+        ``leased_workers`` prevents a replacement coordinator from starting a
+        new worker service on a replica that still owns an unexpired attempt.
+        Completion and retry progress are read exclusively from this durable
+        state rather than mirrored by worker threads.
+        """
+        self._assert_coordinator_owner()
         records = managed_job_state.get_batch_states(self._managed_job_id)
         completed_count = 0
-        leased_count = 0
+        leased_workers: Set[str] = set()
         failed_batches = []
         for rec in records:
             batch_idx = rec['batch_idx']
@@ -441,13 +622,12 @@ class BatchCoordinator:
             elif status == 'COMPLETED':
                 completed_count += 1
             elif status == 'DISPATCHED':
-                leased_count += 1
+                worker_cluster = rec.get('worker_cluster')
+                if worker_cluster:
+                    leased_workers.add(worker_cluster)
             elif status == 'FAILED':
                 failed_batches.append(batch_idx)
-            self._retry_counts[batch_idx] = rec['retry_count']
-        with self._state_lock:
-            self.completed_count = completed_count
-        return leased_count, failed_batches
+        return completed_count, leased_workers, failed_batches
 
     def _start_batch_lease_renewer(
         self, batch_idx: int, attempt_id: int
@@ -461,7 +641,7 @@ class BatchCoordinator:
                 try:
                     owned = managed_job_state.renew_batch_lease(
                         self._managed_job_id, batch_idx, attempt_id,
-                        constants.BATCH_LEASE_DURATION)
+                        self._worker_token, constants.BATCH_LEASE_DURATION)
                 except Exception as e:  # pylint: disable=broad-except
                     logger.warning('Failed to renew batch lease %d/%d: %s',
                                    batch_idx, attempt_id, e)
@@ -623,17 +803,6 @@ class BatchCoordinator:
         output_formats_json = json.dumps(self._output_formats_dict or
                                          []).replace('\'', '\'\\\'\'')
 
-        port = constants.WORKER_SERVICE_PORT
-        # Python snippet that frees port {port} if a stale worker
-        # service is still holding it after a controller crash.  Kept
-        # as a module-level constant (``_PORT_CLEANUP_PY``) so it is
-        # not reindented by the surrounding textwrap.dedent call, then
-        # base64-encoded so the whole thing is a single opaque token in
-        # the generated shell script (no multi-line content that would
-        # confuse textwrap.dedent).
-        port_cleanup_py = _PORT_CLEANUP_PY.format(port=port)
-        port_cleanup_b64 = base64.b64encode(
-            port_cleanup_py.encode('utf-8')).decode('ascii')
         return textwrap.dedent(f"""\
             set -e
             export SKY_BATCH_SERIALIZED_FN='{self.serialized_fn}'
@@ -642,11 +811,6 @@ class BatchCoordinator:
             export SKY_BATCH_WORKER_TOKEN='{self._worker_token}'
             export SKY_BATCH_INPUT_FORMAT='{input_format_json}'
             export SKY_BATCH_OUTPUT_FORMATS='{output_formats_json}'
-
-            # On HA resume the previous worker service may still hold port
-            # {port}. Free only that listener before binding a replacement;
-            # do not cancel unrelated jobs that share this pool replica.
-            echo '{port_cleanup_b64}' | base64 -d | {sky_runtime}/bin/python -
 
             # Make sky.batch visible to the user's python.
             SKY_SITE=$({sky_runtime}/bin/python -c \\
@@ -693,13 +857,137 @@ class BatchCoordinator:
         """Generate a script that shuts down the worker service."""
         port = constants.WORKER_SERVICE_PORT
         return textwrap.dedent(f"""\
-            curl -sf -X POST http://127.0.0.1:{port}/shutdown \\
+            curl -sf --connect-timeout 2 --max-time 5 -X POST \\
+                http://127.0.0.1:{port}/shutdown \\
                 -H 'X-Sky-Batch-Worker-Token: {self._worker_token}' || true
             """)
 
     # ------------------------------------------------------------------
     # Worker service lifecycle
     # ------------------------------------------------------------------
+
+    def _worker_job_name(self, worker_token: str) -> str:
+        """Return the immutable job name for one coordinator incarnation."""
+        return (f'batch-worker-{self._managed_job_id}-'
+                f'{worker_token}')
+
+    def _refresh_stale_worker_tokens(self) -> None:
+        """Load every durable worker generation older than this owner."""
+        for record in managed_job_state.get_batch_worker_records(
+                self._managed_job_id):
+            token = record['coordinator_token']
+            if token != self._worker_token:
+                self._stale_worker_tokens.add(token)
+
+    def _cancel_stale_worker_jobs(self, cluster_name: str,
+                                  worker_token: str) -> None:
+        """Cancel durable exact-ID launches for one stale generation."""
+        if not worker_token or worker_token == self._worker_token:
+            raise ValueError('cleanup requires a non-current worker token')
+        if worker_token not in self._stale_worker_tokens:
+            raise ValueError('cleanup requires a durably captured stale token')
+        if not self._stale_attempt_leases_drained:
+            raise RuntimeError('cannot clean stale Batch workers before old '
+                               'attempt leases are drained')
+        self._cleanup_worker_services_for_token(worker_token, [cluster_name])
+
+    def _resolve_worker_job_id(self, record: Dict[str, Any]) -> Optional[int]:
+        """Resolve one launch intent without guessing among duplicate names."""
+        worker_job_id = record.get('worker_job_id')
+        if worker_job_id is not None:
+            return int(worker_job_id)
+
+        request_id = record.get('launch_request_id')
+        if request_id:
+            try:
+                result = sdk.get(request_id)
+                if isinstance(result, tuple) and result:
+                    worker_job_id = result[0]
+                elif isinstance(result, int):
+                    worker_job_id = result
+            except Exception as e:  # pylint: disable=broad-except
+                logger.warning('Failed to recover Batch worker request %s: %s',
+                               request_id, e)
+
+        if worker_job_id is None:
+            queue_request_id = sdk.queue(record['worker_cluster'],
+                                         skip_finished=True)
+            queued_jobs = sdk.get(queue_request_id)
+            matching_ids = []
+            for queued_job in queued_jobs:
+                if isinstance(queued_job, dict):
+                    name = queued_job.get('job_name')
+                    queued_job_id = queued_job.get('job_id')
+                else:
+                    name = queued_job.job_name
+                    queued_job_id = queued_job.job_id
+                if (name == record['worker_job_name'] and
+                        queued_job_id is not None):
+                    matching_ids.append(int(queued_job_id))
+            matching_ids = sorted(set(matching_ids))
+            if len(matching_ids) > 1:
+                logger.error(
+                    'Refusing ambiguous Batch worker cleanup for %s on %s: '
+                    'duplicate name maps to exact IDs %s',
+                    record['worker_job_name'], record['worker_cluster'],
+                    matching_ids)
+                return None
+            if matching_ids:
+                worker_job_id = matching_ids[0]
+
+        if worker_job_id is None:
+            return None
+        worker_job_id = int(worker_job_id)
+        managed_job_state.record_batch_worker_job_id(
+            self._managed_job_id, record['coordinator_token'],
+            record['worker_cluster'], worker_job_id)
+        return worker_job_id
+
+    def _cancel_worker_record(self, record: Dict[str, Any]) -> None:
+        """Cancel one durable worker record by exactly one external job ID."""
+        worker_job_id = self._resolve_worker_job_id(record)
+        if worker_job_id is None:
+            return
+        self._cancel_worker_job_by_id(record['worker_cluster'], worker_job_id,
+                                      record['coordinator_token'])
+        logger.info('Cancelled exact Batch worker job %s for token %s on %s',
+                    worker_job_id, record['coordinator_token'],
+                    record['worker_cluster'])
+
+    def _cleanup_worker_services_for_token(
+            self,
+            worker_token: str,
+            workers: Optional[List[str]] = None) -> None:
+        """Clean durable records for one token, one exact job ID at a time."""
+        worker_filter = set(workers) if workers is not None else None
+        for record in managed_job_state.get_batch_worker_records(
+                self._managed_job_id):
+            if record['coordinator_token'] != worker_token:
+                continue
+            if (worker_filter is not None and
+                    record['worker_cluster'] not in worker_filter):
+                continue
+            self._cancel_worker_record(record)
+
+    def _cleanup_stale_worker_services(self,
+                                       workers: Optional[List[str]] = None,
+                                       strict: bool = False) -> None:
+        """Clean exact old-token workers after their attempt leases expire."""
+        self._refresh_stale_worker_tokens()
+        if not self._stale_worker_tokens:
+            return
+        if not self._stale_attempt_leases_drained:
+            raise RuntimeError('cannot clean stale Batch workers before old '
+                               'attempt leases are drained')
+        for worker_token in sorted(self._stale_worker_tokens):
+            try:
+                self._cleanup_worker_services_for_token(worker_token, workers)
+            except Exception as e:  # pylint: disable=broad-except
+                if strict:
+                    raise
+                logger.warning(
+                    'Failed to clean stale Batch worker token '
+                    '%s: %s', worker_token, e)
 
     def _launch_worker_service(self, cluster_name: str) -> int:
         """Launch worker service as a long-running SkyPilot job.
@@ -708,11 +996,28 @@ class BatchCoordinator:
             The SkyPilot job ID of the worker service.
         """
         job_id = str(self._managed_job_id)
+        self._assert_coordinator_owner()
+        # A replica may become READY after the initial takeover cleanup.  Its
+        # old token-scoped service is now safe to remove because all old
+        # attempt leases were drained before dispatch began.
+        self._cleanup_stale_worker_services([cluster_name], strict=True)
+        # A failed thread from this same incarnation may have left an exact
+        # durable worker record behind.  Retire it before reusing the
+        # (job, token, cluster) launch-intent key.
+        self._cleanup_worker_services_for_token(self._worker_token,
+                                                [cluster_name])
         startup_code = self._generate_worker_startup_code()
-        task = sky.Task(name=f'batch-worker-{job_id}', run=startup_code)
+        worker_job_name = self._worker_job_name(self._worker_token)
+        task = sky.Task(name=worker_job_name, run=startup_code)
         pool_resources = self._get_pool_resources()
         if pool_resources is not None:
             task.set_resources(pool_resources)
+        registered = managed_job_state.register_batch_worker_launch(
+            self._managed_job_id, self._worker_token, cluster_name,
+            worker_job_name)
+        if not registered:
+            raise SupersededCoordinator(
+                'Batch coordinator lost ownership before worker launch')
         logger.info(f'Submitting exec to {cluster_name} '
                     f'with resources={pool_resources}')
         try:
@@ -720,12 +1025,30 @@ class BatchCoordinator:
         except Exception as e:
             logger.error(f'sdk.exec() failed: {e}', exc_info=True)
             raise
+        managed_job_state.record_batch_worker_launch_request(
+            self._managed_job_id, self._worker_token, cluster_name,
+            str(request_id))
         try:
             worker_job_id, _ = sdk.get(request_id)
         except Exception as e:
             logger.error(f'sdk.get() for exec failed: {e}', exc_info=True)
             raise
         assert worker_job_id is not None, 'Failed to get worker job ID'
+        worker_job_id = int(worker_job_id)
+        managed_job_state.record_batch_worker_job_id(self._managed_job_id,
+                                                     self._worker_token,
+                                                     cluster_name,
+                                                     worker_job_id)
+
+        if not managed_job_state.is_batch_coordinator_owner(
+                self._managed_job_id, self._worker_token):
+            # The launch crossed a takeover.  Cancel the immutable job ID we
+            # just created; a replacement has a different token and name.
+            self._cancel_worker_job_by_id(cluster_name, worker_job_id,
+                                          self._worker_token)
+            raise SupersededCoordinator(
+                f'Batch coordinator lost ownership while launching worker '
+                f'{worker_job_id} on {cluster_name}')
 
         logger.info(f'Launched worker service as job '
                     f'{worker_job_id} on {cluster_name}')
@@ -747,23 +1070,43 @@ class BatchCoordinator:
             echo "ERROR: Worker service did not start within {timeout}s"
             exit 1
             """)
-        health_task = sky.Task(name=f'health-check-{job_id}', run=health_code)
+        health_task = sky.Task(
+            name=f'health-check-{job_id}-{self._worker_token}', run=health_code)
         try:
             req_id = sdk.exec(health_task, cluster_name=cluster_name)
             sdk.get(req_id)
             logger.info(f'Worker service ready on {cluster_name}')
             return worker_job_id
         except Exception as e:  # pylint: disable=broad-except
+            try:
+                self._cancel_worker_job_by_id(cluster_name, worker_job_id,
+                                              self._worker_token)
+            except Exception as cancel_error:  # pylint: disable=broad-except
+                logger.warning(
+                    'Failed to cancel unhealthy Batch worker %s '
+                    'on %s: %s', worker_job_id, cluster_name, cancel_error)
             raise RuntimeError(
                 f'Worker service on {cluster_name} failed to start: '
                 f'{e}') from e
+
+    def _cancel_worker_job_by_id(self, cluster_name: str, worker_job_id: int,
+                                 worker_token: str) -> None:
+        """Cancel exactly one worker ID and retire its durable record."""
+        cancel_request_id = sdk.cancel(cluster_name, job_ids=[worker_job_id])
+        sdk.get(cancel_request_id)
+        managed_job_state.remove_batch_worker_record(
+            self._managed_job_id,
+            worker_token,
+            cluster_name,
+            worker_job_id=worker_job_id)
 
     def _shutdown_worker(self,
                          cluster_name: str,
                          worker_job_id: Optional[int] = None) -> None:
         """Send shutdown signal and cancel worker job."""
         shutdown_code = self._generate_shutdown_code()
-        task = sky.Task(name=f'batch-shutdown-{cluster_name}',
+        task = sky.Task(name=(f'batch-shutdown-{self._managed_job_id}-'
+                              f'{self._worker_token}'),
                         run=shutdown_code)
         try:
             request_id = sdk.exec(task, cluster_name=cluster_name)
@@ -775,9 +1118,8 @@ class BatchCoordinator:
         if worker_job_id is not None:
             time.sleep(5)
             try:
-                cancel_req_id = sdk.cancel(cluster_name,
-                                           job_ids=[worker_job_id])
-                sdk.get(cancel_req_id)
+                self._cancel_worker_job_by_id(cluster_name, worker_job_id,
+                                              self._worker_token)
                 logger.info(f'Cancelled worker job {worker_job_id} on '
                             f'{cluster_name}')
             except Exception as e:  # pylint: disable=broad-except
@@ -810,14 +1152,14 @@ class BatchCoordinator:
                         continue
                     return
 
-                retries = self._retry_counts.get(batch_idx, 0)
-                attempt_id = managed_job_state.claim_batch(
-                    self._managed_job_id, batch_idx, cluster_name,
-                    constants.BATCH_LEASE_DURATION)
-                if attempt_id is None:
+                claim = managed_job_state.claim_batch(
+                    self._managed_job_id, batch_idx, self._worker_token,
+                    cluster_name, constants.BATCH_LEASE_DURATION)
+                if claim is None:
                     # Another coordinator/thread won the claim, or persisted
                     # retry backoff has not elapsed yet.
                     continue
+                attempt_id, retries = claim
                 lease_stop, lease_lost, lease_renewer = (
                     self._start_batch_lease_renewer(batch_idx, attempt_id))
 
@@ -876,16 +1218,14 @@ class BatchCoordinator:
                     self._stop_batch_lease_renewer(lease_stop, lease_renewer)
                     completed = managed_job_state.set_batch_attempt_status(
                         self._managed_job_id, batch_idx, attempt_id,
-                        'COMPLETED')
+                        self._worker_token, 'COMPLETED')
                     if not completed:
                         logger.warning(
                             'Ignoring completion from stale batch attempt '
                             '%d/%d', batch_idx, attempt_id)
                         continue
-                    completed_count = self._increment_completed_count()
-                    logger.info(
-                        f'Batch {batch_idx} completed on {cluster_name} '
-                        f'({completed_count}/{len(self.batches)})')
+                    logger.info('Batch %d durably completed on %s', batch_idx,
+                                cluster_name)
                 except Exception as e:  # pylint: disable=broad-except
                     self._stop_batch_lease_renewer(lease_stop, lease_renewer)
                     logger.error(f'Batch {batch_idx} failed on '
@@ -898,11 +1238,11 @@ class BatchCoordinator:
                             self._managed_job_id,
                             batch_idx,
                             attempt_id,
+                            self._worker_token,
                             'PENDING',
                             retry_count=retry_count,
                             next_retry_at=ready_at)
                         if requeued:
-                            self._retry_counts[batch_idx] = retry_count
                             self._enqueue_batch(batch_idx, ready_at)
                             logger.info(f'Re-queued batch {batch_idx} '
                                         f'(retry {retry_count}/'
@@ -917,6 +1257,7 @@ class BatchCoordinator:
                             self._managed_job_id,
                             batch_idx,
                             attempt_id,
+                            self._worker_token,
                             'FAILED',
                             retry_count=retries)
                         if failed:
@@ -927,7 +1268,11 @@ class BatchCoordinator:
                             'Ignoring terminal failure from stale batch '
                             'attempt %d/%d', batch_idx, attempt_id)
         finally:
-            self._shutdown_worker(cluster_name, worker_job_id=worker_job_id)
+            # Once supersession cleanup starts, it exclusively owns bounded
+            # external shutdown.  Worker threads only release local tracking,
+            # so they cannot start another SDK call after its global deadline.
+            if not self._superseded_cleanup_started:
+                self._shutdown_worker(cluster_name, worker_job_id=worker_job_id)
             with self._active_workers_lock:
                 self._active_workers.pop(cluster_name, None)
 
@@ -965,16 +1310,21 @@ class BatchCoordinator:
             t.start()
             active_threads[cluster_name] = t
 
-        # Start initial workers.
-        for cluster_name in self._workers:
-            _start_worker_thread(cluster_name)
-
         # Monitor until all batches complete, periodically discovering
-        # new workers and spawning threads for them.
+        # new workers and spawning threads for them.  Worker startup is delayed
+        # until after the durable lease snapshot so a replacement coordinator
+        # cannot tear down a still-valid attempt on that replica.
         while not self._cancelled:
+            self._assert_coordinator_owner()
             self._reclaim_expired_batches()
-            leased_count, failed_batches = self._sync_batch_progress_from_db()
-            completed_count = self._get_completed_count()
+            # Retry unresolved pre-crash launch intents.  The API cannot make
+            # the interval between accepting ``exec`` and returning its
+            # request ID atomic with our DB, so a successor keeps polling the
+            # exact persisted worker name until it can bind one unambiguous
+            # external ID.  Duplicate matches are deliberately left alone.
+            self._cleanup_stale_worker_services()
+            completed_count, leased_workers, failed_batches = (
+                self._sync_batch_progress_from_db())
             if completed_count >= len(self.batches):
                 break
             if failed_batches:
@@ -987,7 +1337,7 @@ class BatchCoordinator:
             has_pending = self._has_pending_batches()
 
             if not alive and not has_pending:
-                if leased_count:
+                if leased_workers:
                     # A previous coordinator incarnation still owns a live
                     # lease.  Wait for either its completion or expiry.
                     time.sleep(10)
@@ -998,23 +1348,26 @@ class BatchCoordinator:
             started_new = False
             try:
                 current_workers = self._get_ready_workers()
+                if not current_workers:
+                    current_workers = self._workers
                 for w in current_workers:
                     already_active = (w in active_threads and
                                       active_threads[w].is_alive())
-                    if not already_active and self._has_pending_batches():
+                    if (not already_active and w not in leased_workers and
+                            self._has_pending_batches()):
                         logger.info(f'Discovered new/idle worker: {w}')
-                        try:
-                            self._shutdown_worker(w)
-                        except Exception:  # pylint: disable=broad-except
-                            pass
                         _start_worker_thread(w)
                         started_new = True
             except Exception:  # pylint: disable=broad-except
                 pass
 
             # If all threads are dead, work remains, and we couldn't
-            # start any new threads, there's nothing more we can do.
+            # start any new threads, wait if durable leases are the only
+            # blocker; otherwise there is nothing more we can do.
             if (not alive and self._has_pending_batches() and not started_new):
+                if leased_workers:
+                    time.sleep(10)
+                    continue
                 break
 
             time.sleep(10)
@@ -1023,8 +1376,12 @@ class BatchCoordinator:
         for t in active_threads.values():
             t.join(timeout=60)
 
-        completed_count = self._get_completed_count()
+        completed_count, _, failed_batches = self._sync_batch_progress_from_db()
         if completed_count != len(self.batches):
+            if failed_batches and not errors:
+                errors.append(
+                    RuntimeError('Batch job has terminally failed batches: '
+                                 f'{failed_batches}'))
             if errors:
                 raise errors[0]
             raise RuntimeError(
@@ -1043,8 +1400,16 @@ class BatchCoordinator:
                 raise RuntimeError(
                     f'Cannot reduce batch {rec["batch_idx"]} in state '
                     f'{rec["status"]}.')
-            attempts.append((rec['start_idx'], rec['end_idx'],
-                             int(rec.get('attempt_id') or 0)))
+            attempt_id = int(rec.get('attempt_id') or 0)
+            if attempt_id <= 0:
+                raise RuntimeError(
+                    f'Completed batch {rec["batch_idx"]} has no fenced '
+                    'attempt ID.')
+            if not rec.get('attempt_owner_token'):
+                raise RuntimeError(
+                    f'Completed batch {rec["batch_idx"]} has no attempt '
+                    'owner token.')
+            attempts.append((rec['start_idx'], rec['end_idx'], attempt_id))
         if len(attempts) != len(self.batches):
             raise RuntimeError(f'Expected {len(self.batches)} completed batch '
                                f'attempts, found {len(attempts)}.')
@@ -1052,18 +1417,23 @@ class BatchCoordinator:
 
     def _reduce_results(self) -> None:
         """Publish outputs from only the durably completed attempts."""
+        self._assert_coordinator_owner()
         job_id = str(self._managed_job_id)
         batch_attempts = self._get_completed_batch_attempts()
         logger.info('Reducing results...')
         for fmt in self._output_formats:
+            self._assert_coordinator_owner()
             logger.info(f'Handling output format: {type(fmt).__name__}')
             fmt.reduce_attempt_results(job_id, batch_attempts)
+            self._assert_coordinator_owner()
             logger.info(f'Results written to {fmt.path}')
 
     def cleanup(self) -> None:
         """Best-effort cleanup after the managed job is durably SUCCEEDED."""
+        self._assert_coordinator_owner()
         job_id = str(self._managed_job_id)
         for fmt in self._output_formats:
+            self._assert_coordinator_owner()
             fmt.cleanup(job_id)
             logger.info(f'Cleaned up temp files for {fmt.path}')
 

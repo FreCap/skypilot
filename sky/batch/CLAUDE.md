@@ -89,7 +89,7 @@ Readers and writers are defined in `io_formats.py`:
 1. `ds.map()` launches managed job → gets `managed_job_id`
 2. Jobs controller passes `job_id` to `BatchCoordinator(job_id=self._job_id)`
 3. Coordinator passes `str(managed_job_id)` as `SKY_BATCH_JOB_ID` env var to workers
-4. Workers use it with the attempt token for immutable temp paths: `.sky_batch_tmp/{managed_job_id}/attempts/{attempt_id}/batch_XXXXX-YYYYY.jsonl`
+4. Workers use it with an output-path hash and attempt token for immutable temp paths: `.sky_batch_tmp/{managed_job_id}/outputs/{output_id}/attempts/{attempt_id}/batch_XXXXX-YYYYY.jsonl`
 5. Client uses same `managed_job_id` to poll progress from DB
 
 ## Progress Reporting
@@ -102,7 +102,7 @@ Readers and writers are defined in `io_formats.py`:
 
 ## Database Schema
 
-`batch_state` table (created in migration 018 and extended with attempt leases in migration 022):
+`batch_state` table (created in migration 018, extended with attempt leases in migration 022, and owner fencing in migration 023):
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -114,27 +114,43 @@ Readers and writers are defined in `io_formats.py`:
 | `worker_cluster` | Text | Which worker processed this batch |
 | `retry_count` | Integer | Number of retries for this batch |
 | `attempt_id` | Integer | Monotonic fencing token assigned on each claim |
+| `attempt_owner_token` | Text | Coordinator incarnation that owns the attempt |
 | `lease_expires_at` | Float | Time after which an abandoned DISPATCHED attempt can be reclaimed |
 | `next_retry_at` | Float | Earliest time a retried PENDING batch is eligible |
 | `updated_at` | Float | Last update timestamp |
 
+`batch_worker` stores one durable worker launch intent per managed job,
+coordinator token, and pool replica. The intent is committed before `sdk.exec`;
+`launch_request_id` and the exact returned `worker_job_id` are filled in as the
+API makes them available.
+
 **State functions** in `sky/jobs/state.py`:
-- `save_batch_states(job_id, batches)` — Bulk insert all batches atomically
+- `acquire_batch_coordinator(...)` — Atomically replace the durable owner token on `job_info`
+- `save_batch_states(job_id, batches, owner_token)` — Owner-fenced bulk insert
 - `get_batch_states(job_id)` — Read all batch records
-- `claim_batch(...)` — Atomically claim an eligible PENDING batch and return its attempt token
-- `renew_batch_lease(...)` — Extend a lease only for the current attempt token
-- `set_batch_attempt_status(...)` — Attempt-fenced transition to PENDING, COMPLETED, or FAILED
-- `requeue_expired_batch_attempts(...)` — Reclaim only expired DISPATCHED attempts
+- `claim_batch(...)` — Owner-fenced claim of an eligible PENDING batch
+- `renew_batch_lease(...)` — Extend a lease only for the current coordinator and attempt owner
+- `set_batch_attempt_status(...)` — Owner- and attempt-fenced transition to PENDING, COMPLETED, or FAILED
+- `requeue_expired_batch_attempts(...)` — Current-owner-only reclaim of expired DISPATCHED attempts
+- `register_batch_worker_launch(...)` — Owner-fenced launch intent committed before external submission
+- `record_batch_worker_launch_request(...)` / `record_batch_worker_job_id(...)` — Durable external identities for exact cleanup
 - `is_batch_job(job_id)` — Check if job has batch state records
 
 ## HA Recovery
 
 - Batch states are persisted to DB with statuses: PENDING → DISPATCHED → COMPLETED (or FAILED)
+- Each coordinator atomically replaces `job_info.batch_coordinator_token`; takeover and every owner-gated mutation serialize on that same row (`FOR UPDATE` on PostgreSQL, a write lock on SQLite)
+- Superseded controllers propagate through `ControllerManager.run_job_loop` on a dedicated non-failure path: they never run replacement-owned recovery-script, storage, API-token, terminal-state, or scheduler cleanup
 - Every dispatch receives an `attempt_id`; stale controllers cannot complete, fail, or requeue a newer attempt
 - Dispatchers renew a short lease while SDK calls or worker jobs are active; expired attempts are reclaimed after a crash
-- Retry counts and `next_retry_at` are persisted, so retry limits and exponential backoff survive restarts
-- Worker startup kills only a stale listener on the dedicated worker port. It never cancels every job on a shared pool replica
+- Retry counts and `next_retry_at` are persisted, so retry limits and exponential backoff survive restarts without an in-memory retry mirror
+- A worker launch intent is durable before the external launch, so a worker started before the first batch claim remains discoverable across multiple coordinator takeovers
+- A replacement waits for old live attempt leases, then cancels each stale worker by its one durable exact job ID; duplicate task names are never bulk-cancelled
+- The API has an unavoidable interval between accepting `exec` and returning its request ID. During that interval the durable intent contains only the exact token-scoped name; successors retry resolution, accept a single unambiguous queue match, and refuse cleanup if duplicate names map to multiple IDs
+- Superseded cleanup has one global deadline. A timed-out synchronous SDK call may finish only its already-started exact-own action; no additional cleanup action starts after the deadline
+- Pre-fence attempted rows without `attempt_owner_token` are rejected; Batch uses a clean schema cutover rather than legacy recovery fallbacks
 - Worker health/feed/shutdown requests carry a per-coordinator token so an older controller cannot control a replacement service
+- The worker uses a threaded localhost server so a long-running feed request cannot block health or bounded shutdown requests
 - Workers write immutable attempt-scoped objects; reduction publishes only the attempt token stored on each COMPLETED row
 - Max retries per batch: `MAX_RETRIES = 3` with exponential backoff (`RETRY_BACKOFF_BASE = 2`)
 
@@ -169,7 +185,7 @@ Readers and writers are defined in `io_formats.py`:
    c. Generate a token-scoped notify script (`curl /feed_batch`) and submit via `sdk.exec()`
    d. Poll `sdk.job_status()` until terminal state
    e. Use the attempt token to transition DISPATCHED → COMPLETED, FAILED, or delayed PENDING
-   f. Increment `completed_count` only if the fenced completion succeeds
+   f. Let the monitor derive completion progress from durable batch rows
 3. Finally: `_shutdown_worker()` via `/shutdown` endpoint
 
 Error tolerance: up to 12 consecutive `None` status polls (~60s) before treating as failure.

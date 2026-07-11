@@ -360,8 +360,10 @@ def start_worker(serialized_fn: str,
     _dataset_format = _resolve_input_format()
     _output_formats = _resolve_output_formats()
 
-    # Start HTTP server.
-    server = http_server.HTTPServer(
+    # A feed request remains open until the mapper saves its output.  Serve
+    # control requests on separate threads so shutdown is never blocked behind
+    # that long-running request.
+    server = http_server.ThreadingHTTPServer(
         ('127.0.0.1', constants.WORKER_SERVICE_PORT), _WorkerHandler)
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()

@@ -740,13 +740,12 @@ class JobController:
 
         try:
             await asyncio.to_thread(coordinator.run)
-            await managed_job_state.set_succeeded_async(
-                job_id=self._job_id,
-                task_id=task_id,
-                end_time=time.time(),
-                callback_func=callback_func)
+            await asyncio.to_thread(coordinator.mark_succeeded, time.time())
+            await callback_func('SUCCEEDED')
             try:
                 await asyncio.to_thread(coordinator.cleanup)
+            except batch_coordinator.SupersededCoordinator:
+                raise
             except Exception as e:  # pylint: disable=broad-except
                 # Output publication is complete and SUCCEEDED is durable.
                 # Temp-file cleanup must never turn a successful batch into a
@@ -755,17 +754,22 @@ class JobController:
                                e,
                                exc_info=True)
             return True
+        except batch_coordinator.SupersededCoordinator:
+            logger.info('Batch coordinator was superseded; leaving job state '
+                        'to the replacement coordinator.')
+            await coordinator.handle_superseded()
+            raise
         except asyncio.CancelledError:
             coordinator.cancel()
             raise
         except Exception as e:  # pylint: disable=broad-except
             logger.error(f'Batch coordinator failed: {e}', exc_info=True)
-            await managed_job_state.set_failed_async(
-                job_id=self._job_id,
-                task_id=task_id,
-                failure_type=managed_job_state.ManagedJobStatus.FAILED,
-                failure_reason=str(e),
-                callback_func=callback_func)
+            try:
+                await asyncio.to_thread(coordinator.mark_failed, str(e))
+            except batch_coordinator.SupersededCoordinator:
+                await coordinator.handle_superseded()
+                raise
+            await callback_func('FAILED')
             return False
 
     async def _monitor_one_task(
@@ -1840,6 +1844,7 @@ class JobController:
         logger.info(f'Starting JobsController run for job {self._job_id}')
         task_id = 0
         cancelled = False
+        superseded = False
 
         try:
             succeeded = True
@@ -1904,6 +1909,12 @@ class JobController:
             # below.
             cancelled = True
             raise
+        except batch_coordinator.SupersededCoordinator:
+            superseded = True
+            logger.info(
+                'JobsController for Batch job %s was superseded; '
+                'skipping terminal state transitions.', self._job_id)
+            raise
         except (Exception, SystemExit) as e:  # pylint: disable=broad-except
             logger.error(
                 f'Unexpected error in JobsController run for task {task_id}')
@@ -1916,19 +1927,20 @@ class JobController:
                 task_id, managed_job_state.ManagedJobStatus.FAILED_CONTROLLER,
                 msg)
         finally:
-            callback_func = managed_job_utils.event_callback_func(
-                job_id=self._job_id,
-                task_id=task_id,
-                task=self._dag.tasks[task_id])
-            await managed_job_state.set_cancelling_async(
-                job_id=self._job_id, callback_func=callback_func)
-            if not cancelled:
-                # the others haven't been run yet so we can set them to
-                # cancelled immediately (no resources to clean up).
-                # if we are running and get cancelled, we need to clean up the
-                # resources first so this will be done later.
-                await managed_job_state.set_cancelled_async(
+            if not superseded:
+                callback_func = managed_job_utils.event_callback_func(
+                    job_id=self._job_id,
+                    task_id=task_id,
+                    task=self._dag.tasks[task_id])
+                await managed_job_state.set_cancelling_async(
                     job_id=self._job_id, callback_func=callback_func)
+                if not cancelled:
+                    # the others haven't been run yet so we can set them to
+                    # cancelled immediately (no resources to clean up).
+                    # if we are running and get cancelled, we need to clean up
+                    # the resources first so this will be done later.
+                    await managed_job_state.set_cancelled_async(
+                        job_id=self._job_id, callback_func=callback_func)
 
     async def _update_failed_task_state(
             self, task_id: int,
@@ -2274,6 +2286,7 @@ class ControllerManager:
         usage_lib.install_fresh_messages_for_current_context()
 
         cancelling = False
+        superseded = False
         graceful, graceful_timeout = False, None
         try:
             controller = JobController(job_id, self.starting,
@@ -2349,56 +2362,61 @@ class ControllerManager:
 
             cancelling = True
             raise
+        except batch_coordinator.SupersededCoordinator:
+            superseded = True
+            logger.info(
+                'Job loop for Batch job %s was superseded; preserving '
+                'replacement-owned durable state and resources.', job_id)
+            raise
         except Exception as e:
             logger.error(f'Unexpected error in job loop for {job_id}: '
                          f'{common_utils.format_exception(e)}')
             raise
         finally:
-            try:
-                await self._cleanup(job_id,
-                                    pool=pool,
-                                    graceful=graceful,
-                                    graceful_timeout=graceful_timeout)
-                logger.info(
-                    f'Cluster of managed job {job_id} has been cleaned up.')
-            except Exception as e:  # pylint: disable=broad-except
-                failure_reason = ('Failed to clean up: '
-                                  f'{common_utils.format_exception(e)}')
-                await managed_job_state.set_failed_async(
-                    job_id,
-                    task_id=None,
-                    failure_type=managed_job_state.ManagedJobStatus.
-                    FAILED_CONTROLLER,
-                    failure_reason=failure_reason,
-                    override_terminal=True)
+            if not superseded:
+                try:
+                    await self._cleanup(job_id,
+                                        pool=pool,
+                                        graceful=graceful,
+                                        graceful_timeout=graceful_timeout)
+                    logger.info(
+                        f'Cluster of managed job {job_id} has been cleaned up.')
+                except Exception as e:  # pylint: disable=broad-except
+                    failure_reason = ('Failed to clean up: '
+                                      f'{common_utils.format_exception(e)}')
+                    await managed_job_state.set_failed_async(
+                        job_id,
+                        task_id=None,
+                        failure_type=managed_job_state.ManagedJobStatus.
+                        FAILED_CONTROLLER,
+                        failure_reason=failure_reason,
+                        override_terminal=True)
 
-            if cancelling:
-                # Since it's set with cancelling
-                assert task_id is not None, job_id
-                await managed_job_state.set_cancelled_async(
-                    job_id=job_id,
-                    callback_func=managed_job_utils.event_callback_func(
-                        job_id=job_id, task_id=task_id,
-                        task=dag.tasks[task_id]))
+                if cancelling:
+                    # Since it's set with cancelling
+                    assert task_id is not None, job_id
+                    await managed_job_state.set_cancelled_async(
+                        job_id=job_id,
+                        callback_func=managed_job_utils.event_callback_func(
+                            job_id=job_id,
+                            task_id=task_id,
+                            task=dag.tasks[task_id]))
 
-            # We should check job status after 'set_cancelled', otherwise
-            # the job status is not terminal.
-            job_status = await managed_job_state.get_status_async(job_id)
-            assert job_status is not None
-            # The job can be non-terminal if the controller exited abnormally,
-            # e.g. failed to launch cluster after reaching the MAX_RETRY.
-            if not job_status.is_terminal():
-                logger.info(f'Previous job status: {job_status.value}')
-                await managed_job_state.set_failed_async(
-                    job_id,
-                    task_id=None,
-                    failure_type=managed_job_state.ManagedJobStatus.
-                    FAILED_CONTROLLER,
-                    failure_reason=(
-                        'Unexpected error occurred. For details, '
-                        f'run: sky jobs logs --controller {job_id}'))
+                # Check status after set_cancelled so cancellation is terminal.
+                job_status = await managed_job_state.get_status_async(job_id)
+                assert job_status is not None
+                if not job_status.is_terminal():
+                    logger.info(f'Previous job status: {job_status.value}')
+                    await managed_job_state.set_failed_async(
+                        job_id,
+                        task_id=None,
+                        failure_type=managed_job_state.ManagedJobStatus.
+                        FAILED_CONTROLLER,
+                        failure_reason=(
+                            'Unexpected error occurred. For details, '
+                            f'run: sky jobs logs --controller {job_id}'))
 
-            await scheduler.job_done_async(job_id)
+                await scheduler.job_done_async(job_id)
 
             async with self._job_tasks_lock:
                 try:

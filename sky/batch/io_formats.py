@@ -442,9 +442,6 @@ class ImageWriter(OutputWriter):
                                batch_attempts: List[BatchAttempt]) -> None:
         output_dir = self.path.rstrip('/')
         for start_idx, end_idx, attempt_id in batch_attempts:
-            if attempt_id == 0:
-                # Pre-fencing workers wrote directly to the final path.
-                continue
             for global_idx in range(start_idx, end_idx + 1):
                 source_path = utils.get_attempt_image_path(
                     self.path, global_idx, job_id, attempt_id)
@@ -452,4 +449,5 @@ class ImageWriter(OutputWriter):
                 utils.copy_cloud_file(source_path, destination_path)
 
     def cleanup(self, job_id: str) -> None:
-        utils.delete_cloud_prefix(utils.get_job_temp_prefix(self.path, job_id))
+        utils.delete_cloud_prefix(
+            utils.get_directory_job_temp_prefix(self.path, job_id))
