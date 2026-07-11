@@ -5,13 +5,23 @@ from unittest import mock
 import jwt as pyjwt
 import pytest
 
+from sky.jobs import utils as job_utils
 from sky.server import config
+from sky.utils import controller_utils
 
 
 @pytest.fixture(autouse=True)
 def _clear_long_worker_cpu_multiplier_env(monkeypatch):
-    """Isolate tests from SKYPILOT_LONG_WORKER_CPU_MULTIPLIER in the env."""
+    """Isolate worker sizing from process-global deployment state."""
     monkeypatch.delenv(config.LONG_WORKER_CPU_MULTIPLIER_ENV_VAR, raising=False)
+    monkeypatch.setattr(job_utils, 'is_consolidation_mode', lambda: False)
+    monkeypatch.setattr(controller_utils, '_is_consolidation_mode',
+                        lambda _pool: False)
+    controller_utils._get_parallelism.cache_clear()
+    controller_utils._get_request_parallelism.cache_clear()
+    yield
+    controller_utils._get_parallelism.cache_clear()
+    controller_utils._get_request_parallelism.cache_clear()
 
 
 @mock.patch('sky.utils.common_utils.get_mem_size_gb', return_value=8)
@@ -79,7 +89,8 @@ def test_compute_server_config_low_resources(cpu_count, mem_size_gb):
     assert c.num_server_workers == 1
     assert c.long_worker_config.garanteed_parallelism == 1
     assert c.long_worker_config.burstable_parallelism == 0
-    assert c.short_worker_config.garanteed_parallelism == 5
+    assert (c.short_worker_config.garanteed_parallelism ==
+            config._get_min_short_workers())
     assert c.short_worker_config.burstable_parallelism == 0
     assert c.queue_backend == config.QueueBackend.MULTIPROCESSING
 
@@ -89,7 +100,6 @@ def test_compute_server_config_low_resources(cpu_count, mem_size_gb):
 @mock.patch('sky.utils.env_options.Options.RUNNING_IN_BUILDKITE.get',
             return_value=False)
 def test_compute_server_config_pool(cpu_count, mem_size_gb, buildkite_mock):
-    from sky.utils import controller_utils
     reserved_memory_mb = float(
         controller_utils.MAXIMUM_CONTROLLER_RESERVED_MEMORY_MB)
 
@@ -150,7 +160,7 @@ def test_parallel_size_short():
     # Test with insufficient memory
     blocking_size = 1
     mem_size_gb = 2
-    expected = 5
+    expected = config._get_min_short_workers()
     assert config._max_short_worker_parallism(mem_size_gb,
                                               blocking_size) == expected
 
@@ -164,7 +174,7 @@ def test_parallel_size_short():
     # Test with limited memory
     blocking_size = 1
     mem_size_gb = 3
-    expected = 5
+    expected = config._get_min_short_workers()
     assert config._max_short_worker_parallism(mem_size_gb,
                                               blocking_size) == expected
 

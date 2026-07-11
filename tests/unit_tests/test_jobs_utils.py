@@ -9,11 +9,22 @@ import pytest
 from sky.backends import cloud_vm_ray_backend
 from sky.exceptions import ClusterDoesNotExist
 from sky.jobs import utils
+from sky.utils import controller_utils
 
 # String path for mock.patch — can't use the constant directly because
 # mock.patch needs the dotted path to the attribute being patched.
 _SIGNAL_FILE_CONST = (
     'sky.jobs.constants.JOBS_CONSOLIDATION_RELOADED_SIGNAL_FILE')
+
+
+@pytest.fixture(autouse=True)
+def _clear_consolidation_mode_caches():
+    """Keep request-scoped consolidation state from leaking across tests."""
+    utils.is_consolidation_mode.cache_clear()
+    controller_utils._effective_jobs_consolidation_with_warnings.cache_clear()
+    yield
+    utils.is_consolidation_mode.cache_clear()
+    controller_utils._effective_jobs_consolidation_with_warnings.cache_clear()
 
 
 @mock.patch('sky.core.down')
@@ -152,7 +163,6 @@ def test_consolidation_mode_warning_without_restart(mock_config, mock_logger,
     """
     # Clear the LRU caches on both the wrapper and the shared helper.
     utils.is_consolidation_mode.cache_clear()
-    import sky.utils.controller_utils as controller_utils
     controller_utils._effective_jobs_consolidation_with_warnings.cache_clear()
 
     # Mock config to return True for consolidation mode
@@ -654,9 +664,6 @@ class TestClusterHandleFields:
 
 class TestIsConsolidationMode:
     """Tests for is_consolidation_mode() with None sentinel."""
-
-    def setup_method(self):
-        utils.is_consolidation_mode.cache_clear()
 
     def test_no_signal_returns_false(self):
         """No signal file => False."""
