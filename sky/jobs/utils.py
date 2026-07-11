@@ -741,6 +741,26 @@ def update_managed_jobs_statuses(job_id: Optional[int] = None):
                         'deferring to the next status update cycle.')
             continue
 
+        # The controller can also die AFTER all tasks are already terminal but
+        # BEFORE it flips schedule_state to DONE, e.g. during log streaming or
+        # cluster teardown. Preserve the terminal task outcome and only
+        # finalize scheduler state; rewriting the job to FAILED_CONTROLLER here
+        # would clobber a real SUCCEEDED/FAILED result with a cleanup crash.
+        if fresh_info['all_tasks_terminal']:
+            logger.info(f'Job {job_id} already reached terminal task status; '
+                        'finalizing schedule state without rewriting the job '
+                        'to FAILED_CONTROLLER.')
+            if _controller_is_restarting():
+                logger.info(f'Controller restart in progress for terminal job '
+                            f'{job_id}; deferring cleanup/finalization to the '
+                            'next status update cycle.')
+                continue
+            cleanup_error = _cleanup_job_clusters(job_id, tasks, info['pool'])
+            if cleanup_error:
+                logger.error(cleanup_error)
+            scheduler.job_done(job_id, idempotent=True)
+            continue
+
         if pid is not None:
             logger.error(f'Controller process for {job_id} seems to be dead.')
             failure_reason = 'Controller process is dead'

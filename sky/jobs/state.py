@@ -1588,13 +1588,19 @@ def get_jobs_status_check_info(job_ids: List[int]) -> Dict[int, Dict[str, Any]]:
 
 
 def get_job_status_check_state(job_id: int) -> Optional[Dict[str, Any]]:
-    """Fetch the minimal fresh job_info state for a destructive recheck.
+    """Fetch the minimal fresh job/task state for a destructive recheck.
 
     ``update_managed_jobs_statuses`` reuses its sweep-wide task snapshot for
     cleanup, but before any destructive action it must confirm the job still
-    has the same controller ownership fields.  That safety recheck only needs
-    the authoritative ``job_info`` row, not task rows.
+    has the same controller ownership fields. It also needs to know if every
+    task is already terminal, so a controller crash during post-terminal
+    cleanup can preserve the task outcome instead of overwriting it with
+    ``FAILED_CONTROLLER``. The recheck stays slim: one grouped join on the
+    small scalar fields plus a non-terminal task count.
     """
+    terminal_status_values = [
+        status.value for status in ManagedJobStatus.terminal_statuses()
+    ]
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         row = session.execute(
@@ -1602,13 +1608,29 @@ def get_job_status_check_state(job_id: int) -> Optional[Dict[str, Any]]:
                 job_info_table.c.schedule_state,
                 job_info_table.c.controller_pid,
                 job_info_table.c.controller_pid_started_at,
-            ).where(job_info_table.c.spot_job_id == job_id)).fetchone()
+                sqlalchemy.func.count(  # pylint: disable=not-callable
+                    spot_table.c.task_id).label('task_count'),
+                sqlalchemy.func.sum(
+                    sqlalchemy.case(
+                        (~spot_table.c.status.in_(terminal_status_values), 1),
+                        else_=0)).label('nonterminal_task_count'),
+            ).select_from(
+                job_info_table.outerjoin(
+                    spot_table,
+                    spot_table.c.spot_job_id == job_info_table.c.spot_job_id)).
+            where(job_info_table.c.spot_job_id == job_id).group_by(
+                job_info_table.c.schedule_state,
+                job_info_table.c.controller_pid,
+                job_info_table.c.controller_pid_started_at)).fetchone()
     if row is None or row[0] is None:
         return None
+    task_count = int(row[3] or 0)
+    nonterminal_task_count = int(row[4] or 0)
     return {
         'schedule_state': ManagedJobScheduleState(row[0]),
         'controller_pid': row[1],
         'controller_pid_started_at': row[2],
+        'all_tasks_terminal': task_count > 0 and nonterminal_task_count == 0,
     }
 
 
