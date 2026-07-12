@@ -155,6 +155,11 @@ LB_CONTROLLER_SYNC_TIMEOUT_SECONDS = 30
 # five-second budget for its owner reads and response forwarding.
 LB_CONTROLLER_PROXY_TIMEOUT_SECONDS = 25
 
+# Lightweight controller-child supervision endpoint.  Do not use
+# /autoscaler/info for liveness: serializing a large fleet is legitimate work
+# and can exceed the parent's tight health-check timeout during launch storms.
+CONTROLLER_HEALTH_ENDPOINT_PATH = '/controller/health'
+
 # [boltz fork] Cadence of the LB's per-replica async-occupancy probe (the
 # `async_capacity` action). The HTTP-envelope in-flight accounting reads ~0
 # for fast-ack async workloads while replicas crunch hour-long jobs, so the

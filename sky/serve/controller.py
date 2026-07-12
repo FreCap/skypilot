@@ -882,6 +882,16 @@ class SkyServeController:
                 self._controller_owner_fingerprint))
 
         @self._app.get(
+            serve_constants.CONTROLLER_HEALTH_ENDPOINT_PATH,
+            dependencies=[admin_auth_dependency, controller_owner_dependency])
+        async def get_controller_health() -> fastapi.Response:
+            # Keep child liveness independent from fleet size.  In particular,
+            # autoscaler.info() serializes every replica and can legitimately
+            # exceed the supervisor's one-second read budget at fleet scale.
+            return responses.JSONResponse(content={'status': 'ok'},
+                                          status_code=200)
+
+        @self._app.get(
             '/autoscaler/info',
             dependencies=[admin_auth_dependency, controller_owner_dependency])
         async def get_autoscaler_info() -> fastapi.Response:

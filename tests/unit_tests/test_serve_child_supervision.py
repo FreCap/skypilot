@@ -2,6 +2,7 @@
 # pylint: disable=protected-access
 from unittest import mock
 
+from sky.serve import constants
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve import service
@@ -29,7 +30,7 @@ class TestControllerHealth:
                                                         '10.0.0.2', 20001)
         get.assert_called_once_with(
             'svc', ('incarnation-a', service.os.getpid(), '10.0.0.2', 20001),
-            '/autoscaler/info',
+            constants.CONTROLLER_HEALTH_ENDPOINT_PATH,
             timeout=(0.5, 1.0))
 
     def test_failed_health_check_is_unhealthy(self):

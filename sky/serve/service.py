@@ -713,7 +713,7 @@ def _controller_child_responding(service_name: str, service_hash: str,
         response = serve_utils._get_to_local_controller_with_retry(  # pylint: disable=protected-access
             service_name,
             (service_hash, os.getpid(), controller_ip, controller_port),
-            '/autoscaler/info',
+            constants.CONTROLLER_HEALTH_ENDPOINT_PATH,
             timeout=(0.5, 1.0))
         return response.status_code == 200
     except Exception as e:  # pylint: disable=broad-except
