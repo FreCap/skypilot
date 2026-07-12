@@ -91,7 +91,10 @@ export async function getCurrentUserRole() {
     } finally {
       currentUserPromise = null;
     }
-    return cacheCurrentUser(null);
+    // Do not cache failures: the next caller retries instead of pinning a
+    // transient error into the TTL window. roleFetchFailed lets permission
+    // gates distinguish "request failed" from "authenticated non-admin".
+    return { ...normalizeCurrentUser(null), roleFetchFailed: true };
   })();
 
   return currentUserPromise;

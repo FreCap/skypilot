@@ -187,6 +187,11 @@ export function EstimatedSpend() {
     try {
       const role = await getCurrentUserRole();
       if (generation !== requestGeneration.current) return;
+      if (role.roleFetchFailed) {
+        // A failed role lookup is an error, not a permission denial: keep
+        // the error UI so the next refresh cycle retries.
+        throw new Error('Failed to fetch current role');
+      }
       if (role.role !== 'admin') {
         setForbidden(true);
         setData(null);

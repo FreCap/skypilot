@@ -22,11 +22,3 @@ export async function getEstimatedSpend(days = 30, groupBy = 'job') {
   }
   return response.json();
 }
-
-export async function getCurrentRole() {
-  const response = await apiClient.get('/users/role');
-  if (!response.ok) {
-    throw new Error(`Failed to fetch current role (${response.status})`);
-  }
-  return response.json();
-}

@@ -203,6 +203,27 @@ test('shows spot and on-demand as purchase-option groups', async () => {
   ).not.toBeTruthy();
 });
 
+test('treats a failed role lookup as an error, not a permission denial', async () => {
+  getCurrentUserRole.mockClear();
+  getEstimatedSpend.mockClear();
+  getCurrentUserRole.mockResolvedValue({
+    id: 'local',
+    name: 'local',
+    role: null,
+    roleFetchFailed: true,
+  });
+  getEstimatedSpend.mockResolvedValue(response(30, 10));
+
+  render(<EstimatedSpend />);
+
+  await waitFor(() => expect(getCurrentUserRole).toHaveBeenCalledTimes(1));
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: /refresh/i })).toBeEnabled()
+  );
+  expect(screen.queryByText('Admin access required')).not.toBeTruthy();
+  expect(getEstimatedSpend).not.toHaveBeenCalled();
+});
+
 test('does not invent purchase-option costs for a legacy server response', async () => {
   getCurrentUserRole.mockResolvedValue({ role: 'admin' });
   const legacyResponse = response(30, 10);
