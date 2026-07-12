@@ -804,7 +804,7 @@ class BatchCoordinator:
                                          []).replace('\'', '\'\\\'\'')
 
         return textwrap.dedent(f"""\
-            set -e
+            set -eo pipefail
             export SKY_BATCH_SERIALIZED_FN='{self.serialized_fn}'
             export SKY_BATCH_OUTPUT_PATH='{self.output_path}'
             export SKY_BATCH_JOB_ID='{job_id}'

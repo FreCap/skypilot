@@ -16,7 +16,9 @@ import logging
 import os
 import queue
 import threading
-from typing import Any, Dict, Iterator, List, Optional
+import time
+import traceback
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from sky.batch import constants
 from sky.batch import io_formats
@@ -64,6 +66,8 @@ _job_id: Optional[str] = None
 _worker_token: Optional[str] = None
 _dataset_format: Optional[io_formats.InputReader] = None
 _output_formats: List[io_formats.OutputWriter] = []
+_mapper_failure: Optional[str] = None
+_mapper_failure_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # HTTP handler (localhost only)
@@ -87,7 +91,8 @@ class _WorkerHandler(http_server.BaseHTTPRequestHandler):
         if not self._is_authorized():
             return
         if self.path == '/health':
-            self._send_json(200, {'status': 'healthy'})
+            code, body = _get_health_response()
+            self._send_json(code, body)
         else:
             self.send_error(404)
 
@@ -124,6 +129,11 @@ class _WorkerHandler(http_server.BaseHTTPRequestHandler):
 
     def _handle_feed_batch(self) -> None:
         """Download batch from source, feed to load(), wait for completion."""
+        mapper_failure = _get_mapper_failure()
+        if mapper_failure is not None:
+            self._send_json(500, {'error': mapper_failure})
+            return
+
         body = self._read_json()
         dataset_path = body['dataset_path']
         start_idx = int(body['start_idx'])
@@ -151,8 +161,7 @@ class _WorkerHandler(http_server.BaseHTTPRequestHandler):
         _batch_queue.put(item)
 
         # Block until save_results() (or an error) sets the event.
-        completed = item.done_event.wait(
-            timeout=constants.BATCH_COMPLETION_TIMEOUT)
+        completed = _wait_for_batch_completion(item)
 
         if not completed:
             timeout_msg = (
@@ -217,6 +226,63 @@ def _expire_batch(item: _BatchItem, error: str) -> None:
         item.done_event.set()
         if _current_batch is item:
             _current_batch = None
+
+
+def _reset_worker_runtime_state() -> None:
+    """Reset module globals for a fresh worker process or unit test."""
+    global _batch_queue, _current_batch, _mapper_failure
+    _batch_queue = queue.Queue()
+    _current_batch = None
+    with _mapper_failure_lock:
+        _mapper_failure = None
+
+
+def _record_mapper_failure(error: str) -> str:
+    """Persist the first mapper failure and return the durable message."""
+    global _mapper_failure
+    error = error.strip()
+    with _mapper_failure_lock:
+        if _mapper_failure is None:
+            _mapper_failure = error
+        return _mapper_failure
+
+
+def _get_mapper_failure() -> Optional[str]:
+    with _mapper_failure_lock:
+        return _mapper_failure
+
+
+def _get_health_response() -> Tuple[int, Dict[str, str]]:
+    mapper_failure = _get_mapper_failure()
+    if mapper_failure is not None:
+        return 503, {
+            'status': 'failed',
+            'error': mapper_failure,
+        }
+    return 200, {'status': 'healthy'}
+
+
+def _wait_for_batch_completion(
+        item: _BatchItem,
+        timeout: float = constants.BATCH_COMPLETION_TIMEOUT,
+        poll_interval: float = 0.2) -> bool:
+    """Wait for save_results(), but fail fast if the mapper dies."""
+    mapper_failure = _get_mapper_failure()
+    if mapper_failure is not None:
+        _expire_batch(item, mapper_failure)
+        return True
+
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        if item.done_event.wait(timeout=min(poll_interval, remaining)):
+            return True
+        mapper_failure = _get_mapper_failure()
+        if mapper_failure is not None:
+            _expire_batch(item, mapper_failure)
+            return True
 
 
 # ---------------------------------------------------------------------------
@@ -354,6 +420,7 @@ def start_worker(serialized_fn: str,
     """
     global _output_path, _job_id, _worker_token, _dataset_format
     global _output_formats
+    _reset_worker_runtime_state()
     _output_path = output_path
     _job_id = job_id
     _worker_token = worker_token
@@ -375,10 +442,13 @@ def start_worker(serialized_fn: str,
     try:
         mapper_fn()
     except Exception as e:  # pylint: disable=broad-except
-        logger.error('Mapper function raised: %s', e)
+        mapper_failure = _record_mapper_failure(''.join(
+            traceback.format_exception(type(e), e, e.__traceback__)))
+        logger.error('Mapper function raised:\n%s', mapper_failure)
         # If the mapper crashed while processing a batch, unblock the
         # HTTP handler so the sky.exec job can fail cleanly.
-        signal_batch_done(error=str(e))
+        signal_batch_done(error=mapper_failure)
+        raise
     finally:
         server.shutdown()
         logger.info('Worker service stopped')

@@ -868,6 +868,93 @@ def test_worker_uses_threaded_http_server(monkeypatch):
     server.shutdown.assert_called_once_with()
 
 
+def test_worker_start_raises_on_mapper_crash(monkeypatch):
+    server = mock.Mock()
+    server.serve_forever = mock.Mock()
+    server.shutdown = mock.Mock()
+    server_factory = mock.Mock(return_value=server)
+    monkeypatch.setattr(worker.http_server, 'ThreadingHTTPServer',
+                        server_factory)
+    monkeypatch.setattr(worker, '_resolve_input_format', mock.Mock())
+    monkeypatch.setattr(worker, '_resolve_output_formats',
+                        mock.Mock(return_value=[]))
+    monkeypatch.setattr(
+        worker.utils, 'deserialize_function',
+        mock.Mock(
+            return_value=lambda: (_ for _ in ()).throw(RuntimeError('boom'))))
+
+    with pytest.raises(RuntimeError, match='boom'):
+        worker.start_worker('serialized', 's3://bucket/output', 'job-1',
+                            'token')
+
+    assert 'RuntimeError: boom' in worker._get_mapper_failure()
+    server.shutdown.assert_called_once_with()
+
+
+def test_worker_health_reports_mapper_failure(monkeypatch):
+    monkeypatch.setattr(worker, '_mapper_failure', None)
+    assert worker._get_health_response() == (200, {'status': 'healthy'})
+
+    worker._record_mapper_failure('mapper crashed')
+
+    assert worker._get_health_response() == (503, {
+        'status': 'failed',
+        'error': 'mapper crashed',
+    })
+
+
+def test_wait_for_batch_completion_fails_fast_when_mapper_failed(monkeypatch):
+    item = worker._BatchItem([{'value': 1}], 0, 0, 0)
+    monkeypatch.setattr(worker, '_mapper_failure', None)
+    worker._record_mapper_failure('mapper crashed')
+
+    start = time.monotonic()
+    completed = worker._wait_for_batch_completion(item,
+                                                  timeout=3600,
+                                                  poll_interval=0.01)
+    elapsed = time.monotonic() - start
+
+    assert completed
+    assert elapsed < 0.5
+    assert item.done_event.is_set()
+    assert item.error == 'mapper crashed'
+
+
+def test_wait_for_batch_completion_notices_late_mapper_failure(monkeypatch):
+    item = worker._BatchItem([{'value': 1}], 0, 0, 0)
+    monkeypatch.setattr(worker, '_mapper_failure', None)
+
+    def _fail_mapper():
+        time.sleep(0.05)
+        worker._record_mapper_failure('late crash')
+
+    failure_thread = threading.Thread(target=_fail_mapper, daemon=True)
+    failure_thread.start()
+    try:
+        start = time.monotonic()
+        completed = worker._wait_for_batch_completion(item,
+                                                      timeout=3600,
+                                                      poll_interval=0.01)
+        elapsed = time.monotonic() - start
+    finally:
+        failure_thread.join(timeout=1)
+
+    assert completed
+    assert elapsed < 0.5
+    assert item.done_event.is_set()
+    assert item.error == 'late crash'
+
+
+def test_worker_startup_code_preserves_python_exit_status():
+    batch_coordinator = _make_coordinator()
+    batch_coordinator._resolve_formats()
+
+    startup_code = batch_coordinator._generate_worker_startup_code()
+
+    assert 'set -eo pipefail' in startup_code
+    assert 'tee /tmp/sky_batch_worker.log' in startup_code
+
+
 def test_expired_worker_batch_rejects_late_save(monkeypatch):
     item = worker._BatchItem([{'value': 1}], 0, 0, 0)
     monkeypatch.setattr(worker, '_current_batch', item)
