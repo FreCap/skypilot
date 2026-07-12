@@ -410,11 +410,9 @@ class SkyServeLoadBalancer:
         # handler without an await between a read and its write.
         self._queue_depth: int = 0
         # Reject window with dedup: job key -> last-seen monotonic time.
-        # Keyed by the LB_JOB_ID_HEADER value (stable across retries of
-        # the same job) so a held job the platform re-fires every ~30s
-        # counts as ONE unit of pressure, not window/retry-period units
-        # (see the constant's comment for why raw counting over-provisions
-        # ~10x). Entries older than LB_REJECT_WINDOW_SECONDS are pruned on
+        # Keyed by the LB_JOB_ID_HEADER value so repeated attempts for one
+        # logical job refresh its TTL while still counting as one unit of
+        # pressure. Entries older than LB_REJECT_WINDOW_SECONDS are pruned on
         # access. Monotonic clock: TTLs must not be distorted by
         # wall-clock steps (NTP). (Typed Optional at class level; always
         # a real dict on instances -- _prune_reject_window materializes.)
