@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { CircularProgress } from '@mui/material';
 import { useRouter } from 'next/router';
 import Link from 'next/link';
@@ -23,27 +23,39 @@ import { formatYaml } from '@/lib/yamlUtils';
 import { UserDisplay } from '@/components/elements/UserDisplay';
 import { YamlCodeBlock } from '@/components/ui/yaml-code-block';
 
-function useVolumeDetails({ volumeName }) {
+export function useVolumeDetails({ volumeName }) {
   const [volumeData, setVolumeData] = useState(null);
   const [loading, setLoading] = useState(true);
+  const requestVersionRef = useRef(0);
 
   const fetchData = useCallback(async () => {
     if (!volumeName) return;
+    const requestVersion = requestVersionRef.current + 1;
+    requestVersionRef.current = requestVersion;
+    const isCurrentRequest = () => requestVersionRef.current === requestVersion;
     setLoading(true);
+    setVolumeData((current) => (current?.name === volumeName ? current : null));
     try {
       const volumes = await dashboardCache.get(getVolumes);
+      if (!isCurrentRequest()) return;
       const found = volumes.find((v) => v.name === volumeName);
       setVolumeData(found || null);
     } catch (error) {
+      if (!isCurrentRequest()) return;
       console.error('Failed to fetch volume details:', error);
       setVolumeData(null);
     } finally {
-      setLoading(false);
+      if (isCurrentRequest()) {
+        setLoading(false);
+      }
     }
   }, [volumeName]);
 
   useEffect(() => {
     fetchData();
+    return () => {
+      requestVersionRef.current += 1;
+    };
   }, [fetchData]);
 
   const refreshData = useCallback(async () => {
