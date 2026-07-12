@@ -40,7 +40,7 @@ function makePageResponse(id, total = 1) {
 
 describe('JobsCacheManager invalidation fencing', () => {
   beforeEach(() => {
-    jest.clearAllMocks();
+    jest.resetAllMocks();
     delete window.__skyJobsPaginationFetch;
   });
 
@@ -73,6 +73,64 @@ describe('JobsCacheManager invalidation fencing', () => {
     const cachedResult = await manager.getPaginatedJobs(options);
     expect(cachedResult.fromCache).toBe(true);
     expect(cachedResult.jobs[0].id).toBe('fresh-job');
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not reuse an invalidated in-flight page request for the same page', async () => {
+    const manager = new JobsCacheManager();
+    jest
+      .spyOn(manager, '_kickOffBackgroundPrefetch')
+      .mockImplementation(() => {});
+    const firstFetch = deferred();
+    const secondFetch = deferred();
+    const options = { page: 1, limit: 10, statuses: ['RUNNING'] };
+
+    dashboardCache.get
+      .mockImplementationOnce(() => firstFetch.promise)
+      .mockImplementationOnce(() => secondFetch.promise);
+
+    const staleResultPromise = manager.getPaginatedJobs(options);
+    manager.invalidateCache(options);
+    const freshResultPromise = manager.getPaginatedJobs(options);
+
+    secondFetch.resolve(makePageResponse('fresh-job'));
+    firstFetch.resolve(makePageResponse('stale-job'));
+
+    const [staleResult, freshResult] = await Promise.all([
+      staleResultPromise,
+      freshResultPromise,
+    ]);
+    expect(staleResult.jobs[0].id).toBe('stale-job');
+    expect(freshResult.jobs[0].id).toBe('fresh-job');
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not reuse an invalidated in-flight page request after filter invalidation', async () => {
+    const manager = new JobsCacheManager();
+    jest
+      .spyOn(manager, '_kickOffBackgroundPrefetch')
+      .mockImplementation(() => {});
+    const firstFetch = deferred();
+    const secondFetch = deferred();
+    const options = { page: 1, limit: 10, statuses: ['RUNNING'] };
+
+    dashboardCache.get
+      .mockImplementationOnce(() => firstFetch.promise)
+      .mockImplementationOnce(() => secondFetch.promise);
+
+    const staleResultPromise = manager.getPaginatedJobs(options);
+    manager.invalidateFilteredPages({ statuses: ['RUNNING'] });
+    const freshResultPromise = manager.getPaginatedJobs(options);
+
+    secondFetch.resolve(makePageResponse('fresh-job'));
+    firstFetch.resolve(makePageResponse('stale-job'));
+
+    const [staleResult, freshResult] = await Promise.all([
+      staleResultPromise,
+      freshResultPromise,
+    ]);
+    expect(staleResult.jobs[0].id).toBe('stale-job');
+    expect(freshResult.jobs[0].id).toBe('fresh-job');
     expect(dashboardCache.get).toHaveBeenCalledTimes(2);
   });
 

@@ -60,6 +60,24 @@ class JobsCacheManager {
     );
   }
 
+  _cacheKeyMatchesFilterKey(cacheKey, filterKey) {
+    try {
+      const keyObj = JSON.parse(cacheKey);
+      const keyFilterObj = {
+        allUsers: keyObj.allUsers,
+        jobIdMatch: keyObj.jobIdMatch,
+        nameMatch: keyObj.nameMatch,
+        userMatch: keyObj.userMatch,
+        workspaceMatch: keyObj.workspaceMatch,
+        poolMatch: keyObj.poolMatch,
+        statuses: keyObj.statuses,
+      };
+      return JSON.stringify(keyFilterObj) === filterKey;
+    } catch (e) {
+      return false;
+    }
+  }
+
   /**
    * Generate a cache key that includes ALL parameters (page, limit, sort, filters)
    * This is the primary cache key for paginated results
@@ -608,6 +626,7 @@ class JobsCacheManager {
       // Invalidate specific cache key
       const cacheKey = this._generateCacheKey(options);
       this.pageCache.delete(cacheKey);
+      this.pendingRequests.delete(cacheKey);
 
       // Also invalidate related filter key for full data cache and background prefetch
       const filterKey = this._generateFilterKey(options);
@@ -638,27 +657,20 @@ class JobsCacheManager {
 
     // Remove all page cache entries that match this filter
     for (const [key] of this.pageCache.entries()) {
-      try {
-        const keyObj = JSON.parse(key);
-        const keyFilterObj = {
-          allUsers: keyObj.allUsers,
-          jobIdMatch: keyObj.jobIdMatch,
-          nameMatch: keyObj.nameMatch,
-          userMatch: keyObj.userMatch,
-          workspaceMatch: keyObj.workspaceMatch,
-          poolMatch: keyObj.poolMatch,
-          statuses: keyObj.statuses,
-        };
-        if (JSON.stringify(keyFilterObj) === filterKey) {
-          this.pageCache.delete(key);
-        }
-      } catch (e) {
-        // Skip malformed keys
+      if (this._cacheKeyMatchesFilterKey(key, filterKey)) {
+        this.pageCache.delete(key);
+      }
+    }
+
+    for (const [key] of this.pendingRequests.entries()) {
+      if (this._cacheKeyMatchesFilterKey(key, filterKey)) {
+        this.pendingRequests.delete(key);
       }
     }
 
     // Also remove full data cache for this filter
     this.fullDataCache.delete(filterKey);
+    this.backgroundPrefetching.delete(filterKey);
   }
 
   /**
