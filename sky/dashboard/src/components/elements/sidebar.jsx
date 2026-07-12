@@ -51,6 +51,7 @@ import { ThemeToggle } from '@/components/elements/ThemeToggle';
 import { DeploymentVersion } from '@/components/elements/version-display';
 import { useGroupedNavLinks, usePluginRoutes } from '@/plugins/PluginProvider';
 import { PluginSlot } from '@/plugins/PluginSlot';
+import { RequestActivityIndicator } from './request-activity-indicator';
 
 // Create a context for sidebar state management
 const SidebarContext = createContext(null);
@@ -596,6 +597,7 @@ export function TopBar() {
 
           {/* External links and user profile - only show on desktop, mobile uses sidebar */}
           <div className="flex items-center space-x-1 ml-auto">
+            <RequestActivityIndicator compact={isMobile} />
             {!isMobile && (
               <>
                 {/* Ungrouped plugin links - positioned on the right */}

@@ -8,6 +8,11 @@ import {
   ENDPOINT,
   VERSION_HEADER,
 } from './constants';
+import { trackDashboardRequest } from '@/lib/request-activity';
+
+function trackedFetch(...args) {
+  return trackDashboardRequest(() => fetch(...args));
+}
 
 // The server's APIVersionMiddleware uses these headers to (a) negotiate
 // protocol compatibility and (b) populate the `_remote_api_version`
@@ -71,9 +76,12 @@ export async function getCurrentUserRole() {
   currentUserPromise = (async () => {
     try {
       const baseUrl = window.location.origin;
-      const response = await fetch(`${baseUrl}/internal/dashboard/users/role`, {
-        headers: withVersionHeader({}),
-      });
+      const response = await trackedFetch(
+        `${baseUrl}/internal/dashboard/users/role`,
+        {
+          headers: withVersionHeader({}),
+        }
+      );
       if (response.ok) {
         const data = await response.json();
         return cacheCurrentUser(data);
@@ -154,7 +162,7 @@ export const apiClient = {
       };
     }
 
-    return await fetch(fullUrl, {
+    return await trackedFetch(fullUrl, {
       method,
       headers,
       body: method === 'POST' ? JSON.stringify(body) : undefined,
@@ -182,7 +190,7 @@ export const apiClient = {
         throw new Error(msg);
       }
 
-      const fetchedData = await fetch(
+      const fetchedData = await trackedFetch(
         `${baseUrl}${ENDPOINT}/api/get?request_id=${id}`,
         { headers: withVersionHeader({}) }
       );
@@ -213,7 +221,7 @@ export const apiClient = {
     const baseUrl = window.location.origin;
     const fullUrl = `${baseUrl}${ENDPOINT}${path}`;
 
-    return await fetch(fullUrl, {
+    return await trackedFetch(fullUrl, {
       method: 'POST',
       headers,
       body: JSON.stringify(body),
@@ -247,6 +255,6 @@ export const apiClient = {
   get: async (path) => {
     const baseUrl = window.location.origin;
     const fullUrl = `${baseUrl}${ENDPOINT}${path}`;
-    return await fetch(fullUrl, { headers: withVersionHeader({}) });
+    return await trackedFetch(fullUrl, { headers: withVersionHeader({}) });
   },
 };
