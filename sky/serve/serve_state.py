@@ -721,13 +721,15 @@ def add_service(name: str,
                     f'cleanup: {", ".join(sorted(orphan_storage_scopes))}. '
                     'Run down --purge for this name before retrying.')
             if lifecycle_epoch is not None:
-                # The lifecycle lock makes it safe to clear non-resource
-                # script/claim leftovers before publishing the successor.
-                for table in (serve_ha_recovery_script_table,
-                              reserved_fill_claims_table):
-                    session.execute(
-                        sqlalchemy.delete(table).where(
-                            table.c.service_name == name))
+                # The API parent publishes the current lifecycle's HA script
+                # before spawning this controller.  Deleting it here leaves a
+                # successfully registered service without any recovery path
+                # after an API-pod replacement.  The fenced script upsert has
+                # already replaced a same-name predecessor, so only stale
+                # reserved-fill claims need to be cleared during registration.
+                session.execute(
+                    sqlalchemy.delete(reserved_fill_claims_table).where(
+                        reserved_fill_claims_table.c.service_name == name))
 
             session.execute(
                 insert_func(services_table).values(
