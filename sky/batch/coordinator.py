@@ -789,13 +789,28 @@ class BatchCoordinator:
     # Worker code generation
     # ------------------------------------------------------------------
 
-    def _generate_worker_startup_code(self) -> str:
+    @staticmethod
+    def _new_failure_marker_path() -> str:
+        """Return a launch-unique failure marker path.
+
+        The marker lives in a fixed per-node location; a stale marker from a
+        crashed previous worker launch must never fail the health check of a
+        fresh launch on the same node, so each launch gets its own file.
+        """
+        base, ext = os.path.splitext(constants.WORKER_FAILURE_MARKER_PATH)
+        return f'{base}.{uuid.uuid4().hex}{ext}'
+
+    def _generate_worker_startup_code(self,
+                                      failure_marker_path: Optional[str] = None
+                                     ) -> str:
         """Generate code to start the long-running worker service."""
         job_id = str(self._managed_job_id)
         activate = self.activate_env.strip()
         activate_line = f'{activate} &&' if activate else ''
         sky_runtime = skylet_constants.SKY_REMOTE_PYTHON_ENV
-        failure_marker = shlex.quote(constants.WORKER_FAILURE_MARKER_PATH)
+        if failure_marker_path is None:
+            failure_marker_path = constants.WORKER_FAILURE_MARKER_PATH
+        failure_marker = shlex.quote(failure_marker_path)
 
         # Serialize typed format dicts as JSON env vars for workers.
         input_format_json = json.dumps(self._input_format.to_dict()).replace(
@@ -812,6 +827,7 @@ class BatchCoordinator:
             export SKY_BATCH_WORKER_TOKEN='{self._worker_token}'
             export SKY_BATCH_INPUT_FORMAT='{input_format_json}'
             export SKY_BATCH_OUTPUT_FORMATS='{output_formats_json}'
+            export {constants.WORKER_FAILURE_MARKER_ENV_VAR}={failure_marker}
 
             # Make sky.batch visible to the user's python.
             SKY_SITE=$({sky_runtime}/bin/python -c \\
@@ -835,11 +851,14 @@ class BatchCoordinator:
             ' 2>&1 | tee /tmp/sky_batch_worker.log
             """)
 
-    def _generate_worker_health_check_code(self) -> str:
+    def _generate_worker_health_check_code(
+            self, failure_marker_path: Optional[str] = None) -> str:
         """Generate code that waits for the worker to report healthy."""
         port = constants.WORKER_SERVICE_PORT
         timeout = constants.WORKER_SERVICE_STARTUP_TIMEOUT
-        failure_marker = shlex.quote(constants.WORKER_FAILURE_MARKER_PATH)
+        if failure_marker_path is None:
+            failure_marker_path = constants.WORKER_FAILURE_MARKER_PATH
+        failure_marker = shlex.quote(failure_marker_path)
         return textwrap.dedent(f"""\
             set -e
             failure_marker={failure_marker}
@@ -1042,7 +1061,8 @@ class BatchCoordinator:
         # (job, token, cluster) launch-intent key.
         self._cleanup_worker_services_for_token(self._worker_token,
                                                 [cluster_name])
-        startup_code = self._generate_worker_startup_code()
+        failure_marker_path = self._new_failure_marker_path()
+        startup_code = self._generate_worker_startup_code(failure_marker_path)
         worker_job_name = self._worker_job_name(self._worker_token)
         task = sky.Task(name=worker_job_name, run=startup_code)
         pool_resources = self._get_pool_resources()
@@ -1090,7 +1110,8 @@ class BatchCoordinator:
                     f'{worker_job_id} on {cluster_name}')
 
         # Wait for worker to be ready
-        health_code = self._generate_worker_health_check_code()
+        health_code = self._generate_worker_health_check_code(
+            failure_marker_path)
         health_task = sky.Task(
             name=f'health-check-{job_id}-{self._worker_token}', run=health_code)
         try:

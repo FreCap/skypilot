@@ -228,9 +228,14 @@ def _expire_batch(item: _BatchItem, error: str) -> None:
             _current_batch = None
 
 
+def _failure_marker_path() -> str:
+    return os.environ.get(constants.WORKER_FAILURE_MARKER_ENV_VAR,
+                          constants.WORKER_FAILURE_MARKER_PATH)
+
+
 def _clear_mapper_failure_marker() -> None:
     try:
-        os.remove(constants.WORKER_FAILURE_MARKER_PATH)
+        os.remove(_failure_marker_path())
     except FileNotFoundError:
         return
     except OSError as e:
@@ -239,9 +244,10 @@ def _clear_mapper_failure_marker() -> None:
 
 def _write_mapper_failure_marker(error: str) -> None:
     try:
-        with open(constants.WORKER_FAILURE_MARKER_PATH, 'w',
-                  encoding='utf-8') as f:
-            f.write(error)
+        with open(_failure_marker_path(), 'w', encoding='utf-8') as f:
+            # The health check treats an empty marker as absent, so always
+            # write a non-empty payload.
+            f.write(error or 'mapper failed without error output')
     except OSError as e:
         logger.warning('Failed to write worker failure marker: %s', e)
 
