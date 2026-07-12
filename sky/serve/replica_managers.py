@@ -19,6 +19,7 @@ from sky import backends
 from sky import exceptions
 from sky import global_user_state
 from sky import sky_logging
+from sky import skypilot_config
 from sky import task as task_lib
 from sky.backends import backend_utils
 from sky.client import sdk
@@ -455,6 +456,14 @@ def terminate_cluster(
         _wait_for_drain(drain_deadline, drain_complete)
     else:
         time.sleep(replica_drain_delay_seconds)
+
+    # Controller-side teardown runs in the API server's workspace context,
+    # which may differ from the replica cluster's recorded workspace. Pin each
+    # down request to the durable cluster identity so failed-service purge can
+    # clean up replicas after their controller is gone.
+    cluster_record = global_user_state.get_cluster_from_name(cluster_name)
+    cluster_workspace = (cluster_record.get('workspace')
+                         if cluster_record is not None else None)
     retry_cnt = 0
     backoff = common_utils.Backoff()
     while True:
@@ -466,8 +475,12 @@ def terminate_cluster(
         try:
             usage_lib.messages.usage.set_internal()
             logger.info(f'Sending down request to cluster {cluster_name}')
-            request_id = sdk.down(cluster_name)
-            sdk.stream_and_get(request_id)
+            workspace_ctx: contextlib.AbstractContextManager = (
+                skypilot_config.local_active_workspace_ctx(cluster_workspace)
+                if cluster_workspace else contextlib.nullcontext())
+            with workspace_ctx:
+                request_id = sdk.down(cluster_name)
+                sdk.stream_and_get(request_id)
             logger.info(f'Replica cluster {cluster_name} terminated.')
             return
         except ValueError:
