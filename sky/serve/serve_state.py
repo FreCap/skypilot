@@ -1463,26 +1463,34 @@ def get_service_from_name(service_name: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def get_service_controller_owner(service_name: str) -> Optional[Dict[str, Any]]:
+def get_service_controller_owner(
+        service_name: str,
+        require_version: bool = False) -> Optional[Dict[str, Any]]:
     """Get only the fields needed to route to a service controller.
 
     Unlike :func:`get_service_from_name`, this hot-path lookup does not join
     ``version_specs``, deserialize the latest spec, or issue a second query.
     The service hash distinguishes a same-name successor from the row read
     before a proxied request; status lets the proxy reject terminal rows.
+    ``require_version`` preserves callers whose old joined read treated an
+    orphan/versionless service row as missing, using an indexed existence
+    check without loading version metadata.
     """
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
-        row = session.execute(
-            sqlalchemy.select(
-                services_table.c.hash,
-                services_table.c.status,
-                services_table.c.controller_pid,
-                services_table.c.controller_ip,
-                services_table.c.controller_port,
-                services_table.c.lifecycle_epoch,
-                services_table.c.resource_scope,
-            ).where(services_table.c.name == service_name)).fetchone()
+        query = sqlalchemy.select(
+            services_table.c.hash,
+            services_table.c.status,
+            services_table.c.controller_pid,
+            services_table.c.controller_ip,
+            services_table.c.controller_port,
+            services_table.c.lifecycle_epoch,
+            services_table.c.resource_scope,
+        ).where(services_table.c.name == service_name)
+        if require_version:
+            query = query.where(sqlalchemy.exists().where(
+                version_specs_table.c.service_name == services_table.c.name))
+        row = session.execute(query).fetchone()
     if row is None:
         return None
     mapping = row._mapping  # pylint: disable=protected-access

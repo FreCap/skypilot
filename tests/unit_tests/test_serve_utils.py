@@ -1691,7 +1691,7 @@ def test_set_service_status_from_replica_uses_all_replicas(
         'controller_ip': '10.0.0.1',
     }
     with mock.patch.object(serve_state,
-                           'get_service_from_name',
+                           'get_service_controller_owner',
                            return_value=record), \
          mock.patch.object(
              serve_state,
@@ -1717,7 +1717,7 @@ def test_set_service_status_from_replica_active_versions_ready_only():
         'controller_ip': '10.0.0.1',
     }
     with mock.patch.object(serve_state,
-                           'get_service_from_name',
+                           'get_service_controller_owner',
                            return_value=record), \
          mock.patch.object(
              serve_state,
@@ -1737,7 +1737,7 @@ def test_stale_controller_cannot_authenticate_status_as_replacement_owner():
         'controller_ip': '10.0.0.2',
     }
     with mock.patch.object(serve_state,
-                           'get_service_from_name',
+                           'get_service_controller_owner',
                            return_value=record), \
          mock.patch.object(
              serve_state,
@@ -1760,7 +1760,8 @@ def test_replica_status_writer_cannot_erase_interleaved_shutdown():
     read_complete = threading.Event()
     resume = threading.Event()
 
-    def _read(_service_name):
+    def _read(_service_name, require_version=False):
+        assert require_version
         snapshot = dict(db_record)
         read_complete.set()
         assert resume.wait(timeout=2)
@@ -1776,7 +1777,7 @@ def test_replica_status_writer_cannot_erase_interleaved_shutdown():
         return True
 
     with mock.patch.object(serve_state,
-                           'get_service_from_name',
+                           'get_service_controller_owner',
                            side_effect=_read), \
          mock.patch.object(
              serve_state,
