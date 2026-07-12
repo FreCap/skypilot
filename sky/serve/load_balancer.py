@@ -754,10 +754,9 @@ class SkyServeLoadBalancer:
     def _record_rejection(self, request: fastapi.Request) -> None:
         """Record a terminal-503 exit for the reject-window gauge.
 
-        Keyed by the job-id header when present: the platform re-fires
-        the SAME held job every ~30s, so the re-fire must refresh the
-        TTL and still count once -- that dedup is the whole point of the
-        window (raw counting over-provisions ~10x, see constants).
+        Keyed by the job-id header when present, so repeated attempts for one
+        logical job refresh the TTL while still counting once. This prevents
+        retries from multiplying autoscaling pressure (see constants).
         Headerless requests get a unique per-request key: one unit each.
         """
         # Starlette header lookup is case-insensitive per the HTTP spec.
