@@ -1,11 +1,13 @@
 """Tests for external-only controller-child supervision."""
-# pylint: disable=protected-access
+# pylint: disable=missing-class-docstring,protected-access
 from unittest import mock
 
 from sky.serve import constants
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve import service
+
+_SET_STATUS_METHOD = 'set_service_status_and_active_versions_if_owner'
 
 
 class TestBackoff:
@@ -59,7 +61,7 @@ class TestDegradedFlag:
                 return_value=_record(serve_state.ServiceStatus.READY)), \
              mock.patch.object(
                  service.serve_state,
-                 'set_service_status_and_active_versions_if_owner') as set_status:
+                 _SET_STATUS_METHOD) as set_status:
             service._flag_service_degraded('svc', 'incarnation-a', 123,
                                            '10.0.0.1')
         set_status.assert_called_once_with(
@@ -78,7 +80,7 @@ class TestDegradedFlag:
                                    return_value=_record(status)), \
                  mock.patch.object(
                      service.serve_state,
-                     'set_service_status_and_active_versions_if_owner'
+                     _SET_STATUS_METHOD
                  ) as set_status:
                 service._flag_service_degraded('svc', 'incarnation-a', 123,
                                                '10.0.0.1')
@@ -92,7 +94,7 @@ class TestDegradedFlag:
                     serve_state.ServiceStatus.CONTROLLER_FAILED)), \
              mock.patch.object(
                  service.serve_state,
-                 'set_service_status_and_active_versions_if_owner') as set_status:
+                 _SET_STATUS_METHOD) as set_status:
             service._flag_service_degraded('svc', 'incarnation-a', 123,
                                            '10.0.0.1')
         set_status.assert_not_called()
@@ -115,7 +117,7 @@ class TestDegradedHeal:
                     serve_state.ServiceStatus.CONTROLLER_FAILED)), \
              mock.patch.object(
                  service.serve_state,
-                 'set_service_status_and_active_versions_if_owner',
+                 _SET_STATUS_METHOD,
                  return_value=True) as set_status:
             assert service._heal_service_degraded('svc', 'incarnation-a', 123,
                                                   '10.0.0.1')
@@ -136,7 +138,7 @@ class TestDegradedHeal:
                                    return_value=_record(status)), \
                  mock.patch.object(
                      service.serve_state,
-                     'set_service_status_and_active_versions_if_owner'
+                     _SET_STATUS_METHOD
                  ) as set_status:
                 assert service._heal_service_degraded('svc', 'incarnation-a',
                                                       123, '10.0.0.1')
@@ -158,7 +160,7 @@ class TestDegradedHeal:
                     serve_state.ServiceStatus.CONTROLLER_FAILED)), \
              mock.patch.object(
                  service.serve_state,
-                 'set_service_status_and_active_versions_if_owner',
+                 _SET_STATUS_METHOD,
                  side_effect=RuntimeError('db down')):
             assert not service._heal_service_degraded('svc', 'incarnation-a',
                                                       123, '10.0.0.1')
@@ -174,7 +176,7 @@ class TestReplicaWriterGuard:
                     serve_state.ServiceStatus.CONTROLLER_FAILED)), \
              mock.patch.object(
                  serve_utils.serve_state,
-                 'set_service_status_and_active_versions_if_owner') as set_status:
+                 _SET_STATUS_METHOD) as set_status:
             serve_utils.set_service_status_and_active_versions_from_replica(
                 'svc', [], serve_utils.UpdateMode.ROLLING)
         set_status.assert_not_called()

@@ -1,4 +1,5 @@
 """Tests for the stable external-LB to SkyServe-controller proxy."""
+# pylint: disable=protected-access
 
 import asyncio
 from typing import List, Optional, Tuple
