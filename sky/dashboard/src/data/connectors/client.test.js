@@ -220,21 +220,71 @@ describe('current user cache', () => {
     expect(global.fetch).toHaveBeenCalledTimes(2);
   });
 
-  it('normalizes failed lookups to the local non-admin user', async () => {
-    global.fetch.mockResolvedValue({
-      ok: false,
-      json: async () => ({}),
-    });
+  it('normalizes failed lookups without caching them for the ttl', async () => {
+    global.fetch
+      .mockResolvedValueOnce({
+        ok: false,
+        json: async () => ({}),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          id: 'user-1',
+          name: 'Alice',
+          role: 'admin',
+        }),
+      });
 
+    // The failure is normalized and flagged, but not cached...
     await expect(getCurrentUserRole()).resolves.toEqual({
       id: 'local',
       name: 'local',
       role: null,
+      roleFetchFailed: true,
     });
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+
+    // ...so the next caller retries and can recover immediately.
+    await expect(getCurrentUserRole()).resolves.toEqual({
+      id: 'user-1',
+      name: 'Alice',
+      role: 'admin',
+    });
+    expect(global.fetch).toHaveBeenCalledTimes(2);
+
+    await expect(getCurrentUserInfo()).resolves.toEqual({
+      id: 'user-1',
+      name: 'Alice',
+    });
+    expect(global.fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps identity fallback for thrown fetches without persisting it', async () => {
+    const consoleError = jest
+      .spyOn(console, 'error')
+      .mockImplementation(() => {});
+    global.fetch
+      .mockRejectedValueOnce(new Error('network down'))
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          id: 'user-1',
+          name: 'Alice',
+          role: 'admin',
+        }),
+      });
+
     await expect(getCurrentUserInfo()).resolves.toEqual({
       id: 'local',
       name: 'local',
     });
-    expect(global.fetch).toHaveBeenCalledTimes(1);
+    expect(consoleError).toHaveBeenCalled();
+
+    await expect(getCurrentUserRole()).resolves.toEqual({
+      id: 'user-1',
+      name: 'Alice',
+      role: 'admin',
+    });
+    expect(global.fetch).toHaveBeenCalledTimes(2);
   });
 });
