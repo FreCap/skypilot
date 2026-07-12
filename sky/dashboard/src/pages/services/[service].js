@@ -3,7 +3,13 @@ import { CircularProgress } from '@mui/material';
 import { useRouter } from 'next/router';
 import Link from 'next/link';
 import Head from 'next/head';
-import { RotateCwIcon } from 'lucide-react';
+import {
+  CheckIcon,
+  ChevronDownIcon,
+  ChevronRightIcon,
+  CopyIcon,
+  RotateCwIcon,
+} from 'lucide-react';
 import {
   Table,
   TableHeader,
@@ -23,6 +29,8 @@ import {
 } from '@/components/utils';
 import { EndpointCell, formatUptime } from '@/components/services';
 import { useMobile } from '@/hooks/useMobile';
+import { formatYaml } from '@/lib/yamlUtils';
+import { YamlCodeBlock } from '@/components/ui/yaml-code-block';
 
 export function useServiceDetails({ serviceName }) {
   const [serviceData, setServiceData] = useState(null);
@@ -284,9 +292,72 @@ function ServiceDetailCard({ serviceData }) {
                   : '-'}
               </div>
             </div>
+            {serviceData.serviceYaml && (
+              <ServiceYamlSection serviceYaml={serviceData.serviceYaml} />
+            )}
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+// Collapsible YAML viewer, mirroring the managed-jobs detail page. The
+// YAML arrives already redacted from the server (secrets masked); this
+// only handles display formatting and copy.
+function ServiceYamlSection({ serviceYaml }) {
+  const [isYamlExpanded, setIsYamlExpanded] = useState(false);
+  const [isCopied, setIsCopied] = useState(false);
+
+  const formattedYaml = formatYaml(serviceYaml);
+
+  const copyYamlToClipboard = async () => {
+    try {
+      await navigator.clipboard.writeText(formattedYaml);
+      setIsCopied(true);
+      setTimeout(() => setIsCopied(false), 2000);
+    } catch (err) {
+      console.error('Failed to copy YAML to clipboard:', err);
+    }
+  };
+
+  return (
+    <div className="col-span-2">
+      <div className="flex items-center">
+        <button
+          onClick={() => setIsYamlExpanded(!isYamlExpanded)}
+          className="flex items-center text-left focus:outline-none text-gray-700 hover:text-gray-900 transition-colors duration-200"
+        >
+          {isYamlExpanded ? (
+            <ChevronDownIcon className="w-4 h-4 mr-1" />
+          ) : (
+            <ChevronRightIcon className="w-4 h-4 mr-1" />
+          )}
+          <span className="text-base">Show SkyPilot YAML</span>
+        </button>
+
+        <Tooltip
+          content={isCopied ? 'Copied!' : 'Copy YAML'}
+          className="text-muted-foreground"
+        >
+          <button
+            onClick={copyYamlToClipboard}
+            className="flex items-center text-gray-500 hover:text-gray-700 transition-colors duration-200 p-1 ml-2"
+          >
+            {isCopied ? (
+              <CheckIcon className="w-4 h-4 text-green-600" />
+            ) : (
+              <CopyIcon className="w-4 h-4" />
+            )}
+          </button>
+        </Tooltip>
+      </div>
+
+      {isYamlExpanded && (
+        <div className="mt-2">
+          <YamlCodeBlock value={formattedYaml} readOnly />
+        </div>
+      )}
     </div>
   );
 }

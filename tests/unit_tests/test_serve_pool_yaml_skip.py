@@ -38,7 +38,7 @@ def test_ha_recovery_pool_liveness_skips_pool_yaml(tmp_path):
     get_status.assert_called_once_with('svc',
                                        pool=True,
                                        with_replica_info=False,
-                                       with_pool_yaml=False)
+                                       with_yaml=False)
 
 
 def test_update_pool_status_liveness_skips_pool_yaml():
@@ -64,4 +64,4 @@ def test_update_pool_status_liveness_skips_pool_yaml():
     get_status.assert_called_once_with('pool-a',
                                        pool=True,
                                        with_replica_info=False,
-                                       with_pool_yaml=False)
+                                       with_yaml=False)
