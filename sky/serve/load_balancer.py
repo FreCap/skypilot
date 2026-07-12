@@ -94,6 +94,12 @@ def _is_dead_connection_error(exc: Exception) -> bool:
     return isinstance(exc, (httpx.NetworkError, httpx.ProtocolError))
 
 
+def _is_definitely_not_dispatched(exc: Exception) -> bool:
+    """Whether a proxy failure proves the request never reached a replica."""
+    return isinstance(exc, (_PreDispatchError, httpx.ConnectError,
+                            httpx.ConnectTimeout, httpx.PoolTimeout))
+
+
 def _can_retry_proxy_failure(method: str, exc: Exception) -> bool:
     """Whether replaying a failed proxy attempt preserves request semantics.
 
@@ -107,8 +113,7 @@ def _can_retry_proxy_failure(method: str, exc: Exception) -> bool:
         return True
     if method.upper() in _IDEMPOTENT_METHODS:
         return True
-    return isinstance(exc, (_PreDispatchError, httpx.ConnectError,
-                            httpx.ConnectTimeout, httpx.PoolTimeout))
+    return _is_definitely_not_dispatched(exc)
 
 
 class _DrainableServer(uvicorn.Server):
@@ -1719,11 +1724,10 @@ class SkyServeLoadBalancer:
         failed_urls: Set[str] = set()
 
         def _unavailable(detail: str) -> fastapi.HTTPException:
-            # Both terminal-503 exits ("no ready replicas", "all ready
-            # replicas at capacity") funnel through here: record the
-            # rejection so the demand feed keeps pressure on the
-            # autoscaler for as long as the job stays unplaced (the QPS
-            # window alone decays while the need persists).
+            # Every terminal 503 means this job remains unplaced, including a
+            # proven pre-dispatch failure. Retain it as demand so the
+            # autoscaler keeps pressure on unavailable capacity instead of
+            # letting the QPS window decay while the need persists.
             self._record_rejection(request)
             # Retry-After lets a well-behaved client back off instead of
             # hammering; the ready set only changes on the controller
@@ -1830,9 +1834,24 @@ class SkyServeLoadBalancer:
             if retry_cnt >= self._max_retries:
                 if isinstance(response_or_exception, fastapi.HTTPException):
                     raise response_or_exception
+                if _is_definitely_not_dispatched(response_or_exception):
+                    raise _unavailable(
+                        'Request was not dispatched before the retry budget '
+                        f'was exhausted. Last error: {response_or_exception}.')
+                if isinstance(response_or_exception, _RetriableStatusError):
+                    raise _unavailable(
+                        'The retry budget was exhausted after configured '
+                        'retriable replica responses. '
+                        f'Last error: {response_or_exception}.')
                 exception = common_utils.remove_color(
                     common_utils.format_exception(response_or_exception,
                                                   use_bracket=True))
+                if isinstance(response_or_exception, httpx.RequestError):
+                    raise fastapi.HTTPException(
+                        status_code=502,
+                        detail='Upstream outcome is unknown after the retry '
+                        'budget was exhausted. '
+                        f'Last error encountered: {exception}.')
                 raise fastapi.HTTPException(
                     # 500 means internal server error.
                     status_code=500,

@@ -195,8 +195,10 @@ class TestRetryTuning(unittest.TestCase):
     def test_max_retries_bounds_attempts(self):
         attempts, exc = self._run_all_failing(self._balancer(max_retries=5))
         self.assertEqual(len(attempts), 5)
-        self.assertEqual(exc.status_code, 500)
-        self.assertIn('Max retries 5 exceeded', exc.detail)
+        self.assertEqual(exc.status_code, 503)
+        self.assertIn('not dispatched', exc.detail)
+        self.assertEqual(exc.headers['Retry-After'],
+                         str(lb_module.constants.LB_503_RETRY_AFTER_SECONDS))
 
     def test_default_max_retries_unchanged(self):
         attempts, _ = self._run_all_failing(self._balancer())
@@ -216,6 +218,19 @@ class TestRetryTuning(unittest.TestCase):
                                side_effect=_spy):
             self._run_all_failing(balancer)
         self.assertEqual(captured['initial'], 0.25)
+
+    def test_definitely_not_dispatched_classification(self):
+        for error in (lb_module._PreDispatchError('no client'),
+                      httpx.ConnectError('refused'),
+                      httpx.ConnectTimeout('timed out'),
+                      httpx.PoolTimeout('pool full')):
+            with self.subTest(error=type(error).__name__):
+                self.assertTrue(lb_module._is_definitely_not_dispatched(error))
+        for error in (httpx.ReadError('reset after send'),
+                      httpx.WriteError('reset while sending'),
+                      httpx.RemoteProtocolError('bad response')):
+            with self.subTest(error=type(error).__name__):
+                self.assertFalse(lb_module._is_definitely_not_dispatched(error))
 
 
 class TestRoutingSpecSync(unittest.TestCase):
@@ -291,7 +306,7 @@ class TestRetryShortCircuit(unittest.TestCase):
         balancer._proxy_request_to = proxy
         return balancer
 
-    def _run(self, balancer):
+    def _run(self, balancer, request=None):
         sleeps = []
 
         async def _sleep(t):
@@ -299,7 +314,7 @@ class TestRetryShortCircuit(unittest.TestCase):
 
         with mock.patch('sky.serve.load_balancer.asyncio.sleep', new=_sleep):
             with self.assertRaises(fastapi.HTTPException) as ctx:
-                asyncio.run(balancer._proxy_with_retries(_request()))
+                asyncio.run(balancer._proxy_with_retries(request or _request()))
         return sleeps, ctx.exception
 
     def test_no_replicas_fails_fast_with_retry_after(self):
@@ -328,6 +343,25 @@ class TestRetryShortCircuit(unittest.TestCase):
         self.assertEqual(len(sleeps), 1)
         self.assertEqual(exc.status_code, 503)
         self.assertIn('Retry-After', exc.headers)
+
+    def test_retry_budget_exhausted_on_shedding_is_unavailable(self):
+        attempts = []
+
+        async def _proxy(url, request):
+            del request
+            attempts.append(url)
+            return lb_module._RetriableStatusError(429, url)
+
+        balancer = self._balancer(
+            ['http://a:8080', 'http://b:8080', 'http://c:8080'], _proxy)
+        balancer._max_retries = 1
+        sleeps, exc = self._run(balancer)
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(sleeps, [])
+        self.assertEqual(exc.status_code, 503)
+        self.assertIn('configured retriable', exc.detail)
+        self.assertEqual(exc.headers['Retry-After'],
+                         str(lb_module.constants.LB_503_RETRY_AFTER_SECONDS))
 
     def test_transport_failures_keep_fallback_attempts(self):
         # A lone replica's pre-dispatch connection blip proves the POST did not
@@ -390,6 +424,22 @@ class TestRetryShortCircuit(unittest.TestCase):
                 balancer._proxy_with_retries(_request(method='GET')))
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(attempts), 2)
+
+    def test_get_ambiguous_exhaustion_does_not_claim_no_dispatch(self):
+        attempts = []
+
+        async def _proxy(url, request):
+            del url, request
+            attempts.append(1)
+            return httpx.ReadError('reset after send')
+
+        balancer = self._balancer(['http://a:8080'], _proxy)
+        balancer._max_retries = 2
+        sleeps, exc = self._run(balancer, _request(method='GET'))
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(len(sleeps), 1)
+        self.assertEqual(exc.status_code, 502)
+        self.assertIn('Upstream outcome is unknown', exc.detail)
 
     def test_mixed_fleet_shed_then_healthy_succeeds(self):
 
