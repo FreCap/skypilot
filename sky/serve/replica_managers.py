@@ -444,6 +444,8 @@ def terminate_cluster(
         drain_complete: Optional[Callable[[], bool]] = None,
         continue_guard: Optional[Callable[[], bool]] = None) -> None:
     """Terminate the sky serve replica cluster."""
+    from sky import core  # pylint: disable=import-outside-toplevel
+
     # Setup logging redirection.
     ctx = context.get()
     assert ctx is not None, 'Context is not initialized'
@@ -479,11 +481,10 @@ def terminate_cluster(
                 skypilot_config.local_active_workspace_ctx(cluster_workspace)
                 if cluster_workspace else contextlib.nullcontext())
             with workspace_ctx:
-                request_id = sdk.down(cluster_name)
-                sdk.stream_and_get(request_id)
+                core.down(cluster_name)
             logger.info(f'Replica cluster {cluster_name} terminated.')
             return
-        except ValueError:
+        except exceptions.ClusterDoesNotExist:
             # The cluster is already terminated.
             logger.info(
                 f'Replica cluster {cluster_name} is already terminated.')

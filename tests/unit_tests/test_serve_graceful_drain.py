@@ -94,9 +94,8 @@ class TestWaitForDrain:
                                return_value=None), \
              mock.patch.object(replica_managers.usage_lib.messages.usage,
                                'set_internal'), \
-             mock.patch.object(replica_managers.sdk,
-                               'down',
-                               side_effect=RuntimeError('first request failed')) \
+             mock.patch('sky.core.down',
+                        side_effect=RuntimeError('first request failed')) \
                  as down, \
              mock.patch.object(replica_managers.common_utils.Backoff,
                                'current_backoff',
@@ -119,7 +118,6 @@ class TestWaitForDrain:
             observed_workspaces.append(skypilot_config.get_active_workspace())
             if len(observed_workspaces) == 1:
                 raise RuntimeError('transient down failure')
-            return 'down-request'
 
         with mock.patch.object(replica_managers.context,
                                'get',
@@ -132,11 +130,7 @@ class TestWaitForDrain:
                                }), \
              mock.patch.object(replica_managers.usage_lib.messages.usage,
                                'set_internal'), \
-             mock.patch.object(replica_managers.sdk,
-                               'down',
-                               side_effect=_down), \
-             mock.patch.object(replica_managers.sdk,
-                               'stream_and_get') as stream, \
+             mock.patch('sky.core.down', side_effect=_down), \
              mock.patch.object(replica_managers.common_utils.Backoff,
                                'current_backoff',
                                return_value=0), \
@@ -146,7 +140,6 @@ class TestWaitForDrain:
                     'svc-1', '/tmp/replica.log', max_retry=2)
 
         assert observed_workspaces == ['mt_hybrid', 'mt_hybrid']
-        stream.assert_called_once_with('down-request')
 
 
 def _manager(is_pool=False):
