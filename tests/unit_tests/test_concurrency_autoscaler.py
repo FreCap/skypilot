@@ -234,6 +234,25 @@ class TestTargetMath(unittest.TestCase):
         self._recompute(autoscaler, replicas)
         self.assertEqual(autoscaler.target_num_replicas, 5)
 
+    def test_first_fresh_downscale_honors_delay(self):
+        interval = constants.AUTOSCALER_DEFAULT_DECISION_INTERVAL_SECONDS
+        autoscaler = _make_autoscaler(
+            knob=1.0,
+            min_replicas=1,
+            downscale_delay_seconds=2 * interval,
+        )
+        replicas = [_replica(i) for i in (1, 2, 3)]
+        autoscaler.target_num_replicas = 3
+        _report(autoscaler, in_flight={1: 0, 2: 0, 3: 0})
+
+        # The first fresh report consumes the construction/update snap, but a
+        # lower target still needs the configured sustained-idle evidence.
+        self._recompute(autoscaler, replicas)
+        self.assertEqual(autoscaler.target_num_replicas, 3)
+        self.assertEqual(autoscaler.downscale_counter, 1)
+        self._recompute(autoscaler, replicas)
+        self.assertEqual(autoscaler.target_num_replicas, 1)
+
 
 class TestSignalGap(unittest.TestCase):
     """No shrink of any kind while the demand report is stale."""
@@ -391,6 +410,23 @@ class TestDrainAwareDownscale(unittest.TestCase):
         decisions = _decisions(autoscaler, replicas)
         self.assertEqual(_scale_downs(decisions), [])
 
+    def test_pending_upscale_does_not_emit_opposite_scale_down(self):
+        interval = constants.AUTOSCALER_DEFAULT_DECISION_INTERVAL_SECONDS
+        autoscaler = _make_autoscaler(
+            knob=1.0,
+            min_replicas=1,
+            upscale_delay_seconds=3 * interval,
+        )
+        replicas = [_replica(i) for i in (1, 2, 3)]
+        autoscaler._snap_target_on_next_recompute = False
+        _report(autoscaler, in_flight={1: 1, 2: 0, 3: 0}, rejected=2)
+
+        decisions = _decisions(autoscaler, replicas)
+        self.assertEqual(autoscaler.target_num_replicas, 1)
+        self.assertEqual(autoscaler.upscale_counter, 1)
+        self.assertTrue(autoscaler._upscale_pending)
+        self.assertEqual(_scale_downs(decisions), [])
+
     def test_equal_capacity_victims_shed_paid_before_zero_cost(self):
         # Cost tiebreak (mirrors the instance-aware ordering): among
         # idle victims of equal status and capacity, the EXPENSIVE
@@ -459,6 +495,43 @@ class TestRollingDrain(unittest.TestCase):
                                   serve_utils.UpdateMode.ROLLING)
         autoscaler.target_num_replicas = target
         return autoscaler
+
+    def test_pending_upscale_keeps_old_provisioning_capacity(self):
+        interval = constants.AUTOSCALER_DEFAULT_DECISION_INTERVAL_SECONDS
+        autoscaler = _make_autoscaler(
+            knob=1.0,
+            min_replicas=1,
+            upscale_delay_seconds=3 * interval,
+        )
+        autoscaler.update_version(
+            2,
+            _spec(
+                knob=1.0,
+                min_replicas=1,
+                upscale_delay_seconds=3 * interval,
+            ),
+            serve_utils.UpdateMode.ROLLING,
+        )
+        autoscaler._snap_target_on_next_recompute = False
+        old = [
+            _replica(1, version=1),
+            _replica(
+                2,
+                version=1,
+                status=serve_state.ReplicaStatus.PROVISIONING,
+            ),
+            _replica(
+                3,
+                version=1,
+                status=serve_state.ReplicaStatus.PROVISIONING,
+            ),
+        ]
+        _report(autoscaler, in_flight={1: 1}, rejected=2)
+
+        decisions = _decisions(autoscaler, old, active_versions=(1,))
+        self.assertTrue(autoscaler._upscale_pending)
+        self.assertEqual(_scale_downs(decisions), [])
+        self.assertEqual(len(_scale_ups(decisions)), 1)
 
     def test_keeps_old_capacity_covering_shortfall_prefers_idle_victims(self):
         autoscaler = self._mid_update(target=2)
