@@ -1448,11 +1448,12 @@ def set_service_status_and_active_versions_from_replica(
     expected_controller_owner: Optional[Tuple[Optional[int],
                                               Optional[str]]] = None
 ) -> None:
+    # The owner lookup reads the services row directly, so it is non-None for
+    # a strict superset of get_service_from_name (whose latest-version inner
+    # join drops legacy versionless rows). Legacy rows surface here with a
+    # NULL hash and are refused by the durable-incarnation guard below instead
+    # of raising.
     record = serve_state.get_service_controller_owner(service_name)
-    if record is None:
-        # The fast-path owner lookup is sufficient for live services. Fall back
-        # only for legacy/versionless cases that still rely on the full row.
-        record = serve_state.get_service_from_name(service_name)
     if record is None:
         with ux_utils.print_exception_no_traceback():
             raise ValueError(
