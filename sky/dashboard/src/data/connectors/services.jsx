@@ -89,6 +89,10 @@ export function normalizeService(record) {
     activeVersions: record.active_versions || [],
     version: record.version ?? null,
     tlsEncrypted: Boolean(record.tls_encrypted),
+    // User-facing task YAML, redacted server-side (`service_yaml` in
+    // _get_service_status); absent on old servers and empty when the
+    // controller could not read the stored YAML.
+    serviceYaml: record.service_yaml || null,
     replicas,
   };
 }

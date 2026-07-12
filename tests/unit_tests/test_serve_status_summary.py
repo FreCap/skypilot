@@ -29,6 +29,9 @@ def patched_state(monkeypatch):
         'controller_port': 30001,
         'version': 1,
         'hash': 'incarnation-a',
+        # Present on the latest-version join; keeps the service_yaml
+        # branch off the storage-read fallback.
+        'yaml_content': 'run: echo hi\n',
     }
     monkeypatch.setattr(serve_state, 'get_service_from_name',
                         lambda name: dict(record))
@@ -106,7 +109,7 @@ class TestGetServiceStatusSummary:
             'pool-a',
             pool=True,
             with_replica_info=False,
-            with_pool_yaml=False,
+            with_yaml=False,
             with_target_num_replicas=False)
 
         assert result is not None

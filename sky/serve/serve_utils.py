@@ -46,6 +46,7 @@ from sky.utils import annotations
 from sky.utils import command_runner
 from sky.utils import common_utils
 from sky.utils import controller_utils
+from sky.utils import debug_dump_helpers
 from sky.utils import locks
 from sky.utils import log_utils
 from sky.utils import message_utils
@@ -899,7 +900,7 @@ def ha_recovery_for_consolidation_mode(pool: bool,
             svc = _get_service_status(service_name,
                                       pool=pool,
                                       with_replica_info=False,
-                                      with_pool_yaml=not pool)
+                                      with_yaml=False)
             # A row with no version_specs row is invisible to the joined
             # status query.  A row whose latest version is a NULL-yaml
             # placeholder is visible, but is equally unbootable when it has
@@ -1525,7 +1526,7 @@ def update_service_status(pool: bool) -> None:
         record = _get_service_status(service_name,
                                      pool=pool,
                                      with_replica_info=False,
-                                     with_pool_yaml=not pool)
+                                     with_yaml=False)
         if record is None:
             continue
         service_status = record['status']
@@ -1585,7 +1586,11 @@ def update_service_encoded(
         expected_lifecycle_epoch: Optional[int] = None) -> str:
     noun = 'pool' if pool else 'service'
     capnoun = noun.capitalize()
-    service_status = _get_service_status(service_name, pool=pool)
+    # Only existence and the incarnation hash are consumed here; skip the
+    # YAML render.
+    service_status = _get_service_status(service_name,
+                                         pool=pool,
+                                         with_yaml=False)
     if service_status is None:
         with ux_utils.print_exception_no_traceback():
             raise ValueError(f'{capnoun} {service_name!r} does not exist.')
@@ -1641,7 +1646,10 @@ def update_service_encoded(
 
 def terminate_replica(service_name: str, replica_id: int, purge: bool) -> str:
     # TODO(tian): Currently pool does not support terminating replica.
-    service_status = _get_service_status(service_name, pool=False)
+    # Only existence is consumed here; skip the YAML render.
+    service_status = _get_service_status(service_name,
+                                         pool=False,
+                                         with_yaml=False)
     if service_status is None:
         with ux_utils.print_exception_no_traceback():
             raise ValueError(f'Service {service_name!r} does not exist.')
@@ -1692,7 +1700,7 @@ def _get_service_status(
         pool: bool,
         with_replica_info: bool = True,
         with_replica_counts: bool = False,
-        with_pool_yaml: bool = True,
+        with_yaml: bool = True,
         with_target_num_replicas: bool = True) -> Optional[Dict[str, Any]]:
     """Get the status dict of the service.
 
@@ -1704,9 +1712,10 @@ def _get_service_status(
             ``with_replica_info`` but not free (one pass over the replica
             rows), so internal callers that only need the service row
             should leave both off.
-        with_pool_yaml: Whether to include the rendered pool YAML. Liveness
-            callers can skip the storage read when they only need controller
-            metadata.
+        with_yaml: Whether to include the rendered YAML (``pool_yaml`` for
+            pools, secret-redacted ``service_yaml`` for services). Liveness
+            callers can skip the parse/dump work when they only need
+            controller metadata.
 
     Returns:
         A dictionary describing the status of the service if the service exists.
@@ -1718,7 +1727,7 @@ def _get_service_status(
     if record['pool'] != pool:
         return None
 
-    if record['pool'] and with_pool_yaml:
+    if record['pool'] and with_yaml:
         record['pool_yaml'] = ''
         version = record['version']
         try:
@@ -1745,6 +1754,34 @@ def _get_service_status(
             else:
                 original_config = yaml_utils.safe_load(original_config)
             record['pool_yaml'] = yaml_utils.dump_yaml_str(original_config)
+    elif not record['pool'] and with_yaml:
+        # Services get a display-only copy of their YAML (e.g. for the
+        # dashboard service page). Unlike ``pool_yaml``, which the batch
+        # coordinator parses back into a launchable task, this is for
+        # humans, so secrets are redacted.
+        record['service_yaml'] = ''
+        version = record['version']
+        try:
+            # The latest-version join already fetched the YAML; only fall
+            # back to a storage read for old rows that predate YAML-in-DB.
+            stored_yaml = record.get('yaml_content')
+            if stored_yaml is None:
+                stored_yaml = get_yaml_content(service_name, version,
+                                               record.get('resource_scope'))
+            raw_yaml_config = yaml_utils.read_yaml_str(stored_yaml)
+            original_yaml = raw_yaml_config.get('_user_specified_yaml')
+            if original_yaml is None:
+                # Old records without the embedded user YAML: show the
+                # rendered task YAML instead.
+                original_yaml = stored_yaml
+            record['service_yaml'] = debug_dump_helpers.redact_task_yaml(
+                str(original_yaml))
+        except Exception as e:  # pylint: disable=broad-except
+            # Same rationale as the pool branch: a lost or malformed YAML
+            # must not fail the whole status query.
+            logger.error(f'Failed to read YAML for service {service_name} '
+                         f'with version {version}: {e}')
+            record['service_yaml'] = ''
 
     if with_target_num_replicas:
         record['target_num_replicas'] = 0
@@ -1885,6 +1922,14 @@ def get_service_status_pickled(
     max_workers = min(len(service_names), _STATUS_FANOUT_MAX_WORKERS)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
         statuses = list(ex.map(_run_in_context, service_names))
+    for status in statuses:
+        # The rendered YAML carries plaintext secrets (replicas need it
+        # launchable), so it never leaves the controller for services:
+        # clients get the redacted `service_yaml` instead. Pools keep it
+        # because the batch coordinator and worker-count updates parse
+        # `yaml_content`/`pool_yaml` back into a launchable task.
+        if status is not None and not status.get('pool'):
+            status.pop('yaml_content', None)
     service_statuses: List[Dict[str, str]] = [{
         k: base64.b64encode(pickle.dumps(v)).decode('utf-8')
         for k, v in s.items()
