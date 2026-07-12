@@ -84,6 +84,11 @@ class Location:
     cloud: 'sky_clouds.Cloud'
     region: str
     zone: Optional[str]
+    # TODO(fcapponi): Split placement coordinates from launch-shape data.
+    # Keep cloud/region/zone as Location identity and carry the selected
+    # any_of entry's backend-specific fields in a typed resource_overrides
+    # value. It must preserve serialization, equality, and explicit None
+    # clearing when a heterogeneous launch switches backends.
     accelerators: Optional[Dict[str, int]] = None
     use_spot: bool = True
     # The image the shape entry pins (e.g. a docker: reference for a
