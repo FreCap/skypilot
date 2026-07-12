@@ -2914,13 +2914,13 @@ def _update_cluster_status(
             global_user_state.ClusterEventType.STATUS_CHANGE,
             nop_if_duplicate=True)
         # Use set_cluster_status() to directly update the status in DB
-        # instead of add_or_update_cluster() which only supports INIT/UP
-        global_user_state.set_cluster_status(
+        # instead of add_or_update_cluster() which only supports INIT/UP.
+        # set_cluster_status() only touches status/status_updated_at, and we
+        # hold the cluster lock, so patch the in-memory record instead of
+        # re-reading the full row (extra SELECT + handle unpickle).
+        record['status_updated_at'] = global_user_state.set_cluster_status(
             cluster_name, status_lib.ClusterStatus.AUTOSTOPPING)
-        return global_user_state.get_cluster_from_name(
-            cluster_name,
-            include_user_info=include_user_info,
-            summary_response=summary_response)
+        return record
 
     # Determining if the cluster is healthy (UP):
     #
@@ -3284,11 +3284,11 @@ def _update_cluster_status(
     # do not want to modify the cluster status in this function except for in the
     # case where the cluster has been terminated on cloud, in which case we should
     # clean up the cluster from SkyPilot's global state.
+    # Nothing was written in this path, so the record read at the start of
+    # this refresh (under the cluster lock) is still current: return it
+    # without another full-row SELECT.
     if external_cluster_failures and not to_terminate:
-        return global_user_state.get_cluster_from_name(
-            cluster_name,
-            include_user_info=include_user_info,
-            summary_response=summary_response)
+        return record
 
     verb = 'terminated' if to_terminate else 'stopped'
     backend = backends.CloudVmRayBackend()
