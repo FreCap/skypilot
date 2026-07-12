@@ -13,6 +13,7 @@ from unittest import mock
 import jsonschema
 import pytest
 
+from sky import skypilot_config
 from sky.serve import replica_managers
 from sky.serve import service_spec as service_spec_lib
 from sky.utils import schemas
@@ -88,6 +89,9 @@ class TestWaitForDrain:
         with mock.patch.object(replica_managers.context,
                                'get',
                                return_value=context), \
+             mock.patch.object(replica_managers.global_user_state,
+                               'get_cluster_from_name',
+                               return_value=None), \
              mock.patch.object(replica_managers.usage_lib.messages.usage,
                                'set_internal'), \
              mock.patch.object(replica_managers.sdk,
@@ -105,6 +109,44 @@ class TestWaitForDrain:
                     continue_guard=lambda: next(ownership))
 
         down.assert_called_once_with('svc-1')
+
+    def test_terminate_pins_recorded_workspace_on_each_retry(self):
+        context = mock.MagicMock()
+        observed_workspaces = []
+
+        def _down(cluster_name):
+            assert cluster_name == 'svc-1'
+            observed_workspaces.append(skypilot_config.get_active_workspace())
+            if len(observed_workspaces) == 1:
+                raise RuntimeError('transient down failure')
+            return 'down-request'
+
+        with mock.patch.object(replica_managers.context,
+                               'get',
+                               return_value=context), \
+             mock.patch.object(replica_managers.global_user_state,
+                               'get_cluster_from_name',
+                               return_value={
+                                   'name': 'svc-1',
+                                   'workspace': 'mt_hybrid',
+                               }), \
+             mock.patch.object(replica_managers.usage_lib.messages.usage,
+                               'set_internal'), \
+             mock.patch.object(replica_managers.sdk,
+                               'down',
+                               side_effect=_down), \
+             mock.patch.object(replica_managers.sdk,
+                               'stream_and_get') as stream, \
+             mock.patch.object(replica_managers.common_utils.Backoff,
+                               'current_backoff',
+                               return_value=0), \
+             mock.patch.object(replica_managers.time, 'sleep'):
+            with skypilot_config.local_active_workspace_ctx('default'):
+                replica_managers.terminate_cluster.__wrapped__(
+                    'svc-1', '/tmp/replica.log', max_retry=2)
+
+        assert observed_workspaces == ['mt_hybrid', 'mt_hybrid']
+        stream.assert_called_once_with('down-request')
 
 
 def _manager(is_pool=False):
