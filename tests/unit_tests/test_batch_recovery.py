@@ -5,6 +5,7 @@
 import contextlib
 import importlib
 import shutil
+import subprocess
 import threading
 import time
 import types
@@ -1035,6 +1036,30 @@ def test_worker_startup_code_preserves_python_exit_status():
 
     assert 'set -eo pipefail' in startup_code
     assert 'tee /tmp/sky_batch_worker.log' in startup_code
+    assert (f'rm -f {coordinator.constants.WORKER_FAILURE_MARKER_PATH}'
+            in startup_code)
+
+
+def test_worker_health_check_code_fails_fast_on_failure_marker(
+        tmp_path, monkeypatch):
+    failure_marker = tmp_path / 'worker-failure.txt'
+    monkeypatch.setattr(coordinator.constants, 'WORKER_FAILURE_MARKER_PATH',
+                        str(failure_marker))
+    batch_coordinator = _make_coordinator()
+
+    failure_marker.write_text('mapper crashed', encoding='utf-8')
+    health_code = batch_coordinator._generate_worker_health_check_code()
+
+    start = time.monotonic()
+    proc = subprocess.run(['/bin/bash', '-lc', health_code],
+                          check=False,
+                          capture_output=True,
+                          text=True)
+    elapsed = time.monotonic() - start
+
+    assert proc.returncode == 1
+    assert elapsed < 1
+    assert 'mapper crashed' in proc.stdout
 
 
 def test_expired_worker_batch_rejects_late_save(monkeypatch):
@@ -1047,6 +1072,19 @@ def test_expired_worker_batch_rejects_late_save(monkeypatch):
     assert worker._current_batch is None
     with pytest.raises(RuntimeError, match='without a current batch'):
         worker.save_results([{'value': 2}])
+
+
+def test_record_mapper_failure_persists_failure_marker(tmp_path, monkeypatch):
+    failure_marker = tmp_path / 'worker-failure.txt'
+    monkeypatch.setattr(worker.constants, 'WORKER_FAILURE_MARKER_PATH',
+                        str(failure_marker))
+
+    worker._reset_worker_runtime_state()
+    worker._record_mapper_failure('mapper crashed')
+    worker._record_mapper_failure(
+        'later crash should not replace the first one')
+
+    assert failure_marker.read_text(encoding='utf-8') == 'mapper crashed'
 
 
 def test_worker_uploads_to_attempt_scoped_writer(monkeypatch):

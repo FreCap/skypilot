@@ -3,6 +3,7 @@
 # Worker service (localhost HTTP on each worker node)
 WORKER_SERVICE_PORT = 8290
 WORKER_SERVICE_STARTUP_TIMEOUT = 60  # seconds to wait for service health
+WORKER_FAILURE_MARKER_PATH = '/tmp/sky_batch_worker_failure.txt'
 
 # Timeouts (in seconds)
 WORKER_DISCOVERY_TIMEOUT = 300

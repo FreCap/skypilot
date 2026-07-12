@@ -228,11 +228,30 @@ def _expire_batch(item: _BatchItem, error: str) -> None:
             _current_batch = None
 
 
+def _clear_mapper_failure_marker() -> None:
+    try:
+        os.remove(constants.WORKER_FAILURE_MARKER_PATH)
+    except FileNotFoundError:
+        return
+    except OSError as e:
+        logger.warning('Failed to clear worker failure marker: %s', e)
+
+
+def _write_mapper_failure_marker(error: str) -> None:
+    try:
+        with open(constants.WORKER_FAILURE_MARKER_PATH, 'w',
+                  encoding='utf-8') as f:
+            f.write(error)
+    except OSError as e:
+        logger.warning('Failed to write worker failure marker: %s', e)
+
+
 def _reset_worker_runtime_state() -> None:
     """Reset module globals for a fresh worker process or unit test."""
     global _batch_queue, _current_batch, _mapper_failure
     _batch_queue = queue.Queue()
     _current_batch = None
+    _clear_mapper_failure_marker()
     with _mapper_failure_lock:
         _mapper_failure = None
 
@@ -244,6 +263,7 @@ def _record_mapper_failure(error: str) -> str:
     with _mapper_failure_lock:
         if _mapper_failure is None:
             _mapper_failure = error
+            _write_mapper_failure_marker(error)
         return _mapper_failure
 
 
