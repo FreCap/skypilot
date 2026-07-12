@@ -151,7 +151,8 @@ def test_proxy_forwards_raw_body_once_and_preserves_response(monkeypatch):
     assert calls[0]['headers'][constants.CONTROLLER_OWNER_HEADER] == (
         serve_utils.make_controller_owner_fingerprint(*owner))
     assert calls[0]['allow_redirects'] is False
-    assert calls[0]['timeout'].total == 25
+    assert calls[0]['timeout'].total == (
+        constants.LB_CONTROLLER_PROXY_TIMEOUT_SECONDS)
 
 
 def test_proxy_rejects_response_if_owner_changes(monkeypatch):

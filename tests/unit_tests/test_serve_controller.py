@@ -54,6 +54,7 @@ class _FakeReplicaInfo:
                  accelerators: Optional[Dict[str, int]] = None,
                  handle_is_none: bool = False) -> None:
         self.replica_id = replica_id
+        self.cluster_name = f'replica-{replica_id}'
         self.status = status
         self.version = version
         self._url = url
@@ -75,11 +76,17 @@ class _FakeReplicaInfo:
     def is_terminal(self) -> bool:
         return self.status in serve_state.ReplicaStatus.terminal_statuses()
 
-    def handle(self) -> Optional[_FakeHandle]:
+    def handle(self, cluster_record=None) -> Optional[_FakeHandle]:
+        del cluster_record
         self.handle_resolutions += 1
         if self._handle_is_none:
             return None
         return _FakeHandle(self._accelerators)
+
+    def _resolve_url(self, cluster_record=None, handle=None) -> Optional[str]:
+        del cluster_record, handle
+        self.url_resolutions += 1
+        return self._url
 
 
 def _make_controller() -> controller.SkyServeController:
@@ -88,6 +95,7 @@ def _make_controller() -> controller.SkyServeController:
     ctrl._service_name = 'svc'  # pylint: disable=protected-access
     ctrl._lb_replica_cache = {}  # pylint: disable=protected-access
     ctrl._lb_translation_cache = {}  # pylint: disable=protected-access
+    ctrl._lb_sync_lock = asyncio.Lock()  # pylint: disable=protected-access
     ctrl._routing_spec = None  # pylint: disable=protected-access
     ctrl._reserved_capacity_fill_enabled = False  # pylint: disable=protected-access
     return ctrl
@@ -224,14 +232,22 @@ class TestGetRoutingSpec:
         }
 
 
-def _sync_full(ctrl: controller.SkyServeController, infos,
-               active_versions=(1,)):
+def _sync_full(ctrl: controller.SkyServeController,
+               infos,
+               active_versions=(1,),
+               async_occupancy_by_version=None):
     """Returns the full (replica_info, num_ready) tuple."""
     record = {'active_versions': list(active_versions)}
     with mock.patch.object(controller.serve_state,
                            'get_service_from_name',
-                           return_value=record):
-        return ctrl._get_lb_replica_info(infos)  # pylint: disable=protected-access
+                           return_value=record), \
+         mock.patch.object(
+             controller.global_user_state,
+             'get_clusters_from_names',
+             side_effect=lambda names: {name: {'handle': mock.sentinel.handle}
+                                        for name in names}):
+        return ctrl._get_lb_replica_info(  # pylint: disable=protected-access
+            infos, async_occupancy_by_version)
 
 
 def _sync(ctrl: controller.SkyServeController, infos,
@@ -278,14 +294,10 @@ class TestGetLbReplicaInfo:
                                version=2,
                                url='http://2.2.2.2:8080',
                                accelerators={'L4': 1})
-        with mock.patch.object(controller.serve_state,
-                               'get_service_from_name',
-                               return_value={'active_versions': [1, 2]}):
-            replica_info, _ = ctrl._get_lb_replica_info(  # pylint: disable=protected-access
-                [old, new], {
-                    1: True,
-                    2: False
-                })
+        replica_info, _ = _sync_full(ctrl, [old, new], (1, 2), {
+            1: True,
+            2: False
+        })
         assert replica_info['http://1.1.1.1:8080']['async_occupancy'] == 'true'
         assert replica_info['http://2.2.2.2:8080']['async_occupancy'] == 'false'
 
@@ -295,11 +307,7 @@ class TestGetLbReplicaInfo:
                                 serve_state.ReplicaStatus.READY,
                                 url='http://1.1.1.1:8080',
                                 accelerators={'L4': 1})
-        with mock.patch.object(controller.serve_state,
-                               'get_service_from_name',
-                               return_value={'active_versions': [1]}):
-            replica_info, _ = ctrl._get_lb_replica_info(  # pylint: disable=protected-access
-                [info], {1: None})
+        replica_info, _ = _sync_full(ctrl, [info], (1,), {1: None})
         assert 'async_occupancy' not in replica_info['http://1.1.1.1:8080']
 
     def test_resolution_happens_at_most_once_per_replica(self):
@@ -314,6 +322,37 @@ class TestGetLbReplicaInfo:
         # url and handle must be resolved on the first sync only.
         assert info.url_resolutions == 1
         assert info.handle_resolutions == 1
+
+    def test_cold_sync_batches_cluster_records_and_warm_sync_skips_lookup(self):
+        ctrl = _make_controller()
+        infos = [
+            _FakeReplicaInfo(1,
+                             serve_state.ReplicaStatus.READY,
+                             url='http://1.1.1.1:8080',
+                             accelerators={'L4': 1}),
+            _FakeReplicaInfo(2,
+                             serve_state.ReplicaStatus.READY,
+                             url='http://2.2.2.2:8080',
+                             accelerators={'L4': 1}),
+        ]
+        with mock.patch.object(
+                controller.serve_state,
+                'get_service_from_name',
+                return_value={'active_versions': [1]}), mock.patch.object(
+                    controller.global_user_state,
+                    'get_clusters_from_names',
+                    return_value={
+                        info.cluster_name: {
+                            'handle': mock.sentinel.handle
+                        } for info in infos
+                    }) as get_clusters:
+            first = ctrl._get_lb_replica_info(  # pylint: disable=protected-access
+                infos, None)
+            second = ctrl._get_lb_replica_info(  # pylint: disable=protected-access
+                infos, None)
+
+        assert first == second
+        get_clusters.assert_called_once_with(['replica-1', 'replica-2'])
 
     def test_not_ready_replicas_are_never_resolved(self):
         ctrl = _make_controller()
@@ -935,9 +974,11 @@ class TestAuthoritativeLbReportIngestion:
                              accelerators={'L4': 1}),
         ]
         observed = {}
+        event_loop_thread = threading.get_ident()
 
         def _capture_lb_replica_info(replica_infos, async_occupancy_by_version):
             del replica_infos
+            observed['sync_thread'] = threading.get_ident()
             observed['sync'] = dict(async_occupancy_by_version)
             return ({}, 0)
 
@@ -984,6 +1025,7 @@ class TestAuthoritativeLbReportIngestion:
         get_specs.assert_called_once_with('svc', [1, 2, 3])
         assert observed['sync'] == {1: False, 2: None, 3: True}
         assert observed['ingest'] == {1: False, 2: None, 3: True}
+        assert observed['sync_thread'] != event_loop_thread
 
 
 class _FakeAutoscaler:
