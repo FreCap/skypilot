@@ -1,4 +1,4 @@
-import { renderHook, waitFor } from '@testing-library/react';
+import { act, renderHook, waitFor } from '@testing-library/react';
 
 // Mock the shared dashboard cache so we can observe get/invalidate calls
 // without hitting the network.
@@ -16,6 +16,16 @@ jest.mock('@/lib/cache', () => ({
 
 import dashboardCache from '@/lib/cache';
 import { useSingleManagedJob, getManagedJobs } from '@/data/connectors/jobs';
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
 
 describe('useSingleManagedJob manual-refresh cache invalidation', () => {
   const jobId = '56164';
@@ -85,5 +95,83 @@ describe('useSingleManagedJob manual-refresh cache invalidation', () => {
 
     await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(1));
     expect(dashboardCache.invalidate).not.toHaveBeenCalled();
+  });
+
+  it('ignores an earlier job response that resolves after navigation', async () => {
+    const firstRequest = deferred();
+    const secondRequest = deferred();
+    dashboardCache.get
+      .mockImplementationOnce(() => firstRequest.promise)
+      .mockImplementationOnce(() => secondRequest.promise);
+
+    const { result, rerender } = renderHook(
+      ({ id }) => useSingleManagedJob(id, 0),
+      { initialProps: { id: '56164' } }
+    );
+
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(1));
+    rerender({ id: '56165' });
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      secondRequest.resolve({
+        jobs: [{ id: 56165, status: 'RUNNING' }],
+        controllerStopped: false,
+      });
+      await secondRequest.promise;
+    });
+    expect(result.current.jobData.jobs[0].id).toBe(56165);
+
+    await act(async () => {
+      firstRequest.resolve({
+        jobs: [{ id: 56164, status: 'SUCCEEDED' }],
+        controllerStopped: false,
+      });
+      await firstRequest.promise;
+    });
+
+    expect(result.current.jobData.jobs[0].id).toBe(56165);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps a refreshed request loading when the superseded request fails', async () => {
+    const initialRequest = deferred();
+    const refreshedRequest = deferred();
+    const consoleError = jest
+      .spyOn(console, 'error')
+      .mockImplementation(() => {});
+    dashboardCache.get
+      .mockImplementationOnce(() => initialRequest.promise)
+      .mockImplementationOnce(() => refreshedRequest.promise);
+
+    const { result, rerender } = renderHook(
+      ({ trigger }) => useSingleManagedJob('56164', trigger),
+      { initialProps: { trigger: 0 } }
+    );
+
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(1));
+    rerender({ trigger: 1 });
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      initialRequest.reject(new Error('superseded request failed'));
+      await initialRequest.promise.catch(() => {});
+    });
+
+    expect(result.current.loading).toBe(true);
+    expect(result.current.jobData).toBeNull();
+
+    await act(async () => {
+      refreshedRequest.resolve({
+        jobs: [{ id: 56164, status: 'RUNNING' }],
+        controllerStopped: false,
+      });
+      await refreshedRequest.promise;
+    });
+
+    expect(result.current.loading).toBe(false);
+    expect(result.current.jobData.jobs[0].status).toBe('RUNNING');
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+    consoleError.mockRestore();
   });
 });

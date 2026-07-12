@@ -546,6 +546,8 @@ export function useSingleManagedJob(jobId, refreshTrigger = 0) {
   const loading = loadingJobData;
 
   useEffect(() => {
+    let isCurrentRequest = true;
+
     async function fetchJobData() {
       if (!jobId) return;
 
@@ -567,6 +569,9 @@ export function useSingleManagedJob(jobId, refreshTrigger = 0) {
         }
         prevRefreshTriggerRef.current = refreshTrigger;
         const allJobsData = await dashboardCache.get(getManagedJobs, cacheArgs);
+        if (!isCurrentRequest) {
+          return;
+        }
 
         // Filter for ALL tasks matching this job_id (supports multi-task jobs)
         const matchingJobs =
@@ -586,14 +591,22 @@ export function useSingleManagedJob(jobId, refreshTrigger = 0) {
           });
         }
       } catch (error) {
+        if (!isCurrentRequest) {
+          return;
+        }
         console.error('Error fetching single managed job data:', error);
         setJobData({ jobs: [], controllerStopped: false });
       } finally {
-        setLoadingJobData(false);
+        if (isCurrentRequest) {
+          setLoadingJobData(false);
+        }
       }
     }
 
     fetchJobData();
+    return () => {
+      isCurrentRequest = false;
+    };
   }, [jobId, refreshTrigger]);
 
   return { jobData, loading };
