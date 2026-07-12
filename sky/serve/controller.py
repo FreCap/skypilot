@@ -258,9 +258,10 @@ class SkyServeController:
         """Build the url -> replica info mapping for load_balancer_sync.
 
         [boltz fork] Resolving a replica's url and gpu_type is expensive, so
-        cluster records for newly-READY replicas are fetched in one batched
-        lookup and the resulting endpoint/accelerator data is cached for the
-        replica's lifetime. A warm sync performs no cluster-record lookup.
+        cluster records and provider configs for newly-READY replicas are each
+        fetched in one batched lookup. The resulting endpoint/accelerator data
+        is cached for the replica's lifetime. A warm sync performs neither
+        lookup.
         A brand-new replica whose gpu_type cannot be resolved yet is reported
         as 'unknown' until it is.
 
@@ -304,6 +305,34 @@ class SkyServeController:
             cluster_records = global_user_state.get_clusters_from_names(
                 uncached_cluster_names)
 
+        # get_endpoints normally reads and parses each cluster YAML to obtain
+        # its provider config. That is another fleet-sized DB N+1. Reuse the
+        # records above to collect the YAML paths, then fetch all YAMLs in one
+        # query before resolving endpoints.
+        uncached_handles: Dict[int, Any] = {}
+        yaml_replica_ids: List[int] = []
+        yaml_paths: List[str] = []
+        for info in ready_infos:
+            if info.replica_id in self._lb_replica_cache:
+                continue
+            cluster_record = cluster_records.get(info.cluster_name)
+            if cluster_record is None:
+                continue
+            handle = info.handle(cluster_record)
+            uncached_handles[info.replica_id] = handle
+            cluster_yaml = getattr(handle, 'cluster_yaml', None)
+            if cluster_yaml is not None:
+                yaml_replica_ids.append(info.replica_id)
+                yaml_paths.append(cluster_yaml)
+        provider_configs: Dict[int, Dict[str, Any]] = {}
+        if yaml_paths:
+            yaml_configs = global_user_state.get_cluster_yaml_dict_multiple(
+                yaml_paths)
+            provider_configs = {
+                replica_id: config['provider']
+                for replica_id, config in zip(yaml_replica_ids, yaml_configs)
+            }
+
         for info in ready_infos:
             cached = self._lb_replica_cache.get(info.replica_id)
             if cached is None:
@@ -313,10 +342,11 @@ class SkyServeController:
                                    'its cluster record is not available yet; '
                                    'skipping for this sync.')
                     continue
-                handle = info.handle(cluster_record)
+                handle = uncached_handles.get(info.replica_id)
                 url = info._resolve_url(  # pylint: disable=protected-access
                     cluster_record=cluster_record,
-                    handle=handle)
+                    handle=handle,
+                    provider_config=provider_configs.get(info.replica_id))
                 if url is None:
                     # A replica can be READY while its endpoint is briefly
                     # unresolvable (e.g. the cluster record has no head IP

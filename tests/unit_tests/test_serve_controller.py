@@ -38,9 +38,11 @@ def test_run_controller_preserves_authoritative_launch_fence_bit(monkeypatch):
 class _FakeHandle:
     """Stub for the resource handle returned by ReplicaInfo.handle()."""
 
-    def __init__(self, accelerators: Optional[Dict[str, int]]) -> None:
+    def __init__(self, accelerators: Optional[Dict[str, int]],
+                 cluster_yaml: str) -> None:
         self.launched_resources = mock.Mock()
         self.launched_resources.accelerators = accelerators
+        self.cluster_yaml = cluster_yaml
 
 
 class _FakeReplicaInfo:
@@ -62,6 +64,7 @@ class _FakeReplicaInfo:
         self._handle_is_none = handle_is_none
         self.url_resolutions = 0
         self.handle_resolutions = 0
+        self.last_provider_config = None
 
     @property
     def url(self) -> Optional[str]:
@@ -81,10 +84,14 @@ class _FakeReplicaInfo:
         self.handle_resolutions += 1
         if self._handle_is_none:
             return None
-        return _FakeHandle(self._accelerators)
+        return _FakeHandle(self._accelerators, f'{self.cluster_name}.yaml')
 
-    def _resolve_url(self, cluster_record=None, handle=None) -> Optional[str]:
+    def _resolve_url(self,
+                     cluster_record=None,
+                     handle=None,
+                     provider_config=None) -> Optional[str]:
         del cluster_record, handle
+        self.last_provider_config = provider_config
         self.url_resolutions += 1
         return self._url
 
@@ -245,7 +252,12 @@ def _sync_full(ctrl: controller.SkyServeController,
              controller.global_user_state,
              'get_clusters_from_names',
              side_effect=lambda names: {name: {'handle': mock.sentinel.handle}
-                                        for name in names}):
+                                        for name in names}), \
+         mock.patch.object(
+             controller.global_user_state,
+             'get_cluster_yaml_dict_multiple',
+             side_effect=lambda paths: [{'provider': {'path': path}}
+                                        for path in paths]):
         return ctrl._get_lb_replica_info(  # pylint: disable=protected-access
             infos, async_occupancy_by_version)
 
@@ -345,7 +357,14 @@ class TestGetLbReplicaInfo:
                         info.cluster_name: {
                             'handle': mock.sentinel.handle
                         } for info in infos
-                    }) as get_clusters:
+                    }) as get_clusters, mock.patch.object(
+                        controller.global_user_state,
+                        'get_cluster_yaml_dict_multiple',
+                        return_value=[{
+                            'provider': {
+                                'replica': info.replica_id
+                            }
+                        } for info in infos]) as get_yamls:
             first = ctrl._get_lb_replica_info(  # pylint: disable=protected-access
                 infos, None)
             second = ctrl._get_lb_replica_info(  # pylint: disable=protected-access
@@ -353,6 +372,9 @@ class TestGetLbReplicaInfo:
 
         assert first == second
         get_clusters.assert_called_once_with(['replica-1', 'replica-2'])
+        get_yamls.assert_called_once_with(['replica-1.yaml', 'replica-2.yaml'])
+        assert infos[0].last_provider_config == {'replica': 1}
+        assert infos[1].last_provider_config == {'replica': 2}
 
     def test_not_ready_replicas_are_never_resolved(self):
         ctrl = _make_controller()
