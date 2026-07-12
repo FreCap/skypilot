@@ -1385,7 +1385,7 @@ def _get_service_from_row(r: 'row.RowMapping') -> Dict[str, Any]:
         'entrypoint': r['entrypoint'],
         'yaml_content': r.get('yaml_content'),
     }
-    latest_spec = get_spec(r['name'], current_version)
+    latest_spec = pickle.loads(r['spec']) if r.get('spec') is not None else None
     if latest_spec is not None:
         record['policy'] = latest_spec.autoscaling_policy_str()
         record['load_balancing_policy'] = latest_spec.load_balancing_policy
@@ -1394,7 +1394,7 @@ def _get_service_from_row(r: 'row.RowMapping') -> Dict[str, Any]:
 
 def _build_services_with_latest_version_query(
         service_name: Optional[str] = None) -> sqlalchemy.sql.Select:
-    """Builds a query joining services with their latest version and yaml.
+    """Build a query joining services with their latest version metadata.
 
     Args:
         service_name: If provided, filter to this service only.
@@ -1403,7 +1403,7 @@ def _build_services_with_latest_version_query(
         A SQLAlchemy selectable for fetching rows, including columns:
         - max_version (latest version per service)
         - services_table.*
-        - yaml_content (from version_specs_table for latest version)
+        - spec/yaml_content (from version_specs_table for latest version)
     """
     subquery = sqlalchemy.select(
         version_specs_table.c.service_name,
@@ -1413,6 +1413,7 @@ def _build_services_with_latest_version_query(
     query = sqlalchemy.select(
         subquery.c.max_version,
         services_table,
+        version_specs_table.c.spec,
         version_specs_table.c.yaml_content,
     ).select_from(
         services_table.join(

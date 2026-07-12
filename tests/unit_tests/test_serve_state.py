@@ -21,6 +21,16 @@ from sky.serve import serve_state
 from sky.utils import common_utils
 
 
+class _FakeSpec:
+
+    def __init__(self, policy: str, load_balancing_policy: str):
+        self._policy = policy
+        self.load_balancing_policy = load_balancing_policy
+
+    def autoscaling_policy_str(self):
+        return self._policy
+
+
 def _read_row(engine, name):
     """Read raw services row directly (bypassing get_service_from_name which
     does an INNER JOIN with version_specs and would skip rows without a
@@ -68,7 +78,8 @@ def _add_minimal_service(name: str,
                          lifecycle_epoch=None,
                          resource_scope=None,
                          yaml_content='yaml: v1',
-                         pool=False):
+                         pool=False,
+                         spec=None):
     """Add a service row with all-required-args defaults so individual tests
     only need to specify what they care about."""
     return serve_state.add_service(
@@ -85,7 +96,7 @@ def _add_minimal_service(name: str,
         # A None spec is stored as pickled None (like `add_version` does), so
         # the read path (`_get_service_from_row`) skips the spec-dependent
         # fields instead of calling SkyServiceSpec methods on it.
-        spec=None,
+        spec=spec,
         yaml_content=yaml_content,
         controller_ip=controller_ip,
         service_hash=service_hash,
@@ -178,6 +189,35 @@ def test_get_specs_batches_requested_versions_in_one_query(_mock_serve_db):
     assert set(specs) == {1, 2}
     assert specs[1].graceful_drain_async_occupancy is False
     assert specs[2].graceful_drain_async_occupancy is True
+
+
+def test_get_service_from_name_uses_joined_spec_in_single_query(_mock_serve_db):
+    spec = _FakeSpec('qps=2', 'least_load')
+    assert _add_minimal_service('svc-read', spec=spec) is True
+
+    with _count_sql_statements(_mock_serve_db) as counts:
+        record = serve_state.get_service_from_name('svc-read')
+
+    assert counts['n'] == 1, counts
+    assert record is not None
+    assert record['policy'] == 'qps=2'
+    assert record['load_balancing_policy'] == 'least_load'
+
+
+def test_get_services_uses_single_query_for_multiple_rows(_mock_serve_db):
+    assert _add_minimal_service('svc-a') is True
+    assert _add_minimal_service('svc-b') is True
+    assert _add_minimal_service('svc-c') is True
+
+    with _count_sql_statements(_mock_serve_db) as counts:
+        records = serve_state.get_services()
+
+    assert counts['n'] == 1, counts
+    assert sorted(record['name'] for record in records) == [
+        'svc-a',
+        'svc-b',
+        'svc-c',
+    ]
 
 
 class TestAddServiceWritesControllerIp:
