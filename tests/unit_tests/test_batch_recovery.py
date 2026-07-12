@@ -1052,17 +1052,27 @@ def test_worker_health_check_code_fails_fast_on_failure_marker(
     fake_curl = fake_bin / 'curl'
     fake_curl.write_text(f"""#!/bin/bash
 touch '{curl_marker}'
-exit 99
+printf '200'
 """,
                          encoding='utf-8')
     fake_curl.chmod(0o755)
     monkeypatch.setenv('PATH', f'{fake_bin}:{os.environ["PATH"]}')
     batch_coordinator = _make_coordinator()
 
-    failure_marker.write_text('mapper crashed', encoding='utf-8')
     health_code = batch_coordinator._generate_worker_health_check_code()
 
-    proc = subprocess.run(['/bin/bash', '-lc', health_code],
+    # Prove the fake curl is reachable before relying on its marker to verify
+    # that the failure-marker branch short-circuits the health request.
+    proc = subprocess.run(['/bin/bash', '-c', health_code],
+                          check=False,
+                          capture_output=True,
+                          text=True)
+    assert proc.returncode == 0
+    assert curl_marker.exists()
+
+    curl_marker.unlink()
+    failure_marker.write_text('mapper crashed', encoding='utf-8')
+    proc = subprocess.run(['/bin/bash', '-c', health_code],
                           check=False,
                           capture_output=True,
                           text=True)
