@@ -50,6 +50,27 @@ ChartJS.register(CategoryScale, LinearScale, BarElement, Tooltip, Legend);
 
 const RANGE_OPTIONS = [7, 30, 90];
 const AUTO_REFRESH_MS = 60 * 1000;
+const GROUP_OPTIONS = [
+  { value: 'job', label: 'Job / workload' },
+  { value: 'user', label: 'User' },
+  { value: 'purchase_option', label: 'Purchase option' },
+];
+const SERIES_COLORS = [
+  ['rgba(14, 165, 233, 0.78)', 'rgb(2, 132, 199)'],
+  ['rgba(99, 102, 241, 0.78)', 'rgb(79, 70, 229)'],
+  ['rgba(168, 85, 247, 0.78)', 'rgb(147, 51, 234)'],
+  ['rgba(236, 72, 153, 0.78)', 'rgb(219, 39, 119)'],
+  ['rgba(249, 115, 22, 0.78)', 'rgb(234, 88, 12)'],
+  ['rgba(234, 179, 8, 0.78)', 'rgb(202, 138, 4)'],
+  ['rgba(34, 197, 94, 0.78)', 'rgb(22, 163, 74)'],
+  ['rgba(20, 184, 166, 0.78)', 'rgb(13, 148, 136)'],
+];
+const PURCHASE_OPTION_COLORS = {
+  spot: ['rgba(34, 197, 94, 0.78)', 'rgb(22, 163, 74)'],
+  on_demand: ['rgba(14, 165, 233, 0.78)', 'rgb(2, 132, 199)'],
+  unknown: ['rgba(148, 163, 184, 0.78)', 'rgb(100, 116, 139)'],
+};
+const OTHER_COLOR = ['rgba(148, 163, 184, 0.62)', 'rgb(100, 116, 139)'];
 
 export function formatCurrency(value) {
   const number = Number(value || 0);
@@ -78,6 +99,34 @@ export function workloadLabel(workload) {
   if (type === 'controller') return `Platform · ${id}`;
   if (type === 'managed') return `Managed workload · ${id}`;
   return `Cluster · ${id}`;
+}
+
+export function breakdownLabel(groupBy, group) {
+  if (group.is_other) return 'Other';
+  if (groupBy === 'job') return workloadLabel(group);
+  if (groupBy === 'user') {
+    return group.user_name || group.user_hash || 'Unknown';
+  }
+  if (group.purchase_option === 'spot') return 'Spot';
+  if (group.purchase_option === 'on_demand') return 'On-demand';
+  return 'Unknown / unpriced';
+}
+
+function breakdownKey(groupBy, group) {
+  if (group.is_other) return 'other';
+  if (groupBy === 'job') {
+    return `${group.workload_type || 'cluster'}:${group.workload_id || ''}`;
+  }
+  if (groupBy === 'user') return `user:${group.user_hash || 'unknown'}`;
+  return group.purchase_option || 'unknown';
+}
+
+function seriesColor(groupBy, series, index) {
+  if (series.is_other) return OTHER_COLOR;
+  if (groupBy === 'purchase_option') {
+    return PURCHASE_OPTION_COLORS[series.purchase_option] || OTHER_COLOR;
+  }
+  return SERIES_COLORS[index % SERIES_COLORS.length];
 }
 
 function MetricCard({ title, value, detail, icon: Icon }) {
@@ -125,6 +174,7 @@ function EmptyEstimate() {
 
 export function EstimatedSpend() {
   const [rangeDays, setRangeDays] = useState(30);
+  const [groupBy, setGroupBy] = useState('job');
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -145,8 +195,11 @@ export function EstimatedSpend() {
         return;
       }
       setForbidden(false);
-      const estimate = await getEstimatedSpend(rangeDays);
+      const estimate = await getEstimatedSpend(rangeDays, groupBy);
       if (generation !== requestGeneration.current) return;
+      if (!estimate.group_by && groupBy !== 'job') {
+        setGroupBy('job');
+      }
       setData(estimate);
       setLastFetchedAt(new Date());
     } catch (fetchError) {
@@ -161,7 +214,7 @@ export function EstimatedSpend() {
         setLoading(false);
       }
     }
-  }, [rangeDays]);
+  }, [groupBy, rangeDays]);
 
   useEffect(() => {
     fetchData();
@@ -174,6 +227,37 @@ export function EstimatedSpend() {
 
   const chartData = useMemo(() => {
     const days = data?.days || [];
+    const selectedGroupBy = data?.group_by || 'job';
+    const groupedSeries = data?.series || [];
+    const datasets = groupedSeries.length
+      ? groupedSeries.map((series, index) => {
+          const [backgroundColor, borderColor] = seriesColor(
+            selectedGroupBy,
+            series,
+            index
+          );
+          return {
+            label: breakdownLabel(selectedGroupBy, series),
+            data: series.estimated_cost_by_day || [],
+            backgroundColor,
+            borderColor,
+            borderWidth: 1,
+            borderRadius: 3,
+            maxBarThickness: 36,
+            stack: 'estimated-spend',
+          };
+        })
+      : [
+          {
+            label: 'Estimated compute cost',
+            data: days.map((day) => day.estimated_cost),
+            backgroundColor: 'rgba(14, 165, 233, 0.75)',
+            borderColor: 'rgb(2, 132, 199)',
+            borderWidth: 1,
+            borderRadius: 4,
+            maxBarThickness: 36,
+          },
+        ];
     return {
       labels: days.map((day) =>
         new Date(`${day.date}T00:00:00Z`).toLocaleDateString(undefined, {
@@ -182,17 +266,7 @@ export function EstimatedSpend() {
           timeZone: 'UTC',
         })
       ),
-      datasets: [
-        {
-          label: 'Estimated compute cost',
-          data: days.map((day) => day.estimated_cost),
-          backgroundColor: 'rgba(14, 165, 233, 0.75)',
-          borderColor: 'rgb(2, 132, 199)',
-          borderWidth: 1,
-          borderRadius: 4,
-          maxBarThickness: 36,
-        },
-      ],
+      datasets,
     };
   }, [data]);
 
@@ -202,7 +276,7 @@ export function EstimatedSpend() {
       maintainAspectRatio: false,
       interaction: { intersect: false, mode: 'index' },
       plugins: {
-        legend: { display: false },
+        legend: { display: chartData.datasets.length > 1, position: 'bottom' },
         tooltip: {
           callbacks: {
             label: (context) => formatCurrency(context.parsed.y),
@@ -210,14 +284,15 @@ export function EstimatedSpend() {
         },
       },
       scales: {
-        x: { grid: { display: false } },
+        x: { grid: { display: false }, stacked: true },
         y: {
           beginAtZero: true,
+          stacked: true,
           ticks: { callback: (value) => `$${value}` },
         },
       },
     }),
-    []
+    [chartData.datasets.length]
   );
 
   if (forbidden) {
@@ -243,7 +318,20 @@ export function EstimatedSpend() {
   const lastSuccess = data?.last_successful_refresh_at
     ? new Date(data.last_successful_refresh_at * 1000)
     : null;
-  const workloads = (data?.workloads || []).slice(0, 20);
+  const displayedGroupBy = data?.group_by || 'job';
+  const supportsBreakdowns = Boolean(
+    data?.group_by && Array.isArray(data?.groups)
+  );
+  const groups = supportsBreakdowns
+    ? data.groups
+    : displayedGroupBy === 'job'
+      ? data?.workloads || []
+      : [];
+  const groupOption = GROUP_OPTIONS.find(
+    (option) => option.value === displayedGroupBy
+  );
+  const showPurchaseColumns =
+    supportsBreakdowns && displayedGroupBy !== 'purchase_option';
   const clouds = data?.clouds || [];
   const totalCost = Number(totals.estimated_cost || 0);
 
@@ -265,6 +353,23 @@ export function EstimatedSpend() {
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
+          {(!data || supportsBreakdowns) && (
+            <label className="flex items-center gap-2 text-sm text-muted-foreground">
+              <span>Group by</span>
+              <select
+                aria-label="Group spend by"
+                value={groupBy}
+                onChange={(event) => setGroupBy(event.target.value)}
+                className="h-9 rounded-md border border-input bg-background px-3 text-sm text-foreground shadow-sm focus:outline-none focus:ring-2 focus:ring-ring"
+              >
+                {GROUP_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
           <div className="inline-flex rounded-md border bg-background p-1">
             {RANGE_OPTIONS.map((days) => (
               <button
@@ -342,10 +447,12 @@ export function EstimatedSpend() {
 
           <Card>
             <CardHeader>
-              <CardTitle className="text-lg">Daily estimate</CardTitle>
+              <CardTitle className="text-lg">
+                Daily estimate by {groupOption?.label.toLowerCase() || 'group'}
+              </CardTitle>
               <CardDescription>
-                Machine uptime split at UTC midnight. The current day is
-                partial.
+                Stacked catalog-priced cost split at UTC midnight. The current
+                day is partial; lower-cost groups are combined as Other.
               </CardDescription>
             </CardHeader>
             <CardContent>
@@ -358,10 +465,18 @@ export function EstimatedSpend() {
           <div className="grid gap-6 xl:grid-cols-[2fr_1fr]">
             <Card>
               <CardHeader>
-                <CardTitle className="text-lg">Top workloads</CardTitle>
+                <CardTitle className="text-lg">
+                  {displayedGroupBy === 'purchase_option'
+                    ? 'Spend'
+                    : 'Top spend'}{' '}
+                  by {groupOption?.label.toLowerCase() || 'group'}
+                </CardTitle>
                 <CardDescription>
-                  Dedicated managed jobs include provisioning and recovery
-                  uptime. Shared machines remain attributed to their pool.
+                  {displayedGroupBy === 'job'
+                    ? 'Up to 50 workloads. Managed jobs include provisioning and recovery uptime; shared machines remain attributed to their pool.'
+                    : displayedGroupBy === 'user'
+                      ? 'Up to 50 users. Ownership follows the user recorded when each cluster was launched.'
+                      : 'Catalog-priced compute split between spot and on-demand capacity.'}
                 </CardDescription>
               </CardHeader>
               <CardContent>
@@ -369,44 +484,58 @@ export function EstimatedSpend() {
                   <Table>
                     <TableHeader>
                       <TableRow>
-                        <TableHead>Workload</TableHead>
+                        <TableHead>
+                          {displayedGroupBy === 'job'
+                            ? 'Job / workload'
+                            : displayedGroupBy === 'user'
+                              ? 'User'
+                              : 'Purchase option'}
+                        </TableHead>
                         <TableHead className="text-right">
                           Machine time
                         </TableHead>
-                        <TableHead className="text-right">Estimate</TableHead>
+                        <TableHead className="text-right">Total</TableHead>
+                        {showPurchaseColumns && (
+                          <>
+                            <TableHead className="text-right">Spot</TableHead>
+                            <TableHead className="text-right">
+                              On-demand
+                            </TableHead>
+                          </>
+                        )}
                         <TableHead className="text-right">Share</TableHead>
                       </TableRow>
                     </TableHeader>
                     <TableBody>
-                      {workloads.length === 0 ? (
+                      {groups.length === 0 ? (
                         <TableRow>
                           <TableCell
-                            colSpan={4}
+                            colSpan={showPurchaseColumns ? 6 : 4}
                             className="py-8 text-center text-muted-foreground"
                           >
-                            No priced workloads in this range.
+                            No priced groups in this range.
                           </TableCell>
                         </TableRow>
                       ) : (
-                        workloads.map((workload) => {
-                          const cost = Number(workload.estimated_cost || 0);
+                        groups.map((group) => {
+                          const cost = Number(group.estimated_cost || 0);
                           const share =
                             totalCost > 0 ? (cost / totalCost) * 100 : 0;
                           return (
                             <TableRow
-                              key={`${workload.workload_type}:${workload.workload_id}`}
+                              key={breakdownKey(displayedGroupBy, group)}
                             >
                               <TableCell className="max-w-md truncate font-medium">
-                                {workloadLabel(workload)}
+                                {breakdownLabel(displayedGroupBy, group)}
                               </TableCell>
                               <TableCell className="text-right text-muted-foreground">
                                 <div>
-                                  {formatHours(workload.priced_machine_seconds)}
+                                  {formatHours(group.priced_machine_seconds)}
                                 </div>
-                                {workload.excluded_machine_seconds > 0 && (
+                                {group.excluded_machine_seconds > 0 && (
                                   <div className="text-xs">
                                     {formatHours(
-                                      workload.excluded_machine_seconds
+                                      group.excluded_machine_seconds
                                     )}{' '}
                                     excluded
                                   </div>
@@ -415,6 +544,18 @@ export function EstimatedSpend() {
                               <TableCell className="text-right font-medium">
                                 {formatCurrency(cost)}
                               </TableCell>
+                              {showPurchaseColumns && (
+                                <>
+                                  <TableCell className="text-right text-emerald-700 dark:text-emerald-300">
+                                    {formatCurrency(group.spot_estimated_cost)}
+                                  </TableCell>
+                                  <TableCell className="text-right text-sky-700 dark:text-sky-300">
+                                    {formatCurrency(
+                                      group.on_demand_estimated_cost
+                                    )}
+                                  </TableCell>
+                                </>
+                              )}
                               <TableCell className="text-right text-muted-foreground">
                                 {share.toFixed(1)}%
                               </TableCell>

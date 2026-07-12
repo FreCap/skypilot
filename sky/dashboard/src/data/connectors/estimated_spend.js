@@ -1,7 +1,11 @@
 import { apiClient } from '@/data/connectors/client';
 
-export async function getEstimatedSpend(days = 30) {
-  const response = await apiClient.get(`/estimated_spend?days=${days}`);
+export async function getEstimatedSpend(days = 30, groupBy = 'job') {
+  const query = new URLSearchParams({
+    days: String(days),
+    group_by: groupBy,
+  });
+  const response = await apiClient.get(`/estimated_spend?${query.toString()}`);
   if (!response.ok) {
     let detail = '';
     try {
