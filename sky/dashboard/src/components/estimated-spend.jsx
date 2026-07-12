@@ -41,10 +41,8 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
-import {
-  getCurrentRole,
-  getEstimatedSpend,
-} from '@/data/connectors/estimated_spend';
+import { getEstimatedSpend } from '@/data/connectors/estimated_spend';
+import { getCurrentUserRole } from '@/data/connectors/client';
 
 ChartJS.register(CategoryScale, LinearScale, BarElement, Tooltip, Legend);
 
@@ -187,7 +185,7 @@ export function EstimatedSpend() {
     setLoading(true);
     setError(null);
     try {
-      const role = await getCurrentRole();
+      const role = await getCurrentUserRole();
       if (generation !== requestGeneration.current) return;
       if (role.role !== 'admin') {
         setForbidden(true);
