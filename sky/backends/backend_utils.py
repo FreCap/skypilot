@@ -2906,15 +2906,18 @@ def _update_cluster_status(
         operation_str = 'autodowning' if record.get('to_down',
                                                     False) else 'autostopping'
         logger.info(f'Cluster {cluster_name!r} is {operation_str}.')
+        event_reason = f'Cluster is {operation_str}.'
 
         # Set cluster to AUTOSTOPPING status
         record['status'] = status_lib.ClusterStatus.AUTOSTOPPING
         global_user_state.add_cluster_event(
             cluster_name,
             status_lib.ClusterStatus.AUTOSTOPPING,
-            f'Cluster is {operation_str}.',
+            event_reason,
             global_user_state.ClusterEventType.STATUS_CHANGE,
             nop_if_duplicate=True)
+        if not summary_response:
+            record['last_event'] = event_reason
         # Use set_cluster_status() to directly update the status in DB
         # instead of add_or_update_cluster() which only supports INIT/UP.
         # set_cluster_status() only touches status/status_updated_at, and we
