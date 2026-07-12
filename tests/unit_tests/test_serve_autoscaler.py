@@ -263,6 +263,7 @@ class TestQueueLengthAutoscalerIdleReplicas(unittest.TestCase):
         info.cluster_name = cluster_name
         info.version = 1
         info.status = serve_state.ReplicaStatus.READY
+        info.is_terminal = False
         return info
 
     def test_idle_replicas_use_grouped_counts_once(self):
@@ -308,6 +309,31 @@ class TestQueueLengthAutoscalerIdleReplicas(unittest.TestCase):
             idle = autoscaler._get_idle_replicas(replicas)
 
         self.assertEqual([info.replica_id for info in idle], [1, 3])
+
+    def test_scale_down_reuses_grouped_counts_once(self):
+        autoscaler = autoscalers.QueueLengthAutoscaler('pool-a',
+                                                       self._spec(),
+                                                       version=1)
+        replicas = [
+            self._replica(1, 'replica-1'),
+            self._replica(2, 'replica-2'),
+            self._replica(3, 'replica-3'),
+        ]
+        autoscaler.target_num_replicas = 1
+        autoscaler._set_target_num_replicas_with_hysteresis = lambda: None
+
+        with mock.patch(
+                'sky.serve.autoscalers.managed_job_state.'
+                'get_nonterminal_job_counts_by_pool',
+                return_value={'replica-2': 2}) as grouped_counts, \
+             mock.patch(
+                 'sky.serve.autoscalers.managed_job_state.'
+                 'get_nonterminal_job_ids_by_pool') as per_replica_lookup:
+            decisions = autoscaler._generate_scaling_decisions(replicas)
+
+        self.assertEqual([decision.target for decision in decisions], [3, 1])
+        grouped_counts.assert_called_once_with('pool-a')
+        per_replica_lookup.assert_not_called()
 
 
 class TestInstanceAwareGpuShapeCache(unittest.TestCase):

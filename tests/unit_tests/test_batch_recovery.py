@@ -4,6 +4,7 @@
 
 import contextlib
 import importlib
+import os
 import shutil
 import subprocess
 import threading
@@ -1043,22 +1044,31 @@ def test_worker_startup_code_preserves_python_exit_status():
 def test_worker_health_check_code_fails_fast_on_failure_marker(
         tmp_path, monkeypatch):
     failure_marker = tmp_path / 'worker-failure.txt'
+    fake_bin = tmp_path / 'fake-bin'
+    curl_marker = tmp_path / 'curl-invoked'
     monkeypatch.setattr(coordinator.constants, 'WORKER_FAILURE_MARKER_PATH',
                         str(failure_marker))
+    fake_bin.mkdir()
+    fake_curl = fake_bin / 'curl'
+    fake_curl.write_text(f"""#!/bin/bash
+touch '{curl_marker}'
+exit 99
+""",
+                         encoding='utf-8')
+    fake_curl.chmod(0o755)
+    monkeypatch.setenv('PATH', f'{fake_bin}:{os.environ["PATH"]}')
     batch_coordinator = _make_coordinator()
 
     failure_marker.write_text('mapper crashed', encoding='utf-8')
     health_code = batch_coordinator._generate_worker_health_check_code()
 
-    start = time.monotonic()
     proc = subprocess.run(['/bin/bash', '-lc', health_code],
                           check=False,
                           capture_output=True,
                           text=True)
-    elapsed = time.monotonic() - start
 
     assert proc.returncode == 1
-    assert elapsed < 1
+    assert not curl_marker.exists()
     assert 'mapper crashed' in proc.stdout
 
 
