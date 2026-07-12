@@ -545,6 +545,37 @@ def test_get_pending_jobs_count_by_pool_counts_distinct_jobs(
     assert pending_multi_task != pending_single
 
 
+def test_get_pending_jobs_count_by_pool_excludes_jobs_with_assigned_worker(
+        _mock_managed_jobs_db_conn):
+    """Assigned pool jobs should not still count as queued demand."""
+    engine = state._db_manager.get_engine()
+
+    queued_job = _new_pool_job(engine,
+                               pool='pool-a',
+                               status=ManagedJobStatus.PENDING)
+
+    assigned_multi_task = state.set_job_info_without_job_id(
+        name='assigned-multi',
+        workspace='ws',
+        entrypoint='entry',
+        pool='pool-a',
+        pool_hash=None,
+        user_hash='u',
+    )
+    _insert_task(engine,
+                 assigned_multi_task,
+                 0,
+                 status=ManagedJobStatus.RUNNING)
+    _insert_task(engine,
+                 assigned_multi_task,
+                 1,
+                 status=ManagedJobStatus.PENDING)
+    state.set_current_cluster_name(assigned_multi_task, 'replica-1')
+
+    assert state.get_pending_jobs_count_by_pool('pool-a') == 1
+    assert assigned_multi_task != queued_job
+
+
 def test_get_pending_jobs_count_by_pool_uses_single_aggregate_query(
         _mock_managed_jobs_db_conn):
     """Queue length should stay one grouped query, not scale with tasks."""

@@ -3151,7 +3151,9 @@ def get_pending_jobs_count_by_pool(pool: str) -> int:
 
     Pending jobs are distinct managed jobs that are waiting for a worker.
     A single job can contribute multiple task rows while it remains queued, so
-    the queue length must count unique job IDs instead of raw task rows.
+    the queue length must count unique job IDs instead of raw task rows. Jobs
+    already assigned to a replica must not keep contributing queued demand just
+    because later task rows are still pending in the task table.
 
     Args:
         pool: The pool name
@@ -3172,6 +3174,7 @@ def get_pending_jobs_count_by_pool(pool: str) -> int:
                                 spot_table.c.status ==
                                 ManagedJobStatus.PENDING.value,
                                 job_info_table.c.pool == pool,
+                                job_info_table.c.current_cluster_name.is_(None),
                             ))
         result = session.execute(query).fetchone()
         return result[0] if result else 0
