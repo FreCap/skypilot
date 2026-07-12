@@ -2409,6 +2409,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         # walk. Only the admission pass below needs the lock.
         launch_to_admit: List[Tuple[int, thread_utils.SafeThread,
                                     ReplicaInfo]] = []
+        pending_launches: List[Tuple[int, thread_utils.SafeThread,
+                                     ReplicaInfo]] = []
         for replica_id, t in launch_thread_pool_snapshot:
             if t.is_alive():
                 continue
@@ -2416,27 +2418,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                                         replica_id)
             assert info is not None, replica_id
             if info.status == serve_state.ReplicaStatus.PENDING:
-                # sky.launch not started yet; admitted below under the
-                # resources lock.
-                authorization = self._service_launch_authorization()
-                if authorization is None:
-                    logger.warning(
-                        f'Deferring queued launch for replica {replica_id}: '
-                        'controller ownership is temporarily unverifiable.')
-                    continue
-                if not authorization:
-                    # Do not delete the durable PENDING row: the successor
-                    # owns it and recovery will either re-drive its
-                    # incarnation-scoped cluster or garbage-collect it. Only
-                    # discard this stale manager's never-started thread.
-                    logger.warning(
-                        f'Discarding queued launch for replica {replica_id} '
-                        'after controller ownership loss.')
-                    self._launch_thread_pool.pop(replica_id)
-                    self._replica_to_request_id.pop(replica_id)
-                    self._replica_to_launch_cancelled.pop(replica_id)
-                    continue
-                launch_to_admit.append((replica_id, t, info))
+                pending_launches.append((replica_id, t, info))
                 continue
             # sky.launch finished
             # TODO(tian): Try-catch in thread, and have an enum return
@@ -2483,6 +2465,33 @@ class SkyPilotReplicaManager(ReplicaManager):
                 self._terminate_replica(replica_id,
                                         sync_down_logs=True,
                                         replica_drain_delay_seconds=0)
+
+        if pending_launches:
+            # Queued launches for one service share the same controller-owner
+            # proof; re-checking it per replica only burns DB work and log
+            # budget without changing the admission decision for this tick.
+            authorization = self._service_launch_authorization()
+            for replica_id, t, info in pending_launches:
+                if authorization is None:
+                    logger.warning(
+                        f'Deferring queued launch for replica {replica_id}: '
+                        'controller ownership is temporarily unverifiable.')
+                    continue
+                if not authorization:
+                    # Do not delete the durable PENDING row: the successor
+                    # owns it and recovery will either re-drive its
+                    # incarnation-scoped cluster or garbage-collect it. Only
+                    # discard this stale manager's never-started thread.
+                    logger.warning(
+                        f'Discarding queued launch for replica {replica_id} '
+                        'after controller ownership loss.')
+                    self._launch_thread_pool.pop(replica_id)
+                    self._replica_to_request_id.pop(replica_id)
+                    self._replica_to_launch_cancelled.pop(replica_id)
+                    continue
+                # sky.launch not started yet; admitted below under the
+                # resources lock.
+                launch_to_admit.append((replica_id, t, info))
 
         # Snapshot AFTER the finished-launch pass so down threads it scheduled
         # (via _terminate_replica for failed launches) are admitted this tick.
