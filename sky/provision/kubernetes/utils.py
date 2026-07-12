@@ -30,6 +30,7 @@ from sky.adaptors import gcp
 from sky.adaptors import kubernetes
 from sky.provision import constants as provision_constants
 from sky.provision.kubernetes import constants as kubernetes_constants
+from sky.provision.kubernetes import context_utils
 from sky.provision.kubernetes import network_utils
 from sky.skylet import constants
 from sky.utils import annotations
@@ -39,7 +40,6 @@ from sky.utils import env_options
 from sky.utils import gpu_names
 from sky.utils import kubernetes_enums
 from sky.utils import plugin_extensions
-from sky.utils import schemas
 from sky.utils import status_lib
 from sky.utils import timeline
 from sky.utils import ux_utils
@@ -3028,251 +3028,54 @@ def check_pod_config(pod_config: dict) \
 
 def is_kubeconfig_exec_auth(
         context: Optional[str] = None) -> Tuple[bool, Optional[str]]:
-    """Checks if the kubeconfig file uses exec-based authentication
-
-    Exec-based auth is commonly used for authenticating with cloud hosted
-    Kubernetes services, such as GKE. Here is an example snippet from a
-    kubeconfig using exec-based authentication for a GKE cluster:
-    - name: mycluster
-      user:
-        exec:
-          apiVersion: client.authentication.k8s.io/v1beta1
-          command: /Users/romilb/google-cloud-sdk/bin/gke-gcloud-auth-plugin
-          installHint: Install gke-gcloud-auth-plugin ...
-          provideClusterInfo: true
-
-
-    Using exec-based authentication is problematic when used in conjunction
-    with kubernetes.remote_identity = LOCAL_CREDENTIAL in ~/.sky/config.yaml.
-    This is because the exec-based authentication may not have the relevant
-    dependencies installed on the remote cluster or may have hardcoded paths
-    that are not available on the remote cluster.
-
-    Returns:
-        bool: True if exec-based authentication is used and LOCAL_CREDENTIAL
-            mode is used for remote_identity in ~/.sky/config.yaml.
-        str: Error message if exec-based authentication is used, None otherwise
-    """
-    k8s = kubernetes.kubernetes
-    if context == kubernetes.in_cluster_context_name():
-        # If in-cluster config is used, exec-based auth is not used.
-        return False, None
-    try:
-        k8s.config.load_kube_config()
-    except kubernetes.config_exception():
-        # Using service account token or other auth methods, continue
-        return False, None
-
-    # Get active context and user from kubeconfig using k8s api
-    all_contexts, current_context = kubernetes.list_kube_config_contexts()
-    context_obj = current_context
-    if context is not None:
-        for c in all_contexts:
-            if c['name'] == context:
-                context_obj = c
-                break
-        else:
-            raise ValueError(f'Kubernetes context {context!r} not found.')
-    target_username = context_obj['context']['user']
-
-    # Load the kubeconfig for the context
-    kubeconfig_text = _get_kubeconfig_text_for_context(context)
-    kubeconfig = yaml_utils.safe_load(kubeconfig_text)
-
-    # Get the user details
-    user_details = kubeconfig['users']
-
-    # Find user matching the target username
-    user_details = next(
-        user for user in user_details if user['name'] == target_username)
-
-    remote_identity = skypilot_config.get_effective_workspace_region_config(
-        cloud='kubernetes',
-        region=context,
-        keys=('remote_identity',),
-        default_value=schemas.get_default_remote_identity('kubernetes'))
-    if ('exec' in user_details.get('user', {}) and remote_identity
-            == schemas.RemoteIdentityOptions.LOCAL_CREDENTIALS.value):
-        ctx_name = context_obj['name']
-        exec_msg = ('exec-based authentication is used for '
-                    f'Kubernetes context {ctx_name!r}. '
-                    'Make sure that the corresponding cloud provider is '
-                    'also enabled through `sky check` (e.g.: GCP for GKE). '
-                    'Alternatively, configure SkyPilot to create a service '
-                    'account for running pods by setting the following in '
-                    '~/.sky/config.yaml:\n'
-                    '    kubernetes:\n'
-                    '      remote_identity: SERVICE_ACCOUNT\n'
-                    '    More: https://docs.skypilot.co/en/latest/'
-                    'reference/config.html')
-        return True, exec_msg
-    return False, None
+    """Checks if the kubeconfig file uses exec-based authentication."""
+    return context_utils.is_kubeconfig_exec_auth(
+        context, get_kubeconfig_text_fn=_get_kubeconfig_text_for_context)
 
 
 def _get_kubeconfig_text_for_context(context: Optional[str] = None) -> str:
-    """Get the kubeconfig text for the given context.
-
-    The kubeconfig might be multiple files, this function use kubectl to
-    handle merging automatically.
-    """
-    command = 'kubectl config view --minify'
-    if context is not None:
-        command += f' --context={context}'
-
-    # Ensure subprocess inherits the current environment properly
-    # This fixes the issue where kubectl can't find ~/.kube/config in API server context
-    env = os.environ.copy()
-
-    proc = subprocess.run(command,
-                          shell=True,
-                          check=False,
-                          env=env,
-                          stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE)
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f'Failed to get kubeconfig text for context {context}: {proc.stderr.decode("utf-8")}'
-        )
-    return proc.stdout.decode('utf-8')
+    """Get the kubeconfig text for the given context."""
+    return context_utils.get_kubeconfig_text_for_context(context)
 
 
 @annotations.lru_cache(scope='request')
 def get_current_kube_config_context_name() -> Optional[str]:
-    """Get the current kubernetes context from the kubeconfig file
-
-    Returns:
-        str | None: The current kubernetes context if it exists, None otherwise
-    """
-    k8s = kubernetes.kubernetes
-    try:
-        _, current_context = kubernetes.list_kube_config_contexts()
-        return current_context['name']
-    except k8s.config.config_exception.ConfigException:
-        # If kubeconfig is not available, check if running in-cluster and
-        # return the in-cluster context name. This is needed when kubeconfig
-        # is not uploaded to the pod (e.g., remote_identity: SERVICE_ACCOUNT)
-        # but we still need to know the context name for operations like
-        # port mode detection.
-        if is_incluster_config_available():
-            return kubernetes.in_cluster_context_name()
-        return None
+    """Get the current kubernetes context from the kubeconfig file."""
+    return context_utils.get_current_kube_config_context_name(
+        is_incluster_config_available_fn=is_incluster_config_available)
 
 
 def is_incluster_config_available() -> bool:
-    """Check if in-cluster auth is available.
-
-    Note: We cannot use load_incluster_config() to check if in-cluster config
-    is available because it will load the in-cluster config (if available)
-    and modify the current global kubernetes config. We simply check if the
-    service account token file exists to determine if in-cluster config may
-    be available.
-    """
-    return os.path.exists('/var/run/secrets/kubernetes.io/serviceaccount/token')
+    """Check if in-cluster auth is available."""
+    return context_utils.is_incluster_config_available()
 
 
 def get_all_kube_context_names() -> List[str]:
-    """Get all kubernetes context names available in the environment.
-
-    Fetches context names from the kubeconfig file and in-cluster auth, if any.
-
-    If running in-cluster and IN_CLUSTER_CONTEXT_NAME_ENV_VAR is not set,
-    returns the default in-cluster kubernetes context name.
-
-    We should not cache the result of this function as the admin policy may
-    update the contexts.
-
-    Returns:
-        List[Optional[str]]: The list of kubernetes context names if
-            available, an empty list otherwise.
-    """
-    k8s = kubernetes.kubernetes
-    context_names = []
-    try:
-        all_contexts, _ = kubernetes.list_kube_config_contexts()
-        # all_contexts will always have at least one context. If kubeconfig
-        # does not have any contexts defined, it will raise ConfigException.
-        context_names = [context['name'] for context in all_contexts]
-    except k8s.config.config_exception.ConfigException:
-        # If no config found, continue
-        pass
-    if is_incluster_config_available():
-        context_names.append(kubernetes.in_cluster_context_name())
-    return context_names
+    """Get all kubernetes context names available in the environment."""
+    return context_utils.get_all_kube_context_names(
+        is_incluster_config_available_fn=is_incluster_config_available)
 
 
 @annotations.lru_cache(scope='request')
 def get_kube_config_context_namespace(
         context_name: Optional[str] = None) -> str:
-    """Get the current kubernetes context namespace from the kubeconfig file
-
-    Returns:
-        str: The current kubernetes context namespace if it exists, else
-            the default namespace.
-    """
-    k8s = kubernetes.kubernetes
-    ns_path = '/var/run/secrets/kubernetes.io/serviceaccount/namespace'
-    # If using in-cluster context, first check for the environment variable,
-    # then fall back to the service account namespace file. Uses the same logic
-    # as adaptors.kubernetes._load_config() to stay consistent with in-cluster
-    # config loading.
-    if (context_name == kubernetes.in_cluster_context_name() or
-            context_name is None):
-        # First check for environment variable. We allow the env var to take
-        # effect only when using in-cluster auth because the recommended way to
-        # set the namespace when using kubeconfig is to change the namespace
-        # configured in the context.
-        env_namespace = os.getenv(
-            kubernetes_constants.KUBERNETES_IN_CLUSTER_NAMESPACE_ENV_VAR)
-        if env_namespace:
-            return env_namespace
-        # Fall back to service account namespace file
-        if os.path.exists(ns_path):
-            with open(ns_path, encoding='utf-8') as f:
-                return f.read().strip()
-    # If not in-cluster, get the namespace from kubeconfig
-    try:
-        contexts, current_context = kubernetes.list_kube_config_contexts()
-        if context_name is None:
-            context = current_context
-        else:
-            context = next((c for c in contexts if c['name'] == context_name),
-                           None)
-            if context is None:
-                return DEFAULT_NAMESPACE
-
-        if 'namespace' in context['context']:
-            return context['context']['namespace']
-        else:
-            return DEFAULT_NAMESPACE
-    except k8s.config.config_exception.ConfigException:
-        return DEFAULT_NAMESPACE
+    """Get the current kubernetes context namespace from the kubeconfig file."""
+    return context_utils.get_kube_config_context_namespace(
+        context_name, default_namespace=DEFAULT_NAMESPACE)
 
 
 def get_namespace(context: Optional[str] = None,
                   workspace: Optional[str] = None,
                   override_configs: Optional[Dict[str, Any]] = None,
                   cloud: str = 'kubernetes') -> str:
-    """Resolve the Kubernetes namespace for ``context``, with fallback.
-
-    Calls ``skypilot_config.get_effective_namespace`` to resolve the
-    namespace from config; on miss, falls back to
-    ``get_kube_config_context_namespace(context)`` (then ``"default"``).
-
-    Drop-in replacement for ``get_kube_config_context_namespace`` at
-    sites that have a workspace in scope.
-
-    ``cloud`` selects the top-level config key the resolver consults
-    (e.g. ``'kubernetes'`` vs ``'ssh'``).
-    """
-    config_namespace = skypilot_config.get_effective_namespace(
-        cloud=cloud,
-        region=context,
-        workspace=workspace,
-        override_configs=override_configs,
-    )
-    if config_namespace is not None:
-        return config_namespace
-    return get_kube_config_context_namespace(context)
+    """Resolve the Kubernetes namespace for ``context``, with fallback."""
+    return context_utils.get_namespace(
+        context,
+        workspace,
+        override_configs,
+        cloud,
+        get_effective_namespace=skypilot_config.get_effective_namespace,
+        get_kube_config_context_namespace_fn=get_kube_config_context_namespace)
 
 
 def parse_cpu_or_gpu_resource_to_float(resource_str: str) -> float:
@@ -4988,16 +4791,8 @@ def get_gpu_resource_key(context: Optional[str] = None) -> str:
 
 
 def get_kubeconfig_paths() -> List[str]:
-    """Get the path to the kubeconfig files.
-    Parses `KUBECONFIG` env var if present, else uses the default path.
-    """
-    # We should always use the latest KUBECONFIG environment variable to
-    # make sure env var overrides get respected.
-    paths = os.getenv('KUBECONFIG', kubernetes.DEFAULT_KUBECONFIG_PATH)
-    expanded = []
-    for path in paths.split(kubernetes.ENV_KUBECONFIG_PATH_SEPARATOR):
-        expanded.append(os.path.expanduser(path))
-    return expanded
+    """Get the path to the kubeconfig files."""
+    return context_utils.get_kubeconfig_paths()
 
 
 def format_kubeconfig_exec_auth(config: Any,
