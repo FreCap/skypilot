@@ -1347,6 +1347,21 @@ def _configure_runtime_class(pod_spec: Dict[str,
         spec['runtimeClassName'] = 'nvidia'
 
 
+def _validate_cluster_name_annotations(pods: Dict[str, Any], cluster_name: str,
+                                       cluster_name_on_cloud: str) -> None:
+    """Refuse to adopt Pods owned by a different full cluster name."""
+    for pod in pods.values():
+        annotations = pod.metadata.annotations or {}
+        annotated_name = annotations.get('skypilot-cluster-name')
+        # Older Pods may predate this annotation. New SkyPilot Pods always set
+        # it below, so a present mismatch is authoritative collision evidence.
+        if isinstance(annotated_name, str) and annotated_name != cluster_name:
+            raise config_lib.KubernetesError(
+                'Kubernetes cluster name collision: shortened name '
+                f'{cluster_name_on_cloud!r} is already owned by full cluster '
+                f'{annotated_name!r}, not requested cluster {cluster_name!r}.')
+
+
 @timeline.event
 def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
                  config: common.ProvisionConfig) -> common.ProvisionRecord:
@@ -1419,6 +1434,8 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
 
     terminating_pods = kubernetes_utils.filter_pods(namespace, context, tags,
                                                     ['Terminating'])
+    _validate_cluster_name_annotations(terminating_pods, cluster_name,
+                                       cluster_name_on_cloud)
     start_time = time.time()
     while (terminating_pods and
            time.time() - start_time < _TIMEOUT_FOR_POD_TERMINATION):
@@ -1428,6 +1445,8 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
         time.sleep(POLL_INTERVAL)
         terminating_pods = kubernetes_utils.filter_pods(namespace, context,
                                                         tags, ['Terminating'])
+        _validate_cluster_name_annotations(terminating_pods, cluster_name,
+                                           cluster_name_on_cloud)
 
     if terminating_pods:
         # If there are still terminating pods, we force delete them.
@@ -1449,6 +1468,8 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
     # block pod creation with the same name (409 AlreadyExists).
     stale_pods = kubernetes_utils.filter_pods(namespace, context, tags,
                                               ['Failed', 'Succeeded'])
+    _validate_cluster_name_annotations(stale_pods, cluster_name,
+                                       cluster_name_on_cloud)
     if stale_pods:
         logger.info(f'Found {len(stale_pods)} pods in Failed/Succeeded '
                     f'phase: {list(stale_pods.keys())}. Deleting them.')
@@ -1466,6 +1487,8 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
 
     running_pods = kubernetes_utils.filter_pods(namespace, context, tags,
                                                 ['Pending', 'Running'])
+    _validate_cluster_name_annotations(running_pods, cluster_name,
+                                       cluster_name_on_cloud)
     head_pod_name = _get_head_pod_name(running_pods)
     running_pod_statuses = [{
         pod.metadata.name: pod.status.phase

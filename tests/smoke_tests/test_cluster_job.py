@@ -1222,6 +1222,10 @@ def test_task_labels_azure():
 @pytest.mark.kubernetes
 def test_task_labels_kubernetes():
     name = smoke_tests_utils.get_cluster_name()
+    name_on_cloud = common_utils.make_cluster_name_on_cloud(
+        name,
+        sky.Kubernetes.max_cluster_name_length(),
+        cluster_name_hash_length=sky.Kubernetes.cluster_name_hash_length())
     template_str = pathlib.Path(
         'tests/test_yamls/test_labels.yaml.j2').read_text()
     template = jinja2.Template(template_str)
@@ -1246,8 +1250,7 @@ def test_task_labels_kubernetes():
                     '--selector inlinelabel1=inlinevalue1 '
                     '--selector inlinelabel2=inlinevalue2 '
                     '-o jsonpath=\'{.items[*].metadata.name}\' | '
-                    f'grep \'^{common_utils.make_cluster_name_on_cloud(name, sky.Kubernetes.max_cluster_name_length())}\''
-                )
+                    f'grep \'^{name_on_cloud}\'')
             ],
             f'sky down -y {name} && '
             f'{smoke_tests_utils.down_cluster_for_cloud_cmd(name)}',
@@ -1482,7 +1485,9 @@ def test_enable_docker_on_kubernetes(yaml_file, volumes_needed, sidecar,
                                      cache_mount):
     name = smoke_tests_utils.get_cluster_name()
     name_on_cloud = common_utils.make_cluster_name_on_cloud(
-        name, sky.Kubernetes.max_cluster_name_length())
+        name,
+        sky.Kubernetes.max_cluster_name_length(),
+        cluster_name_hash_length=sky.Kubernetes.cluster_name_hash_length())
 
     setup_cmds: List[str] = []
     for vol in volumes_needed:
@@ -3001,7 +3006,9 @@ def test_kubernetes_recovery():
     """Test Kubernetes recovery."""
     name = smoke_tests_utils.get_cluster_name()
     name_on_cloud = common_utils.make_cluster_name_on_cloud(
-        name, sky.Kubernetes.max_cluster_name_length())
+        name,
+        sky.Kubernetes.max_cluster_name_length(),
+        cluster_name_hash_length=sky.Kubernetes.cluster_name_hash_length())
     head = f'{name_on_cloud}-head'
     worker2 = f'{name_on_cloud}-worker2'
     worker3 = f'{name_on_cloud}-worker3'
@@ -3062,7 +3069,9 @@ def test_kubernetes_stale_pod_cleanup():
     """
     name = smoke_tests_utils.get_cluster_name()
     name_on_cloud = common_utils.make_cluster_name_on_cloud(
-        name, sky.Kubernetes.max_cluster_name_length())
+        name,
+        sky.Kubernetes.max_cluster_name_length(),
+        cluster_name_hash_length=sky.Kubernetes.cluster_name_hash_length())
     head_pod = f'{name_on_cloud}-head'
     test = smoke_tests_utils.Test(
         'kubernetes_stale_pod_cleanup',
@@ -3097,7 +3106,9 @@ def test_kubernetes_sigterm_keepalive():
     """Test that worker pods survive SIGTERM (node drain) via keep-alive fix."""
     name = smoke_tests_utils.get_cluster_name()
     name_on_cloud = common_utils.make_cluster_name_on_cloud(
-        name, sky.Kubernetes.max_cluster_name_length())
+        name,
+        sky.Kubernetes.max_cluster_name_length(),
+        cluster_name_hash_length=sky.Kubernetes.cluster_name_hash_length())
     worker1 = f'{name_on_cloud}-worker1'
     verify_two_pods_running = (
         f'count=$(kubectl get pod -l ray-cluster-name={name_on_cloud} '
@@ -3147,7 +3158,9 @@ def test_kubernetes_service_cleanup_on_down():
     after pods have been externally deleted."""
     name = smoke_tests_utils.get_cluster_name()
     name_on_cloud = common_utils.make_cluster_name_on_cloud(
-        name, sky.Kubernetes.max_cluster_name_length())
+        name,
+        sky.Kubernetes.max_cluster_name_length(),
+        cluster_name_hash_length=sky.Kubernetes.cluster_name_hash_length())
     service_cleanup_check = _get_k8s_service_cleanup_check_cmd(
         name, name_on_cloud)
     test = smoke_tests_utils.Test(
@@ -3188,7 +3201,9 @@ def test_kubernetes_service_cleanup_on_status_refresh():
     daemon after pods have been externally deleted."""
     name = smoke_tests_utils.get_cluster_name()
     name_on_cloud = common_utils.make_cluster_name_on_cloud(
-        name, sky.Kubernetes.max_cluster_name_length())
+        name,
+        sky.Kubernetes.max_cluster_name_length(),
+        cluster_name_hash_length=sky.Kubernetes.cluster_name_hash_length())
     service_cleanup_check = _get_k8s_service_cleanup_check_cmd(
         name, name_on_cloud)
     test = smoke_tests_utils.Test(
@@ -3293,7 +3308,9 @@ def test_launching_with_pending_pods():
     """Test Kubernetes launching with pending pods."""
     name = smoke_tests_utils.get_cluster_name()
     name_on_cloud = common_utils.make_cluster_name_on_cloud(
-        name, sky.Kubernetes.max_cluster_name_length())
+        name,
+        sky.Kubernetes.max_cluster_name_length(),
+        cluster_name_hash_length=sky.Kubernetes.cluster_name_hash_length())
     head = f'{name_on_cloud}-head'
     test = smoke_tests_utils.Test(
         'kubernetes_pod_pending',
@@ -3440,7 +3457,9 @@ def test_kubernetes_pod_config_sidecar():
     """
     name = smoke_tests_utils.get_cluster_name()
     name_on_cloud = common_utils.make_cluster_name_on_cloud(
-        name, sky.Kubernetes.max_cluster_name_length())
+        name,
+        sky.Kubernetes.max_cluster_name_length(),
+        cluster_name_hash_length=sky.Kubernetes.cluster_name_hash_length())
 
     template_str = pathlib.Path(
         'tests/test_yamls/test_k8s_pod_config_sidecar.yaml.j2').read_text()
@@ -3493,7 +3512,9 @@ def test_kubernetes_set_pod_resource_limits():
     """
     name = smoke_tests_utils.get_cluster_name()
     name_on_cloud = common_utils.make_cluster_name_on_cloud(
-        name, sky.Kubernetes.max_cluster_name_length())
+        name,
+        sky.Kubernetes.max_cluster_name_length(),
+        cluster_name_hash_length=sky.Kubernetes.cluster_name_hash_length())
 
     # Config with set_pod_resource_limits with a 2x multiplier
     config = textwrap.dedent("""

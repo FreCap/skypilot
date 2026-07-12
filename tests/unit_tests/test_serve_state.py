@@ -362,8 +362,13 @@ class TestAddServiceAtomicRegistration:
         assert len(replicas) == 1
         assert replicas[0].cluster_name == 'billable-cluster-9'
 
-    def test_script_and_claim_only_leftovers_do_not_block_registration(
+    def test_current_recovery_script_survives_fenced_registration(
             self, _mock_serve_db):
+        # Model the consolidation-mode launch ordering: an old script may
+        # remain after predecessor cleanup, then the API parent claims the
+        # next lifecycle and atomically replaces it before spawning the new
+        # controller.  Initial registration must preserve that current script
+        # while still clearing stale reserved-fill claims.
         assert serve_state.set_ha_recovery_script('svc-stale', 'old-script')
         with orm.Session(_mock_serve_db) as session:
             session.execute(
@@ -380,10 +385,13 @@ class TestAddServiceAtomicRegistration:
         assert 'svc-stale' not in (serve_state.get_orphaned_service_child_names(
             ['svc-stale']))
         epoch = serve_state.claim_service_lifecycle_epoch('svc-stale')
+        assert serve_state.set_ha_recovery_script('svc-stale', 'current-script',
+                                                  epoch)
         assert _add_minimal_service('svc-stale',
                                     service_hash='new-incarnation',
                                     lifecycle_epoch=epoch)
-        assert serve_state.get_ha_recovery_script('svc-stale') is None
+        assert (
+            serve_state.get_ha_recovery_script('svc-stale') == 'current-script')
         with orm.Session(_mock_serve_db) as session:
             claim = session.execute(
                 sqlalchemy.select(

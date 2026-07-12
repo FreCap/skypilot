@@ -827,7 +827,9 @@ def write_cluster_config(
     assert cloud is not None, to_provision
 
     cluster_name_on_cloud = common_utils.make_cluster_name_on_cloud(
-        cluster_name, max_length=cloud.max_cluster_name_length())
+        cluster_name,
+        max_length=cloud.max_cluster_name_length(),
+        cluster_name_hash_length=cloud.cluster_name_hash_length())
 
     # This can raise a ResourcesUnavailableError when:
     #  * The region/zones requested does not appear in the catalog. It can be

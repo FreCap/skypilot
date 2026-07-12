@@ -149,6 +149,25 @@ class TestMakeClusterNameOnCloud:
         assert "cuda-11-8-ab12cd34" == common_utils.make_cluster_name_on_cloud(
             "Cuda_11.8", max_length=20)
 
+    @mock.patch('sky.utils.common_utils.get_user_hash')
+    def test_longer_hash_avoids_kubernetes_replica_collision(
+            self, mock_get_user_hash):
+        mock_get_user_hash.return_value = '0ae18643'
+        v1_replica = ('boltz25-feature-inference-hybrid-500-v1-68-ea9c52abfa')
+        v2_replica = ('boltz25-feature-inference-hybrid-500-v2-8-68890017c3')
+
+        assert common_utils.make_cluster_name_on_cloud(
+            v1_replica,
+            max_length=42) == common_utils.make_cluster_name_on_cloud(
+                v2_replica, max_length=42)
+        v1_name = common_utils.make_cluster_name_on_cloud(
+            v1_replica, max_length=42, cluster_name_hash_length=8)
+        v2_name = common_utils.make_cluster_name_on_cloud(
+            v2_replica, max_length=42, cluster_name_hash_length=8)
+        assert v1_name != v2_name
+        assert len(v1_name) <= 42
+        assert len(v2_name) <= 42
+
 
 class TestCgroupFunctions:
     """Test cgroup-related functions."""

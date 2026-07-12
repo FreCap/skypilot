@@ -151,6 +151,7 @@ class Cloud:
         resources_utils.NetworkTier.STANDARD, resources_utils.NetworkTier.BEST
     }
     _SUPPORTS_SERVICE_ACCOUNT_ON_REMOTE = False
+    _CLUSTER_NAME_HASH_LENGTH = 2
 
     # The version of provisioner and status query. This is used to determine
     # the code path to use for each cloud in the backend.
@@ -169,6 +170,11 @@ class Cloud:
         None means no limit.
         """
         return None
+
+    @classmethod
+    def cluster_name_hash_length(cls) -> int:
+        """Returns the hash length used for truncated cluster names."""
+        return cls._CLUSTER_NAME_HASH_LENGTH
 
     @classmethod
     def supports_service_account_on_remote(cls) -> bool:

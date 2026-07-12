@@ -199,6 +199,11 @@ class Kubernetes(clouds.Cloud):
     # where the suffix is 21 characters long.
     _MAX_CLUSTER_NAME_LEN_LIMIT = 42
 
+    # Kubernetes clusters can be created at high cardinality by SkyServe.
+    # Keep enough hash entropy that truncated replica names cannot alias an
+    # existing Pod selector and accidentally adopt another replica.
+    _CLUSTER_NAME_HASH_LENGTH = 8
+
     # Limit the length of the volume name to match the label value
     # limit (63 characters)
     _MAX_VOLUME_NAME_LEN_LIMIT = 63
