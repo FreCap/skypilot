@@ -304,6 +304,16 @@ def _install(monkeypatch,
             'controller_pid': os.getpid(),
             'hash': 'incarnation',
         } if name in live else None)
+    monkeypatch.setattr(
+        lb_k8s.serve_state, 'get_service_controller_owner', lambda name: {
+            'controller_pid': os.getpid(),
+            'controller_ip': None,
+            'hash': 'incarnation',
+            'resource_scope': None,
+            'status': None,
+            'controller_port': None,
+            'lifecycle_epoch': None,
+        } if name in live else None)
     monkeypatch.setattr(lb_k8s.serve_state, 'get_service_hash',
                         lambda name: 'incarnation' if name in live else None)
     monkeypatch.setattr(lb_k8s.serve_state,
@@ -1223,6 +1233,19 @@ def test_pod_authority_splits_ready_from_live_with_one_listing(monkeypatch):
     assert core.list_namespaced_pod.call_args.kwargs['label_selector'] == (
         f'app={lb_k8s.lb_deployment_name("svc")},'
         f'{lb_k8s.SERVICE_HASH_LABEL_KEY}=incarnation')
+
+
+def test_pod_authority_uses_controller_owner_lookup(monkeypatch):
+    _, core = _install(monkeypatch, db_service_names=('svc',))
+    monkeypatch.setattr(
+        lb_k8s.serve_state, 'get_service_from_name', lambda unused_name:
+        (_ for _ in
+         ()).throw(AssertionError('full service read should not be used')))
+    core.list_namespaced_pod.return_value = SimpleNamespace(
+        items=[_lb_pod('new')])
+
+    assert lb_k8s.get_lb_pod_authority('svc') == lb_k8s.LbPodAuthority(
+        ready_nonterminating_uids={'new'}, live_uids={'new'})
 
 
 def test_pod_authority_query_failure_is_unknown(monkeypatch):

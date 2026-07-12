@@ -1534,10 +1534,10 @@ def ensure_lb_objects_exist(service_name: str,
     # window, and is bounded: the next recovery's reconcile reaps a dead
     # service's LB, and the live owner's own ensure/recovery converges a
     # same-name successor's objects.
-    record = serve_state.get_service_from_name(service_name)
-    if (record is None or record.get('controller_pid') != os.getpid() or
-        (service_hash and record.get('hash') != service_hash) or
-        (controller_ip and record.get('controller_ip') != controller_ip)):
+    owner = serve_state.get_service_controller_owner(service_name)
+    if (owner is None or owner.get('controller_pid') != os.getpid() or
+        (service_hash and owner.get('hash') != service_hash) or
+        (controller_ip and owner.get('controller_ip') != controller_ip)):
         logger.info(f'External LB objects for {service_name!r} are missing '
                     'but this process no longer owns the service '
                     '(row gone or taken over); skipping recreation.')
@@ -1577,9 +1577,9 @@ def get_lb_pod_authority(service_name: str) -> Optional[LbPodAuthority]:
     try:
         context = kubernetes.in_cluster_context_name()
         namespace = get_lb_namespace()
-        record = serve_state.get_service_from_name(service_name)
-        service_hash = record.get('hash') if record else None
-        resource_scope = record.get('resource_scope') if record else None
+        owner = serve_state.get_service_controller_owner(service_name)
+        service_hash = owner.get('hash') if owner else None
+        resource_scope = owner.get('resource_scope') if owner else None
         if not service_hash:
             logger.warning(f'Cannot determine the active incarnation for '
                            f'{service_name!r}; load balancer reports will '
@@ -1638,9 +1638,9 @@ def stream_lb_logs(service_name: str, follow: bool, tail: Optional[int]) -> str:
     require_external_lb_runtime()
     context = kubernetes.in_cluster_context_name()
     namespace = get_lb_namespace()
-    record = serve_state.get_service_from_name(service_name)
-    service_hash = record.get('hash') if record else None
-    resource_scope = record.get('resource_scope') if record else None
+    owner = serve_state.get_service_controller_owner(service_name)
+    service_hash = owner.get('hash') if owner else None
+    resource_scope = owner.get('resource_scope') if owner else None
     if not service_hash:
         return (f'Cannot determine the active service incarnation for '
                 f'{service_name!r}.')
