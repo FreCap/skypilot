@@ -102,7 +102,7 @@ def _make_controller() -> controller.SkyServeController:
     ctrl._service_name = 'svc'  # pylint: disable=protected-access
     ctrl._lb_replica_cache = {}  # pylint: disable=protected-access
     ctrl._lb_translation_cache = {}  # pylint: disable=protected-access
-    ctrl._lb_sync_lock = asyncio.Lock()  # pylint: disable=protected-access
+    ctrl._lb_sync_lock = None  # pylint: disable=protected-access
     ctrl._routing_spec = None  # pylint: disable=protected-access
     ctrl._reserved_capacity_fill_enabled = False  # pylint: disable=protected-access
     return ctrl

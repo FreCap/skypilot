@@ -135,8 +135,11 @@ class SkyServeController:
         # Serialize LB snapshots while resolving a cold replica cache in the
         # threadpool. Concurrent LB Pods can overlap during a rollout; without
         # this lock they would duplicate the fleet-wide endpoint work and race
-        # to replace the shared routing/translation caches.
-        self._lb_sync_lock = asyncio.Lock()
+        # to replace the shared routing/translation caches. Create the asyncio
+        # lock lazily inside the running server loop: on Python 3.9 eager lock
+        # construction fails if an earlier asyncio.run() closed the thread's
+        # current loop.
+        self._lb_sync_lock: Optional[asyncio.Lock] = None
         self._controller_owner_fingerprint = controller_owner_fingerprint
         self._is_pool = service_spec.pool
         self._replica_manager: replica_managers.ReplicaManager = (
@@ -630,7 +633,11 @@ class SkyServeController:
         """Validate LB membership before disclosing confidential routing."""
         if not self._owns_current_service():
             return fastapi.Response(status_code=503)
-        async with self._lb_sync_lock:
+        lb_sync_lock = self._lb_sync_lock
+        if lb_sync_lock is None:
+            lb_sync_lock = asyncio.Lock()
+            self._lb_sync_lock = lb_sync_lock
+        async with lb_sync_lock:
             loop = asyncio.get_running_loop()
             authority = await loop.run_in_executor(
                 None, self._lb_report_authority,
