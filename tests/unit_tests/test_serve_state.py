@@ -781,6 +781,16 @@ class TestGetServiceControllerOwner:
     def test_missing_row_returns_none(self, _mock_serve_db):
         assert serve_state.get_service_controller_owner('missing') is None
 
+    def test_require_version_rejects_orphan_service_row(self, _mock_serve_db):
+        _insert_orphan_service_row(_mock_serve_db, 'svc-orphan')
+
+        with _count_sql_statements(_mock_serve_db) as counts:
+            record = serve_state.get_service_controller_owner(
+                'svc-orphan', require_version=True)
+
+        assert record is None
+        assert counts['n'] == 1
+
 
 class TestUpdateServiceControllerPidIpAndPort:
     """The atomic update is the core of the HA-recovery DB flip — it must

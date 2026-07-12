@@ -1760,7 +1760,8 @@ def test_replica_status_writer_cannot_erase_interleaved_shutdown():
     read_complete = threading.Event()
     resume = threading.Event()
 
-    def _read(_service_name):
+    def _read(_service_name, require_version=False):
+        assert require_version
         snapshot = dict(db_record)
         read_complete.set()
         assert resume.wait(timeout=2)
