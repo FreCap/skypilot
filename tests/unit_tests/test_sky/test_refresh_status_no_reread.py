@@ -98,9 +98,19 @@ def _make_record(handle):
     }
 
 
-def test_autostopping_patches_record_without_reread():
+@pytest.mark.parametrize(('to_down', 'summary_response', 'expected_last_event'),
+                         [
+                             (False, False, 'Cluster is autostopping.'),
+                             (True, False, 'Cluster is autodowning.'),
+                             (False, True, None),
+                         ])
+def test_autostopping_patches_record_without_reread(to_down, summary_response,
+                                                    expected_last_event):
     handle = _make_handle()
     record = _make_record(handle)
+    record['to_down'] = to_down
+    if not summary_response:
+        record['last_event'] = 'All nodes up; SkyPilot runtime healthy.'
     node_statuses = {'pod-0': (status_lib.ClusterStatus.UP, None)}
 
     autostopping_backend = mock.Mock(spec=backends.CloudVmRayBackend)
@@ -125,15 +135,21 @@ def test_autostopping_patches_record_without_reread():
              backend_utils.global_user_state, 'get_cluster_from_name',
              side_effect=AssertionError(
                  'must not re-read the record on this path')):
-        result = backend_utils._update_cluster_status('test-cluster',
-                                                      record,
-                                                      retry_if_missing=False)
+        result = backend_utils._update_cluster_status(
+            'test-cluster',
+            record,
+            retry_if_missing=False,
+            summary_response=summary_response)
 
     set_status.assert_called_once_with('test-cluster',
                                        status_lib.ClusterStatus.AUTOSTOPPING)
     assert result is record
     assert result['status'] == status_lib.ClusterStatus.AUTOSTOPPING
     assert result['status_updated_at'] == 12345
+    if expected_last_event is None:
+        assert 'last_event' not in result
+    else:
+        assert result['last_event'] == expected_last_event
 
 
 def test_external_failures_return_record_without_reread():
