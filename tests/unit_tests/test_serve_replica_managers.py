@@ -10,6 +10,9 @@ Covers:
 - `_launch_replica` passing `availability_max_retry=1` only for spot
   replicas managed by a spot placer.
 """
+# pylint: disable=protected-access,import-outside-toplevel,reimported
+# pylint: disable=unused-argument,invalid-name,line-too-long
+# pylint: disable=missing-class-docstring,unnecessary-dunder-call
 import threading
 from unittest import mock
 
@@ -18,6 +21,8 @@ import pytest
 from sky import exceptions
 from sky.serve import replica_managers
 from sky.serve import serve_utils
+from sky.utils import common_utils
+from sky.utils import controller_utils
 from sky.utils import thread_utils
 
 
@@ -498,6 +503,7 @@ class TestLaunchOwnershipFence:
     def _pending_info():
         info = mock.Mock()
         info.status = replica_managers.serve_state.ReplicaStatus.PENDING
+        info.status_property = mock.Mock()
         return info
 
     @staticmethod
@@ -507,6 +513,28 @@ class TestLaunchOwnershipFence:
         mgr._controller_owner = (101, '10.0.0.1')
         mgr._ownership_lost = threading.Event()
         return mgr
+
+    @classmethod
+    def _queued_manager(cls, replica_ids):
+        mgr = _make_manager()
+        mgr._is_pool = False
+        mgr.least_recent_version = 1
+        mgr._spot_placer = None
+        mgr._replica_to_request_id = thread_utils.ThreadSafeDict()
+        mgr._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
+        mgr._launch_thread_pool = thread_utils.ThreadSafeDict()
+        mgr._down_thread_pool = thread_utils.ThreadSafeDict()
+
+        infos = {}
+        for replica_id in replica_ids:
+            thread = mock.Mock()
+            thread.is_alive.return_value = False
+            thread.format_exc = None
+            mgr._launch_thread_pool[replica_id] = thread
+            mgr._replica_to_request_id[replica_id] = f'req-{replica_id}'
+            mgr._replica_to_launch_cancelled[replica_id] = False
+            infos[replica_id] = cls._pending_info()
+        return mgr, infos
 
     def test_recovering_exact_owner_may_launch_from_controller_failed(self):
         mgr = self._owned_manager()
@@ -619,6 +647,29 @@ class TestLaunchOwnershipFence:
         assert mgr._launch_thread_pool[1] is launch_thread
         persist.assert_not_called()
 
+    def test_transient_lookup_is_shared_across_queued_launches(self):
+        mgr, infos = self._queued_manager([1, 2, 3])
+
+        with mock.patch.object(mgr,
+                               '_service_launch_authorization',
+                               return_value=None) as authorize, \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_info_from_id',
+                               side_effect=lambda _svc, rid: infos[rid]), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(mgr, '_persist_replica') as persist:
+            mgr._refresh_thread_pool()
+
+        assert authorize.call_count == 1
+        for launch_thread in mgr._launch_thread_pool.values():
+            launch_thread.start.assert_not_called()
+        assert len(mgr._launch_thread_pool) == 3
+        for replica_id in (1, 2, 3):
+            assert replica_id in mgr._launch_thread_pool
+        persist.assert_not_called()
+
     def test_stale_queued_launch_is_discarded_without_deleting_row(self):
         mgr = _make_manager()
         mgr._is_pool = False
@@ -648,6 +699,57 @@ class TestLaunchOwnershipFence:
         launch_thread.start.assert_not_called()
         assert 1 not in mgr._launch_thread_pool
         persist.assert_not_called()
+
+    def test_stale_lookup_is_shared_across_queued_launches(self):
+        mgr, infos = self._queued_manager([1, 2, 3])
+
+        with mock.patch.object(mgr,
+                               '_service_launch_authorization',
+                               return_value=False) as authorize, \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_info_from_id',
+                               side_effect=lambda _svc, rid: infos[rid]), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(mgr, '_persist_replica') as persist:
+            mgr._refresh_thread_pool()
+
+        assert authorize.call_count == 1
+        assert len(mgr._launch_thread_pool) == 0
+        assert len(mgr._replica_to_request_id) == 0
+        assert len(mgr._replica_to_launch_cancelled) == 0
+        persist.assert_not_called()
+
+    def test_authorized_lookup_is_shared_across_queued_launches(self, tmp_path):
+        mgr, infos = self._queued_manager([1, 2, 3])
+
+        with mock.patch.object(mgr,
+                               '_service_launch_authorization',
+                               return_value=True) as authorize, \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_info_from_id',
+                               side_effect=lambda _svc, rid: infos[rid]), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(controller_utils, 'get_resources_lock_path',
+                               return_value=str(tmp_path / 'resources.lock')), \
+             mock.patch.object(controller_utils, 'in_flight_launch_count',
+                               return_value=0), \
+             mock.patch.object(controller_utils,
+                               'can_provision',
+                               return_value=True), \
+             mock.patch.object(mgr, '_persist_replica') as persist:
+            mgr._refresh_thread_pool()
+
+        assert authorize.call_count == 1
+        for info in infos.values():
+            assert (info.status_property.sky_launch_status ==
+                    common_utils.ProcessStatus.RUNNING)
+        for launch_thread in mgr._launch_thread_pool.values():
+            launch_thread.start.assert_called_once_with()
+        assert persist.call_count == 3
 
     def test_old_version_retirement_leaves_storage_to_durable_intents(self):
         mgr = _make_manager()
