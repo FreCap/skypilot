@@ -4,6 +4,10 @@
 WORKER_SERVICE_PORT = 8290
 WORKER_SERVICE_STARTUP_TIMEOUT = 60  # seconds to wait for service health
 WORKER_FAILURE_MARKER_PATH = '/tmp/sky_batch_worker_failure.txt'
+# Env var carrying the launch-unique failure marker path. Each worker launch
+# uses its own marker file so a stale marker left by a crashed previous worker
+# on the same node cannot fail the health check of a fresh launch.
+WORKER_FAILURE_MARKER_ENV_VAR = 'SKY_BATCH_FAILURE_MARKER'
 
 # Timeouts (in seconds)
 WORKER_DISCOVERY_TIMEOUT = 300

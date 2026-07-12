@@ -1072,6 +1072,80 @@ exit 99
     assert 'mapper crashed' in proc.stdout
 
 
+def test_worker_health_check_ignores_stale_marker_from_previous_launch(
+        tmp_path, monkeypatch):
+    """A marker left by a crashed prior launch must not fail a fresh one."""
+    stale_marker = tmp_path / 'worker-failure.txt'
+    fake_bin = tmp_path / 'fake-bin'
+    monkeypatch.setattr(coordinator.constants, 'WORKER_FAILURE_MARKER_PATH',
+                        str(stale_marker))
+    fake_bin.mkdir()
+    fake_curl = fake_bin / 'curl'
+    # Healthy worker: report HTTP 200 and write the -o body file.
+    fake_curl.write_text("""#!/bin/bash
+while [ $# -gt 0 ]; do
+    if [ "$1" = "-o" ]; then echo healthy > "$2"; shift; fi
+    shift
+done
+printf '200'
+""",
+                         encoding='utf-8')
+    fake_curl.chmod(0o755)
+    monkeypatch.setenv('PATH', f'{fake_bin}:{os.environ["PATH"]}')
+    batch_coordinator = _make_coordinator()
+
+    # Simulate a crashed previous worker launch on the same node.
+    stale_marker.write_text('mapper crashed', encoding='utf-8')
+
+    launch_marker = batch_coordinator._new_failure_marker_path()
+    health_code = batch_coordinator._generate_worker_health_check_code(
+        launch_marker)
+
+    # Plain (non-login) shell so the monkeypatched PATH is preserved.
+    proc = subprocess.run(['/bin/bash', '-c', health_code],
+                          check=False,
+                          capture_output=True,
+                          text=True)
+
+    assert proc.returncode == 0
+    assert 'ready' in proc.stdout
+
+
+def test_worker_launch_failure_marker_is_launch_unique():
+    batch_coordinator = _make_coordinator()
+    batch_coordinator._resolve_formats()
+
+    first = batch_coordinator._new_failure_marker_path()
+    second = batch_coordinator._new_failure_marker_path()
+
+    assert first != second
+    base, _ = os.path.splitext(coordinator.constants.WORKER_FAILURE_MARKER_PATH)
+    assert first.startswith(base)
+
+    startup_code = batch_coordinator._generate_worker_startup_code(first)
+    health_code = batch_coordinator._generate_worker_health_check_code(first)
+    env_var = coordinator.constants.WORKER_FAILURE_MARKER_ENV_VAR
+    assert f'rm -f {first}' in startup_code
+    assert f'export {env_var}={first}' in startup_code
+    assert f'failure_marker={first}' in health_code
+
+
+def test_record_mapper_failure_honors_marker_env_override(
+        tmp_path, monkeypatch):
+    launch_marker = tmp_path / 'launch-scoped-failure.txt'
+    default_marker = tmp_path / 'default-failure.txt'
+    monkeypatch.setattr(worker.constants, 'WORKER_FAILURE_MARKER_PATH',
+                        str(default_marker))
+    monkeypatch.setenv(worker.constants.WORKER_FAILURE_MARKER_ENV_VAR,
+                       str(launch_marker))
+
+    worker._reset_worker_runtime_state()
+    worker._record_mapper_failure('mapper crashed')
+
+    assert launch_marker.read_text(encoding='utf-8') == 'mapper crashed'
+    assert not default_marker.exists()
+
+
 def test_expired_worker_batch_rejects_late_save(monkeypatch):
     item = worker._BatchItem([{'value': 1}], 0, 0, 0)
     monkeypatch.setattr(worker, '_current_batch', item)
