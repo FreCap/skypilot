@@ -16,14 +16,23 @@ import {
 } from '@/lib/request-activity';
 
 describe('current user cache', () => {
+  let originalTextDecoder;
+
   beforeEach(() => {
     resetCurrentUserCacheForTests();
     resetRequestActivityForTests();
     global.fetch.mockReset();
+    originalTextDecoder = global.TextDecoder;
+    global.TextDecoder = class {
+      decode(value) {
+        return Buffer.from(value).toString('utf8');
+      }
+    };
   });
 
   afterEach(() => {
     resetRequestActivityForTests();
+    global.TextDecoder = originalTextDecoder;
     jest.restoreAllMocks();
   });
 
@@ -42,6 +51,71 @@ describe('current user cache', () => {
 
     resolveResponse({ ok: true });
     await expect(responsePromise).resolves.toEqual({ ok: true });
+    expect(getRequestActivitySnapshot().inFlight).toBe(0);
+  });
+
+  it('keeps streamed requests active until the reader finishes', async () => {
+    let resolveRead;
+    const read = jest
+      .fn()
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveRead = resolve;
+          })
+      )
+      .mockResolvedValueOnce({ done: true });
+    global.fetch.mockResolvedValue({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read,
+        }),
+      },
+    });
+
+    const onData = jest.fn();
+    const streamPromise = apiClient.stream('/stream', {}, onData);
+
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+    expect(getRequestActivitySnapshot().inFlight).toBe(1);
+    expect(getRequestActivitySnapshot().history.at(-1).count).toBe(1);
+    expect(typeof resolveRead).toBe('function');
+
+    resolveRead({
+      done: false,
+      value: Uint8Array.from([104, 101, 108, 108, 111]),
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(onData).toHaveBeenCalledWith('hello');
+    expect(getRequestActivitySnapshot().inFlight).toBe(1);
+
+    await expect(streamPromise).resolves.toBeUndefined();
+    expect(getRequestActivitySnapshot().inFlight).toBe(0);
+  });
+
+  it('cleans up streamed requests when the reader fails', async () => {
+    const consoleError = jest
+      .spyOn(console, 'error')
+      .mockImplementation(() => {});
+    global.fetch.mockResolvedValue({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: jest.fn().mockRejectedValue(new Error('stream broke')),
+        }),
+      },
+    });
+
+    await expect(apiClient.stream('/stream', {}, jest.fn())).rejects.toThrow(
+      'stream broke'
+    );
+    expect(consoleError).toHaveBeenCalled();
+    expect(global.fetch).toHaveBeenCalledTimes(1);
     expect(getRequestActivitySnapshot().inFlight).toBe(0);
   });
 

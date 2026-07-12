@@ -150,6 +150,7 @@ export const apiClient = {
 
     const baseUrl = window.location.origin;
     const fullUrl = `${baseUrl}${ENDPOINT}${path}`;
+    const request = options.trackRequest === false ? fetch : trackedFetch;
 
     if (body !== undefined) {
       // Get user info (cached after first call)
@@ -162,7 +163,7 @@ export const apiClient = {
       };
     }
 
-    return await trackedFetch(fullUrl, {
+    return await request(fullUrl, {
       method,
       headers,
       body: method === 'POST' ? JSON.stringify(body) : undefined,
@@ -220,8 +221,9 @@ export const apiClient = {
 
     const baseUrl = window.location.origin;
     const fullUrl = `${baseUrl}${ENDPOINT}${path}`;
+    const request = options.trackRequest === false ? fetch : trackedFetch;
 
-    return await trackedFetch(fullUrl, {
+    return await request(fullUrl, {
       method: 'POST',
       headers,
       body: JSON.stringify(body),
@@ -231,25 +233,30 @@ export const apiClient = {
 
   // Helper method for streaming responses
   stream: async (path, body, onData, options = {}) => {
-    const response = await apiClient.post(path, body, options);
-    if (!response.ok) {
-      const msg = `API request ${path} failed with status ${response.status}`;
-      console.error(msg);
-      throw new Error(msg);
-    }
-    const reader = response.body.getReader();
-
-    try {
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const chunk = new TextDecoder().decode(value);
-        onData(chunk);
+    return await trackDashboardRequest(async () => {
+      const response = await apiClient.post(path, body, {
+        ...options,
+        trackRequest: false,
+      });
+      if (!response.ok) {
+        const msg = `API request ${path} failed with status ${response.status}`;
+        console.error(msg);
+        throw new Error(msg);
       }
-    } catch (error) {
-      console.error('Error in stream:', error);
-      throw error;
-    }
+      const reader = response.body.getReader();
+
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const chunk = new TextDecoder().decode(value);
+          onData(chunk);
+        }
+      } catch (error) {
+        console.error('Error in stream:', error);
+        throw error;
+      }
+    });
   },
 
   get: async (path) => {
