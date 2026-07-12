@@ -6,7 +6,7 @@ cloud spot (L4). The placer must fill the zero-cost tier COMPLETELY
 before spending on spot, pin each launch's accelerators/use_spot via its
 location, and pull load back when reserved capacity frees (TTL retry).
 """
-# pylint: disable=redefined-outer-name,protected-access,unused-variable
+# pylint: disable=import-outside-toplevel,redefined-outer-name,protected-access,unused-variable
 from unittest import mock
 
 import pytest
@@ -65,6 +65,32 @@ class TestZeroCostTierFirst:
         assert placer.select_next_location([cheap_spot] * 10) == k8s
 
 
+class TestProvisionTimeoutWarning:
+    """The safety warning must use the task's effective timeout."""
+
+    def test_task_override_suppresses_false_global_warning(self, monkeypatch):
+        task_override = {'kubernetes': {'provision_timeout': 90}}
+        resource = mock.MagicMock(cluster_config_overrides=task_override)
+        task = mock.MagicMock(resources=[resource], num_nodes=1)
+        k8s = make_location('research-ctx', cloud_name='Kubernetes')
+        monkeypatch.setattr(spot_placer, '_get_possible_location_from_task',
+                            lambda _: [k8s])
+
+        get_timeout = mock.MagicMock(
+            side_effect=lambda *args, override_configs=None, **kwargs:
+            (override_configs['kubernetes']['provision_timeout']
+             if override_configs else 600))
+        monkeypatch.setattr(spot_placer.skypilot_config,
+                            'get_effective_region_config', get_timeout)
+        warning = mock.MagicMock()
+        monkeypatch.setattr(spot_placer.logger, 'warning', warning)
+
+        spot_placer.DynamicFallbackSpotPlacer(task)
+
+        warning.assert_not_called()
+        assert get_timeout.call_args.kwargs['override_configs'] == task_override
+
+
 class TestHeterogeneousLocations:
     """Locations are distinct per shape and carry launch overrides."""
 
@@ -84,6 +110,7 @@ class TestHeterogeneousLocations:
         # VM-selected launch clearing the k8s entry's docker image.
         assert 'image_id' in d and d['image_id'] is None
         assert 'disk_tier' in d and d['disk_tier'] is None
+        assert 'ephemeral_storage' in d and d['ephemeral_storage'] is None
         # accelerators likewise unconditional: a CPU-only location must
         # strip GPU entries' accelerators from its copies.
         cpu_only = make_location('cpu-region', accelerators=None)
@@ -113,6 +140,76 @@ class TestHeterogeneousLocations:
             })
             assert old.accelerators is None
             assert old.use_spot is True
+
+
+class TestEphemeralStoragePerLocation:
+    """Kubernetes entries carry storage requests without poisoning VMs."""
+
+    def test_mixed_storage_request_reaches_each_cloud_shape(self, monkeypatch):
+        # pylint: disable=import-outside-toplevel
+        import sky
+        from sky.clouds import aws as aws_cloud
+        from sky.clouds import kubernetes as kubernetes_cloud
+        from sky.utils import resources_utils
+
+        captured = []
+
+        def _capture(self, resources, num_nodes=1):
+            del self, num_nodes
+            captured.append(resources)
+            return resources_utils.FeasibleResources([], [], None)
+
+        monkeypatch.setattr(aws_cloud.AWS, 'get_feasible_launchable_resources',
+                            _capture)
+        monkeypatch.setattr(kubernetes_cloud.Kubernetes,
+                            'get_feasible_launchable_resources', _capture)
+        task = sky.Task.from_yaml_str("""
+resources:
+  cpus: 4+
+  ports: 8080
+  any_of:
+    - infra: k8s/research-ctx
+      accelerators: A100:1
+      use_spot: false
+      ephemeral_storage: 20
+    - infra: aws/us-east-1
+      accelerators: L4:1
+      use_spot: true
+run: echo hi
+""")
+
+        spot_placer._get_possible_location_from_task(task)
+
+        by_accelerator = {next(iter(r.accelerators or {})): r for r in captured}
+        assert by_accelerator['A100'].ephemeral_storage == 20
+        assert by_accelerator['L4'].ephemeral_storage is None
+
+    def test_location_override_pins_or_clears_ephemeral_storage(self):
+        k8s = make_location('research-ctx',
+                            cloud_name='Kubernetes',
+                            ephemeral_storage=20)
+        cloud = make_location('us-east-1', cloud_name='AWS')
+
+        assert k8s.to_dict()['ephemeral_storage'] == 20
+        assert cloud.to_dict()['ephemeral_storage'] is None
+
+    def test_pickle_roundtrip_and_backcompat(self):
+        with mock.patch.object(spot_placer.registry.CLOUD_REGISTRY,
+                               'from_str',
+                               return_value=mock.MagicMock()):
+            loc = spot_placer.Location.from_pickleable({
+                'cloud': 'Kubernetes',
+                'region': 'research-ctx',
+                'zone': None,
+                'ephemeral_storage': 20,
+            })
+            assert loc.ephemeral_storage == 20
+            old = spot_placer.Location.from_pickleable({
+                'cloud': 'Kubernetes',
+                'region': 'research-ctx',
+                'zone': None,
+            })
+            assert old.ephemeral_storage is None
 
 
 class TestShouldUseSpotMixed:

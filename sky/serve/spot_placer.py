@@ -93,6 +93,9 @@ class Location:
     # Per-entry disk tier (e.g. 'high' on VM entries for docker-load
     # throughput; unset on Kubernetes entries, which reject the field).
     disk_tier: Optional[str] = None
+    # Per-entry Kubernetes ephemeral-storage request in GiB. Cloud VM
+    # entries must keep this unset because they reject the field.
+    ephemeral_storage: Optional[int] = None
 
     def _accel_key(self) -> str:
         parts = []
@@ -104,6 +107,8 @@ class Location:
                 self.image_id.items(), key=lambda kv: str(kv[0]))))
         if self.disk_tier:
             parts.append(f'disk_tier={self.disk_tier}')
+        if self.ephemeral_storage is not None:
+            parts.append(f'ephemeral_storage={self.ephemeral_storage}')
         return '|'.join(parts)
 
     def __eq__(self, other) -> bool:
@@ -133,7 +138,8 @@ class Location:
                    accelerators=resources.accelerators,
                    use_spot=resources.use_spot,
                    image_id=image_id,
-                   disk_tier=disk_tier)
+                   disk_tier=disk_tier,
+                   ephemeral_storage=resources.ephemeral_storage)
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {
@@ -148,16 +154,12 @@ class Location:
             # draws from location2status), never on deserialized rows.
             'accelerators': self.accelerators,
         }
-        # image_id and disk_tier are ALWAYS included (None clears): the
-        # override is applied to every any_of entry, so a location without
-        # the attribute must strip it from entries that carry it — a
-        # VM-selected launch must clear the Kubernetes entry's
-        # context-keyed docker image (invalid on AWS/GCP), and a
-        # k8s-selected launch must clear the VM entries' disk_tier
-        # (rejected by Kubernetes). Either leftover fails resource
-        # validation before optimization.
+        # Per-location fields are ALWAYS included (None clears): the override
+        # is applied to every any_of entry, so each selected location must
+        # strip fields that only another backend supports.
         d['image_id'] = self.image_id
         d['disk_tier'] = self.disk_tier
+        d['ephemeral_storage'] = self.ephemeral_storage
         return d
 
     @classmethod
@@ -181,6 +183,7 @@ class Location:
             use_spot=data.get('use_spot', True),
             image_id=data.get('image_id'),
             disk_tier=data.get('disk_tier'),
+            ephemeral_storage=data.get('ephemeral_storage'),
         )
 
     def to_pickleable(self) -> Dict[str, Any]:
@@ -192,6 +195,7 @@ class Location:
             'use_spot': self.use_spot,
             'image_id': self.image_id,
             'disk_tier': self.disk_tier,
+            'ephemeral_storage': self.ephemeral_storage,
         }
 
     @classmethod
@@ -228,6 +232,7 @@ class Location:
             use_spot=override.get('use_spot', True),
             image_id=override.get('image_id'),
             disk_tier=override.get('disk_tier'),
+            ephemeral_storage=override.get('ephemeral_storage'),
         )
 
 
@@ -235,8 +240,8 @@ def locations_match_placement(replica_location: Location,
                               zero_cost: Location) -> bool:
     """Relaxed zero-cost identity match for fill accounting.
 
-    Deliberately NOT Location.__eq__: full equality includes
-    image_id/disk_tier (via _accel_key), so pre-upgrade shape-less
+    Deliberately NOT Location.__eq__: full equality includes image_id,
+    disk_tier, and ephemeral_storage (via _accel_key), so pre-upgrade shape-less
     replica rows and replicas surviving an image-changing update
     would stop matching, undercounting zero_cost_count and stripping
     the fleet's scale-down protection. For "is this replica on the
@@ -288,7 +293,7 @@ def _get_possible_location_from_task(task: 'task_lib.Task') -> List[Location]:
         config = resources.copy(cloud=None, region=None,
                                 zone=None).to_yaml_config()
         for key in ('accelerators', 'use_spot', 'spot_recovery', 'image_id',
-                    'disk_tier'):
+                    'disk_tier', 'ephemeral_storage'):
             config.pop(key, None)
         return config
 
@@ -303,7 +308,8 @@ def _get_possible_location_from_task(task: 'task_lib.Task') -> List[Location]:
                     'Different resource configurations are not supported '
                     'for spot placement. All resources must have the same '
                     'configuration except for cloud/region/zone/'
-                    'accelerators/use_spot.')
+                    'accelerators/use_spot/image_id/disk_tier/'
+                    'ephemeral_storage.')
 
     # Group entries by (accelerators, use_spot) shape: locations are
     # enumerated per shape so each candidate location knows exactly what
@@ -378,6 +384,7 @@ def _get_possible_location_from_task(task: 'task_lib.Task') -> List[Location]:
                     loc.image_id = _normalize_image_id(r.image_id)
                     loc.disk_tier = (r.disk_tier.value
                                      if r.disk_tier is not None else None)
+                    loc.ephemeral_storage = r.ephemeral_storage
                     possible_locations.add(loc)
 
     return list(possible_locations)
@@ -644,7 +651,8 @@ class DynamicFallbackSpotPlacer(SpotPlacer,
                 cloud='kubernetes',
                 region=context,
                 keys=('provision_timeout',),
-                default_value=None)
+                default_value=None,
+                override_configs=self.resources.cluster_config_overrides)
             if timeout is None:
                 continue
             try:
