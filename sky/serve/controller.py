@@ -589,13 +589,16 @@ class SkyServeController:
             return fastapi.Response(status_code=503)
 
         replica_infos = serve_state.get_replica_infos(self._service_name)
-        async_occupancy_by_version: Dict[int, Optional[bool]] = {}
-        for replica_version in {info.version for info in replica_infos}:
-            version_spec = serve_state.get_spec(self._service_name,
-                                                replica_version)
-            async_occupancy_by_version[replica_version] = (
-                None if version_spec is None else getattr(
-                    version_spec, 'graceful_drain_async_occupancy', None))
+        replica_versions = sorted({info.version for info in replica_infos})
+        version_specs = serve_state.get_specs(self._service_name,
+                                              replica_versions)
+        async_occupancy_by_version: Dict[int, Optional[bool]] = {
+            replica_version:
+            None if version_specs.get(replica_version) is None else getattr(
+                version_specs[replica_version],
+                'graceful_drain_async_occupancy', None)
+            for replica_version in replica_versions
+        }
         lb_replica_info, num_ready = self._get_lb_replica_info(
             replica_infos, async_occupancy_by_version)
         if not self._owns_current_service():

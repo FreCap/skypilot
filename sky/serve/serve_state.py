@@ -2306,6 +2306,26 @@ def get_spec(service_name: str,
     return pickle.loads(result[0]) if result else None
 
 
+def get_specs(
+        service_name: str, versions: List[int]
+) -> Dict[int, Optional['service_spec.SkyServiceSpec']]:
+    """Gets specs for a service's versions in one query."""
+    if not versions:
+        return {}
+
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        rows = session.execute(
+            sqlalchemy.select(
+                version_specs_table.c.version,
+                version_specs_table.c.spec).where(
+                    sqlalchemy.and_(
+                        version_specs_table.c.service_name == service_name,
+                        version_specs_table.c.version.in_(sorted(
+                            set(versions)))))).fetchall()
+    return {row[0]: pickle.loads(row[1]) for row in rows}
+
+
 def get_yaml_content(service_name: str, version: int) -> Optional[str]:
     """Gets the yaml content of a version."""
     engine = _db_manager.get_engine()
