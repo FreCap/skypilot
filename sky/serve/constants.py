@@ -236,15 +236,12 @@ LB_EVICTION_CONSECUTIVE_FAILURES = 3
 LB_EVICTION_QUARANTINE_SECONDS = 30
 
 # [boltz fork] Demand feed for concurrency-native autoscaling. Terminal LB
-# 503s ("no ready replicas" / "all ready replicas at capacity") are backlog
-# pressure the QPS window cannot express: the platform's marker-timeout loop
-# re-fires the SAME held job every ~30s, so summing raw rejects over a window
-# would multiply one outstanding job by window/retry-period (~10x
-# over-target, each over-launched GPU then pinned by hysteresis). The LB
-# instead dedups rejects by the stable per-job header below and reports the
-# count of UNIQUE jobs terminally rejected within this TTL window: a held job
-# re-firing refreshes its TTL and still counts as one unit of pressure; once
-# it lands (or spills for good) its pressure decays after one window.
+# 503s ("no ready replicas" / "all ready replicas at capacity") are short-lived
+# shadow pressure that the QPS window cannot express. Callers may retry the same
+# logical job, so raw counts could multiply one unit of demand. The LB instead
+# dedups by the stable per-job header below and reports the number of UNIQUE jobs
+# rejected within this TTL. A retry refreshes the TTL and still counts once; a
+# job that lands elsewhere after the rejection decays after one window.
 LB_REJECT_WINDOW_SECONDS = 360
 
 # Request header carrying a job id that is STABLE across retries of the same

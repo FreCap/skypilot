@@ -410,11 +410,9 @@ class SkyServeLoadBalancer:
         # handler without an await between a read and its write.
         self._queue_depth: int = 0
         # Reject window with dedup: job key -> last-seen monotonic time.
-        # Keyed by the LB_JOB_ID_HEADER value (stable across retries of
-        # the same job) so a held job the platform re-fires every ~30s
-        # counts as ONE unit of pressure, not window/retry-period units
-        # (see the constant's comment for why raw counting over-provisions
-        # ~10x). Entries older than LB_REJECT_WINDOW_SECONDS are pruned on
+        # Keyed by the LB_JOB_ID_HEADER value so repeated attempts for one
+        # logical job refresh its TTL while still counting as one unit of
+        # pressure. Entries older than LB_REJECT_WINDOW_SECONDS are pruned on
         # access. Monotonic clock: TTLs must not be distorted by
         # wall-clock steps (NTP). (Typed Optional at class level; always
         # a real dict on instances -- _prune_reject_window materializes.)
@@ -754,10 +752,9 @@ class SkyServeLoadBalancer:
     def _record_rejection(self, request: fastapi.Request) -> None:
         """Record a terminal-503 exit for the reject-window gauge.
 
-        Keyed by the job-id header when present: the platform re-fires
-        the SAME held job every ~30s, so the re-fire must refresh the
-        TTL and still count once -- that dedup is the whole point of the
-        window (raw counting over-provisions ~10x, see constants).
+        Keyed by the job-id header when present, so repeated attempts for one
+        logical job refresh the TTL while still counting once. This prevents
+        retries from multiplying autoscaling pressure (see constants).
         Headerless requests get a unique per-request key: one unit each.
         """
         # Starlette header lookup is case-insensitive per the HTTP spec.

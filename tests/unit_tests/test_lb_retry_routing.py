@@ -355,13 +355,16 @@ class TestRetryShortCircuit(unittest.TestCase):
         balancer = self._balancer(
             ['http://a:8080', 'http://b:8080', 'http://c:8080'], _proxy)
         balancer._max_retries = 1
-        sleeps, exc = self._run(balancer)
+        request = _request()
+        request.headers.get.return_value = 'stable-job-1'
+        sleeps, exc = self._run(balancer, request)
         self.assertEqual(len(attempts), 1)
         self.assertEqual(sleeps, [])
         self.assertEqual(exc.status_code, 503)
         self.assertIn('configured retriable', exc.detail)
         self.assertEqual(exc.headers['Retry-After'],
                          str(lb_module.constants.LB_503_RETRY_AFTER_SECONDS))
+        self.assertEqual(balancer._rejected_in_window(), 1)
 
     def test_transport_failures_keep_fallback_attempts(self):
         # A lone replica's pre-dispatch connection blip proves the POST did not
