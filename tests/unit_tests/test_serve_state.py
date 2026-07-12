@@ -7,6 +7,7 @@ leader-aware routing.
 # underscore is the standard convention for fixtures injected for side
 # effects). Disable for the file.
 # pylint: disable=invalid-name,protected-access
+import contextlib
 import types
 
 import pytest
@@ -29,6 +30,21 @@ def _read_row(engine, name):
             sqlalchemy.select(serve_state.services_table).where(
                 serve_state.services_table.c.name == name)).fetchone()
     return None if result is None else dict(result._mapping)  # pylint: disable=protected-access
+
+
+@contextlib.contextmanager
+def _count_sql_statements(engine):
+    counts = {'n': 0}
+
+    def _count(*args, **kwargs):
+        del args, kwargs
+        counts['n'] += 1
+
+    sqlalchemy.event.listen(engine, 'before_cursor_execute', _count)
+    try:
+        yield counts
+    finally:
+        sqlalchemy.event.remove(engine, 'before_cursor_execute', _count)
 
 
 @pytest.fixture
@@ -138,6 +154,30 @@ def test_launch_budget_counts_share_one_replica_scan(_mock_serve_db,
     monkeypatch.setattr(serve_state.pickle, 'loads', _counting_loads)
     assert serve_state.get_replica_launch_budget_counts() == (2, 1)
     assert unpickles == 2
+
+
+def test_get_specs_batches_requested_versions_in_one_query(_mock_serve_db):
+    assert _add_minimal_service('svc-specs') is True
+    serve_state.add_or_update_version(
+        'svc-specs',
+        1,
+        types.SimpleNamespace(graceful_drain_async_occupancy=False),
+        'yaml: v1',
+    )
+    serve_state.add_or_update_version(
+        'svc-specs',
+        2,
+        types.SimpleNamespace(graceful_drain_async_occupancy=True),
+        'yaml: v2',
+    )
+
+    with _count_sql_statements(_mock_serve_db) as counts:
+        specs = serve_state.get_specs('svc-specs', [2, 1, 2, 3])
+
+    assert counts['n'] == 1, counts
+    assert set(specs) == {1, 2}
+    assert specs[1].graceful_drain_async_occupancy is False
+    assert specs[2].graceful_drain_async_occupancy is True
 
 
 class TestAddServiceWritesControllerIp:
@@ -555,7 +595,7 @@ class TestEphemeralStorageCleanupIntents:
 
     @staticmethod
     def _yaml(resource_scope: str, generation: str) -> str:
-        return f'''\
+        return f"""\
 metadata:
   {serve_constants.EPHEMERAL_STORAGE_SCOPE_METADATA_KEY}:
     resource_scope: {resource_scope}
@@ -564,7 +604,7 @@ metadata:
     storage_mounts: []
 service:
   readiness_probe: /
-'''
+"""
 
     def test_initial_registration_adopts_intent_in_same_transaction(
             self, _mock_serve_db):
@@ -612,6 +652,7 @@ service:
 
 
 class TestGetServiceFromNameReturnsControllerIp:
+    """Joined service reads must surface the persisted controller IP."""
 
     def _add_with_version(self, service_name, controller_ip):
         # Reading via get_service_from_name requires a version_specs row
@@ -840,6 +881,7 @@ class TestUpdateServiceControllerPidIpAndPort:
 
 
 class TestUpdateServiceControllerPidIfOwner:
+    """Recovery preclaim must fence by incarnation, pid, and controller IP."""
 
     def test_preclaim_requires_original_hash_and_pid(self, _mock_serve_db):
         _add_minimal_service('svc', controller_pid=111)
@@ -920,6 +962,7 @@ class TestSetServiceControllerPortIfOwner:
 
 
 class TestAcknowledgeControllerTeardown:
+    """Owner-only teardown ack must publish the terminal controller port."""
 
     def test_owner_atomically_publishes_terminal_status_and_ack(
             self, _mock_serve_db):
@@ -1041,7 +1084,7 @@ class TestRemoveServiceCompletely:
             expected_status=serve_state.ServiceStatus.CONTROLLER_INIT)
 
         with orm.Session(_mock_serve_db) as session:
-            for table, column in [
+            for _, column in [
                 (serve_state.services_table, serve_state.services_table.c.name),
                 (serve_state.replicas_table,
                  serve_state.replicas_table.c.service_name),
@@ -1319,6 +1362,7 @@ class TestUnrecoverableServiceCleanup:
 
 
 class TestTerminalServiceRejectsVersionWrites:
+    """Terminal services must reject later version placeholder/YAML writes."""
 
     def test_down_winner_blocks_placeholder_and_yaml_commit(
             self, _mock_serve_db):
@@ -1340,8 +1384,6 @@ class TestBatchReplicaUpsert:
     """add_or_update_replicas: one statement for a probe round's writes."""
 
     def test_batch_insert_then_batch_update(self, _mock_serve_db):
-        import types
-
         infos = [(i, types.SimpleNamespace(replica_id=i, tag='v1'))
                  for i in range(1, 4)]
         serve_state.add_or_update_replicas('svc', infos)
@@ -1365,8 +1407,6 @@ class TestBatchReplicaUpsert:
         assert not serve_state.get_replica_infos('svc')
 
     def test_batch_larger_than_chunk_size(self, _mock_serve_db):
-        import types
-
         n = serve_state._REPLICA_UPSERT_CHUNK_SIZE * 2 + 17
         infos = [
             (i, types.SimpleNamespace(replica_id=i)) for i in range(1, n + 1)

@@ -915,6 +915,76 @@ class TestAuthoritativeLbReportIngestion:
                 self._URL: 2
             }, [self._URL], [self._URL], [self._URL], 'lb-a'), 1)
 
+    def test_load_balancer_sync_batches_version_spec_reads(self):
+        ctrl, _, report = self._controller_and_report()
+        infos = [
+            _FakeReplicaInfo(1,
+                             serve_state.ReplicaStatus.READY,
+                             version=1,
+                             url='http://1.1.1.1:8080',
+                             accelerators={'L4': 1}),
+            _FakeReplicaInfo(2,
+                             serve_state.ReplicaStatus.READY,
+                             version=2,
+                             url='http://2.2.2.2:8080',
+                             accelerators={'L4': 1}),
+            _FakeReplicaInfo(3,
+                             serve_state.ReplicaStatus.READY,
+                             version=3,
+                             url='http://3.3.3.3:8080',
+                             accelerators={'L4': 1}),
+        ]
+        observed = {}
+
+        def _capture_lb_replica_info(replica_infos, async_occupancy_by_version):
+            del replica_infos
+            observed['sync'] = dict(async_occupancy_by_version)
+            return ({}, 0)
+
+        async def _capture_ingest(request_data,
+                                  replica_infos,
+                                  async_occupancy_by_version,
+                                  authority=None):
+            del request_data, replica_infos, authority
+            observed['ingest'] = dict(async_occupancy_by_version)
+            return True
+
+        ctrl._get_lb_replica_info = _capture_lb_replica_info  # pylint: disable=protected-access
+        ctrl._ingest_load_balancer_report = _capture_ingest  # pylint: disable=protected-access
+        ctrl._get_capacity_hint = lambda replica_infos: {  # pylint: disable=protected-access
+            'n': len(replica_infos)
+        }
+        ctrl._routing_spec = {'policy': 'round_robin'}  # pylint: disable=protected-access
+
+        with mock.patch.object(controller.lb_k8s,
+                               'get_lb_pod_authority',
+                               return_value=controller.lb_k8s.LbPodAuthority(
+                                   {'lb-a'}, {'lb-a'})), \
+             mock.patch.object(controller.serve_state,
+                               'get_replica_infos',
+                               return_value=infos), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_specs',
+                 return_value={
+                     1: types.SimpleNamespace(
+                         graceful_drain_async_occupancy=False),
+                     3: types.SimpleNamespace(
+                         graceful_drain_async_occupancy=True),
+                 }) as get_specs, \
+             mock.patch.object(controller.serve_state,
+                               'get_spec',
+                               side_effect=AssertionError(
+                                   'per-version reads should be batched')):
+            response = asyncio.run(
+                ctrl._handle_load_balancer_sync(  # pylint: disable=protected-access
+                    report))
+
+        assert response.status_code == 200
+        get_specs.assert_called_once_with('svc', [1, 2, 3])
+        assert observed['sync'] == {1: False, 2: None, 3: True}
+        assert observed['ingest'] == {1: False, 2: None, 3: True}
+
 
 class _FakeAutoscaler:
     """Autoscaler stub for the capacity-hint computation."""
