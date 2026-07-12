@@ -50,6 +50,22 @@ def _fake_pod(name):
     return pod
 
 
+def test_cluster_name_annotation_collision_fails_closed():
+    pod = mock.MagicMock()
+    pod.metadata.name = 'short-name-head'
+    pod.metadata.annotations = {
+        'skypilot-cluster-name': 'service-v1-replica-68'
+    }
+
+    with pytest.raises(config_lib.KubernetesError,
+                       match='already owned by full cluster'):
+        instance._validate_cluster_name_annotations(
+            {pod.metadata.name: pod},
+            'service-v2-replica-8',
+            'short-name',
+        )
+
+
 def _patch_create_pods_k8s_boundary(monkeypatch, existing_pods, head_name):
     """Stub the Kubernetes-touching calls _create_pods makes.
 

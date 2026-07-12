@@ -378,10 +378,11 @@ def test_workspace_k8s_remote_identity():
 
     name = smoke_tests_utils.get_cluster_name()
     max_len = sky.Kubernetes.max_cluster_name_length()
+    hash_len = sky.Kubernetes.cluster_name_hash_length()
     name_on_cloud_1 = common_utils.make_cluster_name_on_cloud(
-        f'{name}-1', max_len)
+        f'{name}-1', max_len, cluster_name_hash_length=hash_len)
     name_on_cloud_2 = common_utils.make_cluster_name_on_cloud(
-        f'{name}-2', max_len)
+        f'{name}-2', max_len, cluster_name_hash_length=hash_len)
 
     def _get_pod_sa_cmd(name_on_cloud: str) -> str:
         return (f'kubectl get pod -l skypilot-cluster-name={name_on_cloud} '
