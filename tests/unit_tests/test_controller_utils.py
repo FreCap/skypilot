@@ -27,6 +27,22 @@ _DEFAULT_AUTOSTOP = {
 }
 
 
+@pytest.mark.parametrize('controller', list(controller_utils.Controllers))
+def test_controller_identity_public_contract(controller):
+    """Controller identities remain importable through the public module."""
+    assert controller_utils.Controllers.__module__ == 'sky.utils.controller_utils'
+    assert (controller_utils.Controllers.from_type(
+        controller.value.controller_type) is controller)
+
+
+@pytest.mark.parametrize('pool,expected', [
+    (True, controller_utils.Controllers.JOBS_CONTROLLER),
+    (False, controller_utils.Controllers.SKY_SERVE_CONTROLLER),
+])
+def test_get_controller_for_pool_identity(pool, expected):
+    assert controller_utils.get_controller_for_pool(pool) is expected
+
+
 def test_configured_bucket_cleanup_manifest_precedes_upload(tmp_path):
     """A crash after upload retains permission to delete the scoped subpath."""
     workdir = tmp_path / 'workdir'
