@@ -795,6 +795,7 @@ class BatchCoordinator:
         activate = self.activate_env.strip()
         activate_line = f'{activate} &&' if activate else ''
         sky_runtime = skylet_constants.SKY_REMOTE_PYTHON_ENV
+        failure_marker = shlex.quote(constants.WORKER_FAILURE_MARKER_PATH)
 
         # Serialize typed format dicts as JSON env vars for workers.
         input_format_json = json.dumps(self._input_format.to_dict()).replace(
@@ -821,6 +822,7 @@ class BatchCoordinator:
             {activate_line} pip install boto3 2>/dev/null
 
             # Start worker service in the activated environment.
+            rm -f {failure_marker}
             {activate_line} python -u -c '
             import os
             from sky.batch.worker import start_worker
@@ -831,6 +833,40 @@ class BatchCoordinator:
                 worker_token=os.environ["SKY_BATCH_WORKER_TOKEN"],
             )
             ' 2>&1 | tee /tmp/sky_batch_worker.log
+            """)
+
+    def _generate_worker_health_check_code(self) -> str:
+        """Generate code that waits for the worker to report healthy."""
+        port = constants.WORKER_SERVICE_PORT
+        timeout = constants.WORKER_SERVICE_STARTUP_TIMEOUT
+        failure_marker = shlex.quote(constants.WORKER_FAILURE_MARKER_PATH)
+        return textwrap.dedent(f"""\
+            set -e
+            failure_marker={failure_marker}
+            health_output=$(mktemp)
+            trap 'rm -f "$health_output"' EXIT
+            for i in $(seq 1 {timeout}); do
+                if [ -s "$failure_marker" ]; then
+                    echo "ERROR: Worker service failed before becoming healthy"
+                    cat "$failure_marker"
+                    exit 1
+                fi
+                http_code=$(curl -s -o "$health_output" -w '%{{http_code}}' \
+                    http://127.0.0.1:{port}/health \
+                    -H 'X-Sky-Batch-Worker-Token: {self._worker_token}' || true)
+                if [ "$http_code" = "200" ]; then
+                    echo "Worker service ready after $i seconds"
+                    exit 0
+                fi
+                if [ "$http_code" = "503" ]; then
+                    echo "ERROR: Worker service reported a durable failure"
+                    cat "$health_output"
+                    exit 1
+                fi
+                sleep 1
+            done
+            echo "ERROR: Worker service did not start within {timeout}s"
+            exit 1
             """)
 
     def _generate_notify_code(self, batch_idx: int, attempt_id: int) -> str:
@@ -1054,22 +1090,7 @@ class BatchCoordinator:
                     f'{worker_job_id} on {cluster_name}')
 
         # Wait for worker to be ready
-        port = constants.WORKER_SERVICE_PORT
-        timeout = constants.WORKER_SERVICE_STARTUP_TIMEOUT
-        health_code = textwrap.dedent(f"""\
-            set -e
-            for i in $(seq 1 {timeout}); do
-                if curl -sf http://127.0.0.1:{port}/health \\
-                    -H 'X-Sky-Batch-Worker-Token: {self._worker_token}' \\
-                    > /dev/null 2>&1; then
-                    echo "Worker service ready after $i seconds"
-                    exit 0
-                fi
-                sleep 1
-            done
-            echo "ERROR: Worker service did not start within {timeout}s"
-            exit 1
-            """)
+        health_code = self._generate_worker_health_check_code()
         health_task = sky.Task(
             name=f'health-check-{job_id}-{self._worker_token}', run=health_code)
         try:
