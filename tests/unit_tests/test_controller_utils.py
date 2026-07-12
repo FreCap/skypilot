@@ -30,7 +30,8 @@ _DEFAULT_AUTOSTOP = {
 @pytest.mark.parametrize('controller', list(controller_utils.Controllers))
 def test_controller_identity_public_contract(controller):
     """Controller identities remain importable through the public module."""
-    assert controller_utils.Controllers.__module__ == 'sky.utils.controller_utils'
+    assert (controller_utils.Controllers.__module__ ==
+            'sky.utils.controller_utils')
     assert (controller_utils.Controllers.from_type(
         controller.value.controller_type) is controller)
 
