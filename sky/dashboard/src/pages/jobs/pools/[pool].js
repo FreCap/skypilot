@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { useRouter } from 'next/router';
 import Head from 'next/head';
 import Link from 'next/link';
@@ -115,6 +115,7 @@ export default function PoolDetailPage() {
   const [loading, setLoading] = useState(false);
   const [initialLoading, setInitialLoading] = useState(true);
   const [error, setError] = useState(null);
+  const requestVersionRef = useRef(0);
 
   // Pagination state
   const [currentPage, setCurrentPage] = useState(1);
@@ -140,15 +141,22 @@ export default function PoolDetailPage() {
     async (isRefresh = false) => {
       if (!poolName) return;
 
+      const requestVersion = requestVersionRef.current + 1;
+      requestVersionRef.current = requestVersion;
+      const isCurrentRequest = () =>
+        requestVersionRef.current === requestVersion;
+
       if (isRefresh) {
         setLoading(true);
       } else {
+        setLoading(false);
         setInitialLoading(true);
       }
       setError(null);
 
       try {
         const poolsResponse = await dashboardCache.get(getPoolStatus, [{}]);
+        if (!isCurrentRequest()) return;
         const { pools = [] } = poolsResponse || {};
 
         const foundPool = pools.find((pool) => pool.name === poolName);
@@ -159,10 +167,12 @@ export default function PoolDetailPage() {
           setPoolData(foundPool);
         }
       } catch (err) {
+        if (!isCurrentRequest()) return;
         console.error('Error fetching pool data:', err);
         setError(`Failed to fetch pool data: ${err.message}`);
         setPoolData(null);
       } finally {
+        if (!isCurrentRequest()) return;
         if (isRefresh) {
           setLoading(false);
         } else {
@@ -175,6 +185,9 @@ export default function PoolDetailPage() {
 
   useEffect(() => {
     fetchPoolData();
+    return () => {
+      requestVersionRef.current += 1;
+    };
   }, [poolName, fetchPoolData]);
 
   // Sorting functions
