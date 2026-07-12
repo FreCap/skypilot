@@ -14,6 +14,7 @@ import {
   getRequestActivitySnapshot,
   resetRequestActivityForTests,
 } from '@/lib/request-activity';
+import { TextDecoder as NodeTextDecoder, TextEncoder } from 'util';
 
 describe('current user cache', () => {
   let originalTextDecoder;
@@ -23,11 +24,7 @@ describe('current user cache', () => {
     resetRequestActivityForTests();
     global.fetch.mockReset();
     originalTextDecoder = global.TextDecoder;
-    global.TextDecoder = class {
-      decode(value) {
-        return Buffer.from(value).toString('utf8');
-      }
-    };
+    global.TextDecoder = NodeTextDecoder;
   });
 
   afterEach(() => {
@@ -96,6 +93,66 @@ describe('current user cache', () => {
 
     await expect(streamPromise).resolves.toBeUndefined();
     expect(getRequestActivitySnapshot().inFlight).toBe(0);
+  });
+
+  it('preserves utf-8 characters split across streamed chunks', async () => {
+    const encoded = new TextEncoder().encode('A🙂B');
+    const read = jest
+      .fn()
+      .mockResolvedValueOnce({ done: false, value: encoded.slice(0, 3) })
+      .mockResolvedValueOnce({ done: false, value: encoded.slice(3) })
+      .mockResolvedValueOnce({ done: true });
+    global.fetch.mockResolvedValue({
+      ok: true,
+      body: {
+        getReader: () => ({ read }),
+      },
+    });
+
+    const chunks = [];
+    await apiClient.stream('/stream', {}, (chunk) => chunks.push(chunk));
+
+    expect(chunks.join('')).toBe('A🙂B');
+    expect(chunks).not.toContain('');
+  });
+
+  it('creates one decoder for the entire stream', async () => {
+    const decoder = {
+      decode: jest
+        .fn()
+        .mockReturnValueOnce('first')
+        .mockReturnValueOnce('second')
+        .mockReturnValueOnce(''),
+    };
+    const Decoder = jest.fn(() => decoder);
+    global.TextDecoder = Decoder;
+    const first = Uint8Array.from([1]);
+    const second = Uint8Array.from([2]);
+    const read = jest
+      .fn()
+      .mockResolvedValueOnce({ done: false, value: first })
+      .mockResolvedValueOnce({ done: false, value: second })
+      .mockResolvedValueOnce({ done: true });
+    global.fetch.mockResolvedValue({
+      ok: true,
+      body: {
+        getReader: () => ({ read }),
+      },
+    });
+
+    const onData = jest.fn();
+    await apiClient.stream('/stream', {}, onData);
+
+    expect(Decoder).toHaveBeenCalledTimes(1);
+    expect(decoder.decode).toHaveBeenNthCalledWith(1, first, {
+      stream: true,
+    });
+    expect(decoder.decode).toHaveBeenNthCalledWith(2, second, {
+      stream: true,
+    });
+    expect(decoder.decode).toHaveBeenNthCalledWith(3);
+    expect(onData).toHaveBeenNthCalledWith(1, 'first');
+    expect(onData).toHaveBeenNthCalledWith(2, 'second');
   });
 
   it('cleans up streamed requests when the reader fails', async () => {

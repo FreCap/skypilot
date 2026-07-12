@@ -244,13 +244,18 @@ export const apiClient = {
         throw new Error(msg);
       }
       const reader = response.body.getReader();
+      const decoder = new TextDecoder();
 
       try {
         for (;;) {
           const { done, value } = await reader.read();
-          if (done) break;
-          const chunk = new TextDecoder().decode(value);
-          onData(chunk);
+          if (done) {
+            const trailingChunk = decoder.decode();
+            if (trailingChunk) onData(trailingChunk);
+            break;
+          }
+          const chunk = decoder.decode(value, { stream: true });
+          if (chunk) onData(chunk);
         }
       } catch (error) {
         console.error('Error in stream:', error);
