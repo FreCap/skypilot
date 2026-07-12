@@ -5,8 +5,24 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import pytest
 
 from sky import exceptions
+from sky.jobs import naming as job_naming
+from sky.jobs import queue_utils
 from sky.jobs import state as managed_job_state
 from sky.jobs import utils as jobs_utils
+
+
+class TestFacadeReexports:
+
+    def test_utils_reexports_queue_helpers(self):
+        assert jobs_utils.ManagedJobQueueResultType is (
+            queue_utils.ManagedJobQueueResultType)
+        assert jobs_utils.load_managed_job_queue is (
+            queue_utils.load_managed_job_queue)
+        assert jobs_utils.format_job_table is queue_utils.format_job_table
+
+    def test_utils_reexports_naming_helper(self):
+        assert jobs_utils.generate_managed_job_cluster_name is (
+            job_naming.generate_managed_job_cluster_name)
 
 
 class TestClusterHandleNotRequired:
