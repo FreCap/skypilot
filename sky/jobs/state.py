@@ -327,6 +327,11 @@ def create_table(engine: sqlalchemy.engine.Engine):
 _db_manager = db_utils.DatabaseManager('spot_jobs', create_table)
 
 
+def _supports_update_returning(engine: sqlalchemy.engine.Engine) -> bool:
+    """Whether UPDATE ... RETURNING is supported on the active dialect."""
+    return bool(getattr(engine.dialect, 'update_returning', False))
+
+
 async def _retry_session(operation):
     """Run `operation(session)` in a fresh async session with retry on
     transient DB errors. Use when a function has non-DB side effects
@@ -2744,21 +2749,31 @@ def claim_batch(job_id: int,
         if not _lock_batch_coordinator_owner(session, job_id, owner_token):
             session.rollback()
             return None
-        result = session.execute(
-            sqlalchemy.update(batch_state_table).where(
-                sqlalchemy.and_(
-                    batch_state_table.c.job_id == job_id,
-                    batch_state_table.c.batch_idx == batch_idx,
-                    batch_state_table.c.status == 'PENDING',
-                    sqlalchemy.or_(batch_state_table.c.next_retry_at.is_(None),
-                                   batch_state_table.c.next_retry_at <= now),
-                )).values(status='DISPATCHED',
-                          worker_cluster=worker_cluster,
-                          attempt_id=batch_state_table.c.attempt_id + 1,
-                          attempt_owner_token=owner_token,
-                          lease_expires_at=now + lease_duration,
-                          next_retry_at=None,
-                          updated_at=now))
+        update_stmt = sqlalchemy.update(batch_state_table).where(
+            sqlalchemy.and_(
+                batch_state_table.c.job_id == job_id,
+                batch_state_table.c.batch_idx == batch_idx,
+                batch_state_table.c.status == 'PENDING',
+                sqlalchemy.or_(batch_state_table.c.next_retry_at.is_(None),
+                               batch_state_table.c.next_retry_at <= now),
+            )).values(status='DISPATCHED',
+                      worker_cluster=worker_cluster,
+                      attempt_id=batch_state_table.c.attempt_id + 1,
+                      attempt_owner_token=owner_token,
+                      lease_expires_at=now + lease_duration,
+                      next_retry_at=None,
+                      updated_at=now)
+        if _supports_update_returning(engine):
+            claimed = session.execute(
+                update_stmt.returning(
+                    batch_state_table.c.attempt_id,
+                    batch_state_table.c.retry_count)).one_or_none()
+            session.commit()
+            if claimed is None:
+                return None
+            return int(claimed.attempt_id), int(claimed.retry_count)
+
+        result = session.execute(update_stmt)
         if result.rowcount != 1:
             session.commit()
             return None
@@ -2878,6 +2893,25 @@ def requeue_expired_batch_attempts(job_id: int,
         if not _lock_batch_coordinator_owner(session, job_id, owner_token):
             session.rollback()
             return reclaimed
+        if _supports_update_returning(engine):
+            rows = session.execute(
+                sqlalchemy.update(batch_state_table).where(
+                    sqlalchemy.and_(
+                        batch_state_table.c.job_id == job_id,
+                        batch_state_table.c.status == 'DISPATCHED',
+                        batch_state_table.c.attempt_owner_token.is_not(None),
+                        sqlalchemy.or_(
+                            batch_state_table.c.lease_expires_at.is_(None),
+                            batch_state_table.c.lease_expires_at <= now,
+                        ))).values(status='PENDING',
+                                   worker_cluster=None,
+                                   lease_expires_at=None,
+                                   next_retry_at=now,
+                                   updated_at=now).returning(
+                                       batch_state_table.c.batch_idx)).all()
+            session.commit()
+            return sorted(int(row.batch_idx) for row in rows)
+
         candidates = session.execute(
             sqlalchemy.select(
                 batch_state_table.c.batch_idx,
