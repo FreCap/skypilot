@@ -5,6 +5,7 @@ from typing import Optional
 
 import filelock
 import pytest
+import sqlalchemy
 from sqlalchemy import create_engine
 from sqlalchemy import orm
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -87,6 +88,21 @@ def _insert_job_info(engine,
         job_id = result.lastrowid
         session.commit()
         return job_id
+
+
+@contextlib.contextmanager
+def _count_sql_statements(engine):
+    counts = {'n': 0}
+
+    def _count(*args, **kwargs):
+        del args, kwargs
+        counts['n'] += 1
+
+    sqlalchemy.event.listen(engine, 'before_cursor_execute', _count)
+    try:
+        yield counts
+    finally:
+        sqlalchemy.event.remove(engine, 'before_cursor_execute', _count)
 
 
 def test_get_task_logs_to_clean_basic(_mock_managed_jobs_db_conn):
@@ -499,3 +515,55 @@ def test_get_nonterminal_job_ids_by_pool_grouped_all_terminal(
                   cluster_name='replica-x')
     _new_pool_job(engine, pool='pool-done', status=ManagedJobStatus.FAILED)
     assert not state.get_nonterminal_job_ids_by_pool_grouped('pool-done')
+
+
+def test_get_pending_jobs_count_by_pool_counts_distinct_jobs(
+        _mock_managed_jobs_db_conn):
+    """Pending queue length should count jobs once, even with many tasks."""
+    engine = state._db_manager.get_engine()
+
+    pending_multi_task = state.set_job_info_without_job_id(
+        name='pending-multi',
+        workspace='ws',
+        entrypoint='entry',
+        pool='pool-a',
+        pool_hash=None,
+        user_hash='u',
+    )
+    _insert_task(engine, pending_multi_task, 0, status=ManagedJobStatus.PENDING)
+    _insert_task(engine, pending_multi_task, 1, status=ManagedJobStatus.PENDING)
+
+    pending_single = _new_pool_job(engine,
+                                   pool='pool-a',
+                                   status=ManagedJobStatus.PENDING)
+    _new_pool_job(engine, pool='pool-a', status=ManagedJobStatus.RUNNING)
+    _new_pool_job(engine, pool='pool-a', status=ManagedJobStatus.SUCCEEDED)
+    _new_pool_job(engine, pool='pool-b', status=ManagedJobStatus.PENDING)
+
+    assert state.get_pending_jobs_count_by_pool('pool-a') == 2
+    assert state.get_pending_jobs_count_by_pool('pool-b') == 1
+    assert pending_multi_task != pending_single
+
+
+def test_get_pending_jobs_count_by_pool_uses_single_aggregate_query(
+        _mock_managed_jobs_db_conn):
+    """Queue length should stay one grouped query, not scale with tasks."""
+    engine = state._db_manager.get_engine()
+    pending_multi_task = state.set_job_info_without_job_id(
+        name='pending-multi-query-shape',
+        workspace='ws',
+        entrypoint='entry',
+        pool='pool-a',
+        pool_hash=None,
+        user_hash='u',
+    )
+    for task_id in range(50):
+        _insert_task(engine,
+                     pending_multi_task,
+                     task_id,
+                     status=ManagedJobStatus.PENDING)
+
+    with _count_sql_statements(engine) as counts:
+        assert state.get_pending_jobs_count_by_pool('pool-a') == 1
+
+    assert counts['n'] == 1, counts
