@@ -17,8 +17,7 @@ import tempfile
 import threading
 import time
 import typing
-from typing import (Any, Callable, Dict, Iterator, List, Optional, Sequence,
-                    Set, Tuple, TypeVar, Union)
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 import uuid
 
 import aiohttp
@@ -40,6 +39,7 @@ from sky import provision as provision_lib
 from sky import sky_logging
 from sky import skypilot_config
 from sky.adaptors import common as adaptors_common
+from sky.backends import skylet_rpc
 from sky.jobs import utils as managed_job_utils
 from sky.provision import common as provision_common
 from sky.provision import instance_setup
@@ -4868,165 +4868,8 @@ def open_ssh_tunnel(head_runner: Union[command_runner.SSHCommandRunner,
     return ssh_tunnel_proc
 
 
-T = TypeVar('T')
-
-
-def _raise_if_ctx_canceled() -> None:
-    """If we are running inside a cancelled SkyPilotContext, raise immediately.
-
-    Used between gRPC retry attempts so a context cancelled during the
-    backoff sleep does not silently start a new RPC that nobody is waiting
-    for.
-    """
-    ctx = context_lib.get()
-    if ctx is not None and ctx.is_canceled():
-        raise asyncio.CancelledError(
-            'SkyPilotContext cancelled during Skylet retry')
-
-
-def _cancelled_via_ctx(ctx: 'context_lib.SkyPilotContext',
-                       err: 'grpc.RpcError') -> bool:
-    """Did this RpcError come from ctx.cancel() firing our call.cancel()?"""
-    return ctx.is_canceled() and err.code() == grpc.StatusCode.CANCELLED
-
-
-def invoke_grpc_unary(method: Any, *args: Any, **kwargs: Any) -> Any:
-    """Call a gRPC unary method; cancel it on SkyPilotContext cancel.
-
-    Without this wrapper, ``method(request, timeout=...)`` blocks the worker
-    thread inside ``threading.Condition.wait()`` until the gRPC deadline
-    fires, even if the surrounding asyncio task has already been cancelled
-    and nobody is waiting for the result.
-
-    Using ``method.future(...)`` exposes the underlying call object, which
-    can be cancelled from any thread; we register that cancellation with the
-    active SkyPilotContext so it fires on client disconnect, request
-    cancellation, or any other code path that calls ``ctx.cancel()``.
-
-    When the surrounding ctx cancels the call, the gRPC ``CANCELLED``
-    ``RpcError`` is re-raised as ``asyncio.CancelledError`` so the request
-    executor classifies the request as CANCELLED rather than FAILED.
-
-    With no active context, this falls through to the plain blocking call.
-    ``*args`` / ``**kwargs`` are forwarded verbatim so callers can pass
-    ``metadata``, ``credentials``, ``wait_for_ready`` and other gRPC
-    options unchanged.
-    """
-    ctx = context_lib.get()
-    if ctx is None:
-        return method(*args, **kwargs)
-    call = method.future(*args, **kwargs)
-    ctx.register_cancel_callback(call.cancel)
-    try:
-        return call.result()
-    except grpc.RpcError as e:
-        if _cancelled_via_ctx(ctx, e):
-            raise asyncio.CancelledError(
-                'Skylet gRPC call cancelled via SkyPilotContext') from e
-        raise
-    finally:
-        ctx.unregister_cancel_callback(call.cancel)
-
-
-def invoke_grpc_streaming(method: Any, *args: Any,
-                          **kwargs: Any) -> Iterator[Any]:
-    """Call a gRPC unary-stream method; cancel it on SkyPilotContext cancel.
-
-    The streaming iterator returned by gRPC is a ``_MultiThreadedRendezvous``
-    whose ``.cancel()`` aborts the RPC and unblocks any thread stuck in
-    ``__next__``. We register that on the current SkyPilotContext so a
-    client disconnect tears the stream down instead of leaking a worker
-    thread until the (often absent) deadline.
-
-    When the surrounding ctx cancels the stream, the gRPC ``CANCELLED``
-    ``RpcError`` is re-raised as ``asyncio.CancelledError`` (same
-    rationale as ``invoke_grpc_unary``).
-
-    The returned generator unregisters the callback on completion or
-    error, so successful streams that outlive the cancel scope don't leak
-    the iterator's ``.cancel`` reference. ``*args`` / ``**kwargs`` are
-    forwarded verbatim.
-    """
-    ctx = context_lib.get()
-    call = method(*args, **kwargs)
-    if ctx is None:
-        yield from call
-        return
-    ctx.register_cancel_callback(call.cancel)
-    try:
-        yield from call
-    except grpc.RpcError as e:
-        if _cancelled_via_ctx(ctx, e):
-            raise asyncio.CancelledError(
-                'Skylet gRPC stream cancelled via SkyPilotContext') from e
-        raise
-    finally:
-        ctx.unregister_cancel_callback(call.cancel)
-
-
-def invoke_skylet_with_retries(func: Callable[..., T]) -> T:
-    """Generic helper for making Skylet gRPC requests.
-
-    This method handles the common pattern of:
-    1. Try the gRPC request
-    2. If SSH tunnel is closed, recreate it and retry
-    """
-    max_attempts = 5
-    backoff = common_utils.Backoff(initial_backoff=0.5)
-    last_exception: Optional[Exception] = None
-
-    for _ in range(max_attempts):
-        _raise_if_ctx_canceled()
-        try:
-            return func()
-        except grpc.RpcError as e:
-            last_exception = e
-            _handle_grpc_error(e, backoff.current_backoff())
-
-    raise exceptions.SkyletUnavailableError(
-        f'Failed to invoke Skylet after {max_attempts} attempts: {last_exception}'
-    ) from last_exception
-
-
-def invoke_skylet_streaming_with_retries(
-        stream_func: Callable[..., Iterator[T]]) -> Iterator[T]:
-    """Generic helper for making Skylet streaming gRPC requests."""
-    max_attempts = 3
-    backoff = common_utils.Backoff(initial_backoff=0.5)
-    last_exception: Optional[Exception] = None
-
-    for _ in range(max_attempts):
-        _raise_if_ctx_canceled()
-        try:
-            for response in stream_func():
-                yield response
-            return
-        except grpc.RpcError as e:
-            last_exception = e
-            _handle_grpc_error(e, backoff.current_backoff())
-
-    raise exceptions.SkyletUnavailableError(
-        f'Failed to stream Skylet response after {max_attempts} attempts'
-    ) from last_exception
-
-
-def _handle_grpc_error(e: 'grpc.RpcError', current_backoff: float) -> None:
-    if e.code() == grpc.StatusCode.INTERNAL:
-        with ux_utils.print_exception_no_traceback():
-            raise exceptions.SkyletInternalError(e.details())
-    elif e.code() == grpc.StatusCode.UNAVAILABLE:
-        details = e.details() or ''
-        if 'Connection refused' in details:
-            # Skylet is not running — retrying won't help.
-            raise exceptions.SkyletUnavailableError(
-                f'Skylet is not running (connection refused): {details}') from e
-        time.sleep(current_backoff)
-    elif e.code() == grpc.StatusCode.UNIMPLEMENTED or e.code(
-    ) == grpc.StatusCode.UNKNOWN:
-        # Handle backwards compatibility: old server doesn't implement this RPC.
-        # Let the caller fall back to legacy execution.
-        raise exceptions.SkyletMethodNotImplementedError(
-            f'gRPC method not implemented on server, falling back to legacy execution: {e.details()}'
-        )
-    else:
-        raise e
+invoke_grpc_unary = skylet_rpc.invoke_grpc_unary
+invoke_grpc_streaming = skylet_rpc.invoke_grpc_streaming
+invoke_skylet_with_retries = skylet_rpc.invoke_skylet_with_retries
+invoke_skylet_streaming_with_retries = (
+    skylet_rpc.invoke_skylet_streaming_with_retries)
