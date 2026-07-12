@@ -6,7 +6,7 @@ cloud spot (L4). The placer must fill the zero-cost tier COMPLETELY
 before spending on spot, pin each launch's accelerators/use_spot via its
 location, and pull load back when reserved capacity frees (TTL retry).
 """
-# pylint: disable=redefined-outer-name,protected-access,unused-variable
+# pylint: disable=import-outside-toplevel,redefined-outer-name,protected-access,unused-variable
 from unittest import mock
 
 import pytest
@@ -63,6 +63,32 @@ class TestZeroCostTierFirst:
         # again and immediately preferred.
         now[0] += spot_placer._PREEMPTION_RETRY_SECONDS_DEFAULT + 1
         assert placer.select_next_location([cheap_spot] * 10) == k8s
+
+
+class TestProvisionTimeoutWarning:
+    """The safety warning must use the task's effective timeout."""
+
+    def test_task_override_suppresses_false_global_warning(self, monkeypatch):
+        task_override = {'kubernetes': {'provision_timeout': 90}}
+        resource = mock.MagicMock(cluster_config_overrides=task_override)
+        task = mock.MagicMock(resources=[resource], num_nodes=1)
+        k8s = make_location('research-ctx', cloud_name='Kubernetes')
+        monkeypatch.setattr(spot_placer, '_get_possible_location_from_task',
+                            lambda _: [k8s])
+
+        get_timeout = mock.MagicMock(
+            side_effect=lambda *args, override_configs=None, **kwargs:
+            (override_configs['kubernetes']['provision_timeout']
+             if override_configs else 600))
+        monkeypatch.setattr(spot_placer.skypilot_config,
+                            'get_effective_region_config', get_timeout)
+        warning = mock.MagicMock()
+        monkeypatch.setattr(spot_placer.logger, 'warning', warning)
+
+        spot_placer.DynamicFallbackSpotPlacer(task)
+
+        warning.assert_not_called()
+        assert get_timeout.call_args.kwargs['override_configs'] == task_override
 
 
 class TestHeterogeneousLocations:

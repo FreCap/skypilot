@@ -644,7 +644,8 @@ class DynamicFallbackSpotPlacer(SpotPlacer,
                 cloud='kubernetes',
                 region=context,
                 keys=('provision_timeout',),
-                default_value=None)
+                default_value=None,
+                override_configs=self.resources.cluster_config_overrides)
             if timeout is None:
                 continue
             try:
