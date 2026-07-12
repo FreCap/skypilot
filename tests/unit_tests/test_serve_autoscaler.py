@@ -246,6 +246,70 @@ class TestAutoscalerVersionInitialization(unittest.TestCase):
         self.assertEqual(mock_from_spec.call_args.args[2], 7)
 
 
+class TestQueueLengthAutoscalerIdleReplicas(unittest.TestCase):
+    """Idle detection should use one grouped pool lookup."""
+
+    def _spec(self):
+        return types.SimpleNamespace(min_replicas=0,
+                                     max_replicas=10,
+                                     num_overprovision=None,
+                                     queue_length_threshold=1,
+                                     upscale_delay_seconds=None,
+                                     downscale_delay_seconds=None)
+
+    def _replica(self, replica_id, cluster_name):
+        info = mock.Mock(spec=replica_managers.ReplicaInfo)
+        info.replica_id = replica_id
+        info.cluster_name = cluster_name
+        info.version = 1
+        info.status = serve_state.ReplicaStatus.READY
+        return info
+
+    def test_idle_replicas_use_grouped_counts_once(self):
+        autoscaler = autoscalers.QueueLengthAutoscaler('pool-a',
+                                                       self._spec(),
+                                                       version=1)
+        replicas = [
+            self._replica(1, 'replica-1'),
+            self._replica(2, 'replica-2'),
+            self._replica(3, 'replica-3'),
+        ]
+
+        with mock.patch(
+                'sky.serve.autoscalers.managed_job_state.'
+                'get_nonterminal_job_counts_by_pool',
+                return_value={'replica-2': 2}) as grouped_counts, \
+             mock.patch(
+                 'sky.serve.autoscalers.managed_job_state.'
+                 'get_nonterminal_job_ids_by_pool') as per_replica_lookup:
+            idle = autoscaler._get_idle_replicas(replicas)
+
+        self.assertEqual([info.replica_id for info in idle], [1, 3])
+        grouped_counts.assert_called_once_with('pool-a')
+        per_replica_lookup.assert_not_called()
+
+    def test_idle_replicas_treat_zero_or_missing_counts_as_idle(self):
+        autoscaler = autoscalers.QueueLengthAutoscaler('pool-a',
+                                                       self._spec(),
+                                                       version=1)
+        replicas = [
+            self._replica(1, 'replica-1'),
+            self._replica(2, 'replica-2'),
+            self._replica(3, 'replica-3'),
+        ]
+
+        with mock.patch(
+                'sky.serve.autoscalers.managed_job_state.'
+                'get_nonterminal_job_counts_by_pool',
+                return_value={
+                    'replica-1': 0,
+                    'replica-2': 1,
+                }):
+            idle = autoscaler._get_idle_replicas(replicas)
+
+        self.assertEqual([info.replica_id for info in idle], [1, 3])
+
+
 class TestInstanceAwareGpuShapeCache(unittest.TestCase):
     """The GPU-shape memo must only cache a post-launch resolution.
 

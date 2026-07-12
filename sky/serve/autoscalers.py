@@ -2781,12 +2781,13 @@ class QueueLengthAutoscaler(_AutoscalerWithHysteresis):
         Returns:
             List of replicas that have no active jobs running on them.
         """
+        cluster_job_counts = (
+            managed_job_state.get_nonterminal_job_counts_by_pool(
+                self._service_name))
         idle_replicas = []
         for info in replica_infos:
-            # Check if this replica has any active jobs
-            active_jobs = managed_job_state.get_nonterminal_job_ids_by_pool(
-                self._service_name, cluster_name=info.cluster_name)
-            if not active_jobs:
+            active_job_count = cluster_job_counts.get(info.cluster_name, 0)
+            if active_job_count == 0:
                 idle_replicas.append(info)
                 logger.debug(
                     f'[QueueLengthAutoscaler] Replica {info.replica_id} '
@@ -2794,7 +2795,8 @@ class QueueLengthAutoscaler(_AutoscalerWithHysteresis):
             else:
                 logger.debug(
                     f'[QueueLengthAutoscaler] Replica {info.replica_id} '
-                    f'({info.cluster_name}) has {len(active_jobs)} active jobs,'
+                    f'({info.cluster_name}) has {active_job_count} active '
+                    'jobs,'
                     ' skipping for scale-down')
         return idle_replicas
 
