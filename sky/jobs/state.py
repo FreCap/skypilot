@@ -3149,8 +3149,9 @@ def get_num_alive_jobs(pool: Optional[str] = None) -> int:
 def get_pending_jobs_count_by_pool(pool: str) -> int:
     """Get the count of pending jobs in a pool.
 
-    Pending jobs are jobs that are waiting for a worker, i.e., jobs with:
-    - status = PENDING
+    Pending jobs are distinct managed jobs that are waiting for a worker.
+    A single job can contribute multiple task rows while it remains queued, so
+    the queue length must count unique job IDs instead of raw task rows.
 
     Args:
         pool: The pool name
@@ -3160,17 +3161,18 @@ def get_pending_jobs_count_by_pool(pool: str) -> int:
     """
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
-        # Join job_info_table with spot_table to get status
+        # pylint: disable=not-callable
         query = sqlalchemy.select(
-            sqlalchemy.func.count()  # pylint: disable=not-callable
-        ).select_from(
-            job_info_table.join(
-                spot_table, job_info_table.c.spot_job_id ==
-                spot_table.c.spot_job_id)).where(
-                    sqlalchemy.and_(
-                        spot_table.c.status == ManagedJobStatus.PENDING.value,
-                        job_info_table.c.pool == pool,
-                    ))
+            sqlalchemy.func.count(
+                spot_table.c.spot_job_id.distinct())).select_from(
+                    job_info_table.join(
+                        spot_table, job_info_table.c.spot_job_id ==
+                        spot_table.c.spot_job_id)).where(
+                            sqlalchemy.and_(
+                                spot_table.c.status ==
+                                ManagedJobStatus.PENDING.value,
+                                job_info_table.c.pool == pool,
+                            ))
         result = session.execute(query).fetchone()
         return result[0] if result else 0
 
