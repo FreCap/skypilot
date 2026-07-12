@@ -44,6 +44,20 @@ class TestGetJobStatusCheckState:
             assert info['controller_pid'] == tasks[0]['controller_pid']
             assert info['controller_pid_started_at'] == tasks[0].get(
                 'controller_pid_started_at')
+            assert info['all_tasks_terminal'] == all(
+                task['status'].is_terminal() for task in tasks)
+
+    def test_tracks_terminality_across_multi_task_jobs(self,
+                                                       _seed_multi_task_job):
+        pipeline_id = _seed_multi_task_job['pipeline_job_id']
+        pipeline_info = state.get_job_status_check_state(pipeline_id)
+        assert pipeline_info is not None
+        assert pipeline_info['all_tasks_terminal'] is False
+
+        failed_job_id = _seed_multi_task_job['failed_job_id']
+        failed_info = state.get_job_status_check_state(failed_job_id)
+        assert failed_info is not None
+        assert failed_info['all_tasks_terminal'] is True
 
 
 class TestHasJobsRequiringRecoveryGraceWait:
