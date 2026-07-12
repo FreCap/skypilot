@@ -1039,6 +1039,81 @@ class TestServiceSchema(unittest.TestCase):
     def setUp(self):
         self.service_schema = schemas.get_service_schema()
 
+    def test_characterizes_public_service_fields(self):
+        self.assertEqual(
+            set(self.service_schema['properties']), {
+                'readiness_probe',
+                'graceful_drain_seconds',
+                'graceful_drain_async_occupancy',
+                'load_balancer',
+                'pool',
+                'replica_policy',
+                'ports',
+                'replicas',
+                'workers',
+                'load_balancing_policy',
+                'tls',
+            })
+        self.assertFalse(self.service_schema['additionalProperties'])
+
+    def test_characterizes_nested_service_config(self):
+        config = {
+            'readiness_probe': {
+                'path': '/health',
+                'initial_delay_seconds': 5,
+                'timeout_seconds': 10,
+                'endpoint_probe_interval_seconds': 2,
+                'consecutive_failure_threshold_timeout': 30,
+                'post_data': {
+                    'ready': True,
+                },
+                'headers': {
+                    'Authorization': 'Bearer token',
+                },
+            },
+            'graceful_drain_seconds': 120,
+            'graceful_drain_async_occupancy': True,
+            'load_balancer': {
+                'stream_timeout_seconds': 240,
+                'retriable_status_codes': [429, 503],
+                'max_retries': 3,
+                'retry_initial_backoff_seconds': 0.5,
+            },
+            'pool': {
+                'workers': 4,
+                'min_workers': 1,
+                'queue_length_threshold': 2,
+                'max_workers': 8,
+                'upscale_delay_seconds': 1,
+                'downscale_delay_seconds': 30,
+            },
+            'replica_policy': {
+                'min_replicas': 1,
+                'max_replicas': 4,
+                'num_overprovision': 1,
+                'target_qps_per_replica': {
+                    'L4:1': 2,
+                },
+                'reserved_capacity_fill': {
+                    'floor_replicas': 1,
+                    'weight': 2,
+                },
+                'dynamic_ondemand_fallback': True,
+                'base_ondemand_fallback_replicas': 1,
+                'upscale_delay_seconds': 1,
+                'downscale_delay_seconds': 30,
+            },
+            'ports': 8080,
+            'replicas': 2,
+            'workers': 1,
+            'tls': {
+                'keyfile': '/tmp/key.pem',
+                'certfile': '/tmp/cert.pem',
+            },
+        }
+
+        jsonschema.validate(instance=config, schema=self.service_schema)
+
     def test_valid_load_balancer_config(self):
         config = {
             'readiness_probe': '/',
