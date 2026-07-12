@@ -29,15 +29,15 @@ jest.mock('react-chartjs-2', () => ({
     </div>
   ),
 }));
+jest.mock('@/data/connectors/client', () => ({
+  getCurrentUserRole: jest.fn(),
+}));
 jest.mock('@/data/connectors/estimated_spend', () => ({
-  getCurrentRole: jest.fn(),
   getEstimatedSpend: jest.fn(),
 }));
 
-import {
-  getCurrentRole,
-  getEstimatedSpend,
-} from '@/data/connectors/estimated_spend';
+import { getCurrentUserRole } from '@/data/connectors/client';
+import { getEstimatedSpend } from '@/data/connectors/estimated_spend';
 import { EstimatedSpend } from '@/components/estimated-spend';
 
 function deferred() {
@@ -72,7 +72,7 @@ function response(days, estimatedCost) {
 
 test('keeps the newest range when an older request finishes last', async () => {
   const requests = new Map();
-  getCurrentRole.mockResolvedValue({ role: 'admin' });
+  getCurrentUserRole.mockResolvedValue({ role: 'admin' });
   getEstimatedSpend.mockImplementation((days, groupBy) => {
     const request = deferred();
     requests.set(`${days}:${groupBy}`, request);
@@ -95,12 +95,12 @@ test('keeps the newest range when an older request finishes last', async () => {
   });
   expect(screen.getAllByText('$90.00')).toHaveLength(2);
   expect(screen.queryAllByText('$30.00')).toHaveLength(0);
-  expect(getCurrentRole).toHaveBeenCalledTimes(2);
+  expect(getCurrentUserRole).toHaveBeenCalledTimes(2);
   expect(getEstimatedSpend).toHaveBeenCalledTimes(2);
 });
 
 test('groups the chart and table by user with purchase-option costs', async () => {
-  getCurrentRole.mockResolvedValue({ role: 'admin' });
+  getCurrentUserRole.mockResolvedValue({ role: 'admin' });
   getEstimatedSpend.mockImplementation(async (days, groupBy) => {
     if (groupBy === 'user') {
       return {
@@ -153,7 +153,7 @@ test('groups the chart and table by user with purchase-option costs', async () =
 });
 
 test('shows spot and on-demand as purchase-option groups', async () => {
-  getCurrentRole.mockResolvedValue({ role: 'admin' });
+  getCurrentUserRole.mockResolvedValue({ role: 'admin' });
   getEstimatedSpend.mockImplementation(async (days, groupBy) => {
     if (groupBy === 'purchase_option') {
       return {
@@ -204,7 +204,7 @@ test('shows spot and on-demand as purchase-option groups', async () => {
 });
 
 test('does not invent purchase-option costs for a legacy server response', async () => {
-  getCurrentRole.mockResolvedValue({ role: 'admin' });
+  getCurrentUserRole.mockResolvedValue({ role: 'admin' });
   const legacyResponse = response(30, 10);
   delete legacyResponse.group_by;
   delete legacyResponse.groups;

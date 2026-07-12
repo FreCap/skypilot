@@ -26,20 +26,49 @@ function withVersionHeader(headers) {
 }
 
 // Cache for current user info
-let cachedUserInfo = null;
-let userInfoPromise = null;
+const CURRENT_USER_CACHE_TTL_MS = 5 * 60 * 1000;
+let cachedCurrentUser = null;
+let cachedCurrentUserAt = 0;
+let currentUserPromise = null;
 
-// Fetch and cache the current user info
-export async function getCurrentUserInfo() {
-  if (cachedUserInfo) {
-    return cachedUserInfo;
+function normalizeCurrentUser(data) {
+  const id = data?.id || 'local';
+  return {
+    id,
+    name: data?.name || id || 'local',
+    role: data?.role || null,
+  };
+}
+
+function hasFreshCurrentUserCache() {
+  return (
+    cachedCurrentUser !== null &&
+    Date.now() - cachedCurrentUserAt < CURRENT_USER_CACHE_TTL_MS
+  );
+}
+
+function cacheCurrentUser(data) {
+  cachedCurrentUser = normalizeCurrentUser(data);
+  cachedCurrentUserAt = Date.now();
+  return cachedCurrentUser;
+}
+
+export function resetCurrentUserCacheForTests() {
+  cachedCurrentUser = null;
+  cachedCurrentUserAt = 0;
+  currentUserPromise = null;
+}
+
+export async function getCurrentUserRole() {
+  if (hasFreshCurrentUserCache()) {
+    return cachedCurrentUser;
   }
 
-  if (userInfoPromise) {
-    return userInfoPromise;
+  if (currentUserPromise) {
+    return currentUserPromise;
   }
 
-  userInfoPromise = (async () => {
+  currentUserPromise = (async () => {
     try {
       const baseUrl = window.location.origin;
       const response = await fetch(`${baseUrl}/internal/dashboard/users/role`, {
@@ -47,22 +76,26 @@ export async function getCurrentUserInfo() {
       });
       if (response.ok) {
         const data = await response.json();
-        cachedUserInfo = {
-          id: data.id || 'local',
-          name: data.name || data.id || 'local',
-        };
-      } else {
-        // Not authenticated or error - use 'local' as fallback
-        cachedUserInfo = { id: 'local', name: 'local' };
+        return cacheCurrentUser(data);
       }
     } catch (error) {
-      console.error('Failed to get user info:', error);
-      cachedUserInfo = { id: 'local', name: 'local' };
+      console.error('Failed to get user role:', error);
+    } finally {
+      currentUserPromise = null;
     }
-    return cachedUserInfo;
+    return cacheCurrentUser(null);
   })();
 
-  return userInfoPromise;
+  return currentUserPromise;
+}
+
+// Fetch and cache the current user info
+export async function getCurrentUserInfo() {
+  const currentUser = await getCurrentUserRole();
+  return {
+    id: currentUser.id,
+    name: currentUser.name,
+  };
 }
 
 // Wait for plugins that need early initialization (e.g., fetch interceptors)
