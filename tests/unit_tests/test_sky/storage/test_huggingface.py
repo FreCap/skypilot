@@ -1,5 +1,6 @@
 """Unit tests for the Hugging Face Buckets storage backend."""
 # pylint: disable=protected-access
+import shlex
 from unittest import mock
 
 import pytest
@@ -11,6 +12,7 @@ from sky.adaptors import huggingface
 from sky.data import data_utils
 from sky.data import mounting_utils
 from sky.data import storage
+from sky.data import storage_huggingface
 
 
 class TestSplitHfPath:
@@ -123,6 +125,9 @@ class TestSplitHfRepoPath:
 
 class TestStoreTypeHf:
     """Tests for StoreType.HF enum behavior."""
+
+    def test_storage_reexports_backend_class(self):
+        assert storage.HuggingFaceStore is storage_huggingface.HuggingFaceStore
 
     def test_enum_value(self):
         assert storage.StoreType.HF.value == 'HF'
@@ -437,7 +442,7 @@ class TestHfMountCommands:
             'user/bucket',
             '/mnt/data',
             extra_args=['--cache-dir', '/mnt/my cache'])
-        assert "'/mnt/my cache'" in cmd
+        assert shlex.quote('/mnt/my cache') in cmd
 
 
 class TestStorageIntegration:
@@ -473,7 +478,7 @@ class TestStorageIntegration:
     @mock.patch(
         'sky.data.storage.global_user_state.get_handle_from_storage_name',
         return_value=None)
-    @mock.patch('sky.data.storage._is_storage_cloud_enabled', return_value=True)
+    @mock.patch('sky.data.storage.hf_storage_cloud_enabled', return_value=True)
     @mock.patch('sky.data.storage.huggingface.get_token', return_value='token')
     @mock.patch('sky.data.storage.huggingface.api')
     def test_bucket_source_construct_infers_name_and_sub_path(
@@ -575,11 +580,11 @@ class TestHfCredentials:
         # a missing transitive dependency, etc.). The hint must surface that
         # error instead of unconditionally blaming the token.
         mock_api.return_value.whoami.side_effect = RuntimeError(
-            "the 'socksio' package is not installed")
+            'the \'socksio\' package is not installed')
         ok, hint = huggingface.check_storage_credentials()
         assert ok is False
         assert 'Details:' in hint
-        assert "the 'socksio' package is not installed" in hint
+        assert 'the \'socksio\' package is not installed' in hint
         # The token refresh must be presented as conditional, not the only
         # possible cause.
         assert 'If your token is expired' in hint
@@ -617,7 +622,7 @@ class TestHfCloudStorage:
         command = cloud_stores.HFCloudStorage().make_sync_dir_command(
             'hf://datasets/ns/ds@main/subdir', '/tmp/ds')
         assert 'snapshot_download' in command
-        assert "'dataset'" in command
+        assert shlex.quote('dataset') in command
         assert 'subdir/*' in command
         # ``snapshot_download`` preserves repo-relative paths, so a sub-path
         # source must stage into a temp dir and move only the sub-path
