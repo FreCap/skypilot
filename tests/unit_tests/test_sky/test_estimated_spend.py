@@ -36,6 +36,10 @@ class _FakeResources:
     def get_cost(self, seconds: int) -> float:
         return self.hourly_cost * seconds / estimated_spend.SECONDS_PER_HOUR
 
+    def __repr__(self) -> str:
+        return (f'_FakeResources(hourly_cost={self.hourly_cost!r}, '
+                f'cloud={self.cloud!r}, use_spot={self.use_spot!r})')
+
 
 class _MinimalHandle:
     """Just enough cluster state for attribution persistence tests."""
