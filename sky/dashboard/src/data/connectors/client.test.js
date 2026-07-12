@@ -5,19 +5,44 @@ import {
   VERSION_HEADER,
 } from '@/data/connectors/constants';
 import {
+  apiClient,
   getCurrentUserInfo,
   getCurrentUserRole,
   resetCurrentUserCacheForTests,
 } from '@/data/connectors/client';
+import {
+  getRequestActivitySnapshot,
+  resetRequestActivityForTests,
+} from '@/lib/request-activity';
 
 describe('current user cache', () => {
   beforeEach(() => {
     resetCurrentUserCacheForTests();
+    resetRequestActivityForTests();
     global.fetch.mockReset();
   });
 
   afterEach(() => {
+    resetRequestActivityForTests();
     jest.restoreAllMocks();
+  });
+
+  it('tracks dashboard client calls while they are in flight', async () => {
+    let resolveResponse;
+    global.fetch.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveResponse = resolve;
+        })
+    );
+
+    const responsePromise = apiClient.get('/api/health');
+    expect(getRequestActivitySnapshot().inFlight).toBe(1);
+    expect(getRequestActivitySnapshot().history.at(-1).count).toBe(1);
+
+    resolveResponse({ ok: true });
+    await expect(responsePromise).resolves.toEqual({ ok: true });
+    expect(getRequestActivitySnapshot().inFlight).toBe(0);
   });
 
   it('dedupes concurrent role and info lookups to one request', async () => {
