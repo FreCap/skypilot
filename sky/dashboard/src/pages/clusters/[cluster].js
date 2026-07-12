@@ -63,6 +63,80 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 
+function findHistoricalCluster(historyData, cluster) {
+  return (
+    historyData.find((c) => c.cluster_hash === cluster) ||
+    historyData.find((c) => c.cluster === cluster) ||
+    null
+  );
+}
+
+export function useHistoricalClusterLookup({
+  cluster,
+  clusterData,
+  clusterDetailsLoading,
+}) {
+  const [historyData, setHistoryData] = useState(null);
+  const [isHistoricalCluster, setIsHistoricalCluster] = useState(false);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const requestVersionRef = useRef(0);
+
+  useEffect(() => {
+    if (!cluster || clusterDetailsLoading || clusterData) {
+      requestVersionRef.current += 1;
+      setHistoryData(null);
+      setIsHistoricalCluster(false);
+      setHistoryLoading(false);
+      return;
+    }
+
+    const requestVersion = requestVersionRef.current + 1;
+    requestVersionRef.current = requestVersion;
+    const isCurrentRequest = () => requestVersionRef.current === requestVersion;
+
+    setHistoryLoading(true);
+    setHistoryData(null);
+    setIsHistoricalCluster(false);
+
+    async function checkHistoryCluster() {
+      try {
+        // The URL parameter may be either a cluster hash (when navigated
+        // from the historical clusters list) or a cluster name (when the
+        // user opened the active cluster page and the cluster was later
+        // torn down via `sky down`). Send both filters; the server returns
+        // rows matching either, which resolves the cluster in a single
+        // round trip without fetching the entire history (which can
+        // contain tens of thousands of rows).
+        const historyRows = await dashboardCache.get(getClusterHistory, [
+          cluster,
+          30,
+          cluster,
+        ]);
+        if (!isCurrentRequest()) {
+          return;
+        }
+        const foundHistoryCluster = findHistoricalCluster(historyRows, cluster);
+        if (foundHistoryCluster) {
+          setHistoryData(foundHistoryCluster);
+          setIsHistoricalCluster(true);
+        }
+      } catch (error) {
+        if (isCurrentRequest()) {
+          console.error('Error fetching cluster history:', error);
+        }
+      } finally {
+        if (isCurrentRequest()) {
+          setHistoryLoading(false);
+        }
+      }
+    }
+
+    checkHistoryCluster();
+  }, [cluster, clusterData, clusterDetailsLoading]);
+
+  return { historyData, isHistoricalCluster, historyLoading };
+}
+
 function ClusterDetails() {
   const router = useRouter();
   const { cluster } = router.query; // Access the dynamic part of the URL
@@ -71,9 +145,6 @@ function ClusterDetails() {
   const [isInitialLoad, setIsInitialLoad] = useState(true);
   const [isSSHModalOpen, setIsSSHModalOpen] = useState(false);
   const [isVSCodeModalOpen, setIsVSCodeModalOpen] = useState(false);
-  const [historyData, setHistoryData] = useState(null);
-  const [isHistoricalCluster, setIsHistoricalCluster] = useState(false);
-  const [historyLoading, setHistoryLoading] = useState(false);
   // Counter incremented on refresh to force telemetry iframes to reload.
   // When this value changes, the iframe key changes, causing React to remount the iframe.
   const [telemetryRefreshTrigger, setTelemetryRefreshTrigger] = useState(0);
@@ -87,6 +158,12 @@ function ClusterDetails() {
     refreshData,
     refreshClusterJobsOnly,
   } = useClusterDetails({ cluster });
+  const { historyData, isHistoricalCluster, historyLoading } =
+    useHistoricalClusterLookup({
+      cluster,
+      clusterData,
+      clusterDetailsLoading,
+    });
 
   // Telemetry state
   const [isGrafanaAvailable, setIsGrafanaAvailable] = useState(false);
@@ -106,48 +183,6 @@ function ClusterDetails() {
       setIsInitialLoad(false);
     }
   }, [clusterDetailsLoading, isInitialLoad]);
-
-  // Check for historical cluster if active cluster is not found
-  React.useEffect(() => {
-    const checkHistoryCluster = async () => {
-      if (!cluster || clusterDetailsLoading || clusterData) return;
-
-      setHistoryLoading(true);
-      try {
-        // The URL parameter may be either a cluster hash (when navigated
-        // from the historical clusters list) or a cluster name (when the
-        // user opened the active cluster page and the cluster was later
-        // torn down via `sky down`). Send both filters; the server returns
-        // rows matching either, which resolves the cluster in a single
-        // round trip without fetching the entire history (which can
-        // contain tens of thousands of rows).
-        const historyData = await dashboardCache.get(getClusterHistory, [
-          cluster,
-          30,
-          cluster,
-        ]);
-        // Prefer an exact hash match; otherwise fall back to a name match.
-        // A reused cluster name can produce multiple history rows, in which
-        // case the most recent (server-ordered by launched_at desc) wins.
-        const foundHistoryCluster =
-          historyData.find((c) => c.cluster_hash === cluster) ||
-          historyData.find((c) => c.cluster === cluster);
-        if (foundHistoryCluster) {
-          setHistoryData(foundHistoryCluster);
-          setIsHistoricalCluster(true);
-        }
-      } catch (error) {
-        console.error('Error fetching cluster history:', error);
-      } finally {
-        setHistoryLoading(false);
-      }
-    };
-
-    // Only check history if we've finished loading and no active cluster found
-    if (!clusterDetailsLoading && !clusterData) {
-      checkHistoryCluster();
-    }
-  }, [cluster, clusterDetailsLoading, clusterData]);
 
   const handleManualRefresh = async () => {
     setIsRefreshing(true);
