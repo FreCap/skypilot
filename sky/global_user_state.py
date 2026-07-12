@@ -1743,7 +1743,14 @@ def get_glob_cluster_names(
 @db_retries.retry
 @metrics_lib.time_me
 def set_cluster_status(cluster_name: str,
-                       status: status_lib.ClusterStatus) -> None:
+                       status: status_lib.ClusterStatus) -> int:
+    """Sets the status of a cluster.
+
+    Returns:
+        The status_updated_at timestamp written to the database, so callers
+        holding the cluster lock can patch an in-memory record instead of
+        re-reading the full row.
+    """
     engine = _db_manager.get_engine()
     current_time = int(time.time())
     with orm.Session(engine) as session:
@@ -1756,6 +1763,7 @@ def set_cluster_status(cluster_name: str,
     assert count <= 1, count
     if count == 0:
         raise ValueError(f'Cluster {cluster_name} not found.')
+    return current_time
 
 
 @metrics_lib.time_me
