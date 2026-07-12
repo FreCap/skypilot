@@ -1535,11 +1535,13 @@ def status(
         summary_only=summary_only,
         include_target_num_replicas=include_target_num_replicas)
 
-    # Get the endpoint for each service
+    # Keep summary-only requests on the cheap DB-only path: callers that opt
+    # out of replica detail should not pay an extra per-service Kubernetes
+    # read just to hydrate endpoint strings.
     for service_record in service_records:
         service_record['endpoint'] = None
         # Pool doesn't have an endpoint.
-        if pool:
+        if pool or summary_only:
             continue
         if service_record['load_balancer_port'] is not None:
             # load_balancer_port remains the registration sentinel exposed by

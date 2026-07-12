@@ -297,6 +297,33 @@ class TestStatusDelegatesToRunner:
             'endpoint': None,
         }]
 
+    def test_summary_only_skips_external_service_endpoint_resolution(self):
+        records = [{
+            'name': 'svc-a',
+            'load_balancer_port': 30001,
+            'tls_encrypted': False,
+        }, {
+            'name': 'svc-b',
+            'load_balancer_port': 30001,
+            'tls_encrypted': False,
+        }]
+        runner = mock.Mock()
+        runner.get_service_status.return_value = records
+        serve_runner.register(runner)
+
+        with contextlib.ExitStack() as stack:
+            for p in self._common_patches():
+                stack.enter_context(p)
+            external_endpoint = stack.enter_context(
+                mock.patch.object(impl.lb_k8s,
+                                  'lb_service_endpoint_or_none',
+                                  side_effect=AssertionError(
+                                      'summary-only endpoint resolution')))
+            result = impl.status(pool=False, summary_only=True)
+
+        assert [record['endpoint'] for record in result] == [None, None]
+        external_endpoint.assert_not_called()
+
     @pytest.mark.parametrize('tls_encrypted', [False, True])
     def test_status_uses_only_external_service_endpoint(self, tls_encrypted):
         records = [{
