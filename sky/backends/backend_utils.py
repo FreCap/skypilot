@@ -4595,7 +4595,8 @@ def _get_endpoints_from_cluster_record(
         cluster: str,
         cluster_record: Dict[str, Any],
         port: Optional[int] = None,
-        skip_status_check: bool = False) -> Dict[int, str]:
+        skip_status_check: bool = False,
+        provider_config: Optional[Dict[str, Any]] = None) -> Dict[int, str]:
     """Gets endpoints for a cluster from an already-fetched cluster record."""
     if (not skip_status_check and cluster_record['status']
             not in (status_lib.ClusterStatus.UP,
@@ -4636,12 +4637,14 @@ def _get_endpoints_from_cluster_record(
             raise ValueError('Querying endpoints is not supported '
                              f'for {cluster!r} on {cloud}.') from None
 
-    config = global_user_state.get_cluster_yaml_dict(handle.cluster_yaml)
+    if provider_config is None:
+        config = global_user_state.get_cluster_yaml_dict(handle.cluster_yaml)
+        provider_config = config['provider']
     port_details = provision_lib.query_ports(repr(cloud),
                                              handle.cluster_name_on_cloud,
                                              handle.launched_resources.ports,
                                              head_ip=handle.head_ip,
-                                             provider_config=config['provider'])
+                                             provider_config=provider_config)
 
     launched_resources = handle.launched_resources.assert_launchable()
     # Validation before returning the endpoints
@@ -4690,7 +4693,8 @@ def get_endpoints(
         cluster: str,
         port: Optional[Union[int, str]] = None,
         skip_status_check: bool = False,
-        cluster_record: Optional[Dict[str, Any]] = None) -> Dict[int, str]:
+        cluster_record: Optional[Dict[str, Any]] = None,
+        provider_config: Optional[Dict[str, Any]] = None) -> Dict[int, str]:
     """Gets the endpoint for a given cluster and port number (endpoint).
 
     Args:
@@ -4705,6 +4709,8 @@ def get_endpoints(
             the controller may be in INIT status due to a concurrent launch).
         cluster_record: Optional pre-fetched cluster record to reuse instead
             of looking it up again.
+        provider_config: Optional pre-fetched provider block from the cluster
+            YAML. Supplying it avoids another cluster-YAML database read.
 
     Returns: A dictionary of port numbers to endpoints. If endpoint is None,
         the dictionary will contain all ports:endpoints exposed on the cluster.
@@ -4736,7 +4742,11 @@ def get_endpoints(
         cluster_record = cluster_records[0]
 
     return _get_endpoints_from_cluster_record(
-        cluster, cluster_record, port=port, skip_status_check=skip_status_check)
+        cluster,
+        cluster_record,
+        port=port,
+        skip_status_check=skip_status_check,
+        provider_config=provider_config)
 
 
 def cluster_status_lock_id(cluster_name: str) -> str:

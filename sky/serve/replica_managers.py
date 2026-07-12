@@ -787,6 +787,7 @@ class ReplicaInfo:
         self,
         cluster_record: Any = _NOT_PROVIDED,
         handle: Optional[backends.CloudVmRayResourceHandle] = None,
+        provider_config: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         if handle is None:
             if cluster_record is _NOT_PROVIDED:
@@ -809,6 +810,8 @@ class ReplicaInfo:
             if (cluster_record is not _NOT_PROVIDED and
                     cluster_record is not None):
                 endpoint_kwargs['cluster_record'] = cluster_record
+            if provider_config is not None:
+                endpoint_kwargs['provider_config'] = provider_config
             endpoint_dict = backend_utils.get_endpoints(self.cluster_name,
                                                         replica_port_int,
                                                         **endpoint_kwargs)

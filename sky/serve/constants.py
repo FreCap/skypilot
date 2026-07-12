@@ -145,15 +145,20 @@ UPDATE_SERVICE_TIMEOUT_SECONDS = 600
 LB_CONTROLLER_SYNC_INTERVAL_SECONDS = 20
 
 # [boltz fork] The timeout in seconds for the load balancer to sync with the
-# controller (raised from the previous inline 5s).
-# The controller's load_balancer_sync handler can be slow under a launch storm
-# (the launch threads contend on the same database); a timeout that is too
-# tight makes the sync fail, leaving the load balancer with an empty
-# ready-replica list so it 503s every request even when READY replicas exist.
-LB_CONTROLLER_SYNC_TIMEOUT_SECONDS = 30
+# controller (raised from the previous inline 5s). A cold 215-replica routing
+# snapshot measured 14s even after batching cluster-record reads; endpoint
+# resolution scales with the READY fleet and is expected to take ~33s at the
+# supported 500-replica ceiling. Keep a bounded 60s outer budget so a new LB
+# can become ready during a fleet-scale rollout without masking real hangs.
+LB_CONTROLLER_SYNC_TIMEOUT_SECONDS = 60
 # The API-service proxy must finish before the LB's outer timeout. Leave a
 # five-second budget for its owner reads and response forwarding.
-LB_CONTROLLER_PROXY_TIMEOUT_SECONDS = 25
+LB_CONTROLLER_PROXY_TIMEOUT_SECONDS = 55
+
+# Lightweight controller-child supervision endpoint.  Do not use
+# /autoscaler/info for liveness: serializing a large fleet is legitimate work
+# and can exceed the parent's tight health-check timeout during launch storms.
+CONTROLLER_HEALTH_ENDPOINT_PATH = '/controller/health'
 
 # [boltz fork] Cadence of the LB's per-replica async-occupancy probe (the
 # `async_capacity` action). The HTTP-envelope in-flight accounting reads ~0

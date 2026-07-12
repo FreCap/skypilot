@@ -18,6 +18,7 @@ import fastapi
 from fastapi import responses
 import uvicorn
 
+from sky import global_user_state
 from sky import serve
 from sky import sky_logging
 from sky.serve import autoscalers
@@ -131,6 +132,14 @@ class SkyServeController:
         # newer one; this lock prevents two accepted handlers from interleaving
         # between their durable commit and runtime application.
         self._update_lock = threading.Lock()
+        # Serialize LB snapshots while resolving a cold replica cache in the
+        # threadpool. Concurrent LB Pods can overlap during a rollout; without
+        # this lock they would duplicate the fleet-wide endpoint work and race
+        # to replace the shared routing/translation caches. Create the asyncio
+        # lock lazily inside the running server loop: on Python 3.9 eager lock
+        # construction fails if an earlier asyncio.run() closed the thread's
+        # current loop.
+        self._lb_sync_lock: Optional[asyncio.Lock] = None
         self._controller_owner_fingerprint = controller_owner_fingerprint
         self._is_pool = service_spec.pool
         self._replica_manager: replica_managers.ReplicaManager = (
@@ -251,11 +260,11 @@ class SkyServeController:
     ) -> Tuple[Dict[str, Dict[str, str]], int]:
         """Build the url -> replica info mapping for load_balancer_sync.
 
-        [boltz fork] Resolving a replica's url and gpu_type is expensive (a
-        cluster handle fetch plus, for the url, an endpoint query against a
-        database the launch threads contend on), so both are cached per
-        replica for the replica's lifetime: only newly-READY replicas are
-        resolved on a sync.
+        [boltz fork] Resolving a replica's url and gpu_type is expensive, so
+        cluster records and provider configs for newly-READY replicas are each
+        fetched in one batched lookup. The resulting endpoint/accelerator data
+        is cached for the replica's lifetime. A warm sync performs neither
+        lookup.
         A brand-new replica whose gpu_type cannot be resolved yet is reported
         as 'unknown' until it is.
 
@@ -284,15 +293,63 @@ class SkyServeController:
         active_versions = set(record['active_versions'])
         replica_cache: Dict[int, Tuple[str, str, int]] = {}
         replica_info: Dict[str, Dict[str, str]] = {}
-        num_ready = 0
-        for info in replica_infos:
-            if (info.status != serve_state.ReplicaStatus.READY or
-                    info.version not in active_versions):
+        ready_infos = [
+            info for info in replica_infos
+            if (info.status == serve_state.ReplicaStatus.READY and
+                info.version in active_versions)
+        ]
+        uncached_cluster_names = [
+            info.cluster_name
+            for info in ready_infos
+            if info.replica_id not in self._lb_replica_cache
+        ]
+        cluster_records: Dict[str, Optional[Dict[str, Any]]] = {}
+        if uncached_cluster_names:
+            cluster_records = global_user_state.get_clusters_from_names(
+                uncached_cluster_names)
+
+        # get_endpoints normally reads and parses each cluster YAML to obtain
+        # its provider config. That is another fleet-sized DB N+1. Reuse the
+        # records above to collect the YAML paths, then fetch all YAMLs in one
+        # query before resolving endpoints.
+        uncached_handles: Dict[int, Any] = {}
+        yaml_replica_ids: List[int] = []
+        yaml_paths: List[str] = []
+        for info in ready_infos:
+            if info.replica_id in self._lb_replica_cache:
                 continue
-            num_ready += 1
+            cluster_record = cluster_records.get(info.cluster_name)
+            if cluster_record is None:
+                continue
+            handle = info.handle(cluster_record)
+            uncached_handles[info.replica_id] = handle
+            cluster_yaml = getattr(handle, 'cluster_yaml', None)
+            if cluster_yaml is not None:
+                yaml_replica_ids.append(info.replica_id)
+                yaml_paths.append(cluster_yaml)
+        provider_configs: Dict[int, Dict[str, Any]] = {}
+        if yaml_paths:
+            yaml_configs = global_user_state.get_cluster_yaml_dict_multiple(
+                yaml_paths)
+            provider_configs = {
+                replica_id: config['provider']
+                for replica_id, config in zip(yaml_replica_ids, yaml_configs)
+            }
+
+        for info in ready_infos:
             cached = self._lb_replica_cache.get(info.replica_id)
             if cached is None:
-                url = info.url
+                cluster_record = cluster_records.get(info.cluster_name)
+                if cluster_record is None:
+                    logger.warning(f'Replica {info.replica_id} is READY but '
+                                   'its cluster record is not available yet; '
+                                   'skipping for this sync.')
+                    continue
+                handle = uncached_handles.get(info.replica_id)
+                url = info._resolve_url(  # pylint: disable=protected-access
+                    cluster_record=cluster_record,
+                    handle=handle,
+                    provider_config=provider_configs.get(info.replica_id))
                 if url is None:
                     # A replica can be READY while its endpoint is briefly
                     # unresolvable (e.g. the cluster record has no head IP
@@ -310,7 +367,6 @@ class SkyServeController:
                 # lifetime.
                 gpu_type = 'unknown'
                 gpu_count = 1
-                handle = info.handle()
                 if handle is not None:
                     accelerators = handle.launched_resources.accelerators
                     if accelerators:
@@ -365,7 +421,7 @@ class SkyServeController:
         # Replacing the cache with this sync's active replicas prunes the
         # replicas that are no longer READY.
         self._lb_replica_cache = replica_cache
-        return replica_info, num_ready
+        return replica_info, len(ready_infos)
 
     def _url_to_replica_id_map(self) -> Dict[str, int]:
         """Invert the translation cache (url -> replica id)."""
@@ -577,45 +633,55 @@ class SkyServeController:
         """Validate LB membership before disclosing confidential routing."""
         if not self._owns_current_service():
             return fastapi.Response(status_code=503)
-        loop = asyncio.get_running_loop()
-        authority = await loop.run_in_executor(
-            None, self._lb_report_authority, request_data.get('lb_session_id'))
-        if not authority[0]:
-            # The sync token authenticates the shared LB workload, not
-            # membership in this service. Do not reveal replica URLs, capacity,
-            # or routing policy to another service's Pod.
-            return fastapi.Response(status_code=503)
-        if not self._owns_current_service():
-            return fastapi.Response(status_code=503)
+        lb_sync_lock = self._lb_sync_lock
+        if lb_sync_lock is None:
+            lb_sync_lock = asyncio.Lock()
+            self._lb_sync_lock = lb_sync_lock
+        async with lb_sync_lock:
+            loop = asyncio.get_running_loop()
+            authority = await loop.run_in_executor(
+                None, self._lb_report_authority,
+                request_data.get('lb_session_id'))
+            if not authority[0]:
+                # The sync token authenticates the shared LB workload, not
+                # membership in this service. Do not reveal replica URLs,
+                # capacity, or routing policy to another service's Pod.
+                return fastapi.Response(status_code=503)
+            if not self._owns_current_service():
+                return fastapi.Response(status_code=503)
 
-        replica_infos = serve_state.get_replica_infos(self._service_name)
-        replica_versions = sorted({info.version for info in replica_infos})
-        version_specs = serve_state.get_specs(self._service_name,
-                                              replica_versions)
-        async_occupancy_by_version: Dict[int, Optional[bool]] = {
-            replica_version:
-            None if version_specs.get(replica_version) is None else getattr(
-                version_specs[replica_version],
-                'graceful_drain_async_occupancy', None)
-            for replica_version in replica_versions
-        }
-        lb_replica_info, num_ready = self._get_lb_replica_info(
-            replica_infos, async_occupancy_by_version)
-        if not self._owns_current_service():
-            return fastapi.Response(status_code=503)
-        await self._ingest_load_balancer_report(request_data,
-                                                replica_infos,
-                                                async_occupancy_by_version,
-                                                authority=authority)
-        if not self._owns_current_service():
-            return fastapi.Response(status_code=503)
-        return responses.JSONResponse(content={
-            'replica_info': lb_replica_info,
-            'num_ready_replicas': num_ready,
-            'routing_spec': self._get_routing_spec(),
-            'capacity_hint': self._get_capacity_hint(replica_infos),
-        },
-                                      status_code=200)
+            replica_infos = serve_state.get_replica_infos(self._service_name)
+            replica_versions = sorted({info.version for info in replica_infos})
+            version_specs = serve_state.get_specs(self._service_name,
+                                                  replica_versions)
+            async_occupancy_by_version: Dict[int, Optional[bool]] = {
+                replica_version:
+                None if version_specs.get(replica_version) is None else getattr(
+                    version_specs[replica_version],
+                    'graceful_drain_async_occupancy', None)
+                for replica_version in replica_versions
+            }
+            # Cold endpoint resolution is proportional to the READY fleet and
+            # may take tens of seconds. Keep it off the FastAPI event loop so
+            # controller liveness and ownership probes remain responsive.
+            lb_replica_info, num_ready = await loop.run_in_executor(
+                None, self._get_lb_replica_info, replica_infos,
+                async_occupancy_by_version)
+            if not self._owns_current_service():
+                return fastapi.Response(status_code=503)
+            await self._ingest_load_balancer_report(request_data,
+                                                    replica_infos,
+                                                    async_occupancy_by_version,
+                                                    authority=authority)
+            if not self._owns_current_service():
+                return fastapi.Response(status_code=503)
+            return responses.JSONResponse(content={
+                'replica_info': lb_replica_info,
+                'num_ready_replicas': num_ready,
+                'routing_spec': self._get_routing_spec(),
+                'capacity_hint': self._get_capacity_hint(replica_infos),
+            },
+                                          status_code=200)
 
     def _owns_current_service(self) -> bool:
         """Whether this controller parent still owns the exact DB row."""
@@ -880,6 +946,16 @@ class SkyServeController:
         controller_owner_dependency = fastapi.Depends(
             _make_controller_owner_dependency(
                 self._controller_owner_fingerprint))
+
+        @self._app.get(
+            serve_constants.CONTROLLER_HEALTH_ENDPOINT_PATH,
+            dependencies=[admin_auth_dependency, controller_owner_dependency])
+        async def get_controller_health() -> fastapi.Response:
+            # Keep child liveness independent from fleet size.  In particular,
+            # autoscaler.info() serializes every replica and can legitimately
+            # exceed the supervisor's one-second read budget at fleet scale.
+            return responses.JSONResponse(content={'status': 'ok'},
+                                          status_code=200)
 
         @self._app.get(
             '/autoscaler/info',

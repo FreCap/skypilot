@@ -1867,6 +1867,11 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         # Per-tick freshness snapshot (see _fresh_for_tick). None outside
         # a tick.
         self._tick_fresh: Optional[bool] = None
+        # True only while an increase in the demand-derived target is waiting
+        # for upscale hysteresis.  The live fleet must not be shrunk toward
+        # the old target during that wait: doing so makes the autoscaler issue
+        # scale-down and scale-up intents for opposite demand snapshots.
+        self._upscale_pending: bool = False
 
     def _staleness_threshold_seconds(self) -> float:
         """Age beyond which a demand report no longer counts as fresh.
@@ -2092,6 +2097,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         latest_capacities = self._latest_capacities(replica_infos)
         best_capacity = (latest_capacities[0] if latest_capacities else
                          self.target_concurrency_per_replica)
+        self._upscale_pending = False
 
         if not self._fresh_for_tick():
             # SIGNAL GAP: the only trustworthy signal is arrivals (they
@@ -2140,13 +2146,21 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         old_target_num_replicas = self.target_num_replicas
 
         if self._snap_target_on_next_recompute:
-            # First recompute with fresh data after construction or an
-            # update: apply directly (the base class's post-update snap
-            # semantics, but shape- and demand-aware).
+            # First recompute with fresh data after construction or an update:
+            # snap upward immediately, but never bypass downscale hysteresis.
+            # A policy-only update can land during a brief idle interval; an
+            # immediate downward snap would tear down the live fleet before
+            # the configured downscale delay has proved sustained idleness.
             self._snap_target_on_next_recompute = False
             self.upscale_counter = 0
             self.downscale_counter = 0
-            self.target_num_replicas = target_num_replicas
+            if target_num_replicas >= self.target_num_replicas:
+                self.target_num_replicas = target_num_replicas
+            else:
+                self.downscale_counter = 1
+                if self.downscale_counter >= self.scale_down_threshold:
+                    self.downscale_counter = 0
+                    self.target_num_replicas = target_num_replicas
         # Faster scale up when there is no replica.
         elif self.target_num_replicas == 0:
             self.target_num_replicas = target_num_replicas
@@ -2164,6 +2178,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 self.target_num_replicas = target_num_replicas
         else:
             self.upscale_counter = self.downscale_counter = 0
+
+        self._upscale_pending = (target_num_replicas > self.target_num_replicas)
 
         logger.info(
             f'Concurrency: outstanding work: {outstanding}. '
@@ -2258,6 +2274,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
           complete when every old replica is busy.
         """
         if not self._fresh_for_tick():
+            return []
+        if self._upscale_pending:
+            logger.info('Concurrency autoscaler suppressing outdated-replica '
+                        'drain while an upscale is pending hysteresis.')
             return []
         if self.update_mode != serve_utils.UpdateMode.ROLLING:
             return super()._select_outdated_replicas_to_scale_down(
@@ -2377,6 +2397,11 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 logger.info('Concurrency autoscaler signal-stale: suppressing '
                             f'{current_num_replicas - target_num_replicas} '
                             'scale-down decision(s).')
+                return scaling_decisions
+            if self._upscale_pending:
+                logger.info(
+                    'Concurrency autoscaler suppressing scale-down while an '
+                    'upscale is pending hysteresis.')
                 return scaling_decisions
             num_to_scale_down = current_num_replicas - target_num_replicas
             # Drain-aware victim eligibility (see _replica_is_busy): a
