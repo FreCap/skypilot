@@ -199,8 +199,9 @@ class TestGetServiceStatusPickledSummary:
 
     def test_summary_only_defaults_to_no_target_fetch(self, patched_state,
                                                       monkeypatch):
-        monkeypatch.setattr(serve_state, 'get_glob_service_names',
-                            lambda names: ['svc'])
+        monkeypatch.setattr(serve_state,
+                            'get_glob_service_names',
+                            lambda names, pool=None: ['svc'])
         autoscaler = mock.Mock()
         monkeypatch.setattr(serve_utils, '_get_to_controller_with_retry',
                             autoscaler)
@@ -216,8 +217,9 @@ class TestGetServiceStatusPickledSummary:
 
     def test_summary_only_can_opt_in_target_fetch(self, patched_state,
                                                   monkeypatch):
-        monkeypatch.setattr(serve_state, 'get_glob_service_names',
-                            lambda names: ['svc'])
+        monkeypatch.setattr(serve_state,
+                            'get_glob_service_names',
+                            lambda names, pool=None: ['svc'])
         statuses = serve_utils.get_service_status_pickled(
             None,
             pool=False,
@@ -227,13 +229,117 @@ class TestGetServiceStatusPickledSummary:
         assert decoded['target_num_replicas'] == 4
 
     def test_default_is_full(self, patched_state, monkeypatch):
-        monkeypatch.setattr(serve_state, 'get_glob_service_names',
-                            lambda names: ['svc'])
+        monkeypatch.setattr(serve_state,
+                            'get_glob_service_names',
+                            lambda names, pool=None: ['svc'])
         monkeypatch.setattr(serve_state, 'get_replica_infos', lambda name: [])
         statuses = serve_utils.get_service_status_pickled(None, pool=False)
         decoded = serve_utils.unpickle_service_status(statuses)[0]
         assert decoded['replica_info'] == []
         assert 'replica_status_counts' not in decoded
+
+    def test_summary_only_filters_name_scan_by_mode(self, monkeypatch):
+        mixed_names = [
+            'serve-a',
+            'pool-a',
+            'serve-b',
+            'pool-b',
+            'serve-c',
+        ]
+        scanned = []
+
+        def _get_glob_service_names(names, pool=None):
+            if pool is None:
+                return list(mixed_names)
+            return [
+                name for name in mixed_names if name.startswith('pool-') == pool
+            ]
+
+        def _fake_status(name, *, pool, **kwargs):
+            del kwargs
+            scanned.append(name)
+            return {'name': name, 'status': 'READY', 'pool': pool}
+
+        monkeypatch.setattr(serve_state, 'get_glob_service_names',
+                            _get_glob_service_names)
+        monkeypatch.setattr(serve_utils, '_get_service_status', _fake_status)
+
+        statuses = serve_utils.get_service_status_pickled(None,
+                                                          pool=False,
+                                                          summary_only=True)
+
+        assert scanned == ['serve-a', 'serve-b', 'serve-c']
+        assert len(statuses) == 3
+
+
+class TestServeModeFilteredSweeps:
+    """Long-running sweeps should enumerate only the requested mode."""
+
+    def test_update_service_status_filters_name_scan_by_mode(self, monkeypatch):
+        mixed_names = ['serve-a', 'pool-a', 'serve-b', 'pool-b']
+        scanned = []
+        status_updates = []
+
+        def _get_glob_service_names(names, pool=None):
+            if pool is None:
+                return list(mixed_names)
+            return [
+                name for name in mixed_names if name.startswith('pool-') == pool
+            ]
+
+        def _fake_status(name, *, pool, **kwargs):
+            del kwargs
+            scanned.append(name)
+            return {
+                'name': name,
+                'status': serve_state.ServiceStatus.READY,
+                'controller_pid': None,
+                'controller_ip': None,
+                'hash': f'hash-{name}',
+                'pool': pool,
+            }
+
+        monkeypatch.setattr(serve_state, 'get_glob_service_names',
+                            _get_glob_service_names)
+        monkeypatch.setattr(serve_utils, '_get_service_status', _fake_status)
+        monkeypatch.setattr(
+            serve_state, 'set_service_status_and_active_versions_if_owner',
+            lambda *args, **kwargs: status_updates.append((args, kwargs)))
+
+        serve_utils.update_service_status(pool=False)
+
+        assert scanned == ['serve-a', 'serve-b']
+        assert len(status_updates) == 2
+
+    def test_terminate_services_filters_wildcard_scan_by_mode(
+            self, monkeypatch):
+        mixed_names = ['serve-a', 'pool-a', 'serve-b', 'pool-b']
+        scanned = []
+
+        def _get_glob_service_names(names, pool=None):
+            if pool is None:
+                return list(mixed_names)
+            return [
+                name for name in mixed_names if name.startswith('pool-') == pool
+            ]
+
+        def _fake_status(name, *, pool, **kwargs):
+            del kwargs
+            scanned.append(name)
+            return {
+                'name': name,
+                'status': serve_state.ServiceStatus.SHUTTING_DOWN,
+                'pool': pool,
+            }
+
+        monkeypatch.setattr(serve_state, 'get_glob_service_names',
+                            _get_glob_service_names)
+        monkeypatch.setattr(serve_utils, '_get_service_status', _fake_status)
+
+        message = serve_utils.terminate_services(None, purge=False, pool=False)
+
+        assert scanned == ['serve-a', 'serve-b']
+        assert message == 'No service to terminate.'
 
 
 class TestCodegenVersionGating:
