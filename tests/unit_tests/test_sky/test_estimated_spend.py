@@ -23,11 +23,15 @@ from sky.utils.db import db_utils
 
 
 class _FakeResources:
+    """Minimal priced resource used by rollup tests."""
 
-    def __init__(self, hourly_cost: float, cloud: str = 'AWS'):
+    def __init__(self,
+                 hourly_cost: float,
+                 cloud: str = 'AWS',
+                 use_spot: bool = False):
         self.hourly_cost = hourly_cost
         self.cloud = cloud
-        self.use_spot = False
+        self.use_spot = use_spot
 
     def get_cost(self, seconds: int) -> float:
         return self.hourly_cost * seconds / estimated_spend.SECONDS_PER_HOUR
@@ -46,21 +50,24 @@ def _source(*,
             hourly_cost: float = 2.0,
             cloud: str = 'AWS',
             num_nodes: int = 1,
-            cluster_hash: str = 'hash-1'):
+            cluster_hash: str = 'hash-1',
+            use_spot: bool = False,
+            user_hash: str = 'user-1',
+            workload_id: str = '42'):
     return {
         'cluster_hash': cluster_hash,
         'name': f'job-cluster-{cluster_hash}',
         'num_nodes': num_nodes,
         'launched_resources': pickle.dumps(
-            _FakeResources(hourly_cost, cloud=cloud)),
+            _FakeResources(hourly_cost, cloud=cloud, use_spot=use_spot)),
         'usage_intervals': pickle.dumps([(start, end)]),
-        'user_hash': 'user-1',
+        'user_hash': user_hash,
         'workspace': 'default',
         'cloud': cloud,
         'region': 'us-east-1',
         'is_managed': 1,
         'workload_type': 'managed_job',
-        'workload_id': '42',
+        'workload_id': workload_id,
         'workload_task_id': 0,
     }
 
@@ -88,6 +95,31 @@ def _insert_source(connection, source, *, usage_updated_at: int):
             zone='us-east-1a',
             node_names=None,
             usage_updated_at=usage_updated_at,
+        ))
+
+
+def _insert_daily(connection,
+                  *,
+                  day: int,
+                  cluster_hash: str,
+                  cost: float,
+                  use_spot: bool,
+                  user_hash=None,
+                  workload_id: str = '42'):
+    connection.execute(
+        sqlalchemy.insert(global_user_state.estimated_spend_daily_table).values(
+            day_start_utc=day,
+            cluster_hash=cluster_hash,
+            cluster_name=f'cluster-{cluster_hash}',
+            workload_type='managed_job',
+            workload_id=workload_id,
+            user_hash=user_hash,
+            cloud='AWS',
+            use_spot=use_spot,
+            machine_seconds=3600,
+            catalog_hourly_rate=cost,
+            estimated_cost=cost,
+            updated_at=day + 3600,
         ))
 
 
@@ -328,10 +360,13 @@ def test_estimated_spend_endpoint_serves_admin_snapshot():
                                server.estimated_spend_lib,
                                'get_estimated_spend',
                                return_value=expected) as get_estimate:
-        response = server.estimated_spend(request, days=7)
+        response = server.estimated_spend(request,
+                                          days=7,
+                                          group_by=estimated_spend.GroupBy.USER)
 
     assert response == expected
-    get_estimate.assert_called_once_with(days=7)
+    get_estimate.assert_called_once_with(days=7,
+                                         group_by=estimated_spend.GroupBy.USER)
 
 
 def test_schema_021_upgrades_existing_sqlite_database(tmp_path):
@@ -409,3 +444,122 @@ def test_rollup_is_idempotent_and_query_returns_daily_breakdown(
            ] == [12.0, 12.0, 0.0]
     assert response['workloads'][0]['workload_type'] == 'managed_job'
     assert response['workloads'][0]['workload_id'] == '42'
+
+
+def test_job_breakdown_splits_spot_and_on_demand_cost(tmp_path, monkeypatch):
+    engine = _fresh_db(tmp_path, monkeypatch)
+    day = 1_700_006_400
+    as_of = day + 2 * estimated_spend.SECONDS_PER_DAY
+    with engine.begin() as connection:
+        _insert_source(connection,
+                       _source(start=day,
+                               end=day + 3600,
+                               hourly_cost=2.0,
+                               cluster_hash='spot-recovery',
+                               use_spot=True),
+                       usage_updated_at=as_of - 1)
+        _insert_source(connection,
+                       _source(start=day,
+                               end=day + 3600,
+                               hourly_cost=3.0,
+                               cluster_hash='on-demand-recovery'),
+                       usage_updated_at=as_of - 1)
+
+    estimated_spend.run_rollup_once(now=as_of)
+    monkeypatch.setattr(estimated_spend.time, 'time', lambda: as_of)
+    response = estimated_spend.get_estimated_spend(days=3, group_by='job')
+
+    group = response['groups'][0]
+    assert group['workload_id'] == '42'
+    assert group['estimated_cost'] == 5.0
+    assert group['spot_estimated_cost'] == 2.0
+    assert group['on_demand_estimated_cost'] == 3.0
+    assert response['series'][0]['estimated_cost_by_day'] == [5.0, 0.0, 0.0]
+
+
+def test_user_breakdown_resolves_names_and_keeps_unknown_owner(
+        tmp_path, monkeypatch):
+    engine = _fresh_db(tmp_path, monkeypatch)
+    day = 1_700_006_400
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(global_user_state.user_table).values(
+                id='user-1', name='Alice'))
+        _insert_daily(connection,
+                      day=day,
+                      cluster_hash='alice-spot',
+                      cost=4.0,
+                      use_spot=True,
+                      user_hash='user-1')
+        _insert_daily(connection,
+                      day=day,
+                      cluster_hash='unknown-demand',
+                      cost=6.0,
+                      use_spot=False)
+
+    monkeypatch.setattr(estimated_spend.time, 'time', lambda: day + 3600)
+    response = estimated_spend.get_estimated_spend(days=1, group_by='user')
+    groups = {group['user_hash']: group for group in response['groups']}
+
+    assert groups['user-1']['user_name'] == 'Alice'
+    assert groups['user-1']['spot_estimated_cost'] == 4.0
+    assert groups[None]['user_name'] is None
+    assert groups[None]['on_demand_estimated_cost'] == 6.0
+
+
+def test_purchase_option_breakdown_returns_stacked_series(
+        tmp_path, monkeypatch):
+    engine = _fresh_db(tmp_path, monkeypatch)
+    day = 1_700_006_400
+    with engine.begin() as connection:
+        _insert_daily(connection,
+                      day=day,
+                      cluster_hash='spot',
+                      cost=2.5,
+                      use_spot=True)
+        _insert_daily(connection,
+                      day=day,
+                      cluster_hash='demand',
+                      cost=7.5,
+                      use_spot=False)
+
+    monkeypatch.setattr(estimated_spend.time, 'time', lambda: day + 3600)
+    response = estimated_spend.get_estimated_spend(
+        days=1, group_by=estimated_spend.GroupBy.PURCHASE_OPTION)
+    groups = {group['purchase_option']: group for group in response['groups']}
+    series = {
+        row['purchase_option']: row['estimated_cost_by_day']
+        for row in response['series']
+    }
+
+    assert groups['spot']['estimated_cost'] == 2.5
+    assert groups['on_demand']['estimated_cost'] == 7.5
+    assert series == {'on_demand': [7.5], 'spot': [2.5]}
+
+
+def test_job_chart_bounds_series_and_combines_other(tmp_path, monkeypatch):
+    engine = _fresh_db(tmp_path, monkeypatch)
+    day = 1_700_006_400
+    with engine.begin() as connection:
+        for index in range(10):
+            _insert_daily(connection,
+                          day=day,
+                          cluster_hash=f'cluster-{index}',
+                          cost=float(10 - index),
+                          use_spot=index % 2 == 0,
+                          workload_id=str(index))
+
+    monkeypatch.setattr(estimated_spend.time, 'time', lambda: day + 3600)
+    response = estimated_spend.get_estimated_spend(days=1, group_by='job')
+
+    assert len(response['groups']) == 10
+    assert len(response['series']) == estimated_spend.GROUP_CHART_LIMIT + 1
+    assert response['series'][-1] == {
+        'is_other': True,
+        'estimated_cost_by_day': [3.0],
+    }
+
+
+def test_invalid_group_by_is_rejected_before_querying():
+    with pytest.raises(ValueError, match='group_by must be one of'):
+        estimated_spend.get_estimated_spend(group_by='cloud')

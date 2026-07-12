@@ -2,10 +2,11 @@
 
 import asyncio
 import datetime
+import enum
 import math
 import pickle
 import time
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
 import sqlalchemy
 from sqlalchemy import orm
@@ -34,6 +35,16 @@ PRUNE_BATCH_SIZE = 1000
 ROLLUP_LOCK_ID = 'estimated-spend-rollup'
 _STATE_ID = 1
 _HASH_END_SENTINEL = '\uffff'
+GROUP_TABLE_LIMIT = 50
+GROUP_CHART_LIMIT = 8
+
+
+class GroupBy(str, enum.Enum):
+    """Supported estimated-spend dashboard breakdowns."""
+
+    JOB = 'job'
+    USER = 'user'
+    PURCHASE_OPTION = 'purchase_option'
 
 
 def _utc_day_start(timestamp: int) -> int:
@@ -453,23 +464,7 @@ def _sum_expression(column: Any) -> Any:
     return sqlalchemy.func.coalesce(sqlalchemy.func.sum(column), 0)
 
 
-def _row_to_breakdown(row: Any, key_names: Tuple[str, ...]) -> Dict[str, Any]:
-    result = {name: getattr(row, name) for name in key_names}
-    result.update({
-        'estimated_cost': float(row.estimated_cost or 0),
-        'priced_machine_seconds': int(row.priced_machine_seconds or 0),
-        'excluded_machine_seconds': int(row.excluded_machine_seconds or 0),
-    })
-    return result
-
-
-def get_estimated_spend(days: int = DEFAULT_LOOKBACK_DAYS) -> Dict[str, Any]:
-    """Read the last materialized admin estimate using aggregate SQL only."""
-    days = max(1, min(int(days), MAX_LOOKBACK_DAYS))
-    now = int(time.time())
-    first_day = _utc_day_start(now - (days - 1) * SECONDS_PER_DAY)
-    daily = global_user_state.estimated_spend_daily_table
-    state_table = global_user_state.estimated_spend_state_table
+def _aggregate_columns(daily: Any) -> List[Any]:
     priced_seconds = sqlalchemy.case((sqlalchemy.and_(
         daily.c.exclusion_reason.is_(None),
         daily.c.estimated_cost.is_not(None)), daily.c.machine_seconds),
@@ -477,6 +472,178 @@ def get_estimated_spend(days: int = DEFAULT_LOOKBACK_DAYS) -> Dict[str, Any]:
     excluded_seconds = sqlalchemy.case(
         (daily.c.exclusion_reason.is_not(None), daily.c.machine_seconds),
         else_=0)
+    spot_cost = sqlalchemy.case(
+        (daily.c.use_spot.is_(True), daily.c.estimated_cost), else_=0)
+    on_demand_cost = sqlalchemy.case(
+        (daily.c.use_spot.is_(False), daily.c.estimated_cost), else_=0)
+    return [
+        _sum_expression(daily.c.estimated_cost).label('estimated_cost'),
+        _sum_expression(spot_cost).label('spot_estimated_cost'),
+        _sum_expression(on_demand_cost).label('on_demand_estimated_cost'),
+        _sum_expression(priced_seconds).label('priced_machine_seconds'),
+        _sum_expression(excluded_seconds).label('excluded_machine_seconds'),
+    ]
+
+
+def _purchase_option_expression(daily: Any) -> Any:
+    return sqlalchemy.case((daily.c.use_spot.is_(True), 'spot'),
+                           (daily.c.use_spot.is_(False), 'on_demand'),
+                           else_='unknown')
+
+
+def _row_to_breakdown(row: Any, key_names: Tuple[str, ...]) -> Dict[str, Any]:
+    result = {name: getattr(row, name) for name in key_names}
+    result.update({
+        'estimated_cost': float(row.estimated_cost or 0),
+        'spot_estimated_cost': float(row.spot_estimated_cost or 0),
+        'on_demand_estimated_cost': float(row.on_demand_estimated_cost or 0),
+        'priced_machine_seconds': int(row.priced_machine_seconds or 0),
+        'excluded_machine_seconds': int(row.excluded_machine_seconds or 0),
+    })
+    return result
+
+
+def _normalize_group_by(group_by: Union[str, GroupBy]) -> GroupBy:
+    try:
+        return GroupBy(group_by)
+    except ValueError as e:
+        options = ', '.join(option.value for option in GroupBy)
+        raise ValueError(f'group_by must be one of: {options}') from e
+
+
+def _group_key(group_by: GroupBy, row: Any) -> Tuple[Any, ...]:
+    if group_by == GroupBy.JOB:
+        return (row.workload_type, row.workload_id)
+    if group_by == GroupBy.USER:
+        return (row.user_hash,)
+    return (row.purchase_option,)
+
+
+def _group_key_names(group_by: GroupBy) -> Tuple[str, ...]:
+    if group_by == GroupBy.JOB:
+        return ('workload_type', 'workload_id')
+    if group_by == GroupBy.USER:
+        return ('user_hash', 'user_name')
+    return ('purchase_option',)
+
+
+def _get_group_rows(session: orm.Session, daily: Any, base_filter: Any,
+                    workload_rows: List[Any], group_by: GroupBy) -> List[Any]:
+    if group_by == GroupBy.JOB:
+        return workload_rows
+
+    if group_by == GroupBy.USER:
+        users = global_user_state.user_table
+        query = (sqlalchemy.select(
+            daily.c.user_hash.label('user_hash'),
+            users.c.name.label('user_name'),
+            *_aggregate_columns(daily),
+        ).select_from(daily.outerjoin(
+            users,
+            daily.c.user_hash == users.c.id)).where(base_filter).group_by(
+                daily.c.user_hash, users.c.name).order_by(
+                    sqlalchemy.desc('estimated_cost')).limit(GROUP_TABLE_LIMIT))
+        return session.execute(query).fetchall()
+
+    purchase_option = _purchase_option_expression(daily)
+    query = (sqlalchemy.select(
+        purchase_option.label('purchase_option'),
+        *_aggregate_columns(daily),
+    ).where(base_filter).group_by(purchase_option).order_by(
+        sqlalchemy.desc('estimated_cost')))
+    return session.execute(query).fetchall()
+
+
+def _group_match_condition(daily: Any, group_by: GroupBy, row: Any) -> Any:
+    if group_by == GroupBy.JOB:
+        workload_id = row.workload_id
+        workload_id_condition = (daily.c.workload_id.is_(None)
+                                 if workload_id is None else daily.c.workload_id
+                                 == workload_id)
+        return sqlalchemy.and_(daily.c.workload_type == row.workload_type,
+                               workload_id_condition)
+    if group_by == GroupBy.USER:
+        return (daily.c.user_hash.is_(None) if row.user_hash is None else
+                daily.c.user_hash == row.user_hash)
+    purchase_option = _purchase_option_expression(daily)
+    return purchase_option == row.purchase_option
+
+
+def _get_daily_group_rows(session: orm.Session, daily: Any, base_filter: Any,
+                          group_by: GroupBy,
+                          top_group_rows: List[Any]) -> List[Any]:
+    if not top_group_rows:
+        return []
+    match_conditions = [
+        _group_match_condition(daily, group_by, row) for row in top_group_rows
+    ]
+    if group_by == GroupBy.JOB:
+        key_columns = [daily.c.workload_type, daily.c.workload_id]
+        group_columns = key_columns
+    elif group_by == GroupBy.USER:
+        key_columns = [daily.c.user_hash]
+        group_columns = key_columns
+    else:
+        purchase_option = _purchase_option_expression(daily)
+        key_columns = [purchase_option.label('purchase_option')]
+        group_columns = [purchase_option]
+    query = (sqlalchemy.select(
+        daily.c.day_start_utc.label('day_start_utc'), *key_columns,
+        _sum_expression(daily.c.estimated_cost).label('estimated_cost')).where(
+            sqlalchemy.and_(base_filter,
+                            sqlalchemy.or_(*match_conditions))).group_by(
+                                daily.c.day_start_utc, *group_columns).order_by(
+                                    daily.c.day_start_utc.asc()))
+    return session.execute(query).fetchall()
+
+
+def _build_series(group_by: GroupBy, top_group_rows: List[Any],
+                  daily_group_rows: List[Any],
+                  days_response: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    costs_by_group_and_day = {(_group_key(group_by,
+                                          row), int(row.day_start_utc)):
+                              float(row.estimated_cost or 0)
+                              for row in daily_group_rows}
+    displayed_by_day = {int(day['day_start_utc']): 0.0 for day in days_response}
+    series = []
+    for row in top_group_rows:
+        key = _group_key(group_by, row)
+        costs = []
+        for day in days_response:
+            day_start = int(day['day_start_utc'])
+            cost = costs_by_group_and_day.get((key, day_start), 0.0)
+            costs.append(cost)
+            displayed_by_day[day_start] += cost
+        identity = {
+            name: getattr(row, name) for name in _group_key_names(group_by)
+        }
+        series.append({**identity, 'estimated_cost_by_day': costs})
+
+    other_costs = []
+    for day in days_response:
+        day_start = int(day['day_start_utc'])
+        other_costs.append(
+            max(0.0,
+                float(day['estimated_cost']) - displayed_by_day[day_start]))
+    if any(cost > 1e-9 for cost in other_costs):
+        series.append({
+            'is_other': True,
+            'estimated_cost_by_day': other_costs,
+        })
+    return series
+
+
+def get_estimated_spend(
+    days: int = DEFAULT_LOOKBACK_DAYS,
+    group_by: Union[str, GroupBy] = GroupBy.JOB,
+) -> Dict[str, Any]:
+    """Read the last materialized admin estimate using aggregate SQL only."""
+    days = max(1, min(int(days), MAX_LOOKBACK_DAYS))
+    normalized_group_by = _normalize_group_by(group_by)
+    now = int(time.time())
+    first_day = _utc_day_start(now - (days - 1) * SECONDS_PER_DAY)
+    daily = global_user_state.estimated_spend_daily_table
+    state_table = global_user_state.estimated_spend_state_table
 
     engine = global_user_state.initialize_and_get_db()
     with orm.Session(engine) as session:
@@ -488,10 +655,7 @@ def get_estimated_spend(days: int = DEFAULT_LOOKBACK_DAYS) -> Dict[str, Any]:
         day_rows = session.execute(
             sqlalchemy.select(
                 daily.c.day_start_utc.label('day_start_utc'),
-                _sum_expression(daily.c.estimated_cost).label('estimated_cost'),
-                _sum_expression(priced_seconds).label('priced_machine_seconds'),
-                _sum_expression(excluded_seconds).label(
-                    'excluded_machine_seconds'),
+                *_aggregate_columns(daily),
             ).where(base_filter).group_by(daily.c.day_start_utc).order_by(
                 daily.c.day_start_utc.asc())).fetchall()
 
@@ -499,21 +663,16 @@ def get_estimated_spend(days: int = DEFAULT_LOOKBACK_DAYS) -> Dict[str, Any]:
             sqlalchemy.select(
                 daily.c.workload_type.label('workload_type'),
                 daily.c.workload_id.label('workload_id'),
-                _sum_expression(daily.c.estimated_cost).label('estimated_cost'),
-                _sum_expression(priced_seconds).label('priced_machine_seconds'),
-                _sum_expression(excluded_seconds).label(
-                    'excluded_machine_seconds'),
+                *_aggregate_columns(daily),
             ).where(base_filter).group_by(
-                daily.c.workload_type, daily.c.workload_id).order_by(
-                    sqlalchemy.desc('estimated_cost')).limit(50)).fetchall()
+                daily.c.workload_type,
+                daily.c.workload_id).order_by(sqlalchemy.desc(
+                    'estimated_cost')).limit(GROUP_TABLE_LIMIT)).fetchall()
 
         cloud_rows = session.execute(
             sqlalchemy.select(
                 daily.c.cloud.label('cloud'),
-                _sum_expression(daily.c.estimated_cost).label('estimated_cost'),
-                _sum_expression(priced_seconds).label('priced_machine_seconds'),
-                _sum_expression(excluded_seconds).label(
-                    'excluded_machine_seconds'),
+                *_aggregate_columns(daily),
             ).where(base_filter).group_by(daily.c.cloud).order_by(
                 sqlalchemy.desc('estimated_cost'))).fetchall()
 
@@ -527,9 +686,21 @@ def get_estimated_spend(days: int = DEFAULT_LOOKBACK_DAYS) -> Dict[str, Any]:
                             daily.c.exclusion_reason.is_not(None))).group_by(
                                 daily.c.exclusion_reason)).fetchall()
 
+        group_rows = _get_group_rows(session, daily, base_filter, workload_rows,
+                                     normalized_group_by)
+        top_group_rows = [
+            row for row in group_rows if float(row.estimated_cost or 0) > 0
+        ][:GROUP_CHART_LIMIT]
+        daily_group_rows = _get_daily_group_rows(session, daily, base_filter,
+                                                 normalized_group_by,
+                                                 top_group_rows)
+
     by_day = {
         int(row.day_start_utc): {
             'estimated_cost': float(row.estimated_cost or 0),
+            'spot_estimated_cost': float(row.spot_estimated_cost or 0),
+            'on_demand_estimated_cost': float(row.on_demand_estimated_cost or
+                                              0),
             'priced_machine_seconds': int(row.priced_machine_seconds or 0),
             'excluded_machine_seconds': int(row.excluded_machine_seconds or 0),
         } for row in day_rows
@@ -540,6 +711,8 @@ def get_estimated_spend(days: int = DEFAULT_LOOKBACK_DAYS) -> Dict[str, Any]:
         values = by_day.get(
             day_start, {
                 'estimated_cost': 0.0,
+                'spot_estimated_cost': 0.0,
+                'on_demand_estimated_cost': 0.0,
                 'priced_machine_seconds': 0,
                 'excluded_machine_seconds': 0,
             })
@@ -581,6 +754,13 @@ def get_estimated_spend(days: int = DEFAULT_LOOKBACK_DAYS) -> Dict[str, Any]:
             for row in workload_rows
         ],
         'clouds': [_row_to_breakdown(row, ('cloud',)) for row in cloud_rows],
+        'group_by': normalized_group_by.value,
+        'groups': [
+            _row_to_breakdown(row, _group_key_names(normalized_group_by))
+            for row in group_rows
+        ],
+        'series': _build_series(normalized_group_by, top_group_rows,
+                                daily_group_rows, days_response),
         'excluded_by_reason': {
             str(row.exclusion_reason): int(row.machine_seconds or 0)
             for row in reason_rows

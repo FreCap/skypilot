@@ -10,7 +10,7 @@ from sky.skylet import constants
 # based on version info is needed.
 # For more details and code guidelines, refer to:
 # https://docs.skypilot.co/en/latest/developers/CONTRIBUTING.html#backward-compatibility-guidelines
-API_VERSION = 57  # Restart-safe Sky Batch attempt outputs
+API_VERSION = 58  # Estimated-spend breakdown dimensions
 
 # The minimum peer API version that the code should still work with.
 # Notes (dev):
@@ -86,6 +86,10 @@ MIN_WAITING_STATUS_API_VERSION = 55
 # Minimum server API version that exposes the admin-only materialized
 # estimated-spend endpoint used by the dashboard.
 MIN_ESTIMATED_SPEND_API_VERSION = 57
+
+# Minimum server API version that supports grouped estimated-spend chart and
+# table data by job, user, or purchase option.
+MIN_ESTIMATED_SPEND_BREAKDOWNS_API_VERSION = 58
 
 # Prefix for API request names.
 REQUEST_NAME_PREFIX = 'sky.'

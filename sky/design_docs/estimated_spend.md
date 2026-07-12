@@ -241,17 +241,19 @@ Add a new admin-only API instead of changing the existing `cost_report`
 response shape:
 
 ```
-GET /estimated_spend?days=30
+GET /estimated_spend?days=30&group_by=job
 ```
 
-The new endpoint bumps `API_VERSION`, defines a named minimum-version constant,
-and the dashboard's client API version. Older client/server combinations
-continue to use the unchanged `cost_report` contract. The MVP accepts a
-bounded 1--90 day range and returns daily, workload, and cloud aggregates.
-The route is denied to default users and viewers by RBAC and also checks the
-admin role directly before querying.
+The endpoint bumps `API_VERSION`, defines named minimum-version constants, and
+the dashboard's client API version. Older client/server combinations continue
+to use the unchanged `cost_report` contract. It accepts a bounded 1--90 day
+range and a `job`, `user`, or `purchase_option` grouping. The additive response
+includes a cost-ranked table capped at 50 groups and a daily chart capped at
+the eight highest-cost groups plus `Other`. Job and user rows include spot and
+on-demand subtotals. The route is denied to default users and viewers by RBAC
+and also checks the admin role directly before querying.
 
-Future versions may add workspace, user, cloud, workload, or job filters and
+Future versions may add workspace, cloud, workload, or job filters and
 pagination. Those filters must apply RBAC before querying the rollup table.
 
 Example response:
@@ -286,10 +288,11 @@ The endpoint performs aggregate SQL over the rollup only. It never triggers a
 refresh. If the daemon is late or failed, it returns the last snapshot with
 `stale: true` and the actual timestamp rather than blocking for fresh data.
 
-The initial UI can be a daily chart and total card. A second table can group
-by managed job, pool, service, ordinary cluster, and platform overhead. The
-existing CLI can expose the same result as `sky cost-report --daily` after the
-new API version is negotiated.
+The UI uses a stacked daily chart and a matching table grouped by job/workload,
+user, or purchase option. Managed jobs, pools, services, ordinary clusters, and
+platform overhead remain distinct within job/workload grouping. The existing
+CLI can expose the same result as `sky cost-report --daily` after the new API
+version is negotiated.
 
 ## Provider APIs and reconciliation
 
@@ -360,7 +363,8 @@ pytest tests/unit_tests/test_sky/test_cost_report.py
 Cover UTC-midnight splits, open intervals, multiple stop/start intervals,
 multi-node and spot rates, managed-job recoveries, corrupt rows, unknown
 prices, explicit Kubernetes exclusion, idempotent reruns, watermark recovery,
-and stale-snapshot behavior.
+stale-snapshot behavior, mixed spot/on-demand jobs, user attribution, and the
+bounded `Other` chart series.
 
 Database/API tests should run with both SQLite and PostgreSQL and verify that:
 
