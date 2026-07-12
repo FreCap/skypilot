@@ -78,6 +78,7 @@ def _select_nonterminal_replicas_to_scale_down(
     num_replica_to_scale_down: int,
     replica_infos: Iterable['replica_managers.ReplicaInfo'],
     service_name: Optional[str] = None,
+    cluster_job_counts: Optional[Dict[str, int]] = None,
 ) -> List[int]:
     """Select nonterminal replicas to scale down.
 
@@ -100,6 +101,9 @@ def _select_nonterminal_replicas_to_scale_down(
         replica_infos: The list of replica informations to select from.
         service_name: The name of the pool to query job counts for. When
             provided, replicas with fewer running jobs are scaled down first.
+        cluster_job_counts: Optional pre-fetched pool job counts keyed by
+            cluster name. When provided, avoids re-querying the same pool
+            counts inside a caller that already fetched them.
 
     Returns:
         The list of replica ids to scale down.
@@ -113,10 +117,13 @@ def _select_nonterminal_replicas_to_scale_down(
     # Get the number of running jobs for each replica. For pools this
     # prioritizes scaling down idle workers; when service_name is not
     # provided all counts default to 0 and the sort falls through.
-    cluster_job_counts: Dict[str, int] = {}
     if service_name is not None:
-        cluster_job_counts = (
-            managed_job_state.get_nonterminal_job_counts_by_pool(service_name))
+        if cluster_job_counts is None:
+            cluster_job_counts = (
+                managed_job_state.get_nonterminal_job_counts_by_pool(
+                    service_name))
+    if cluster_job_counts is None:
+        cluster_job_counts = {}
     replica_job_counts: Dict[int, int] = {}
     for info in replicas:
         replica_job_counts[info.replica_id] = (cluster_job_counts.get(
@@ -2772,6 +2779,7 @@ class QueueLengthAutoscaler(_AutoscalerWithHysteresis):
     def _get_idle_replicas(
         self,
         replica_infos: List['replica_managers.ReplicaInfo'],
+        cluster_job_counts: Optional[Dict[str, int]] = None,
     ) -> List['replica_managers.ReplicaInfo']:
         """Get replicas that have no active jobs (idle replicas).
 
@@ -2781,9 +2789,10 @@ class QueueLengthAutoscaler(_AutoscalerWithHysteresis):
         Returns:
             List of replicas that have no active jobs running on them.
         """
-        cluster_job_counts = (
-            managed_job_state.get_nonterminal_job_counts_by_pool(
-                self._service_name))
+        if cluster_job_counts is None:
+            cluster_job_counts = (
+                managed_job_state.get_nonterminal_job_counts_by_pool(
+                    self._service_name))
         idle_replicas = []
         for info in replica_infos:
             active_job_count = cluster_job_counts.get(info.cluster_name, 0)
@@ -2839,9 +2848,13 @@ class QueueLengthAutoscaler(_AutoscalerWithHysteresis):
         if len(latest_nonterminal_replicas) > target_num_replicas:
             num_replicas_to_scale_down = (len(latest_nonterminal_replicas) -
                                           target_num_replicas)
+            cluster_job_counts = (
+                managed_job_state.get_nonterminal_job_counts_by_pool(
+                    self._service_name))
 
             # Get idle replicas (replicas with no active jobs)
-            idle_replicas = self._get_idle_replicas(latest_nonterminal_replicas)
+            idle_replicas = self._get_idle_replicas(latest_nonterminal_replicas,
+                                                    cluster_job_counts)
             num_idle_replicas = len(idle_replicas)
 
             # Clip the number of replicas to scale down to the number of idle
@@ -2861,7 +2874,7 @@ class QueueLengthAutoscaler(_AutoscalerWithHysteresis):
                 replicas_to_scale_down = (
                     _select_nonterminal_replicas_to_scale_down(
                         actual_num_to_scale_down, idle_replicas,
-                        self._service_name))
+                        self._service_name, cluster_job_counts))
                 logger.info(
                     f'[QueueLengthAutoscaler] Number of replicas to scale down:'
                     f' {actual_num_to_scale_down} {replicas_to_scale_down}')
