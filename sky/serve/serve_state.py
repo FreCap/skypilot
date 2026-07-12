@@ -1812,29 +1812,38 @@ def get_service_versions(service_name: str) -> List[int]:
     return [row[0] for row in rows]
 
 
-def get_glob_service_names(
-        service_names: Optional[List[str]] = None) -> List[str]:
+def get_glob_service_names(service_names: Optional[List[str]] = None,
+                           pool: Optional[bool] = None) -> List[str]:
     """Get service names matching the glob patterns.
 
     Args:
         service_names: A list of glob patterns. If None, return all service
             names.
+        pool: When set, only return services whose mode matches the flag.
 
     Returns:
         A list of non-duplicated service names.
     """
     engine = _db_manager.get_engine()
+
+    def _with_pool_filter(query):
+        if pool is None:
+            return query
+        return query.where(services_table.c.pool == int(pool))
+
     with orm.Session(engine) as session:
         if service_names is None:
-            rows = session.execute(sqlalchemy.select(
-                services_table.c.name)).fetchall()
+            rows = session.execute(
+                _with_pool_filter(sqlalchemy.select(
+                    services_table.c.name))).fetchall()
         else:
             rows = []
             for service_name in service_names:
                 pattern_rows = session.execute(
-                    sqlalchemy.select(services_table.c.name).where(
-                        services_table.c.name.like(
-                            service_name.replace('*', '%')))).fetchall()
+                    _with_pool_filter(
+                        sqlalchemy.select(services_table.c.name).where(
+                            services_table.c.name.like(
+                                service_name.replace('*', '%'))))).fetchall()
                 rows.extend(pattern_rows)
     return list({row[0] for row in rows})
 

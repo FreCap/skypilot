@@ -1516,7 +1516,7 @@ def set_service_status_and_active_versions_from_replica(
 def update_service_status(pool: bool) -> None:
     noun = 'pool' if pool else 'serve'
     capnoun = noun.capitalize()
-    service_names = serve_state.get_glob_service_names(None)
+    service_names = serve_state.get_glob_service_names(None, pool=pool)
     for service_name in service_names:
         record = _get_service_status(service_name,
                                      pool=pool,
@@ -1851,8 +1851,8 @@ def get_service_status_pickled(
         include_target_num_replicas: Optional[bool] = None
 ) -> List[Dict[str, str]]:
     if service_names is None:
-        # Get all service names
-        service_names = serve_state.get_glob_service_names(None)
+        # Get all names for the requested mode only.
+        service_names = serve_state.get_glob_service_names(None, pool=pool)
     if not service_names:
         return []
     if include_target_num_replicas is None:
@@ -2692,7 +2692,7 @@ def terminate_services(service_names: Optional[List[str]], purge: bool,
     noun = 'pool' if pool else 'service'
     capnoun = noun.capitalize()
     requested_service_names = service_names
-    service_names = serve_state.get_glob_service_names(service_names)
+    service_names = serve_state.get_glob_service_names(service_names, pool=pool)
     if purge:
         service_names = sorted(
             set(service_names) | set(
