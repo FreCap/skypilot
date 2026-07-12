@@ -2,6 +2,7 @@
 
 # pylint: disable=protected-access,redefined-outer-name
 
+import contextlib
 import importlib
 import shutil
 import threading
@@ -31,6 +32,21 @@ def batch_state_db(tmp_path, monkeypatch):
     state.Base.metadata.create_all(engine)
     yield
     engine.dispose()
+
+
+@contextlib.contextmanager
+def _count_sql_statements(engine):
+    counts = {'n': 0}
+
+    def _count(*args, **kwargs):
+        del args, kwargs
+        counts['n'] += 1
+
+    sqlalchemy.event.listen(engine, 'before_cursor_execute', _count)
+    try:
+        yield counts
+    finally:
+        sqlalchemy.event.remove(engine, 'before_cursor_execute', _count)
 
 
 def _create_batch_job(job_id: int, owner_token: str) -> None:
@@ -130,6 +146,72 @@ def test_expired_batch_attempt_is_reclaimed_once(batch_state_db):
                              'worker-b',
                              lease_duration=10,
                              now=110) == (2, 0)
+
+
+def test_batch_returning_fallback_preserves_claim_and_requeue(
+        batch_state_db, monkeypatch):
+    del batch_state_db
+    monkeypatch.setattr(state, '_supports_update_returning',
+                        lambda engine: False)
+    _create_batch_job(80, 'owner-a')
+    assert state.save_batch_states(80, [[0, 4]], 'owner-a')
+    assert state.claim_batch(80,
+                             0,
+                             'owner-a',
+                             'worker-a',
+                             lease_duration=10,
+                             now=100) == (1, 0)
+    assert state.requeue_expired_batch_attempts(80, 'owner-a', now=110) == [0]
+    assert state.claim_batch(80,
+                             0,
+                             'owner-a',
+                             'worker-b',
+                             lease_duration=10,
+                             now=110) == (2, 0)
+
+
+def test_claim_batch_uses_returning_when_supported(batch_state_db):
+    del batch_state_db
+    engine = state._db_manager.get_engine()
+    if not state._supports_update_returning(engine):
+        pytest.skip('dialect does not support UPDATE RETURNING')
+    _create_batch_job(81, 'owner-a')
+    assert state.save_batch_states(81, [[0, 4]], 'owner-a')
+
+    with _count_sql_statements(engine) as counts:
+        claim = state.claim_batch(81,
+                                  0,
+                                  'owner-a',
+                                  'worker-a',
+                                  lease_duration=10,
+                                  now=100)
+
+    assert claim == (1, 0)
+    assert counts['n'] <= 3, counts
+
+
+def test_requeue_expired_batches_uses_single_returning_update(batch_state_db):
+    del batch_state_db
+    engine = state._db_manager.get_engine()
+    if not state._supports_update_returning(engine):
+        pytest.skip('dialect does not support UPDATE RETURNING')
+    _create_batch_job(82, 'owner-a')
+    assert state.save_batch_states(82,
+                                   [[i * 10, i * 10 + 9] for i in range(50)],
+                                   'owner-a')
+    for i in range(50):
+        assert state.claim_batch(82,
+                                 i,
+                                 'owner-a',
+                                 f'worker-{i}',
+                                 lease_duration=10,
+                                 now=100) == (1, 0)
+
+    with _count_sql_statements(engine) as counts:
+        reclaimed = state.requeue_expired_batch_attempts(82, 'owner-a', now=111)
+
+    assert reclaimed == list(range(50))
+    assert counts['n'] <= 3, counts
 
 
 def test_coordinator_takeover_fences_all_old_owner_mutations(batch_state_db):
