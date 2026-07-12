@@ -13,7 +13,9 @@ from unittest import mock
 import grpc
 import pytest
 
+from sky import exceptions
 from sky.backends import backend_utils
+from sky.backends import skylet_rpc
 from sky.utils import context
 
 
@@ -123,6 +125,13 @@ class _FakeStreamingCall:
         item = self._items[self._idx]
         self._idx += 1
         return item
+
+
+def _rpc_error(status_code, details='transient'):
+    err = grpc.RpcError()
+    err.code = lambda: status_code  # type: ignore
+    err.details = lambda: details  # type: ignore
+    return err
 
 
 def test_unary_no_ctx_falls_through_to_blocking_call():
@@ -292,7 +301,7 @@ def test_invoke_skylet_with_retries_bails_on_ctx_cancel_during_backoff():
         raise err
 
     # Patch sleep so the retry loop reaches the cancel check fast.
-    with mock.patch.object(backend_utils, '_handle_grpc_error') as h:
+    with mock.patch.object(skylet_rpc, '_handle_grpc_error') as h:
         # Make _handle_grpc_error a no-op (simulates retry-worthy error).
         h.return_value = None
         ctx.cancel()
@@ -300,3 +309,23 @@ def test_invoke_skylet_with_retries_bails_on_ctx_cancel_during_backoff():
             backend_utils.invoke_skylet_with_retries(func)
         # Should never have called func because ctx was already cancelled.
         assert call_count['n'] == 0
+
+
+def test_invoke_skylet_with_retries_raises_unavailable_on_connection_refused():
+
+    def func():
+        raise _rpc_error(grpc.StatusCode.UNAVAILABLE, 'Connection refused')
+
+    with pytest.raises(exceptions.SkyletUnavailableError,
+                       match='connection refused'):
+        backend_utils.invoke_skylet_with_retries(func)
+
+
+def test_invoke_skylet_with_retries_raises_fallback_error_on_unimplemented():
+
+    def func():
+        raise _rpc_error(grpc.StatusCode.UNIMPLEMENTED, 'missing method')
+
+    with pytest.raises(exceptions.SkyletMethodNotImplementedError,
+                       match='falling back to legacy execution'):
+        backend_utils.invoke_skylet_with_retries(func)
