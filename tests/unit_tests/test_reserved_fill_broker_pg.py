@@ -20,6 +20,7 @@ only sqlite. This module:
 import shutil
 import threading
 import time
+import types
 from unittest import mock
 import uuid
 
@@ -165,6 +166,31 @@ class TestFencePendingFailsClosedPG(sqlite_suite.TestFencePendingFailsClosed):
 
 class TestOrphanFillRowDebitPG(sqlite_suite.TestOrphanFillRowDebit):
     pass
+
+
+class TestReplicaSnapshotDebitPG(sqlite_suite.TestReplicaSnapshotDebit):
+    pass
+
+
+class TestGroupedReplicaSnapshotPG:
+    """The grouped replica query is portable to the production DB dialect."""
+
+    def test_groups_replica_rows(self, broker_engine, monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        for service_id in range(3):
+            service_name = f'svc-{service_id}'
+            serve_state.add_or_update_replicas(
+                service_name,
+                [(replica_id,
+                  types.SimpleNamespace(replica_id=replica_id,
+                                        service_name=service_name))
+                 for replica_id in range(2)])
+
+        grouped = serve_state.get_replica_infos_grouped()
+
+        assert set(grouped) == {'svc-0', 'svc-1', 'svc-2'}
+        assert all(len(infos) == 2 for infos in grouped.values())
 
 
 # TestSqliteFenceBusySkip is deliberately not re-collected here: it pins

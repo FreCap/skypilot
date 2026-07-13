@@ -736,29 +736,46 @@ def _occupying_debit(
     entitlement_debit = 0
     live_fill: dict[str, int] = {}
     unclaimed_fill = 0
-    scan_names = set(claim_names)
-    try:
-        scan_names.update(serve_state.get_replica_service_names())
-    except Exception as e:  # pylint: disable=broad-except
-        logger.warning(
-            'Reserved-fill broker: could not enumerate replica-owning '
-            'services for the round debit (scanning claimants only): '
-            f'{common_utils.format_exception(e)}')
     claimants = set(claim_names)
-    for name in sorted(scan_names):
-        is_claimant = name in claimants
+    try:
+        replica_infos_by_service = serve_state.get_replica_infos_grouped()
+        # Claimants with no replica rows are still a successful zero-row read;
+        # recording zero replaces their possibly-stale claimed holdings.
+        for name in claimants:
+            replica_infos_by_service.setdefault(name, [])
+    except Exception as snapshot_error:  # pylint: disable=broad-except
+        logger.warning(
+            'Reserved-fill broker: could not snapshot replica rows for the '
+            'round debit; falling back to isolated service reads: '
+            f'{common_utils.format_exception(snapshot_error)}')
+        # Preserve the old failure isolation on corrupt rows or a transient
+        # query failure. Enumeration failure degrades to current claimants,
+        # matching the previous behavior.
+        scan_names = set(claim_names)
         try:
-            infos = serve_state.get_replica_infos(name)
-        except Exception as e:  # pylint: disable=broad-except
-            # Failing to read one service's rows must not sink the round;
-            # skipping its debit (and, for a claimant, falling back to its
-            # possibly-stale claim holdings: no live_fill entry) is the
-            # OPTIMISTIC direction, but bounded (one service, one round)
-            # and self-healing.
+            scan_names.update(serve_state.get_replica_service_names())
+        except Exception as enumeration_error:  # pylint: disable=broad-except
             logger.warning(
-                f'Reserved-fill broker: could not read replicas of {name!r} '
-                f'for the round debit: {common_utils.format_exception(e)}')
-            continue
+                'Reserved-fill broker: could not enumerate replica-owning '
+                'services for the round debit (scanning claimants only): '
+                f'{common_utils.format_exception(enumeration_error)}')
+        replica_infos_by_service = {}
+        for name in scan_names:
+            try:
+                replica_infos_by_service[name] = (
+                    serve_state.get_replica_infos(name))
+            except Exception as service_error:  # pylint: disable=broad-except
+                # Failing to read one service's rows must not sink the round;
+                # skipping its debit (and, for a claimant, falling back to
+                # its possibly-stale claim holdings: no live_fill entry) is
+                # optimistic but bounded to one service and one round.
+                logger.warning(
+                    f'Reserved-fill broker: could not read replicas of '
+                    f'{name!r} for the round debit: '
+                    f'{common_utils.format_exception(service_error)}')
+
+    for name, infos in sorted(replica_infos_by_service.items()):
+        is_claimant = name in claimants
         if is_claimant:
             live_fill[name] = 0
         for info in infos:

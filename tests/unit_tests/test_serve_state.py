@@ -1579,3 +1579,29 @@ class TestBatchReplicaUpsert:
         ]
         serve_state.add_or_update_replicas('svc', infos)
         assert len(serve_state.get_replica_infos('svc')) == n
+
+
+class TestGroupedReplicaSnapshot:
+    """get_replica_infos_grouped reads the global replica table once."""
+
+    def test_groups_all_services_in_one_statement(self, _mock_serve_db):
+        for service_id in range(20):
+            service_name = f'svc-{service_id}'
+            infos = [(replica_id,
+                      types.SimpleNamespace(replica_id=replica_id,
+                                            service_name=service_name))
+                     for replica_id in range(3)]
+            serve_state.add_or_update_replicas(service_name, infos)
+
+        with _count_sql_statements(_mock_serve_db) as counts:
+            grouped = serve_state.get_replica_infos_grouped()
+
+        assert counts['n'] == 1
+        assert set(grouped) == {f'svc-{i}' for i in range(20)}
+        assert all(len(infos) == 3 for infos in grouped.values())
+        assert all(info.service_name == service_name
+                   for service_name, infos in grouped.items()
+                   for info in infos)
+
+    def test_empty_table_returns_empty_mapping(self, _mock_serve_db):
+        assert not serve_state.get_replica_infos_grouped()
