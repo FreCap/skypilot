@@ -212,6 +212,51 @@ describe('useClusterDetails request ownership', () => {
     expect(dashboardCache.get).toHaveBeenCalledTimes(3);
   });
 
+  it('does not restart the jobs spinner or issue a superseded job read', async () => {
+    const slowRefreshCluster = deferred();
+    dashboardCache.get
+      .mockResolvedValueOnce([{ name: 'cluster-a', workspace: 'workspace-a' }])
+      .mockResolvedValueOnce([{ id: 1, status: 'SUCCEEDED' }])
+      .mockImplementationOnce(() => slowRefreshCluster.promise)
+      .mockResolvedValueOnce([{ id: 2, status: 'RUNNING' }])
+      .mockResolvedValue([{ id: 3, status: 'STALE' }]);
+
+    const { result } = renderHook(() =>
+      useClusterDetails({ cluster: 'cluster-a' })
+    );
+    await waitFor(() => expect(result.current.clusterJobsLoading).toBe(false));
+
+    // Full refresh whose cluster read hangs.
+    let refreshPromise;
+    act(() => {
+      refreshPromise = result.current.refreshData();
+    });
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(3));
+
+    // A newer job-only refresh completes while the chain is pending.
+    await act(async () => {
+      await result.current.refreshClusterJobsOnly();
+    });
+    expect(result.current.clusterJobData).toEqual([
+      { id: 2, status: 'RUNNING' },
+    ]);
+    expect(result.current.clusterJobsLoading).toBe(false);
+
+    // The superseded chain resolving must not corrupt newer state.
+    await act(async () => {
+      slowRefreshCluster.resolve([
+        { name: 'cluster-a', workspace: 'workspace-a' },
+      ]);
+      await refreshPromise;
+    });
+
+    expect(result.current.clusterJobsLoading).toBe(false);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(4);
+    expect(result.current.clusterJobData).toEqual([
+      { id: 2, status: 'RUNNING' },
+    ]);
+  });
+
   it('uses one cluster read and one workspace-scoped job read per chain', async () => {
     dashboardCache.get
       .mockResolvedValueOnce([{ name: 'cluster-a', workspace: 'workspace-a' }])

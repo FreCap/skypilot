@@ -475,6 +475,9 @@ export function useClusterDetails({ cluster }) {
     async (workspace, requestVersion) => {
       const isCurrentRequest = () =>
         clusterJobsRequestVersionRef.current === requestVersion;
+      if (!isCurrentRequest()) {
+        return;
+      }
       try {
         setLoadingClusterJobData(true);
         // Use dashboard cache for cluster jobs
@@ -520,6 +523,9 @@ export function useClusterDetails({ cluster }) {
       // its loading state belongs to this request chain immediately.
       setLoadingClusterJobData(true);
       const clusterInfo = await fetchClusterData(clusterRequestVersion);
+      if (clusterJobsRequestVersionRef.current !== clusterJobsRequestVersion) {
+        return;
+      }
       if (clusterInfo) {
         if (invalidateJobs) {
           dashboardCache.invalidate(getClusterJobs, [
