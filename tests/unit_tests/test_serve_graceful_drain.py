@@ -430,9 +430,6 @@ class TestRecoveryRedrive:
                                'get_replica_infos',
                                return_value=[info]), \
              mock.patch.object(replica_managers.serve_state,
-                               'get_replicas_at_status',
-                               return_value=[]), \
-             mock.patch.object(replica_managers.serve_state,
                                'get_replica_info_from_id',
                                return_value=info):
             rm._recover_replica_operations()
@@ -496,10 +493,7 @@ class TestRecoveryRedrive:
         info.get_spot_location.return_value = location
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
-                               return_value=[info]), \
-             mock.patch.object(replica_managers.serve_state,
-                               'get_replicas_at_status',
-                               return_value=[]):
+                               return_value=[info]):
             rm._recover_replica_operations()
 
         rm._spot_placer.set_preemptive.assert_called_once_with(location)
@@ -527,9 +521,6 @@ class TestRecoveryRedrive:
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
                                return_value=[info]), \
-             mock.patch.object(replica_managers.serve_state,
-                               'get_replicas_at_status',
-                               return_value=[]), \
              mock.patch.object(replica_managers.global_user_state,
                                'get_cluster_status_fields',
                                return_value={}), \
@@ -560,9 +551,6 @@ class TestRecoveryRedrive:
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
                                return_value=[info]), \
-             mock.patch.object(replica_managers.serve_state,
-                               'get_replicas_at_status',
-                               return_value=[]), \
              mock.patch.object(
                  replica_managers.global_user_state,
                  'get_cluster_status_fields',
@@ -601,9 +589,6 @@ class TestRecoveryRedrive:
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
                                return_value=[info]), \
-             mock.patch.object(replica_managers.serve_state,
-                               'get_replicas_at_status',
-                               return_value=[]), \
              mock.patch.object(replica_managers.serve_state,
                                'get_replica_info_from_id',
                                return_value=info):

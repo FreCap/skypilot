@@ -138,9 +138,17 @@ def _make_manager(service_name='svc', next_replica_id=1):
     return mgr
 
 
-def _fake_replica_info(replica_id):
+def _fake_replica_info(replica_id, status=None):
     info = mock.Mock()
     info.replica_id = replica_id
+    # Explicit, inert lifecycle fields: a bare Mock attribute is truthy and
+    # would accidentally route the fake into the spot-orphan / re-drive
+    # teardown scans of `_recover_replica_operations`.
+    info.status = status
+    info.is_spot = False
+    info.status_property.preempted = False
+    info.status_property.is_scale_down = False
+    info.status_property.purged = False
     return info
 
 
@@ -175,15 +183,12 @@ class TestReplicaIdSeededOnRecovery:
     def test_seeds_past_max_existing_id(self):
         mgr = _make_manager(next_replica_id=1)
         with mock.patch(
-                'sky.serve.replica_managers.serve_state.get_replicas_at_status',
-                return_value=[]), \
-             mock.patch(
-                 'sky.serve.replica_managers.serve_state.get_replica_infos',
-                 return_value=[
-                     _fake_replica_info(1),
-                     _fake_replica_info(2),
-                     _fake_replica_info(5),
-                 ]):
+                'sky.serve.replica_managers.serve_state.get_replica_infos',
+                return_value=[
+                    _fake_replica_info(1),
+                    _fake_replica_info(2),
+                    _fake_replica_info(5),
+                ]):
             mgr._recover_replica_operations()
         # max existing id is 5 -> next must be 6, NOT 1 (the reset value).
         assert mgr._next_replica_id == 6
@@ -192,11 +197,8 @@ class TestReplicaIdSeededOnRecovery:
         # No replicas yet (first `up`, not a recovery) -> allocator unchanged.
         mgr = _make_manager(next_replica_id=1)
         with mock.patch(
-                'sky.serve.replica_managers.serve_state.get_replicas_at_status',
-                return_value=[]), \
-             mock.patch(
-                 'sky.serve.replica_managers.serve_state.get_replica_infos',
-                 return_value=[]):
+                'sky.serve.replica_managers.serve_state.get_replica_infos',
+                return_value=[]):
             mgr._recover_replica_operations()
         assert mgr._next_replica_id == 1
 
@@ -1168,10 +1170,6 @@ class TestRecoveryRetryAndIsolation:
                 'get_replica_infos',
                 return_value=[info]), \
              mock.patch.object(
-                 replica_managers.serve_state,
-                 'get_replicas_at_status',
-                 return_value=[]), \
-             mock.patch.object(
                  replica_managers.global_user_state,
                  'get_cluster_status_fields',
                  return_value={}), \
@@ -1203,16 +1201,17 @@ class TestRecoveryRetryAndIsolation:
                 raise RuntimeError('boom')
             launched.append(replica_id)
 
-        infos = [_fake_replica_info(i) for i in (1, 2, 3)]
+        infos = [
+            _fake_replica_info(
+                i,
+                status=replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+            for i in (1, 2, 3)
+        ]
         for info in infos:
             info.resources_override = None
         with mock.patch(
                 'sky.serve.replica_managers.serve_state.get_replica_infos',
                 return_value=infos), \
-             mock.patch(
-                 'sky.serve.replica_managers.serve_state.'
-                 'get_replicas_at_status',
-                 side_effect=[infos, [], []]), \
              mock.patch.object(mgr, '_launch_replica', side_effect=_launch):
             mgr._recover_replica_operations()
         # Replica 2 failed; 1 and 3 still re-driven.
@@ -1230,10 +1229,11 @@ class TestRecoveryRetryAndIsolation:
         mgr._spot_placer = None
         mgr._replica_to_request_id = {}
         mgr._replica_to_launch_cancelled = {}
-        fill_row = _fake_replica_info(1)
+        provisioning = replica_managers.serve_state.ReplicaStatus.PROVISIONING
+        fill_row = _fake_replica_info(1, status=provisioning)
         fill_row.resources_override = None
         fill_row.reserved_fill = True
-        demand_row = _fake_replica_info(2)
+        demand_row = _fake_replica_info(2, status=provisioning)
         demand_row.resources_override = None
         demand_row.reserved_fill = False
         persisted: dict = {}
@@ -1250,10 +1250,6 @@ class TestRecoveryRetryAndIsolation:
                  return_value=[fill_row, demand_row]), \
              mock.patch(
                  'sky.serve.replica_managers.serve_state.'
-                 'get_replicas_at_status',
-                 side_effect=[[fill_row, demand_row], [], []]), \
-             mock.patch(
-                 'sky.serve.replica_managers.serve_state.'
                  'add_or_update_replica',
                  side_effect=lambda _svc, rid, info: persisted.__setitem__(
                      rid, info)), \
@@ -1267,10 +1263,84 @@ class TestRecoveryRetryAndIsolation:
         mgr._launch_thread_pool = {7: mock.Mock()}
         with mock.patch(
                 'sky.serve.replica_managers.serve_state.get_replica_infos',
-                return_value=[]), \
-             mock.patch(
-                 'sky.serve.replica_managers.serve_state.'
-                 'get_replicas_at_status',
-                 return_value=[]):
+                return_value=[]):
             # Previously an assert; on a retry pass this must not raise.
             mgr._recover_replica_operations()
+
+
+class TestRecoverySingleSnapshot:
+    """The recovery pass must read the replica table exactly once.
+
+    It previously fetched (and unpickled) the whole table three times: once
+    for the snapshot and once per `get_replicas_at_status(PROVISIONING /
+    PENDING)` call. Beyond the wasted O(3 x rows) work at fleet scale, the
+    reads could diverge: the re-drive list, the id-allocator seed, and the
+    `existing_replica_infos` snapshot passed to `_launch_replica` must all
+    describe the same durable state.
+    """
+
+    @staticmethod
+    def _statuses(*statuses):
+        return [
+            _fake_replica_info(i + 1, status=status)
+            for i, status in enumerate(statuses)
+        ]
+
+    def test_replica_table_is_read_exactly_once(self):
+        mgr = _make_manager()
+        infos = self._statuses(
+            replica_managers.serve_state.ReplicaStatus.PROVISIONING,
+            replica_managers.serve_state.ReplicaStatus.PENDING,
+            replica_managers.serve_state.ReplicaStatus.READY,
+        )
+        for info in infos:
+            info.resources_override = None
+        with mock.patch(
+                'sky.serve.replica_managers.serve_state.get_replica_infos',
+                return_value=infos) as scan, \
+             mock.patch.object(mgr, '_launch_replica'):
+            mgr._recover_replica_operations()
+        assert scan.call_count == 1
+
+    def test_provisioning_redriven_before_pending(self):
+        # PROVISIONING replicas were previously launched and may hold live
+        # cloud resources; they must win the bounded launch queue over
+        # PENDING ones regardless of row order.
+        mgr = _make_manager()
+        infos = self._statuses(
+            replica_managers.serve_state.ReplicaStatus.PENDING,
+            replica_managers.serve_state.ReplicaStatus.PROVISIONING,
+            replica_managers.serve_state.ReplicaStatus.PENDING,
+            replica_managers.serve_state.ReplicaStatus.PROVISIONING,
+        )
+        for info in infos:
+            info.resources_override = None
+        launched = []
+        with mock.patch(
+                'sky.serve.replica_managers.serve_state.get_replica_infos',
+                return_value=infos), \
+             mock.patch.object(
+                 mgr, '_launch_replica',
+                 side_effect=lambda replica_id, **_: launched.append(
+                     replica_id)):
+            mgr._recover_replica_operations()
+        assert launched == [2, 4, 1, 3]
+
+    def test_launch_redrive_reuses_the_snapshot(self):
+        # `existing_replica_infos` handed to each re-driven launch must be
+        # the same object as the recovery snapshot (no per-launch re-scan).
+        mgr = _make_manager()
+        infos = self._statuses(
+            replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+        infos[0].resources_override = None
+        seen_snapshots = []
+        with mock.patch(
+                'sky.serve.replica_managers.serve_state.get_replica_infos',
+                return_value=infos), \
+             mock.patch.object(
+                 mgr, '_launch_replica',
+                 side_effect=lambda replica_id, existing_replica_infos=None,
+                 **_: seen_snapshots.append(existing_replica_infos)):
+            mgr._recover_replica_operations()
+        assert seen_snapshots == [infos]
+        assert seen_snapshots[0] is infos

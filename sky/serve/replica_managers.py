@@ -1474,11 +1474,17 @@ class SkyPilotReplicaManager(ReplicaManager):
         # launched but may have been interrupted and need to be restarted.
         # This is why we handle PENDING replicas only after PROVISIONING
         # replicas.
-        to_up_replicas = serve_state.get_replicas_at_status(
-            self._service_name, serve_state.ReplicaStatus.PROVISIONING)
+        # Filter the snapshot in-memory rather than re-querying per status:
+        # each `get_replicas_at_status` re-read and re-unpickled the whole
+        # replica table, and separate reads could also diverge from the
+        # snapshot the allocator seed and `existing_replica_infos` use.
+        to_up_replicas = [
+            info for info in all_replica_infos
+            if info.status == serve_state.ReplicaStatus.PROVISIONING
+        ]
         to_up_replicas.extend(
-            serve_state.get_replicas_at_status(
-                self._service_name, serve_state.ReplicaStatus.PENDING))
+            info for info in all_replica_infos
+            if info.status == serve_state.ReplicaStatus.PENDING)
 
         for replica_info in to_up_replicas:
             # It should be robust enough for `execution.launch` to handle cases

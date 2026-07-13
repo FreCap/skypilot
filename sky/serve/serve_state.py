@@ -2137,14 +2137,6 @@ def get_replica_launch_budget_counts() -> Tuple[int, int]:
     return provisioning_count, terminating_count
 
 
-def get_replicas_at_status(
-    service_name: str,
-    status: ReplicaStatus,
-) -> List['replica_managers.ReplicaInfo']:
-    replicas = get_replica_infos(service_name)
-    return [replica for replica in replicas if replica.status == status]
-
-
 # === Version functions ===
 def _lock_service_for_version_mutation(session: orm.Session,
                                        service_name: str) -> bool:
