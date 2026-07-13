@@ -320,6 +320,10 @@ def _broker_db(broker_engine, monkeypatch, clock):  # pylint: disable=unused-arg
                         mock.Mock(return_value=[]))
     monkeypatch.setattr(serve_state, 'get_replica_service_names',
                         mock.Mock(return_value=[]))
+    # Existing allocation tests exercise the isolated-read fallback with
+    # precise per-service mocks. Snapshot-specific tests below override this.
+    monkeypatch.setattr(serve_state, 'get_replica_infos_grouped',
+                        mock.Mock(side_effect=RuntimeError('fallback')))
     broker.clear_caches()
     yield engine
     broker.clear_caches()
@@ -1322,12 +1326,8 @@ class TestOrphanFillRowDebit:
         orphan_rows = [
             _replica_stub(is_ready=False, reserved_fill=True, created_at=1.0)
         ]
-        monkeypatch.setattr(
-            serve_state, 'get_replica_infos',
-            mock.Mock(side_effect=lambda name: orphan_rows
-                      if name == 'svc-gone' else []))
-        monkeypatch.setattr(serve_state, 'get_replica_service_names',
-                            mock.Mock(return_value=['svc-gone']))
+        monkeypatch.setattr(serve_state, 'get_replica_infos_grouped',
+                            mock.Mock(return_value={'svc-gone': orphan_rows}))
         _upsert('svc-a')
         _upsert('svc-b')
         alloc = _run('svc-a', free=4)
@@ -1355,12 +1355,8 @@ class TestOrphanFillRowDebit:
                           reserved_fill=True,
                           created_at=1.0)
         ]
-        monkeypatch.setattr(
-            serve_state, 'get_replica_infos',
-            mock.Mock(side_effect=lambda name: orphan_rows
-                      if name == 'svc-gone' else []))
-        monkeypatch.setattr(serve_state, 'get_replica_service_names',
-                            mock.Mock(return_value=['svc-gone']))
+        monkeypatch.setattr(serve_state, 'get_replica_infos_grouped',
+                            mock.Mock(return_value={'svc-gone': orphan_rows}))
         _upsert('svc-a')
         _upsert('svc-b')
         alloc = _run('svc-a', free=0)
@@ -1371,6 +1367,63 @@ class TestOrphanFillRowDebit:
         assert sum(json.loads(round_row['grants']).values()) == 1
         # Nothing is feedable: the drainer's pod still holds its slot.
         assert sum(json.loads(round_row['feeds']).values()) == 0
+
+
+@pytest.mark.usefixtures('_broker_db')
+class TestReplicaSnapshotDebit:
+    """The normal broker path consumes one row-consistent replica snapshot."""
+
+    def test_snapshot_covers_claimants_and_former_claimants(self, monkeypatch):
+        claimant_row = _replica_stub(reserved_fill=True, created_at=1.0)
+        orphan_row = _replica_stub(is_ready=False,
+                                   reserved_fill=True,
+                                   created_at=1.0)
+        snapshot = mock.Mock(return_value={
+            'svc-a': [claimant_row],
+            'svc-gone': [orphan_row],
+        })
+        monkeypatch.setattr(serve_state, 'get_replica_infos_grouped', snapshot)
+        legacy_names = mock.Mock(side_effect=AssertionError('legacy query'))
+        legacy_infos = mock.Mock(side_effect=AssertionError('legacy query'))
+        monkeypatch.setattr(serve_state, 'get_replica_service_names',
+                            legacy_names)
+        monkeypatch.setattr(serve_state, 'get_replica_infos', legacy_infos)
+
+        result = broker._occupying_debit(['svc-a', 'svc-b'], _POOL, 10.0)
+
+        assert result == (1, 0, {'svc-a': 1, 'svc-b': 0}, 1)
+        snapshot.assert_called_once_with()
+        legacy_names.assert_not_called()
+        legacy_infos.assert_not_called()
+
+    def test_snapshot_failure_falls_back_per_service(self, monkeypatch):
+        monkeypatch.setattr(
+            serve_state, 'get_replica_infos_grouped',
+            mock.Mock(side_effect=ValueError('corrupt grouped row')))
+        monkeypatch.setattr(serve_state, 'get_replica_service_names',
+                            mock.Mock(return_value=['svc-gone', 'svc-bad']))
+        claimant_row = _replica_stub(reserved_fill=True, created_at=1.0)
+        orphan_row = _replica_stub(is_ready=False,
+                                   reserved_fill=True,
+                                   created_at=1.0)
+
+        def _isolated_read(name):
+            if name == 'svc-bad':
+                raise ValueError('corrupt isolated row')
+            if name == 'svc-a':
+                return [claimant_row]
+            if name == 'svc-gone':
+                return [orphan_row]
+            return []
+
+        isolated_read = mock.Mock(side_effect=_isolated_read)
+        monkeypatch.setattr(serve_state, 'get_replica_infos', isolated_read)
+
+        result = broker._occupying_debit(['svc-a', 'svc-bad'], _POOL, 10.0)
+
+        assert result == (1, 0, {'svc-a': 1}, 1)
+        assert {call.args[0] for call in isolated_read.call_args_list
+               } == {'svc-a', 'svc-bad', 'svc-gone'}
 
 
 @pytest.mark.usefixtures('_broker_db')

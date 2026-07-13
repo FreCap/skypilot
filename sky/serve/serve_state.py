@@ -2108,6 +2108,23 @@ def get_replica_infos(
     return [pickle.loads(row[0]) for row in rows]
 
 
+def get_replica_infos_grouped(
+) -> dict[str, list['replica_managers.ReplicaInfo']]:
+    """Gets every replica info grouped by its owning service in one query."""
+    engine = _db_manager.get_engine()
+    infos_by_service: dict[
+        str, list[replica_managers.ReplicaInfo]] = collections.defaultdict(list)
+    with orm.Session(engine) as session:
+        rows = session.execute(
+            sqlalchemy.select(replicas_table.c.service_name,
+                              replicas_table.c.replica_info))
+        # Iterate the cursor instead of materializing a second list of every
+        # serialized blob alongside the decoded snapshot.
+        for service_name, replica_info in rows:
+            infos_by_service[service_name].append(pickle.loads(replica_info))
+    return dict(infos_by_service)
+
+
 def get_replica_service_names() -> list[str]:
     """Every service that currently has any replica row (a cheap DISTINCT).
 
