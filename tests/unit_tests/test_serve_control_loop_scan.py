@@ -79,8 +79,8 @@ def test_refresh_thread_pool_scans_budget_once_per_tick(monkeypatch, tmp_path):
 
     monkeypatch.setattr(serve_state, 'get_replica_launch_budget_counts',
                         _count_budget)
-    monkeypatch.setattr(serve_state, 'get_replica_info_from_id',
-                        lambda svc, rid: replicas[rid])
+    monkeypatch.setattr(serve_state, 'get_replica_infos_from_ids',
+                        lambda svc, rids: {rid: replicas[rid] for rid in rids})
     monkeypatch.setattr(serve_state, 'get_replica_infos',
                         lambda svc: list(replicas.values()))
     monkeypatch.setattr(serve_state, 'add_or_update_replica',
@@ -122,8 +122,8 @@ def test_down_admission_uses_hoisted_budget(monkeypatch, tmp_path):
         return 0, 0
 
     monkeypatch.setattr(serve_state, 'get_replica_launch_budget_counts', _scan)
-    monkeypatch.setattr(serve_state, 'get_replica_info_from_id',
-                        lambda svc, rid: replicas[rid])
+    monkeypatch.setattr(serve_state, 'get_replica_infos_from_ids',
+                        lambda svc, rids: {rid: replicas[rid] for rid in rids})
     monkeypatch.setattr(serve_state, 'get_replica_infos',
                         lambda svc: list(replicas.values()))
     monkeypatch.setattr(serve_state, 'add_or_update_replica',
@@ -143,6 +143,51 @@ def test_down_admission_uses_hoisted_budget(monkeypatch, tmp_path):
     assert all(info.status_property.sky_down_status ==
                common_utils.ProcessStatus.RUNNING for info in replicas.values())
     assert scans['n'] <= 1
+
+
+def test_refresh_thread_pool_batches_replica_row_reads(monkeypatch, tmp_path):
+    """Finished launch/down threads hydrate with one batch read per pool.
+
+    Before the fix, every finished (or still-PENDING queued) thread issued its
+    own ``get_replica_info_from_id`` DB read on every tick, so K queued
+    launches cost K reads per tick until admitted.
+    """
+    num_launching = 25
+    replicas = {rid: _pending_replica(rid) for rid in range(num_launching)}
+    reads = {'batch': 0}
+
+    def _batch(svc, rids):
+        del svc
+        reads['batch'] += 1
+        return {rid: replicas[rid] for rid in rids}
+
+    def _single(svc, rid):
+        raise AssertionError(
+            f'per-replica DB read for {svc}/{rid} in refresh tick')
+
+    monkeypatch.setattr(serve_state, 'get_replica_infos_from_ids', _batch)
+    monkeypatch.setattr(serve_state, 'get_replica_info_from_id', _single)
+    monkeypatch.setattr(serve_state, 'get_replica_launch_budget_counts', lambda:
+                        (0, 0))
+    monkeypatch.setattr(serve_state, 'get_replica_infos',
+                        lambda svc: list(replicas.values()))
+    monkeypatch.setattr(serve_state, 'add_or_update_replica',
+                        lambda svc, rid, info: replicas.__setitem__(rid, info))
+    monkeypatch.setattr(controller_utils, '_get_request_parallelism',
+                        lambda pool: 10_000)
+    monkeypatch.setattr(controller_utils, 'get_resources_lock_path',
+                        lambda: str(tmp_path / 'resources.lock'))
+
+    mgr = _build_manager(num_launching)
+    mgr._refresh_thread_pool()
+
+    # Correctness preserved: every pending replica got launched...
+    assert all(t.started for t in mgr._launch_thread_pool.values())
+    # ...via one batch hydration per pool (launch + down), not one read per
+    # queued replica per tick.
+    assert reads['batch'] <= 2, (
+        f'{reads["batch"]} replica-row reads for {num_launching} queued '
+        'launches; expected at most one batch read per thread pool')
 
 
 def test_idle_tick_performs_no_budget_scan(monkeypatch):

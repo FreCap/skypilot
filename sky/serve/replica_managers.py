@@ -2474,11 +2474,17 @@ class SkyPilotReplicaManager(ReplicaManager):
                                     ReplicaInfo]] = []
         pending_launches: list[tuple[int, thread_utils.SafeThread,
                                      ReplicaInfo]] = []
-        for replica_id, t in launch_thread_pool_snapshot:
-            if t.is_alive():
-                continue
-            info = serve_state.get_replica_info_from_id(self._service_name,
-                                                        replica_id)
+        # One query for every finished launch thread; walking the pool with
+        # per-replica reads makes queued PENDING launches re-hit the DB every
+        # tick until they are admitted.
+        finished_launches = [(replica_id, t)
+                             for replica_id, t in launch_thread_pool_snapshot
+                             if not t.is_alive()]
+        launch_infos = serve_state.get_replica_infos_from_ids(
+            self._service_name,
+            [replica_id for replica_id, _ in finished_launches])
+        for replica_id, t in finished_launches:
+            info = launch_infos.get(replica_id)
             assert info is not None, replica_id
             if info.status == serve_state.ReplicaStatus.PENDING:
                 pending_launches.append((replica_id, t, info))
@@ -2561,11 +2567,14 @@ class SkyPilotReplicaManager(ReplicaManager):
         down_thread_pool_snapshot = list(self._down_thread_pool.items())
         down_to_admit: list[tuple[int, thread_utils.SafeThread,
                                   ReplicaInfo]] = []
-        for replica_id, t in down_thread_pool_snapshot:
-            if t.is_alive():
-                continue
-            info = serve_state.get_replica_info_from_id(self._service_name,
-                                                        replica_id)
+        finished_downs = [(replica_id, t)
+                          for replica_id, t in down_thread_pool_snapshot
+                          if not t.is_alive()]
+        down_infos = serve_state.get_replica_infos_from_ids(
+            self._service_name,
+            [replica_id for replica_id, _ in finished_downs])
+        for replica_id, t in finished_downs:
+            info = down_infos.get(replica_id)
             assert info is not None, replica_id
             if (info.status_property.sky_down_status ==
                     common_utils.ProcessStatus.SCHEDULED):

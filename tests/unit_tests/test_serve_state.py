@@ -191,6 +191,33 @@ def test_get_specs_batches_requested_versions_in_one_query(_mock_serve_db):
     assert specs[2].graceful_drain_async_occupancy is True
 
 
+def test_get_replica_infos_from_ids_batches_in_one_query(_mock_serve_db):
+    for rid in (1, 2, 3):
+        info = replica_managers.ReplicaInfo(replica_id=rid,
+                                            cluster_name=f'svc-{rid}',
+                                            replica_port='8080',
+                                            is_spot=False,
+                                            location=None,
+                                            version=1,
+                                            resources_override=None)
+        serve_state.add_or_update_replica('svc', rid, info)
+
+    with _count_sql_statements(_mock_serve_db) as counts:
+        infos = serve_state.get_replica_infos_from_ids('svc', [2, 1, 2, 4])
+
+    assert counts['n'] == 1, counts
+    assert set(infos) == {1, 2}
+    assert infos[1].replica_id == 1
+    assert infos[2].replica_id == 2
+
+
+def test_get_replica_infos_from_ids_empty_skips_query(_mock_serve_db):
+    with _count_sql_statements(_mock_serve_db) as counts:
+        assert serve_state.get_replica_infos_from_ids('svc', []) == {}
+
+    assert counts['n'] == 0, counts
+
+
 def test_get_yaml_contents_batches_requested_versions_in_one_query(
         _mock_serve_db):
     assert _add_minimal_service('svc-yamls') is True
