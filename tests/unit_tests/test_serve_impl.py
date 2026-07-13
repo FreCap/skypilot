@@ -6,9 +6,12 @@ also makes the user-visible failure mode "go run --purge" instead of "look
 at the connection-refused traceback and figure it out."
 """
 # pylint: disable=invalid-name,protected-access
+import base64
+import shlex
 from unittest import mock
 
 import pytest
+import yaml
 
 from sky import backends
 from sky.data import storage as storage_lib
@@ -87,6 +90,159 @@ def test_scoped_storage_metadata_is_independent_of_local_intent_db():
         'storage_generation': generation,
         'storage_mounts': ['/data'],
     }
+
+
+class TestCleanupProvisionalStorageIntents:
+    """Regression coverage for failed up/update storage-intent cleanup."""
+
+    @staticmethod
+    def _task_with_scope(resource_scope, storage_generation):
+        metadata = {
+            constants.EPHEMERAL_STORAGE_SCOPE_METADATA_KEY: {
+                'resource_scope': resource_scope,
+                'storage_generation': storage_generation,
+            }
+        }
+        return mock.Mock(metadata=metadata)
+
+    def test_scans_committed_versions_once_and_after_lifecycle_fence(self):
+        intents = [
+            {
+                'resource_scope': 'scope-a',
+                'storage_generation': 'gen-a',
+                'yaml_content': 'yaml-a',
+            },
+            {
+                'resource_scope': 'scope-b',
+                'storage_generation': 'gen-b',
+                'yaml_content': 'yaml-b',
+            },
+            {
+                'resource_scope': 'scope-c',
+                'storage_generation': 'gen-c',
+                'yaml_content': 'yaml-c',
+            },
+        ]
+        calls = []
+        with mock.patch.object(impl.serve_state,
+                               'get_ephemeral_storage_cleanup_intents',
+                               return_value=intents), \
+             mock.patch.object(
+                 impl.serve_utils,
+                 'advance_service_lifecycle_epoch',
+                 side_effect=lambda lock: calls.append('advance') or 99), \
+             mock.patch.object(
+                 impl.serve_state,
+                 'get_service_versions',
+                 side_effect=lambda service_name: calls.append('versions') or
+                 [1, 2]) as get_versions, \
+             mock.patch.object(
+                 impl.serve_state,
+                 'get_yaml_content',
+                 side_effect=lambda service_name, version: {
+                     1: 'yaml-v1',
+                     2: 'yaml-v2',
+                 }[version]) as get_yaml_content, \
+             mock.patch.object(
+                 impl.task_lib.Task,
+                 'from_yaml_str',
+                 side_effect=lambda yaml_content: {
+                     'yaml-v1': self._task_with_scope('scope-a', 'gen-a'),
+                     'yaml-v2': self._task_with_scope('scope-z', 'gen-z'),
+                 }[yaml_content]) as from_yaml_str, \
+             mock.patch.object(impl.service_lib,
+                               'cleanup_storage',
+                               return_value=True) as cleanup_storage, \
+             mock.patch.object(
+                 impl.serve_state,
+                 'remove_provisional_ephemeral_storage_cleanup_intents',
+                 return_value=True) as remove_intents:
+            impl._cleanup_provisional_storage_intents('svc', 7,
+                                                      mock.MagicMock())
+
+        assert calls == ['advance', 'versions']
+        assert get_versions.call_count == 1
+        assert get_yaml_content.call_count == 2
+        assert from_yaml_str.call_count == 2
+        cleanup_storage.assert_has_calls([
+            mock.call('yaml-b', 'scope-b'),
+            mock.call('yaml-c', 'scope-c'),
+        ])
+        assert cleanup_storage.call_count == 2
+        remove_intents.assert_has_calls([
+            mock.call('svc', 'scope-b', 7, 99),
+            mock.call('svc', 'scope-c', 7, 99),
+        ],
+                                        any_order=True)
+        assert remove_intents.call_count == 2
+
+    def test_unreadable_committed_yaml_retains_all_intents(self):
+        intents = [{
+            'resource_scope': 'scope-a',
+            'storage_generation': 'gen-a',
+            'yaml_content': 'yaml-a',
+        }]
+        with mock.patch.object(impl.serve_state,
+                               'get_ephemeral_storage_cleanup_intents',
+                               return_value=intents), \
+             mock.patch.object(impl.serve_utils,
+                               'advance_service_lifecycle_epoch',
+                               return_value=99), \
+             mock.patch.object(impl.serve_state,
+                               'get_service_versions',
+                               return_value=[1]), \
+             mock.patch.object(impl.serve_state,
+                               'get_yaml_content',
+                               return_value='broken-yaml'), \
+             mock.patch.object(impl.task_lib.Task,
+                               'from_yaml_str',
+                               side_effect=ValueError('bad yaml')), \
+             mock.patch.object(impl.service_lib,
+                               'cleanup_storage') as cleanup_storage, \
+             mock.patch.object(
+                 impl.serve_state,
+                 'remove_provisional_ephemeral_storage_cleanup_intents'
+             ) as remove_intents:
+            impl._cleanup_provisional_storage_intents('svc', 7,
+                                                      mock.MagicMock())
+
+        cleanup_storage.assert_not_called()
+        remove_intents.assert_not_called()
+
+    def test_removal_is_grouped_by_resource_scope(self):
+        intents = [
+            {
+                'resource_scope': 'scope-a',
+                'storage_generation': 'gen-a',
+                'yaml_content': 'yaml-a',
+            },
+            {
+                'resource_scope': 'scope-a',
+                'storage_generation': 'gen-b',
+                'yaml_content': 'yaml-b',
+            },
+        ]
+        with mock.patch.object(impl.serve_state,
+                               'get_ephemeral_storage_cleanup_intents',
+                               return_value=intents), \
+             mock.patch.object(impl.serve_utils,
+                               'advance_service_lifecycle_epoch',
+                               return_value=99), \
+             mock.patch.object(impl.serve_state,
+                               'get_service_versions',
+                               return_value=[]), \
+             mock.patch.object(impl.service_lib,
+                               'cleanup_storage',
+                               return_value=True) as cleanup_storage, \
+             mock.patch.object(
+                 impl.serve_state,
+                 'remove_provisional_ephemeral_storage_cleanup_intents',
+                 return_value=True) as remove_intents:
+            impl._cleanup_provisional_storage_intents('svc', 7,
+                                                      mock.MagicMock())
+
+        assert cleanup_storage.call_count == 2
+        remove_intents.assert_called_once_with('svc', 'scope-a', 7, 99)
 
 
 class TestExternalOnlyTopologyPreflight:
@@ -228,6 +384,7 @@ class TestExternalCapabilityMutationPaths:
 
 
 class TestServiceNameValidation:
+    """Service naming must respect LB and cluster-name constraints."""
 
     def test_external_service_label_boundary(self):
         impl._validate_service_name('s' * 63, pool=False)
@@ -383,37 +540,33 @@ class TestHaRecoveryRestoreCmds:
     subtrees stripped before the embed."""
 
     def test_embeds_contents_with_home_spliced_quoting(self):
-        import base64 as b64
-        import shlex as shlex_mod
         content = b'active_workspace: mt_native\n'
         cmds = impl._ha_recovery_restore_cmds(
             {'~/.sky/serve/svc/config.yaml': content})
         assert len(cmds) == 1
-        assert b64.b64encode(content).decode() in cmds[0]
+        assert base64.b64encode(content).decode() in cmds[0]
         # Home-relative paths must expand at runtime: the leading ~ is
         # spliced to an unquoted "$HOME" with only the remainder quoted
         # (shlex leaves this metacharacter-free remainder unquoted).
-        expected_path = '"$HOME"' + shlex_mod.quote(
-            '/.sky/serve/svc/config.yaml')
+        expected_path = '"$HOME"' + shlex.quote('/.sky/serve/svc/config.yaml')
         assert f'mkdir -p -- "$(dirname -- {expected_path})"' in cmds[0]
         assert cmds[0].endswith(f'> {expected_path}')
 
     def test_hostile_paths_are_quoted_inert(self):
-        import shlex as shlex_mod
         hostile = '/tmp/a b; rm -rf $HOME/pwn'
         cmds = impl._ha_recovery_restore_cmds({hostile: b'x: 1\n'})
         assert len(cmds) == 1
-        assert shlex_mod.quote(hostile) in cmds[0]
-        assert '; rm -rf' not in cmds[0].replace(shlex_mod.quote(hostile), '')
+        assert shlex.quote(hostile) in cmds[0]
+        assert '; rm -rf' not in cmds[0].replace(shlex.quote(hostile), '')
 
     def test_oversized_content_skipped(self):
         cmds = impl._ha_recovery_restore_cmds(
             {'~/x/big.bin': b'x' * (1024 * 1024 + 1)})
-        assert cmds == []
+        assert not cmds
 
     def test_empty(self):
-        assert impl._ha_recovery_restore_cmds(None) == []
-        assert impl._ha_recovery_restore_cmds({}) == []
+        assert not impl._ha_recovery_restore_cmds(None)
+        assert not impl._ha_recovery_restore_cmds({})
 
 
 class TestSanitizedConfigBytes:
@@ -421,7 +574,6 @@ class TestSanitizedConfigBytes:
     ha_recovery_script DB row."""
 
     def test_strips_vast_create_instance_kwargs(self, tmp_path):
-        import yaml
         cfg = tmp_path / 'config.yaml'
         cfg.write_text('active_workspace: mt_native\n'
                        'workspaces:\n  mt_native: {}\n'
@@ -449,7 +601,6 @@ class TestSanitizedConfigBytes:
         assert impl._sanitized_config_bytes(str(cfg)) is None
 
     def test_strips_pod_config_including_per_context(self, tmp_path):
-        import yaml
         cfg = tmp_path / 'config.yaml'
         cfg.write_text(
             'active_workspace: mt_native\n'
@@ -644,5 +795,5 @@ class TestLifecycleLocking:
 
     def test_down_all_takes_no_per_service_locks(self):
         locked, mock_term = self._run_down(None, all=True)
-        assert locked == []
+        assert not locked
         mock_term.assert_called_once()
