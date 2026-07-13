@@ -70,6 +70,8 @@ class TestToInfoDictPreComputedFields:
         so new clients never need to touch the handle blob."""
         info = _make_replica_info()
         handle, simple, full = _make_handle()
+        handle.launched_nodes = 2
+        handle.launched_resources.get_cost.return_value = 3.25
         with mock.patch.object(info, 'handle',
                                return_value=handle) as handle_call:
             with mock.patch(
@@ -87,6 +89,8 @@ class TestToInfoDictPreComputedFields:
         assert result['infra'] == 'aws (us-east-1)'
         assert result['resources_str'] == simple
         assert result['resources_str_full'] == full
+        assert result['hourly_cost'] == 6.5
+        assert result['hourly_cost_exclusion_reason'] is None
         # with_handle=False MUST NOT add the bulky handle to the dict.
         assert 'handle' not in result
 
@@ -138,7 +142,8 @@ class TestToInfoDictPreComputedFields:
         assert result['launched_at'] is None
         assert result['handle'] is None
         for key in ('cloud', 'region', 'infra', 'resources_str',
-                    'resources_str_full'):
+                    'resources_str_full', 'hourly_cost',
+                    'hourly_cost_exclusion_reason'):
             assert key not in result
 
 

@@ -170,6 +170,16 @@ def test_kubernetes_is_excluded_not_zero_priced():
     assert rows[0]['machine_seconds'] == 3600
 
 
+def test_estimate_hourly_cost_uses_actual_purchase_option_and_nodes():
+    spot_resources = _FakeResources(1.25, use_spot=True)
+    assert estimated_spend.estimate_hourly_cost(spot_resources,
+                                                2) == (2.5, None)
+
+    kubernetes_resources = _FakeResources(99.0, cloud='Kubernetes')
+    assert estimated_spend.estimate_hourly_cost(kubernetes_resources) == (
+        None, 'kubernetes')
+
+
 def test_corrupt_resource_pickle_does_not_block_rollup(tmp_path, monkeypatch):
     engine = _fresh_db(tmp_path, monkeypatch)
     day = 1_700_006_400

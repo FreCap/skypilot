@@ -1788,7 +1788,21 @@ def _get_service_status(
         try:
             resp = _get_to_controller_with_retry(service_name, record['hash'],
                                                  '/autoscaler/info')
-            record['target_num_replicas'] = resp.json()['target_num_replicas']
+            autoscaler_info = resp.json()
+            record['target_num_replicas'] = autoscaler_info[
+                'target_num_replicas']
+            request_field_map = {
+                'recent_request_count': 'recent_request_count',
+                'request_window_seconds': 'request_window_seconds',
+                'requests_per_second': 'requests_per_second',
+                'in_flight_requests': 'in_flight_total',
+                'request_queue_depth': 'queue_depth',
+                'rejected_requests': 'rejected_in_window',
+                'request_stats_age_seconds': 'report_age_seconds',
+            }
+            for record_field, autoscaler_field in request_field_map.items():
+                if autoscaler_field in autoscaler_info:
+                    record[record_field] = autoscaler_info[autoscaler_field]
         except requests.exceptions.RequestException:
             record['target_num_replicas'] = None
         except Exception as e:  # pylint: disable=broad-except
@@ -1818,11 +1832,13 @@ def _get_service_status(
         cluster_names = [info.cluster_name for info in replica_infos]
         cluster_records = global_user_state.get_clusters_from_names(
             cluster_names)
+        rate_cache: dict[str, float] = {}
         record['replica_info'] = [
             info.to_info_dict(
                 with_handle=True,
                 with_url=not pool,
                 cluster_record=cluster_records[info.cluster_name],
+                rate_cache=rate_cache,
             ) for info in replica_infos
         ]
         if pool:
