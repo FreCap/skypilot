@@ -91,7 +91,7 @@ def _generate_tmp_yaml(tmp_path, filename: str) -> str:
 
 
 @pytest.fixture
-def _mock_cluster_state(_mock_db_conn, tmp_path):
+def _mock_cluster_state(_mock_db_conn, tmp_path, mock_aws_catalog):
     assert 'state.db' not in str(global_user_state._db_manager.get_engine().url)
     # Mock an empty /tmp/cluster1.yaml using tmp_path
 
@@ -100,8 +100,9 @@ def _mock_cluster_state(_mock_db_conn, tmp_path):
         cluster_name_on_cloud='test-cluster1',
         cluster_yaml=_generate_tmp_yaml(tmp_path, 'cluster1.yaml'),
         launched_nodes=2,
-        launched_resources=sky.Resources(infra='aws/us-east-1',
-                                         instance_type='p3.2xlarge'),
+        launched_resources=sky.Resources(
+            infra='aws/us-east-1',
+            instance_type=mock_aws_catalog['v100_instance_type']),
     )
     global_user_state.add_or_update_cluster(
         'test-cluster1',
@@ -138,14 +139,15 @@ def _mock_cluster_state(_mock_db_conn, tmp_path):
 
 
 @pytest.fixture
-def _mock_jobs_controller(_mock_db_conn, tmp_path):
+def _mock_jobs_controller(_mock_db_conn, tmp_path, mock_aws_catalog):
     handle = backends.CloudVmRayResourceHandle(
         cluster_name=common.JOB_CONTROLLER_NAME,
         cluster_name_on_cloud=common.JOB_CONTROLLER_NAME,
         cluster_yaml=_generate_tmp_yaml(tmp_path, 'jobs_controller.yaml'),
         launched_nodes=1,
-        launched_resources=sky.Resources(infra='aws/us-west-1',
-                                         instance_type='m4.2xlarge'),
+        launched_resources=sky.Resources(
+            infra='aws/us-east-1',
+            instance_type=mock_aws_catalog['cpu_instance_type']),
     )
     global_user_state.add_or_update_cluster(
         common.JOB_CONTROLLER_NAME,
@@ -155,15 +157,16 @@ def _mock_jobs_controller(_mock_db_conn, tmp_path):
 
 
 @pytest.fixture
-def _mock_serve_controller(_mock_db_conn, tmp_path):
+def _mock_serve_controller(_mock_db_conn, tmp_path, mock_aws_catalog):
     yaml_path = _generate_tmp_yaml(tmp_path, 'serve_controller.yaml')
     handle = backends.CloudVmRayResourceHandle(
         cluster_name=common.SKY_SERVE_CONTROLLER_NAME,
         cluster_name_on_cloud=common.SKY_SERVE_CONTROLLER_NAME,
         cluster_yaml=yaml_path,
         launched_nodes=1,
-        launched_resources=sky.Resources(infra='aws/us-west-1',
-                                         instance_type='m4.2xlarge'),
+        launched_resources=sky.Resources(
+            infra='aws/us-east-1',
+            instance_type=mock_aws_catalog['cpu_instance_type']),
         stable_internal_external_ips=[('1.2.3.4', '4.3.2.1')],
         stable_ssh_ports=[22],
     )
