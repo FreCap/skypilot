@@ -667,17 +667,22 @@ export async function streamManagedJobLogs({
 
       // Stream the logs
       const reader = response.body.getReader();
+      const decoder = new TextDecoder();
 
       try {
         while (true) {
           const { done, value } = await reader.read();
-          if (done) break;
+          if (done) {
+            const trailingChunk = decoder.decode();
+            if (trailingChunk) onNewLog(trailingChunk);
+            break;
+          }
 
           // Update activity timestamp when we receive data
           lastActivity = Date.now();
 
-          const chunk = new TextDecoder().decode(value);
-          onNewLog(chunk);
+          const chunk = decoder.decode(value, { stream: true });
+          if (chunk) onNewLog(chunk);
         }
       } finally {
         // Only cancel the reader if the signal hasn't been aborted
