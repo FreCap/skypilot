@@ -222,7 +222,38 @@ def test_get_yaml_contents_empty_versions_skips_query(_mock_serve_db):
         yamls = serve_state.get_yaml_contents('svc-yamls', [])
 
     assert counts['n'] == 0, counts
-    assert yamls == {}
+
+
+def test_get_version_yaml_contents_fetches_all_versions_in_one_query(
+        _mock_serve_db):
+    assert _add_minimal_service('svc-all-yamls') is True
+    serve_state.add_or_update_version(
+        'svc-all-yamls',
+        2,
+        types.SimpleNamespace(graceful_drain_async_occupancy=True),
+        'yaml: v2',
+    )
+    serve_state.add_or_update_version(
+        'svc-all-yamls',
+        1,
+        types.SimpleNamespace(graceful_drain_async_occupancy=False),
+        'yaml: v1',
+    )
+
+    with _count_sql_statements(_mock_serve_db) as counts:
+        yamls = serve_state.get_version_yaml_contents('svc-all-yamls')
+
+    assert counts['n'] == 1, counts
+    assert yamls == {
+        1: 'yaml: v1',
+        2: 'yaml: v2',
+    }
+    assert list(yamls) == [1, 2]
+
+
+def test_get_version_yaml_contents_unknown_service_returns_empty(
+        _mock_serve_db):
+    assert serve_state.get_version_yaml_contents('svc-missing') == {}
 
 
 def test_get_service_from_name_uses_joined_spec_in_single_query(_mock_serve_db):

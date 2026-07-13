@@ -302,23 +302,22 @@ def cleanup_storage_intents(
     # Rolling compatibility: a service can contain surviving pre-migration
     # version YAMLs plus newer intent-backed generations. Clean their union,
     # deduplicating only generations already covered by an exact intent.
-    for version in serve_state.get_service_versions(service_name):
+    version_yamls = serve_state.get_version_yaml_contents(service_name)
+    for yaml_content in version_yamls.values():
         if ownership_guard is not None and not ownership_guard():
             raise ServiceOwnershipLostError(
                 'Lifecycle ownership lost before scoped storage cleanup.')
-        yaml_content = serve_state.get_yaml_content(service_name, version)
-        if yaml_content is not None:
-            try:
-                version_task = task_lib.Task.from_yaml_str(yaml_content)
-                scope_metadata = version_task.metadata.get(
-                    constants.EPHEMERAL_STORAGE_SCOPE_METADATA_KEY)
-                generation = (scope_metadata.get('storage_generation')
-                              if isinstance(scope_metadata, dict) else None)
-            except Exception:  # pylint: disable=broad-except
-                generation = None
-            if generation in cleaned_generations:
-                continue
-            results.append(cleanup_storage(yaml_content, resource_scope))
+        try:
+            version_task = task_lib.Task.from_yaml_str(yaml_content)
+            scope_metadata = version_task.metadata.get(
+                constants.EPHEMERAL_STORAGE_SCOPE_METADATA_KEY)
+            generation = (scope_metadata.get('storage_generation')
+                          if isinstance(scope_metadata, dict) else None)
+        except Exception:  # pylint: disable=broad-except
+            generation = None
+        if generation in cleaned_generations:
+            continue
+        results.append(cleanup_storage(yaml_content, resource_scope))
     return all(results)
 
 
