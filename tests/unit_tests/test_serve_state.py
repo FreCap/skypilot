@@ -826,6 +826,49 @@ class TestGetServiceControllerOwner:
         assert counts['n'] == 1
 
 
+class TestGetServiceRuntimeSnapshot:
+    """The controller hot paths should avoid the joined latest-spec read."""
+
+    def test_returns_runtime_fields_without_loading_spec(
+            self, _mock_serve_db, monkeypatch):
+        spec = _FakeSpec('qps=3', 'least_load')
+        _add_minimal_service('svc-runtime',
+                             controller_ip='10.4.10.9',
+                             spec=spec)
+        serve_state.set_service_status_and_active_versions(
+            'svc-runtime',
+            serve_state.ServiceStatus.CONTROLLER_INIT,
+            active_versions=[2])
+
+        def fail_if_spec_loaded(*args, **kwargs):
+            del args, kwargs
+            raise AssertionError(
+                'runtime snapshot must not deserialize the latest spec')
+
+        monkeypatch.setattr(serve_state.pickle, 'loads', fail_if_spec_loaded)
+        with _count_sql_statements(_mock_serve_db) as counts:
+            record = serve_state.get_service_runtime_snapshot(
+                'svc-runtime', require_version=True)
+
+        assert counts['n'] == 1, counts
+        assert record == {
+            'hash': _read_row(_mock_serve_db, 'svc-runtime')['hash'],
+            'controller_pid': 12345,
+            'controller_ip': '10.4.10.9',
+            'active_versions': [2],
+        }
+
+    def test_require_version_rejects_orphan_service_row(self, _mock_serve_db):
+        _insert_orphan_service_row(_mock_serve_db, 'svc-orphan')
+
+        with _count_sql_statements(_mock_serve_db) as counts:
+            record = serve_state.get_service_runtime_snapshot(
+                'svc-orphan', require_version=True)
+
+        assert record is None
+        assert counts['n'] == 1
+
+
 class TestUpdateServiceControllerPidIpAndPort:
     """The atomic update is the core of the HA-recovery DB flip — it must
     write pid, ip, AND port in a single transaction so clients never

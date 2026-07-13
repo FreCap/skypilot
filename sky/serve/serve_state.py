@@ -1462,6 +1462,40 @@ def get_service_from_name(service_name: str) -> dict[str, Any] | None:
     return None
 
 
+def get_service_runtime_snapshot(
+        service_name: str,
+        require_version: bool = False) -> dict[str, Any] | None:
+    """Read the slim runtime fields used by controller control loops.
+
+    Unlike :func:`get_service_from_name`, this helper stays on the
+    ``services`` table: no ``version_specs`` join and no latest-spec
+    deserialization. ``require_version`` preserves callers whose old joined
+    read treated an orphan/versionless service row as missing.
+    """
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        query = sqlalchemy.select(
+            services_table.c.hash,
+            services_table.c.controller_pid,
+            services_table.c.controller_ip,
+            services_table.c.active_versions,
+        ).where(services_table.c.name == service_name)
+        if require_version:
+            query = query.where(sqlalchemy.exists().where(
+                version_specs_table.c.service_name == services_table.c.name))
+        row = session.execute(query).fetchone()
+    if row is None:
+        return None
+    mapping = row._mapping  # pylint: disable=protected-access
+    return {
+        'hash': mapping['hash'],
+        'controller_pid': mapping['controller_pid'],
+        'controller_ip': mapping['controller_ip'],
+        'active_versions': json.loads(mapping['active_versions'])
+                           if mapping['active_versions'] else [],
+    }
+
+
 def get_service_controller_owner(
         service_name: str,
         require_version: bool = False) -> dict[str, Any] | None:

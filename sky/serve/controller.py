@@ -279,18 +279,19 @@ class SkyServeController:
         a spurious empty map (READY replicas exist but none resolved), so it
         never blanks a healthy routing set on a transient blip.
         """
-        record = serve_state.get_service_from_name(self._service_name)
-        assert record is not None, ('No service record found for '
-                                    f'{self._service_name}')
+        runtime_snapshot = serve_state.get_service_runtime_snapshot(
+            self._service_name, require_version=True)
+        assert runtime_snapshot is not None, ('No service record found for '
+                                              f'{self._service_name}')
         service_hash = getattr(self, '_service_hash', None)
         controller_owner = getattr(self, '_controller_owner', None)
         if (service_hash is not None and
-            (record.get('hash') != service_hash or
-             (record.get('controller_pid'), record.get('controller_ip'))
-             != controller_owner)):
+            (runtime_snapshot.get('hash') != service_hash or
+             (runtime_snapshot.get('controller_pid'),
+              runtime_snapshot.get('controller_ip')) != controller_owner)):
             raise RuntimeError('Controller ownership changed while building '
                                'the load balancer routing snapshot.')
-        active_versions = set(record['active_versions'])
+        active_versions = set(runtime_snapshot['active_versions'])
         replica_cache: dict[int, tuple[str, str, int]] = {}
         replica_info: dict[str, dict[str, str]] = {}
         ready_infos = [
@@ -877,10 +878,12 @@ class SkyServeController:
                 # Use the active versions set by replica manager to make
                 # sure we only scale down the outdated replicas that are
                 # not used by the load balancer.
-                record = serve_state.get_service_from_name(self._service_name)
-                assert record is not None, ('No service record found for '
-                                            f'{self._service_name}')
-                active_versions = record['active_versions']
+                runtime_snapshot = serve_state.get_service_runtime_snapshot(
+                    self._service_name, require_version=True)
+                assert runtime_snapshot is not None, (
+                    'No service record found for '
+                    f'{self._service_name}')
+                active_versions = runtime_snapshot['active_versions']
                 logger.info(f'All replica info for autoscaler: {replica_infos}')
 
                 # Autoscaler now extracts GPU type info directly from

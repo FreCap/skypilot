@@ -249,7 +249,7 @@ def _sync_full(ctrl: controller.SkyServeController,
     """Returns the full (replica_info, num_ready) tuple."""
     record = {'active_versions': list(active_versions)}
     with mock.patch.object(controller.serve_state,
-                           'get_service_from_name',
+                           'get_service_runtime_snapshot',
                            return_value=record), \
          mock.patch.object(
              controller.global_user_state,
@@ -352,7 +352,7 @@ class TestGetLbReplicaInfo:
         ]
         with mock.patch.object(
                 controller.serve_state,
-                'get_service_from_name',
+                'get_service_runtime_snapshot',
                 return_value={'active_versions': [1]}), mock.patch.object(
                     controller.global_user_state,
                     'get_clusters_from_names',
@@ -378,6 +378,28 @@ class TestGetLbReplicaInfo:
         get_yamls.assert_called_once_with(['replica-1.yaml', 'replica-2.yaml'])
         assert infos[0].last_provider_config == {'replica': 1}
         assert infos[1].last_provider_config == {'replica': 2}
+
+    def test_uses_runtime_snapshot_not_joined_service_read(self):
+        ctrl = _make_controller()
+        info = _FakeReplicaInfo(1,
+                                serve_state.ReplicaStatus.READY,
+                                url='http://1.1.1.1:8080',
+                                accelerators={'L4': 1})
+        with mock.patch.object(
+                controller.serve_state,
+                'get_service_from_name',
+                side_effect=AssertionError(
+                    'lb sync must not use joined service reads')), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_service_runtime_snapshot',
+                 return_value={'active_versions': [1]}):
+            assert _sync(ctrl, [info]) == {
+                'http://1.1.1.1:8080': {
+                    'gpu_type': 'L4',
+                    'gpu_count': '1'
+                }
+            }
 
     def test_not_ready_replicas_are_never_resolved(self):
         ctrl = _make_controller()
@@ -541,6 +563,39 @@ class TestNumReadyReplicas:
         # Only replica 2 is active+READY; its url is unresolvable this round.
         assert not replica_info
         assert num_ready == 1
+
+
+class TestAutoscalerRuntimeSnapshot:
+
+    def test_run_autoscaler_uses_runtime_snapshot_for_active_versions(self):
+        ctrl = _make_controller()
+        ctrl._autoscaler = mock.Mock()  # pylint: disable=protected-access
+        ctrl._autoscaler.generate_scaling_decisions.return_value = []
+        ctrl._autoscaler.get_decision_interval.return_value = 0
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+
+        with mock.patch.object(controller.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_service_from_name',
+                 side_effect=AssertionError(
+                     'autoscaler must not use joined service reads')), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_service_runtime_snapshot',
+                 return_value={'active_versions': [2]}), \
+             mock.patch.object(controller.time,
+                               'sleep',
+                               side_effect=StopIteration):
+            try:
+                ctrl._run_autoscaler()  # pylint: disable=protected-access
+            except StopIteration:
+                pass
+
+        ctrl._autoscaler.generate_scaling_decisions.assert_called_once_with([],
+                                                                            [2])
 
 
 class TestTranslateInFlight:
