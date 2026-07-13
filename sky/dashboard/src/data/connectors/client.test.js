@@ -189,26 +189,54 @@ describe('current user cache', () => {
 
   it('releases stream accounting when the reader aborts mid-stream', async () => {
     jest.spyOn(console, 'error').mockImplementation(() => {});
+    const controller = new AbortController();
     const abortError = new Error('aborted');
     abortError.name = 'AbortError';
-    global.fetch.mockResolvedValue({
-      ok: true,
-      body: {
-        getReader: () => ({
-          read: jest
-            .fn()
-            .mockResolvedValueOnce({
-              done: false,
-              value: Uint8Array.from([104, 105]),
-            })
-            .mockRejectedValueOnce(abortError),
-        }),
-      },
+    let receivedSignal;
+    let markReaderWaiting;
+    const readerWaiting = new Promise((resolve) => {
+      markReaderWaiting = resolve;
+    });
+    const read = jest
+      .fn()
+      .mockResolvedValueOnce({
+        done: false,
+        value: Uint8Array.from([104, 105]),
+      })
+      .mockImplementationOnce(
+        () =>
+          new Promise((_, reject) => {
+            controller.signal.addEventListener(
+              'abort',
+              () => reject(abortError),
+              {
+                once: true,
+              }
+            );
+            markReaderWaiting();
+          })
+      );
+    global.fetch.mockImplementation(async (_url, options) => {
+      receivedSignal = options.signal;
+      return {
+        ok: true,
+        body: {
+          getReader: () => ({ read }),
+        },
+      };
     });
 
-    await expect(
-      apiClient.stream('/stream', {}, jest.fn())
-    ).rejects.toMatchObject({ name: 'AbortError' });
+    const onData = jest.fn();
+    const streamPromise = apiClient.stream('/stream', {}, onData, {
+      signal: controller.signal,
+    });
+    await readerWaiting;
+    expect(onData).toHaveBeenCalledWith('hi');
+    expect(getRequestActivitySnapshot().inFlight).toBe(1);
+
+    controller.abort();
+    await expect(streamPromise).rejects.toMatchObject({ name: 'AbortError' });
+    expect(receivedSignal).toBe(controller.signal);
     expect(getRequestActivitySnapshot().inFlight).toBe(0);
   });
 
