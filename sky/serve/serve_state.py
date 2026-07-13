@@ -2521,8 +2521,7 @@ def get_latest_committed_version(service_name: str) -> int | None:
 
 
 def get_latest_committed_version_spec(
-        service_name: str
-) -> Optional[tuple[int, 'service_spec.SkyServiceSpec']]:
+        service_name: str) -> tuple[int, 'service_spec.SkyServiceSpec'] | None:
     """Returns the latest committed version and spec from one row snapshot.
 
     A controller-child respawn must not pair a version selected in one
