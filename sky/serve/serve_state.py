@@ -2113,8 +2113,7 @@ def get_replica_infos_grouped(
     """Gets every replica info grouped by its owning service in one query."""
     engine = _db_manager.get_engine()
     infos_by_service: dict[
-        str,
-        list['replica_managers.ReplicaInfo']] = collections.defaultdict(list)
+        str, list[replica_managers.ReplicaInfo]] = collections.defaultdict(list)
     with orm.Session(engine) as session:
         rows = session.execute(
             sqlalchemy.select(replicas_table.c.service_name,
