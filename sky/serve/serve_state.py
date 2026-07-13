@@ -2097,6 +2097,29 @@ def get_replica_info_from_id(
     return pickle.loads(result[0]) if result else None
 
 
+def get_replica_infos_from_ids(
+        service_name: str,
+        replica_ids: list[int]) -> dict[int, 'replica_managers.ReplicaInfo']:
+    """Gets replica infos for the given replica ids in one query.
+
+    Ids without a matching row are omitted from the returned dict.
+    """
+    if not replica_ids:
+        return {}
+
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        rows = session.execute(
+            sqlalchemy.select(
+                replicas_table.c.replica_id,
+                replicas_table.c.replica_info).where(
+                    sqlalchemy.and_(
+                        replicas_table.c.service_name == service_name,
+                        replicas_table.c.replica_id.in_(sorted(
+                            set(replica_ids)))))).fetchall()
+    return {row[0]: pickle.loads(row[1]) for row in rows}
+
+
 def get_replica_infos(
         service_name: str) -> list['replica_managers.ReplicaInfo']:
     """Gets all replica infos of a service."""

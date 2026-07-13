@@ -849,8 +849,9 @@ class TestLaunchOwnershipFence:
                                '_service_launch_authorization',
                                return_value=None), \
              mock.patch.object(replica_managers.serve_state,
-                               'get_replica_info_from_id',
-                               return_value=info), \
+                               'get_replica_infos_from_ids',
+                               side_effect=lambda _svc, ids:
+                               {rid: info for rid in ids}), \
              mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
                                return_value=[]), \
@@ -868,8 +869,9 @@ class TestLaunchOwnershipFence:
                                '_service_launch_authorization',
                                return_value=None) as authorize, \
              mock.patch.object(replica_managers.serve_state,
-                               'get_replica_info_from_id',
-                               side_effect=lambda _svc, rid: infos[rid]), \
+                               'get_replica_infos_from_ids',
+                               side_effect=lambda _svc, ids:
+                               {rid: infos[rid] for rid in ids}), \
              mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
                                return_value=[]), \
@@ -902,8 +904,9 @@ class TestLaunchOwnershipFence:
                                '_service_launch_authorization',
                                return_value=False), \
              mock.patch.object(replica_managers.serve_state,
-                               'get_replica_info_from_id',
-                               return_value=info), \
+                               'get_replica_infos_from_ids',
+                               side_effect=lambda _svc, ids:
+                               {rid: info for rid in ids}), \
              mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
                                return_value=[]), \
@@ -921,8 +924,9 @@ class TestLaunchOwnershipFence:
                                '_service_launch_authorization',
                                return_value=False) as authorize, \
              mock.patch.object(replica_managers.serve_state,
-                               'get_replica_info_from_id',
-                               side_effect=lambda _svc, rid: infos[rid]), \
+                               'get_replica_infos_from_ids',
+                               side_effect=lambda _svc, ids:
+                               {rid: infos[rid] for rid in ids}), \
              mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
                                return_value=[]), \
@@ -942,8 +946,9 @@ class TestLaunchOwnershipFence:
                                '_service_launch_authorization',
                                return_value=True) as authorize, \
              mock.patch.object(replica_managers.serve_state,
-                               'get_replica_info_from_id',
-                               side_effect=lambda _svc, rid: infos[rid]), \
+                               'get_replica_infos_from_ids',
+                               side_effect=lambda _svc, ids:
+                               {rid: infos[rid] for rid in ids}), \
              mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
                                return_value=[]), \
