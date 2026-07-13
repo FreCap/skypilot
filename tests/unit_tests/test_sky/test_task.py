@@ -289,6 +289,108 @@ def test_to_yaml_config_preserves_other_fields():
     assert 'resources' in config_redacted
 
 
+def test_to_yaml_config_characterizes_full_projection_and_nested_calls():
+    """Lock Task's YAML projection before extracting its implementation."""
+    resource = mock.Mock()
+    resource.hooks = []
+    resource.to_yaml_config.return_value = {'cpus': '2+'}
+    service = mock.Mock()
+    service.to_yaml_config.return_value = {'readiness_probe': '/health'}
+    storage = mock.Mock()
+    storage.to_yaml_config.return_value = {'name': 'dataset', 'mode': 'MOUNT'}
+    volume_mount = mock.Mock()
+    volume_mount.to_yaml_config.return_value = {
+        'name': 'cache',
+        'mount_path': '/cache'
+    }
+
+    task_obj = task.Task(name='projection',
+                         setup='prepare',
+                         run='execute',
+                         envs={'PUBLIC': 'value'},
+                         secrets={'TOKEN': 'secret'},
+                         num_nodes=2,
+                         api_server_access=False,
+                         _file_mounts_mapping={'/local': '/remote'},
+                         _volume_mounts=[volume_mount],
+                         _metadata={'request_id': 'req-1'},
+                         _user_specified_yaml='name: original')
+    task_obj.resources = [resource]
+    task_obj._service = service
+    task_obj.inputs = 'input'
+    task_obj.estimated_inputs_size_gigabytes = 1.5
+    task_obj.outputs = 'output'
+    task_obj.estimated_outputs_size_gigabytes = 2.5
+    task_obj.workdir = '/workdir'
+    task_obj.event_callback = 'callback.sh'
+    task_obj.file_mounts = {'/code': './src'}
+    task_obj.storage_mounts = {'/data': storage}
+    task_obj._volumes = {'/cache': 'cache-volume'}
+    task_obj._managed_secret_refs = [
+        task.ManagedSecretRef(name='database',
+                              scope_override='user',
+                              mount_path='/secrets/database')
+    ]
+
+    assert task_obj._to_yaml_config(redact_secrets=True) == {
+        'name': 'projection',
+        'resources': {
+            'cpus': '2+'
+        },
+        'service': {
+            'readiness_probe': '/health'
+        },
+        'num_nodes': 2,
+        'inputs': {
+            'input': 1.5
+        },
+        'outputs': {
+            'output': 2.5
+        },
+        'setup': 'prepare',
+        'workdir': '/workdir',
+        'event_callback': 'callback.sh',
+        'run': 'execute',
+        'envs': {
+            'PUBLIC': 'value'
+        },
+        'secrets': {
+            'TOKEN': '<redacted>'
+        },
+        'managed_secrets': [{
+            'user.database': {
+                'mount_path': '/secrets/database'
+            }
+        }],
+        'file_mounts': {
+            '/code': './src',
+            '/data': {
+                'name': 'dataset',
+                'mode': 'MOUNT'
+            }
+        },
+        'file_mounts_mapping': {
+            '/local': '/remote'
+        },
+        'volumes': {
+            '/cache': 'cache-volume'
+        },
+        'volume_mounts': [{
+            'name': 'cache',
+            'mount_path': '/cache'
+        }],
+        'api_server_access': False,
+        '_metadata': {
+            'request_id': 'req-1'
+        },
+        '_user_specified_yaml': 'name: original'
+    }
+    resource.to_yaml_config.assert_called_once_with(redact_secrets=True)
+    service.to_yaml_config.assert_called_once_with()
+    storage.to_yaml_config.assert_called_once_with()
+    volume_mount.to_yaml_config.assert_called_once_with()
+
+
 def test_update_secrets():
     """Test the update_secrets method."""
     task_obj = task.Task(run='echo hello')
