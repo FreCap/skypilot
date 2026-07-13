@@ -305,6 +305,11 @@ class InstanceAwareLeastLoadPolicy(LeastLoadPolicy,
         self.replica_info: dict[str, dict[str, Any]] = {}  # replica_url -> info
         self.target_qps_per_accelerator: dict[str, float] = {
         }  # accelerator_type -> target_qps
+        # Resolved per-replica target QPS by (gpu_type, gpu_count). This keeps
+        # flexible matching off the per-request routing hot path after the
+        # first lookup for a given shape and is invalidated on routing-spec
+        # updates.
+        self._target_qps_cache: dict[tuple[str, int], float] = {}
         # Uniform per-GPU weight for services without a QPS dict
         # (concurrency-sized): consulted after the dict keys, before the
         # flat fallback. See set_default_per_gpu_target.
@@ -342,7 +347,8 @@ class InstanceAwareLeastLoadPolicy(LeastLoadPolicy,
             self, target_qps_per_accelerator: dict[str, float]) -> None:
         """Set target QPS for each accelerator type."""
         with self.lock:
-            self.target_qps_per_accelerator = target_qps_per_accelerator
+            self.target_qps_per_accelerator = dict(target_qps_per_accelerator)
+            self._target_qps_cache.clear()
             # A concrete QPS dict is authoritative: drop the uniform
             # per-GPU default so the two weighting modes never mix.
             if target_qps_per_accelerator:
@@ -361,6 +367,7 @@ class InstanceAwareLeastLoadPolicy(LeastLoadPolicy,
         """
         with self.lock:
             self._default_per_gpu_qps = per_gpu_target
+            self._target_qps_cache.clear()
             if per_gpu_target is not None:
                 self.target_qps_per_accelerator = {}
 
@@ -408,6 +415,10 @@ class InstanceAwareLeastLoadPolicy(LeastLoadPolicy,
                                         accelerator_count: int = 1) -> float:
         """Per-replica target QPS with flexible matching.
 
+        The result is memoized by GPU shape. Callers already hold
+        ``self.lock`` on the load-balancer hot path, so cache reads and writes
+        stay serialized with routing-spec updates.
+
         Same key semantics as the instance-aware autoscaler (kept inline —
         this module runs in the load balancer process and must not pull in
         serve_utils' import graph):
@@ -418,6 +429,19 @@ class InstanceAwareLeastLoadPolicy(LeastLoadPolicy,
         Per-GPU semantics assume one model instance per GPU; models
         needing k GPUs per instance must use exact shape keys.
         """
+        cache_key = (accelerator_type, accelerator_count)
+        cached = self._target_qps_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        target_qps = self._resolve_target_qps_for_accelerator(
+            accelerator_type, accelerator_count)
+        self._target_qps_cache[cache_key] = target_qps
+        return target_qps
+
+    def _resolve_target_qps_for_accelerator(self, accelerator_type: str,
+                                            accelerator_count: int) -> float:
+        """Resolve target QPS for one GPU shape without memoization."""
         # Exact shape match first
         exact_key = f'{accelerator_type}:{accelerator_count}'
         if exact_key in self.target_qps_per_accelerator:

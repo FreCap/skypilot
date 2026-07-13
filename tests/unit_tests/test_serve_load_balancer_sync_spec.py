@@ -149,6 +149,68 @@ def test_qps_dict_update_clears_per_gpu_default():
     assert policy._get_target_qps_for_accelerator('L4', 1) == 2.5
 
 
+def test_target_qps_resolution_memoized_per_shape():
+    policy = lb_policies.InstanceAwareLeastLoadPolicy()
+    policy.set_target_qps_per_accelerator({'L4:1': 2.0})
+
+    with mock.patch.object(
+            policy,
+            '_resolve_target_qps_for_accelerator',
+            wraps=policy._resolve_target_qps_for_accelerator) as resolve:
+        assert policy._get_target_qps_for_accelerator('L4', 4) == 8.0
+        assert policy._get_target_qps_for_accelerator('L4', 4) == 8.0
+        assert policy._get_target_qps_for_accelerator('L4', 1) == 2.0
+        assert policy._get_target_qps_for_accelerator('L4', 1) == 2.0
+
+    assert resolve.call_args_list == [
+        mock.call('L4', 4),
+        mock.call('L4', 1),
+    ]
+
+
+def test_target_qps_cache_invalidated_by_qps_update():
+    policy = lb_policies.InstanceAwareLeastLoadPolicy()
+    policy.set_target_qps_per_accelerator({'L4': 1.0})
+    assert policy._get_target_qps_for_accelerator('L4', 2) == 2.0
+
+    policy.set_target_qps_per_accelerator({'L4': 3.0})
+    with mock.patch.object(
+            policy,
+            '_resolve_target_qps_for_accelerator',
+            wraps=policy._resolve_target_qps_for_accelerator) as resolve:
+        assert policy._get_target_qps_for_accelerator('L4', 2) == 6.0
+        assert policy._get_target_qps_for_accelerator('L4', 2) == 6.0
+
+    resolve.assert_called_once_with('L4', 2)
+
+
+def test_target_qps_update_copies_input():
+    policy = lb_policies.InstanceAwareLeastLoadPolicy()
+    target_qps = {'L4': 1.0}
+    policy.set_target_qps_per_accelerator(target_qps)
+
+    target_qps['L4'] = 3.0
+
+    assert policy.target_qps_per_accelerator == {'L4': 1.0}
+    assert policy._get_target_qps_for_accelerator('L4', 2) == 2.0
+
+
+def test_target_qps_cache_invalidated_by_mode_switch():
+    policy = lb_policies.InstanceAwareLeastLoadPolicy()
+    policy.set_target_qps_per_accelerator({'L4': 1.0})
+    assert policy._get_target_qps_for_accelerator('L4', 4) == 4.0
+
+    policy.set_default_per_gpu_target(2.5)
+    with mock.patch.object(
+            policy,
+            '_resolve_target_qps_for_accelerator',
+            wraps=policy._resolve_target_qps_for_accelerator) as resolve:
+        assert policy._get_target_qps_for_accelerator('L4', 4) == 10.0
+        assert policy._get_target_qps_for_accelerator('L4', 4) == 10.0
+
+    resolve.assert_called_once_with('L4', 4)
+
+
 def test_ready_replicas_repopulated_after_swap():
     # After a policy swap the new object is empty; a subsequent
     # set_ready_replicas (what the sync loop does) fully initializes it.
@@ -235,7 +297,7 @@ class _FakeSession:
     async def __aexit__(self, *exc) -> bool:
         return False
 
-    def post(self, *args, **kwargs) -> _FakeResp:
+    def post(self, *_args, **_kwargs) -> _FakeResp:
         return self._resp
 
 
