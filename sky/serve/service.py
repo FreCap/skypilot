@@ -890,6 +890,23 @@ def _respawn_controller(
     return new_controller, controller_port
 
 
+def _get_latest_committed_lb_termination_grace_seconds(
+        service_name: str) -> int | None:
+    """Return LB termination grace seconds from the latest committed spec.
+
+    The external-LB supervision loop runs for the lifetime of the service, so
+    it should reuse the one-row committed `(version, spec)` snapshot instead of
+    re-issuing separate latest-version and spec reads on every upkeep round.
+    """
+    snapshot = serve_state.get_latest_committed_version_spec(service_name)
+    if snapshot is None:
+        return None
+    _, latest_spec = snapshot
+    return lb_k8s.lb_termination_grace_period_seconds(
+        latest_spec.lb_stream_timeout_seconds,
+        latest_spec.graceful_drain_seconds)
+
+
 def _should_resume_teardown(is_recovery: bool,
                             service: dict[str, Any] | None) -> bool:
     """Whether a recovery run should resume teardown instead of serving.
@@ -1603,16 +1620,11 @@ def _start(service_name: str,
                             f'{service_name}: '
                             f'{common_utils.format_exception(e)}; will retry.')
                 try:
-                    latest_version = serve_state.get_latest_committed_version(
-                        service_name)
-                    if latest_version is not None:
-                        latest_spec = serve_state.get_spec(
-                            service_name, latest_version)
-                        if latest_spec is not None:
-                            lb_termination_grace_seconds = (
-                                lb_k8s.lb_termination_grace_period_seconds(
-                                    latest_spec.lb_stream_timeout_seconds,
-                                    latest_spec.graceful_drain_seconds))
+                    latest_lb_grace_seconds = (
+                        _get_latest_committed_lb_termination_grace_seconds(
+                            service_name))
+                    if latest_lb_grace_seconds is not None:
+                        lb_termination_grace_seconds = (latest_lb_grace_seconds)
                     external_lb_healthy = lb_k8s.ensure_lb_objects_exist(
                         service_name,
                         lb_termination_grace_seconds,
