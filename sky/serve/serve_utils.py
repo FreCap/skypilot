@@ -3052,8 +3052,9 @@ def get_latest_version_with_min_replicas(
             version2count[info.version] += 1
 
     active_versions = sorted(version2count.keys(), reverse=True)
+    specs_by_version = serve_state.get_specs(service_name, active_versions)
     for version in active_versions:
-        spec = serve_state.get_spec(service_name, version)
+        spec = specs_by_version.get(version)
         if (spec is not None and version2count[version] >= spec.min_replicas):
             return version
     # Use the oldest version if no version has enough replicas.
