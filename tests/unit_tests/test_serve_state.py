@@ -217,6 +217,14 @@ def test_get_yaml_contents_batches_requested_versions_in_one_query(
     }
 
 
+def test_get_yaml_contents_empty_versions_skips_query(_mock_serve_db):
+    with _count_sql_statements(_mock_serve_db) as counts:
+        yamls = serve_state.get_yaml_contents('svc-yamls', [])
+
+    assert counts['n'] == 0, counts
+    assert yamls == {}
+
+
 def test_get_service_from_name_uses_joined_spec_in_single_query(_mock_serve_db):
     spec = _FakeSpec('qps=2', 'least_load')
     assert _add_minimal_service('svc-read', spec=spec) is True

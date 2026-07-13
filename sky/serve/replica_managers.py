@@ -3009,14 +3009,16 @@ class SkyPilotReplicaManager(ReplicaManager):
             for info in replica_infos
             if info.version < version and not info.is_terminal
         })
-        prior_yaml_contents = serve_state.get_yaml_contents(
-            self._service_name, prior_versions)
+        prior_yaml_contents = (serve_state.get_yaml_contents(
+            self._service_name, prior_versions) if prior_versions else {})
         prior_configs = {}
         prior_any_of = {}
-        for prior_version, yaml_content in prior_yaml_contents.items():
-            assert yaml_content is not None, (
-                'yaml content not found for '
-                f'{self._service_name} version {prior_version}')
+        for prior_version in prior_versions:
+            yaml_content = prior_yaml_contents.get(prior_version)
+            if yaml_content is None:
+                raise ValueError('yaml content not found for '
+                                 f'{self._service_name} version '
+                                 f'{prior_version}')
             old_config = yaml_utils.safe_load(yaml_content)
             for key in ['service', 'pool', '_user_specified_yaml']:
                 old_config.pop(key, None)

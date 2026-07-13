@@ -550,6 +550,76 @@ class TestUpdateVersionBatchesPriorVersionYamls:
         assert info3.version == 2
         assert terminal.version == 1
 
+    def test_missing_old_version_yaml_fails_before_persisting(self):
+        mgr = _make_manager()
+        mgr.latest_version = 1
+        mgr.yaml_content = 'old: yaml'
+        mgr._update_mode = None
+        persisted = []
+        mgr._persist_replica = lambda replica_id, info: persisted.append(
+            (replica_id, info.version))
+        replica_infos = [
+            mock.Mock(replica_id=1, version=1, is_terminal=False),
+            mock.Mock(replica_id=2, version=2, is_terminal=False),
+        ]
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_yaml_content',
+                return_value=('resources: {}\n'
+                              'file_mounts: {}\n'
+                              'service: {readiness_probe: /}\n')), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_yaml_contents',
+                 return_value={
+                     1: ('resources: {}\n'
+                         'file_mounts: {}\n'
+                         'service: {readiness_probe: /}\n'),
+                 }), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_replica_infos',
+                 return_value=replica_infos):
+            with pytest.raises(
+                    ValueError,
+                    match='yaml content not found for svc version 2'):
+                mgr.update_version(3,
+                                   mock.Mock(),
+                                   update_mode=serve_utils.UpdateMode.ROLLING)
+
+        assert not persisted
+        assert [info.version for info in replica_infos] == [1, 2]
+
+    def test_no_prior_nonterminal_versions_skips_yaml_lookup(self):
+        for replica_infos in (
+            [],
+            [mock.Mock(replica_id=1, version=1, is_terminal=True)],
+        ):
+            mgr = _make_manager()
+            mgr.latest_version = 1
+            mgr.yaml_content = 'old: yaml'
+            mgr._update_mode = None
+
+            with mock.patch.object(
+                    replica_managers.serve_state,
+                    'get_yaml_content',
+                    return_value=('resources: {}\n'
+                                  'file_mounts: {}\n'
+                                  'service: {readiness_probe: /}\n')), \
+                 mock.patch.object(
+                     replica_managers.serve_state,
+                     'get_yaml_contents') as get_old_yamls, \
+                 mock.patch.object(
+                     replica_managers.serve_state,
+                     'get_replica_infos',
+                     return_value=replica_infos):
+                mgr.update_version(2,
+                                   mock.Mock(),
+                                   update_mode=serve_utils.UpdateMode.ROLLING)
+
+            get_old_yamls.assert_not_called()
+
 
 class TestLaunchOwnershipFence:
     """A stale manager must never start work that was only queued locally."""
