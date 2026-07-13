@@ -30,7 +30,6 @@ import psutil
 from sky import backends
 from sky import catalog
 from sky import check as sky_check
-from sky import cloud_stores
 from sky import clouds
 from sky import exceptions
 from sky import global_user_state
@@ -43,13 +42,13 @@ from sky import skypilot_config
 from sky import task as task_lib
 from sky.adaptors import common as adaptors_common
 from sky.backends import backend_utils
+from sky.backends import cloud_vm_ray_file_sync
 from sky.backends import task_codegen
 from sky.backends import wheel_utils
 from sky.clouds import cloud as sky_cloud
 from sky.clouds import kubernetes as k8s_cloud
 from sky.clouds.utils import gcp_utils
 from sky.dag import DEFAULT_EXECUTION
-from sky.data import data_utils
 from sky.data import storage as storage_lib
 from sky.provision import capacity_cache
 from sky.provision import common as provision_common
@@ -141,8 +140,6 @@ SKY_REMOTE_APP_DIR = backend_utils.SKY_REMOTE_APP_DIR
 SKY_REMOTE_WORKDIR = constants.SKY_REMOTE_WORKDIR
 
 logger = sky_logging.init_logger(__name__)
-
-_PATH_SIZE_MEGABYTES_WARN_THRESHOLD = 256
 
 # Timeout (seconds) for provision progress: if in this duration no new nodes
 # are launched, abort and failover.
@@ -4195,114 +4192,8 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
     def _sync_workdir(self, handle: CloudVmRayResourceHandle,
                       workdir: Path | dict[str, Any],
                       envs_and_secrets: dict[str, str]) -> None:
-        if handle.provision_runtime_metadata.workdir_synced:
-            logger.info('Skipping workdir sync: provisioner reported ready.')
-            return
-
-        # Even though provision() takes care of it, there may be cases where
-        # this function is called in isolation, without calling provision(),
-        # e.g., in CLI.  So we should rerun rsync_up.
-        if isinstance(workdir, dict):
-            self._sync_git_workdir(handle, envs_and_secrets)
-        else:
-            self._sync_path_workdir(handle, workdir)
-
-    def _sync_git_workdir(self, handle: CloudVmRayResourceHandle,
-                          envs_and_secrets: dict[str, str]) -> None:
-        style = colorama.Style
-        ip_list = handle.external_ips()
-        assert ip_list is not None, 'external_ips is not cached in handle'
-
-        log_path = os.path.join(self.log_dir, 'workdir_sync.log')
-
-        # TODO(zhwu): refactor this with backend_utils.parallel_cmd_with_rsync
-        runners = handle.get_command_runners()
-
-        def _sync_git_workdir_node(
-                runner: command_runner.CommandRunner) -> None:
-            # Type assertion to help mypy understand the type
-            assert hasattr(
-                runner, 'git_clone'
-            ), f'CommandRunner should have git_clone method, ' \
-                f'got {type(runner)}'
-            runner.git_clone(
-                target_dir=SKY_REMOTE_WORKDIR,
-                log_path=log_path,
-                stream_logs=False,
-                max_retry=3,
-                envs_and_secrets=envs_and_secrets,
-            )
-
-        num_nodes = handle.launched_nodes
-        plural = 's' if num_nodes > 1 else ''
-        logger.info(
-            f'  {style.DIM}Syncing workdir (to {num_nodes} node{plural}): '
-            f'{SKY_REMOTE_WORKDIR}{style.RESET_ALL}')
-        os.makedirs(os.path.expanduser(self.log_dir), exist_ok=True)
-        os.system(f'touch {log_path}')
-        num_threads = subprocess_utils.get_parallel_threads(
-            str(handle.launched_resources.cloud))
-        with rich_utils.safe_status(
-                ux_utils.spinner_message('Syncing workdir', log_path)):
-            subprocess_utils.run_in_parallel(_sync_git_workdir_node, runners,
-                                             num_threads)
-        logger.info(ux_utils.finishing_message('Synced workdir.', log_path))
-
-    def _sync_path_workdir(self, handle: CloudVmRayResourceHandle,
-                           workdir: Path) -> None:
-        fore = colorama.Fore
-        style = colorama.Style
-        ip_list = handle.external_ips()
-        assert ip_list is not None, 'external_ips is not cached in handle'
-        full_workdir = os.path.abspath(os.path.expanduser(workdir))
-
-        # These asserts have been validated at Task construction time.
-        assert os.path.exists(full_workdir), f'{full_workdir} does not exist'
-        if os.path.islink(full_workdir):
-            logger.warning(
-                f'{fore.YELLOW}Workdir {workdir!r} is a symlink. '
-                f'Symlink contents are not uploaded.{style.RESET_ALL}')
-        else:
-            assert os.path.isdir(
-                full_workdir), f'{full_workdir} should be a directory.'
-
-        # Raise warning if directory is too large
-        dir_size = backend_utils.path_size_megabytes(full_workdir)
-        if dir_size >= _PATH_SIZE_MEGABYTES_WARN_THRESHOLD:
-            logger.warning(
-                f'  {fore.YELLOW}The size of workdir {workdir!r} '
-                f'is {dir_size} MB. Try to keep workdir small or use '
-                '.skyignore to exclude large files, as large sizes will slow '
-                f'down rsync.{style.RESET_ALL}')
-
-        log_path = os.path.join(self.log_dir, 'workdir_sync.log')
-
-        # TODO(zhwu): refactor this with backend_utils.parallel_cmd_with_rsync
-        runners = handle.get_command_runners()
-
-        def _sync_workdir_node(runner: command_runner.CommandRunner) -> None:
-            runner.rsync(
-                source=workdir,
-                target=SKY_REMOTE_WORKDIR,
-                up=True,
-                log_path=log_path,
-                stream_logs=False,
-            )
-
-        num_nodes = handle.launched_nodes
-        plural = 's' if num_nodes > 1 else ''
-        logger.info(
-            f'  {style.DIM}Syncing workdir (to {num_nodes} node{plural}): '
-            f'{workdir} -> {SKY_REMOTE_WORKDIR}{style.RESET_ALL}')
-        os.makedirs(os.path.expanduser(self.log_dir), exist_ok=True)
-        os.system(f'touch {log_path}')
-        num_threads = subprocess_utils.get_parallel_threads(
-            str(handle.launched_resources.cloud))
-        with rich_utils.safe_status(
-                ux_utils.spinner_message('Syncing workdir', log_path)):
-            subprocess_utils.run_in_parallel(_sync_workdir_node, runners,
-                                             num_threads)
-        logger.info(ux_utils.finishing_message('Synced workdir.', log_path))
+        cloud_vm_ray_file_sync.sync_workdir(handle, workdir, envs_and_secrets,
+                                            self.log_dir)
 
     def _sync_file_mounts(
         self,
@@ -4327,7 +4218,8 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         with rich_utils.safe_status(ux_utils.spinner_message('Syncing files')):
             controller_utils.replace_skypilot_config_path_in_file_mounts(
                 launched_resources.cloud, all_file_mounts)
-            self._execute_file_mounts(handle, all_file_mounts)
+            cloud_vm_ray_file_sync.execute_file_mounts(handle, all_file_mounts,
+                                                       self.log_dir)
             self._execute_storage_mounts(handle, storage_mounts)
             self._set_storage_mounts_metadata(handle.cluster_name,
                                               storage_mounts)
@@ -4500,14 +4392,8 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
     def _download_file(self, handle: CloudVmRayResourceHandle,
                        local_file_path: str, remote_file_path: str) -> None:
         """Syncs file from remote to local."""
-        runners = handle.get_command_runners()
-        head_runner = runners[0]
-        head_runner.rsync(
-            source=local_file_path,
-            target=remote_file_path,
-            up=False,
-            stream_logs=False,
-        )
+        cloud_vm_ray_file_sync.download_file(handle, local_file_path,
+                                             remote_file_path)
 
     def _exec_code_on_head(
         self,
@@ -6649,149 +6535,6 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             prev_handle=None,
             prev_cluster_ever_up=False,
             prev_config_hash=prev_config_hash)
-
-    def _execute_file_mounts(self, handle: CloudVmRayResourceHandle,
-                             file_mounts: dict[Path, Path] | None):
-        """Executes file mounts.
-
-        Rsyncing local files and copying from remote stores.
-        """
-        # File mounts handling for remote paths possibly without write access:
-        #  (1) in 'file_mounts' sections, add <prefix> to these target paths.
-        #  (2) then, create symlinks from '/.../file' to '<prefix>/.../file'.
-        if file_mounts is None or not file_mounts:
-            return
-        symlink_commands = []
-        fore = colorama.Fore
-        style = colorama.Style
-        start = time.time()
-        runners = handle.get_command_runners()
-        log_path = os.path.join(self.log_dir, 'file_mounts.log')
-        num_threads = subprocess_utils.get_max_workers_for_file_mounts(
-            file_mounts, str(handle.launched_resources.cloud))
-
-        # Check the files and warn
-        for dst, src in file_mounts.items():
-            if not data_utils.is_cloud_store_url(src):
-                full_src = os.path.abspath(os.path.expanduser(src))
-                # Checked during Task.set_file_mounts().
-                assert os.path.exists(
-                    full_src), f'{full_src} does not exist. {file_mounts}'
-                src_size = backend_utils.path_size_megabytes(full_src)
-                if src_size >= _PATH_SIZE_MEGABYTES_WARN_THRESHOLD:
-                    logger.warning(
-                        f'  {fore.YELLOW}The size of file mount src {src!r} '
-                        f'is {src_size} MB. Try to keep src small or use '
-                        '.skyignore to exclude large files, as large sizes '
-                        f'will slow down rsync. {style.RESET_ALL}')
-                if os.path.islink(full_src):
-                    logger.warning(
-                        f'  {fore.YELLOW}Source path {src!r} is a symlink. '
-                        f'Symlink contents are not uploaded.{style.RESET_ALL}')
-
-        os.makedirs(os.path.expanduser(self.log_dir), exist_ok=True)
-        os.system(f'touch {log_path}')
-
-        rich_utils.force_update_status(
-            ux_utils.spinner_message('Syncing file mounts', log_path))
-
-        for dst, src in file_mounts.items():
-            # TODO: room for improvement.  Here there are many moving parts
-            # (download gsutil on remote, run gsutil on remote).  Consider
-            # alternatives (smart_open, each provider's own sdk), a
-            # data-transfer container etc.
-            if not os.path.isabs(dst) and not dst.startswith('~/'):
-                dst = f'{SKY_REMOTE_WORKDIR}/{dst}'
-            # Sync 'src' to 'wrapped_dst', a safe-to-write "wrapped" path.
-            wrapped_dst = dst
-            if not dst.startswith('~/') and not dst.startswith('/tmp/'):
-                # Handles the remote paths possibly without write access.
-                # (1) add <prefix> to these target paths.
-                wrapped_dst = backend_utils.FileMountHelper.wrap_file_mount(dst)
-                cmd = backend_utils.FileMountHelper.make_safe_symlink_command(
-                    source=dst, target=wrapped_dst)
-                symlink_commands.append(cmd)
-
-            if not data_utils.is_cloud_store_url(src):
-                full_src = os.path.abspath(os.path.expanduser(src))
-
-                if os.path.isfile(full_src):
-                    mkdir_for_wrapped_dst = (
-                        f'mkdir -p {os.path.dirname(wrapped_dst)}')
-                else:
-                    mkdir_for_wrapped_dst = f'mkdir -p {wrapped_dst}'
-
-                # TODO(mluo): Fix method so that mkdir and rsync run together
-                backend_utils.parallel_data_transfer_to_nodes(
-                    runners,
-                    source=src,
-                    target=wrapped_dst,
-                    cmd=mkdir_for_wrapped_dst,
-                    run_rsync=True,
-                    action_message='Syncing',
-                    log_path=log_path,
-                    stream_logs=False,
-                    num_threads=num_threads,
-                )
-                continue
-
-            storage = cloud_stores.get_storage_from_path(src)
-            if storage.is_directory(src):
-                sync_cmd = (storage.make_sync_dir_command(
-                    source=src, destination=wrapped_dst))
-                # It is a directory so make sure it exists.
-                mkdir_for_wrapped_dst = f'mkdir -p {wrapped_dst}'
-            else:
-                sync_cmd = (storage.make_sync_file_command(
-                    source=src, destination=wrapped_dst))
-                # It is a file so make sure *its parent dir* exists.
-                mkdir_for_wrapped_dst = (
-                    f'mkdir -p {os.path.dirname(wrapped_dst)}')
-
-            download_target_commands = [
-                # Ensure sync can write to wrapped_dst (e.g., '/data/').
-                mkdir_for_wrapped_dst,
-                # Both the wrapped and the symlink dir exist; sync.
-                sync_cmd,
-            ]
-            command = ' && '.join(download_target_commands)
-            # dst is only used for message printing.
-            backend_utils.parallel_data_transfer_to_nodes(
-                runners,
-                source=src,
-                target=dst,
-                cmd=command,
-                run_rsync=False,
-                action_message='Syncing',
-                log_path=log_path,
-                stream_logs=False,
-                # Need to source bashrc, as the cloud specific CLI or SDK may
-                # require PATH in bashrc.
-                source_bashrc=True,
-                num_threads=num_threads,
-            )
-        # (2) Run the commands to create symlinks on all the nodes.
-        symlink_command = ' && '.join(symlink_commands)
-        if symlink_command:
-            # ALIAS_SUDO_TO_EMPTY_FOR_ROOT_CMD sets sudo to empty string for
-            # root. We need this as we do not source bashrc for the command for
-            # better performance, and our sudo handling is only in bashrc.
-            symlink_command = (
-                f'{command_runner.ALIAS_SUDO_TO_EMPTY_FOR_ROOT_CMD} && '
-                f'{symlink_command}')
-
-            def _symlink_node(runner: command_runner.CommandRunner):
-                returncode = runner.run(symlink_command, log_path=log_path)
-                subprocess_utils.handle_returncode(
-                    returncode, symlink_command,
-                    'Failed to create symlinks. The target destination '
-                    f'may already exist. Log: {log_path}')
-
-            subprocess_utils.run_in_parallel(_symlink_node, runners,
-                                             num_threads)
-        end = time.time()
-        logger.debug(f'File mount sync took {end - start} seconds.')
-        logger.info(ux_utils.finishing_message('Synced file_mounts.', log_path))
 
     def _execute_storage_mounts(
             self, handle: CloudVmRayResourceHandle,
