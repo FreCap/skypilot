@@ -31,6 +31,87 @@ import { EndpointCell, formatUptime } from '@/components/services';
 import { useMobile } from '@/hooks/useMobile';
 import { formatYaml } from '@/lib/yamlUtils';
 import { YamlCodeBlock } from '@/components/ui/yaml-code-block';
+import { CLOUD_CANONICALIZATIONS } from '@/data/connectors/constants';
+
+const REPLICA_PLACEMENT_COLUMNS = [
+  { key: 'pending', label: 'Pending' },
+  { key: 'provisioning', label: 'Provisioning' },
+  { key: 'initializing', label: 'Initializing' },
+  { key: 'ready', label: 'Ready' },
+  { key: 'notReady', label: 'Not ready' },
+  { key: 'stopping', label: 'Stopping' },
+  { key: 'error', label: 'Error' },
+  { key: 'other', label: 'Other' },
+];
+
+const REPLICA_ERROR_STATUSES = new Set([
+  'FAILED',
+  'FAILED_CLEANUP',
+  'FAILED_INITIAL_DELAY',
+  'FAILED_PROBING',
+  'FAILED_PROVISION',
+  'UNKNOWN',
+]);
+
+function getReplicaPlacementStatusBucket(status) {
+  if (REPLICA_ERROR_STATUSES.has(status)) return 'error';
+  switch (status) {
+    case 'PENDING':
+      return 'pending';
+    case 'PROVISIONING':
+      return 'provisioning';
+    case 'STARTING':
+      return 'initializing';
+    case 'READY':
+      return 'ready';
+    case 'NOT_READY':
+      return 'notReady';
+    case 'SHUTTING_DOWN':
+    case 'PREEMPTED':
+      return 'stopping';
+    default:
+      return 'other';
+  }
+}
+
+export function getReplicaPlacementBreakdown(replicas) {
+  const replicaList = Array.isArray(replicas) ? replicas : [];
+  const rowsByPlacement = new Map();
+
+  replicaList.forEach((replica) => {
+    const rawCloud = replica.cloud?.trim();
+    const cloud = rawCloud
+      ? CLOUD_CANONICALIZATIONS[rawCloud.toLowerCase()] || rawCloud
+      : 'Unknown';
+    const region = replica.region?.trim() || 'Pending placement';
+    const placementKey = `${cloud}\u0000${region}`;
+    let row = rowsByPlacement.get(placementKey);
+    if (!row) {
+      row = {
+        cloud,
+        region,
+        pending: 0,
+        provisioning: 0,
+        initializing: 0,
+        ready: 0,
+        notReady: 0,
+        stopping: 0,
+        error: 0,
+        other: 0,
+        total: 0,
+      };
+      rowsByPlacement.set(placementKey, row);
+    }
+    row[getReplicaPlacementStatusBucket(replica.status)] += 1;
+    row.total += 1;
+  });
+
+  return Array.from(rowsByPlacement.values()).sort(
+    (left, right) =>
+      left.cloud.localeCompare(right.cloud) ||
+      left.region.localeCompare(right.region)
+  );
+}
 
 export function useServiceDetails({ serviceName }) {
   const [serviceData, setServiceData] = useState(null);
@@ -195,6 +276,10 @@ function ServiceDetails() {
             <ServiceDetailCard
               serviceData={serviceData}
               pricingLoading={replicasLoading && serviceData.summaryOnly}
+            />
+            <ReplicaPlacementCard
+              replicas={serviceData.replicas}
+              loading={replicasLoading && serviceData.summaryOnly}
             />
             <ReplicasCard
               replicas={serviceData.replicas}
@@ -466,6 +551,88 @@ function ServiceYamlSection({ serviceYaml }) {
           <YamlCodeBlock value={formattedYaml} readOnly />
         </div>
       )}
+    </div>
+  );
+}
+
+export function ReplicaPlacementCard({ replicas, loading }) {
+  const rows = getReplicaPlacementBreakdown(replicas);
+
+  return (
+    <div className="mb-6">
+      <div className="flex items-center justify-between mb-2">
+        <div>
+          <h3 className="text-lg font-semibold">Machines by region</h3>
+          <p className="text-sm text-gray-500">
+            Kubernetes contexts and cloud regions, grouped by lifecycle state.
+          </p>
+        </div>
+        {loading && (
+          <span className="text-sm text-gray-500 whitespace-nowrap">
+            <CircularProgress size={14} className="mr-2" />
+            Loading machines…
+          </span>
+        )}
+      </div>
+      <Card>
+        <div className="overflow-x-auto rounded-lg">
+          <Table className="min-w-full">
+            <TableHeader>
+              <TableRow>
+                <TableHead className="whitespace-nowrap">Provider</TableHead>
+                <TableHead className="whitespace-nowrap">
+                  Region / context
+                </TableHead>
+                {REPLICA_PLACEMENT_COLUMNS.map((column) => (
+                  <TableHead
+                    key={column.key}
+                    className="whitespace-nowrap text-right"
+                  >
+                    {column.label}
+                  </TableHead>
+                ))}
+                <TableHead className="whitespace-nowrap text-right">
+                  Total
+                </TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {rows.length > 0 ? (
+                rows.map((row) => (
+                  <TableRow key={`${row.cloud}/${row.region}`}>
+                    <TableCell className="font-medium">{row.cloud}</TableCell>
+                    <TableCell>{row.region}</TableCell>
+                    {REPLICA_PLACEMENT_COLUMNS.map((column) => (
+                      <TableCell
+                        key={column.key}
+                        className={
+                          row[column.key] > 0
+                            ? 'text-right tabular-nums'
+                            : 'text-right tabular-nums text-gray-400'
+                        }
+                      >
+                        {row[column.key]}
+                      </TableCell>
+                    ))}
+                    <TableCell className="text-right tabular-nums font-semibold">
+                      {row.total}
+                    </TableCell>
+                  </TableRow>
+                ))
+              ) : (
+                <TableRow>
+                  <TableCell
+                    colSpan={REPLICA_PLACEMENT_COLUMNS.length + 3}
+                    className="text-center py-6 text-gray-500"
+                  >
+                    {loading ? 'Loading machine placement…' : 'No replicas.'}
+                  </TableCell>
+                </TableRow>
+              )}
+            </TableBody>
+          </Table>
+        </div>
+      </Card>
     </div>
   );
 }

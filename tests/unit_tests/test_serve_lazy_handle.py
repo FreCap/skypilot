@@ -1,10 +1,10 @@
 """Tests for the lazy-handle changes in serve/pool status responses.
 
 Coverage:
-1. ``ReplicaInfo.to_info_dict`` always populates pre-computed string fields
-   (``infra``, ``resources_str``, ``resources_str_full``, ``cloud``,
-   ``region``) when a handle is reachable, and only attaches the handle
-   when ``with_handle=True``.
+1. ``ReplicaInfo.to_info_dict`` always populates placement fields from the
+   selected location or launched handle, populates resource strings when a
+   handle is reachable, and only attaches the handle when
+   ``with_handle=True``.
 2. ``_decode_serve_status`` tolerates both an absent ``handle`` key and an
    explicit ``handle=None`` (the new wire shape from new servers).
 3. ``serialize_serve_status`` strips the handle to ``None`` only for
@@ -25,10 +25,12 @@ from unittest import mock
 import orjson
 import pytest
 
+from sky import clouds
 from sky import exceptions
 from sky.serve import replica_managers
 from sky.serve import serve_state
 from sky.serve import serve_utils
+from sky.serve import spot_placer
 from sky.server import constants as server_constants
 from sky.server.requests.serializers import decoders
 from sky.server.requests.serializers import return_value_serializers
@@ -69,11 +71,20 @@ class TestToInfoDictPreComputedFields:
         """Even with ``with_handle=False`` the small string fields are set
         so new clients never need to touch the handle blob."""
         info = _make_replica_info()
+        # The launch result is authoritative if it differs from the placer's
+        # earlier selection (for example, after optimizer failover).
+        info.location = spot_placer.Location(
+            cloud=clouds.GCP(),
+            region='us-central1',
+            zone=None,
+        ).to_pickleable()
         handle, simple, full = _make_handle()
         handle.launched_nodes = 2
         handle.launched_resources.get_cost.return_value = 3.25
         with mock.patch.object(info, 'handle',
-                               return_value=handle) as handle_call:
+                               return_value=handle) as handle_call, \
+             mock.patch.object(info,
+                               'get_spot_location') as location_call:
             with mock.patch(
                     'sky.serve.replica_managers.resources_utils.'
                     'get_readable_resources_repr',
@@ -83,6 +94,7 @@ class TestToInfoDictPreComputedFields:
                                            cluster_record={'launched_at': 42})
 
         handle_call.assert_called_once_with({'launched_at': 42})
+        location_call.assert_not_called()
         assert result['launched_at'] == 42
         assert result['cloud'] == 'aws'
         assert result['region'] == 'us-east-1'
@@ -145,6 +157,34 @@ class TestToInfoDictPreComputedFields:
                     'resources_str_full', 'hourly_cost',
                     'hourly_cost_exclusion_reason'):
             assert key not in result
+
+    def test_uses_selected_location_when_handle_missing(self):
+        """Pre-launch replicas keep their placer cloud and region visible."""
+        location = spot_placer.Location(cloud=clouds.Kubernetes(),
+                                        region='research-context',
+                                        zone=None,
+                                        use_spot=False)
+        info = replica_managers.ReplicaInfo(replica_id=1,
+                                            cluster_name='r-1',
+                                            replica_port='8080',
+                                            is_spot=False,
+                                            location=location,
+                                            version=1,
+                                            resources_override=None)
+        info.status_property.to_replica_status = lambda: (
+            serve_state.ReplicaStatus.PROVISIONING)
+
+        with mock.patch.object(info, 'handle') as handle_call:
+            result = info.to_info_dict(with_handle=False,
+                                       with_url=False,
+                                       cluster_record=None)
+
+        handle_call.assert_not_called()
+        assert result['status'] == serve_state.ReplicaStatus.PROVISIONING
+        assert result['cloud'] == 'Kubernetes'
+        assert result['region'] == 'research-context'
+        assert result['infra'] == 'Kubernetes (research-context)'
+        assert 'resources_str' not in result
 
 
 class TestToInfoDictEndpointSnapshot:

@@ -3,6 +3,7 @@ import {
   render,
   renderHook,
   screen,
+  within,
   waitFor,
 } from '@testing-library/react';
 
@@ -21,6 +22,8 @@ jest.mock('@/lib/cache', () => ({
 import dashboardCache from '@/lib/cache';
 import { getServices } from '@/data/connectors/services';
 import {
+  getReplicaPlacementBreakdown,
+  ReplicaPlacementCard,
   ServiceDetailCard,
   useServiceDetails,
 } from '@/pages/services/[service]';
@@ -196,5 +199,118 @@ describe('ServiceDetailCard cost and request estimates', () => {
       )
     ).toBeTruthy();
     expect(screen.getByText('$3.0556')).toBeTruthy();
+  });
+});
+
+describe('service replica placement breakdown', () => {
+  const replicas = [
+    {
+      cloud: 'kubernetes',
+      region: 'research-context',
+      status: 'READY',
+    },
+    {
+      cloud: 'Kubernetes',
+      region: 'research-context',
+      status: 'PROVISIONING',
+    },
+    {
+      cloud: 'Kubernetes',
+      region: 'research-context',
+      status: 'STARTING',
+    },
+    {
+      cloud: 'Kubernetes',
+      region: 'research-context',
+      status: 'FAILED_PROVISION',
+    },
+    { cloud: 'aws', region: 'us-east-1', status: 'PENDING' },
+    { cloud: 'AWS', region: 'us-east-1', status: 'READY' },
+    { cloud: 'GCP', region: 'us-central1', status: 'NOT_READY' },
+    { cloud: 'GCP', region: 'us-central1', status: 'PREEMPTED' },
+    { cloud: 'GCP', region: 'us-central1', status: 'FAILED_PROBING' },
+    { cloud: null, region: null, status: 'SUSPENDED' },
+  ];
+
+  it('groups providers and regions into lifecycle counts', () => {
+    expect(getReplicaPlacementBreakdown(replicas)).toEqual([
+      {
+        cloud: 'AWS',
+        region: 'us-east-1',
+        pending: 1,
+        provisioning: 0,
+        initializing: 0,
+        ready: 1,
+        notReady: 0,
+        stopping: 0,
+        error: 0,
+        other: 0,
+        total: 2,
+      },
+      {
+        cloud: 'GCP',
+        region: 'us-central1',
+        pending: 0,
+        provisioning: 0,
+        initializing: 0,
+        ready: 0,
+        notReady: 1,
+        stopping: 1,
+        error: 1,
+        other: 0,
+        total: 3,
+      },
+      {
+        cloud: 'Kubernetes',
+        region: 'research-context',
+        pending: 0,
+        provisioning: 1,
+        initializing: 1,
+        ready: 1,
+        notReady: 0,
+        stopping: 0,
+        error: 1,
+        other: 0,
+        total: 4,
+      },
+      {
+        cloud: 'Unknown',
+        region: 'Pending placement',
+        pending: 0,
+        provisioning: 0,
+        initializing: 0,
+        ready: 0,
+        notReady: 0,
+        stopping: 0,
+        error: 0,
+        other: 1,
+        total: 1,
+      },
+    ]);
+  });
+
+  it('renders one row per provider and region after machines load', () => {
+    render(<ReplicaPlacementCard replicas={replicas} loading={false} />);
+
+    expect(screen.getByText('Machines by region')).toBeTruthy();
+    const researchRow = screen.getByText('research-context').closest('tr');
+    expect(
+      within(researchRow)
+        .getAllByRole('cell')
+        .map((cell) => cell.textContent)
+    ).toEqual([
+      'Kubernetes',
+      'research-context',
+      '0',
+      '1',
+      '1',
+      '1',
+      '0',
+      '0',
+      '1',
+      '0',
+      '4',
+    ]);
+    expect(screen.getByText('Pending placement')).toBeTruthy();
   });
 });

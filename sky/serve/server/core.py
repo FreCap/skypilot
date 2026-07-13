@@ -207,8 +207,10 @@ def status(
                 on the wire to keep payloads small; callers should read the
                 pre-computed string fields below instead. Old servers still
                 return a full handle.
-            'cloud': (Optional[str]) cloud name of the replica,
-            'region': (Optional[str]) region of the replica,
+            'cloud': (Optional[str]) selected or launched cloud name of the
+                replica,
+            'region': (Optional[str]) selected or launched region of the
+                replica,
             'infra': (Optional[str]) human-readable infra string,
                 e.g. ``'aws (us-east-1)'``,
             'resources_str': (Optional[str]) simplified resource string,

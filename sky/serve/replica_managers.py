@@ -939,6 +939,19 @@ class ReplicaInfo:
             info_dict['resources_str_full'] = (full
                                                if full is not None else simple)
             info_dict['infra'] = handle.launched_resources.infra.formatted_str()
+        else:
+            # A placer-selected location exists before the replica has a
+            # cluster handle, including while it is PENDING or early
+            # PROVISIONING. Publish it through the existing placement fields
+            # so status consumers can account for every replica by
+            # cloud/region. Avoid reconstructing it for launched replicas,
+            # whose resources above are authoritative.
+            location = self.get_spot_location()
+            if location is not None:
+                cloud = repr(location.cloud)
+                info_dict['cloud'] = cloud
+                info_dict['region'] = location.region
+                info_dict['infra'] = f'{cloud} ({location.region})'
         if with_handle:
             info_dict['handle'] = handle
         return info_dict
