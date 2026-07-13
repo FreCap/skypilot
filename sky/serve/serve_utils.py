@@ -1527,7 +1527,8 @@ def update_service_status(pool: bool) -> None:
         record = _get_service_status(service_name,
                                      pool=pool,
                                      with_replica_info=False,
-                                     with_yaml=False)
+                                     with_yaml=False,
+                                     with_target_num_replicas=False)
         if record is None:
             continue
         service_status = record['status']
