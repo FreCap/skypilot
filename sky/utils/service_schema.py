@@ -110,17 +110,17 @@ def get_service_schema():
                             'min_size': {
                                 'type': 'integer',
                                 'minimum': 0,
-                                'maximum': 2000,
+                                'maximum': 3000,
                             },
                             'size_per_replica': {
                                 'type': 'integer',
                                 'minimum': 0,
-                                'maximum': 2000,
+                                'maximum': 3000,
                             },
                             'max_size': {
                                 'type': 'integer',
                                 'minimum': 1,
-                                'maximum': 2000,
+                                'maximum': 3000,
                             },
                             'max_concurrency_per_replica': {
                                 'type': 'integer',
@@ -140,6 +140,9 @@ def get_service_schema():
                                 'type': 'integer',
                                 'minimum': 1,
                                 'maximum': 16777216,
+                            },
+                            'use_async_occupancy': {
+                                'type': 'boolean',
                             },
                         },
                     },

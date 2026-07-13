@@ -1524,6 +1524,7 @@ Controls request proxy behavior for the SkyServe load balancer.
           max_concurrency: 32
           timeout_seconds: 120
           max_request_body_bytes: 1048576
+          use_async_occupancy: false
 
 
 .. _yaml-spec-service-load-balancer-stream-timeout-seconds:
@@ -1560,11 +1561,17 @@ queue size receive HTTP 503, requests that wait longer than
 ``max_concurrency_per_replica`` controls how many requests may be dispatched
 per ready replica before new arrivals wait in the queue, while
 ``max_concurrency`` is the absolute load-balancer-wide dispatch ceiling.
-The queue accepts at most 2,000 waiting requests, 128 concurrent requests,
+When ``use_async_occupancy`` is true, dispatch concurrency is also clamped by
+the fresh free-slot total reported by occupancy-capable replicas. Unknown
+occupancy contributes no free capacity, and occupancy probe updates wake
+waiting requests.
+
+The queue accepts at most 3,000 waiting requests, 128 concurrent requests,
 and 16 MiB per request body. The product of ``max_concurrency`` and
 ``max_request_body_bytes`` must stay within a 128 MiB aggregate buffering
 budget, leaving headroom under the external load balancer's default 512 MiB
-limit.
+limit. Waiting requests have not had their bodies read, so the 3,000-waiter
+ceiling bounds request envelopes rather than buffered payloads.
 
 .. code-block:: yaml
 
@@ -1578,6 +1585,7 @@ limit.
           max_concurrency: 32
           timeout_seconds: 120
           max_request_body_bytes: 1048576
+          use_async_occupancy: false
 
 
 .. _yaml-spec-service-replica-policy:

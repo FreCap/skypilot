@@ -273,6 +273,7 @@ class SkyServiceSpec:
                 'timeout_seconds': constants.LB_REQUEST_QUEUE_TIMEOUT_SECONDS,
                 'max_request_body_bytes':
                     constants.LB_REQUEST_QUEUE_MAX_BODY_BYTES,
+                'use_async_occupancy': False,
             }
             queue_defaults.update(lb_request_queue)
             for field in ('min_size', 'size_per_replica', 'max_size',
@@ -312,6 +313,12 @@ class SkyServiceSpec:
                     raise ValueError(
                         'load_balancer.request_queue.timeout_seconds must be '
                         f'a finite number > 0. Got: {timeout_seconds!r}')
+            use_async_occupancy = queue_defaults['use_async_occupancy']
+            if not isinstance(use_async_occupancy, bool):
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        'load_balancer.request_queue.use_async_occupancy must '
+                        f'be a boolean. Got: {use_async_occupancy!r}')
             if queue_defaults['min_size'] > queue_defaults['max_size']:
                 min_size = queue_defaults['min_size']
                 max_size = queue_defaults['max_size']

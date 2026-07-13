@@ -630,10 +630,21 @@ class SkyServeLoadBalancer:
         config = self._request_queue_config
         assert config is not None
         with self._client_pool_lock:
-            ready_replicas = len(self._load_balancing_policy.ready_replicas)
+            ready_urls = set(self._load_balancing_policy.ready_replicas)
+            ready_replicas = len(ready_urls)
+            free_slots = None
+            if config.get('use_async_occupancy', False):
+                # Unknown occupancy is not free capacity. Async dispatch
+                # invalidates the selected replica's sample before its
+                # fast HTTP acknowledgement releases the admission slot.
+                free_slots = sum(
+                    slots for url, slots in self._replica_free_slots.items()
+                    if url in ready_urls)
         dispatch_limit = min(
             config['max_concurrency'],
             ready_replicas * config['max_concurrency_per_replica'])
+        if free_slots is not None:
+            dispatch_limit = min(dispatch_limit, free_slots)
         queue_size = max(config['min_size'],
                          ready_replicas * config['size_per_replica'])
         return dispatch_limit, min(config['max_size'], queue_size)
@@ -1041,6 +1052,14 @@ class SkyServeLoadBalancer:
             probed_replicas = len(probed)
             busy_replicas = sum(1 for free in probed.values() if free <= 0)
             free_slots = sum(probed.values())
+        request_queue_capacity: int | None = None
+        request_queue_dispatch_limit: int | None = None
+        request_queue_uses_async_occupancy: bool | None = None
+        if self._request_queue_config is not None:
+            (request_queue_dispatch_limit,
+             request_queue_capacity) = self._request_queue_limits()
+            request_queue_uses_async_occupancy = self._request_queue_config.get(
+                'use_async_occupancy', False)
         # Envelope in-flight plus occupancy per url and including
         # pruned-but-draining work. The count API has no job ids, so the brief
         # fast-ack overlap is summed conservatively rather than risking that
@@ -1067,6 +1086,10 @@ class SkyServeLoadBalancer:
             'synced': self._ready,
             'last_sync_age_seconds': last_sync_age,
             'queue_depth': self._queue_depth,
+            'request_queue_depth': self._waiting_request_count,
+            'request_queue_capacity': request_queue_capacity,
+            'request_queue_dispatch_limit': request_queue_dispatch_limit,
+            'request_queue_uses_async_occupancy': request_queue_uses_async_occupancy,
             'rejected_in_window': self._rejected_in_window(),
             'provisioning_replicas': hint.get('provisioning_replicas'),
             'target_replicas': hint.get('target_num_replicas'),
@@ -1202,6 +1225,7 @@ class SkyServeLoadBalancer:
                 self._occupancy_sampled_off_ready = set()
                 self._last_occupancy_probe_time = time.monotonic()
                 self._load_balancing_policy.set_occupancy({})
+            await self._notify_request_queue()
             return
         async with aiohttp.ClientSession() as session:
             results = await asyncio.gather(
@@ -1327,6 +1351,7 @@ class SkyServeLoadBalancer:
                 for url, count in occupancy.items()
                 if url in valid_sample_urls
             })
+        await self._notify_request_queue()
 
     async def _probe_occupancy_loop(self) -> None:
         """Background occupancy prober, beside the controller-sync loop."""

@@ -2,6 +2,7 @@
 # pylint: disable=protected-access
 import asyncio
 from collections.abc import AsyncIterator
+import json
 from typing import Any
 from unittest import mock
 
@@ -21,6 +22,7 @@ def _queue_config(**overrides: Any) -> dict[str, Any]:
         'max_concurrency': 32,
         'timeout_seconds': 1,
         'max_request_body_bytes': 16,
+        'use_async_occupancy': False,
     }
     config.update(overrides)
     return config
@@ -54,6 +56,7 @@ def test_queue_config_round_trip_and_defaults():
     assert queue['max_size'] == 1000
     assert queue['max_concurrency'] == 32
     assert queue['max_request_body_bytes'] == 1024 * 1024
+    assert queue['use_async_occupancy'] is False
     restored = service_spec_lib.SkyServiceSpec.from_yaml_config(
         spec.to_yaml_config())
     assert restored.lb_request_queue == queue
@@ -81,7 +84,10 @@ def test_queue_config_round_trip_and_defaults():
         'max_request_body_bytes': 0
     },
     {
-        'max_size': 2001
+        'max_size': 3001
+    },
+    {
+        'use_async_occupancy': 1
     },
     {
         'max_concurrency': 128,
@@ -94,14 +100,35 @@ def test_invalid_queue_config_rejected(queue):
 
 
 def test_dynamic_queue_size_is_capped():
-    lb = _make_lb(min_size=10, size_per_replica=3, max_size=20)
-    assert lb._request_queue_limits() == (0, 10)
+    lb = _make_lb(min_size=0, size_per_replica=3, max_size=3000)
+    assert lb._request_queue_limits() == (0, 0)
+    lb._load_balancing_policy.set_ready_replicas(['http://worker-0:8000'])
+    assert lb._request_queue_limits() == (1, 3)
     lb._load_balancing_policy.set_ready_replicas(
-        [f'http://worker-{i}:8000' for i in range(4)])
-    assert lb._request_queue_limits() == (4, 12)
-    lb._load_balancing_policy.set_ready_replicas(
-        [f'http://worker-{i}:8000' for i in range(10)])
-    assert lb._request_queue_limits() == (10, 20)
+        [f'http://worker-{i}:8000' for i in range(1000)])
+    assert lb._request_queue_limits() == (32, 3000)
+
+
+def test_async_occupancy_clamps_dispatch_limit():
+    lb = _make_lb(min_size=0,
+                  size_per_replica=3,
+                  max_size=3000,
+                  use_async_occupancy=True)
+    urls = ['http://worker-0:8000', 'http://worker-1:8000']
+    lb._load_balancing_policy.set_ready_replicas(urls)
+    lb._replica_free_slots = {urls[0]: 0, urls[1]: 1}
+    assert lb._request_queue_limits() == (1, 6)
+    lb._replica_free_slots = {}
+    assert lb._request_queue_limits() == (0, 6)
+
+
+def test_legacy_queue_config_defaults_to_envelope_admission():
+    lb = load_balancer.SkyServeLoadBalancer('http://controller:8001', 8890)
+    config = _queue_config()
+    config.pop('use_async_occupancy')
+    lb._apply_routing_spec({'request_queue': config})
+    lb._load_balancing_policy.set_ready_replicas(['http://worker:8000'])
+    assert lb._request_queue_limits() == (1, 10)
 
 
 def test_dispatch_concurrency_has_absolute_cap():
@@ -143,6 +170,81 @@ def test_waiter_wakes_when_dispatch_slot_released():
         assert await waiter is True
         assert lb._waiting_request_count == 0
         assert lb._active_request_count == 1
+
+    asyncio.run(_run())
+
+
+def test_occupancy_probe_wakes_waiter():
+
+    async def _run():
+        lb = _make_lb(min_size=0, use_async_occupancy=True, timeout_seconds=1)
+        url = 'http://worker:8000'
+        lb._load_balancing_policy.set_ready_replicas([url])
+        request = mock.MagicMock()
+        request.headers = {}
+        waiter = asyncio.create_task(lb._acquire_request_slot(request))
+        while lb._waiting_request_count != 1:
+            await asyncio.sleep(0)
+
+        async def _free_slot(session, replica_url):
+            del session
+            assert replica_url == url
+            return 0, 1
+
+        with mock.patch.object(lb,
+                               '_fetch_replica_occupancy',
+                               side_effect=_free_slot):
+            await lb._probe_replica_occupancy_once()
+        assert await waiter is True
+        assert lb._waiting_request_count == 0
+        assert lb._active_request_count == 1
+
+    asyncio.run(_run())
+
+
+def test_timeout_and_cancellation_remove_waiters():
+
+    async def _run():
+        lb = _make_lb(min_size=0,
+                      use_async_occupancy=True,
+                      timeout_seconds=0.01)
+        lb._load_balancing_policy.set_ready_replicas(['http://worker:8000'])
+        request = mock.MagicMock()
+        request.headers = {}
+        with pytest.raises(fastapi.HTTPException) as exc:
+            await lb._acquire_request_slot(request)
+        assert exc.value.status_code == 503
+        assert lb._waiting_request_count == 0
+
+        lb._request_queue_config['timeout_seconds'] = 1
+        waiter = asyncio.create_task(lb._acquire_request_slot(request))
+        while lb._waiting_request_count != 1:
+            await asyncio.sleep(0)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        assert lb._waiting_request_count == 0
+
+    asyncio.run(_run())
+
+
+def test_capacity_reports_request_queue_state():
+
+    async def _run():
+        lb = _make_lb(min_size=0,
+                      size_per_replica=3,
+                      max_size=3000,
+                      use_async_occupancy=True)
+        url = 'http://worker:8000'
+        lb._load_balancing_policy.set_ready_replicas([url])
+        lb._replica_free_slots = {url: 1}
+        lb._waiting_request_count = 2
+        response = await lb._capacity(mock.MagicMock())
+        payload = json.loads(response.body)
+        assert payload['request_queue_depth'] == 2
+        assert payload['request_queue_capacity'] == 3
+        assert payload['request_queue_dispatch_limit'] == 1
+        assert payload['request_queue_uses_async_occupancy'] is True
 
     asyncio.run(_run())
 
