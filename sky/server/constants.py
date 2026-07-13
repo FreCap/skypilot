@@ -10,7 +10,7 @@ from sky.skylet import constants
 # based on version info is needed.
 # For more details and code guidelines, refer to:
 # https://docs.skypilot.co/en/latest/developers/CONTRIBUTING.html#backward-compatibility-guidelines
-API_VERSION = 58  # Estimated-spend breakdown dimensions
+API_VERSION = 59  # Estimated-spend exact UTC date ranges
 
 # The minimum peer API version that the code should still work with.
 # Notes (dev):
@@ -90,6 +90,10 @@ MIN_ESTIMATED_SPEND_API_VERSION = 57
 # Minimum server API version that supports grouped estimated-spend chart and
 # table data by job, user, or purchase option.
 MIN_ESTIMATED_SPEND_BREAKDOWNS_API_VERSION = 58
+
+# Minimum server API version that supports exact start/end UTC dates on the
+# estimated-spend endpoint.
+MIN_ESTIMATED_SPEND_DATE_RANGE_API_VERSION = 59
 
 # Prefix for API request names.
 REQUEST_NAME_PREFIX = 'sky.'

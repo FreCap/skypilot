@@ -2,6 +2,7 @@
 
 # pylint: disable=protected-access
 
+import datetime
 import importlib
 import pickle
 from unittest import mock
@@ -129,6 +130,11 @@ def _insert_daily(connection,
         ))
 
 
+def _utc_date(day_start: int) -> datetime.date:
+    return datetime.datetime.fromtimestamp(day_start,
+                                           tz=datetime.timezone.utc).date()
+
+
 def test_split_interval_at_utc_midnight():
     day = 1_700_006_400  # UTC midnight.
     overlaps = estimated_spend._split_interval_by_utc_day(
@@ -150,7 +156,8 @@ def test_build_rows_uses_machine_uptime_and_node_count():
                                              rate_cache={})
 
     assert [row['machine_seconds'] for row in rows] == [4 * 3600, 4 * 3600]
-    assert sum(row['estimated_cost'] for row in rows) == 24.0
+    expected_cost = _FakeResources(3.0).get_cost(4 * 3600) * 2
+    assert sum(row['estimated_cost'] for row in rows) == expected_cost == 24.0
     assert all(row['workload_id'] == '42' for row in rows)
 
 
@@ -380,6 +387,8 @@ def test_estimated_spend_endpoint_serves_admin_snapshot():
     request = mock.MagicMock()
     request.state.auth_user = models.User(id='admin-1', name='Admin')
     expected = {'as_of': 123, 'days': []}
+    start_date = datetime.date(2026, 7, 12)
+    end_date = datetime.date(2026, 7, 13)
     with mock.patch.object(server.permission.permission_service,
                            'get_user_roles',
                            return_value=['admin']), mock.patch.object(
@@ -388,11 +397,35 @@ def test_estimated_spend_endpoint_serves_admin_snapshot():
                                return_value=expected) as get_estimate:
         response = server.estimated_spend(request,
                                           days=7,
-                                          group_by=estimated_spend.GroupBy.USER)
+                                          group_by=estimated_spend.GroupBy.USER,
+                                          start_date=start_date,
+                                          end_date=end_date)
 
     assert response == expected
     get_estimate.assert_called_once_with(days=7,
-                                         group_by=estimated_spend.GroupBy.USER)
+                                         group_by=estimated_spend.GroupBy.USER,
+                                         start_date=start_date,
+                                         end_date=end_date)
+
+
+def test_estimated_spend_endpoint_rejects_invalid_date_range():
+    request = mock.MagicMock()
+    request.state.auth_user = models.User(id='admin-1', name='Admin')
+    with mock.patch.object(
+            server.permission.permission_service,
+            'get_user_roles',
+            return_value=['admin']), mock.patch.object(
+                server.estimated_spend_lib,
+                'get_estimated_spend',
+                side_effect=estimated_spend.InvalidDateRangeError(
+                    'invalid UTC range')):
+        with pytest.raises(fastapi.HTTPException) as exc_info:
+            server.estimated_spend(request,
+                                   start_date=datetime.date(2026, 7, 13),
+                                   end_date=datetime.date(2026, 7, 12))
+
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.detail == 'invalid UTC range'
 
 
 def test_schema_021_upgrades_existing_sqlite_database(tmp_path):
@@ -470,6 +503,83 @@ def test_rollup_is_idempotent_and_query_returns_daily_breakdown(
            ] == [12.0, 12.0, 0.0]
     assert response['workloads'][0]['workload_type'] == 'managed_job'
     assert response['workloads'][0]['workload_id'] == '42'
+
+
+def test_exact_date_range_filters_all_aggregates(tmp_path, monkeypatch):
+    engine = _fresh_db(tmp_path, monkeypatch)
+    day = 1_700_006_400
+    current_day = day + 2 * estimated_spend.SECONDS_PER_DAY
+    with engine.begin() as connection:
+        _insert_daily(connection,
+                      day=day,
+                      cluster_hash='before',
+                      cost=1.0,
+                      use_spot=True,
+                      workload_id='before')
+        _insert_daily(connection,
+                      day=day + estimated_spend.SECONDS_PER_DAY,
+                      cluster_hash='selected',
+                      cost=2.5,
+                      use_spot=False,
+                      workload_id='selected')
+        _insert_daily(connection,
+                      day=current_day,
+                      cluster_hash='after',
+                      cost=4.0,
+                      use_spot=True,
+                      workload_id='after')
+
+    monkeypatch.setattr(estimated_spend.time, 'time',
+                        lambda: current_day + 3600)
+    selected_date = _utc_date(day + estimated_spend.SECONDS_PER_DAY)
+    response = estimated_spend.get_estimated_spend(days=30,
+                                                   group_by='job',
+                                                   start_date=selected_date,
+                                                   end_date=selected_date)
+
+    assert response['start_date'] == selected_date.isoformat()
+    assert response['end_date'] == selected_date.isoformat()
+    assert response['requested_days'] == 1
+    assert response['totals']['estimated_cost'] == 2.5
+    assert response['totals']['priced_machine_seconds'] == 3600
+    assert [row['estimated_cost'] for row in response['days']] == [2.5]
+    assert [row['workload_id'] for row in response['workloads']] == ['selected']
+    assert response['clouds'][0]['estimated_cost'] == 2.5
+    assert [row['workload_id'] for row in response['groups']] == ['selected']
+    assert response['series'] == [{
+        'workload_type': 'managed_job',
+        'workload_id': 'selected',
+        'estimated_cost_by_day': [2.5],
+    }]
+
+    inclusive_response = estimated_spend.get_estimated_spend(
+        start_date=_utc_date(day), end_date=selected_date)
+    assert inclusive_response['requested_days'] == 2
+    assert inclusive_response['totals']['estimated_cost'] == 3.5
+    assert [row['estimated_cost'] for row in inclusive_response['days']
+           ] == [1.0, 2.5]
+
+
+@pytest.mark.parametrize(('start_offset', 'end_offset', 'message'), [
+    (None, 0, 'provided together'),
+    (0, None, 'provided together'),
+    (0, -1, 'on or before'),
+    (-90, -89, 'within the last 90'),
+    (0, 1, 'cannot be after'),
+])
+def test_exact_date_range_validation(start_offset, end_offset, message):
+    current_day = 1_700_006_400
+    current_date = _utc_date(current_day)
+    start_date = (None if start_offset is None else current_date +
+                  datetime.timedelta(days=start_offset))
+    end_date = (None if end_offset is None else current_date +
+                datetime.timedelta(days=end_offset))
+
+    with pytest.raises(estimated_spend.InvalidDateRangeError, match=message):
+        estimated_spend._resolve_query_range(days=30,
+                                             start_date=start_date,
+                                             end_date=end_date,
+                                             now=current_day + 3600)
 
 
 def test_job_breakdown_splits_spot_and_on_demand_cost(tmp_path, monkeypatch):

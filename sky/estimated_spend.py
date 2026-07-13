@@ -49,8 +49,61 @@ class GroupBy(str, enum.Enum):
     PURCHASE_OPTION = 'purchase_option'
 
 
+class InvalidDateRangeError(ValueError):
+    """The requested estimated-spend UTC date range is invalid."""
+
+
 def _utc_day_start(timestamp: int) -> int:
     return int(timestamp) // SECONDS_PER_DAY * SECONDS_PER_DAY
+
+
+def _utc_date_from_day_start(day_start: int) -> datetime.date:
+    return datetime.datetime.fromtimestamp(day_start,
+                                           tz=datetime.timezone.utc).date()
+
+
+def _utc_day_start_from_date(date: datetime.date) -> int:
+    return int(
+        datetime.datetime.combine(date,
+                                  datetime.time.min,
+                                  tzinfo=datetime.timezone.utc).timestamp())
+
+
+def _resolve_query_range(
+    days: int,
+    start_date: datetime.date | None,
+    end_date: datetime.date | None,
+    now: int,
+) -> tuple[int, int, int]:
+    """Resolve a lookback or exact UTC date range to inclusive day bounds."""
+    current_day = _utc_day_start(now)
+    if (start_date is None) != (end_date is None):
+        raise InvalidDateRangeError(
+            'start_date and end_date must be provided together')
+
+    if start_date is None:
+        requested_days = max(1, min(int(days), MAX_LOOKBACK_DAYS))
+        first_day = current_day - (requested_days - 1) * SECONDS_PER_DAY
+        return first_day, current_day, requested_days
+
+    assert end_date is not None
+    first_day = _utc_day_start_from_date(start_date)
+    last_day = _utc_day_start_from_date(end_date)
+    earliest_day = current_day - (MAX_LOOKBACK_DAYS - 1) * SECONDS_PER_DAY
+    if first_day > last_day:
+        raise InvalidDateRangeError('start_date must be on or before end_date')
+    if last_day > current_day:
+        raise InvalidDateRangeError(
+            'end_date cannot be after the current UTC date')
+    if first_day < earliest_day:
+        raise InvalidDateRangeError(
+            f'start_date must be within the last {MAX_LOOKBACK_DAYS} UTC days')
+
+    requested_days = (last_day - first_day) // SECONDS_PER_DAY + 1
+    if requested_days > MAX_LOOKBACK_DAYS:
+        raise InvalidDateRangeError(
+            f'date range cannot exceed {MAX_LOOKBACK_DAYS} UTC days')
+    return first_day, last_day, requested_days
 
 
 def _split_interval_by_utc_day(start: int, end: int) -> dict[int, int]:
@@ -650,12 +703,14 @@ def _build_series(group_by: GroupBy, top_group_rows: list[Any],
 def get_estimated_spend(
     days: int = DEFAULT_LOOKBACK_DAYS,
     group_by: str | GroupBy = GroupBy.JOB,
+    start_date: datetime.date | None = None,
+    end_date: datetime.date | None = None,
 ) -> dict[str, Any]:
     """Read the last materialized admin estimate using aggregate SQL only."""
-    days = max(1, min(int(days), MAX_LOOKBACK_DAYS))
     normalized_group_by = _normalize_group_by(group_by)
     now = int(time.time())
-    first_day = _utc_day_start(now - (days - 1) * SECONDS_PER_DAY)
+    first_day, last_day, requested_days = _resolve_query_range(
+        days, start_date, end_date, now)
     daily = global_user_state.estimated_spend_daily_table
     state_table = global_user_state.estimated_spend_state_table
 
@@ -665,7 +720,9 @@ def get_estimated_spend(
             sqlalchemy.select(state_table).where(
                 state_table.c.singleton_id == _STATE_ID)).mappings().first()
 
-        base_filter = daily.c.day_start_utc >= first_day
+        base_filter = sqlalchemy.and_(
+            daily.c.day_start_utc >= first_day, daily.c.day_start_utc
+            < last_day + SECONDS_PER_DAY)
         day_rows = session.execute(
             sqlalchemy.select(
                 daily.c.day_start_utc.label('day_start_utc'),
@@ -720,7 +777,7 @@ def get_estimated_spend(
         } for row in day_rows
     }
     days_response: list[dict[str, Any]] = []
-    for offset in range(days):
+    for offset in range(requested_days):
         day_start = first_day + offset * SECONDS_PER_DAY
         values = by_day.get(
             day_start, {
@@ -731,8 +788,7 @@ def get_estimated_spend(
                 'excluded_machine_seconds': 0,
             })
         days_response.append({
-            'date': datetime.datetime.fromtimestamp(
-                day_start, tz=datetime.timezone.utc).date().isoformat(),
+            'date': _utc_date_from_day_start(day_start).isoformat(),
             'day_start_utc': day_start,
             **values,
         })
@@ -757,6 +813,9 @@ def get_estimated_spend(
              if state and state['coverage_start_utc'] is not None else None),
         'kubernetes_included': False,
         'reservation_adjustments_applied': False,
+        'start_date': _utc_date_from_day_start(first_day).isoformat(),
+        'end_date': _utc_date_from_day_start(last_day).isoformat(),
+        'requested_days': requested_days,
         'totals': {
             'estimated_cost': total_cost,
             'priced_machine_seconds': total_priced_seconds,

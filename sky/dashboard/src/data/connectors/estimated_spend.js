@@ -1,10 +1,18 @@
 import { apiClient } from '@/data/connectors/client';
 
-export async function getEstimatedSpend(days = 30, groupBy = 'job') {
+export async function getEstimatedSpend(
+  days = 30,
+  groupBy = 'job',
+  dateRange = null
+) {
   const query = new URLSearchParams({
     days: String(days),
     group_by: groupBy,
   });
+  if (dateRange?.startDate && dateRange?.endDate) {
+    query.set('start_date', dateRange.startDate);
+    query.set('end_date', dateRange.endDate);
+  }
   const response = await apiClient.get(`/estimated_spend?${query.toString()}`);
   if (!response.ok) {
     let detail = '';

@@ -242,12 +242,15 @@ response shape:
 
 ```
 GET /estimated_spend?days=30&group_by=job
+GET /estimated_spend?start_date=2026-07-12&end_date=2026-07-12&group_by=job
 ```
 
 The endpoint bumps `API_VERSION`, defines named minimum-version constants, and
 the dashboard's client API version. Older client/server combinations continue
-to use the unchanged `cost_report` contract. It accepts a bounded 1--90 day
-range and a `job`, `user`, or `purchase_option` grouping. The additive response
+to use the unchanged `cost_report` contract. It accepts either a bounded
+1--90 day rolling range or an exact inclusive UTC `start_date` and `end_date`
+within the retained 90 days, plus a `job`, `user`, or `purchase_option`
+grouping. Exact bounds apply to every returned aggregate. The additive response
 includes a cost-ranked table capped at 50 groups and a daily chart capped at
 the eight highest-cost groups plus `Other`. Job and user rows include spot and
 on-demand subtotals. The route is denied to default users and viewers by RBAC
@@ -268,17 +271,20 @@ Example response:
   "kubernetes_included": false,
   "reservation_adjustments_applied": false,
   "coverage_start_utc": 1781136000,
+  "start_date": "2026-07-10",
+  "end_date": "2026-07-10",
+  "requested_days": 1,
   "totals": {
     "estimated_cost": 4312.18,
     "priced_machine_seconds": 987654,
-    "unpriced_machine_seconds": 1234
+    "excluded_machine_seconds": 1234
   },
   "days": [
     {
       "date": "2026-07-10",
       "estimated_cost": 182.41,
       "priced_machine_seconds": 42120,
-      "unpriced_machine_seconds": 0
+      "excluded_machine_seconds": 0
     }
   ]
 }
@@ -289,10 +295,12 @@ refresh. If the daemon is late or failed, it returns the last snapshot with
 `stale: true` and the actual timestamp rather than blocking for fresh data.
 
 The UI uses a stacked daily chart and a matching table grouped by job/workload,
-user, or purchase option. Managed jobs, pools, services, ordinary clusters, and
-platform overhead remain distinct within job/workload grouping. The existing
-CLI can expose the same result as `sky cost-report --daily` after the new API
-version is negotiated.
+user, or purchase option. It offers Today, Yesterday, rolling presets, and an
+exact UTC range. Chart tooltips name each nonzero series and omit zero-valued
+entries. Managed jobs, pools, services, ordinary clusters, and platform
+overhead remain distinct within job/workload grouping. The existing CLI can
+expose the same result as `sky cost-report --daily` after the new API version
+is negotiated.
 
 ## Provider APIs and reconciliation
 
