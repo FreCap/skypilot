@@ -498,6 +498,59 @@ class TestUpdateVersionHoldsManagerLock:
         thread.join(timeout=5)
 
 
+class TestUpdateVersionBatchesPriorVersionYamls:
+    """`update_version` should reuse old YAMLs per distinct version."""
+
+    def test_reuses_distinct_old_version_yamls(self):
+        mgr = _make_manager()
+        mgr.latest_version = 2
+        mgr.yaml_content = 'old: yaml'
+        mgr._update_mode = None
+        persisted = []
+        mgr._persist_replica = lambda replica_id, info: persisted.append(
+            (replica_id, info.version))
+
+        info1 = mock.Mock(replica_id=1, version=1, is_terminal=False)
+        info2 = mock.Mock(replica_id=2, version=1, is_terminal=False)
+        info3 = mock.Mock(replica_id=3, version=2, is_terminal=False)
+        terminal = mock.Mock(replica_id=4, version=1, is_terminal=True)
+        replica_infos = [info1, info2, info3, terminal]
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_yaml_content',
+                return_value=('resources: {}\n'
+                              'file_mounts: {}\n'
+                              'service: {readiness_probe: /}\n')
+        ) as get_new_yaml, \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_yaml_contents',
+                 return_value={
+                     1: ('resources: {}\n'
+                         'file_mounts: {}\n'
+                         'service: {readiness_probe: /}\n'),
+                     2: ('resources: {cpus: 2}\n'
+                         'file_mounts: {}\n'
+                         'service: {readiness_probe: /}\n'),
+                 }) as get_old_yamls, \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_replica_infos',
+                 return_value=replica_infos):
+            mgr.update_version(3,
+                               mock.Mock(),
+                               update_mode=serve_utils.UpdateMode.ROLLING)
+
+        get_new_yaml.assert_called_once_with('svc', 3)
+        get_old_yamls.assert_called_once_with('svc', [1, 2])
+        assert persisted == [(1, 3), (2, 3)]
+        assert info1.version == 3
+        assert info2.version == 3
+        assert info3.version == 2
+        assert terminal.version == 1
+
+
 class TestLaunchOwnershipFence:
     """A stale manager must never start work that was only queued locally."""
 

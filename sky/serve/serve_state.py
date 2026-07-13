@@ -2324,6 +2324,25 @@ def get_specs(
     return {row[0]: pickle.loads(row[1]) for row in rows}
 
 
+def get_yaml_contents(service_name: str,
+                      versions: list[int]) -> dict[int, str | None]:
+    """Gets yaml contents for a service's versions in one query."""
+    if not versions:
+        return {}
+
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        rows = session.execute(
+            sqlalchemy.select(
+                version_specs_table.c.version,
+                version_specs_table.c.yaml_content).where(
+                    sqlalchemy.and_(
+                        version_specs_table.c.service_name == service_name,
+                        version_specs_table.c.version.in_(sorted(
+                            set(versions)))))).fetchall()
+    return {row[0]: row[1] for row in rows}
+
+
 def get_yaml_content(service_name: str, version: int) -> str | None:
     """Gets the yaml content of a version."""
     engine = _db_manager.get_engine()
