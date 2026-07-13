@@ -2373,6 +2373,22 @@ def get_yaml_contents(service_name: str,
     return {row[0]: row[1] for row in rows}
 
 
+def get_version_yaml_contents(service_name: str) -> dict[int, str]:
+    """Gets yaml contents for all of a service's versions in one query.
+
+    Versions whose yaml content is missing (NULL) are omitted. Keys are
+    returned in ascending version order.
+    """
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        rows = session.execute(
+            sqlalchemy.select(version_specs_table.c.version,
+                              version_specs_table.c.yaml_content).
+            where(version_specs_table.c.service_name == service_name).order_by(
+                version_specs_table.c.version)).fetchall()
+    return {row[0]: row[1] for row in rows if row[1] is not None}
+
+
 def get_yaml_content(service_name: str, version: int) -> str | None:
     """Gets the yaml content of a version."""
     engine = _db_manager.get_engine()

@@ -133,16 +133,12 @@ class TestCleanupProvisionalStorageIntents:
                  side_effect=lambda lock: calls.append('advance') or 99), \
              mock.patch.object(
                  impl.serve_state,
-                 'get_service_versions',
+                 'get_version_yaml_contents',
                  side_effect=lambda service_name: calls.append('versions') or
-                 [1, 2]) as get_versions, \
-             mock.patch.object(
-                 impl.serve_state,
-                 'get_yaml_content',
-                 side_effect=lambda service_name, version: {
+                 {
                      1: 'yaml-v1',
                      2: 'yaml-v2',
-                 }[version]) as get_yaml_content, \
+                 }) as get_version_yamls, \
              mock.patch.object(
                  impl.task_lib.Task,
                  'from_yaml_str',
@@ -161,8 +157,7 @@ class TestCleanupProvisionalStorageIntents:
                                                       mock.MagicMock())
 
         assert calls == ['advance', 'versions']
-        assert get_versions.call_count == 1
-        assert get_yaml_content.call_count == 2
+        assert get_version_yamls.call_count == 1
         assert from_yaml_str.call_count == 2
         cleanup_storage.assert_has_calls([
             mock.call('yaml-b', 'scope-b'),
@@ -189,11 +184,8 @@ class TestCleanupProvisionalStorageIntents:
                                'advance_service_lifecycle_epoch',
                                return_value=99), \
              mock.patch.object(impl.serve_state,
-                               'get_service_versions',
-                               return_value=[1]), \
-             mock.patch.object(impl.serve_state,
-                               'get_yaml_content',
-                               return_value='broken-yaml'), \
+                               'get_version_yaml_contents',
+                               return_value={1: 'broken-yaml'}), \
              mock.patch.object(impl.task_lib.Task,
                                'from_yaml_str',
                                side_effect=ValueError('bad yaml')), \
@@ -229,8 +221,8 @@ class TestCleanupProvisionalStorageIntents:
                                'advance_service_lifecycle_epoch',
                                return_value=99), \
              mock.patch.object(impl.serve_state,
-                               'get_service_versions',
-                               return_value=[]), \
+                               'get_version_yaml_contents',
+                               return_value={}), \
              mock.patch.object(impl.service_lib,
                                'cleanup_storage',
                                return_value=True) as cleanup_storage, \

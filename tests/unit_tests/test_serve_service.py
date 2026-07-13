@@ -341,10 +341,9 @@ class TestCleanupUsesDurableVersionStorageManifests:
                 'sky.serve.service.serve_utils.'
                 'lifecycle_lock_is_valid',
                 return_value=True),
-            mock.patch('sky.serve.service.serve_state.get_service_versions',
-                       return_value=[1]),
-            mock.patch('sky.serve.service.serve_state.get_yaml_content',
-                       return_value='yaml-v1'),
+            mock.patch(
+                'sky.serve.service.serve_state.get_version_yaml_contents',
+                return_value={1: 'yaml-v1'}),
         ]
 
     def test_scoped_storage_is_cleaned_before_manifest_removal(self):

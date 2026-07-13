@@ -152,10 +152,8 @@ def _get_committed_storage_generations(
     closed and retain the durable cleanup intent.
     """
     committed_generations: set[tuple[str, str]] = set()
-    for version in serve_state.get_service_versions(service_name):
-        yaml_content = serve_state.get_yaml_content(service_name, version)
-        if yaml_content is None:
-            continue
+    for yaml_content in serve_state.get_version_yaml_contents(
+            service_name).values():
         try:
             version_task = task_lib.Task.from_yaml_str(yaml_content)
         except Exception:  # pylint: disable=broad-except
