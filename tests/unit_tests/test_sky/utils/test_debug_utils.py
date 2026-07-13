@@ -1,5 +1,6 @@
 """Tests for sky.utils.debug_utils module."""
 import datetime
+import inspect
 import json
 import os
 import posixpath
@@ -18,6 +19,26 @@ from sky.skylet import constants as skylet_constants
 from sky.utils import debug_dump_helpers
 from sky.utils import debug_utils
 from sky.utils import status_lib
+
+
+def test_cluster_collection_facade_contract():
+    """Cluster collection helpers keep their existing facade contract."""
+    assert list(inspect.signature(
+        debug_utils._dump_cluster_info).parameters) == [
+            'cluster_names', 'dump_dir', 'errors'
+        ]
+    assert list(
+        inspect.signature(
+            debug_utils._collect_cluster_skylet_log).parameters) == [
+                'cluster_name', 'cluster_dir', 'handle', 'errors', 'status'
+            ]
+    assert list(
+        inspect.signature(
+            debug_utils._resolve_remote_skylet_log_path).parameters) == [
+                'runner', 'cluster_name'
+            ]
+    assert debug_utils._SKYLET_LOG_RESOLVE_CONNECT_TIMEOUT == 10
+    assert debug_utils._SKYLET_LOG_RSYNC_TIMEOUT == 60
 
 
 def _make_context(
