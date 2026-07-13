@@ -17,6 +17,7 @@ import filelock
 import requests
 
 from sky import backends
+from sky import estimated_spend
 from sky import exceptions
 from sky import global_user_state
 from sky import sky_logging
@@ -849,10 +850,12 @@ class ReplicaInfo:
                          f'replica {self.replica_id}.')
         return replica_status
 
-    def to_info_dict(self,
-                     with_handle: bool,
-                     with_url: bool = True,
-                     cluster_record: Any = _NOT_PROVIDED) -> dict[str, Any]:
+    def to_info_dict(
+            self,
+            with_handle: bool,
+            with_url: bool = True,
+            cluster_record: Any = _NOT_PROVIDED,
+            rate_cache: dict[str, float] | None = None) -> dict[str, Any]:
         """Build the dashboard/CLI view dict for this replica.
 
         Args:
@@ -867,6 +870,8 @@ class ReplicaInfo:
                 ``_NOT_PROVIDED`` (the default) to fall back to the
                 self-fetch path for backward compatibility (e.g. ``__repr__``
                 still works without changes).
+            rate_cache: optional per-status-request pricing cache shared by
+                replicas with identical launched resources.
         """
         if cluster_record is _NOT_PROVIDED:
             cluster_record = global_user_state.get_cluster_from_name(
@@ -899,6 +904,12 @@ class ReplicaInfo:
         if handle is not None and handle.launched_resources is not None:
             info_dict['cloud'] = repr(handle.launched_resources.cloud)
             info_dict['region'] = handle.launched_resources.region
+            hourly_cost, exclusion_reason = (
+                estimated_spend.estimate_hourly_cost(handle.launched_resources,
+                                                     handle.launched_nodes,
+                                                     rate_cache))
+            info_dict['hourly_cost'] = hourly_cost
+            info_dict['hourly_cost_exclusion_reason'] = exclusion_reason
             simple, full = resources_utils.get_readable_resources_repr(
                 handle, simplified_only=False)
             info_dict['resources_str'] = simple

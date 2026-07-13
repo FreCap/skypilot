@@ -1,4 +1,10 @@
-import { act, renderHook, waitFor } from '@testing-library/react';
+import {
+  act,
+  render,
+  renderHook,
+  screen,
+  waitFor,
+} from '@testing-library/react';
 
 jest.mock('@/lib/cache', () => ({
   __esModule: true,
@@ -14,7 +20,10 @@ jest.mock('@/lib/cache', () => ({
 
 import dashboardCache from '@/lib/cache';
 import { getServices } from '@/data/connectors/services';
-import { useServiceDetails } from '@/pages/services/[service]';
+import {
+  ServiceDetailCard,
+  useServiceDetails,
+} from '@/pages/services/[service]';
 
 function deferred() {
   let resolve;
@@ -138,5 +147,54 @@ describe('useServiceDetails stale-response fencing', () => {
 
     expect(result.current.serviceData.name).toBe('svc-b');
     expect(result.current.serviceData.status).toBe('svc-b-full');
+  });
+});
+
+describe('ServiceDetailCard cost and request estimates', () => {
+  it('shows hourly cost, request activity, and compute cost per request', () => {
+    render(
+      <ServiceDetailCard
+        serviceData={{
+          name: 'svc',
+          status: 'READY',
+          uptime: null,
+          replicasReady: 2,
+          replicasTotal: 2,
+          replicasFailed: 0,
+          targetReplicas: 2,
+          endpoint: null,
+          policy: 'autoscaling',
+          loadBalancingPolicy: 'round_robin',
+          requestedResources: 'L4:1',
+          activeVersions: [1],
+          estimatedHourlyCost: 5.5,
+          spotHourlyCost: 1.5,
+          onDemandHourlyCost: 4,
+          hourlyCostExcludedReplicaCount: 0,
+          requestRate: 0.5,
+          recentRequestCount: 30,
+          requestWindowSeconds: 60,
+          inFlightRequests: 2,
+          requestQueueDepth: 1,
+          rejectedRequests: 3,
+          requestStatsAgeSeconds: 4,
+          costPerThousandRequests: 3.055555,
+        }}
+      />
+    );
+
+    expect(screen.getByText('$5.50/hr')).toBeTruthy();
+    expect(
+      screen.getByText(
+        'Spot $1.50/hr · On-demand $4.00/hr · Current catalog, compute only'
+      )
+    ).toBeTruthy();
+    expect(screen.getByText('0.50 req/s')).toBeTruthy();
+    expect(
+      screen.getByText(
+        '30 requests in 60s · 2 in flight · 1 queued · 3 rejected · activity report 4s old'
+      )
+    ).toBeTruthy();
+    expect(screen.getByText('$3.0556')).toBeTruthy();
   });
 });

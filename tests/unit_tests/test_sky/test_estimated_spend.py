@@ -17,6 +17,7 @@ from sky import global_user_state
 from sky import models
 from sky.backends import cloud_vm_ray_backend
 from sky.serve import constants as serve_constants
+from sky.serve import serve_utils
 from sky.server import server
 from sky.skylet import constants
 from sky.utils.db import db_utils
@@ -57,6 +58,7 @@ def _source(*,
             cluster_hash: str = 'hash-1',
             use_spot: bool = False,
             user_hash: str = 'user-1',
+            workload_type: str = 'managed_job',
             workload_id: str = '42'):
     return {
         'cluster_hash': cluster_hash,
@@ -70,7 +72,7 @@ def _source(*,
         'cloud': cloud,
         'region': 'us-east-1',
         'is_managed': 1,
-        'workload_type': 'managed_job',
+        'workload_type': workload_type,
         'workload_id': workload_id,
         'workload_task_id': 0,
     }
@@ -168,6 +170,16 @@ def test_kubernetes_is_excluded_not_zero_priced():
     assert rows[0]['machine_seconds'] == 3600
 
 
+def test_estimate_hourly_cost_uses_actual_purchase_option_and_nodes():
+    spot_resources = _FakeResources(1.25, use_spot=True)
+    assert estimated_spend.estimate_hourly_cost(spot_resources,
+                                                2) == (2.5, None)
+
+    kubernetes_resources = _FakeResources(99.0, cloud='Kubernetes')
+    assert estimated_spend.estimate_hourly_cost(kubernetes_resources) == (
+        None, 'kubernetes')
+
+
 def test_corrupt_resource_pickle_does_not_block_rollup(tmp_path, monkeypatch):
     engine = _fresh_db(tmp_path, monkeypatch)
     day = 1_700_006_400
@@ -226,7 +238,7 @@ def test_workload_attribution_is_persisted(tmp_path, monkeypatch):
         assert row['workload_task_id'] == 3
 
 
-def test_managed_job_attribution_uses_launch_env_without_lookup():
+def test_workload_attribution_uses_launch_metadata_without_lookup():
     task = mock.MagicMock()
     task.envs = {
         constants.MANAGED_JOB_ID_ENV_VAR: '42',
@@ -244,6 +256,16 @@ def test_managed_job_attribution_uses_launch_env_without_lookup():
     pool = cloud_vm_ray_backend._get_workload_attribution(
         task, 'training-pool-7', 'pool')
     assert pool == ('training-pool', None)
+
+    service_name = 'inference-service-with-a-name-that-can-be-truncated'
+    scoped_cluster_name = serve_utils.generate_replica_cluster_name(
+        service_name, 7, resource_scope='service-incarnation-hash')
+    assert scoped_cluster_name != f'{service_name}-7'
+    scoped_service = cloud_vm_ray_backend._get_workload_attribution(
+        task, scoped_cluster_name, 'service', {
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY: service_name,
+        })
+    assert scoped_service == (service_name, None)
 
 
 def test_changed_rows_with_same_timestamp_make_keyset_progress(
@@ -479,6 +501,47 @@ def test_job_breakdown_splits_spot_and_on_demand_cost(tmp_path, monkeypatch):
     assert group['spot_estimated_cost'] == 2.0
     assert group['on_demand_estimated_cost'] == 3.0
     assert response['series'][0]['estimated_cost_by_day'] == [5.0, 0.0, 0.0]
+
+
+def test_service_breakdown_combines_spot_and_on_demand_replicas(
+        tmp_path, monkeypatch):
+    engine = _fresh_db(tmp_path, monkeypatch)
+    day = 1_700_006_400
+    as_of = day + 2 * estimated_spend.SECONDS_PER_DAY
+    with engine.begin() as connection:
+        _insert_source(connection,
+                       _source(start=day,
+                               end=day + 3600,
+                               hourly_cost=1.5,
+                               cluster_hash='service-spot-replica',
+                               use_spot=True,
+                               workload_type='service',
+                               workload_id='inference-service'),
+                       usage_updated_at=as_of - 1)
+        _insert_source(connection,
+                       _source(start=day,
+                               end=day + 3600,
+                               hourly_cost=4.0,
+                               cluster_hash='service-demand-replica',
+                               workload_type='service',
+                               workload_id='inference-service'),
+                       usage_updated_at=as_of - 1)
+
+    estimated_spend.run_rollup_once(now=as_of)
+    monkeypatch.setattr(estimated_spend.time, 'time', lambda: as_of)
+    response = estimated_spend.get_estimated_spend(days=3, group_by='job')
+
+    group = response['groups'][0]
+    assert group['workload_type'] == 'service'
+    assert group['workload_id'] == 'inference-service'
+    assert group['estimated_cost'] == 5.5
+    assert group['spot_estimated_cost'] == 1.5
+    assert group['on_demand_estimated_cost'] == 4.0
+    assert response['series'][0] == {
+        'workload_type': 'service',
+        'workload_id': 'inference-service',
+        'estimated_cost_by_day': [5.5, 0.0, 0.0],
+    }
 
 
 def test_user_breakdown_resolves_names_and_keeps_unknown_owner(

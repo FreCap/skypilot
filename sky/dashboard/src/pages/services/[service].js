@@ -192,7 +192,10 @@ function ServiceDetails() {
           </div>
         ) : serviceData ? (
           <>
-            <ServiceDetailCard serviceData={serviceData} />
+            <ServiceDetailCard
+              serviceData={serviceData}
+              pricingLoading={replicasLoading && serviceData.summaryOnly}
+            />
             <ReplicasCard
               replicas={serviceData.replicas}
               loading={replicasLoading && serviceData.summaryOnly}
@@ -208,7 +211,67 @@ function ServiceDetails() {
   );
 }
 
-function ServiceDetailCard({ serviceData }) {
+function formatUsd(value) {
+  return Number(value).toLocaleString(undefined, {
+    style: 'currency',
+    currency: 'USD',
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 4,
+  });
+}
+
+function formatRequestRate(value) {
+  return `${Number(value).toLocaleString(undefined, {
+    minimumFractionDigits: value < 1 ? 2 : 1,
+    maximumFractionDigits: value < 1 ? 3 : 1,
+  })} req/s`;
+}
+
+export function ServiceDetailCard({ serviceData, pricingLoading = false }) {
+  const hourlyCostDetails = [];
+  if (serviceData.spotHourlyCost > 0) {
+    hourlyCostDetails.push(`Spot ${formatUsd(serviceData.spotHourlyCost)}/hr`);
+  }
+  if (serviceData.onDemandHourlyCost > 0) {
+    hourlyCostDetails.push(
+      `On-demand ${formatUsd(serviceData.onDemandHourlyCost)}/hr`
+    );
+  }
+  if (serviceData.hourlyCostExcludedReplicaCount > 0) {
+    hourlyCostDetails.push(
+      `${serviceData.hourlyCostExcludedReplicaCount} unpriced replica${
+        serviceData.hourlyCostExcludedReplicaCount === 1 ? '' : 's'
+      }`
+    );
+  }
+  if (serviceData.estimatedHourlyCost != null) {
+    hourlyCostDetails.push('Current catalog, compute only');
+  }
+
+  const requestDetails = [];
+  if (
+    serviceData.recentRequestCount != null &&
+    serviceData.requestWindowSeconds != null
+  ) {
+    requestDetails.push(
+      `${serviceData.recentRequestCount.toLocaleString()} requests in ${serviceData.requestWindowSeconds}s`
+    );
+  }
+  if (serviceData.inFlightRequests != null) {
+    requestDetails.push(`${serviceData.inFlightRequests} in flight`);
+  }
+  if (serviceData.requestQueueDepth != null) {
+    requestDetails.push(`${serviceData.requestQueueDepth} queued`);
+  }
+  if (serviceData.rejectedRequests != null) {
+    requestDetails.push(`${serviceData.rejectedRequests} rejected`);
+  }
+  if (serviceData.requestStatsAgeSeconds != null) {
+    requestDetails.push(
+      `activity report ${Math.round(serviceData.requestStatsAgeSeconds)}s old`
+    );
+  }
+
   return (
     <div className="mb-6">
       <div className="rounded-lg border bg-card text-card-foreground shadow-sm">
@@ -279,6 +342,51 @@ function ServiceDetailCard({ serviceData }) {
               </div>
               <div className="text-base mt-1">
                 {serviceData.requestedResources || '-'}
+              </div>
+            </div>
+            <div>
+              <div className="text-gray-600 font-medium text-base">
+                Estimated compute cost
+              </div>
+              <div className="text-base mt-1">
+                {serviceData.estimatedHourlyCost != null
+                  ? `${formatUsd(serviceData.estimatedHourlyCost)}/hr`
+                  : pricingLoading
+                    ? 'Loading replica prices...'
+                    : '-'}
+              </div>
+              {hourlyCostDetails.length > 0 && (
+                <div className="text-xs text-gray-500 mt-1">
+                  {hourlyCostDetails.join(' · ')}
+                </div>
+              )}
+            </div>
+            <div>
+              <div className="text-gray-600 font-medium text-base">
+                Recent request rate
+              </div>
+              <div className="text-base mt-1">
+                {serviceData.requestRate != null
+                  ? formatRequestRate(serviceData.requestRate)
+                  : '-'}
+              </div>
+              {requestDetails.length > 0 && (
+                <div className="text-xs text-gray-500 mt-1">
+                  {requestDetails.join(' · ')}
+                </div>
+              )}
+            </div>
+            <div>
+              <div className="text-gray-600 font-medium text-base">
+                Estimated compute / 1K requests
+              </div>
+              <div className="text-base mt-1">
+                {serviceData.costPerThousandRequests != null
+                  ? formatUsd(serviceData.costPerThousandRequests)
+                  : '-'}
+              </div>
+              <div className="text-xs text-gray-500 mt-1">
+                Current fleet cost at the recent request rate
               </div>
             </div>
             <div>
@@ -385,6 +493,7 @@ function ReplicasCard({ replicas, loading }) {
                 <TableHead className="whitespace-nowrap">Status</TableHead>
                 <TableHead className="whitespace-nowrap">Version</TableHead>
                 <TableHead className="whitespace-nowrap">Resources</TableHead>
+                <TableHead className="whitespace-nowrap">Est. $/hr</TableHead>
                 <TableHead className="whitespace-nowrap">Region</TableHead>
                 <TableHead className="whitespace-nowrap">Endpoint</TableHead>
                 <TableHead className="whitespace-nowrap">Launched</TableHead>
@@ -418,6 +527,11 @@ function ReplicasCard({ replicas, loading }) {
                         '-'
                       )}
                     </TableCell>
+                    <TableCell>
+                      {replica.hourlyCost != null
+                        ? formatUsd(replica.hourlyCost)
+                        : '-'}
+                    </TableCell>
                     <TableCell>{replica.region || '-'}</TableCell>
                     <TableCell>
                       <EndpointCell endpoint={replica.endpoint} />
@@ -434,7 +548,7 @@ function ReplicasCard({ replicas, loading }) {
               ) : (
                 <TableRow>
                   <TableCell
-                    colSpan={7}
+                    colSpan={8}
                     className="text-center py-6 text-gray-500"
                   >
                     No replicas.

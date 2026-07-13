@@ -6,6 +6,11 @@ import { CLUSTER_NOT_UP_ERROR } from '@/data/connectors/constants';
 // their plain string values (sky/serve/serve_state.py ReplicaStatus) and
 // leaves the pickled `handle` as an opaque blob, which we ignore.
 export function normalizeReplica(replica) {
+  const rawHourlyCost = replica.hourly_cost;
+  const hourlyCost =
+    rawHourlyCost === null || rawHourlyCost === undefined
+      ? null
+      : Number(rawHourlyCost);
   return {
     id: replica.replica_id,
     status: replica.status,
@@ -19,6 +24,8 @@ export function normalizeReplica(replica) {
     resources_str: replica.resources_str || null,
     resources_str_full:
       replica.resources_str_full || replica.resources_str || null,
+    hourlyCost: Number.isFinite(hourlyCost) ? hourlyCost : null,
+    hourlyCostExclusionReason: replica.hourly_cost_exclusion_reason || null,
   };
 }
 
@@ -67,6 +74,36 @@ export function normalizeService(record) {
     replicasTotalRaw = replicas.length;
   }
 
+  const pricedReplicas = replicas.filter(
+    (replica) => replica.hourlyCost !== null
+  );
+  const estimatedHourlyCost = pricedReplicas.length
+    ? pricedReplicas.reduce((total, replica) => total + replica.hourlyCost, 0)
+    : null;
+  const spotHourlyCost = pricedReplicas
+    .filter((replica) => replica.is_spot)
+    .reduce((total, replica) => total + replica.hourlyCost, 0);
+  const onDemandHourlyCost = pricedReplicas
+    .filter((replica) => !replica.is_spot)
+    .reduce((total, replica) => total + replica.hourlyCost, 0);
+  const hourlyCostExcludedReplicaCount = replicas.filter(
+    (replica) => replica.hourlyCostExclusionReason
+  ).length;
+  const rawRequestRate = record.requests_per_second;
+  const requestRate =
+    rawRequestRate === null || rawRequestRate === undefined
+      ? null
+      : Number(rawRequestRate);
+  const normalizedRequestRate = Number.isFinite(requestRate)
+    ? requestRate
+    : null;
+  const costPerThousandRequests =
+    estimatedHourlyCost !== null &&
+    hourlyCostExcludedReplicaCount === 0 &&
+    normalizedRequestRate > 0
+      ? (estimatedHourlyCost * 1000) / (normalizedRequestRate * 3600)
+      : null;
+
   return {
     name: record.name,
     status: record.status,
@@ -93,6 +130,19 @@ export function normalizeService(record) {
     // _get_service_status); absent on old servers and empty when the
     // controller could not read the stored YAML.
     serviceYaml: record.service_yaml || null,
+    estimatedHourlyCost,
+    spotHourlyCost,
+    onDemandHourlyCost,
+    pricedReplicaCount: pricedReplicas.length,
+    hourlyCostExcludedReplicaCount,
+    recentRequestCount: record.recent_request_count ?? null,
+    requestWindowSeconds: record.request_window_seconds ?? null,
+    requestRate: normalizedRequestRate,
+    inFlightRequests: record.in_flight_requests ?? null,
+    requestQueueDepth: record.request_queue_depth ?? null,
+    rejectedRequests: record.rejected_requests ?? null,
+    requestStatsAgeSeconds: record.request_stats_age_seconds ?? null,
+    costPerThousandRequests,
     replicas,
   };
 }

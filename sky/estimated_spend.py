@@ -108,6 +108,18 @@ def _get_pricing(
     return hourly_rate, None
 
 
+def estimate_hourly_cost(
+    resources: Any,
+    num_nodes: int = 1,
+    rate_cache: dict[str, float] | None = None
+) -> tuple[float | None, str | None]:
+    """Return a current-catalog hourly estimate and exclusion reason."""
+    if rate_cache is None:
+        rate_cache = {}
+    return _get_pricing(resources, _resource_cloud(resources), num_nodes,
+                        rate_cache)
+
+
 def _build_daily_rows(source: Mapping[str,
                                       Any], as_of: int, recompute_start: int,
                       rate_cache: dict[str, float]) -> list[dict[str, Any]]:

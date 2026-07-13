@@ -150,7 +150,16 @@ class TestGetServiceStatusSummary:
 
     def test_summary_can_opt_in_target_fetch(self, patched_state, monkeypatch):
         autoscaler_resp = mock.MagicMock()
-        autoscaler_resp.json.return_value = {'target_num_replicas': 4}
+        autoscaler_resp.json.return_value = {
+            'target_num_replicas': 4,
+            'recent_request_count': 30,
+            'request_window_seconds': 60,
+            'requests_per_second': 0.5,
+            'in_flight_total': 2,
+            'queue_depth': 1,
+            'rejected_in_window': 3,
+            'report_age_seconds': 4.0,
+        }
         autoscaler = mock.Mock(return_value=autoscaler_resp)
         monkeypatch.setattr(serve_utils, '_get_to_controller_with_retry',
                             autoscaler)
@@ -163,6 +172,13 @@ class TestGetServiceStatusSummary:
         assert record is not None
         autoscaler.assert_called_once()
         assert record['target_num_replicas'] == 4
+        assert record['recent_request_count'] == 30
+        assert record['request_window_seconds'] == 60
+        assert record['requests_per_second'] == 0.5
+        assert record['in_flight_requests'] == 2
+        assert record['request_queue_depth'] == 1
+        assert record['rejected_requests'] == 3
+        assert record['request_stats_age_seconds'] == 4.0
 
     def test_default_call_has_no_counts(self, patched_state, monkeypatch):
         # Internal callers that only want the service row

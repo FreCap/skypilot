@@ -178,6 +178,16 @@ def status(
               requested resources,
             'load_balancing_policy': (str) load balancing policy name,
             'tls_encrypted': (bool) whether the service is TLS encrypted,
+            'recent_request_count': (Optional[int]) requests observed in the
+              autoscaler's rolling window,
+            'request_window_seconds': (Optional[int]) rolling window size,
+            'requests_per_second': (Optional[float]) average request rate in
+              that rolling window,
+            'in_flight_requests': (Optional[int]) currently in-flight
+              requests when concurrency metrics are available,
+            'request_queue_depth': (Optional[int]) requests waiting for a
+              replica,
+            'rejected_requests': (Optional[int]) recent capacity rejections,
             'replica_info': (List[Dict[str, Any]]) replica information,
         }
 
@@ -204,6 +214,10 @@ def status(
             'resources_str': (Optional[str]) simplified resource string,
             'resources_str_full': (Optional[str]) full resource string with
                 accelerator details,
+            'hourly_cost': (Optional[float]) current-catalog hourly compute
+                estimate for the launched replica resources,
+            'hourly_cost_exclusion_reason': (Optional[str]) why the replica
+                could not be priced,
             'endpoint': (str) endpoint of the replica,
         }
 

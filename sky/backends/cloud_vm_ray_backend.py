@@ -955,13 +955,20 @@ def _failure_requested_full_demand(error: BaseException,
         count == num_nodes for count in requested_counts)
 
 
-def _get_workload_attribution(task: task_lib.Task, cluster_name: str,
-                              workload_type: str) -> tuple[str, int | None]:
+def _get_workload_attribution(
+        task: task_lib.Task,
+        cluster_name: str,
+        workload_type: str,
+        launch_context: dict[str, Any] | None = None) -> tuple[str, int | None]:
     """Returns scalar workload attribution without any external lookup."""
     workload_id = cluster_name
     workload_task_id = None
     task_envs = task.envs or {}
     if workload_type in ('service', 'pool'):
+        service_name = (launch_context or {}).get(
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY)
+        if isinstance(service_name, str) and service_name:
+            return service_name, workload_task_id
         replica_id = task_envs.get(serve_constants.REPLICA_ID_ENV_VAR)
         replica_suffix = f'-{replica_id}' if replica_id is not None else None
         if replica_suffix and cluster_name.endswith(replica_suffix):
@@ -1459,7 +1466,8 @@ class RetryingVmProvisioner:
 
                 # This sets the status to INIT (even for a normal, UP cluster).
                 workload_id, workload_task_id = _get_workload_attribution(
-                    task, cluster_name, self._workload_type)
+                    task, cluster_name, self._workload_type,
+                    self._extra_launch_context)
                 global_user_state.add_or_update_cluster(
                     cluster_name,
                     cluster_handle=handle,

@@ -684,6 +684,20 @@ class Autoscaler:
             'min_replicas': self.min_replicas,
             'max_replicas': self.max_replicas,
         }
+        request_timestamps = getattr(self, 'request_timestamps', None)
+        request_window_seconds = getattr(self, 'qps_window_size', None)
+        if (isinstance(request_timestamps, list) and
+                isinstance(request_window_seconds, int) and
+                request_window_seconds > 0):
+            cutoff = time.time() - request_window_seconds
+            recent_request_count = sum(
+                timestamp >= cutoff for timestamp in request_timestamps)
+            info.update({
+                'recent_request_count': recent_request_count,
+                'request_window_seconds': request_window_seconds,
+                'requests_per_second': recent_request_count /
+                                       request_window_seconds,
+            })
         if self.reserved_capacity_fill:
             # target_num_replicas above stays demand-only; the fill
             # overlay is observable through these keys instead.

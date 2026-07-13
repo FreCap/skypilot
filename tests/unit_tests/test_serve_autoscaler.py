@@ -246,6 +246,26 @@ class TestAutoscalerVersionInitialization(unittest.TestCase):
         self.assertEqual(mock_from_spec.call_args.args[2], 7)
 
 
+class TestAutoscalerInfo(unittest.TestCase):
+    """Autoscaler status should expose a current rolling request rate."""
+
+    def test_info_reports_only_requests_inside_window(self):
+        autoscaler = object.__new__(autoscalers.Autoscaler)
+        autoscaler.target_num_replicas = 2
+        autoscaler.min_replicas = 1
+        autoscaler.max_replicas = 4
+        autoscaler.reserved_capacity_fill = False
+        autoscaler.qps_window_size = 60
+        autoscaler.request_timestamps = [900.0, 940.0, 950.0, 999.0]
+
+        with mock.patch('sky.serve.autoscalers.time.time', return_value=1000.0):
+            info = autoscaler.info()
+
+        self.assertEqual(info['recent_request_count'], 3)
+        self.assertEqual(info['request_window_seconds'], 60)
+        self.assertEqual(info['requests_per_second'], 0.05)
+
+
 class TestQueueLengthAutoscalerIdleReplicas(unittest.TestCase):
     """Idle detection should use one grouped pool lookup."""
 

@@ -48,6 +48,12 @@ function rawServiceRecord(overrides = {}) {
     active_versions: [2],
     version: 2,
     target_num_replicas: 2,
+    recent_request_count: 30,
+    request_window_seconds: 60,
+    requests_per_second: 0.5,
+    in_flight_requests: 2,
+    request_queue_depth: 1,
+    rejected_requests: 3,
     replica_info: [
       {
         replica_id: 1,
@@ -62,6 +68,8 @@ function rawServiceRecord(overrides = {}) {
         infra: 'AWS (us-east-1)',
         resources_str: '1x(gpus=L4:1)',
         resources_str_full: '1x(gpus=L4:1, cpus=4, mem=16)',
+        hourly_cost: 1.25,
+        hourly_cost_exclusion_reason: null,
         handle: 'opaque-encoded-handle',
       },
     ],
@@ -103,6 +111,13 @@ describe('getServices', () => {
       loadBalancingPolicy: 'round_robin',
       requestedResources: '1x[L4:1]',
       activeVersions: [2],
+      estimatedHourlyCost: 1.25,
+      requestRate: 0.5,
+      recentRequestCount: 30,
+      inFlightRequests: 2,
+      requestQueueDepth: 1,
+      rejectedRequests: 3,
+      costPerThousandRequests: 0.6944444444444444,
     });
     expect(service.replicas).toHaveLength(1);
     expect(service.replicas[0]).toMatchObject({
@@ -114,6 +129,7 @@ describe('getServices', () => {
       region: 'us-east-1',
       resources_str: '1x(gpus=L4:1)',
       resources_str_full: '1x(gpus=L4:1, cpus=4, mem=16)',
+      hourlyCost: 1.25,
     });
     // The pickled handle blob must not leak into the normalized replica.
     expect(service.replicas[0].handle).toBeUndefined();
@@ -282,6 +298,42 @@ describe('getServices', () => {
 });
 
 describe('normalizeService / normalizeReplica', () => {
+  it('combines spot and on-demand replica costs and tracks exclusions', () => {
+    const service = normalizeService(
+      rawServiceRecord({
+        requests_per_second: 0.5,
+        replica_info: [
+          {
+            replica_id: 1,
+            status: 'READY',
+            is_spot: true,
+            hourly_cost: 1.5,
+          },
+          {
+            replica_id: 2,
+            status: 'READY',
+            is_spot: false,
+            hourly_cost: 4,
+          },
+          {
+            replica_id: 3,
+            status: 'READY',
+            hourly_cost: null,
+            hourly_cost_exclusion_reason: 'kubernetes',
+          },
+        ],
+      })
+    );
+
+    expect(service.estimatedHourlyCost).toBe(5.5);
+    expect(service.spotHourlyCost).toBe(1.5);
+    expect(service.onDemandHourlyCost).toBe(4);
+    expect(service.pricedReplicaCount).toBe(2);
+    expect(service.hourlyCostExcludedReplicaCount).toBe(1);
+    // A partial fleet price must not produce an understated per-request cost.
+    expect(service.costPerThousandRequests).toBeNull();
+  });
+
   it('handles a service with no replica_info', () => {
     const service = normalizeService(
       rawServiceRecord({
