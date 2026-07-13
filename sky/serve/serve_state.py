@@ -2520,6 +2520,36 @@ def get_latest_committed_version(service_name: str) -> int | None:
     return result[0] if result else None
 
 
+def get_latest_committed_version_spec(
+        service_name: str
+) -> Optional[tuple[int, 'service_spec.SkyServiceSpec']]:
+    """Returns the latest committed version and spec from one row snapshot.
+
+    A controller-child respawn must not pair a version selected in one
+    transaction with a spec fetched in another.  In particular, if the spec
+    row disappears between those reads, falling back to the parent loop's
+    captured version can resurrect stale configuration after an update.
+
+    Returns None when no row has committed YAML or its spec is unusable.
+    """
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        result = session.execute(
+            sqlalchemy.select(
+                version_specs_table.c.version,
+                version_specs_table.c.spec).where(
+                    sqlalchemy.and_(
+                        version_specs_table.c.service_name == service_name,
+                        version_specs_table.c.yaml_content.isnot(None))).
+            order_by(version_specs_table.c.version.desc()).limit(1)).fetchone()
+    if result is None:
+        return None
+    spec = pickle.loads(result[1])
+    if spec is None:
+        return None
+    return result[0], spec
+
+
 def get_ha_recovery_script(service_name: str) -> str | None:
     """Gets the HA recovery script for a service."""
     engine = _db_manager.get_engine()

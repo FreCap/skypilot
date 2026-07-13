@@ -11,6 +11,7 @@ from sky.utils import subprocess_utils
 
 _PORT = 20005
 _HASH = 'incarnation-a'
+_DEFAULT_SNAPSHOT = object()
 
 
 class _FakeProc:
@@ -43,18 +44,17 @@ def _spec():
 def _setup(monkeypatch,
            *,
            new_controller,
-           latest_version=None,
-           latest_spec=None,
+           latest_snapshot=_DEFAULT_SNAPSHOT,
            killed=None,
            owns_row=True):
     monkeypatch.setattr(service.filelock, 'FileLock', _DummyLock)
     monkeypatch.setattr(common_utils, 'find_free_port', lambda unused: _PORT)
     monkeypatch.setattr(serve_state, 'set_service_controller_port_if_owner',
                         lambda name, service_hash, pid, ip, port: owns_row)
-    monkeypatch.setattr(serve_state, 'get_latest_committed_version',
-                        lambda unused_name: latest_version)
-    monkeypatch.setattr(serve_state, 'get_spec',
-                        lambda unused_name, unused_version: latest_spec)
+    if latest_snapshot is _DEFAULT_SNAPSHOT:
+        latest_snapshot = (1, _spec())
+    monkeypatch.setattr(serve_state, 'get_latest_committed_version_spec',
+                        lambda unused_name: latest_snapshot)
 
     spawn_calls = []
 
@@ -92,8 +92,6 @@ def test_respawn_recreates_only_controller_on_fresh_port(monkeypatch):
                                  killed=[])
 
     result = service._respawn_controller('svc',
-                                         _spec(),
-                                         1,
                                          '127.0.0.1',
                                          dead,
                                          service_hash=_HASH)
@@ -116,8 +114,6 @@ def test_respawn_port_publish_fences_hash_pid_and_ip(monkeypatch):
                         lambda *args: owner_calls.append(args) or True)
 
     result = service._respawn_controller('svc',
-                                         _spec(),
-                                         1,
                                          '127.0.0.1',
                                          _FakeProc(False, 111),
                                          service_hash='incarnation-a',
@@ -132,12 +128,9 @@ def test_respawn_reloads_latest_committed_spec(monkeypatch):
     latest_spec = _spec()
     spawn_calls, _ = _setup(monkeypatch,
                             new_controller=_FakeProc(True, 333),
-                            latest_version=7,
-                            latest_spec=latest_spec)
+                            latest_snapshot=(7, latest_spec))
 
     service._respawn_controller('svc',
-                                _spec(),
-                                1,
                                 '127.0.0.1',
                                 _FakeProc(False, 111),
                                 service_hash=_HASH)
@@ -150,8 +143,6 @@ def test_respawn_preserves_authoritative_launch_fence_bit(monkeypatch):
     spawn_calls, _ = _setup(monkeypatch, new_controller=_FakeProc(True, 333))
 
     service._respawn_controller('svc',
-                                _spec(),
-                                1,
                                 '127.0.0.1',
                                 _FakeProc(False, 111),
                                 service_hash=_HASH,
@@ -166,15 +157,29 @@ def test_respawn_db_error_retries_without_stale_spec(monkeypatch):
     def _db_error(unused_name):
         raise RuntimeError('db unavailable')
 
-    monkeypatch.setattr(serve_state, 'get_latest_committed_version', _db_error)
+    monkeypatch.setattr(serve_state, 'get_latest_committed_version_spec',
+                        _db_error)
     result = service._respawn_controller('svc',
-                                         _spec(),
-                                         1,
                                          '127.0.0.1',
                                          _FakeProc(False, 111),
                                          service_hash=_HASH)
     assert result is None
-    assert spawn_calls == []
+    assert not spawn_calls
+
+
+def test_respawn_without_committed_spec_retries_without_stale_fallback(
+        monkeypatch):
+    spawn_calls, _ = _setup(monkeypatch,
+                            new_controller=_FakeProc(True, 333),
+                            latest_snapshot=None)
+
+    result = service._respawn_controller('svc',
+                                         '127.0.0.1',
+                                         _FakeProc(False, 111),
+                                         service_hash=_HASH)
+
+    assert result is None
+    assert not spawn_calls
 
 
 def test_respawn_failure_is_contained(monkeypatch):
@@ -182,8 +187,6 @@ def test_respawn_failure_is_contained(monkeypatch):
                        new_controller=OSError('no memory'),
                        killed=[])
     result = service._respawn_controller('svc',
-                                         _spec(),
-                                         1,
                                          '127.0.0.1',
                                          _FakeProc(False, 111),
                                          service_hash=_HASH)
@@ -197,8 +200,6 @@ def test_respawn_dead_replacement_is_reaped(monkeypatch):
     replacement = _FakeProc(False, 333)
     _, killed = _setup(monkeypatch, new_controller=replacement, killed=[])
     result = service._respawn_controller('svc',
-                                         _spec(),
-                                         1,
                                          '127.0.0.1',
                                          _FakeProc(False, 111),
                                          service_hash=_HASH)
@@ -213,8 +214,6 @@ def test_respawn_lost_ownership_discards_replacement(monkeypatch):
                        killed=[],
                        owns_row=False)
     result = service._respawn_controller('svc',
-                                         _spec(),
-                                         1,
                                          '127.0.0.1',
                                          _FakeProc(False, 111),
                                          service_hash=_HASH)

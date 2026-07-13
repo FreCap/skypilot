@@ -249,6 +249,7 @@ def test_get_yaml_contents_empty_versions_skips_query(_mock_serve_db):
         yamls = serve_state.get_yaml_contents('svc-yamls', [])
 
     assert counts['n'] == 0, counts
+    assert not yamls
 
 
 def test_get_version_yaml_contents_fetches_all_versions_in_one_query(
@@ -1507,6 +1508,37 @@ class TestRecoveryVersionSelection:
     def test_committed_version_none_when_only_placeholder(self, _mock_serve_db):
         serve_state.add_version('svc')  # placeholder v1, no committed yaml
         assert serve_state.get_latest_committed_version('svc') is None
+
+    def test_committed_version_spec_is_one_row_snapshot(self, _mock_serve_db):
+        serve_state.add_or_update_version('svc', 1, 'spec-1', 'yaml: v1')
+        serve_state.add_or_update_version('svc', 2, 'spec-2', 'yaml: v2')
+        serve_state.add_version('svc')  # placeholder v3
+
+        statements = []
+
+        def _record_statement(*args):
+            statements.append(args[2])
+
+        sqlalchemy.event.listen(_mock_serve_db, 'before_cursor_execute',
+                                _record_statement)
+        try:
+            snapshot = serve_state.get_latest_committed_version_spec('svc')
+        finally:
+            sqlalchemy.event.remove(_mock_serve_db, 'before_cursor_execute',
+                                    _record_statement)
+
+        assert snapshot == (2, 'spec-2')
+        assert len(statements) == 1, statements
+
+    def test_committed_version_spec_none_without_committed_row(
+            self, _mock_serve_db):
+        serve_state.add_version('svc')
+        assert serve_state.get_latest_committed_version_spec('svc') is None
+
+    def test_committed_version_spec_none_for_unusable_spec(
+            self, _mock_serve_db):
+        serve_state.add_or_update_version('svc', 1, None, 'yaml: v1')
+        assert serve_state.get_latest_committed_version_spec('svc') is None
 
 
 class TestUnrecoverableServiceCleanup:
