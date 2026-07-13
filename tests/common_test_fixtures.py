@@ -21,6 +21,7 @@ from sky import global_user_state
 from sky import sky_logging
 from sky import skypilot_config
 from sky.backends.cloud_vm_ray_backend import CloudVmRayBackend
+from sky.catalog import aws_catalog
 from sky.catalog import vsphere_catalog
 from sky.provision import common as provision_common
 from sky.provision.aws import config as aws_config
@@ -189,6 +190,54 @@ def regions_with_offering_mock(*_, **__):
 
 def check_quota_available_mock(*_, **__):
     return True
+
+
+@pytest.fixture
+def mock_aws_catalog(monkeypatch):
+    """Provide stable AWS instance types for catalog-independent tests."""
+    v100_instance_type = 'test-v100-instance'
+    cpu_instance_type = 'test-cpu-instance'
+    catalog = pd.DataFrame([
+        {
+            'InstanceType': v100_instance_type,
+            'AcceleratorName': 'V100',
+            'AcceleratorCount': 1,
+            'vCPUs': 8,
+            'MemoryGiB': 61,
+            'GpuInfo': None,
+            'Price': 1.0,
+            'SpotPrice': 0.5,
+            'Region': 'us-east-1',
+            'Arch': 'x86_64',
+            'LocalDiskType': None,
+            'NVMeSupported': False,
+            'LocalDiskSize': None,
+            'LocalDiskCount': None,
+            'AvailabilityZone': 'us-east-1a',
+        },
+        {
+            'InstanceType': cpu_instance_type,
+            'AcceleratorName': None,
+            'AcceleratorCount': None,
+            'vCPUs': 8,
+            'MemoryGiB': 32,
+            'GpuInfo': None,
+            'Price': 0.5,
+            'SpotPrice': 0.25,
+            'Region': 'us-east-1',
+            'Arch': 'x86_64',
+            'LocalDiskType': None,
+            'NVMeSupported': False,
+            'LocalDiskSize': None,
+            'LocalDiskCount': None,
+            'AvailabilityZone': 'us-east-1a',
+        },
+    ])
+    monkeypatch.setattr(aws_catalog, '_get_df', lambda: catalog)
+    return {
+        'v100_instance_type': v100_instance_type,
+        'cpu_instance_type': cpu_instance_type,
+    }
 
 
 @pytest.fixture

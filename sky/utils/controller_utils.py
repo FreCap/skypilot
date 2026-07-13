@@ -80,6 +80,7 @@ get_controller_for_pool = controller_types.get_controller_for_pool
 high_availability_specified = controller_types.high_availability_specified
 _ControllerSpec.__module__ = __name__
 Controllers.__module__ = __name__
+get_controller_for_pool.__module__ = __name__
 high_availability_specified.__module__ = __name__
 
 

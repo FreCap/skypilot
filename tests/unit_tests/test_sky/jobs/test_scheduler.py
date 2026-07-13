@@ -17,7 +17,82 @@ def _record(pid: int, started_at: float = 0.0):
     return managed_job_state.ControllerPidRecord(pid=pid, started_at=started_at)
 
 
+def _submission_files(tmp_path):
+    dag = tmp_path / 'dag.yaml'
+    user = tmp_path / 'user.yaml'
+    env = tmp_path / 'env'
+    dag.write_text('name: dag\n', encoding='utf-8')
+    user.write_text('name: user\n', encoding='utf-8')
+    env.write_text('KEY=value\n', encoding='utf-8')
+    return dag, user, env
+
+
+def test_submit_jobs_uses_one_snapshot_and_filters_live_controllers(tmp_path):
+    dag, user, env = _submission_files(tmp_path)
+    records = {
+        1: _record(101, 1001.0),
+        2: _record(202, 1002.0),
+    }
+
+    def _is_alive(record):
+        return record.pid == 101
+
+    with mock.patch.object(
+            scheduler.state,
+            'get_job_controller_processes',
+            return_value=records) as get_processes, mock.patch.object(
+                scheduler.state,
+                'get_job_controller_process',
+                side_effect=AssertionError('scalar lookup used')), \
+            mock.patch.object(scheduler.managed_job_utils,
+                              'controller_process_alive',
+                              side_effect=_is_alive) as is_alive, \
+            mock.patch.object(scheduler.state,
+                              'scheduler_set_waiting') as set_waiting, \
+            mock.patch.object(scheduler,
+                              'maybe_start_controllers') as start_controllers:
+        scheduler.submit_jobs([1, 2, 3], str(dag), str(user), str(env), 50,
+                              'normal')
+
+    get_processes.assert_called_once_with([1, 2, 3])
+    assert [call.args[0].pid for call in is_alive.call_args_list] == [101, 202]
+    set_waiting.assert_called_once_with([2, 3], 'name: dag\n', 'name: user\n',
+                                        'KEY=value\n', None, 50, 'normal')
+    start_controllers.assert_called_once_with(from_scheduler=True)
+
+
+def test_submit_jobs_returns_before_file_reads_when_every_controller_is_live(
+        tmp_path):
+    missing = tmp_path / 'must-not-be-read'
+    records = {
+        1: _record(101, 1001.0),
+        2: _record(202, 1002.0),
+    }
+
+    with mock.patch.object(
+            scheduler.state,
+            'get_job_controller_processes',
+            return_value=records) as get_processes, mock.patch.object(
+                scheduler.state,
+                'get_job_controller_process',
+                side_effect=AssertionError('scalar lookup used')), \
+            mock.patch.object(scheduler.managed_job_utils,
+                              'controller_process_alive',
+                              return_value=True), \
+            mock.patch.object(scheduler.state,
+                              'scheduler_set_waiting') as set_waiting, \
+            mock.patch.object(scheduler,
+                              'maybe_start_controllers') as start_controllers:
+        scheduler.submit_jobs([1, 2], str(missing), str(missing), str(missing),
+                              50)
+
+    get_processes.assert_called_once_with([1, 2])
+    set_waiting.assert_not_called()
+    start_controllers.assert_not_called()
+
+
 class TestKillLocalConsolidationControllers:
+    """Tests shutdown cleanup for consolidated controller processes."""
 
     def test_pid_reader_ignores_legacy_and_malformed_entries(
             self, monkeypatch, tmp_path):

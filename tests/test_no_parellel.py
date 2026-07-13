@@ -41,13 +41,14 @@ def test_optimize_speed(enable_all_clouds):
 
 class TestAllCloudsEnabled:
 
-    def test_accelerator_mismatch(self, enable_all_clouds):
+    def test_accelerator_mismatch(self, enable_all_clouds, mock_aws_catalog):
         """Test the specified accelerator does not match the instance_type."""
 
-        spec = textwrap.dedent("""\
+        instance_type = mock_aws_catalog['v100_instance_type']
+        spec = textwrap.dedent(f"""\
             resources:
                 cloud: aws
-                instance_type: p3.2xlarge""")
+                instance_type: {instance_type}""")
         cli_runner = cli_testing.CliRunner()
 
         def _capture_mismatch_gpus_spec(file_path, gpus: str):

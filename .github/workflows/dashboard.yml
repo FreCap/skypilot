@@ -33,6 +33,7 @@ jobs:
           src/data/connectors/services.test.jsx \
           src/data/connectors/jobs.test.jsx \
           src/data/connectors/jobs-download-logs.test.jsx \
+          src/data/connectors/stream-decoders.test.jsx \
           src/tests/service-details.test.jsx \
           src/tests/cluster-history-details.test.jsx \
           src/tests/volume-details.test.jsx \
