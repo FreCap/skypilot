@@ -791,8 +791,6 @@ def _heal_service_degraded(service_name: str, service_hash: str,
 
 def _respawn_controller(
     service_name: str,
-    service_spec: 'service_spec_lib.SkyServiceSpec',
-    version: int,
     controller_host: str,
     dead_controller: multiprocessing.Process | None,
     service_hash: str,
@@ -821,26 +819,22 @@ def _respawn_controller(
     The external LB continues serving its last routing view while the proxy
     reports 503 during the controller gap.
     """
-    # Reload the latest COMMITTED version + spec so a respawn after
-    # /update_service uses the current config. Use the committed version, not
-    # raw MAX(version): an interrupted `sky serve update` can leave a NULL-yaml
-    # placeholder as MAX whose spec is None, which would otherwise drop us back
-    # to the stale captured parent version/spec instead of the latest
-    # fully-committed version. On a DB error, retry on the next tick instead of
-    # proceeding: the captured version/spec are stale after an in-place update,
-    # and a controller rebuilt from them would tear down every newer-version
-    # replica and relaunch old-version ones.
+    # Snapshot the latest COMMITTED version + spec so a respawn after
+    # /update_service uses the current config.  The parent loop's captured
+    # values may be stale after an in-place update, so absence or a DB error
+    # must defer to the next tick rather than resurrecting them.
     try:
-        latest = serve_state.get_latest_committed_version(service_name)
-        if latest is not None:
-            spec = serve_state.get_spec(service_name, latest)
-            if spec is not None:
-                version, service_spec = latest, spec
+        snapshot = serve_state.get_latest_committed_version_spec(service_name)
     except Exception as e:  # pylint: disable=broad-except
         logger.error(f'Failed to reload the latest committed version/spec for '
                      f'{service_name}: {common_utils.format_exception(e)}; '
                      f'will retry on the next tick.')
         return None
+    if snapshot is None:
+        logger.error(f'No committed version/spec found for {service_name}; '
+                     'will retry on the next tick.')
+        return None
+    version, service_spec = snapshot
 
     new_controller = None
     try:
@@ -1656,8 +1650,6 @@ def _start(service_name: str,
                     if now >= child_retry_at:
                         result = _respawn_controller(
                             service_name,
-                            service_spec,
-                            version,
                             controller_host,
                             controller_process,
                             service_hash=service_incarnation,
