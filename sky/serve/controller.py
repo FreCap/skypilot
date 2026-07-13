@@ -704,11 +704,11 @@ class SkyServeController:
         version_specs = serve_state.get_specs(self._service_name,
                                               replica_versions)
         async_occupancy_by_version: dict[int, bool | None] = {
-            replica_version:
-            None if version_specs.get(replica_version) is None else getattr(
-                version_specs[replica_version],
-                'graceful_drain_async_occupancy', None)
-            for replica_version in replica_versions
+            replica_version: None if version_specs.get(replica_version)
+                             is None else getattr(
+                                 version_specs[replica_version],
+                                 'graceful_drain_async_occupancy',
+                                 None) for replica_version in replica_versions
         }
         return replica_infos, async_occupancy_by_version
 
