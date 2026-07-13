@@ -631,14 +631,18 @@ class SkyServeController:
     async def _handle_load_balancer_sync(
             self, request_data: dict[str, Any]) -> fastapi.Response:
         """Validate LB membership before disclosing confidential routing."""
-        if not self._owns_current_service():
+        # Every DB read below (ownership fences, replica/spec snapshot) runs
+        # in the executor: on a large replica table these are the sync
+        # handler's blocking calls, and the FastAPI event loop must stay free
+        # so controller liveness and ownership probes remain responsive.
+        loop = asyncio.get_running_loop()
+        if not await loop.run_in_executor(None, self._owns_current_service):
             return fastapi.Response(status_code=503)
         lb_sync_lock = self._lb_sync_lock
         if lb_sync_lock is None:
             lb_sync_lock = asyncio.Lock()
             self._lb_sync_lock = lb_sync_lock
         async with lb_sync_lock:
-            loop = asyncio.get_running_loop()
             authority = await loop.run_in_executor(
                 None, self._lb_report_authority,
                 request_data.get('lb_session_id'))
@@ -647,33 +651,25 @@ class SkyServeController:
                 # membership in this service. Do not reveal replica URLs,
                 # capacity, or routing policy to another service's Pod.
                 return fastapi.Response(status_code=503)
-            if not self._owns_current_service():
+            if not await loop.run_in_executor(None, self._owns_current_service):
                 return fastapi.Response(status_code=503)
 
-            replica_infos = serve_state.get_replica_infos(self._service_name)
-            replica_versions = sorted({info.version for info in replica_infos})
-            version_specs = serve_state.get_specs(self._service_name,
-                                                  replica_versions)
-            async_occupancy_by_version: dict[int, bool | None] = {
-                replica_version: None if version_specs.get(replica_version)
-                                 is None else getattr(
-                                     version_specs[replica_version],
-                                     'graceful_drain_async_occupancy', None)
-                for replica_version in replica_versions
-            }
+            (replica_infos,
+             async_occupancy_by_version) = (await loop.run_in_executor(
+                 None, self._snapshot_replica_occupancy))
             # Cold endpoint resolution is proportional to the READY fleet and
             # may take tens of seconds. Keep it off the FastAPI event loop so
             # controller liveness and ownership probes remain responsive.
             lb_replica_info, num_ready = await loop.run_in_executor(
                 None, self._get_lb_replica_info, replica_infos,
                 async_occupancy_by_version)
-            if not self._owns_current_service():
+            if not await loop.run_in_executor(None, self._owns_current_service):
                 return fastapi.Response(status_code=503)
             await self._ingest_load_balancer_report(request_data,
                                                     replica_infos,
                                                     async_occupancy_by_version,
                                                     authority=authority)
-            if not self._owns_current_service():
+            if not await loop.run_in_executor(None, self._owns_current_service):
                 return fastapi.Response(status_code=503)
             return responses.JSONResponse(content={
                 'replica_info': lb_replica_info,
@@ -694,6 +690,27 @@ class SkyServeController:
         return (owner is not None and owner.get('hash') == service_hash and
                 (owner.get('controller_pid'), owner.get('controller_ip'))
                 == controller_owner)
+
+    def _snapshot_replica_occupancy(
+        self
+    ) -> tuple[list['replica_managers.ReplicaInfo'], dict[int, bool | None]]:
+        """Read the replica rows and per-version async-occupancy flags.
+
+        Blocking DB reads; callers on the event loop must run this in an
+        executor.
+        """
+        replica_infos = serve_state.get_replica_infos(self._service_name)
+        replica_versions = sorted({info.version for info in replica_infos})
+        version_specs = serve_state.get_specs(self._service_name,
+                                              replica_versions)
+        async_occupancy_by_version: dict[int, bool | None] = {
+            replica_version: None if version_specs.get(replica_version)
+                             is None else getattr(
+                                 version_specs[replica_version],
+                                 'graceful_drain_async_occupancy',
+                                 None) for replica_version in replica_versions
+        }
+        return replica_infos, async_occupancy_by_version
 
     def _get_capacity_hint(
             self, replica_infos: list['replica_managers.ReplicaInfo']
