@@ -435,10 +435,12 @@ class TestGetServiceStatusPickledParallel:
     def test_returns_sorted_by_name(self):
         names = ['svc-c', 'svc-a', 'svc-b']
 
-        def status(name, pool, *, with_replica_info, with_replica_counts):
+        def status(name, pool, *, with_replica_info, with_replica_counts,
+                   with_target_num_replicas):
             assert pool is False
             assert with_replica_info is True
             assert with_replica_counts is False
+            assert with_target_num_replicas is True
             return self._fake_status(name)
 
         with mock.patch('sky.serve.serve_utils._get_service_status',
@@ -455,8 +457,10 @@ class TestGetServiceStatusPickledParallel:
         """A service that vanished mid-call (`_get_service_status` returns
         None) must be silently dropped, not stuffed into the response."""
 
-        def side(name, pool, *, with_replica_info, with_replica_counts):
-            del pool, with_replica_info, with_replica_counts
+        def side(name, pool, *, with_replica_info, with_replica_counts,
+                 with_target_num_replicas):
+            del (pool, with_replica_info, with_replica_counts,
+                 with_target_num_replicas)
             return None if name == 'svc-gone' else self._fake_status(name)
 
         with mock.patch('sky.serve.serve_utils._get_service_status',
@@ -473,8 +477,10 @@ class TestGetServiceStatusPickledParallel:
         class Boom(Exception):
             pass
 
-        def side(name, pool, *, with_replica_info, with_replica_counts):
-            del pool, with_replica_info, with_replica_counts
+        def side(name, pool, *, with_replica_info, with_replica_counts,
+                 with_target_num_replicas):
+            del (pool, with_replica_info, with_replica_counts,
+                 with_target_num_replicas)
             if name == 'svc-boom':
                 raise Boom('controller went away')
             return self._fake_status(name)
@@ -503,8 +509,10 @@ class TestGetServiceStatusPickledParallel:
 
         barrier = threading.Barrier(4)
 
-        def slow(name, pool, *, with_replica_info, with_replica_counts):
-            del pool, with_replica_info, with_replica_counts
+        def slow(name, pool, *, with_replica_info, with_replica_counts,
+                 with_target_num_replicas):
+            del (pool, with_replica_info, with_replica_counts,
+                 with_target_num_replicas)
             try:
                 barrier.wait(timeout=2)
             except threading.BrokenBarrierError as e:
@@ -526,8 +534,10 @@ class TestGetServiceStatusPickledParallel:
             contextvars.ContextVar('test_marker', default=None))
         seen_in_worker: List[Optional[str]] = []
 
-        def capture(name, pool, *, with_replica_info, with_replica_counts):
-            del pool, with_replica_info, with_replica_counts
+        def capture(name, pool, *, with_replica_info, with_replica_counts,
+                    with_target_num_replicas):
+            del (pool, with_replica_info, with_replica_counts,
+                 with_target_num_replicas)
             seen_in_worker.append(marker.get())
             return self._fake_status(name)
 

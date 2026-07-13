@@ -201,6 +201,23 @@ class TestGetServiceStatusSummary:
         assert 'replica_info' not in record
         assert not called
 
+    def test_default_skips_target_fetch(self, patched_state, monkeypatch):
+        # The controller HTTP fetch is opt-in: control/liveness callers
+        # (HA recovery sweep, termination, registration polling) call
+        # _get_service_status without the flag and must never block on a
+        # possibly-dead controller's connect timeout.
+        autoscaler = mock.Mock()
+        monkeypatch.setattr(serve_utils, '_get_to_controller_with_retry',
+                            autoscaler)
+        record = serve_utils._get_service_status(  # pylint: disable=protected-access
+            'svc',
+            pool=False,
+            with_replica_info=False,
+            with_yaml=False)
+        assert record is not None
+        autoscaler.assert_not_called()
+        assert 'target_num_replicas' not in record
+
     def test_full_status_unaffected(self, patched_state, monkeypatch):
         # with_replica_info=True keeps the original full contract.
         monkeypatch.setattr(serve_state, 'get_replica_infos', lambda name: [])
@@ -256,6 +273,9 @@ class TestGetServiceStatusPickledSummary:
         decoded = serve_utils.unpickle_service_status(statuses)[0]
         assert decoded['replica_info'] == []
         assert 'replica_status_counts' not in decoded
+        # Full (non-summary) status is the user-facing rendering path and
+        # still opts into the controller autoscaler fetch by default.
+        assert decoded['target_num_replicas'] == 4
 
     def test_summary_only_filters_name_scan_by_mode(self, monkeypatch):
         mixed_names = [
