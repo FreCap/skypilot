@@ -112,6 +112,48 @@ def test_marks_failed_controller_when_no_restart(monkeypatch):
     assert len(job_done_calls) == 1
 
 
+def test_cleanup_reports_every_failed_cluster_termination(monkeypatch):
+    """All termination failures must reach the persisted failure reason.
+
+    A multi-task job tears down one cluster per task. If terminations for
+    several tasks fail, each failed cluster must be attempted and appear in
+    the FAILED_CONTROLLER failure reason, not just the last one.
+    """
+    set_failed_calls, job_done_calls = [], []
+    _wire_dead_controller(monkeypatch, set_failed_calls, job_done_calls)
+    monkeypatch.setattr(utils, '_controller_is_restarting', lambda: False)
+    info = _make_status_check_info()
+    info[1]['tasks'] = [{
+        'task_id': i,
+        'status': managed_job_state.ManagedJobStatus.RUNNING,
+        'task_name': name,
+    } for i, name in enumerate(['task-a', 'task-b', 'task-c'])]
+    monkeypatch.setattr(managed_job_state,
+                        'get_jobs_to_check_status_info',
+                        lambda job_id=None: info)
+    monkeypatch.setattr(utils, 'generate_managed_job_cluster_name',
+                        lambda task_name, job_id: f'{task_name}-{job_id}')
+    monkeypatch.setattr(utils.global_user_state, 'get_handle_from_cluster_name',
+                        lambda name: object())
+    attempted = []
+
+    def _terminate(cluster_name):
+        attempted.append(cluster_name)
+        if cluster_name != 'task-b-1':
+            raise RuntimeError(f'teardown boom for {cluster_name}')
+
+    monkeypatch.setattr(utils, 'terminate_cluster', _terminate)
+
+    utils.update_managed_jobs_statuses(job_id=1)
+
+    # A failure on one cluster must not stop teardown of the others.
+    assert attempted == ['task-a-1', 'task-b-1', 'task-c-1']
+    assert len(set_failed_calls) == 1
+    failure_reason = set_failed_calls[0][1]['failure_reason']
+    assert 'task-a-1' in failure_reason
+    assert 'task-c-1' in failure_reason
+
+
 def test_terminal_job_preserves_status_when_controller_dies_during_cleanup(
         monkeypatch):
     """A terminal job should be finalized, not rewritten to FAILED_CONTROLLER.
