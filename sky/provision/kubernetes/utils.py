@@ -2486,7 +2486,7 @@ def get_accelerator_label_key_values(
     acc_count: int,
     check_mode=False
 ) -> tuple[str | None, list[str] | None, str | None, str | None]:
-    """Returns the label key and value for the given GPU/TPU type.
+    """Returns the label key and values for the given GPU/TPU type.
 
     Args:
         acc_type: The GPU/TPU type required by the task.
@@ -2582,6 +2582,9 @@ def get_accelerator_label_key_values(
         else:
             # Validate the label value on all nodes labels to ensure they are
             # correctly setup and will behave as expected.
+            matching_label_key = None
+            matching_label_values = []
+            seen_label_values = set()
             for node_name, label_list in node_labels.items():
                 for label, value in label_list:
                     if label_formatter.match_label_key(label):
@@ -2643,7 +2646,16 @@ def get_accelerator_label_key_values(
                                 else:
                                     continue
                         else:
-                            return label, [value], None, None
+                            if matching_label_key is None:
+                                matching_label_key = label
+                            if label != matching_label_key:
+                                continue
+                            if value not in seen_label_values:
+                                matching_label_values.append(value)
+                                seen_label_values.add(value)
+
+            if matching_label_key is not None:
+                return (matching_label_key, matching_label_values, None, None)
 
             # If no node is found with the requested acc_type, raise error
             with ux_utils.print_exception_no_traceback():
