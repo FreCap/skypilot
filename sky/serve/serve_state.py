@@ -1875,20 +1875,16 @@ def get_glob_service_names(service_names: list[str] | None = None,
             return query
         return query.where(services_table.c.pool == int(pool))
 
+    query = sqlalchemy.select(services_table.c.name)
+    if service_names is not None:
+        if not service_names:
+            return []
+        query = query.where(
+            sqlalchemy.or_(
+                *(services_table.c.name.like(service_name.replace('*', '%'))
+                  for service_name in service_names)))
     with orm.Session(engine) as session:
-        if service_names is None:
-            rows = session.execute(
-                _with_pool_filter(sqlalchemy.select(
-                    services_table.c.name))).fetchall()
-        else:
-            rows = []
-            for service_name in service_names:
-                pattern_rows = session.execute(
-                    _with_pool_filter(
-                        sqlalchemy.select(services_table.c.name).where(
-                            services_table.c.name.like(
-                                service_name.replace('*', '%'))))).fetchall()
-                rows.extend(pattern_rows)
+        rows = session.execute(_with_pool_filter(query)).fetchall()
     return list({row[0] for row in rows})
 
 
