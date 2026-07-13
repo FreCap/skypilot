@@ -13,6 +13,8 @@ import types
 from typing import Dict, Optional
 from unittest import mock
 
+import pytest
+
 from sky.serve import controller
 from sky.serve import serve_state
 
@@ -400,6 +402,52 @@ class TestGetLbReplicaInfo:
                     'gpu_count': '1'
                 }
             }
+
+    def test_ownership_fence_reads_runtime_snapshot_fields(self):
+        # The fence compares the exact field names returned by
+        # get_service_runtime_snapshot; a renamed/dropped key would either
+        # disable the fence or make it fire on every sync.
+        ctrl = _make_controller()
+        ctrl._service_hash = 'hash-a'  # pylint: disable=protected-access
+        ctrl._controller_owner = (111, '10.0.0.1')  # pylint: disable=protected-access
+        info = _FakeReplicaInfo(1,
+                                serve_state.ReplicaStatus.READY,
+                                url='http://1.1.1.1:8080',
+                                accelerators={'L4': 1})
+        owned = {
+            'hash': 'hash-a',
+            'controller_pid': 111,
+            'controller_ip': '10.0.0.1',
+            'active_versions': [1],
+        }
+
+        def sync_with(snapshot):
+            with mock.patch.object(controller.serve_state,
+                                   'get_service_runtime_snapshot',
+                                   return_value=snapshot), \
+                 mock.patch.object(
+                     controller.global_user_state,
+                     'get_clusters_from_names',
+                     side_effect=lambda names: {
+                         name: {'handle': mock.sentinel.handle}
+                         for name in names
+                     }), \
+                 mock.patch.object(
+                     controller.global_user_state,
+                     'get_cluster_yaml_dict_multiple',
+                     side_effect=lambda paths: [{'provider': {}}
+                                                for _ in paths]):
+                return ctrl._get_lb_replica_info(  # pylint: disable=protected-access
+                    [info], None)
+
+        replica_info, _ = sync_with(owned)
+        assert list(replica_info) == ['http://1.1.1.1:8080']
+
+        for stale in (dict(owned, hash='hash-b'), dict(owned,
+                                                       controller_pid=222),
+                      dict(owned, controller_ip='10.0.0.2')):
+            with pytest.raises(RuntimeError, match='ownership changed'):
+                sync_with(stale)
 
     def test_not_ready_replicas_are_never_resolved(self):
         ctrl = _make_controller()
