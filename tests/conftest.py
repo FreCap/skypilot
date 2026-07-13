@@ -31,6 +31,7 @@ logger = sky_logging.init_logger(__name__)
 from common_test_fixtures import aws_config_region
 from common_test_fixtures import enable_all_clouds
 from common_test_fixtures import mock_aws_backend
+from common_test_fixtures import mock_aws_catalog
 from common_test_fixtures import mock_client_requests
 from common_test_fixtures import mock_controller_accessible
 from common_test_fixtures import mock_execute_in_coroutine
