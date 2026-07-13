@@ -4563,22 +4563,33 @@ def get_latest_recovery_reasons(job_ids: list[int]) -> dict[int, str]:
         return {}
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
+        ranked_events = sqlalchemy.select(
+            job_events_table.c.spot_job_id.label('spot_job_id'),
+            job_events_table.c.reason.label('reason'),
+            sqlalchemy.func.row_number().over(
+                partition_by=job_events_table.c.spot_job_id,
+                order_by=(
+                    job_events_table.c.timestamp.desc(),
+                    job_events_table.c.id.desc(),
+                ),
+            ).label('rank'),
+        ).where(
+            sqlalchemy.and_(
+                job_events_table.c.spot_job_id.in_(job_ids),
+                job_events_table.c.new_status ==
+                ManagedJobStatus.RECOVERING.value,
+            )).subquery('ranked_recovery_events')
         rows = session.execute(
             sqlalchemy.select(
-                job_events_table.c.spot_job_id,
-                job_events_table.c.reason,
+                ranked_events.c.spot_job_id,
+                ranked_events.c.reason,
             ).where(
                 sqlalchemy.and_(
-                    job_events_table.c.spot_job_id.in_(job_ids),
-                    job_events_table.c.new_status ==
-                    ManagedJobStatus.RECOVERING.value,
-                )).order_by(job_events_table.c.timestamp.desc())).fetchall()
-    # rows are newest-first; keep the first (latest) non-empty reason per job.
-    reasons: dict[int, str] = {}
-    for spot_job_id, reason in rows:
-        if spot_job_id not in reasons and reason:
-            reasons[spot_job_id] = reason
-    return reasons
+                    ranked_events.c.rank == 1,
+                    ranked_events.c.reason.is_not(None),
+                    ranked_events.c.reason != '',
+                ))).fetchall()
+    return {spot_job_id: reason for spot_job_id, reason in rows}
 
 
 async def cleanup_job_events_with_retention_async(
