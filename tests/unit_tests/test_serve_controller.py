@@ -8,6 +8,7 @@ pruned when a replica leaves the ready set.
 """
 # pylint: disable=missing-class-docstring,protected-access
 import asyncio
+import json
 import threading
 import types
 from typing import Dict, Optional
@@ -1285,3 +1286,81 @@ class TestSeedFillZeroCostLocations:
         autoscaler.reserved_capacity_fill = True
         ctrl._seed_fill_zero_cost_locations(autoscaler)
         autoscaler.seed_zero_cost_locations.assert_not_called()
+
+
+class TestLbSyncBlockingReadsOffLoop:
+    """`/lb/sync` DB reads must run in the executor, not on the event loop.
+
+    On a large replica table `get_replica_infos` / `get_specs` / the
+    ownership-fence reads are the handler's blocking calls; running them on
+    the FastAPI event loop stalls the controller liveness and ownership
+    probes served by the same loop (the same invariant that already keeps
+    `_lb_report_authority` and `_get_lb_replica_info` in the executor).
+    """
+
+    def _run_sync(self):
+        ctrl = _make_controller()
+        # Arm the ownership fence so _owns_current_service reads the DB.
+        ctrl._service_hash = 'incarnation-a'  # pylint: disable=protected-access
+        ctrl._controller_owner = (101, '10.0.0.1')  # pylint: disable=protected-access
+
+        read_threads = []
+
+        def _record(result):
+
+            def _side_effect(*_args, **_kwargs):
+                read_threads.append(threading.get_ident())
+                return result
+
+            return _side_effect
+
+        owner_row = {
+            'hash': 'incarnation-a',
+            'controller_pid': 101,
+            'controller_ip': '10.0.0.1',
+        }
+
+        async def _ingest(*_args, **_kwargs):
+            return True
+
+        loop_thread = []
+
+        async def _drive():
+            loop_thread.append(threading.get_ident())
+            return await ctrl._handle_load_balancer_sync(  # pylint: disable=protected-access
+                {'lb_session_id': 'lb-a'})
+
+        with mock.patch.object(controller.serve_state,
+                               'get_service_controller_owner',
+                               side_effect=_record(owner_row)), \
+             mock.patch.object(controller.serve_state, 'get_replica_infos',
+                               side_effect=_record([])), \
+             mock.patch.object(controller.serve_state, 'get_specs',
+                               side_effect=_record({})), \
+             mock.patch.object(ctrl, '_lb_report_authority',
+                               return_value=(True, True, True)), \
+             mock.patch.object(ctrl, '_get_lb_replica_info',
+                               return_value=([], 0)), \
+             mock.patch.object(ctrl, '_ingest_load_balancer_report',
+                               side_effect=_ingest), \
+             mock.patch.object(ctrl, '_get_capacity_hint',
+                               return_value={}):
+            response = asyncio.run(_drive())
+        return response, read_threads, loop_thread[0]
+
+    def test_db_reads_run_off_the_event_loop(self):
+        response, read_threads, loop_thread = self._run_sync()
+        assert response.status_code == 200
+        # 4 ownership-fence reads + replica rows + specs all happened...
+        assert len(read_threads) == 6
+        # ...and none of them on the event-loop thread.
+        assert all(tid != loop_thread for tid in read_threads)
+
+    def test_sync_response_shape_preserved(self):
+        response, _, _ = self._run_sync()
+        assert response.status_code == 200
+        body = json.loads(response.body)
+        assert set(body) == {
+            'replica_info', 'num_ready_replicas', 'routing_spec',
+            'capacity_hint'
+        }
