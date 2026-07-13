@@ -7,14 +7,15 @@ The existing encoders.py handles object -> dict conversion at set_return_value()
 time. This module handles dict -> JSON string serialization at encode() time,
 with version-aware field filtering for backward compatibility.
 """
-from typing import Any, Callable, Dict, List
+from collections.abc import Callable
+from typing import Any
 
 import orjson
 
 from sky.server import constants as server_constants
 from sky.server import versions
 
-handlers: Dict[str, Callable[[Any], str]] = {}
+handlers: dict[str, Callable[[Any], str]] = {}
 
 
 def register_serializer(*names: str):
@@ -45,7 +46,7 @@ def default_serializer(return_value: Any) -> str:
 
 
 @register_serializer('kubernetes_node_info')
-def serialize_kubernetes_node_info(return_value: Dict[str, Any]) -> str:
+def serialize_kubernetes_node_info(return_value: dict[str, Any]) -> str:
     """Serialize kubernetes node info with version compatibility.
 
     The is_ready field was added in API version 25. Remove it for old clients
@@ -134,8 +135,8 @@ def serialize_serve_status(return_value: Any) -> str:
     """
     remote_api_version = versions.get_remote_api_version()
     if (return_value is not None and remote_api_version is not None and
-            remote_api_version >=
-            server_constants.MIN_LAZY_REPLICA_HANDLE_API_VERSION):
+            remote_api_version
+            >= server_constants.MIN_LAZY_REPLICA_HANDLE_API_VERSION):
         for service_status in return_value:
             for replica_info in service_status.get('replica_info', []):
                 if 'handle' in replica_info:
@@ -144,7 +145,7 @@ def serialize_serve_status(return_value: Any) -> str:
 
 
 @register_serializer('realtime_slurm_gpu_availability')
-def serialize_realtime_slurm_gpu_availability(return_value: List[Any]) -> str:
+def serialize_realtime_slurm_gpu_availability(return_value: list[Any]) -> str:
     """Serialize Slurm GPU availability with version compatibility.
 
     The error field (3rd element) was added in API version 35. Strip it

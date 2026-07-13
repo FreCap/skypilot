@@ -25,7 +25,7 @@ def _get_kubernetes_namespace() -> str:
         if os.path.exists(namespace_file):
             with open(namespace_file, encoding='utf-8') as f:
                 return f.read().strip()
-    except (OSError, IOError):
+    except OSError:
         pass
     return 'default'
 

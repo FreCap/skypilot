@@ -17,7 +17,7 @@ else:
 def get_jsonrpc_endpoint_url(host):
     # The URL for the stub requests are made against the /api HTTP endpoint
     # of the vCenter system.
-    return 'https://{}/api'.format(host)
+    return f'https://{host}/api'
 
 
 def connect(host,

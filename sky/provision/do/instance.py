@@ -1,7 +1,7 @@
 """DigitalOcean instance provisioning."""
 
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 import uuid
 
 from sky import sky_logging
@@ -19,7 +19,7 @@ logger = sky_logging.init_logger(__name__)
 
 
 def _get_head_instance(
-        instances: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        instances: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
     for instance_name, instance_meta in instances.items():
         if instance_name.endswith('-head'):
             return instance_meta
@@ -100,7 +100,7 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
             created_instance_ids=[],
         )
 
-    created_instances: List[Dict[str, Any]] = []
+    created_instances: list[dict[str, Any]] = []
     for _ in range(to_start_count):
         instance_type = 'head' if head_instance is None else 'worker'
         instance = utils.create_instance(
@@ -143,14 +143,14 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
 
 
 def wait_instances(region: str, cluster_name_on_cloud: str,
-                   state: Optional[status_lib.ClusterStatus]) -> None:
+                   state: status_lib.ClusterStatus | None) -> None:
     del region, cluster_name_on_cloud, state  # unused
     # We already wait on ready state in `run_instances` no need
 
 
 def stop_instances(
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     worker_only: bool = False,
 ) -> None:
     del provider_config  # unused
@@ -180,7 +180,7 @@ def stop_instances(
 
 def terminate_instances(
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     worker_only: bool = False,
 ) -> None:
     """See sky/provision/__init__.py"""
@@ -208,13 +208,13 @@ def terminate_instances(
 def get_cluster_info(
     region: str,
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
 ) -> common.ClusterInfo:
     del region  # unused
     running_instances = utils.filter_instances(cluster_name_on_cloud,
                                                ['active'])
-    instances: Dict[str, List[common.InstanceInfo]] = {}
-    head_instance: Optional[str] = None
+    instances: dict[str, list[common.InstanceInfo]] = {}
+    head_instance: str | None = None
     for instance_name, instance_meta in running_instances.items():
         if instance_name.endswith('-head'):
             head_instance = instance_name
@@ -245,10 +245,10 @@ def get_cluster_info(
 def query_instances(
     cluster_name: str,
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     non_terminated_only: bool = True,
     retry_if_missing: bool = False,
-) -> Dict[str, Tuple[Optional['status_lib.ClusterStatus'], Optional[str]]]:
+) -> dict[str, tuple[Optional['status_lib.ClusterStatus'], str | None]]:
     """See sky/provision/__init__.py"""
     del cluster_name, retry_if_missing  # unused
     # terminated instances are not retrieved by the
@@ -264,8 +264,7 @@ def query_instances(
         'active': status_lib.ClusterStatus.UP,
         'off': status_lib.ClusterStatus.STOPPED,
     }
-    statuses: Dict[str, Tuple[Optional['status_lib.ClusterStatus'],
-                              Optional[str]]] = {}
+    statuses: dict[str, tuple[status_lib.ClusterStatus | None, str | None]] = {}
     for instance_meta in instances.values():
         status = status_map[instance_meta['status']]
         statuses[instance_meta['name']] = (status, None)
@@ -274,8 +273,8 @@ def query_instances(
 
 def open_ports(
     cluster_name_on_cloud: str,
-    ports: List[str],
-    provider_config: Optional[Dict[str, Any]] = None,
+    ports: list[str],
+    provider_config: dict[str, Any] | None = None,
 ) -> None:
     """See sky/provision/__init__.py"""
     logger.debug(
@@ -286,7 +285,7 @@ def open_ports(
 
 def cleanup_ports(
     cluster_name_on_cloud: str,
-    ports: List[str],
-    provider_config: Optional[Dict[str, Any]] = None,
+    ports: list[str],
+    provider_config: dict[str, Any] | None = None,
 ) -> None:
     del cluster_name_on_cloud, provider_config, ports

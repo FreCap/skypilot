@@ -9,7 +9,7 @@ import signal
 import threading
 import time
 import traceback
-from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple, Union
+from typing import Any, Union
 
 import aiohttp
 import fastapi
@@ -277,48 +277,48 @@ class SkyServeLoadBalancer:
     # _prune_reject_window (the single funnel every read and write goes
     # through), so instances cannot leak reject state into one another.
     _queue_depth: int = 0
-    _reject_last_seen: Optional[Dict[str, float]] = None
+    _reject_last_seen: dict[str, float] | None = None
     _reject_fallback_seq: int = 0
-    _capacity_hint: Optional[Dict[str, Any]] = None
-    _draining_clients: Optional[Dict[str, List[httpx.AsyncClient]]] = None
-    _occupancy_capable: Optional[Set[str]] = None
+    _capacity_hint: dict[str, Any] | None = None
+    _draining_clients: dict[str, list[httpx.AsyncClient]] | None = None
+    _occupancy_capable: set[str] | None = None
     # Subset explicitly declared by the per-version service contract. Unlike
     # inferred capability, declaration is fail-closed: any dispatched request
     # may outlive its envelope, including custom request shapes the LB cannot
     # recognize.
-    _occupancy_declared_urls: Optional[Set[str]] = None
+    _occupancy_declared_urls: set[str] | None = None
     # Explicit disable is two-phase: a service-only update can flip true ->
     # false while old async work still runs on the same replica URL. Retain
     # capability until a generation-valid zero proves that work drained.
-    _occupancy_disable_pending: Optional[Set[str]] = None
+    _occupancy_disable_pending: set[str] | None = None
     # Authoritative false persists after pending old work drains. Generic
     # probes cannot re-enable it; a recognized async request may temporarily
     # override false until the next generation-valid zero.
-    _occupancy_explicitly_disabled_urls: Optional[Set[str]] = None
+    _occupancy_explicitly_disabled_urls: set[str] | None = None
     # url -> monotonic time of the FIRST probe round that observed the
     # capable url off-ready and unanswered (cleared whenever the url is
     # confirmed again). Bounds how long such a url survives consecutive
     # probe misses -- and, because it starts at retirement rather than at
     # the last pre-retirement confirmation, guarantees the retention
     # outlives any allowed graceful_drain_seconds deadline.
-    _occupancy_off_ready_since: Optional[Dict[str, float]] = None
+    _occupancy_off_ready_since: dict[str, float] | None = None
     # urls whose occupancy sample in the LAST completed probe round was
     # taken while the url was off-ready. Only such samples can prove
     # post-retirement idleness: a sample taken while the url was still
     # routed may predate work that arrived just before retirement.
-    _occupancy_sampled_off_ready: Optional[Set[str]] = None
+    _occupancy_sampled_off_ready: set[str] | None = None
     # Per-url ordering between async dispatches and occupancy probes. A sample
     # is valid only when its captured generation still equals the current
     # generation; this prevents a probe begun before a fast-ack submit from
     # publishing a stale zero after that submit lands.
-    _occupancy_dispatch_generation: Optional[Dict[str, int]] = None
-    _occupancy_sample_generation: Optional[Dict[str, int]] = None
+    _occupancy_dispatch_generation: dict[str, int] | None = None
+    _occupancy_sample_generation: dict[str, int] | None = None
 
     def __init__(
         self,
         controller_url: str,
         load_balancer_port: int,
-        service_hash: Optional[str] = None,
+        service_hash: str | None = None,
     ) -> None:
         """Initialize the load balancer.
 
@@ -338,6 +338,9 @@ class SkyServeLoadBalancer:
         self._controller_url: str = controller_url
         self._load_balancer_port: int = load_balancer_port
         self._service_hash = service_hash
+        # Strong references to fire-and-forget startup tasks (the event loop
+        # only holds weak references to tasks).
+        self._background_tasks: list[asyncio.Task] = []
         # Use the registry to create the load balancing policy. Track the
         # resolved policy name so a sync only rebuilds the policy object when
         # the name actually changes (a policy swap is rare -- only on an
@@ -356,7 +359,7 @@ class SkyServeLoadBalancer:
         # transport failures (empty = never, the default). Safe only for
         # idempotent workloads and "not now" statuses (503/429): the body
         # is discarded before any byte reaches the client.
-        self._retriable_status_codes: FrozenSet[int] = frozenset()
+        self._retriable_status_codes: frozenset[int] = frozenset()
         # Retry-loop tuning (service YAML load_balancer.max_retries /
         # retry_initial_backoff_seconds). With failed-URL exclusion, more
         # retries = more distinct replicas tried before the client sees an
@@ -373,7 +376,7 @@ class SkyServeLoadBalancer:
         # httpx.Client will queue the requests and send them when a
         # connection is available.
         # Reference: https://github.com/encode/httpcore/blob/a8f80980daaca98d556baea1783c5568775daadc/httpcore/_async/connection_pool.py#L69-L71 # pylint: disable=line-too-long
-        self._client_pool: Dict[str, httpx.AsyncClient] = dict()
+        self._client_pool: dict[str, httpx.AsyncClient] = dict()
         # We need this lock to avoid getting from the client pool while
         # updating it from _sync_with_controller.
         self._client_pool_lock: threading.Lock = threading.Lock()
@@ -382,8 +385,8 @@ class SkyServeLoadBalancer:
         # counts consecutive dead-connection failures per replica;
         # _replica_quarantine_until maps a replica URL to the wall-clock time
         # until which it stays out of routing.
-        self._replica_dead_failures: Dict[str, int] = dict()
-        self._replica_quarantine_until: Dict[str, float] = dict()
+        self._replica_dead_failures: dict[str, int] = dict()
+        self._replica_quarantine_until: dict[str, float] = dict()
         # Rollout state. `_ready` flips true after the first successful
         # controller sync, so k8s never routes to a cold LB. `_draining` flips
         # true on SIGTERM, which fails readiness and stops the controller sync
@@ -397,7 +400,7 @@ class SkyServeLoadBalancer:
         # Monotonic clock: the age must not be distorted by wall-clock
         # steps (NTP) — hiding staleness is the exact failure this field
         # exists to expose.
-        self._last_sync_time: Optional[float] = None
+        self._last_sync_time: float | None = None
         # Demand-feed gauges for concurrency-native autoscaling. All three
         # are GAUGES re-read whole on every controller sync -- never
         # cleared on ack -- so a failed or duplicated sync cannot lose or
@@ -425,7 +428,7 @@ class SkyServeLoadBalancer:
         # (provisioning/target replica counts). None until a sync carries
         # one (old controller, or never synced); /_lb/capacity readers
         # judge its freshness via last_sync_age_seconds.
-        self._capacity_hint: Optional[Dict[str, Any]] = None
+        self._capacity_hint: dict[str, Any] | None = None
         # [boltz fork] Replica-reported async occupancy, from the probe loop
         # (see _probe_occupancy_loop): url -> running async jobs, and
         # url -> free predict slots (max(0, predict_concurrency - running)).
@@ -433,19 +436,19 @@ class SkyServeLoadBalancer:
         # pruned replica ages out on the next round. Absent url == probe
         # failed/never ran == occupancy unknown (never assumed busy). Guarded
         # by _client_pool_lock like the rest of the routing state.
-        self._replica_occupancy: Dict[str, int] = {}
-        self._replica_free_slots: Dict[str, int] = {}
+        self._replica_occupancy: dict[str, int] = {}
+        self._replica_free_slots: dict[str, int] = {}
         self._occupancy_dispatch_generation = {}
         self._occupancy_sample_generation = {}
         # Monotonic time of the last COMPLETED probe round (same clock
         # rationale as _last_sync_time: staleness must not hide behind
         # wall-clock steps).
-        self._last_occupancy_probe_time: Optional[float] = None
+        self._last_occupancy_probe_time: float | None = None
         # Strong refs to in-progress drain-close tasks (see
         # _drain_and_close_client); a bare create_task result can be GCed.
-        self._client_close_tasks: Set[asyncio.Task] = set()
+        self._client_close_tasks: set[asyncio.Task] = set()
 
-    def _quarantined_replicas(self) -> Set[str]:
+    def _quarantined_replicas(self) -> set[str]:
         """Replica URLs currently quarantined (TTL not yet expired).
 
         Must be called while holding `_client_pool_lock`.
@@ -527,7 +530,7 @@ class SkyServeLoadBalancer:
                 self._replica_dead_failures.pop(url, None)
                 self._replica_quarantine_until.pop(url, None)
 
-    def _apply_routing_spec(self, routing_spec: Dict[str, Any]) -> None:
+    def _apply_routing_spec(self, routing_spec: dict[str, Any]) -> None:
         """Apply a routing spec fetched from the controller.
 
         Must be called while holding `_client_pool_lock` (it mutates the
@@ -623,8 +626,7 @@ class SkyServeLoadBalancer:
         return fastapi.responses.Response(status_code=200)
 
     def _in_flight_with_draining(
-        self,
-    ) -> Tuple[Optional[Dict[str, int]], List[str], List[str], List[str]]:
+        self,) -> tuple[dict[str, int] | None, list[str], list[str], list[str]]:
         """Per-url busyness snapshot: envelopes, occupancy, and draining.
 
         Three measures of the same running jobs, unioned:
@@ -716,7 +718,7 @@ class SkyServeLoadBalancer:
         # exact refcounts (not envelope guesses), and dropping them would
         # let a retirement drain read the url as gone and kill the very
         # requests it is waiting for.
-        unknown_urls: List[str] = []
+        unknown_urls: list[str] = []
         for url in capable:
             if url not in sampled_set:
                 if in_flight.get(url, 0) <= 0:
@@ -728,7 +730,7 @@ class SkyServeLoadBalancer:
                 unknown_urls.append(url)
         return in_flight, routing_urls, unknown_urls, sampled_urls
 
-    def _prune_reject_window(self) -> Dict[str, float]:
+    def _prune_reject_window(self) -> dict[str, float]:
         """Drop reject entries older than the window; return the live dict.
 
         Called on every access (record + read) rather than on a timer:
@@ -741,7 +743,7 @@ class SkyServeLoadBalancer:
         """
         cutoff = time.monotonic() - constants.LB_REJECT_WINDOW_SECONDS
         current = self._reject_last_seen
-        pruned: Dict[str, float] = {}
+        pruned: dict[str, float] = {}
         if current:
             pruned = {
                 key: seen for key, seen in current.items() if seen > cutoff
@@ -882,10 +884,10 @@ class SkyServeLoadBalancer:
         in_flight_map, _, _, _ = self._in_flight_with_draining()
         in_flight = (sum(in_flight_map.values())
                      if in_flight_map is not None else None)
-        last_sync_age: Optional[float] = None
+        last_sync_age: float | None = None
         if self._last_sync_time is not None:
             last_sync_age = max(time.monotonic() - self._last_sync_time, 0.0)
-        occupancy_probe_age: Optional[float] = None
+        occupancy_probe_age: float | None = None
         if self._last_occupancy_probe_time is not None:
             occupancy_probe_age = max(
                 time.monotonic() - self._last_occupancy_probe_time, 0.0)
@@ -916,8 +918,8 @@ class SkyServeLoadBalancer:
         })
 
     def _should_keep_ready_set_on_empty_sync(
-            self, ready_replica_urls: List[str],
-            num_ready_replicas: Optional[int]) -> bool:
+            self, ready_replica_urls: list[str],
+            num_ready_replicas: int | None) -> bool:
         """Whether to keep the current ready set instead of applying an empty
         sync result.
 
@@ -963,7 +965,7 @@ class SkyServeLoadBalancer:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _parse_replica_occupancy(raw: Any) -> Optional[Tuple[int, int]]:
+    def _parse_replica_occupancy(raw: Any) -> tuple[int, int] | None:
         """(running_count, free_slots) from an async_capacity payload.
 
         None on any non-conforming shape (older image without the action,
@@ -985,7 +987,7 @@ class SkyServeLoadBalancer:
 
     async def _fetch_replica_occupancy(
             self, session: 'aiohttp.ClientSession',
-            replica_url: str) -> Optional[Tuple[int, int]]:
+            replica_url: str) -> tuple[int, int] | None:
         """One occupancy probe; None on any failure (unknown, never busy)."""
         try:
             async with session.post(
@@ -1040,8 +1042,8 @@ class SkyServeLoadBalancer:
             results = await asyncio.gather(
                 *(self._fetch_replica_occupancy(session, url)
                   for url in probe_urls))
-        occupancy: Dict[str, int] = {}
-        free_slots: Dict[str, int] = {}
+        occupancy: dict[str, int] = {}
+        free_slots: dict[str, int] = {}
         for url, result in zip(probe_urls, results):
             if result is None:
                 continue
@@ -1192,7 +1194,7 @@ class SkyServeLoadBalancer:
         ready_replica_urls = []
         replica_info = {}
         routing_spec = None
-        num_ready_replicas: Optional[int] = None
+        num_ready_replicas: int | None = None
         capacity_hint = None
 
         # Read the purpose-specific ring fresh for every sync. The primary is
@@ -1240,7 +1242,7 @@ class SkyServeLoadBalancer:
                 # Send request information. Drain the aggregator once for the
                 # entire credential sequence: a rejected primary must not
                 # restore/re-drain the batch before the overlap retry.
-                token_attempts: Tuple[Optional[str],
+                token_attempts: tuple[str | None,
                                       ...] = (sync_tokens if sync_tokens else
                                               (None,))
                 for token_index, controller_token in enumerate(token_attempts):
@@ -1471,7 +1473,9 @@ class SkyServeLoadBalancer:
         deadline = (asyncio.get_event_loop().time() +
                     self._stream_timeout_seconds +
                     constants.LB_DRAIN_CLOSE_GRACE_SECONDS)
-        while (getattr(client, _INFLIGHT_ATTR, 0) > 0 and
+        # Deliberate 1s poll: in-flight tracking is a plain counter attribute
+        # on the httpx client, with no Event to await.
+        while (getattr(client, _INFLIGHT_ATTR, 0) > 0 and  # noqa: ASYNC110
                asyncio.get_event_loop().time() < deadline):
             await asyncio.sleep(1)
         inflight = getattr(client, _INFLIGHT_ATTR, 0)
@@ -1538,8 +1542,8 @@ class SkyServeLoadBalancer:
                 await asyncio.sleep(retry_delay)
 
     async def _proxy_request_to(
-        self, url: str, request: fastapi.Request
-    ) -> Union[fastapi.responses.Response, Exception]:
+            self, url: str,
+            request: fastapi.Request) -> fastapi.responses.Response | Exception:
         """Proxy the request to the specified URL.
 
         Returns:
@@ -1713,12 +1717,12 @@ class SkyServeLoadBalancer:
         # SkyServe supports serving on Spot Instances. To avoid preemptions
         # during request handling, we add a retry here.
         retry_cnt = 0
-        async_occupancy_request: Optional[bool] = None
+        async_occupancy_request: bool | None = None
         # URLs that already failed THIS request: without exclusion,
         # least-load retries deterministically re-select a
         # dead-but-not-yet-pruned replica on a busy fleet (it sits at
         # load 0 while every healthy replica carries traffic).
-        failed_urls: Set[str] = set()
+        failed_urls: set[str] = set()
 
         def _unavailable(detail: str) -> fastapi.HTTPException:
             # Every terminal 503 means this job remains unplaced, including a
@@ -1899,11 +1903,16 @@ class SkyServeLoadBalancer:
             for handler in uvicorn_access_logger.handlers:
                 handler.setFormatter(sky_logging.FORMATTER)
 
+            # Keep strong references: the loop only holds weak refs to
+            # tasks, so an unreferenced background task can be GC'd
+            # mid-flight.
             # Register controller synchronization task
-            asyncio.create_task(self._sync_with_controller())
+            self._background_tasks.append(
+                asyncio.create_task(self._sync_with_controller()))
             # [boltz fork] Register the async-occupancy prober (no-op task
             # when disabled via env).
-            asyncio.create_task(self._probe_occupancy_loop())
+            self._background_tasks.append(
+                asyncio.create_task(self._probe_occupancy_loop()))
 
         logger.info('SkyServe Load Balancer started on '
                     f'http://0.0.0.0:{self._load_balancer_port}. '
@@ -1923,7 +1932,7 @@ class SkyServeLoadBalancer:
 def run_load_balancer(
     controller_addr: str,
     load_balancer_port: int,
-    service_hash: Optional[str] = None,
+    service_hash: str | None = None,
 ) -> None:
     """Run the load balancer.
 
@@ -1962,7 +1971,7 @@ def _build_argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _resolve_launch_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
+def _resolve_launch_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     """Translate the external LB CLI's infrastructure arguments."""
     return dict(
         controller_addr=args.controller_addr,

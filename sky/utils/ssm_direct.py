@@ -22,7 +22,6 @@ Design constraints (from adversarial review):
 import socket
 import threading
 import time
-from typing import Dict, Optional, Tuple
 
 from sky import sky_logging
 
@@ -36,10 +35,10 @@ _cache_lock = threading.Lock()
 # (ip, port) -> (direct_ok, recorded_at). Entries expire by state-specific
 # TTL: a stale positive is dangerous (IP reuse), a stale negative only delays
 # re-enabling the optimization.
-_cache: Dict[Tuple[str, int], Tuple[bool, float]] = {}
+_cache: dict[tuple[str, int], tuple[bool, float]] = {}
 
 
-def is_skypilot_ssm_proxy(proxy_command: Optional[str]) -> bool:
+def is_skypilot_ssm_proxy(proxy_command: str | None) -> bool:
     """Whether the proxy command is a SkyPilot-generated SSM session.
 
     Matches both the current form (with the adaptive-retry export prefix)
@@ -113,7 +112,7 @@ def _cached_direct_ok(ip: str, port: int) -> bool:
 
 
 def maybe_bypass_proxy(ip: str, port: int,
-                       proxy_command: Optional[str]) -> Optional[str]:
+                       proxy_command: str | None) -> str | None:
     """Returns None (drop the proxy -> direct SSH) for verified targets.
 
     Cache-only and non-blocking: never touches the network, so it is safe

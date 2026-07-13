@@ -20,14 +20,14 @@ import io
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any
 
 from sky.batch import utils
 from sky.utils import registry
 
 logger = logging.getLogger(__name__)
 
-BatchAttempt = Tuple[int, int, int]
+BatchAttempt = tuple[int, int, int]
 
 
 @dataclass
@@ -51,7 +51,7 @@ class InputReader(ABC):
                 return name
         raise ValueError(f'Unregistered input reader: {type(self).__name__}')
 
-    def _get_class_source(self) -> Optional[str]:
+    def _get_class_source(self) -> str | None:
         """Return module source for custom (non-builtin) readers."""
         stored = getattr(self, '_class_source_code', None)
         if stored is not None:
@@ -65,7 +65,7 @@ class InputReader(ABC):
                 return None
         return None
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Serialize this reader to a dict.
 
         Auto-generated via ``dataclasses.asdict``: every field with a
@@ -80,7 +80,7 @@ class InputReader(ABC):
         return d
 
     @staticmethod
-    def from_dict(d: Dict[str, Any]) -> 'InputReader':
+    def from_dict(d: dict[str, Any]) -> 'InputReader':
         """Reconstruct an InputReader from a dict."""
         fmt = d.get('format')
         class_source = d.get('_class_source')
@@ -96,7 +96,7 @@ class InputReader(ABC):
         return instance
 
     @classmethod
-    def from_dict_args(cls, d: Dict[str, Any]) -> 'InputReader':
+    def from_dict_args(cls, d: dict[str, Any]) -> 'InputReader':
         """Construct an instance from a serialized dict.
 
         Auto-generated from dataclass fields.  Subclasses normally do
@@ -111,7 +111,7 @@ class InputReader(ABC):
 
     @abstractmethod
     def download_batch(self, start_idx: int, end_idx: int,
-                       cache_dir: str) -> List[Dict[str, Any]]:
+                       cache_dir: str) -> list[dict[str, Any]]:
         """Download data for a specific batch range."""
 
 
@@ -136,7 +136,7 @@ class OutputWriter(ABC):
                 return name
         raise ValueError(f'Unregistered output writer: {type(self).__name__}')
 
-    def _get_class_source(self) -> Optional[str]:
+    def _get_class_source(self) -> str | None:
         """Return module source for custom (non-builtin) writers."""
         stored = getattr(self, '_class_source_code', None)
         if stored is not None:
@@ -150,7 +150,7 @@ class OutputWriter(ABC):
                 return None
         return None
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Serialize this writer to a dict.
 
         Auto-generated via ``dataclasses.asdict``: every field with a
@@ -165,7 +165,7 @@ class OutputWriter(ABC):
         return d
 
     @staticmethod
-    def from_dict(d: Dict[str, Any]) -> 'OutputWriter':
+    def from_dict(d: dict[str, Any]) -> 'OutputWriter':
         """Reconstruct an OutputWriter from a dict."""
         fmt = d.get('format')
         class_source = d.get('_class_source')
@@ -181,7 +181,7 @@ class OutputWriter(ABC):
         return instance
 
     @classmethod
-    def from_dict_args(cls, d: Dict[str, Any]) -> 'OutputWriter':
+    def from_dict_args(cls, d: dict[str, Any]) -> 'OutputWriter':
         """Construct an instance from a serialized dict.
 
         Auto-generated from dataclass fields.  Subclasses normally do
@@ -191,11 +191,11 @@ class OutputWriter(ABC):
         return cls(**{k: v for k, v in d.items() if k in field_names})
 
     @abstractmethod
-    def upload_batch(self, results: List[Dict[str, Any]], start_idx: int,
+    def upload_batch(self, results: list[dict[str, Any]], start_idx: int,
                      end_idx: int, job_id: str) -> str:
         """Upload results for a specific batch."""
 
-    def upload_batch_attempt(self, results: List[Dict[str,
+    def upload_batch_attempt(self, results: list[dict[str,
                                                       Any]], start_idx: int,
                              end_idx: int, job_id: str, attempt_id: int) -> str:
         """Upload an immutable result for one fenced batch attempt.
@@ -213,7 +213,7 @@ class OutputWriter(ABC):
         """Reduce all result batches into final output."""
 
     def reduce_attempt_results(self, job_id: str,
-                               batch_attempts: List[BatchAttempt]) -> None:
+                               batch_attempts: list[BatchAttempt]) -> None:
         """Publish only the attempt selected by durable batch state."""
         del job_id, batch_attempts
         raise NotImplementedError(
@@ -223,10 +223,10 @@ class OutputWriter(ABC):
     def validate_attempt_fencing(self) -> None:
         """Fail before dispatch if a custom writer lacks fencing hooks."""
         writer_type = type(self)
-        if (writer_type.upload_batch_attempt is
-                OutputWriter.upload_batch_attempt or
-                writer_type.reduce_attempt_results is
-                OutputWriter.reduce_attempt_results):
+        if (writer_type.upload_batch_attempt
+                is OutputWriter.upload_batch_attempt or
+                writer_type.reduce_attempt_results
+                is OutputWriter.reduce_attempt_results):
             raise ValueError(
                 f'{writer_type.__name__} must implement '
                 'upload_batch_attempt() and reduce_attempt_results() for '
@@ -270,7 +270,7 @@ class JsonReader(InputReader):
         return utils.count_jsonl_lines_from_cloud(self.path)
 
     def download_batch(self, start_idx: int, end_idx: int,
-                       cache_dir: str) -> List[Dict[str, Any]]:
+                       cache_dir: str) -> list[dict[str, Any]]:
         path_hash = hashlib.md5(self.path.encode(),
                                 usedforsecurity=False).hexdigest()
         cache_path = os.path.join(cache_dir, f'dataset_{path_hash}.jsonl')
@@ -280,7 +280,7 @@ class JsonReader(InputReader):
             utils.download_from_cloud(self.path, cache_path)
 
         data = []
-        with open(cache_path, 'r', encoding='utf-8') as f:
+        with open(cache_path, encoding='utf-8') as f:
             for i, line in enumerate(f):
                 if i >= start_idx and i <= end_idx:
                     data.append(json.loads(line.strip()))
@@ -307,7 +307,7 @@ class JsonWriter(OutputWriter):
                 are written (backward compatible).
     """
 
-    column: Optional[Union[str, List[str]]] = None
+    column: str | list[str] | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.column, str):
@@ -323,20 +323,19 @@ class JsonWriter(OutputWriter):
             raise ValueError(
                 f'JsonWriter path must end with .jsonl: {self.path}')
 
-    def upload_batch(self, results: List[Dict[str, Any]], start_idx: int,
+    def upload_batch(self, results: list[dict[str, Any]], start_idx: int,
                      end_idx: int, job_id: str) -> str:
         batch_path = utils.get_batch_path(self.path, start_idx, end_idx, job_id)
         return self._upload_batch_to_path(results, batch_path)
 
-    def _upload_batch_to_path(self, results: List[Dict[str, Any]],
+    def _upload_batch_to_path(self, results: list[dict[str, Any]],
                               batch_path: str) -> str:
         if self.column is not None:
-            results = [{k: r[k] for k in self.column if k in r} for r in results
-                      ]
+            results = [{k: r[k] for k in self.column if k in r} for r in results]
         utils.save_jsonl_to_cloud(results, batch_path)
         return batch_path
 
-    def upload_batch_attempt(self, results: List[Dict[str,
+    def upload_batch_attempt(self, results: list[dict[str,
                                                       Any]], start_idx: int,
                              end_idx: int, job_id: str, attempt_id: int) -> str:
         batch_path = utils.get_attempt_batch_path(self.path, start_idx, end_idx,
@@ -347,7 +346,7 @@ class JsonWriter(OutputWriter):
         utils.concatenate_batches_to_output(self.path, job_id)
 
     def reduce_attempt_results(self, job_id: str,
-                               batch_attempts: List[BatchAttempt]) -> None:
+                               batch_attempts: list[BatchAttempt]) -> None:
         batch_paths = [
             utils.get_attempt_batch_path(self.path, start_idx, end_idx, job_id,
                                          attempt_id)
@@ -387,7 +386,7 @@ class ImageWriter(OutputWriter):
         if not self.path.endswith('/'):
             raise ValueError(f'ImageWriter path must end with /: {self.path}')
 
-    def upload_batch(self, results: List[Dict[str, Any]], start_idx: int,
+    def upload_batch(self, results: list[dict[str, Any]], start_idx: int,
                      end_idx: int, job_id: str) -> str:
         output_dir = self.path.rstrip('/')
 
@@ -413,7 +412,7 @@ class ImageWriter(OutputWriter):
                     end_idx)
         return output_dir
 
-    def upload_batch_attempt(self, results: List[Dict[str,
+    def upload_batch_attempt(self, results: list[dict[str,
                                                       Any]], start_idx: int,
                              end_idx: int, job_id: str, attempt_id: int) -> str:
         for i, result in enumerate(results):
@@ -439,7 +438,7 @@ class ImageWriter(OutputWriter):
         """No-op -- images are already in their final location."""
 
     def reduce_attempt_results(self, job_id: str,
-                               batch_attempts: List[BatchAttempt]) -> None:
+                               batch_attempts: list[BatchAttempt]) -> None:
         output_dir = self.path.rstrip('/')
         for start_idx, end_idx, attempt_id in batch_attempts:
             for global_idx in range(start_idx, end_idx + 1):

@@ -963,11 +963,11 @@ class TestGitRepo:
             assert result is None
 
     @patch('os.path.exists')
-    @patch('builtins.open',
-           new_callable=mock.mock_open,
-           read_data=
-           '-----BEGIN PRIVATE KEY-----\nkey_content\n-----END PRIVATE KEY-----'
-          )
+    @patch(
+        'builtins.open',
+        new_callable=mock.mock_open,
+        read_data=
+        '-----BEGIN PRIVATE KEY-----\nkey_content\n-----END PRIVATE KEY-----')
     @patch('os.stat')
     @patch('os.path.expanduser')
     def test_get_ssh_key_info_provided_key(self, mock_expanduser, mock_stat,
@@ -986,11 +986,11 @@ class TestGitRepo:
         assert '-----BEGIN PRIVATE KEY-----' in result[1]
 
     @patch('os.path.exists')
-    @patch('builtins.open',
-           new_callable=mock.mock_open,
-           read_data=
-           '-----BEGIN PRIVATE KEY-----\nkey_content\n-----END PRIVATE KEY-----'
-          )
+    @patch(
+        'builtins.open',
+        new_callable=mock.mock_open,
+        read_data=
+        '-----BEGIN PRIVATE KEY-----\nkey_content\n-----END PRIVATE KEY-----')
     @patch('os.stat')
     @patch('os.path.expanduser')
     def test_get_ssh_key_info_insecure_permissions(self, mock_expanduser,
@@ -1082,11 +1082,11 @@ class TestGitRepo:
 
     @patch.object(git.GitRepo, '_parse_ssh_config')
     @patch('os.path.exists')
-    @patch('builtins.open',
-           new_callable=mock.mock_open,
-           read_data=
-           '-----BEGIN PRIVATE KEY-----\ndefault_key\n-----END PRIVATE KEY-----'
-          )
+    @patch(
+        'builtins.open',
+        new_callable=mock.mock_open,
+        read_data=
+        '-----BEGIN PRIVATE KEY-----\ndefault_key\n-----END PRIVATE KEY-----')
     @patch('os.path.expanduser')
     @patch('os.stat')
     def test_get_ssh_key_info_default_keys(self, mock_stat, mock_expanduser,

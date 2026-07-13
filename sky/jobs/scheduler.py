@@ -50,7 +50,6 @@ import shutil
 import signal
 import sys
 import typing
-from typing import List, Optional, Set
 import uuid
 
 import filelock
@@ -68,7 +67,6 @@ from sky.utils import dag_utils
 from sky.utils import subprocess_utils
 
 if typing.TYPE_CHECKING:
-    import logging
 
     import psutil
 else:
@@ -87,8 +85,7 @@ JOB_CONTROLLER_ENV_PATH = os.path.expanduser('~/.sky/job_controller_env')
 CURRENT_HASH = os.path.expanduser('~/.sky/wheels/current_sky_wheel_hash')
 
 
-def _parse_controller_pid_entry(
-        entry: str) -> Optional[state.ControllerPidRecord]:
+def _parse_controller_pid_entry(entry: str) -> state.ControllerPidRecord | None:
     entry = entry.strip()
     if not entry:
         return None
@@ -112,20 +109,19 @@ def _parse_controller_pid_entry(
     return state.ControllerPidRecord(pid=pid, started_at=started_at)
 
 
-def get_controller_process_records(
-) -> Optional[List[state.ControllerPidRecord]]:
+def get_controller_process_records() -> list[state.ControllerPidRecord] | None:
     """Return recorded controller processes if the file can be read."""
     if not os.path.exists(JOB_CONTROLLER_PID_PATH):
         # If the file doesn't exist, it means the controller server is not
         # running, so we return an empty list
         return []
     try:
-        with open(JOB_CONTROLLER_PID_PATH, 'r', encoding='utf-8') as f:
+        with open(JOB_CONTROLLER_PID_PATH, encoding='utf-8') as f:
             lines = f.read().splitlines()
     except (FileNotFoundError, OSError):
         return None
 
-    records: List[state.ControllerPidRecord] = []
+    records: list[state.ControllerPidRecord] = []
     for line in lines:
         record = _parse_controller_pid_entry(line)
         if record is not None:
@@ -175,7 +171,7 @@ def start_controller() -> None:
     _append_controller_pid_record(pid, pid_started_at)
 
 
-def get_alive_controllers() -> Optional[int]:
+def get_alive_controllers() -> int | None:
     records = get_controller_process_records()
     if records is None:
         # If we cannot read the file reliably, avoid starting extra controllers.
@@ -247,8 +243,8 @@ def maybe_start_controllers(from_scheduler: bool = False) -> None:
                 old = pathlib.Path(f'{CURRENT_HASH}.old')
 
                 if old.exists() and cur.exists():
-                    if (old.read_text(encoding='utf-8') !=
-                            cur.read_text(encoding='utf-8')):
+                    if (old.read_text(encoding='utf-8')
+                            != cur.read_text(encoding='utf-8')):
                         # TODO(luca): there is a 1/2^160 chance that there will
                         # be a collision. using a geometric distribution and
                         # assuming one update a day, we expect a bug slightly
@@ -289,12 +285,12 @@ def maybe_start_controllers(from_scheduler: bool = False) -> None:
         pass
 
 
-def submit_jobs(job_ids: List[int],
+def submit_jobs(job_ids: list[int],
                 dag_yaml_path: str,
                 original_user_yaml_path: str,
                 env_file_path: str,
                 priority: int,
-                priority_class: Optional[str] = None) -> None:
+                priority_class: str | None = None) -> None:
     """Submit multiple existing jobs to the scheduler.
 
     This should be called after jobs are created in the `spot` table as
@@ -318,21 +314,21 @@ def submit_jobs(job_ids: List[int],
         job_ids_without_controller_process.append(job_id)
     job_ids = job_ids_without_controller_process
 
-    with open(dag_yaml_path, 'r', encoding='utf-8') as dag_file:
+    with open(dag_yaml_path, encoding='utf-8') as dag_file:
         dag_yaml_content = dag_file.read()
-    with open(original_user_yaml_path, 'r',
+    with open(original_user_yaml_path,
               encoding='utf-8') as original_user_yaml_file:
         original_user_yaml_content = original_user_yaml_file.read()
-    with open(env_file_path, 'r', encoding='utf-8') as env_file:
+    with open(env_file_path, encoding='utf-8') as env_file:
         env_file_content = env_file.read()
 
     # Read config file if SKYPILOT_CONFIG env var is set
-    config_file_content: Optional[str] = None
+    config_file_content: str | None = None
     config_file_path = os.environ.get(skypilot_config.ENV_VAR_SKYPILOT_CONFIG)
     if config_file_path:
         config_file_path = os.path.expanduser(config_file_path)
         if os.path.exists(config_file_path):
-            with open(config_file_path, 'r', encoding='utf-8') as config_file:
+            with open(config_file_path, encoding='utf-8') as config_file:
                 config_file_content = config_file.read()
 
     config_bytes = (len(config_file_content) if config_file_content else 0)
@@ -352,7 +348,7 @@ def submit_jobs(job_ids: List[int],
 @contextlib.asynccontextmanager
 async def scheduled_launch(
     job_id: int,
-    starting: Set[int],
+    starting: set[int],
     starting_lock: asyncio.Lock,
     starting_signal: asyncio.Condition,
 ):

@@ -149,17 +149,3 @@ def test_find_entry_point_select_api():
     assert entry_point is not None
     assert entry_point.value == _TARGET_MODULE
     assert sky._find_client_sdk_entry_point('missing') is None
-
-
-def test_find_entry_point_legacy_mapping(monkeypatch):
-    # On Python < 3.10 ``entry_points()`` returns a plain mapping with no
-    # ``.select`` method, so the loader falls back to ``.get(group)``.
-    def _legacy_entry_points():
-        return {'sky.client_sdks': [_make_entry_point()]}
-
-    monkeypatch.setattr(importlib.metadata, 'entry_points',
-                        _legacy_entry_points)
-    # pylint: disable=protected-access
-    entry_point = sky._find_client_sdk_entry_point(_SDK_NAME)
-    assert entry_point is not None
-    assert entry_point.value == _TARGET_MODULE

@@ -30,10 +30,10 @@ def _is_proctrack_cgroup_enabled(shared_home_dir: str) -> bool:
     proctrack_file = os.path.join(shared_home_dir,
                                   constants.SLURM_PROCTRACK_TYPE_FILE)
     try:
-        with open(proctrack_file, 'r', encoding='utf-8') as f:
+        with open(proctrack_file, encoding='utf-8') as f:
             proctrack_type = f.read().strip()
             return proctrack_type == 'cgroup'
-    except (FileNotFoundError, IOError):
+    except (OSError, FileNotFoundError):
         # If file doesn't exist or can't be read,
         # default to True to be conservative.
         return True
@@ -141,7 +141,7 @@ def main():
     log_path = os.path.join(args.log_dir, log_filename)
 
     if args.script_path:
-        with open(args.script_path, 'r', encoding='utf-8') as f:
+        with open(args.script_path, encoding='utf-8') as f:
             script = f.read()
     else:
         script = args.script

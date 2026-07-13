@@ -4,10 +4,10 @@ Provides a simple interface for distributing batch processing workloads
 across a pool of workers via managed jobs.  The Dataset is created from
 a typed ``InputReader`` (e.g. ``JsonReader``) and dispatched with ``map()``.
 """
+from collections.abc import Callable
 import logging
 import time
 import typing
-from typing import Callable, List, Optional, Union
 import uuid
 
 import tqdm
@@ -155,9 +155,8 @@ class Dataset:
             mapper_fn: Callable,
             pool_name: str,
             batch_size: int,
-            output: Union[io_formats.OutputWriter,
-                          List[io_formats.OutputWriter]],
-            activate_env: Optional[str] = None,
+            output: io_formats.OutputWriter | list[io_formats.OutputWriter],
+            activate_env: str | None = None,
             stream: bool = True) -> int:
         """Submit batch job as a managed job. Blocks until completion.
 
@@ -214,7 +213,7 @@ class Dataset:
             raise ValueError(f'batch_size must be positive, got: {batch_size}')
 
         # Normalize to list internally.
-        outputs: List[io_formats.OutputWriter] = (output if isinstance(
+        outputs: list[io_formats.OutputWriter] = (output if isinstance(
             output, list) else [output])
 
         for fmt in outputs:

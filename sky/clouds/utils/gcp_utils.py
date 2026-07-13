@@ -10,7 +10,7 @@ import dataclasses
 import json
 import time
 import typing
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Optional
 
 import cachetools
 
@@ -94,7 +94,7 @@ class GCPReservation:
 
     def is_consumable(
         self,
-        specific_reservations: Set[str],
+        specific_reservations: set[str],
     ) -> bool:
         """Check if the reservation is consumable.
 
@@ -120,16 +120,15 @@ class GCPReservation:
 def list_reservations_for_instance_type_in_zone(
     instance_type: str,
     zone: str,
-) -> List[GCPReservation]:
+) -> list[GCPReservation]:
     reservations = _list_reservations_for_instance_type(instance_type)
     return [r for r in reservations if r.zone.endswith(f'/{zone}')]
 
 
-@cachetools.cached(cache=cachetools.TTLCache(maxsize=1,
-                                             ttl=300,
-                                             timer=time.time))
+@cachetools.cached(
+    cache=cachetools.TTLCache(maxsize=1, ttl=300, timer=time.time))
 def _list_reservations_for_instance_type(
-    instance_type: str,) -> List[GCPReservation]:
+    instance_type: str,) -> list[GCPReservation]:
     """List all reservations for the given instance type.
 
     TODO: We need to incorporate accelerators because the reserved instance
@@ -175,7 +174,7 @@ def _list_reservations_for_instance_type(
     return [GCPReservation.from_dict(r) for r in json.loads(stdout)]
 
 
-def get_minimal_compute_permissions() -> List[str]:
+def get_minimal_compute_permissions() -> list[str]:
     permissions = copy.copy(constants.VM_MINIMAL_PERMISSIONS)
     custom_vpc_name = skypilot_config.get_effective_region_config(
         cloud='gcp', region=None, keys=('vpc_name',), default_value=None)
@@ -204,7 +203,7 @@ def get_minimal_compute_permissions() -> List[str]:
     return permissions
 
 
-def get_minimal_storage_permissions() -> List[str]:
+def get_minimal_storage_permissions() -> list[str]:
     permissions = copy.copy(constants.STORAGE_MINIMAL_PERMISSIONS)
 
     permissions += constants.GCP_MINIMAL_PERMISSIONS
@@ -215,9 +214,9 @@ def get_minimal_storage_permissions() -> List[str]:
 # Get the DWS configuration for the given context in GKE.
 def get_dws_config(
     context: str,
-    k8s_kueue_local_queue_name: Optional[str],
-    cluster_config_overrides: Optional[Dict[str, Any]] = None,
-) -> Tuple[bool, bool, Optional[int]]:
+    k8s_kueue_local_queue_name: str | None,
+    cluster_config_overrides: dict[str, Any] | None = None,
+) -> tuple[bool, bool, int | None]:
     """Get the DWS configuration for the given context.
 
         Args:

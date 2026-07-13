@@ -95,10 +95,10 @@ jobs:
         run: |
           cd sky/dashboard
           npm run build
-      - name: Set up Python 3.10
+      - name: Set up Python 3.14
         uses: actions/setup-python@7f4fc3e22c37d6ff65e88745f38bd3157c663f7c # v4.9.1
         with:
-          python-version: '3.10'
+          python-version: '3.14'
           cache: 'pip' # caching pip dependencies
       - name: Install pypa/build
         run: >-
@@ -412,9 +412,9 @@ jobs:
           - [Smoke Tests Slurm Minimal](https://buildkite.com/skypilot-1/smoke-tests/builds/${{ needs.smoke-tests-slurm-minimal.outputs.build_number }}) - $([ "${{ needs.smoke-tests-slurm-minimal.outputs.build_status }}" == "success" ] && echo "✅ Success" || echo "❌ Failed")
           EOF
           fi
-          # if [ "${{ needs.smoke-tests-runpod-minimal.result }}" != "skipped" ] && [ -n "${{ needs.smoke-tests-runpod-minimal.outputs.build_number }}" ]; then
+          # if [ "<needs.smoke-tests-runpod-minimal.result>" != "skipped" ] && [ -n "<needs.smoke-tests-runpod-minimal.outputs.build_number>" ]; then
           #   cat <<EOF >> "$GITHUB_STEP_SUMMARY"
-          # - [Smoke Tests RunPod Minimal](https://buildkite.com/skypilot-1/smoke-tests/builds/${{ needs.smoke-tests-runpod-minimal.outputs.build_number }}) - $([ "${{ needs.smoke-tests-runpod-minimal.outputs.build_status }}" == "success" ] && echo "✅ Success" || echo "❌ Failed")
+          # - [Smoke Tests RunPod Minimal](https://buildkite.com/skypilot-1/smoke-tests/builds/<needs.smoke-tests-runpod-minimal.outputs.build_number>) - $([ "<needs.smoke-tests-runpod-minimal.outputs.build_status>" == "success" ] && echo "✅ Success" || echo "❌ Failed")
           # EOF
           # fi
           if [ "${{ needs.backward-compat-test-nightly.result }}" != "skipped" ] && [ -n "${{ needs.backward-compat-test-nightly.outputs.build_number }}" ]; then
@@ -492,11 +492,11 @@ jobs:
               fi
               BUILDKITE_MSG="${BUILDKITE_MSG} <https://buildkite.com/skypilot-1/smoke-tests/builds/${{ needs.smoke-tests-slurm-minimal.outputs.build_number }}|Buildkite Log(test_minimal --slurm)>"
             fi
-            # if [[ "${{ needs.smoke-tests-runpod-minimal.result }}" == "failure" ]]; then
+            # if [[ "<needs.smoke-tests-runpod-minimal.result>" == "failure" ]]; then
             #   if [[ ! -z "$BUILDKITE_MSG" ]]; then
             #     BUILDKITE_MSG="${BUILDKITE_MSG} and"
             #   fi
-            #   BUILDKITE_MSG="${BUILDKITE_MSG} <https://buildkite.com/skypilot-1/smoke-tests/builds/${{ needs.smoke-tests-runpod-minimal.outputs.build_number }}|Buildkite Log(test_minimal --runpod)>"
+            #   BUILDKITE_MSG="${BUILDKITE_MSG} <https://buildkite.com/skypilot-1/smoke-tests/builds/<needs.smoke-tests-runpod-minimal.outputs.build_number>|Buildkite Log(test_minimal --runpod)>"
             # fi
             if [[ "${{ needs.backward-compat-test-nightly.result }}" == "failure" ]]; then
               if [[ ! -z "$BUILDKITE_MSG" ]]; then

@@ -3,7 +3,7 @@ import json
 import os
 import posixpath
 import traceback
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Optional
 
 from sky import exceptions
 from sky import global_user_state
@@ -72,7 +72,7 @@ def collect_cluster_skylet_log(
         cluster_name: str,
         cluster_dir: str,
         handle: Any,
-        errors: Optional[List[Dict[str, str]]] = None,
+        errors: list[dict[str, str]] | None = None,
         status: Optional['status_lib.ClusterStatus'] = None) -> None:
     """Rsync the head node's skylet log into the cluster dump directory."""
     expected_failure = (status == status_lib.ClusterStatus.INIT)
@@ -125,9 +125,9 @@ def collect_cluster_skylet_log(
             f'Failed to collect skylet log for cluster {cluster_name}', e)
 
 
-def dump_cluster_info(cluster_names: Set[str],
+def dump_cluster_info(cluster_names: set[str],
                       dump_dir: str,
-                      errors: Optional[List[Dict[str, str]]] = None) -> None:
+                      errors: list[dict[str, str]] | None = None) -> None:
     """Collect cluster state, events, associated requests, and skylet logs."""
     if not cluster_names:
         logger.debug('No clusters to dump')

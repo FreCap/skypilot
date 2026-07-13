@@ -1,10 +1,9 @@
 """Process-local queue implementation."""
 import queue
 import threading
-from typing import Dict
 
 # Global dict to store queues
-_queues: Dict[str, queue.Queue] = {}
+_queues: dict[str, queue.Queue] = {}
 _lock = threading.Lock()
 
 

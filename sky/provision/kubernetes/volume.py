@@ -1,6 +1,6 @@
 """Kubernetes volume provisioning (PVC and hostPath)."""
 import time as time_module
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any
 
 from sky import global_user_state
 from sky import models
@@ -31,7 +31,7 @@ def _is_rbac_permission_error(e: Exception) -> bool:
     return getattr(e, 'status', None) in (401, 403)
 
 
-def _get_context_namespace(config: models.VolumeConfig) -> Tuple[str, str]:
+def _get_context_namespace(config: models.VolumeConfig) -> tuple[str, str]:
     """Gets the context and namespace of a volume."""
     if config.region is None:
         context = kubernetes_utils.get_current_kube_config_context_name()
@@ -45,8 +45,8 @@ def _get_context_namespace(config: models.VolumeConfig) -> Tuple[str, str]:
     return context, namespace
 
 
-def check_pvc_usage_for_pod(context: Optional[str], namespace: str,
-                            pod_spec: Dict[str, Any]) -> None:
+def check_pvc_usage_for_pod(context: str | None, namespace: str,
+                            pod_spec: dict[str, Any]) -> None:
     """Checks if the PVC is used by any pod in the namespace."""
     volumes = pod_spec.get('spec', {}).get('volumes', [])
     if not volumes:
@@ -81,7 +81,7 @@ def apply_volume(config: models.VolumeConfig) -> models.VolumeConfig:
     return _apply_pvc_volume(config)
 
 
-def _check_cluster_has_default_storage_class(context: Optional[str]) -> None:
+def _check_cluster_has_default_storage_class(context: str | None) -> None:
     """Verifies the cluster has a default StorageClass annotated.
 
     Called when the user did not specify `storage_class_name` in the volume
@@ -120,7 +120,7 @@ def _check_cluster_has_default_storage_class(context: Optional[str]) -> None:
         f'storage class, or mark one as default on the cluster.')
 
 
-def _validate_explicit_storage_class(context: Optional[str],
+def _validate_explicit_storage_class(context: str | None,
                                      storage_class_name: str) -> None:
     """Verifies the named StorageClass exists on the cluster.
 
@@ -326,7 +326,7 @@ def _delete_hostpath_volume(config: models.VolumeConfig) -> models.VolumeConfig:
     return config
 
 
-def _wait_for_daemonset_ready(context: Optional[str],
+def _wait_for_daemonset_ready(context: str | None,
                               namespace: str,
                               ds_name: str,
                               timeout: int = 300) -> None:
@@ -350,10 +350,10 @@ def _wait_for_daemonset_ready(context: Optional[str],
 
 
 def _get_volume_usedby(
-    context: Optional[str],
+    context: str | None,
     namespace: str,
     pvc_name: str,
-) -> Tuple[List[str], List[str]]:
+) -> tuple[list[str], list[str]]:
     """Gets the usedby resources of a volume.
 
     This function returns the pods and clusters that are using the volume.
@@ -411,7 +411,7 @@ def _get_volume_usedby(
     return usedby_pods, usedby_clusters
 
 
-def _get_cluster_name_on_cloud_to_cluster_name_map() -> Dict[str, str]:
+def _get_cluster_name_on_cloud_to_cluster_name_map() -> dict[str, str]:
     """Gets the map from cluster name on cloud to cluster name."""
     clusters = global_user_state.get_clusters()
     cloud_to_name_map = {}
@@ -424,7 +424,7 @@ def _get_cluster_name_on_cloud_to_cluster_name_map() -> Dict[str, str]:
 
 
 def get_volume_usedby(
-    config: models.VolumeConfig,) -> Tuple[List[str], List[str]]:
+    config: models.VolumeConfig,) -> tuple[list[str], list[str]]:
     """Gets the usedby resources of a volume."""
     # hostPath volumes have no PVC — cannot track usage via K8s API
     if config.type == volume_lib.VolumeType.HOSTPATH.value:
@@ -435,7 +435,7 @@ def get_volume_usedby(
 
 
 def refresh_volume_config(
-    config: models.VolumeConfig,) -> Tuple[bool, models.VolumeConfig]:
+    config: models.VolumeConfig,) -> tuple[bool, models.VolumeConfig]:
     """Refreshes the volume config.
 
     For volumes created without an explicit region before PR #8386, the
@@ -459,8 +459,8 @@ def refresh_volume_config(
 
 
 def get_all_volumes_usedby(
-    configs: List[models.VolumeConfig],
-) -> Tuple[Dict[str, Any], Dict[str, Any], Set[str]]:
+    configs: list[models.VolumeConfig],
+) -> tuple[dict[str, Any], dict[str, Any], set[str]]:
     """Gets the usedby resources of all volumes.
 
     Args:
@@ -480,9 +480,9 @@ def get_all_volumes_usedby(
         for phase in k8s_constants.PVC_NOT_HOLD_POD_PHASES
     ])
     label_selector = 'parent=skypilot'
-    context_to_namespaces: Dict[str, Set[str]] = {}
+    context_to_namespaces: dict[str, set[str]] = {}
     pvc_names = set()
-    original_volume_names: Dict[str, Dict[str, List[str]]] = {}
+    original_volume_names: dict[str, dict[str, list[str]]] = {}
     for config in configs:
         # Skip hostPath volumes — they have no PVC to track
         if config.type == volume_lib.VolumeType.HOSTPATH.value:
@@ -495,9 +495,9 @@ def get_all_volumes_usedby(
         pvc_names.add(config.name_on_cloud)
     cloud_to_name_map = _get_cluster_name_on_cloud_to_cluster_name_map()
     # Get all pods in the namespace
-    used_by_pods: Dict[str, Dict[str, Dict[str, List[str]]]] = {}
-    used_by_clusters: Dict[str, Dict[str, Dict[str, List[str]]]] = {}
-    failed_volume_names: Set[str] = set()
+    used_by_pods: dict[str, dict[str, dict[str, list[str]]]] = {}
+    used_by_clusters: dict[str, dict[str, dict[str, list[str]]]] = {}
+    failed_volume_names: set[str] = set()
     for context, namespaces in context_to_namespaces.items():
         used_by_pods[context] = {}
         used_by_clusters[context] = {}
@@ -548,8 +548,8 @@ def get_all_volumes_usedby(
 
 
 def map_all_volumes_usedby(
-        used_by_pods: Dict[str, Any], used_by_clusters: Dict[str, Any],
-        config: models.VolumeConfig) -> Tuple[List[str], List[str]]:
+        used_by_pods: dict[str, Any], used_by_clusters: dict[str, Any],
+        config: models.VolumeConfig) -> tuple[list[str], list[str]]:
     """Maps the usedby resources of a volume."""
     context, namespace = _get_context_namespace(config)
     pvc_name = config.name_on_cloud
@@ -560,7 +560,7 @@ def map_all_volumes_usedby(
 
 
 def get_all_volumes_errors(
-    configs: List[models.VolumeConfig],) -> Dict[str, Optional[str]]:
+    configs: list[models.VolumeConfig],) -> dict[str, str | None]:
     """Gets error messages for all Kubernetes PVC volumes.
 
     Checks if PVCs are in Pending state and if so, checks for access mode
@@ -572,8 +572,8 @@ def get_all_volumes_errors(
     Returns:
         Dictionary mapping volume name to error message (None if no error).
     """
-    context_to_namespaces: Dict[str, Set[str]] = {}
-    config_by_pvc_name: Dict[str, Dict[str, models.VolumeConfig]] = {}
+    context_to_namespaces: dict[str, set[str]] = {}
+    config_by_pvc_name: dict[str, dict[str, models.VolumeConfig]] = {}
 
     for config in configs:
         # Skip hostPath volumes — they have no PVC to check
@@ -584,7 +584,7 @@ def get_all_volumes_errors(
         config_by_pvc_name.setdefault(context,
                                       {})[config.name_on_cloud] = config
 
-    volume_errors: Dict[str, Optional[str]] = {}
+    volume_errors: dict[str, str | None] = {}
 
     for context, namespaces in context_to_namespaces.items():
         for namespace in namespaces:
@@ -662,8 +662,8 @@ def get_all_volumes_errors(
     return volume_errors
 
 
-def _check_storage_class_volume_binding_mode(context: Optional[str],
-                                             pvc: Any) -> Optional[str]:
+def _check_storage_class_volume_binding_mode(context: str | None,
+                                             pvc: Any) -> str | None:
     """Check the volumeBindingMode of the storage class for the PVC.
 
     Args:
@@ -686,8 +686,7 @@ def _check_storage_class_volume_binding_mode(context: Optional[str],
         return None
 
 
-def _check_pvc_access_mode_error(context: Optional[str],
-                                 pvc: Any) -> Optional[str]:
+def _check_pvc_access_mode_error(context: str | None, pvc: Any) -> str | None:
     """Check if a pending PVC has an access mode mismatch.
 
     Args:
@@ -809,8 +808,8 @@ def _populate_config_from_pvc(config: models.VolumeConfig,
         config.size = pvc_size
 
 
-def _find_pvc_by_name_or_label(context: Optional[str], namespace: str,
-                               volume_name: str) -> Optional[Any]:
+def _find_pvc_by_name_or_label(context: str | None, namespace: str,
+                               volume_name: str) -> Any | None:
     """Find PVC by name or skypilot-name label.
 
     This function searches for a PVC in two ways:
@@ -860,9 +859,9 @@ def _find_pvc_by_name_or_label(context: Optional[str], namespace: str,
 
 def create_persistent_volume_claim(
     namespace: str,
-    context: Optional[str],
-    pvc_spec: Dict[str, Any],
-    config: Optional[models.VolumeConfig] = None,
+    context: str | None,
+    pvc_spec: dict[str, Any],
+    config: models.VolumeConfig | None = None,
 ) -> None:
     """Creates a persistent volume claim for SkyServe controller."""
     pvc_name = pvc_spec['metadata']['name']
@@ -915,14 +914,14 @@ def create_persistent_volume_claim(
 
 
 def _get_pvc_spec(namespace: str,
-                  config: models.VolumeConfig) -> Dict[str, Any]:
+                  config: models.VolumeConfig) -> dict[str, Any]:
     """Gets the PVC spec for the given storage config."""
     access_mode = config.config.get('access_mode')
     size = config.size
     # The previous code assumes that the access_mode and size are always set.
     assert access_mode is not None, f'access_mode is None for volume ' \
                                     f'{config.name_on_cloud}'
-    pvc_spec: Dict[str, Any] = {
+    pvc_spec: dict[str, Any] = {
         'metadata': {
             'name': config.name_on_cloud,
             'namespace': namespace,

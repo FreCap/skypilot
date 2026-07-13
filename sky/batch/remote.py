@@ -5,8 +5,9 @@ for execution on remote workers.
 """
 import ast
 import builtins
+from collections.abc import Callable
 import inspect
-from typing import Callable, Set, TypeVar
+from typing import TypeVar
 
 F = TypeVar('F', bound=Callable)
 
@@ -192,7 +193,7 @@ def _validate_no_global_references(fn: Callable) -> None:
                 f'       vllm.LLM(...)  # Works!\n')
 
 
-def _collect_local_names(func_def: ast.FunctionDef) -> Set[str]:
+def _collect_local_names(func_def: ast.FunctionDef) -> set[str]:
     """Collect names defined locally within a function.
 
     This includes:
@@ -254,7 +255,7 @@ def _collect_local_names(func_def: ast.FunctionDef) -> Set[str]:
     return local_names
 
 
-def _collect_referenced_names(func_def: ast.FunctionDef) -> Set[str]:
+def _collect_referenced_names(func_def: ast.FunctionDef) -> set[str]:
     """Collect names referenced (loaded) within a function.
 
     Args:

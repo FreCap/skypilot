@@ -10,11 +10,11 @@ makes children exit when their parent dies so port/health checks stay
 truthful.
 """
 
+from collections.abc import Callable
 import multiprocessing
 import os
 import threading
 import time
-from typing import Callable, Optional
 
 from sky import sky_logging
 
@@ -24,8 +24,7 @@ _POLL_INTERVAL_SECONDS = 1.0
 
 
 def running_in_child_process(
-    parent_process: Callable[[],
-                             Optional[object]] = multiprocessing.parent_process
+    parent_process: Callable[[], object | None] = multiprocessing.parent_process
 ) -> bool:
     """Whether this process is a multiprocessing child of another process."""
     return parent_process() is not None
@@ -45,7 +44,7 @@ def _watch_parent(initial_ppid: int, poll_interval: float,
 
 
 def start_parent_death_watchdog(
-    on_parent_death: Optional[Callable[[int], None]] = None,
+    on_parent_death: Callable[[int], None] | None = None,
     getppid: Callable[[], int] = os.getppid,
     sleep: Callable[[float], None] = time.sleep,
     poll_interval: float = _POLL_INTERVAL_SECONDS,

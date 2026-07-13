@@ -12,7 +12,7 @@ import threading
 import time
 import traceback
 import typing
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Optional
 
 import dotenv
 import filelock
@@ -65,7 +65,7 @@ else:
 
 logger = sky_logging.init_logger('sky.jobs.controller')
 
-_background_tasks: Set[asyncio.Task] = set()
+_background_tasks: set[asyncio.Task] = set()
 _background_tasks_lock: asyncio.Lock = asyncio.Lock()
 
 # How many consecutive monitor ticks must observe a non-UP cluster while the
@@ -156,7 +156,7 @@ def _add_k8s_annotations(task: 'sky.Task', job_id: int) -> None:
     a cluster on other clouds.
     """
     original_resources = task.resources
-    new_resources_list: List['sky.Resources'] = []
+    new_resources_list: list[sky.Resources] = []
     for original_resource in original_resources:
         # Get existing config overrides or create new dict
         config_overrides = original_resource.cluster_config_overrides.copy()
@@ -179,9 +179,9 @@ def _add_k8s_annotations(task: 'sky.Task', job_id: int) -> None:
 
 
 def _build_task_specs(
-    executor: 'recovery_strategy.StrategyExecutor',) -> Dict[str, Any]:
+    executor: 'recovery_strategy.StrategyExecutor',) -> dict[str, Any]:
     """Merge base and strategy-specific task specs with collision detection."""
-    base_specs: Dict[str, Any] = {
+    base_specs: dict[str, Any] = {
         'max_restarts_on_errors': executor.max_restarts_on_errors,
         'recover_on_exit_codes': executor.recover_on_exit_codes,
     }
@@ -231,11 +231,11 @@ class JobController:
     def __init__(
         self,
         job_id: int,
-        starting: Set[int],
+        starting: set[int],
         starting_lock: asyncio.Lock,
         starting_signal: asyncio.Condition,
-        pool: Optional[str] = None,
-        rank: Optional[int] = None,
+        pool: str | None = None,
+        rank: int | None = None,
     ) -> None:
         """Initialize a ``JobsController``.
 
@@ -311,9 +311,9 @@ class JobController:
 
     def download_log_and_stream(
         self,
-        task_id: Optional[int],
+        task_id: int | None,
         handle: Optional['cloud_vm_ray_backend.CloudVmRayResourceHandle'],
-        job_id_on_pool_cluster: Optional[int],
+        job_id_on_pool_cluster: int | None,
     ) -> None:
         """Downloads and streams the logs of the current job with given task ID.
 
@@ -362,7 +362,7 @@ class JobController:
 
         logger.info(f'\n== End of logs (ID: {self._job_id}) ==')
 
-    async def _cleanup_cluster(self, cluster_name: Optional[str]) -> None:
+    async def _cleanup_cluster(self, cluster_name: str | None) -> None:
         if cluster_name is None:
             return
         if self._pool is None:
@@ -370,9 +370,9 @@ class JobController:
                                     cluster_name)
 
     async def _get_cluster_job_exit_codes(
-        self, job_id: Optional[int],
-        handle: 'cloud_vm_ray_backend.CloudVmRayResourceHandle'
-    ) -> Optional[list]:
+            self, job_id: int | None,
+            handle: 'cloud_vm_ray_backend.CloudVmRayResourceHandle'
+    ) -> list | None:
         """Retrieve exit codes from the remote cluster.
 
         Args:
@@ -468,8 +468,8 @@ class JobController:
             managed_job_state.get_latest_task_id_status_async(self._job_id))
 
         is_resume = False
-        if (latest_task_id is not None and last_task_prev_status !=
-                managed_job_state.ManagedJobStatus.PENDING):
+        if (latest_task_id is not None and last_task_prev_status
+                != managed_job_state.ManagedJobStatus.PENDING):
             assert latest_task_id >= task_id, (latest_task_id, task_id)
             if latest_task_id > task_id:
                 logger.info(f'Task {task_id} ({task.name}) has already '
@@ -572,7 +572,7 @@ class JobController:
             launch_time = time.time() - launch_start
             logger.info(f'Cluster launch completed in {launch_time:.2f}s')
             assert remote_job_submitted_at is not None, remote_job_submitted_at
-        job_id_on_pool_cluster: Optional[int] = None
+        job_id_on_pool_cluster: int | None = None
         if self._pool:
             # Update the cluster name when using pool.
             cluster_name, job_id_on_pool_cluster = (
@@ -778,11 +778,11 @@ class JobController:
         task: 'sky.Task',
         cluster_name: str,
         executor: 'recovery_strategy.StrategyExecutor',
-        job_id_on_pool_cluster: Optional[int] = None,
-        callback_func: Optional[typing.Callable] = None,
+        job_id_on_pool_cluster: int | None = None,
+        callback_func: typing.Callable | None = None,
         cleanup_cluster_on_success: bool = True,
         force_transit_to_recovering: bool = False,
-        on_recovery: Optional[typing.Callable[[], typing.Coroutine]] = None,
+        on_recovery: typing.Callable[[], typing.Coroutine] | None = None,
     ) -> bool:
         """Monitor a single task until completion with recovery support.
 
@@ -955,7 +955,7 @@ class JobController:
                 cluster_name,
                 force_refresh_statuses=set(status_lib.ClusterStatus))
 
-            external_failures: Optional[List[ExternalClusterFailure]] = None
+            external_failures: list[ExternalClusterFailure] | None = None
             cluster_event_reason = None
             if cluster_status != status_lib.ClusterStatus.UP:
                 # The cluster is (partially) preempted or failed. It can be
@@ -1228,8 +1228,8 @@ class JobController:
 
     async def _prepare_job_group_task_for_launch(
         self, task: 'sky.Task', task_id: int, job_group_name: str,
-        other_job_names: List[str]
-    ) -> Tuple[str, recovery_strategy.StrategyExecutor]:
+        other_job_names: list[str]
+    ) -> tuple[str, recovery_strategy.StrategyExecutor]:
         """Prepare a JobGroup task for launch.
 
         This function:
@@ -1310,7 +1310,7 @@ class JobController:
         cluster_name: str,
         executor: recovery_strategy.StrategyExecutor,
         job_group_name: str,
-        all_tasks_handles: List[Tuple['sky.Task', typing.Any]],
+        all_tasks_handles: list[tuple['sky.Task', typing.Any]],
         force_transit_to_recovering: bool = False,
     ) -> bool:
         """Monitor a single task in a JobGroup until completion.
@@ -1399,7 +1399,7 @@ class JobController:
                     f'{len(tasks)} jobs: {[t.name for t in tasks]}')
 
         # Inject JobGroup environment variables into all tasks
-        runtime_envs: Dict[str, str] = {}
+        runtime_envs: dict[str, str] = {}
         if managed_job_runtime.is_registered():
             extra_envs = await asyncio.to_thread(
                 managed_job_runtime.job_group_envs, tasks, self._job_id)
@@ -1420,8 +1420,9 @@ class JobController:
         #   - RUNNING: resume monitoring without forced recovery
         #   - Other non-terminal: resume with forced recovery
         # Key: task_id, Value: (task_status, force_transit_to_recovering)
-        task_resume_info: Dict[int, Tuple[
-            Optional[managed_job_state.ManagedJobStatus], bool]] = {}
+        task_resume_info: dict[int,
+                               tuple[managed_job_state.ManagedJobStatus | None,
+                                     bool]] = {}
 
         for task_id, task in enumerate(tasks):
             task_status = await (
@@ -1474,8 +1475,8 @@ class JobController:
 
         # Phase 1: Launch clusters for tasks that need launching
         launch_start = time.time()
-        cluster_names: List[Optional[str]] = []
-        strategy_executors: List[recovery_strategy.StrategyExecutor] = []
+        cluster_names: list[str | None] = []
+        strategy_executors: list[recovery_strategy.StrategyExecutor] = []
         tasks_to_launch = [
             tid for tid in range(len(tasks)) if needs_launch(tid)
         ]
@@ -1573,10 +1574,8 @@ class JobController:
         sync_results = await asyncio.gather(*sync_coros)
 
         # Build handles list from sync results
-        handles: List[
-            Optional['cloud_vm_ray_backend.CloudVmRayResourceHandle']] = [
-                None
-            ] * len(tasks)
+        handles: list[cloud_vm_ray_backend.CloudVmRayResourceHandle |
+                      None] = [None] * len(tasks)
         for i, handle in enumerate(sync_results):
             task_id = sync_task_ids[i]
             handles[task_id] = handle
@@ -1586,8 +1585,8 @@ class JobController:
         # Build list of (task, handle) for non-terminal tasks with valid
         # handles. Skip tasks that inline the DNS mapping — they already
         # start the DNS updater from task.run.
-        tasks_handles: List[Tuple[
-            'sky.Task', 'cloud_vm_ray_backend.CloudVmRayResourceHandle']] = []
+        tasks_handles: list[tuple[
+            sky.Task, cloud_vm_ray_backend.CloudVmRayResourceHandle]] = []
         for tid, task in enumerate(tasks):
             task_handle = handles[tid]
             if task_handle is None:
@@ -1614,8 +1613,8 @@ class JobController:
         primary_job_names = self._dag.primary_tasks
         if not primary_job_names:
             # All jobs are primary (traditional behavior)
-            primary_task_ids: Set[int] = set(range(len(tasks)))
-            auxiliary_task_ids: Set[int] = set()
+            primary_task_ids: set[int] = set(range(len(tasks)))
+            auxiliary_task_ids: set[int] = set()
         else:
             primary_task_ids = {
                 tid for tid, t in enumerate(tasks)
@@ -1632,7 +1631,7 @@ class JobController:
 
         # Create asyncio.Task objects for all non-terminal tasks
         # Maps task_id -> asyncio.Task
-        monitor_async_tasks: Dict[int, asyncio.Task] = {}
+        monitor_async_tasks: dict[int, asyncio.Task] = {}
         for task_id, task in enumerate(tasks):
             if is_terminal(task_id):
                 continue
@@ -1650,13 +1649,13 @@ class JobController:
                 coro, name=f'monitor_{task.name}')
 
         # Track results: task_id -> success (True/False/Exception)
-        task_results: Dict[int, typing.Union[bool, Exception]] = {}
+        task_results: dict[int, bool | Exception] = {}
         # Track remaining primary task IDs (non-terminal ones)
         remaining_primary = primary_task_ids - {
             tid for tid in range(len(tasks)) if is_terminal(tid)
         }
         # Reverse mapping: asyncio.Task -> task_id for efficient lookup
-        async_task_to_id: Dict[asyncio.Task, int] = {
+        async_task_to_id: dict[asyncio.Task, int] = {
             at: tid for tid, at in monitor_async_tasks.items()
         }
 
@@ -1677,7 +1676,7 @@ class JobController:
 
                     # Get result
                     try:
-                        task_result: typing.Union[bool, Exception] = (
+                        task_result: bool | Exception = (
                             completed_task.result())
                         task_results[completed_task_id] = task_result
                         if task_result:
@@ -1759,10 +1758,10 @@ class JobController:
         await self._cleanup_job_group_clusters(cluster_names)
         return all_succeeded
 
-    async def _terminate_auxiliary_jobs(self, tasks: List['task_lib.Task'],
-                                        monitor_async_tasks: Dict[int,
+    async def _terminate_auxiliary_jobs(self, tasks: list['task_lib.Task'],
+                                        monitor_async_tasks: dict[int,
                                                                   asyncio.Task],
-                                        cluster_names: List[Optional[str]],
+                                        cluster_names: list[str | None],
                                         all_primary_succeeded: bool) -> None:
         """Terminate auxiliary jobs after all primary jobs complete.
 
@@ -1830,7 +1829,7 @@ class JobController:
         await asyncio.gather(*termination_coros, return_exceptions=True)
 
     async def _cleanup_job_group_clusters(
-            self, cluster_names: typing.List[typing.Optional[str]]) -> None:
+            self, cluster_names: list[str | None]) -> None:
         """Clean up all clusters in a JobGroup."""
         for cluster_name in cluster_names:
             if cluster_name is not None:
@@ -1969,8 +1968,8 @@ class ControllerManager:
     def __init__(self, controller_uuid: str) -> None:
         self._controller_uuid = controller_uuid
         # Global state for active jobs
-        self.job_tasks: Dict[int, asyncio.Task] = {}
-        self.starting: Set[int] = set()
+        self.job_tasks: dict[int, asyncio.Task] = {}
+        self.starting: set[int] = set()
 
         # Lock for synchronizing access to global state dictionary
         # Must always hold _job_tasks_lock when accessing the _starting_signal.
@@ -1983,7 +1982,7 @@ class ControllerManager:
 
         # Store graceful cancel info per job, keyed by job_id.
         # Populated by cancel_job() and consumed by run_job().
-        self._cancel_info: Dict[int, Tuple[bool, Optional[int]]] = {}
+        self._cancel_info: dict[int, tuple[bool, int | None]] = {}
         self._cancel_info_lock = asyncio.Lock()
 
         self._pid = os.getpid()
@@ -1991,9 +1990,9 @@ class ControllerManager:
 
     async def _cleanup(self,
                        job_id: int,
-                       pool: Optional[str] = None,
+                       pool: str | None = None,
                        graceful: bool = False,
-                       graceful_timeout: Optional[int] = None):
+                       graceful_timeout: int | None = None):
         """Clean up the cluster(s) and storages.
 
         (1) Clean up the succeeded task(s)' ephemeral storage. The storage has
@@ -2127,7 +2126,7 @@ class ControllerManager:
             job_id: int,
             task_id: int,
             cluster_name: str,
-            job_id_on_cluster: Optional[int] = None) -> None:
+            job_id_on_cluster: int | None = None) -> None:
         """Download logs for a single task from its cluster.
 
         Looks up the cluster by name and downloads logs via the controller's
@@ -2152,9 +2151,9 @@ class ControllerManager:
                                 handle, job_id_on_cluster)
 
     async def _download_logs_for_cancelled_job(self, controller: JobController,
-                                               job_id: int, task_ids: List[int],
+                                               job_id: int, task_ids: list[int],
                                                dag: 'sky.Dag',
-                                               pool: Optional[str]) -> None:
+                                               pool: str | None) -> None:
         """Download logs for a cancelled job before cleanup.
 
         This ensures that logs remain accessible after job cancellation,
@@ -2215,7 +2214,7 @@ class ControllerManager:
     async def run_job_loop(self,
                            job_id: int,
                            log_file: str,
-                           pool: Optional[str] = None):
+                           pool: str | None = None):
         """Background task that runs the job loop."""
         ctx = context.get()
         assert ctx is not None, 'Context is not initialized'
@@ -2438,7 +2437,7 @@ class ControllerManager:
     async def start_job(
         self,
         job_id: int,
-        pool: Optional[str] = None,
+        pool: str | None = None,
     ):
         """Start a new job.
 

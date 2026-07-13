@@ -47,7 +47,7 @@ def main():
 
     args = parser.parse_args()
 
-    with open(args.input, 'r', encoding='utf-8') as file:
+    with open(args.input, encoding='utf-8') as file:
         config = yaml.safe_load(file)
 
     updated = kubernetes_utils.format_kubeconfig_exec_auth(

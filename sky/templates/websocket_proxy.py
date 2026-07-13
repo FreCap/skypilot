@@ -15,7 +15,6 @@ import os
 import struct
 import sys
 import time
-from typing import Dict, Optional
 
 import websockets
 from websockets.asyncio.client import ClientConnection
@@ -41,7 +40,7 @@ async def main(
     url: str,
     timestamps_supported: bool,
     login_url: str,
-    override_headers: Optional[Dict[str, str]] = None,
+    override_headers: dict[str, str] | None = None,
 ) -> None:
     headers = {}
     if override_headers:
@@ -66,7 +65,7 @@ async def main(
 
 async def run_websocket_proxy(websocket: ClientConnection,
                               timestamps_supported: bool,
-                              first_message: Optional[bytes] = None) -> None:
+                              first_message: bytes | None = None) -> None:
     if os.isatty(sys.stdin.fileno()):
         # pylint: disable=import-outside-toplevel
         import termios
@@ -88,7 +87,7 @@ async def run_websocket_proxy(websocket: ClientConnection,
             asyncio.streams.FlowControlMixin, sys.stdout)  # type: ignore
         stdout_writer = asyncio.StreamWriter(transport, protocol, None, loop)
         # Dictionary to store last ping time for latency measurement
-        last_ping_time_dict: Optional[Dict[int, float]] = None
+        last_ping_time_dict: dict[int, float] | None = None
         if timestamps_supported:
             last_ping_time_dict = {}
 
@@ -112,7 +111,7 @@ async def run_websocket_proxy(websocket: ClientConnection,
 
 
 async def latency_monitor(websocket: ClientConnection,
-                          last_ping_time_dict: Optional[dict],
+                          last_ping_time_dict: dict | None,
                           websocket_closed_event: asyncio.Event,
                           websocket_lock: asyncio.Lock):
     """Periodically send PING messages (type 1) to measure latency."""
@@ -180,10 +179,10 @@ async def stdin_to_websocket(reader: asyncio.StreamReader,
 async def websocket_to_stdout(websocket: ClientConnection,
                               writer: asyncio.StreamWriter,
                               timestamps_supported: bool,
-                              last_ping_time_dict: Optional[dict],
+                              last_ping_time_dict: dict | None,
                               websocket_closed_event: asyncio.Event,
                               websocket_lock: asyncio.Lock,
-                              first_message: Optional[bytes] = None):
+                              first_message: bytes | None = None):
     try:
         # If we already received a first message (e.g. from redirect check),
         # process it before entering the recv loop.
@@ -242,7 +241,7 @@ async def websocket_to_stdout(websocket: ClientConnection,
 async def _connect_with_redirect(ws_url: str, timestamps_supported: bool,
                                  login_url: str) -> None:
     """Connect to WebSocket, handle REDIRECT frame if server sends one."""
-    headers: Dict[str, str] = {}
+    headers: dict[str, str] = {}
     headers.update(server_common.get_cookie_header_for_url(ws_url))
     headers.update(service_account_auth.get_service_account_headers())
     try:

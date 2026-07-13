@@ -1,5 +1,6 @@
 """Utility functions for subprocesses."""
 import collections
+from collections.abc import Callable
 import multiprocessing
 from multiprocessing import pool
 import os
@@ -12,8 +13,7 @@ import termios
 import threading
 import time
 import typing
-from typing import (Any, Callable, Dict, List, Optional, Protocol, Set, Tuple,
-                    Union)
+from typing import Any, Protocol, TypeAlias
 
 import colorama
 
@@ -38,7 +38,7 @@ _fd_limit_warning_shown = False
 _PROCFS = '/proc'
 
 
-def _safe_children(process: 'psutil.Process') -> List['psutil.Process']:
+def _safe_children(process: 'psutil.Process') -> list['psutil.Process']:
     """Tolerant wrapper around ``process.children(recursive=True)``."""
     try:
         return process.children(recursive=True)
@@ -65,10 +65,10 @@ def _safe_children(process: 'psutil.Process') -> List['psutil.Process']:
         return _fallback_children(process.pid, parent_ctime)
 
 
-def _pid_diag(pid: int) -> Dict[str, str]:
+def _pid_diag(pid: int) -> dict[str, str]:
     """Best-effort identification of a PID whose /proc/<pid>/stat read
     was just denied for some reasons."""
-    diag: Dict[str, str] = {}
+    diag: dict[str, str] = {}
     try:
         st = os.stat(f'{_PROCFS}/{pid}')
         diag['uid'] = str(st.st_uid)
@@ -82,7 +82,7 @@ def _pid_diag(pid: int) -> Dict[str, str]:
 
 
 def _fallback_children(parent_pid: int,
-                       parent_ctime: float) -> List['psutil.Process']:
+                       parent_ctime: float) -> list['psutil.Process']:
     """Resilient descendant walk: read /proc/<N>/stat, ignore failures.
 
     Mirrors the DFS in ``psutil.Process.children(recursive=True)`` but
@@ -98,7 +98,7 @@ def _fallback_children(parent_pid: int,
         entries = os.listdir(_PROCFS)
     except OSError:
         return []
-    ppid_map: Dict[int, int] = {}
+    ppid_map: dict[int, int] = {}
     for entry in entries:
         if not entry.isdigit():
             continue
@@ -120,12 +120,12 @@ def _fallback_children(parent_pid: int,
     # Traversal pattern (DFS via deque.pop) matches the upstream
     # psutil.Process.children(recursive=True) implementation; order does
     # not matter for our callers, which kill the whole subtree anyway.
-    children_of: Dict[int, List[int]] = {}
+    children_of: dict[int, list[int]] = {}
     for pid, ppid in ppid_map.items():
         children_of.setdefault(ppid, []).append(pid)
-    descendants: List['psutil.Process'] = []
-    seen: Set[int] = set()
-    stack: 'collections.deque[int]' = collections.deque([parent_pid])
+    descendants: list[psutil.Process] = []
+    seen: set[int] = set()
+    stack: collections.deque[int] = collections.deque([parent_pid])
     while stack:
         cur = stack.pop()
         if cur in seen:
@@ -170,15 +170,15 @@ def run_no_outputs(cmd, **kwargs):
                **kwargs)
 
 
-def _get_thread_multiplier(cloud_str: Optional[str] = None) -> int:
+def _get_thread_multiplier(cloud_str: str | None = None) -> int:
     # If using Kubernetes, we use 4x the number of cores.
     if cloud_str and cloud_str.lower() == 'kubernetes':
         return 4
     return 1
 
 
-def get_max_workers_for_file_mounts(common_file_mounts: Dict[str, str],
-                                    cloud_str: Optional[str] = None) -> int:
+def get_max_workers_for_file_mounts(common_file_mounts: dict[str, str],
+                                    cloud_str: str | None = None) -> int:
     global _fd_limit_warning_shown
     fd_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
 
@@ -208,7 +208,7 @@ def get_max_workers_for_file_mounts(common_file_mounts: Dict[str, str],
     return max_workers
 
 
-def get_parallel_threads(cloud_str: Optional[str] = None) -> int:
+def get_parallel_threads(cloud_str: str | None = None) -> int:
     """Returns the number of threads to use for parallel execution.
 
     Args:
@@ -221,8 +221,8 @@ def get_parallel_threads(cloud_str: Optional[str] = None) -> int:
 
 
 def run_in_parallel(func: Callable,
-                    args: Union[List[Any], Set[Any]],
-                    num_threads: Optional[int] = None) -> List[Any]:
+                    args: list[Any] | set[Any],
+                    num_threads: int | None = None) -> list[Any]:
     """Run a function in parallel on a list of arguments.
 
     Args:
@@ -254,8 +254,8 @@ def run_in_parallel(func: Callable,
 
 def handle_returncode(returncode: int,
                       command: str,
-                      error_msg: Union[str, Callable[[], str]],
-                      stderr: Optional[str] = None,
+                      error_msg: str | Callable[[], str],
+                      stderr: str | None = None,
                       stream_logs: bool = True) -> None:
     """Handle the returncode of a command.
 
@@ -280,8 +280,7 @@ def handle_returncode(returncode: int,
                                           stderr)
 
 
-def kill_children_processes(parent_pids: Optional[Union[
-    int, List[Optional[int]]]] = None,
+def kill_children_processes(parent_pids: int | list[int | None] | None = None,
                             force: bool = False) -> None:
     """Kill children processes recursively.
 
@@ -326,8 +325,8 @@ def kill_children_processes(parent_pids: Optional[Union[
             kill_process_with_grace_period(child, force=force)
 
 
-GenericProcess = Union[multiprocessing.Process, psutil.Process,
-                       subprocess.Popen]
+GenericProcess: TypeAlias = (multiprocessing.Process | psutil.Process |
+                             subprocess.Popen)
 
 
 def _wait_non_child_process(proc: 'psutil.Process', grace_period: int) -> None:
@@ -407,8 +406,8 @@ def kill_process_with_grace_period(proc: GenericProcess,
 def run_with_retries(
         cmd: str,
         max_retry: int = 3,
-        retry_returncode: Optional[List[int]] = None,
-        retry_stderrs: Optional[List[str]] = None) -> Tuple[int, str, str]:
+        retry_returncode: list[int] | None = None,
+        retry_stderrs: list[str] | None = None) -> tuple[int, str, str]:
     """Run a command and retry if it fails due to the specified reasons.
 
     Args:
@@ -470,7 +469,7 @@ def kill_process_daemon(process_pid: int, use_kill_pg: bool = False) -> None:
     try:
         process = psutil.Process(process_pid)
     except psutil.NoSuchProcess:
-        initial_children: List[int] = []
+        initial_children: list[int] = []
     else:
         initial_children = [p.pid for p in _safe_children(process)]
 
@@ -536,8 +535,7 @@ def launch_new_process_tree(cmd: str, log_output: str = '/dev/null') -> int:
     wrapped_cmd = (f'nohup bash -c {shlex.quote(cmd)} '
                    f'</dev/null >{log_output} 2>&1 & echo $!')
     proc = subprocess.run(wrapped_cmd,
-                          stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE,
+                          capture_output=True,
                           stdin=subprocess.DEVNULL,
                           start_new_session=True,
                           check=True,
@@ -559,10 +557,10 @@ class Startable(Protocol):
 OnStartFn = Callable[[Startable], None]
 
 
-def slow_start_processes(processes: List[Startable],
+def slow_start_processes(processes: list[Startable],
                          delay: float = 2.0,
-                         on_start: Optional[OnStartFn] = None,
-                         should_exit: Optional[threading.Event] = None) -> None:
+                         on_start: OnStartFn | None = None,
+                         should_exit: threading.Event | None = None) -> None:
     """Start processes with slow start.
 
     Profile shows that it takes 1~2 seconds to start a worker process when

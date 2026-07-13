@@ -44,7 +44,7 @@ class RecipeType(enum.Enum):
                          f'Must be one of: {", ".join(valid_types)}')
 
 
-def recipe_type_to_str(recipe_type: Union[RecipeType, str]) -> str:
+def recipe_type_to_str(recipe_type: RecipeType | str) -> str:
     """Get the string value of a recipe type.
 
     Works for both built-in ``RecipeType`` enum members and raw strings

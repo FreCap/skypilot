@@ -9,6 +9,7 @@ Set SKYPILOT_KUBECONFIG_REFRESH_INTERVAL_SECONDS (seconds) to refresh the
 client proactively at a fixed interval so it is rebuilt from the updated
 kubeconfig (e.g. for short-lived certs).
 """
+from collections.abc import Callable
 import functools
 import logging
 import os
@@ -16,7 +17,7 @@ import platform
 import threading
 import time
 import typing
-from typing import Any, Callable, List, Optional, Set
+from typing import Any
 
 from sky import sky_logging
 from sky.adaptors import common
@@ -67,7 +68,7 @@ def _decorate_methods(obj: Any, decorator: Callable, decoration_type: str):
         # Skip methods starting with '__' since they are invoked through one
         # of the main methods, which are already decorated.
         if callable(attr) and not attr_name.startswith('__'):
-            decorated_types: Set[str] = getattr(attr, '_sky_decorator_types',
+            decorated_types: set[str] = getattr(attr, '_sky_decorator_types',
                                                 set())
             if decoration_type not in decorated_types:
                 decorated_attr = decorator(attr)
@@ -105,7 +106,7 @@ def _get_config_file() -> str:
     return os.environ.get('KUBECONFIG', DEFAULT_KUBECONFIG_PATH)
 
 
-def _get_api_client(context: Optional[str] = None) -> Any:
+def _get_api_client(context: str | None = None) -> Any:
     """Get an ApiClient for the given context without modifying global config.
 
     This is fully thread-safe because it creates isolated Configuration
@@ -124,7 +125,7 @@ def _get_api_client(context: Optional[str] = None) -> Any:
     """
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-    def _get_api_client_from_kubeconfig(context: Optional[str] = None) -> Any:
+    def _get_api_client_from_kubeconfig(context: str | None = None) -> Any:
         """Load kubeconfig, return ApiClient without modifying global state."""
         try:
             # new_client_from_config returns an ApiClient configured for the
@@ -209,7 +210,7 @@ def list_kube_config_contexts():
     return kubernetes.config.list_kube_config_contexts(_get_config_file())
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _get_kubeconfig_refresh_interval_seconds() -> float:
     """Parse refresh interval from env; 0 means disabled.
 
@@ -328,21 +329,21 @@ def _retryable_kubernetes_client(getter: Callable) -> Callable:
 @_api_logging_decorator('urllib3', logging.ERROR)
 @annotations.lru_cache(scope='request')
 @_retryable_kubernetes_client
-def core_api(context: Optional[str] = None):
+def core_api(context: str | None = None):
     return kubernetes.client.CoreV1Api(api_client=_get_api_client(context))
 
 
 @_api_logging_decorator('urllib3', logging.ERROR)
 @annotations.lru_cache(scope='request')
 @_retryable_kubernetes_client
-def storage_api(context: Optional[str] = None):
+def storage_api(context: str | None = None):
     return kubernetes.client.StorageV1Api(api_client=_get_api_client(context))
 
 
 @_api_logging_decorator('urllib3', logging.ERROR)
 @annotations.lru_cache(scope='request')
 @_retryable_kubernetes_client
-def auth_api(context: Optional[str] = None):
+def auth_api(context: str | None = None):
     return kubernetes.client.RbacAuthorizationV1Api(
         api_client=_get_api_client(context))
 
@@ -350,7 +351,7 @@ def auth_api(context: Optional[str] = None):
 @_api_logging_decorator('urllib3', logging.ERROR)
 @annotations.lru_cache(scope='request')
 @_retryable_kubernetes_client
-def authz_api(context: Optional[str] = None):
+def authz_api(context: str | None = None):
     # AuthorizationV1Api exposes SelfSubjectAccessReview, unlike auth_api()
     # (RbacAuthorizationV1Api). Used for startup RBAC preflight checks.
     return kubernetes.client.AuthorizationV1Api(
@@ -360,7 +361,7 @@ def authz_api(context: Optional[str] = None):
 @_api_logging_decorator('urllib3', logging.ERROR)
 @annotations.lru_cache(scope='request')
 @_retryable_kubernetes_client
-def networking_api(context: Optional[str] = None):
+def networking_api(context: str | None = None):
     return kubernetes.client.NetworkingV1Api(
         api_client=_get_api_client(context))
 
@@ -368,7 +369,7 @@ def networking_api(context: Optional[str] = None):
 @_api_logging_decorator('urllib3', logging.ERROR)
 @annotations.lru_cache(scope='request')
 @_retryable_kubernetes_client
-def custom_objects_api(context: Optional[str] = None):
+def custom_objects_api(context: str | None = None):
     return kubernetes.client.CustomObjectsApi(
         api_client=_get_api_client(context))
 
@@ -376,35 +377,35 @@ def custom_objects_api(context: Optional[str] = None):
 @_api_logging_decorator('urllib3', logging.ERROR)
 @annotations.lru_cache(scope='request')
 @_retryable_kubernetes_client
-def node_api(context: Optional[str] = None):
+def node_api(context: str | None = None):
     return kubernetes.client.NodeV1Api(api_client=_get_api_client(context))
 
 
 @_api_logging_decorator('urllib3', logging.ERROR)
 @annotations.lru_cache(scope='request')
 @_retryable_kubernetes_client
-def apps_api(context: Optional[str] = None):
+def apps_api(context: str | None = None):
     return kubernetes.client.AppsV1Api(api_client=_get_api_client(context))
 
 
 @_api_logging_decorator('urllib3', logging.ERROR)
 @annotations.lru_cache(scope='request')
 @_retryable_kubernetes_client
-def batch_api(context: Optional[str] = None):
+def batch_api(context: str | None = None):
     return kubernetes.client.BatchV1Api(api_client=_get_api_client(context))
 
 
 @_api_logging_decorator('urllib3', logging.ERROR)
 @annotations.lru_cache(scope='request')
 @_retryable_kubernetes_client
-def api_client(context: Optional[str] = None):
+def api_client(context: str | None = None):
     return _get_api_client(context)
 
 
 @_api_logging_decorator('urllib3', logging.ERROR)
 @annotations.lru_cache(scope='request')
 @_retryable_kubernetes_client
-def custom_resources_api(context: Optional[str] = None):
+def custom_resources_api(context: str | None = None):
     return kubernetes.client.CustomObjectsApi(
         api_client=_get_api_client(context))
 
@@ -412,7 +413,7 @@ def custom_resources_api(context: Optional[str] = None):
 @_api_logging_decorator('urllib3', logging.ERROR)
 @annotations.lru_cache(scope='request')
 @_retryable_kubernetes_client
-def watch(context: Optional[str] = None):
+def watch(context: str | None = None):
     w = kubernetes.watch.Watch()
     w._api_client = _get_api_client(context)  # pylint: disable=protected-access
     return w
@@ -444,7 +445,7 @@ def in_cluster_context_name() -> str:
             DEFAULT_IN_CLUSTER_REGION)
 
 
-def in_cluster_identity() -> List[str]:
+def in_cluster_identity() -> list[str]:
     """Returns the cluster owner identity for contexts launched with
     in-cluster authentication."""
     return [f'{IN_CLUSTER_IDENTITY_PREFIX}-{in_cluster_context_name()}']

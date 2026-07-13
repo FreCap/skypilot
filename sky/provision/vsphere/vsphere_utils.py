@@ -3,7 +3,7 @@
 import http.cookies as http_cookies
 import os
 import ssl
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from sky import exceptions
 from sky import sky_logging
@@ -47,7 +47,7 @@ class VsphereClient:
         server: str,
         username: str,
         password: str,
-        clusters: List[Dict[str, str]],
+        clusters: list[dict[str, str]],
         skip_verification: bool,
     ) -> None:
         self.__server = server
@@ -69,7 +69,7 @@ class VsphereClient:
         if self.servicemanager:
             self.servicemanager.disconnect()
 
-    def remove_instances(self, *instance_ids: str) -> Dict[str, Any]:  # pylint: disable=unused-argument
+    def remove_instances(self, *instance_ids: str) -> dict[str, Any]:  # pylint: disable=unused-argument
         """Terminate instances."""
         ### TODO: Add implementation
         # pass
@@ -81,13 +81,13 @@ class VsphereClient:
 
     def filter_instances(
         self,
-        instance_uuids: Optional[List[str]] = None,
-        filters: Optional[List[Dict[str, str]]] = None,
-        vsphere_cluster_names: Optional[List[str]] = None,
+        instance_uuids: list[str] | None = None,
+        filters: list[dict[str, str]] | None = None,
+        vsphere_cluster_names: list[str] | None = None,
     ):
         """Filter the vm instances using custom attribute
         """
-        instances: List[Any] = []
+        instances: list[Any] = []
         service_manager = self.servicemanager
         # If no instance_ids passed in, then get all VMs in vsphere cluster;
         # Else get instances by instance_ids.
@@ -158,7 +158,7 @@ class VsphereClient:
                 raise exceptions.ResourcesUnavailableError(
                     f'Failed to find cluster {cluster}')
             cluster_obj = cluster_obj[cluster]
-            logger.info('Cluster Moref: {0}'.format(cluster_obj))
+            logger.info(f'Cluster Moref: {cluster_obj}')
 
             # Find the deployment target
             deployment_target = vsphere_adaptor.get_ovf_client(
@@ -168,8 +168,7 @@ class VsphereClient:
 
             ovf_summary = self.client.ovf_lib_item_service.filter(
                 ovf_library_item_id=lib_item_id, target=deployment_target)
-            logger.info('Found an OVF template :{0} to deploy.'.format(
-                ovf_summary.name))
+            logger.info(f'Found an OVF template :{ovf_summary.name} to deploy.')
 
             # Find out the storage profile id
             profile_id = self.get_skypilot_profile_id()
@@ -212,7 +211,7 @@ class VsphereClient:
         else:
             raise VsphereError('Failed to connect to vSphere.')
 
-    def set_tags(self, head_instance_uuid: str, tags: List[Dict[str, str]]):
+    def set_tags(self, head_instance_uuid: str, tags: list[dict[str, str]]):
         """Set tag for vm instance"""
         service_manager = self.servicemanager
         if service_manager:
@@ -320,7 +319,7 @@ def get_vsphere_credentials(name=None):
     credential_path = os.path.expanduser(CREDENTIALS_PATH)
     assert os.path.exists(
         credential_path), f'Missing credential file at {credential_path}.'
-    with open(credential_path, 'r', encoding='utf-8') as file:
+    with open(credential_path, encoding='utf-8') as file:
         credential = yaml_utils.safe_load(file)
         vcenters = credential['vcenters']
         if name is None:

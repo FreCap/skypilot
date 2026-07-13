@@ -21,16 +21,16 @@ Create Date: 2026-05-18
 
 """
 # pylint: disable=invalid-name
-from typing import Sequence, Union
+from collections.abc import Sequence
 
 from alembic import op
 import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = '020'
-down_revision: Union[str, Sequence[str], None] = '019'
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+down_revision: str | Sequence[str] | None = '019'
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 _INDEXES = (
     ('ix_job_info_pool', 'job_info', ['pool']),

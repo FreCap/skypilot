@@ -1,6 +1,6 @@
 """Prime Intellect instance provisioning."""
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
 from sky import exceptions
 from sky import sky_logging
@@ -27,7 +27,7 @@ SSH_CONN_RETRY_INTERVAL_SECONDS = 10
 
 
 def _filter_instances(cluster_name_on_cloud: str,
-                      status_filters: Optional[List[str]]) -> Dict[str, Any]:
+                      status_filters: list[str] | None) -> dict[str, Any]:
     client = utils.PrimeIntellectAPIClient()
     instances = client.list_instances()
     # TODO: verify names are we using it?
@@ -48,12 +48,12 @@ def _filter_instances(cluster_name_on_cloud: str,
     return filtered_instances
 
 
-def _get_instance_info(instance_id: str) -> Dict[str, Any]:
+def _get_instance_info(instance_id: str) -> dict[str, Any]:
     client = utils.PrimeIntellectAPIClient()
     return client.get_instance_details(instance_id)
 
 
-def _get_head_instance_id(instances: Dict[str, Any]) -> Optional[str]:
+def _get_head_instance_id(instances: dict[str, Any]) -> str | None:
     head_instance_id = None
     for inst_id, inst in instances.items():
         if inst['name'].endswith('-head'):
@@ -245,13 +245,13 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
 
 
 def wait_instances(region: str, cluster_name_on_cloud: str,
-                   state: Optional[status_lib.ClusterStatus]) -> None:
+                   state: status_lib.ClusterStatus | None) -> None:
     del region, cluster_name_on_cloud, state
 
 
 def stop_instances(
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     worker_only: bool = False,
 ) -> None:
     raise NotImplementedError()
@@ -259,7 +259,7 @@ def stop_instances(
 
 def terminate_instances(
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     worker_only: bool = False,
 ) -> None:
     """See sky/provision/__init__.py"""
@@ -360,10 +360,10 @@ def terminate_instances(
 def get_cluster_info(
         region: str,
         cluster_name_on_cloud: str,
-        provider_config: Optional[Dict[str, Any]] = None) -> common.ClusterInfo:
+        provider_config: dict[str, Any] | None = None) -> common.ClusterInfo:
     del region  # unused
     running_instances = _filter_instances(cluster_name_on_cloud, ['ACTIVE'])
-    instances: Dict[str, List[common.InstanceInfo]] = {}
+    instances: dict[str, list[common.InstanceInfo]] = {}
     head_instance_id = None
     head_ssh_user = None
     for instance_id, instance in running_instances.items():
@@ -423,10 +423,10 @@ def get_cluster_info(
 def query_instances(
     cluster_name: str,
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     non_terminated_only: bool = True,
     retry_if_missing: bool = False,
-) -> Dict[str, Tuple[Optional['status_lib.ClusterStatus'], Optional[str]]]:
+) -> dict[str, tuple[Optional['status_lib.ClusterStatus'], str | None]]:
     """See sky/provision/__init__.py"""
     del cluster_name, retry_if_missing  # unused
     assert provider_config is not None, (cluster_name_on_cloud, provider_config)
@@ -441,8 +441,7 @@ def query_instances(
         'DELETING': None,  # Being deleted - should be filtered out
         'TERMINATED': None,  # Already terminated - should be filtered out
     }
-    statuses: Dict[str, Tuple[Optional[status_lib.ClusterStatus],
-                              Optional[str]]] = {}
+    statuses: dict[str, tuple[status_lib.ClusterStatus | None, str | None]] = {}
     for inst_id, inst in instances.items():
         status = status_map[inst['status']]
         if non_terminated_only and status is None:
@@ -453,7 +452,7 @@ def query_instances(
 
 def cleanup_ports(
     cluster_name_on_cloud: str,
-    ports: List[str],
-    provider_config: Optional[Dict[str, Any]] = None,
+    ports: list[str],
+    provider_config: dict[str, Any] | None = None,
 ) -> None:
     del cluster_name_on_cloud, ports, provider_config  # Unused.

@@ -4,7 +4,7 @@ import json
 import os
 import time
 import typing
-from typing import Any, Dict, List
+from typing import Any
 import uuid
 
 from sky.adaptors import common as adaptors_common
@@ -25,7 +25,7 @@ FLUIDSTACK_API_KEY_PATH = '~/.fluidstack/api_key'
 
 
 def read_contents(path: str) -> str:
-    with open(path, mode='r', encoding='utf-8') as f:
+    with open(path, encoding='utf-8') as f:
         return f.read().strip()
 
 
@@ -66,7 +66,7 @@ class FluidstackClient:
         plans = response.json()
         return plans
 
-    def list_instances(self) -> List[Dict[str, Any]]:
+    def list_instances(self) -> list[dict[str, Any]]:
         response = requests.get(
             ENDPOINT + 'instances',
             headers={'api-key': self.api_key},
@@ -82,7 +82,7 @@ class FluidstackClient:
         region: str = '',
         ssh_pub_key: str = '',
         count: int = 1,
-    ) -> List[str]:
+    ) -> list[str]:
         """Launch new instances."""
 
         plans = self.get_plans()
@@ -125,7 +125,7 @@ class FluidstackClient:
         raise_fluidstack_error(response)
         return response.json()
 
-    def get_or_add_ssh_key(self, ssh_pub_key: str = '') -> Dict[str, str]:
+    def get_or_add_ssh_key(self, ssh_pub_key: str = '') -> dict[str, str]:
         """Add ssh key if not already added."""
         ssh_keys = self.list_ssh_keys()
         for key in ssh_keys:
@@ -145,7 +145,7 @@ class FluidstackClient:
     def list_regions(self):
         plans = self.get_plans()
 
-        def get_regions(plans: List) -> dict:
+        def get_regions(plans: list) -> dict:
             """Return a list of regions where the plan is available."""
             regions = {}
             for plan in plans:

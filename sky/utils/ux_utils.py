@@ -1,4 +1,6 @@
 """Utility functions for UX."""
+from collections.abc import Callable
+from collections.abc import Iterable
 import contextlib
 import enum
 import fnmatch
@@ -6,7 +8,7 @@ import os
 import sys
 import traceback
 import typing
-from typing import Callable, Iterable, List, Optional, Union
+from typing import Union
 
 import colorama
 
@@ -150,7 +152,7 @@ def log_path_hint(log_path: Union[str, 'pathlib.Path'],
     return _LOG_PATH_HINT.format(log_path=log_path)
 
 
-def provision_hint(cluster_name: Optional[str]) -> Optional[str]:
+def provision_hint(cluster_name: str | None) -> str | None:
     if not cluster_name:
         return None
     return _PROVISION_LOG_HINT.format(cluster_name=cluster_name)
@@ -165,10 +167,10 @@ def starting_message(message: str) -> str:
 
 
 def finishing_message(message: str,
-                      log_path: Optional[Union[str, 'pathlib.Path']] = None,
+                      log_path: Union[str, 'pathlib.Path'] | None = None,
                       is_local: bool = False,
-                      follow_up_message: Optional[str] = None,
-                      cluster_name: Optional[str] = None) -> str:
+                      follow_up_message: str | None = None,
+                      cluster_name: str | None = None) -> str:
     """Gets the finishing message for the given message.
 
     Args:
@@ -196,9 +198,9 @@ def finishing_message(message: str,
 
 
 def error_message(message: str,
-                  log_path: Optional[Union[str, 'pathlib.Path']] = None,
+                  log_path: Union[str, 'pathlib.Path'] | None = None,
                   is_local: bool = False,
-                  cluster_name: Optional[str] = None) -> str:
+                  cluster_name: str | None = None) -> str:
     """Gets the error message for the given message."""
     # We have to reset the color before the message, because sometimes if a
     # previous spinner with dimmed color overflows in a narrow terminal, the
@@ -224,9 +226,9 @@ def retry_message(message: str) -> str:
 
 
 def spinner_message(message: str,
-                    log_path: Optional[Union[str, 'pathlib.Path']] = None,
+                    log_path: Union[str, 'pathlib.Path'] | None = None,
                     is_local: bool = False,
-                    cluster_name: Optional[str] = None) -> str:
+                    cluster_name: str | None = None) -> str:
     """Gets the spinner message for the given message and log path.
 
     If cluster_name is provided, recommend `sky logs --provision <cluster>`.
@@ -247,9 +249,9 @@ class CommandHintType(enum.Enum):
 
 
 def command_hint_messages(hint_type: CommandHintType,
-                          job_id: Optional[str] = None,
-                          cluster_name: Optional[str] = None,
-                          dashboard_url: Optional[str] = None) -> str:
+                          job_id: str | None = None,
+                          cluster_name: str | None = None,
+                          dashboard_url: str | None = None) -> str:
     """Gets the command hint messages for the given job id."""
     dashboard_hint = ''
     if dashboard_url is not None:
@@ -311,7 +313,7 @@ def is_glob_pattern(pattern: str) -> bool:
 
 
 def get_non_matched_query(query_clusters: Iterable[str],
-                          cluster_names: Iterable[str]) -> List[str]:
+                          cluster_names: Iterable[str]) -> list[str]:
     """Gets the non-matched query clusters."""
     glob_query_clusters = []
     non_glob_query_clusters = []

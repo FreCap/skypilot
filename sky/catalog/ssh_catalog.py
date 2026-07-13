@@ -4,7 +4,6 @@ This catalog inherits from the Kubernetes catalog as SSH cloud is a wrapper
 around Kubernetes that uses SSH-specific contexts.
 """
 import typing
-from typing import Dict, List, Optional, Tuple
 
 from sky import sky_logging
 from sky.catalog import CloudFilter
@@ -28,7 +27,7 @@ _image_df = common.read_catalog('kubernetes/images.csv',
                                 pull_frequency_hours=_PULL_FREQUENCY_HOURS)
 
 
-def get_image_id_from_tag(tag: str, region: Optional[str]) -> Optional[str]:
+def get_image_id_from_tag(tag: str, region: str | None) -> str | None:
     """Returns the image id from the tag.
 
     Delegates to Kubernetes catalog implementation.
@@ -36,7 +35,7 @@ def get_image_id_from_tag(tag: str, region: Optional[str]) -> Optional[str]:
     return kubernetes_catalog.get_image_id_from_tag(tag, region)
 
 
-def is_image_tag_valid(tag: str, region: Optional[str]) -> bool:
+def is_image_tag_valid(tag: str, region: str | None) -> bool:
     """Returns whether the image tag is valid.
 
     Delegates to Kubernetes catalog implementation.
@@ -46,12 +45,12 @@ def is_image_tag_valid(tag: str, region: Optional[str]) -> bool:
 
 def list_accelerators(
         gpus_only: bool,
-        name_filter: Optional[str],
-        region_filter: Optional[str],
-        quantity_filter: Optional[int],
+        name_filter: str | None,
+        region_filter: str | None,
+        quantity_filter: int | None,
         case_sensitive: bool = True,
         all_regions: bool = False,
-        require_price: bool = True) -> Dict[str, List[common.InstanceTypeInfo]]:
+        require_price: bool = True) -> dict[str, list[common.InstanceTypeInfo]]:
     """List accelerators in SSH-based Kubernetes clusters.
 
     Delegates to the Kubernetes _list_accelerators function but restricts to
@@ -69,13 +68,13 @@ def list_accelerators(
 
 def list_accelerators_realtime(
     gpus_only: bool,
-    name_filter: Optional[str],
-    region_filter: Optional[str],
-    quantity_filter: Optional[int],
+    name_filter: str | None,
+    region_filter: str | None,
+    quantity_filter: int | None,
     case_sensitive: bool = True,
     all_regions: bool = False,
     require_price: bool = True
-) -> Tuple[Dict[str, List[common.InstanceTypeInfo]], Dict[str, int], Dict[str,
+) -> tuple[dict[str, list[common.InstanceTypeInfo]], dict[str, int], dict[str,
                                                                           int]]:
     """List accelerators in SSH Node Pools with real-time information.
 
@@ -94,14 +93,14 @@ def list_accelerators_realtime(
 
 def _list_accelerators(
     gpus_only: bool,
-    name_filter: Optional[str],
-    region_filter: Optional[str],
-    quantity_filter: Optional[int],
+    name_filter: str | None,
+    region_filter: str | None,
+    quantity_filter: int | None,
     case_sensitive: bool = True,
     all_regions: bool = False,
     require_price: bool = True,
     realtime: bool = False
-) -> Tuple[Dict[str, List[common.InstanceTypeInfo]], Dict[str, int], Dict[str,
+) -> tuple[dict[str, list[common.InstanceTypeInfo]], dict[str, int], dict[str,
                                                                           int]]:
     """List accelerators in SSH-based Kubernetes clusters.
 
@@ -145,9 +144,9 @@ def _list_accelerators(
 
 
 def validate_region_zone(
-        region_name: Optional[str],
-        zone_name: Optional[str],
-        clouds: CloudFilter = None) -> Tuple[Optional[str], Optional[str]]:
+        region_name: str | None,
+        zone_name: str | None,
+        clouds: CloudFilter = None) -> tuple[str | None, str | None]:
     """Validates the region and zone for SSH cloud.
 
     Delegates to the Kubernetes catalog implementation but ensures

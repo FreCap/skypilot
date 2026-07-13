@@ -10,6 +10,7 @@ Usage example:
     statuses = sky.get(request_id)
 
 """
+from collections.abc import Iterator
 from http import cookiejar
 import json
 import logging
@@ -18,8 +19,7 @@ import platform
 import subprocess
 import sys
 import typing
-from typing import (Any, Dict, Iterator, List, Literal, Optional, Tuple,
-                    TypeVar, Union)
+from typing import Any, Literal, Optional, TypeVar, Union
 from urllib import parse as urlparse
 
 import click
@@ -135,16 +135,16 @@ def stream_response(request_id: server_common.RequestId[T],
                     output_stream: Optional['io.TextIOBase'] = None,
                     resumable: bool = False,
                     get_result: bool = True,
-                    relay_rich_status: bool = False) -> Optional[T]:
+                    relay_rich_status: bool = False) -> T | None:
     ...
 
 
-def stream_response(request_id: Optional[server_common.RequestId[T]],
+def stream_response(request_id: server_common.RequestId[T] | None,
                     response: 'requests.Response',
                     output_stream: Optional['io.TextIOBase'] = None,
                     resumable: bool = False,
                     get_result: bool = True,
-                    relay_rich_status: bool = False) -> Optional[T]:
+                    relay_rich_status: bool = False) -> T | None:
     """Streams the response to the console.
 
     Args:
@@ -220,10 +220,10 @@ def stream_response(request_id: Optional[server_common.RequestId[T]],
 @server_common.check_server_healthy_or_start
 @annotations.client_api
 def check(
-    infra_list: Optional[Tuple[str, ...]],
+    infra_list: tuple[str, ...] | None,
     verbose: bool,
-    workspace: Optional[str] = None
-) -> server_common.RequestId[Dict[str, Dict[str, List[str]]]]:
+    workspace: str | None = None
+) -> server_common.RequestId[dict[str, dict[str, list[str]]]]:
     """Checks the credentials to enable clouds.
 
     Args:
@@ -266,8 +266,8 @@ def check(
 @usage_lib.entrypoint
 @server_common.check_server_healthy_or_start
 @annotations.client_api
-def enabled_clouds(workspace: Optional[str] = None,
-                   expand: bool = False) -> server_common.RequestId[List[str]]:
+def enabled_clouds(workspace: str | None = None,
+                   expand: bool = False) -> server_common.RequestId[list[str]]:
     """Gets the enabled clouds.
 
     Args:
@@ -304,15 +304,15 @@ def enabled_clouds(workspace: Optional[str] = None,
 @annotations.client_api
 def list_accelerators(
     gpus_only: bool = True,
-    name_filter: Optional[str] = None,
-    region_filter: Optional[str] = None,
-    quantity_filter: Optional[int] = None,
-    clouds: Optional[Union[List[str], str]] = None,
+    name_filter: str | None = None,
+    region_filter: str | None = None,
+    quantity_filter: int | None = None,
+    clouds: list[str] | str | None = None,
     all_regions: bool = False,
     require_price: bool = True,
     case_sensitive: bool = True
-) -> server_common.RequestId[Dict[str,
-                                  List['catalog.common.InstanceTypeInfo']]]:
+) -> server_common.RequestId[dict[str,
+                                  list['catalog.common.InstanceTypeInfo']]]:
     """Lists the names of all accelerators offered by Sky.
 
     This will include all accelerators offered by Sky, including those
@@ -356,11 +356,11 @@ def list_accelerators(
 @annotations.client_api
 def list_accelerator_counts(
     gpus_only: bool = True,
-    name_filter: Optional[str] = None,
-    region_filter: Optional[str] = None,
-    quantity_filter: Optional[int] = None,
-    clouds: Optional[Union[List[str], str]] = None
-) -> server_common.RequestId[Dict[str, List[float]]]:
+    name_filter: str | None = None,
+    region_filter: str | None = None,
+    quantity_filter: int | None = None,
+    clouds: list[str] | str | None = None
+) -> server_common.RequestId[dict[str, list[float]]]:
     """Lists all accelerators offered by Sky and available counts.
 
     Args:
@@ -397,10 +397,10 @@ def list_accelerator_counts(
 @versions.minimal_api_version(34)
 @annotations.client_api
 def kubernetes_label_gpus(
-    context: Optional[str] = None,
+    context: str | None = None,
     cleanup_only: bool = False,
     wait_for_completion: bool = True,
-) -> server_common.RequestId[Dict[str, Any]]:
+) -> server_common.RequestId[dict[str, Any]]:
     """Labels GPU nodes in a Kubernetes cluster for use with SkyPilot.
 
     Note: Currently only supports NVIDIA GPUs. AMD GPUs must be labeled
@@ -432,7 +432,7 @@ def kubernetes_label_gpus(
 def optimize(
     dag: 'sky.Dag',
     minimize: common.OptimizeTarget = common.OptimizeTarget.COST,
-    admin_policy_request_options: Optional[admin_policy.RequestOptions] = None
+    admin_policy_request_options: admin_policy.RequestOptions | None = None
 ) -> server_common.RequestId['sky.Dag']:
     """Finds the best execution plan for the given DAG.
 
@@ -464,7 +464,7 @@ def optimize(
     return server_common.get_request_id(response)
 
 
-def workspaces() -> server_common.RequestId[Dict[str, Any]]:
+def workspaces() -> server_common.RequestId[dict[str, Any]]:
     """Gets the workspaces."""
     response = server_common.make_authenticated_request('GET', '/workspaces')
     return server_common.get_request_id(response)
@@ -475,7 +475,7 @@ def workspaces() -> server_common.RequestId[Dict[str, Any]]:
 @versions.minimal_api_version(
     server_constants.MIN_PREFERRED_WORKSPACE_API_VERSION)
 @annotations.client_api
-def set_preferred_workspace(preferred: Optional[str]) -> Dict[str, Any]:
+def set_preferred_workspace(preferred: str | None) -> dict[str, Any]:
     """Sets (or clears with None) the user's preferred workspace.
 
     Args:
@@ -499,7 +499,7 @@ def set_preferred_workspace(preferred: Optional[str]) -> Dict[str, Any]:
 @versions.minimal_api_version(
     server_constants.MIN_PREFERRED_WORKSPACE_API_VERSION)
 @annotations.client_api
-def get_user_workspace(requested: Optional[str] = None) -> Dict[str, Any]:
+def get_user_workspace(requested: str | None = None) -> dict[str, Any]:
     """Returns workspace state for the calling user.
 
     Mirrors the launch-path precedence — if the caller has an explicit
@@ -565,7 +565,7 @@ def _raise_exception_object_on_client(e: BaseException) -> None:
 def validate(
     dag: 'sky.Dag',
     workdir_only: bool = False,
-    admin_policy_request_options: Optional[admin_policy.RequestOptions] = None
+    admin_policy_request_options: admin_policy.RequestOptions | None = None
 ) -> None:
     """Validates the tasks.
 
@@ -652,7 +652,7 @@ def validate(
 @usage_lib.entrypoint
 @server_common.check_server_healthy_or_start
 @annotations.client_api
-def dashboard(starting_page: Optional[str] = None) -> None:
+def dashboard(starting_page: str | None = None) -> None:
     """Starts the dashboard for SkyPilot."""
     api_server_url = server_common.get_server_url()
     url = server_common.get_dashboard_url(api_server_url,
@@ -667,16 +667,16 @@ def dashboard(starting_page: Optional[str] = None) -> None:
 @sky_context.contextual
 def launch(
     task: Union['sky.Task', 'sky.Dag'],
-    cluster_name: Optional[str] = None,
+    cluster_name: str | None = None,
     retry_until_up: bool = False,
-    idle_minutes_to_autostop: Optional[int] = None,
-    wait_for: Optional[autostop_lib.AutostopWaitFor] = None,
+    idle_minutes_to_autostop: int | None = None,
+    wait_for: autostop_lib.AutostopWaitFor | None = None,
     dryrun: bool = False,
     down: bool = False,  # pylint: disable=redefined-outer-name
     backend: Optional['backends.Backend'] = None,
     optimize_target: common.OptimizeTarget = common.OptimizeTarget.COST,
     no_setup: bool = False,
-    clone_disk_from: Optional[str] = None,
+    clone_disk_from: str | None = None,
     fast: bool = False,
     # Internal only:
     # pylint: disable=invalid-name
@@ -684,10 +684,10 @@ def launch(
     _is_launched_by_jobs_controller: bool = False,
     _is_launched_by_sky_serve_controller: bool = False,
     _disable_controller_check: bool = False,
-    _file_mounts_blob_id: Optional[str] = None,
-    _extra_launch_context: Optional[Dict[str, Any]] = None,
+    _file_mounts_blob_id: str | None = None,
+    _extra_launch_context: dict[str, Any] | None = None,
     _include_credentials: bool = False,
-) -> server_common.RequestId[Tuple[Optional[int],
+) -> server_common.RequestId[tuple[int | None,
                                    Optional['backends.ResourceHandle']]]:
     """Launches a cluster or task.
 
@@ -862,13 +862,13 @@ def _launch(
     cluster_name: str,
     request_options: admin_policy.RequestOptions,
     retry_until_up: bool = False,
-    idle_minutes_to_autostop: Optional[int] = None,
+    idle_minutes_to_autostop: int | None = None,
     dryrun: bool = False,
     down: bool = False,  # pylint: disable=redefined-outer-name
     backend: Optional['backends.Backend'] = None,
     optimize_target: common.OptimizeTarget = common.OptimizeTarget.COST,
     no_setup: bool = False,
-    clone_disk_from: Optional[str] = None,
+    clone_disk_from: str | None = None,
     fast: bool = False,
     # Internal only:
     # pylint: disable=invalid-name
@@ -876,10 +876,10 @@ def _launch(
     _is_launched_by_jobs_controller: bool = False,
     _is_launched_by_sky_serve_controller: bool = False,
     _disable_controller_check: bool = False,
-    _file_mounts_blob_id: Optional[str] = None,
-    _extra_launch_context: Optional[Dict[str, Any]] = None,
+    _file_mounts_blob_id: str | None = None,
+    _extra_launch_context: dict[str, Any] | None = None,
     _include_credentials: bool = False,
-) -> server_common.RequestId[Tuple[Optional[int],
+) -> server_common.RequestId[tuple[int | None,
                                    Optional['backends.ResourceHandle']]]:
     """Auxiliary function for launch(), refer to launch() for details."""
 
@@ -944,7 +944,7 @@ def _launch(
         click.secho('Running on cluster: ', fg='cyan', nl=False)
         click.secho(cluster_name)
 
-    file_mounts_blob_id: Optional[str] = None
+    file_mounts_blob_id: str | None = None
     if _file_mounts_blob_id is not None:
         # Caller (e.g. job controller) has a blob for this dag's file mounts,
         # skip the re-upload.
@@ -963,8 +963,8 @@ def _launch(
     include_credentials = _include_credentials
     if include_credentials:
         remote_api_version = versions.get_remote_api_version()
-        if (remote_api_version is None or remote_api_version <
-                server_constants.MIN_LAUNCH_CREDENTIALS_API_VERSION):
+        if (remote_api_version is None or remote_api_version
+                < server_constants.MIN_LAUNCH_CREDENTIALS_API_VERSION):
             include_credentials = False
 
     body = payloads.LaunchBody(
@@ -997,11 +997,11 @@ def _launch(
 @annotations.client_api
 def exec(  # pylint: disable=redefined-builtin
     task: Union['sky.Task', 'sky.Dag'],
-    cluster_name: Optional[str] = None,
+    cluster_name: str | None = None,
     dryrun: bool = False,
     down: bool = False,  # pylint: disable=redefined-outer-name
     backend: Optional['backends.Backend'] = None,
-) -> server_common.RequestId[Tuple[Optional[int],
+) -> server_common.RequestId[tuple[int | None,
                                    Optional['backends.ResourceHandle']]]:
     """Executes a task on an existing cluster.
 
@@ -1078,7 +1078,7 @@ def exec(  # pylint: disable=redefined-builtin
 @typing.overload
 def tail_logs(
         cluster_name: str,
-        job_id: Optional[int],
+        job_id: int | None,
         follow: bool,
         tail: int = 0,
         output_stream: Optional['io.TextIOBase'] = None,
@@ -1089,12 +1089,12 @@ def tail_logs(
 
 @typing.overload
 def tail_logs(cluster_name: str,
-              job_id: Optional[int],
+              job_id: int | None,
               follow: bool,
               tail: int = 0,
               output_stream: None = None,
               *,
-              preload_content: Literal[False]) -> Iterator[Optional[str]]:
+              preload_content: Literal[False]) -> Iterator[str | None]:
     ...
 
 
@@ -1106,13 +1106,13 @@ def tail_logs(cluster_name: str,
 @rest.retry_transient_errors()
 def tail_logs(
     cluster_name: str,
-    job_id: Optional[int],
+    job_id: int | None,
     follow: bool,
     tail: int = 0,
     output_stream: Optional['io.TextIOBase'] = None,
     *,  # keyword only separator
     preload_content: bool = True
-) -> Union[int, Iterator[Optional[str]]]:
+) -> int | Iterator[str | None]:
     """Tails the logs of a job.
 
     Args:
@@ -1185,7 +1185,7 @@ def tail_logs(
 @annotations.client_api
 @rest.retry_transient_errors()
 def tail_provision_logs(cluster_name: str,
-                        worker: Optional[int] = None,
+                        worker: int | None = None,
                         follow: bool = True,
                         tail: int = 0,
                         output_stream: Optional['io.TextIOBase'] = None) -> int:
@@ -1260,7 +1260,7 @@ def tail_provision_logs(cluster_name: str,
 @versions.minimal_api_version(52)
 @annotations.client_api
 def tail_hook_logs(cluster_name: str,
-                   event: Optional[str] = None,
+                   event: str | None = None,
                    follow: bool = True,
                    tail: int = 0) -> int:
     """Tails a per-event lifecycle-hook log on the cluster.
@@ -1309,7 +1309,7 @@ def tail_autostop_logs(cluster_name: str,
 @server_common.check_server_healthy_or_start
 @annotations.client_api
 def download_logs(cluster_name: str,
-                  job_ids: Optional[List[str]]) -> Dict[str, str]:
+                  job_ids: list[str] | None) -> dict[str, str]:
     """Downloads the logs of jobs.
 
     Args:
@@ -1338,7 +1338,7 @@ def download_logs(cluster_name: str,
     )
     response = server_common.make_authenticated_request(
         'POST', '/download_logs', json=json.loads(body.model_dump_json()))
-    request_id: server_common.RequestId[Dict[
+    request_id: server_common.RequestId[dict[
         str, str]] = server_common.get_request_id(response)
     job_id_remote_path_dict = stream_and_get(request_id)
     remote2local_path_dict = client_common.download_logs_from_api_server(
@@ -1354,8 +1354,8 @@ def download_logs(cluster_name: str,
 @annotations.client_api
 def start(
     cluster_name: str,
-    idle_minutes_to_autostop: Optional[int] = None,
-    wait_for: Optional[autostop_lib.AutostopWaitFor] = None,
+    idle_minutes_to_autostop: int | None = None,
+    wait_for: autostop_lib.AutostopWaitFor | None = None,
     retry_until_up: bool = False,
     down: bool = False,  # pylint: disable=redefined-outer-name
     force: bool = False,
@@ -1445,7 +1445,7 @@ def down(
     cluster_name: str,
     purge: bool = False,
     graceful: bool = False,
-    graceful_timeout: Optional[int] = None,
+    graceful_timeout: int | None = None,
 ) -> server_common.RequestId[None]:
     """Tears down a cluster.
 
@@ -1502,7 +1502,7 @@ def stop(
     cluster_name: str,
     purge: bool = False,
     graceful: bool = False,
-    graceful_timeout: Optional[int] = None,
+    graceful_timeout: int | None = None,
 ) -> server_common.RequestId[None]:
     """Stops a cluster.
 
@@ -1557,10 +1557,10 @@ def stop(
 def autostop(
     cluster_name: str,
     idle_minutes: int,
-    wait_for: Optional[autostop_lib.AutostopWaitFor] = None,
+    wait_for: autostop_lib.AutostopWaitFor | None = None,
     down: bool = False,  # pylint: disable=redefined-outer-name
-    hook: Optional[str] = None,
-    hook_timeout: Optional[int] = None,
+    hook: str | None = None,
+    hook_timeout: int | None = None,
 ) -> server_common.RequestId[None]:
     """Schedules an autostop/autodown for a cluster.
 
@@ -1661,7 +1661,7 @@ def queue(
     cluster_name: str,
     skip_finished: bool = False,
     all_users: bool = False
-) -> server_common.RequestId[List[responses.ClusterJobRecord]]:
+) -> server_common.RequestId[list[responses.ClusterJobRecord]]:
     """Gets the job queue of a cluster.
 
     Args:
@@ -1720,9 +1720,8 @@ def queue(
 @annotations.client_api
 def job_status(
     cluster_name: str,
-    job_ids: Optional[List[int]] = None
-) -> server_common.RequestId[Dict[Optional[int],
-                                  Optional['job_lib.JobStatus']]]:
+    job_ids: list[int] | None = None
+) -> server_common.RequestId[dict[int | None, Optional['job_lib.JobStatus']]]:
     """Gets the status of jobs on a cluster.
 
     Args:
@@ -1766,7 +1765,7 @@ def cancel(
     cluster_name: str,
     all: bool = False,  # pylint: disable=redefined-builtin
     all_users: bool = False,
-    job_ids: Optional[List[int]] = None,
+    job_ids: list[int] | None = None,
     # pylint: disable=invalid-name
     _try_cancel_if_cluster_is_init: bool = False
 ) -> server_common.RequestId[None]:
@@ -1816,13 +1815,13 @@ def cancel(
 @server_common.check_server_healthy_or_start
 @annotations.client_api
 def status(
-    cluster_names: Optional[List[str]] = None,
+    cluster_names: list[str] | None = None,
     refresh: common.StatusRefreshMode = common.StatusRefreshMode.NONE,
     all_users: bool = False,
     *,
     _include_credentials: bool = False,
     _summary_response: bool = False,
-) -> server_common.RequestId[List[responses.StatusResponse]]:
+) -> server_common.RequestId[list[responses.StatusResponse]]:
     """Gets cluster statuses.
 
     If cluster_names is given, return those clusters. Otherwise, return all
@@ -1918,9 +1917,9 @@ def status(
 @server_common.check_server_healthy_or_start
 @annotations.client_api
 def endpoints(
-    cluster: str,
-    port: Optional[Union[int, str]] = None
-) -> server_common.RequestId[Dict[int, str]]:
+        cluster: str,
+        port: int | str | None = None
+) -> server_common.RequestId[dict[int, str]]:
     """Gets the endpoint for a given cluster and port number (endpoint).
 
     Example:
@@ -1962,8 +1961,8 @@ def endpoints(
 @server_common.check_server_healthy_or_start
 @annotations.client_api
 def cost_report(
-    days: Optional[int] = None
-) -> server_common.RequestId[List[Dict[str, Any]]]:  # pylint: disable=redefined-builtin
+    days: int | None = None
+) -> server_common.RequestId[list[dict[str, Any]]]:  # pylint: disable=redefined-builtin
     """Gets all cluster cost reports, including those that have been downed.
 
     The estimated cost column indicates price for the cluster based on the type
@@ -2008,7 +2007,7 @@ def cost_report(
 @usage_lib.entrypoint
 @server_common.check_server_healthy_or_start
 @annotations.client_api
-def storage_ls() -> server_common.RequestId[List[responses.StorageRecord]]:
+def storage_ls() -> server_common.RequestId[list[responses.StorageRecord]]:
     """Gets the storages.
 
     Returns:
@@ -2053,8 +2052,8 @@ def storage_delete(name: str) -> server_common.RequestId[None]:
 @server_common.check_server_healthy_or_start
 @annotations.client_api
 def local_up(gpus: bool,
-             name: Optional[str] = None,
-             port_start: Optional[int] = None) -> server_common.RequestId[None]:
+             name: str | None = None,
+             port_start: int | None = None) -> server_common.RequestId[None]:
     """Launches a Kubernetes cluster on local machines.
 
     Returns:
@@ -2077,7 +2076,7 @@ def local_up(gpus: bool,
 @usage_lib.entrypoint
 @server_common.check_server_healthy_or_start
 @annotations.client_api
-def local_down(name: Optional[str]) -> server_common.RequestId[None]:
+def local_down(name: str | None) -> server_common.RequestId[None]:
     """Tears down the Kubernetes cluster started by local_up."""
     # We do not allow local up when the API server is running remotely since it
     # will modify the kubeconfig.
@@ -2093,8 +2092,7 @@ def local_down(name: Optional[str]) -> server_common.RequestId[None]:
     return server_common.get_request_id(response)
 
 
-def _update_remote_ssh_node_pools(file: str,
-                                  infra: Optional[str] = None) -> None:
+def _update_remote_ssh_node_pools(file: str, infra: str | None = None) -> None:
     """Update the SSH node pools on the remote server.
 
     This function will also upload the local SSH key to the remote server, and
@@ -2154,8 +2152,8 @@ def _upload_ssh_key_and_wait(key_name: str, key_file_path: str) -> str:
 @usage_lib.entrypoint
 @server_common.check_server_healthy_or_start
 @annotations.client_api
-def ssh_up(infra: Optional[str] = None,
-           file: Optional[str] = None) -> server_common.RequestId[None]:
+def ssh_up(infra: str | None = None,
+           file: str | None = None) -> server_common.RequestId[None]:
     """Deploys the SSH Node Pools defined in ~/.sky/ssh_targets.yaml.
 
     Args:
@@ -2188,7 +2186,7 @@ def ssh_up(infra: Optional[str] = None,
 @usage_lib.entrypoint
 @server_common.check_server_healthy_or_start
 @annotations.client_api
-def ssh_down(infra: Optional[str] = None) -> server_common.RequestId[None]:
+def ssh_down(infra: str | None = None) -> server_common.RequestId[None]:
     """Tears down a Kubernetes cluster on SSH targets.
 
     Args:
@@ -2217,12 +2215,12 @@ def ssh_down(infra: Optional[str] = None) -> server_common.RequestId[None]:
 @server_common.check_server_healthy_or_start
 @annotations.client_api
 def realtime_kubernetes_gpu_availability(
-    context: Optional[str] = None,
-    name_filter: Optional[str] = None,
-    quantity_filter: Optional[int] = None,
-    is_ssh: Optional[bool] = None
-) -> server_common.RequestId[List[Tuple[
-        str, List['models.RealtimeGpuAvailability']]]]:
+    context: str | None = None,
+    name_filter: str | None = None,
+    quantity_filter: int | None = None,
+    is_ssh: bool | None = None
+) -> server_common.RequestId[list[tuple[
+        str, list['models.RealtimeGpuAvailability']]]]:
     """Gets the real-time Kubernetes GPU availability.
 
     Returns:
@@ -2245,7 +2243,7 @@ def realtime_kubernetes_gpu_availability(
 @server_common.check_server_healthy_or_start
 @annotations.client_api
 def kubernetes_node_info(
-    context: Optional[str] = None
+    context: str | None = None
 ) -> server_common.RequestId['models.KubernetesNodesInfo']:
     """Gets the resource information for all the nodes in the cluster.
 
@@ -2278,9 +2276,9 @@ def kubernetes_node_info(
 @server_common.check_server_healthy_or_start
 @annotations.client_api
 def status_kubernetes() -> server_common.RequestId[
-    Tuple[List['kubernetes_utils.KubernetesSkyPilotClusterInfoPayload'],
-          List['kubernetes_utils.KubernetesSkyPilotClusterInfoPayload'],
-          List[responses.ManagedJobRecord], Optional[str]]]:
+    tuple[list['kubernetes_utils.KubernetesSkyPilotClusterInfoPayload'],
+          list['kubernetes_utils.KubernetesSkyPilotClusterInfoPayload'],
+          list[responses.ManagedJobRecord], str | None]]:
     """[Experimental] Gets all SkyPilot clusters and jobs
     in the Kubernetes cluster.
 
@@ -2366,8 +2364,8 @@ def get(request_id: server_common.RequestId[T]) -> T:
 
 @typing.overload
 def stream_and_get(request_id: server_common.RequestId[T],
-                   log_path: Optional[str] = None,
-                   tail: Optional[int] = None,
+                   log_path: str | None = None,
+                   tail: int | None = None,
                    follow: bool = True,
                    output_stream: Optional['io.TextIOBase'] = None,
                    relay_rich_status: bool = False) -> T:
@@ -2376,8 +2374,8 @@ def stream_and_get(request_id: server_common.RequestId[T],
 
 @typing.overload
 def stream_and_get(request_id: None = None,
-                   log_path: Optional[str] = None,
-                   tail: Optional[int] = None,
+                   log_path: str | None = None,
+                   tail: int | None = None,
                    follow: bool = True,
                    output_stream: Optional['io.TextIOBase'] = None,
                    relay_rich_status: bool = False) -> None:
@@ -2389,13 +2387,13 @@ def stream_and_get(request_id: None = None,
 @annotations.client_api
 @rest.retry_transient_errors()
 def stream_and_get(
-    request_id: Optional[server_common.RequestId[T]] = None,
-    log_path: Optional[str] = None,
-    tail: Optional[int] = None,
+    request_id: server_common.RequestId[T] | None = None,
+    log_path: str | None = None,
+    tail: int | None = None,
     follow: bool = True,
     output_stream: Optional['io.TextIOBase'] = None,
     relay_rich_status: bool = False,
-) -> Optional[T]:
+) -> T | None:
     """Streams the logs of a request or a log file and gets the final result.
 
     This will block until the request is finished. The request id can be a
@@ -2448,8 +2446,8 @@ def stream_and_get(
         detail = response.json().get('detail')
         with ux_utils.print_exception_no_traceback():
             raise exceptions.ClientError(f'Failed to stream logs: {detail}')
-    stream_request_id: Optional[server_common.RequestId[
-        T]] = server_common.get_stream_request_id(response)
+    stream_request_id: server_common.RequestId[
+        T] | None = server_common.get_stream_request_id(response)
     if request_id is not None and stream_request_id is not None:
         assert request_id == stream_request_id
     if request_id is None:
@@ -2470,11 +2468,10 @@ def stream_and_get(
 
 @usage_lib.entrypoint
 @annotations.client_api
-def api_cancel(request_ids: Optional[Union[server_common.RequestId[T],
-                                           List[server_common.RequestId[T]],
-                                           str, List[str]]] = None,
+def api_cancel(request_ids: server_common.RequestId[T] |
+               list[server_common.RequestId[T]] | str | list[str] | None = None,
                all_users: bool = False,
-               silent: bool = False) -> server_common.RequestId[List[str]]:
+               silent: bool = False) -> server_common.RequestId[list[str]]:
     """Aborts a request or all requests.
 
     Args:
@@ -2537,13 +2534,13 @@ def _local_api_server_running(kill: bool = False) -> bool:
 @usage_lib.entrypoint
 @annotations.client_api
 def api_status(
-    request_ids: Optional[List[Union[server_common.RequestId[T], str]]] = None,
+    request_ids: list[server_common.RequestId[T] | str] | None = None,
     # pylint: disable=redefined-builtin
     all_status: bool = False,
-    limit: Optional[int] = None,
-    fields: Optional[List[str]] = None,
-    cluster_name: Optional[str] = None,
-) -> List[payloads.RequestPayload]:
+    limit: int | None = None,
+    fields: list[str] | None = None,
+    cluster_name: str | None = None,
+) -> list[payloads.RequestPayload]:
     """Lists all requests.
 
     Args:
@@ -2627,7 +2624,7 @@ def api_start(
     host: str = '127.0.0.1',
     foreground: bool = False,
     metrics: bool = False,
-    metrics_port: Optional[int] = None,
+    metrics_port: int | None = None,
     enable_basic_auth: bool = False,
 ) -> None:
     """Starts the API server.
@@ -2732,7 +2729,7 @@ def api_stop() -> None:
 # Use the same args as `docker logs`
 @usage_lib.entrypoint
 @annotations.client_api
-def api_server_logs(follow: bool = True, tail: Optional[int] = None) -> None:
+def api_server_logs(follow: bool = True, tail: int | None = None) -> None:
     """Streams the API server logs.
 
     Args:
@@ -2755,15 +2752,15 @@ def api_server_logs(follow: bool = True, tail: Optional[int] = None) -> None:
         stream_and_get(log_path=constants.API_SERVER_LOGS, tail=tail)
 
 
-def _save_config_updates(endpoint: Optional[str] = None,
-                         service_account_token: Optional[str] = None) -> None:
+def _save_config_updates(endpoint: str | None = None,
+                         service_account_token: str | None = None) -> None:
     """Save endpoint and/or service account token to config file."""
     config_path = pathlib.Path(
         skypilot_config.get_user_config_path()).expanduser()
     with filelock.FileLock(config_path.with_suffix('.lock')):
         if not config_path.exists():
             config_path.touch()
-            config: Dict[str, Any] = {}
+            config: dict[str, Any] = {}
         else:
             config = skypilot_config.get_user_config()
             config = dict(config)
@@ -2805,7 +2802,7 @@ def _clear_api_server_config() -> None:
         skypilot_config.reload_config()
 
 
-def _validate_endpoint(endpoint: Optional[str]) -> str:
+def _validate_endpoint(endpoint: str | None) -> str:
     """Validate and normalize the endpoint URL."""
     if endpoint is None:
         endpoint = click.prompt('Enter your SkyPilot API server endpoint')
@@ -2830,7 +2827,7 @@ def _check_endpoint_in_env_var(is_login: bool) -> None:
                                'clear the environment variable.')
 
 
-def _try_polling_auth(endpoint: str, no_browser: bool = False) -> Optional[str]:
+def _try_polling_auth(endpoint: str, no_browser: bool = False) -> str | None:
     """Try the polling-based authentication flow."""
     try:
         # Generate code verifier (random secret) and challenge (hash)
@@ -2893,17 +2890,17 @@ def _try_polling_auth(endpoint: str, no_browser: bool = False) -> Optional[str]:
 
 
 def _try_localhost_callback_auth(endpoint: str,
-                                 no_browser: bool = False) -> Optional[str]:
+                                 no_browser: bool = False) -> str | None:
     """Try the localhost callback authentication flow (legacy)."""
     if no_browser:
         # This flow requires the browser to redirect back to a localhost port
         # on this machine, so it cannot work without a local browser.
         logger.debug('Skipping localhost callback flow: --no-browser is set.')
         return None
-    server: Optional[oauth_lib.HTTPServer] = None
+    server: oauth_lib.HTTPServer | None = None
     try:
         callback_port = common_utils.find_free_port(8000)
-        token_container: Dict[str, Optional[str]] = {'token': None}
+        token_container: dict[str, str | None] = {'token': None}
         server = oauth_lib.start_local_auth_server(callback_port,
                                                    token_container, endpoint)
 
@@ -2917,8 +2914,8 @@ def _try_localhost_callback_auth(endpoint: str,
                    f'{colorama.Style.RESET_ALL}')
 
         start_time = time.time()
-        while (token_container['token'] is None and time.time() - start_time <
-               server_constants.AUTH_SESSION_TIMEOUT_SECONDS):
+        while (token_container['token'] is None and time.time() - start_time
+               < server_constants.AUTH_SESSION_TIMEOUT_SECONDS):
             time.sleep(1)
 
         if token_container['token'] is None:
@@ -2942,7 +2939,7 @@ def _try_localhost_callback_auth(endpoint: str,
                 pass
 
 
-def _try_manual_token_entry(endpoint: str) -> Optional[str]:
+def _try_manual_token_entry(endpoint: str) -> str | None:
     """Fall back to manual token entry."""
     try:
         token_url = f'{endpoint}/token'
@@ -2961,9 +2958,9 @@ def _try_manual_token_entry(endpoint: str) -> Optional[str]:
 
 @usage_lib.entrypoint
 @annotations.client_api
-def api_login(endpoint: Optional[str] = None,
+def api_login(endpoint: str | None = None,
               relogin: bool = False,
-              service_account_token: Optional[str] = None,
+              service_account_token: str | None = None,
               no_browser: bool = False) -> None:
     """Logs into a SkyPilot API server.
 
@@ -2991,7 +2988,7 @@ def api_login(endpoint: Optional[str] = None,
     endpoint = _validate_endpoint(endpoint)
 
     def _show_logged_in_message(
-            endpoint: str, dashboard_url: str, user: Optional[Dict[str, Any]],
+            endpoint: str, dashboard_url: str, user: dict[str, Any] | None,
             server_status: server_common.ApiServerStatus) -> None:
         """Show the logged in message."""
         if server_status != server_common.ApiServerStatus.HEALTHY:
@@ -3017,7 +3014,7 @@ def api_login(endpoint: Optional[str] = None,
             f'{dashboard_msg}',
             fg='green')
 
-    def _set_user_hash(user_hash: Optional[str]) -> None:
+    def _set_user_hash(user_hash: str | None) -> None:
         if user_hash is not None:
             if not common_utils.is_valid_user_hash(user_hash):
                 raise ValueError(f'Invalid user hash: {user_hash}')
@@ -3068,7 +3065,7 @@ def api_login(endpoint: Optional[str] = None,
         endpoint)
     if server_status == server_common.ApiServerStatus.NEEDS_AUTH or relogin:
         # We detected an auth proxy, so go through the auth proxy cookie flow.
-        token: Optional[str] = None
+        token: str | None = None
 
         # Try methods in order:
         # 1. New polling-based flow - only on servers >= API v30
@@ -3179,7 +3176,7 @@ def api_login(endpoint: Optional[str] = None,
 
     # see https://github.com/python/mypy/issues/5107 on why
     # typing is disabled on this line
-    server_common.get_api_server_status_response.cache_clear()  # type: ignore
+    server_common.get_api_server_status_response.cache_clear()
     # After successful authentication, check server health again to get user
     # identity
     server_status, final_api_server_info = server_common.check_server_healthy(
@@ -3221,9 +3218,9 @@ def api_logout() -> None:
 @versions.minimal_api_version(24)
 @annotations.client_api
 def realtime_slurm_gpu_availability(
-        name_filter: Optional[str] = None,
-        quantity_filter: Optional[int] = None,
-        slurm_cluster_name: Optional[str] = None) -> server_common.RequestId:
+        name_filter: str | None = None,
+        quantity_filter: int | None = None,
+        slurm_cluster_name: str | None = None) -> server_common.RequestId:
     """Gets the real-time Slurm GPU availability.
 
     Args:
@@ -3261,7 +3258,7 @@ def realtime_slurm_gpu_availability(
 @versions.minimal_api_version(24)
 @annotations.client_api
 def slurm_node_info(
-        slurm_cluster_name: Optional[str] = None) -> server_common.RequestId:
+        slurm_cluster_name: str | None = None) -> server_common.RequestId:
     """Gets the resource information for all nodes in the Slurm cluster.
 
     Returns:
@@ -3287,13 +3284,13 @@ def slurm_node_info(
 # =====================
 
 
-def _build_client_info() -> Dict[str, Any]:
+def _build_client_info() -> dict[str, Any]:
     """Build client-side info for debug dumps."""
     import sky  # pylint: disable=import-outside-toplevel
 
     # Get configs
-    user_config: Dict[str, Any] = {}
-    merged_config: Dict[str, Any] = {}
+    user_config: dict[str, Any] = {}
+    merged_config: dict[str, Any] = {}
     try:
         user_config = debug_dump_helpers.redact_config(
             dict(skypilot_config.get_user_config()))
@@ -3324,10 +3321,10 @@ def _build_client_info() -> Dict[str, Any]:
 @versions.minimal_api_version(46)
 @annotations.client_api
 def create_debug_dump(
-    request_ids: Optional[List[str]] = None,
-    cluster_names: Optional[List[str]] = None,
-    managed_job_ids: Optional[List[int]] = None,
-    recent_minutes: Optional[float] = None,
+    request_ids: list[str] | None = None,
+    cluster_names: list[str] | None = None,
+    managed_job_ids: list[int] | None = None,
+    recent_minutes: float | None = None,
 ) -> server_common.RequestId[str]:
     """Create a debug dump for troubleshooting.
 
@@ -3369,7 +3366,7 @@ def create_debug_dump(
 @versions.minimal_api_version(46)
 @annotations.client_api
 def download_debug_dump(dump_filename: str,
-                        local_path: Optional[str] = None) -> str:
+                        local_path: str | None = None) -> str:
     """Download a debug dump from the server.
 
     Args:

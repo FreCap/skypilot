@@ -2,10 +2,10 @@
 
 import asyncio
 import collections
+from collections.abc import AsyncGenerator
 import fcntl
 import os
 import pathlib
-from typing import AsyncGenerator, Deque, List, Optional, Tuple
 
 import aiofiles
 import aiofiles.os
@@ -73,7 +73,7 @@ async def _rewind_if_log_truncated(
 
 def _request_log_marker(
     log_file: aiofiles.threadpool.binary.AsyncBufferedReader,
-) -> Optional[sky_context.RequestLogTruncationMarker]:
+) -> sky_context.RequestLogTruncationMarker | None:
     """Read a bounded request log's marker without buffered read-ahead."""
     # BufferedReader can retain bytes from before an in-place truncate, even
     # after seek(0). pread() bypasses that user-space buffer and leaves the
@@ -86,8 +86,8 @@ def _request_log_marker(
 
 async def _rewind_if_log_generation_changed(
     log_file: aiofiles.threadpool.binary.AsyncBufferedReader,
-    previous_marker: Optional[sky_context.RequestLogTruncationMarker],
-) -> Tuple[Optional[sky_context.RequestLogTruncationMarker], bool, bool]:
+    previous_marker: sky_context.RequestLogTruncationMarker | None,
+) -> tuple[sky_context.RequestLogTruncationMarker | None, bool, bool]:
     """Map a follower across rollover, including truncate-and-regrow races.
 
     Returns the current marker, whether the generation changed, and whether
@@ -139,9 +139,9 @@ async def _acquire_shared_file_lock(fd: int) -> None:
 
 async def _read_request_log_chunk(
     log_file: aiofiles.threadpool.binary.AsyncBufferedReader,
-    previous_marker: Optional[sky_context.RequestLogTruncationMarker],
+    previous_marker: sky_context.RequestLogTruncationMarker | None,
     log_path: pathlib.Path,
-) -> Tuple[bytes, Optional[sky_context.RequestLogTruncationMarker], bool]:
+) -> tuple[bytes, sky_context.RequestLogTruncationMarker | None, bool]:
     """Read one chunk atomically with respect to bounded-log rollover."""
     fd = log_file.fileno()
     await _acquire_shared_file_lock(fd)
@@ -259,12 +259,12 @@ async def wait_for_request_to_start(
 
 
 async def log_streamer(
-    request_id: Optional[str],
-    log_path: Optional[pathlib.Path] = None,
+    request_id: str | None,
+    log_path: pathlib.Path | None = None,
     plain_logs: bool = False,
-    tail: Optional[int] = None,
+    tail: int | None = None,
     follow: bool = True,
-    cluster_name: Optional[str] = None,
+    cluster_name: str | None = None,
     polling_interval: float = DEFAULT_POLL_INTERVAL
 ) -> AsyncGenerator[str, None]:
     """Streams the logs of a request.
@@ -329,13 +329,13 @@ async def log_streamer(
 
 async def _tail_log_file(
     f: aiofiles.threadpool.binary.AsyncBufferedReader,
-    request_id: Optional[str] = None,
+    request_id: str | None = None,
     plain_logs: bool = False,
-    tail: Optional[int] = None,
+    tail: int | None = None,
     follow: bool = True,
-    cluster_name: Optional[str] = None,
+    cluster_name: str | None = None,
     polling_interval: float = DEFAULT_POLL_INTERVAL,
-    log_path: Optional[pathlib.Path] = None,
+    log_path: pathlib.Path | None = None,
 ) -> AsyncGenerator[str, None]:
     """Tail the opened log file, buffer the lines and flush in chunks."""
 
@@ -346,7 +346,7 @@ async def _tail_log_file(
         # TODO(zhwu): this will include the control lines for rich status,
         # which may not lead to exact tail lines when showing on the client
         # side.
-        lines: Deque[str] = collections.deque(maxlen=tail)
+        lines: collections.deque[str] = collections.deque(maxlen=tail)
         if log_path is not None:
             fd = f.fileno()
             await _acquire_shared_file_lock(fd)
@@ -367,7 +367,7 @@ async def _tail_log_file(
 
     # Buffer the lines in memory and flush them in chunks to improve log
     # tailing throughput.
-    buffer: List[str] = []
+    buffer: list[str] = []
     buffer_bytes = 0
     last_flush_time = asyncio.get_event_loop().time()
 

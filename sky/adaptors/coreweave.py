@@ -4,7 +4,6 @@ import configparser
 import contextlib
 import os
 import threading
-from typing import Dict, Optional, Tuple
 
 from sky import exceptions
 from sky import sky_logging
@@ -184,7 +183,7 @@ def get_endpoint():
 
 
 def check_credentials(
-        cloud_capability: cloud.CloudCapability) -> Tuple[bool, Optional[str]]:
+        cloud_capability: cloud.CloudCapability) -> tuple[bool, str | None]:
     if cloud_capability == cloud.CloudCapability.STORAGE:
         return check_storage_credentials()
     else:
@@ -192,7 +191,7 @@ def check_credentials(
             f'{NAME} does not support {cloud_capability}.')
 
 
-def check_storage_credentials() -> Tuple[bool, Optional[str]]:
+def check_storage_credentials() -> tuple[bool, str | None]:
     """Checks if the user has access credentials to CoreWeave Object Storage.
 
     Returns:
@@ -243,7 +242,7 @@ def coreweave_profile_in_config() -> bool:
     conf_path = os.path.expanduser(COREWEAVE_CONFIG_PATH)
     coreweave_profile_exists = False
     if os.path.isfile(conf_path):
-        with open(conf_path, 'r', encoding='utf-8') as file:
+        with open(conf_path, encoding='utf-8') as file:
             for line in file:
                 if f'[profile {COREWEAVE_PROFILE_NAME}]' in line:
                     coreweave_profile_exists = True
@@ -256,7 +255,7 @@ def coreweave_profile_in_cred() -> bool:
     cred_path = os.path.expanduser(COREWEAVE_CREDENTIALS_PATH)
     coreweave_profile_exists = False
     if os.path.isfile(cred_path):
-        with open(cred_path, 'r', encoding='utf-8') as file:
+        with open(cred_path, encoding='utf-8') as file:
             for line in file:
                 if f'[{COREWEAVE_PROFILE_NAME}]' in line:
                     coreweave_profile_exists = True
@@ -264,7 +263,7 @@ def coreweave_profile_in_cred() -> bool:
     return coreweave_profile_exists
 
 
-def get_credential_file_mounts() -> Dict[str, str]:
+def get_credential_file_mounts() -> dict[str, str]:
     """Returns credential file mounts for CoreWeave.
 
     Returns:

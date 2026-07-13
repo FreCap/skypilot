@@ -1,10 +1,11 @@
 """Azure."""
+from collections.abc import Iterator
 import os
 import re
 import subprocess
 import textwrap
 import typing
-from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, Optional
 
 import colorama
 from packaging import version as pversion
@@ -55,11 +56,7 @@ _COMMUNITY_IMAGE_PREFIX = '/CommunityGalleries'
 
 
 def _run_output(cmd):
-    proc = subprocess.run(cmd,
-                          shell=True,
-                          check=True,
-                          stderr=subprocess.PIPE,
-                          stdout=subprocess.PIPE)
+    proc = subprocess.run(cmd, shell=True, check=True, capture_output=True)
     return proc.stdout.decode('ascii')
 
 
@@ -91,8 +88,8 @@ class Azure(clouds.Cloud):
     def _unsupported_features_for_resources(
         cls,
         resources: 'resources.Resources',
-        region: Optional[str] = None,
-    ) -> Dict[clouds.CloudImplementationFeatures, str]:
+        region: str | None = None,
+    ) -> dict[clouds.CloudImplementationFeatures, str]:
         features = {
             clouds.CloudImplementationFeatures.CLONE_DISK_FROM_CLUSTER:
                 (f'Migrating disk is currently not supported on {cls._REPR}.'),
@@ -120,8 +117,8 @@ class Azure(clouds.Cloud):
     def instance_type_to_hourly_cost(self,
                                      instance_type: str,
                                      use_spot: bool,
-                                     region: Optional[str] = None,
-                                     zone: Optional[str] = None) -> float:
+                                     region: str | None = None,
+                                     zone: str | None = None) -> float:
         return catalog.get_hourly_cost(instance_type,
                                        use_spot=use_spot,
                                        region=region,
@@ -129,10 +126,10 @@ class Azure(clouds.Cloud):
                                        clouds='azure')
 
     def accelerators_to_hourly_cost(self,
-                                    accelerators: Dict[str, int],
+                                    accelerators: dict[str, int],
                                     use_spot: bool,
-                                    region: Optional[str] = None,
-                                    zone: Optional[str] = None) -> float:
+                                    region: str | None = None,
+                                    zone: str | None = None) -> float:
         del accelerators, use_spot, region, zone  # unused
         # Azure includes accelerators as part of the instance type.
         # Implementing this is also necessary for e.g., the instance may have 4
@@ -165,15 +162,15 @@ class Azure(clouds.Cloud):
     @classmethod
     def get_default_instance_type(
         cls,
-        cpus: Optional[str] = None,
-        memory: Optional[str] = None,
-        disk_tier: Optional[resources_utils.DiskTier] = None,
-        local_disk: Optional[str] = None,
-        region: Optional[str] = None,
-        zone: Optional[str] = None,
+        cpus: str | None = None,
+        memory: str | None = None,
+        disk_tier: resources_utils.DiskTier | None = None,
+        local_disk: str | None = None,
+        region: str | None = None,
+        zone: str | None = None,
         use_spot: bool = False,
-        max_hourly_cost: Optional[float] = None,
-    ) -> Optional[str]:
+        max_hourly_cost: float | None = None,
+    ) -> str | None:
         return catalog.get_default_instance_type(
             cpus=cpus,
             memory=memory,
@@ -186,7 +183,7 @@ class Azure(clouds.Cloud):
             clouds='azure')
 
     @classmethod
-    def get_image_size(cls, image_id: str, region: Optional[str]) -> float:
+    def get_image_size(cls, image_id: str, region: str | None) -> float:
         # Process skypilot images.
         if image_id.startswith('skypilot:'):
             image_id = catalog.get_image_id_from_tag(image_id, clouds='azure')
@@ -283,12 +280,12 @@ class Azure(clouds.Cloud):
     def regions_with_offering(
         cls,
         instance_type: str,
-        accelerators: Optional[Dict[str, int]],
+        accelerators: dict[str, int] | None,
         use_spot: bool,
-        region: Optional[str],
-        zone: Optional[str],
+        region: str | None,
+        zone: str | None,
         resources: Optional['resources.Resources'] = None,
-    ) -> List[clouds.Region]:
+    ) -> list[clouds.Region]:
         del accelerators  # unused
         assert zone is None, 'Azure does not support zones'
         regions = catalog.get_region_zones_for_instance_type(
@@ -305,7 +302,7 @@ class Azure(clouds.Cloud):
         region: str,
         num_nodes: int,
         instance_type: str,
-        accelerators: Optional[Dict[str, int]] = None,
+        accelerators: dict[str, int] | None = None,
         use_spot: bool = False,
     ) -> Iterator[None]:
         del num_nodes  # unused
@@ -325,7 +322,7 @@ class Azure(clouds.Cloud):
     def get_accelerators_from_instance_type(
         cls,
         instance_type: str,
-    ) -> Optional[Dict[str, Union[int, float]]]:
+    ) -> dict[str, int | float] | None:
         return catalog.get_accelerators_from_instance_type(instance_type,
                                                            clouds='azure')
 
@@ -333,12 +330,12 @@ class Azure(clouds.Cloud):
     def get_vcpus_mem_from_instance_type(
         cls,
         instance_type: str,
-    ) -> Tuple[Optional[float], Optional[float]]:
+    ) -> tuple[float | None, float | None]:
         return catalog.get_vcpus_mem_from_instance_type(instance_type,
                                                         clouds='azure')
 
     @classmethod
-    def get_zone_shell_cmd(cls) -> Optional[str]:
+    def get_zone_shell_cmd(cls) -> str | None:
         return None
 
     def make_deploy_resources_variables(
@@ -346,11 +343,11 @@ class Azure(clouds.Cloud):
         resources: 'resources.Resources',
         cluster_name: resources_utils.ClusterName,
         region: 'clouds.Region',
-        zones: Optional[List['clouds.Zone']],
+        zones: list['clouds.Zone'] | None,
         num_nodes: int,
         dryrun: bool = False,
-        volume_mounts: Optional[List['volume_lib.VolumeMount']] = None,
-    ) -> Dict[str, Any]:
+        volume_mounts: list['volume_lib.VolumeMount'] | None = None,
+    ) -> dict[str, Any]:
         assert zones is None, ('Azure does not support zones', zones)
 
         region_name = region.name
@@ -440,7 +437,7 @@ class Azure(clouds.Cloud):
                   APT::Periodic::Enable "0";
             """).split('\n')
 
-        def _failover_disk_tier() -> Optional[resources_utils.DiskTier]:
+        def _failover_disk_tier() -> resources_utils.DiskTier | None:
             if (resources.disk_tier is not None and
                     resources.disk_tier != resources_utils.DiskTier.BEST):
                 return resources.disk_tier
@@ -461,7 +458,7 @@ class Azure(clouds.Cloud):
 
         disk_tier = _failover_disk_tier()
 
-        resources_vars: Dict[str, Any] = {
+        resources_vars: dict[str, Any] = {
             'instance_type': resources.instance_type,
             'custom_resources': custom_resources,
             'num_gpus': acc_count,
@@ -558,20 +555,20 @@ class Azure(clouds.Cloud):
 
     @classmethod
     def _check_compute_credentials(
-            cls) -> Tuple[bool, Optional[Union[str, Dict[str, str]]]]:
+            cls) -> tuple[bool, str | dict[str, str] | None]:
         """Checks if the user has access credentials to this cloud's compute service."""
         return cls._check_credentials()
 
     @classmethod
     def _check_storage_credentials(
-            cls) -> Tuple[bool, Optional[Union[str, Dict[str, str]]]]:
+            cls) -> tuple[bool, str | dict[str, str] | None]:
         """Checks if the user has access credentials to this cloud's storage service."""
         # TODO(seungjin): Implement separate check for
         # if the user has access to Azure Blob Storage.
         return cls._check_credentials()
 
     @classmethod
-    def _check_credentials(cls) -> Tuple[bool, Optional[str]]:
+    def _check_credentials(cls) -> tuple[bool, str | None]:
         """Checks if the user has access credentials to this cloud."""
 
         help_str = (
@@ -620,7 +617,7 @@ class Azure(clouds.Cloud):
                            f'{common_utils.format_exception(e)}')
         return True, None
 
-    def get_credential_file_mounts(self) -> Dict[str, str]:
+    def get_credential_file_mounts(self) -> dict[str, str]:
         """Returns a dict of credential file paths to mount paths."""
         return {
             f'~/.azure/{filename}': f'~/.azure/{filename}'
@@ -633,7 +630,7 @@ class Azure(clouds.Cloud):
     @classmethod
     @annotations.lru_cache(scope='global',
                            maxsize=1)  # Cache since getting identity is slow.
-    def get_user_identities(cls) -> Optional[List[List[str]]]:
+    def get_user_identities(cls) -> list[list[str]] | None:
         """Returns the cloud user identity."""
         # This returns the user's email address + [subscription_id].
         retry_cnt = 0
@@ -680,7 +677,7 @@ class Azure(clouds.Cloud):
         return [[f'{account_email} [subscription_id={project_id}]']]
 
     @classmethod
-    def get_active_user_identity_str(cls) -> Optional[str]:
+    def get_active_user_identity_str(cls) -> str | None:
         user_identity = cls.get_active_user_identity()
         if user_identity is None:
             return None
@@ -710,7 +707,7 @@ class Azure(clouds.Cloud):
         return azure_subscription_id
 
     @classmethod
-    def _is_s_series(cls, instance_type: Optional[str]) -> bool:
+    def _is_s_series(cls, instance_type: str | None) -> bool:
         # For azure naming convention, see https://learn.microsoft.com/en-us/azure/virtual-machines/vm-naming-conventions  # pylint: disable=line-too-long
         if instance_type is None:
             return True
@@ -722,8 +719,8 @@ class Azure(clouds.Cloud):
 
     @classmethod
     def check_disk_tier(
-            cls, instance_type: Optional[str],
-            disk_tier: Optional[resources_utils.DiskTier]) -> Tuple[bool, str]:
+            cls, instance_type: str | None,
+            disk_tier: resources_utils.DiskTier | None) -> tuple[bool, str]:
         if disk_tier is None or disk_tier == resources_utils.DiskTier.BEST:
             return True, ''
         if disk_tier == resources_utils.DiskTier.ULTRA:
@@ -742,7 +739,7 @@ class Azure(clouds.Cloud):
         return True, ''
 
     @classmethod
-    def check_disk_tier_enabled(cls, instance_type: Optional[str],
+    def check_disk_tier_enabled(cls, instance_type: str | None,
                                 disk_tier: resources_utils.DiskTier) -> None:
         ok, msg = cls.check_disk_tier(instance_type, disk_tier)
         if not ok:
@@ -750,8 +747,7 @@ class Azure(clouds.Cloud):
                 raise exceptions.NotSupportedError(msg)
 
     @classmethod
-    def _get_disk_type(cls,
-                       disk_tier: Optional[resources_utils.DiskTier]) -> str:
+    def _get_disk_type(cls, disk_tier: resources_utils.DiskTier | None) -> str:
         tier = cls._translate_disk_tier(disk_tier)
         # TODO(tian): Maybe use PremiumV2_LRS/UltraSSD_LRS? Notice these two
         # cannot be used as OS disks so we might need data disk support

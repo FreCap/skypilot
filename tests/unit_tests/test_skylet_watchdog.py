@@ -110,8 +110,8 @@ class TestWatchdogGating:
         with mock.patch.dict(
                 'os.environ',
             {instance_setup._DISABLE_SKYLET_WATCHDOG_ENV_VAR: '1'}):
-            assert (instance_setup._should_install_skylet_watchdog(info) is
-                    False)
+            assert (instance_setup._should_install_skylet_watchdog(info)
+                    is False)
 
     def test_installed_on_vm_clouds(self):
         info = _make_cluster_info('aws')

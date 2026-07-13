@@ -1,12 +1,12 @@
 """Utils for workspaces."""
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from sky.users import resolver as user_resolver
 
 
 def get_workspace_users(
-        workspace_config: Dict[str, Any],
-        resolver: Optional[user_resolver.UserResolver] = None) -> List[str]:
+        workspace_config: dict[str, Any],
+        resolver: user_resolver.UserResolver | None = None) -> list[str]:
     """Get the user_ids that should have access to a workspace.
 
     For private workspaces, resolves ``allowed_users`` (which may contain

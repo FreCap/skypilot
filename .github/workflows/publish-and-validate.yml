@@ -15,7 +15,6 @@ on:
         description: 'Repository to publish to (test-pypi or pypi)'
         required: true
         type: string
-        default: 'test-pypi'
     secrets:
       TEST_PYPI_API_TOKEN:
         description: 'API token for Test PyPI'

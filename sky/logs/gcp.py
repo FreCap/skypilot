@@ -1,6 +1,6 @@
 """GCP logging agent."""
 
-from typing import Any, Dict, Optional
+from typing import Any
 
 import pydantic
 
@@ -11,9 +11,9 @@ from sky.utils import resources_utils
 
 class _GCPLoggingConfig(pydantic.BaseModel):
     """Configuration for GCP logging agent."""
-    project_id: Optional[str] = None
-    credentials_file: Optional[str] = None
-    additional_labels: Optional[Dict[str, str]] = None
+    project_id: str | None = None
+    credentials_file: str | None = None
+    additional_labels: dict[str, str] | None = None
 
 
 class _StackdriverOutputConfig(pydantic.BaseModel):
@@ -23,10 +23,10 @@ class _StackdriverOutputConfig(pydantic.BaseModel):
     """
     name: str = 'stackdriver'
     match: str = '*'
-    export_to_project_id: Optional[str] = None
-    labels: Optional[Dict[str, str]] = None
+    export_to_project_id: str | None = None
+    labels: dict[str, str] | None = None
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         config = self.model_dump(exclude_none=True)
         if self.labels:
             # Replace the label format from `{k: v}` to `k=v`
@@ -38,7 +38,7 @@ class _StackdriverOutputConfig(pydantic.BaseModel):
 class GCPLoggingAgent(FluentbitAgent):
     """GCP logging agent."""
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: dict[str, Any]):
         self.config = _GCPLoggingConfig(**config)
 
     def get_setup_command(self,
@@ -73,7 +73,7 @@ class GCPLoggingAgent(FluentbitAgent):
         return pre_cmd + ' && ' + super().get_setup_command(cluster_name)
 
     def fluentbit_output_config(
-            self, cluster_name: resources_utils.ClusterName) -> Dict[str, Any]:
+            self, cluster_name: resources_utils.ClusterName) -> dict[str, Any]:
         display_name = cluster_name.display_name
         unique_name = cluster_name.name_on_cloud
 
@@ -86,7 +86,7 @@ class GCPLoggingAgent(FluentbitAgent):
             },
         ).to_dict()
 
-    def get_credential_file_mounts(self) -> Dict[str, str]:
+    def get_credential_file_mounts(self) -> dict[str, str]:
         if self.config.credentials_file:
             return {self.config.credentials_file: self.config.credentials_file}
         return {}

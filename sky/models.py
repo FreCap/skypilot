@@ -5,7 +5,7 @@ import dataclasses
 import enum
 import getpass
 import os
-from typing import Any, ClassVar, Dict, List, Optional
+from typing import Any, ClassVar
 
 import pydantic
 
@@ -33,23 +33,23 @@ class User:
     # User hash
     id: str
     # Display name of the user
-    name: Optional[str] = None
-    password: Optional[str] = None
-    created_at: Optional[int] = None
-    user_type: Optional[str] = None
+    name: str | None = None
+    password: str | None = None
+    created_at: int | None = None
+    user_type: str | None = None
     # The user's preferred default workspace, if one has been set.
     # Resolution and RBAC validation live in sky/workspaces/; this field is
     # just the persisted value. None means "no preference set".
-    preferred_workspace: Optional[str] = None
+    preferred_workspace: str | None = None
 
     def __init__(
         self,
         id: str,  # pylint: disable=redefined-builtin
-        name: Optional[str] = None,
-        password: Optional[str] = None,
-        created_at: Optional[int] = None,
-        user_type: Optional[str] = None,
-        preferred_workspace: Optional[str] = None,
+        name: str | None = None,
+        password: str | None = None,
+        created_at: int | None = None,
+        user_type: str | None = None,
+        preferred_workspace: str | None = None,
     ):
         self.id = id.strip().lower()
         self.name = name
@@ -58,7 +58,7 @@ class User:
         self.user_type = user_type
         self.preferred_workspace = preferred_workspace
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             'id': self.id,
             'name': self.name,
@@ -86,21 +86,21 @@ RealtimeGpuAvailability = collections.namedtuple(
 class KubernetesNodeInfo:
     """Dataclass to store Kubernetes node information."""
     name: str
-    accelerator_type: Optional[str]
+    accelerator_type: str | None
     # Resources available on the node. E.g., {'nvidia.com/gpu': '2'}
-    total: Dict[str, int]
-    free: Dict[str, int]
+    total: dict[str, int]
+    free: dict[str, int]
     # IP address of the node (external IP preferred, fallback to internal IP)
-    ip_address: Optional[str] = None
+    ip_address: str | None = None
     # CPU count (total CPUs available on the node)
-    cpu_count: Optional[float] = None
+    cpu_count: float | None = None
     # Memory in GB (total memory available on the node)
-    memory_gb: Optional[float] = None
+    memory_gb: float | None = None
     # Free CPU count (free CPUs available on the node after pod allocations)
-    cpu_free: Optional[float] = None
+    cpu_free: float | None = None
     # Free memory in GB (free memory available on the node after pod
     # allocations)
-    memory_free_gb: Optional[float] = None
+    memory_free_gb: float | None = None
     # Whether the node is ready (all conditions are satisfied)
     is_ready: bool = True
     # Whether the node is cordoned (spec.unschedulable is true)
@@ -109,18 +109,18 @@ class KubernetesNodeInfo:
     # 'effect', and optionally 'tolerated' (a bool indicating whether the
     # taint is matched by an entry in the configured
     # `kubernetes.pod_config.spec.tolerations`).
-    taints: Optional[List[Dict[str, Any]]] = None
+    taints: list[dict[str, Any]] | None = None
 
 
 @dataclasses.dataclass
 class KubernetesNodesInfo:
     """Dataclass to store Kubernetes node info map."""
     # The nodes in the cluster, keyed by node name.
-    node_info_dict: Dict[str, KubernetesNodeInfo]
+    node_info_dict: dict[str, KubernetesNodeInfo]
     # Additional hint for the node info.
     hint: str
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             'node_info_dict': {
                 node_name: dataclasses.asdict(node_info)
@@ -130,7 +130,7 @@ class KubernetesNodesInfo:
         }
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> 'KubernetesNodesInfo':
+    def from_dict(cls, data: dict[str, Any]) -> 'KubernetesNodesInfo':
         return cls(
             node_info_dict={
                 node_name: KubernetesNodeInfo(**node_info)
@@ -150,20 +150,20 @@ class VolumeConfig(pydantic.BaseModel):
     name: str
     type: str
     cloud: str
-    region: Optional[str]
-    zone: Optional[str]
+    region: str | None
+    zone: str | None
     name_on_cloud: str
-    size: Optional[str]
-    config: Dict[str, Any] = {}
-    labels: Optional[Dict[str, str]] = None
-    id_on_cloud: Optional[str] = None
+    size: str | None
+    config: dict[str, Any] = {}
+    labels: dict[str, str] | None = None
+    id_on_cloud: str | None = None
 
-    def __getstate__(self) -> Dict[str, Any]:
+    def __getstate__(self) -> dict[str, Any]:
         state = super().__getstate__()
         state['_version'] = self._VERSION
         return state
 
-    def __setstate__(self, state: Dict[str, Any]) -> None:
+    def __setstate__(self, state: dict[str, Any]) -> None:
         """Set state from pickled state, for backward compatibility."""
         super().__setstate__(state)
         version = state.pop('_version', None)

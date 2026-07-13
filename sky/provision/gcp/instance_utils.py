@@ -6,7 +6,7 @@ from multiprocessing import pool
 import re
 import subprocess
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 import uuid
 
 from sky import sky_logging
@@ -81,7 +81,7 @@ def _is_reservation_bound(project_id: str, zone: str,
 
 
 def _retry_on_gcp_http_exception(
-    regex: Optional[str] = None,
+    regex: str | None = None,
     max_retries: int = GCP_MAX_RETRIES,
     retry_interval_s: int = GCP_RETRY_INTERVAL_SECONDS,
 ):
@@ -140,8 +140,8 @@ def _generate_node_name(cluster_name: str, node_suffix: str,
     return node_name
 
 
-def _format_and_log_message_from_errors(errors: List[Dict[str, str]], e: Any,
-                                        zone: Optional[str]) -> str:
+def _format_and_log_message_from_errors(errors: list[dict[str, str]], e: Any,
+                                        zone: str | None) -> str:
     """Format errors into a string and log it to the console."""
     if errors:
         plural = 's' if len(errors) > 1 else ''
@@ -182,13 +182,13 @@ def instance_to_handler(instance: str):
 
 class GCPInstance:
     """Base class for GCP instance handlers."""
-    PENDING_STATES: List[str] = []
-    NEED_TO_STOP_STATES: List[str] = []
-    NON_STOPPED_STATES: List[str] = []
-    NEED_TO_TERMINATE_STATES: List[str] = []
+    PENDING_STATES: list[str] = []
+    NEED_TO_STOP_STATES: list[str] = []
+    NON_STOPPED_STATES: list[str] = []
+    NEED_TO_TERMINATE_STATES: list[str] = []
     RUNNING_STATE: str = ''
-    STOPPING_STATES: List[str] = []
-    STOPPED_STATES: List[str] = []
+    STOPPING_STATES: list[str] = []
+    STOPPED_STATES: list[str] = []
     STATUS_FIELD: str = ''
 
     @classmethod
@@ -222,8 +222,8 @@ class GCPInstance:
     def wait_for_operation(cls,
                            operation: dict,
                            project_id: str,
-                           region: Optional[str] = None,
-                           zone: Optional[str] = None) -> None:
+                           region: str | None = None,
+                           zone: str | None = None) -> None:
         raise NotImplementedError
 
     @classmethod
@@ -231,11 +231,11 @@ class GCPInstance:
         cls,
         project_id: str,
         zone: str,
-        label_filters: Optional[Dict[str, str]],
-        status_filters: Optional[List[str]],
-        included_instances: Optional[List[str]] = None,
-        excluded_instances: Optional[List[str]] = None,
-    ) -> Dict[str, Any]:
+        label_filters: dict[str, str] | None,
+        status_filters: list[str] | None,
+        included_instances: list[str] | None = None,
+        excluded_instances: list[str] | None = None,
+    ) -> dict[str, Any]:
         raise NotImplementedError
 
     @classmethod
@@ -262,7 +262,7 @@ class GCPInstance:
         project_id: str,
         vpc_name: str,
         cluster_name_on_cloud: str,
-        ports: List[str],
+        ports: list[str],
     ) -> dict:
         raise NotImplementedError
 
@@ -287,7 +287,7 @@ class GCPInstance:
         count: int,
         total_count: int,
         include_head_node: bool,
-    ) -> Tuple[Optional[List], List[str]]:
+    ) -> tuple[list | None, list[str]]:
         """Creates multiple instances and returns result.
 
         Returns a tuple of (errors, list[instance_names]).
@@ -296,8 +296,8 @@ class GCPInstance:
 
     @classmethod
     def start_instances(cls, cluster_name: str, project_id: str, zone: str,
-                        instances: List[str], labels: Dict[str,
-                                                           str]) -> List[str]:
+                        instances: list[str], labels: dict[str,
+                                                           str]) -> list[str]:
         """Start multiple instances.
 
         Returns:
@@ -338,7 +338,7 @@ class GCPInstance:
 
     @classmethod
     def get_instance_info(cls, project_id: str, availability_zone: str,
-                          instance_id: str) -> List[common.InstanceInfo]:
+                          instance_id: str) -> list[common.InstanceInfo]:
         raise NotImplementedError
 
     @classmethod
@@ -406,24 +406,22 @@ class GCPComputeInstance(GCPInstance):
         cls,
         project_id: str,
         zone: str,
-        label_filters: Optional[Dict[str, str]],
-        status_filters: Optional[List[str]],
-        included_instances: Optional[List[str]] = None,
-        excluded_instances: Optional[List[str]] = None,
-    ) -> Dict[str, Any]:
+        label_filters: dict[str, str] | None,
+        status_filters: list[str] | None,
+        included_instances: list[str] | None = None,
+        excluded_instances: list[str] | None = None,
+    ) -> dict[str, Any]:
         if label_filters:
             label_filter_expr = ('(' + ' AND '.join([
-                '(labels.{key} = {value})'.format(key=key, value=value)
+                f'(labels.{key} = {value})'
                 for key, value in label_filters.items()
             ]) + ')')
         else:
             label_filter_expr = ''
 
         if status_filters:
-            instance_state_filter_expr = ('(' + ' OR '.join([
-                '(status = {status})'.format(status=status)
-                for status in status_filters
-            ]) + ')')
+            instance_state_filter_expr = ('(' + ' OR '.join(
+                [f'(status = {status})' for status in status_filters]) + ')')
         else:
             instance_state_filter_expr = ''
 
@@ -459,8 +457,8 @@ class GCPComputeInstance(GCPInstance):
     def wait_for_operation(cls,
                            operation: dict,
                            project_id: str,
-                           region: Optional[str] = None,
-                           zone: Optional[str] = None,
+                           region: str | None = None,
+                           zone: str | None = None,
                            timeout: int = GCP_TIMEOUT) -> None:
         if zone is not None:
             kwargs = {'zone': zone}
@@ -616,7 +614,7 @@ class GCPComputeInstance(GCPInstance):
         project_id: str,
         vpc_name: str,
         cluster_name_on_cloud: str,
-        ports: List[str],
+        ports: list[str],
     ) -> dict:
         try:
             body = cls.load_resource().firewalls().get(
@@ -692,7 +690,7 @@ class GCPComputeInstance(GCPInstance):
         count: int,
         total_count: int,
         include_head_node: bool,
-    ) -> Tuple[Optional[List], List[str]]:
+    ) -> tuple[list | None, list[str]]:
         # NOTE: The syntax for bulkInsert() is different from insert().
         # bulkInsert expects resource names without prefix. Otherwise
         # it causes a 503 error.
@@ -786,8 +784,8 @@ class GCPComputeInstance(GCPInstance):
         return errors, all_names
 
     @classmethod
-    def _insert(cls, names: List[str], project_id: str, zone: str,
-                config: dict) -> List[dict]:
+    def _insert(cls, names: list[str], project_id: str, zone: str,
+                config: dict) -> list[dict]:
         # Convert name to selflink
         existing_machine_type = config['machineType']
         if not re.search('.*/machineTypes/.*', existing_machine_type):
@@ -836,8 +834,8 @@ class GCPComputeInstance(GCPInstance):
                 accelerator['acceleratorType'])
 
     @classmethod
-    def _bulk_insert(cls, names: List[str], project_id: str, zone: str,
-                     config: dict) -> List[dict]:
+    def _bulk_insert(cls, names: list[str], project_id: str, zone: str,
+                     config: dict) -> list[dict]:
         source_instance_template = config.pop('sourceInstanceTemplate', None)
         if 'scheduling' in config and isinstance(config['scheduling'], list):
             # For backeward compatibility: converting the list of dictionaries
@@ -854,7 +852,9 @@ class GCPComputeInstance(GCPInstance):
             'count': len(names),
             'instanceProperties': config,
             'sourceInstanceTemplate': source_instance_template,
-            'perInstanceProperties': {n: {} for n in names}
+            'perInstanceProperties': {
+                n: {} for n in names
+            }
         }
         logger.debug('Launching GCP instances with "bulkInsert" ...')
         request = cls.load_resource().instances().bulkInsert(
@@ -913,12 +913,12 @@ class GCPComputeInstance(GCPInstance):
     @classmethod
     def _create_instances(
         cls,
-        names: List[str],
+        names: list[str],
         project_id: str,
         zone: str,
         config: dict,
-        head_tag_needed: List[bool],
-    ) -> Optional[List]:
+        head_tag_needed: list[bool],
+    ) -> list | None:
 
         # Allow Google Compute Engine instance templates.
         #
@@ -978,7 +978,7 @@ class GCPComputeInstance(GCPInstance):
 
     @classmethod
     def get_instance_info(cls, project_id: str, availability_zone: str,
-                          instance_id: str) -> List[common.InstanceInfo]:
+                          instance_id: str) -> list[common.InstanceInfo]:
         result = cls.load_resource().instances().get(
             project=project_id,
             zone=availability_zone,
@@ -1052,7 +1052,7 @@ class GCPManagedInstanceGroup(GCPComputeInstance):
         count: int,
         total_count: int,
         include_head_node: bool,
-    ) -> Tuple[Optional[List], List[str]]:
+    ) -> tuple[list | None, list[str]]:
         logger.debug(f'Creating cluster with MIG: {cluster_name!r}')
         config = copy.deepcopy(node_config)
         labels = dict(config.get('labels', {}), **labels)
@@ -1227,8 +1227,8 @@ class GCPManagedInstanceGroup(GCPComputeInstance):
     @classmethod
     def _add_labels_and_find_head(
             cls, cluster_name: str, project_id: str, zone: str,
-            labels: Dict[str, str],
-            potential_head_instances: List[str]) -> List[str]:
+            labels: dict[str, str],
+            potential_head_instances: list[str]) -> list[str]:
         pending_running_instances = cls.filter(
             project_id,
             zone,
@@ -1279,8 +1279,8 @@ class GCPTPUVMInstance(GCPInstance):
     def wait_for_operation(cls,
                            operation: dict,
                            project_id: str,
-                           region: Optional[str] = None,
-                           zone: Optional[str] = None) -> None:
+                           region: str | None = None,
+                           zone: str | None = None) -> None:
         """Poll for TPU operation until finished."""
         del project_id, region, zone  # unused
 
@@ -1329,11 +1329,11 @@ class GCPTPUVMInstance(GCPInstance):
         cls,
         project_id: str,
         zone: str,
-        label_filters: Optional[Dict[str, str]],
-        status_filters: Optional[List[str]],
-        included_instances: Optional[List[str]] = None,
-        excluded_instances: Optional[List[str]] = None,
-    ) -> Dict[str, Any]:
+        label_filters: dict[str, str] | None,
+        status_filters: list[str] | None,
+        included_instances: list[str] | None = None,
+        excluded_instances: list[str] | None = None,
+    ) -> dict[str, Any]:
         path = f'projects/{project_id}/locations/{zone}'
         try:
             response = (cls.load_resource().projects().locations().nodes().list(
@@ -1560,7 +1560,7 @@ class GCPTPUVMInstance(GCPInstance):
         count: int,
         total_count: int,
         include_head_node: bool,
-    ) -> Tuple[Optional[List], List[str]]:
+    ) -> tuple[list | None, list[str]]:
         config = copy.deepcopy(node_config)
         # removing Compute-specific default key set in config.py
         config.pop('networkInterfaces', None)
@@ -1600,11 +1600,11 @@ class GCPTPUVMInstance(GCPInstance):
     @classmethod
     def _create_queued_resource_instances(
         cls,
-        names: List[str],
+        names: list[str],
         project_id: str,
         zone: str,
         config: dict,
-    ) -> Tuple[Optional[List], List[str]]:
+    ) -> tuple[list | None, list[str]]:
         operations = []
         queued_resource_ids = []
 
@@ -1692,11 +1692,11 @@ class GCPTPUVMInstance(GCPInstance):
     @classmethod
     def _create_standard_instances(
         cls,
-        names: List[str],
+        names: list[str],
         project_id: str,
         zone: str,
         config: dict,
-    ) -> Tuple[Optional[List], List[str]]:
+    ) -> tuple[list | None, list[str]]:
         operations = []
         for i, name in enumerate(names):
             node_config = config.copy()
@@ -1775,7 +1775,7 @@ class GCPTPUVMInstance(GCPInstance):
         logger.debug('Waiting GCP instances to be ready ...')
         wait_start = time.time()
         success = [False] * len(operations)
-        results: List[dict] = [{} for _ in range(len(operations))]
+        results: list[dict] = [{} for _ in range(len(operations))]
         while time.time() - wait_start < GCP_TIMEOUT:
             # Retry the wait() call until it succeeds or times out.
             # This is because the wait() call is only best effort, and does not
@@ -1855,7 +1855,7 @@ class GCPTPUVMInstance(GCPInstance):
 
     @classmethod
     def get_instance_info(cls, project_id: str, availability_zone: str,
-                          instance_id: str) -> List[common.InstanceInfo]:
+                          instance_id: str) -> list[common.InstanceInfo]:
         del project_id, availability_zone  # unused
         result = cls.load_resource().projects().locations().nodes().get(
             name=instance_id).execute()
@@ -1887,7 +1887,7 @@ class GCPNodeType(enum.Enum):
     TPU = 'tpu'
 
 
-def get_node_type(config: Dict[str, Any]) -> GCPNodeType:
+def get_node_type(config: dict[str, Any]) -> GCPNodeType:
     """Returns node type based on the keys in ``node``.
 
     This is a very simple check. If we have a ``machineType`` key,
@@ -1916,7 +1916,7 @@ def get_node_type(config: Dict[str, Any]) -> GCPNodeType:
     return GCPNodeType.COMPUTE
 
 
-def create_tpu_node(project_id: str, zone: str, tpu_node_config: Dict[str, str],
+def create_tpu_node(project_id: str, zone: str, tpu_node_config: dict[str, str],
                     vpc_name: str):
     """Create a TPU node with gcloud CLI."""
     # TODO(suquark, zhwu): move this to GcpTpuNodeInstance.
@@ -1932,8 +1932,7 @@ def create_tpu_node(project_id: str, zone: str, tpu_node_config: Dict[str, str],
         logger.debug(f'Creating TPU {tpu_name} with command:\n{cmd}')
         proc = subprocess.run(
             f'yes | {cmd}',
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             shell=True,
             check=True,
         )
@@ -2002,7 +2001,7 @@ def create_tpu_node(project_id: str, zone: str, tpu_node_config: Dict[str, str],
         raise provisioner_err from e
 
 
-def delete_tpu_node(project_id: str, zone: str, tpu_node_config: Dict[str,
+def delete_tpu_node(project_id: str, zone: str, tpu_node_config: dict[str,
                                                                       str]):
     """Delete a TPU node with gcloud CLI.
 
@@ -2018,8 +2017,7 @@ def delete_tpu_node(project_id: str, zone: str, tpu_node_config: Dict[str,
         logger.debug(f'Deleting TPU {tpu_name} with cmd:\n{cmd}')
         proc = subprocess.run(
             f'yes | {cmd}',
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             shell=True,
             check=True,
         )

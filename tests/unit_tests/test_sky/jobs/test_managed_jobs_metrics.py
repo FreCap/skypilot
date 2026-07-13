@@ -37,8 +37,10 @@ class TestManagedJobsCollector:
 
         status_family = families[0]
         assert status_family.name == 'sky_managed_jobs_count'
-        samples = {(s.labels['workspace'], s.labels['user'], s.labels['status'],
-                    s.labels['cloud']): s.value for s in status_family.samples}
+        samples = {
+            (s.labels['workspace'], s.labels['user'], s.labels['status'], s.labels['cloud']):
+                s.value for s in status_family.samples
+        }
         assert samples == {
             ('ws', 'u', 'RUNNING', 'AWS'): 3,
             ('ws', 'u', 'PENDING', ''): 2,

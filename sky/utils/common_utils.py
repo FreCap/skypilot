@@ -1,6 +1,7 @@
 """Utils shared between all of sky"""
 
 import base64
+from collections.abc import Callable
 import ctypes
 import difflib
 import enum
@@ -21,7 +22,7 @@ import sys
 import tempfile
 import time
 import typing
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Optional
 import uuid
 
 import jsonschema
@@ -79,7 +80,7 @@ class ProcessStatus(enum.Enum):
     FAILED = 'FAILED'
 
 
-def is_valid_user_hash(user_hash: Optional[str]) -> bool:
+def is_valid_user_hash(user_hash: str | None) -> bool:
     if user_hash is None:
         return False
     # Must start with a letter, followed by alphanumeric characters and hyphens
@@ -101,7 +102,7 @@ def generate_user_hash() -> str:
     return user_hash
 
 
-def get_git_commit(path: Optional[str] = None) -> Optional[str]:
+def get_git_commit(path: str | None = None) -> str | None:
     try:
         result = subprocess.run(['git', 'rev-parse', 'HEAD'],
                                 capture_output=True,
@@ -126,7 +127,7 @@ def get_user_hash() -> str:
 
     if os.path.exists(USER_HASH_FILE):
         # Read from cached user hash file.
-        with open(USER_HASH_FILE, 'r', encoding='utf-8') as f:
+        with open(USER_HASH_FILE, encoding='utf-8') as f:
             # Remove invalid characters.
             user_hash = f.read().strip()
         if is_valid_user_hash(user_hash):
@@ -161,7 +162,7 @@ def base36_encode(hex_str: str) -> str:
     return _base36_encode(int_value)
 
 
-def check_cluster_name_is_valid(cluster_name: Optional[str]) -> None:
+def check_cluster_name_is_valid(cluster_name: str | None) -> None:
     """Errors out on invalid cluster names.
 
     Bans (including but not limited to) names that:
@@ -183,7 +184,7 @@ def check_cluster_name_is_valid(cluster_name: Optional[str]) -> None:
                 f'{valid_regex}')
 
 
-def cluster_name_looks_like_file_path(cluster_name: Optional[str]) -> bool:
+def cluster_name_looks_like_file_path(cluster_name: str | None) -> bool:
     """Returns True if the cluster name looks like a file path.
 
     This detects a common user mistake: typing 'sky launch -c job.yaml'
@@ -197,7 +198,7 @@ def cluster_name_looks_like_file_path(cluster_name: Optional[str]) -> bool:
             os.path.isfile(os.path.expanduser(cluster_name)))
 
 
-def check_recipe_name_is_valid(recipe_name: Optional[str]) -> None:
+def check_recipe_name_is_valid(recipe_name: str | None) -> None:
     """Errors out on invalid recipe names.
 
     Recipe names must:
@@ -226,7 +227,7 @@ def check_recipe_name_is_valid(recipe_name: Optional[str]) -> None:
                 'only contains letters, numbers, and dashes).')
 
 
-def check_workspace_name_is_valid(workspace_name: Optional[str]) -> None:
+def check_workspace_name_is_valid(workspace_name: str | None) -> None:
     """Errors out on invalid workspace names.
 
     Workspace names must:
@@ -258,7 +259,7 @@ def check_workspace_name_is_valid(workspace_name: Optional[str]) -> None:
 
 def make_cluster_name_on_cloud(
         display_name: str,
-        max_length: Optional[int] = 15,
+        max_length: int | None = 15,
         add_user_hash: bool = True,
         cluster_name_hash_length: int = CLUSTER_NAME_HASH_LENGTH) -> str:
     """Generate valid cluster name on cloud that is unique to the user.
@@ -322,9 +323,9 @@ def cluster_name_in_hint(cluster_name: str, cluster_name_on_cloud: str) -> str:
 
 
 def get_global_job_id(job_timestamp: str,
-                      cluster_name: Optional[str],
+                      cluster_name: str | None,
                       job_id: str,
-                      task_id: Optional[int] = None,
+                      task_id: int | None = None,
                       is_managed_job: bool = False) -> str:
     """Returns a unique job run id for each job run.
 
@@ -376,8 +377,8 @@ _USER_KEY = 'user'
 _REQUEST_ID_KEY = 'request_id'
 
 
-def set_request_context(client_entrypoint: Optional[str],
-                        client_command: Optional[str],
+def set_request_context(client_entrypoint: str | None,
+                        client_command: str | None,
                         using_remote_api_server: bool,
                         user: Optional['models.User'], request_id: str) -> None:
     """Override the current client entrypoint and command.
@@ -499,7 +500,7 @@ def read_last_n_lines(file_path: str,
                       n: int,
                       chunk_size: int = 8192,
                       encoding: str = 'utf-8',
-                      errors: str = 'replace') -> List[str]:
+                      errors: str = 'replace') -> list[str]:
     """Read the last N lines of a file.
 
     Args:
@@ -572,7 +573,7 @@ def read_last_n_lines(file_path: str,
                 f'Failed to read last {n} lines from {file_path}: {e}') from e
 
 
-def _redact_secrets_values(argv: List[str]) -> List[str]:
+def _redact_secrets_values(argv: list[str]) -> list[str]:
     """Redact sensitive values from --secret arguments.
 
     Args:
@@ -667,8 +668,7 @@ def user_and_hostname_hash() -> str:
     return f'{getpass.getuser()}-{hostname_hash}'
 
 
-def make_decorator(cls, name_or_fn: Union[str, Callable],
-                   **ctx_kwargs) -> Callable:
+def make_decorator(cls, name_or_fn: str | Callable, **ctx_kwargs) -> Callable:
     """Make the cls a decorator.
 
     class cls:
@@ -756,7 +756,7 @@ def class_fullname(cls, skip_builtins: bool = True):
     return f'{cls.__module__}.{cls.__name__}'
 
 
-def format_exception(e: Union[Exception, SystemExit, KeyboardInterrupt],
+def format_exception(e: Exception | SystemExit | KeyboardInterrupt,
                      use_bracket: bool = False) -> str:
     """Format an exception to a string.
 
@@ -783,7 +783,7 @@ def remove_color(s: str):
     return _COLOR_PATTERN.sub('', s)
 
 
-def remove_file_if_exists(path: Optional[str]):
+def remove_file_if_exists(path: str | None):
     """Delete a file if it exists.
 
     Args:
@@ -864,13 +864,13 @@ def is_valid_env_var(name: str) -> bool:
     return bool(re.fullmatch(_VALID_ENV_VAR_REGEX, name))
 
 
-def format_float(num: Union[float, int], precision: int = 1) -> str:
+def format_float(num: float | int, precision: int = 1) -> str:
     """Formats a float to not show decimal point if it is a whole number
 
     If it is not a whole number, it will show upto precision decimal point."""
     if isinstance(num, int):
         return str(num)
-    return '{:.0f}'.format(num) if num.is_integer() else f'{num:.{precision}f}'
+    return f'{num:.0f}' if num.is_integer() else f'{num:.{precision}f}'
 
 
 def validate_schema(obj, schema, err_msg_prefix='', skip_none=True):
@@ -974,7 +974,7 @@ def get_cleaned_username(username: str = '') -> str:
     return username
 
 
-def fill_template(template_ref: str, variables: Dict[str, Any],
+def fill_template(template_ref: str, variables: dict[str, Any],
                   output_path: str) -> None:
     """Create a file from a Jinja template.
 
@@ -991,7 +991,7 @@ def fill_template(template_ref: str, variables: Dict[str, Any],
         template_path = os.path.join(root_dir, 'templates', template_ref)
     if not os.path.exists(template_path):
         raise FileNotFoundError(f'Template "{template_ref}" does not exist.')
-    with open(template_path, 'r', encoding='utf-8') as fin:
+    with open(template_path, encoding='utf-8') as fin:
         template = fin.read()
     output_path = os.path.abspath(os.path.expanduser(output_path))
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -1008,7 +1008,7 @@ def deprecated_function(
         name: str,
         deprecated_name: str,
         removing_version: str,
-        override_argument: Optional[Dict[str, Any]] = None) -> Callable:
+        override_argument: dict[str, Any] | None = None) -> Callable:
     """Decorator for creating deprecated functions, for backward compatibility.
 
     It will result in a warning being emitted when the function is used.
@@ -1191,7 +1191,7 @@ def _mem_size_gb() -> float:
 # for the standards of handler files in cgroupv1 and v2.
 # Since all those paths are well-known standards that are unlikely to change,
 # we use string literals instead of defining extra constants.
-def _get_cgroup_cpu_limit() -> Optional[float]:
+def _get_cgroup_cpu_limit() -> float | None:
     """Return cpu limit from cgroups in cores.
 
     Returns:
@@ -1200,7 +1200,7 @@ def _get_cgroup_cpu_limit() -> Optional[float]:
     """
     try:
         if _is_cgroup_v2():
-            with open('/sys/fs/cgroup/cpu.max', 'r', encoding='utf-8') as f:
+            with open('/sys/fs/cgroup/cpu.max', encoding='utf-8') as f:
                 quota_str, period_str = f.read().strip().split()
                 if quota_str == 'max':
                     return None
@@ -1210,11 +1210,9 @@ def _get_cgroup_cpu_limit() -> Optional[float]:
         else:
             # cgroup v1
             with open('/sys/fs/cgroup/cpu/cpu.cfs_quota_us',
-                      'r',
                       encoding='utf-8') as f:
                 quota = float(f.read().strip())
             with open('/sys/fs/cgroup/cpu/cpu.cfs_period_us',
-                      'r',
                       encoding='utf-8') as f:
                 period = float(f.read().strip())
             # Return unlimited if cpu quota is not set.
@@ -1227,7 +1225,7 @@ def _get_cgroup_cpu_limit() -> Optional[float]:
         return None
 
 
-def _get_cgroup_memory_limit() -> Optional[int]:
+def _get_cgroup_memory_limit() -> int | None:
     """Return memory limit from cgroups in bytes.
 
     Returns:
@@ -1236,7 +1234,7 @@ def _get_cgroup_memory_limit() -> Optional[int]:
     try:
         path = ('/sys/fs/cgroup/memory.max' if _is_cgroup_v2() else
                 '/sys/fs/cgroup/memory/memory.limit_in_bytes')
-        with open(path, 'r', encoding='utf-8') as f:
+        with open(path, encoding='utf-8') as f:
             value = f.read().strip()
             if value == 'max' or not value:
                 return None
@@ -1296,9 +1294,8 @@ def compute_code_challenge(code_verifier: str) -> str:
     return base64_url_encode(digest)
 
 
-def merge_node_names_lineage(
-        existing_json: Optional[str],
-        current_names: Optional[List[str]]) -> Optional[str]:
+def merge_node_names_lineage(existing_json: str | None,
+                             current_names: list[str] | None) -> str | None:
     """Merge current node names into the existing node name lineage.
 
     The node_names column stores a JSON list of lists. Each inner list
@@ -1317,7 +1314,7 @@ def merge_node_names_lineage(
     if current_names is None:
         return existing_json
 
-    existing: List[List[str]] = []
+    existing: list[list[str]] = []
     if existing_json is not None:
         try:
             parsed = json.loads(existing_json)
@@ -1326,7 +1323,7 @@ def merge_node_names_lineage(
         except (json.JSONDecodeError, TypeError):
             pass
 
-    result: List[List[str]] = []
+    result: list[list[str]] = []
     for i, name in enumerate(current_names):
         if i < len(existing) and isinstance(existing[i], list):
             lineage = list(existing[i])
@@ -1343,7 +1340,7 @@ def merge_node_names_lineage(
     return json.dumps(result) if result else None
 
 
-def get_display_node_names(node_names_json: Optional[str]) -> Optional[str]:
+def get_display_node_names(node_names_json: str | None) -> str | None:
     """Extract display node names from the lineage JSON.
 
     Takes the last entry from each inner list (the most recent name for

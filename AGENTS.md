@@ -57,9 +57,9 @@ skypilot/
 ### Environment Setup
 
 ```bash
-# Create virtual environment with uv (Python 3.8-3.11 supported)
+# Create virtual environment with uv (Python 3.14, matching the production image)
 # --seed is required to ensure pip is installed (needed for building wheels)
-uv venv --seed --python 3.11
+uv venv --seed --python 3.14
 source .venv/bin/activate
 
 # Install in editable mode with all cloud support
@@ -246,7 +246,7 @@ Dependencies are defined in `sky/setup_files/dependencies.py`:
 When updating dependencies:
 
 1. Check version constraints carefully - some packages have breaking changes
-2. Consider Python version compatibility (3.8-3.11)
+2. Consider Python version compatibility (3.14, the production interpreter)
 3. Test with both minimum and latest allowed versions
 4. Document version constraints with comments explaining why
 

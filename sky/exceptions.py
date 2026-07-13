@@ -1,10 +1,11 @@
 """Exceptions."""
 import builtins
+from collections.abc import Sequence
 import enum
 import traceback
 import types
 import typing
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Optional
 
 from sky.backends import backend
 from sky.utils import env_options
@@ -75,7 +76,7 @@ def wrap_exception(exc: BaseException) -> BaseException:
 
 
 # Accept BaseException to handle SystemExit and KeyboardInterrupt
-def serialize_exception(e: BaseException) -> Dict[str, Any]:
+def serialize_exception(e: BaseException) -> dict[str, Any]:
     """Serialize the exception.
 
     This function also wraps any unsafe exceptions (e.g., cloud exceptions)
@@ -168,17 +169,17 @@ class ResourcesUnavailableError(Exception):
     def __init__(self,
                  message: str,
                  no_failover: bool = False,
-                 failover_history: Optional[List[Exception]] = None) -> None:
+                 failover_history: list[Exception] | None = None) -> None:
         super().__init__(message)
         self.no_failover = no_failover
         if failover_history is None:
             failover_history = []
         # Copy the list to avoid modifying from outside.
-        self.failover_history: List[Exception] = list(failover_history)
+        self.failover_history: list[Exception] = list(failover_history)
 
     def with_failover_history(
             self,
-            failover_history: List[Exception]) -> 'ResourcesUnavailableError':
+            failover_history: list[Exception]) -> 'ResourcesUnavailableError':
         # Copy the list to avoid modifying from outside.
         self.failover_history = list(failover_history)
         return self
@@ -200,7 +201,7 @@ class KubernetesValidationError(Exception):
     caused the validation error.
     """
 
-    def __init__(self, path: List[str], message: str):
+    def __init__(self, path: list[str], message: str):
         super().__init__(message)
         self.path = path
 
@@ -287,7 +288,7 @@ class CommandFailureException(SkyPilotExcludeArgsBaseException):
     """
 
     def __init__(self, command: str, failure: str, error_msg: str,
-                 detailed_reason: Optional[str]) -> None:
+                 detailed_reason: str | None) -> None:
         self.command = command
         self.failure = failure
         self.error_msg = error_msg
@@ -320,8 +321,8 @@ class CommandError(CommandFailureException):
                  returncode: int,
                  command: str,
                  error_msg: str,
-                 detailed_reason: Optional[str],
-                 failure: Optional[str] = None) -> None:
+                 detailed_reason: str | None,
+                 failure: str | None = None) -> None:
         self.returncode = returncode
         if failure is None:
             failure = f'failed with return code {returncode}'
@@ -501,7 +502,7 @@ class WorkspaceAmbiguousError(SkyPilotExcludeArgsBaseException):
                 'Or, for a one-shot override on `sky launch` / '
                 '`sky jobs launch`, pass `--workspace <name>`.')
 
-    def __init__(self, accessible: List[str], note: Optional[str] = None):
+    def __init__(self, accessible: list[str], note: str | None = None):
         self.accessible = sorted(accessible)
         self.note = note
         names = ', '.join(self.accessible)
@@ -743,7 +744,7 @@ class ExecutionPausedError(ExecutionRetryableError):
                  message: str,
                  hint: str,
                  retry_wait_seconds: int,
-                 continue_condition: Optional[Any] = None) -> None:
+                 continue_condition: Any | None = None) -> None:
         super().__init__(message, hint, retry_wait_seconds)
         self.continue_condition = continue_condition
 

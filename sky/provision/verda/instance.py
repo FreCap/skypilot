@@ -1,7 +1,7 @@
 """Verda Cloud (formerly DataCrunch) instance provisioning."""
 
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
 from sky import exceptions
 from sky import sky_logging
@@ -32,7 +32,7 @@ verda = VerdaClient()
 
 def _filter_instances(
         cluster_name_on_cloud: str,
-        status_filters: Optional[List[str]] = None) -> Dict[str, Instance]:
+        status_filters: list[str] | None = None) -> dict[str, Instance]:
     instances = verda.instances_get()
     filtered_instances = {}
     for instance in instances:
@@ -52,7 +52,7 @@ def _get_instance_info(instance_id: str) -> Instance:
     return verda.instance_get(instance_id)
 
 
-def _get_head_instance_id(instances: Dict[str, Instance]) -> Optional[str]:
+def _get_head_instance_id(instances: dict[str, Instance]) -> str | None:
     head_instance_id = None
     for inst_id, inst in instances.items():
         if inst.hostname.endswith('-head'):
@@ -235,7 +235,7 @@ def run_instances(
 def wait_instances(
     region: str,
     cluster_name_on_cloud: str,
-    state: Optional[status_lib.ClusterStatus],
+    state: status_lib.ClusterStatus | None,
 ) -> None:
     # Waiting for instances to be ready is already handled in run_instances.
     del region, cluster_name_on_cloud, state
@@ -243,7 +243,7 @@ def wait_instances(
 
 def stop_instances(
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     worker_only: bool = False,
 ) -> None:
     raise NotImplementedError()
@@ -251,7 +251,7 @@ def stop_instances(
 
 def terminate_instances(
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     worker_only: bool = False,
 ) -> None:
     """See sky/provision/__init__.py"""
@@ -352,12 +352,12 @@ def terminate_instances(
 def get_cluster_info(
     region: str,
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
 ) -> common.ClusterInfo:
     del region  # unused
     running_instances = _filter_instances(cluster_name_on_cloud,
                                           [InstanceStatus.RUNNING])
-    instances: Dict[str, List[common.InstanceInfo]] = {}
+    instances: dict[str, list[common.InstanceInfo]] = {}
     head_instance_id = None
     for instance_id, instance in running_instances.items():
         running_instances[instance_id] = _get_instance_info(instance_id)
@@ -388,10 +388,10 @@ def get_cluster_info(
 
 def query_instances(
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     non_terminated_only: bool = True,
     retry_if_missing: bool = False,
-) -> Dict[str, Tuple[Optional['status_lib.ClusterStatus'], Optional[str]]]:
+) -> dict[str, tuple[Optional['status_lib.ClusterStatus'], str | None]]:
     """See sky/provision/__init__.py"""
     assert provider_config is not None, (cluster_name_on_cloud, provider_config)
     del retry_if_missing  # unused
@@ -405,8 +405,7 @@ def query_instances(
         'deleted': None,  # Being deleted - should be filtered out
         'discontinued': None,  # Already terminated - should be filtered out
     }
-    statuses: Dict[str, Tuple[Optional[status_lib.ClusterStatus],
-                              Optional[str]]] = {}
+    statuses: dict[str, tuple[status_lib.ClusterStatus | None, str | None]] = {}
     for inst_id, inst in instances.items():
         status = status_map[inst.status]
         if non_terminated_only and status is None:
@@ -417,7 +416,7 @@ def query_instances(
 
 def cleanup_ports(
     cluster_name_on_cloud: str,
-    ports: List[str],
-    provider_config: Optional[Dict[str, Any]] = None,
+    ports: list[str],
+    provider_config: dict[str, Any] | None = None,
 ) -> None:
     del cluster_name_on_cloud, ports, provider_config  # Unused.

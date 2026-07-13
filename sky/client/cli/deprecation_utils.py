@@ -2,7 +2,7 @@
 
 import copy
 import functools
-from typing import Any, Dict, Optional
+from typing import Any
 
 import click
 
@@ -11,11 +11,11 @@ from sky import sky_logging
 logger = sky_logging.init_logger(__name__)
 
 
-def _with_deprecation_warning(
-        f,
-        original_name: str,
-        alias_name: str,
-        override_command_argument: Optional[Dict[str, Any]] = None):
+def _with_deprecation_warning(f,
+                              original_name: str,
+                              alias_name: str,
+                              override_command_argument: dict[str, Any] |
+                              None = None):
 
     @functools.wraps(f)
     def wrapper(self, *args, **kwargs):
@@ -42,7 +42,7 @@ def _with_deprecation_warning(
     return wrapper
 
 
-def _override_arguments(callback, override_command_argument: Dict[str, Any]):
+def _override_arguments(callback, override_command_argument: dict[str, Any]):
 
     def wrapper(*args, **kwargs):
         logger.info(f'Overriding arguments: {override_command_argument}')
@@ -56,9 +56,9 @@ def _add_command_alias(
     group: click.Group,
     command: click.Command,
     hidden: bool = False,
-    new_group: Optional[click.Group] = None,
-    new_command_name: Optional[str] = None,
-    override_command_argument: Optional[Dict[str, Any]] = None,
+    new_group: click.Group | None = None,
+    new_command_name: str | None = None,
+    override_command_argument: dict[str, Any] | None = None,
     with_warning: bool = True,
 ) -> None:
     """Add a alias of a command to a group."""

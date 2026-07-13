@@ -11,7 +11,6 @@ import argparse
 import csv
 import json
 import os
-from typing import Optional
 
 import requests
 
@@ -83,9 +82,9 @@ def create_catalog(api_key: str, output_path: str) -> None:
             mem = float(specs['memory_gib'])
             price = (float(info[vm]['instance_type']['price_cents_per_hour']) /
                      100)
-            gpu: Optional[str] = None
-            gpu_cnt: Optional[float] = None
-            gpuinfo: Optional[str] = None
+            gpu: str | None = None
+            gpu_cnt: float | None = None
+            gpuinfo: str | None = None
             if specs.get('gpus', 0) > 0:
                 gpu = name_to_gpu(vm)
                 gpu_cnt = float(specs['gpus'])
@@ -111,13 +110,11 @@ def get_api_key(cmdline_args: argparse.Namespace) -> str:
     api_key = cmdline_args.api_key
     if api_key is None:
         if cmdline_args.api_key_path is not None:
-            with open(cmdline_args.api_key_path, mode='r',
-                      encoding='utf-8') as f:
+            with open(cmdline_args.api_key_path, encoding='utf-8') as f:
                 api_key = f.read().strip()
         else:
             # Read from ~/.lambda_cloud/lambda_keys
-            with open(DEFAULT_LAMBDA_KEYS_PATH, mode='r',
-                      encoding='utf-8') as f:
+            with open(DEFAULT_LAMBDA_KEYS_PATH, encoding='utf-8') as f:
                 lines = [
                     line.strip() for line in f.readlines() if ' = ' in line
                 ]

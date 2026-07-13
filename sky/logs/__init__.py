@@ -8,7 +8,7 @@ from sky.logs.aws import CloudwatchLoggingAgent
 from sky.logs.gcp import GCPLoggingAgent
 
 
-def get_logging_agent() -> Optional[LoggingAgent]:
+def get_logging_agent() -> LoggingAgent | None:
     store = skypilot_config.get_nested(('logs', 'store'), None)
     if store is None:
         return None

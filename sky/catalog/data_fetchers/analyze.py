@@ -1,6 +1,5 @@
 """Analyze the new catalog fetched with the original."""
 import typing
-from typing import List
 
 from sky.adaptors import common as adaptors_common
 from sky.catalog import common
@@ -12,7 +11,7 @@ else:
 
 
 def resource_diff(original_df: 'pd.DataFrame', new_df: 'pd.DataFrame',
-                  check_tuple: List[str]) -> 'pd.DataFrame':
+                  check_tuple: list[str]) -> 'pd.DataFrame':
     """Returns the difference between two dataframes."""
     original_resources = original_df[check_tuple]
     new_resources = new_df[check_tuple]

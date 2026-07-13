@@ -1,20 +1,15 @@
 """Request execution threads management."""
 
 import asyncio
+from collections.abc import Callable
 import concurrent.futures
-import sys
 import threading
-from typing import Callable, Set, TypeVar
+# pylint: disable=ungrouped-imports
+from typing import ParamSpec, TypeVar
 
 from sky import exceptions
 from sky import sky_logging
 from sky.utils import atomic
-
-# pylint: disable=ungrouped-imports
-if sys.version_info >= (3, 10):
-    from typing import ParamSpec
-else:
-    from typing_extensions import ParamSpec
 
 _P = ParamSpec('_P')
 _T = TypeVar('_T')
@@ -44,7 +39,7 @@ class OnDemandThreadExecutor(concurrent.futures.Executor):
         self.running: atomic.AtomicInt = atomic.AtomicInt(0)
         self._shutdown: bool = False
         self._shutdown_lock: threading.Lock = threading.Lock()
-        self._threads: Set[threading.Thread] = set()
+        self._threads: set[threading.Thread] = set()
         self._threads_lock: threading.Lock = threading.Lock()
 
     def _cleanup_thread(self, thread: threading.Thread):

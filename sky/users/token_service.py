@@ -1,5 +1,6 @@
 """JWT-based service account token management for SkyPilot."""
 
+from collections.abc import Generator
 import contextlib
 import datetime
 import hashlib
@@ -7,7 +8,7 @@ import os
 import secrets
 import threading
 import time
-from typing import Any, Dict, Generator, Optional
+from typing import Any
 
 import filelock
 import jwt
@@ -100,7 +101,7 @@ class TokenService:
                      creator_user_id: str,
                      service_account_user_id: str,
                      token_name: str,
-                     expires_in_days: Optional[int] = None) -> Dict[str, Any]:
+                     expires_in_days: int | None = None) -> dict[str, Any]:
         """Create a new JWT service account token.
 
         Args:
@@ -163,7 +164,7 @@ class TokenService:
             'expires_at': expires_at,
         }
 
-    def verify_token(self, token: str) -> Optional[Dict[str, Any]]:
+    def verify_token(self, token: str) -> dict[str, Any] | None:
         """Verify and decode a JWT token.
 
         Args:

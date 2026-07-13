@@ -79,8 +79,9 @@ async def test_create_or_refresh_existing_row_returns_false_and_refreshes_env(
     # Request with the new env.
     monkeypatch.setenv('SKYPILOT_RECON_TAG', 'new')
     req_second = requests.build_internal_daemon_request(daemon)
-    assert (await requests.create_or_refresh_internal_daemon_async(req_second)
-           ) is False
+    assert (
+        await
+        requests.create_or_refresh_internal_daemon_async(req_second)) is False
 
     row = await requests.get_request_async('alpha-daemon')
     assert row.request_body.env_vars.get('SKYPILOT_RECON_TAG') == 'new'

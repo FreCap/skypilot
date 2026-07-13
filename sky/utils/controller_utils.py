@@ -1,10 +1,12 @@
 """Util constants/functions for SkyPilot Controllers."""
+from collections.abc import Callable
+from collections.abc import Iterable
 import copy
 import os
 import pathlib
 import tempfile
 import typing
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any
 import uuid
 
 import colorama
@@ -84,13 +86,13 @@ high_availability_specified.__module__ = __name__
 # Install cli dependencies. Not using SkyPilot wheels because the wheel
 # can be cleaned up by another process.
 def _get_cloud_dependencies_installation_commands(
-        controller: Controllers) -> List[str]:
+        controller: Controllers) -> list[str]:
     # We use <step>/<total> instead of strong formatting, as we need to update
     # the <total> at the end of the for loop, and python does not support
     # partial string formatting.
     prefix_str = ('[<step>/<total>] Check & install cloud dependencies '
                   'on controller: ')
-    commands: List[str] = []
+    commands: list[str] = []
     # This is to make sure the shorter checking message does not have junk
     # characters from the previous message.
     empty_str = ' ' * 20
@@ -98,7 +100,7 @@ def _get_cloud_dependencies_installation_commands(
     # All python dependencies will be accumulated and then installed in one
     # command at the end. This is very fast if the packages are already
     # installed, so we don't check that.
-    python_packages: Set[str] = set()
+    python_packages: set[str] = set()
 
     step_prefix = prefix_str.replace('<step>', str(len(commands) + 1))
     # Wrap in braces to isolate the || in SKY_UV_INSTALL_CMD from
@@ -123,7 +125,7 @@ def _get_cloud_dependencies_installation_commands(
     k8s_dependencies_installed = False
 
     for cloud in sorted(enabled_clouds, key=repr):
-        cloud_python_dependencies: List[str] = copy.deepcopy(
+        cloud_python_dependencies: list[str] = copy.deepcopy(
             dependencies.extras_require[cloud.canonical_name()])
 
         if isinstance(cloud, clouds.Azure):
@@ -240,9 +242,8 @@ def _get_cloud_dependencies_installation_commands(
     return commands
 
 
-def check_cluster_name_not_controller(
-        cluster_name: Optional[str],
-        operation_str: Optional[str] = None) -> None:
+def check_cluster_name_not_controller(cluster_name: str | None,
+                                      operation_str: str | None = None) -> None:
     """Errors out if the cluster name is a controller name.
 
     Raises:
@@ -267,8 +268,8 @@ def download_and_stream_job_log(
         backend: 'cloud_vm_ray_backend.CloudVmRayBackend',
         handle: 'cloud_vm_ray_backend.CloudVmRayResourceHandle',
         local_dir: str,
-        job_ids: Optional[List[str]] = None,
-        on_downloaded: Optional[Callable[[str], None]] = None) -> Optional[str]:
+        job_ids: list[str] | None = None,
+        on_downloaded: Callable[[str], None] | None = None) -> str | None:
     """Downloads and streams the latest job log.
 
     This function is only used by jobs controller and sky serve controller.
@@ -337,10 +338,7 @@ def download_and_stream_job_log(
         # copy is the synced run.log on disk anyway. errors='replace' so a
         # stray invalid-UTF-8 byte in the user log can't abort the copy
         # mid-stream (matches log_lib's decode handling).
-        with open(log_file,
-                  'r',
-                  encoding='utf-8',
-                  newline='\n',
+        with open(log_file, encoding='utf-8', newline='\n',
                   errors='replace') as f:
             # Stream the logs to the console without reading the whole file into
             # memory.
@@ -366,7 +364,7 @@ def download_and_stream_job_log(
 
 def shared_controller_vars_to_fill(
         controller: Controllers, remote_user_config_path: str,
-        local_user_config: Dict[str, Any]) -> Dict[str, str]:
+        local_user_config: dict[str, Any]) -> dict[str, str]:
     if not local_user_config:
         local_user_config_path = None
     else:
@@ -391,13 +389,13 @@ def shared_controller_vars_to_fill(
             yaml_utils.dump_yaml(temp_file.name, dict(**local_user_config))
         local_user_config_path = temp_file.name
 
-    vars_to_fill: Dict[str, Any] = controller_only_vars_to_fill(controller)
+    vars_to_fill: dict[str, Any] = controller_only_vars_to_fill(controller)
     vars_to_fill.update({
         'sky_activate_python_env': constants.ACTIVATE_SKY_REMOTE_PYTHON_ENV,
         'sky_python_cmd': constants.SKY_PYTHON_CMD,
         'local_user_config_path': local_user_config_path,
     })
-    env_vars: Dict[str, Any] = {
+    env_vars: dict[str, Any] = {
         env.env_key: str(int(env.get())) for env in env_options.Options
     }
     env_vars.update({
@@ -422,7 +420,7 @@ def shared_controller_vars_to_fill(
     return vars_to_fill
 
 
-def controller_only_vars_to_fill(controller: Controllers) -> Dict[str, str]:
+def controller_only_vars_to_fill(controller: Controllers) -> dict[str, str]:
     # Get plugins config and wheel file mounts/commands together to ensure
     # consistency between the uploaded wheel paths and installation commands.
     # Only upload plugins specified in remote_plugins.yaml - plugins in
@@ -433,7 +431,7 @@ def controller_only_vars_to_fill(controller: Controllers) -> Dict[str, str]:
     if plugin_wheel_file_mounts and plugins_wheel_install_commands:
         local_plugins_config_path = (
             plugin_utils.get_filtered_plugins_config_path())
-    vars_to_fill: Dict[str, Any] = {
+    vars_to_fill: dict[str, Any] = {
         'sky_activate_python_env': constants.ACTIVATE_SKY_REMOTE_PYTHON_ENV,
         'cloud_dependencies_installation_commands':
             _get_cloud_dependencies_installation_commands(controller),
@@ -443,7 +441,7 @@ def controller_only_vars_to_fill(controller: Controllers) -> Dict[str, str]:
         'plugin_wheel_file_mounts': plugin_wheel_file_mounts,
         'plugins_wheel_install_commands': plugins_wheel_install_commands,
     }
-    env_vars: Dict[str, Any] = {
+    env_vars: dict[str, Any] = {
         env.env_key: str(int(env.get())) for env in env_options.Options
     }
     env_vars.update({
@@ -480,7 +478,7 @@ def controller_only_vars_to_fill(controller: Controllers) -> Dict[str, str]:
 def get_controller_resources(
     controller: Controllers,
     task_resources: Iterable['resources.Resources'],
-) -> Set['resources.Resources']:
+) -> set['resources.Resources']:
     """Read the skypilot config and setup the controller resources.
 
     Returns:
@@ -490,7 +488,7 @@ def get_controller_resources(
         specified, the controller will be launched on one of the clouds
         of the task resources for better connectivity.
     """
-    controller_resources_config_copied: Dict[str, Any] = copy.copy(
+    controller_resources_config_copied: dict[str, Any] = copy.copy(
         controller.value.default_resources_config)
     if skypilot_config.loaded():
         # Override the controller resources with the ones specified in the
@@ -565,8 +563,8 @@ def get_controller_resources(
     # from the clouds (and regions/zones) of the resources if the user does not
     # specify the cloud (and region/zone) for the controller.
 
-    requested_clouds_with_region_zone: Dict[str, Dict[Optional[str],
-                                                      Set[Optional[str]]]] = {}
+    requested_clouds_with_region_zone: dict[str, dict[str | None,
+                                                      set[str | None]]] = {}
     for resource in task_resources:
         if resource.cloud is not None:
             cloud_name = str(resource.cloud)
@@ -619,28 +617,28 @@ def get_controller_resources(
     controller_zone = controller_resources_to_use.zone
 
     # Filter clouds if controller_resources_to_use.cloud is specified.
-    filtered_clouds: Set[str] = {controller_cloud
+    filtered_clouds: set[str] = {controller_cloud
                                 } if controller_cloud is not None else set(
                                     requested_clouds_with_region_zone.keys())
 
     # Filter regions and zones and construct the result.
-    result: Set[resources.Resources] = set()
+    result: set[resources.Resources] = set()
     for cloud_name in filtered_clouds:
         regions = requested_clouds_with_region_zone.get(cloud_name,
                                                         {None: {None}})
 
         # Filter regions if controller_resources_to_use.region is specified.
-        filtered_regions: Set[Optional[str]] = ({
-            controller_region
-        } if controller_region is not None else set(regions.keys()))
+        filtered_regions: set[str |
+                              None] = ({controller_region} if controller_region
+                                       is not None else set(regions.keys()))
 
         for region in filtered_regions:
             zones = regions.get(region, {None})
 
             # Filter zones if controller_resources_to_use.zone is specified.
-            filtered_zones: Set[Optional[str]] = ({
-                controller_zone
-            } if controller_zone is not None else set(zones))
+            filtered_zones: set[str |
+                                None] = ({controller_zone} if controller_zone
+                                         is not None else set(zones))
 
             # Create combinations of cloud, region, and zone.
             for zone in filtered_zones:
@@ -658,7 +656,6 @@ def get_controller_resources(
 def get_controller_mem_size_gb() -> float:
     try:
         with open(os.path.expanduser(constants.CONTROLLER_K8S_MEMORY_FILE),
-                  'r',
                   encoding='utf-8') as f:
             return float(f.read())
     except FileNotFoundError:
@@ -668,7 +665,7 @@ def get_controller_mem_size_gb() -> float:
 
 def _setup_proxy_command_on_controller(
         controller_launched_cloud: 'clouds.Cloud',
-        user_config: Dict[str, Any]) -> config_utils.Config:
+        user_config: dict[str, Any]) -> config_utils.Config:
     """Sets up proxy command on the controller.
 
     This function should be called on the controller (remote cluster), which
@@ -723,7 +720,7 @@ def _setup_proxy_command_on_controller(
 
 
 def replace_skypilot_config_path_in_file_mounts(
-        cloud: 'clouds.Cloud', file_mounts: Optional[Dict[str, str]]):
+        cloud: 'clouds.Cloud', file_mounts: dict[str, str] | None):
     """Replaces the SkyPilot config path in file mounts with the real path."""
     # TODO(zhwu): This function can be moved to `backend_utils` once we have
     # more predefined file mounts that needs to be replaced after the cluster
@@ -755,8 +752,8 @@ def _generate_run_uuid() -> str:
 
 
 def translate_local_file_mounts_to_two_hop(task: 'task_lib.Task',
-                                           run_id: Optional[str] = None
-                                          ) -> Dict[str, str]:
+                                           run_id: str | None = None
+                                          ) -> dict[str, str]:
     """Translates local->VM mounts into two-hop file mounts.
 
     This strategy will upload the local files to the controller first, using a
@@ -814,9 +811,8 @@ def translate_local_file_mounts_to_two_hop(task: 'task_lib.Task',
 def maybe_translate_local_file_mounts_and_sync_up(
     task: 'task_lib.Task',
     task_type: str,
-    run_id: Optional[str] = None,
-    on_storage_mounts_prepared: Optional[Callable[['task_lib.Task'],
-                                                  None]] = None
+    run_id: str | None = None,
+    on_storage_mounts_prepared: Callable[['task_lib.Task'], None] | None = None
 ) -> None:
     """Translates local->VM mounts into Storage->VM, then syncs up any Storage.
 
@@ -844,7 +840,7 @@ def maybe_translate_local_file_mounts_and_sync_up(
     # Translate the workdir and local file mounts to cloud file mounts.
     # ================================================================
 
-    def _sub_path_join(sub_path: Optional[str], path: str) -> str:
+    def _sub_path_join(sub_path: str | None, path: str) -> str:
         if sub_path is None:
             return path
         return os.path.join(sub_path, path).strip('/')
@@ -883,7 +879,7 @@ def maybe_translate_local_file_mounts_and_sync_up(
     # Get the bucket name for the workdir and file mounts,
     # we store all these files in same bucket from config.
     bucket_wth_prefix = skypilot_config.get_nested((task_type, 'bucket'), None)
-    store_kwargs: Dict[str, Any] = {}
+    store_kwargs: dict[str, Any] = {}
     if bucket_wth_prefix is None:
         store_type = sub_path = None
         storage_account_name = region = None
@@ -1304,8 +1300,7 @@ def warn_jobs_consolidation_mode_intent(enabled: bool) -> None:
 
 
 @annotations.lru_cache(scope='request', maxsize=1)
-def _effective_jobs_consolidation_with_warnings(
-) -> Tuple[bool, Optional[bool]]:
+def _effective_jobs_consolidation_with_warnings() -> tuple[bool, bool | None]:
     """Compute effective jobs consolidation and emit warnings once per request.
 
     Returns (effective, intent_arg). intent_arg is None when not on the API
@@ -1339,7 +1334,7 @@ def _effective_jobs_consolidation_with_warnings(
 
 
 def is_jobs_consolidation_mode(
-        extra_validator: Optional[Callable[[bool], None]] = None) -> bool:
+        extra_validator: Callable[[bool], None] | None = None) -> bool:
     """Return effective jobs-controller consolidation state.
 
     Single source of truth for whether the jobs controller is running in
@@ -1467,7 +1462,7 @@ def in_flight_launch_count() -> float:
     return provisioning + terminating / SERVE_LAUNCH_RATIO
 
 
-def can_provision(pool: bool, in_flight: Optional[float] = None) -> bool:
+def can_provision(pool: bool, in_flight: float | None = None) -> bool:
     # TODO(tian): probe API server to see if there is any pending provision
     # requests.
     return can_terminate(pool, in_flight=in_flight)
@@ -1509,7 +1504,7 @@ def get_max_services_error_message(pool: bool) -> str:
     return msg
 
 
-def can_terminate(pool: bool, in_flight: Optional[float] = None) -> bool:
+def can_terminate(pool: bool, in_flight: float | None = None) -> bool:
     # TODO(tian): probe API server to see if there is any pending terminate
     # requests.
     if in_flight is None:

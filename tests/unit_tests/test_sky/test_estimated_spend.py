@@ -401,8 +401,8 @@ def test_schema_021_upgrades_existing_sqlite_database(tmp_path):
     history_indexes = {
         index['name'] for index in inspector.get_indexes('cluster_history')
     }
-    assert {'workload_type', 'workload_id', 'workload_task_id'
-           } <= cluster_columns
+    assert {'workload_type', 'workload_id',
+            'workload_task_id'} <= cluster_columns
     assert {
         'workload_type', 'workload_id', 'workload_task_id', 'usage_updated_at'
     } <= history_columns

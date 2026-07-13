@@ -6,7 +6,7 @@ import enum
 import os
 import time
 import typing
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Optional
 
 from sky import check as sky_check
 from sky import clouds as sky_clouds
@@ -42,8 +42,7 @@ _PREEMPTION_RETRY_SECONDS_ENV_VAR = 'SKYPILOT_SPOT_PLACER_RETRY_SECONDS'
 
 
 def _normalize_image_id(
-    image_id: Optional[Dict[Optional[str], str]]
-) -> Optional[Dict[Optional[str], str]]:
+        image_id: dict[str | None, str] | None) -> dict[str | None, str] | None:
     """Region-independent form of a single-image dict.
 
     Parsed YAML keys single-value image dicts by the entry's
@@ -83,24 +82,24 @@ class Location:
     """
     cloud: 'sky_clouds.Cloud'
     region: str
-    zone: Optional[str]
+    zone: str | None
     # TODO(fcapponi): Split placement coordinates from launch-shape data.
     # Keep cloud/region/zone as Location identity and carry the selected
     # any_of entry's backend-specific fields in a typed resource_overrides
     # value. It must preserve serialization, equality, and explicit None
     # clearing when a heterogeneous launch switches backends.
-    accelerators: Optional[Dict[str, int]] = None
+    accelerators: dict[str, int] | None = None
     use_spot: bool = True
     # The image the shape entry pins (e.g. a docker: reference for a
     # Kubernetes pool entry whose replicas run inside the model image).
     # Normalized SkyPilot form: {region_or_None: image_ref}.
-    image_id: Optional[Dict[Optional[str], str]] = None
+    image_id: dict[str | None, str] | None = None
     # Per-entry disk tier (e.g. 'high' on VM entries for docker-load
     # throughput; unset on Kubernetes entries, which reject the field).
-    disk_tier: Optional[str] = None
+    disk_tier: str | None = None
     # Per-entry Kubernetes ephemeral-storage request in GiB. Cloud VM
     # entries must keep this unset because they reject the field.
-    ephemeral_storage: Optional[int] = None
+    ephemeral_storage: int | None = None
 
     def _accel_key(self) -> str:
         parts = []
@@ -146,8 +145,8 @@ class Location:
                    disk_tier=disk_tier,
                    ephemeral_storage=resources.ephemeral_storage)
 
-    def to_dict(self) -> Dict[str, Any]:
-        d: Dict[str, Any] = {
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
             'cloud': self.cloud,
             'region': self.region,
             'zone': self.zone,
@@ -170,7 +169,7 @@ class Location:
     @classmethod
     def from_pickleable(
         cls,
-        data: Optional[Dict[str, Any]],
+        data: dict[str, Any] | None,
     ) -> Optional['Location']:
         if data is None:
             return None
@@ -191,7 +190,7 @@ class Location:
             ephemeral_storage=data.get('ephemeral_storage'),
         )
 
-    def to_pickleable(self) -> Dict[str, Any]:
+    def to_pickleable(self) -> dict[str, Any]:
         return {
             'cloud': str(self.cloud),
             'region': self.region,
@@ -205,7 +204,7 @@ class Location:
 
     @classmethod
     def from_resources_override(
-            cls, override: Optional[Dict[str, Any]]) -> Optional['Location']:
+            cls, override: dict[str, Any] | None) -> Optional['Location']:
         """Reconstruct a location from an override that inlined to_dict().
 
         A placer-pinned launch stamps its location fields into the
@@ -224,7 +223,7 @@ class Location:
         region = override.get('region')
         if cloud_val is None or region is None:
             return None
-        cloud: Optional[sky_clouds.Cloud] = (cloud_val if isinstance(
+        cloud: sky_clouds.Cloud | None = (cloud_val if isinstance(
             cloud_val, sky_clouds.Cloud) else registry.CLOUD_REGISTRY.from_str(
                 str(cloud_val)))
         if cloud is None:
@@ -284,10 +283,10 @@ class LocationStatus(enum.Enum):
     PREEMPTED = 'PREEMPTED'
 
 
-def _get_possible_location_from_task(task: 'task_lib.Task') -> List[Location]:
+def _get_possible_location_from_task(task: 'task_lib.Task') -> list[Location]:
 
     def _shape_free_config(
-            resources: 'resources_lib.Resources') -> Dict[str, Any]:
+            resources: 'resources_lib.Resources') -> dict[str, Any]:
         # Accelerators and spot-ness are per-location attributes (a
         # heterogeneous any_of mixes e.g. cloud L4 spot with
         # reserved-cluster A100 on-demand); everything else must be
@@ -321,7 +320,7 @@ def _get_possible_location_from_task(task: 'task_lib.Task') -> List[Location]:
     # to launch there.
     possible_locations = set()
     for shape_entry in resources_list:
-        location_requirements: Dict[str, Dict[str, Set[str]]] = (
+        location_requirements: dict[str, dict[str, set[str]]] = (
             collections.defaultdict(lambda: collections.defaultdict(set)))
         r = shape_entry
         if r.cloud is not None:
@@ -333,7 +332,7 @@ def _get_possible_location_from_task(task: 'task_lib.Task') -> List[Location]:
             else:
                 location_requirements[cloud_str][r.region].add(r.zone)
 
-        clouds_list: List[sky_clouds.Cloud] = []
+        clouds_list: list[sky_clouds.Cloud] = []
         for c in location_requirements.keys():
             cloud_obj = registry.CLOUD_REGISTRY.from_str(c)
             assert cloud_obj is not None
@@ -361,7 +360,7 @@ def _get_possible_location_from_task(task: 'task_lib.Task') -> List[Location]:
                 # We set override_optimize_by_zone=True to force the
                 # provisioner to use zone-level provisioning. This is to get
                 # accurate location information.
-                launchables: List['resources_lib.Resources'] = (
+                launchables: list[resources_lib.Resources] = (
                     resources_utils.make_launchables_for_valid_region_zones(
                         feasible, override_optimize_by_zone=True))
                 for launchable in launchables:
@@ -403,12 +402,12 @@ class SpotPlacer:
         logger.info(f'{len(possible_locations)} possible location candidates '
                     'are enabled for spot placement.')
         logger.debug(f'All possible locations: {possible_locations}')
-        self.location2status: Dict[Location, LocationStatus] = {
+        self.location2status: dict[Location, LocationStatus] = {
             location: LocationStatus.ACTIVE for location in possible_locations
         }
         # When each PREEMPTED mark was set; drives the TTL retry.
-        self.location2preempted_at: Dict[Location, float] = {}
-        self.location2cost: Dict[Location, float] = {}
+        self.location2preempted_at: dict[Location, float] = {}
+        self.location2cost: dict[Location, float] = {}
         # Already checked there is only one resource in the task.
         self.resources = list(task.resources)[0]
         self.num_nodes = task.num_nodes
@@ -423,7 +422,7 @@ class SpotPlacer:
 
     def select_next_location(
             self,
-            current_locations: List[Location],
+            current_locations: list[Location],
             skip_zero_cost_preference: bool = False) -> Location:
         """Select next location to place spot instance.
 
@@ -434,7 +433,7 @@ class SpotPlacer:
         """
         raise NotImplementedError
 
-    def resolve_location(self, location: Location) -> Optional[Location]:
+    def resolve_location(self, location: Location) -> Location | None:
         """Map a possibly-legacy location onto this placer's key set.
 
         Replica rows pickled before locations carried
@@ -484,7 +483,7 @@ class SpotPlacer:
             return self.location2cost[location]
         # TODO(tian): Is there a better way to do this? This is for filling
         # instance type so the get_cost() can operate normally.
-        r: 'resources_lib.Resources' = self.resources.copy(**location.to_dict())
+        r: resources_lib.Resources = self.resources.copy(**location.to_dict())
         assert r.cloud is not None
         rs = r.cloud.get_feasible_launchable_resources(
             r, num_nodes=self.num_nodes).resources_list
@@ -510,7 +509,7 @@ class SpotPlacer:
         self.location2cost[location] = cost
         return cost
 
-    def _min_cost_location(self, locations: List[Location]) -> Location:
+    def _min_cost_location(self, locations: list[Location]) -> Location:
         return min(locations, key=self._get_cost_per_hour_cached)
 
     def _effective_status(self, location: Location) -> LocationStatus:
@@ -528,7 +527,7 @@ class SpotPlacer:
                 return LocationStatus.ACTIVE
         return status
 
-    def _location_with_status(self, status: LocationStatus) -> List[Location]:
+    def _location_with_status(self, status: LocationStatus) -> list[Location]:
         return [
             location for location in self.location2status
             if self._effective_status(location) == status
@@ -549,15 +548,15 @@ class SpotPlacer:
         if self.location2status.get(location) == LocationStatus.PREEMPTED:
             self.location2preempted_at[location] = time.time()
 
-    def active_locations(self) -> List[Location]:
+    def active_locations(self) -> list[Location]:
         return self._location_with_status(LocationStatus.ACTIVE)
 
-    def preemptive_locations(self) -> List[Location]:
+    def preemptive_locations(self) -> list[Location]:
         return self._location_with_status(LocationStatus.PREEMPTED)
 
     def _select_least_loaded_min_cost(
-            self, candidate_locations: List[Location],
-            current_locations: List[Location]) -> Location:
+            self, candidate_locations: list[Location],
+            current_locations: list[Location]) -> Location:
         """Least-loaded candidate, cheapest on ties (shared selection core).
 
         Prioritize the least-loaded locations (unused ones have load 0, so
@@ -577,7 +576,7 @@ class SpotPlacer:
         min_load = min(
             (location_load[location] for location in candidate_locations),
             default=0)
-        least_loaded: List[Location] = [
+        least_loaded: list[Location] = [
             location for location in candidate_locations
             if location_load[location] == min_load
         ]
@@ -585,7 +584,7 @@ class SpotPlacer:
             least_loaded = candidate_locations
         return self._min_cost_location(least_loaded)
 
-    def zero_cost_locations(self) -> List[Location]:
+    def zero_cost_locations(self) -> list[Location]:
         """All zero-cost locations, regardless of bench status.
 
         Enumeration surface for the reserved-capacity fill poller: a
@@ -599,7 +598,7 @@ class SpotPlacer:
         ]
 
     def select_next_zero_cost_location(
-            self, current_locations: List[Location]) -> Optional[Location]:
+            self, current_locations: list[Location]) -> Location | None:
         """Select among zero-cost ACTIVE locations only; None when none is.
 
         The no-spill guarantee of reserved-capacity fill: a fill launch
@@ -676,7 +675,7 @@ class DynamicFallbackSpotPlacer(SpotPlacer,
 
     def select_next_location(
             self,
-            current_locations: List[Location],
+            current_locations: list[Location],
             skip_zero_cost_preference: bool = False) -> Location:
         active_locations = self.active_locations()
         # Zero-cost tier first: locations that cost nothing (reserved /

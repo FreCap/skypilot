@@ -1,10 +1,11 @@
 """SDK functions for managed jobs."""
+from collections.abc import Iterator
+from collections.abc import Sequence
 import json
 import pathlib
 import threading
 import typing
-from typing import (Any, Dict, Iterator, List, Literal, Optional, Sequence,
-                    Tuple, Union)
+from typing import Any, Literal, Optional, Union
 import zlib
 
 import click
@@ -44,13 +45,13 @@ logger = sky_logging.init_logger(__name__)
 @server_common.check_server_healthy_or_start
 def launch(
     task: Union['sky.Task', 'sky.Dag'],
-    name: Optional[str] = None,
-    pool: Optional[str] = None,
-    num_jobs: Optional[int] = None,
+    name: str | None = None,
+    pool: str | None = None,
+    num_jobs: int | None = None,
     # Internal only:
     # pylint: disable=invalid-name
     _need_confirmation: bool = False,
-) -> server_common.RequestId[Tuple[Optional[List[int]],
+) -> server_common.RequestId[tuple[list[int] | None,
                                    Optional['backends.ResourceHandle']]]:
     """Launches a managed job.
 
@@ -128,8 +129,8 @@ def launch(
         any_api_access = any(t.api_server_access for t in dag.tasks)
         if any_api_access:
             remote_api_version = versions.get_remote_api_version()
-            if (remote_api_version is not None and remote_api_version <
-                    server_constants.MIN_API_ACCESS_API_VERSION):
+            if (remote_api_version is not None and remote_api_version
+                    < server_constants.MIN_API_ACCESS_API_VERSION):
                 logger.debug(
                     'Skipping api_server_access injection: API server '
                     'version too old (need >= %s, got %s).',
@@ -173,15 +174,15 @@ def queue_v2(
     refresh: bool,
     skip_finished: bool = False,
     all_users: bool = False,
-    job_ids: Optional[List[int]] = None,
-    limit: Optional[int] = None,
-    fields: Optional[List[str]] = None,
-    sort_by: Optional[str] = None,
-    sort_order: Optional[str] = None,
-    statuses: Optional[List[str]] = None,
-    submitted_after: Optional[float] = None,
-    submitted_before: Optional[float] = None,
-) -> server_common.RequestId[Tuple[List[responses.ManagedJobRecord], int, Dict[
+    job_ids: list[int] | None = None,
+    limit: int | None = None,
+    fields: list[str] | None = None,
+    sort_by: str | None = None,
+    sort_order: str | None = None,
+    statuses: list[str] | None = None,
+    submitted_after: float | None = None,
+    submitted_before: float | None = None,
+) -> server_common.RequestId[tuple[list[responses.ManagedJobRecord], int, dict[
         str, int], int]]:
     """Gets statuses of managed jobs.
 
@@ -252,8 +253,8 @@ def queue_v2(
 
     remote_api_version = versions.get_remote_api_version()
     if ((submitted_after is not None or submitted_before is not None) and
-            remote_api_version is not None and remote_api_version <
-            server_constants.MIN_JOBS_SUBMITTED_AT_FILTER_API_VERSION):
+            remote_api_version is not None and remote_api_version
+            < server_constants.MIN_JOBS_SUBMITTED_AT_FILTER_API_VERSION):
         logger.warning(
             'Filtering managed jobs by submission time is not supported in '
             'your API server; the server will ignore it and show all jobs. '
@@ -294,10 +295,10 @@ def queue(
     refresh: bool,
     skip_finished: bool = False,
     all_users: bool = False,
-    job_ids: Optional[List[int]] = None,
+    job_ids: list[int] | None = None,
     version: int = 1,
-) -> server_common.RequestId[Union[List[responses.ManagedJobRecord], Tuple[
-        List[responses.ManagedJobRecord], int, Dict[str, int], int]]]:
+) -> server_common.RequestId[list[responses.ManagedJobRecord] | tuple[
+        list[responses.ManagedJobRecord], int, dict[str, int], int]]:
     """Gets statuses of managed jobs.
 
     Deprecated. Please use queue_v2 instead for better performance.
@@ -374,13 +375,13 @@ def queue(
 @usage_lib.entrypoint
 @server_common.check_server_healthy_or_start
 def cancel(
-    name: Optional[str] = None,
-    job_ids: Optional[Sequence[int]] = None,
+    name: str | None = None,
+    job_ids: Sequence[int] | None = None,
     all: bool = False,  # pylint: disable=redefined-builtin
     all_users: bool = False,
-    pool: Optional[str] = None,
+    pool: str | None = None,
     graceful: bool = False,
-    graceful_timeout: Optional[int] = None,
+    graceful_timeout: int | None = None,
 ) -> server_common.RequestId[None]:
     """Cancels managed jobs.
 
@@ -435,33 +436,32 @@ def cancel(
 
 @typing.overload
 def tail_logs(
-    name: Optional[str] = None,
-    job_id: Optional[int] = None,
+    name: str | None = None,
+    job_id: int | None = None,
     follow: bool = True,
     controller: bool = False,
     refresh: bool = False,
-    tail: Optional[int] = None,
-    tail_offset: Optional[int] = None,
+    tail: int | None = None,
+    tail_offset: int | None = None,
     output_stream: Optional['io.TextIOBase'] = None,
-    task: Optional[Union[str, int]] = None,
+    task: str | int | None = None,
     *,  # keyword only separator
-    preload_content: Literal[True] = True
-) -> Optional[int]:
+    preload_content: Literal[True] = True) -> int | None:
     ...
 
 
 @typing.overload
-def tail_logs(name: Optional[str] = None,
-              job_id: Optional[int] = None,
+def tail_logs(name: str | None = None,
+              job_id: int | None = None,
               follow: bool = True,
               controller: bool = False,
               refresh: bool = False,
-              tail: Optional[int] = None,
-              tail_offset: Optional[int] = None,
+              tail: int | None = None,
+              tail_offset: int | None = None,
               output_stream: None = None,
-              task: Optional[Union[str, int]] = None,
+              task: str | int | None = None,
               *,
-              preload_content: Literal[False]) -> Iterator[Optional[str]]:
+              preload_content: Literal[False]) -> Iterator[str | None]:
     ...
 
 
@@ -469,18 +469,18 @@ def tail_logs(name: Optional[str] = None,
 @server_common.check_server_healthy_or_start
 @rest.retry_transient_errors()
 def tail_logs(
-    name: Optional[str] = None,
-    job_id: Optional[int] = None,
+    name: str | None = None,
+    job_id: int | None = None,
     follow: bool = True,
     controller: bool = False,
     refresh: bool = False,
-    tail: Optional[int] = None,
-    tail_offset: Optional[int] = None,
+    tail: int | None = None,
+    tail_offset: int | None = None,
     output_stream: Optional['io.TextIOBase'] = None,
-    task: Optional[Union[str, int]] = None,
+    task: str | int | None = None,
     *,  # keyword only separator
     preload_content: bool = True
-) -> Union[Optional[int], Iterator[Optional[str]]]:
+) -> int | None | Iterator[str | None]:
     """Tails logs of managed jobs.
 
     You can provide either a job name or a job ID to tail logs. If both are not
@@ -563,11 +563,11 @@ def tail_logs(
 @server_common.check_server_healthy_or_start
 @versions.minimal_api_version(45)
 def wait(
-    name: Optional[str] = None,
-    job_id: Optional[int] = None,
-    timeout: Optional[int] = None,
+    name: str | None = None,
+    job_id: int | None = None,
+    timeout: int | None = None,
     poll_interval: int = 15,
-    task: Optional[Union[str, int]] = None,
+    task: str | int | None = None,
 ) -> server_common.RequestId[int]:
     """Waits for a managed job to reach a terminal state.
 
@@ -618,12 +618,12 @@ def wait(
 @usage_lib.entrypoint
 @server_common.check_server_healthy_or_start
 def download_logs_streaming(
-    name: Optional[str],
-    job_id: Optional[int],
+    name: str | None,
+    job_id: int | None,
     refresh: bool,
     controller: bool,
     local_dir: str = constants.SKY_LOGS_DIRECTORY,
-) -> Optional[Dict[int, str]]:
+) -> dict[int, str] | None:
     """Download a managed job's log via the streaming /api/stream path.
 
     Returns None when the server stream is empty (e.g. terminal job
@@ -743,11 +743,11 @@ def download_logs_streaming(
 @usage_lib.entrypoint
 @server_common.check_server_healthy_or_start
 def download_logs(
-        name: Optional[str],
-        job_id: Optional[int],
+        name: str | None,
+        job_id: int | None,
         refresh: bool,
         controller: bool,
-        local_dir: str = constants.SKY_LOGS_DIRECTORY) -> Dict[int, str]:
+        local_dir: str = constants.SKY_LOGS_DIRECTORY) -> dict[int, str]:
     """Sync down logs of managed jobs.
 
     Please refer to sky.cli.job_logs for documentation.
@@ -779,7 +779,7 @@ def download_logs(
         '/jobs/download_logs',
         json=json.loads(body.model_dump_json()),
         timeout=(5, None))
-    request_id: server_common.RequestId[Dict[
+    request_id: server_common.RequestId[dict[
         str, str]] = server_common.get_request_id(response)
     job_id_remote_path_dict = sdk.stream_and_get(request_id)
     remote2local_path_dict = client_common.download_logs_from_api_server(
@@ -828,10 +828,10 @@ def dashboard() -> None:
 @server_common.check_server_healthy_or_start
 @versions.minimal_api_version(12)
 def pool_apply(
-    task: Optional[Union['sky.Task', 'sky.Dag']],
+    task: Union['sky.Task', 'sky.Dag'] | None,
     pool_name: str,
     mode: 'serve_utils.UpdateMode',
-    workers: Optional[int] = None,
+    workers: int | None = None,
     # Internal only:
     # pylint: disable=invalid-name
     _need_confirmation: bool = False
@@ -856,7 +856,7 @@ def pool_apply(
 @server_common.check_server_healthy_or_start
 @versions.minimal_api_version(12)
 def pool_down(
-    pool_names: Optional[Union[str, List[str]]],
+    pool_names: str | list[str] | None,
     all: bool = False,  # pylint: disable=redefined-builtin
     purge: bool = False,
 ) -> server_common.RequestId[None]:
@@ -868,8 +868,8 @@ def pool_down(
 @server_common.check_server_healthy_or_start
 @versions.minimal_api_version(12)
 def pool_status(
-    pool_names: Optional[Union[str, List[str]]],
-) -> server_common.RequestId[List[Dict[str, Any]]]:
+    pool_names: str | list[str] | None,
+) -> server_common.RequestId[list[dict[str, Any]]]:
     """Query a pool."""
     return impl.status(pool_names, pool=True)
 
@@ -880,10 +880,10 @@ def pool_status(
 @versions.minimal_api_version(16)
 def pool_tail_logs(pool_name: str,
                    target: Union[str, 'serve_utils.ServiceComponent'],
-                   worker_id: Optional[int] = None,
+                   worker_id: int | None = None,
                    follow: bool = True,
                    output_stream: Optional['io.TextIOBase'] = None,
-                   tail: Optional[int] = None) -> None:
+                   tail: int | None = None) -> None:
     """Tails logs of a pool."""
     return impl.tail_logs(pool_name,
                           target,
@@ -898,14 +898,15 @@ def pool_tail_logs(pool_name: str,
 @server_common.check_server_healthy_or_start
 @rest.retry_transient_errors()
 @versions.minimal_api_version(16)
-def pool_sync_down_logs(pool_name: str,
-                        local_dir: str,
-                        *,
-                        targets: Optional[Union[
-                            str, 'serve_utils.ServiceComponent', Sequence[Union[
-                                str, 'serve_utils.ServiceComponent']]]] = None,
-                        worker_ids: Optional[List[int]] = None,
-                        tail: Optional[int] = None) -> None:
+def pool_sync_down_logs(
+        pool_name: str,
+        local_dir: str,
+        *,
+        targets: Union[str, 'serve_utils.ServiceComponent',
+                       Sequence[Union[str, 'serve_utils.ServiceComponent']]] |
+    None = None,
+        worker_ids: list[int] | None = None,
+        tail: int | None = None) -> None:
     """Sync down logs of a pool."""
     return impl.sync_down_logs(pool_name,
                                local_dir,

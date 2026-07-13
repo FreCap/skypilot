@@ -1,5 +1,6 @@
 """Util constants/functions for the backends."""
 import asyncio
+from collections.abc import Sequence
 from datetime import datetime
 import enum
 import fnmatch
@@ -17,7 +18,7 @@ import tempfile
 import threading
 import time
 import typing
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Literal
 import uuid
 
 import aiohttp
@@ -25,7 +26,6 @@ from aiohttp import ClientTimeout
 from aiohttp import TCPConnector
 import colorama
 from packaging import version
-from typing_extensions import Literal
 
 import sky
 from sky import authentication as auth
@@ -120,7 +120,7 @@ _LAUNCHED_RESERVED_WORKER_PATTERN = re.compile(
 # bug with python=3.6.
 # 10.133.0.5: ray.worker.default,
 _LAUNCHING_IP_PATTERN = re.compile(
-    r'({}): ray[._]worker[._](?:default|reserved)'.format(IP_ADDR_REGEX))
+    rf'({IP_ADDR_REGEX}): ray[._]worker[._](?:default|reserved)')
 SSH_CONNECTION_ERROR_PATTERN = re.compile(
     r'^ssh:.*(timed out|connection refused)$', re.IGNORECASE)
 _SSH_CONNECTION_TIMED_OUT_PATTERN = re.compile(r'^ssh:.*timed out$',
@@ -169,7 +169,7 @@ def _wrap_ssm_proxy_command_with_adaptive_retry(ssm_proxy_command: str) -> str:
 
 
 def _upgrade_legacy_ssm_proxy_command(
-        ssh_proxy_command: Optional[str]) -> Optional[str]:
+        ssh_proxy_command: str | None) -> str | None:
     """Normalize persisted SSM proxy commands to the adaptive-retry form.
 
     Clusters keep their originally-written auth section forever: on
@@ -544,7 +544,7 @@ def path_size_megabytes(path: str) -> int:
     return -1
 
 
-class FileMountHelper(object):
+class FileMountHelper:
     """Helper for handling file mounts."""
 
     @classmethod
@@ -634,8 +634,8 @@ class FileMountHelper(object):
 
 
 def _replace_yaml_dicts(
-        new_yaml: str, old_yaml: str, restore_key_names: Set[str],
-        restore_key_names_exceptions: Sequence[Tuple[str, ...]]) -> str:
+        new_yaml: str, old_yaml: str, restore_key_names: set[str],
+        restore_key_names_exceptions: Sequence[tuple[str, ...]]) -> str:
     """Replaces 'new' with 'old' for all keys in restore_key_names.
 
     The replacement will be applied recursively and only for the blocks
@@ -647,7 +647,7 @@ def _replace_yaml_dicts(
     tree after the replacement.
     """
 
-    def _restore_block(new_block: Dict[str, Any], old_block: Dict[str, Any]):
+    def _restore_block(new_block: dict[str, Any], old_block: dict[str, Any]):
         for key, value in new_block.items():
             if key in restore_key_names:
                 if key in old_block:
@@ -696,7 +696,7 @@ def _replace_yaml_dicts(
 
 
 def get_expirable_clouds(
-        enabled_clouds: Sequence[clouds.Cloud]) -> List[clouds.Cloud]:
+        enabled_clouds: Sequence[clouds.Cloud]) -> list[clouds.Cloud]:
     """Returns a list of clouds that use local credentials and whose credentials can expire.
 
     This function checks each cloud in the provided sequence to determine if it uses local credentials
@@ -717,7 +717,7 @@ def get_expirable_clouds(
             # get all custom contexts
             contexts = kubernetes_utils.get_custom_config_k8s_contexts()
             # add remote_identity of each context if it exists
-            remote_identities: Optional[Union[str, List[Dict[str, str]]]] = None
+            remote_identities: str | list[dict[str, str]] | None = None
             for context in contexts:
                 context_remote_identity = skypilot_config.get_effective_workspace_region_config(
                     cloud='kubernetes',
@@ -791,13 +791,13 @@ def write_cluster_config(
     local_wheel_path: pathlib.Path,
     wheel_hash: str,
     region: clouds.Region,
-    zones: Optional[List[clouds.Zone]] = None,
+    zones: list[clouds.Zone] | None = None,
     dryrun: bool = False,
     keep_launch_fields_in_existing_config: bool = True,
-    volume_mounts: Optional[List['volume_utils.VolumeMount']] = None,
-    cloud_specific_failover_overrides: Optional[Dict[str, Any]] = None,
-    extra_template_variables: Optional[Dict[str, Any]] = None,
-) -> Dict[str, str]:
+    volume_mounts: list['volume_utils.VolumeMount'] | None = None,
+    cloud_specific_failover_overrides: dict[str, Any] | None = None,
+    extra_template_variables: dict[str, Any] | None = None,
+) -> dict[str, str]:
     """Fills in cluster configuration templates and writes them out.
 
     Returns:
@@ -867,7 +867,7 @@ def write_cluster_config(
     # other cases, we exclude the cloud from credential file uploads after
     # running required checks.
     assert cluster_name is not None
-    excluded_clouds: Set[clouds.Cloud] = set()
+    excluded_clouds: set[clouds.Cloud] = set()
     remote_identity_config = skypilot_config.get_effective_workspace_region_config(
         cloud=str(cloud).lower(),
         region=region.name,
@@ -1143,7 +1143,7 @@ def write_cluster_config(
             default_value=None)
         if auto_mounts_config:
             home_dir = kubernetes_utils.DEFAULT_HOME_DIRECTORY
-            attached_auto_mount_volumes: Set[str] = set()
+            attached_auto_mount_volumes: set[str] = set()
             for entry in auto_mounts_config:
                 volume_name = entry['volume_name']
                 mount_paths = entry.get('mount_paths', [])
@@ -1158,8 +1158,8 @@ def write_cluster_config(
                 # Only hostPath and ReadWriteMany PVC volumes support
                 # concurrent multi-pod access required by auto_mounts.
                 if (volume_config.type == volume_utils.VolumeType.PVC.value and
-                        volume_config.config.get('access_mode') !=
-                        volume_utils.VolumeAccessMode.READ_WRITE_MANY.value):
+                        volume_config.config.get('access_mode')
+                        != volume_utils.VolumeAccessMode.READ_WRITE_MANY.value):
                     logger.warning(
                         f'Auto-mount volume {volume_name!r} has access '
                         f'mode '
@@ -1219,7 +1219,7 @@ def write_cluster_config(
     # script checks each path and fixes permissions if the current user cannot
     # write to it (e.g. hostPath dirs created as root by kubelet, PVC subPath
     # dirs created as root, or NFS volumes that ignore fsGroup).
-    volume_mount_rw_paths: List[str] = [v.path for v in volume_mount_vars]
+    volume_mount_rw_paths: list[str] = [v.path for v in volume_mount_vars]
 
     # Use a tmp file path to avoid incomplete YAML file being re-used in the
     # future.
@@ -1364,7 +1364,7 @@ def write_cluster_config(
     # Add kubernetes config fields from ~/.sky/config
     if isinstance(cloud, clouds.Kubernetes):
         cluster_config_overrides = to_provision.cluster_config_overrides
-        with open(tmp_yaml_path, 'r', encoding='utf-8') as f:
+        with open(tmp_yaml_path, encoding='utf-8') as f:
             tmp_yaml_str = f.read()
         cluster_yaml_obj = yaml_utils.safe_load(tmp_yaml_str)
         combined_yaml_obj = kubernetes_utils.combine_pod_config_fields_and_metadata(
@@ -1375,7 +1375,7 @@ def write_cluster_config(
         # Write the updated YAML back to the file
         yaml_utils.dump_yaml(tmp_yaml_path, combined_yaml_obj)
 
-        pod_config: Dict[str, Any] = combined_yaml_obj['available_node_types'][
+        pod_config: dict[str, Any] = combined_yaml_obj['available_node_types'][
             'ray_head_default']['node_config']
         # Check pod spec only. For high availability controllers, we deploy pvc & deployment for the controller. Read kubernetes-ray.yml.j2 for more details.
         pod_config.pop('deployment_spec', None)
@@ -1400,7 +1400,7 @@ def write_cluster_config(
     # Restore the old yaml content for backward compatibility.
     old_yaml_content = global_user_state.get_cluster_yaml_str(yaml_path)
     if old_yaml_content is not None and keep_launch_fields_in_existing_config:
-        with open(tmp_yaml_path, 'r', encoding='utf-8') as f:
+        with open(tmp_yaml_path, encoding='utf-8') as f:
             new_yaml_content = f.read()
         restored_yaml_content = _replace_yaml_dicts(
             new_yaml_content, old_yaml_content,
@@ -1439,7 +1439,7 @@ def write_cluster_config(
     # commit the final yaml to the database
     global_user_state.set_cluster_yaml(
         cluster_name,
-        open(tmp_yaml_path, 'r', encoding='utf-8').read())
+        open(tmp_yaml_path, encoding='utf-8').read())
 
     usage_lib.messages.usage.update_ray_yaml(tmp_yaml_path)
 
@@ -1515,7 +1515,7 @@ def get_timestamp_from_run_timestamp(run_timestamp: str) -> float:
 
 def _count_healthy_nodes_from_ray(output: str,
                                   is_local_cloud: bool = False
-                                 ) -> Tuple[int, int]:
+                                 ) -> tuple[int, int]:
     """Count the number of healthy nodes from the output of `ray status`."""
 
     def get_ready_nodes_counts(pattern, output):
@@ -1569,7 +1569,7 @@ def _count_healthy_nodes_from_ray(output: str,
 _SKYLET_HEALTH_PROBE_TIMEOUT_SECONDS = 5.0
 
 
-def _ray_status_via_skylet_grpc(handle) -> Optional[Tuple[int, str, str]]:
+def _ray_status_via_skylet_grpc(handle) -> tuple[int, str, str] | None:
     """Run `ray status` on the head node via the skylet HealthService.
 
     Returns the same (returncode, stdout, stderr) triple the SSH probe
@@ -1694,7 +1694,7 @@ def _deterministic_cluster_yaml_hash(tmp_yaml_path: str) -> str:
         # If the file mount source is a symlink, this should be true. In that
         # case we hash the contents of the symlink destination.
         if os.path.isfile(expanded_src):
-            config_hash.update('file'.encode('utf-8'))
+            config_hash.update(b'file')
             if os.path.basename(expanded_src) not in (
                     _FILE_MOUNT_BASENAMES_SKIP_HASH):
                 config_hash.update(_hash_file(expanded_src))
@@ -1702,7 +1702,7 @@ def _deterministic_cluster_yaml_hash(tmp_yaml_path: str) -> str:
         # This can also be a symlink to a directory. os.walk will treat it as a
         # normal directory and list the contents of the symlink destination.
         elif os.path.isdir(expanded_src):
-            config_hash.update('dir'.encode('utf-8'))
+            config_hash.update(b'dir')
 
             # Aside from expanded_src, os.walk will list symlinks to directories
             # but will not recurse into them.
@@ -1769,8 +1769,8 @@ def wait_until_ray_cluster_ready(
     num_nodes: int,
     log_path: str,
     is_local_cloud: bool = False,
-    nodes_launching_progress_timeout: Optional[int] = None,
-) -> Tuple[bool, Optional[str]]:
+    nodes_launching_progress_timeout: int | None = None,
+) -> tuple[bool, str | None]:
     """Wait until the ray cluster is set up on VMs or in containers.
 
     Returns:  whether the entire ray cluster is ready, and docker username
@@ -1872,10 +1872,10 @@ def wait_until_ray_cluster_ready(
 
 
 def ssh_credential_from_yaml(
-    cluster_yaml: Optional[str],
-    docker_user: Optional[str] = None,
-    ssh_user: Optional[str] = None,
-) -> Dict[str, Any]:
+    cluster_yaml: str | None,
+    docker_user: str | None = None,
+    ssh_user: str | None = None,
+) -> dict[str, Any]:
     """Returns ssh_user, ssh_private_key and ssh_control name.
 
     Args:
@@ -1918,8 +1918,8 @@ def ssh_credential_from_yaml(
 
 
 def ssh_credentials_from_handles(
-    handles: List['cloud_vm_ray_backend.CloudVmRayResourceHandle'],
-) -> List[Dict[str, Any]]:
+    handles: list['cloud_vm_ray_backend.CloudVmRayResourceHandle'],
+) -> list[dict[str, Any]]:
     """Returns ssh_user, ssh_private_key and ssh_control name.
     """
     non_empty_cluster_yaml_paths = [
@@ -1935,7 +1935,7 @@ def ssh_credentials_from_handles(
             non_empty_cluster_yaml_paths, cluster_yaml_dicts)
     }
 
-    credentials_to_return: List[Dict[str, Any]] = []
+    credentials_to_return: list[dict[str, Any]] = []
     for handle in handles:
         if handle.cluster_yaml is None:
             credentials_to_return.append(dict())
@@ -1975,10 +1975,10 @@ def ssh_credentials_from_handles(
 
 
 def parallel_data_transfer_to_nodes(
-        runners: List[command_runner.CommandRunner],
-        source: Optional[str],
+        runners: list[command_runner.CommandRunner],
+        source: str | None,
         target: str,
-        cmd: Optional[str],
+        cmd: str | None,
         run_rsync: bool,
         *,
         action_message: str,
@@ -1986,7 +1986,7 @@ def parallel_data_transfer_to_nodes(
         log_path: str = os.devnull,
         stream_logs: bool = False,
         source_bashrc: bool = False,
-        num_threads: Optional[int] = None):
+        num_threads: int | None = None):
     """Runs a command on all nodes and optionally runs rsync from src->dst.
 
     Args:
@@ -2118,7 +2118,7 @@ def get_node_ips(cluster_yaml: str,
                  expected_num_nodes: int,
                  head_ip_max_attempts: int = 1,
                  worker_ip_max_attempts: int = 1,
-                 get_internal_ips: bool = False) -> List[str]:
+                 get_internal_ips: bool = False) -> list[str]:
     """Returns the IPs of all nodes in the cluster, with head node at front.
 
     Args:
@@ -2330,7 +2330,7 @@ def check_owner_identity(cluster_name: str) -> None:
 
 
 def _check_owner_identity_with_record(cluster_name: str,
-                                      record: Dict[str, Any]) -> None:
+                                      record: dict[str, Any]) -> None:
     if env_options.Options.SKIP_CLOUD_IDENTITY_CHECK.get():
         return
     handle = record['handle']
@@ -2448,7 +2448,7 @@ def _check_owner_identity_with_record(cluster_name: str,
     _raise_identity_error()
 
 
-def tag_filter_for_cluster(cluster_name: str) -> Dict[str, str]:
+def tag_filter_for_cluster(cluster_name: str) -> dict[str, str]:
     """Returns a tag filter for the cluster."""
     return {
         'ray-cluster-name': cluster_name,
@@ -2459,7 +2459,7 @@ def tag_filter_for_cluster(cluster_name: str) -> Dict[str, str]:
 def _query_cluster_status_via_cloud_api(
     handle: 'cloud_vm_ray_backend.CloudVmRayResourceHandle',
     retry_if_missing: bool,
-) -> Dict[str, Tuple[status_lib.ClusterStatus, Optional[str]]]:
+) -> dict[str, tuple[status_lib.ClusterStatus, str | None]]:
     """Returns a dict mapping instance/pod name to (status, reason).
 
     For the new provisioner API, keys are instance IDs (e.g., pod names
@@ -2558,8 +2558,8 @@ def _query_cluster_info_via_cloud_api(
 
 
 def check_can_clone_disk_and_override_task(
-    cluster_name: str, target_cluster_name: Optional[str], task: 'task_lib.Task'
-) -> Tuple['task_lib.Task', 'cloud_vm_ray_backend.CloudVmRayResourceHandle']:
+    cluster_name: str, target_cluster_name: str | None, task: 'task_lib.Task'
+) -> tuple['task_lib.Task', 'cloud_vm_ray_backend.CloudVmRayResourceHandle']:
     """Check if the task is compatible to clone disk from the source cluster.
 
     Args:
@@ -2623,7 +2623,7 @@ def check_can_clone_disk_and_override_task(
             continue
         has_cloud_met = True
 
-        override_param: Dict[str, Any] = {}
+        override_param: dict[str, Any] = {}
         if task_resources.cloud is None:
             override_param['cloud'] = original_cloud
         if task_resources.region is None:
@@ -2672,10 +2672,10 @@ def check_can_clone_disk_and_override_task(
 
 def _update_cluster_status(
         cluster_name: str,
-        record: Dict[str, Any],
+        record: dict[str, Any],
         retry_if_missing: bool,
         include_user_info: bool = True,
-        summary_response: bool = False) -> Optional[Dict[str, Any]]:
+        summary_response: bool = False) -> dict[str, Any] | None:
     """Update the cluster status.
 
     The cluster status is updated by checking ray cluster and real status from
@@ -2740,7 +2740,7 @@ def _update_cluster_status(
     skylet_grpc_unavailable = False
 
     def get_node_counts_from_ray_status(
-            runner: command_runner.CommandRunner) -> Tuple[int, int, str, str]:
+            runner: command_runner.CommandRunner) -> tuple[int, int, str, str]:
         nonlocal skylet_grpc_unavailable
         # Prefer running `ray status` locally on the head via skylet gRPC:
         # the SSH exec adds a class of transport false positives that, at
@@ -2768,7 +2768,7 @@ def _update_cluster_status(
                 f'{output}\n', stderr)
         return (*_count_healthy_nodes_from_ray(output), output, stderr)
 
-    ray_status_details: Optional[str] = None
+    ray_status_details: str | None = None
 
     def run_ray_status_to_check_ray_cluster_healthy() -> bool:
         nonlocal ray_status_details
@@ -2889,7 +2889,7 @@ def _update_cluster_status(
         return False
 
     def _handle_autostopping_cluster(
-            print_newline: bool = False) -> Optional[Dict[str, Any]]:
+            print_newline: bool = False) -> dict[str, Any] | None:
         """Handle cluster that is autostopping/autodowning.
 
         Sets the cluster status to AUTOSTOPPING and returns the cluster record.
@@ -2981,8 +2981,8 @@ def _update_cluster_status(
 
     # All cases below are transitioning the cluster to non-UP states.
     launched_resources = handle.launched_resources.assert_launchable()
-    if (not node_statuses and launched_resources.cloud.STATUS_VERSION >=
-            clouds.StatusVersion.SKYPILOT):
+    if (not node_statuses and launched_resources.cloud.STATUS_VERSION
+            >= clouds.StatusVersion.SKYPILOT):
         # Note: launched_at is set during sky launch, even on an existing
         # cluster. This will catch the case where the cluster was terminated on
         # the cloud and restarted by sky launch.
@@ -3070,7 +3070,7 @@ def _update_cluster_status(
 
         # For Kubernetes clusters with unhealthy pods, check node health
         # to provide better diagnostics (e.g., "node X is NotReady").
-        node_health: Optional[Dict[str, 'NodeHealthInfo']] = None
+        node_health: dict[str, NodeHealthInfo] | None = None
         if (ray_cluster_unhealthy and
                 isinstance(launched_resources.cloud, clouds.Kubernetes)):
             unhealthy_pods = [
@@ -3348,9 +3348,8 @@ def _update_cluster_status(
 
 
 def _must_refresh_cluster_status(
-        record: Dict[str, Any],
-        force_refresh_statuses: Optional[Set[status_lib.ClusterStatus]]
-) -> bool:
+        record: dict[str, Any],
+        force_refresh_statuses: set[status_lib.ClusterStatus] | None) -> bool:
     force_refresh_for_cluster = (force_refresh_statuses is not None and
                                  record['status'] in force_refresh_statuses)
 
@@ -3360,8 +3359,8 @@ def _must_refresh_cluster_status(
     # If cluster is AUTOSTOPPING, always refresh to check if it transitioned to STOPPED
     is_autostopping = record['status'] == status_lib.ClusterStatus.AUTOSTOPPING
     recently_refreshed = (record['status_updated_at'] is not None and
-                          time.time() - record['status_updated_at'] <
-                          CLUSTER_STATUS_CACHE_DURATION_SECONDS)
+                          time.time() - record['status_updated_at']
+                          < CLUSTER_STATUS_CACHE_DURATION_SECONDS)
     is_stale = (use_spot or has_autostop or
                 is_autostopping) and not recently_refreshed
 
@@ -3371,12 +3370,12 @@ def _must_refresh_cluster_status(
 def refresh_cluster_record(
         cluster_name: str,
         *,
-        force_refresh_statuses: Optional[Set[status_lib.ClusterStatus]] = None,
+        force_refresh_statuses: set[status_lib.ClusterStatus] | None = None,
         cluster_lock_already_held: bool = False,
         cluster_status_lock_timeout: int = CLUSTER_STATUS_LOCK_TIMEOUT_SECONDS,
         include_user_info: bool = True,
         summary_response: bool = False,
-        retry_if_missing: bool = True) -> Optional[Dict[str, Any]]:
+        retry_if_missing: bool = True) -> dict[str, Any] | None:
     """Refresh the cluster, and return the possibly updated record.
 
     The function will update the cached cluster status in the global state. For
@@ -3507,12 +3506,11 @@ def refresh_cluster_record(
 def refresh_cluster_status_handle(
     cluster_name: str,
     *,
-    force_refresh_statuses: Optional[Set[status_lib.ClusterStatus]] = None,
+    force_refresh_statuses: set[status_lib.ClusterStatus] | None = None,
     cluster_lock_already_held: bool = False,
     cluster_status_lock_timeout: int = CLUSTER_STATUS_LOCK_TIMEOUT_SECONDS,
     retry_if_missing: bool = True,
-) -> Tuple[Optional[status_lib.ClusterStatus],
-           Optional[backends.ResourceHandle]]:
+) -> tuple[status_lib.ClusterStatus | None, backends.ResourceHandle | None]:
     """Refresh the cluster, and return the possibly updated status and handle.
 
     This is a wrapper of refresh_cluster_record, which returns the status and
@@ -3535,7 +3533,7 @@ def refresh_cluster_status_handle(
 def query_cluster_instance_statuses(
     handle: 'cloud_vm_ray_backend.CloudVmRayResourceHandle',
     retry_if_missing: bool = False,
-) -> Dict[str, Tuple[status_lib.ClusterStatus, Optional[str]]]:
+) -> dict[str, tuple[status_lib.ClusterStatus, str | None]]:
     """Cloud-provider-only view of a cluster's instance statuses.
 
     A public thin wrapper over the cloud-API query used internally by the
@@ -3704,7 +3702,7 @@ def check_cluster_available(
 def is_controller_accessible(
     controller: controller_utils.Controllers,
     stopped_message: str,
-    non_existent_message: Optional[str] = None,
+    non_existent_message: str | None = None,
     exit_if_not_accessible: bool = False,
 ) -> 'backends.CloudVmRayResourceHandle':
     """Check if the jobs/serve controller is up.
@@ -3851,10 +3849,9 @@ class CloudFilter(enum.Enum):
     LOCAL = 'local'
 
 
-def _get_glob_clusters(
-        clusters: List[str],
-        silent: bool = False,
-        workspaces_filter: Optional[Set[str]] = None) -> List[str]:
+def _get_glob_clusters(clusters: list[str],
+                       silent: bool = False,
+                       workspaces_filter: set[str] | None = None) -> list[str]:
     """Returns a list of clusters that match the glob pattern."""
     glob_clusters = []
     for cluster in clusters:
@@ -3870,9 +3867,9 @@ _MAX_NAMES_IN_SUMMARY = 3
 
 
 def _summarize_pod_reasons(
-    node_statuses: Dict[str, Tuple[status_lib.ClusterStatus, Optional[str]]],
+    node_statuses: dict[str, tuple[status_lib.ClusterStatus, str | None]],
     total_pods: int,
-    node_health: Optional[Dict[str, 'NodeHealthInfo']] = None,
+    node_health: dict[str, 'NodeHealthInfo'] | None = None,
 ) -> str:
     """Summarize per-pod reasons into a concise grouped message.
 
@@ -3896,8 +3893,8 @@ def _summarize_pod_reasons(
     # 1. Node-level summary (from structured data)
     if node_health:
         # Group by issue type (e.g., all NotReady together)
-        by_issue: Dict[str, List[str]] = {}
-        affected_by_issue: Dict[str, int] = {}
+        by_issue: dict[str, list[str]] = {}
+        affected_by_issue: dict[str, int] = {}
         for node_name, info in node_health.items():
             by_issue.setdefault(info.issue, []).append(node_name)
             affected_by_issue[info.issue] = (
@@ -3925,7 +3922,7 @@ def _summarize_pod_reasons(
             node_explained_pods.update(info.pods)
 
     # 2. Pod-level summary (pods not already explained by node issues)
-    pod_issues: Dict[str, List[str]] = {}
+    pod_issues: dict[str, list[str]] = {}
     for pod_name, (_, reason) in node_statuses.items():
         if reason is None:
             continue
@@ -3947,11 +3944,11 @@ def _summarize_pod_reasons(
     return '; '.join(parts)
 
 
-def _refresh_cluster(
-        cluster_name: str,
-        force_refresh_statuses: Optional[Set[status_lib.ClusterStatus]],
-        include_user_info: bool = True,
-        summary_response: bool = False) -> Optional[Dict[str, Any]]:
+def _refresh_cluster(cluster_name: str,
+                     force_refresh_statuses: set[status_lib.ClusterStatus] |
+                     None,
+                     include_user_info: bool = True,
+                     summary_response: bool = False) -> dict[str, Any] | None:
     try:
         record = refresh_cluster_record(
             cluster_name,
@@ -3989,13 +3986,13 @@ CLUSTER_REFRESH_PARALLELISM_ENV_VAR = 'SKYPILOT_CLUSTER_REFRESH_PARALLELISM'
 # Invalid values already warned about, so the refresh daemon (which calls
 # _get_cluster_refresh_parallelism every sweep) warns once per value instead
 # of every CLUSTER_REFRESH_DAEMON_INTERVAL_SECONDS.
-_warned_invalid_refresh_parallelism: Set[str] = set()
+_warned_invalid_refresh_parallelism: set[str] = set()
 
 
 def _get_cluster_refresh_parallelism() -> int:
     override = os.environ.get(CLUSTER_REFRESH_PARALLELISM_ENV_VAR)
     if override is not None:
-        parsed: Optional[int] = None
+        parsed: int | None = None
         try:
             parsed = int(override)
         except ValueError:
@@ -4010,7 +4007,7 @@ def _get_cluster_refresh_parallelism() -> int:
     return subprocess_utils.get_parallel_threads()
 
 
-def _sort_clusters_for_refresh(cluster_names: List[str]) -> List[str]:
+def _sort_clusters_for_refresh(cluster_names: list[str]) -> list[str]:
     """Orders clusters so those most in need of reconciliation go first.
 
     INIT clusters (e.g. half-provisioned clusters orphaned by an API server
@@ -4029,7 +4026,7 @@ def _sort_clusters_for_refresh(cluster_names: List[str]) -> List[str]:
         status_fields = global_user_state.get_cluster_status_fields(
             cluster_names)
 
-        def _priority(cluster_name: str) -> Tuple[int, float]:
+        def _priority(cluster_name: str) -> tuple[int, float]:
             status, status_updated_at = status_fields.get(
                 cluster_name, (None, None))
             if status_updated_at is None:
@@ -4097,7 +4094,7 @@ def refresh_cluster_records() -> None:
 
 
 def _get_records_with_handle(
-        records: List[Optional[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+        records: list[dict[str, Any] | None]) -> list[dict[str, Any]]:
     """Filter for records that have a handle"""
     return [
         record for record in records
@@ -4105,7 +4102,7 @@ def _get_records_with_handle(
     ]
 
 
-def _update_records_with_handle_info(records_with_handle: List[Dict[str, Any]],
+def _update_records_with_handle_info(records_with_handle: list[dict[str, Any]],
                                      summary_response: bool = False) -> None:
     """Add resource str to record"""
     for record in records_with_handle:
@@ -4121,7 +4118,7 @@ def _update_records_with_handle_info(records_with_handle: List[Dict[str, Any]],
 
 def get_clusters(
     refresh: common.StatusRefreshMode,
-    cluster_names: Optional[Union[str, List[str]]] = None,
+    cluster_names: str | list[str] | None = None,
     all_users: bool = True,
     include_credentials: bool = False,
     summary_response: bool = False,
@@ -4129,7 +4126,7 @@ def get_clusters(
     # Internal only:
     # pylint: disable=invalid-name
     _include_is_managed: bool = False,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Returns a list of cached or optionally refreshed cluster records.
 
     Combs through the database (in ~/.sky/state.db) to get a list of records
@@ -4211,7 +4208,7 @@ def get_clusters(
             logger.info(f'Cluster(s) not found: {bright}{clusters_str}{reset}.')
 
     def _update_records_with_credentials(
-            records: List[Optional[Dict[str, Any]]]) -> None:
+            records: list[dict[str, Any] | None]) -> None:
         """Add the credentials to the record.
 
         This is useful for the client side to setup the ssh config of the
@@ -4223,7 +4220,7 @@ def get_clusters(
 
         handles = [record['handle'] for record in records_with_handle]
         credentials = ssh_credentials_from_handles(handles)
-        cached_private_keys: Dict[str, str] = {}
+        cached_private_keys: dict[str, str] = {}
         for record, credential in zip(records_with_handle, credentials):
             if not credential:
                 continue
@@ -4248,15 +4245,14 @@ def get_clusters(
                 credential['ssh_private_key_content'] = cached_private_keys[
                     expanded_private_key_path]
             else:
-                with open(expanded_private_key_path, 'r',
-                          encoding='utf-8') as f:
+                with open(expanded_private_key_path, encoding='utf-8') as f:
                     credential['ssh_private_key_content'] = f.read()
                     cached_private_keys[expanded_private_key_path] = credential[
                         'ssh_private_key_content']
             record['credentials'] = credential
 
     def _update_records_with_resources(
-        records: List[Optional[Dict[str, Any]]],) -> None:
+        records: list[dict[str, Any] | None],) -> None:
         """Add the resources to the record."""
         for record in _get_records_with_handle(records):
             handle = record['handle']
@@ -4345,7 +4341,7 @@ def get_clusters(
                 ])
     # Preserve the index of the cluster name as it appears on "records"
     # before filtering for clusters being launched.
-    updated_records_dict: Dict[int, Optional[Dict[str, Any]]] = {
+    updated_records_dict: dict[int, dict[str, Any] | None] = {
         cluster_names_without_launch_request[i][0]: updated_records[i]
         for i in range(len(cluster_names_without_launch_request))
     }
@@ -4435,7 +4431,7 @@ def get_backend_from_handle(
     return backend
 
 
-def get_task_demands_dict(task: 'task_lib.Task') -> Dict[str, float]:
+def get_task_demands_dict(task: 'task_lib.Task') -> dict[str, float]:
     """Returns the resources dict of the task.
 
     Returns:
@@ -4501,7 +4497,7 @@ def get_task_resources_str(task: 'task_lib.Task',
     else:
         resource_accelerators = []
         min_cpus = float('inf')
-        spot_type: Set[str] = set()
+        spot_type: set[str] = set()
         for resource in task.resources:
             task_cpu_demand = '1+'
             if resource.cpus is not None:
@@ -4565,8 +4561,7 @@ def check_rsync_installed() -> None:
         subprocess.run('rsync --version',
                        shell=True,
                        check=True,
-                       stdout=subprocess.PIPE,
-                       stderr=subprocess.PIPE)
+                       capture_output=True)
     except subprocess.CalledProcessError:
         with ux_utils.print_exception_no_traceback():
             raise RuntimeError(
@@ -4598,10 +4593,10 @@ def check_stale_runtime_on_remote(returncode: int, stderr: str,
 
 def _get_endpoints_from_cluster_record(
         cluster: str,
-        cluster_record: Dict[str, Any],
-        port: Optional[int] = None,
+        cluster_record: dict[str, Any],
+        port: int | None = None,
         skip_status_check: bool = False,
-        provider_config: Optional[Dict[str, Any]] = None) -> Dict[int, str]:
+        provider_config: dict[str, Any] | None = None) -> dict[int, str]:
     """Gets endpoints for a cluster from an already-fetched cluster record."""
     if (not skip_status_check and cluster_record['status']
             not in (status_lib.ClusterStatus.UP,
@@ -4696,10 +4691,10 @@ def _get_endpoints_from_cluster_record(
 
 def get_endpoints(
         cluster: str,
-        port: Optional[Union[int, str]] = None,
+        port: int | str | None = None,
         skip_status_check: bool = False,
-        cluster_record: Optional[Dict[str, Any]] = None,
-        provider_config: Optional[Dict[str, Any]] = None) -> Dict[int, str]:
+        cluster_record: dict[str, Any] | None = None,
+        provider_config: dict[str, Any] | None = None) -> dict[int, str]:
     """Gets the endpoint for a given cluster and port number (endpoint).
 
     Args:
@@ -4774,9 +4769,9 @@ def cluster_tunnel_lock_id(cluster_name: str) -> str:
     return f'{cluster_name}_ssh_tunnel'
 
 
-def open_ssh_tunnel(head_runner: Union[command_runner.SSHCommandRunner,
-                                       command_runner.KubernetesCommandRunner],
-                    port_forward: Tuple[int, int]) -> subprocess.Popen:
+def open_ssh_tunnel(head_runner: command_runner.SSHCommandRunner |
+                    command_runner.KubernetesCommandRunner,
+                    port_forward: tuple[int, int]) -> subprocess.Popen:
     local_port, remote_port = port_forward
     if isinstance(head_runner, command_runner.SSHCommandRunner):
         # Disabling ControlMaster makes things easier to reason about
@@ -4789,7 +4784,7 @@ def open_ssh_tunnel(head_runner: Union[command_runner.SSHCommandRunner,
     # connecting to clusters using a jump server.
     # We use NON_INTERACTIVE mode to avoid allocating a pseudo-tty,
     # which is counted towards non-idleness.
-    cmd: List[str] = head_runner.port_forward_command(
+    cmd: list[str] = head_runner.port_forward_command(
         [(local_port, remote_port)],
         connect_timeout=5,
         ssh_mode=command_runner.SshMode.NON_INTERACTIVE)

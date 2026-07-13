@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import abc
+from collections.abc import AsyncGenerator
+from collections.abc import Generator
 import contextlib
 import time
-from typing import (Any, AsyncGenerator, Generator, List, Optional, Set, Tuple,
-                    TYPE_CHECKING)
+from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from sky.server import daemons as daemons_lib
@@ -22,7 +23,7 @@ class RequestBackend(abc.ABC):
     @abc.abstractmethod
     def get_request(self,
                     request_id: str,
-                    fields: Optional[List[str]] = None) -> Optional[Request]:
+                    fields: list[str] | None = None) -> Request | None:
         """Get a request by ID with appropriate locking."""
         raise NotImplementedError
 
@@ -30,14 +31,14 @@ class RequestBackend(abc.ABC):
     async def get_request_async(
             self,
             request_id: str,
-            fields: Optional[List[str]] = None) -> Optional[Request]:
+            fields: list[str] | None = None) -> Request | None:
         """Async version of get_request."""
         raise NotImplementedError
 
     @abc.abstractmethod
     @contextlib.contextmanager
     def update_request(
-            self, request_id: str) -> Generator[Optional[Request], None, None]:
+            self, request_id: str) -> Generator[Request | None, None, None]:
         """Atomic read-modify-write with appropriate locking.
 
         Yields the request object. Caller modifies it in-place. On context
@@ -49,7 +50,7 @@ class RequestBackend(abc.ABC):
     @abc.abstractmethod
     @contextlib.asynccontextmanager
     async def update_request_async(
-            self, request_id: str) -> AsyncGenerator[Optional[Request], None]:
+            self, request_id: str) -> AsyncGenerator[Request | None, None]:
         """Async version of update_request."""
         del request_id
         yield None
@@ -64,8 +65,8 @@ class RequestBackend(abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
-    async def create_or_refresh_internal_daemon_async(
-            self, request: 'Request') -> bool:
+    async def create_or_refresh_internal_daemon_async(self,
+                                                      request: Request) -> bool:
         """For an internal daemon request: insert a fresh PENDING row or
         refresh env-bearing columns on an existing row.
 
@@ -89,7 +90,7 @@ class RequestBackend(abc.ABC):
     @abc.abstractmethod
     async def delete_orphan_internal_daemons_async(
         self,
-        internal_daemons: List['daemons_lib.InternalRequestDaemon'],
+        internal_daemons: list[daemons_lib.InternalRequestDaemon],
     ) -> None:
         """Delete daemon-shaped rows whose `request_id` is not in
         `internal_daemons` (daemon was renamed / removed in code),
@@ -101,18 +102,18 @@ class RequestBackend(abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def query_requests(self, req_filter: RequestTaskFilter) -> List[Request]:
+    def query_requests(self, req_filter: RequestTaskFilter) -> list[Request]:
         """Query requests matching the filter."""
         raise NotImplementedError
 
     @abc.abstractmethod
     async def query_requests_async(
-            self, req_filter: RequestTaskFilter) -> List[Request]:
+            self, req_filter: RequestTaskFilter) -> list[Request]:
         """Async version of query_requests."""
         raise NotImplementedError
 
     @abc.abstractmethod
-    async def delete_requests(self, request_ids: List[str]) -> None:
+    async def delete_requests(self, request_ids: list[str]) -> None:
         """Delete requests by their IDs."""
         raise NotImplementedError
 
@@ -128,7 +129,7 @@ class RequestBackend(abc.ABC):
         """Update the status message of a request."""
         raise NotImplementedError
 
-    def try_mark_running(self, request_id: str, pid: Optional[int]) -> bool:
+    def try_mark_running(self, request_id: str, pid: int | None) -> bool:
         """Atomically flip a request to RUNNING if it is still executable.
 
         Records `pid` and clears any stale retry-backoff status_msg. Non-
@@ -158,9 +159,9 @@ class RequestBackend(abc.ABC):
 
     def set_request_finished(self,
                              request_id: str,
-                             status: 'RequestStatus',
-                             error: Optional[BaseException] = None,
-                             result: Optional[Any] = None) -> None:
+                             status: RequestStatus,
+                             error: BaseException | None = None,
+                             result: Any | None = None) -> None:
         """Persist a terminal status (SUCCEEDED/FAILED) for a request.
 
         Must not overwrite a status that is already terminal: a late
@@ -187,9 +188,9 @@ class RequestBackend(abc.ABC):
 
     async def set_request_finished_async(self,
                                          request_id: str,
-                                         status: 'RequestStatus',
-                                         error: Optional[BaseException] = None,
-                                         result: Optional[Any] = None) -> None:
+                                         status: RequestStatus,
+                                         error: BaseException | None = None,
+                                         result: Any | None = None) -> None:
         """Async version of set_request_finished."""
         # pylint: disable=import-outside-toplevel
         from sky.server.requests import requests as requests_lib
@@ -208,8 +209,8 @@ class RequestBackend(abc.ABC):
 
     @abc.abstractmethod
     def kill_requests(self,
-                      request_ids: Optional[List[str]] = None,
-                      user_id: Optional[str] = None) -> List[str]:
+                      request_ids: list[str] | None = None,
+                      user_id: str | None = None) -> list[str]:
         """Kill requests and set their status to CANCELLED.
 
         Returns:
@@ -227,7 +228,7 @@ class RequestBackend(abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
-    async def get_latest_request_id_async(self) -> Optional[str]:
+    async def get_latest_request_id_async(self) -> str | None:
         """Get the most recent request ID."""
         raise NotImplementedError
 
@@ -235,7 +236,7 @@ class RequestBackend(abc.ABC):
     def get_requests_with_prefix(
             self,
             request_id_prefix: str,
-            fields: Optional[List[str]] = None) -> Optional[List[Request]]:
+            fields: list[str] | None = None) -> list[Request] | None:
         """Get all requests matching an ID prefix."""
         raise NotImplementedError
 
@@ -243,7 +244,7 @@ class RequestBackend(abc.ABC):
     async def get_requests_async_with_prefix(
             self,
             request_id_prefix: str,
-            fields: Optional[List[str]] = None) -> Optional[List[Request]]:
+            fields: list[str] | None = None) -> list[Request] | None:
         """Async version of get_requests_with_prefix."""
         raise NotImplementedError
 
@@ -251,23 +252,23 @@ class RequestBackend(abc.ABC):
     async def get_request_status_async(
             self,
             request_id: str,
-            include_msg: bool = False) -> Optional[StatusWithMsg]:
+            include_msg: bool = False) -> StatusWithMsg | None:
         """Get the status (and optionally status_msg) of a request."""
         raise NotImplementedError
 
     @abc.abstractmethod
     async def get_api_request_ids_start_with(self,
-                                             incomplete: str) -> List[str]:
+                                             incomplete: str) -> list[str]:
         """Get request IDs for shell completion."""
         raise NotImplementedError
 
     @abc.abstractmethod
-    def get_active_file_mounts_blob_ids(self) -> Set[str]:
+    def get_active_file_mounts_blob_ids(self) -> set[str]:
         """Get blob IDs referenced by active (PENDING/RUNNING) requests."""
         raise NotImplementedError
 
     @abc.abstractmethod
-    def get_shutdown_active_requests(self) -> List[Tuple[str, str]]:
+    def get_shutdown_active_requests(self) -> list[tuple[str, str]]:
         """Get (request_id, name) pairs to wait for during graceful shutdown."""
         raise NotImplementedError
 
@@ -275,7 +276,7 @@ class RequestBackend(abc.ABC):
         """Called on server startup for backend-specific initialization."""
 
 
-_storage_backend: Optional[RequestBackend] = None
+_storage_backend: RequestBackend | None = None
 
 
 def get_request_backend() -> RequestBackend:

@@ -1,16 +1,18 @@
 """Registry for classes to be discovered"""
 
+from collections.abc import Callable
 import difflib
 import typing
-from typing import Callable, Dict, List, Optional, Set, Type, Union
 
 from sky.utils import ux_utils
 
 if typing.TYPE_CHECKING:
-    from sky.backends import backend
-    from sky.batch import io_formats
-    from sky.clouds import cloud
-    from sky.jobs import recovery_strategy
+    # Used only inside string generics like _Registry['cloud.Cloud'] below;
+    # static linters do not see those as usages, so keep F401 suppressed.
+    from sky.backends import backend  # noqa: F401
+    from sky.batch import io_formats  # noqa: F401
+    from sky.clouds import cloud  # noqa: F401
+    from sky.jobs import recovery_strategy  # noqa: F401
 
 T = typing.TypeVar('T')
 
@@ -20,16 +22,16 @@ class _Registry(dict, typing.Generic[T]):
 
     def __init__(self,
                  registry_name: str,
-                 exclude: Optional[Set[str]],
+                 exclude: set[str] | None,
                  type_register: bool = False):
         super().__init__()
         self._registry_name = registry_name
         self._exclude = exclude or set()
-        self._default: Optional[str] = None
+        self._default: str | None = None
         self._type_register: bool = type_register
-        self._aliases: Dict[str, str] = {}
+        self._aliases: dict[str, str] = {}
 
-    def from_str(self, name: Optional[str]) -> Optional[T]:
+    def from_str(self, name: str | None) -> T | None:
         """Returns the cloud instance from the canonical name or alias."""
         if name is None:
             return None
@@ -59,11 +61,11 @@ class _Registry(dict, typing.Generic[T]):
 
     def type_register(self,
                       name: str,
-                      default: bool = False) -> Callable[[Type[T]], Type[T]]:
+                      default: bool = False) -> Callable[[type[T]], type[T]]:
 
         name = name.lower()
 
-        def decorator(cls: Type[T]) -> Type[T]:
+        def decorator(cls: type[T]) -> type[T]:
             assert self._type_register, ('type_register can only be used '
                                          'when type_register is True')
             assert name not in self, f'{name} already registered'
@@ -75,26 +77,24 @@ class _Registry(dict, typing.Generic[T]):
         return decorator
 
     @typing.overload
-    def register(self, cls: Type[T]) -> Type[T]:
+    def register(self, cls: type[T]) -> type[T]:
         ...
 
     @typing.overload
     def register(
             self,
             cls: None = None,
-            aliases: Optional[List[str]] = None
-    ) -> Callable[[Type[T]], Type[T]]:
+            aliases: list[str] | None = None) -> Callable[[type[T]], type[T]]:
         ...
 
-    def register(
-        self,
-        cls: Optional[Type[T]] = None,
-        aliases: Optional[List[str]] = None
-    ) -> Union[Type[T], Callable[[Type[T]], Type[T]]]:
+    def register(self,
+                 cls: type[T] | None = None,
+                 aliases: list[str] | None = None
+                ) -> type[T] | Callable[[type[T]], type[T]]:
         assert not self._type_register, ('register can only be used when '
                                          'type_register is False')
 
-        def _register(cls: Type[T]) -> Type[T]:
+        def _register(cls: type[T]) -> type[T]:
             name = cls.__name__.lower()
             assert name not in self, f'{name} already registered'
             self[name] = cls()

@@ -1,5 +1,6 @@
 """Utilities for SkyPilot context."""
 import asyncio
+from collections.abc import Callable
 import concurrent.futures
 import contextvars
 import functools
@@ -10,7 +11,7 @@ import subprocess
 import sys
 import time
 import typing
-from typing import Any, Callable, IO, Optional, Tuple, TypeVar
+from typing import Any, IO, TypeVar
 
 from typing_extensions import ParamSpec
 
@@ -79,8 +80,8 @@ def passthrough_stream_handler(in_stream: IO[Any], out_stream: IO[Any]) -> str:
             has_unflushed_content = True
 
         # Flush only if we have unflushed content and timeout reached
-        if (has_unflushed_content and current_time - last_flush_time >=
-                PASSTHROUGH_FLUSH_INTERVAL_SECONDS):
+        if (has_unflushed_content and current_time - last_flush_time
+                >= PASSTHROUGH_FLUSH_INTERVAL_SECONDS):
             out_stream.flush()
             last_flush_time = current_time
             has_unflushed_content = False
@@ -97,10 +98,9 @@ def pipe_and_wait_process(
         ctx: context.SkyPilotContext,
         proc: subprocess.Popen,
         poll_interval: float = 0.5,
-        cancel_callback: Optional[Callable[[], None]] = None,
-        stdout_stream_handler: Optional[StreamHandler] = None,
-        stderr_stream_handler: Optional[StreamHandler] = None
-) -> Tuple[str, str]:
+        cancel_callback: Callable[[], None] | None = None,
+        stdout_stream_handler: StreamHandler | None = None,
+        stderr_stream_handler: StreamHandler | None = None) -> tuple[str, str]:
     """Wait for the process to finish or cancel it if the context is cancelled.
 
     Args:
@@ -150,7 +150,7 @@ def pipe_and_wait_process(
 def wait_process(ctx: context.SkyPilotContext,
                  proc: subprocess.Popen,
                  poll_interval: float = 0.5,
-                 cancel_callback: Optional[Callable[[], None]] = None):
+                 cancel_callback: Callable[[], None] | None = None):
     """Wait for the process to finish or cancel it if the context is cancelled.
 
     Args:
@@ -218,7 +218,7 @@ P = ParamSpec('P')
 T = TypeVar('T')
 
 
-def to_thread_with_executor(executor: Optional[concurrent.futures.Executor],
+def to_thread_with_executor(executor: concurrent.futures.Executor | None,
                             func: Callable[P, T], /, *args: P.args,
                             **kwargs: P.kwargs) -> 'asyncio.Future[T]':
     """Asynchronously run function *func* in a separate thread with

@@ -22,7 +22,7 @@ import shlex
 import subprocess
 import time
 import typing
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
 from sky import sky_logging
 from sky.adaptors import common as adaptors_common
@@ -69,7 +69,7 @@ class AutostopWaitFor(enum.Enum):
     NONE = 'none'
 
     @classmethod
-    def supported_modes(cls) -> List[str]:
+    def supported_modes(cls) -> list[str]:
         return [mode.value for mode in cls]
 
     @classmethod
@@ -140,11 +140,11 @@ class AutostopConfig:
     def __init__(self,
                  autostop_idle_minutes: int,
                  boot_time: float,
-                 backend: Optional[str],
+                 backend: str | None,
                  wait_for: AutostopWaitFor,
                  down: bool = False,
-                 hook: Optional[str] = None,
-                 hook_timeout: Optional[int] = None):
+                 hook: str | None = None,
+                 hook_timeout: int | None = None):
         assert autostop_idle_minutes < 0 or backend is not None, (
             autostop_idle_minutes, backend)
         self.autostop_idle_minutes = autostop_idle_minutes
@@ -179,11 +179,11 @@ def get_autostop_config() -> AutostopConfig:
 
 
 def set_autostop(idle_minutes: int,
-                 backend: Optional[str],
+                 backend: str | None,
                  wait_for: AutostopWaitFor,
                  down: bool,
-                 hook: Optional[str] = None,
-                 hook_timeout: Optional[int] = None) -> None:
+                 hook: str | None = None,
+                 hook_timeout: int | None = None) -> None:
     """Set autostop configuration.
 
     Args:
@@ -263,8 +263,8 @@ def get_last_active_time() -> float:
     return -1
 
 
-_EVENT_TO_PROTO: Dict[str, int] = {}
-_PROTO_TO_EVENT: Dict[int, str] = {}
+_EVENT_TO_PROTO: dict[str, int] = {}
+_PROTO_TO_EVENT: dict[int, str] = {}
 
 
 def _ensure_event_maps() -> None:
@@ -283,7 +283,7 @@ def _ensure_event_maps() -> None:
     _PROTO_TO_EVENT.update({v: k for k, v in _EVENT_TO_PROTO.items()})
 
 
-def hooks_to_protobuf(hooks: List[Dict[str, Any]]):
+def hooks_to_protobuf(hooks: list[dict[str, Any]]):
     """Convert a list of hook dicts into protobuf ``Hook`` messages.
 
     Lives in this module because the hooks payload currently rides on
@@ -304,7 +304,7 @@ def hooks_to_protobuf(hooks: List[Dict[str, Any]]):
     return out
 
 
-def hooks_from_protobuf(proto_hooks) -> List[Dict[str, Any]]:
+def hooks_from_protobuf(proto_hooks) -> list[dict[str, Any]]:
     """Convert protobuf ``Hook`` messages back into hook dicts.
 
     Re-applies the ``events`` default on receive: proto3 ``repeated``
@@ -317,7 +317,7 @@ def hooks_from_protobuf(proto_hooks) -> List[Dict[str, Any]]:
     the planned proto split lands.
     """
     _ensure_event_maps()
-    out: List[Dict[str, Any]] = []
+    out: list[dict[str, Any]] = []
     for h in proto_hooks:
         events = [_PROTO_TO_EVENT[e] for e in h.events if e in _PROTO_TO_EVENT]
         if not events:
@@ -331,7 +331,7 @@ def hooks_from_protobuf(proto_hooks) -> List[Dict[str, Any]]:
     return out
 
 
-def set_hooks(hooks: Optional[List[Dict[str, Any]]]) -> None:
+def set_hooks(hooks: list[dict[str, Any]] | None) -> None:
     """Store the cluster's lifecycle-hooks list.
 
     Called during launch via the ``SetAutostop`` gRPC (which carries
@@ -347,7 +347,7 @@ def set_hooks(hooks: Optional[List[Dict[str, Any]]]) -> None:
         configs.set_config(_HOOKS_CONFIG_KEY, '')
 
 
-def get_hooks() -> List[Dict[str, Any]]:
+def get_hooks() -> list[dict[str, Any]]:
     """Load the stored lifecycle-hooks list, or [] if never set.
 
     Counterpart to :func:`set_hooks`; see the module docstring for the
@@ -420,8 +420,8 @@ def has_active_ssh_sessions() -> bool:
         return False
 
 
-def execute_autostop_hook(hook: Optional[str],
-                          hook_timeout: Optional[int] = None) -> bool:
+def execute_autostop_hook(hook: str | None,
+                          hook_timeout: int | None = None) -> bool:
     """Execute the autostop hook script if provided.
 
     Args:
@@ -486,11 +486,11 @@ class AutostopCodeGen:
     def set_autostop(cls,
                      idle_minutes: int,
                      backend: str,
-                     wait_for: Optional[AutostopWaitFor],
+                     wait_for: AutostopWaitFor | None,
                      down: bool = False,
-                     hook: Optional[str] = None,
-                     hook_timeout: Optional[int] = None,
-                     hooks: Optional[List[Dict[str, Any]]] = None) -> str:
+                     hook: str | None = None,
+                     hook_timeout: int | None = None,
+                     hooks: list[dict[str, Any]] | None = None) -> str:
         """Render skylet-side autostop + hooks setup as a Python one-liner.
 
         Dual-emits for mixed-version environments:
@@ -553,7 +553,7 @@ class AutostopCodeGen:
         return cls._build(code)
 
     @classmethod
-    def _build(cls, code: List[str]) -> str:
+    def _build(cls, code: list[str]) -> str:
         code = cls._PREFIX + code
         code = ';'.join(code)
         return f'{constants.SKY_PYTHON_CMD} -u -c {shlex.quote(code)}'

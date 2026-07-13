@@ -1,7 +1,7 @@
 """Responses for the API server."""
 
 import enum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import pydantic
 
@@ -79,16 +79,16 @@ class APIHealthResponse(ResponseBaseModel):
     commit: str = ''
     # Monotonic build number (git commit count); auto-increments with every
     # commit. None when unknown (e.g. no git metadata at build time).
-    build: Optional[str] = None
+    build: str | None = None
     # Whether basic auth on api server is enabled
     basic_auth_enabled: bool = False
-    user: Optional[models.User] = None
+    user: models.User | None = None
     # Whether service account token is enabled
     service_account_token_enabled: bool = False
     # Whether basic auth on ingress is enabled
     ingress_basic_auth_enabled: bool = False
     # Latest version info (if available)
-    latest_version: Optional[str] = None
+    latest_version: str | None = None
     # Whether external proxy auth is enabled
     external_proxy_auth_enabled: bool = False
     # Whether telemetry/usage collection is enabled
@@ -103,49 +103,49 @@ class StatusResponse(ResponseBaseModel):
     # backends.ResourceHandle, so we use Any here.
     # This is an internally facing field anyway, so it's less
     # of a problem that it's not typed.
-    handle: Optional[Any] = None
-    last_use: Optional[str] = None
+    handle: Any | None = None
+    last_use: str | None = None
     status: status_lib.ClusterStatus
     autostop: int
     to_down: bool
-    owner: Optional[List[str]] = None
+    owner: list[str] | None = None
     # metadata is a JSON, so we use Any here.
-    metadata: Optional[Dict[str, Any]] = None
+    metadata: dict[str, Any] | None = None
     cluster_hash: str
     cluster_ever_up: bool
-    status_updated_at: Optional[int] = None
+    status_updated_at: int | None = None
     user_hash: str
     user_name: str
-    config_hash: Optional[str] = None
+    config_hash: str | None = None
     workspace: str
-    last_creation_yaml: Optional[str] = None
-    last_creation_command: Optional[str] = None
+    last_creation_yaml: str | None = None
+    last_creation_command: str | None = None
     is_managed: bool
-    last_event: Optional[str] = None
+    last_event: str | None = None
     # Latest LAUNCH_PROGRESS event reason for clusters in INIT status
     # (rendered as LAUNCHING on the dashboard). None for all other
     # statuses and for clusters that have not yet emitted a
     # launch-progress event.
-    launch_status_reason: Optional[str] = None
-    resources_str: Optional[str] = None
-    resources_str_full: Optional[str] = None
+    launch_status_reason: str | None = None
+    resources_str: str | None = None
+    resources_str_full: str | None = None
     # credentials is a JSON, so we use Any here.
-    credentials: Optional[Dict[str, Any]] = None
+    credentials: dict[str, Any] | None = None
     nodes: int
-    cloud: Optional[str] = None
-    region: Optional[str] = None
-    cpus: Optional[str] = None
-    memory: Optional[str] = None
-    accelerators: Optional[str] = None
-    labels: Optional[Dict[str, str]] = None
-    cluster_name_on_cloud: Optional[str] = None
-    node_names: Optional[str] = None
-    priority: Optional[int] = None
-    priority_class: Optional[str] = None
+    cloud: str | None = None
+    region: str | None = None
+    cpus: str | None = None
+    memory: str | None = None
+    accelerators: str | None = None
+    labels: dict[str, str] | None = None
+    cluster_name_on_cloud: str | None = None
+    node_names: str | None = None
+    priority: int | None = None
+    priority_class: str | None = None
     # External links surfaced on the dashboard's cluster detail page.
     # Currently populated with cloud-provider instance console URLs at launch
     # time (mirrors ManagedJobRecord.links). Shape: {label: url}.
-    links: Optional[Dict[str, str]] = None
+    links: dict[str, str] | None = None
 
 
 class ClusterJobRecord(ResponseBaseModel):
@@ -156,13 +156,13 @@ class ClusterJobRecord(ResponseBaseModel):
     user_hash: str
     submitted_at: float
     # None if the job has not started yet.
-    start_at: Optional[float] = None
+    start_at: float | None = None
     # None if the job has not ended yet.
-    end_at: Optional[float] = None
+    end_at: float | None = None
     resources: str
     status: job_lib.JobStatus
     log_path: str
-    metadata: Dict[str, Any] = {}
+    metadata: dict[str, Any] = {}
 
 
 class UploadStatus(enum.Enum):
@@ -175,7 +175,7 @@ class StorageRecord(ResponseBaseModel):
     """Response for the storage list endpoint."""
     name: str
     launched_at: int
-    store: List[data.StoreType]
+    store: list[data.StoreType]
     last_use: str
     status: status_lib.StorageStatus
 
@@ -185,71 +185,71 @@ class StorageRecord(ResponseBaseModel):
 class ManagedJobRecord(ResponseBaseModel):
     """A single managed job record."""
     # The job_id in the spot table
-    task_job_id: Optional[int] = pydantic.Field(None, alias='_job_id')
-    job_id: Optional[int] = None
-    task_id: Optional[int] = None
-    job_name: Optional[str] = None
-    task_name: Optional[str] = None
-    job_duration: Optional[float] = None
-    workspace: Optional[str] = None
-    status: Optional[job_state.ManagedJobStatus] = None
-    schedule_state: Optional[str] = None
-    resources: Optional[str] = None
-    cluster_resources: Optional[str] = None
-    cluster_resources_full: Optional[str] = None
-    cloud: Optional[str] = None
-    region: Optional[str] = None
-    zone: Optional[str] = None
-    infra: Optional[str] = None
-    recovery_count: Optional[int] = None
-    details: Optional[str] = None
-    failure_reason: Optional[str] = None
-    user_name: Optional[str] = None
-    user_hash: Optional[str] = None
-    submitted_at: Optional[float] = None
-    start_at: Optional[float] = None
-    end_at: Optional[float] = None
-    user_yaml: Optional[str] = None
-    entrypoint: Optional[str] = None
-    metadata: Optional[Dict[str, Any]] = None
-    controller_pid: Optional[int] = None
-    controller_pid_started_at: Optional[float] = None
-    dag_yaml_path: Optional[str] = None
-    env_file_path: Optional[str] = None
-    last_recovered_at: Optional[float] = None
-    run_timestamp: Optional[str] = None
-    priority: Optional[int] = None
-    priority_class: Optional[str] = None
-    original_user_yaml_path: Optional[str] = None
-    pool: Optional[str] = None
-    pool_hash: Optional[str] = None
-    current_cluster_name: Optional[str] = None
-    cluster_name_on_cloud: Optional[str] = None
-    job_id_on_pool_cluster: Optional[int] = None
-    accelerators: Optional[Dict[str, int]] = None
-    labels: Optional[Dict[str, str]] = None
-    links: Optional[Dict[str, str]] = None
+    task_job_id: int | None = pydantic.Field(None, alias='_job_id')
+    job_id: int | None = None
+    task_id: int | None = None
+    job_name: str | None = None
+    task_name: str | None = None
+    job_duration: float | None = None
+    workspace: str | None = None
+    status: job_state.ManagedJobStatus | None = None
+    schedule_state: str | None = None
+    resources: str | None = None
+    cluster_resources: str | None = None
+    cluster_resources_full: str | None = None
+    cloud: str | None = None
+    region: str | None = None
+    zone: str | None = None
+    infra: str | None = None
+    recovery_count: int | None = None
+    details: str | None = None
+    failure_reason: str | None = None
+    user_name: str | None = None
+    user_hash: str | None = None
+    submitted_at: float | None = None
+    start_at: float | None = None
+    end_at: float | None = None
+    user_yaml: str | None = None
+    entrypoint: str | None = None
+    metadata: dict[str, Any] | None = None
+    controller_pid: int | None = None
+    controller_pid_started_at: float | None = None
+    dag_yaml_path: str | None = None
+    env_file_path: str | None = None
+    last_recovered_at: float | None = None
+    run_timestamp: str | None = None
+    priority: int | None = None
+    priority_class: str | None = None
+    original_user_yaml_path: str | None = None
+    pool: str | None = None
+    pool_hash: str | None = None
+    current_cluster_name: str | None = None
+    cluster_name_on_cloud: str | None = None
+    job_id_on_pool_cluster: int | None = None
+    accelerators: dict[str, int] | None = None
+    labels: dict[str, str] | None = None
+    links: dict[str, str] | None = None
     # Node names for dashboard display (comma-separated)
-    node_names: Optional[str] = None
+    node_names: str | None = None
     # JobGroup fields
     # Execution mode: 'parallel' (job group) or 'serial' (pipeline/single job)
-    execution: Optional[str] = None
-    is_job_group: Optional[bool] = None
+    execution: str | None = None
+    is_job_group: bool | None = None
     # Whether this task is a primary task (True) or auxiliary task (False)
     # within a job group. NULL for non-job-group jobs (single jobs and
     # pipelines).
-    is_primary_in_job_group: Optional[bool] = None
+    is_primary_in_job_group: bool | None = None
     # Whether this job is a batch coordinator (ds.map())
-    is_batch: Optional[bool] = None
+    is_batch: bool | None = None
     # Batch progress fields (NULL for non-batch jobs)
-    batch_total_batches: Optional[int] = None
-    batch_completed_batches: Optional[int] = None
+    batch_total_batches: int | None = None
+    batch_completed_batches: int | None = None
     # Network endpoint information (extracted from cluster handle)
     # List of (internal_ip, external_ip) tuples for all nodes
-    internal_external_ips: Optional[List[Tuple[str, str]]] = None
+    internal_external_ips: list[tuple[str, str]] | None = None
     # K8s DNS entries mapping Pod name to internal_svc
     # Only populated for Kubernetes clusters
-    internal_services: Optional[Dict[str, Optional[str]]] = None
+    internal_services: dict[str, str | None] | None = None
 
 
 class VolumeRecord(ResponseBaseModel):
@@ -258,23 +258,23 @@ class VolumeRecord(ResponseBaseModel):
     type: str
     launched_at: int
     cloud: str
-    region: Optional[str] = None
-    zone: Optional[str] = None
-    size: Optional[str] = None
-    config: Dict[str, Any]
+    region: str | None = None
+    zone: str | None = None
+    size: str | None = None
+    config: dict[str, Any]
     name_on_cloud: str
     user_hash: str
     user_name: str
     workspace: str
-    last_attached_at: Optional[int] = None
-    last_use: Optional[str] = None
-    status: Optional[str] = None
-    usedby_pods: List[str]
-    usedby_clusters: List[str]
+    last_attached_at: int | None = None
+    last_use: str | None = None
+    status: str | None = None
+    usedby_pods: list[str]
+    usedby_clusters: list[str]
     is_ephemeral: bool = False
     usedby_fetch_failed: bool = False
     # Error message for volume in ERROR state (e.g., PVC pending due to
     # access mode mismatch)
-    error_message: Optional[str] = None
+    error_message: str | None = None
     # YAML configuration used to create the volume
-    creation_yaml: Optional[str] = None
+    creation_yaml: str | None = None

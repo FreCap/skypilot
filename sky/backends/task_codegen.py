@@ -7,7 +7,6 @@ import math
 import os
 import shlex
 import textwrap
-from typing import Dict, List, Optional, Tuple
 
 import colorama
 
@@ -29,13 +28,13 @@ class TaskCodeGen:
 
     def __init__(self) -> None:
         # Code generated so far, to be joined via '\n'.
-        self._code: List[str] = []
+        self._code: list[str] = []
         # Guard method calling order.
         self._has_prologue: bool = False
         self._has_epilogue: bool = False
         self._has_setup: bool = False
         # Job ID is used to identify the job (also this generated code).
-        self.job_id: Optional[int] = None
+        self.job_id: int | None = None
 
     def _add_common_imports(self) -> None:
         """Add common imports for both Ray and Slurm execution."""
@@ -108,8 +107,8 @@ class TaskCodeGen:
 
     def _get_accelerator_details(
         self,
-        resources_dict: Dict[str, float],
-    ) -> Tuple[Optional[str], float]:
+        resources_dict: dict[str, float],
+    ) -> tuple[str | None, float]:
         resources_copy = resources_dict.copy()
         resources_copy.pop('CPU', None)
 
@@ -194,7 +193,7 @@ class TaskCodeGen:
 
     @staticmethod
     def build_task_bash_script(bash_script: str,
-                               env_prefix: Optional[str] = None) -> str:
+                               env_prefix: str | None = None) -> str:
         """Build the complete bash script for a task.
 
         Prepends env_prefix (if any) and appends the rclone flush script.
@@ -223,11 +222,11 @@ class TaskCodeGen:
     def add_setup(
         self,
         num_nodes: int,
-        resources_dict: Dict[str, float],
-        stable_cluster_internal_ips: List[str],
-        env_vars: Dict[str, str],
+        resources_dict: dict[str, float],
+        stable_cluster_internal_ips: list[str],
+        env_vars: dict[str, str],
         log_dir: str,
-        setup_cmd: Optional[str] = None,
+        setup_cmd: str | None = None,
     ) -> None:
         """Generates code to set up the task on each node.
 
@@ -240,11 +239,11 @@ class TaskCodeGen:
     def add_task(
         self,
         num_nodes: int,
-        bash_script: Optional[str],
-        task_name: Optional[str],
-        resources_dict: Dict[str, float],
+        bash_script: str | None,
+        task_name: str | None,
+        resources_dict: dict[str, float],
         log_dir: str,
-        env_vars: Optional[Dict[str, str]] = None,
+        env_vars: dict[str, str] | None = None,
     ) -> None:
         """Generates code to run the bash command on all num_nodes nodes."""
         raise NotImplementedError
@@ -424,11 +423,11 @@ class RayCodeGen(TaskCodeGen):
     def add_setup(
         self,
         num_nodes: int,
-        resources_dict: Dict[str, float],
-        stable_cluster_internal_ips: List[str],
-        env_vars: Dict[str, str],
+        resources_dict: dict[str, float],
+        stable_cluster_internal_ips: list[str],
+        env_vars: dict[str, str],
         log_dir: str,
-        setup_cmd: Optional[str] = None,
+        setup_cmd: str | None = None,
     ) -> None:
         assert self._has_prologue, ('Call add_prologue() before '
                                     'add_setup().')
@@ -571,11 +570,11 @@ class RayCodeGen(TaskCodeGen):
 
     def add_task(self,
                  num_nodes: int,
-                 bash_script: Optional[str],
-                 task_name: Optional[str],
-                 resources_dict: Dict[str, float],
+                 bash_script: str | None,
+                 task_name: str | None,
+                 resources_dict: dict[str, float],
                  log_dir: str,
-                 env_vars: Optional[Dict[str, str]] = None) -> None:
+                 env_vars: dict[str, str] | None = None) -> None:
         # TODO(zhwu): The resources limitation for multi-node ray.tune and
         # horovod should be considered.
         for i in range(num_nodes):
@@ -589,11 +588,11 @@ class RayCodeGen(TaskCodeGen):
                                gang_scheduling_id=i)
 
     def _add_ray_task(self,
-                      bash_script: Optional[str],
-                      task_name: Optional[str],
-                      resources_dict: Dict[str, float],
+                      bash_script: str | None,
+                      task_name: str | None,
+                      resources_dict: dict[str, float],
                       log_dir: str,
-                      env_vars: Optional[Dict[str, str]] = None,
+                      env_vars: dict[str, str] | None = None,
                       gang_scheduling_id: int = 0) -> None:
         """Generates code for a ray remote task that runs a bash command."""
         assert self._has_setup, 'Call add_setup() before add_task().'
@@ -690,7 +689,7 @@ class SlurmCodeGen(TaskCodeGen):
     def __init__(
         self,
         slurm_job_id: str,
-        container_name: Optional[str],
+        container_name: str | None,
     ):
         """Initialize SlurmCodeGen.
 
@@ -766,19 +765,19 @@ class SlurmCodeGen(TaskCodeGen):
             f'job_lib.set_status({job_id!r}, job_lib.JobStatus.PENDING)',
         ]
 
-        self._setup_cmd: Optional[str] = None
-        self._setup_envs: Optional[Dict[str, str]] = None
-        self._setup_log_dir: Optional[str] = None
-        self._setup_num_nodes: Optional[int] = None
+        self._setup_cmd: str | None = None
+        self._setup_envs: dict[str, str] | None = None
+        self._setup_log_dir: str | None = None
+        self._setup_num_nodes: int | None = None
 
     def add_setup(
         self,
         num_nodes: int,
-        resources_dict: Dict[str, float],
-        stable_cluster_internal_ips: List[str],
-        env_vars: Dict[str, str],
+        resources_dict: dict[str, float],
+        stable_cluster_internal_ips: list[str],
+        env_vars: dict[str, str],
         log_dir: str,
-        setup_cmd: Optional[str] = None,
+        setup_cmd: str | None = None,
     ) -> None:
         assert self._has_prologue, ('Call add_prologue() before add_setup().')
         self._has_setup = True
@@ -799,11 +798,11 @@ class SlurmCodeGen(TaskCodeGen):
     def add_task(
         self,
         num_nodes: int,
-        bash_script: Optional[str],
-        task_name: Optional[str],
-        resources_dict: Dict[str, float],
+        bash_script: str | None,
+        task_name: str | None,
+        resources_dict: dict[str, float],
         log_dir: str,
-        env_vars: Optional[Dict[str, str]] = None,
+        env_vars: dict[str, str] | None = None,
     ) -> None:
         """Generates code for invoking a bash command
         using srun within sbatch allocation.

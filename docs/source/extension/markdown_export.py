@@ -26,8 +26,8 @@ def export_markdown_files(app, exception):
         # .html — sphinx only refreshes .html mtime when the page actually
         # needs regenerating, so this avoids invoking pandoc on every
         # unchanged page (~32s on this codebase).
-        if md_path.exists(
-        ) and md_path.stat().st_mtime >= html_path.stat().st_mtime:
+        if md_path.exists() and md_path.stat().st_mtime >= html_path.stat(
+        ).st_mtime:
             continue
 
         if source_path.suffix in ['.md', '.rst']:
@@ -130,8 +130,8 @@ def resolve_literalincludes(content, source_path, pattern):
 
     def replace_literalinclude(match):
         include_path = source_path.parent / match.group(1)
-        language = match.group(
-            2) if len(match.groups()) > 1 and match.group(2) else 'yaml'
+        language = match.group(2) if len(
+            match.groups()) > 1 and match.group(2) else 'yaml'
         if include_path.exists():
             return f"```{language}\n{include_path.read_text()}\n```"
         return match.group(0)

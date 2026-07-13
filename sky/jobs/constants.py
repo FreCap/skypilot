@@ -1,6 +1,6 @@
 """Constants used for Managed Jobs."""
 import os
-from typing import Any, Dict, Union
+from typing import Any
 
 # Environment variable for JobGroup name, injected into all jobs in a JobGroup
 SKYPILOT_JOBGROUP_NAME_ENV_VAR = 'SKYPILOT_JOBGROUP_NAME'
@@ -40,7 +40,7 @@ JOBS_CONSOLIDATION_RELOADED_SIGNAL_FILE = (
 
 # Resources as a dict for the jobs controller.
 # We use 50 GB disk size to reduce the cost.
-CONTROLLER_RESOURCES: Dict[str, Union[str, int]] = {
+CONTROLLER_RESOURCES: dict[str, str | int] = {
     'cpus': '4+',
     'memory': '4x',
     'disk_size': 50
@@ -48,7 +48,7 @@ CONTROLLER_RESOURCES: Dict[str, Union[str, int]] = {
 
 # Autostop config for the jobs controller. These are the default values for
 # jobs.controller.autostop in ~/.sky/config.yaml.
-CONTROLLER_AUTOSTOP: Dict[str, Any] = {
+CONTROLLER_AUTOSTOP: dict[str, Any] = {
     'idle_minutes': 10,
     'down': False,
 }

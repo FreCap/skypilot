@@ -1,10 +1,12 @@
 """GCP instance provisioning."""
 import collections
+from collections.abc import Callable
+from collections.abc import Iterable
 import copy
 from multiprocessing import pool
 import re
 import time
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Type
+from typing import Any, Optional
 
 from sky import sky_logging
 from sky.adaptors import gcp
@@ -24,15 +26,15 @@ _INSTANCE_RESOURCE_NOT_FOUND_PATTERN = re.compile(
 
 
 def _filter_instances(
-    handlers: Iterable[Type[instance_utils.GCPInstance]],
+    handlers: Iterable[type[instance_utils.GCPInstance]],
     project_id: str,
     zone: str,
-    label_filters: Dict[str, str],
-    status_filters_fn: Callable[[Type[instance_utils.GCPInstance]],
-                                Optional[List[str]]],
-    included_instances: Optional[List[str]] = None,
-    excluded_instances: Optional[List[str]] = None,
-) -> Dict[Type[instance_utils.GCPInstance], List[str]]:
+    label_filters: dict[str, str],
+    status_filters_fn: Callable[[type[instance_utils.GCPInstance]],
+                                list[str] | None],
+    included_instances: list[str] | None = None,
+    excluded_instances: list[str] | None = None,
+) -> dict[type[instance_utils.GCPInstance], list[str]]:
     """Filter instances using all instance handlers."""
     instances = set()
     logger.debug(f'handlers: {handlers}')
@@ -60,10 +62,10 @@ def _filter_instances(
 def query_instances(
     cluster_name: str,
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     non_terminated_only: bool = True,
     retry_if_missing: bool = False,
-) -> Dict[str, Tuple[Optional['status_lib.ClusterStatus'], Optional[str]]]:
+) -> dict[str, tuple[Optional['status_lib.ClusterStatus'], str | None]]:
     """See sky/provision/__init__.py"""
     del cluster_name, retry_if_missing  # unused
     assert provider_config is not None, (cluster_name_on_cloud, provider_config)
@@ -73,7 +75,7 @@ def query_instances(
         provision_constants.TAG_RAY_CLUSTER_NAME: cluster_name_on_cloud
     }
 
-    handler: Type[
+    handler: type[
         instance_utils.GCPInstance] = instance_utils.GCPComputeInstance
     use_tpu_vms = provider_config.get('_has_tpus', False)
     if use_tpu_vms:
@@ -87,8 +89,7 @@ def query_instances(
     )
 
     raw_statuses = {}
-    statuses: Dict[str, Tuple[Optional['status_lib.ClusterStatus'],
-                              Optional[str]]] = {}
+    statuses: dict[str, tuple[status_lib.ClusterStatus | None, str | None]] = {}
     for inst_id, instance in instances.items():
         raw_status = instance[handler.STATUS_FIELD]
         raw_statuses[inst_id] = raw_status
@@ -116,9 +117,9 @@ def query_instances(
 
 
 def _wait_for_operations(
-    handlers_to_operations: Dict[Type[instance_utils.GCPInstance], List[dict]],
+    handlers_to_operations: dict[type[instance_utils.GCPInstance], list[dict]],
     project_id: str,
-    zone: Optional[str],
+    zone: str | None,
 ) -> None:
     """Poll for compute zone / global operation until finished.
 
@@ -133,7 +134,7 @@ def _wait_for_operations(
             handler.wait_for_operation(operation, project_id, zone=zone)
 
 
-def _get_head_instance_id(instances: List) -> Optional[str]:
+def _get_head_instance_id(instances: list) -> str | None:
     head_instance_id = None
     for inst in instances:
         labels = inst.get('labels', {})
@@ -151,8 +152,8 @@ def _run_instances(region: str, cluster_name_on_cloud: str,
     #  not used for indexing. Instead, we use the instance name.
     labels = config.tags  # gcp uses 'labels' instead of aws 'tags'
     labels = dict(sorted(copy.deepcopy(labels).items()))
-    resumed_instance_ids: List[str] = []
-    created_instance_ids: List[str] = []
+    resumed_instance_ids: list[str] = []
+    created_instance_ids: list[str] = []
 
     node_type = instance_utils.get_node_type(config.node_config)
     project_id = config.provider_config['project_id']
@@ -161,7 +162,7 @@ def _run_instances(region: str, cluster_name_on_cloud: str,
     # SKY: 'TERMINATED' for compute VM, 'STOPPED' for TPU VM
     # 'STOPPING' means the VM is being stopped, which needs
     # to be included to avoid creating a new VM.
-    resource: Type[instance_utils.GCPInstance]
+    resource: type[instance_utils.GCPInstance]
     if node_type == instance_utils.GCPNodeType.COMPUTE:
         resource = instance_utils.GCPComputeInstance
     elif node_type == instance_utils.GCPNodeType.MIG:
@@ -391,7 +392,7 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
 
 
 def wait_instances(region: str, cluster_name_on_cloud: str,
-                   state: Optional[status_lib.ClusterStatus]) -> None:
+                   state: status_lib.ClusterStatus | None) -> None:
     """See sky/provision/__init__.py"""
     del region, cluster_name_on_cloud, state
     # We already wait for the instances to be running in run_instances.
@@ -401,7 +402,7 @@ def wait_instances(region: str, cluster_name_on_cloud: str,
 def get_cluster_info(
         region: str,
         cluster_name_on_cloud: str,
-        provider_config: Optional[Dict[str, Any]] = None) -> common.ClusterInfo:
+        provider_config: dict[str, Any] | None = None) -> common.ClusterInfo:
     """See sky/provision/__init__.py"""
     del region
     assert provider_config is not None, cluster_name_on_cloud
@@ -411,7 +412,7 @@ def get_cluster_info(
         provision_constants.TAG_RAY_CLUSTER_NAME: cluster_name_on_cloud
     }
 
-    handlers: List[Type[instance_utils.GCPInstance]] = [
+    handlers: list[type[instance_utils.GCPInstance]] = [
         instance_utils.GCPComputeInstance
     ]
     use_tpu_vms = provider_config.get('_has_tpus', False)
@@ -425,7 +426,7 @@ def get_cluster_info(
         label_filters,
         lambda h: [h.RUNNING_STATE],
     )
-    instances: Dict[str, List[common.InstanceInfo]] = {}
+    instances: dict[str, list[common.InstanceInfo]] = {}
     for res, insts in handler_to_instances.items():
         with pool.ThreadPool() as p:
             inst_info = p.starmap(res.get_instance_info,
@@ -457,7 +458,7 @@ def get_cluster_info(
 
 def stop_instances(
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     worker_only: bool = False,
 ) -> None:
     assert provider_config is not None, cluster_name_on_cloud
@@ -474,7 +475,7 @@ def stop_instances(
     if worker_only:
         label_filters[provision_constants.TAG_RAY_NODE_KIND] = 'worker'
 
-    handlers: List[Type[instance_utils.GCPInstance]] = [
+    handlers: list[type[instance_utils.GCPInstance]] = [
         instance_utils.GCPComputeInstance
     ]
     use_tpu_vms = provider_config.get('_has_tpus', False)
@@ -521,7 +522,7 @@ def stop_instances(
 
 def terminate_instances(
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     worker_only: bool = False,
 ) -> None:
     """See sky/provision/__init__.py"""
@@ -549,7 +550,7 @@ def terminate_instances(
     if worker_only:
         label_filters[provision_constants.TAG_RAY_NODE_KIND] = 'worker'
 
-    handlers: List[Type[instance_utils.GCPInstance]] = [
+    handlers: list[type[instance_utils.GCPInstance]] = [
         instance_utils.GCPComputeInstance
     ]
     if use_tpu_vms:
@@ -581,7 +582,7 @@ def terminate_instances(
 
 def cleanup_custom_multi_network(
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     failover: bool = False,
 ) -> None:
     """See sky/provision/__init__.py"""
@@ -600,8 +601,8 @@ def cleanup_custom_multi_network(
 
 def open_ports(
     cluster_name_on_cloud: str,
-    ports: List[str],
-    provider_config: Optional[Dict[str, Any]] = None,
+    ports: list[str],
+    provider_config: dict[str, Any] | None = None,
 ) -> None:
     """See sky/provision/__init__.py"""
     assert provider_config is not None, cluster_name_on_cloud
@@ -612,7 +613,7 @@ def open_ports(
     label_filters = {
         provision_constants.TAG_RAY_CLUSTER_NAME: cluster_name_on_cloud
     }
-    handlers: List[Type[instance_utils.GCPInstance]] = [
+    handlers: list[type[instance_utils.GCPInstance]] = [
         instance_utils.GCPComputeInstance,
     ]
     use_tpu_vms = provider_config.get('_has_tpus', False)
@@ -622,7 +623,7 @@ def open_ports(
     handler_to_instances = _filter_instances(handlers, project_id, zone,
                                              label_filters, lambda _: None)
     operations = collections.defaultdict(list)
-    compute_handler: Type[instance_utils.GCPInstance] = (
+    compute_handler: type[instance_utils.GCPInstance] = (
         instance_utils.GCPComputeInstance)
     for handler, instances in handler_to_instances.items():
         if not instances:
@@ -658,8 +659,8 @@ def open_ports(
 
 def cleanup_ports(
     cluster_name_on_cloud: str,
-    ports: List[str],
-    provider_config: Optional[Dict[str, Any]] = None,
+    ports: list[str],
+    provider_config: dict[str, Any] | None = None,
 ) -> None:
     """See sky/provision/__init__.py"""
     del ports  # Unused.

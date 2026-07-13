@@ -1,7 +1,7 @@
 """Volume functions for provisioning and deleting ephemeral volumes."""
 
 import copy
-from typing import Any, Dict, Optional
+from typing import Any
 
 from sky import clouds
 from sky import global_user_state
@@ -17,8 +17,7 @@ from sky.volumes.server import core as volume_server_core
 logger = sky_logging.init_logger(__name__)
 
 
-def _resolve_volume_type(cloud: clouds.Cloud,
-                         volume_type: Optional[str]) -> str:
+def _resolve_volume_type(cloud: clouds.Cloud, volume_type: str | None) -> str:
     if not volume_type:
         volume_types = None
         for cloud_key, vol_types in volume_lib.CLOUD_TO_VOLUME_TYPE.items():
@@ -51,7 +50,7 @@ def _resolve_volume_type(cloud: clouds.Cloud,
 
 def _resolve_pvc_volume_config(cloud: clouds.Cloud,
                                config: provision_common.ProvisionConfig,
-                               volume_config: Dict[str, Any]) -> Dict[str, Any]:
+                               volume_config: dict[str, Any]) -> dict[str, Any]:
     provider_config = config.provider_config
     if not cloud.is_same_cloud(clouds.Kubernetes()):
         raise ValueError(
@@ -76,10 +75,10 @@ def _resolve_pvc_volume_config(cloud: clouds.Cloud,
 
 
 def _create_ephemeral_volume(
-    cloud: clouds.Cloud, region: str, cluster_name_on_cloud: str,
-    config: provision_common.ProvisionConfig,
-    volume_mount: volume_utils.VolumeMount
-) -> Optional[volume_utils.VolumeInfo]:
+        cloud: clouds.Cloud, region: str, cluster_name_on_cloud: str,
+        config: provision_common.ProvisionConfig,
+        volume_mount: volume_utils.VolumeMount
+) -> volume_utils.VolumeInfo | None:
     provider_name = repr(cloud)
     path = volume_mount.path
     volume_config = volume_mount.volume_config
@@ -156,7 +155,7 @@ def provision_ephemeral_volumes(
         raise e
 
 
-def delete_ephemeral_volumes(provider_config: Dict[str, Any],) -> None:
+def delete_ephemeral_volumes(provider_config: dict[str, Any],) -> None:
     """Provision ephemeral volumes for a cluster."""
     ephemeral_volume_mounts = provider_config.get('ephemeral_volume_specs')
     if not ephemeral_volume_mounts:

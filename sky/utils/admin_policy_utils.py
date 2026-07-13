@@ -1,9 +1,10 @@
 """Admin policy utils."""
+from collections.abc import Iterator
 import contextlib
 import copy
 import importlib
 import typing
-from typing import Iterator, Optional, Tuple, Union
+from typing import Union
 from urllib import parse as urlparse
 
 import colorama
@@ -23,7 +24,7 @@ from sky.utils import ux_utils
 logger = sky_logging.init_logger(__name__)
 
 if typing.TYPE_CHECKING:
-    from sky import models
+    pass
 
 
 def _is_url(policy_string: str) -> bool:
@@ -36,8 +37,7 @@ def _is_url(policy_string: str) -> bool:
 
 
 def _get_policy_impl(
-        policy_location: Optional[str]
-) -> Optional[admin_policy.PolicyInterface]:
+        policy_location: str | None) -> admin_policy.PolicyInterface | None:
     """Gets admin-defined policy."""
     if policy_location is None:
         return None
@@ -80,7 +80,7 @@ def _get_policy_impl(
 def apply_and_use_config_in_current_request(
     entrypoint: Union['dag_lib.Dag', 'task_lib.Task'],
     request_name: request_names.AdminPolicyRequestName,
-    request_options: Optional[admin_policy.RequestOptions] = None,
+    request_options: admin_policy.RequestOptions | None = None,
     at_client_side: bool = False,
 ) -> Iterator['dag_lib.Dag']:
     """Applies an admin policy and override SkyPilot config for current request
@@ -105,9 +105,9 @@ def apply_and_use_config_in_current_request(
 def apply(
     entrypoint: Union['dag_lib.Dag', 'task_lib.Task'],
     request_name: request_names.AdminPolicyRequestName,
-    request_options: Optional[admin_policy.RequestOptions] = None,
+    request_options: admin_policy.RequestOptions | None = None,
     at_client_side: bool = False,
-) -> Tuple['dag_lib.Dag', config_utils.Config]:
+) -> tuple['dag_lib.Dag', config_utils.Config]:
     """Applies an admin policy (if registered) to a DAG or a task.
 
     It mutates a Dag by applying any registered admin policy and also

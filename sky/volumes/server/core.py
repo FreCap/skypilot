@@ -1,8 +1,9 @@
 """Volume management core."""
 
+from collections.abc import Generator
 import contextlib
 import os
-from typing import Any, Dict, Generator, List, Optional
+from typing import Any
 import uuid
 
 import filelock
@@ -40,8 +41,8 @@ def volume_refresh() -> None:
     volumes = global_user_state.get_volumes(is_ephemeral=False)
 
     # Group volumes by cloud for batch API calls
-    cloud_to_configs: Dict[str, List[models.VolumeConfig]] = {}
-    volume_name_to_config: Dict[str, models.VolumeConfig] = {}
+    cloud_to_configs: dict[str, list[models.VolumeConfig]] = {}
+    volume_name_to_config: dict[str, models.VolumeConfig] = {}
     for volume in volumes:
         config = volume.get('handle')
         if config is None:
@@ -55,7 +56,7 @@ def volume_refresh() -> None:
         volume_name_to_config[volume.get('name')] = config
 
     # Check for volume errors (e.g., misconfiguration)
-    cloud_to_volume_errors: Dict[str, Dict[str, Optional[str]]] = {}
+    cloud_to_volume_errors: dict[str, dict[str, str | None]] = {}
     for cloud, configs in cloud_to_configs.items():
         try:
             volume_errors = provision.get_all_volumes_errors(cloud, configs)
@@ -66,9 +67,9 @@ def volume_refresh() -> None:
             cloud_to_volume_errors[cloud] = {}
 
     # Get usedby info for all volumes
-    cloud_to_used_by_pods: Dict[str, Dict[str, Any]] = {}
-    cloud_to_used_by_clusters: Dict[str, Dict[str, Any]] = {}
-    cloud_to_failed_volume_names: Dict[str, set] = {}
+    cloud_to_used_by_pods: dict[str, dict[str, Any]] = {}
+    cloud_to_used_by_clusters: dict[str, dict[str, Any]] = {}
+    cloud_to_failed_volume_names: dict[str, set] = {}
     for cloud, configs in cloud_to_configs.items():
         try:
             used_by_pods, used_by_clusters, failed_volume_names = (
@@ -136,9 +137,9 @@ def volume_refresh() -> None:
             # Update if anything changed
             status_changed = current_status != new_status
             error_changed = current_error != new_error
-            usedby_changed = (
-                set(current_usedby_pods) != set(usedby_pods) or
-                set(current_usedby_clusters) != set(usedby_clusters))
+            usedby_changed = (set(current_usedby_pods) != set(usedby_pods) or
+                              set(current_usedby_clusters)
+                              != set(usedby_clusters))
 
             if status_changed or error_changed or usedby_changed:
                 logger.info(f'Update volume {volume_name} status to '
@@ -168,9 +169,9 @@ def volume_refresh() -> None:
 
 
 def volume_list(
-    is_ephemeral: Optional[bool] = None,
+    is_ephemeral: bool | None = None,
     refresh: bool = False,
-) -> List[responses.VolumeRecord]:
+) -> list[responses.VolumeRecord]:
     """Gets volumes from the database.
 
     Args:
@@ -218,7 +219,7 @@ def volume_list(
                 continue
 
             status = volume.get('status')
-            record: Dict[str, Any] = {
+            record: dict[str, Any] = {
                 'name': volume_name,
                 'launched_at': volume.get('launched_at'),
                 'user_hash': volume.get('user_hash'),
@@ -245,7 +246,7 @@ def volume_list(
         return records
 
 
-def volume_delete(names: List[str],
+def volume_delete(names: list[str],
                   ignore_not_found: bool = False,
                   purge: bool = False) -> None:
     """Deletes volumes.
@@ -306,14 +307,14 @@ def volume_apply(
     name: str,
     volume_type: str,
     cloud: str,
-    region: Optional[str],
-    zone: Optional[str],
-    size: Optional[str],
-    config: Dict[str, Any],
-    labels: Optional[Dict[str, str]] = None,
-    use_existing: Optional[bool] = None,
+    region: str | None,
+    zone: str | None,
+    size: str | None,
+    config: dict[str, Any],
+    labels: dict[str, str] | None = None,
+    use_existing: bool | None = None,
     is_ephemeral: bool = False,
-    creation_yaml: Optional[str] = None,
+    creation_yaml: str | None = None,
 ) -> None:
     """Creates or registers a volume.
 

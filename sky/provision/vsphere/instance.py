@@ -1,7 +1,7 @@
 """Vsphere instance provisioning."""
 import json
 import typing
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
 from sky import sky_logging
 from sky.adaptors import common as adaptors_common
@@ -36,8 +36,8 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
     del cluster_name  # unused
     logger.info('New provision of Vsphere: run_instances().')
 
-    resumed_instance_ids: List[str] = []
-    created_instance_ids: List[str] = []
+    resumed_instance_ids: list[str] = []
+    created_instance_ids: list[str] = []
     vc_object = _get_vc_object(region)
     vc_object.connect()
 
@@ -290,10 +290,10 @@ def _create_instances(
         # the 64bitMMIOSizeGB will be x * 16 *2  where x the is number
         # of GPU, here is will be 1
         if spec.memoryMB >= 16 * 1024:
-            use64mmio = vsphere_adaptor.get_vim().OptionValue()  # type: ignore
+            use64mmio = vsphere_adaptor.get_vim().OptionValue()
             use64mmio.key = 'pciPassthru.use64bitMMIO'
             use64mmio.value = 'TRUE'
-            mmiosizegb = vsphere_adaptor.get_vim().OptionValue()  # type: ignore
+            mmiosizegb = vsphere_adaptor.get_vim().OptionValue()
             mmiosizegb.key = 'pciPassthru.64bitMMIOSizeGB'
             mmiosizegb.value = int(spec.memoryMB * 2 / 1024)
             spec.extraConfig = [use64mmio, mmiosizegb]
@@ -396,10 +396,10 @@ def _get_cluster_name_filter(cluster_name_on_cloud):
 def query_instances(
     cluster_name: str,
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     non_terminated_only: bool = True,
     retry_if_missing: bool = False,
-) -> Dict[str, Tuple[Optional['status_lib.ClusterStatus'], Optional[str]]]:
+) -> dict[str, tuple[Optional['status_lib.ClusterStatus'], str | None]]:
     """See sky/provision/__init__.py"""
     del cluster_name, retry_if_missing  # unused
     logger.info('New provision of Vsphere: query_instances().')
@@ -417,8 +417,7 @@ def query_instances(
         'suspended': None,
     }
 
-    status: Dict[str, Tuple[Optional['status_lib.ClusterStatus'],
-                            Optional[str]]] = {}
+    status: dict[str, tuple[status_lib.ClusterStatus | None, str | None]] = {}
     for inst in instances:
         stat = status_map[inst.runtime.powerState]
         if non_terminated_only and stat is None:
@@ -431,7 +430,7 @@ def query_instances(
 def _get_filtered_instance(
     vc_object,
     cluster_name_on_cloud: str,
-    provider_config: Dict[str, Any],
+    provider_config: dict[str, Any],
     worker_only: bool = False,
 ):
     # Get instance uuid in cache file
@@ -460,7 +459,7 @@ def _get_filtered_instance(
 
 def stop_instances(
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     worker_only: bool = False,
 ) -> None:
     """See sky/provision/__init__.py"""
@@ -482,7 +481,7 @@ def stop_instances(
 
 def terminate_instances(
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     worker_only: bool = False,
 ) -> None:
     """See sky/provision/__init__.py"""
@@ -509,7 +508,7 @@ def terminate_instances(
 
 
 def wait_instances(region: str, cluster_name: str,
-                   state: Optional[status_lib.ClusterStatus]) -> None:
+                   state: status_lib.ClusterStatus | None) -> None:
     """See sky/provision/__init__.py"""
     logger.info(f'New provision of Vsphere: wait_instances().'
                 f'{region} {cluster_name} {state}')
@@ -518,8 +517,8 @@ def wait_instances(region: str, cluster_name: str,
 
 def open_ports(
     cluster_name_on_cloud: str,
-    ports: List[str],
-    provider_config: Optional[Dict[str, Any]] = None,
+    ports: list[str],
+    provider_config: dict[str, Any] | None = None,
 ) -> None:
     """See sky/provision/__init__.py"""
     logger.info(f'New provision of Vsphere: open_ports(). '
@@ -531,7 +530,7 @@ def open_ports(
 
 def cleanup_ports(
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
 ) -> None:
     """See sky/provision/__init__.py"""
     logger.info(f'New provision of Vsphere: cleanup_ports().'
@@ -564,7 +563,7 @@ def _get_head_instance_id(instances):
 def get_cluster_info(
         region: str,
         cluster_name: str,
-        provider_config: Optional[Dict[str, Any]] = None) -> common.ClusterInfo:
+        provider_config: dict[str, Any] | None = None) -> common.ClusterInfo:
     """See sky/provision/__init__.py"""
     logger.info('New provision of Vsphere: get_cluster_info().')
 

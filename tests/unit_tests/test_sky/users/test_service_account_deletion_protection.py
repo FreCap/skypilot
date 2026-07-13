@@ -82,8 +82,8 @@ class TestServiceAccountDeletionProtection:
         'sky.users.server.permission.permission_service.check_service_account_token_permission'
     )
     @mock.patch('sky.users.server.global_user_state.get_user')
-    @mock.patch('sky.utils.resource_checker.check_no_active_resources_for_users'
-               )
+    @mock.patch(
+        'sky.utils.resource_checker.check_no_active_resources_for_users')
     async def test_delete_service_account_token_blocked_by_active_clusters(
             self, mock_check_resources, mock_get_user, mock_check_permission,
             mock_get_token, mock_request, sample_service_account_token):
@@ -129,8 +129,8 @@ class TestServiceAccountDeletionProtection:
         'sky.users.server.permission.permission_service.check_service_account_token_permission'
     )
     @mock.patch('sky.users.server.global_user_state.get_user')
-    @mock.patch('sky.utils.resource_checker.check_no_active_resources_for_users'
-               )
+    @mock.patch(
+        'sky.utils.resource_checker.check_no_active_resources_for_users')
     async def test_delete_service_account_token_blocked_by_active_jobs(
             self, mock_check_resources, mock_get_user, mock_check_permission,
             mock_get_token, mock_request, sample_service_account_token):
@@ -171,8 +171,8 @@ class TestServiceAccountDeletionProtection:
         'sky.users.server.permission.permission_service.check_service_account_token_permission'
     )
     @mock.patch('sky.users.server.global_user_state.get_user')
-    @mock.patch('sky.utils.resource_checker.check_no_active_resources_for_users'
-               )
+    @mock.patch(
+        'sky.utils.resource_checker.check_no_active_resources_for_users')
     async def test_delete_service_account_token_blocked_by_mixed_resources(
             self, mock_check_resources, mock_get_user, mock_check_permission,
             mock_get_token, mock_request, sample_service_account_token):

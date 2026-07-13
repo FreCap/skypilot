@@ -3,7 +3,7 @@ from dataclasses import dataclass
 import enum
 import re
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 from sky import exceptions
 from sky import global_user_state
@@ -45,11 +45,11 @@ class VolumeInfo:
     """Represents volume info."""
     name: str
     path: str
-    volume_name_on_cloud: Optional[str] = None
-    volume_id_on_cloud: Optional[str] = None
-    sub_path: Optional[str] = None
-    volume_type: Optional[str] = None
-    host_path: Optional[str] = None
+    volume_name_on_cloud: str | None = None
+    volume_id_on_cloud: str | None = None
+    sub_path: str | None = None
+    volume_type: str | None = None
+    host_path: str | None = None
 
 
 class VolumeMount:
@@ -60,12 +60,12 @@ class VolumeMount:
                  volume_name: str,
                  volume_config: models.VolumeConfig,
                  is_ephemeral: bool = False,
-                 sub_path: Optional[str] = None):
+                 sub_path: str | None = None):
         self.path: str = path
         self.volume_name: str = volume_name
         self.volume_config: models.VolumeConfig = volume_config
         self.is_ephemeral: bool = is_ephemeral
-        self.sub_path: Optional[str] = sub_path
+        self.sub_path: str | None = sub_path
 
     def pre_mount(self) -> None:
         """Update the volume status before actual mounting."""
@@ -83,7 +83,7 @@ class VolumeMount:
     def resolve(cls,
                 path: str,
                 volume_name: str,
-                sub_path: Optional[str] = None) -> 'VolumeMount':
+                sub_path: str | None = None) -> 'VolumeMount':
         """Resolve the volume mount by populating metadata of volume."""
         if sub_path is not None:
             if not re.match(constants.SUB_PATH_PATTERN, sub_path):
@@ -112,7 +112,7 @@ class VolumeMount:
         return cls(path, volume_name, volume_config, sub_path=sub_path)
 
     @classmethod
-    def from_yaml_config(cls, config: Dict[str, Any]) -> 'VolumeMount':
+    def from_yaml_config(cls, config: dict[str, Any]) -> 'VolumeMount':
         common_utils.validate_schema(config, schemas.get_volume_mount_schema(),
                                      'Invalid volume mount config: ')
 
@@ -130,7 +130,7 @@ class VolumeMount:
 
     @classmethod
     def resolve_ephemeral_config(cls, path: str,
-                                 config: Dict[str, Any]) -> 'VolumeMount':
+                                 config: dict[str, Any]) -> 'VolumeMount':
         """Create an ephemeral volume mount from inline config.
 
         Args:
@@ -178,7 +178,7 @@ class VolumeMount:
 
         return cls(path, '', volume_config, is_ephemeral=True)
 
-    def to_yaml_config(self) -> Dict[str, Any]:
+    def to_yaml_config(self) -> dict[str, Any]:
         config = {
             'path': self.path,
             'volume_name': self.volume_name,
@@ -219,17 +219,17 @@ class VolumeMountConflictChecker:
 
     def __init__(self):
         # mount_path -> (source, volume_desc)
-        self._seen_mount_paths: Dict[str, Tuple[str, str]] = {}
+        self._seen_mount_paths: dict[str, tuple[str, str]] = {}
         # volume_name -> (source, volume_desc, vol_source_id)
-        self._seen_volume_names: Dict[str, Tuple[str, str, Optional[str]]] = {}
+        self._seen_volume_names: dict[str, tuple[str, str, str | None]] = {}
         # volume_name_on_cloud -> (volume_name, source, volume_desc)
-        self._seen_pvcs: Dict[str, Tuple[str, str, str]] = {}
+        self._seen_pvcs: dict[str, tuple[str, str, str]] = {}
 
     @staticmethod
     def _get_vol_source_identity(
-            volume_type: Optional[str],
-            vol_name_on_cloud: Optional[str] = None,
-            vol_host_path: Optional[str] = None) -> Optional[str]:
+            volume_type: str | None,
+            vol_name_on_cloud: str | None = None,
+            vol_host_path: str | None = None) -> str | None:
         """Return a type-aware volume source identity string.
 
         Each volume type defines its own identity key. Returns None if

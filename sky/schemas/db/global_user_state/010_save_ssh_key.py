@@ -5,19 +5,19 @@ Revises: 009
 Create Date: 2025-10-07
 
 """
+from collections.abc import Sequence
 import glob
 # pylint: disable=invalid-name
 import os
-from typing import Sequence, Union
 
 from alembic import op
 import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = '010'
-down_revision: Union[str, Sequence[str], None] = '009'
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+down_revision: str | Sequence[str] | None = '009'
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 
 def upgrade():
@@ -43,9 +43,9 @@ def upgrade():
         public_key_path = os.path.join(match_dir, 'sky-key.pub')
         private_key_path = os.path.join(match_dir, 'sky-key')
         try:
-            with open(public_key_path, 'r', encoding='utf-8') as f:
+            with open(public_key_path, encoding='utf-8') as f:
                 public_key = f.read().strip()
-            with open(private_key_path, 'r', encoding='utf-8') as f:
+            with open(private_key_path, encoding='utf-8') as f:
                 private_key = f.read().strip()
         except FileNotFoundError:
             # Skip if the key files are not found

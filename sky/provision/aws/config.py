@@ -12,7 +12,7 @@ import json
 import logging
 import time
 import typing
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any
 
 import colorama
 
@@ -65,8 +65,8 @@ def bootstrap_instances(
     node_cfg = config.node_config
     aws_credentials = config.provider_config.get('aws_credentials', {})
 
-    subnet_ids = node_cfg.get('SubnetIds')  # type: ignore
-    security_group_ids = node_cfg.get('SecurityGroupIds')  # type: ignore
+    subnet_ids = node_cfg.get('SubnetIds')
+    security_group_ids = node_cfg.get('SecurityGroupIds')
     assert 'NetworkInterfaces' not in node_cfg, (
         'SkyPilot: NetworkInterfaces is not supported in '
         'node config')
@@ -186,7 +186,7 @@ def delete_placement_group(ec2: 'mypy_boto3_ec2.ServiceResource',
             raise exc
 
 
-def _configure_iam_role(iam) -> Dict[str, Any]:
+def _configure_iam_role(iam) -> dict[str, Any]:
 
     def _get_instance_profile(profile_name: str):
         profile = iam.InstanceProfile(profile_name)
@@ -291,9 +291,8 @@ def _configure_iam_role(iam) -> Dict[str, Any]:
 
 
 @annotations.lru_cache(scope='request', maxsize=128)  # Keep bounded.
-def _get_route_tables(ec2: 'mypy_boto3_ec2.ServiceResource',
-                      vpc_id: Optional[str], region: str,
-                      main: bool) -> List[Any]:
+def _get_route_tables(ec2: 'mypy_boto3_ec2.ServiceResource', vpc_id: str | None,
+                      region: str, main: bool) -> list[Any]:
     """Get route tables associated with a VPC and region
 
     Args:
@@ -308,7 +307,7 @@ def _get_route_tables(ec2: 'mypy_boto3_ec2.ServiceResource',
     Returns:
         A list of route tables associated with the options VPC and region
     """
-    filters: List['ec2_type_defs.FilterTypeDef'] = [{
+    filters: list[ec2_type_defs.FilterTypeDef] = [{
         'Name': 'association.main',
         'Values': [str(main).lower()],
     }]
@@ -321,7 +320,7 @@ def _get_route_tables(ec2: 'mypy_boto3_ec2.ServiceResource',
 
 
 def _is_subnet_public(ec2: 'mypy_boto3_ec2.ServiceResource', subnet_id,
-                      vpc_id: Optional[str]) -> bool:
+                      vpc_id: str | None) -> bool:
     """Checks if a subnet is public by existence of a route to an IGW.
 
     Conventionally, public subnets connect to a IGW, and private subnets to a
@@ -366,12 +365,12 @@ def _is_subnet_public(ec2: 'mypy_boto3_ec2.ServiceResource', subnet_id,
 
 def _usable_subnets(
     ec2,
-    user_specified_subnets: Optional[List[Any]],
-    all_subnets: List[Any],
-    azs: Optional[str],
-    vpc_id_of_sg: Optional[str],
+    user_specified_subnets: list[Any] | None,
+    all_subnets: list[Any],
+    azs: str | None,
+    vpc_id_of_sg: str | None,
     use_internal_ips: bool,
-) -> Tuple[List, str]:
+) -> tuple[list, str]:
     """Prunes subnets down to those that meet the following criteria.
 
     Subnets must be:
@@ -393,11 +392,11 @@ def _usable_subnets(
     # not handle this special case as we don't want to sacrifice the performance
     # for every launch just for this rare case.
 
-    def _are_user_subnets_pruned(current_subnets: List[Any]) -> bool:
+    def _are_user_subnets_pruned(current_subnets: list[Any]) -> bool:
         return user_specified_subnets is not None and len(
             current_subnets) != len(user_specified_subnets)
 
-    def _get_pruned_subnets(current_subnets: List[Any]) -> Set[str]:
+    def _get_pruned_subnets(current_subnets: list[Any]) -> set[str]:
         current_subnet_ids = {s.subnet_id for s in current_subnets}
         user_specified_subnet_ids = {
             s.subnet_id for s in user_specified_subnets  # type: ignore
@@ -530,10 +529,10 @@ def _usable_subnets(
 
 
 def _vpc_id_from_security_group_ids(ec2: 'mypy_boto3_ec2.ServiceResource',
-                                    sg_ids: List[str]) -> Any:
+                                    sg_ids: list[str]) -> Any:
     # sort security group IDs to support deterministic unit test stubbing
     sg_ids = sorted(set(sg_ids))
-    filters: List['ec2_type_defs.FilterTypeDef'] = [{
+    filters: list[ec2_type_defs.FilterTypeDef] = [{
         'Name': 'group-id',
         'Values': sg_ids
     }]
@@ -563,7 +562,7 @@ def get_vpc_id_by_name(ec2: 'mypy_boto3_ec2.ServiceResource', vpc_name: str,
       - More than 1 VPC with the given name are found in the current region.
     """
     # Look in the 'Name' tag (shown as Name column in console).
-    filters: List['ec2_type_defs.FilterTypeDef'] = [{
+    filters: list[ec2_type_defs.FilterTypeDef] = [{
         'Name': 'tag:Name',
         'Values': [vpc_name]
     }]
@@ -582,12 +581,11 @@ def get_vpc_id_by_name(ec2: 'mypy_boto3_ec2.ServiceResource', vpc_name: str,
     return vpcs[0].id
 
 
-def _get_subnet_and_vpc_id(
-        ec2: 'mypy_boto3_ec2.ServiceResource',
-        security_group_ids: Optional[List[str]], region: str,
-        availability_zone: Optional[str], use_internal_ips: bool,
-        vpc_name: Optional[str],
-        subnet_names: Optional[List[str]]) -> Tuple[Any, str]:
+def _get_subnet_and_vpc_id(ec2: 'mypy_boto3_ec2.ServiceResource',
+                           security_group_ids: list[str] | None, region: str,
+                           availability_zone: str | None,
+                           use_internal_ips: bool, vpc_name: str | None,
+                           subnet_names: list[str] | None) -> tuple[Any, str]:
 
     if isinstance(subnet_names, str):
         subnet_names = [subnet_names]
@@ -641,8 +639,8 @@ def _get_subnet_and_vpc_id(
 
 def _configure_security_group(ec2: 'mypy_boto3_ec2.ServiceResource',
                               vpc_id: str, expected_sg_name: str,
-                              extended_ip_rules: List,
-                              enable_efa: bool) -> List[str]:
+                              extended_ip_rules: list,
+                              enable_efa: bool) -> list[str]:
     security_group = _get_or_create_vpc_security_group(ec2, vpc_id,
                                                        expected_sg_name)
     sg_ids = [security_group.id]
@@ -695,7 +693,7 @@ def _configure_security_group(ec2: 'mypy_boto3_ec2.ServiceResource',
 
 def _need_to_update_outbound_rules(
     security_group: Any,
-    outbound_rules: List[Dict[str, Any]],
+    outbound_rules: list[dict[str, Any]],
 ) -> bool:
     """Check if we need to update the outbound rules of the security group."""
     if not security_group.ip_permissions_egress:
@@ -787,8 +785,7 @@ def _get_or_create_vpc_security_group(ec2: 'mypy_boto3_ec2.ServiceResource',
 
 
 def get_security_group_from_vpc_id(ec2: 'mypy_boto3_ec2.ServiceResource',
-                                   vpc_id: str,
-                                   group_name: str) -> Optional[Any]:
+                                   vpc_id: str, group_name: str) -> Any | None:
     """Get security group by VPC ID and group name."""
     existing_groups = list(
         ec2.security_groups.filter(Filters=[{

@@ -4,7 +4,6 @@ This module loads the service catalog file and can be used to query
 instance types and pricing information for FluidStack.
 """
 import typing
-from typing import Dict, List, Optional, Tuple, Union
 
 from sky.catalog import common
 from sky.utils import ux_utils
@@ -23,9 +22,8 @@ def instance_type_exists(instance_type: str) -> bool:
     return common.instance_type_exists_impl(_df, instance_type)
 
 
-def validate_region_zone(
-        region: Optional[str],
-        zone: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+def validate_region_zone(region: str | None,
+                         zone: str | None) -> tuple[str | None, str | None]:
     if zone is not None:
         with ux_utils.print_exception_no_traceback():
             raise ValueError('FluidStack Cloud does not support zones.')
@@ -34,8 +32,8 @@ def validate_region_zone(
 
 def get_hourly_cost(instance_type: str,
                     use_spot: bool = False,
-                    region: Optional[str] = None,
-                    zone: Optional[str] = None) -> float:
+                    region: str | None = None,
+                    zone: str | None = None) -> float:
     """Returns the cost, or the cheapest cost among all zones for spot."""
     assert not use_spot, 'FluidStack Cloud does not support spot.'
     if zone is not None:
@@ -46,19 +44,19 @@ def get_hourly_cost(instance_type: str,
 
 
 def get_vcpus_mem_from_instance_type(
-        instance_type: str) -> Tuple[Optional[float], Optional[float]]:
+        instance_type: str) -> tuple[float | None, float | None]:
     return common.get_vcpus_mem_from_instance_type_impl(_df, instance_type)
 
 
 def get_default_instance_type(
-        cpus: Optional[str] = None,
-        memory: Optional[str] = None,
-        disk_tier: Optional[str] = None,
-        local_disk: Optional[str] = None,
-        region: Optional[str] = None,
-        zone: Optional[str] = None,
+        cpus: str | None = None,
+        memory: str | None = None,
+        disk_tier: str | None = None,
+        local_disk: str | None = None,
+        region: str | None = None,
+        zone: str | None = None,
         use_spot: bool = False,
-        max_hourly_cost: Optional[float] = None) -> Optional[str]:
+        max_hourly_cost: float | None = None) -> str | None:
     del disk_tier, local_disk  # unused
     if cpus is None and memory is None:
         cpus = f'{_DEFAULT_NUM_VCPUS}+'
@@ -73,21 +71,21 @@ def get_default_instance_type(
 
 
 def get_accelerators_from_instance_type(
-        instance_type: str) -> Optional[Dict[str, Union[int, float]]]:
+        instance_type: str) -> dict[str, int | float] | None:
     return common.get_accelerators_from_instance_type_impl(_df, instance_type)
 
 
 def get_instance_type_for_accelerator(
-    acc_name: str,
-    acc_count: int,
-    cpus: Optional[str] = None,
-    memory: Optional[str] = None,
-    use_spot: bool = False,
-    local_disk: Optional[str] = None,
-    region: Optional[str] = None,
-    zone: Optional[str] = None,
-    max_hourly_cost: Optional[float] = None
-) -> Tuple[Optional[List[str]], List[str]]:
+        acc_name: str,
+        acc_count: int,
+        cpus: str | None = None,
+        memory: str | None = None,
+        use_spot: bool = False,
+        local_disk: str | None = None,
+        region: str | None = None,
+        zone: str | None = None,
+        max_hourly_cost: float | None = None
+) -> tuple[list[str] | None, list[str]]:
     """Returns a list of instance types satisfying the required count of
     accelerators with sorted prices and a list of candidates with fuzzy search.
     """
@@ -107,12 +105,12 @@ def get_instance_type_for_accelerator(
         max_hourly_cost=max_hourly_cost)
 
 
-def regions() -> List['cloud.Region']:
+def regions() -> list['cloud.Region']:
     return common.get_region_zones(_df, use_spot=False)
 
 
 def get_region_zones_for_instance_type(instance_type: str,
-                                       use_spot: bool) -> List['cloud.Region']:
+                                       use_spot: bool) -> list['cloud.Region']:
     df = _df[_df['InstanceType'] == instance_type]
     region_list = common.get_region_zones(df, use_spot)
     # Hack: Enforce US regions are always tried first
@@ -128,13 +126,13 @@ def get_region_zones_for_instance_type(instance_type: str,
 
 def list_accelerators(
     gpus_only: bool,
-    name_filter: Optional[str],
-    region_filter: Optional[str],
-    quantity_filter: Optional[int],
+    name_filter: str | None,
+    region_filter: str | None,
+    quantity_filter: int | None,
     case_sensitive: bool = True,
     all_regions: bool = False,
     require_price: bool = True,
-) -> Dict[str, List[common.InstanceTypeInfo]]:
+) -> dict[str, list[common.InstanceTypeInfo]]:
     """Returns all instance types in Fluidstack offering GPUs."""
     del require_price
     return common.list_accelerators_impl('Fluidstack', _df, gpus_only,

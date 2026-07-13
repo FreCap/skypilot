@@ -81,8 +81,9 @@ class QpsGenerator(GeneratorBase):
             per_op.setdefault(r['op'], []).append(r)
         per_op_stats = {
             op: {
-                **summarize_durations(rows_), 'errors': sum(
-                    1 for e in err_rows if e['op'] == op)
+                **summarize_durations(rows_), 'errors': sum(1
+                                                            for e in err_rows
+                                                            if e['op'] == op)
             } for op, rows_ in per_op.items()
         }
         return {

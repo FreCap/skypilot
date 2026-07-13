@@ -1,6 +1,6 @@
 """Accelerator registry."""
 import typing
-from typing import List, Optional
+from typing import Optional
 
 from sky import catalog
 from sky.catalog import common as catalog_common
@@ -49,7 +49,7 @@ _SCHEDULABLE_NON_GPU_ACCELERATORS = [
 
 def get_devices_by_memory(memory: float,
                           plus: bool = False,
-                          manufacturer: Optional[str] = None) -> List[str]:
+                          manufacturer: str | None = None) -> list[str]:
     """Returns a list of device names that meet the memory and manufacturer
        requirements.
 

@@ -657,9 +657,7 @@ def generate_python_sdk():
     }
 
     # Build name -> (sig, docstring, lineno) map
-    func_map = {
-        name: (sig, doc, lineno) for name, sig, doc, lineno in functions
-    }
+    func_map = {name: (sig, doc, lineno) for name, sig, doc, lineno in functions}
 
     lines = [
         '<!-- AUTO-GENERATED from sky/client/sdk.py -->',

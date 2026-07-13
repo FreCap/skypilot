@@ -1,14 +1,16 @@
 """Temporary storage context manager."""
 
+from collections.abc import Callable
+from collections.abc import Iterator
 import contextlib
 import contextvars
 import functools
 import os
 import tempfile
 import typing
-from typing import Any, Callable, Iterator, Optional, TypeVar
+from typing import Any, TypeVar
 
-_TEMP_DIR: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+_TEMP_DIR: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     'temp_store_dir', default=None)
 
 
@@ -33,9 +35,9 @@ def tempdir() -> Iterator[str]:
 
 # Keep the function signature same as tempfile.mkdtemp.
 # pylint: disable=redefined-builtin
-def mkdtemp(suffix: Optional[str] = None,
-            prefix: Optional[str] = None,
-            dir: Optional[str] = None) -> str:
+def mkdtemp(suffix: str | None = None,
+            prefix: str | None = None,
+            dir: str | None = None) -> str:
     """Create a temporary directory in the temp dir of current context.
 
     The directory will be cleaned when the current context exits.

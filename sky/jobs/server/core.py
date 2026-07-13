@@ -8,7 +8,7 @@ import sys
 import tempfile
 import time
 import typing
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Union
 from urllib import parse as urlparse
 import uuid
 
@@ -157,7 +157,7 @@ def _warn_file_mounts_rolling_update(dag: 'sky.Dag') -> None:
         f'{colorama.Style.RESET_ALL}')
 
 
-def _upload_files_to_controller(dag: 'sky.Dag') -> Dict[str, str]:
+def _upload_files_to_controller(dag: 'sky.Dag') -> dict[str, str]:
     """Upload files to the controller.
 
     In consolidation mode, we still need to upload files to the controller as
@@ -165,7 +165,7 @@ def _upload_files_to_controller(dag: 'sky.Dag') -> Dict[str, str]:
     the same workdir, if there are some modifications to the workdir after job 1
     is submitted, on recovery of job 1, the modifications should not be applied.
     """
-    local_to_controller_file_mounts: Dict[str, str] = {}
+    local_to_controller_file_mounts: dict[str, str] = {}
 
     # Check if user has explicitly configured a bucket for jobs.
     # If so, we should use cloud storage even in consolidation mode to persist
@@ -215,7 +215,7 @@ def _upload_files_to_controller(dag: 'sky.Dag') -> Dict[str, str]:
     return local_to_controller_file_mounts
 
 
-def _job_ids_to_str(job_ids: Optional[List[int]]) -> str:
+def _job_ids_to_str(job_ids: list[int] | None) -> str:
     if not job_ids:
         return ''
 
@@ -251,22 +251,22 @@ class _DefaultManagedJobRunner:
         handle: 'backends.CloudVmRayResourceHandle',
         backend: 'backends.CloudVmRayBackend',
         skip_finished: bool,
-        accessible_workspaces: List[str],
-        job_ids: Optional[List[int]],
-        workspace_match: Optional[str],
-        name_match: Optional[str],
-        pool_match: Optional[str],
-        page: Optional[int],
-        limit: Optional[int],
-        user_hashes: Optional[List[Optional[str]]],
-        statuses: Optional[List[str]],
-        fields: Optional[List[str]],
-        sort_by: Optional[str],
-        sort_order: Optional[str],
-        submitted_after: Optional[float],
-        submitted_before: Optional[float],
-    ) -> Tuple[List[Dict[str, Any]], int,
-               'managed_job_utils.ManagedJobQueueResultType', int, Dict[str,
+        accessible_workspaces: list[str],
+        job_ids: list[int] | None,
+        workspace_match: str | None,
+        name_match: str | None,
+        pool_match: str | None,
+        page: int | None,
+        limit: int | None,
+        user_hashes: list[str | None] | None,
+        statuses: list[str] | None,
+        fields: list[str] | None,
+        sort_by: str | None,
+        sort_order: str | None,
+        submitted_after: float | None,
+        submitted_before: float | None,
+    ) -> tuple[list[dict[str, Any]], int,
+               'managed_job_utils.ManagedJobQueueResultType', int, dict[str,
                                                                         int]]:
         """Fetch the managed jobs table from the jobs controller.
 
@@ -311,11 +311,11 @@ class _DefaultManagedJobRunner:
         backend: 'backends.CloudVmRayBackend',
         all_users: bool,
         all: bool,  # pylint: disable=redefined-builtin
-        job_ids: Optional[List[int]],
-        name: Optional[str],
-        pool: Optional[str],
+        job_ids: list[int] | None,
+        name: str | None,
+        pool: str | None,
         graceful: bool,
-        graceful_timeout: Optional[int],
+        graceful_timeout: int | None,
     ) -> str:
         # Single codegen that embeds the dispatcher (``cancel_managed_jobs``)
         # via ``inspect.getsource`` — keeps the variant selection in one place.
@@ -347,13 +347,13 @@ class _DefaultManagedJobRunner:
         *,
         handle: 'backends.CloudVmRayResourceHandle',
         backend: 'backends.CloudVmRayBackend',
-        job_id: Optional[int],
-        job_name: Optional[str],
+        job_id: int | None,
+        job_name: str | None,
         follow: bool,
         controller: bool,
-        tail: Optional[int],
-        tail_offset: Optional[int] = None,
-        task: Optional[Union[str, int]],
+        tail: int | None,
+        tail_offset: int | None = None,
+        task: str | int | None,
     ) -> int:
         return backend.tail_managed_job_logs(handle,
                                              job_id=job_id,
@@ -368,8 +368,8 @@ class _DefaultManagedJobRunner:
 def _consolidated_launch(
     controller: controller_utils.Controllers,
     controller_task: 'sky.Task',
-    job_ids: List[int],
-) -> Tuple[List[int], backends.ResourceHandle]:
+    job_ids: list[int],
+) -> tuple[list[int], backends.ResourceHandle]:
     local_handle = backend_utils.is_controller_accessible(controller=controller,
                                                           stopped_message='')
     backend = backend_utils.get_backend_from_handle(local_handle)
@@ -406,7 +406,7 @@ def _maybe_submit_job_locally(
         prefix: str,
         dag: 'sky.Dag',
         num_jobs: int,
-        file_mounts_blob_id: Optional[str] = None) -> Optional[List[int]]:
+        file_mounts_blob_id: str | None = None) -> list[int] | None:
     """Submit the managed job locally if in consolidation mode.
 
     In normal mode the managed job submission is done in the ray job submission.
@@ -463,7 +463,7 @@ def _maybe_submit_job_locally(
             # For job groups, determine which tasks are primary vs auxiliary.
             # For non-job-groups (single jobs, pipelines),
             # is_primary_in_job_group is None for all tasks.
-            is_primary_in_job_group: Optional[bool] = None
+            is_primary_in_job_group: bool | None = None
             if dag.is_job_group():
                 is_primary_in_job_group = (dag.primary_tasks is None or
                                            task.name in dag.primary_tasks)
@@ -478,7 +478,7 @@ def _maybe_submit_job_locally(
 
 def _ensure_controller_up(
     controller: controller_utils.Controllers,
-    task_resources: Optional[List['resources.Resources']] = None
+    task_resources: list['resources.Resources'] | None = None
 ) -> 'cloud_vm_ray_backend.CloudVmRayResourceHandle':
     """Ensure the jobs controller is up before proceeding.
 
@@ -507,7 +507,7 @@ def _ensure_controller_up(
     # are installed.
     dag_uuid = str(uuid.uuid4())
 
-    vars_to_fill: Dict[str, Any] = {
+    vars_to_fill: dict[str, Any] = {
         'dag_name': 'ensure_controller_up',
         'job_controller_indicator_file':
             managed_job_constants.JOB_CONTROLLER_INDICATOR_FILE,
@@ -553,8 +553,8 @@ def _ensure_controller_up(
 
 def _submit_remotely(controller: controller_utils.Controllers,
                      dag: 'sky.Dag',
-                     pool: Optional[str] = None,
-                     num_jobs: int = 1) -> List[int]:
+                     pool: str | None = None,
+                     num_jobs: int = 1) -> list[int]:
     # Ensure the controller is up before trying to create job IDs
     # Use the same cloud as the tasks for the controller
     task_resources = None
@@ -624,8 +624,8 @@ def _submit_remotely(controller: controller_utils.Controllers,
     return job_ids
 
 
-def _create_job_api_token(creator_user_id: str, job_name: Optional[str],
-                          dag_uuid: str) -> Tuple[str, str]:
+def _create_job_api_token(creator_user_id: str, job_name: str | None,
+                          dag_uuid: str) -> tuple[str, str]:
     """Create a service account token for a managed job with api_server_access.
 
     Issues a token as the original user so nested jobs have the same
@@ -662,12 +662,12 @@ def _create_job_api_token(creator_user_id: str, job_name: Optional[str],
 @usage_lib.entrypoint
 def launch(
     task: Union['sky.Task', 'sky.Dag'],
-    name: Optional[str] = None,
-    pool: Optional[str] = None,
-    num_jobs: Optional[int] = None,
+    name: str | None = None,
+    pool: str | None = None,
+    num_jobs: int | None = None,
     stream_logs: bool = True,
-    file_mounts_blob_id: Optional[str] = None,
-) -> Tuple[Optional[Union[int, List[int]]], Optional[backends.ResourceHandle]]:
+    file_mounts_blob_id: str | None = None,
+) -> tuple[int | list[int] | None, backends.ResourceHandle | None]:
     # NOTE(dev): Keep the docstring consistent between the Python API and CLI.
     """Launches a managed job.
 
@@ -742,7 +742,7 @@ def launch(
                 best_cloud = task_.best_resources.cloud
                 best_region = task_.best_resources.region
                 if best_cloud is not None or best_region is not None:
-                    override_params: Dict[str, Any] = {}
+                    override_params: dict[str, Any] = {}
                     if best_cloud is not None:
                         override_params['cloud'] = best_cloud
                     if best_region is not None:
@@ -773,8 +773,8 @@ def launch(
         db_path = mutated_user_config.get('db', None)
         if db_path is not None:
             parsed = urlparse.urlparse(db_path)
-            if ((parsed.hostname == 'localhost' or
-                 ipaddress.ip_address(parsed.hostname).is_loopback)):
+            if (parsed.hostname == 'localhost' or
+                    ipaddress.ip_address(parsed.hostname).is_loopback):
                 mutated_user_config.pop('db', None)
 
     user_dag_str_user_specified = dag_utils.dump_dag_to_yaml_str(
@@ -969,7 +969,7 @@ def launch(
 
         dag_utils.dump_dag_to_yaml(dag, f.name)
 
-        vars_to_fill: Dict[str, Any] = {
+        vars_to_fill: dict[str, Any] = {
             'remote_original_user_yaml_path': remote_orig_user_yaml_path,
             'original_user_dag_path': original_user_yaml_path.name,
             'remote_user_yaml_path': remote_user_yaml_path,
@@ -1077,8 +1077,8 @@ def launch(
 
 def queue_from_kubernetes_pod(
         pod_name: str,
-        context: Optional[str] = None,
-        skip_finished: bool = False) -> List[Dict[str, Any]]:
+        context: str | None = None,
+        skip_finished: bool = False) -> list[dict[str, Any]]:
     """Gets the jobs queue from a specific controller pod.
 
     Args:
@@ -1208,7 +1208,7 @@ def _maybe_restart_controller(
 def queue(refresh: bool,
           skip_finished: bool = False,
           all_users: bool = False,
-          job_ids: Optional[List[int]] = None) -> List[Dict[str, Any]]:
+          job_ids: list[int] | None = None) -> list[dict[str, Any]]:
     # NOTE(dev): Keep the docstring consistent between the Python API and CLI.
     """Gets statuses of managed jobs.
 
@@ -1248,20 +1248,20 @@ def queue_v2_api(
     refresh: bool,
     skip_finished: bool = False,
     all_users: bool = False,
-    job_ids: Optional[List[int]] = None,
-    user_match: Optional[str] = None,
-    workspace_match: Optional[str] = None,
-    name_match: Optional[str] = None,
-    pool_match: Optional[str] = None,
-    page: Optional[int] = None,
-    limit: Optional[int] = None,
-    statuses: Optional[List[str]] = None,
-    fields: Optional[List[str]] = None,
-    sort_by: Optional[str] = None,
-    sort_order: Optional[str] = None,
-    submitted_after: Optional[float] = None,
-    submitted_before: Optional[float] = None,
-) -> Tuple[List[responses.ManagedJobRecord], int, Dict[str, int], int]:
+    job_ids: list[int] | None = None,
+    user_match: str | None = None,
+    workspace_match: str | None = None,
+    name_match: str | None = None,
+    pool_match: str | None = None,
+    page: int | None = None,
+    limit: int | None = None,
+    statuses: list[str] | None = None,
+    fields: list[str] | None = None,
+    sort_by: str | None = None,
+    sort_order: str | None = None,
+    submitted_after: float | None = None,
+    submitted_before: float | None = None,
+) -> tuple[list[responses.ManagedJobRecord], int, dict[str, int], int]:
     """Gets statuses of managed jobs and parse the
     jobs to responses.ManagedJobRecord."""
     jobs, total, status_counts, total_no_filter = queue_v2(
@@ -1277,20 +1277,20 @@ def queue_v2(
     refresh: bool,
     skip_finished: bool = False,
     all_users: bool = False,
-    job_ids: Optional[List[int]] = None,
-    user_match: Optional[str] = None,
-    workspace_match: Optional[str] = None,
-    name_match: Optional[str] = None,
-    pool_match: Optional[str] = None,
-    page: Optional[int] = None,
-    limit: Optional[int] = None,
-    statuses: Optional[List[str]] = None,
-    fields: Optional[List[str]] = None,
-    sort_by: Optional[str] = None,
-    sort_order: Optional[str] = None,
-    submitted_after: Optional[float] = None,
-    submitted_before: Optional[float] = None,
-) -> Tuple[List[Dict[str, Any]], int, Dict[str, int], int]:
+    job_ids: list[int] | None = None,
+    user_match: str | None = None,
+    workspace_match: str | None = None,
+    name_match: str | None = None,
+    pool_match: str | None = None,
+    page: int | None = None,
+    limit: int | None = None,
+    statuses: list[str] | None = None,
+    fields: list[str] | None = None,
+    sort_by: str | None = None,
+    sort_order: str | None = None,
+    submitted_after: float | None = None,
+    submitted_before: float | None = None,
+) -> tuple[list[dict[str, Any]], int, dict[str, int], int]:
     # NOTE(dev): Keep the docstring consistent between the Python API and CLI.
     """Gets statuses of managed jobs with filtering.
 
@@ -1344,7 +1344,7 @@ def queue_v2(
     backend = backend_utils.get_backend_from_handle(handle)
     assert isinstance(backend, backends.CloudVmRayBackend)
 
-    user_hashes: Optional[List[Optional[str]]] = None
+    user_hashes: list[str | None] | None = None
     show_jobs_without_user_hash = False
     if not all_users:
         user_hashes = [common_utils.get_user_hash()]
@@ -1428,7 +1428,7 @@ def queue_v2(
     with metrics_lib.time_it('jobs.queue.filter_and_process', group='jobs'):
         if not all_users:
 
-            def user_hash_matches_or_missing(job: Dict[str, Any]) -> bool:
+            def user_hash_matches_or_missing(job: dict[str, Any]) -> bool:
                 user_hash = job.get('user_hash', None)
                 if user_hash is None:
                     # For backwards compatibility, we show jobs that do not have
@@ -1472,13 +1472,13 @@ def queue_v2(
 
 @usage_lib.entrypoint
 # pylint: disable=redefined-builtin
-def cancel(name: Optional[str] = None,
-           job_ids: Optional[List[int]] = None,
+def cancel(name: str | None = None,
+           job_ids: list[int] | None = None,
            all: bool = False,
            all_users: bool = False,
-           pool: Optional[str] = None,
+           pool: str | None = None,
            graceful: bool = False,
-           graceful_timeout: Optional[int] = None) -> None:
+           graceful_timeout: int | None = None) -> None:
     # NOTE(dev): Keep the docstring consistent between the Python API and CLI.
     """Cancels managed jobs.
 
@@ -1567,14 +1567,14 @@ def cancel(name: Optional[str] = None,
 
 
 @usage_lib.entrypoint
-def tail_logs(name: Optional[str],
-              job_id: Optional[int],
+def tail_logs(name: str | None,
+              job_id: int | None,
               follow: bool,
               controller: bool,
               refresh: bool,
-              tail: Optional[int] = None,
-              tail_offset: Optional[int] = None,
-              task: Optional[Union[str, int]] = None) -> int:
+              tail: int | None = None,
+              tail_offset: int | None = None,
+              task: str | int | None = None) -> int:
     # NOTE(dev): Keep the docstring consistent between the Python API and CLI.
     """Tail logs of managed jobs.
 
@@ -1635,11 +1635,11 @@ def tail_logs(name: Optional[str],
     )
 
 
-def wait(name: Optional[str],
-         job_id: Optional[int],
-         timeout: Optional[int],
+def wait(name: str | None,
+         job_id: int | None,
+         timeout: int | None,
          poll_interval: int,
-         task: Optional[Union[str, int]] = None) -> int:
+         task: str | int | None = None) -> int:
     """Waits for a managed job to reach a terminal state.
 
     Polls the job status via queue_v2_api at the given interval until the job
@@ -1741,11 +1741,11 @@ def wait(name: Optional[str],
 
 @usage_lib.entrypoint
 def download_logs(
-        name: Optional[str],
-        job_id: Optional[int],
+        name: str | None,
+        job_id: int | None,
         refresh: bool,
         controller: bool,
-        local_dir: str = skylet_constants.SKY_LOGS_DIRECTORY) -> Dict[str, str]:
+        local_dir: str = skylet_constants.SKY_LOGS_DIRECTORY) -> dict[str, str]:
     """Sync down logs of managed jobs.
 
     Please refer to sky.cli.job_logs for documentation.
@@ -1792,7 +1792,7 @@ def pool_apply(
     task: 'sky.Task',
     pool_name: str,
     mode: serve_utils.UpdateMode = serve_utils.DEFAULT_UPDATE_MODE,
-    workers: Optional[int] = None,
+    workers: int | None = None,
 ) -> None:
     """Apply a config to a pool."""
     return impl.apply(task, workers, pool_name, mode, pool=True)
@@ -1801,7 +1801,7 @@ def pool_apply(
 @usage_lib.entrypoint
 # pylint: disable=redefined-builtin
 def pool_down(
-    pool_names: Optional[Union[str, List[str]]] = None,
+    pool_names: str | list[str] | None = None,
     all: bool = False,
     purge: bool = False,
 ) -> None:
@@ -1811,13 +1811,12 @@ def pool_down(
 
 @usage_lib.entrypoint
 def pool_status(
-    pool_names: Optional[Union[str,
-                               List[str]]] = None,) -> List[Dict[str, Any]]:
+    pool_names: str | list[str] | None = None,) -> list[dict[str, Any]]:
     """Query a pool."""
     return impl.status(pool_names, pool=True)
 
 
-ServiceComponentOrStr = Union[str, serve_utils.ServiceComponent]
+ServiceComponentOrStr = str | serve_utils.ServiceComponent
 
 
 @usage_lib.entrypoint
@@ -1825,9 +1824,9 @@ def pool_tail_logs(
     pool_name: str,
     *,
     target: ServiceComponentOrStr,
-    worker_id: Optional[int] = None,
+    worker_id: int | None = None,
     follow: bool = True,
-    tail: Optional[int] = None,
+    tail: int | None = None,
 ) -> None:
     """Tail logs of a pool."""
     return impl.tail_logs(pool_name,
@@ -1843,10 +1842,9 @@ def pool_sync_down_logs(
     pool_name: str,
     *,
     local_dir: str,
-    targets: Union[ServiceComponentOrStr, List[ServiceComponentOrStr],
-                   None] = None,
-    worker_ids: Optional[List[int]] = None,
-    tail: Optional[int] = None,
+    targets: ServiceComponentOrStr | list[ServiceComponentOrStr] | None = None,
+    worker_ids: list[int] | None = None,
+    tail: int | None = None,
 ) -> str:
     """Sync down logs of a pool."""
     return impl.sync_down_logs(pool_name,
@@ -1858,7 +1856,7 @@ def pool_sync_down_logs(
 
 
 def _get_job_cluster_names(job_id: int,
-                           task_id: Optional[int] = None) -> List[str]:
+                           task_id: int | None = None) -> list[str]:
     """Reconstruct the underlying cluster name(s) for a managed job.
 
     Mirrors the derivation used by the controller (see ``jobs/controller.py``):
@@ -1873,7 +1871,7 @@ def _get_job_cluster_names(job_id: int,
     Returns a de-duplicated list of cluster names (a multi-task pipeline uses
     one cluster per task).
     """
-    cluster_names: List[str] = []
+    cluster_names: list[str] = []
     for task in managed_job_state.get_managed_job_tasks(job_id):
         if task_id is not None and task.get('task_id') != task_id:
             continue
@@ -1895,10 +1893,10 @@ def _get_job_cluster_names(job_id: int,
 @usage_lib.entrypoint
 def get_job_events(
     job_id: int,
-    task_id: Optional[int] = None,
-    limit: Optional[int] = 10,
+    task_id: int | None = None,
+    limit: int | None = 10,
     include_cluster_events: bool = False,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Get task events for a managed job.
 
     Args:
@@ -1934,7 +1932,7 @@ def get_job_events(
         global_user_state.ClusterEventType.STATUS_CHANGE,
         global_user_state.ClusterEventType.LAUNCH_PROGRESS,
     ]
-    cluster_events: List[Dict[str, Any]] = []
+    cluster_events: list[dict[str, Any]] = []
     for cluster_name in cluster_names:
         try:
             cluster_events.extend(

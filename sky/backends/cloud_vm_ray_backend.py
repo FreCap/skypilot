@@ -1,4 +1,8 @@
 """Backend: runs on cloud virtual machines, managed by Ray."""
+from collections.abc import Callable
+from collections.abc import Iterable
+from collections.abc import Iterator
+from collections.abc import Sequence
 import copy
 import dataclasses
 import enum
@@ -18,8 +22,7 @@ import textwrap
 import threading
 import time
 import typing
-from typing import (Any, Callable, Dict, Iterable, Iterator, List, Optional,
-                    Sequence, Set, Tuple, Union)
+from typing import Any, Optional
 
 import colorama
 import psutil
@@ -219,8 +222,7 @@ _RESOURCES_UNAVAILABLE_LOG = (
     'Reasons for provision failures (for details, please check the log above):')
 
 
-def _get_kubernetes_hint(reason: str,
-                         context: Optional[str] = None) -> Optional[str]:
+def _get_kubernetes_hint(reason: str, context: str | None = None) -> str | None:
     """Return a hint for the given Kubernetes failure reason, or None.
 
     Sources the canonical hint table from
@@ -250,7 +252,7 @@ def _get_kubernetes_hint(reason: str,
 
 
 def _format_provision_failure_blocks(
-    resource_exceptions: Dict['resources_lib.Resources', Exception],) -> str:
+    resource_exceptions: dict['resources_lib.Resources', Exception],) -> str:
     """Format provision failures as blocks instead of a table."""
     num_infra = len(resource_exceptions)
     lines = [f'Provision failures (tried {num_infra} infra):\n']
@@ -274,8 +276,8 @@ _CLUSTER_LOCK_TIMEOUT = 5.0
 
 
 def _is_message_too_long(returncode: int,
-                         output: Optional[str] = None,
-                         file_path: Optional[str] = None) -> bool:
+                         output: str | None = None,
+                         file_path: str | None = None) -> bool:
     """Check if the message sent to the remote is too long.
 
     We use inline script to run the setup or run command, i.e. the script will
@@ -313,8 +315,7 @@ def _is_message_too_long(returncode: int,
 
     if file_path is not None:
         try:
-            with open(os.path.expanduser(file_path), 'r',
-                      encoding='utf-8') as f:
+            with open(os.path.expanduser(file_path), encoding='utf-8') as f:
                 content = f.read()
                 return _check_output_for_match_str(content)
         except Exception as e:  # pylint: disable=broad-except
@@ -360,8 +361,8 @@ def _get_cluster_config_template(cloud):
 
 
 def write_ray_up_script_with_patched_launch_hash_fn(
-    cluster_config_path: Optional[str],
-    ray_up_kwargs: Dict[str, bool],
+    cluster_config_path: str | None,
+    ray_up_kwargs: dict[str, bool],
 ) -> str:
     """Writes a Python script that runs `ray up` with our launch hash func.
 
@@ -370,7 +371,6 @@ def write_ray_up_script_with_patched_launch_hash_fn(
     calculation.
     """
     with open(_RAY_UP_WITH_MONKEY_PATCHED_HASH_LAUNCH_CONF_PATH,
-              'r',
               encoding='utf-8') as f:
         ray_up_no_restart_script = f.read().format(
             ray_yaml_path=repr(cluster_config_path),
@@ -402,7 +402,7 @@ class _ResourcesFeaturesUnsupportedError(Exception):
     """
 
 
-def _add_to_blocked_resources(blocked_resources: Set['resources_lib.Resources'],
+def _add_to_blocked_resources(blocked_resources: set['resources_lib.Resources'],
                               resources: 'resources_lib.Resources') -> None:
     # If the resources is already blocked by blocked_resources, we don't need to
     # add it again to avoid duplicated entries.
@@ -422,7 +422,7 @@ class FailoverCloudErrorHandlerV1:
 
     @staticmethod
     def _handle_errors(stdout: str, stderr: str,
-                       is_error_str_known: Callable[[str], bool]) -> List[str]:
+                       is_error_str_known: Callable[[str], bool]) -> list[str]:
         stdout_splits = stdout.split('\n')
         stderr_splits = stderr.split('\n')
         errors = [
@@ -455,11 +455,10 @@ class FailoverCloudErrorHandlerV1:
             raise e
 
     @staticmethod
-    def _ibm_handler(blocked_resources: Set['resources_lib.Resources'],
+    def _ibm_handler(blocked_resources: set['resources_lib.Resources'],
                      launchable_resources: 'resources_lib.Resources',
-                     region: 'clouds.Region',
-                     zones: Optional[List['clouds.Zone']], stdout: str,
-                     stderr: str):
+                     region: 'clouds.Region', zones: list['clouds.Zone'] | None,
+                     stdout: str, stderr: str):
 
         errors = FailoverCloudErrorHandlerV1._handle_errors(
             stdout, stderr,
@@ -476,10 +475,10 @@ class FailoverCloudErrorHandlerV1:
 
     @staticmethod
     def update_blocklist_on_error(
-            blocked_resources: Set['resources_lib.Resources'],
+            blocked_resources: set['resources_lib.Resources'],
             launchable_resources: 'resources_lib.Resources',
-            region: 'clouds.Region', zones: Optional[List['clouds.Zone']],
-            stdout: Optional[str], stderr: Optional[str]) -> bool:
+            region: 'clouds.Region', zones: list['clouds.Zone'] | None,
+            stdout: str | None, stderr: str | None) -> bool:
         """Handles cloud-specific errors and updates the block list.
 
         This parses textual stdout/stderr because we don't directly use the
@@ -548,9 +547,9 @@ class FailoverCloudErrorHandlerV2:
     """
 
     @staticmethod
-    def _azure_handler(blocked_resources: Set['resources_lib.Resources'],
+    def _azure_handler(blocked_resources: set['resources_lib.Resources'],
                        launchable_resources: 'resources_lib.Resources',
-                       region: 'clouds.Region', zones: List['clouds.Zone'],
+                       region: 'clouds.Region', zones: list['clouds.Zone'],
                        err: Exception):
         del region, zones  # Unused.
         if '(ReadOnlyDisabledSubscription)' in str(err):
@@ -571,9 +570,9 @@ class FailoverCloudErrorHandlerV2:
                                       launchable_resources.copy(zone=None))
 
     @staticmethod
-    def _gcp_handler(blocked_resources: Set['resources_lib.Resources'],
+    def _gcp_handler(blocked_resources: set['resources_lib.Resources'],
                      launchable_resources: 'resources_lib.Resources',
-                     region: 'clouds.Region', zones: List['clouds.Zone'],
+                     region: 'clouds.Region', zones: list['clouds.Zone'],
                      err: Exception):
         assert zones and len(zones) == 1, zones
         zone = zones[0]
@@ -726,10 +725,10 @@ class FailoverCloudErrorHandlerV2:
                     launchable_resources.copy(zone=zone.name))
 
     @staticmethod
-    def _lambda_handler(blocked_resources: Set['resources_lib.Resources'],
+    def _lambda_handler(blocked_resources: set['resources_lib.Resources'],
                         launchable_resources: 'resources_lib.Resources',
                         region: 'clouds.Region',
-                        zones: Optional[List['clouds.Zone']], error: Exception):
+                        zones: list['clouds.Zone'] | None, error: Exception):
         output = str(error)
         # Sometimes, lambda cloud error will list available regions.
         if output.find('Regions with capacity available:') != -1:
@@ -743,10 +742,9 @@ class FailoverCloudErrorHandlerV2:
                 blocked_resources, launchable_resources, region, zones, error)
 
     @staticmethod
-    def _aws_handler(blocked_resources: Set['resources_lib.Resources'],
+    def _aws_handler(blocked_resources: set['resources_lib.Resources'],
                      launchable_resources: 'resources_lib.Resources',
-                     region: 'clouds.Region',
-                     zones: Optional[List['clouds.Zone']],
+                     region: 'clouds.Region', zones: list['clouds.Zone'] | None,
                      error: Exception) -> None:
         logger.info(f'AWS handler error: {error}')
         # Block AWS if the credential has expired.
@@ -758,10 +756,9 @@ class FailoverCloudErrorHandlerV2:
                 blocked_resources, launchable_resources, region, zones, error)
 
     @staticmethod
-    def _scp_handler(blocked_resources: Set['resources_lib.Resources'],
+    def _scp_handler(blocked_resources: set['resources_lib.Resources'],
                      launchable_resources: 'resources_lib.Resources',
-                     region: 'clouds.Region',
-                     zones: Optional[List['clouds.Zone']],
+                     region: 'clouds.Region', zones: list['clouds.Zone'] | None,
                      error: Exception) -> None:
         logger.info(f'SCP handler error: {error}')
         # Block SCP if the credential has expired.
@@ -773,10 +770,10 @@ class FailoverCloudErrorHandlerV2:
                 blocked_resources, launchable_resources, region, zones, error)
 
     @staticmethod
-    def _default_handler(blocked_resources: Set['resources_lib.Resources'],
+    def _default_handler(blocked_resources: set['resources_lib.Resources'],
                          launchable_resources: 'resources_lib.Resources',
                          region: 'clouds.Region',
-                         zones: Optional[List['clouds.Zone']],
+                         zones: list['clouds.Zone'] | None,
                          error: Exception) -> None:
         """Handles cloud-specific errors and updates the block list."""
         del region  # Unused.
@@ -794,9 +791,9 @@ class FailoverCloudErrorHandlerV2:
 
     @staticmethod
     def update_blocklist_on_error(
-            blocked_resources: Set['resources_lib.Resources'],
+            blocked_resources: set['resources_lib.Resources'],
             launchable_resources: 'resources_lib.Resources',
-            region: 'clouds.Region', zones: Optional[List['clouds.Zone']],
+            region: 'clouds.Region', zones: list['clouds.Zone'] | None,
             error: Exception) -> None:
         """Handles cloud-specific errors and updates the block list."""
         cloud = launchable_resources.cloud
@@ -828,8 +825,8 @@ def _record_capacity_metric(reason: str, action: str) -> None:
 
 def _iter_error_chain(error: BaseException) -> Iterable[BaseException]:
     """Yields explicit exception causes, excluding implicit context."""
-    seen: Set[int] = set()
-    exc: Optional[BaseException] = error
+    seen: set[int] = set()
+    exc: BaseException | None = error
     while exc is not None and id(exc) not in seen:
         seen.add(id(exc))
         yield exc
@@ -837,7 +834,7 @@ def _iter_error_chain(error: BaseException) -> Iterable[BaseException]:
 
 
 def _classify_capacity_error(cloud: 'clouds.Cloud',
-                             error: BaseException) -> Optional[str]:
+                             error: BaseException) -> str | None:
     """Classifies an AWS failure using structured codes only.
 
     AWS's provisioner records every failed RunInstances attempt on a
@@ -847,7 +844,7 @@ def _classify_capacity_error(cloud: 'clouds.Cloud',
     """
     if not isinstance(cloud, clouds.AWS):
         return None
-    codes: List[str] = []
+    codes: list[str] = []
     for exc in _iter_error_chain(error):
         errors = getattr(exc, 'errors', None)
         if isinstance(errors, list):
@@ -874,8 +871,8 @@ def _classify_capacity_error(cloud: 'clouds.Cloud',
 
 def _capacity_cache_key(
         to_provision: 'resources_lib.Resources', region: 'clouds.Region',
-        zones: Optional[List['clouds.Zone']], num_nodes: int,
-        account: Optional[str]) -> Optional['capacity_cache.ResourceKey']:
+        zones: list['clouds.Zone'] | None, num_nodes: int,
+        account: str | None) -> Optional['capacity_cache.ResourceKey']:
     """Returns a key only for the exact, safe-to-cache incident path."""
     if (not isinstance(to_provision.cloud, clouds.AWS) or
             not to_provision.use_spot or zones is None or len(zones) != 1 or
@@ -890,8 +887,8 @@ def _capacity_cache_key(
 
 def _capacity_cache_exhausted_zone_names(
         to_provision: 'resources_lib.Resources', region: 'clouds.Region',
-        zones: Optional[List['clouds.Zone']], num_nodes: int,
-        account: Optional[str]) -> Set[str]:
+        zones: list['clouds.Zone'] | None, num_nodes: int,
+        account: str | None) -> set[str]:
     """Returns the attempted zone when its short-lived hint is active."""
     key = _capacity_cache_key(to_provision, region, zones, num_nodes, account)
     if key is None:
@@ -910,7 +907,7 @@ def _capacity_cache_exhausted_zone_names(
 def _quota_cooldown_key(
         to_provision: 'resources_lib.Resources', region: 'clouds.Region',
         num_nodes: int,
-        account: Optional[str]) -> Optional['capacity_cache.QuotaCooldownKey']:
+        account: str | None) -> Optional['capacity_cache.QuotaCooldownKey']:
     """Returns a demand-specific key for a brief Spot quota cooldown."""
     if (not isinstance(to_provision.cloud, clouds.AWS) or
             not to_provision.use_spot or not account or
@@ -959,7 +956,7 @@ def _failure_requested_full_demand(error: BaseException,
 
 
 def _get_workload_attribution(task: task_lib.Task, cluster_name: str,
-                              workload_type: str) -> Tuple[str, Optional[int]]:
+                              workload_type: str) -> tuple[str, int | None]:
     """Returns scalar workload attribution without any external lookup."""
     workload_id = cluster_name
     workload_task_id = None
@@ -984,7 +981,7 @@ def _get_workload_attribution(task: task_lib.Task, cluster_name: str,
     return workload_id, workload_task_id
 
 
-class RetryingVmProvisioner(object):
+class RetryingVmProvisioner:
     """A provisioner that retries different cloud/regions/zones."""
 
     class ToProvisionConfig:
@@ -995,10 +992,10 @@ class RetryingVmProvisioner(object):
             cluster_name: str,
             resources: resources_lib.Resources,
             num_nodes: int,
-            prev_cluster_status: Optional[status_lib.ClusterStatus],
+            prev_cluster_status: status_lib.ClusterStatus | None,
             prev_handle: Optional['CloudVmRayResourceHandle'],
             prev_cluster_ever_up: bool,
-            prev_config_hash: Optional[str],
+            prev_config_hash: str | None,
         ) -> None:
             assert cluster_name is not None, 'cluster_name must be specified.'
             self.cluster_name = cluster_name
@@ -1013,17 +1010,17 @@ class RetryingVmProvisioner(object):
                  log_dir: str,
                  dag: 'dag.Dag',
                  optimize_target: 'common.OptimizeTarget',
-                 requested_features: Set[clouds.CloudImplementationFeatures],
+                 requested_features: set[clouds.CloudImplementationFeatures],
                  local_wheel_path: pathlib.Path,
                  wheel_hash: str,
-                 blocked_resources: Optional[Iterable[
-                     resources_lib.Resources]] = None,
-                 is_managed: Optional[bool] = None,
+                 blocked_resources: Iterable[resources_lib.Resources] |
+                 None = None,
+                 is_managed: bool | None = None,
                  *,
-                 extra_launch_context: Dict[str, Any],
+                 extra_launch_context: dict[str, Any],
                  is_launched_by_jobs_controller: bool = False,
                  workload_type: str = 'cluster'):
-        self._blocked_resources: Set[resources_lib.Resources] = set()
+        self._blocked_resources: set[resources_lib.Resources] = set()
         if blocked_resources:
             # blocked_resources is not None and not empty.
             self._blocked_resources.update(blocked_resources)
@@ -1035,16 +1032,15 @@ class RetryingVmProvisioner(object):
         self._local_wheel_path = local_wheel_path
         self._wheel_hash = wheel_hash
         self._is_managed = is_managed
-        self._extra_launch_context: Dict[str, Any] = extra_launch_context
+        self._extra_launch_context: dict[str, Any] = extra_launch_context
         self._is_launched_by_jobs_controller = is_launched_by_jobs_controller
         self._workload_type = workload_type
 
     def _yield_zones(
             self, to_provision: resources_lib.Resources, num_nodes: int,
             cluster_name: str,
-            prev_cluster_status: Optional[status_lib.ClusterStatus],
-            prev_cluster_ever_up: bool
-    ) -> Iterable[Optional[List[clouds.Zone]]]:
+            prev_cluster_status: status_lib.ClusterStatus | None,
+            prev_cluster_ever_up: bool) -> Iterable[list[clouds.Zone] | None]:
         """Yield zones within the given region to try for provisioning.
 
         Yields:
@@ -1067,7 +1063,7 @@ class RetryingVmProvisioner(object):
         region = clouds.Region(to_provision.region)
         zones = None
 
-        def _get_previously_launched_zones() -> Optional[List[clouds.Zone]]:
+        def _get_previously_launched_zones() -> list[clouds.Zone] | None:
             # When the cluster exists, the to_provision should have been set
             # to the previous cluster's resources.
             zones = [
@@ -1170,9 +1166,9 @@ class RetryingVmProvisioner(object):
     def _insufficient_resources_msg(
         self,
         to_provision: resources_lib.Resources,
-        requested_resources: Set[resources_lib.Resources],
-        insufficient_resources: Optional[List[str]],
-        last_error_reason: Optional[str] = None,
+        requested_resources: set[resources_lib.Resources],
+        insufficient_resources: list[str] | None,
+        last_error_reason: str | None = None,
     ) -> str:
         insufficent_resource_msg = ('' if insufficient_resources is None else
                                     f' ({", ".join(insufficient_resources)})')
@@ -1204,18 +1200,18 @@ class RetryingVmProvisioner(object):
         self,
         to_provision: resources_lib.Resources,
         num_nodes: int,
-        requested_resources: Set[resources_lib.Resources],
+        requested_resources: set[resources_lib.Resources],
         dryrun: bool,
         stream_logs: bool,
         cluster_name: str,
-        cloud_user_identity: Optional[List[str]],
-        prev_cluster_status: Optional[status_lib.ClusterStatus],
+        cloud_user_identity: list[str] | None,
+        prev_cluster_status: status_lib.ClusterStatus | None,
         prev_handle: Optional['CloudVmRayResourceHandle'],
         prev_cluster_ever_up: bool,
-        skip_if_config_hash_matches: Optional[str],
-        volume_mounts: Optional[List[volume_lib.VolumeMount]],
+        skip_if_config_hash_matches: str | None,
+        volume_mounts: list[volume_lib.VolumeMount] | None,
         task: task_lib.Task,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """The provision retry loop.
 
         Returns a config_dict with the following fields:
@@ -1295,7 +1291,7 @@ class RetryingVmProvisioner(object):
                 f'https://docs.skypilot.co/en/latest/cloud-setup/quota.html.')
 
         insufficient_resources = None
-        last_error_reason: Optional[str] = None
+        last_error_reason: str | None = None
         for zones in self._yield_zones(to_provision, num_nodes, cluster_name,
                                        prev_cluster_status,
                                        prev_cluster_ever_up):
@@ -1503,8 +1499,8 @@ class RetryingVmProvisioner(object):
                         list(
                             resources_utils.port_ranges_to_set(
                                 to_provision.ports))
-                        if to_provision.cloud.OPEN_PORTS_VERSION <=
-                        clouds.OpenPortsVersion.LAUNCH_ONLY else None)
+                        if to_provision.cloud.OPEN_PORTS_VERSION
+                        <= clouds.OpenPortsVersion.LAUNCH_ONLY else None)
                     try:
                         controller = controller_utils.Controllers.from_name(
                             cluster_name)
@@ -1817,7 +1813,7 @@ class RetryingVmProvisioner(object):
         self, to_provision_cloud: clouds.Cloud, cluster_config_file: str,
         cluster_handle: 'backends.CloudVmRayResourceHandle', log_abs_path: str,
         stream_logs: bool, logging_info: dict, use_spot: bool
-    ) -> Tuple[GangSchedulingStatus, str, str, Optional[str], Optional[str]]:
+    ) -> tuple[GangSchedulingStatus, str, str, str | None, str | None]:
         """Provisions a cluster via 'ray up' and wait until fully provisioned.
 
         Returns:
@@ -1898,7 +1894,7 @@ class RetryingVmProvisioner(object):
         # many ssh connections and can be fixed by retrying.
         # This is required when using custom image for GCP.
         def need_ray_up(
-                ray_up_return_value: Optional[Tuple[int, str, str]]) -> bool:
+                ray_up_return_value: tuple[int, str, str] | None) -> bool:
 
             # Indicates the first ray up.
             if ray_up_return_value is None:
@@ -1943,8 +1939,7 @@ class RetryingVmProvisioner(object):
             retry_cnt += 1
             if retry_cnt > 1:
                 sleep = backoff.current_backoff()
-                logger.info(
-                    'Retrying launching in {:.1f} seconds.'.format(sleep))
+                logger.info(f'Retrying launching in {sleep:.1f} seconds.')
                 time.sleep(sleep)
             # TODO(zhwu): when we retry ray up, it is possible that the ray
             # cluster fail to start because --no-restart flag is used.
@@ -2075,7 +2070,7 @@ class RetryingVmProvisioner(object):
         dryrun: bool,
         stream_logs: bool,
         skip_unnecessary_provisioning: bool,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Provision with retries for all launchable resources.
 
         Returns the config_dict from _retry_zones() - see its docstring for
@@ -2092,8 +2087,8 @@ class RetryingVmProvisioner(object):
         skip_if_config_hash_matches = (to_provision_config.prev_config_hash if
                                        skip_unnecessary_provisioning else None)
 
-        failover_history: List[Exception] = list()
-        resource_exceptions: Dict[resources_lib.Resources, Exception] = dict()
+        failover_history: list[Exception] = list()
+        resource_exceptions: dict[resources_lib.Resources, Exception] = dict()
         # If the user is using local credentials which may expire, the
         # controller may leak resources if the credentials expire while a job
         # is running. Here we check the enabled clouds and expiring credentials
@@ -2333,7 +2328,7 @@ class RetryingVmProvisioner(object):
                 blocks = _format_provision_failure_blocks(resource_exceptions)
                 raise exceptions.ResourcesUnavailableError(
                     _RESOURCES_UNAVAILABLE_LOG + '\n' + blocks,
-                    failover_history=failover_history)
+                    failover_history=failover_history) from e
             best_resources = task.best_resources
             assert task in self._dag.tasks, 'Internal logic error.'
             assert best_resources is not None, task
@@ -2353,7 +2348,7 @@ def _is_tunnel_healthy(tunnel: SSHTunnelInfo) -> bool:
             s.settimeout(0.5)
             s.connect(('localhost', tunnel.port))
         return True
-    except socket.error as e:
+    except OSError as e:
         logger.warning(f'Failed to connect to tunnel on port {tunnel.port}: '
                        f'{common_utils.format_exception(e)}')
         return False
@@ -2386,21 +2381,19 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
 
     # Set by from_dict() since cached_cluster_info is not available
     # when reconstructing from a dict.
-    _ssh_user: Optional[str] = None
+    _ssh_user: str | None = None
 
     def __init__(
             self,
             *,
             cluster_name: str,
             cluster_name_on_cloud: str,
-            cluster_yaml: Optional[str],
+            cluster_yaml: str | None,
             launched_nodes: int,
             launched_resources: resources_lib.Resources,
-            stable_internal_external_ips: Optional[List[Tuple[str,
-                                                              str]]] = None,
-            stable_ssh_ports: Optional[List[int]] = None,
-            cluster_info: Optional[provision_common.ClusterInfo] = None
-    ) -> None:
+            stable_internal_external_ips: list[tuple[str, str]] | None = None,
+            stable_ssh_ports: list[int] | None = None,
+            cluster_info: provision_common.ClusterInfo | None = None) -> None:
         self._version = self._VERSION
         self.cluster_name = cluster_name
         self.cluster_name_on_cloud = cluster_name_on_cloud
@@ -2418,7 +2411,7 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
         self.cached_cluster_info = cluster_info
         self.launched_nodes = launched_nodes
         self.launched_resources = launched_resources
-        self.docker_user: Optional[str] = None
+        self.docker_user: str | None = None
         self.is_grpc_enabled = True
         # A handle is created before provisioning runs, so nothing is set up
         # on the cluster yet; bulk_provision() fills in the real record on
@@ -2483,8 +2476,8 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
         # When a cluster is on a cloud that does not support the new
         # provisioner, we should skip updating cluster_info.
         if (self.launched_resources.cloud is not None and
-                self.launched_resources.cloud.PROVISIONER_VERSION >=
-                clouds.ProvisionerVersion.SKYPILOT):
+                self.launched_resources.cloud.PROVISIONER_VERSION
+                >= clouds.ProvisionerVersion.SKYPILOT):
             provider_name = str(self.launched_resources.cloud).lower()
             config = {}
             # It is possible that the cluster yaml is not available when
@@ -2523,10 +2516,9 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
     def update_cluster_ips(
             self,
             max_attempts: int = 1,
-            internal_ips: Optional[List[Optional[str]]] = None,
-            external_ips: Optional[List[Optional[str]]] = None,
-            cluster_info: Optional[provision_common.ClusterInfo] = None
-    ) -> None:
+            internal_ips: list[str | None] | None = None,
+            external_ips: list[str | None] | None = None,
+            cluster_info: provision_common.ClusterInfo | None = None) -> None:
         """Updates the cluster IPs cached in the handle.
 
         We cache the cluster IPs in the handle to avoid having to retrieve
@@ -2564,8 +2556,7 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
             # For clouds that do not support the SkyPilot Provisioner API.
             # TODO(zhwu): once all the clouds are migrated to SkyPilot
             # Provisioner API, we should remove this else block
-            def is_provided_ips_valid(
-                    ips: Optional[List[Optional[str]]]) -> bool:
+            def is_provided_ips_valid(ips: list[str | None] | None) -> bool:
                 return (ips is not None and len(ips)
                         == self.num_ips_per_node * self.launched_nodes and
                         all(ip is not None for ip in ips))
@@ -2578,7 +2569,7 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
             # it is a list of internal IPs.
             if is_provided_ips_valid(external_ips):
                 logger.debug(f'Using provided external IPs: {external_ips}')
-                cluster_feasible_ips = typing.cast(List[str], external_ips)
+                cluster_feasible_ips = typing.cast(list[str], external_ips)
             else:
                 cluster_feasible_ips = backend_utils.get_node_ips(
                     self.cluster_yaml,
@@ -2610,7 +2601,7 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
                 cluster_internal_ips = list(cluster_feasible_ips)
             elif is_provided_ips_valid(internal_ips):
                 logger.debug(f'Using provided internal IPs: {internal_ips}')
-                cluster_internal_ips = typing.cast(List[str], internal_ips)
+                cluster_internal_ips = typing.cast(list[str], internal_ips)
             else:
                 cluster_internal_ips = backend_utils.get_node_ips(
                     self.cluster_yaml,
@@ -2627,7 +2618,7 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
         # List of (internal_ip, feasible_ip) tuples for all the nodes in the
         # cluster, sorted by the feasible ips. The feasible ips can be either
         # internal or external ips, depending on the use_internal_ips flag.
-        internal_external_ips: List[Tuple[str, str]] = list(
+        internal_external_ips: list[tuple[str, str]] = list(
             zip(cluster_internal_ips, cluster_feasible_ips))
 
         # Ensure head node is the first element, then sort based on the
@@ -2652,7 +2643,7 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
     def get_command_runners(self,
                             force_cached: bool = False,
                             avoid_ssh_control: bool = False
-                           ) -> List[command_runner.CommandRunner]:
+                           ) -> list[command_runner.CommandRunner]:
         """Returns a list of command runners for the cluster."""
         ssh_credentials = backend_utils.ssh_credential_from_yaml(
             self.cluster_yaml, self.docker_user, self.ssh_user)
@@ -2661,8 +2652,8 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
 
         launched_resources = self.launched_resources.assert_launchable()
         updated_to_skypilot_provisioner_after_provisioned = (
-            launched_resources.cloud.PROVISIONER_VERSION >=
-            clouds.ProvisionerVersion.SKYPILOT and
+            launched_resources.cloud.PROVISIONER_VERSION
+            >= clouds.ProvisionerVersion.SKYPILOT and
             self.cached_external_ips is not None and
             self.cached_cluster_info is None)
         if updated_to_skypilot_provisioner_after_provisioned:
@@ -2671,8 +2662,8 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
                 f'provisioner after cluster {self.cluster_name} was '
                 f'provisioned. Cached IPs are used for connecting to the '
                 'cluster.')
-        if (clouds.ProvisionerVersion.RAY_PROVISIONER_SKYPILOT_TERMINATOR >=
-                launched_resources.cloud.PROVISIONER_VERSION or
+        if (clouds.ProvisionerVersion.RAY_PROVISIONER_SKYPILOT_TERMINATOR
+                >= launched_resources.cloud.PROVISIONER_VERSION or
                 updated_to_skypilot_provisioner_after_provisioned):
             ip_list = (self.cached_external_ips
                        if force_cached else self.external_ips())
@@ -2721,13 +2712,13 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
         return runners
 
     @property
-    def cached_internal_ips(self) -> Optional[List[str]]:
+    def cached_internal_ips(self) -> list[str] | None:
         if self.stable_internal_external_ips is not None:
             return [ips[0] for ips in self.stable_internal_external_ips]
         return None
 
     def internal_ips(self,
-                     max_attempts: int = _FETCH_IP_MAX_ATTEMPTS) -> List[str]:
+                     max_attempts: int = _FETCH_IP_MAX_ATTEMPTS) -> list[str]:
         internal_ips = self.cached_internal_ips
         if internal_ips is not None:
             return internal_ips
@@ -2737,13 +2728,13 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
         return internal_ips
 
     @property
-    def cached_external_ips(self) -> Optional[List[str]]:
+    def cached_external_ips(self) -> list[str] | None:
         if self.stable_internal_external_ips is not None:
             return [ips[1] for ips in self.stable_internal_external_ips]
         return None
 
     def external_ips(self,
-                     max_attempts: int = _FETCH_IP_MAX_ATTEMPTS) -> List[str]:
+                     max_attempts: int = _FETCH_IP_MAX_ATTEMPTS) -> list[str]:
         external_ips = self.cached_external_ips
         if external_ips is not None:
             return external_ips
@@ -2753,14 +2744,14 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
         return external_ips
 
     @property
-    def cached_external_ssh_ports(self) -> Optional[List[int]]:
+    def cached_external_ssh_ports(self) -> list[int] | None:
         if self.stable_ssh_ports is not None:
             return self.stable_ssh_ports
         return None
 
     def external_ssh_ports(self,
                            max_attempts: int = _FETCH_IP_MAX_ATTEMPTS
-                          ) -> List[int]:
+                          ) -> list[int]:
         cached_ssh_ports = self.cached_external_ssh_ports
         if cached_ssh_ports is not None:
             return cached_ssh_ports
@@ -2781,14 +2772,14 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
                                                     cluster_config_file)
         self.docker_user = docker_user
 
-    def _get_skylet_ssh_tunnel(self) -> Optional[SSHTunnelInfo]:
+    def _get_skylet_ssh_tunnel(self) -> SSHTunnelInfo | None:
         metadata = global_user_state.get_cluster_skylet_ssh_tunnel_metadata(
             self.cluster_name)
         if metadata is None:
             return None
         return SSHTunnelInfo(port=metadata[0], pid=metadata[1])
 
-    def _set_skylet_ssh_tunnel(self, tunnel: Optional[SSHTunnelInfo]) -> None:
+    def _set_skylet_ssh_tunnel(self, tunnel: SSHTunnelInfo | None) -> None:
         global_user_state.set_cluster_skylet_ssh_tunnel_metadata(
             self.cluster_name,
             (tunnel.port, tunnel.pid) if tunnel is not None else None)
@@ -2983,13 +2974,13 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
             raise e
 
     @property
-    def cluster_yaml(self) -> Optional[str]:
+    def cluster_yaml(self) -> str | None:
         if self._cluster_yaml is None:
             return None
         return os.path.expanduser(self._cluster_yaml)
 
     @cluster_yaml.setter
-    def cluster_yaml(self, value: Optional[str]):
+    def cluster_yaml(self, value: str | None):
         self._cluster_yaml = value
 
     @property
@@ -3062,7 +3053,7 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
     def from_dict(cls, d: dict) -> 'CloudVmRayResourceHandle':
         """Reconstruct from a dict produced by to_dict()."""
         resources_dict = d.get('launched_resources')
-        launched_resources: Optional[resources_lib.Resources]
+        launched_resources: resources_lib.Resources | None
         if resources_dict is not None:
             launched_resources = (
                 resources_lib.Resources._from_yaml_config_single(  # pylint: disable=protected-access
@@ -3091,10 +3082,9 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
                     provision_common.ProvisionRuntimeMetadata)
             }
             handle.provision_runtime_metadata = (
-                provision_common.ProvisionRuntimeMetadata(
-                    **{k: v
-                       for k, v in runtime_metadata.items()
-                       if k in known}))
+                provision_common.ProvisionRuntimeMetadata(**{
+                    k: v for k, v in runtime_metadata.items() if k in known
+                }))
         else:
             handle.provision_runtime_metadata = (
                 provision_common.ProvisionRuntimeMetadata())
@@ -3183,10 +3173,9 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
                     provision_common.ProvisionRuntimeMetadata)
             }
             state['provision_runtime_metadata'] = (
-                provision_common.ProvisionRuntimeMetadata(
-                    **{k: v
-                       for k, v in runtime_metadata.items()
-                       if k in known}))
+                provision_common.ProvisionRuntimeMetadata(**{
+                    k: v for k, v in runtime_metadata.items() if k in known
+                }))
         elif runtime_metadata is None:
             state['provision_runtime_metadata'] = (
                 provision_common.ProvisionRuntimeMetadata())
@@ -3223,14 +3212,12 @@ class LocalResourcesHandle(CloudVmRayResourceHandle):
             *,
             cluster_name: str,
             cluster_name_on_cloud: str,
-            cluster_yaml: Optional[str],
+            cluster_yaml: str | None,
             launched_nodes: int,
             launched_resources: resources_lib.Resources,
-            stable_internal_external_ips: Optional[List[Tuple[str,
-                                                              str]]] = None,
-            stable_ssh_ports: Optional[List[int]] = None,
-            cluster_info: Optional[provision_common.ClusterInfo] = None
-    ) -> None:
+            stable_internal_external_ips: list[tuple[str, str]] | None = None,
+            stable_ssh_ports: list[int] | None = None,
+            cluster_info: provision_common.ClusterInfo | None = None) -> None:
         super().__init__(
             cluster_name=cluster_name,
             cluster_name_on_cloud=cluster_name_on_cloud,
@@ -3257,7 +3244,7 @@ class LocalResourcesHandle(CloudVmRayResourceHandle):
     def get_command_runners(self,
                             force_cached: bool = False,
                             avoid_ssh_control: bool = False
-                           ) -> List[command_runner.CommandRunner]:
+                           ) -> list[command_runner.CommandRunner]:
         """Returns a list of local command runners."""
         del force_cached, avoid_ssh_control  # Unused.
         return [command_runner.LocalProcessCommandRunner()]
@@ -3313,77 +3300,77 @@ class SkyletClient:
     def set_autostop(
         self,
         request: 'autostopv1_pb2.SetAutostopRequest',
-        timeout: Optional[float] = constants.SKYLET_GRPC_TIMEOUT_SECONDS
+        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
     ) -> 'autostopv1_pb2.SetAutostopResponse':
         return self._autostop_stub.SetAutostop(request, timeout=timeout)
 
     def is_autostopping(
         self,
         request: 'autostopv1_pb2.IsAutostoppingRequest',
-        timeout: Optional[float] = constants.SKYLET_GRPC_TIMEOUT_SECONDS
+        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
     ) -> 'autostopv1_pb2.IsAutostoppingResponse':
         return self._autostop_stub.IsAutostopping(request, timeout=timeout)
 
     def add_job(
         self,
         request: 'jobsv1_pb2.AddJobRequest',
-        timeout: Optional[float] = constants.SKYLET_GRPC_TIMEOUT_SECONDS
+        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
     ) -> 'jobsv1_pb2.AddJobResponse':
         return self._jobs_stub.AddJob(request, timeout=timeout)
 
     def set_job_info_without_job_id(
         self,
         request: 'jobsv1_pb2.SetJobInfoWithoutJobIdRequest',
-        timeout: Optional[float] = constants.SKYLET_GRPC_TIMEOUT_SECONDS
+        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
     ) -> 'jobsv1_pb2.SetJobInfoWithoutJobIdResponse':
         return self._jobs_stub.SetJobInfoWithoutJobId(request, timeout=timeout)
 
     def queue_job(
         self,
         request: 'jobsv1_pb2.QueueJobRequest',
-        timeout: Optional[float] = constants.SKYLET_GRPC_TIMEOUT_SECONDS
+        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
     ) -> 'jobsv1_pb2.QueueJobResponse':
         return self._jobs_stub.QueueJob(request, timeout=timeout)
 
     def update_status(
         self,
         request: 'jobsv1_pb2.UpdateStatusRequest',
-        timeout: Optional[float] = constants.SKYLET_GRPC_TIMEOUT_SECONDS
+        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
     ) -> 'jobsv1_pb2.UpdateStatusResponse':
         return self._jobs_stub.UpdateStatus(request, timeout=timeout)
 
     def get_job_queue(
         self,
         request: 'jobsv1_pb2.GetJobQueueRequest',
-        timeout: Optional[float] = constants.SKYLET_GRPC_TIMEOUT_SECONDS
+        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
     ) -> 'jobsv1_pb2.GetJobQueueResponse':
         return self._jobs_stub.GetJobQueue(request, timeout=timeout)
 
     def cancel_jobs(
         self,
         request: 'jobsv1_pb2.CancelJobsRequest',
-        timeout: Optional[float] = constants.SKYLET_GRPC_TIMEOUT_SECONDS
+        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
     ) -> 'jobsv1_pb2.CancelJobsResponse':
         return self._jobs_stub.CancelJobs(request, timeout=timeout)
 
     def fail_all_in_progress_jobs(
         self,
         request: 'jobsv1_pb2.FailAllInProgressJobsRequest',
-        timeout: Optional[float] = constants.SKYLET_GRPC_TIMEOUT_SECONDS
+        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
     ) -> 'jobsv1_pb2.FailAllInProgressJobsResponse':
         return self._jobs_stub.FailAllInProgressJobs(request, timeout=timeout)
 
     def get_job_status(
         self,
         request: 'jobsv1_pb2.GetJobStatusRequest',
-        timeout: Optional[float] = constants.SKYLET_GRPC_TIMEOUT_SECONDS
+        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
     ) -> 'jobsv1_pb2.GetJobStatusResponse':
         return self._jobs_stub.GetJobStatus(request, timeout=timeout)
 
     def get_job_submitted_timestamp(
         self,
         request: 'jobsv1_pb2.GetJobSubmittedTimestampRequest',
-        timeout: Optional[float] = constants.SKYLET_GRPC_TIMEOUT_SECONDS
+        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
     ) -> 'jobsv1_pb2.GetJobSubmittedTimestampResponse':
         return self._jobs_stub.GetJobSubmittedTimestamp(request,
                                                         timeout=timeout)
@@ -3391,63 +3378,63 @@ class SkyletClient:
     def get_job_ended_timestamp(
         self,
         request: 'jobsv1_pb2.GetJobEndedTimestampRequest',
-        timeout: Optional[float] = constants.SKYLET_GRPC_TIMEOUT_SECONDS
+        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
     ) -> 'jobsv1_pb2.GetJobEndedTimestampResponse':
         return self._jobs_stub.GetJobEndedTimestamp(request, timeout=timeout)
 
     def get_log_dirs_for_jobs(
         self,
         request: 'jobsv1_pb2.GetLogDirsForJobsRequest',
-        timeout: Optional[float] = constants.SKYLET_GRPC_TIMEOUT_SECONDS
+        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
     ) -> 'jobsv1_pb2.GetLogDirsForJobsResponse':
         return self._jobs_stub.GetLogDirsForJobs(request, timeout=timeout)
 
     def get_job_exit_codes(
         self,
         request: 'jobsv1_pb2.GetJobExitCodesRequest',
-        timeout: Optional[float] = constants.SKYLET_GRPC_TIMEOUT_SECONDS
+        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
     ) -> 'jobsv1_pb2.GetJobExitCodesResponse':
         return self._jobs_stub.GetJobExitCodes(request, timeout=timeout)
 
     def tail_logs(
         self,
         request: 'jobsv1_pb2.TailLogsRequest',
-        timeout: Optional[float] = constants.SKYLET_GRPC_TIMEOUT_SECONDS
+        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
     ) -> Iterator['jobsv1_pb2.TailLogsResponse']:
         return self._jobs_stub.TailLogs(request, timeout=timeout)
 
     def get_service_status(
         self,
         request: 'servev1_pb2.GetServiceStatusRequest',
-        timeout: Optional[float] = constants.SKYLET_GRPC_TIMEOUT_SECONDS
+        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
     ) -> 'servev1_pb2.GetServiceStatusResponse':
         return self._serve_stub.GetServiceStatus(request, timeout=timeout)
 
     def add_serve_version(
         self,
         request: 'servev1_pb2.AddVersionRequest',
-        timeout: Optional[float] = constants.SKYLET_GRPC_TIMEOUT_SECONDS
+        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
     ) -> 'servev1_pb2.AddVersionResponse':
         return self._serve_stub.AddVersion(request, timeout=timeout)
 
     def terminate_services(
         self,
         request: 'servev1_pb2.TerminateServicesRequest',
-        timeout: Optional[float] = constants.SKYLET_GRPC_TIMEOUT_SECONDS
+        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
     ) -> 'servev1_pb2.TerminateServicesResponse':
         return self._serve_stub.TerminateServices(request, timeout=timeout)
 
     def terminate_replica(
         self,
         request: 'servev1_pb2.TerminateReplicaRequest',
-        timeout: Optional[float] = constants.SKYLET_GRPC_TIMEOUT_SECONDS
+        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
     ) -> 'servev1_pb2.TerminateReplicaResponse':
         return self._serve_stub.TerminateReplica(request, timeout=timeout)
 
     def wait_service_registration(
         self,
         request: 'servev1_pb2.WaitServiceRegistrationRequest',
-        timeout: Optional[float] = constants.SKYLET_GRPC_TIMEOUT_SECONDS
+        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
     ) -> 'servev1_pb2.WaitServiceRegistrationResponse':
         # set timeout to at least 10 seconds more than service register
         # constant to make sure that timeouts will not occur.
@@ -3460,7 +3447,7 @@ class SkyletClient:
     def update_service(
         self,
         request: 'servev1_pb2.UpdateServiceRequest',
-        timeout: Optional[float] = constants.SKYLET_GRPC_TIMEOUT_SECONDS
+        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
     ) -> 'servev1_pb2.UpdateServiceResponse':
         # The skylet-side handler waits on the controller's replica-manager
         # lock for up to UPDATE_SERVICE_TIMEOUT_SECONDS (see
@@ -3474,7 +3461,7 @@ class SkyletClient:
     def get_ray_status(
         self,
         request: 'healthv1_pb2.GetRayStatusRequest',
-        timeout: Optional[float] = constants.SKYLET_GRPC_TIMEOUT_SECONDS
+        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
     ) -> 'healthv1_pb2.GetRayStatusResponse':
         """Run `ray status` locally on the head node via skylet.
 
@@ -3486,21 +3473,21 @@ class SkyletClient:
     def get_managed_job_controller_version(
         self,
         request: 'managed_jobsv1_pb2.GetVersionRequest',
-        timeout: Optional[float] = constants.SKYLET_GRPC_TIMEOUT_SECONDS
+        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
     ) -> 'managed_jobsv1_pb2.GetVersionResponse':
         return self._managed_jobs_stub.GetVersion(request, timeout=timeout)
 
     def get_managed_job_table(
         self,
         request: 'managed_jobsv1_pb2.GetJobTableRequest',
-        timeout: Optional[float] = constants.SKYLET_GRPC_TIMEOUT_SECONDS
+        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
     ) -> 'managed_jobsv1_pb2.GetJobTableResponse':
         return self._managed_jobs_stub.GetJobTable(request, timeout=timeout)
 
     def get_all_managed_job_ids_by_name(
         self,
         request: 'managed_jobsv1_pb2.GetAllJobIdsByNameRequest',
-        timeout: Optional[float] = constants.SKYLET_GRPC_TIMEOUT_SECONDS
+        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
     ) -> 'managed_jobsv1_pb2.GetAllJobIdsByNameResponse':
         return self._managed_jobs_stub.GetAllJobIdsByName(request,
                                                           timeout=timeout)
@@ -3508,7 +3495,7 @@ class SkyletClient:
     def cancel_managed_jobs(
         self,
         request: 'managed_jobsv1_pb2.CancelJobsRequest',
-        timeout: Optional[float] = constants.SKYLET_GRPC_TIMEOUT_SECONDS
+        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
     ) -> 'managed_jobsv1_pb2.CancelJobsResponse':
         return self._managed_jobs_stub.CancelJobs(request, timeout=timeout)
 
@@ -3542,7 +3529,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         self._requested_features = set()
         self._dump_final_script = False
         self._is_managed = False
-        self._extra_launch_context: Dict[str, Any] = {}
+        self._extra_launch_context: dict[str, Any] = {}
         self._is_launched_by_jobs_controller = False
         self._workload_type = 'cluster'
         # Optional planner (via register_info): used under the per-cluster lock
@@ -3685,13 +3672,13 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
     def _provision(
         self,
         task: task_lib.Task,
-        to_provision: Optional[resources_lib.Resources],
+        to_provision: resources_lib.Resources | None,
         dryrun: bool,
         stream_logs: bool,
         cluster_name: str,
         retry_until_up: bool = False,
         skip_unnecessary_provisioning: bool = False,
-    ) -> Tuple[Optional[CloudVmRayResourceHandle], bool]:
+    ) -> tuple[CloudVmRayResourceHandle | None, bool]:
         """Provisions the cluster, or re-provisions an existing cluster.
 
         Use the SKYPILOT provisioner if it's supported by the cloud, otherwise
@@ -3745,7 +3732,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
 
     def _maybe_clear_external_cluster_failures(
             self, cluster_name: str,
-            prev_cluster_status: Optional[status_lib.ClusterStatus]) -> None:
+            prev_cluster_status: status_lib.ClusterStatus | None) -> None:
         """Clear any existing cluster failures when reusing a cluster.
 
         Clear any existing cluster failures when reusing a cluster. This ensures
@@ -3779,13 +3766,13 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         self,
         lock_id: str,
         task: task_lib.Task,
-        to_provision: Optional[resources_lib.Resources],
+        to_provision: resources_lib.Resources | None,
         dryrun: bool,
         stream_logs: bool,
         cluster_name: str,
         retry_until_up: bool = False,
         skip_unnecessary_provisioning: bool = False,
-    ) -> Tuple[Optional[CloudVmRayResourceHandle], bool]:
+    ) -> tuple[CloudVmRayResourceHandle | None, bool]:
         with lock_events.DistributedLockEvent(lock_id, _CLUSTER_LOCK_TIMEOUT):
             # Reset spinner message to remove any mention of being blocked
             # by other requests.
@@ -4074,9 +4061,8 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
 
     def _update_after_cluster_provisioned(
             self, handle: CloudVmRayResourceHandle,
-            prev_handle: Optional[CloudVmRayResourceHandle],
-            task: task_lib.Task,
-            prev_cluster_status: Optional[status_lib.ClusterStatus],
+            prev_handle: CloudVmRayResourceHandle | None, task: task_lib.Task,
+            prev_cluster_status: status_lib.ClusterStatus | None,
             config_hash: str) -> None:
         usage_lib.messages.usage.update_cluster_resources(
             handle.launched_nodes, handle.launched_resources)
@@ -4151,8 +4137,8 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             resources_utils.port_ranges_to_set(prev_ports))
         if open_new_ports:
             launched_resources = handle.launched_resources.assert_launchable()
-            if not (launched_resources.cloud.OPEN_PORTS_VERSION <=
-                    clouds.OpenPortsVersion.LAUNCH_ONLY):
+            if not (launched_resources.cloud.OPEN_PORTS_VERSION
+                    <= clouds.OpenPortsVersion.LAUNCH_ONLY):
                 with rich_utils.safe_status(
                         ux_utils.spinner_message(
                             'Launching - Opening new ports')):
@@ -4199,8 +4185,8 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                     handle.ssh_user)
 
     def _sync_workdir(self, handle: CloudVmRayResourceHandle,
-                      workdir: Union[Path, Dict[str, Any]],
-                      envs_and_secrets: Dict[str, str]) -> None:
+                      workdir: Path | dict[str, Any],
+                      envs_and_secrets: dict[str, str]) -> None:
         if handle.provision_runtime_metadata.workdir_synced:
             logger.info('Skipping workdir sync: provisioner reported ready.')
             return
@@ -4214,7 +4200,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             self._sync_path_workdir(handle, workdir)
 
     def _sync_git_workdir(self, handle: CloudVmRayResourceHandle,
-                          envs_and_secrets: Dict[str, str]) -> None:
+                          envs_and_secrets: dict[str, str]) -> None:
         style = colorama.Style
         ip_list = handle.external_ips()
         assert ip_list is not None, 'external_ips is not cached in handle'
@@ -4313,8 +4299,8 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
     def _sync_file_mounts(
         self,
         handle: CloudVmRayResourceHandle,
-        all_file_mounts: Optional[Dict[Path, Path]],
-        storage_mounts: Optional[Dict[Path, storage_lib.Storage]],
+        all_file_mounts: dict[Path, Path] | None,
+        storage_mounts: dict[Path, storage_lib.Storage] | None,
     ) -> None:
         """Mounts all user files to the remote nodes.
 
@@ -4521,8 +4507,8 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         codegen: str,
         job_id: int,
         managed_job_dag: Optional['dag.Dag'] = None,
-        managed_job_user_id: Optional[str] = None,
-        remote_log_dir: Optional[str] = None,
+        managed_job_user_id: str | None = None,
+        remote_log_dir: str | None = None,
     ) -> None:
         """Executes generated code on the head node."""
         use_legacy = not handle.is_grpc_enabled_with_flag
@@ -4585,7 +4571,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
 
         if not use_legacy:
             try:
-                managed_job_info: Optional[jobsv1_pb2.ManagedJobInfo] = None
+                managed_job_info: jobsv1_pb2.ManagedJobInfo | None = None
                 if managed_job_dag is not None:
                     # `ManagedJobInfo.workspace` is currently not read by
                     # skylet (see `services.py::QueueJob`). Kept on the
@@ -4594,7 +4580,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                         force_user_workspace=True)
                     entrypoint = common_utils.get_current_command()
 
-                    managed_job_tasks: List[jobsv1_pb2.ManagedJobTask] = []
+                    managed_job_tasks: list[jobsv1_pb2.ManagedJobTask] = []
                     for task_id, task in enumerate(managed_job_dag.tasks):
                         resources_str = backend_utils.get_task_resources_str(
                             task, is_managed_job=True)
@@ -4699,9 +4685,8 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 ux_utils.starting_message(f'Job submitted, ID: {job_id}'))
         rich_utils.stop_safe_status()
 
-    def _add_job(self, handle: CloudVmRayResourceHandle,
-                 job_name: Optional[str], resources_str: str,
-                 metadata: str) -> Tuple[int, str]:
+    def _add_job(self, handle: CloudVmRayResourceHandle, job_name: str | None,
+                 resources_str: str, metadata: str) -> tuple[int, str]:
         use_legacy = not handle.is_grpc_enabled_with_flag
 
         if not use_legacy:
@@ -4769,18 +4754,18 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         name: str,
         workspace: str,
         entrypoint: str,
-        pool: Optional[str],
-        pool_hash: Optional[str],
-        user_hash: Optional[str],
-        task_ids: List[int],
-        task_names: List[str],
+        pool: str | None,
+        pool_hash: str | None,
+        user_hash: str | None,
+        task_ids: list[int],
+        task_names: list[str],
         resources_str: str,
-        metadata_jsons: List[str],
-        is_primary_in_job_groups: List[bool],
+        metadata_jsons: list[str],
+        is_primary_in_job_groups: list[bool],
         num_jobs: int = 1,
         execution: str = DEFAULT_EXECUTION.value,
         is_batch: bool = False,
-    ) -> List[int]:
+    ) -> list[int]:
         """Set job info without creating entries in the jobs table.
 
         This creates entries in job_info_table and spot_table without creating
@@ -4863,7 +4848,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         handle: CloudVmRayResourceHandle,
         task: task_lib.Task,
         dryrun: bool = False,
-    ) -> Optional[int]:
+    ) -> int | None:
         """Executes the task on the cluster.
 
         Returns:
@@ -5032,18 +5017,18 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
     # --- CloudVMRayBackend Specific APIs ---
 
     def get_job_status(
-        self,
-        handle: CloudVmRayResourceHandle,
-        job_ids: Optional[List[int]] = None,
-        stream_logs: bool = True
-    ) -> Dict[Optional[int], Optional[job_lib.JobStatus]]:
+            self,
+            handle: CloudVmRayResourceHandle,
+            job_ids: list[int] | None = None,
+            stream_logs: bool = True
+    ) -> dict[int | None, job_lib.JobStatus | None]:
         if handle.is_grpc_enabled_with_flag:
             try:
                 request = jobsv1_pb2.GetJobStatusRequest(job_ids=job_ids)
                 response = backend_utils.invoke_skylet_with_retries(
                     lambda: SkyletClient(handle.get_grpc_channel()
                                         ).get_job_status(request))
-                statuses: Dict[Optional[int], Optional[job_lib.JobStatus]] = {
+                statuses: dict[int | None, job_lib.JobStatus | None] = {
                     job_id: job_lib.JobStatus.from_protobuf(proto_status)
                     for job_id, proto_status in response.job_statuses.items()
                 }
@@ -5074,9 +5059,9 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
 
     def cancel_jobs(self,
                     handle: CloudVmRayResourceHandle,
-                    jobs: Optional[List[int]],
+                    jobs: list[int] | None,
                     cancel_all: bool = False,
-                    user_hash: Optional[str] = None) -> None:
+                    user_hash: str | None = None) -> None:
         """Cancels jobs.
 
         See `skylet.job_lib.cancel_jobs_encoded_results` for more details.
@@ -5117,14 +5102,14 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
     def sync_down_logs(
             self,
             handle: CloudVmRayResourceHandle,
-            job_ids: Optional[List[str]],
-            local_dir: str = constants.SKY_LOGS_DIRECTORY) -> Dict[str, str]:
+            job_ids: list[str] | None,
+            local_dir: str = constants.SKY_LOGS_DIRECTORY) -> dict[str, str]:
         """Sync down logs for the given job_ids.
 
         Returns:
             A dictionary mapping job_id to log path.
         """
-        job_to_dir: Dict[str, str] = {}
+        job_to_dir: dict[str, str] = {}
         use_legacy = not handle.is_grpc_enabled_with_flag
 
         if not use_legacy:
@@ -5229,17 +5214,16 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         return dict(zip(job_ids, local_log_dirs))
 
     @context_utils.cancellation_guard
-    def tail_logs(
-            self,
-            handle: CloudVmRayResourceHandle,
-            job_id: Optional[int],
-            managed_job_id: Optional[int] = None,
-            follow: bool = True,
-            tail: int = 0,
-            tail_offset: Optional[int] = None,
-            require_outputs: bool = False,
-            stream_logs: bool = True,
-            process_stream: bool = False) -> Union[int, Tuple[int, str, str]]:
+    def tail_logs(self,
+                  handle: CloudVmRayResourceHandle,
+                  job_id: int | None,
+                  managed_job_id: int | None = None,
+                  follow: bool = True,
+                  tail: int = 0,
+                  tail_offset: int | None = None,
+                  require_outputs: bool = False,
+                  stream_logs: bool = True,
+                  process_stream: bool = False) -> int | tuple[int, str, str]:
         """Tail the logs of a job.
 
         Args:
@@ -5316,7 +5300,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
 
     def tail_hook_logs(self,
                        handle: CloudVmRayResourceHandle,
-                       event: Optional[str] = None,
+                       event: str | None = None,
                        follow: bool = True,
                        tail: int = 0) -> int:
         """Tail per-event lifecycle-hook logs.
@@ -5403,13 +5387,13 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
 
     def tail_managed_job_logs(self,
                               handle: CloudVmRayResourceHandle,
-                              job_id: Optional[int] = None,
-                              job_name: Optional[str] = None,
+                              job_id: int | None = None,
+                              job_name: str | None = None,
                               controller: bool = False,
                               follow: bool = True,
-                              tail: Optional[int] = None,
-                              tail_offset: Optional[int] = None,
-                              task: Optional[Union[str, int]] = None) -> int:
+                              tail: int | None = None,
+                              tail_offset: int | None = None,
+                              task: str | int | None = None) -> int:
         # if job_name is not None, job_id should be None
         assert job_name is None or job_id is None, (job_name, job_id)
         # TODO(kevin): Migrate stream_logs to gRPC
@@ -5438,10 +5422,10 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
     def sync_down_managed_job_logs(
             self,
             handle: CloudVmRayResourceHandle,
-            job_id: Optional[int] = None,
-            job_name: Optional[str] = None,
+            job_id: int | None = None,
+            job_name: str | None = None,
             controller: bool = False,
-            local_dir: str = constants.SKY_LOGS_DIRECTORY) -> Dict[str, str]:
+            local_dir: str = constants.SKY_LOGS_DIRECTORY) -> dict[str, str]:
         """Sync down logs for a managed job.
 
         Args:
@@ -6110,13 +6094,13 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
 
     def set_autostop(self,
                      handle: CloudVmRayResourceHandle,
-                     idle_minutes_to_autostop: Optional[int],
-                     wait_for: Optional[autostop_lib.AutostopWaitFor],
+                     idle_minutes_to_autostop: int | None,
+                     wait_for: autostop_lib.AutostopWaitFor | None,
                      down: bool = False,
                      stream_logs: bool = True,
-                     hook: Optional[str] = None,
-                     hook_timeout: Optional[int] = None,
-                     hooks: Optional[List[Dict[str, Any]]] = None) -> None:
+                     hook: str | None = None,
+                     hook_timeout: int | None = None,
+                     hooks: list[dict[str, Any]] | None = None) -> None:
         if not handle.provision_runtime_metadata.has_skylet:
             return
         # The core.autostop() function should have already checked that the
@@ -6274,7 +6258,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         handle: CloudVmRayResourceHandle,
         cmd: str,
         *,
-        port_forward: Optional[List[int]] = None,
+        port_forward: list[int] | None = None,
         log_path: str = '/dev/null',
         stream_logs: bool = False,
         ssh_mode: command_runner.SshMode = command_runner.SshMode.
@@ -6285,7 +6269,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         process_stream: bool = True,
         source_bashrc: bool = False,
         **kwargs,
-    ) -> Union[int, Tuple[int, str, str]]:
+    ) -> int | tuple[int, str, str]:
         """Runs 'cmd' on the cluster's head node.
 
         It will try to fetch the head node IP if it is not cached.
@@ -6348,7 +6332,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
     def _check_existing_cluster(
             self,
             task: task_lib.Task,
-            to_provision: Optional[resources_lib.Resources],
+            to_provision: resources_lib.Resources | None,
             cluster_name: str,
             dryrun: bool = False) -> RetryingVmProvisioner.ToProvisionConfig:
         """Checks if the cluster exists and returns the provision config.
@@ -6368,7 +6352,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             handle_before_refresh = record['handle']
             status_before_refresh = record['status']
 
-        handle: Optional[CloudVmRayResourceHandle]
+        handle: CloudVmRayResourceHandle | None
         prev_cluster_status, handle = (status_before_refresh,
                                        handle_before_refresh)
 
@@ -6421,8 +6405,8 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             to_provision = handle.launched_resources
             assert to_provision is not None
             to_provision = to_provision.assert_launchable()
-            if (to_provision.cloud.OPEN_PORTS_VERSION <=
-                    clouds.OpenPortsVersion.LAUNCH_ONLY):
+            if (to_provision.cloud.OPEN_PORTS_VERSION
+                    <= clouds.OpenPortsVersion.LAUNCH_ONLY):
                 if not requested_ports_set <= current_ports_set:
                     current_cloud = to_provision.cloud
                     with ux_utils.print_exception_no_traceback():
@@ -6475,7 +6459,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             cluster_yaml_obj = (yaml_utils.safe_load(cluster_yaml_str)
                                 if cluster_yaml_str is not None else None)
 
-            def _get_pod_config(yaml_obj: Dict[str, Any]) -> Dict[str, Any]:
+            def _get_pod_config(yaml_obj: dict[str, Any]) -> dict[str, Any]:
                 return (yaml_obj.get('available_node_types',
                                      {}).get('ray_head_default',
                                              {}).get('node_config', {}))
@@ -6659,7 +6643,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             prev_config_hash=prev_config_hash)
 
     def _execute_file_mounts(self, handle: CloudVmRayResourceHandle,
-                             file_mounts: Optional[Dict[Path, Path]]):
+                             file_mounts: dict[Path, Path] | None):
         """Executes file mounts.
 
         Rsyncing local files and copying from remote stores.
@@ -6803,7 +6787,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
 
     def _execute_storage_mounts(
             self, handle: CloudVmRayResourceHandle,
-            storage_mounts: Optional[Dict[Path, storage_lib.Storage]]):
+            storage_mounts: dict[Path, storage_lib.Storage] | None):
         """Executes storage mounts: installing mounting tools and mounting."""
         # Handle cases where `storage_mounts` is None. This occurs when users
         # initiate a 'sky start' command from a Skypilot version that predates
@@ -6924,7 +6908,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
 
     def _set_storage_mounts_metadata(
             self, cluster_name: str,
-            storage_mounts: Optional[Dict[Path, storage_lib.Storage]]) -> None:
+            storage_mounts: dict[Path, storage_lib.Storage] | None) -> None:
         """Sets 'storage_mounts' object in cluster's storage_mounts_metadata.
 
         After converting Storage objects in 'storage_mounts' to metadata,
@@ -6953,8 +6937,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 f'{common_utils.format_exception(e)}') from None
 
     def get_storage_mounts_metadata(
-            self,
-            cluster_name: str) -> Optional[Dict[Path, storage_lib.Storage]]:
+            self, cluster_name: str) -> dict[Path, storage_lib.Storage] | None:
         """Gets 'storage_mounts' object from cluster's storage_mounts_metadata.
 
         After retrieving storage_mounts_metadata, it converts back the
@@ -6987,7 +6970,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         return storage_mounts
 
     def _skypilot_predefined_env_vars(
-            self, handle: CloudVmRayResourceHandle) -> Dict[str, str]:
+            self, handle: CloudVmRayResourceHandle) -> dict[str, str]:
         """Returns the SkyPilot predefined environment variables.
 
         TODO(zhwu): Check if a single variable for all the cluster info is more
@@ -7007,7 +6990,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         }
 
     def _get_task_env_vars(self, task: task_lib.Task, job_id: int,
-                           handle: CloudVmRayResourceHandle) -> Dict[str, str]:
+                           handle: CloudVmRayResourceHandle) -> dict[str, str]:
         """Returns the environment variables for the task."""
         env_vars = task_lib.get_plaintext_envs_and_secrets(
             task.envs_and_secrets)
@@ -7022,7 +7005,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         env_vars.update(self._skypilot_predefined_env_vars(handle))
         return env_vars
 
-    def _get_managed_job_user_id(self, task: task_lib.Task) -> Optional[str]:
+    def _get_managed_job_user_id(self, task: task_lib.Task) -> str | None:
         """Returns the user id for the managed job."""
         if task.managed_job_dag is not None:
             return task.envs[constants.USER_ID_ENV_VAR]

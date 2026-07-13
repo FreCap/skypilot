@@ -1,11 +1,8 @@
 # formatting
 # match the version with .pre-commit-config.yaml
-yapf==0.32.0
+yapf==0.43.0
 # match the version with .pre-commit-config.yaml
-pylint==2.14.5
-# https://github.com/edaniszewski/pylint-quotes
-# match the version with .pre-commit-config.yaml
-pylint-quotes==0.2.3
+pylint==4.0.4
 # match the version with .pre-commit-config.yaml
 toml==0.10.2
 # match the version with .pre-commit-config.yaml
@@ -14,6 +11,12 @@ isort==5.12.0
 # type checking
 # match the version with .pre-commit-config.yaml
 mypy==1.19.1
+# Ruff runs as a bug-finding linter (rule set in pyproject [tool.ruff]);
+# formatting stays with the formatters above. Keep in sync with
+# static-analysis.yml.
+ruff==0.15.21
+# Enforces the import contracts in pyproject [tool.importlinter].
+import-linter==2.13
 types-PyYAML
 types-paramiko
 # 2.31 requires urlib3>2, which is incompatible with IBM and
@@ -45,7 +48,7 @@ moto==5.1.2
 boto3-stubs[s3,ec2,sts,iam,service-quotas]
 
 # For postgres
-psycopg2-binary==2.9.10
+psycopg2-binary==2.9.12  # >=2.9.11 for Python 3.14 wheels
 # Real-Postgres unit tests (tests/unit_tests/test_reserved_fill_broker_pg.py):
 # boots a throwaway postgres:16 container per test session. 4.14.x pulls
 # docker-py >= 7 (compatible with the docker 29.x daemon) but needs
@@ -53,27 +56,23 @@ psycopg2-binary==2.9.10
 testcontainers[postgres]==4.14.2; python_version >= "3.10"
 
 # For helm okta test
-selenium==4.33.0
+# 4.33.0 capped typing-extensions<4.14, which in turn forced pydantic<2.12;
+# 4.40.0 lifts the cap (needed for Python 3.14, where only pydantic>=2.12
+# ships wheels).
+selenium==4.40.0
 webdriver-manager==4.0.2
 
-# For grpcio/protobuf code generation
-# We arrived at 1.63.0 through the following:
-# 1. pip install -e ".[all]"
-# 2. pip show protobuf -> 5.29.5, so let's use 5.x as a baseline.
-# 3. 1.63.0 is the oldest version of grpc that supports protobuf >= 5.x.y.
-# TODO(kevin): Have this value be maintained by the CI pipeline,
-# to make sure it's always up to date.
-grpcio-tools==1.63.0
-grpcio==1.63.0
-# Bumped from 5.26.1 to 5.29.6 to close CVE-2025-4565 (DoS) and
-# CVE-2026-0994 (JSON recursion bypass). grpcio 1.63.0 supports
-# protobuf >= 5.x, so this minor bump is compatible.
-protobuf==5.29.6
+# For grpcio/protobuf code generation.
+# These exact pins keep codegen output identical to the checked-in files in
+# sky/schemas/generated/ (verified by the compile-protos-check CI job); the
+# runtime grpcio/protobuf requirements in dependencies.py are >= ranges with
+# floors matching this generator.
+grpcio-tools==1.76.0
+grpcio==1.76.0
+protobuf==6.33.6
 
-# Pin to avoid a runtime break between pydantic>=2.12 (which requires
-# pydantic-core 2.41.x) and typing_extensions 4.13.x. In 2.41.x,
-# pydantic-core does `from typing_extensions import Sentinel`, but 4.13.x no
-# longer exports the public `Sentinel` symbol, causing ImportError. Keeping
-# pydantic<2.12 avoids pulling pydantic-core 2.41.x. Revisit once upstream
-# resolves the import or we align versions accordingly.
-pydantic<2.12
+# pydantic>=2.12 requires pydantic-core 2.41.x, which imports Sentinel from
+# typing_extensions>=4.14. That used to clash with selenium 4.33's
+# typing-extensions<4.14 cap; the selenium bump above removes the clash.
+# Python 3.14 has pydantic wheels only from 2.12 onwards, so require it.
+pydantic>=2.12

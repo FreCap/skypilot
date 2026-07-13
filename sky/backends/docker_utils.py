@@ -4,7 +4,6 @@ import shutil
 import subprocess
 import tempfile
 import textwrap
-from typing import Dict, Optional, Tuple
 
 import colorama
 
@@ -37,11 +36,11 @@ SKY_DOCKER_WORKDIR = 'sky_workdir'
 
 def create_dockerfile(
     base_image: str,
-    setup_command: Optional[str],
+    setup_command: str | None,
     copy_path: str,
     build_dir: str,
-    run_command: Optional[str] = None,
-) -> Tuple[str, Dict[str, str]]:
+    run_command: str | None = None,
+) -> tuple[str, dict[str, str]]:
     """Writes a valid dockerfile to the specified path.
 
     performs three operations:
@@ -79,8 +78,7 @@ def create_dockerfile(
             copy_command=copy_docker_cmd)
 
     def add_script_to_dockerfile(dockerfile_contents: str,
-                                 multiline_cmds: Optional[str],
-                                 out_filename: str):
+                                 multiline_cmds: str | None, out_filename: str):
         # Converts multiline commands to a script and adds the script to the
         # dockerfile. You still need to add the docker command to run the
         # script (either as CMD or RUN).
@@ -146,7 +144,7 @@ def _execute_build(tag, context_path):
 
 
 def build_dockerimage(task: task_mod.Task,
-                      tag: str) -> Tuple[str, Dict[str, str]]:
+                      tag: str) -> tuple[str, dict[str, str]]:
     """Builds a docker image for the given task.
 
     This method is responsible for:
@@ -187,7 +185,7 @@ def build_dockerimage(task: task_mod.Task,
 
 
 def build_dockerimage_from_task(
-        task: task_mod.Task) -> Tuple[str, Dict[str, str]]:
+        task: task_mod.Task) -> tuple[str, dict[str, str]]:
     """ Builds a docker image from a Task"""
     assert task.name is not None, task
     tag, img_metadata = build_dockerimage(task, tag=task.name)
@@ -220,8 +218,8 @@ def make_bash_from_multiline(codegen: str) -> str:
 
 
 def bash_codegen(workdir_name: str,
-                 multiline_cmds: Optional[str],
-                 out_path: Optional[str] = None):
+                 multiline_cmds: str | None,
+                 out_path: str | None = None):
     # Generate commands (if they exist) script and write to file
     if not multiline_cmds:
         multiline_cmds = ''

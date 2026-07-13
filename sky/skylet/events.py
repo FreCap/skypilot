@@ -5,7 +5,6 @@ import re
 import subprocess
 import time
 import traceback
-from typing import Optional
 
 import psutil
 
@@ -161,7 +160,7 @@ class UsageHeartbeatReportEvent(SkyletEvent):
         # exported into skylet's environment by
         # start_skylet_on_head_node at provisioning time. Forward
         # whatever is set.
-        def _int_env(name: str) -> Optional[int]:
+        def _int_env(name: str) -> int | None:
             value = os.environ.get(name)
             if value is None or value == '':
                 return None
@@ -170,7 +169,7 @@ class UsageHeartbeatReportEvent(SkyletEvent):
             except ValueError:
                 return None
 
-        def _bool_env(name: str) -> Optional[bool]:
+        def _bool_env(name: str) -> bool | None:
             value = os.environ.get(name)
             if value is None or value == '':
                 return None
@@ -441,7 +440,7 @@ class StopEvent(SkyletEvent):
                      provider_config=cluster_config['provider'])
 
     def _replace_yaml_for_stopping(self, yaml_path: str, down: bool):
-        with open(yaml_path, 'r', encoding='utf-8') as f:
+        with open(yaml_path, encoding='utf-8') as f:
             yaml_str = f.read()
         yaml_str = self._UPSCALING_PATTERN.sub(r'upscaling_speed: 0', yaml_str)
         if down:

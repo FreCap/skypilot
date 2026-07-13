@@ -7,7 +7,7 @@ import dataclasses
 import functools
 import inspect
 import typing
-from typing import Any, Dict, List, Optional, Protocol, Set, Tuple, Type
+from typing import Any, Optional, Protocol
 
 from sky import models
 from sky import sky_logging
@@ -62,7 +62,7 @@ class TemplateSpec:
     template variables when the template is rendered.
     """
     template_path: str
-    variables: Dict[str, Any] = dataclasses.field(default_factory=dict)
+    variables: dict[str, Any] = dataclasses.field(default_factory=dict)
 
 
 class TemplateOverrideFn(Protocol):
@@ -90,9 +90,9 @@ class TemplateOverrideFn(Protocol):
         task: 'task_lib.Task',
         to_provision: 'resources_lib.Resources',
         *,
-        _extra_launch_context: Dict[str, Any],
+        _extra_launch_context: dict[str, Any],
         _is_launched_by_jobs_controller: bool,
-    ) -> Optional[TemplateSpec]:
+    ) -> TemplateSpec | None:
         ...
 
 
@@ -113,17 +113,17 @@ class Provisioner:
     redirect a task to a custom Jinja template + extra variables.
     """
     module: Any
-    template_override: Optional[TemplateOverrideFn] = None
+    template_override: TemplateOverrideFn | None = None
 
 
-_registered_provisioners: Dict[str, Provisioner] = {}
+_registered_provisioners: dict[str, Provisioner] = {}
 
 
 def register_provisioner(
     cloud_name: str,
     module: Any,
     *,
-    template_override: Optional[TemplateOverrideFn] = None,
+    template_override: TemplateOverrideFn | None = None,
 ) -> None:
     """Register a Provisioner under a cloud name. Last registration wins.
 
@@ -139,7 +139,7 @@ def register_provisioner(
         type(module).__name__, template_override is not None)
 
 
-def get_registered_provisioner(cloud_name: str) -> Optional[Provisioner]:
+def get_registered_provisioner(cloud_name: str) -> Provisioner | None:
     """Return the Provisioner registered for ``cloud_name``, or None."""
     return _registered_provisioners.get(cloud_name.lower())
 
@@ -194,10 +194,10 @@ def query_instances(
     provider_name: str,
     cluster_name: str,
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     non_terminated_only: bool = True,
     retry_if_missing: bool = False,
-) -> Dict[str, Tuple[Optional['status_lib.ClusterStatus'], Optional[str]]]:
+) -> dict[str, tuple[Optional['status_lib.ClusterStatus'], str | None]]:
     """Query instances.
 
     Returns a dictionary of instance IDs and a tuple of (status, reason for
@@ -253,7 +253,7 @@ def delete_volume(provider_name: str,
 def get_volume_usedby(
     provider_name: str,
     volume_config: models.VolumeConfig,
-) -> Tuple[List[str], List[str]]:
+) -> tuple[list[str], list[str]]:
     """Get the usedby of a volume.
 
     Returns:
@@ -268,7 +268,7 @@ def get_volume_usedby(
 def refresh_volume_config(
     provider_name: str,
     volume_config: models.VolumeConfig,
-) -> Tuple[bool, models.VolumeConfig]:
+) -> tuple[bool, models.VolumeConfig]:
     """Whether need to refresh the volume config in the cloud.
 
     Returns:
@@ -280,8 +280,8 @@ def refresh_volume_config(
 
 @_route_to_cloud_impl
 def get_all_volumes_usedby(
-    provider_name: str, configs: List[models.VolumeConfig]
-) -> Tuple[Dict[str, Any], Dict[str, Any], Set[str]]:
+    provider_name: str, configs: list[models.VolumeConfig]
+) -> tuple[dict[str, Any], dict[str, Any], set[str]]:
     """Get the usedby of all volumes.
 
     Args:
@@ -299,9 +299,9 @@ def get_all_volumes_usedby(
 
 @_route_to_cloud_impl
 def map_all_volumes_usedby(
-        provider_name: str, used_by_pods: Dict[str, Any],
-        used_by_clusters: Dict[str, Any],
-        config: models.VolumeConfig) -> Tuple[List[str], List[str]]:
+        provider_name: str, used_by_pods: dict[str, Any],
+        used_by_clusters: dict[str, Any],
+        config: models.VolumeConfig) -> tuple[list[str], list[str]]:
     """Map the usedby resources of a volume."""
     raise NotImplementedError
 
@@ -309,7 +309,7 @@ def map_all_volumes_usedby(
 @_route_to_cloud_impl
 def get_all_volumes_errors(
         provider_name: str,
-        configs: List[models.VolumeConfig]) -> Dict[str, Optional[str]]:
+        configs: list[models.VolumeConfig]) -> dict[str, str | None]:
     """Get error messages for all volumes.
 
     Checks if volumes have errors (e.g., pending state due to
@@ -339,7 +339,7 @@ def run_instances(provider_name: str, region: str, cluster_name: str,
 def stop_instances(
     provider_name: str,
     cluster_name_on_cloud: str,
-    provider_config: Dict[str, Any],
+    provider_config: dict[str, Any],
     worker_only: bool = False,
 ) -> None:
     """Stop running instances."""
@@ -350,7 +350,7 @@ def stop_instances(
 def terminate_instances(
     provider_name: str,
     cluster_name_on_cloud: str,
-    provider_config: Dict[str, Any],
+    provider_config: dict[str, Any],
     worker_only: bool = False,
 ) -> None:
     """Terminate running or stopped instances."""
@@ -361,7 +361,7 @@ def terminate_instances(
 def cleanup_cluster_resources(
     provider_name: str,
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
 ) -> None:
     """Cleanup all cloud resources for a cluster (services, etc.).
 
@@ -382,7 +382,7 @@ def cleanup_cluster_resources(
 def cleanup_custom_multi_network(
     provider_name: str,
     cluster_name_on_cloud: str,
-    provider_config: Dict[str, Any],
+    provider_config: dict[str, Any],
     failover: bool = False,
 ) -> None:
     """Cleanup custom multi-network."""
@@ -393,8 +393,8 @@ def cleanup_custom_multi_network(
 def open_ports(
     provider_name: str,
     cluster_name_on_cloud: str,
-    ports: List[str],
-    provider_config: Optional[Dict[str, Any]] = None,
+    ports: list[str],
+    provider_config: dict[str, Any] | None = None,
 ) -> None:
     """Open ports for inbound traffic."""
     raise NotImplementedError
@@ -405,8 +405,8 @@ def cleanup_ports(
     provider_name: str,
     cluster_name_on_cloud: str,
     # TODO: make ports optional and allow cleaning up only specified ports.
-    ports: List[str],
-    provider_config: Optional[Dict[str, Any]] = None,
+    ports: list[str],
+    provider_config: dict[str, Any] | None = None,
 ) -> None:
     """Delete any opened ports."""
     raise NotImplementedError
@@ -416,10 +416,10 @@ def cleanup_ports(
 def query_ports(
     provider_name: str,
     cluster_name_on_cloud: str,
-    ports: List[str],
-    head_ip: Optional[str] = None,
-    provider_config: Optional[Dict[str, Any]] = None,
-) -> Dict[int, List[common.Endpoint]]:
+    ports: list[str],
+    head_ip: str | None = None,
+    provider_config: dict[str, Any] | None = None,
+) -> dict[int, list[common.Endpoint]]:
     """Query details about ports on a cluster.
 
     If head_ip is provided, it may be used by the cloud implementation to
@@ -448,7 +448,7 @@ def get_cluster_info(
         provider_name: str,
         region: str,
         cluster_name_on_cloud: str,
-        provider_config: Optional[Dict[str, Any]] = None) -> common.ClusterInfo:
+        provider_config: dict[str, Any] | None = None) -> common.ClusterInfo:
     """Get the metadata of instances in a cluster."""
     raise NotImplementedError
 
@@ -457,8 +457,8 @@ def get_cluster_info(
 def get_command_runners(
     provider_name: str,
     cluster_info: common.ClusterInfo,
-    **credentials: Dict[str, Any],
-) -> List[command_runner.CommandRunner]:
+    **credentials: dict[str, Any],
+) -> list[command_runner.CommandRunner]:
     """Get a command runner for the given cluster."""
     ip_list = cluster_info.get_feasible_ips()
     port_list = cluster_info.get_ssh_ports()

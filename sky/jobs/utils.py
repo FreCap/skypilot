@@ -22,7 +22,7 @@ import threading
 import time
 import traceback
 import typing
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Optional
 
 import colorama
 import filelock
@@ -61,7 +61,6 @@ if typing.TYPE_CHECKING:
     from google.protobuf import json_format
     import grpc
     import psutil
-    import sqlalchemy
 
     import sky
     from sky import dag as dag_lib
@@ -177,7 +176,7 @@ def terminate_cluster(
     cluster_name: str,
     max_retry: int = 6,
     graceful: bool = False,
-    graceful_timeout: Optional[int] = None,
+    graceful_timeout: int | None = None,
 ) -> None:
     """Terminate the cluster."""
     from sky import core  # pylint: disable=import-outside-toplevel
@@ -428,9 +427,8 @@ def ha_recovery_for_consolidation_mode() -> None:
 
 
 async def get_job_status(
-    backend: 'backends.CloudVmRayBackend', cluster_name: str,
-    job_id: Optional[int]
-) -> Tuple[Optional['job_lib.JobStatus'], Optional[str]]:
+        backend: 'backends.CloudVmRayBackend', cluster_name: str,
+        job_id: int | None) -> tuple[Optional['job_lib.JobStatus'], str | None]:
     """Check the status of the job running on a managed job cluster.
 
     It can be None, INIT, RUNNING, SUCCEEDED, FAILED, FAILED_DRIVER,
@@ -576,7 +574,7 @@ def _controller_is_restarting() -> bool:
         os.path.expanduser(constants.PERSISTENT_RUN_RESTARTING_SIGNAL_FILE))
 
 
-def update_managed_jobs_statuses(job_id: Optional[int] = None):
+def update_managed_jobs_statuses(job_id: int | None = None):
     """Update managed job status if the controller process failed abnormally.
 
     Check the status of the controller process. If it is not running, it must
@@ -598,8 +596,8 @@ def update_managed_jobs_statuses(job_id: Optional[int] = None):
     if _controller_is_restarting():
         return
 
-    def _cleanup_job_clusters(job_id: int, tasks: List[Dict[str, Any]],
-                              pool: Optional[str]) -> Optional[str]:
+    def _cleanup_job_clusters(job_id: int, tasks: list[dict[str, Any]],
+                              pool: str | None) -> str | None:
         """Clean up clusters for a job. Returns error message if any.
 
         This function should not throw any exception. If it fails, it will
@@ -829,7 +827,7 @@ def update_managed_jobs_statuses(job_id: Optional[int] = None):
 
 
 def get_job_timestamp(backend: 'backends.CloudVmRayBackend', cluster_name: str,
-                      job_id: Optional[int], get_end_time: bool) -> float:
+                      job_id: int | None, get_end_time: bool) -> float:
     """Get the submitted/ended time of the job."""
     handle = global_user_state.get_handle_from_cluster_name(cluster_name)
     assert handle is not None, (
@@ -869,7 +867,7 @@ def get_job_timestamp(backend: 'backends.CloudVmRayBackend', cluster_name: str,
 
 
 def try_to_get_job_end_time(backend: 'backends.CloudVmRayBackend',
-                            cluster_name: str, job_id: Optional[int]) -> float:
+                            cluster_name: str, job_id: int | None) -> float:
     """Try to get the end time of the job.
 
     If the job is preempted or we can't connect to the instance for whatever
@@ -905,7 +903,7 @@ def try_to_get_job_end_time(backend: 'backends.CloudVmRayBackend',
 
 
 def event_callback_func(
-        job_id: int, task_id: Optional[int],
+        job_id: int, task_id: int | None,
         task: Optional['sky.Task']) -> managed_job_state.AsyncCallbackType:
     """Run event callback for the task."""
 
@@ -961,7 +959,7 @@ def _full_traceback() -> str:
 
 
 @contextlib.contextmanager
-def _catch_to_errors(errors: List[Dict[str, str]], component: str,
+def _catch_to_errors(errors: list[dict[str, str]], component: str,
                      resource: str):
     """Catch exceptions and append to errors list with traceback."""
     try:
@@ -975,7 +973,7 @@ def _catch_to_errors(errors: List[Dict[str, str]], component: str,
         })
 
 
-def collect_debug_dump_manifest(job_ids: List[int]) -> Dict[str, Any]:
+def collect_debug_dump_manifest(job_ids: list[int]) -> dict[str, Any]:
     """Collect a debug dump manifest from the controller.
 
     This function runs ON the controller via CodeGen/SSH. It gathers small
@@ -988,17 +986,17 @@ def collect_debug_dump_manifest(job_ids: List[int]) -> Dict[str, Any]:
           'file_paths': list of {'remote_path': str, 'relative_path': str}
           'errors': list of {'component': str, 'resource': str, 'error': str}
     """
-    inline_data: List[Dict[str, str]] = []
-    file_paths: List[Dict[str, str]] = []
-    errors: List[Dict[str, str]] = []
+    inline_data: list[dict[str, str]] = []
+    file_paths: list[dict[str, str]] = []
+    errors: list[dict[str, str]] = []
 
     # Collect per-job data in parallel
     with concurrent.futures.ThreadPoolExecutor() as executor:
         results = list(executor.map(_collect_job_debug_manifest, job_ids))
 
     # Merge results and collect cluster info for unique clusters
-    seen_cluster_names: Set[str] = set()
-    seen_controller_uuids: Set[str] = set()
+    seen_cluster_names: set[str] = set()
+    seen_controller_uuids: set[str] = set()
     for job_id, (job_inline, job_files, job_errors, cluster_name,
                  controller_uuids) in zip(job_ids, results):
         inline_data.extend(job_inline)
@@ -1027,8 +1025,8 @@ def collect_debug_dump_manifest(job_ids: List[int]) -> Dict[str, Any]:
 
 def _collect_job_debug_manifest(
     job_id: int,
-) -> Tuple[List[Dict[str, str]], List[Dict[str, str]], List[Dict[str, str]],
-           Optional[str], Set[str]]:
+) -> tuple[list[dict[str, str]], list[dict[str, str]], list[dict[str, str]],
+           str | None, set[str]]:
     """Collect debug manifest entries for a single managed job.
 
     Returns:
@@ -1037,10 +1035,10 @@ def _collect_job_debug_manifest(
         UUIDs that ran this job (empty if no <jobid>.log exists yet or the
         log doesn't contain the marker — e.g., the job never started).
     """
-    inline_data: List[Dict[str, str]] = []
-    file_paths: List[Dict[str, str]] = []
-    errors: List[Dict[str, str]] = []
-    controller_uuids: Set[str] = set()
+    inline_data: list[dict[str, str]] = []
+    file_paths: list[dict[str, str]] = []
+    errors: list[dict[str, str]] = []
+    controller_uuids: set[str] = set()
     job_prefix = f'managed_jobs/{job_id}'
 
     # 1. Controller log for this job (FILE — needs rsync). Also parse its
@@ -1061,8 +1059,7 @@ def _collect_job_debug_manifest(
                 # fresh "From controller <UUID>" line after the prior
                 # controller's entire output, which can be many MB into
                 # the file. Bounded memory regardless of file size.
-                with open(log_file, 'r', encoding='utf-8',
-                          errors='replace') as f:
+                with open(log_file, encoding='utf-8', errors='replace') as f:
                     for line in f:
                         match = _CONTROLLER_UUID_LOG_RE.search(line)
                         if match is not None:
@@ -1136,8 +1133,8 @@ def _collect_job_debug_manifest(
 
 
 def _collect_cluster_debug_manifest(cluster_name: str, job_prefix: str,
-                                    inline_data: List[Dict[str, str]],
-                                    errors: List[Dict[str, str]]) -> None:
+                                    inline_data: list[dict[str, str]],
+                                    errors: list[dict[str, str]]) -> None:
     """Collect cluster info and events for a managed job's cluster."""
     cluster_prefix = f'{job_prefix}/clusters/{cluster_name}'
 
@@ -1167,9 +1164,9 @@ def _collect_cluster_debug_manifest(cluster_name: str, job_prefix: str,
             })
 
 
-def _collect_controller_system_log_paths(file_paths: List[Dict[str, str]],
-                                         errors: List[Dict[str, str]],
-                                         relevant_uuids: Set[str]) -> None:
+def _collect_controller_system_log_paths(file_paths: list[dict[str, str]],
+                                         errors: list[dict[str, str]],
+                                         relevant_uuids: set[str]) -> None:
     """Collect controller system log file paths (controller_*.log files).
 
     Only the controllers whose UUIDs appear in ``relevant_uuids`` are
@@ -1196,12 +1193,12 @@ def _collect_controller_system_log_paths(file_paths: List[Dict[str, str]],
                 })
 
 
-def cancel_jobs_by_id(job_ids: Optional[List[int]],
+def cancel_jobs_by_id(job_ids: list[int] | None,
                       all_users: bool = False,
-                      current_workspace: Optional[str] = None,
-                      user_hash: Optional[str] = None,
+                      current_workspace: str | None = None,
+                      user_hash: str | None = None,
                       graceful: bool = False,
-                      graceful_timeout: Optional[int] = None) -> str:
+                      graceful_timeout: int | None = None) -> str:
     """Cancel jobs by id.
 
     If job_ids is None, cancel all jobs.
@@ -1215,8 +1212,8 @@ def cancel_jobs_by_id(job_ids: Optional[List[int]],
     if current_workspace is None:
         current_workspace = constants.SKYPILOT_DEFAULT_WORKSPACE
 
-    cancelled_job_ids: List[int] = []
-    wrong_workspace_job_ids: List[int] = []
+    cancelled_job_ids: list[int] = []
+    wrong_workspace_job_ids: list[int] = []
     for job_id in job_ids:
         # Check the status of the managed job status. If it is in
         # terminal state, we can safely skip it.
@@ -1301,9 +1298,9 @@ def cancel_jobs_by_id(job_ids: Optional[List[int]],
 
 
 def cancel_job_by_name(job_name: str,
-                       current_workspace: Optional[str] = None,
+                       current_workspace: str | None = None,
                        graceful: bool = False,
-                       graceful_timeout: Optional[int] = None) -> str:
+                       graceful_timeout: int | None = None) -> str:
     """Cancel a job by name."""
     job_ids = managed_job_state.get_nonterminal_job_ids_by_name(job_name)
     if not job_ids:
@@ -1320,7 +1317,7 @@ def cancel_job_by_name(job_name: str,
 
 
 def cancel_jobs_by_pool(pool_name: str,
-                        current_workspace: Optional[str] = None) -> str:
+                        current_workspace: str | None = None) -> str:
     """Cancel all jobs in a pool."""
     job_ids = managed_job_state.get_nonterminal_job_ids_by_pool(pool_name)
     if not job_ids:
@@ -1330,15 +1327,15 @@ def cancel_jobs_by_pool(pool_name: str,
 
 def cancel_managed_jobs(
     *,
-    name: Optional[str] = None,
-    job_ids: Optional[List[int]] = None,
-    pool: Optional[str] = None,
+    name: str | None = None,
+    job_ids: list[int] | None = None,
+    pool: str | None = None,
     all: bool = False,  # pylint: disable=redefined-builtin
     all_users: bool = False,
     graceful: bool = False,
-    graceful_timeout: Optional[int] = None,
-    current_workspace: Optional[str] = None,
-    user_hash: Optional[str] = None,
+    graceful_timeout: int | None = None,
+    current_workspace: str | None = None,
+    user_hash: str | None = None,
 ) -> str:
     """Dispatch to the correct cancel variant based on selector args.
 
@@ -1388,7 +1385,7 @@ def controller_log_file_for_job(job_id: int,
 
 def read_provision_status_from_log(
         log_path: str, pos: int,
-        current_msg: Optional[str]) -> Tuple[int, Optional[str]]:
+        current_msg: str | None) -> tuple[int, str | None]:
     """Reads rich-status spinner messages relayed into a controller log.
 
     The jobs controller relays the inner cluster-launch rich-status payloads
@@ -1417,7 +1414,7 @@ def read_provision_status_from_log(
         if os.path.exists(log_path) and pos > os.path.getsize(log_path):
             pos = 0
             msg = None
-        with open(log_path, 'r', encoding='utf-8') as f:
+        with open(log_path, encoding='utf-8') as f:
             f.seek(pos)
             while True:
                 line_start = f.tell()
@@ -1467,7 +1464,7 @@ def _is_relayed_status_payload_line(line: str) -> bool:
     return is_payload
 
 
-def _provision_status_headline(provision_msg: str) -> Optional[str]:
+def _provision_status_headline(provision_msg: str) -> str | None:
     """Returns the blue headline of a provisioning spinner message.
 
     Provisioning messages from the cluster launch are built by
@@ -1501,12 +1498,11 @@ def _provision_status_headline(provision_msg: str) -> Optional[str]:
     return None
 
 
-def stream_logs_by_id(
-        job_id: int,
-        follow: bool = True,
-        tail: Optional[int] = None,
-        tail_offset: Optional[int] = None,
-        task: Optional[Union[str, int]] = None) -> Tuple[str, int]:
+def stream_logs_by_id(job_id: int,
+                      follow: bool = True,
+                      tail: int | None = None,
+                      tail_offset: int | None = None,
+                      task: str | int | None = None) -> tuple[str, int]:
     """Stream logs by job id.
 
     Args:
@@ -1605,7 +1601,7 @@ def stream_logs_by_id(
                 status != managed_job_state.ManagedJobStatus.CANCELLING)
 
     def matches_task_filter(task_id: int, task_name: str,
-                            task_filter: Optional[Union[str, int]]) -> bool:
+                            task_filter: str | int | None) -> bool:
         """Check if a task matches the task filter.
 
         If task_filter is an int, it is matched against task_id.
@@ -1630,7 +1626,7 @@ def stream_logs_by_id(
 
     # Resolve task filter to a specific task_id if provided
     # This is used for running jobs to stream logs from the correct task
-    filtered_task_id: Optional[int] = None
+    filtered_task_id: int | None = None
     if task is not None:
         task_info = managed_job_state.get_all_task_ids_names_statuses_logs(
             job_id)
@@ -1651,9 +1647,9 @@ def stream_logs_by_id(
     # to drive the single status spinner.
     controller_log_path = controller_log_file_for_job(job_id)
     provision_pos = 0
-    provision_msg: Optional[str] = None
+    provision_msg: str | None = None
 
-    def _latest_provision_status_msg() -> Optional[str]:
+    def _latest_provision_status_msg() -> str | None:
         nonlocal provision_pos, provision_msg
         provision_pos, provision_msg = read_provision_status_from_log(
             controller_log_path, provision_pos, provision_msg)
@@ -1726,7 +1722,7 @@ def stream_logs_by_id(
                         # tail window (small log fully covered), filter
                         # so pre-marker boilerplate (Ray INFO lines etc.)
                         # is hidden.
-                        with open(log_path, 'r', encoding='utf-8') as peek_f:
+                        with open(log_path, encoding='utf-8') as peek_f:
                             head_lines = log_lib._peek_head_lines(peek_f)  # type: ignore[attr-defined] # pylint: disable=protected-access
                         start_streaming = (
                             log_lib._should_stream_the_whole_tail_lines(  # type: ignore[attr-defined] # pylint: disable=protected-access
@@ -1738,7 +1734,7 @@ def stream_logs_by_id(
                             if start_streaming:
                                 print(line, end='', flush=True)
                     else:
-                        with open(log_path, 'r', encoding='utf-8') as f:
+                        with open(log_path, encoding='utf-8') as f:
                             start_streaming = False
                             for line in f:
                                 if (log_lib.LOG_FILE_START_STREAMING_AT
@@ -1818,11 +1814,11 @@ def stream_logs_by_id(
             # the table before the managed job state is updated by the
             # controller. In this case, we should skip the logging, and wait for
             # the next round of status check.
-            if (handle is None or managed_job_status !=
-                    managed_job_state.ManagedJobStatus.RUNNING):
+            if (handle is None or managed_job_status
+                    != managed_job_state.ManagedJobStatus.RUNNING):
                 status_str = ''
-                if (managed_job_status is not None and managed_job_status !=
-                        managed_job_state.ManagedJobStatus.RUNNING):
+                if (managed_job_status is not None and managed_job_status
+                        != managed_job_state.ManagedJobStatus.RUNNING):
                     status_str = f' (status: {managed_job_status.value})'
                 logger.debug(
                     f'INFO: The log is not ready yet{status_str}. '
@@ -1898,7 +1894,7 @@ def stream_logs_by_id(
                 # succeeded (even though the real job can be SUCCEEDED or
                 # FAILED). We use the status in job queue to show the
                 # information, as the ManagedJobStatus is not updated yet.
-                job_status: Optional[job_lib.JobStatus] = None
+                job_status: job_lib.JobStatus | None = None
                 # handle being non-None implies cluster_name was set.
                 assert cluster_name is not None, (job_id, task_id)
                 if managed_job_runtime.is_registered():
@@ -1935,7 +1931,7 @@ def stream_logs_by_id(
                         status_display.start()
 
                         def is_managed_job_status_updated(
-                            status: Optional[managed_job_state.ManagedJobStatus]
+                            status: managed_job_state.ManagedJobStatus | None
                         ) -> bool:
                             """Check if local managed job status reflects remote
                             job failure.
@@ -1944,8 +1940,9 @@ def stream_logs_by_id(
                             failure detection (JobStatus.FAILED) and controller
                             retry logic.
                             """
-                            return (status !=
-                                    managed_job_state.ManagedJobStatus.RUNNING)
+                            return (
+                                status
+                                != managed_job_state.ManagedJobStatus.RUNNING)
 
                         while not is_managed_job_status_updated(
                                 managed_job_status :=
@@ -2044,13 +2041,13 @@ def stream_logs_by_id(
         managed_job_status)
 
 
-def stream_logs(job_id: Optional[int],
-                job_name: Optional[str],
+def stream_logs(job_id: int | None,
+                job_name: str | None,
                 controller: bool = False,
                 follow: bool = True,
-                tail: Optional[int] = None,
-                tail_offset: Optional[int] = None,
-                task: Optional[Union[str, int]] = None) -> Tuple[str, int]:
+                tail: int | None = None,
+                tail_offset: int | None = None,
+                task: str | int | None = None) -> tuple[str, int]:
     """Stream logs by job id or job name.
 
     Args:
@@ -2081,7 +2078,7 @@ def stream_logs(job_id: Optional[int],
             # We manually filter the jobs by name, instead of using
             # get_nonterminal_job_ids_by_name, as with `controller=True`, we
             # should be able to show the logs for jobs in terminal states.
-            managed_job_ids: Set[int] = {
+            managed_job_ids: set[int] = {
                 job['job_id']
                 for job in managed_jobs
                 if job['job_name'] == job_name
@@ -2144,8 +2141,7 @@ def stream_logs(job_id: Optional[int],
                 print(line, end='')
             print(end='', flush=True)
         else:
-            with open(controller_log_path, 'r', newline='',
-                      encoding='utf-8') as f:
+            with open(controller_log_path, newline='', encoding='utf-8') as f:
                 for line in f:
                     if _is_relayed_status_payload_line(line):
                         continue
@@ -2157,8 +2153,7 @@ def stream_logs(job_id: Optional[int],
         # stopped. Reopen so the prior file handle (which may have been
         # binary in the seek branch) doesn't leak.
         if follow:
-            with open(controller_log_path, 'r', newline='',
-                      encoding='utf-8') as f:
+            with open(controller_log_path, newline='', encoding='utf-8') as f:
                 f.seek(end_pos)
                 while True:
                     # Print all new lines, if there are any.
@@ -2216,7 +2211,7 @@ def stream_logs(job_id: Optional[int],
     return stream_logs_by_id(job_id, follow, tail, tail_offset, task)
 
 
-def parse_job_cancel_file(content: str) -> Tuple[bool, Optional[int]]:
+def parse_job_cancel_file(content: str) -> tuple[bool, int | None]:
     """Parse the job cancel signal file to check if graceful cancel is enabled.
 
     Args:
@@ -2274,20 +2269,20 @@ class ManagedJobCodeGen:
     def get_job_table(
         cls,
         skip_finished: bool = False,
-        accessible_workspaces: Optional[List[str]] = None,
-        job_ids: Optional[List[int]] = None,
-        workspace_match: Optional[str] = None,
-        name_match: Optional[str] = None,
-        pool_match: Optional[str] = None,
-        page: Optional[int] = None,
-        limit: Optional[int] = None,
-        user_hashes: Optional[List[Optional[str]]] = None,
-        statuses: Optional[List[str]] = None,
-        fields: Optional[List[str]] = None,
-        sort_by: Optional[str] = None,
-        sort_order: Optional[str] = None,
-        submitted_after: Optional[float] = None,
-        submitted_before: Optional[float] = None,
+        accessible_workspaces: list[str] | None = None,
+        job_ids: list[int] | None = None,
+        workspace_match: str | None = None,
+        name_match: str | None = None,
+        pool_match: str | None = None,
+        page: int | None = None,
+        limit: int | None = None,
+        user_hashes: list[str | None] | None = None,
+        statuses: list[str] | None = None,
+        fields: list[str] | None = None,
+        sort_by: str | None = None,
+        sort_order: str | None = None,
+        submitted_after: float | None = None,
+        submitted_before: float | None = None,
     ) -> str:
         code = textwrap.dedent(f"""\
         # Filter out is_primary_in_job_group for older controllers (< 15)
@@ -2379,13 +2374,13 @@ class ManagedJobCodeGen:
     def cancel_managed_jobs(
         cls,
         *,
-        name: Optional[str] = None,
-        job_ids: Optional[List[int]] = None,
-        pool: Optional[str] = None,
+        name: str | None = None,
+        job_ids: list[int] | None = None,
+        pool: str | None = None,
         all: bool = False,  # pylint: disable=redefined-builtin
         all_users: bool = False,
         graceful: bool = False,
-        graceful_timeout: Optional[int] = None,
+        graceful_timeout: int | None = None,
     ) -> str:
         """Unified cancel codegen.
 
@@ -2505,7 +2500,7 @@ class ManagedJobCodeGen:
         return cls._build(code)
 
     @classmethod
-    def get_all_job_ids_by_name(cls, job_name: Optional[str]) -> str:
+    def get_all_job_ids_by_name(cls, job_name: str | None) -> str:
         code = textwrap.dedent(f"""\
         from sky.utils import message_utils
         job_id = managed_job_state.get_all_job_ids_by_name({job_name!r})
@@ -2514,7 +2509,7 @@ class ManagedJobCodeGen:
         return cls._build(code)
 
     @classmethod
-    def get_debug_dump_manifest(cls, job_ids: List[int]) -> str:
+    def get_debug_dump_manifest(cls, job_ids: list[int]) -> str:
         code = textwrap.dedent(f"""\
         from sky.utils import message_utils
         if managed_job_version >= 17:
@@ -2531,13 +2526,13 @@ class ManagedJobCodeGen:
 
     @classmethod
     def stream_logs(cls,
-                    job_name: Optional[str],
-                    job_id: Optional[int],
+                    job_name: str | None,
+                    job_id: int | None,
                     follow: bool = True,
                     controller: bool = False,
-                    tail: Optional[int] = None,
-                    tail_offset: Optional[int] = None,
-                    task: Optional[Union[str, int]] = None) -> str:
+                    tail: int | None = None,
+                    tail_offset: int | None = None,
+                    task: str | int | None = None) -> str:
         code = textwrap.dedent(f"""\
         if managed_job_version < 6:
             # Versions before 6 did not support tail parameter
@@ -2574,7 +2569,7 @@ class ManagedJobCodeGen:
                     managed_job_dag: 'dag_lib.Dag',
                     workspace: str,
                     entrypoint: str,
-                    user_hash: Optional[str] = None) -> str:
+                    user_hash: str | None = None) -> str:
         dag_name = managed_job_dag.name
         pool = managed_job_dag.pool
         # Execution mode: 'parallel' for job groups, 'serial' for pipelines and
@@ -2607,7 +2602,7 @@ class ManagedJobCodeGen:
                 task, is_managed_job=True)
             # For job groups, determine which tasks are primary vs auxiliary.
             # For non-job-groups, is_primary_in_job_group=None for all tasks.
-            is_primary_in_job_group: Optional[bool] = None
+            is_primary_in_job_group: bool | None = None
             if managed_job_dag.is_job_group():
                 is_primary_in_job_group = (
                     managed_job_dag.primary_tasks is None or

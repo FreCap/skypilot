@@ -42,16 +42,16 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set up Python 3.10
+      - name: Set up Python 3.14
         uses: actions/setup-python@7f4fc3e22c37d6ff65e88745f38bd3157c663f7c # v4.9.1
         with:
-          python-version: '3.10'
+          python-version: '3.14'
 
       - name: Install the latest version of uv
         uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4.2.0
         with:
           version: "latest"
-          python-version: '3.10'
+          python-version: '3.14'
 
       - name: Find latest release from PyPI
         id: find_previous_release_branch

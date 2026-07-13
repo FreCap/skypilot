@@ -1,12 +1,13 @@
 """Autoscalers: perform autoscaling by monitoring metrics."""
 import bisect
+from collections.abc import Iterable
 import copy
 import dataclasses
 import enum
 import math
 import time
 import typing
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
+from typing import Any
 
 from sky import sky_logging
 from sky.jobs import state as managed_job_state
@@ -42,11 +43,11 @@ class AutoscalerDecision:
     |------------------------------------------------------------------------|
     """
     operator: AutoscalerDecisionOperator
-    target: Union[Optional[Dict[str, Any]], int]
+    target: dict[str, Any] | None | int
 
     # TODO(MaoZiming): Add a doc to elaborate on autoscaling policies.
     def __init__(self, operator: AutoscalerDecisionOperator,
-                 target: Union[Optional[Dict[str, Any]], int]):
+                 target: dict[str, Any] | None | int):
         if operator == AutoscalerDecisionOperator.SCALE_UP:
             assert (target is None or isinstance(target, dict))
         else:
@@ -59,7 +60,7 @@ class AutoscalerDecision:
 
 
 def _generate_scale_up_decisions(
-        num: int, target: Optional[Dict[str, Any]]) -> List[AutoscalerDecision]:
+        num: int, target: dict[str, Any] | None) -> list[AutoscalerDecision]:
     return [
         AutoscalerDecision(AutoscalerDecisionOperator.SCALE_UP,
                            copy.copy(target)) for _ in range(num)
@@ -67,7 +68,7 @@ def _generate_scale_up_decisions(
 
 
 def _generate_scale_down_decisions(
-        replica_ids: List[int]) -> List[AutoscalerDecision]:
+        replica_ids: list[int]) -> list[AutoscalerDecision]:
     return [
         AutoscalerDecision(AutoscalerDecisionOperator.SCALE_DOWN, replica_id)
         for replica_id in replica_ids
@@ -77,9 +78,9 @@ def _generate_scale_down_decisions(
 def _select_nonterminal_replicas_to_scale_down(
     num_replica_to_scale_down: int,
     replica_infos: Iterable['replica_managers.ReplicaInfo'],
-    service_name: Optional[str] = None,
-    cluster_job_counts: Optional[Dict[str, int]] = None,
-) -> List[int]:
+    service_name: str | None = None,
+    cluster_job_counts: dict[str, int] | None = None,
+) -> list[int]:
     """Select nonterminal replicas to scale down.
 
     We sort the replicas based on the following order:
@@ -124,7 +125,7 @@ def _select_nonterminal_replicas_to_scale_down(
                     service_name))
     if cluster_job_counts is None:
         cluster_job_counts = {}
-    replica_job_counts: Dict[int, int] = {}
+    replica_job_counts: dict[int, int] = {}
     for info in replicas:
         replica_job_counts[info.replica_id] = (cluster_job_counts.get(
             info.cluster_name, 0))
@@ -169,7 +170,7 @@ class Autoscaler:
         self.min_replicas: int = spec.min_replicas
         self.max_replicas: int = (spec.max_replicas if spec.max_replicas
                                   is not None else spec.min_replicas)
-        self.num_overprovision: Optional[int] = spec.num_overprovision
+        self.num_overprovision: int | None = spec.num_overprovision
         # Target number of replicas is initialized to min replicas
         self.target_num_replicas: int = spec.min_replicas
         # Seed from the constructed service version (not always
@@ -203,9 +204,9 @@ class Autoscaler:
         # Damped free-slot value the fill target acts on (see
         # collect_reserved_capacity for the two-poll increase damping).
         self._fill_free_slots: int = 0
-        self._fill_last_raw_free_slots: Optional[int] = None
-        self._fill_zero_cost_locations: List[spot_placer.Location] = []
-        self._fill_snapshot_time: Optional[float] = None
+        self._fill_last_raw_free_slots: int | None = None
+        self._fill_zero_cost_locations: list[spot_placer.Location] = []
+        self._fill_snapshot_time: float | None = None
         # Last computed fill target, surfaced via info() only.
         self._fill_target: int = 0
         # Broker grant ceiling + the epoch it was issued under + the pool
@@ -217,9 +218,9 @@ class Autoscaler:
         # and the poller re-feeds them within one interval -- a swapped-in
         # autoscaler briefly without a ceiling is safe (ceilings only gate
         # NEW launches).
-        self._fill_grant: Optional[int] = None
-        self._fill_grant_epoch: Optional[int] = None
-        self._fill_grant_pool_key: Optional[str] = None
+        self._fill_grant: int | None = None
+        self._fill_grant_epoch: int | None = None
+        self._fill_grant_pool_key: str | None = None
 
     def get_final_target_num_replicas(self) -> int:
         """Get the final target number of replicas."""
@@ -260,17 +261,17 @@ class Autoscaler:
             getattr(spec, 'reserved_fill_weight', 1.0) or 1.0)
 
     def collect_request_information(
-            self, request_aggregator_info: Dict[str, Any]) -> None:
+            self, request_aggregator_info: dict[str, Any]) -> None:
         """Collect request information from aggregator for autoscaling."""
         raise NotImplementedError
 
     def collect_reserved_capacity(self,
                                   free_slots: int,
-                                  zero_cost_location_keys: List[Dict[str, Any]],
+                                  zero_cost_location_keys: list[dict[str, Any]],
                                   timestamp: float,
-                                  grant: Optional[int] = None,
-                                  grant_epoch: Optional[int] = None,
-                                  grant_pool_key: Optional[str] = None) -> None:
+                                  grant: int | None = None,
+                                  grant_epoch: int | None = None,
+                                  grant_pool_key: str | None = None) -> None:
         """Ingest a free-capacity snapshot from the reserved-capacity poller.
 
         `zero_cost_location_keys` are Location.to_pickleable() dicts of
@@ -310,8 +311,8 @@ class Autoscaler:
         self._fill_grant_pool_key = grant_pool_key
 
     def count_zero_cost_holdings(
-            self, replica_infos: List['replica_managers.ReplicaInfo']
-    ) -> Tuple[int, int]:
+            self, replica_infos: list['replica_managers.ReplicaInfo']
+    ) -> tuple[int, int]:
         """(fill, demand) split of nonterminal zero-cost replicas.
 
         The broker claim heartbeat reports this split: fill holdings are
@@ -335,7 +336,7 @@ class Autoscaler:
         return fill, demand
 
     def seed_zero_cost_locations(
-            self, zero_cost_location_keys: List[Dict[str, Any]]) -> None:
+            self, zero_cost_location_keys: list[dict[str, Any]]) -> None:
         """Seed the zero-cost location set WITHOUT granting free slots.
 
         Called synchronously by the controller (at boot, and on the
@@ -433,9 +434,9 @@ class Autoscaler:
 
     def _apply_reserved_capacity_fill(
         self,
-        replica_infos: List['replica_managers.ReplicaInfo'],
-        decisions: List[AutoscalerDecision],
-    ) -> List[AutoscalerDecision]:
+        replica_infos: list['replica_managers.ReplicaInfo'],
+        decisions: list[AutoscalerDecision],
+    ) -> list[AutoscalerDecision]:
         """Overlay zero-cost capacity fill onto the demand decisions.
 
         fill_target = (nonterminal replicas already on a zero-cost
@@ -557,8 +558,8 @@ class Autoscaler:
         # already excludes them from the fill capacity it arbitrates.
         # Version scope per side per the CEILING note above: launch-side
         # counts latest-version demand-placed rows only.
-        fill_ceiling: Optional[int] = None
-        fill_ceiling_launch: Optional[int] = None
+        fill_ceiling: int | None = None
+        fill_ceiling_launch: int | None = None
         if self._fill_grant is not None:
             fill_ceiling = self._fill_grant + zero_cost_demand_placed
             fill_ceiling_launch = (self._fill_grant +
@@ -594,7 +595,7 @@ class Autoscaler:
                         self._replica_on_zero_cost_location(victim)):
                     zero_cost_decision_ids.append(idx)
         suppressed_ids = set(zero_cost_decision_ids[-surplus_covered:])
-        result: List[AutoscalerDecision] = [
+        result: list[AutoscalerDecision] = [
             decision for idx, decision in enumerate(decisions)
             if idx not in suppressed_ids
         ]
@@ -620,7 +621,7 @@ class Autoscaler:
                         f'{spendable_free_slots}), demand target '
                         f'{demand_target}; scaling up {num_fill_up} '
                         'zero-cost-only replica(s).')
-            fill_override: Dict[str, Any] = {
+            fill_override: dict[str, Any] = {
                 constants.RESERVED_CAPACITY_FILL_OVERRIDE_KEY: True
             }
             if self._fill_grant_epoch is not None:
@@ -676,9 +677,9 @@ class Autoscaler:
         """
         return True
 
-    def info(self) -> Dict[str, Any]:
+    def info(self) -> dict[str, Any]:
         """Get information about the autoscaler."""
-        info: Dict[str, Any] = {
+        info: dict[str, Any] = {
             'target_num_replicas': self.target_num_replicas,
             'min_replicas': self.min_replicas,
             'max_replicas': self.max_replicas,
@@ -697,16 +698,16 @@ class Autoscaler:
 
     def _generate_scaling_decisions(
         self,
-        replica_infos: List['replica_managers.ReplicaInfo'],
-    ) -> List[AutoscalerDecision]:
+        replica_infos: list['replica_managers.ReplicaInfo'],
+    ) -> list[AutoscalerDecision]:
         """Generate Autoscaling decisions based on replica information."""
         raise NotImplementedError
 
-    def _dump_dynamic_states(self) -> Dict[str, Any]:
+    def _dump_dynamic_states(self) -> dict[str, Any]:
         """Dump dynamic states from autoscaler."""
         raise NotImplementedError
 
-    def _load_dynamic_states(self, dynamic_states: Dict[str, Any]) -> None:
+    def _load_dynamic_states(self, dynamic_states: dict[str, Any]) -> None:
         """Load dynamic states to autoscaler."""
         raise NotImplementedError
 
@@ -759,14 +760,14 @@ class Autoscaler:
 
     def _select_outdated_replicas_to_scale_down(
         self,
-        replica_infos: List['replica_managers.ReplicaInfo'],
-        active_versions: List[int],
-    ) -> List[int]:
+        replica_infos: list['replica_managers.ReplicaInfo'],
+        active_versions: list[int],
+    ) -> list[int]:
         """Select outdated replicas to scale down."""
 
         if self.update_mode == serve_utils.UpdateMode.ROLLING:
-            latest_ready_replicas: List['replica_managers.ReplicaInfo'] = []
-            old_nonterminal_replicas: List['replica_managers.ReplicaInfo'] = []
+            latest_ready_replicas: list[replica_managers.ReplicaInfo] = []
+            old_nonterminal_replicas: list[replica_managers.ReplicaInfo] = []
             for info in replica_infos:
                 if info.version == self.latest_version:
                     if info.is_ready:
@@ -781,8 +782,8 @@ class Autoscaler:
             # old and latest versions are allowed in rolling update, this will
             # not affect the time it takes for the service to updated to the
             # latest version.
-            if (num_latest_ready_replicas >=
-                    self.get_final_target_num_replicas()):
+            if (num_latest_ready_replicas
+                    >= self.get_final_target_num_replicas()):
                 # Once the number of ready new replicas is greater than or equal
                 # to the target, we can scale down all old replicas.
                 return [info.replica_id for info in old_nonterminal_replicas]
@@ -823,9 +824,9 @@ class Autoscaler:
 
     def generate_scaling_decisions(
         self,
-        replica_infos: List['replica_managers.ReplicaInfo'],
-        active_versions: List[int],
-    ) -> List[AutoscalerDecision]:
+        replica_infos: list['replica_managers.ReplicaInfo'],
+        active_versions: list[int],
+    ) -> list[AutoscalerDecision]:
         """Generate Autoscaling decisions based on replica information.
         If the number of launched replicas is less than the target, trigger a
         scale up. Else, trigger a scale down. This function also handles the
@@ -838,7 +839,7 @@ class Autoscaler:
         """
 
         # Handle latest version unrecoverable failure first.
-        latest_replicas: List['replica_managers.ReplicaInfo'] = []
+        latest_replicas: list[replica_managers.ReplicaInfo] = []
         for info in replica_infos:
             if info.version == self.latest_version:
                 latest_replicas.append(info)
@@ -882,9 +883,9 @@ class Autoscaler:
 
         return scaling_decisions
 
-    def dump_dynamic_states(self) -> Dict[str, Any]:
+    def dump_dynamic_states(self) -> dict[str, Any]:
         """Dump dynamic states from autoscaler."""
-        states: Dict[str, Any] = {
+        states: dict[str, Any] = {
             'latest_version_ever_ready': self.latest_version_ever_ready
         }
         # Reserved-capacity fill snapshot: carried across the in-process
@@ -905,7 +906,7 @@ class Autoscaler:
         states.update(self._dump_dynamic_states())
         return states
 
-    def load_dynamic_states(self, dynamic_states: Dict[str, Any]) -> None:
+    def load_dynamic_states(self, dynamic_states: dict[str, Any]) -> None:
         """Load dynamic states to autoscaler."""
         self.latest_version_ever_ready = dynamic_states.pop(
             'latest_version_ever_ready', constants.INITIAL_VERSION)
@@ -1040,10 +1041,10 @@ class RequestRateAutoscaler(_AutoscalerWithHysteresis):
             request_timestamps: All request timestamps within the window.
         """
         super().__init__(service_name, spec, version)
-        self.target_qps_per_replica: Optional[Union[float, Dict[
-            str, float]]] = spec.target_qps_per_replica
+        self.target_qps_per_replica: float | dict[
+            str, float] | None = spec.target_qps_per_replica
         self.qps_window_size: int = constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS
-        self.request_timestamps: List[float] = []
+        self.request_timestamps: list[float] = []
 
     def _calculate_target_num_replicas(self) -> int:
         if self.target_qps_per_replica is None:
@@ -1075,7 +1076,7 @@ class RequestRateAutoscaler(_AutoscalerWithHysteresis):
         self.target_qps_per_replica = spec.target_qps_per_replica
 
     def collect_request_information(
-            self, request_aggregator_info: Dict[str, Any]) -> None:
+            self, request_aggregator_info: dict[str, Any]) -> None:
         """Collect request information from aggregator for autoscaling.
 
         request_aggregator_info should be a dict with the following format:
@@ -1095,21 +1096,21 @@ class RequestRateAutoscaler(_AutoscalerWithHysteresis):
 
     def _generate_scaling_decisions(
         self,
-        replica_infos: List['replica_managers.ReplicaInfo'],
-    ) -> List[AutoscalerDecision]:
+        replica_infos: list['replica_managers.ReplicaInfo'],
+    ) -> list[AutoscalerDecision]:
         """Generate Autoscaling decisions based on request rate."""
 
         # Use standard hysteresis-based logic (non-instance-aware)
         self._set_target_num_replicas_with_hysteresis()
 
-        latest_nonterminal_replicas: List['replica_managers.ReplicaInfo'] = []
+        latest_nonterminal_replicas: list[replica_managers.ReplicaInfo] = []
 
         for info in replica_infos:
             if info.version == self.latest_version:
                 if not info.is_terminal:
                     latest_nonterminal_replicas.append(info)
 
-        scaling_decisions: List[AutoscalerDecision] = []
+        scaling_decisions: list[AutoscalerDecision] = []
 
         # Case 1. when latest_nonterminal_replicas is less
         # than num_to_provision, we always scale up new replicas.
@@ -1141,12 +1142,12 @@ class RequestRateAutoscaler(_AutoscalerWithHysteresis):
 
         return scaling_decisions
 
-    def _dump_dynamic_states(self) -> Dict[str, Any]:
+    def _dump_dynamic_states(self) -> dict[str, Any]:
         return {
             'request_timestamps': self.request_timestamps,
         }
 
-    def _load_dynamic_states(self, dynamic_states: Dict[str, Any]) -> None:
+    def _load_dynamic_states(self, dynamic_states: dict[str, Any]) -> None:
         if 'request_timestamps' in dynamic_states:
             self.request_timestamps = dynamic_states.pop('request_timestamps')
         if dynamic_states:
@@ -1170,13 +1171,13 @@ class _GpuShapeResolverMixin:
     # accelerators can change, so a mid-launch resolution must be
     # re-resolved on later ticks. After launch the shape is fixed for the
     # replica's lifetime.
-    _gpu_shape_cache: Dict[int, Tuple[str, int]]
+    _gpu_shape_cache: dict[int, tuple[str, int]]
     # replica_id -> hourly cost of launched resources (same lifecycle
     # rules as the shape cache). Backs cost-aware victim ordering in both
     # shape-aware autoscalers.
-    _replica_cost_cache: Dict[int, float]
+    _replica_cost_cache: dict[int, float]
 
-    def _prune_gpu_shape_cache(self, live_replica_ids: Set[int]) -> None:
+    def _prune_gpu_shape_cache(self, live_replica_ids: set[int]) -> None:
         """Drop cached shapes/costs for replicas that no longer exist."""
         for replica_id in list(self._gpu_shape_cache):
             if replica_id not in live_replica_ids:
@@ -1215,7 +1216,7 @@ class _GpuShapeResolverMixin:
 
     def _get_gpu_shape_from_replica_info(
             self,
-            replica_info: 'replica_managers.ReplicaInfo') -> Tuple[str, int]:
+            replica_info: 'replica_managers.ReplicaInfo') -> tuple[str, int]:
         """Extract (GPU type, GPU count) from ReplicaInfo object."""
         cached = self._gpu_shape_cache.get(replica_info.replica_id)
         if cached is not None:
@@ -1274,12 +1275,12 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         # change, so a mid-launch resolution must be re-resolved on later
         # ticks. After launch the shape is fixed for the replica's lifetime.
         # Pruned to the live replica set each tick.
-        self._gpu_shape_cache: Dict[int, Tuple[str, int]] = {}
+        self._gpu_shape_cache: dict[int, tuple[str, int]] = {}
         # replica_id -> hourly cost of launched resources (same lifecycle
         # rules as the shape cache).
-        self._replica_cost_cache: Dict[int, float] = {}
+        self._replica_cost_cache: dict[int, float] = {}
         # Shapes already warned about bare-key per-GPU scaling.
-        self._bare_key_warned: Set[Tuple[str, int]] = set()
+        self._bare_key_warned: set[tuple[str, int]] = set()
         # One-shot hysteresis bypass, armed by update_version AND at
         # construction: the base class snaps target_num_replicas directly
         # after an update so the service scales quickly; the instance-
@@ -1301,15 +1302,15 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         # collapses the computed target and lets the rolling drain kill
         # them before the new capacity exists. Pruned each tick to the
         # live replica versions (+ latest).
-        self._qps_dict_by_version: Dict[int, Dict[str, float]] = {
+        self._qps_dict_by_version: dict[int, dict[str, float]] = {
             version: spec.target_qps_per_replica
         }
 
     def generate_scaling_decisions(
         self,
-        replica_infos: List['replica_managers.ReplicaInfo'],
-        active_versions: List[int],
-    ) -> List[AutoscalerDecision]:
+        replica_infos: list['replica_managers.ReplicaInfo'],
+        active_versions: list[int],
+    ) -> list[AutoscalerDecision]:
         # Recompute the shape-aware target BEFORE the base class runs the
         # outdated-replica drain: the drain compares ready new-version
         # replicas against target_num_replicas, and a stale target (e.g.
@@ -1333,14 +1334,14 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
 
     def _generate_scaling_decisions(
         self,
-        replica_infos: List['replica_managers.ReplicaInfo'],
-    ) -> List[AutoscalerDecision]:
+        replica_infos: list['replica_managers.ReplicaInfo'],
+    ) -> list[AutoscalerDecision]:
         """Generate autoscaling decisions with instance-aware logic.
 
         The shape-aware target was already recomputed for this tick in
         generate_scaling_decisions (before the outdated-replica drain).
         """
-        latest_nonterminal_replicas: List['replica_managers.ReplicaInfo'] = []
+        latest_nonterminal_replicas: list[replica_managers.ReplicaInfo] = []
 
         for info in replica_infos:
             if not info.is_terminal and info.version == self.latest_version:
@@ -1349,7 +1350,7 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         target_num_replicas = self.get_final_target_num_replicas()
         current_num_replicas = len(latest_nonterminal_replicas)
 
-        scaling_decisions: List[AutoscalerDecision] = []
+        scaling_decisions: list[AutoscalerDecision] = []
 
         # Decide if to scale up or down.
         if target_num_replicas > current_num_replicas:
@@ -1390,7 +1391,7 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         return scaling_decisions
 
     def _set_target_num_replicas_with_instance_aware_logic(
-            self, replica_infos: List['replica_managers.ReplicaInfo']) -> None:
+            self, replica_infos: list['replica_managers.ReplicaInfo']) -> None:
         """Set target_num_replicas using instance-aware logic."""
         assert isinstance(self.target_qps_per_replica,
                           dict), 'Expected dict for instance-aware logic'
@@ -1491,9 +1492,9 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
 
     def _select_outdated_replicas_to_scale_down(
         self,
-        replica_infos: List['replica_managers.ReplicaInfo'],
-        active_versions: List[int],
-    ) -> List[int]:
+        replica_infos: list['replica_managers.ReplicaInfo'],
+        active_versions: list[int],
+    ) -> list[int]:
         """Capacity-aware rolling drain of old-version replicas.
 
         The base class keeps (target - ready_new) OLD replicas — a count
@@ -1552,7 +1553,7 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         # across ticks.
         ready_old.sort(key=lambda pair: (-pair[0], pair[1].replica_id))
 
-        keep_ids: Set[int] = set()
+        keep_ids: set[int] = set()
         covered_qps = 0.0
         for capacity, info in ready_old:
             if covered_qps >= shortfall and len(keep_ids) >= keep_count_floor:
@@ -1574,7 +1575,7 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
             if info.replica_id not in keep_ids
         ]
 
-    def _get_qps_dict_for_version(self, version: int) -> Dict[str, float]:
+    def _get_qps_dict_for_version(self, version: int) -> dict[str, float]:
         """The qps dict a given service version was launched under.
 
         Unknown versions (the autoscaler was rebuilt after the update
@@ -1605,7 +1606,7 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
     def _get_target_qps_for_gpu_shape(self,
                                       gpu_type: str,
                                       gpu_count: int,
-                                      version: Optional[int] = None) -> float:
+                                      version: int | None = None) -> float:
         """Per-replica target QPS for a `gpu_count` x `gpu_type` replica.
 
         Resolution (see serve_utils.resolve_target_qps_for_gpu_shape):
@@ -1652,11 +1653,10 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
 
     def _select_replicas_to_scale_down_by_qps(
             self, num_replicas_to_scale_down: int,
-            replica_infos: List['replica_managers.ReplicaInfo']) -> List[int]:
+            replica_infos: list['replica_managers.ReplicaInfo']) -> list[int]:
         """Select replicas to scale down (lowest QPS first)."""
         # Create a list of (replica_info, target_qps) tuples
-        replica_qps_pairs: List[Tuple['replica_managers.ReplicaInfo',
-                                      float]] = []
+        replica_qps_pairs: list[tuple[replica_managers.ReplicaInfo, float]] = []
 
         for info in replica_infos:
             # Include old-version replicas as well so they also get a target_qps
@@ -1821,7 +1821,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         # available while the demand report is stale), windowed exactly
         # like RequestRateAutoscaler's QPS window.
         self.qps_window_size: int = constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS
-        self.request_timestamps: List[float] = []
+        self.request_timestamps: list[float] = []
         # Latest demand report from the LB. `None` in-flight means no
         # usable report has ever been received (or the loaded one carried
         # none): the signal-gap rule keys on this plus the report's age.
@@ -1829,19 +1829,19 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         # stored, so a report ages out automatically (also after a
         # _load_dynamic_states round-trip, since the received-at time is
         # absolute).
-        self._in_flight_by_replica_id: Optional[Dict[int, int]] = None
+        self._in_flight_by_replica_id: dict[int, int] | None = None
         self._queue_depth: int = 0
         self._rejected_in_window: int = 0
         # Replica ids whose declared async occupancy could not be sampled.
         # They contribute their full per-version capacity to outstanding work:
         # unknown is a potentially-full replica, never an idle zero.
-        self._unknown_in_flight_replica_ids: Set[int] = set()
-        self._report_received_at: Optional[float] = None
-        self._gpu_shape_cache: Dict[int, Tuple[str, int]] = {}
+        self._unknown_in_flight_replica_ids: set[int] = set()
+        self._report_received_at: float | None = None
+        self._gpu_shape_cache: dict[int, tuple[str, int]] = {}
         # Backs the cost-descending victim tiebreak (shed paid spot
         # before zero-cost reserved capacity); pruned with the shape
         # cache each tick.
-        self._replica_cost_cache: Dict[int, float] = {}
+        self._replica_cost_cache: dict[int, float] = {}
         # version -> that version's per-GPU knob. A live replica's
         # capacity is a property of the spec it was launched under: after
         # an update that raises the knob (1 -> 2), sizing old-version
@@ -1850,7 +1850,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         # actually replace (same hazard the instance-aware autoscaler
         # guards with _qps_dict_by_version). Pruned each tick to the live
         # replica versions (+ latest).
-        self._knob_by_version: Dict[int, float] = {
+        self._knob_by_version: dict[int, float] = {
             version: float(target_concurrency)
         }
         # One-shot hysteresis bypass, armed by update_version AND at
@@ -1866,7 +1866,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         self._snap_target_on_next_recompute: bool = True
         # Per-tick freshness snapshot (see _fresh_for_tick). None outside
         # a tick.
-        self._tick_fresh: Optional[bool] = None
+        self._tick_fresh: bool | None = None
         # True only while an increase in the demand-derived target is waiting
         # for upscale hysteresis.  The live fleet must not be shrunk toward
         # the old target during that wait: doing so makes the autoscaler issue
@@ -1887,8 +1887,9 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         if (self._in_flight_by_replica_id is None or
                 self._report_received_at is None):
             return False
-        return (time.time() - self._report_received_at
-               ) <= self._staleness_threshold_seconds()
+        return (
+            time.time() -
+            self._report_received_at) <= self._staleness_threshold_seconds()
 
     def has_recomputed_with_fresh_data(self) -> bool:
         """Whether the target reflects at least one fresh-data recompute.
@@ -1945,7 +1946,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         return in_flight.get(info.replica_id, 0) > 0
 
     def collect_request_information(
-            self, request_aggregator_info: Dict[str, Any]) -> None:
+            self, request_aggregator_info: dict[str, Any]) -> None:
         """Collect timestamps and the latest LB demand report.
 
         Expected dict (extra keys ignored; all demand keys optional so an
@@ -2038,7 +2039,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
 
     def _latest_capacities(
             self,
-            replica_infos: List['replica_managers.ReplicaInfo']) -> List[float]:
+            replica_infos: list['replica_managers.ReplicaInfo']) -> list[float]:
         """Capacities of live latest-version replicas, largest first."""
         capacities = []
         for info in replica_infos:
@@ -2052,7 +2053,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
 
     def _outstanding_work(
         self,
-        replica_infos: Optional[List['replica_managers.ReplicaInfo']] = None,
+        replica_infos: list['replica_managers.ReplicaInfo'] | None = None,
     ) -> float:
         """Outstanding jobs per the latest report (gauges, one snapshot).
 
@@ -2085,7 +2086,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             self._rejected_in_window + unknown_floor)
 
     def _set_target_num_replicas_with_concurrency_logic(
-            self, replica_infos: List['replica_managers.ReplicaInfo']) -> None:
+            self, replica_infos: list['replica_managers.ReplicaInfo']) -> None:
         """Recompute target_num_replicas for this tick.
 
         Mirrors _set_target_num_replicas_with_instance_aware_logic's
@@ -2194,9 +2195,9 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
 
     def generate_scaling_decisions(
         self,
-        replica_infos: List['replica_managers.ReplicaInfo'],
-        active_versions: List[int],
-    ) -> List[AutoscalerDecision]:
+        replica_infos: list['replica_managers.ReplicaInfo'],
+        active_versions: list[int],
+    ) -> list[AutoscalerDecision]:
         # Recompute the target BEFORE the base class runs the
         # outdated-replica drain, for the same reason as the
         # instance-aware autoscaler: the drain compares ready new-version
@@ -2253,9 +2254,9 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
 
     def _select_outdated_replicas_to_scale_down(
         self,
-        replica_infos: List['replica_managers.ReplicaInfo'],
-        active_versions: List[int],
-    ) -> List[int]:
+        replica_infos: list['replica_managers.ReplicaInfo'],
+        active_versions: list[int],
+    ) -> list[int]:
         """Capacity-aware rolling drain in concurrency units.
 
         Mirrors the instance-aware implementation with demand =
@@ -2335,7 +2336,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         ready_old.sort(key=lambda pair: (not self._replica_is_busy(pair[1]),
                                          -pair[0], pair[1].replica_id))
 
-        keep_ids: Set[int] = set()
+        keep_ids: set[int] = set()
         covered = 0.0
         for capacity, info in ready_old:
             if covered >= shortfall and len(keep_ids) >= keep_count_floor:
@@ -2367,19 +2368,19 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
 
     def _generate_scaling_decisions(
         self,
-        replica_infos: List['replica_managers.ReplicaInfo'],
-    ) -> List[AutoscalerDecision]:
+        replica_infos: list['replica_managers.ReplicaInfo'],
+    ) -> list[AutoscalerDecision]:
         """Generate scale-up/down decisions with drain-aware victims.
 
         The target was already recomputed for this tick in
         generate_scaling_decisions (before the outdated-replica drain).
         """
-        latest_nonterminal_replicas: List['replica_managers.ReplicaInfo'] = []
+        latest_nonterminal_replicas: list[replica_managers.ReplicaInfo] = []
         for info in replica_infos:
             if not info.is_terminal and info.version == self.latest_version:
                 latest_nonterminal_replicas.append(info)
 
-        scaling_decisions: List[AutoscalerDecision] = []
+        scaling_decisions: list[AutoscalerDecision] = []
         target_num_replicas = self.get_final_target_num_replicas()
         current_num_replicas = len(latest_nonterminal_replicas)
 
@@ -2434,8 +2435,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
 
     def _select_victims_capacity_and_cost_aware(
             self, num_to_scale_down: int,
-            eligible_victims: List['replica_managers.ReplicaInfo']
-    ) -> List[int]:
+            eligible_victims: list['replica_managers.ReplicaInfo']
+    ) -> list[int]:
         """Order victims: status, capacity (asc), then COST (desc).
 
         Mirrors the instance-aware autoscaler's rationale: among equal
@@ -2471,7 +2472,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                          ))
         return [info.replica_id for info in ordered[:num_to_scale_down]]
 
-    def info(self) -> Dict[str, Any]:
+    def info(self) -> dict[str, Any]:
         info = super().info()
         in_flight_total = (sum(self._in_flight_by_replica_id.values()) if
                            self._in_flight_by_replica_id is not None else None)
@@ -2487,7 +2488,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         })
         return info
 
-    def _dump_dynamic_states(self) -> Dict[str, Any]:
+    def _dump_dynamic_states(self) -> dict[str, Any]:
         # Only consumed by the in-process autoscaler swap during
         # update_service (NOT on controller restart). The received-at
         # time is absolute, so a report that crosses the swap simply
@@ -2502,7 +2503,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             'report_received_at': self._report_received_at,
         }
 
-    def _load_dynamic_states(self, dynamic_states: Dict[str, Any]) -> None:
+    def _load_dynamic_states(self, dynamic_states: dict[str, Any]) -> None:
         # Tolerate dumps from other autoscaler types (an update can
         # change the autoscaler class; e.g. RequestRateAutoscaler only
         # dumps request_timestamps): missing keys keep the stale-start
@@ -2585,8 +2586,8 @@ class FallbackRequestRateAutoscaler(RequestRateAutoscaler):
 
     def _generate_scaling_decisions(
         self,
-        replica_infos: List['replica_managers.ReplicaInfo'],
-    ) -> List[AutoscalerDecision]:
+        replica_infos: list['replica_managers.ReplicaInfo'],
+    ) -> list[AutoscalerDecision]:
         """Generate Autoscaling decisions based on request rate, with on-demand
         fallback.
 
@@ -2620,8 +2621,8 @@ class FallbackRequestRateAutoscaler(RequestRateAutoscaler):
             f'Number of alive on-demand instances: {num_nonterminal_ondemand}, '
             f'Number of ready on-demand instances: {num_ready_ondemand}')
 
-        scaling_decisions: List[AutoscalerDecision] = []
-        all_replica_ids_to_scale_down: List[int] = []
+        scaling_decisions: list[AutoscalerDecision] = []
+        all_replica_ids_to_scale_down: list[int] = []
 
         # Decide how many spot instances to launch.
         num_spot_to_provision = (self.get_final_target_num_replicas() -
@@ -2794,7 +2795,7 @@ class QueueLengthAutoscaler(_AutoscalerWithHysteresis):
             self.queue_length_threshold = spec.queue_length_threshold
 
     def collect_request_information(
-            self, request_aggregator_info: Dict[str, Any]) -> None:
+            self, request_aggregator_info: dict[str, Any]) -> None:
         """Collect request information from aggregator for autoscaling.
 
         Not needed for queue-based autoscaling, we query the job queue directly.
@@ -2803,9 +2804,9 @@ class QueueLengthAutoscaler(_AutoscalerWithHysteresis):
 
     def _get_idle_replicas(
         self,
-        replica_infos: List['replica_managers.ReplicaInfo'],
-        cluster_job_counts: Optional[Dict[str, int]] = None,
-    ) -> List['replica_managers.ReplicaInfo']:
+        replica_infos: list['replica_managers.ReplicaInfo'],
+        cluster_job_counts: dict[str, int] | None = None,
+    ) -> list['replica_managers.ReplicaInfo']:
         """Get replicas that have no active jobs (idle replicas).
 
         Args:
@@ -2836,8 +2837,8 @@ class QueueLengthAutoscaler(_AutoscalerWithHysteresis):
 
     def _generate_scaling_decisions(
         self,
-        replica_infos: List['replica_managers.ReplicaInfo'],
-    ) -> List[AutoscalerDecision]:
+        replica_infos: list['replica_managers.ReplicaInfo'],
+    ) -> list[AutoscalerDecision]:
         """Generate Autoscaling decisions based on queue length.
 
         Overrides parent to ensure we only scale down replicas that are idle
@@ -2846,14 +2847,14 @@ class QueueLengthAutoscaler(_AutoscalerWithHysteresis):
         # Use standard hysteresis-based logic
         self._set_target_num_replicas_with_hysteresis()
 
-        latest_nonterminal_replicas: List['replica_managers.ReplicaInfo'] = []
+        latest_nonterminal_replicas: list[replica_managers.ReplicaInfo] = []
 
         for info in replica_infos:
             if info.version == self.latest_version:
                 if not info.is_terminal:
                     latest_nonterminal_replicas.append(info)
 
-        scaling_decisions: List[AutoscalerDecision] = []
+        scaling_decisions: list[AutoscalerDecision] = []
 
         # Case 1. when latest_nonterminal_replicas is less
         # than num_to_provision, we always scale up new replicas.
@@ -2914,14 +2915,14 @@ class QueueLengthAutoscaler(_AutoscalerWithHysteresis):
 
         return scaling_decisions
 
-    def _dump_dynamic_states(self) -> Dict[str, Any]:
+    def _dump_dynamic_states(self) -> dict[str, Any]:
         """Dump dynamic states from autoscaler.
 
         Hysteresis state is handled by base class, no additional state needed.
         """
         return {}
 
-    def _load_dynamic_states(self, dynamic_states: Dict[str, Any]) -> None:
+    def _load_dynamic_states(self, dynamic_states: dict[str, Any]) -> None:
         """Load dynamic states to autoscaler.
 
         Hysteresis state is handled by base class, no additional state needed.

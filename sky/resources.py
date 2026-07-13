@@ -5,7 +5,7 @@ import re
 import sys
 import textwrap
 import typing
-from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
+from typing import Any, Literal, Optional, Union
 
 import colorama
 
@@ -71,12 +71,12 @@ class AutostopConfig:
     # flags.
     idle_minutes: int = 0
     down: bool = False
-    wait_for: Optional[autostop_lib.AutostopWaitFor] = None
+    wait_for: autostop_lib.AutostopWaitFor | None = None
 
-    def to_yaml_config(self) -> Union[Literal[False], Dict[str, Any]]:
+    def to_yaml_config(self) -> Literal[False] | dict[str, Any]:
         if not self.enabled:
             return False
-        config: Dict[str, Any] = {
+        config: dict[str, Any] = {
             'idle_minutes': self.idle_minutes,
             'down': self.down,
         }
@@ -86,7 +86,7 @@ class AutostopConfig:
 
     @classmethod
     def from_yaml_config(
-        cls, config: Union[bool, int, str, Dict[str, Any], None]
+        cls, config: bool | int | str | dict[str, Any] | None
     ) -> Optional['AutostopConfig']:
         if isinstance(config, bool):
             if config:
@@ -125,9 +125,9 @@ class AutostopConfig:
 _HOOK_EVENTS = ('stop', 'preemption', 'down')
 
 
-def _normalize_hook_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+def _normalize_hook_entry(entry: dict[str, Any]) -> dict[str, Any]:
     """Apply load-time defaults to a single hook entry."""
-    result: Dict[str, Any] = {'run': entry['run']}
+    result: dict[str, Any] = {'run': entry['run']}
     events = entry.get('events')
     if not events:
         events = list(_HOOK_EVENTS)
@@ -160,40 +160,39 @@ class Resources:
 
     def __init__(
         self,
-        cloud: Optional[clouds.Cloud] = None,
-        instance_type: Optional[str] = None,
-        cpus: Union[None, int, float, str] = None,
-        memory: Union[None, int, float, str] = None,
-        accelerators: Union[None, str, Dict[str, Union[int, float]]] = None,
-        accelerator_args: Optional[Dict[str, str]] = None,
-        infra: Optional[str] = None,
-        use_spot: Optional[bool] = None,
-        job_recovery: Optional[Union[Dict[str, Optional[Union[str, int]]],
-                                     str]] = None,
-        region: Optional[str] = None,
-        zone: Optional[str] = None,
-        image_id: Union[Dict[Optional[str], str], str, None] = None,
-        disk_size: Optional[Union[str, int]] = None,
-        ephemeral_storage: Optional[Union[str, int]] = None,
-        disk_tier: Optional[Union[str, resources_utils.DiskTier]] = None,
-        network_tier: Optional[Union[str, resources_utils.NetworkTier]] = None,
-        local_disk: Optional[str] = None,
-        max_hourly_cost: Optional[float] = None,
-        ports: Optional[Union[int, str, List[str], Tuple[str]]] = None,
-        labels: Optional[Dict[str, str]] = None,
-        autostop: Union[bool, int, str, Dict[str, Any], None] = None,
-        hooks: Optional[List[Dict[str, Any]]] = None,
-        priority: Optional[int] = None,
-        priority_class: Optional[str] = None,
-        volumes: Optional[List[Dict[str, Any]]] = None,
+        cloud: clouds.Cloud | None = None,
+        instance_type: str | None = None,
+        cpus: None | int | float | str = None,
+        memory: None | int | float | str = None,
+        accelerators: None | str | dict[str, int | float] = None,
+        accelerator_args: dict[str, str] | None = None,
+        infra: str | None = None,
+        use_spot: bool | None = None,
+        job_recovery: dict[str, str | int | None] | str | None = None,
+        region: str | None = None,
+        zone: str | None = None,
+        image_id: dict[str | None, str] | str | None = None,
+        disk_size: str | int | None = None,
+        ephemeral_storage: str | int | None = None,
+        disk_tier: str | resources_utils.DiskTier | None = None,
+        network_tier: str | resources_utils.NetworkTier | None = None,
+        local_disk: str | None = None,
+        max_hourly_cost: float | None = None,
+        ports: int | str | list[str] | tuple[str] | None = None,
+        labels: dict[str, str] | None = None,
+        autostop: bool | int | str | dict[str, Any] | None = None,
+        hooks: list[dict[str, Any]] | None = None,
+        priority: int | None = None,
+        priority_class: str | None = None,
+        volumes: list[dict[str, Any]] | None = None,
         # Internal use only.
         # pylint: disable=invalid-name
-        _docker_login_config: Optional[docker_utils.DockerLoginConfig] = None,
-        _docker_username_for_runpod: Optional[str] = None,
-        _is_image_managed: Optional[bool] = None,
-        _requires_fuse: Optional[bool] = None,
-        _cluster_config_overrides: Optional[Dict[str, Any]] = None,
-        _no_missing_accel_warnings: Optional[bool] = None,
+        _docker_login_config: docker_utils.DockerLoginConfig | None = None,
+        _docker_username_for_runpod: str | None = None,
+        _is_image_managed: bool | None = None,
+        _requires_fuse: bool | None = None,
+        _cluster_config_overrides: dict[str, Any] | None = None,
+        _no_missing_accel_warnings: bool | None = None,
     ):
         """Initialize a Resources object.
 
@@ -332,15 +331,14 @@ class Resources:
             zone = infra_info.zone
 
         self._cloud = cloud
-        self._region: Optional[str] = region
-        self._zone: Optional[str] = zone
+        self._region: str | None = region
+        self._zone: str | None = zone
 
         self._instance_type = instance_type
 
         self._use_spot_specified = use_spot is not None
         self._use_spot = use_spot if use_spot is not None else False
-        self._job_recovery: Optional[Dict[str, Optional[Union[str,
-                                                              int]]]] = None
+        self._job_recovery: dict[str, str | int | None] | None = None
         if job_recovery is not None:
             if isinstance(job_recovery, str):
                 job_recovery = {'strategy': job_recovery}
@@ -367,14 +365,14 @@ class Resources:
             self._disk_size = DEFAULT_DISK_SIZE_GB
 
         if ephemeral_storage is not None:
-            self._ephemeral_storage: Optional[int] = int(
+            self._ephemeral_storage: int | None = int(
                 resources_utils.parse_memory_resource(ephemeral_storage,
                                                       'ephemeral_storage'))
         else:
             self._ephemeral_storage = None
 
-        self._image_id: Optional[Dict[Optional[str], str]] = None
-        self._docker_image: Optional[str] = None
+        self._image_id: dict[str | None, str] | None = None
+        self._docker_image: str | None = None
         if isinstance(image_id, str):
             self._image_id = {self._region: image_id.strip()}
         elif isinstance(image_id, dict):
@@ -448,7 +446,7 @@ class Resources:
                 ports = [str(ports)]
             # Split comma-separated port entries (e.g. '8000,9000') into
             # individual tokens so each is validated on its own.
-            flattened_ports: List[str] = []
+            flattened_ports: list[str] = []
             for port in ports:
                 for token in str(port).split(','):
                     token = token.strip()
@@ -474,17 +472,17 @@ class Resources:
         self._requires_fuse = _requires_fuse
 
         self._cluster_config_overrides = _cluster_config_overrides
-        self._cached_repr: Optional[str] = None
+        self._cached_repr: str | None = None
         self._no_missing_accel_warnings = _no_missing_accel_warnings
 
         # Initialize _priority before calling the setter
-        self._priority: Optional[int] = None
-        self._priority_class: Optional[str] = None
+        self._priority: int | None = None
+        self._priority_class: str | None = None
 
         self._set_cpus(cpus)
         self._set_memory(memory)
         self._set_accelerators(accelerators, accelerator_args)
-        self._hooks: Optional[List[Dict[str, Any]]] = None
+        self._hooks: list[dict[str, Any]] | None = None
         self._set_autostop_config(autostop, extra_hooks=hooks)
         self._set_priority(priority)
         self._set_priority_class(priority_class)
@@ -649,24 +647,24 @@ class Resources:
         return infra_utils.InfraInfo(cloud, self.region, self.zone)
 
     @property
-    def cloud(self) -> Optional[clouds.Cloud]:
+    def cloud(self) -> clouds.Cloud | None:
         return self._cloud
 
     @property
-    def region(self) -> Optional[str]:
+    def region(self) -> str | None:
         return self._region
 
     @property
-    def zone(self) -> Optional[str]:
+    def zone(self) -> str | None:
         return self._zone
 
     @property
-    def instance_type(self) -> Optional[str]:
+    def instance_type(self) -> str | None:
         return self._instance_type
 
     @property
     @annotations.lru_cache(scope='global', maxsize=1)
-    def cpus(self) -> Optional[str]:
+    def cpus(self) -> str | None:
         """Returns the number of vCPUs that each instance must have.
 
         For example, cpus='4' means each instance must have exactly 4 vCPUs,
@@ -686,7 +684,7 @@ class Resources:
         return None
 
     @property
-    def memory(self) -> Optional[str]:
+    def memory(self) -> str | None:
         """Returns the memory that each instance must have in GB.
 
         For example, memory='16' means each instance must have exactly 16GB
@@ -704,7 +702,7 @@ class Resources:
 
     @property
     @annotations.lru_cache(scope='global', maxsize=1)
-    def accelerators(self) -> Optional[Dict[str, Union[int, float]]]:
+    def accelerators(self) -> dict[str, int | float] | None:
         """Returns the accelerators field directly or by inferring.
 
         For example, Resources(infra='aws', instance_type='p3.2xlarge') has its
@@ -719,7 +717,7 @@ class Resources:
         return None
 
     @property
-    def accelerator_args(self) -> Optional[Dict[str, Any]]:
+    def accelerator_args(self) -> dict[str, Any] | None:
         return self._accelerator_args
 
     @property
@@ -731,7 +729,7 @@ class Resources:
         return self._use_spot_specified
 
     @property
-    def job_recovery(self) -> Optional[Dict[str, Optional[Union[str, int]]]]:
+    def job_recovery(self) -> dict[str, str | int | None] | None:
         return self._job_recovery
 
     @property
@@ -739,23 +737,23 @@ class Resources:
         return self._disk_size
 
     @property
-    def ephemeral_storage(self) -> Optional[int]:
+    def ephemeral_storage(self) -> int | None:
         return self._ephemeral_storage
 
     @property
-    def image_id(self) -> Optional[Dict[Optional[str], str]]:
+    def image_id(self) -> dict[str | None, str] | None:
         return self._image_id
 
     @property
-    def disk_tier(self) -> Optional[resources_utils.DiskTier]:
+    def disk_tier(self) -> resources_utils.DiskTier | None:
         return self._disk_tier
 
     @property
-    def network_tier(self) -> Optional[resources_utils.NetworkTier]:
+    def network_tier(self) -> resources_utils.NetworkTier | None:
         return self._network_tier
 
     @property
-    def local_disk(self) -> Optional[str]:
+    def local_disk(self) -> str | None:
         if self._local_disk is not None:
             return self._local_disk
         if self.cloud is not None and self._instance_type is not None:
@@ -764,23 +762,23 @@ class Resources:
         return None
 
     @property
-    def max_hourly_cost(self) -> Optional[float]:
+    def max_hourly_cost(self) -> float | None:
         return self._max_hourly_cost
 
     @property
-    def ports(self) -> Optional[List[str]]:
+    def ports(self) -> list[str] | None:
         return self._ports
 
     @property
-    def labels(self) -> Optional[Dict[str, str]]:
+    def labels(self) -> dict[str, str] | None:
         return self._labels
 
     @property
-    def volumes(self) -> Optional[List[Dict[str, Any]]]:
+    def volumes(self) -> list[dict[str, Any]] | None:
         return self._volumes
 
     @property
-    def autostop_config(self) -> Optional[AutostopConfig]:
+    def autostop_config(self) -> AutostopConfig | None:
         """The requested autostop config.
 
         Warning: This is the autostop config that was originally used to
@@ -790,7 +788,7 @@ class Resources:
         return self._autostop_config
 
     @property
-    def hooks(self) -> Optional[List[Dict[str, Any]]]:
+    def hooks(self) -> list[dict[str, Any]] | None:
         """Lifecycle hooks set via `resources.hooks:`.
 
         Each entry is a dict with keys `run`, `events`, `timeout` (all
@@ -800,7 +798,7 @@ class Resources:
         return self._hooks
 
     @property
-    def priority(self) -> Optional[int]:
+    def priority(self) -> int | None:
         """The priority for this resource configuration.
 
         Higher values indicate higher priority. Valid range is -1000 to 1000.
@@ -808,12 +806,12 @@ class Resources:
         return self._priority
 
     @property
-    def priority_class(self) -> Optional[str]:
+    def priority_class(self) -> str | None:
         """Logical priority class name, if set."""
         return self._priority_class
 
     @property
-    def is_image_managed(self) -> Optional[bool]:
+    def is_image_managed(self) -> bool | None:
         return self._is_image_managed
 
     @property
@@ -840,22 +838,22 @@ class Resources:
         self._requires_fuse = value
 
     @property
-    def cluster_config_overrides(self) -> Dict[str, Any]:
+    def cluster_config_overrides(self) -> dict[str, Any]:
         if self._cluster_config_overrides is None:
             return {}
         return self._cluster_config_overrides
 
     @property
-    def docker_login_config(self) -> Optional[docker_utils.DockerLoginConfig]:
+    def docker_login_config(self) -> docker_utils.DockerLoginConfig | None:
         return self._docker_login_config
 
     @property
-    def docker_username_for_runpod(self) -> Optional[str]:
+    def docker_username_for_runpod(self) -> str | None:
         return self._docker_username_for_runpod
 
     def _set_cpus(
         self,
-        cpus: Union[None, int, float, str],
+        cpus: None | int | float | str,
     ) -> None:
         if cpus is None:
             self._cpus = None
@@ -885,7 +883,7 @@ class Resources:
 
     def _set_memory(
         self,
-        memory: Union[None, int, float, str],
+        memory: None | int | float | str,
     ) -> None:
         if memory is None:
             self._memory = None
@@ -928,8 +926,8 @@ class Resources:
 
     def _set_accelerators(
         self,
-        accelerators: Union[None, str, Dict[str, Union[int, float]]],
-        accelerator_args: Optional[Dict[str, Any]],
+        accelerators: None | str | dict[str, int | float],
+        accelerator_args: dict[str, Any] | None,
     ) -> None:
         """Sets accelerators.
 
@@ -1017,14 +1015,13 @@ class Resources:
                                     'Cannot specify instance type (got '
                                     f'{self.instance_type!r}) for TPU VM.')
 
-        self._accelerators: Optional[Dict[str, Union[int,
-                                                     float]]] = accelerators
-        self._accelerator_args: Optional[Dict[str, Any]] = accelerator_args
+        self._accelerators: dict[str, int | float] | None = accelerators
+        self._accelerator_args: dict[str, Any] | None = accelerator_args
 
     def _set_autostop_config(
         self,
-        autostop: Union[bool, int, str, Dict[str, Any], None],
-        extra_hooks: Optional[List[Dict[str, Any]]] = None,
+        autostop: bool | int | str | dict[str, Any] | None,
+        extra_hooks: list[dict[str, Any]] | None = None,
     ) -> None:
         """Set autostop config and hooks together.
 
@@ -1043,9 +1040,8 @@ class Resources:
 
     @staticmethod
     def _extract_legacy_autostop_hook(
-        autostop: Union[bool, int, str, Dict[str, Any], None],
-    ) -> Tuple[Optional[Dict[str, Any]], Union[bool, int, str, Dict[str, Any],
-                                               None]]:
+        autostop: bool | int | str | dict[str, Any] | None,
+    ) -> tuple[dict[str, Any] | None, bool | int | str | dict[str, Any] | None]:
         """Pop ``autostop.hook`` / ``autostop.hook_timeout`` and convert
         to a normalized hook entry.
 
@@ -1078,11 +1074,11 @@ class Resources:
 
     def _set_hooks(
         self,
-        extra_hooks: Optional[List[Dict[str, Any]]],
-        legacy_hook_entry: Optional[Dict[str, Any]] = None,
+        extra_hooks: list[dict[str, Any]] | None,
+        legacy_hook_entry: dict[str, Any] | None = None,
     ) -> None:
         """Normalize and merge explicit + legacy hook entries into _hooks."""
-        collected: List[Dict[str, Any]] = []
+        collected: list[dict[str, Any]] = []
         if extra_hooks:
             for entry in extra_hooks:
                 collected.append(_normalize_hook_entry(entry))
@@ -1090,7 +1086,7 @@ class Resources:
             collected.append(legacy_hook_entry)
         self._hooks = collected if collected else None
 
-    def _set_priority(self, priority: Optional[int]) -> None:
+    def _set_priority(self, priority: int | None) -> None:
         """Sets the priority for this resource configuration.
 
         Args:
@@ -1105,7 +1101,7 @@ class Resources:
                         f' {constants.MAX_PRIORITY}. Found: {priority}')
         self._priority = priority
 
-    def _set_priority_class(self, priority_class: Optional[str]) -> None:
+    def _set_priority_class(self, priority_class: str | None) -> None:
         if priority_class is not None:
             priority_class = str(priority_class).strip()
             if not priority_class:
@@ -1114,7 +1110,7 @@ class Resources:
 
     def _set_volumes(
         self,
-        volumes: Optional[List[Dict[str, Any]]],
+        volumes: list[dict[str, Any]] | None,
     ) -> None:
         if not volumes:
             self._volumes = None
@@ -1198,7 +1194,7 @@ class Resources:
             valid_volumes.append(volume)
         self._volumes = valid_volumes
 
-    def _set_local_disk(self, local_disk: Optional[str]) -> None:
+    def _set_local_disk(self, local_disk: str | None) -> None:
         if local_disk is None:
             self._local_disk = None
             return
@@ -1208,8 +1204,8 @@ class Resources:
     def override_autostop_config(
             self,
             down: bool = False,
-            idle_minutes: Optional[int] = None,
-            wait_for: Optional[autostop_lib.AutostopWaitFor] = None) -> None:
+            idle_minutes: int | None = None,
+            wait_for: autostop_lib.AutostopWaitFor | None = None) -> None:
         """Override autostop config to the resource.
 
         Args:
@@ -1328,7 +1324,7 @@ class Resources:
         self._region, self._zone = self._cloud.validate_region_zone(
             self._region, self._zone)
 
-    def get_valid_regions_for_launchable(self) -> List[clouds.Region]:
+    def get_valid_regions_for_launchable(self) -> list[clouds.Region]:
         """Returns a set of `Region`s that can provision this Resources.
 
         Each `Region` has a list of `Zone`s that can provision this Resources.
@@ -1506,7 +1502,7 @@ class Resources:
             if annotations.is_on_api_server:
                 raise
 
-    def extract_docker_image(self) -> Optional[str]:
+    def extract_docker_image(self) -> str | None:
         if self._docker_image is not None:
             return self._docker_image
         if self.image_id is None:
@@ -1521,7 +1517,7 @@ class Resources:
                     return image_id[len('docker:'):]
         return None
 
-    def get_cloud_image_id(self) -> Optional[Dict[Optional[str], str]]:
+    def get_cloud_image_id(self) -> dict[str | None, str] | None:
         """Returns the cloud VM image_id, or None if only a docker image.
 
         When both a cloud image and a docker image are specified (via the
@@ -1883,11 +1879,11 @@ class Resources:
         self,
         cluster_name: resources_utils.ClusterName,
         region: clouds.Region,
-        zones: Optional[List[clouds.Zone]],
+        zones: list[clouds.Zone] | None,
         num_nodes: int,
         dryrun: bool,
-        volume_mounts: Optional[List['volume_lib.VolumeMount']] = None,
-    ) -> Dict[str, Optional[str]]:
+        volume_mounts: list['volume_lib.VolumeMount'] | None = None,
+    ) -> dict[str, str | None]:
         """Converts planned sky.Resources to resource variables.
 
         These variables are divided into two categories: cloud-specific and
@@ -1952,7 +1948,7 @@ class Resources:
                 'initial_setup_commands': initial_setup_commands,
             })
 
-    def get_reservations_available_resources(self) -> Dict[str, int]:
+    def get_reservations_available_resources(self) -> dict[str, int]:
         """Returns the number of available reservation resources."""
         if self.use_spot:
             # GCP's & AWS's reservations do not support spot instances. We
@@ -1983,7 +1979,7 @@ class Resources:
 
     def less_demanding_than(
         self,
-        other: Union[List['Resources'], 'Resources'],
+        other: Union[list['Resources'], 'Resources'],
         requested_num_nodes: int = 1,
         check_ports: bool = False,
         check_cloud: bool = True,
@@ -2326,7 +2322,7 @@ class Resources:
         assert not override
         return resources
 
-    def valid_on_region_zones(self, region: str, zones: List[str]) -> bool:
+    def valid_on_region_zones(self, region: str, zones: list[str]) -> bool:
         """Returns whether this Resources is valid on given region and zones"""
         if self.region is not None and self.region != region:
             return False
@@ -2338,7 +2334,7 @@ class Resources:
         return True
 
     def get_required_cloud_features(
-            self) -> Set[clouds.CloudImplementationFeatures]:
+            self) -> set[clouds.CloudImplementationFeatures]:
         """Returns the set of cloud features required by this Resources."""
         features = set()
         if self.use_spot:
@@ -2366,8 +2362,7 @@ class Resources:
         return features
 
     @staticmethod
-    def _apply_resource_config_aliases(
-            config: Optional[Dict[str, Any]]) -> None:
+    def _apply_resource_config_aliases(config: dict[str, Any] | None) -> None:
         """Mutatively applies overriding aliases to the passed in config.
 
         Note: Nested aliases are not supported.
@@ -2391,7 +2386,7 @@ class Resources:
 
     @classmethod
     def _parse_accelerators_from_str(
-            cls, accelerators: str) -> List[Tuple[str, bool]]:
+            cls, accelerators: str) -> list[tuple[str, bool]]:
         """Parse accelerators string into a list of possible accelerators.
 
         Returns:
@@ -2446,8 +2441,8 @@ class Resources:
 
     @classmethod
     def from_yaml_config(
-        cls, config: Optional[Dict[str, Any]]
-    ) -> Union[Set['Resources'], List['Resources']]:
+            cls, config: dict[str, Any] | None
+    ) -> set['Resources'] | list['Resources']:
         """Creates Resources objects from a YAML config.
 
         Args:
@@ -2483,8 +2478,8 @@ class Resources:
             config['hooks'] = hooks_passthrough
 
         def _override_resources(
-                base_resource_config: Dict[str, Any],
-                override_configs: List[Dict[str, Any]]) -> List[Resources]:
+                base_resource_config: dict[str, Any],
+                override_configs: list[dict[str, Any]]) -> list[Resources]:
             resources_list = []
             for override_config in override_configs:
                 new_resource_config = base_resource_config.copy()
@@ -2549,7 +2544,7 @@ class Resources:
             # other copy being given by memory size. In this case, we only care
             # about the user specified ones (so we can give a warning if it
             # doesn't exist).
-            accel_to_user_specified: Dict[str, bool] = collections.OrderedDict()
+            accel_to_user_specified: dict[str, bool] = collections.OrderedDict()
             for accel, user_specified in accelerators_list:
                 # If this accelerator is not in dict yet, or if current one is
                 # user specified and existing one is not, update the entry
@@ -2603,8 +2598,8 @@ class Resources:
         return {Resources._from_yaml_config_single(config)}
 
     @classmethod
-    def _from_yaml_config_single(cls, config: Dict[str, str]) -> 'Resources':
-        resources_fields: Dict[str, Any] = {}
+    def _from_yaml_config_single(cls, config: dict[str, str]) -> 'Resources':
+        resources_fields: dict[str, Any] = {}
 
         # Extract infra field if present
         infra = config.pop('infra', None)
@@ -2685,8 +2680,7 @@ class Resources:
         return Resources(**resources_fields)
 
     def to_yaml_config(self,
-                       redact_secrets: bool = False
-                      ) -> Dict[str, Union[str, int]]:
+                       redact_secrets: bool = False) -> dict[str, str | int]:
         """Returns a yaml-style dict of config for this resource bundle."""
         config = {}
 
@@ -2811,8 +2805,8 @@ class Resources:
             accelerators = state.pop('_accelerators', None)
             if accelerators is not None:
                 accelerators = {
-                    accelerator_registry.canonicalize_accelerator_name(
-                        acc, cloud=None): acc_count
+                    accelerator_registry.canonicalize_accelerator_name(acc,
+                                                                       cloud=None): acc_count
                     for acc, acc_count in accelerators.items()
                 }
             state['_accelerators'] = accelerators
@@ -3010,7 +3004,7 @@ class LaunchableResources(Resources):
 
 
 def _maybe_add_docker_prefix_to_image_id(
-        image_id_dict: Optional[Dict[Optional[str], str]]) -> None:
+        image_id_dict: dict[str | None, str] | None) -> None:
     if image_id_dict is None:
         return
     for k, v in image_id_dict.items():

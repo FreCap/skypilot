@@ -5,7 +5,7 @@ import random
 import shlex
 import textwrap
 import typing
-from typing import List, Optional
+from typing import Optional
 
 from sky import exceptions
 from sky import skypilot_config
@@ -113,9 +113,9 @@ def get_s3_mount_install_cmd() -> str:
 # pylint: disable=invalid-name
 def _get_s3_compatible_mount_cmd(bucket_name: str,
                                  mount_path: str,
-                                 _bucket_sub_path: Optional[str] = None,
-                                 endpoint_url: Optional[str] = None,
-                                 region: Optional[str] = None,
+                                 _bucket_sub_path: str | None = None,
+                                 endpoint_url: str | None = None,
+                                 region: str | None = None,
                                  cred_env: str = '',
                                  rclone_extra_flags: str = '',
                                  goofys_extra_flags: str = '',
@@ -196,7 +196,7 @@ def _get_s3_compatible_mount_cmd(bucket_name: str,
 # pylint: disable=invalid-name
 def get_s3_mount_cmd(bucket_name: str,
                      mount_path: str,
-                     _bucket_sub_path: Optional[str] = None,
+                     _bucket_sub_path: str | None = None,
                      read_only: bool = False) -> str:
     """Returns a command to mount an S3 bucket."""
     return _get_s3_compatible_mount_cmd(bucket_name=bucket_name,
@@ -211,7 +211,7 @@ def get_nebius_mount_cmd(nebius_profile_name: str,
                          bucket_name: str,
                          endpoint_url: str,
                          mount_path: str,
-                         _bucket_sub_path: Optional[str] = None,
+                         _bucket_sub_path: str | None = None,
                          read_only: bool = False) -> str:
     """Returns a command to mount Nebius bucket."""
     return _get_s3_compatible_mount_cmd(
@@ -228,7 +228,7 @@ def get_coreweave_mount_cmd(cw_credentials_path: str,
                             bucket_name: str,
                             endpoint_url: str,
                             mount_path: str,
-                            _bucket_sub_path: Optional[str] = None,
+                            _bucket_sub_path: str | None = None,
                             read_only: bool = False) -> str:
     """Returns a command to mount CoreWeave bucket."""
     cred_env = (f'AWS_SHARED_CREDENTIALS_FILE={cw_credentials_path} '
@@ -249,8 +249,8 @@ def get_oci_s3_mount_cmd(oci_s3_credentials_path: str,
                          bucket_name: str,
                          endpoint_url: str,
                          mount_path: str,
-                         region: Optional[str] = None,
-                         _bucket_sub_path: Optional[str] = None,
+                         region: str | None = None,
+                         _bucket_sub_path: str | None = None,
                          read_only: bool = False) -> str:
     """Returns a command to mount an OCI bucket via the S3-compatible API.
 
@@ -281,7 +281,7 @@ def get_vastdata_mount_cmd(vastdata_credentials_path: str,
                            bucket_name: str,
                            endpoint_url: str,
                            mount_path: str,
-                           _bucket_sub_path: Optional[str] = None,
+                           _bucket_sub_path: str | None = None,
                            read_only: bool = False) -> str:
     """Returns a command to mount VastData bucket."""
     cred_env = (f'AWS_SHARED_CREDENTIALS_FILE={vastdata_credentials_path} '
@@ -313,7 +313,7 @@ def get_gcs_mount_install_cmd() -> str:
 # pylint: disable=invalid-name
 def get_gcs_mount_cmd(bucket_name: str,
                       mount_path: str,
-                      _bucket_sub_path: Optional[str] = None,
+                      _bucket_sub_path: str | None = None,
                       read_only: bool = False) -> str:
     """Returns a command to mount a GCS bucket using gcsfuse."""
     bucket_sub_path_arg = f'--only-dir {_bucket_sub_path} '\
@@ -387,12 +387,12 @@ def get_hf_mount_version_check_cmd() -> str:
 
 def get_hf_mount_cmd(hf_id: str,
                      mount_path: str,
-                     _bucket_sub_path: Optional[str] = None,
+                     _bucket_sub_path: str | None = None,
                      read_only: bool = False,
-                     token_file: Optional[str] = None,
+                     token_file: str | None = None,
                      mode: str = 'bucket',
-                     revision: Optional[str] = None,
-                     extra_args: Optional[List[str]] = None) -> str:
+                     revision: str | None = None,
+                     extra_args: list[str] | None = None) -> str:
     """Returns a command to mount an HF Bucket/repo via ``hf-mount``.
 
     Uses the FUSE backend (``--fuse``). hf-mount defaults to NFS, but the
@@ -570,8 +570,8 @@ def get_az_mount_install_cmd() -> str:
 def get_az_mount_cmd(container_name: str,
                      storage_account_name: str,
                      mount_path: str,
-                     storage_account_key: Optional[str] = None,
-                     _bucket_sub_path: Optional[str] = None,
+                     storage_account_key: str | None = None,
+                     _bucket_sub_path: str | None = None,
                      read_only: bool = False) -> str:
     """Returns a command to mount an AZ Container using blobfuse2.
 
@@ -655,7 +655,7 @@ def get_r2_mount_cmd(r2_credentials_path: str,
                      endpoint_url: str,
                      bucket_name: str,
                      mount_path: str,
-                     _bucket_sub_path: Optional[str] = None,
+                     _bucket_sub_path: str | None = None,
                      read_only: bool = False) -> str:
     """Returns a command to mount R2 bucket."""
     cred_env = (f'AWS_SHARED_CREDENTIALS_FILE={r2_credentials_path} '
@@ -672,7 +672,7 @@ def get_cos_mount_cmd(rclone_config: str,
                       rclone_profile_name: str,
                       bucket_name: str,
                       mount_path: str,
-                      _bucket_sub_path: Optional[str] = None,
+                      _bucket_sub_path: str | None = None,
                       read_only: bool = False) -> str:
     """Returns a command to mount an IBM COS bucket using rclone."""
     # stores bucket profile in rclone config file at the cluster's nodes.
@@ -828,7 +828,7 @@ def get_mounting_script(
     mount_path: str,
     mount_cmd: str,
     install_cmd: str,
-    version_check_cmd: Optional[str] = None,
+    version_check_cmd: str | None = None,
 ) -> str:
     """Generates the mounting script.
 
@@ -973,7 +973,7 @@ def get_mounting_command(
     mount_path: str,
     install_cmd: str,
     mount_cmd: str,
-    version_check_cmd: Optional[str] = None,
+    version_check_cmd: str | None = None,
 ) -> str:
     """Generates the mounting command for a given bucket.
 

@@ -2,7 +2,7 @@
 import abc
 import os
 import shlex
-from typing import Any, Dict
+from typing import Any
 
 from sky.skylet import constants
 from sky.utils import resources_utils
@@ -24,7 +24,7 @@ class LoggingAgent(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def get_credential_file_mounts(self) -> Dict[str, str]:
+    def get_credential_file_mounts(self) -> dict[str, str]:
         pass
 
 
@@ -111,5 +111,5 @@ class FluentbitAgent(LoggingAgent):
 
     @abc.abstractmethod
     def fluentbit_output_config(
-            self, cluster_name: resources_utils.ClusterName) -> Dict[str, Any]:
+            self, cluster_name: resources_utils.ClusterName) -> dict[str, Any]:
         pass

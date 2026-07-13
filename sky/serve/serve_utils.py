@@ -1,6 +1,8 @@
 """User interface with the SkyServe."""
 import base64
 import collections
+from collections.abc import Callable
+from collections.abc import Iterator
 import concurrent.futures
 import contextvars
 import dataclasses
@@ -19,8 +21,7 @@ import threading
 import time
 import traceback
 import typing
-from typing import (Any, Callable, DefaultDict, Deque, Dict, Iterator, List,
-                    Optional, Set, TextIO, Tuple, Type, Union)
+from typing import Any, TextIO
 import uuid
 
 import colorama
@@ -115,12 +116,12 @@ class _PurgeResult:
     """Outcome of an immediate purge attempt."""
 
     completed: bool
-    message: Optional[str] = None
+    message: str | None = None
 
 
 _AUTH_TOKEN_PATTERN = re.compile(r'[A-Za-z0-9._~+/=-]+')
 
-_ControllerOwner = Tuple[str, int, Optional[str], int]
+_ControllerOwner = tuple[str, int, str | None, int]
 
 
 def make_controller_owner_fingerprint(service_hash: object,
@@ -138,7 +139,7 @@ def make_controller_owner_fingerprint(service_hash: object,
             isinstance(controller_port, bool) or
             not 1 <= controller_port <= 65535):
         raise ControllerOwnerError('Controller port is missing or invalid.')
-    normalized_ip: Optional[str] = None
+    normalized_ip: str | None = None
     if controller_ip is not None:
         if not isinstance(controller_ip, str) or not controller_ip:
             raise ControllerOwnerError('Controller IP is invalid.')
@@ -153,7 +154,7 @@ def make_controller_owner_fingerprint(service_hash: object,
 
 
 def _get_controller_url(service_name: str,
-                        expected_service_hash: str) -> Tuple[str, str]:
+                        expected_service_hash: str) -> tuple[str, str]:
     """Resolve and fence the controller HTTP URL.
 
     In single-pod (or daemon == controller pod) deployments the IP read from
@@ -205,7 +206,7 @@ def _get_controller_url(service_name: str,
     return url, owner_fingerprint
 
 
-def _get_local_controller_url(owner: _ControllerOwner) -> Tuple[str, str]:
+def _get_local_controller_url(owner: _ControllerOwner) -> tuple[str, str]:
     """Resolve a specifically supervised local child without consulting DB."""
     service_hash, controller_pid, controller_ip, controller_port = owner
     owner_fingerprint = make_controller_owner_fingerprint(
@@ -213,14 +214,14 @@ def _get_local_controller_url(owner: _ControllerOwner) -> Tuple[str, str]:
     return f'http://localhost:{controller_port}', owner_fingerprint
 
 
-def _request_to_controller_with_retry(
-        method: str,
-        service_name: str,
-        expected_service_hash: str,
-        path: str,
-        *,
-        fixed_controller_owner: Optional[_ControllerOwner] = None,
-        **kwargs):
+def _request_to_controller_with_retry(method: str,
+                                      service_name: str,
+                                      expected_service_hash: str,
+                                      path: str,
+                                      *,
+                                      fixed_controller_owner: _ControllerOwner |
+                                      None = None,
+                                      **kwargs):
     """HTTP `method` to the controller with bounded retry on ConnectionError.
     """
     request_fn = getattr(requests, method)
@@ -344,11 +345,11 @@ class ServiceComponentTarget:
     """Represents a target service component with an optional replica ID.
     """
     component: ServiceComponent
-    replica_id: Optional[int] = None
+    replica_id: int | None = None
 
     def __init__(self,
-                 component: Union[str, ServiceComponent],
-                 replica_id: Optional[int] = None):
+                 component: str | ServiceComponent,
+                 replica_id: int | None = None):
         if isinstance(component, str):
             component = ServiceComponent(component)
         self.component = component
@@ -356,8 +357,8 @@ class ServiceComponentTarget:
 
     def __post_init__(self):
         """Validate that replica_id is only provided for REPLICA component."""
-        if (self.component
-                == ServiceComponent.REPLICA) != (self.replica_id is None):
+        if (self.component == ServiceComponent.REPLICA) != (self.replica_id
+                                                            is None):
             raise ValueError(
                 'replica_id must be specified if and only if component is '
                 'REPLICA.')
@@ -382,7 +383,7 @@ class UserSignal(enum.Enum):
 
     # TODO(tian): Add more signals, such as pause.
 
-    def error_type(self) -> Type[Exception]:
+    def error_type(self) -> type[Exception]:
         """Get the error corresponding to the signal."""
         return _SIGNAL_TO_ERROR[self]
 
@@ -418,7 +419,7 @@ class RequestsAggregator:
         """Clear all current request aggregator."""
         raise NotImplementedError
 
-    def drain(self) -> Dict[str, Any]:
+    def drain(self) -> dict[str, Any]:
         """Atomically take the current report batch out of the aggregator.
 
         New samples added after this method returns belong to the next batch.
@@ -426,11 +427,11 @@ class RequestsAggregator:
         """
         raise NotImplementedError
 
-    def restore(self, batch: Dict[str, Any]) -> None:
+    def restore(self, batch: dict[str, Any]) -> None:
         """Restore a previously drained batch after failed delivery."""
         raise NotImplementedError
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Convert the aggregator to a dict."""
         raise NotImplementedError
 
@@ -449,7 +450,7 @@ class RequestTimestamp(RequestsAggregator):
         # load signal is not dropped), but a persistent failure must not grow it
         # without limit -- maxlen keeps only the most recent samples (ample for
         # QPS autoscaling). See constants.LB_REQUEST_TIMESTAMP_CAP.
-        self.timestamps: 'collections.deque[float]' = collections.deque(
+        self.timestamps: collections.deque[float] = collections.deque(
             maxlen=constants.LB_REQUEST_TIMESTAMP_CAP)
 
     def add(self, request: 'fastapi.Request') -> None:
@@ -461,13 +462,13 @@ class RequestTimestamp(RequestsAggregator):
         """Clear all current request aggregator."""
         self.timestamps.clear()
 
-    def drain(self) -> Dict[str, Any]:
+    def drain(self) -> dict[str, Any]:
         """Take the current timestamps, leaving later arrivals untouched."""
         batch = self.to_dict()
         self.timestamps.clear()
         return batch
 
-    def restore(self, batch: Dict[str, Any]) -> None:
+    def restore(self, batch: dict[str, Any]) -> None:
         """Merge a failed batch back ahead of any arrivals made in-flight.
 
         Extending oldest-to-newest also preserves the deque's bounded behavior:
@@ -482,7 +483,7 @@ class RequestTimestamp(RequestsAggregator):
         self.timestamps.extend(drained)
         self.timestamps.extend(current)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Convert the aggregator to a dict."""
         return {'timestamps': list(self.timestamps)}
 
@@ -514,7 +515,7 @@ class ServiceLifecycleLock:
     def __init__(self, service_name: str, lock: locks.DistributedLock) -> None:
         self.service_name = service_name
         self.lock = lock
-        self.epoch: Optional[int] = None
+        self.epoch: int | None = None
 
     def acquire(self) -> 'ServiceLifecycleLock':
         self.lock.acquire()
@@ -746,9 +747,9 @@ def is_lb_data_plane_auth_enabled() -> bool:
 
 
 def _get_auth_tokens(file_env_var: str,
-                     legacy_token_env_var: Optional[str],
+                     legacy_token_env_var: str | None,
                      ring_name: str,
-                     required: bool = False) -> Tuple[str, ...]:
+                     required: bool = False) -> tuple[str, ...]:
     """Read a newline-delimited bearer-token ring without caching it.
 
     The configured file is authoritative and is read fresh on every call so a
@@ -802,7 +803,7 @@ def _get_auth_tokens(file_env_var: str,
 def _get_controller_auth_token_rings(
         sync_required: bool = False,
         admin_required: bool = False
-) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Read both controller rings and reject any cross-domain credential.
 
     Each ring may contain multiple credentials for an overlap rotation within
@@ -836,19 +837,19 @@ def validate_controller_auth_token_isolation(required: bool = False) -> None:
                                      admin_required=required)
 
 
-def get_lb_sync_auth_tokens(required: bool = False) -> Tuple[str, ...]:
+def get_lb_sync_auth_tokens(required: bool = False) -> tuple[str, ...]:
     """Credentials accepted on, and presented to, the LB sync endpoint."""
     sync_tokens, _ = _get_controller_auth_token_rings(sync_required=required)
     return sync_tokens
 
 
-def get_controller_admin_auth_tokens(required: bool = False) -> Tuple[str, ...]:
+def get_controller_admin_auth_tokens(required: bool = False) -> tuple[str, ...]:
     """Credentials accepted by trusted controller administration callers."""
     _, admin_tokens = _get_controller_auth_token_rings(admin_required=required)
     return admin_tokens
 
 
-def get_lb_auth_tokens(required: bool = False) -> Tuple[str, ...]:
+def get_lb_auth_tokens(required: bool = False) -> tuple[str, ...]:
     """Credentials accepted by the external LB inference data plane."""
     return _get_auth_tokens(constants.LB_AUTH_TOKENS_FILE_ENV_VAR,
                             constants.LB_AUTH_TOKEN_ENV_VAR,
@@ -856,8 +857,8 @@ def get_lb_auth_tokens(required: bool = False) -> Tuple[str, ...]:
 
 
 def ha_recovery_for_consolidation_mode(pool: bool,
-                                       still_leader: Optional[Callable[
-                                           [], bool]] = None):
+                                       still_leader: Callable[[], bool] |
+                                       None = None):
     """Recovery logic for HA mode.
 
     Args:
@@ -911,8 +912,8 @@ def ha_recovery_for_consolidation_mode(pool: bool,
                                              ('yaml_content' in svc and
                                               svc['yaml_content'] is None))
             if (needs_committed_version_check and
-                    serve_state.get_latest_committed_version(service_name) is
-                    None):
+                    serve_state.get_latest_committed_version(service_name)
+                    is None):
                 raw_identity = serve_state.get_service_mode_and_hash(
                     service_name)
                 if (raw_identity is not None and raw_identity[0] == pool and
@@ -1051,7 +1052,7 @@ def ha_recovery_for_consolidation_mode(pool: bool,
 
 def _controller_process_alive(pid: int,
                               service_name: str,
-                              service_incarnation: Optional[str] = None,
+                              service_incarnation: str | None = None,
                               allow_legacy: bool = True) -> bool:
     """Check exact local controller identity, not pod-local PID alone."""
     try:
@@ -1079,7 +1080,7 @@ def _controller_process_alive(pid: int,
 
 
 def _snapshot_in_flight_start_service_incarnations(
-) -> Set[Tuple[str, Optional[str]]]:
+) -> set[tuple[str, str | None]]:
     """Return active ``(service name, requested incarnation)`` processes.
 
     Used by ha_recovery_for_consolidation_mode to deduplicate recovery
@@ -1100,7 +1101,7 @@ def _snapshot_in_flight_start_service_incarnations(
     Matching is on the argv LIST (not a joined string), so
     `--service-name pool-a` does not falsely match `--service-name pool-abc`.
     """
-    in_flight: Set[Tuple[str, Optional[str]]] = set()
+    in_flight: set[tuple[str, str | None]] = set()
     for proc in psutil.process_iter(['cmdline', 'status']):
         try:
             if proc.info.get('status') == psutil.STATUS_ZOMBIE:
@@ -1167,7 +1168,7 @@ def validate_service_task(task: 'sky.Task', pool: bool) -> None:
         ValueError: if the arguments are invalid.
         RuntimeError: if the task.serve is not found.
     """
-    spot_resources: List['sky.Resources'] = [
+    spot_resources: list[sky.Resources] = [
         resource for resource in task.resources if resource.use_spot
     ]
     has_spot_placer = (task.service is not None and
@@ -1248,7 +1249,7 @@ def validate_service_task(task: 'sky.Task', pool: bool) -> None:
                     f'{shapes}. Keep a single Kubernetes '
                     'shape, or disable reserved_capacity_fill.')
 
-    replica_ingress_port: Optional[int] = int(
+    replica_ingress_port: int | None = int(
         task.service.ports) if (task.service.ports is not None) else None
     for requested_resources in task.resources:
         if (task.service.use_ondemand_fallback and
@@ -1344,8 +1345,7 @@ def ephemeral_storage_identity_matches_scope(storage: Any,
 
 
 def generate_remote_service_dir_name(service_name: str,
-                                     resource_scope: Optional[str] = None
-                                    ) -> str:
+                                     resource_scope: str | None = None) -> str:
     legacy_name = service_name.replace('-', '_')
     if resource_scope is None:
         # Compatibility only for rows created before resource_scope existed.
@@ -1366,7 +1366,7 @@ def generate_remote_service_dir_name(service_name: str,
 
 
 def generate_remote_tmp_task_yaml_file_name(service_name: str,
-                                            resource_scope: Optional[str] = None
+                                            resource_scope: str | None = None
                                            ) -> str:
     dir_name = generate_remote_service_dir_name(service_name, resource_scope)
     # Don't expand here since it is used for remote machine.
@@ -1376,7 +1376,7 @@ def generate_remote_tmp_task_yaml_file_name(service_name: str,
 def generate_task_yaml_file_name(service_name: str,
                                  version: int,
                                  expand_user: bool = True,
-                                 resource_scope: Optional[str] = None) -> str:
+                                 resource_scope: str | None = None) -> str:
     dir_name = generate_remote_service_dir_name(service_name, resource_scope)
     if expand_user:
         dir_name = os.path.expanduser(dir_name)
@@ -1384,22 +1384,24 @@ def generate_task_yaml_file_name(service_name: str,
 
 
 def generate_remote_config_yaml_file_name(service_name: str,
-                                          resource_scope: Optional[str] = None
+                                          resource_scope: str | None = None
                                          ) -> str:
     dir_name = generate_remote_service_dir_name(service_name, resource_scope)
     # Don't expand here since it is used for remote machine.
     return os.path.join(dir_name, 'config.yaml')
 
 
-def generate_remote_controller_log_file_name(
-        service_name: str, resource_scope: Optional[str] = None) -> str:
+def generate_remote_controller_log_file_name(service_name: str,
+                                             resource_scope: str | None = None
+                                            ) -> str:
     dir_name = generate_remote_service_dir_name(service_name, resource_scope)
     # Don't expand here since it is used for remote machine.
     return os.path.join(dir_name, 'controller.log')
 
 
-def generate_remote_batch_controller_log_file_name(
-        service_name: str, resource_scope: Optional[str] = None) -> str:
+def generate_remote_batch_controller_log_file_name(service_name: str,
+                                                   resource_scope: str |
+                                                   None = None) -> str:
     dir_name = generate_remote_service_dir_name(service_name, resource_scope)
     # Don't expand here since it is used for remote machine.
     return os.path.join(dir_name, 'batch_controller.log')
@@ -1408,7 +1410,7 @@ def generate_remote_batch_controller_log_file_name(
 def generate_replica_launch_log_file_name(
         service_name: str,
         replica_id: int,
-        resource_scope: Optional[str] = None) -> str:
+        resource_scope: str | None = None) -> str:
     dir_name = generate_remote_service_dir_name(service_name, resource_scope)
     dir_name = os.path.expanduser(dir_name)
     return os.path.join(dir_name, f'replica_{replica_id}_launch.log')
@@ -1416,7 +1418,7 @@ def generate_replica_launch_log_file_name(
 
 def generate_replica_log_file_name(service_name: str,
                                    replica_id: int,
-                                   resource_scope: Optional[str] = None) -> str:
+                                   resource_scope: str | None = None) -> str:
     dir_name = generate_remote_service_dir_name(service_name, resource_scope)
     dir_name = os.path.expanduser(dir_name)
     return os.path.join(dir_name, f'replica_{replica_id}.log')
@@ -1424,7 +1426,7 @@ def generate_replica_log_file_name(service_name: str,
 
 def generate_replica_cluster_name(service_name: str,
                                   replica_id: int,
-                                  resource_scope: Optional[str] = None) -> str:
+                                  resource_scope: str | None = None) -> str:
     # NOTE(dev): This format is used in sky/serve/service.py::_cleanup, for
     # checking replica cluster existence. Be careful when changing it.
     if resource_scope is None:
@@ -1442,11 +1444,10 @@ def generate_replica_cluster_name(service_name: str,
 
 def set_service_status_and_active_versions_from_replica(
     service_name: str,
-    replica_infos: List['replica_managers.ReplicaInfo'],
+    replica_infos: list['replica_managers.ReplicaInfo'],
     update_mode: UpdateMode,
-    expected_service_hash: Optional[str] = None,
-    expected_controller_owner: Optional[Tuple[Optional[int],
-                                              Optional[str]]] = None
+    expected_service_hash: str | None = None,
+    expected_controller_owner: tuple[int | None, str | None] | None = None
 ) -> None:
     record = serve_state.get_service_controller_owner(service_name,
                                                       require_version=True)
@@ -1577,13 +1578,12 @@ def update_service_status(pool: bool) -> None:
             expected_status=service_status)
 
 
-def update_service_encoded(
-        service_name: str,
-        version: int,
-        mode: str,
-        pool: bool,
-        expected_service_hash: Optional[str] = None,
-        expected_lifecycle_epoch: Optional[int] = None) -> str:
+def update_service_encoded(service_name: str,
+                           version: int,
+                           mode: str,
+                           pool: bool,
+                           expected_service_hash: str | None = None,
+                           expected_lifecycle_epoch: int | None = None) -> str:
     noun = 'pool' if pool else 'service'
     capnoun = noun.capitalize()
     # Only existence and the incarnation hash are consumed here; skip the
@@ -1679,7 +1679,7 @@ def terminate_replica(service_name: str, replica_id: int, purge: bool) -> str:
 
 def get_yaml_content(service_name: str,
                      version: int,
-                     resource_scope: Optional[str] = None) -> str:
+                     resource_scope: str | None = None) -> str:
     yaml_content = serve_state.get_yaml_content(service_name, version)
     if yaml_content is not None:
         return yaml_content
@@ -1691,7 +1691,7 @@ def get_yaml_content(service_name: str,
         resource_scope = record.get('resource_scope') if record else None
     latest_yaml_path = generate_task_yaml_file_name(
         service_name, version, resource_scope=resource_scope)
-    with open(latest_yaml_path, 'r', encoding='utf-8') as f:
+    with open(latest_yaml_path, encoding='utf-8') as f:
         return f.read()
 
 
@@ -1701,7 +1701,7 @@ def _get_service_status(
         with_replica_info: bool = True,
         with_replica_counts: bool = False,
         with_yaml: bool = True,
-        with_target_num_replicas: bool = True) -> Optional[Dict[str, Any]]:
+        with_target_num_replicas: bool = True) -> dict[str, Any] | None:
     """Get the status dict of the service.
 
     Args:
@@ -1747,7 +1747,7 @@ def _get_service_status(
                 # Fall back to old display format.
                 original_config = raw_yaml_config
                 original_config.pop('run', None)
-                svc: Dict[str, Any] = original_config.pop('service')
+                svc: dict[str, Any] = original_config.pop('service')
                 if svc is not None:
                     svc.pop('pool', None)  # Remove pool from service config
                     original_config['pool'] = svc  # Add pool to root config
@@ -1804,7 +1804,8 @@ def _get_service_status(
         # one unpickle pass over the rows, no cluster-record joins, no
         # URL resolution. At fleet scale (hundreds of replicas) this is
         # the difference between a snappy summary and a 30s+ full query.
-        status_counts: DefaultDict[str, int] = collections.defaultdict(int)
+        status_counts: collections.defaultdict[
+            str, int] = collections.defaultdict(int)
         for info in serve_state.get_replica_infos(service_name):
             status_counts[info.status.value] += 1
         record['replica_status_counts'] = dict(status_counts)
@@ -1854,7 +1855,7 @@ def _get_service_status(
 
 def resolve_target_qps_for_gpu_shape(
         gpu_type: str, gpu_count: int,
-        target_qps_per_replica: Dict[str, float]) -> Optional[float]:
+        target_qps_per_replica: dict[str, float]) -> float | None:
     """Per-REPLICA target QPS for a replica with `gpu_count` x `gpu_type`.
 
     Key semantics (backward compatible with the count-blind matcher):
@@ -1886,11 +1887,11 @@ def resolve_target_qps_for_gpu_shape(
 
 
 def get_service_status_pickled(
-        service_names: Optional[List[str]],
+        service_names: list[str] | None,
         pool: bool,
         summary_only: bool = False,
-        include_target_num_replicas: Optional[bool] = None
-) -> List[Dict[str, str]]:
+        include_target_num_replicas: bool | None = None
+) -> list[dict[str, str]]:
     if service_names is None:
         # Get all names for the requested mode only.
         service_names = serve_state.get_glob_service_names(None, pool=pool)
@@ -1909,7 +1910,7 @@ def get_service_status_pickled(
     # aborts the whole call).
     parent_ctx = contextvars.copy_context()
 
-    def _run_in_context(name: str) -> Optional[Dict[str, Any]]:
+    def _run_in_context(name: str) -> dict[str, Any] | None:
         kwargs = {
             'pool': pool,
             'with_replica_info': not summary_only,
@@ -1930,7 +1931,7 @@ def get_service_status_pickled(
         # `yaml_content`/`pool_yaml` back into a launchable task.
         if status is not None and not status.get('pool'):
             status.pop('yaml_content', None)
-    service_statuses: List[Dict[str, str]] = [{
+    service_statuses: list[dict[str, str]] = [{
         k: base64.b64encode(pickle.dumps(v)).decode('utf-8')
         for k, v in s.items()
     }
@@ -1941,10 +1942,10 @@ def get_service_status_pickled(
 
 # TODO (kyuds): remove when serve codegen is removed
 def get_service_status_encoded(
-        service_names: Optional[List[str]],
+        service_names: list[str] | None,
         pool: bool,
         summary_only: bool = False,
-        include_target_num_replicas: Optional[bool] = None) -> str:
+        include_target_num_replicas: bool | None = None) -> str:
     # We have to use payload_type here to avoid the issue of
     # message_utils.decode_payload() not being able to correctly decode the
     # message with <sky-payload> tags.
@@ -1958,8 +1959,8 @@ def get_service_status_encoded(
 
 
 def unpickle_service_status(
-        payload: List[Dict[str, str]]) -> List[Dict[str, Any]]:
-    service_statuses: List[Dict[str, Any]] = []
+        payload: list[dict[str, str]]) -> list[dict[str, Any]]:
+    service_statuses: list[dict[str, Any]] = []
     for service_status in payload:
         if not isinstance(service_status, dict):
             raise ValueError(f'Invalid service status: {service_status}')
@@ -1971,7 +1972,7 @@ def unpickle_service_status(
 
 
 # TODO (kyuds): remove when serve codegen is removed
-def load_service_status(payload: str) -> List[Dict[str, Any]]:
+def load_service_status(payload: str) -> list[dict[str, Any]]:
     try:
         service_statuses_encoded = message_utils.decode_payload(
             payload, payload_type='service_status')
@@ -1997,7 +1998,7 @@ def load_version_string(payload: str) -> str:
 
 
 def get_ready_replicas(
-        service_name: str) -> List['replica_managers.ReplicaInfo']:
+        service_name: str) -> list['replica_managers.ReplicaInfo']:
     logger.info(f'Get number of replicas for pool {service_name!r}')
     return [
         info for info in serve_state.get_replica_infos(service_name)
@@ -2029,7 +2030,7 @@ def _is_empty_resource(resource: 'resources_lib.Resources') -> bool:
 
 
 def get_free_worker_resources(
-        pool: str) -> Optional[Dict[str, Optional[resources_lib.Resources]]]:
+        pool: str) -> dict[str, resources_lib.Resources | None] | None:
     """Get free resources for each worker in a pool.
 
     Args:
@@ -2040,7 +2041,7 @@ def get_free_worker_resources(
         None if worker is not available or has no free resources).
     """
 
-    free_resources: Dict[str, Optional[resources_lib.Resources]] = {}
+    free_resources: dict[str, resources_lib.Resources | None] = {}
     replicas = serve_state.get_replica_infos(pool)
     used_resources_by_cluster = (
         managed_job_state.get_pool_worker_used_resources_by_cluster(pool))
@@ -2084,10 +2085,10 @@ def get_free_worker_resources(
 def get_next_cluster_name(
     service_name: str,
     job_id: int,
-    task_resources: Optional[typing.Union[
-        'resources_lib.Resources', typing.Set['resources_lib.Resources'],
-        typing.List['resources_lib.Resources']]] = None
-) -> Optional[str]:
+    task_resources: typing.Union['resources_lib.Resources',
+                                 set['resources_lib.Resources'],
+                                 list['resources_lib.Resources']] | None = None
+) -> str | None:
     """Get the next available cluster name from replicas with sufficient
     resources.
 
@@ -2118,7 +2119,7 @@ def get_next_cluster_name(
 
         logger.debug(f'Ready replicas: {ready_replicas!r}')
 
-        idle_replicas: List['replica_managers.ReplicaInfo'] = []
+        idle_replicas: list[replica_managers.ReplicaInfo] = []
 
         # If task_resources is provided, use resource-aware scheduling
         # Normalize task_resources to a list
@@ -2257,8 +2258,8 @@ def _purge_ownership_failure(service_name: str, detail: str) -> str:
 
 def quiesce_service_replica_launch_requests(
     service_name: str,
-    replica_infos: List['replica_managers.ReplicaInfo'],
-    continue_guard: Optional[Callable[[], bool]] = None,
+    replica_infos: list['replica_managers.ReplicaInfo'],
+    continue_guard: Callable[[], bool] | None = None,
 ) -> bool:
     """Cancel and await every active launch backed by replica inventory.
 
@@ -2288,8 +2289,8 @@ def quiesce_service_replica_launch_requests(
                            request_names.RequestName.CLUSTER_LAUNCH.value)
     cluster_names = sorted({info.cluster_name for info in replica_infos})
 
-    def _active_launch_request_ids() -> Set[str]:
-        active_request_ids: Set[str] = set()
+    def _active_launch_request_ids() -> set[str]:
+        active_request_ids: set[str] = set()
         for cluster_name in cluster_names:
             for request in sdk.api_status(all_status=False,
                                           cluster_name=cluster_name):
@@ -2328,9 +2329,8 @@ def quiesce_service_replica_launch_requests(
 
 
 def _terminate_failed_services(service_name: str,
-                               expected_service_hash: Optional[str],
-                               service_status: Optional[
-                                   serve_state.ServiceStatus],
+                               expected_service_hash: str | None,
+                               service_status: serve_state.ServiceStatus | None,
                                pool: bool = False) -> _PurgeResult:
     """Terminate service in failed status.
 
@@ -2362,7 +2362,7 @@ def _terminate_failed_services(service_name: str,
 
 def _terminate_failed_services_locked(
         service_name: str, expected_service_hash: str, pool: bool,
-        lifecycle_lock: ServiceLifecycleLock) -> Optional[str]:
+        lifecycle_lock: ServiceLifecycleLock) -> str | None:
     """Locked implementation of failed-service purge."""
 
     def _still_owns() -> bool:
@@ -2492,7 +2492,7 @@ def _terminate_failed_services_locked(
         return _purge_ownership_failure(
             service_name, 'ownership lost after load balancer cleanup')
 
-    remaining_replica_clusters: List[str] = []
+    remaining_replica_clusters: list[str] = []
     # The controller is dead (CONTROLLER_FAILED / FAILED_CLEANUP / zombie
     # SHUTTING_DOWN), so no down thread will ever run for these replicas:
     # terminate their clusters here, BEFORE dropping the DB rows. Deleting
@@ -2521,7 +2521,7 @@ def _terminate_failed_services_locked(
                 return _still_owns()
 
         def _terminate_replica_cluster(
-                info: 'replica_managers.ReplicaInfo') -> Optional[str]:
+                info: 'replica_managers.ReplicaInfo') -> str | None:
             # Reuse the normal replica down path (sdk.down with retries);
             # logs go to the replica's log file like a regular teardown.
             log_file_name = generate_replica_log_file_name(
@@ -2613,7 +2613,7 @@ def _terminate_orphaned_service_children(service_name: str,
 
 
 def _terminate_orphaned_service_children_impl(
-        service_name: str, expected_pool: bool) -> Optional[str]:
+        service_name: str, expected_pool: bool) -> str | None:
     """Implementation returning a diagnostic for an incomplete purge."""
     lifecycle_lock = get_service_lifecycle_lock(service_name)
     with lifecycle_lock:
@@ -2665,7 +2665,7 @@ def _terminate_orphaned_service_children_impl(
             for intent in intents
             if isinstance(intent.get('resource_scope'), str)
         })
-        api_deployment_uid: Optional[str] = None
+        api_deployment_uid: str | None = None
         if resource_scopes and not expected_pool:
             try:
                 api_deployment_uid = lb_k8s.get_api_deployment_owner_uid(
@@ -2736,7 +2736,7 @@ def _terminate_orphaned_service_children_impl(
     return None
 
 
-def terminate_services(service_names: Optional[List[str]], purge: bool,
+def terminate_services(service_names: list[str] | None, purge: bool,
                        pool: bool) -> str:
     noun = 'pool' if pool else 'service'
     capnoun = noun.capitalize()
@@ -2747,8 +2747,8 @@ def terminate_services(service_names: Optional[List[str]], purge: bool,
             set(service_names) | set(
                 serve_state.get_orphaned_service_child_names(
                     requested_service_names)))
-    terminated_service_names: List[str] = []
-    messages: List[str] = []
+    terminated_service_names: list[str] = []
+    messages: list[str] = []
 
     for service_name in service_names:
         service_status = _get_service_status(service_name,
@@ -2894,8 +2894,8 @@ def terminate_services(service_names: Optional[List[str]], purge: bool,
         if (service_status is None or
             (service_status['status']
              not in serve_state.ServiceStatus.failed_statuses() and
-             service_status['status'] != serve_state.ServiceStatus.SHUTTING_DOWN
-            ) or not purge):
+             service_status['status']
+             != serve_state.ServiceStatus.SHUTTING_DOWN) or not purge):
             terminated_service_names.append(f'{service_name!r}')
     if not terminated_service_names:
         messages.append(f'No {noun} to terminate.')
@@ -2912,7 +2912,7 @@ def wait_service_registration(
         service_name: str,
         job_id: int,
         pool: bool,
-        expected_resource_scope: Optional[str] = None) -> str:
+        expected_resource_scope: str | None = None) -> str:
     """Util function to call at the end of `sky.serve.up()`.
 
     This function will:
@@ -2928,7 +2928,7 @@ def wait_service_registration(
 
     # TODO (kyuds): when codegen is fully deprecated, return the lb port
     # as an int directly instead of encoding it.
-    def _controller_log_path(record: Optional[Dict[str, Any]] = None) -> str:
+    def _controller_log_path(record: dict[str, Any] | None = None) -> str:
         resource_scope = (record.get('resource_scope')
                           if record is not None else expected_resource_scope)
         return os.path.expanduser(
@@ -2946,8 +2946,8 @@ def wait_service_registration(
             if job_status is None or job_status < job_lib.JobStatus.RUNNING:
                 # Wait for the controller process to finish setting up. It
                 # can be slow if a lot cloud dependencies are being installed.
-                if (time.time() - start_time >
-                        constants.CONTROLLER_SETUP_TIMEOUT_SECONDS):
+                if (time.time() - start_time
+                        > constants.CONTROLLER_SETUP_TIMEOUT_SECONDS):
                     with ux_utils.print_exception_no_traceback():
                         raise RuntimeError(
                             f'Failed to start the controller process for '
@@ -2999,7 +2999,7 @@ def wait_service_registration(
         else:
             controller_log_path = _controller_log_path()
             if os.path.exists(controller_log_path):
-                with open(controller_log_path, 'r', encoding='utf-8') as f:
+                with open(controller_log_path, encoding='utf-8') as f:
                     log_content = f.read()
                 if (constants.MAX_NUMBER_OF_SERVICES_REACHED_ERROR
                         in log_content):
@@ -3012,7 +3012,7 @@ def wait_service_registration(
             # Print the controller log to help user debug.
             controller_log_path = _controller_log_path(record)
             try:
-                with open(controller_log_path, 'r', encoding='utf-8') as f:
+                with open(controller_log_path, encoding='utf-8') as f:
                     log_content = f.read()
             except FileNotFoundError:
                 log_content = (f'Controller log {controller_log_path!r} '
@@ -3028,8 +3028,7 @@ def load_service_initialization_result(payload: str) -> int:
     return message_utils.decode_payload(payload)
 
 
-def _check_service_status_healthy(service_name: str,
-                                  pool: bool) -> Optional[str]:
+def _check_service_status_healthy(service_name: str, pool: bool) -> str | None:
     service_record = _get_service_status(service_name,
                                          pool,
                                          with_replica_info=False)
@@ -3044,9 +3043,10 @@ def _check_service_status_healthy(service_name: str,
 
 def get_latest_version_with_min_replicas(
         service_name: str,
-        replica_infos: List['replica_managers.ReplicaInfo']) -> Optional[int]:
+        replica_infos: list['replica_managers.ReplicaInfo']) -> int | None:
     # Find the latest version with at least min_replicas replicas.
-    version2count: DefaultDict[int, int] = collections.defaultdict(int)
+    version2count: collections.defaultdict[int,
+                                           int] = collections.defaultdict(int)
     for info in replica_infos:
         if info.is_ready:
             version2count[info.version] += 1
@@ -3065,7 +3065,7 @@ def _process_line(
         line: str,
         cluster_name: str,
         stop_on_eof: bool = False,
-        streamed_provision_log_paths: Optional[set] = None) -> Iterator[str]:
+        streamed_provision_log_paths: set | None = None) -> Iterator[str]:
     # The line might be directing users to view logs, like
     # `✓ Cluster launched: new-http.  View logs at: *.log`
     # We should tail the detailed logs for user.
@@ -3096,7 +3096,7 @@ def _process_line(
             streamed_provision_log_paths.add(resolved_path)
 
         try:
-            with open(p, 'r', newline='', encoding='utf-8') as f:
+            with open(p, newline='', encoding='utf-8') as f:
                 # Exit if >10s without new content to avoid hanging when INIT
                 yield from log_utils.follow_logs(f,
                                                  should_stop=cluster_is_up,
@@ -3151,7 +3151,7 @@ def _follow_logs_with_provision_expanding(
     *,
     should_stop: Callable[[], bool],
     stop_on_eof: bool = False,
-    idle_timeout_seconds: Optional[int] = None,
+    idle_timeout_seconds: int | None = None,
 ) -> Iterator[str]:
     """Follows logs and expands any provision.log references found.
 
@@ -3183,7 +3183,7 @@ def _follow_logs_with_provision_expanding(
 
 
 def _capped_follow_logs_with_provision_expanding(
-    log_list: List[str],
+    log_list: list[str],
     cluster_name: str,
     *,
     line_cap: int = 100,
@@ -3198,7 +3198,7 @@ def _capped_follow_logs_with_provision_expanding(
     Yields:
         Log lines, including expanded content from referenced provision logs.
     """
-    all_lines: Deque[str] = collections.deque(maxlen=line_cap)
+    all_lines: collections.deque[str] = collections.deque(maxlen=line_cap)
     streamed_provision_log_paths: set = set()
 
     for line in log_list:
@@ -3213,7 +3213,7 @@ def _capped_follow_logs_with_provision_expanding(
 
 
 def stream_replica_logs(service_name: str, replica_id: int, follow: bool,
-                        tail: Optional[int], pool: bool) -> str:
+                        tail: int | None, pool: bool) -> str:
     msg = _check_service_status_healthy(service_name, pool=pool)
     if msg is not None:
         return msg
@@ -3243,7 +3243,7 @@ def stream_replica_logs(service_name: str, replica_id: int, follow: bool,
                     line += '\n'
                 print(line, end='', flush=True)
         else:
-            with open(log_file_name, 'r', encoding='utf-8') as f:
+            with open(log_file_name, encoding='utf-8') as f:
                 print(f.read(), flush=True)
         return ''
 
@@ -3286,7 +3286,7 @@ def stream_replica_logs(service_name: str, replica_id: int, follow: bool,
             ))
         final_lines_to_print += lines
     else:
-        with open(launch_log_file_name, 'r', newline='', encoding='utf-8') as f:
+        with open(launch_log_file_name, newline='', encoding='utf-8') as f:
             for line in _follow_logs_with_provision_expanding(
                     f,
                     replica_cluster_name,
@@ -3352,7 +3352,7 @@ def stream_replica_logs(service_name: str, replica_id: int, follow: bool,
 
 
 def stream_serve_process_logs(service_name: str, stream_controller: bool,
-                              follow: bool, tail: Optional[int],
+                              follow: bool, tail: int | None,
                               pool: bool) -> str:
     msg = _check_service_status_healthy(service_name, pool)
     if msg is not None:
@@ -3386,9 +3386,7 @@ def stream_serve_process_logs(service_name: str, stream_controller: bool,
                 line += '\n'
             print(line, end='', flush=True)
     else:
-        with open(os.path.expanduser(log_file),
-                  'r',
-                  newline='',
+        with open(os.path.expanduser(log_file), newline='',
                   encoding='utf-8') as f:
             for line in log_utils.follow_logs(
                     f,
@@ -3402,7 +3400,7 @@ def stream_serve_process_logs(service_name: str, stream_controller: bool,
 # ================== Table Formatter for `sky serve status` ==================
 
 
-def _get_replicas(service_record: Dict[str, Any]) -> str:
+def _get_replicas(service_record: dict[str, Any]) -> str:
     ready_replica_num, total_replica_num = 0, 0
     for info in service_record['replica_info']:
         if info['status'] == serve_state.ReplicaStatus.READY:
@@ -3413,7 +3411,7 @@ def _get_replicas(service_record: Dict[str, Any]) -> str:
     return f'{ready_replica_num}/{total_replica_num}'
 
 
-def format_service_table(service_records: List[Dict[str, Any]], show_all: bool,
+def format_service_table(service_records: list[dict[str, Any]], show_all: bool,
                          pool: bool) -> str:
     noun = 'pool' if pool else 'service'
     if not service_records:
@@ -3434,7 +3432,7 @@ def format_service_table(service_records: List[Dict[str, Any]], show_all: bool,
             service_columns.pop(-2)
     service_table = log_utils.create_table(service_columns)
 
-    replica_infos: List[Dict[str, Any]] = []
+    replica_infos: list[dict[str, Any]] = []
     for record in service_records:
         for replica in record['replica_info']:
             replica['service_name'] = record['name']
@@ -3480,7 +3478,7 @@ def format_service_table(service_records: List[Dict[str, Any]], show_all: bool,
             f'{replica_table}')
 
 
-def _format_replica_table(replica_records: List[Dict[str, Any]], show_all: bool,
+def _format_replica_table(replica_records: list[dict[str, Any]], show_all: bool,
                           pool: bool) -> str:
     noun = 'worker' if pool else 'replica'
     if not replica_records:
@@ -3546,8 +3544,8 @@ def _format_replica_table(replica_records: List[Dict[str, Any]], show_all: bool,
             resources_str = resources_pre
 
         if infra_pre is None or resources_pre is None:
-            replica_handle: Optional[
-                'backends.CloudVmRayResourceHandle'] = record.get('handle')
+            replica_handle: backends.CloudVmRayResourceHandle | None = record.get(
+                'handle')
             if (replica_handle is not None and
                     replica_handle.launched_resources is not None):
                 if infra_pre is None:
@@ -3608,10 +3606,10 @@ class ServeCodeGen:
     @classmethod
     def get_service_status(
             cls,
-            service_names: Optional[List[str]],
+            service_names: list[str] | None,
             pool: bool,
             summary_only: bool = False,
-            include_target_num_replicas: Optional[bool] = None) -> str:
+            include_target_num_replicas: bool | None = None) -> str:
         # summary_only is only forwarded to controllers whose lib version
         # understands it (v6+); older controllers just return the full
         # payload — a graceful degradation, never an error.
@@ -3636,7 +3634,7 @@ class ServeCodeGen:
         return cls._build(code)
 
     @classmethod
-    def terminate_services(cls, service_names: Optional[List[str]], purge: bool,
+    def terminate_services(cls, service_names: list[str] | None, purge: bool,
                            pool: bool) -> str:
         code = [
             f'kwargs={{}} if serve_version < 3 else {{"pool": {pool}}}',
@@ -3681,8 +3679,7 @@ class ServeCodeGen:
 
     @classmethod
     def stream_replica_logs(cls, service_name: str, replica_id: int,
-                            follow: bool, tail: Optional[int],
-                            pool: bool) -> str:
+                            follow: bool, tail: int | None, pool: bool) -> str:
         code = [
             f'kwargs={{}} if serve_version < 5 else {{"pool": {pool}}}',
             'msg = serve_utils.stream_replica_logs('
@@ -3694,7 +3691,7 @@ class ServeCodeGen:
     @classmethod
     def stream_serve_process_logs(cls, service_name: str,
                                   stream_controller: bool, follow: bool,
-                                  tail: Optional[int], pool: bool) -> str:
+                                  tail: int | None, pool: bool) -> str:
         code = [
             f'kwargs={{}} if serve_version < 5 else {{"pool": {pool}}}',
             f'msg = serve_utils.stream_serve_process_logs({service_name!r}, '
@@ -3715,7 +3712,7 @@ class ServeCodeGen:
         return cls._build(code)
 
     @classmethod
-    def _build(cls, code: List[str]) -> str:
+    def _build(cls, code: list[str]) -> str:
         code = cls._PREFIX + code
         generated_code = '; '.join(code)
         # Use the local user id to make sure the operation goes to the correct

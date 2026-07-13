@@ -1,9 +1,9 @@
 """Skylet configs."""
+from collections.abc import Callable
 import functools
 import os
 import pathlib
 import threading
-from typing import Callable, Optional, Union
 
 from sky.skylet import runtime_utils
 from sky.utils.db import db_utils
@@ -49,7 +49,7 @@ def init_db(func: Callable):
 
 
 @init_db
-def get_config(key: str) -> Optional[bytes]:
+def get_config(key: str) -> bytes | None:
     assert _DB_PATH is not None
     with db_utils.safe_cursor(_DB_PATH) as cursor:
         rows = cursor.execute('SELECT value FROM config WHERE key = ?', (key,))
@@ -59,7 +59,7 @@ def get_config(key: str) -> Optional[bytes]:
 
 
 @init_db
-def set_config(key: str, value: Union[bytes, str]) -> None:
+def set_config(key: str, value: bytes | str) -> None:
     assert _DB_PATH is not None
     with db_utils.safe_cursor(_DB_PATH) as cursor:
         cursor.execute(

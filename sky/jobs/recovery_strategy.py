@@ -6,11 +6,13 @@ resources:
     job_recovery: EAGER_NEXT_REGION
 """
 import asyncio
+from collections.abc import Callable
+from collections.abc import Coroutine
 import logging
 import os
 import traceback
 import typing
-from typing import Any, Callable, Coroutine, Dict, List, Optional, Set
+from typing import Any
 
 from sky import backends
 from sky import dag as dag_lib
@@ -85,18 +87,18 @@ class StrategyExecutor:
 
     def __init__(
         self,
-        cluster_name: Optional[str],
+        cluster_name: str | None,
         backend: 'backends.Backend',
         task: 'task_lib.Task',
         max_restarts_on_errors: int,
         job_id: int,
         task_id: int,
-        pool: Optional[str],
-        starting: Set[int],
+        pool: str | None,
+        starting: set[int],
         starting_lock: asyncio.Lock,
         starting_signal: asyncio.Condition,
-        recover_on_exit_codes: Optional[List[int]] = None,
-        file_mounts_blob_id: Optional[str] = None,
+        recover_on_exit_codes: list[int] | None = None,
+        file_mounts_blob_id: str | None = None,
     ) -> None:
         """Initialize the strategy executor.
 
@@ -134,7 +136,7 @@ class StrategyExecutor:
         self.task_id = task_id
         self.pool = pool
         self.restart_cnt_on_failure = 0
-        self.job_id_on_pool_cluster: Optional[int] = None
+        self.job_id_on_pool_cluster: int | None = None
         self.starting = starting
         self.starting_lock = starting_lock
         self.starting_signal = starting_signal
@@ -155,7 +157,7 @@ class StrategyExecutor:
             logger.debug('Unused job_recovery config keys for strategy '
                          f'{type(self).__name__}: {list(config.keys())}')
 
-    def extra_launch_context(self) -> Dict[str, Any]:
+    def extra_launch_context(self) -> dict[str, Any]:
         """Return strategy-specific context for the launch pipeline.
 
         The returned dict is merged into ``_extra_launch_context``
@@ -164,7 +166,7 @@ class StrategyExecutor:
         """
         return {}
 
-    def task_specs(self) -> Dict[str, Any]:
+    def task_specs(self) -> dict[str, Any]:
         """Return strategy-specific keys for the persisted task specs.
 
         Merged into the ``specs`` dict written by
@@ -185,12 +187,12 @@ class StrategyExecutor:
         task_id: int,
         task: 'task_lib.Task',
         cluster_name: str,
-        job_id_on_pool_cluster: Optional[int] = None,
-        callback_func: Optional[Callable[..., Any]] = None,
+        job_id_on_pool_cluster: int | None = None,
+        callback_func: Callable[..., Any] | None = None,
         cleanup_cluster_on_success: bool = True,
         force_transit_to_recovering: bool = False,
-        on_recovery: Optional[Callable[[], Coroutine[Any, Any, None]]] = None,
-    ) -> Optional[bool]:
+        on_recovery: Callable[[], Coroutine[Any, Any, None]] | None = None,
+    ) -> bool | None:
         """Strategy-owned monitoring loop override.
 
         # TODO(kevin): The default monitor (JobController._monitor_one_task)
@@ -210,16 +212,16 @@ class StrategyExecutor:
     @classmethod
     def make(
         cls,
-        cluster_name: Optional[str],
+        cluster_name: str | None,
         backend: 'backends.Backend',
         task: 'task_lib.Task',
         job_id: int,
         task_id: int,
-        pool: Optional[str],
-        starting: Set[int],
+        pool: str | None,
+        starting: set[int],
         starting_lock: asyncio.Lock,
         starting_signal: asyncio.Condition,
-        file_mounts_blob_id: Optional[str] = None,
+        file_mounts_blob_id: str | None = None,
     ) -> 'StrategyExecutor':
         """Create a strategy from a task."""
 
@@ -249,12 +251,12 @@ class StrategyExecutor:
                 'strategy', registry.JOBS_RECOVERY_STRATEGY_REGISTRY.default)
             assert name is None or isinstance(name, str), (
                 name, 'The job recovery strategy name must be a string or None')
-            job_recovery_name: Optional[str] = name
+            job_recovery_name: str | None = name
             max_restarts_on_errors = job_recovery.pop('max_restarts_on_errors',
                                                       0)
             recover_exit_codes = job_recovery.pop('recover_on_exit_codes', None)
             # Normalize single integer to list
-            recover_on_exit_codes: Optional[List[int]] = None
+            recover_on_exit_codes: list[int] | None = None
             if isinstance(recover_exit_codes, int):
                 recover_on_exit_codes = [recover_exit_codes]
             elif isinstance(recover_exit_codes, list):
@@ -364,7 +366,7 @@ class StrategyExecutor:
                         'remaining job process interferes with recovery.')
             await asyncio.to_thread(self._cleanup_cluster)
 
-    async def _wait_until_job_starts_on_cluster(self) -> Optional[float]:
+    async def _wait_until_job_starts_on_cluster(self) -> float | None:
         """Wait for MAX_JOB_CHECKING_RETRY times until job starts on the cluster
 
         Returns:
@@ -507,9 +509,9 @@ class StrategyExecutor:
                 f'(priority_class={new_priority_class}) from persisted DAG.')
 
     async def _launch(self,
-                      max_retry: Optional[int] = 3,
+                      max_retry: int | None = 3,
                       raise_on_failure: bool = True,
-                      recovery: bool = False) -> Optional[float]:
+                      recovery: bool = False) -> float | None:
         """Implementation of launch().
 
         The function will wait until the job starts running, but will leave the
@@ -862,8 +864,7 @@ class StrategyExecutor:
                 assert False, 'Unreachable'
 
     def should_restart_on_failure(self,
-                                  exit_codes: Optional[List[int]] = None
-                                 ) -> bool:
+                                  exit_codes: list[int] | None = None) -> bool:
         """Increments counter & checks if job should be restarted on a failure.
 
         Args:
@@ -902,18 +903,18 @@ class FailoverStrategyExecutor(StrategyExecutor):
 
     def __init__(
         self,
-        cluster_name: Optional[str],
+        cluster_name: str | None,
         backend: 'backends.Backend',
         task: 'task_lib.Task',
         max_restarts_on_errors: int,
         job_id: int,
         task_id: int,
-        pool: Optional[str],
-        starting: Set[int],
+        pool: str | None,
+        starting: set[int],
         starting_lock: asyncio.Lock,
         starting_signal: asyncio.Condition,
-        recover_on_exit_codes: Optional[List[int]] = None,
-        file_mounts_blob_id: Optional[str] = None,
+        recover_on_exit_codes: list[int] | None = None,
+        file_mounts_blob_id: str | None = None,
     ) -> None:
         super().__init__(cluster_name, backend, task, max_restarts_on_errors,
                          job_id, task_id, pool, starting, starting_lock,
@@ -923,12 +924,12 @@ class FailoverStrategyExecutor(StrategyExecutor):
         # first retry in the same cloud/region. (Inside recover() we may not
         # rely on cluster handle, as it can be None if the cluster is
         # preempted.)
-        self._launched_resources: Optional['resources.Resources'] = None
+        self._launched_resources: resources.Resources | None = None
 
     async def _launch(self,
-                      max_retry: Optional[int] = 3,
+                      max_retry: int | None = 3,
                       raise_on_failure: bool = True,
-                      recovery: bool = False) -> Optional[float]:
+                      recovery: bool = False) -> float | None:
         job_submitted_at = await super()._launch(max_retry, raise_on_failure,
                                                  recovery)
         if job_submitted_at is not None and self.cluster_name is not None:
@@ -1099,7 +1100,7 @@ class EagerFailoverStrategyExecutor(FailoverStrategyExecutor):
             return job_submitted_at
 
 
-def _get_logger_file(file_logger: logging.Logger) -> Optional[str]:
+def _get_logger_file(file_logger: logging.Logger) -> str | None:
     """Gets the file path that the logger writes to."""
     for handler in file_logger.handlers:
         if isinstance(handler, logging.FileHandler):

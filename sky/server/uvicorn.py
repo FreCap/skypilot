@@ -12,7 +12,6 @@ import sys
 import threading
 import time
 from types import FrameType
-from typing import Optional, Union
 
 import filelock
 import uvicorn
@@ -108,15 +107,15 @@ class Server(uvicorn.Server):
 
     def __init__(self,
                  config: uvicorn.Config,
-                 max_db_connections: Optional[int] = None):
+                 max_db_connections: int | None = None):
         super().__init__(config=config)
         self.exiting: bool = False
         self.max_db_connections = max_db_connections
         # Monotonic time at which the first shutdown signal arrived; used to
         # budget the on-going-request wait against the real SIGKILL deadline.
-        self._shutdown_started_at: Optional[float] = None
+        self._shutdown_started_at: float | None = None
 
-    def handle_exit(self, sig: int, frame: Union[FrameType, None]) -> None:
+    def handle_exit(self, sig: int, frame: FrameType | None) -> None:
         """Handle exit signal.
 
         When a server process receives a SIGTERM or SIGINT signal, a graceful
@@ -143,8 +142,7 @@ class Server(uvicorn.Server):
                              args=(sig, frame),
                              daemon=True).start()
 
-    def _graceful_shutdown(self, sig: int, frame: Union[FrameType,
-                                                        None]) -> None:
+    def _graceful_shutdown(self, sig: int, frame: FrameType | None) -> None:
         """Perform graceful shutdown."""
         time.sleep(_GRACE_WAIT_SECONDS)
         # Block new requests so that we can wait until all on-going requests
@@ -274,11 +272,16 @@ class Server(uvicorn.Server):
         # to every subsequent /metrics scrape and liveall-based probe.
         metrics_lib.register_multiproc_cleanup_atexit()
         lag_threshold = perf_utils.get_loop_lag_threshold()
-        if lag_threshold is not None:
-            event_loop = asyncio.get_event_loop()
-            # Same as set PYTHONASYNCIODEBUG=1, but with custom threshold.
-            event_loop.set_debug(True)
-            event_loop.slow_callback_duration = lag_threshold
+
+        async def _serve(*serve_args, **serve_kwargs):
+            # Configure the serving loop from inside the coroutine:
+            # asyncio.run() below creates its own fresh loop, so a loop
+            # obtained here via asyncio.get_event_loop() would not be the
+            # one that serves (and on Python 3.14+ that call raises when no
+            # loop is running).
+            _configure_running_loop_lag_debug(lag_threshold)
+            await self.serve(*serve_args, **serve_kwargs)
+
         stop_monitor = threading.Event()
         monitor = threading.Thread(
             target=metrics_lib.process_monitor,
@@ -288,13 +291,27 @@ class Server(uvicorn.Server):
         monitor.start()
         try:
             with self.capture_signals():
-                asyncio.run(self.serve(*args, **kwargs))
+                asyncio.run(_serve(*args, **kwargs))
         finally:
             stop_monitor.set()
             monitor.join()
 
 
-def run(config: uvicorn.Config, max_db_connections: Optional[int] = None):
+def _configure_running_loop_lag_debug(lag_threshold: float | None) -> None:
+    """Enable slow-callback logging on the currently running loop.
+
+    Must be called from inside the serving coroutine so it configures the
+    loop created by asyncio.run(), not a bystander loop.
+    """
+    if lag_threshold is None:
+        return
+    event_loop = asyncio.get_running_loop()
+    # Same as set PYTHONASYNCIODEBUG=1, but with custom threshold.
+    event_loop.set_debug(True)
+    event_loop.slow_callback_duration = lag_threshold
+
+
+def run(config: uvicorn.Config, max_db_connections: int | None = None):
     """Run unvicorn server."""
     if config.reload:
         # Reload and multi-workers are mutually exclusive
@@ -332,7 +349,7 @@ class SlowStartMultiprocess(multiprocess.Multiprocess):
             config: The uvicorn config.
         """
         super().__init__(config, **kwargs)
-        self._init_thread: Optional[threading.Thread] = None
+        self._init_thread: threading.Thread | None = None
 
     def init_processes(self) -> None:
         # Slow start worker processes asynchronously to avoid blocking signal

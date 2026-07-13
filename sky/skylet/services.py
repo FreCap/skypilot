@@ -3,7 +3,6 @@
 import json
 import os
 import subprocess
-from typing import List, Optional
 
 import grpc
 
@@ -337,10 +336,8 @@ class JobsServiceImpl(jobsv1_pb2_grpc.JobsServiceServicer):
         except Exception as e:  # pylint: disable=broad-except
             context.abort(grpc.StatusCode.INTERNAL, str(e))
 
-    def TailLogs(
-            self,
-            request: jobsv1_pb2.TailLogsRequest,  # type: ignore[return]
-            context: grpc.ServicerContext):
+    def TailLogs(self, request: jobsv1_pb2.TailLogsRequest,
+                 context: grpc.ServicerContext):
         buffer = log_lib.LogBuffer()
         try:
             job_id = request.job_id if request.HasField(
@@ -449,7 +446,7 @@ class JobsServiceImpl(jobsv1_pb2_grpc.JobsServiceServicer):
         try:
             job_id = request.job_id if request.HasField(
                 'job_id') else job_lib.get_latest_job_id()
-            exit_codes: Optional[List[int]] = None
+            exit_codes: list[int] | None = None
             if job_id:
                 exit_codes_list = job_lib.get_exit_codes(job_id)
                 exit_codes = exit_codes_list if exit_codes_list else []
@@ -482,7 +479,7 @@ class ManagedJobsServiceImpl(managed_jobsv1_pb2_grpc.ManagedJobsServiceServicer
                 if request.HasField('accessible_workspaces') else None)
             job_ids = (list(request.job_ids.ids)
                        if request.HasField('job_ids') else None)
-            user_hashes: Optional[List[Optional[str]]] = None
+            user_hashes: list[str | None] | None = None
             if request.HasField('user_hashes'):
                 user_hashes = list(request.user_hashes.hashes)
                 # For backwards compatibility, we show jobs that do not have a
@@ -662,11 +659,8 @@ class ManagedJobsServiceImpl(managed_jobsv1_pb2_grpc.ManagedJobsServiceServicer
         except Exception as e:  # pylint: disable=broad-except
             context.abort(grpc.StatusCode.INTERNAL, str(e))
 
-    def StreamLogs(
-            self,
-            request: managed_jobsv1_pb2.
-        StreamLogsRequest,  # type: ignore[return]
-            context: grpc.ServicerContext):
+    def StreamLogs(self, request: managed_jobsv1_pb2.StreamLogsRequest,
+                   context: grpc.ServicerContext):
         # TODO(kevin): implement this
         context.abort(grpc.StatusCode.UNIMPLEMENTED,
                       'StreamLogs is not implemented')
@@ -703,7 +697,7 @@ class HealthServiceImpl(healthv1_pb2_grpc.HealthServiceServicer):
         try:
             port_path = runtime_utils.get_runtime_dir_path(
                 constants.SKY_REMOTE_RAY_PORT_FILE)
-            with open(port_path, 'r', encoding='utf-8') as f:
+            with open(port_path, encoding='utf-8') as f:
                 return int(json.load(f)['ray_port'])
         except Exception:  # pylint: disable=broad-except
             return constants.SKY_REMOTE_RAY_PORT

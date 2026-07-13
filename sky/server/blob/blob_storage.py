@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import abc
+from collections.abc import Generator
 import contextlib
 import os
 import pathlib
-from typing import Generator, List, Optional, Tuple
 
 from sky import sky_logging
 from sky.skylet import constants
@@ -60,7 +60,7 @@ class BlobStorage(abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def list_blob_ids(self, user_id: str) -> List[Tuple[str, float]]:
+    def list_blob_ids(self, user_id: str) -> list[tuple[str, float]]:
         """List ``(blob_id, mtime)`` pairs for a user.
 
         Excludes internal directories (``.locks``, ``.staging``).
@@ -73,7 +73,7 @@ class BlobStorage(abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def list_users(self) -> List[str]:
+    def list_users(self) -> list[str]:
         """List user IDs that have blob directories.
 
         Used by GC to discover which users need cleanup.
@@ -119,7 +119,7 @@ class BlobStorage(abc.ABC):
         """Return a staging directory for log downloads for a user."""
         raise NotImplementedError
 
-    def download_tmp_base_dir(self) -> Optional[str]:
+    def download_tmp_base_dir(self) -> str | None:
         """Return the base directory for download tmp cleanup.
 
         Returns None if downloads share the persistent log directory
@@ -141,7 +141,7 @@ class BlobStorage(abc.ABC):
         return self.blobs_dir(user_id) / blob_id
 
 
-_blob_storage: Optional[BlobStorage] = None
+_blob_storage: BlobStorage | None = None
 
 
 def get_blob_storage() -> BlobStorage:

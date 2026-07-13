@@ -1,5 +1,6 @@
 """Common data structures and constants used in the API."""
 
+from collections.abc import Callable
 import dataclasses
 import enum
 import functools
@@ -15,8 +16,7 @@ import tempfile
 import threading
 import time
 import typing
-from typing import (Any, Callable, cast, Dict, Generic, Literal, Optional,
-                    Tuple, TypeVar, Union)
+from typing import Any, cast, Generic, Literal, Optional, TypeVar
 from urllib.request import Request
 import uuid
 
@@ -101,7 +101,7 @@ class RequestId(str, Generic[T]):
     pass
 
 
-ApiVersion = Optional[str]
+ApiVersion = str | None
 
 logger = sky_logging.init_logger(__name__)
 
@@ -111,7 +111,7 @@ _upgrade_hint_shown = False
 # to include client user hash in usage reports and request env vars.
 basic_auth_enabled: bool = False
 # Cached client user hash (machine-local identity), computed once.
-client_user_hash: Optional[str] = None
+client_user_hash: str | None = None
 
 crypt_ctx = passlib_context.CryptContext([
     'bcrypt', 'sha256_crypt', 'sha512_crypt', 'des_crypt', 'apr_md5_crypt',
@@ -130,13 +130,13 @@ class ApiServerStatus(enum.Enum):
 class ApiServerInfo:
     status: ApiServerStatus
     api_version: ApiVersion = None
-    version: Optional[str] = None
-    version_on_disk: Optional[str] = None
-    commit: Optional[str] = None
-    user: Optional[Dict[str, Any]] = None
+    version: str | None = None
+    version_on_disk: str | None = None
+    commit: str | None = None
+    user: dict[str, Any] | None = None
     basic_auth_enabled: bool = False
-    error: Optional[str] = None
-    latest_version: Optional[str] = None
+    error: str | None = None
+    latest_version: str | None = None
 
 
 def check_and_print_upgrade_hint(api_server_info: ApiServerInfo,
@@ -234,7 +234,7 @@ def get_api_cookie_jar() -> requests.cookies.RequestsCookieJar:
     return cookie_jar
 
 
-def get_cookie_header_for_url(url: str) -> Dict[str, str]:
+def get_cookie_header_for_url(url: str) -> dict[str, str]:
     """Extract Cookie header value from a cookie jar for a specific URL"""
     cookies = get_api_cookie_jar()
     if not cookies:
@@ -296,8 +296,8 @@ def get_cookies_from_response(
 
 def _prepare_authenticated_request_params(
         path: str,
-        server_url: Optional[str] = None,
-        **kwargs) -> Tuple[str, Dict[str, Any]]:
+        server_url: str | None = None,
+        **kwargs) -> tuple[str, dict[str, Any]]:
     """Prepare common parameters for authenticated requests (sync or async).
 
     Returns:
@@ -327,7 +327,7 @@ def _prepare_authenticated_request_params(
 
 
 def _convert_requests_cookies_to_aiohttp(
-        cookie_jar: requests.cookies.RequestsCookieJar) -> Dict[str, str]:
+        cookie_jar: requests.cookies.RequestsCookieJar) -> dict[str, str]:
     """Convert requests cookie jar to aiohttp-compatible dict format."""
     cookies = {}
     for cookie in cookie_jar:
@@ -337,7 +337,7 @@ def _convert_requests_cookies_to_aiohttp(
 
 def make_authenticated_request(method: str,
                                path: str,
-                               server_url: Optional[str] = None,
+                               server_url: str | None = None,
                                retry: bool = True,
                                **kwargs) -> 'requests.Response':
     """Make an authenticated HTTP request to the API server.
@@ -370,7 +370,7 @@ async def make_authenticated_request_async(
         session: 'aiohttp.ClientSession',
         method: str,
         path: str,
-        server_url: Optional[str] = None,
+        server_url: str | None = None,
         retry: bool = True,
         **kwargs) -> 'aiohttp.ClientResponse':
     """Make an authenticated async HTTP request to the API server using aiohttp.
@@ -430,7 +430,7 @@ async def make_authenticated_request_async(
 
 
 @annotations.lru_cache(scope='global')
-def get_server_url(host: Optional[str] = None) -> str:
+def get_server_url(host: str | None = None) -> str:
     endpoint = DEFAULT_SERVER_URL
     if host is not None:
         endpoint = f'http://{host}:46580'
@@ -442,8 +442,7 @@ def get_server_url(host: Optional[str] = None) -> str:
 
 
 @annotations.lru_cache(scope='global')
-def get_dashboard_url(server_url: str,
-                      starting_page: Optional[str] = None) -> str:
+def get_dashboard_url(server_url: str, starting_page: str | None = None) -> str:
     dashboard_url = server_url.rstrip('/')
     dashboard_url = f'{dashboard_url}/dashboard'
     if starting_page:
@@ -452,7 +451,7 @@ def get_dashboard_url(server_url: str,
 
 
 @annotations.lru_cache(scope='global')
-def is_api_server_local(endpoint: Optional[str] = None):
+def is_api_server_local(endpoint: str | None = None):
     server_url = endpoint if endpoint is not None else get_server_url()
     return server_url in AVAILABLE_LOCAL_API_SERVER_URLS
 
@@ -479,7 +478,7 @@ def _handle_non_200_server_status(
                                              timer=time.time),
                    lock=threading.RLock())
 def get_api_server_status_response(
-        endpoint: Optional[str] = None) -> Optional['requests.Response']:
+        endpoint: str | None = None) -> Optional['requests.Response']:
     # Cache the response to set the api version across multiple threads.
     # Refer to https://github.com/skypilot-org/skypilot/issues/8879
     time_out_try_count = 1
@@ -500,7 +499,7 @@ def get_api_server_status_response(
     return None
 
 
-def get_api_server_status(endpoint: Optional[str] = None) -> ApiServerInfo:
+def get_api_server_status(endpoint: str | None = None) -> ApiServerInfo:
     """Retrieve the status of the API server.
 
     This function checks the health of the API server by sending a request
@@ -631,8 +630,7 @@ def get_request_id(response: 'requests.Response') -> RequestId[T]:
     return RequestId[T](request_id)
 
 
-def get_stream_request_id(
-        response: 'requests.Response') -> Optional[RequestId[T]]:
+def get_stream_request_id(response: 'requests.Response') -> RequestId[T] | None:
     """This is same as the above function, but just for `sdk.stream_and_get.
     We do this because `/api/stream` may choose the latest request id, and
     we need to keep track of that information. Request id in this case can
@@ -648,7 +646,7 @@ def _start_api_server(deploy: bool = False,
                       host: str = '127.0.0.1',
                       foreground: bool = False,
                       metrics: bool = False,
-                      metrics_port: Optional[int] = None,
+                      metrics_port: int | None = None,
                       enable_basic_auth: bool = False):
     """Starts a SkyPilot API server locally."""
     server_url = get_server_url(host)
@@ -751,7 +749,7 @@ def _start_api_server(deploy: bool = False,
                         f'View logs at: {constants.API_SERVER_LOGS}')
             try:
                 # Clear the cache to ensure fresh checks during startup
-                get_api_server_status_response.cache_clear()  # type: ignore
+                get_api_server_status_response.cache_clear()
                 check_server_healthy()
             except exceptions.APIVersionMismatchError:
                 raise
@@ -789,7 +787,7 @@ def _start_api_server(deploy: bool = False,
                 f'SkyPilot API server started. {dashboard_msg}'))
 
 
-def _set_metrics_env_var(env: Union[Dict[str, str], os._Environ], metrics: bool,
+def _set_metrics_env_var(env: dict[str, str] | os._Environ, metrics: bool,
                          deploy: bool):
     """Sets the metrics environment variables.
 
@@ -812,11 +810,14 @@ def _set_metrics_env_var(env: Union[Dict[str, str], os._Environ], metrics: bool,
 
 
 def check_server_healthy(
-    endpoint: Optional[str] = None
-) -> Tuple[Literal[
-        # Use an incomplete list of Literals here to enforce raising for other
-        # enum values.
-        ApiServerStatus.HEALTHY, ApiServerStatus.NEEDS_AUTH], ApiServerInfo]:
+    endpoint: str | None = None
+) -> tuple[
+        Literal[
+            # Use an incomplete list of Literals here to enforce raising for other
+            # enum values.
+            ApiServerStatus.HEALTHY,
+            ApiServerStatus.NEEDS_AUTH],
+        ApiServerInfo]:
     """Check if the API server is healthy.
 
     Args:
@@ -881,7 +882,7 @@ def get_skypilot_version_on_disk() -> str:
     assert str(current_file_path).endswith(
         'server/common.py'), current_file_path
     sky_root = current_file_path.parent.parent
-    with open(sky_root / '__init__.py', 'r', encoding='utf-8') as fp:
+    with open(sky_root / '__init__.py', encoding='utf-8') as fp:
         content = fp.read()
     version_match = re.search(r'^__version__ = [\'"]([^\'"]*)[\'"]', content,
                               re.M)
@@ -894,7 +895,7 @@ def check_server_healthy_or_start_fn(deploy: bool = False,
                                      host: str = '127.0.0.1',
                                      foreground: bool = False,
                                      metrics: bool = False,
-                                     metrics_port: Optional[int] = None,
+                                     metrics_port: int | None = None,
                                      enable_basic_auth: bool = False):
     # This function will set remote api version and remote version
     # on the current thread's ContextVars.
@@ -916,7 +917,7 @@ def check_server_healthy_or_start_fn(deploy: bool = False,
                 os.path.expanduser(constants.API_SERVER_CREATION_LOCK_PATH)):
             # Check again if server is already running. Other processes may
             # have started the server while we were waiting for the lock.
-            get_api_server_status_response.cache_clear()  # type: ignore
+            get_api_server_status_response.cache_clear()
             api_server_info = get_api_server_status(endpoint)
             if api_server_info.status == ApiServerStatus.UNHEALTHY:
                 _start_api_server(deploy, host, foreground, metrics,
@@ -955,9 +956,9 @@ def resolve_blob_dir(blob_id: str, user_hash: str) -> str:
 
 def process_mounts_in_task_on_api_server(
         task: str,
-        env_vars: Dict[str, str],
+        env_vars: dict[str, str],
         workdir_only: bool,
-        file_mounts_blob_id: Optional[str] = None) -> 'dag_lib.Dag':
+        file_mounts_blob_id: str | None = None) -> 'dag_lib.Dag':
     """Translates the file mounts path in a task to the path on API server.
 
     When a task involves file mounts, the client will invoke
@@ -1005,7 +1006,7 @@ def process_mounts_in_task_on_api_server(
     file_mounts_base.mkdir(parents=True, exist_ok=True)
 
     def _get_client_file_mounts_path(
-            original_path: str, file_mounts_mapping: Dict[str, str]) -> str:
+            original_path: str, file_mounts_mapping: dict[str, str]) -> str:
         return str(file_mounts_base /
                    file_mounts_mapping[original_path].lstrip('/'))
 
@@ -1068,20 +1069,20 @@ def process_mounts_in_task_on_api_server(
 
 
 def api_server_user_logs_dir_prefix(
-        user_hash: Optional[str] = None) -> pathlib.Path:
+        user_hash: str | None = None) -> pathlib.Path:
     if user_hash is None:
         user_hash = common_utils.get_user_hash()
     return API_SERVER_CLIENT_DIR / user_hash / 'sky_logs'
 
 
-def request_body_to_params(body: 'pydantic.BaseModel') -> Dict[str, Any]:
+def request_body_to_params(body: 'pydantic.BaseModel') -> dict[str, Any]:
     return {
         k: v for k, v in body.model_dump(mode='json').items() if v is not None
     }
 
 
-def reload_for_new_request(client_entrypoint: Optional[str],
-                           client_command: Optional[str],
+def reload_for_new_request(client_entrypoint: str | None,
+                           client_command: str | None,
                            using_remote_api_server: bool, user: 'models.User',
                            request_id: str) -> None:
     """Reload modules, global variables, and usage message for a new request.

@@ -1,11 +1,12 @@
 """Slurm utilities for SkyPilot."""
+from collections.abc import Callable
 import json
 import math
 import os
 import re
 import shlex
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any
 
 from paramiko.config import SSHConfig
 
@@ -44,7 +45,7 @@ _SLURM_PYXIS_CHECK_CACHE_TTL = 24 * 60 * 60
 _SLURM_FUSE_CHECK_CACHE_TTL = 24 * 60 * 60
 
 
-def expand_path_vars(path: str, env: Dict[str, str]) -> str:
+def expand_path_vars(path: str, env: dict[str, str]) -> str:
     """Expand $VAR and ${VAR} in path using the given environment dict.
 
     Inspired by os.path.expandvars from CPython:
@@ -62,7 +63,7 @@ def expand_path_vars(path: str, env: Dict[str, str]) -> str:
     return _VAR_PATTERN.sub(_repl, path)
 
 
-def get_gpu_type_and_count(gres_str: str) -> Tuple[Optional[str], int]:
+def get_gpu_type_and_count(gres_str: str) -> tuple[str | None, int]:
     """Parses GPU type and count from a GRES string.
 
     Returns:
@@ -90,7 +91,7 @@ def get_slurm_ssh_config() -> SSHConfig:
     return slurm_config
 
 
-def get_identity_file(ssh_config_dict: Dict[str, Any]) -> Optional[str]:
+def get_identity_file(ssh_config_dict: dict[str, Any]) -> str | None:
     """Get the first identity file from SSH config, or None if not specified."""
     identity_files = ssh_config_dict.get('identityfile')
     if identity_files:
@@ -98,7 +99,7 @@ def get_identity_file(ssh_config_dict: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def get_identities_only(ssh_config_dict: Dict[str, Any]) -> bool:
+def get_identities_only(ssh_config_dict: dict[str, Any]) -> bool:
     """Check if IdentitiesOnly is set to yes in SSH config.
 
     Returns True if IdentitiesOnly is explicitly set to 'yes', False otherwise.
@@ -108,7 +109,7 @@ def get_identities_only(ssh_config_dict: Dict[str, Any]) -> bool:
 
 
 @annotations.lru_cache(scope='request')
-def get_slurm_nodes_info(cluster: str) -> List[slurm.NodeInfo]:
+def get_slurm_nodes_info(cluster: str) -> list[slurm.NodeInfo]:
     cache_key = f'slurm:nodes_info:{cluster}'
     cached = kv_cache.get_cache_entry(cache_key)
     if cached is not None:
@@ -144,7 +145,7 @@ def get_slurm_nodes_info(cluster: str) -> List[slurm.NodeInfo]:
     return nodes_info
 
 
-def get_proctrack_type(cluster: str) -> Optional[str]:
+def get_proctrack_type(cluster: str) -> str | None:
     """Get the ProctrackType setting from Slurm configuration."""
     cache_key = f'slurm:proctrack_type:{cluster}'
     cached = kv_cache.get_cache_entry(cache_key)
@@ -250,7 +251,7 @@ def check_fuse_enabled(cluster: str) -> bool:
 _SLURM_SELECT_TYPE_PARAMS_CACHE_TTL = 3600  # 1 hour
 
 
-def get_select_type_parameters(cluster: str) -> Optional[str]:
+def get_select_type_parameters(cluster: str) -> str | None:
     """Get the raw SelectTypeParameters value for a Slurm cluster."""
     cache_key = f'slurm:select_type_parameters:{cluster}'
     cached = kv_cache.get_cache_entry(cache_key)
@@ -325,8 +326,8 @@ class SlurmInstanceType:
     def __init__(self,
                  cpus: float,
                  memory: float,
-                 accelerator_count: Optional[int] = None,
-                 accelerator_type: Optional[str] = None):
+                 accelerator_count: int | None = None,
+                 accelerator_type: str | None = None):
         self.cpus = cpus
         self.memory = memory
         self.accelerator_count = accelerator_count
@@ -356,8 +357,7 @@ class SlurmInstanceType:
 
     @classmethod
     def _parse_instance_type(
-            cls,
-            name: str) -> Tuple[float, float, Optional[int], Optional[str]]:
+            cls, name: str) -> tuple[float, float, int | None, str | None]:
         """Parses and returns resources from the given InstanceType name.
 
         Returns:
@@ -403,7 +403,7 @@ class SlurmInstanceType:
     def from_resources(cls,
                        cpus: float,
                        memory: float,
-                       accelerator_count: Union[float, int] = 0,
+                       accelerator_count: float | int = 0,
                        accelerator_type: str = '') -> 'SlurmInstanceType':
         """Returns an instance name object from the given resources.
 
@@ -441,7 +441,7 @@ def instance_id(job_id: str, node: str) -> str:
     return f'job{job_id}-{node}'
 
 
-def get_slurm_cluster_from_config(provider_config: Dict[str, Any]) -> str:
+def get_slurm_cluster_from_config(provider_config: dict[str, Any]) -> str:
     """Return the Slurm cluster from the provider config.
     """
     slurm_cluster = provider_config.get('cluster')
@@ -450,7 +450,7 @@ def get_slurm_cluster_from_config(provider_config: Dict[str, Any]) -> str:
     return slurm_cluster
 
 
-def get_partition_from_config(provider_config: Dict[str, Any]) -> str:
+def get_partition_from_config(provider_config: dict[str, Any]) -> str:
     """Return the partition from the provider config.
 
     The concept of partition can be mapped to a cloud zone.
@@ -462,7 +462,7 @@ def get_partition_from_config(provider_config: Dict[str, Any]) -> str:
 
 
 @annotations.lru_cache(scope='request')
-def get_cluster_default_partition(cluster_name: str) -> Optional[str]:
+def get_cluster_default_partition(cluster_name: str) -> str | None:
     """Get the default partition for a Slurm cluster.
 
     Queries the Slurm cluster for the partition marked with an asterisk (*)
@@ -489,7 +489,7 @@ def get_cluster_default_partition(cluster_name: str) -> Optional[str]:
     return client.get_default_partition()
 
 
-def get_all_slurm_cluster_names() -> List[str]:
+def get_all_slurm_cluster_names() -> list[str]:
     """Get all Slurm cluster names available in the environment.
 
     Returns:
@@ -517,7 +517,7 @@ def get_all_slurm_cluster_names() -> List[str]:
 
 def _check_cpu_mem_fits(
         candidate_instance_type: SlurmInstanceType,
-        node_list: List[slurm.NodeInfo]) -> Tuple[bool, Optional[str]]:
+        node_list: list[slurm.NodeInfo]) -> tuple[bool, str | None]:
     """Checks if instance fits on candidate nodes based on CPU and memory.
 
     We check capacity (not allocatable) because availability can change
@@ -555,7 +555,7 @@ def _check_cpu_mem_fits(
 def check_instance_fits(
         cluster: str,
         instance_type: str,
-        partition: Optional[str] = None) -> Tuple[bool, Optional[str]]:
+        partition: str | None = None) -> tuple[bool, str | None]:
     """Check if the given instance type fits in the given cluster/partition.
 
     Args:
@@ -698,8 +698,8 @@ def _normalize_gpu_name(name: str) -> str:
     return result
 
 
-def _is_segment_subsequence(segments_a: List[str],
-                            segments_b: List[str]) -> bool:
+def _is_segment_subsequence(segments_a: list[str],
+                            segments_b: list[str]) -> bool:
     """Check if segments_a appears as an ordered subsequence of segments_b.
 
     Each segment must match exactly (preventing e.g. 'l4' matching 'l40').
@@ -816,7 +816,7 @@ def canonicalize_raw_gpu_name(raw_name: str) -> str:
 def lookup_gpu_partition_map(
     cluster: str,
     acc_type: str,
-) -> Optional[List[str]]:
+) -> list[str] | None:
     """Look up partitions for a GPU type from gpu_partition_map config.
 
     Reads the gpu_partition_map from global and per-cluster config (with
@@ -843,7 +843,7 @@ def lookup_gpu_partition_map(
     return None
 
 
-def lookup_cpu_partition(cluster: str) -> Optional[str]:
+def lookup_cpu_partition(cluster: str) -> str | None:
     """Look up the cpu_partition for a Slurm cluster.
 
     Reads cpu_partition from global and per-cluster config (with per-cluster
@@ -861,7 +861,7 @@ def resolve_gres_gpu_type(
     cluster: str,
     requested_gpu_type: str,
     requested_count: int = 1,
-    partition: Optional[str] = None,
+    partition: str | None = None,
 ) -> str:
     """Resolve a canonical GPU name to the raw GRES type on a Slurm cluster.
 
@@ -892,8 +892,8 @@ def resolve_gres_gpu_type(
 
     # Collect all GPU types from every node (for error messages) and
     # matching candidates (for selection) in a single pass.
-    all_gpu_types: Dict[str, int] = {}
-    candidates: Dict[str, int] = {}
+    all_gpu_types: dict[str, int] = {}
+    candidates: dict[str, int] = {}
     for node_info in nodes:
         if partition is not None:
             node_part = node_info.partition
@@ -942,7 +942,7 @@ def resolve_gres_gpu_type(
 
 
 def _get_slurm_node_info_list(
-        slurm_cluster_name: Optional[str] = None) -> List[Dict[str, Any]]:
+        slurm_cluster_name: str | None = None) -> list[dict[str, Any]]:
     """Gathers detailed information about each node in the Slurm cluster.
 
     Raises:
@@ -979,7 +979,7 @@ def _get_slurm_node_info_list(
         return []
 
     # 2. Process each node, aggregating partitions per node
-    slurm_nodes_info: Dict[str, Dict[str, Any]] = {}
+    slurm_nodes_info: dict[str, dict[str, Any]] = {}
 
     nodes_to_jobs_gres = slurm_client.get_all_jobs_gres()
     for node_info in node_infos:
@@ -1043,7 +1043,7 @@ def _get_slurm_node_info_list(
 
 
 def slurm_node_info(
-        slurm_cluster_name: Optional[str] = None) -> List[Dict[str, Any]]:
+        slurm_cluster_name: str | None = None) -> list[dict[str, Any]]:
     """Gets detailed information for each node in the Slurm cluster.
 
     Returns:
@@ -1066,7 +1066,7 @@ def is_inside_slurm_cluster() -> bool:
     return os.path.exists(marker_file)
 
 
-def get_partitions(cluster_name: str) -> List[str]:
+def get_partitions(cluster_name: str) -> list[str]:
     """Get unique partition names available in a Slurm cluster.
 
     Args:
@@ -1089,14 +1089,14 @@ def get_partitions(cluster_name: str) -> List[str]:
 
 
 def get_partition_info(cluster_name: str,
-                       partition_name: str) -> Optional[slurm.SlurmPartition]:
+                       partition_name: str) -> slurm.SlurmPartition | None:
     return get_partition_infos(cluster_name=cluster_name).get(partition_name)
 
 
 # Cache the partitions for 1 hour, we do not expect the
 # partitions to change frequently.
 @annotations.ttl_cache(scope='global', timer=time.time, maxsize=10, ttl=60 * 60)
-def get_partition_infos(cluster_name: str) -> Dict[str, slurm.SlurmPartition]:
+def get_partition_infos(cluster_name: str) -> dict[str, slurm.SlurmPartition]:
     """Get the partition information for a Slurm cluster.
 
     Args:
@@ -1129,7 +1129,7 @@ def get_partition_infos(cluster_name: str) -> Dict[str, slurm.SlurmPartition]:
     return {partition.name: partition for partition in partitions_info}
 
 
-def format_slurm_duration(duration_seconds: Optional[int]) -> str:
+def format_slurm_duration(duration_seconds: int | None) -> str:
     """Format the duration in seconds into a Slurm duration string.
     Slurm duration string is in the format of [days-]hours:minutes:seconds.
 

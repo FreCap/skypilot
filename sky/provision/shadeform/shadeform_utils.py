@@ -1,7 +1,7 @@
 """Shadeform API utilities."""
 
 import os
-from typing import Any, Dict
+from typing import Any
 
 from sky.adaptors import common
 
@@ -21,7 +21,7 @@ def get_api_key() -> str:
             f'Shadeform API key not found at {api_key_path}. '
             'Please save your API key to this file.')
 
-    with open(api_key_path, 'r', encoding='utf-8') as f:
+    with open(api_key_path, encoding='utf-8') as f:
         api_key = f.read().strip()
 
     if not api_key:
@@ -49,22 +49,22 @@ def make_request(method: str, endpoint: str, **kwargs) -> Any:
         return {}
 
 
-def get_instances() -> Dict[str, Any]:
+def get_instances() -> dict[str, Any]:
     """Get all instances."""
     return make_request('GET', '/instances')
 
 
-def get_instance_info(instance_id: str) -> Dict[str, Any]:
+def get_instance_info(instance_id: str) -> dict[str, Any]:
     """Get information about a specific instance."""
     return make_request('GET', f'/instances/{instance_id}/info')
 
 
-def create_instance(config: Dict[str, Any]) -> Dict[str, Any]:
+def create_instance(config: dict[str, Any]) -> dict[str, Any]:
     """Create a new instance."""
     return make_request('POST', '/instances/create', json=config)
 
 
-def delete_instance(instance_id: str) -> Dict[str, Any]:
+def delete_instance(instance_id: str) -> dict[str, Any]:
     """Delete an instance.
 
     Note: Shadeform delete API returns empty response with 200 status.
@@ -72,12 +72,12 @@ def delete_instance(instance_id: str) -> Dict[str, Any]:
     return make_request('POST', f'/instances/{instance_id}/delete')
 
 
-def get_ssh_keys() -> Dict[str, Any]:
+def get_ssh_keys() -> dict[str, Any]:
     """Get all SSH keys."""
     return make_request('GET', '/sshkeys')
 
 
-def add_ssh_key(name: str, public_key: str) -> Dict[str, Any]:
+def add_ssh_key(name: str, public_key: str) -> dict[str, Any]:
     """Add a new SSH key."""
     config = {'name': name, 'public_key': public_key}
     return make_request('POST', '/sshkeys/add', json=config)

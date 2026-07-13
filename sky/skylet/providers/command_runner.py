@@ -2,7 +2,6 @@
 import json
 import os
 import time
-from typing import Dict
 
 import click
 from ray.autoscaler._private.cli_logger import cli_logger
@@ -45,8 +44,7 @@ def docker_start_cmds(
 
     # for click, used in ray cli
     env_vars = {'LC_ALL': 'C.UTF-8', 'LANG': 'C.UTF-8'}
-    env_flags = ' '.join(
-        ['-e {name}={val}'.format(name=k, val=v) for k, v in env_vars.items()])
+    env_flags = ' '.join([f'-e {k}={v}' for k, v in env_vars.items()])
 
     user_options_str = ' '.join(user_options)
     docker_run = [
@@ -54,7 +52,7 @@ def docker_start_cmds(
         'run',
         # SkyPilot: Remove --rm flag to keep the container after `ray stop`
         # is executed.
-        '--name {}'.format(container_name),
+        f'--name {container_name}',
         '-d',
         '-it',
         mount_flags,
@@ -133,7 +131,7 @@ class SkyDockerCommandRunner(DockerCommandRunner):
         return 'false' in output.lower(
         ) and 'no such object' not in output.lower()
 
-    def run_init(self, *, as_head: bool, file_mounts: Dict[str, str],
+    def run_init(self, *, as_head: bool, file_mounts: dict[str, str],
                  sync_run_yet: bool):
         bootstrap_mounts = [
             '~/ray_bootstrap_config.yaml', '~/ray_bootstrap_key.pem'

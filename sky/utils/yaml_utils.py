@@ -1,6 +1,6 @@
 """YAML utilities."""
 import io
-from typing import Any, Dict, List, Optional, TYPE_CHECKING, Union
+from typing import Any, TYPE_CHECKING
 
 from sky.adaptors import common
 
@@ -32,7 +32,7 @@ def check_no_duplicate_keys(yaml_str: str) -> None:
 
     def walk(node: 'yaml.Node') -> None:
         if isinstance(node, yaml.MappingNode):
-            seen: Dict[Any, int] = {}
+            seen: dict[Any, int] = {}
             for key_node, value_node in node.value:
                 # Non-scalar keys (e.g. `? [a, b]`) are legal YAML but not
                 # hashable, and SkyPilot schemas don't use them. Skip
@@ -85,15 +85,15 @@ def safe_load_all(stream) -> Any:
         return yaml.load_all(stream, Loader=yaml.SafeLoader)
 
 
-def read_yaml(path: Optional[str]) -> Dict[str, Any]:
+def read_yaml(path: str | None) -> dict[str, Any]:
     if path is None:
         raise ValueError('Attempted to read a None YAML.')
-    with open(path, 'r', encoding='utf-8') as f:
+    with open(path, encoding='utf-8') as f:
         config = safe_load(f)
     return config
 
 
-def read_yaml_str(yaml_str: str) -> Dict[str, Any]:
+def read_yaml_str(yaml_str: str) -> dict[str, Any]:
     stream = io.StringIO(yaml_str)
     parsed_yaml = safe_load(stream)
     if not parsed_yaml:
@@ -102,7 +102,7 @@ def read_yaml_str(yaml_str: str) -> Dict[str, Any]:
     return parsed_yaml
 
 
-def read_yaml_all_str(yaml_str: str) -> List[Dict[str, Any]]:
+def read_yaml_all_str(yaml_str: str) -> list[dict[str, Any]]:
     stream = io.StringIO(yaml_str)
     config = safe_load_all(stream)
     configs = list(config)
@@ -112,13 +112,13 @@ def read_yaml_all_str(yaml_str: str) -> List[Dict[str, Any]]:
     return configs
 
 
-def read_yaml_all(path: str) -> List[Dict[str, Any]]:
-    with open(path, 'r', encoding='utf-8') as f:
+def read_yaml_all(path: str) -> list[dict[str, Any]]:
+    with open(path, encoding='utf-8') as f:
         return read_yaml_all_str(f.read())
 
 
 def dump_yaml(path: str,
-              config: Union[List[Dict[str, Any]], Dict[str, Any]],
+              config: list[dict[str, Any]] | dict[str, Any],
               blank: bool = False) -> None:
     """Dumps a YAML file.
 
@@ -134,7 +134,7 @@ def dump_yaml(path: str,
         f.write(contents)
 
 
-def dump_yaml_str(config: Union[List[Dict[str, Any]], Dict[str, Any]]) -> str:
+def dump_yaml_str(config: list[dict[str, Any]] | dict[str, Any]) -> str:
     """Dumps a YAML string.
     Args:
         config: the configuration to dump.
@@ -151,7 +151,7 @@ def dump_yaml_str(config: Union[List[Dict[str, Any]], Dict[str, Any]]) -> str:
                 super().write_line_break()
 
     if isinstance(config, list):
-        dump_func = yaml.dump_all  # type: ignore
+        dump_func = yaml.dump_all
     else:
         dump_func = yaml.dump  # type: ignore
     return dump_func(config,

@@ -1,10 +1,9 @@
 """ Seeweb Adaptor """
 import configparser
 import pathlib
-from typing import Optional
 
 import pydantic
-import requests  # type: ignore
+import requests
 
 from sky.adaptors import common
 from sky.utils import annotations
@@ -71,9 +70,8 @@ def check_compute_credentials() -> bool:
         except pydantic.ValidationError:
             # Fallback: fetch raw JSON to validate authentication
             # pylint: disable=protected-access
-            base_url = seeweb_client._Api__generate_base_url()  # type: ignore
-            headers = seeweb_client._Api__generate_authentication_headers(
-            )  # type: ignore
+            base_url = seeweb_client._Api__generate_base_url()
+            headers = seeweb_client._Api__generate_authentication_headers()
             url = f'{base_url}/servers'
             resp = requests.get(url, headers=headers, timeout=15)
             resp.raise_for_status()
@@ -121,16 +119,14 @@ def client():
     orig_fetch_servers = api.fetch_servers
     orig_delete_server = api.delete_server
 
-    def _tolerant_fetch_servers(
-            timeout: Optional[int] = None):  # type: ignore[override]
+    def _tolerant_fetch_servers(timeout: int | None = None):
         try:
             return orig_fetch_servers(timeout=timeout)
         except pydantic.ValidationError:
             # Fallback path: fetch raw JSON, drop snapshot fields, then validate
             # pylint: disable=protected-access
-            base_url = api._Api__generate_base_url()  # type: ignore
-            headers = api._Api__generate_authentication_headers(
-            )  # type: ignore
+            base_url = api._Api__generate_base_url()
+            headers = api._Api__generate_authentication_headers()
             url = f'{base_url}/servers'
             resp = requests.get(url, headers=headers, timeout=timeout or 15)
             resp.raise_for_status()
@@ -150,18 +146,16 @@ def client():
             servers_response = server_list_response_cls.model_validate(data)
             return servers_response.server
 
-    api.fetch_servers = _tolerant_fetch_servers  # type: ignore[assignment]
+    api.fetch_servers = _tolerant_fetch_servers
 
-    def _tolerant_delete_server(server_name: str,
-                                timeout: Optional[int] = None):
+    def _tolerant_delete_server(server_name: str, timeout: int | None = None):
         try:
             return orig_delete_server(server_name, timeout=timeout)
         except pydantic.ValidationError:
             # Fallback: perform raw DELETE and interpret not_found as success
             # pylint: disable=protected-access
-            base_url = api._Api__generate_base_url()  # type: ignore
-            headers = api._Api__generate_authentication_headers(
-            )  # type: ignore
+            base_url = api._Api__generate_base_url()
+            headers = api._Api__generate_authentication_headers()
             url = f'{base_url}/servers/{server_name}'
             resp = requests.delete(url, headers=headers, timeout=timeout or 15)
             # Treat 404 as idempotent success
@@ -179,5 +173,5 @@ def client():
             # Best-effort: return None to indicate deletion requested
             return None
 
-    api.delete_server = _tolerant_delete_server  # type: ignore[assignment]
+    api.delete_server = _tolerant_delete_server
     return api

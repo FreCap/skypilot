@@ -4,7 +4,6 @@ import contextlib
 import logging
 import os
 import threading
-from typing import Optional
 
 from alembic import command as alembic_command
 from alembic.config import Config
@@ -70,7 +69,7 @@ def db_lock(db_name: str):
 
 def get_alembic_config(engine: sqlalchemy.engine.Engine,
                        section: str,
-                       alembic_ini_path: Optional[str] = None):
+                       alembic_ini_path: str | None = None):
     """Get Alembic configuration for the given section.
 
     Args:
@@ -102,7 +101,7 @@ def get_alembic_config(engine: sqlalchemy.engine.Engine,
 def needs_upgrade(engine: sqlalchemy.engine.Engine,
                   section: str,
                   target_revision: str,
-                  alembic_ini_path: Optional[str] = None):
+                  alembic_ini_path: str | None = None):
     """Check if the database needs to be upgraded.
 
     Args:
@@ -145,7 +144,7 @@ def needs_upgrade(engine: sqlalchemy.engine.Engine,
 def safe_alembic_upgrade(engine: sqlalchemy.engine.Engine,
                          section: str,
                          target_revision: str,
-                         alembic_ini_path: Optional[str] = None):
+                         alembic_ini_path: str | None = None):
     """Upgrade the database if needed. Uses a file lock to ensure
     that only one process tries to upgrade the database at a time.
 

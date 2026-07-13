@@ -2,7 +2,7 @@
 import concurrent.futures
 import shlex
 import typing
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Literal
 
 import colorama
 
@@ -64,9 +64,9 @@ logger = sky_logging.init_logger(__name__)
 def optimize(
     dag: 'dag_lib.Dag',
     minimize: common.OptimizeTarget = common.OptimizeTarget.COST,
-    blocked_resources: Optional[List['resources_lib.Resources']] = None,
+    blocked_resources: list['resources_lib.Resources'] | None = None,
     quiet: bool = False,
-    request_options: Optional[admin_policy.RequestOptions] = None
+    request_options: admin_policy.RequestOptions | None = None
 ) -> 'dag_lib.Dag':
     """Finds the best execution plan for the given DAG.
 
@@ -111,13 +111,13 @@ def optimize(
 
 @usage_lib.entrypoint
 def status(
-    cluster_names: Optional[Union[str, List[str]]] = None,
+    cluster_names: str | list[str] | None = None,
     refresh: common.StatusRefreshMode = common.StatusRefreshMode.NONE,
     all_users: bool = False,
     include_credentials: bool = False,
     summary_response: bool = False,
     include_handle: bool = True,
-) -> List[responses.StatusResponse]:
+) -> list[responses.StatusResponse]:
     # NOTE(dev): Keep the docstring consistent between the Python API and CLI.
     """Gets cluster statuses.
 
@@ -212,9 +212,9 @@ def status(
 
 
 def status_kubernetes(
-) -> Tuple[List['kubernetes_utils.KubernetesSkyPilotClusterInfoPayload'],
-           List['kubernetes_utils.KubernetesSkyPilotClusterInfoPayload'],
-           List[responses.ManagedJobRecord], Optional[str]]:
+) -> tuple[list['kubernetes_utils.KubernetesSkyPilotClusterInfoPayload'],
+           list['kubernetes_utils.KubernetesSkyPilotClusterInfoPayload'],
+           list[responses.ManagedJobRecord], str | None]:
     """Gets all SkyPilot clusters and jobs in the Kubernetes cluster.
 
     Managed jobs and services are also included in the clusters returned.
@@ -295,44 +295,43 @@ all_clusters, unmanaged_clusters, all_jobs, context
 
 @typing.overload
 def get_cluster_events(
-    cluster_name: Optional[str] = ...,
-    cluster_hash: Optional[str] = ...,
+    cluster_name: str | None = ...,
+    cluster_hash: str | None = ...,
     event_type: str = ...,
     include_timestamps: Literal[False] = ...,
-    limit: Optional[int] = ...,
-) -> List[str]:
+    limit: int | None = ...,
+) -> list[str]:
     ...
 
 
 @typing.overload
 def get_cluster_events(
-    cluster_name: Optional[str] = ...,
-    cluster_hash: Optional[str] = ...,
+    cluster_name: str | None = ...,
+    cluster_hash: str | None = ...,
     event_type: str = ...,
     include_timestamps: Literal[True] = ...,
-    limit: Optional[int] = ...,
-) -> List[Dict[str, Union[str, int]]]:
+    limit: int | None = ...,
+) -> list[dict[str, str | int]]:
     ...
 
 
 @typing.overload
 def get_cluster_events(
-    cluster_name: Optional[str] = ...,
-    cluster_hash: Optional[str] = ...,
+    cluster_name: str | None = ...,
+    cluster_hash: str | None = ...,
     event_type: str = ...,
     include_timestamps: bool = ...,
-    limit: Optional[int] = ...,
-) -> Union[List[str], List[Dict[str, Union[str, int]]]]:
+    limit: int | None = ...,
+) -> list[str] | list[dict[str, str | int]]:
     ...
 
 
 def get_cluster_events(
-    cluster_name: Optional[str] = None,
-    cluster_hash: Optional[str] = None,
-    event_type: str = 'STATUS_CHANGE',
-    include_timestamps: bool = False,
-    limit: Optional[int] = None
-) -> Union[List[str], List[Dict[str, Union[str, int]]]]:
+        cluster_name: str | None = None,
+        cluster_hash: str | None = None,
+        event_type: str = 'STATUS_CHANGE',
+        include_timestamps: bool = False,
+        limit: int | None = None) -> list[str] | list[dict[str, str | int]]:
     """Get events for a cluster.
 
     Args:
@@ -372,8 +371,7 @@ def get_cluster_events(
         limit=limit)
 
 
-def endpoints(cluster: str,
-              port: Optional[Union[int, str]] = None) -> Dict[int, str]:
+def endpoints(cluster: str, port: int | str | None = None) -> dict[int, str]:
     """Gets the endpoint for a given cluster and port number (endpoint).
 
     Args:
@@ -397,11 +395,11 @@ def endpoints(cluster: str,
 
 
 @usage_lib.entrypoint
-def cost_report(days: Optional[int] = None,
+def cost_report(days: int | None = None,
                 dashboard_summary_response: bool = False,
-                cluster_hashes: Optional[List[str]] = None,
-                cluster_names: Optional[List[str]] = None,
-                exclude_managed_clusters: bool = False) -> List[Dict[str, Any]]:
+                cluster_hashes: list[str] | None = None,
+                cluster_names: list[str] | None = None,
+                exclude_managed_clusters: bool = False) -> list[dict[str, Any]]:
     # NOTE(dev): Keep the docstring consistent between the Python API and CLI.
     """Get all cluster cost reports, including those that have been downed.
 
@@ -475,7 +473,7 @@ def cost_report(days: Optional[int] = None,
         f'{len(cluster_reports)} clusters found from history with {days} days.')
 
     def _process_cluster_report(
-            cluster_report: Dict[str, Any]) -> Dict[str, Any]:
+            cluster_report: dict[str, Any]) -> dict[str, Any]:
         """Process cluster report by calculating cost and adding fields."""
         # Make a copy to avoid modifying the original
         report = cluster_report.copy()
@@ -517,7 +515,7 @@ def cost_report(days: Optional[int] = None,
 
 
 def _update_record_with_resources(
-        record: Dict[str, Any],
+        record: dict[str, Any],
         dashboard_summary_response: bool = False) -> None:
     """Add resource fields for dashboard compatibility."""
     if record is None:
@@ -558,9 +556,9 @@ def _update_record_with_resources(
 
 def _start(
     cluster_name: str,
-    idle_minutes_to_autostop: Optional[int] = None,
-    wait_for: Optional[autostop_lib.AutostopWaitFor] = (
-        autostop_lib.DEFAULT_AUTOSTOP_WAIT_FOR),
+    idle_minutes_to_autostop: int | None = None,
+    wait_for: autostop_lib.AutostopWaitFor |
+    None = (autostop_lib.DEFAULT_AUTOSTOP_WAIT_FOR),
     retry_until_up: bool = False,
     down: bool = False,  # pylint: disable=redefined-outer-name
     force: bool = False,
@@ -600,8 +598,8 @@ def _start(
         launched.cloud.check_features_are_supported(
             launched, execution.autostop_requested_features(down))
 
-    hook: Optional[str] = None
-    hook_timeout: Optional[int] = None
+    hook: str | None = None
+    hook_timeout: int | None = None
     if controller is not None:
         if down or idle_minutes_to_autostop:
             arguments = []
@@ -735,7 +733,7 @@ def _start(
         # For controller clusters, hook comes from controller_autostop_config.
         # For regular clusters, hook is None so it will be inherited from the
         # existing config on the remote cluster.
-        hooks_list: Optional[List[Dict[str, Any]]] = None
+        hooks_list: list[dict[str, Any]] | None = None
         if controller is not None and controller_resources:
             # pylint: disable=unsubscriptable-object
             hooks_list = list(controller_resources)[0].hooks
@@ -754,9 +752,9 @@ def _start(
 @usage_lib.entrypoint
 def start(
     cluster_name: str,
-    idle_minutes_to_autostop: Optional[int] = None,
-    wait_for: Optional[autostop_lib.AutostopWaitFor] = (
-        autostop_lib.DEFAULT_AUTOSTOP_WAIT_FOR),
+    idle_minutes_to_autostop: int | None = None,
+    wait_for: autostop_lib.AutostopWaitFor |
+    None = (autostop_lib.DEFAULT_AUTOSTOP_WAIT_FOR),
     retry_until_up: bool = False,
     down: bool = False,  # pylint: disable=redefined-outer-name
     force: bool = False,
@@ -832,7 +830,7 @@ def _stop_not_supported_message(resources: 'resources_lib.Resources') -> str:
 def _graceful_job_cancel(handle: backends.ResourceHandle,
                          backend: backends.Backend,
                          cluster_name: str,
-                         timeout: Optional[int] = None,
+                         timeout: int | None = None,
                          terminate: bool = True) -> None:
     """Stop jobs and flush rclone uploads on all nodes in parallel."""
     op = 'shutdown' if terminate else 'stop'
@@ -905,7 +903,7 @@ def _graceful_job_cancel(handle: backends.ResourceHandle,
 def user_initiated_down(cluster_name: str,
                         purge: bool = False,
                         graceful: bool = False,
-                        graceful_timeout: Optional[int] = None) -> None:
+                        graceful_timeout: int | None = None) -> None:
     down(cluster_name, purge, graceful, graceful_timeout, user_initiated=True)
 
 
@@ -913,7 +911,7 @@ def user_initiated_down(cluster_name: str,
 def down(cluster_name: str,
          purge: bool = False,
          graceful: bool = False,
-         graceful_timeout: Optional[int] = None,
+         graceful_timeout: int | None = None,
          user_initiated: bool = False) -> None:
     # NOTE(dev): Keep the docstring consistent between the Python API and CLI.
     """Tears down a cluster.
@@ -1052,7 +1050,7 @@ def _maybe_run_stop_hooks(handle: 'backends.ResourceHandle',
 def stop(cluster_name: str,
          purge: bool = False,
          graceful: bool = False,
-         graceful_timeout: Optional[int] = None) -> None:
+         graceful_timeout: int | None = None) -> None:
     # NOTE(dev): Keep the docstring consistent between the Python API and CLI.
     """Stops a cluster.
 
@@ -1132,11 +1130,11 @@ def stop(cluster_name: str,
 def autostop(
     cluster_name: str,
     idle_minutes: int,
-    wait_for: Optional[
-        autostop_lib.AutostopWaitFor] = autostop_lib.DEFAULT_AUTOSTOP_WAIT_FOR,
+    wait_for: autostop_lib.AutostopWaitFor |
+    None = autostop_lib.DEFAULT_AUTOSTOP_WAIT_FOR,
     down: bool = False,  # pylint: disable=redefined-outer-name
-    hook: Optional[str] = None,
-    hook_timeout: Optional[int] = None,
+    hook: str | None = None,
+    hook_timeout: int | None = None,
 ) -> None:
     # NOTE(dev): Keep the docstring consistent between the Python API and CLI.
     """Schedules an autostop/autodown for a cluster.
@@ -1248,9 +1246,8 @@ def autostop(
 
 
 def _get_job_queue(handle: backends.CloudVmRayResourceHandle,
-                   backend: backends.CloudVmRayBackend,
-                   user_hash: Optional[str],
-                   all_jobs: bool) -> List[Dict[str, Any]]:
+                   backend: backends.CloudVmRayBackend, user_hash: str | None,
+                   all_jobs: bool) -> list[dict[str, Any]]:
     """Get the job queue from the cluster via gRPC or SSH fallback."""
     if handle.is_grpc_enabled_with_flag:
         try:
@@ -1301,7 +1298,7 @@ def _get_job_queue(handle: backends.CloudVmRayResourceHandle,
 @usage_lib.entrypoint
 def queue(cluster_name: str,
           skip_finished: bool = False,
-          all_users: bool = False) -> List[responses.ClusterJobRecord]:
+          all_users: bool = False) -> list[responses.ClusterJobRecord]:
     # NOTE(dev): Keep the docstring consistent between the Python API and CLI.
     """Gets the job queue of a cluster.
 
@@ -1356,7 +1353,7 @@ def cancel(
     cluster_name: str,
     all: bool = False,
     all_users: bool = False,
-    job_ids: Optional[List[int]] = None,
+    job_ids: list[int] | None = None,
     # pylint: disable=invalid-name
     # Internal only:
     _try_cancel_if_cluster_is_init: bool = False,
@@ -1417,7 +1414,7 @@ def cancel(
         f'handle for cluster {cluster_name!r} should not be None')
 
     backend = backend_utils.get_backend_from_handle(handle)
-    user_hash: Optional[str] = common_utils.get_current_user().id
+    user_hash: str | None = common_utils.get_current_user().id
 
     if all_users:
         user_hash = None
@@ -1450,7 +1447,7 @@ def cancel(
 
 @usage_lib.entrypoint
 def tail_logs(cluster_name: str,
-              job_id: Optional[int],
+              job_id: int | None,
               follow: bool = True,
               tail: int = 0) -> int:
     # NOTE(dev): Keep the docstring consistent between the Python API and CLI.
@@ -1493,7 +1490,7 @@ def tail_logs(cluster_name: str,
 
 @usage_lib.entrypoint
 def tail_hook_logs(cluster_name: str,
-                   event: Optional[str] = None,
+                   event: str | None = None,
                    follow: bool = True,
                    tail: int = 0) -> int:
     """Tails per-event lifecycle-hook logs of a cluster.
@@ -1539,8 +1536,8 @@ def tail_hook_logs(cluster_name: str,
 @usage_lib.entrypoint
 def download_logs(
         cluster_name: str,
-        job_ids: Optional[List[str]],
-        local_dir: str = constants.SKY_LOGS_DIRECTORY) -> Dict[str, str]:
+        job_ids: list[str] | None,
+        local_dir: str = constants.SKY_LOGS_DIRECTORY) -> dict[str, str]:
     # NOTE(dev): Keep the docstring consistent between the Python API and CLI.
     """Downloads the logs of jobs.
 
@@ -1580,9 +1577,9 @@ def download_logs(
 
 @usage_lib.entrypoint
 def job_status(cluster_name: str,
-               job_ids: Optional[List[int]],
+               job_ids: list[int] | None,
                stream_logs: bool = False
-              ) -> Dict[Optional[int], Optional[job_lib.JobStatus]]:
+              ) -> dict[int | None, job_lib.JobStatus | None]:
     # NOTE(dev): Keep the docstring consistent between the Python API and CLI.
     """Get the status of jobs.
 
@@ -1632,7 +1629,7 @@ def job_status(cluster_name: str,
 # = Storage Management =
 # ======================
 @usage_lib.entrypoint
-def storage_ls() -> List[responses.StorageRecord]:
+def storage_ls() -> list[responses.StorageRecord]:
     # NOTE(dev): Keep the docstring consistent between the Python API and CLI.
     """Gets the storages.
 
@@ -1674,8 +1671,8 @@ def storage_delete(name: str) -> None:
 # = Catalog Observe =
 # ===================
 @usage_lib.entrypoint
-def enabled_clouds(workspace: Optional[str] = None,
-                   expand: bool = False) -> List[str]:
+def enabled_clouds(workspace: str | None = None,
+                   expand: bool = False) -> list[str]:
     if workspace is None:
         workspace = skypilot_config.get_active_workspace()
     else:
@@ -1710,8 +1707,8 @@ def enabled_clouds(workspace: Optional[str] = None,
 
 
 @usage_lib.entrypoint
-def enabled_clouds_batch(workspaces: List[str],
-                         expand: bool = False) -> Dict[str, List[str]]:
+def enabled_clouds_batch(workspaces: list[str],
+                         expand: bool = False) -> dict[str, list[str]]:
     """Returns enabled clouds for multiple workspaces in a single call.
 
     Args:
@@ -1737,11 +1734,11 @@ def enabled_clouds_batch(workspaces: List[str],
 
 @usage_lib.entrypoint
 def realtime_kubernetes_gpu_availability(
-    context: Optional[str] = None,
-    name_filter: Optional[str] = None,
-    quantity_filter: Optional[int] = None,
-    is_ssh: Optional[bool] = None
-) -> List[Tuple[str, List[models.RealtimeGpuAvailability]]]:
+    context: str | None = None,
+    name_filter: str | None = None,
+    quantity_filter: int | None = None,
+    is_ssh: bool | None = None
+) -> list[tuple[str, list[models.RealtimeGpuAvailability]]]:
     """Gets the real-time Kubernetes GPU availability.
 
     Returns:
@@ -1764,10 +1761,10 @@ def realtime_kubernetes_gpu_availability(
         context_list = [context]
 
     def _realtime_kubernetes_gpu_availability_single(
-        context: Optional[str] = None,
-        name_filter: Optional[str] = None,
-        quantity_filter: Optional[int] = None
-    ) -> List[models.RealtimeGpuAvailability]:
+        context: str | None = None,
+        name_filter: str | None = None,
+        quantity_filter: int | None = None
+    ) -> list[models.RealtimeGpuAvailability]:
         counts, capacity, available = catalog.list_accelerator_realtime(
             gpus_only=True,
             clouds='ssh' if is_ssh else 'kubernetes',
@@ -1782,7 +1779,7 @@ def realtime_kubernetes_gpu_availability(
         capacity = {key: capacity.get(key, 0) for key in all_keys}
         available = {key: available.get(key, 0) for key in all_keys}
 
-        realtime_gpu_availability_list: List[
+        realtime_gpu_availability_list: list[
             models.RealtimeGpuAvailability] = []
 
         for gpu, _ in sorted(counts.items()):
@@ -1795,8 +1792,8 @@ def realtime_kubernetes_gpu_availability(
                 ))
         return realtime_gpu_availability_list
 
-    availability_lists: List[Tuple[str,
-                                   List[models.RealtimeGpuAvailability]]] = []
+    availability_lists: list[tuple[str,
+                                   list[models.RealtimeGpuAvailability]]] = []
     cumulative_count = 0
     parallel_queried = subprocess_utils.run_in_parallel(
         lambda ctx: _realtime_kubernetes_gpu_availability_single(
@@ -1834,12 +1831,12 @@ def realtime_kubernetes_gpu_availability(
 
 
 def realtime_slurm_gpu_availability(
-    slurm_cluster_name: Optional[str] = None,
-    name_filter: Optional[str] = None,
-    quantity_filter: Optional[int] = None,
-    env_vars: Optional[Dict[str, str]] = None,
+    slurm_cluster_name: str | None = None,
+    name_filter: str | None = None,
+    quantity_filter: int | None = None,
+    env_vars: dict[str, str] | None = None,
     **kwargs,
-) -> List[Tuple[str, List[models.RealtimeGpuAvailability], Optional[str]]]:
+) -> list[tuple[str, list[models.RealtimeGpuAvailability], str | None]]:
     """Gets Slurm real-time GPU availability grouped by partition.
 
     This function calls the Slurm backend to fetch GPU info.
@@ -1890,7 +1887,7 @@ def realtime_slurm_gpu_availability(
 
     def realtime_slurm_gpu_availability_single(
         slurm_cluster_name: str,
-    ) -> Tuple[List[models.RealtimeGpuAvailability], Optional[str]]:
+    ) -> tuple[list[models.RealtimeGpuAvailability], str | None]:
         try:
             # This function now returns aggregated data per GPU type:
             # Tuple[Dict[str, List[InstanceTypeInfo]], Dict[str, int],
@@ -1922,7 +1919,7 @@ def realtime_slurm_gpu_availability(
                         f'{common_utils.format_exception(e)}')
 
         # --- Format the output ---
-        realtime_gpu_availability_list: List[
+        realtime_gpu_availability_list: list[
             models.RealtimeGpuAvailability] = []
         for gpu_type, _ in sorted(accelerator_counts.items()):
             realtime_gpu_availability_list.append(
@@ -1936,8 +1933,8 @@ def realtime_slurm_gpu_availability(
 
     parallel_queried = subprocess_utils.run_in_parallel(
         realtime_slurm_gpu_availability_single, slurm_cluster_names)
-    availability_lists: List[Tuple[str, List[models.RealtimeGpuAvailability],
-                                   Optional[str]]] = []
+    availability_lists: list[tuple[str, list[models.RealtimeGpuAvailability],
+                                   str | None]] = []
     for name, (queried, error) in zip(slurm_cluster_names, parallel_queried):
         if len(queried) == 0 and error is None:
             logger.debug(f'No gpus found in Slurm cluster {name}')
@@ -1951,18 +1948,18 @@ def realtime_slurm_gpu_availability(
 # =================
 @usage_lib.entrypoint
 def local_up(gpus: bool,
-             name: Optional[str] = None,
-             port_start: Optional[int] = None) -> None:
+             name: str | None = None,
+             port_start: int | None = None) -> None:
     """Creates a local cluster."""
     kubernetes_deploy_utils.deploy_local_cluster(name, port_start, gpus)
 
 
-def local_down(name: Optional[str] = None) -> None:
+def local_down(name: str | None = None) -> None:
     """Tears down the Kubernetes cluster started by local_up."""
     kubernetes_deploy_utils.teardown_local_cluster(name)
 
 
-def get_all_contexts() -> List[str]:
+def get_all_contexts() -> list[str]:
     """Get all available contexts from Kubernetes and SSH clouds.
 
     Returns:
@@ -1976,11 +1973,11 @@ def get_all_contexts() -> List[str]:
     return sorted(list(set(kube_contexts + ssh_contexts)))
 
 
-def create_debug_dump(request_ids: Optional[List[str]] = None,
-                      cluster_names: Optional[List[str]] = None,
-                      managed_job_ids: Optional[List[int]] = None,
-                      recent_minutes: Optional[float] = None,
-                      client_info: Optional[Dict[str, Any]] = None) -> str:
+def create_debug_dump(request_ids: list[str] | None = None,
+                      cluster_names: list[str] | None = None,
+                      managed_job_ids: list[int] | None = None,
+                      recent_minutes: float | None = None,
+                      client_info: dict[str, Any] | None = None) -> str:
     """Create a debug dump for troubleshooting.
 
     Args:

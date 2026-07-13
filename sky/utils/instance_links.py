@@ -1,5 +1,4 @@
 """Utility functions for generating instance links for cloud providers."""
-from typing import Dict
 
 from sky import sky_logging
 from sky.provision import common
@@ -75,7 +74,7 @@ def _build_gcp_instances_url(project_id: str, tag_key: str,
 def generate_instance_links(
     cluster_info: common.ClusterInfo,
     cluster_name: str,
-) -> Dict[str, str]:
+) -> dict[str, str]:
     """Generate instance links for a cluster based on the cloud provider.
 
     Creates links to filtered views in cloud consoles that show all instances
@@ -89,7 +88,7 @@ def generate_instance_links(
         Dictionary mapping link labels to URLs. Empty dict if links cannot be
         generated (e.g., for Kubernetes or unsupported clouds).
     """
-    links: Dict[str, str] = {}
+    links: dict[str, str] = {}
     provider_name = cluster_info.provider_name.lower()
     provider_config = cluster_info.provider_config or {}
 

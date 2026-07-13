@@ -5,7 +5,6 @@ import shlex
 import subprocess
 import tempfile
 import textwrap
-from typing import Optional, Tuple
 
 from sky import check as sky_check
 from sky import sky_logging
@@ -88,7 +87,7 @@ def generate_kind_config(port_start: int,
     return config
 
 
-def _get_port_range(name: str, port_start: Optional[int]) -> Tuple[int, int]:
+def _get_port_range(name: str, port_start: int | None) -> tuple[int, int]:
     is_default = name == DEFAULT_LOCAL_CLUSTER_NAME
     if port_start is None:
         if is_default:
@@ -111,8 +110,7 @@ def _get_port_range(name: str, port_start: Optional[int]) -> Tuple[int, int]:
     return port_start, port_end
 
 
-def deploy_local_cluster(name: Optional[str], port_start: Optional[int],
-                         gpus: bool):
+def deploy_local_cluster(name: str | None, port_start: int | None, gpus: bool):
     name = name or DEFAULT_LOCAL_CLUSTER_NAME
     port_start, port_end = _get_port_range(name, port_start)
     context_name = f'kind-{name}'
@@ -262,7 +260,7 @@ def deploy_local_cluster(name: Optional[str], port_start: Optional[int],
                     f'{gpu_hint}')))
 
 
-def teardown_local_cluster(name: Optional[str] = None):
+def teardown_local_cluster(name: str | None = None):
     name = name or DEFAULT_LOCAL_CLUSTER_NAME
     cluster_removed = False
 

@@ -4,11 +4,12 @@ This module provides an abstraction for locking that can use
 either local file locks or database-based distributed locks.
 """
 import abc
+from collections.abc import Callable
 import hashlib
 import logging
 import os
 import time
-from typing import Any, Callable, Optional, TypeVar
+from typing import Any, TypeVar
 
 import filelock
 import psycopg2
@@ -59,7 +60,7 @@ class DistributedLock(abc.ABC):
 
     def __init__(self,
                  lock_id: str,
-                 timeout: Optional[float] = None,
+                 timeout: float | None = None,
                  poll_interval: float = 0.1):
         """Initialize the lock.
 
@@ -123,7 +124,7 @@ class FileLock(DistributedLock):
 
     def __init__(self,
                  lock_id: str,
-                 timeout: Optional[float] = None,
+                 timeout: float | None = None,
                  poll_interval: float = 0.1):
         """Initialize the file lock.
 
@@ -179,7 +180,7 @@ class PostgresLock(DistributedLock):
 
     def __init__(self,
                  lock_id: str,
-                 timeout: Optional[float] = None,
+                 timeout: float | None = None,
                  poll_interval: float = 1,
                  shared_lock: bool = False):
         """Initialize the postgres lock.
@@ -197,7 +198,7 @@ class PostgresLock(DistributedLock):
         self._lock_key = self._string_to_lock_key(lock_id)
         self._shared_lock = shared_lock
         self._acquired = False
-        self._connection: Optional[sqlalchemy.pool.PoolProxiedConnection] = None
+        self._connection: sqlalchemy.pool.PoolProxiedConnection | None = None
 
     def _string_to_lock_key(self, s: str) -> int:
         """Convert string to a 64-bit integer for advisory lock key."""
@@ -425,9 +426,9 @@ class PostgresLock(DistributedLock):
 
 
 def get_lock(lock_id: str,
-             timeout: Optional[float] = None,
-             lock_type: Optional[str] = None,
-             poll_interval: Optional[float] = None,
+             timeout: float | None = None,
+             lock_type: str | None = None,
+             poll_interval: float | None = None,
              shared_lock: bool = False) -> DistributedLock:
     """Create a distributed lock instance.
 

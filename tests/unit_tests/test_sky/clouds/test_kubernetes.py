@@ -321,8 +321,8 @@ class TestKubernetesExistingAllowedContexts(unittest.TestCase):
     @patch('sky.provision.kubernetes.utils.get_all_kube_context_names')
     @patch('sky.skypilot_config.get_workspace_cloud')
     @patch('sky.skypilot_config.get_nested')
-    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
-          )
+    @patch(
+        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
     @patch('sky.provision.kubernetes.utils.is_incluster_config_available')
     def test_empty_result_when_no_contexts_found(
             self, mock_is_incluster_available, mock_get_current_context,
@@ -587,8 +587,8 @@ class TestKubernetesSecurityContextMerging(unittest.TestCase):
         self.region.name = "test-context"
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
-    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
-          )
+    @patch(
+        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
     @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_keys')
     @patch('sky.provision.kubernetes.utils.is_kubeconfig_exec_auth')
@@ -658,8 +658,8 @@ class TestKubernetesSecurityContextMerging(unittest.TestCase):
                          'test-context')
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
-    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
-          )
+    @patch(
+        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
     @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_keys')
     @patch('sky.provision.kubernetes.utils.is_kubeconfig_exec_auth')
@@ -725,8 +725,8 @@ class TestKubernetesSecurityContextMerging(unittest.TestCase):
         self.assertNotIn('UCX_NET_DEVICES', k8s_env_vars)
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
-    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
-          )
+    @patch(
+        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
     @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_keys')
     @patch('sky.provision.kubernetes.utils.is_kubeconfig_exec_auth')
@@ -790,8 +790,8 @@ class TestKubernetesSecurityContextMerging(unittest.TestCase):
         self.assertFalse(deploy_vars['k8s_ipc_lock_capability'])
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
-    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
-          )
+    @patch(
+        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
     @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_keys')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_key_values')
@@ -898,8 +898,8 @@ class TestKubernetesSecurityContextMerging(unittest.TestCase):
         self.assertFalse(deploy_vars['tpu_requested'])  # H100 is GPU, not TPU
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
-    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
-          )
+    @patch(
+        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
     @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_keys')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_key_values')
@@ -995,8 +995,8 @@ class TestKubernetesSecurityContextMerging(unittest.TestCase):
         self.assertEqual(k8s_env_vars['NCCL_SOCKET_IFNAME'], 'eth0')
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
-    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
-          )
+    @patch(
+        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
     @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_keys')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_key_values')
@@ -1106,8 +1106,8 @@ class TestKubernetesMakeDeployResourcesVariables(unittest.TestCase):
         self.region.name = "my-k8s-cluster"
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
-    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
-          )
+    @patch(
+        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
     @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_keys')
     @patch('sky.provision.kubernetes.utils.is_kubeconfig_exec_auth')
@@ -1201,8 +1201,8 @@ class TestKubernetesMakeDeployResourcesVariables(unittest.TestCase):
         self.assertEqual(deploy_vars['timeout'], '3600')
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
-    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
-          )
+    @patch(
+        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
     @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_keys')
     @patch('sky.provision.kubernetes.utils.is_kubeconfig_exec_auth')
@@ -1290,8 +1290,8 @@ class TestKubernetesMakeDeployResourcesVariables(unittest.TestCase):
         self.assertEqual(deploy_vars['timeout'], '5400')
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
-    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
-          )
+    @patch(
+        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
     @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_keys')
     @patch('sky.provision.kubernetes.utils.is_kubeconfig_exec_auth')
@@ -1454,8 +1454,8 @@ class TestKubernetesMakeDeployResourcesVariables(unittest.TestCase):
         mock_get_image.return_value = "test-image:latest"
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
-    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
-          )
+    @patch(
+        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
     @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_keys')
     @patch('sky.provision.kubernetes.utils.is_kubeconfig_exec_auth')
@@ -1504,8 +1504,8 @@ class TestKubernetesMakeDeployResourcesVariables(unittest.TestCase):
         self.assertEqual(deploy_vars['k8s_memory_limit'], 4.0)
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
-    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
-          )
+    @patch(
+        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
     @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_keys')
     @patch('sky.provision.kubernetes.utils.is_kubeconfig_exec_auth')
@@ -1554,8 +1554,8 @@ class TestKubernetesMakeDeployResourcesVariables(unittest.TestCase):
         self.assertEqual(deploy_vars['k8s_memory_limit'], 6.0)
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
-    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
-          )
+    @patch(
+        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
     @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_keys')
     @patch('sky.provision.kubernetes.utils.is_kubeconfig_exec_auth')
@@ -1601,8 +1601,8 @@ class TestKubernetesMakeDeployResourcesVariables(unittest.TestCase):
         self.assertNotIn('k8s_memory_limit', deploy_vars)
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
-    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
-          )
+    @patch(
+        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
     @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_keys')
     @patch('sky.provision.kubernetes.utils.is_kubeconfig_exec_auth')
@@ -1652,8 +1652,8 @@ class TestKubernetesMakeDeployResourcesVariables(unittest.TestCase):
         self.assertNotIn('k8s_ephemeral_storage_limit', deploy_vars)
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
-    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
-          )
+    @patch(
+        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
     @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_keys')
     @patch('sky.provision.kubernetes.utils.is_kubeconfig_exec_auth')
@@ -1704,8 +1704,8 @@ class TestKubernetesMakeDeployResourcesVariables(unittest.TestCase):
         self.assertEqual(deploy_vars['k8s_ephemeral_storage_limit'], 75.0)
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
-    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
-          )
+    @patch(
+        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
     @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_keys')
     @patch('sky.provision.kubernetes.utils.is_kubeconfig_exec_auth')
@@ -1839,8 +1839,8 @@ class TestKubernetesMakeDeployResourcesVariables(unittest.TestCase):
         return jinja2.Template(snippet).render(**deploy_vars)
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
-    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
-          )
+    @patch(
+        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
     @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_keys')
     @patch('sky.provision.kubernetes.utils.is_kubeconfig_exec_auth')
@@ -1893,8 +1893,8 @@ class TestKubernetesMakeDeployResourcesVariables(unittest.TestCase):
         self.assertIn('if [ "$APT_OS" = "ubuntu" ]; then', rendered)
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
-    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
-          )
+    @patch(
+        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
     @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_keys')
     @patch('sky.provision.kubernetes.utils.is_kubeconfig_exec_auth')
@@ -1946,8 +1946,8 @@ class TestKubernetesMakeDeployResourcesVariables(unittest.TestCase):
             rendered)
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
-    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
-          )
+    @patch(
+        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
     @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_keys')
     @patch('sky.provision.kubernetes.utils.is_kubeconfig_exec_auth')

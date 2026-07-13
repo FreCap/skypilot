@@ -1,5 +1,7 @@
 """Common utilities for the client."""
 
+from collections.abc import Generator
+from collections.abc import Iterable
 import contextlib
 import dataclasses
 import hashlib
@@ -11,7 +13,6 @@ import pathlib
 import tempfile
 import time
 import typing
-from typing import Dict, Generator, Iterable, Optional, Tuple
 import uuid
 import zipfile
 
@@ -69,7 +70,7 @@ def download_logs_from_api_server(
         remote_machine_prefix: str = str(
             server_common.api_server_user_logs_dir_prefix()),
         local_machine_prefix: str = constants.SKY_LOGS_DIRECTORY
-) -> Dict[str, str]:
+) -> dict[str, str]:
     """Downloads the logs from the API server.
 
     Args:
@@ -321,7 +322,7 @@ def _compute_zip_blob_id(zip_path: str) -> str:
 def upload_mounts_to_api_server(
     dag: 'sky.Dag',
     workdir_only: bool = False,
-) -> Tuple['dag_lib.Dag', Optional[str]]:
+) -> tuple['dag_lib.Dag', str | None]:
     """Upload user files to remote API server.
 
     This function needs to be called after sdk.validate(),

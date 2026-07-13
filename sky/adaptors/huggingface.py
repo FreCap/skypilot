@@ -2,7 +2,6 @@
 # pylint: disable=import-outside-toplevel
 import os
 import stat
-from typing import Dict, Optional, Tuple
 
 from sky import exceptions
 from sky.adaptors import common
@@ -50,7 +49,7 @@ def api():
     return huggingface_hub.HfApi()
 
 
-def get_token() -> Optional[str]:
+def get_token() -> str | None:
     """Returns the user's Hugging Face token, or None if unauthenticated.
 
     Tries, in order: the ``HF_TOKEN`` / ``HUGGING_FACE_HUB_TOKEN`` environment
@@ -65,7 +64,7 @@ def get_token() -> Optional[str]:
         path = os.path.expanduser(candidate)
         if os.path.isfile(path):
             try:
-                with open(path, 'r', encoding='utf-8') as f:
+                with open(path, encoding='utf-8') as f:
                     token = f.read().strip()
                 if token:
                     return token
@@ -82,14 +81,14 @@ def hf_hub_errors():
 
 
 def check_credentials(
-        cloud_capability: cloud.CloudCapability) -> Tuple[bool, Optional[str]]:
+        cloud_capability: cloud.CloudCapability) -> tuple[bool, str | None]:
     if cloud_capability == cloud.CloudCapability.STORAGE:
         return check_storage_credentials()
     raise exceptions.NotSupportedError(
         f'{NAME} does not support {cloud_capability}.')
 
 
-def check_storage_credentials() -> Tuple[bool, Optional[str]]:
+def check_storage_credentials() -> tuple[bool, str | None]:
     """Checks if the user is authenticated against the Hugging Face Hub.
 
     Returns:
@@ -144,14 +143,14 @@ def check_storage_credentials() -> Tuple[bool, Optional[str]]:
                        '(empty whoami response).')
 
 
-def get_credential_file_mounts() -> Dict[str, str]:
+def get_credential_file_mounts() -> dict[str, str]:
     """Returns credential file mounts for Hugging Face.
 
     The token file is uploaded so that ``huggingface_hub`` and ``hf-mount`` on
     the remote cluster can authenticate without needing the token to be baked
     into the task YAML.
     """
-    mounts: Dict[str, str] = {}
+    mounts: dict[str, str] = {}
     canonical_path = os.path.expanduser(HF_TOKEN_PATH)
     legacy_path = os.path.expanduser(HF_TOKEN_PATH_LEGACY)
     if os.path.exists(canonical_path):

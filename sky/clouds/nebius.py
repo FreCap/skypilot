@@ -1,11 +1,12 @@
 """ Nebius Cloud. """
+from collections.abc import Iterator
 import fnmatch
 import hashlib
 import json
 import os
 import tempfile
 import typing
-from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, Optional
 
 from sky import catalog
 from sky import clouds
@@ -36,7 +37,7 @@ def nebius_profile_in_aws_cred_and_config() -> bool:
     credentials_path = os.path.expanduser('~/.aws/credentials')
     nebius_profile_exists_in_credentials = False
     if os.path.isfile(credentials_path):
-        with open(credentials_path, 'r', encoding='utf-8') as file:
+        with open(credentials_path, encoding='utf-8') as file:
             for line in file:
                 if f'[{nebius.NEBIUS_PROFILE_NAME}]' in line:
                     nebius_profile_exists_in_credentials = True
@@ -44,7 +45,7 @@ def nebius_profile_in_aws_cred_and_config() -> bool:
     config_path = os.path.expanduser('~/.aws/config')
     nebius_profile_exists_in_config = False
     if os.path.isfile(config_path):
-        with open(config_path, 'r', encoding='utf-8') as file:
+        with open(config_path, encoding='utf-8') as file:
             for line in file:
                 if f'[profile {nebius.NEBIUS_PROFILE_NAME}]' in line:
                     nebius_profile_exists_in_config = True
@@ -77,7 +78,7 @@ def _write_nebius_temp_credential_file(prefix: str, value: str) -> str:
     path = os.path.join(tempfile.gettempdir(), f'{prefix}{uid}-{digest}')
     expected = value + '\n'
     try:
-        with open(path, 'r', encoding='utf-8') as existing:
+        with open(path, encoding='utf-8') as existing:
             if existing.read() == expected:
                 return path
     except OSError:
@@ -110,7 +111,7 @@ class Nebius(clouds.Cloud):
     # we add 4 character from UUID to make uniq `-xxxx`
     # our provisioner adds additional `-worker`.
     _MAX_CLUSTER_NAME_LEN_LIMIT = 50
-    _regions: List[clouds.Region] = []
+    _regions: list[clouds.Region] = []
 
     _BEST_DISK_TIER = resources_utils.DiskTier.HIGH
     _DEFAULT_DISK_TIER = resources_utils.DiskTier.MEDIUM
@@ -129,8 +130,8 @@ class Nebius(clouds.Cloud):
     def _unsupported_features_for_resources(
         cls,
         resources: 'resources_lib.Resources',
-        region: Optional[str] = None,
-    ) -> Dict[clouds.CloudImplementationFeatures, str]:
+        region: str | None = None,
+    ) -> dict[clouds.CloudImplementationFeatures, str]:
         unsupported = cls._CLOUD_UNSUPPORTED_FEATURES.copy()
 
         # Check if the accelerators support InfiniBand (H100 or H200) and 8 GPUs
@@ -148,19 +149,19 @@ class Nebius(clouds.Cloud):
         return unsupported
 
     @classmethod
-    def _max_cluster_name_length(cls) -> Optional[int]:
+    def _max_cluster_name_length(cls) -> int | None:
         return cls._MAX_CLUSTER_NAME_LEN_LIMIT
 
     @classmethod
     def regions_with_offering(
         cls,
         instance_type: str,
-        accelerators: Optional[Dict[str, int]],
+        accelerators: dict[str, int] | None,
         use_spot: bool,
-        region: Optional[str],
-        zone: Optional[str],
+        region: str | None,
+        zone: str | None,
         resources: Optional['resources_lib.Resources'] = None,
-    ) -> List[clouds.Region]:
+    ) -> list[clouds.Region]:
         assert zone is None, 'Nebius does not support zones.'
         del accelerators, zone  # unused
         regions = catalog.get_region_zones_for_instance_type(
@@ -174,7 +175,7 @@ class Nebius(clouds.Cloud):
     def get_vcpus_mem_from_instance_type(
         cls,
         instance_type: str,
-    ) -> Tuple[Optional[float], Optional[float]]:
+    ) -> tuple[float | None, float | None]:
         return catalog.get_vcpus_mem_from_instance_type(instance_type,
                                                         clouds='nebius')
 
@@ -185,7 +186,7 @@ class Nebius(clouds.Cloud):
         region: str,
         num_nodes: int,
         instance_type: str,
-        accelerators: Optional[Dict[str, int]] = None,
+        accelerators: dict[str, int] | None = None,
         use_spot: bool = False,
     ) -> Iterator[None]:
         del num_nodes  # unused
@@ -200,8 +201,8 @@ class Nebius(clouds.Cloud):
 
     @classmethod
     def check_disk_tier(
-            cls, instance_type: Optional[str],
-            disk_tier: Optional[resources_utils.DiskTier]) -> Tuple[bool, str]:
+            cls, instance_type: str | None,
+            disk_tier: resources_utils.DiskTier | None) -> tuple[bool, str]:
         del instance_type
         if (disk_tier is not None and
                 disk_tier == resources_utils.DiskTier.ULTRA):
@@ -211,7 +212,7 @@ class Nebius(clouds.Cloud):
         return True, ''
 
     @classmethod
-    def check_disk_tier_enabled(cls, instance_type: Optional[str],
+    def check_disk_tier_enabled(cls, instance_type: str | None,
                                 disk_tier: resources_utils.DiskTier) -> None:
         ok, msg = cls.check_disk_tier(instance_type, disk_tier)
         if not ok:
@@ -221,8 +222,8 @@ class Nebius(clouds.Cloud):
     def instance_type_to_hourly_cost(self,
                                      instance_type: str,
                                      use_spot: bool,
-                                     region: Optional[str] = None,
-                                     zone: Optional[str] = None) -> float:
+                                     region: str | None = None,
+                                     zone: str | None = None) -> float:
         return catalog.get_hourly_cost(instance_type,
                                        use_spot=use_spot,
                                        region=region,
@@ -230,10 +231,10 @@ class Nebius(clouds.Cloud):
                                        clouds='nebius')
 
     def accelerators_to_hourly_cost(self,
-                                    accelerators: Dict[str, int],
+                                    accelerators: dict[str, int],
                                     use_spot: bool,
-                                    region: Optional[str] = None,
-                                    zone: Optional[str] = None) -> float:
+                                    region: str | None = None,
+                                    zone: str | None = None) -> float:
         """Returns the hourly cost of the accelerators, in dollars/hour."""
         del accelerators, use_spot, region, zone  # unused
         return 0.0
@@ -251,15 +252,15 @@ class Nebius(clouds.Cloud):
     @classmethod
     def get_default_instance_type(
         cls,
-        cpus: Optional[str] = None,
-        memory: Optional[str] = None,
-        disk_tier: Optional[resources_utils.DiskTier] = None,
-        local_disk: Optional[str] = None,
-        region: Optional[str] = None,
-        zone: Optional[str] = None,
+        cpus: str | None = None,
+        memory: str | None = None,
+        disk_tier: resources_utils.DiskTier | None = None,
+        local_disk: str | None = None,
+        region: str | None = None,
+        zone: str | None = None,
         use_spot: bool = False,
-        max_hourly_cost: Optional[float] = None,
-    ) -> Optional[str]:
+        max_hourly_cost: float | None = None,
+    ) -> str | None:
         """Returns the default instance type for Nebius."""
         return catalog.get_default_instance_type(
             cpus=cpus,
@@ -276,12 +277,12 @@ class Nebius(clouds.Cloud):
     def get_accelerators_from_instance_type(
         cls,
         instance_type: str,
-    ) -> Optional[Dict[str, Union[int, float]]]:
+    ) -> dict[str, int | float] | None:
         return catalog.get_accelerators_from_instance_type(instance_type,
                                                            clouds='nebius')
 
     @classmethod
-    def get_zone_shell_cmd(cls) -> Optional[str]:
+    def get_zone_shell_cmd(cls) -> str | None:
         return None
 
     def make_deploy_resources_variables(
@@ -289,11 +290,11 @@ class Nebius(clouds.Cloud):
         resources: 'resources_lib.Resources',
         cluster_name: resources_utils.ClusterName,
         region: 'clouds.Region',
-        zones: Optional[List['clouds.Zone']],
+        zones: list['clouds.Zone'] | None,
         num_nodes: int,
         dryrun: bool = False,
-        volume_mounts: Optional[List['volume_lib.VolumeMount']] = None,
-    ) -> Dict[str, Any]:
+        volume_mounts: list['volume_lib.VolumeMount'] | None = None,
+    ) -> dict[str, Any]:
         del dryrun
         assert zones is None, ('Nebius does not support zones', zones)
 
@@ -355,7 +356,7 @@ class Nebius(clouds.Cloud):
             region=region.name,
             keys=('security_group_name',),
             default_value=None)
-        user_sg: Optional[str] = None
+        user_sg: str | None = None
         if isinstance(user_sg_config, str):
             user_sg = user_sg_config
         elif isinstance(user_sg_config, list):
@@ -383,7 +384,7 @@ class Nebius(clouds.Cloud):
                     f'`nebius.security_group_name` in '
                     f'`~/.sky/config.yaml`.')
 
-        resources_vars: Dict[str, Any] = {
+        resources_vars: dict[str, Any] = {
             'instance_type': resources.instance_type,
             'custom_resources': custom_resources,
             'use_static_ip_address': use_static_ip_address,
@@ -502,7 +503,7 @@ class Nebius(clouds.Cloud):
 
     @classmethod
     def _check_compute_credentials(
-            cls) -> Tuple[bool, Optional[Union[str, Dict[str, str]]]]:
+            cls) -> tuple[bool, str | dict[str, str] | None]:
         """Checks if the user has access credentials to
         Nebius's compute service."""
         token_cred_msg = (
@@ -535,7 +536,7 @@ class Nebius(clouds.Cloud):
     @classmethod
     @annotations.lru_cache(scope='request')
     def _check_storage_credentials(
-            cls) -> Tuple[bool, Optional[Union[str, Dict[str, str]]]]:
+            cls) -> tuple[bool, str | dict[str, str] | None]:
         """Checks if the user has access credentials to Nebius Object Storage.
 
         Returns:
@@ -560,7 +561,7 @@ class Nebius(clouds.Cloud):
             )
         return (False, hints) if hints else (True, hints)
 
-    def get_credential_file_mounts(self) -> Dict[str, str]:
+    def get_credential_file_mounts(self) -> dict[str, str]:
         credential_file_mounts = {}
         tenant_id_path = nebius.tenant_id_path()
         tenant_id = nebius.get_tenant_id()
@@ -582,7 +583,7 @@ class Nebius(clouds.Cloud):
         return credential_file_mounts
 
     @classmethod
-    def get_current_user_identity(cls) -> Optional[List[str]]:
+    def get_current_user_identity(cls) -> list[str] | None:
         # NOTE: used for very advanced SkyPilot functionality
         # Can implement later if desired
         return None
@@ -590,11 +591,11 @@ class Nebius(clouds.Cloud):
     def instance_type_exists(self, instance_type: str) -> bool:
         return catalog.instance_type_exists(instance_type, 'nebius')
 
-    def validate_region_zone(self, region: Optional[str], zone: Optional[str]):
+    def validate_region_zone(self, region: str | None, zone: str | None):
         return catalog.validate_region_zone(region, zone, clouds='nebius')
 
     @classmethod
-    def get_user_identities(cls) -> Optional[List[List[str]]]:
+    def get_user_identities(cls) -> list[list[str]] | None:
         """Returns the email address + project id of the active user."""
         nebius_workspace_config = json.dumps(
             skypilot_config.get_workspace_cloud('nebius'), sort_keys=True)
@@ -603,7 +604,7 @@ class Nebius(clouds.Cloud):
     @classmethod
     @annotations.lru_cache(scope='request', maxsize=5)
     def _get_user_identities(
-            cls, workspace_config: Optional[str]) -> Optional[List[List[str]]]:
+            cls, workspace_config: str | None) -> list[list[str]] | None:
         # We add workspace_config in args to avoid caching the identity for when
         # different workspace configs are used.
         del workspace_config  # Unused
@@ -648,7 +649,7 @@ class Nebius(clouds.Cloud):
 
     # pylint: disable=import-outside-toplevel
     @classmethod
-    def get_image_size(cls, image_id: str, region: Optional[str]) -> float:
+    def get_image_size(cls, image_id: str, region: str | None) -> float:
         from grpc import StatusCode
         from nebius.aio.service_error import RequestError
 

@@ -7,7 +7,7 @@
 """Vast library wrapper for SkyPilot."""
 from pathlib import Path
 import shlex
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from sky import sky_logging
 from sky.adaptors import vast
@@ -15,11 +15,11 @@ from sky.adaptors import vast
 logger = sky_logging.init_logger(__name__)
 
 
-def list_instances() -> Dict[str, Dict[str, Any]]:
+def list_instances() -> dict[str, dict[str, Any]]:
     """Lists instances associated with API key."""
     instances = vast.vast().show_instances()
 
-    instance_dict: Dict[str, Dict[str, Any]] = {}
+    instance_dict: dict[str, dict[str, Any]] = {}
     for instance in instances:
         instance['id'] = str(instance['id'])
         info = instance
@@ -40,13 +40,13 @@ def launch(name: str,
            region: str,
            disk_size: int,
            image_name: str,
-           ports: Optional[List[int]],
+           ports: list[int] | None,
            preemptible: bool,
            secure_only: bool,
-           private_docker_registry: Optional[bool] = None,
-           login: Optional[str] = None,
-           create_instance_kwargs: Optional[Dict[str, Any]] = None,
-           ssh_public_key: Optional[str] = None) -> str:
+           private_docker_registry: bool | None = None,
+           login: str | None = None,
+           create_instance_kwargs: dict[str, Any] | None = None,
+           ssh_public_key: str | None = None) -> str:
     """Launches an instance with the given parameters.
 
     Converts the instance_type to the Vast GPU name, finds the specs for the
@@ -139,7 +139,7 @@ def launch(name: str,
     instance_touse = instance_list[0]
 
     # Start with user-provided kwargs as the base
-    launch_params: Dict[str, Any] = dict(create_instance_kwargs or {})
+    launch_params: dict[str, Any] = dict(create_instance_kwargs or {})
     # Remove None values to avoid overriding defaults
     launch_params = {k: v for k, v in launch_params.items() if v is not None}
 
@@ -225,7 +225,7 @@ def launch(name: str,
     # Handle env - Vast.ai SDK requires env as a dict, not a CLI-style string.
     # Merge user-provided env (dict or legacy string) with skypilot metadata.
     user_env = launch_params.pop('env', None)
-    env_dict: Dict[str, str] = {'__SOURCE': 'skypilot'}
+    env_dict: dict[str, str] = {'__SOURCE': 'skypilot'}
     if user_env is not None:
         if isinstance(user_env, dict):
             env_dict.update(user_env)
@@ -259,7 +259,7 @@ def remove(instance_id: str) -> None:
     vast.vast().destroy_instance(id=instance_id)
 
 
-def get_ssh_ports(cluster_name: str) -> List[int]:
+def get_ssh_ports(cluster_name: str) -> list[int]:
     """Gets the SSH ports for the given cluster."""
     logger.debug(f'Getting SSH ports for cluster {cluster_name}.')
 

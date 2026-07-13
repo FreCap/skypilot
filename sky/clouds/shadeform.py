@@ -1,9 +1,10 @@
 """ Shadeform Cloud. """
 
+from collections.abc import Iterator
 import json
 import os
 import typing
-from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, Optional
 
 from sky import catalog
 from sky import clouds
@@ -68,7 +69,7 @@ class Shadeform(clouds.Cloud):
     }
     # yapf: enable
 
-    _regions: List[clouds.Region] = []
+    _regions: list[clouds.Region] = []
 
     PROVISIONER_VERSION = clouds.ProvisionerVersion.SKYPILOT
     STATUS_VERSION = clouds.StatusVersion.SKYPILOT
@@ -78,26 +79,26 @@ class Shadeform(clouds.Cloud):
     def _unsupported_features_for_resources(
         cls,
         resources: 'resources_lib.Resources',
-        region: Optional[str] = None,
-    ) -> Dict[clouds.CloudImplementationFeatures, str]:
+        region: str | None = None,
+    ) -> dict[clouds.CloudImplementationFeatures, str]:
         """The features not supported based on the resources provided."""
         del resources  # unused
         return cls._CLOUD_UNSUPPORTED_FEATURES
 
     @classmethod
-    def _max_cluster_name_length(cls) -> Optional[int]:
+    def _max_cluster_name_length(cls) -> int | None:
         return cls._MAX_CLUSTER_NAME_LEN_LIMIT
 
     @classmethod
     def regions_with_offering(
         cls,
         instance_type: str,
-        accelerators: Optional[Dict[str, int]],
+        accelerators: dict[str, int] | None,
         use_spot: bool,
-        region: Optional[str],
-        zone: Optional[str],
+        region: str | None,
+        zone: str | None,
         resources: Optional['resources_lib.Resources'] = None,
-    ) -> List[clouds.Region]:
+    ) -> list[clouds.Region]:
         """Get regions that offer the requested instance type."""
         assert zone is None, 'Shadeform does not support zones.'
         del zone  # unused
@@ -121,7 +122,7 @@ class Shadeform(clouds.Cloud):
         region: str,
         num_nodes: int,
         instance_type: str,
-        accelerators: Optional[Dict[str, int]] = None,
+        accelerators: dict[str, int] | None = None,
         use_spot: bool = False,
     ) -> Iterator[None]:
         """Iterate over zones for provisioning."""
@@ -139,7 +140,7 @@ class Shadeform(clouds.Cloud):
     def get_vcpus_mem_from_instance_type(
         cls,
         instance_type: str,
-    ) -> Tuple[Optional[float], Optional[float]]:
+    ) -> tuple[float | None, float | None]:
         """Get vCPUs and memory from instance type."""
         return catalog.get_vcpus_mem_from_instance_type(instance_type,
                                                         clouds='shadeform')
@@ -148,7 +149,7 @@ class Shadeform(clouds.Cloud):
     def get_accelerators_from_instance_type(
         cls,
         instance_type: str,
-    ) -> Optional[Dict[str, Union[int, float]]]:
+    ) -> dict[str, int | float] | None:
         """Get accelerator information from instance type."""
         return catalog.get_accelerators_from_instance_type(instance_type,
                                                            clouds='shadeform')
@@ -156,15 +157,15 @@ class Shadeform(clouds.Cloud):
     @classmethod
     def get_default_instance_type(
         cls,
-        cpus: Optional[str] = None,
-        memory: Optional[str] = None,
-        disk_tier: Optional[resources_utils.DiskTier] = None,
-        local_disk: Optional[str] = None,
-        region: Optional[str] = None,
-        zone: Optional[str] = None,
+        cpus: str | None = None,
+        memory: str | None = None,
+        disk_tier: resources_utils.DiskTier | None = None,
+        local_disk: str | None = None,
+        region: str | None = None,
+        zone: str | None = None,
         use_spot: bool = False,
-        max_hourly_cost: Optional[float] = None,
-    ) -> Optional[str]:
+        max_hourly_cost: float | None = None,
+    ) -> str | None:
         """Get default instance type."""
         del disk_tier, local_disk  # Not supported
         return catalog.get_default_instance_type(
@@ -178,12 +179,12 @@ class Shadeform(clouds.Cloud):
             clouds='shadeform')
 
     @classmethod
-    def get_zone_shell_cmd(cls) -> Optional[str]:
+    def get_zone_shell_cmd(cls) -> str | None:
         """Return shell command to get the zone of the instance."""
         return None
 
     @classmethod
-    def get_user_identities(cls) -> Optional[List[List[str]]]:
+    def get_user_identities(cls) -> list[list[str]] | None:
         """Get user identities for Shadeform."""
         # No user identity support needed
         return None
@@ -194,8 +195,8 @@ class Shadeform(clouds.Cloud):
     def instance_type_to_hourly_cost(self,
                                      instance_type: str,
                                      use_spot: bool,
-                                     region: Optional[str] = None,
-                                     zone: Optional[str] = None) -> float:
+                                     region: str | None = None,
+                                     zone: str | None = None) -> float:
         """Get hourly cost for instance type."""
         if use_spot:
             raise ValueError('Spot instances are not supported on Shadeform')
@@ -206,10 +207,10 @@ class Shadeform(clouds.Cloud):
                                        clouds='shadeform')
 
     def accelerators_to_hourly_cost(self,
-                                    accelerators: Dict[str, int],
+                                    accelerators: dict[str, int],
                                     use_spot: bool,
-                                    region: Optional[str] = None,
-                                    zone: Optional[str] = None) -> float:
+                                    region: str | None = None,
+                                    zone: str | None = None) -> float:
         """Get hourly cost for accelerators."""
         return 0.0
 
@@ -222,7 +223,7 @@ class Shadeform(clouds.Cloud):
         return 'Shadeform'
 
     @classmethod
-    def get_current_user_identity(cls) -> Optional[str]:
+    def get_current_user_identity(cls) -> str | None:
         """Get current user identity."""
         return None
 
@@ -231,11 +232,11 @@ class Shadeform(clouds.Cloud):
         resources: 'resources_lib.Resources',
         cluster_name: resources_utils.ClusterName,
         region: 'clouds.Region',
-        zones: Optional[List['clouds.Zone']],
+        zones: list['clouds.Zone'] | None,
         num_nodes: int,
         dryrun: bool = False,
-        volume_mounts: Optional[List['volume_lib.VolumeMount']] = None,
-    ) -> Dict[str, Any]:
+        volume_mounts: list['volume_lib.VolumeMount'] | None = None,
+    ) -> dict[str, Any]:
         """Make variables for deployment template."""
         del zones, num_nodes, dryrun, volume_mounts  # unused for Shadeform
 
@@ -263,21 +264,21 @@ class Shadeform(clouds.Cloud):
 
         return resources_vars
 
-    def get_credential_file_mounts(self) -> Dict[str, str]:
+    def get_credential_file_mounts(self) -> dict[str, str]:
         """Get credential files that need to be mounted."""
         return {
             f'~/.shadeform/{f}': f'~/.shadeform/{f}' for f in _CREDENTIAL_FILES
         }
 
     @classmethod
-    def get_current_user_identity_str(cls) -> Optional[str]:
+    def get_current_user_identity_str(cls) -> str | None:
         """Get current user identity string."""
         return None
 
     @classmethod
     def check_credentials(
         cls, cloud_capability: clouds.CloudCapability
-    ) -> Tuple[bool, Optional[Union[str, Dict[str, str]]]]:
+    ) -> tuple[bool, str | dict[str, str] | None]:
         """Check if Shadeform credentials are properly configured."""
         del cloud_capability  # unused for Shadeform
         try:
@@ -287,7 +288,7 @@ class Shadeform(clouds.Cloud):
                                f'Please save your API key to {api_key_path}')
 
             # Try to read the API key
-            with open(api_key_path, 'r', encoding='utf-8') as f:
+            with open(api_key_path, encoding='utf-8') as f:
                 api_key = f.read().strip()
 
             if not api_key:
@@ -295,7 +296,7 @@ class Shadeform(clouds.Cloud):
 
             return True, None
 
-        except (OSError, IOError) as e:
+        except OSError as e:
             return False, f'Error checking Shadeform credentials: {str(e)}'
 
     def _get_feasible_launchable_resources(
@@ -394,7 +395,7 @@ class Shadeform(clouds.Cloud):
                     _make_resources([default_instance_type]), [], None)
 
     @classmethod
-    def _check_compute_credentials(cls) -> Tuple[bool, Optional[str]]:
+    def _check_compute_credentials(cls) -> tuple[bool, str | None]:
         """Check compute credentials."""
         success, msg = cls.check_credentials(clouds.CloudCapability.COMPUTE)
         # Convert return type to match expected signature
@@ -403,9 +404,9 @@ class Shadeform(clouds.Cloud):
         return success, msg
 
     @classmethod
-    def query_status(cls, name: str, tag_filters: Dict[str, str],
-                     region: Optional[str], zone: Optional[str],
-                     **kwargs) -> List[status_lib.ClusterStatus]:
+    def query_status(cls, name: str, tag_filters: dict[str, str],
+                     region: str | None, zone: str | None,
+                     **kwargs) -> list[status_lib.ClusterStatus]:
         """Query cluster status."""
         # For validation purposes, return empty list (no existing clusters)
         # Actual status querying is handled by the provisioner

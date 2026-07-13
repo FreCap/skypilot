@@ -5,7 +5,7 @@ from sky.provision.vsphere.common import vapiconnect
 from sky.provision.vsphere.common.ssl_helper import get_unverified_context
 
 
-class ServiceManager(object):
+class ServiceManager:
     """Manages Vim and vAPI services on a management node."""
 
     def __init__(self, server, username, password, skip_verification):

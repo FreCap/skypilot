@@ -122,8 +122,8 @@ def main():
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
             # Submit all files for processing
             future_to_file = {
-                executor.submit(process_parquet_file, (file, args.batch_size)):
-                file for file in parquet_files
+                executor.submit(process_parquet_file, (file, args.batch_size)): file
+                for file in parquet_files
             }
 
             # Process results as they complete

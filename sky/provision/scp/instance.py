@@ -8,7 +8,7 @@ import logging
 import random
 import string
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
 from sky.clouds.utils import scp_utils
 from sky.provision import common
@@ -315,8 +315,7 @@ def _get_vcp_subnets(zone_id):
     return vpc_subnets
 
 
-def _filter_instances(cluster_name_on_cloud,
-                      status_filter: Optional[List[str]]):
+def _filter_instances(cluster_name_on_cloud, status_filter: list[str] | None):
     instances = scp_utils.SCPClient().get_instances()
     v2_head_instance_name = _head(cluster_name_on_cloud)
     v2_worker_prefix = _worker(cluster_name_on_cloud)
@@ -451,7 +450,7 @@ def _get_firewall_id(vpc_id):
 
 
 def _add_firewall_rule(firewall_id, internal_ip, direction,
-                       ports: Optional[List[str]], cnt: Optional[int]):
+                       ports: list[str] | None, cnt: int | None):
     attempts = 0
     max_attempts = 300
     while attempts < max_attempts:
@@ -501,8 +500,7 @@ def _remaining_firewall_rule(firewall_id, rule_ids):
     return False
 
 
-def _get_firewall_rule_ids(instance_info, firewall_id,
-                           ports: Optional[List[str]]):
+def _get_firewall_rule_ids(instance_info, firewall_id, ports: list[str] | None):
     rule_ids = []
     if ports is not None:
         destination_ip = instance_info['ip']
@@ -529,7 +527,7 @@ def _get_firewall_rule_ids(instance_info, firewall_id,
 
 def stop_instances(
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     worker_only: bool = False,
 ) -> None:
     del provider_config
@@ -565,7 +563,7 @@ def stop_instances(
 
 def terminate_instances(
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     worker_only: bool = False,
 ) -> None:
     del provider_config
@@ -604,10 +602,10 @@ def terminate_instances(
 def query_instances(
     cluster_name: str,
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     non_terminated_only: bool = True,
     retry_if_missing: bool = False,
-) -> Dict[str, Tuple[Optional['status_lib.ClusterStatus'], Optional[str]]]:
+) -> dict[str, tuple[Optional['status_lib.ClusterStatus'], str | None]]:
     del cluster_name, retry_if_missing  # unused
     assert provider_config is not None, (cluster_name_on_cloud, provider_config)
     instances = _filter_instances(cluster_name_on_cloud, None)
@@ -624,8 +622,7 @@ def query_instances(
         'TERMINATED': None,
     }
 
-    statuses: Dict[str, Tuple[Optional['status_lib.ClusterStatus'],
-                              Optional[str]]] = {}
+    statuses: dict[str, tuple[status_lib.ClusterStatus | None, str | None]] = {}
     for instance in instances:
         status = status_map[instance['virtualServerState']]
         if non_terminated_only and status is None:
@@ -641,7 +638,7 @@ def wait_instances(region: str, cluster_name_on_cloud: str, state: str) -> None:
 def get_cluster_info(
         region: str,
         cluster_name_on_cloud: str,
-        provider_config: Optional[Dict[str, Any]] = None) -> common.ClusterInfo:
+        provider_config: dict[str, Any] | None = None) -> common.ClusterInfo:
     del region
     running_instances = _filter_instances(cluster_name_on_cloud, ['RUNNING'])
     head_instance_id = _get_head_instance_id(running_instances)
@@ -678,8 +675,8 @@ def get_cluster_info(
 
 def open_ports(
     cluster_name_on_cloud: str,
-    ports: List[str],
-    provider_config: Optional[Dict[str, Any]] = None,
+    ports: list[str],
+    provider_config: dict[str, Any] | None = None,
 ) -> None:
     del provider_config
     instances = _filter_instances(cluster_name_on_cloud, ['RUNNING'])
@@ -695,8 +692,8 @@ def open_ports(
 
 def cleanup_ports(
     cluster_name_on_cloud: str,
-    ports: List[str],
-    provider_config: Optional[Dict[str, Any]] = None,
+    ports: list[str],
+    provider_config: dict[str, Any] | None = None,
 ) -> None:
     del provider_config
     instances = _filter_instances(cluster_name_on_cloud, ['RUNNING'])

@@ -51,7 +51,7 @@ def delete_image_and_snapshots(image_id, region):
 
 
 def main():
-    with open('images.csv', 'r', encoding='utf-8') as csvfile:
+    with open('images.csv', encoding='utf-8') as csvfile:
         reader = csv.DictReader(csvfile)
         for row in reader:
             if row['Tag'] == args.tag:

@@ -1,9 +1,11 @@
 """API versioning module."""
 
+from collections.abc import Callable
+from collections.abc import Mapping
 import contextvars
 import functools
 import re
-from typing import Callable, Literal, Mapping, NamedTuple, Optional, Tuple
+from typing import Literal, NamedTuple
 
 import colorama
 from packaging import version as version_lib
@@ -46,14 +48,14 @@ _REMOTE_TO_ERROR = {
 
 # Context-local (thread or cooroutine) remote API version, captured during
 # communication with the remote peer.
-_remote_api_version: contextvars.ContextVar[Optional[int]] = \
+_remote_api_version: contextvars.ContextVar[int | None] = \
     contextvars.ContextVar('remote_api_version', default=None)
 _remote_version: contextvars.ContextVar[str] = \
     contextvars.ContextVar('remote_version', default='unknown')
 _reminded_for_minor_version_upgrade = False
 
 
-def get_remote_api_version() -> Optional[int]:
+def get_remote_api_version() -> int | None:
     return _remote_api_version.get()
 
 
@@ -72,24 +74,24 @@ def set_remote_version(version: str) -> None:
 class VersionInfo(NamedTuple):
     api_version: int
     version: str
-    error: Optional[str] = None
+    error: str | None = None
 
 
 def check_compatibility_at_server(
-        client_headers: Mapping[str, str]) -> Optional[VersionInfo]:
+        client_headers: Mapping[str, str]) -> VersionInfo | None:
     """Check API compatibility between client and server."""
     return _check_version_compatibility(client_headers, 'client')
 
 
 def check_compatibility_at_client(
-        server_headers: Mapping[str, str]) -> Optional[VersionInfo]:
+        server_headers: Mapping[str, str]) -> VersionInfo | None:
     """Check API compatibility between client and server."""
     return _check_version_compatibility(server_headers, 'server')
 
 
 def _check_version_compatibility(
         remote_headers: Mapping[str, str],
-        remote_type: Literal['client', 'server']) -> Optional[VersionInfo]:
+        remote_type: Literal['client', 'server']) -> VersionInfo | None:
     """Check API compatibility between client and server.
 
     This function can be called at both client and server side, where the
@@ -155,7 +157,7 @@ def get_local_readable_version() -> str:
         return sky.__version__
 
 
-def parse_readable_version(version: str) -> Tuple[str, Optional[str]]:
+def parse_readable_version(version: str) -> tuple[str, str | None]:
     """Parse a readable produced by get_local_readable_version.
 
     Args:
@@ -180,7 +182,7 @@ def parse_readable_version(version: str) -> Tuple[str, Optional[str]]:
         return version, None
 
 
-def install_version_command(version: str, commit: Optional[str] = None) -> str:
+def install_version_command(version: str, commit: str | None = None) -> str:
     if version == DEV_VERSION:
         if commit is not None:
             return ('pip install git+https://github.com/skypilot-org/skypilot@'

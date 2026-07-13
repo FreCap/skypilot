@@ -1,6 +1,5 @@
 """Utility functions for handling infrastructure specifications."""
 import dataclasses
-from typing import Optional
 
 from sky.utils import common_utils
 from sky.utils import ux_utils
@@ -14,14 +13,14 @@ class InfraInfo:
 
     When a field is None, it means the field is not specified.
     """
-    cloud: Optional[str] = None
-    region: Optional[str] = None
-    zone: Optional[str] = None
+    cloud: str | None = None
+    region: str | None = None
+    zone: str | None = None
 
     def __init__(self,
-                 cloud: Optional[str] = None,
-                 region: Optional[str] = None,
-                 zone: Optional[str] = None):
+                 cloud: str | None = None,
+                 region: str | None = None,
+                 zone: str | None = None):
         assert cloud not in ['none', 'None', 'NONE'], 'cloud must be specified'
         if not cloud or cloud == '*':
             cloud = None
@@ -35,7 +34,7 @@ class InfraInfo:
         self.zone = zone
 
     @staticmethod
-    def from_str(infra: Optional[str]) -> 'InfraInfo':
+    def from_str(infra: str | None) -> 'InfraInfo':
         """Parse the infra string into cloud, region, and zone components.
 
         The format of the infra string is `cloud`, `cloud/region`, or
@@ -77,7 +76,7 @@ class InfraInfo:
                     f'Invalid infra format: {infra}. Expected format is '
                     '"cloud", "cloud/region", or "cloud/region/zone".')
 
-        cloud_name: Optional[str] = parts[0].lower()
+        cloud_name: str | None = parts[0].lower()
 
         # Handle Kubernetes contexts specially, as they can contain slashes
         if cloud_name in ['k8s', 'kubernetes']:
@@ -121,7 +120,7 @@ class InfraInfo:
             zone = None
         return InfraInfo(cloud=cloud_name, region=region, zone=zone)
 
-    def to_str(self) -> Optional[str]:
+    def to_str(self) -> str | None:
         """Formats cloud, region, and zone into an infra string.
 
         Args:

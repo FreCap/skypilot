@@ -17,7 +17,6 @@ import re
 import time
 import traceback
 import typing
-from typing import List, Optional, Tuple
 
 from sky import sky_logging
 from sky.adaptors import common as adaptors_common
@@ -209,7 +208,7 @@ class QueryHelper:
                             r'\d{3}\+\d{2}\:\d{2}',
                             'Z',
                             str(agreements.time_retrieved),
-                            0,
+                            count=0,
                         ),
                         '%Y-%m-%d %H:%M:%S.%fZ',
                     ),
@@ -259,7 +258,7 @@ class QueryHelper:
 
     @classmethod
     @debug_enabled(logger)
-    def find_create_vcn_subnet(cls, region) -> Optional[str]:
+    def find_create_vcn_subnet(cls, region) -> str | None:
         """ If sub is not configured, we find/create VCN skypilot_vcn """
         subnet = oci_utils.oci_config.get_vcn_subnet(region)
         if subnet is not None:
@@ -301,8 +300,7 @@ class QueryHelper:
 
     @classmethod
     @debug_enabled(logger)
-    def create_vcn_subnet(cls, net_client,
-                          skypilot_compartment) -> Optional[str]:
+    def create_vcn_subnet(cls, net_client, skypilot_compartment) -> str | None:
 
         skypilot_vcn = None  # VCN for the resources
         subnet = None  # Subnet for the VMs
@@ -491,7 +489,7 @@ class QueryHelper:
     @classmethod
     @debug_enabled(logger)
     def find_nsg(cls, region: str, nsg_name: str,
-                 create_if_not_exist: bool) -> Optional[str]:
+                 create_if_not_exist: bool) -> str | None:
         net_client = oci_adaptor.get_net_client(
             region, oci_utils.oci_config.get_profile())
 
@@ -547,7 +545,7 @@ class QueryHelper:
         return get_nsg_resp.data.id
 
     @classmethod
-    def get_range_min_max(cls, port_range: str) -> Tuple[int, int]:
+    def get_range_min_max(cls, port_range: str) -> tuple[int, int]:
         range_list = port_range.split('-')
         if len(range_list) == 1:
             return (int(range_list[0]), int(range_list[0]))
@@ -557,7 +555,7 @@ class QueryHelper:
     @classmethod
     @debug_enabled(logger)
     def create_nsg_rules(cls, region: str, cluster_name: str,
-                         ports: List[str]) -> None:
+                         ports: list[str]) -> None:
         """ Create per-cluster NSG with ingress rules """
         if not ports:
             return
@@ -596,8 +594,8 @@ class QueryHelper:
             sort_order='DESC',
         )
 
-        ingress_rules: List = list_nsg_rules_resp.data
-        existing_port_ranges: List[str] = []
+        ingress_rules: list = list_nsg_rules_resp.data
+        existing_port_ranges: list[str] = []
         for r in ingress_rules:
             if r.tcp_options:
                 options_range = r.tcp_options.destination_port_range
@@ -640,7 +638,7 @@ class QueryHelper:
 
     @classmethod
     @debug_enabled(logger)
-    def detach_nsg(cls, region: str, inst, nsg_id: Optional[str]) -> None:
+    def detach_nsg(cls, region: str, inst, nsg_id: str | None) -> None:
         if nsg_id is None:
             return
 

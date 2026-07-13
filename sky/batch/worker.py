@@ -10,6 +10,7 @@ Each worker node runs a persistent background process that:
 5. ``POST /shutdown`` causes ``load()`` to stop iterating and the mapper to
    return naturally.
 """
+from collections.abc import Iterator
 import http.server as http_server
 import json
 import logging
@@ -18,7 +19,7 @@ import queue
 import threading
 import time
 import traceback
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any
 
 from sky.batch import constants
 from sky.batch import io_formats
@@ -35,7 +36,7 @@ class _BatchItem:
     """A single batch to be processed by the mapper."""
 
     def __init__(self,
-                 data: List[Dict[str, Any]],
+                 data: list[dict[str, Any]],
                  start_idx: int,
                  end_idx: int,
                  batch_idx: int,
@@ -46,7 +47,7 @@ class _BatchItem:
         self.batch_idx = batch_idx
         self.attempt_id = attempt_id
         self.done_event = threading.Event()
-        self.error: Optional[str] = None
+        self.error: str | None = None
 
 
 class _Shutdown:
@@ -58,15 +59,15 @@ class _Shutdown:
 # ---------------------------------------------------------------------------
 
 _batch_queue: queue.Queue = queue.Queue()
-_current_batch: Optional[_BatchItem] = None
+_current_batch: _BatchItem | None = None
 _current_batch_lock = threading.Lock()
 
-_output_path: Optional[str] = None
-_job_id: Optional[str] = None
-_worker_token: Optional[str] = None
-_dataset_format: Optional[io_formats.InputReader] = None
-_output_formats: List[io_formats.OutputWriter] = []
-_mapper_failure: Optional[str] = None
+_output_path: str | None = None
+_job_id: str | None = None
+_worker_token: str | None = None
+_dataset_format: io_formats.InputReader | None = None
+_output_formats: list[io_formats.OutputWriter] = []
+_mapper_failure: str | None = None
 _mapper_failure_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
@@ -188,7 +189,7 @@ class _WorkerHandler(http_server.BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 
 
-def get_next_batch() -> Optional[_BatchItem]:
+def get_next_batch() -> _BatchItem | None:
     """Block until the next batch arrives or a shutdown signal is received.
 
     Returns:
@@ -203,7 +204,7 @@ def get_next_batch() -> Optional[_BatchItem]:
     return item
 
 
-def signal_batch_done(error: Optional[str] = None) -> None:
+def signal_batch_done(error: str | None = None) -> None:
     """Signal that the current batch is complete (or failed).
 
     Unblocks the HTTP handler waiting on ``done_event``, which in turn
@@ -273,12 +274,12 @@ def _record_mapper_failure(error: str) -> str:
         return _mapper_failure
 
 
-def _get_mapper_failure() -> Optional[str]:
+def _get_mapper_failure() -> str | None:
     with _mapper_failure_lock:
         return _mapper_failure
 
 
-def _get_health_response() -> Tuple[int, Dict[str, str]]:
+def _get_health_response() -> tuple[int, dict[str, str]]:
     mapper_failure = _get_mapper_failure()
     if mapper_failure is not None:
         return 503, {
@@ -316,7 +317,7 @@ def _wait_for_batch_completion(
 # ---------------------------------------------------------------------------
 
 
-def load() -> Iterator[List[Dict[str, Any]]]:
+def load() -> Iterator[list[dict[str, Any]]]:
     """Blocking generator that yields batches as they arrive.
 
     Each iteration blocks until the controller pushes a new batch via
@@ -361,7 +362,7 @@ def load() -> Iterator[List[Dict[str, Any]]]:
             raise RuntimeError(error_msg)
 
 
-def save_results(results: List[Dict[str, Any]]) -> None:
+def save_results(results: list[dict[str, Any]]) -> None:
     """Save results for the current batch.
 
     Uploads the results to cloud storage and signals the worker
@@ -417,7 +418,7 @@ def _resolve_input_format() -> io_formats.InputReader:
     return io_formats.InputReader.from_dict(json.loads(env_val))
 
 
-def _resolve_output_formats() -> List[io_formats.OutputWriter]:
+def _resolve_output_formats() -> list[io_formats.OutputWriter]:
     """Resolve output formats from the ``SKY_BATCH_OUTPUT_FORMATS`` env var."""
     env_val = os.environ.get('SKY_BATCH_OUTPUT_FORMATS')
     if not env_val:
@@ -436,7 +437,7 @@ def _resolve_output_formats() -> List[io_formats.OutputWriter]:
 def start_worker(serialized_fn: str,
                  output_path: str,
                  job_id: str,
-                 worker_token: Optional[str] = None) -> None:
+                 worker_token: str | None = None) -> None:
     """Start the long-running worker service.
 
     1. Launch a localhost HTTP server in a daemon thread.

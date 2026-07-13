@@ -11,7 +11,7 @@ import json
 import math
 import os
 import re
-from typing import Any, Dict, List
+from typing import Any
 
 from sky.adaptors import vast
 
@@ -24,7 +24,7 @@ _map = {
 }
 
 
-def create_instance_type(obj: Dict[str, Any]) -> str:
+def create_instance_type(obj: dict[str, Any]) -> str:
     stubify = lambda x: re.sub(r'\s', '_', x)
     return '{}x-{}-{}-{}'.format(obj['num_gpus'], stubify(obj['gpu_name']),
                                  obj['cpu_cores'], obj['cpu_ram'])
@@ -84,7 +84,7 @@ if __name__ == '__main__':
                'inet_down >= 100 disk_space >= 80'),
         limit=10000)
 
-    priceMap: Dict[str, List] = collections.defaultdict(list)
+    priceMap: dict[str, list] = collections.defaultdict(list)
     for offer in offerList:
         entry = {}
         for ours, theirs in mapped_keys:
@@ -130,10 +130,10 @@ if __name__ == '__main__':
         priceList = sorted([x['Price'] for x in instanceList])
         index = math.ceil(0.5 * len(priceList)) - 1
         priceTarget = priceList[index]
-        toList: List = []
+        toList: list = []
         for instance in instanceList:
             if instance['Price'] <= priceTarget:
-                instance['Price'] = '{:.2f}'.format(priceTarget)
+                instance['Price'] = f'{priceTarget:.2f}'
                 toList.append(instance)
 
         maxBid = max([x.get('SpotPrice') for x in toList])

@@ -1,6 +1,6 @@
 """Nebius library wrapper for SkyPilot."""
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any
 import uuid
 
 from sky import sky_logging
@@ -127,14 +127,14 @@ def get_network_id_from_subnet(subnet_id: str) -> str:
     return subnet.spec.network_id
 
 
-def get_security_group_by_name(project_id: str, sg_name: str) -> Optional[str]:
+def get_security_group_by_name(project_id: str, sg_name: str) -> str | None:
     """Returns the SG id by name, or None if it doesn't exist."""
     sg = _get_security_group_obj_by_name(project_id, sg_name)
     return None if sg is None else sg.metadata.id
 
 
 def get_security_group_id_and_network_by_name(
-        project_id: str, sg_name: str) -> Optional[Tuple[str, str]]:
+        project_id: str, sg_name: str) -> tuple[str, str] | None:
     """Returns (sg_id, network_id) by name, or None if it doesn't exist.
 
     Single-RPC variant used by `bootstrap_instances` to both look up a
@@ -212,10 +212,10 @@ def get_or_create_security_group(project_id: str, sg_name: str,
         return existing
 
 
-def list_security_rules(sg_id: str) -> List[Any]:
+def list_security_rules(sg_id: str) -> list[Any]:
     """Lists all SecurityRule resources attached to the given SG."""
     service = nebius.vpc().SecurityRuleServiceClient(nebius.sdk())
-    rules: List[Any] = []
+    rules: list[Any] = []
     page_token = ''
     while True:
         resp = nebius.sync_call(
@@ -251,7 +251,7 @@ def _create_security_rule(sg_id: str, spec: Any, name_prefix: str) -> None:
             spec=spec)))
 
 
-def _rule_signature(spec: Any) -> Tuple:
+def _rule_signature(spec: Any) -> tuple:
     """Canonicalizes a rule spec for dedup comparison."""
     # The proto's `s_match` oneof reports field-group name ('match'), not the
     # set case — discriminate by which member is populated.
@@ -314,7 +314,7 @@ def ensure_default_sg_rules(sg_id: str) -> None:
             _create_security_rule(sg_id, spec, name_prefix)
 
 
-def add_ingress_tcp_ports(sg_id: str, ports: Set[int]) -> None:
+def add_ingress_tcp_ports(sg_id: str, ports: set[int]) -> None:
     """Adds TCP ingress rules from 0.0.0.0/0 for the given ports.
 
     Idempotent: skips ports already covered by existing rules. Packs up to
@@ -324,7 +324,7 @@ def add_ingress_tcp_ports(sg_id: str, ports: Set[int]) -> None:
     if not ports:
         return
     vpc = nebius.vpc()
-    already_open: Set[int] = set()
+    already_open: set[int] = set()
     for rule in list_security_rules(sg_id):
         spec = rule.spec
         if int(spec.access) != int(vpc.RuleAccessAction.ALLOW):
@@ -422,7 +422,7 @@ def delete_security_group(sg_id: str) -> None:
 
 def delete_cluster(name: str,
                    region: str,
-                   project_id: Optional[str] = None) -> None:
+                   project_id: str | None = None) -> None:
     """Delete a GPU cluster."""
     if project_id is None:
         project_id = get_project_by_region(region)
@@ -443,7 +443,7 @@ def delete_cluster(name: str,
         logger.debug('GPU Cluster does not exist.')
 
 
-def list_instances(project_id: str) -> Dict[str, Dict[str, Any]]:
+def list_instances(project_id: str) -> dict[str, dict[str, Any]]:
     """Lists instances associated with API key."""
     service = nebius.compute().InstanceServiceClient(nebius.sdk())
     page_token = ''
@@ -461,9 +461,9 @@ def list_instances(project_id: str) -> Dict[str, Dict[str, Any]]:
             break
         page_token = result.next_page_token
 
-    instance_dict: Dict[str, Dict[str, Any]] = {}
+    instance_dict: dict[str, dict[str, Any]] = {}
     for instance in instances:
-        info: Dict[str, Any] = {}
+        info: dict[str, Any] = {}
         info['status'] = instance.status.state.name
         info['name'] = instance.metadata.name
         if instance.status.network_interfaces:
@@ -538,12 +538,12 @@ def launch(cluster_name_on_cloud: str,
            disk_size: int,
            user_data: str,
            associate_public_ip_address: bool,
-           filesystems: List[Dict[str, Any]],
+           filesystems: list[dict[str, Any]],
            disk_tier: str,
            use_static_ip_address: bool = False,
            use_spot: bool = False,
-           network_tier: Optional[resources_utils.NetworkTier] = None,
-           security_group_ids: Optional[List[str]] = None) -> str:
+           network_tier: resources_utils.NetworkTier | None = None,
+           security_group_ids: list[str] | None = None) -> str:
     # Each node must have a unique name to avoid conflicts between
     # multiple worker VMs. To ensure uniqueness,a UUID is appended
     # to the node name.

@@ -1,9 +1,9 @@
 """Configuration for Seeweb provisioning."""
 
-from typing import Any, Dict
+from typing import Any
 
 
-def bootstrap_instances(*args, **_kwargs) -> Dict[str, Any]:
+def bootstrap_instances(*args, **_kwargs) -> dict[str, Any]:
     """Bootstrap instances for Seeweb.
 
     Seeweb doesn't require any special configuration bootstrapping,

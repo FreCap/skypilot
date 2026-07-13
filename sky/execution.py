@@ -3,13 +3,14 @@
 See `Stage` for a Task's life cycle.
 """
 import asyncio
+from collections.abc import Callable
 import enum
 import logging
 import os
 import tempfile
 import time
 import typing
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Union
 
 import colorama
 
@@ -63,7 +64,7 @@ class Stage(enum.Enum):
 
 
 def _validate_service_replica_launch_fence(
-        launch_context: Dict[str, Any]) -> None:
+        launch_context: dict[str, Any]) -> None:
     """Reject stale Serve replica launches before any execution-side mutation.
 
     This validation lives in the persisted request entrypoint, not only the
@@ -96,8 +97,8 @@ def _validate_service_replica_launch_fence(
             f'{service_name!r}/{service_hash!r}.')
 
 
-def _maybe_clone_disk_from_cluster(clone_disk_from: Optional[str],
-                                   cluster_name: Optional[str],
+def _maybe_clone_disk_from_cluster(clone_disk_from: str | None,
+                                   cluster_name: str | None,
                                    task: 'sky.Task') -> 'sky.Task':
     if clone_disk_from is None:
         return task
@@ -193,8 +194,8 @@ def _resolve_managed_secrets(dag: 'sky.Dag') -> None:
 
 
 def _compute_set_autostop_args_for_hooks_only_relaunch(
-        cluster_name: str, hooks_payload: List[Dict[str,
-                                                    Any]]) -> Dict[str, Any]:
+        cluster_name: str, hooks_payload: list[dict[str,
+                                                    Any]]) -> dict[str, Any]:
     """Build set_autostop kwargs when a re-launch updates only hooks.
 
     The `elif hooks_payload is not None:` branch in `_execute` updates
@@ -236,7 +237,7 @@ def _compute_set_autostop_args_for_hooks_only_relaunch(
 
 
 def autostop_requested_features(
-        down: bool) -> Set[clouds.CloudImplementationFeatures]:
+        down: bool) -> set[clouds.CloudImplementationFeatures]:
     """Cloud features a launch-time auto{stop,down} config requires.
 
     Autostop WITHOUT down ultimately performs a STOP, so any candidate
@@ -258,8 +259,8 @@ def autostop_requested_features(
     }
 
 
-def _check_autostop_feasibility_early(task: 'sky.Task', autostop_features: Set[
-    clouds.CloudImplementationFeatures], cluster_name: Optional[str]) -> None:
+def _check_autostop_feasibility_early(task: 'sky.Task', autostop_features: set[
+    clouds.CloudImplementationFeatures], cluster_name: str | None) -> None:
     """Fail fast when NO candidate can satisfy the autostop config.
 
     Gives the crisp `sky autostop`-style NotSupportedError up front
@@ -275,7 +276,7 @@ def _check_autostop_feasibility_early(task: 'sky.Task', autostop_features: Set[
     if cluster_name is not None and controller_utils.Controllers.from_name(
             cluster_name) is not None:
         return
-    first_error: Optional[Exception] = None
+    first_error: Exception | None = None
     # Stable iteration order: task.resources is a set, and which
     # candidate's error surfaces as first_error must not vary run to
     # run when several fail for different reasons.
@@ -299,16 +300,16 @@ def _execute(
     dryrun: bool = False,
     down: bool = False,
     stream_logs: bool = True,
-    handle: Optional[backends.ResourceHandle] = None,
-    backend: Optional[backends.Backend] = None,
+    handle: backends.ResourceHandle | None = None,
+    backend: backends.Backend | None = None,
     retry_until_up: bool = False,
     optimize_target: common.OptimizeTarget = common.OptimizeTarget.COST,
-    stages: Optional[List[Stage]] = None,
-    cluster_name: Optional[str] = None,
+    stages: list[Stage] | None = None,
+    cluster_name: str | None = None,
     detach_setup: bool = False,
-    idle_minutes_to_autostop: Optional[int] = None,
+    idle_minutes_to_autostop: int | None = None,
     no_setup: bool = False,
-    clone_disk_from: Optional[str] = None,
+    clone_disk_from: str | None = None,
     skip_unnecessary_provisioning: bool = False,
     *,  #keyword only separator
     # Internal only:
@@ -317,9 +318,9 @@ def _execute(
     _quiet_optimizer: bool = False,
     _is_launched_by_jobs_controller: bool = False,
     _is_launched_by_sky_serve_controller: bool = False,
-    _extra_launch_context: Optional[Dict[str, Any]] = None,
+    _extra_launch_context: dict[str, Any] | None = None,
     job_logger: logging.Logger = logger,
-) -> Tuple[Optional[int], Optional[backends.ResourceHandle]]:
+) -> tuple[int | None, backends.ResourceHandle | None]:
     """Execute an entrypoint.
 
     If sky.Task is given or DAG has not been optimized yet, this will call
@@ -442,23 +443,23 @@ def _execute_dag(
     dag: 'sky.Dag',
     dryrun: bool,
     stream_logs: bool,
-    handle: Optional[backends.ResourceHandle],
-    backend: Optional[backends.Backend],
+    handle: backends.ResourceHandle | None,
+    backend: backends.Backend | None,
     retry_until_up: bool,
     optimize_target: common.OptimizeTarget,
-    stages: Optional[List[Stage]],
-    cluster_name: Optional[str],
+    stages: list[Stage] | None,
+    cluster_name: str | None,
     detach_setup: bool,
     no_setup: bool,
-    clone_disk_from: Optional[str],
+    clone_disk_from: str | None,
     skip_unnecessary_provisioning: bool,
     # pylint: disable=invalid-name
     _quiet_optimizer: bool,
     _is_launched_by_jobs_controller: bool,
     _is_launched_by_sky_serve_controller: bool,
-    _extra_launch_context: Dict[str, Any],
+    _extra_launch_context: dict[str, Any],
     job_logger: logging.Logger = logger,
-) -> Tuple[Optional[int], Optional[backends.ResourceHandle]]:
+) -> tuple[int | None, backends.ResourceHandle | None]:
     """Execute a DAG.
 
     This is an internal helper function for _execute() and is expected to be
@@ -528,9 +529,9 @@ def _execute_dag(
                     'All resources must have the same autostop config.')
         resource_autostop_config = resources[0].autostop_config
 
-        idle_minutes_to_autostop: Optional[int] = None
+        idle_minutes_to_autostop: int | None = None
         down = False
-        wait_for: Optional[autostop_lib.AutostopWaitFor] = None
+        wait_for: autostop_lib.AutostopWaitFor | None = None
         if resource_autostop_config is not None:
             if resource_autostop_config.enabled:
                 idle_minutes_to_autostop = (
@@ -619,7 +620,7 @@ def _execute_dag(
     # cluster just got terminated). To compensate without moving the optimizer
     # into the backend, we inject a small planner the backend can call under
     # the lock only when no reusable snapshot and no caller plan exist.
-    planner: Optional[Callable[['sky.Task'], 'resources_lib.Resources']] = None
+    planner: Callable[[sky.Task], resources_lib.Resources] | None = None
     if isinstance(backend,
                   backends.CloudVmRayBackend) and Stage.OPTIMIZE in stages:
 
@@ -730,7 +731,7 @@ def _execute_dag(
             #   []    → "clear stored hooks" (re-launch dropping hooks)
             #   [...] → "replace stored hooks"
             if task_hooks is not None:
-                hooks_payload: Optional[List[Dict[str, Any]]] = task_hooks
+                hooks_payload: list[dict[str, Any]] | None = task_hooks
             elif cluster_exists:
                 hooks_payload = []
             else:
@@ -740,8 +741,8 @@ def _execute_dag(
             # this launch: ``down`` for autodown, ``stop`` otherwise.
             # AutostopCodeGen.set_autostop dual-emits both fields so
             # pre-v7 skylets keep working until v0.15.0.
-            hook: Optional[str] = None
-            hook_timeout: Optional[int] = None
+            hook: str | None = None
+            hook_timeout: int | None = None
             legacy_event = 'down' if down else 'stop'
             for entry in (resources[0].hooks or []):
                 if legacy_event in entry.get('events', []):
@@ -795,16 +796,16 @@ def _execute_dag(
 @tempstore.with_tempdir
 def launch(
     task: Union['sky.Task', 'sky.Dag'],
-    cluster_name: Optional[str] = None,
+    cluster_name: str | None = None,
     retry_until_up: bool = False,
-    idle_minutes_to_autostop: Optional[int] = None,
+    idle_minutes_to_autostop: int | None = None,
     dryrun: bool = False,
     down: bool = False,
     stream_logs: bool = True,
-    backend: Optional[backends.Backend] = None,
+    backend: backends.Backend | None = None,
     optimize_target: common.OptimizeTarget = common.OptimizeTarget.COST,
     no_setup: bool = False,
-    clone_disk_from: Optional[str] = None,
+    clone_disk_from: str | None = None,
     fast: bool = False,
     *,  #keyword only separator
     # Internal only:
@@ -813,12 +814,12 @@ def launch(
     _is_launched_by_jobs_controller: bool = False,
     _is_launched_by_sky_serve_controller: bool = False,
     _disable_controller_check: bool = False,
-    _extra_launch_context: Optional[Dict[str, Any]] = None,
+    _extra_launch_context: dict[str, Any] | None = None,
     _request_name: request_names.AdminPolicyRequestName = request_names.
     AdminPolicyRequestName.CLUSTER_LAUNCH,
     _include_credentials: bool = False,
     job_logger: logging.Logger = logger,
-) -> Tuple[Optional[int], Optional[backends.ResourceHandle]]:
+) -> tuple[int | None, backends.ResourceHandle | None]:
     # NOTE(dev): Keep the docstring consistent between the Python API and CLI.
     """Launches a cluster or task.
 
@@ -1034,9 +1035,9 @@ def exec(  # pylint: disable=redefined-builtin
     dryrun: bool = False,
     down: bool = False,
     stream_logs: bool = True,
-    backend: Optional[backends.Backend] = None,
+    backend: backends.Backend | None = None,
     job_logger: logging.Logger = logger,
-) -> Tuple[Optional[int], Optional[backends.ResourceHandle]]:
+) -> tuple[int | None, backends.ResourceHandle | None]:
     # NOTE(dev): Keep the docstring consistent between the Python API and CLI.
     """Executes a task on an existing cluster.
 

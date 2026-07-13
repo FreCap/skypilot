@@ -1,5 +1,5 @@
 """RunPod network volume provisioning."""
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any
 
 from sky import global_user_state
 from sky import models
@@ -11,7 +11,7 @@ from sky.utils import volume as volume_lib
 logger = sky_logging.init_logger(__name__)
 
 
-def _list_volumes() -> List[Dict[str, Any]]:
+def _list_volumes() -> list[dict[str, Any]]:
     # GET /v1/networkvolumes returns a list
     result = runpod.rest_request('GET', '/networkvolumes')
     if isinstance(result, list):
@@ -118,7 +118,7 @@ def delete_volume(config: models.VolumeConfig) -> models.VolumeConfig:
 
 
 def _try_resolve_volume_id(name_on_cloud: str,
-                           data_center_id: str) -> Optional[str]:
+                           data_center_id: str) -> str | None:
     vols = _list_volumes()
     matched = next((v for v in vols if v.get('name') == name_on_cloud and
                     v.get('dataCenterId') == data_center_id), None)
@@ -127,15 +127,15 @@ def _try_resolve_volume_id(name_on_cloud: str,
     return None
 
 
-def _try_resolve_volume_by_name(
-        name_on_cloud: str, data_center_id: str) -> Optional[Dict[str, Any]]:
+def _try_resolve_volume_by_name(name_on_cloud: str,
+                                data_center_id: str) -> dict[str, Any] | None:
     vols = _list_volumes()
     return next((v for v in vols if v.get('name') == name_on_cloud and
                  v.get('dataCenterId') == data_center_id), None)
 
 
 def get_volume_usedby(
-    config: models.VolumeConfig,) -> Tuple[List[str], List[str]]:
+    config: models.VolumeConfig,) -> tuple[list[str], list[str]]:
     """Gets the clusters currently using this RunPod network volume.
 
     Returns:
@@ -172,7 +172,7 @@ def get_volume_usedby(
 
     # Map pod names back to SkyPilot cluster names using heuristics.
     clusters = global_user_state.get_clusters()
-    cluster_names: List[str] = []
+    cluster_names: list[str] = []
     user_hash = common_utils.get_user_hash()
     for pod_name in usedby_pod_names:
         matched = None
@@ -193,8 +193,8 @@ def get_volume_usedby(
 
 
 def get_all_volumes_usedby(
-    configs: List[models.VolumeConfig],
-) -> Tuple[Dict[str, Any], Dict[str, Any], Set[str]]:
+    configs: list[models.VolumeConfig],
+) -> tuple[dict[str, Any], dict[str, Any], set[str]]:
     """Gets the usedby resources of all volumes.
 
     Args:
@@ -222,8 +222,8 @@ def get_all_volumes_usedby(
 
 
 def map_all_volumes_usedby(
-        used_by_pods: Dict[str, Any], used_by_clusters: Dict[str, Any],
-        config: models.VolumeConfig) -> Tuple[List[str], List[str]]:
+        used_by_pods: dict[str, Any], used_by_clusters: dict[str, Any],
+        config: models.VolumeConfig) -> tuple[list[str], list[str]]:
     """Maps the usedby resources of a volume."""
     return (used_by_pods.get(config.name_on_cloud,
                              []), used_by_clusters.get(config.name_on_cloud,

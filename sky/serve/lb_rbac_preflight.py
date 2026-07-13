@@ -11,7 +11,6 @@ This module issues SelfSubjectAccessReview checks at controller boot so a
 misconfigured cluster fails fast with an actionable error pointing at the helm
 `namespaceRules` that grant the missing permissions.
 """
-from typing import List, Tuple
 
 from sky import sky_logging
 from sky.adaptors import kubernetes
@@ -26,13 +25,13 @@ logger = sky_logging.init_logger(__name__)
 # Deployments/services span the full create/reconcile/teardown lifecycle; pods
 # only need `get`, because image resolution reads the controller pod
 # (read_namespaced_pod) to mirror its image onto the LB Deployment.
-_DEPLOYMENT_LIFECYCLE_VERBS: List[str] = [
+_DEPLOYMENT_LIFECYCLE_VERBS: list[str] = [
     'create', 'get', 'list', 'patch', 'delete'
 ]
-_SERVICE_LIFECYCLE_VERBS: List[str] = [
+_SERVICE_LIFECYCLE_VERBS: list[str] = [
     'create', 'get', 'list', 'patch', 'delete'
 ]
-_REQUIRED_CHECKS: List[Tuple[str, str, List[str]]] = [
+_REQUIRED_CHECKS: list[tuple[str, str, list[str]]] = [
     ('apps', 'deployments', _DEPLOYMENT_LIFECYCLE_VERBS),
     ('', 'services', _SERVICE_LIFECYCLE_VERBS),
     # get: mirror the API pod image/auth projections; list: derive the
@@ -71,7 +70,7 @@ def check_lb_rbac_preflight() -> None:
     # Preflight the exact namespace create/reconcile will use.
     namespace = lb_k8s.get_lb_namespace()
 
-    missing: List[Tuple[str, str]] = []
+    missing: list[tuple[str, str]] = []
     for group, resource, verbs in _REQUIRED_CHECKS:
         for verb in verbs:
             resource_attributes = kubernetes.kubernetes.client.\

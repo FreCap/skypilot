@@ -86,8 +86,7 @@ async def _handle_interactive_auth_websocket(session_id: str) -> None:
             stdout_dup_file = os.fdopen(stdout_dup_fd, 'wb', buffering=0)
             stdout_dup_fd = None  # File object now owns the FD
             stdout_transport, stdout_protocol = await loop.connect_write_pipe(
-                asyncio.streams.FlowControlMixin,
-                stdout_dup_file)  # type: ignore
+                asyncio.streams.FlowControlMixin, stdout_dup_file)
             stdout_writer = asyncio.StreamWriter(stdout_transport,
                                                  stdout_protocol, None, loop)
 
@@ -152,7 +151,7 @@ async def _handle_interactive_auth_websocket(session_id: str) -> None:
                     pass
 
 
-def handle_interactive_auth(line: str) -> typing.Optional[str]:
+def handle_interactive_auth(line: str) -> str | None:
     """Handle interactive SSH authentication signals (sync version).
 
     Args:
@@ -175,7 +174,7 @@ def handle_interactive_auth(line: str) -> typing.Optional[str]:
     return None
 
 
-async def handle_interactive_auth_async(line: str) -> typing.Optional[str]:
+async def handle_interactive_auth_async(line: str) -> str | None:
     """Handle interactive SSH authentication signals (async version).
 
     Args:

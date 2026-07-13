@@ -1200,8 +1200,8 @@ def test_ensure_requires_published_provider_endpoint(monkeypatch, ingress,
             ]),
         status=SimpleNamespace(load_balancer=SimpleNamespace(ingress=ingress)))
 
-    assert (lb_k8s.ensure_lb_objects_exist('svc', 225, 'incarnation') is
-            expected_healthy)
+    assert (lb_k8s.ensure_lb_objects_exist('svc', 225, 'incarnation')
+            is expected_healthy)
 
 
 def _lb_pod(uid, phase='Running', deleting=False, ready=True):

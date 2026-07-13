@@ -14,7 +14,6 @@ please join us in [this
 discussion](https://github.com/skypilot-org/skypilot/discussions/1016)
 """
 import atexit
-import io
 import os
 import platform
 import re
@@ -51,7 +50,7 @@ def find_version():
     # Extract version information from filepath
     # Adapted from:
     #  https://github.com/ray-project/ray/blob/master/python/setup.py
-    with open(INIT_FILE_PATH, 'r', encoding='utf-8') as fp:
+    with open(INIT_FILE_PATH, encoding='utf-8') as fp:
         version_match = re.search(r'^__version__ = [\'"]([^\'"]*)[\'"]',
                                   fp.read(), re.M)
         if version_match:
@@ -60,7 +59,7 @@ def find_version():
 
 
 def get_commit_hash():
-    with open(INIT_FILE_PATH, 'r', encoding='utf-8') as fp:
+    with open(INIT_FILE_PATH, encoding='utf-8') as fp:
         commit_match = re.search(r'^_SKYPILOT_COMMIT_SHA = [\'"]([^\'"]*)[\'"]',
                                  fp.read(), re.M)
         if commit_match:
@@ -96,7 +95,7 @@ def get_commit_hash():
 def get_commit_count():
     """Get the commit count, i.e. a build number that auto-increments with
     every commit."""
-    with open(INIT_FILE_PATH, 'r', encoding='utf-8') as fp:
+    with open(INIT_FILE_PATH, encoding='utf-8') as fp:
         count_match = re.search(
             r'^_SKYPILOT_COMMIT_COUNT = [\'"]([^\'"]*)[\'"]', fp.read(), re.M)
         if count_match:
@@ -123,7 +122,7 @@ def get_commit_count():
 def replace_commit_hash():
     """Fill in the commit hash and commit count in the __init__.py file."""
     try:
-        with open(INIT_FILE_PATH, 'r', encoding='utf-8') as fp:
+        with open(INIT_FILE_PATH, encoding='utf-8') as fp:
             content = fp.read()
             global original_init_content
             original_init_content = content
@@ -178,7 +177,7 @@ readme_filepath = 'README.md'
 # When sky/backends/wheel_utils.py builds wheels, it will not contain the
 # README.  Skip the description for that case.
 if os.path.exists(readme_filepath):
-    long_description = io.open(readme_filepath, 'r', encoding='utf-8').read()
+    long_description = open(readme_filepath, encoding='utf-8').read()
     long_description = parse_readme(long_description)
 
 if __name__ == '__main__':
@@ -198,7 +197,13 @@ if __name__ == '__main__':
         long_description=long_description,
         long_description_content_type='text/markdown',
         setup_requires=['wheel'],
-        requires_python='>=3.9',
+        # Everything we deploy runs Python 3.14, but this floor must stay
+        # 3.10: SkyPilot bootstraps each cluster worker with a
+        # `uv venv --python 3.10` env (sky/skylet/constants.py) and installs
+        # this wheel plus ray==2.9.3 into it, and ray 2.9.3 has no wheels
+        # past cp311. Raise this only together with the remote runtime
+        # (SKY_REMOTE_RAY_VERSION + the remote --python pin).
+        requires_python='>=3.10',
         install_requires=dependencies['install_requires'],
         extras_require=dependencies['extras_require'],
         entry_points={
@@ -206,11 +211,11 @@ if __name__ == '__main__':
         },
         include_package_data=True,
         classifiers=[
-            'Programming Language :: Python :: 3.9',
             'Programming Language :: Python :: 3.10',
             'Programming Language :: Python :: 3.11',
             'Programming Language :: Python :: 3.12',
             'Programming Language :: Python :: 3.13',
+            'Programming Language :: Python :: 3.14',
             'License :: OSI Approved :: Apache Software License',
             'Operating System :: OS Independent',
             'Topic :: Software Development :: Libraries :: Python Modules',

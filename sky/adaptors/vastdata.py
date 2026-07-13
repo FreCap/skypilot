@@ -4,7 +4,6 @@ import configparser
 import contextlib
 import os
 import threading
-from typing import Dict, Optional, Tuple
 
 from sky import exceptions
 from sky import sky_logging
@@ -181,7 +180,7 @@ def get_endpoint():
 
 
 def check_credentials(
-        cloud_capability: cloud.CloudCapability) -> Tuple[bool, Optional[str]]:
+        cloud_capability: cloud.CloudCapability) -> tuple[bool, str | None]:
     if cloud_capability == cloud.CloudCapability.STORAGE:
         return check_storage_credentials()
     else:
@@ -189,7 +188,7 @@ def check_credentials(
             f'{NAME} does not support {cloud_capability}.')
 
 
-def check_storage_credentials() -> Tuple[bool, Optional[str]]:
+def check_storage_credentials() -> tuple[bool, str | None]:
     """Checks if the user has access credentials to VastData Object Storage.
 
     Returns:
@@ -203,7 +202,7 @@ def check_storage_credentials() -> Tuple[bool, Optional[str]]:
         expanded = os.path.expanduser(file_path)
         if not os.path.isfile(expanded):
             return False
-        with open(expanded, 'r', encoding='utf-8') as f:
+        with open(expanded, encoding='utf-8') as f:
             return any(header in line for line in f)
 
     hints = None
@@ -242,7 +241,7 @@ def check_storage_credentials() -> Tuple[bool, Optional[str]]:
     return (False, hints) if hints else (True, hints)
 
 
-def get_credential_file_mounts() -> Dict[str, str]:
+def get_credential_file_mounts() -> dict[str, str]:
     """Returns credential file mounts for VastData.
 
     Returns:

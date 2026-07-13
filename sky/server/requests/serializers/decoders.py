@@ -2,7 +2,7 @@
 import base64
 import pickle
 import typing
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Optional
 
 from sky import jobs as managed_jobs
 from sky import models
@@ -17,9 +17,8 @@ from sky.utils import status_lib
 
 if typing.TYPE_CHECKING:
     from sky import backends
-    from sky import clouds
 
-handlers: Dict[str, Any] = {}
+handlers: dict[str, Any] = {}
 
 
 def decode_and_unpickle(obj: str) -> Any:
@@ -81,7 +80,7 @@ def default_decode_handler(return_value: Any) -> Any:
 
 @register_decoders('status')
 def decode_status(
-        return_value: List[Dict[str, Any]]) -> List[responses.StatusResponse]:
+        return_value: list[dict[str, Any]]) -> list[responses.StatusResponse]:
     clusters = return_value
     response = []
     for cluster in clusters:
@@ -97,11 +96,11 @@ def decode_status(
 
 @register_decoders('status_kubernetes')
 def decode_status_kubernetes(
-    return_value: Tuple[List[Dict[str, Any]], List[Dict[str, Any]],
-                        List[Dict[str, Any]], Optional[str]]
-) -> Tuple[List[kubernetes_utils.KubernetesSkyPilotClusterInfoPayload],
-           List[kubernetes_utils.KubernetesSkyPilotClusterInfoPayload],
-           List[responses.ManagedJobRecord], Optional[str]]:
+    return_value: tuple[list[dict[str, Any]], list[dict[str, Any]],
+                        list[dict[str, Any]], str | None]
+) -> tuple[list[kubernetes_utils.KubernetesSkyPilotClusterInfoPayload],
+           list[kubernetes_utils.KubernetesSkyPilotClusterInfoPayload],
+           list[responses.ManagedJobRecord], str | None]:
     (encoded_all_clusters, encoded_unmanaged_clusters, all_jobs,
      context) = return_value
     all_clusters = []
@@ -120,9 +119,9 @@ def decode_status_kubernetes(
 
 @register_decoders('launch', 'exec', 'jobs.launch')
 def decode_launch(
-    return_value: Dict[str, Any]
-) -> Union[Tuple[str, 'backends.CloudVmRayResourceHandle'], Tuple[
-        str, 'backends.CloudVmRayResourceHandle', Optional[Dict[str, Any]]]]:
+    return_value: dict[str, Any]
+) -> tuple[str, 'backends.CloudVmRayResourceHandle'] | tuple[
+        str, 'backends.CloudVmRayResourceHandle', dict[str, Any] | None]:
     # New servers (>= MIN_LAUNCH_CREDENTIALS_API_VERSION) include a
     # ``credentials`` key when the caller opted in via
     # ``_include_credentials``. Pass it through as a 3-tuple so the CLI
@@ -142,7 +141,7 @@ def decode_start(return_value: str) -> 'backends.CloudVmRayResourceHandle':
 
 
 @register_decoders('queue')
-def decode_queue(return_value: List[dict],) -> List[responses.ClusterJobRecord]:
+def decode_queue(return_value: list[dict],) -> list[responses.ClusterJobRecord]:
     jobs = return_value
     for job in jobs:
         job['status'] = job_lib.JobStatus(job['status'])
@@ -150,7 +149,7 @@ def decode_queue(return_value: List[dict],) -> List[responses.ClusterJobRecord]:
 
 
 @register_decoders('jobs.queue')
-def decode_jobs_queue(return_value: List[dict],) -> List[Dict[str, Any]]:
+def decode_jobs_queue(return_value: list[dict],) -> list[dict[str, Any]]:
     # To keep backward compatibility with v0.10.2
     return decode_jobs_queue_v2(return_value)
 
@@ -158,8 +157,8 @@ def decode_jobs_queue(return_value: List[dict],) -> List[Dict[str, Any]]:
 @register_decoders('jobs.queue_v2')
 def decode_jobs_queue_v2(
     return_value
-) -> Union[Tuple[List[responses.ManagedJobRecord], int, Dict[str, int], int],
-           List[responses.ManagedJobRecord]]:
+) -> tuple[list[responses.ManagedJobRecord], int, dict[str, int],
+           int] | list[responses.ManagedJobRecord]:
     """Decode jobs queue response.
 
     Supports legacy list, or a dict {jobs, total, total_no_filter,
@@ -170,10 +169,10 @@ def decode_jobs_queue_v2(
     """
     # Case 1: dict shape {jobs, total, total_no_filter, status_counts}
     if isinstance(return_value, dict):
-        jobs: List[Dict[str, Any]] = return_value.get('jobs', [])
+        jobs: list[dict[str, Any]] = return_value.get('jobs', [])
         total: int = return_value.get('total', len(jobs))
         total_no_filter: int = return_value.get('total_no_filter', total)
-        status_counts: Dict[str, int] = return_value.get('status_counts', {})
+        status_counts: dict[str, int] = return_value.get('status_counts', {})
         for job in jobs:
             job['status'] = managed_jobs.ManagedJobStatus(job['status'])
         jobs = [responses.ManagedJobRecord(**job) for job in jobs]
@@ -188,7 +187,7 @@ def decode_jobs_queue_v2(
 
 
 def _decode_serve_status(
-        service_statuses: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        service_statuses: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for service_status in service_statuses:
         service_status['status'] = serve_state.ServiceStatus(
             service_status['status'])
@@ -200,18 +199,18 @@ def _decode_serve_status(
 
 
 @register_decoders('serve.status')
-def decode_serve_status(return_value: List[dict]) -> List[Dict[str, Any]]:
+def decode_serve_status(return_value: list[dict]) -> list[dict[str, Any]]:
     return _decode_serve_status(return_value)
 
 
 @register_decoders('jobs.pool_status')
-def decode_jobs_pool_status(return_value: List[dict]) -> List[Dict[str, Any]]:
+def decode_jobs_pool_status(return_value: list[dict]) -> list[dict[str, Any]]:
     return _decode_serve_status(return_value)
 
 
 @register_decoders('cost_report')
 def decode_cost_report(
-        return_value: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return_value: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for cluster_report in return_value:
         if cluster_report['status'] is not None:
             cluster_report['status'] = status_lib.ClusterStatus(
@@ -223,9 +222,9 @@ def decode_cost_report(
 
 @register_decoders('list_accelerators')
 def decode_list_accelerators(
-    return_value: Dict[str, List[List[Any]]]
-) -> Dict[str, List['common.InstanceTypeInfo']]:
-    instance_dict: Dict[str, List['common.InstanceTypeInfo']] = {}
+    return_value: dict[str, list[list[Any]]]
+) -> dict[str, list['common.InstanceTypeInfo']]:
+    instance_dict: dict[str, list[common.InstanceTypeInfo]] = {}
     for gpu, instance_type_infos in return_value.items():
         instance_dict[gpu] = []
         for instance_type_info in instance_type_infos:
@@ -236,7 +235,7 @@ def decode_list_accelerators(
 
 @register_decoders('storage_ls')
 def decode_storage_ls(
-        return_value: List[Dict[str, Any]]) -> List[responses.StorageRecord]:
+        return_value: list[dict[str, Any]]) -> list[responses.StorageRecord]:
     for storage_info in return_value:
         storage_info['status'] = status_lib.StorageStatus(
             storage_info['status'])
@@ -250,7 +249,7 @@ def decode_storage_ls(
 
 @register_decoders('volume_list')
 def decode_volume_list(
-        return_value: List[Dict[str, Any]]) -> List[responses.VolumeRecord]:
+        return_value: list[dict[str, Any]]) -> list[responses.VolumeRecord]:
     return [
         responses.VolumeRecord(**volume_info) for volume_info in return_value
     ]
@@ -258,9 +257,9 @@ def decode_volume_list(
 
 @register_decoders('job_status')
 def decode_job_status(
-    return_value: Dict[str, Optional[str]]
-) -> Dict[int, Optional['job_lib.JobStatus']]:
-    job_statuses: Dict[int, Optional['job_lib.JobStatus']] = {}
+    return_value: dict[str, str | None]
+) -> dict[int, Optional['job_lib.JobStatus']]:
+    job_statuses: dict[int, job_lib.JobStatus | None] = {}
     for job_id_str, status_str in return_value.items():
         # When we json serialize the job ID for storing in the requests db,
         # the job_id gets converted to a string. Here we convert it back to int.
@@ -274,10 +273,10 @@ def decode_job_status(
 
 @register_decoders('kubernetes_node_info')
 def decode_kubernetes_node_info(
-        return_value: Dict[str, Any]) -> models.KubernetesNodesInfo:
+        return_value: dict[str, Any]) -> models.KubernetesNodesInfo:
     return models.KubernetesNodesInfo.from_dict(return_value)
 
 
 @register_decoders('endpoints')
-def decode_endpoints(return_value: Dict[int, str]) -> Dict[int, str]:
+def decode_endpoints(return_value: dict[int, str]) -> dict[int, str]:
     return {int(k): v for k, v in return_value.items()}

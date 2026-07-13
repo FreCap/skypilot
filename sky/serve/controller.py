@@ -3,6 +3,7 @@
 Responsible for autoscaling and replica management.
 """
 import asyncio
+from collections.abc import Callable
 import contextlib
 import functools
 import hmac
@@ -11,7 +12,7 @@ import os
 import threading
 import time
 import traceback
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any
 
 import colorama
 import fastapi
@@ -50,8 +51,7 @@ def _make_auth_dependency(*,
     401.
     """
 
-    async def _verify(authorization: Optional[str] = fastapi.Header(
-        None)) -> None:
+    async def _verify(authorization: str | None = fastapi.Header(None)) -> None:
         getter = (serve_utils.get_lb_sync_auth_tokens
                   if sync else serve_utils.get_controller_admin_auth_tokens)
         try:
@@ -83,7 +83,7 @@ def _make_controller_owner_dependency(
         controller_owner_fingerprint: str) -> Callable:
     """Fence every child request to the exact controller owner tuple."""
 
-    async def _verify(requested_owner: Optional[str] = fastapi.Header(
+    async def _verify(requested_owner: str | None = fastapi.Header(
         None, alias=serve_constants.CONTROLLER_OWNER_HEADER)) -> None:
         if requested_owner != controller_owner_fingerprint:
             raise fastapi.HTTPException(
@@ -115,10 +115,10 @@ class SkyServeController:
                  host: str,
                  port: int,
                  controller_owner_fingerprint: str,
-                 resource_scope: Optional[str] = None,
-                 service_hash: Optional[str] = None,
-                 controller_pid: Optional[int] = None,
-                 controller_ip: Optional[str] = None,
+                 resource_scope: str | None = None,
+                 service_hash: str | None = None,
+                 controller_pid: int | None = None,
+                 controller_ip: str | None = None,
                  enforce_launch_fence: bool = False) -> None:
         self._service_name = service_name
         self._resource_scope = resource_scope
@@ -139,7 +139,7 @@ class SkyServeController:
         # lock lazily inside the running server loop: on Python 3.9 eager lock
         # construction fails if an earlier asyncio.run() closed the thread's
         # current loop.
-        self._lb_sync_lock: Optional[asyncio.Lock] = None
+        self._lb_sync_lock: asyncio.Lock | None = None
         self._controller_owner_fingerprint = controller_owner_fingerprint
         self._is_pool = service_spec.pool
         self._replica_manager: replica_managers.ReplicaManager = (
@@ -197,13 +197,13 @@ class SkyServeController:
         # replicas on every sync, which prunes replicas that are no longer
         # READY; a replica that recovers with a new endpoint is thus
         # re-resolved.
-        self._lb_replica_cache: Dict[int, Tuple[str, str, int]] = {}
+        self._lb_replica_cache: dict[int, tuple[str, str, int]] = {}
         # Superset of _lb_replica_cache for url -> replica_id translation
         # of the LB's in-flight report: keeps entries for replicas that
         # left READY but are still nonterminal, so a probe-blipped
         # replica's running job stays attributed to it (see
         # _get_lb_replica_info / _translate_in_flight).
-        self._lb_translation_cache: Dict[int, Tuple[str, str, int]] = {}
+        self._lb_translation_cache: dict[int, tuple[str, str, int]] = {}
         # Immutable routing configuration shipped to the external load
         # balancer. Stored in-memory and updated only after the controller's
         # live autoscaler / replica-manager state transitions, so syncs never
@@ -255,9 +255,9 @@ class SkyServeController:
 
     def _get_lb_replica_info(
         self,
-        replica_infos: List['replica_managers.ReplicaInfo'],
-        async_occupancy_by_version: Optional[Dict[int, Optional[bool]]] = None,
-    ) -> Tuple[Dict[str, Dict[str, str]], int]:
+        replica_infos: list['replica_managers.ReplicaInfo'],
+        async_occupancy_by_version: dict[int, bool | None] | None = None,
+    ) -> tuple[dict[str, dict[str, str]], int]:
         """Build the url -> replica info mapping for load_balancer_sync.
 
         [boltz fork] Resolving a replica's url and gpu_type is expensive, so
@@ -286,13 +286,13 @@ class SkyServeController:
         controller_owner = getattr(self, '_controller_owner', None)
         if (service_hash is not None and
             (record.get('hash') != service_hash or
-             (record.get('controller_pid'), record.get('controller_ip')) !=
-             controller_owner)):
+             (record.get('controller_pid'), record.get('controller_ip'))
+             != controller_owner)):
             raise RuntimeError('Controller ownership changed while building '
                                'the load balancer routing snapshot.')
         active_versions = set(record['active_versions'])
-        replica_cache: Dict[int, Tuple[str, str, int]] = {}
-        replica_info: Dict[str, Dict[str, str]] = {}
+        replica_cache: dict[int, tuple[str, str, int]] = {}
+        replica_info: dict[str, dict[str, str]] = {}
         ready_infos = [
             info for info in replica_infos
             if (info.status == serve_state.ReplicaStatus.READY and
@@ -303,7 +303,7 @@ class SkyServeController:
             for info in ready_infos
             if info.replica_id not in self._lb_replica_cache
         ]
-        cluster_records: Dict[str, Optional[Dict[str, Any]]] = {}
+        cluster_records: dict[str, dict[str, Any] | None] = {}
         if uncached_cluster_names:
             cluster_records = global_user_state.get_clusters_from_names(
                 uncached_cluster_names)
@@ -312,9 +312,9 @@ class SkyServeController:
         # its provider config. That is another fleet-sized DB N+1. Reuse the
         # records above to collect the YAML paths, then fetch all YAMLs in one
         # query before resolving endpoints.
-        uncached_handles: Dict[int, Any] = {}
-        yaml_replica_ids: List[int] = []
-        yaml_paths: List[str] = []
+        uncached_handles: dict[int, Any] = {}
+        yaml_replica_ids: list[int] = []
+        yaml_paths: list[str] = []
         for info in ready_infos:
             if info.replica_id in self._lb_replica_cache:
                 continue
@@ -327,7 +327,7 @@ class SkyServeController:
             if cluster_yaml is not None:
                 yaml_replica_ids.append(info.replica_id)
                 yaml_paths.append(cluster_yaml)
-        provider_configs: Dict[int, Dict[str, Any]] = {}
+        provider_configs: dict[int, dict[str, Any]] = {}
         if yaml_paths:
             yaml_configs = global_user_state.get_cluster_yaml_dict_multiple(
                 yaml_paths)
@@ -423,7 +423,7 @@ class SkyServeController:
         self._lb_replica_cache = replica_cache
         return replica_info, len(ready_infos)
 
-    def _url_to_replica_id_map(self) -> Dict[str, int]:
+    def _url_to_replica_id_map(self) -> dict[str, int]:
         """Invert the translation cache (url -> replica id)."""
         return {
             url: replica_id
@@ -432,8 +432,7 @@ class SkyServeController:
 
     def _translate_in_flight(
             self,
-            in_flight_by_url: Optional[Dict[str,
-                                            int]]) -> Optional[Dict[int, int]]:
+            in_flight_by_url: dict[str, int] | None) -> dict[int, int] | None:
         """Translate the LB's url-keyed in-flight gauge to replica ids.
 
         [boltz fork] The LB only knows replicas by url; the autoscaler
@@ -454,7 +453,7 @@ class SkyServeController:
         if in_flight_by_url is None:
             return None
         url_to_replica_id = self._url_to_replica_id_map()
-        in_flight_by_replica_id: Dict[int, int] = {}
+        in_flight_by_replica_id: dict[int, int] = {}
         for url, count in in_flight_by_url.items():
             replica_id = url_to_replica_id.get(url)
             if replica_id is not None:
@@ -463,12 +462,12 @@ class SkyServeController:
 
     def _unknown_async_replica_ids(
         self,
-        replica_infos: List['replica_managers.ReplicaInfo'],
-        async_occupancy_by_version: Dict[int, Optional[bool]],
-        occupancy_sampled_urls: Optional[List[str]],
-        unknown_in_flight_urls: Optional[List[str]],
+        replica_infos: list['replica_managers.ReplicaInfo'],
+        async_occupancy_by_version: dict[int, bool | None],
+        occupancy_sampled_urls: list[str] | None,
+        unknown_in_flight_urls: list[str] | None,
         force_all_live_unknown: bool = False,
-    ) -> Set[int]:
+    ) -> set[int]:
         """Resolve the fail-closed async occupancy set for one LB report.
 
         An envelope count (including explicit zero) does not prove anything
@@ -478,7 +477,7 @@ class SkyServeController:
         application of the controller's declaration, so both remain unknown.
         """
         url_to_replica_id = self._url_to_replica_id_map()
-        sampled_replica_ids: Set[int] = set()
+        sampled_replica_ids: set[int] = set()
         if not force_all_live_unknown:
             sampled_replica_ids = {
                 url_to_replica_id[url]
@@ -509,8 +508,8 @@ class SkyServeController:
                 info.replica_id not in sampled_replica_ids)
         return unknown_replica_ids
 
-    def _lb_report_authority(
-            self, session_id: Optional[str]) -> Tuple[bool, bool, bool]:
+    def _lb_report_authority(self,
+                             session_id: str | None) -> tuple[bool, bool, bool]:
         """Return ``(live member, demand, drain)`` report authority.
 
         The sole Ready, non-terminating Pod sees all new Service traffic, so it
@@ -539,9 +538,9 @@ class SkyServeController:
 
     @staticmethod
     def _lb_drain_report_view(
-        request_data: Dict[str, Any],
+        request_data: dict[str, Any],
         report_is_authoritative: bool,
-    ) -> Tuple[Optional[Dict[str, int]], Optional[List[str]]]:
+    ) -> tuple[dict[str, int] | None, list[str] | None]:
         """Return a raw drain view that only the sole live LB can prove."""
         in_flight = request_data.get('in_flight')
         routing_urls = request_data.get('routing_urls')
@@ -555,10 +554,10 @@ class SkyServeController:
 
     async def _ingest_load_balancer_report(
         self,
-        request_data: Dict[str, Any],
-        replica_infos: List['replica_managers.ReplicaInfo'],
-        async_occupancy_by_version: Dict[int, Optional[bool]],
-        authority: Optional[Tuple[bool, bool, bool]] = None,
+        request_data: dict[str, Any],
+        replica_infos: list['replica_managers.ReplicaInfo'],
+        async_occupancy_by_version: dict[int, bool | None],
+        authority: tuple[bool, bool, bool] | None = None,
     ) -> bool:
         """Apply the independently authorized parts of one external LB report.
 
@@ -591,9 +590,9 @@ class SkyServeController:
             # Besides preventing state mutation, this keeps a stale/wrong Pod
             # from making the controller reject a useful routing response with
             # a malformed demand-only field.
-            request_aggregator: Dict[str, Any] = request_data.get(
+            request_aggregator: dict[str, Any] = request_data.get(
                 'request_aggregator', {})
-            timestamps: List[int] = request_aggregator.get('timestamps', [])
+            timestamps: list[int] = request_aggregator.get('timestamps', [])
             logger.info(f'Received {len(timestamps)} inflight requests.')
             translated_in_flight = self._translate_in_flight(
                 request_data.get('in_flight'))
@@ -629,7 +628,7 @@ class SkyServeController:
         return True
 
     async def _handle_load_balancer_sync(
-            self, request_data: Dict[str, Any]) -> fastapi.Response:
+            self, request_data: dict[str, Any]) -> fastapi.Response:
         """Validate LB membership before disclosing confidential routing."""
         if not self._owns_current_service():
             return fastapi.Response(status_code=503)
@@ -654,11 +653,11 @@ class SkyServeController:
             replica_versions = sorted({info.version for info in replica_infos})
             version_specs = serve_state.get_specs(self._service_name,
                                                   replica_versions)
-            async_occupancy_by_version: Dict[int, Optional[bool]] = {
-                replica_version:
-                None if version_specs.get(replica_version) is None else getattr(
-                    version_specs[replica_version],
-                    'graceful_drain_async_occupancy', None)
+            async_occupancy_by_version: dict[int, bool | None] = {
+                replica_version: None if version_specs.get(replica_version)
+                                 is None else getattr(
+                                     version_specs[replica_version],
+                                     'graceful_drain_async_occupancy', None)
                 for replica_version in replica_versions
             }
             # Cold endpoint resolution is proportional to the READY fleet and
@@ -696,8 +695,8 @@ class SkyServeController:
                 == controller_owner)
 
     def _get_capacity_hint(
-            self, replica_infos: List['replica_managers.ReplicaInfo']
-    ) -> Dict[str, int]:
+            self, replica_infos: list['replica_managers.ReplicaInfo']
+    ) -> dict[str, int]:
         """Build the capacity_hint block of the sync response.
 
         [boltz fork] Computed from the replica_infos list the handler
@@ -739,7 +738,7 @@ class SkyServeController:
         }
 
     @staticmethod
-    def _build_routing_spec(service_spec: Any) -> Optional[Dict[str, Any]]:
+    def _build_routing_spec(service_spec: Any) -> dict[str, Any] | None:
         """Build the immutable routing config shipped on LB syncs."""
         if service_spec is None:
             return None
@@ -765,7 +764,7 @@ class SkyServeController:
                 (service_spec.lb_retry_initial_backoff_seconds),
         }
 
-    def _get_routing_spec(self) -> Optional[Dict[str, Any]]:
+    def _get_routing_spec(self) -> dict[str, Any] | None:
         """Return the routing spec for the load_balancer_sync response.
 
         [boltz fork] The external load balancer fetches its routing
@@ -899,13 +898,16 @@ class SkyServeController:
                 # as the intended pacing mechanism. Decision ORDER is
                 # preserved: scale-downs still execute at their original
                 # position relative to the upscale batches around them.
-                pending_scale_up: List[Optional[Dict[str, Any]]] = []
+                pending_scale_up: list[dict[str, Any] | None] = []
 
+                # The closure is only called within the same outer-loop
+                # iteration that (re)binds pending_scale_up, so capturing the
+                # loop-scoped list is intentional (B023 false positive).
                 def _flush_scale_up() -> None:
-                    if pending_scale_up:
+                    if pending_scale_up:  # noqa: B023
                         self._replica_manager.scale_up_batch(
-                            list(pending_scale_up))
-                        pending_scale_up.clear()
+                            list(pending_scale_up))  # noqa: B023
+                        pending_scale_up.clear()  # noqa: B023
 
                 for scaling_option in scaling_options:
                     logger.info(f'Scaling option received: {scaling_option}')
@@ -992,7 +994,7 @@ class SkyServeController:
             '/controller/update_service',
             dependencies=[admin_auth_dependency, controller_owner_dependency])
         @_serialize_update
-        def update_service(request_data: Dict[str, Any] = fastapi.Body(
+        def update_service(request_data: dict[str, Any] = fastapi.Body(
             ...)) -> fastapi.Response:
             try:
                 version = request_data.get('version', None)
@@ -1011,7 +1013,7 @@ class SkyServeController:
                     self._service_name,
                     version,
                     resource_scope=self._resource_scope)
-                with open(latest_task_yaml, 'r', encoding='utf-8') as f:
+                with open(latest_task_yaml, encoding='utf-8') as f:
                     yaml_content = f.read()
                 service = serve.SkyServiceSpec.from_yaml_str(yaml_content)
                 requested_service_hash = request_data.get('service_hash')
@@ -1170,10 +1172,10 @@ def run_controller(service_name: str,
                    controller_host: str,
                    controller_port: int,
                    controller_owner_fingerprint: str,
-                   resource_scope: Optional[str] = None,
-                   service_hash: Optional[str] = None,
-                   controller_pid: Optional[int] = None,
-                   controller_ip: Optional[str] = None,
+                   resource_scope: str | None = None,
+                   service_hash: str | None = None,
+                   controller_pid: int | None = None,
+                   controller_ip: str | None = None,
                    enforce_launch_fence: bool = False):
     os.environ[constants.OVERRIDE_CONSOLIDATION_MODE] = 'true'
     # Hijack sys.stdout/stderr to be context aware.

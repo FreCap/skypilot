@@ -2,7 +2,7 @@
 
 import base64
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 from sky import sky_logging
 from sky.adaptors import runpod
@@ -189,11 +189,11 @@ def _list_pod_templates_with_container_registry() -> dict:
     return raw_return['data']['myself']['podTemplates']
 
 
-def list_instances() -> Dict[str, Dict[str, Any]]:
+def list_instances() -> dict[str, dict[str, Any]]:
     """Lists instances associated with API key."""
     instances = _sky_get_pods()
 
-    instance_dict: Dict[str, Dict[str, Any]] = {}
+    instance_dict: dict[str, dict[str, Any]] = {}
     for instance in instances:
         info = {}
 
@@ -247,8 +247,8 @@ def delete_register_auth(registry_auth_id: str) -> None:
 def _create_template_for_docker_login(
     cluster_name: str,
     image_name: str,
-    docker_login_config: Optional[Dict[str, str]],
-) -> Tuple[str, Optional[str]]:
+    docker_login_config: dict[str, str] | None,
+) -> tuple[str, str | None]:
     """Creates a template for the given image with the docker login config.
 
     Returns:
@@ -291,14 +291,14 @@ def launch(
     zone: str,
     disk_size: int,
     image_name: str,
-    ports: Optional[List[int]],
+    ports: list[int] | None,
     public_key: str,
-    preemptible: Optional[bool],
+    preemptible: bool | None,
     bid_per_gpu: float,
-    docker_login_config: Optional[Dict[str, str]],
+    docker_login_config: dict[str, str] | None,
     *,
-    network_volume_id: Optional[str] = None,
-    volume_mount_path: Optional[str] = None,
+    network_volume_id: str | None = None,
+    volume_mount_path: str | None = None,
 ) -> str:
     """Launches an instance with the given parameters.
 
@@ -408,7 +408,7 @@ def launch(
 
 
 def get_registry_auth_resources(
-        cluster_name: str) -> Tuple[Optional[str], Optional[str]]:
+        cluster_name: str) -> tuple[str | None, str | None]:
     """Gets the registry auth resources."""
     container_registry_auth_name = _construct_docker_login_template_name(
         cluster_name)
@@ -424,7 +424,7 @@ def remove(instance_id: str) -> None:
     runpod.runpod.terminate_pod(instance_id)
 
 
-def get_ssh_ports(cluster_name) -> List[int]:
+def get_ssh_ports(cluster_name) -> list[int]:
     """Gets the SSH ports for the given cluster."""
     logger.debug(f'Getting SSH ports for cluster {cluster_name}.')
 

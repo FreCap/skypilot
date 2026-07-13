@@ -4,7 +4,7 @@
 from sky.adaptors import vsphere as vsphere_adaptor
 
 
-class ClsApiClient(object):
+class ClsApiClient:
     """    This is a simplified wrapper around the Content Library APIs.
     It is used to access services exposed by Content Library Service.
 

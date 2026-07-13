@@ -1,8 +1,9 @@
 """Kubeconfig and context helpers for Kubernetes provisioning."""
 
+from collections.abc import Callable
 import os
 import subprocess
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any
 
 from sky import skypilot_config
 from sky.adaptors import kubernetes
@@ -12,10 +13,10 @@ from sky.utils import yaml_utils
 
 
 def is_kubeconfig_exec_auth(
-    context: Optional[str],
+    context: str | None,
     *,
-    get_kubeconfig_text_fn: Callable[[Optional[str]], str],
-) -> Tuple[bool, Optional[str]]:
+    get_kubeconfig_text_fn: Callable[[str | None], str],
+) -> tuple[bool, str | None]:
     """Checks if the kubeconfig file uses exec-based authentication."""
     k8s = kubernetes.kubernetes
     if context == kubernetes.in_cluster_context_name():
@@ -64,7 +65,7 @@ def is_kubeconfig_exec_auth(
     return False, None
 
 
-def get_kubeconfig_text_for_context(context: Optional[str] = None) -> str:
+def get_kubeconfig_text_for_context(context: str | None = None) -> str:
     """Get the kubeconfig text for the given context."""
     command = 'kubectl config view --minify'
     if context is not None:
@@ -74,8 +75,7 @@ def get_kubeconfig_text_for_context(context: Optional[str] = None) -> str:
                           shell=True,
                           check=False,
                           env=os.environ.copy(),
-                          stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE)
+                          capture_output=True)
     if proc.returncode != 0:
         raise RuntimeError(
             f'Failed to get kubeconfig text for context {context}: '
@@ -84,8 +84,7 @@ def get_kubeconfig_text_for_context(context: Optional[str] = None) -> str:
 
 
 def get_current_kube_config_context_name(
-        *, is_incluster_config_available_fn: Callable[[],
-                                                      bool]) -> Optional[str]:
+        *, is_incluster_config_available_fn: Callable[[], bool]) -> str | None:
     """Get the current kubernetes context from the kubeconfig file."""
     k8s = kubernetes.kubernetes
     try:
@@ -103,7 +102,7 @@ def is_incluster_config_available() -> bool:
 
 
 def get_all_kube_context_names(
-        *, is_incluster_config_available_fn: Callable[[], bool]) -> List[str]:
+        *, is_incluster_config_available_fn: Callable[[], bool]) -> list[str]:
     """Get all kubernetes context names available in the environment."""
     k8s = kubernetes.kubernetes
     context_names = []
@@ -118,7 +117,7 @@ def get_all_kube_context_names(
 
 
 def get_kube_config_context_namespace(
-    context_name: Optional[str] = None,
+    context_name: str | None = None,
     *,
     default_namespace: str,
 ) -> str:
@@ -152,13 +151,13 @@ def get_kube_config_context_namespace(
 
 
 def get_namespace(
-    context: Optional[str] = None,
-    workspace: Optional[str] = None,
-    override_configs: Optional[Dict[str, Any]] = None,
+    context: str | None = None,
+    workspace: str | None = None,
+    override_configs: dict[str, Any] | None = None,
     cloud: str = 'kubernetes',
     *,
-    get_effective_namespace: Callable[..., Optional[str]],
-    get_kube_config_context_namespace_fn: Callable[[Optional[str]], str],
+    get_effective_namespace: Callable[..., str | None],
+    get_kube_config_context_namespace_fn: Callable[[str | None], str],
 ) -> str:
     """Resolve the Kubernetes namespace for ``context``, with fallback."""
     config_namespace = get_effective_namespace(
@@ -172,7 +171,7 @@ def get_namespace(
     return get_kube_config_context_namespace_fn(context)
 
 
-def get_kubeconfig_paths() -> List[str]:
+def get_kubeconfig_paths() -> list[str]:
     """Get the path to the kubeconfig files."""
     paths = os.getenv('KUBECONFIG', kubernetes.DEFAULT_KUBECONFIG_PATH)
     return [

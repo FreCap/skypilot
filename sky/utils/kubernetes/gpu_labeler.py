@@ -4,7 +4,7 @@ import hashlib
 import os
 import subprocess
 import sys
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 import colorama
 import jinja2
@@ -40,7 +40,7 @@ def _get_status_context(msg: str):
         return rich_utils.client_status(msg)
 
 
-def cleanup(context: Optional[str] = None) -> Tuple[bool, str]:
+def cleanup(context: str | None = None) -> tuple[bool, str]:
     """Deletes all Kubernetes resources created by this script
 
     Used to provide idempotency when the script is run multiple times. Also
@@ -76,8 +76,7 @@ def get_node_hash(node_name: str):
     return md5_hash[:32]
 
 
-def label(context: Optional[str] = None,
-          wait_for_completion: bool = True) -> bool:
+def label(context: str | None = None, wait_for_completion: bool = True) -> bool:
     """Labels GPU nodes in a Kubernetes cluster.
 
     Returns:
@@ -114,7 +113,7 @@ def label(context: Optional[str] = None,
         rbac_template_path = os.path.join(manifest_dir,
                                           'k8s_gpu_labeler_setup.yaml.j2')
         try:
-            with open(rbac_template_path, 'r', encoding='utf-8') as f:
+            with open(rbac_template_path, encoding='utf-8') as f:
                 template_content = f.read()
         except FileNotFoundError:
             print(
@@ -123,7 +122,7 @@ def label(context: Optional[str] = None,
                 'Your SkyPilot installation may be incomplete.',
                 flush=True)
             return False
-        except IOError as e:
+        except OSError as e:
             print(f'Error reading GPU labeler template: {e}', flush=True)
             return False
 
@@ -153,14 +152,14 @@ def label(context: Optional[str] = None,
                   flush=True)
             return False
 
-    jobs_to_node_names: Dict[str, str] = {}
+    jobs_to_node_names: dict[str, str] = {}
     with _get_status_context('Creating GPU labeler jobs'):
         batch_v1 = kubernetes.batch_api(context=context)
         # Load the job manifest
         job_manifest_path = os.path.join(manifest_dir,
                                          'k8s_gpu_labeler_job.yaml')
 
-        with open(job_manifest_path, 'r', encoding='utf-8') as file:
+        with open(job_manifest_path, encoding='utf-8') as file:
             job_manifest = yaml.safe_load(file)
 
         # Check if the 'nvidia' RuntimeClass exists
@@ -239,9 +238,9 @@ def label(context: Optional[str] = None,
         return True
 
 
-def wait_for_jobs_completion(jobs_to_node_names: Dict[str, str],
+def wait_for_jobs_completion(jobs_to_node_names: dict[str, str],
                              namespace: str,
-                             context: Optional[str] = None,
+                             context: str | None = None,
                              timeout: int = 60 * 20):
     """Waits for a Kubernetes Job to complete or fail.
 
@@ -296,9 +295,9 @@ def wait_for_jobs_completion(jobs_to_node_names: Dict[str, str],
     return False  # Timed out
 
 
-def label_gpus_server(context: Optional[str] = None,
+def label_gpus_server(context: str | None = None,
                       cleanup_only: bool = False,
-                      wait_for_completion: bool = True) -> Dict[str, Any]:
+                      wait_for_completion: bool = True) -> dict[str, Any]:
     """Server-side entry point for GPU labeling.
 
     This function is called by the API server to label GPU nodes.

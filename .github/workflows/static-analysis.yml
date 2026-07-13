@@ -1,0 +1,93 @@
+name: static-analysis
+
+on:
+  # Trigger the workflow on push or pull request,
+  # but only for the main branch
+  push:
+    branches:
+      - master
+      - 'releases/**'
+      - improvements
+  pull_request:
+    branches:
+      - master
+      - 'releases/**'
+      - improvements
+  merge_group:
+
+jobs:
+  ruff:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.14"]
+    steps:
+      - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3.6.0
+      - name: Install the latest version of uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4.2.0
+        with:
+          version: "latest"
+          python-version: ${{ matrix.python-version }}
+      - name: Run ruff
+        run: |
+          uv venv --seed ~/lint-env
+          source ~/lint-env/bin/activate
+          uv pip install ruff==0.15.21
+          ruff check sky
+
+  import-linter:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.14"]
+    steps:
+      - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3.6.0
+      - name: Install the latest version of uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4.2.0
+        with:
+          version: "latest"
+          python-version: ${{ matrix.python-version }}
+      - name: Check import contracts
+        run: |
+          uv venv --seed ~/lint-env
+          source ~/lint-env/bin/activate
+          uv pip install import-linter==2.13
+          # Contracts are static (grimp parses imports); no dep install needed.
+          lint-imports
+
+  # NOT a legacy-Python lane: our deployment is 3.14-only, but SkyPilot
+  # bootstraps cluster workers with a Python 3.10 env (ray 2.9.3 has no
+  # newer wheels; see requires_python in setup.py) and pip-installs this
+  # wheel into it. This job only proves the wheel still installs and
+  # imports on that worker floor. Delete it when the remote runtime
+  # (SKY_REMOTE_RAY_VERSION + remote --python pin) moves to 3.14.
+  worker-floor-import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3.6.0
+      - name: Install the latest version of uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4.2.0
+        with:
+          version: "latest"
+          python-version: "3.10"
+      - name: Install and import sky on the cluster-worker Python
+        run: |
+          uv venv --seed ~/worker-env
+          source ~/worker-env/bin/activate
+          uv pip install -e .
+          python -c "import sky, sky.skylet.constants, sky.jobs.state, sky.data.storage; print(sky.__version__)"
+
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3.6.0
+      - name: Run actionlint on workflow files
+        uses: docker://rhysd/actionlint:1.7.7
+        with:
+          # Pre-existing style noise is ignored so real errors (invalid
+          # workflow syntax, unknown keys, broken expressions) still fail:
+          # shellcheck findings and the checkout@v3 age warning.
+          args: >-
+            -color
+            -ignore "shellcheck reported issue in this script"
+            -ignore "action is too old to run on GitHub Actions"

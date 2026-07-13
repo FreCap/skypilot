@@ -2,13 +2,13 @@
 import json
 import re
 import typing
-from typing import Any, Literal, Optional, Tuple, Union
+from typing import Any, Literal
 
 _PAYLOAD_PATTERN = re.compile(r'<sky-payload(.*?)>(.*?)</sky-payload>')
 _PAYLOAD_STR = '<sky-payload{type}>{content}</sky-payload>\n'
 
 
-def encode_payload(payload: Any, payload_type: Optional[str] = None) -> str:
+def encode_payload(payload: Any, payload_type: str | None = None) -> str:
     """Encode a payload to make it more robust for parsing.
 
     This makes message transfer more robust to any additional strings added to
@@ -32,7 +32,7 @@ def encode_payload(payload: Any, payload_type: Optional[str] = None) -> str:
 
 @typing.overload
 def decode_payload(payload_str: str,
-                   payload_type: Optional[str] = None,
+                   payload_type: str | None = None,
                    raise_for_mismatch: Literal[True] = True) -> Any:
     ...
 
@@ -40,15 +40,14 @@ def decode_payload(payload_str: str,
 @typing.overload
 def decode_payload(
         payload_str: str,
-        payload_type: Optional[str] = None,
-        raise_for_mismatch: Literal[False] = False) -> Tuple[bool, Any]:
+        payload_type: str | None = None,
+        raise_for_mismatch: Literal[False] = False) -> tuple[bool, Any]:
     ...
 
 
-def decode_payload(
-        payload_str: str,
-        payload_type: Optional[str] = None,
-        raise_for_mismatch: bool = True) -> Union[Tuple[bool, Any], Any]:
+def decode_payload(payload_str: str,
+                   payload_type: str | None = None,
+                   raise_for_mismatch: bool = True) -> tuple[bool, Any] | Any:
     """Decode a payload string.
 
     Args:

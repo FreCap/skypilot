@@ -17,7 +17,7 @@ result = sky.get(request_id)
 ### `sky.launch`
 
 ```python
-sky.launch(task: Union['sky.Task', 'sky.Dag'], cluster_name: Optional[str] = None, retry_until_up: bool = False, idle_minutes_to_autostop: Optional[int] = None, wait_for: Optional[autostop_lib.AutostopWaitFor] = None, dryrun: bool = False, down: bool = False, backend: Optional['backends.Backend'] = None, optimize_target: common.OptimizeTarget = common.OptimizeTarget.COST, no_setup: bool = False, clone_disk_from: Optional[str] = None, fast: bool = False, _need_confirmation: bool = False, _is_launched_by_jobs_controller: bool = False, _is_launched_by_sky_serve_controller: bool = False, _disable_controller_check: bool = False, _file_mounts_blob_id: Optional[str] = None, _extra_launch_context: Optional[Dict[str, Any]] = None, _include_credentials: bool = False) -> server_common.RequestId[Tuple[Optional[int], Optional['backends.ResourceHandle']]]
+sky.launch(task: Union['sky.Task', 'sky.Dag'], cluster_name: str | None = None, retry_until_up: bool = False, idle_minutes_to_autostop: int | None = None, wait_for: autostop_lib.AutostopWaitFor | None = None, dryrun: bool = False, down: bool = False, backend: Optional['backends.Backend'] = None, optimize_target: common.OptimizeTarget = common.OptimizeTarget.COST, no_setup: bool = False, clone_disk_from: str | None = None, fast: bool = False, _need_confirmation: bool = False, _is_launched_by_jobs_controller: bool = False, _is_launched_by_sky_serve_controller: bool = False, _disable_controller_check: bool = False, _file_mounts_blob_id: str | None = None, _extra_launch_context: dict[str, Any] | None = None, _include_credentials: bool = False) -> server_common.RequestId[tuple[int | None, Optional['backends.ResourceHandle']]]
 ```
 
 Launches a cluster or task.
@@ -122,7 +122,7 @@ Other exceptions may be raised depending on the backend.
 ### `sky.exec`
 
 ```python
-sky.exec(task: Union['sky.Task', 'sky.Dag'], cluster_name: Optional[str] = None, dryrun: bool = False, down: bool = False, backend: Optional['backends.Backend'] = None) -> server_common.RequestId[Tuple[Optional[int], Optional['backends.ResourceHandle']]]
+sky.exec(task: Union['sky.Task', 'sky.Dag'], cluster_name: str | None = None, dryrun: bool = False, down: bool = False, backend: Optional['backends.Backend'] = None) -> server_common.RequestId[tuple[int | None, Optional['backends.ResourceHandle']]]
 ```
 
 Executes a task on an existing cluster.
@@ -181,7 +181,7 @@ use ``sky.launch()`` instead.
 ### `sky.stop`
 
 ```python
-sky.stop(cluster_name: str, purge: bool = False, graceful: bool = False, graceful_timeout: Optional[int] = None) -> server_common.RequestId[None]
+sky.stop(cluster_name: str, purge: bool = False, graceful: bool = False, graceful_timeout: int | None = None) -> server_common.RequestId[None]
 ```
 
 Stops a cluster.
@@ -218,7 +218,7 @@ does allow disk contents to be preserved when stopping spot VMs).
 ### `sky.start`
 
 ```python
-sky.start(cluster_name: str, idle_minutes_to_autostop: Optional[int] = None, wait_for: Optional[autostop_lib.AutostopWaitFor] = None, retry_until_up: bool = False, down: bool = False, force: bool = False) -> server_common.RequestId['backends.CloudVmRayResourceHandle']
+sky.start(cluster_name: str, idle_minutes_to_autostop: int | None = None, wait_for: autostop_lib.AutostopWaitFor | None = None, retry_until_up: bool = False, down: bool = False, force: bool = False) -> server_common.RequestId['backends.CloudVmRayResourceHandle']
 ```
 
 Restart a cluster.
@@ -283,7 +283,7 @@ If a cluster is already in the UP status, this function has no effect.
 ### `sky.down`
 
 ```python
-sky.down(cluster_name: str, purge: bool = False, graceful: bool = False, graceful_timeout: Optional[int] = None) -> server_common.RequestId[None]
+sky.down(cluster_name: str, purge: bool = False, graceful: bool = False, graceful_timeout: int | None = None) -> server_common.RequestId[None]
 ```
 
 Tears down a cluster.
@@ -321,7 +321,7 @@ stops), and any data on the attached disks will be lost.  Accelerators
 ### `sky.status`
 
 ```python
-sky.status(cluster_names: Optional[List[str]] = None, refresh: common.StatusRefreshMode = common.StatusRefreshMode.NONE, all_users: bool = False, *, _include_credentials: bool = False, _summary_response: bool = False) -> server_common.RequestId[List[responses.StatusResponse]]
+sky.status(cluster_names: list[str] | None = None, refresh: common.StatusRefreshMode = common.StatusRefreshMode.NONE, all_users: bool = False, *, _include_credentials: bool = False, _summary_response: bool = False) -> server_common.RequestId[list[responses.StatusResponse]]
 ```
 
 Gets cluster statuses.
@@ -403,7 +403,7 @@ Getting up-to-date cluster statuses:
 ### `sky.autostop`
 
 ```python
-sky.autostop(cluster_name: str, idle_minutes: int, wait_for: Optional[autostop_lib.AutostopWaitFor] = None, down: bool = False, hook: Optional[str] = None, hook_timeout: Optional[int] = None) -> server_common.RequestId[None]
+sky.autostop(cluster_name: str, idle_minutes: int, wait_for: autostop_lib.AutostopWaitFor | None = None, down: bool = False, hook: str | None = None, hook_timeout: int | None = None) -> server_common.RequestId[None]
 ```
 
 Schedules an autostop/autodown for a cluster.
@@ -473,7 +473,7 @@ last setting takes precedence.
 ### `sky.cost_report`
 
 ```python
-sky.cost_report(days: Optional[int] = None) -> server_common.RequestId[List[Dict[str, Any]]]
+sky.cost_report(days: int | None = None) -> server_common.RequestId[list[dict[str, Any]]]
 ```
 
 Gets all cluster cost reports, including those that have been downed.
@@ -513,7 +513,7 @@ autostop/use_spot set or terminated/stopped on the cloud console.
 ### `sky.endpoints`
 
 ```python
-sky.endpoints(cluster: str, port: Optional[Union[int, str]] = None) -> server_common.RequestId[Dict[int, str]]
+sky.endpoints(cluster: str, port: int | str | None = None) -> server_common.RequestId[dict[int, str]]
 ```
 
 Gets the endpoint for a given cluster and port number (endpoint).
@@ -549,7 +549,7 @@ Gets the endpoint for a given cluster and port number (endpoint).
 ### `sky.queue`
 
 ```python
-sky.queue(cluster_name: str, skip_finished: bool = False, all_users: bool = False) -> server_common.RequestId[List[responses.ClusterJobRecord]]
+sky.queue(cluster_name: str, skip_finished: bool = False, all_users: bool = False) -> server_common.RequestId[list[responses.ClusterJobRecord]]
 ```
 
 Gets the job queue of a cluster.
@@ -598,7 +598,7 @@ Gets the job queue of a cluster.
 ### `sky.job_status`
 
 ```python
-sky.job_status(cluster_name: str, job_ids: Optional[List[int]] = None) -> server_common.RequestId[Dict[Optional[int], Optional['job_lib.JobStatus']]]
+sky.job_status(cluster_name: str, job_ids: list[int] | None = None) -> server_common.RequestId[dict[int | None, Optional['job_lib.JobStatus']]]
 ```
 
 Gets the status of jobs on a cluster.
@@ -629,7 +629,7 @@ Gets the status of jobs on a cluster.
 ### `sky.cancel`
 
 ```python
-sky.cancel(cluster_name: str, all: bool = False, all_users: bool = False, job_ids: Optional[List[int]] = None, _try_cancel_if_cluster_is_init: bool = False) -> server_common.RequestId[None]
+sky.cancel(cluster_name: str, all: bool = False, all_users: bool = False, job_ids: list[int] | None = None, _try_cancel_if_cluster_is_init: bool = False) -> server_common.RequestId[None]
 ```
 
 Cancels jobs on a cluster.
@@ -664,7 +664,7 @@ Cancels jobs on a cluster.
 ### `sky.tail_logs`
 
 ```python
-sky.tail_logs(cluster_name: str, job_id: Optional[int], follow: bool, tail: int = 0, output_stream: Optional['io.TextIOBase'] = None, *, preload_content: bool = True) -> Union[int, Iterator[Optional[str]]]
+sky.tail_logs(cluster_name: str, job_id: int | None, follow: bool, tail: int = 0, output_stream: Optional['io.TextIOBase'] = None, *, preload_content: bool = True) -> int | Iterator[str | None]
 ```
 
 Tails the logs of a job.
@@ -706,7 +706,7 @@ Tails the logs of a job.
 ### `sky.tail_provision_logs`
 
 ```python
-sky.tail_provision_logs(cluster_name: str, worker: Optional[int] = None, follow: bool = True, tail: int = 0, output_stream: Optional['io.TextIOBase'] = None) -> int
+sky.tail_provision_logs(cluster_name: str, worker: int | None = None, follow: bool = True, tail: int = 0, output_stream: Optional['io.TextIOBase'] = None) -> int
 ```
 
 Tails the provisioning logs (provision.log) for a cluster.
@@ -724,7 +724,7 @@ Tails the provisioning logs (provision.log) for a cluster.
 ### `sky.tail_hook_logs`
 
 ```python
-sky.tail_hook_logs(cluster_name: str, event: Optional[str] = None, follow: bool = True, tail: int = 0) -> int
+sky.tail_hook_logs(cluster_name: str, event: str | None = None, follow: bool = True, tail: int = 0) -> int
 ```
 
 Tails a per-event lifecycle-hook log on the cluster.
@@ -742,7 +742,7 @@ Tails a per-event lifecycle-hook log on the cluster.
 ### `sky.download_logs`
 
 ```python
-sky.download_logs(cluster_name: str, job_ids: Optional[List[str]]) -> Dict[str, str]
+sky.download_logs(cluster_name: str, job_ids: list[str] | None) -> dict[str, str]
 ```
 
 Downloads the logs of jobs.
@@ -772,7 +772,7 @@ Downloads the logs of jobs.
 ### `sky.check`
 
 ```python
-sky.check(infra_list: Optional[Tuple[str, ...]], verbose: bool, workspace: Optional[str] = None) -> server_common.RequestId[Dict[str, Dict[str, List[str]]]]
+sky.check(infra_list: tuple[str, ...] | None, verbose: bool, workspace: str | None = None) -> server_common.RequestId[dict[str, dict[str, list[str]]]]
 ```
 
 Checks the credentials to enable clouds.
@@ -793,7 +793,7 @@ Checks the credentials to enable clouds.
 ### `sky.enabled_clouds`
 
 ```python
-sky.enabled_clouds(workspace: Optional[str] = None, expand: bool = False) -> server_common.RequestId[List[str]]
+sky.enabled_clouds(workspace: str | None = None, expand: bool = False) -> server_common.RequestId[list[str]]
 ```
 
 Gets the enabled clouds.
@@ -812,7 +812,7 @@ Gets the enabled clouds.
 ### `sky.list_accelerators`
 
 ```python
-sky.list_accelerators(gpus_only: bool = True, name_filter: Optional[str] = None, region_filter: Optional[str] = None, quantity_filter: Optional[int] = None, clouds: Optional[Union[List[str], str]] = None, all_regions: bool = False, require_price: bool = True, case_sensitive: bool = True) -> server_common.RequestId[Dict[str, List['catalog.common.InstanceTypeInfo']]]
+sky.list_accelerators(gpus_only: bool = True, name_filter: str | None = None, region_filter: str | None = None, quantity_filter: int | None = None, clouds: list[str] | str | None = None, all_regions: bool = False, require_price: bool = True, case_sensitive: bool = True) -> server_common.RequestId[dict[str, list['catalog.common.InstanceTypeInfo']]]
 ```
 
 Lists the names of all accelerators offered by Sky.
@@ -841,7 +841,7 @@ that may not be available in the user's account.
 ### `sky.kubernetes_node_info`
 
 ```python
-sky.kubernetes_node_info(context: Optional[str] = None) -> server_common.RequestId['models.KubernetesNodesInfo']
+sky.kubernetes_node_info(context: str | None = None) -> server_common.RequestId['models.KubernetesNodesInfo']
 ```
 
 Gets the resource information for all the nodes in the cluster.
@@ -866,7 +866,7 @@ namespaces, the function will return free GPUs as -1.
 ### `sky.realtime_kubernetes_gpu_availability`
 
 ```python
-sky.realtime_kubernetes_gpu_availability(context: Optional[str] = None, name_filter: Optional[str] = None, quantity_filter: Optional[int] = None, is_ssh: Optional[bool] = None) -> server_common.RequestId[List[Tuple[str, List['models.RealtimeGpuAvailability']]]]
+sky.realtime_kubernetes_gpu_availability(context: str | None = None, name_filter: str | None = None, quantity_filter: int | None = None, is_ssh: bool | None = None) -> server_common.RequestId[list[tuple[str, list['models.RealtimeGpuAvailability']]]]
 ```
 
 Gets the real-time Kubernetes GPU availability.
@@ -877,7 +877,7 @@ Gets the real-time Kubernetes GPU availability.
 ### `sky.optimize`
 
 ```python
-sky.optimize(dag: 'sky.Dag', minimize: common.OptimizeTarget = common.OptimizeTarget.COST, admin_policy_request_options: Optional[admin_policy.RequestOptions] = None) -> server_common.RequestId['sky.Dag']
+sky.optimize(dag: 'sky.Dag', minimize: common.OptimizeTarget = common.OptimizeTarget.COST, admin_policy_request_options: admin_policy.RequestOptions | None = None) -> server_common.RequestId['sky.Dag']
 ```
 
 Finds the best execution plan for the given DAG.
@@ -903,7 +903,7 @@ Finds the best execution plan for the given DAG.
 ### `sky.validate`
 
 ```python
-sky.validate(dag: 'sky.Dag', workdir_only: bool = False, admin_policy_request_options: Optional[admin_policy.RequestOptions] = None) -> None
+sky.validate(dag: 'sky.Dag', workdir_only: bool = False, admin_policy_request_options: admin_policy.RequestOptions | None = None) -> None
 ```
 
 Validates the tasks.
@@ -934,7 +934,7 @@ Reloads the client-side config.
 ### `sky.storage_ls`
 
 ```python
-sky.storage_ls() -> server_common.RequestId[List[responses.StorageRecord]]
+sky.storage_ls() -> server_common.RequestId[list[responses.StorageRecord]]
 ```
 
 Gets the storages.
@@ -971,7 +971,7 @@ Deletes a storage.
 ### `sky.api_start`
 
 ```python
-sky.api_start(*, deploy: bool = False, host: str = '127.0.0.1', foreground: bool = False, metrics: bool = False, metrics_port: Optional[int] = None, enable_basic_auth: bool = False) -> None
+sky.api_start(*, deploy: bool = False, host: str = '127.0.0.1', foreground: bool = False, metrics: bool = False, metrics_port: int | None = None, enable_basic_auth: bool = False) -> None
 ```
 
 Starts the API server.
@@ -1009,7 +1009,7 @@ It will do nothing if the API server is remotely hosted.
 ### `sky.api_status`
 
 ```python
-sky.api_status(request_ids: Optional[List[Union[server_common.RequestId[T], str]]] = None, all_status: bool = False, limit: Optional[int] = None, fields: Optional[List[str]] = None, cluster_name: Optional[str] = None) -> List[payloads.RequestPayload]
+sky.api_status(request_ids: list[server_common.RequestId[T] | str] | None = None, all_status: bool = False, limit: int | None = None, fields: list[str] | None = None, cluster_name: str | None = None) -> list[payloads.RequestPayload]
 ```
 
 Lists all requests.
@@ -1057,7 +1057,7 @@ Gets the server's status, commit and version.
 ### `sky.api_cancel`
 
 ```python
-sky.api_cancel(request_ids: Optional[Union[server_common.RequestId[T], List[server_common.RequestId[T]], str, List[str]]] = None, all_users: bool = False, silent: bool = False) -> server_common.RequestId[List[str]]
+sky.api_cancel(request_ids: server_common.RequestId[T] | list[server_common.RequestId[T]] | str | list[str] | None = None, all_users: bool = False, silent: bool = False) -> server_common.RequestId[list[str]]
 ```
 
 Aborts a request or all requests.
@@ -1081,7 +1081,7 @@ Aborts a request or all requests.
 ### `sky.api_server_logs`
 
 ```python
-sky.api_server_logs(follow: bool = True, tail: Optional[int] = None) -> None
+sky.api_server_logs(follow: bool = True, tail: int | None = None) -> None
 ```
 
 Streams the API server logs.
@@ -1097,7 +1097,7 @@ Streams the API server logs.
 ### `sky.api_login`
 
 ```python
-sky.api_login(endpoint: Optional[str] = None, relogin: bool = False, service_account_token: Optional[str] = None, no_browser: bool = False) -> None
+sky.api_login(endpoint: str | None = None, relogin: bool = False, service_account_token: str | None = None, no_browser: bool = False) -> None
 ```
 
 Logs into a SkyPilot API server.
@@ -1135,7 +1135,7 @@ Clears all cookies and settings stored in ~/.sky/config.yaml
 ### `sky.dashboard`
 
 ```python
-sky.dashboard(starting_page: Optional[str] = None) -> None
+sky.dashboard(starting_page: str | None = None) -> None
 ```
 
 Starts the dashboard for SkyPilot.
@@ -1168,7 +1168,7 @@ may cause GET /api/get being sent to a restarted API server.
 ### `sky.stream_and_get`
 
 ```python
-sky.stream_and_get(request_id: Optional[server_common.RequestId[T]] = None, log_path: Optional[str] = None, tail: Optional[int] = None, follow: bool = True, output_stream: Optional['io.TextIOBase'] = None, relay_rich_status: bool = False) -> Optional[T]
+sky.stream_and_get(request_id: server_common.RequestId[T] | None = None, log_path: str | None = None, tail: int | None = None, follow: bool = True, output_stream: Optional['io.TextIOBase'] = None, relay_rich_status: bool = False) -> T | None
 ```
 
 Streams the logs of a request or a log file and gets the final result.
@@ -1207,7 +1207,7 @@ prefix of the full request id.
 ### `sky.workspaces`
 
 ```python
-sky.workspaces() -> server_common.RequestId[Dict[str, Any]]
+sky.workspaces() -> server_common.RequestId[dict[str, Any]]
 ```
 
 Gets the workspaces.
@@ -1215,7 +1215,7 @@ Gets the workspaces.
 ### `sky.set_preferred_workspace`
 
 ```python
-sky.set_preferred_workspace(preferred: Optional[str]) -> Dict[str, Any]
+sky.set_preferred_workspace(preferred: str | None) -> dict[str, Any]
 ```
 
 Sets (or clears with None) the user's preferred workspace.
@@ -1233,7 +1233,7 @@ Sets (or clears with None) the user's preferred workspace.
 ### `sky.get_user_workspace`
 
 ```python
-sky.get_user_workspace(requested: Optional[str] = None) -> Dict[str, Any]
+sky.get_user_workspace(requested: str | None = None) -> dict[str, Any]
 ```
 
 Returns workspace state for the calling user.
@@ -1276,7 +1276,7 @@ single-membership).
 ### `sky.create_debug_dump`
 
 ```python
-sky.create_debug_dump(request_ids: Optional[List[str]] = None, cluster_names: Optional[List[str]] = None, managed_job_ids: Optional[List[int]] = None, recent_minutes: Optional[float] = None) -> server_common.RequestId[str]
+sky.create_debug_dump(request_ids: list[str] | None = None, cluster_names: list[str] | None = None, managed_job_ids: list[int] | None = None, recent_minutes: float | None = None) -> server_common.RequestId[str]
 ```
 
 Create a debug dump for troubleshooting.
@@ -1302,7 +1302,7 @@ or ``recent_minutes`` must be provided.
 ### `sky.download_debug_dump`
 
 ```python
-sky.download_debug_dump(dump_filename: str, local_path: Optional[str] = None) -> str
+sky.download_debug_dump(dump_filename: str, local_path: str | None = None) -> str
 ```
 
 Download a debug dump from the server.
@@ -1318,7 +1318,7 @@ Download a debug dump from the server.
 ### `sky.kubernetes_label_gpus`
 
 ```python
-sky.kubernetes_label_gpus(context: Optional[str] = None, cleanup_only: bool = False, wait_for_completion: bool = True) -> server_common.RequestId[Dict[str, Any]]
+sky.kubernetes_label_gpus(context: str | None = None, cleanup_only: bool = False, wait_for_completion: bool = True) -> server_common.RequestId[dict[str, Any]]
 ```
 
 Labels GPU nodes in a Kubernetes cluster for use with SkyPilot.
@@ -1337,7 +1337,7 @@ manually.
 ### `sky.list_accelerator_counts`
 
 ```python
-sky.list_accelerator_counts(gpus_only: bool = True, name_filter: Optional[str] = None, region_filter: Optional[str] = None, quantity_filter: Optional[int] = None, clouds: Optional[Union[List[str], str]] = None) -> server_common.RequestId[Dict[str, List[float]]]
+sky.list_accelerator_counts(gpus_only: bool = True, name_filter: str | None = None, region_filter: str | None = None, quantity_filter: int | None = None, clouds: list[str] | str | None = None) -> server_common.RequestId[dict[str, list[float]]]
 ```
 
 Lists all accelerators offered by Sky and available counts.
@@ -1360,7 +1360,7 @@ Lists all accelerators offered by Sky and available counts.
 ### `sky.local_down`
 
 ```python
-sky.local_down(name: Optional[str]) -> server_common.RequestId[None]
+sky.local_down(name: str | None) -> server_common.RequestId[None]
 ```
 
 Tears down the Kubernetes cluster started by local_up.
@@ -1368,7 +1368,7 @@ Tears down the Kubernetes cluster started by local_up.
 ### `sky.local_up`
 
 ```python
-sky.local_up(gpus: bool, name: Optional[str] = None, port_start: Optional[int] = None) -> server_common.RequestId[None]
+sky.local_up(gpus: bool, name: str | None = None, port_start: int | None = None) -> server_common.RequestId[None]
 ```
 
 Launches a Kubernetes cluster on local machines.
@@ -1379,7 +1379,7 @@ Launches a Kubernetes cluster on local machines.
 ### `sky.realtime_slurm_gpu_availability`
 
 ```python
-sky.realtime_slurm_gpu_availability(name_filter: Optional[str] = None, quantity_filter: Optional[int] = None, slurm_cluster_name: Optional[str] = None) -> server_common.RequestId
+sky.realtime_slurm_gpu_availability(name_filter: str | None = None, quantity_filter: int | None = None, slurm_cluster_name: str | None = None) -> server_common.RequestId
 ```
 
 Gets the real-time Slurm GPU availability.
@@ -1395,7 +1395,7 @@ Gets the real-time Slurm GPU availability.
 ### `sky.slurm_node_info`
 
 ```python
-sky.slurm_node_info(slurm_cluster_name: Optional[str] = None) -> server_common.RequestId
+sky.slurm_node_info(slurm_cluster_name: str | None = None) -> server_common.RequestId
 ```
 
 Gets the resource information for all nodes in the Slurm cluster.
@@ -1411,7 +1411,7 @@ Gets the resource information for all nodes in the Slurm cluster.
 ### `sky.ssh_down`
 
 ```python
-sky.ssh_down(infra: Optional[str] = None) -> server_common.RequestId[None]
+sky.ssh_down(infra: str | None = None) -> server_common.RequestId[None]
 ```
 
 Tears down a Kubernetes cluster on SSH targets.
@@ -1426,7 +1426,7 @@ Tears down a Kubernetes cluster on SSH targets.
 ### `sky.ssh_up`
 
 ```python
-sky.ssh_up(infra: Optional[str] = None, file: Optional[str] = None) -> server_common.RequestId[None]
+sky.ssh_up(infra: str | None = None, file: str | None = None) -> server_common.RequestId[None]
 ```
 
 Deploys the SSH Node Pools defined in ~/.sky/ssh_targets.yaml.
@@ -1443,7 +1443,7 @@ Deploys the SSH Node Pools defined in ~/.sky/ssh_targets.yaml.
 ### `sky.status_kubernetes`
 
 ```python
-sky.status_kubernetes() -> server_common.RequestId[Tuple[List['kubernetes_utils.KubernetesSkyPilotClusterInfoPayload'], List['kubernetes_utils.KubernetesSkyPilotClusterInfoPayload'], List[responses.ManagedJobRecord], Optional[str]]]
+sky.status_kubernetes() -> server_common.RequestId[tuple[list['kubernetes_utils.KubernetesSkyPilotClusterInfoPayload'], list['kubernetes_utils.KubernetesSkyPilotClusterInfoPayload'], list[responses.ManagedJobRecord], str | None]]
 ```
 
 [Experimental] Gets all SkyPilot clusters and jobs
@@ -1470,7 +1470,7 @@ as managed jobs or services.
 ### `sky.stream_response`
 
 ```python
-sky.stream_response(request_id: Optional[server_common.RequestId[T]], response: 'requests.Response', output_stream: Optional['io.TextIOBase'] = None, resumable: bool = False, get_result: bool = True, relay_rich_status: bool = False) -> Optional[T]
+sky.stream_response(request_id: server_common.RequestId[T] | None, response: 'requests.Response', output_stream: Optional['io.TextIOBase'] = None, resumable: bool = False, get_result: bool = True, relay_rich_status: bool = False) -> T | None
 ```
 
 Streams the response to the console.

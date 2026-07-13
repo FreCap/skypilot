@@ -3,7 +3,7 @@
 This module provides the main entry points for recipe operations,
 including CRUD operations and deployment functionality.
 """
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any
 
 import yaml
 
@@ -20,7 +20,7 @@ from sky.utils.plugin_extensions import RecipeValidator
 logger = sky_logging.init_logger(__name__)
 
 
-def _validate_no_local_paths(config: Dict[str, Any]) -> None:
+def _validate_no_local_paths(config: dict[str, Any]) -> None:
     """Validate that recipes don't contain local file paths.
 
     Recipes are shareable templates, so they cannot reference local files
@@ -55,8 +55,8 @@ def _validate_no_local_paths(config: Dict[str, Any]) -> None:
                         f'{source!r}')
 
 
-def _validate_skypilot_yaml(content: str, recipe_type: Union[RecipeType,
-                                                             str]) -> None:
+def _validate_skypilot_yaml(content: str,
+                            recipe_type: RecipeType | str) -> None:
     """Validate YAML content against SkyPilot schema.
 
     Args:
@@ -111,7 +111,7 @@ def _validate_skypilot_yaml(content: str, recipe_type: Union[RecipeType,
         raise ValueError(f'Invalid SkyPilot YAML: {e}') from e
 
 
-def get_recipe_content(recipe_name: str) -> Tuple[str, str]:
+def get_recipe_content(recipe_name: str) -> tuple[str, str]:
     """Get recipe content and type by name.
 
     This function is used by the CLI to fetch a recipe from the Hub
@@ -133,11 +133,11 @@ def get_recipe_content(recipe_name: str) -> Tuple[str, str]:
 
 
 def list_recipes(
-    user_id: Optional[str] = None,
+    user_id: str | None = None,
     pinned_only: bool = False,
     my_recipes_only: bool = False,
-    recipe_type: Optional[str] = None,
-) -> List[Dict[str, Any]]:
+    recipe_type: str | None = None,
+) -> list[dict[str, Any]]:
     """List recipes with optional filters.
 
     By default, returns all pinned recipes plus recipes owned by the user.
@@ -162,7 +162,7 @@ def list_recipes(
     return [r.to_dict() for r in recipes]
 
 
-def get_recipe(recipe_name: str) -> Optional[Dict[str, Any]]:
+def get_recipe(recipe_name: str) -> dict[str, Any] | None:
     """Get a single recipe by name.
 
     Args:
@@ -182,9 +182,9 @@ def create_recipe(
     content: str,
     recipe_type: str,
     user_id: str,
-    user_name: Optional[str] = None,
-    description: Optional[str] = None,
-) -> Dict[str, Any]:
+    user_name: str | None = None,
+    description: str | None = None,
+) -> dict[str, Any]:
     """Create a new recipe.
 
     Args:
@@ -221,10 +221,10 @@ def create_recipe(
 def update_recipe(
     recipe_name: str,
     user_id: str,
-    user_name: Optional[str] = None,
-    description: Optional[str] = None,
-    content: Optional[str] = None,
-) -> Optional[Dict[str, Any]]:
+    user_name: str | None = None,
+    description: str | None = None,
+    content: str | None = None,
+) -> dict[str, Any] | None:
     """Update a recipe.
 
     A recipe can only be updated if it's editable.
@@ -282,7 +282,7 @@ def delete_recipe(recipe_name: str, user_id: str) -> bool:
     return recipes_db.delete_recipe(recipe_name, user_id)
 
 
-def toggle_pin(recipe_name: str, pinned: bool) -> Optional[Dict[str, Any]]:
+def toggle_pin(recipe_name: str, pinned: bool) -> dict[str, Any] | None:
     """Toggle the pinned status of a recipe.
 
     Args:

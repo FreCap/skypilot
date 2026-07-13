@@ -1,7 +1,6 @@
 """Canonical GPU names shared across backends (Kubernetes, Slurm, etc.)."""
 
 import re
-from typing import Optional
 
 # Canonical GPU names for GPU detection and labeling.
 #
@@ -77,7 +76,7 @@ _CANONICAL_GPU_MEMORY_GIB_LOWER = {
 _MEMORY_SUFFIX_RE = re.compile(r'-(\d+)\s*gb?(?:-|$)', re.IGNORECASE)
 
 
-def get_gpu_device_memory_gib(name: str) -> Optional[int]:
+def get_gpu_device_memory_gib(name: str) -> int | None:
     """Returns the single-device memory (GiB) implied by a GPU name.
 
     Resolution is intentionally scoped to the GPU families listed in

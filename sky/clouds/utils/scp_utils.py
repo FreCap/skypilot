@@ -11,7 +11,7 @@ import logging
 import os
 import time
 import typing
-from typing import Any, Dict, List, Optional
+from typing import Any
 from urllib import parse
 
 from sky.adaptors import common as adaptors_common
@@ -52,17 +52,17 @@ class Metadata:
         # In case parent directory does not exist
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
 
-    def __getitem__(self, instance_id: str) -> Dict[str, Any]:
+    def __getitem__(self, instance_id: str) -> dict[str, Any]:
         assert os.path.exists(self.path), 'Metadata file not found'
-        with open(self.path, 'r', encoding='utf-8') as f:
+        with open(self.path, encoding='utf-8') as f:
             metadata = json.load(f)
         return metadata.get(instance_id)
 
-    def __setitem__(self, instance_id: str, value: Optional[Dict[str,
-                                                                 Any]]) -> None:
+    def __setitem__(self, instance_id: str,
+                    value: dict[str, Any] | None) -> None:
         # Read from metadata file
         if os.path.exists(self.path):
-            with open(self.path, 'r', encoding='utf-8') as f:
+            with open(self.path, encoding='utf-8') as f:
                 metadata = json.load(f)
         else:
             metadata = {}
@@ -80,11 +80,11 @@ class Metadata:
         with open(self.path, 'w', encoding='utf-8') as f:
             json.dump(metadata, f)
 
-    def refresh(self, instance_ids: List[str]) -> None:
+    def refresh(self, instance_ids: list[str]) -> None:
         """Remove all tags for instances not in instance_ids."""
         if not os.path.exists(self.path):
             return
-        with open(self.path, 'r', encoding='utf-8') as f:
+        with open(self.path, encoding='utf-8') as f:
             metadata = json.load(f)
         for instance_id in list(metadata.keys()):
             if instance_id not in instance_ids:
@@ -98,7 +98,7 @@ class Metadata:
     def keys(self):
         if not os.path.exists(self.path):
             return []
-        with open(self.path, 'r', encoding='utf-8') as f:
+        with open(self.path, encoding='utf-8') as f:
             metadata = json.load(f)
             return list(metadata.keys())
 
@@ -161,7 +161,7 @@ class SCPClient:
     def __init__(self) -> None:
         self.credentials = os.path.expanduser(CREDENTIALS_PATH)
         assert os.path.exists(self.credentials), 'Credentials not found'
-        with open(self.credentials, 'r', encoding='utf-8') as f:
+        with open(self.credentials, encoding='utf-8') as f:
             lines = [line.strip() for line in f.readlines() if ' = ' in line]
             self._credentials = {
                 line.split(' = ')[0]: line.split(' = ')[1] for line in lines
@@ -244,9 +244,8 @@ class SCPClient:
                 return False
         return True
 
-    def add_security_group_rule(self, sg_id, direction,
-                                ports: Optional[List[str]],
-                                cnt: Optional[int]) -> None:
+    def add_security_group_rule(self, sg_id, direction, ports: list[str] | None,
+                                cnt: int | None) -> None:
         if ports is None:
             if direction == 'IN':
                 if cnt == 1:
@@ -299,7 +298,7 @@ class SCPClient:
         return True
 
     def add_firewall_rule(self, firewall_id, internal_ip, direction,
-                          ports: Optional[List[str]], cnt: Optional[int]):
+                          ports: list[str] | None, cnt: int | None):
         if ports is None:
             if direction == 'IN':
                 if cnt == 1:
@@ -344,12 +343,12 @@ class SCPClient:
         url = f'{API_ENDPOINT}/virtual-server/v2/virtual-servers/{instance_id}'
         return self._delete(url)
 
-    def get_instances(self) -> List[dict]:
+    def get_instances(self) -> list[dict]:
         """List existing instances."""
         url = f'{API_ENDPOINT}/virtual-server/v2/virtual-servers'
         return self._get(url)
 
-    def get_catalog(self) -> Dict[str, Any]:
+    def get_catalog(self) -> dict[str, Any]:
         """List offered instances and their availability."""
         url = f'{API_ENDPOINT}/instance-types'
         headers = self._signed_headers('GET', url)
@@ -360,7 +359,7 @@ class SCPClient:
     def get_signature(self,
                       method: str,
                       url: str,
-                      timestamp: Optional[str] = None) -> str:
+                      timestamp: str | None = None) -> str:
         if timestamp is None:
             timestamp = str(int(time.time() * 1000))
 
@@ -384,7 +383,7 @@ class SCPClient:
 
         return str(signature)
 
-    def get_nic(self, instance_id) -> List[dict]:
+    def get_nic(self, instance_id) -> list[dict]:
         url = f'{API_ENDPOINT}/virtual-server/v2/virtual-servers/{instance_id}/nics'  # pylint: disable=line-too-long
         return self._get(url)
 
@@ -395,15 +394,15 @@ class SCPClient:
                 return nic['natIp']
         return None
 
-    def get_zones(self) -> List[dict]:
+    def get_zones(self) -> list[dict]:
         url = f'{API_ENDPOINT}/project/v3/projects/{self.project_id}/zones'
         return self._get(url)
 
-    def get_vpcs(self, service_zone_id) -> List[dict]:
+    def get_vpcs(self, service_zone_id) -> list[dict]:
         url = f'{API_ENDPOINT}/vpc/v2/vpcs?serviceZoneId={service_zone_id}'
         return self._get(url)
 
-    def get_subnets(self) -> List[dict]:
+    def get_subnets(self) -> list[dict]:
         url = f'{API_ENDPOINT}/subnet/v2/subnets?subnetTypes=PUBLIC'
         return self._get(url)
 

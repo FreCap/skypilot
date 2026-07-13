@@ -18,7 +18,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from typing import Optional, Tuple
 
 import colorama
 import filelock
@@ -231,7 +230,7 @@ def _build_sky_wheel() -> pathlib.Path:
         return wheel_dir / wheel_path.name
 
 
-def build_sky_wheel() -> Tuple[pathlib.Path, str]:
+def build_sky_wheel() -> tuple[pathlib.Path, str]:
     """Build a wheel for SkyPilot, or reuse a cached wheel.
 
     Caller is responsible for removing the wheel.
@@ -243,7 +242,7 @@ def build_sky_wheel() -> Tuple[pathlib.Path, str]:
         - wheel_hash: The wheel content hash.
     """
 
-    def _get_latest_modification_time(path: pathlib.Path) -> Optional[float]:
+    def _get_latest_modification_time(path: pathlib.Path) -> float | None:
         max_time = -1.
         if not path.exists():
             return max_time

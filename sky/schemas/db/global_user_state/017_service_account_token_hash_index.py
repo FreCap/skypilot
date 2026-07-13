@@ -11,16 +11,16 @@ duplicate-hash insertion bugs.
 
 """
 # pylint: disable=invalid-name
-from typing import Sequence, Union
+from collections.abc import Sequence
 
 from alembic import op
 import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = '017'
-down_revision: Union[str, Sequence[str], None] = '016'
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+down_revision: str | Sequence[str] | None = '016'
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 _INDEX_NAME = 'ix_service_account_tokens_token_hash'
 _TABLE_NAME = 'service_account_tokens'

@@ -1,7 +1,8 @@
 """SDK for SkyServe."""
+from collections.abc import Sequence
 import json
 import typing
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Optional, Union
 
 from sky.serve.client import impl
 from sky.server import common as server_common
@@ -26,7 +27,7 @@ def up(
     # Internal only:
     # pylint: disable=invalid-name
     _need_confirmation: bool = False
-) -> server_common.RequestId[Tuple[str, str]]:
+) -> server_common.RequestId[tuple[str, str]]:
     """Spins up a service.
 
     Please refer to the sky.cli.serve_up for the document.
@@ -91,7 +92,7 @@ def update(
 @usage_lib.entrypoint
 @server_common.check_server_healthy_or_start
 def down(
-    service_names: Optional[Union[str, List[str]]],
+    service_names: str | list[str] | None,
     all: bool = False,  # pylint: disable=redefined-builtin
     purge: bool = False
 ) -> server_common.RequestId[None]:
@@ -156,9 +157,9 @@ def terminate_replica(service_name: str, replica_id: int,
 @usage_lib.entrypoint
 @server_common.check_server_healthy_or_start
 def status(
-    service_names: Optional[Union[str, List[str]]],
+    service_names: str | list[str] | None,
     summary_only: bool = False,
-) -> server_common.RequestId[List[Dict[str, Any]]]:
+) -> server_common.RequestId[list[dict[str, Any]]]:
     """Gets service statuses.
 
     If service_names is given, return those services. Otherwise, return all
@@ -225,10 +226,10 @@ def status(
 @rest.retry_transient_errors()
 def tail_logs(service_name: str,
               target: Union[str, 'serve_utils.ServiceComponent'],
-              replica_id: Optional[int] = None,
+              replica_id: int | None = None,
               follow: bool = True,
               output_stream: Optional['io.TextIOBase'] = None,
-              tail: Optional[int] = None) -> None:
+              tail: int | None = None) -> None:
     """Tails logs for a service.
 
     Usage:
@@ -301,15 +302,15 @@ def tail_logs(service_name: str,
 
 @usage_lib.entrypoint
 @server_common.check_server_healthy_or_start
-def sync_down_logs(service_name: str,
-                   local_dir: str,
-                   *,
-                   targets: Optional[Union[
-                       str, 'serve_utils.ServiceComponent',
-                       Sequence[Union[str,
-                                      'serve_utils.ServiceComponent']]]] = None,
-                   replica_ids: Optional[List[int]] = None,
-                   tail: Optional[int] = None) -> None:
+def sync_down_logs(
+        service_name: str,
+        local_dir: str,
+        *,
+        targets: Union[str, 'serve_utils.ServiceComponent',
+                       Sequence[Union[str, 'serve_utils.ServiceComponent']]] |
+    None = None,
+        replica_ids: list[int] | None = None,
+        tail: int | None = None) -> None:
     """Sync down logs from the service components to a local directory.
 
     This function syncs logs from the specified service components (controller,

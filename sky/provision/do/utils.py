@@ -6,7 +6,7 @@ https://github.com/digitalocean/pydo/blob/main/examples/poc_droplets_volumes_ssh
 
 import copy
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any
 import urllib
 import uuid
 
@@ -132,7 +132,7 @@ def ssh_key_id(public_key: str):
     return _ssh_key_id
 
 
-def _create_volume(request: Dict[str, Any]) -> Dict[str, Any]:
+def _create_volume(request: dict[str, Any]) -> dict[str, Any]:
     try:
         resp = client().volumes.create(body=request)
         volume = resp['volume']
@@ -144,7 +144,7 @@ def _create_volume(request: Dict[str, Any]) -> Dict[str, Any]:
         return volume
 
 
-def _create_droplet(request: Dict[str, Any]) -> Dict[str, Any]:
+def _create_droplet(request: dict[str, Any]) -> dict[str, Any]:
     try:
         resp = client().droplets.create(body=request)
         droplet_id = resp['droplet']['id']
@@ -159,7 +159,7 @@ def _create_droplet(request: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def create_instance(region: str, cluster_name_on_cloud: str, instance_type: str,
-                    config: common.ProvisionConfig) -> Dict[str, Any]:
+                    config: common.ProvisionConfig) -> dict[str, Any]:
     """Creates a instance and mounts the requested block storage
 
     Args:
@@ -220,7 +220,7 @@ def create_instance(region: str, cluster_name_on_cloud: str, instance_type: str,
     return instance
 
 
-def start_instance(instance: Dict[str, Any]):
+def start_instance(instance: dict[str, Any]):
     try:
         client().droplet_actions.post(droplet_id=instance['id'],
                                       body={'type': 'power_on'})
@@ -230,7 +230,7 @@ def start_instance(instance: Dict[str, Any]):
         ) from err
 
 
-def stop_instance(instance: Dict[str, Any]):
+def stop_instance(instance: dict[str, Any]):
     try:
         client().droplet_actions.post(
             droplet_id=instance['id'],
@@ -242,7 +242,7 @@ def stop_instance(instance: Dict[str, Any]):
         ) from err
 
 
-def down_instance(instance: Dict[str, Any]):
+def down_instance(instance: dict[str, Any]):
     # We use dangerous destroy to atomically delete
     # block storage and instance for autodown
     try:
@@ -256,7 +256,7 @@ def down_instance(instance: Dict[str, Any]):
         ) from err
 
 
-def rename_instance(instance: Dict[str, Any], new_name: str):
+def rename_instance(instance: dict[str, Any], new_name: str):
     try:
         client().droplet_actions.rename(droplet=instance['id'],
                                         body={
@@ -269,14 +269,13 @@ def rename_instance(instance: Dict[str, Any], new_name: str):
         ) from err
 
 
-def filter_instances(
-        cluster_name_on_cloud: str,
-        status_filters: Optional[List[str]] = None) -> Dict[str, Any]:
+def filter_instances(cluster_name_on_cloud: str,
+                     status_filters: list[str] | None = None) -> dict[str, Any]:
     """Returns Dict mapping instance name
     to instance metadata filtered by status
     """
 
-    filtered_instances: Dict[str, Any] = {}
+    filtered_instances: dict[str, Any] = {}
     page = 1
     paginated = True
     while paginated:

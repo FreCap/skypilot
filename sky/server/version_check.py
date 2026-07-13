@@ -4,7 +4,6 @@ import json
 import pathlib
 import re
 import time
-from typing import Optional
 
 from packaging import version as version_lib
 import requests
@@ -23,7 +22,7 @@ CACHE_TTL_SECONDS = 24 * 60 * 60
 DEV_VERSION_PATTERN = re.compile(r'^.*-dev\d*$', re.IGNORECASE)
 
 # Version info cache
-_version_cache: Optional[dict] = None
+_version_cache: dict | None = None
 
 
 def _is_dev_version(version_str: str) -> bool:
@@ -31,7 +30,7 @@ def _is_dev_version(version_str: str) -> bool:
     return bool(DEV_VERSION_PATTERN.match(version_str))
 
 
-def _load_cache() -> Optional[dict]:
+def _load_cache() -> dict | None:
     """Load version cache from disk."""
     global _version_cache
     if _version_cache is not None:
@@ -41,7 +40,7 @@ def _load_cache() -> Optional[dict]:
         return None
 
     try:
-        with open(VERSION_CACHE_FILE, 'r', encoding='utf-8') as f:
+        with open(VERSION_CACHE_FILE, encoding='utf-8') as f:
             cache = json.load(f)
             _version_cache = cache
             return cache
@@ -72,7 +71,7 @@ def _is_cache_valid(cache: dict) -> bool:
     return (current_time - cached_time) < CACHE_TTL_SECONDS
 
 
-def _check_pypi_release() -> Optional[str]:
+def _check_pypi_release() -> str | None:
     """Check pypi.org for latest release version."""
     try:
         # Check pypi.org for skypilot
@@ -89,7 +88,7 @@ def _check_pypi_release() -> Optional[str]:
     return None
 
 
-def _check_pypi_versions() -> Optional[str]:
+def _check_pypi_versions() -> str | None:
     """Check PyPI for latest stable release version.
 
     Returns:
@@ -98,7 +97,7 @@ def _check_pypi_versions() -> Optional[str]:
     return _check_pypi_release()
 
 
-def get_latest_versions() -> Optional[str]:
+def get_latest_versions() -> str | None:
     """Get latest stable release version from cache or PyPI.
 
     Returns:
@@ -121,7 +120,7 @@ def get_latest_versions() -> Optional[str]:
     return release_version
 
 
-def get_latest_version_for_current() -> Optional[str]:
+def get_latest_version_for_current() -> str | None:
     """Get latest stable release version for notifications.
 
     Returns:

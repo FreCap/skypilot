@@ -17,7 +17,7 @@ Example usage in core SkyPilot:
     # Get cached node info (returns None if not registered or unavailable)
     node_info = NodeInfoSource.get(context='my-k8s-context')
 """
-from typing import Callable, Optional
+from collections.abc import Callable
 
 from sky import models
 from sky import sky_logging
@@ -26,7 +26,7 @@ logger = sky_logging.init_logger(__name__)
 
 # Type alias for the node info provider function
 # Function signature: (context: str) -> Optional[KubernetesNodesInfo]
-NodeInfoProviderFunc = Callable[[str], Optional[models.KubernetesNodesInfo]]
+NodeInfoProviderFunc = Callable[[str], models.KubernetesNodesInfo | None]
 
 
 class NodeInfoSource:
@@ -42,7 +42,7 @@ class NodeInfoSource:
     cached node info before falling back to direct Kubernetes API calls.
     """
 
-    _provider_func: Optional[NodeInfoProviderFunc] = None
+    _provider_func: NodeInfoProviderFunc | None = None
 
     @classmethod
     def register(cls, provider: NodeInfoProviderFunc) -> None:
@@ -65,7 +65,7 @@ class NodeInfoSource:
         return cls._provider_func is not None
 
     @classmethod
-    def get(cls, context: str) -> Optional[models.KubernetesNodesInfo]:
+    def get(cls, context: str) -> models.KubernetesNodesInfo | None:
         """Get node info from the registered provider.
 
         Args:

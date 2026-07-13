@@ -1,6 +1,6 @@
 """Mithril instance provisioning."""
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
 from sky import sky_logging
 from sky.provision import common
@@ -14,8 +14,7 @@ logger = sky_logging.init_logger(__name__)
 
 
 def _resolve_config(
-    provider_config: Optional[Dict[str,
-                                   Any]] = None,) -> Optional[Dict[str, str]]:
+    provider_config: dict[str, Any] | None = None,) -> dict[str, str] | None:
     """Resolve Mithril API config from stored provider_config.
 
     If provider_config contains a profile, resolves api_key and api_url
@@ -41,10 +40,10 @@ def _resolve_config(
 
 def _filter_instances(
     cluster_name_on_cloud: str,
-    status_in: Optional[List[MithrilStatus]] = None,
-    status_not_in: Optional[List[MithrilStatus]] = None,
-    config: Optional[Dict[str, str]] = None,
-) -> Dict[str, Dict[str, Any]]:
+    status_in: list[MithrilStatus] | None = None,
+    status_not_in: list[MithrilStatus] | None = None,
+    config: dict[str, str] | None = None,
+) -> dict[str, dict[str, Any]]:
     """Filter instances by cluster name and status.
 
     Args:
@@ -57,7 +56,7 @@ def _filter_instances(
                  f'status_in={status_in}, status_not_in={status_not_in}')
 
     instances = utils.list_instances(config=config)
-    filtered_instances: Dict[str, Dict[str, Any]] = {}
+    filtered_instances: dict[str, dict[str, Any]] = {}
 
     for instance_id, instance in instances.items():
         instance_name = instance['name']
@@ -95,7 +94,7 @@ def run_instances(
     logger.debug(f'Config: {config}')
 
     # Check if there's a paused bid that needs to be resumed
-    resumed_instance_ids: List[str] = []
+    resumed_instance_ids: list[str] = []
     if config.resume_stopped_nodes:
         bid = utils.get_bid(cluster_name_on_cloud)
         if bid:
@@ -212,7 +211,7 @@ def run_instances(
 
 def terminate_instances(
     cluster_name_on_cloud: str,
-    provider_config: Optional[dict] = None,
+    provider_config: dict | None = None,
     worker_only: bool = False,
 ) -> None:
     """Terminate all instances in the cluster by canceling their bid.
@@ -241,7 +240,7 @@ def terminate_instances(
 def get_cluster_info(
     region: str,
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
 ) -> common.ClusterInfo:
     """Returns information about the cluster.
 
@@ -261,7 +260,7 @@ def get_cluster_info(
         ],
         config=config,
     )
-    instances: Dict[str, List[common.InstanceInfo]] = {}
+    instances: dict[str, list[common.InstanceInfo]] = {}
     head_instance_id = None
     ssh_user = 'ubuntu'  # Default SSH user for Mithril
 
@@ -297,17 +296,16 @@ def get_cluster_info(
 def query_instances(
     cluster_name: str,
     cluster_name_on_cloud: str,
-    provider_config: Optional[dict] = None,
+    provider_config: dict | None = None,
     non_terminated_only: bool = True,
     retry_if_missing: bool = False,
-) -> Dict[str, Tuple[Optional['status_lib.ClusterStatus'], Optional[str]]]:
+) -> dict[str, tuple[Optional['status_lib.ClusterStatus'], str | None]]:
     """Returns the status of the specified instances for Mithril."""
     del cluster_name, retry_if_missing  # unused
     config = _resolve_config(provider_config)
     instances = _filter_instances(cluster_name_on_cloud, config=config)
 
-    statuses: Dict[str, Tuple[Optional['status_lib.ClusterStatus'],
-                              Optional[str]]] = {}
+    statuses: dict[str, tuple[status_lib.ClusterStatus | None, str | None]] = {}
     for instance_id, instance in instances.items():
         cluster_status = utils.to_cluster_status(instance['status'])
         if non_terminated_only and cluster_status is None:
@@ -317,7 +315,7 @@ def query_instances(
 
 
 def wait_instances(region: str, cluster_name_on_cloud: str,
-                   state: Optional[status_lib.ClusterStatus]) -> None:
+                   state: status_lib.ClusterStatus | None) -> None:
     """Wait for instances to reach the desired state.
 
     For Mithril, waiting is done in run_instances() via wait_for_bid() and
@@ -328,7 +326,7 @@ def wait_instances(region: str, cluster_name_on_cloud: str,
 
 def stop_instances(
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     worker_only: bool = False,
 ) -> None:
     """Stop running instances by pausing the bid.
@@ -354,8 +352,8 @@ def stop_instances(
 
 def cleanup_ports(
     cluster_name_on_cloud: str,
-    provider_config: Optional[dict] = None,
-    ports: Optional[list] = None,
+    provider_config: dict | None = None,
+    ports: list | None = None,
 ) -> None:
     """Cleanup ports. Not supported for Mithril."""
     raise NotImplementedError('cleanup_ports is not supported for Mithril')
@@ -363,7 +361,7 @@ def cleanup_ports(
 
 def cleanup_custom_multi_network(
     cluster_name_on_cloud: str,
-    provider_config: Dict[str, Any],
+    provider_config: dict[str, Any],
     failover: bool = False,
 ) -> None:
     """Cleanup custom multi-network. Not supported for Mithril."""
@@ -374,7 +372,7 @@ def cleanup_custom_multi_network(
 def open_ports(
     cluster_name_on_cloud: str,
     ports: list,
-    provider_config: Optional[dict] = None,
+    provider_config: dict | None = None,
 ) -> None:
     """Open ports. Not supported for Mithril."""
     raise NotImplementedError('open_ports is not supported for Mithril')

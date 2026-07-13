@@ -14,7 +14,7 @@ import asyncio
 import dataclasses
 import logging
 import typing
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Optional, Union
 
 import aiohttp
 import colorama
@@ -64,8 +64,8 @@ class StreamConfig:
         output_stream: The output stream to write to. If None, print to the
             console.
     """
-    log_path: Optional[str] = None
-    tail: Optional[int] = None
+    log_path: str | None = None
+    tail: int | None = None
     follow: bool = True
     output_stream: Optional['io.TextIOBase'] = None
 
@@ -146,7 +146,7 @@ async def get(request_id: str) -> Any:
 @usage_lib.entrypoint
 @server_common.check_server_healthy_or_start
 @annotations.client_api
-async def stream_response_async(request_id: Optional[str],
+async def stream_response_async(request_id: str | None,
                                 response: 'aiohttp.ClientResponse',
                                 output_stream: Optional['io.TextIOBase'] = None,
                                 resumable: bool = False,
@@ -208,7 +208,7 @@ async def stream_response_async(request_id: Optional[str],
 
 
 async def _stream_and_get(
-    request_id: Optional[str] = None,
+    request_id: str | None = None,
     config: StreamConfig = DEFAULT_STREAM_CONFIG,
 ) -> Any:
     """Streams the logs of a request or a log file and gets the final result.
@@ -223,9 +223,9 @@ async def _stream_and_get(
 
 
 async def stream_and_get(
-    request_id: Optional[str] = None,
-    log_path: Optional[str] = None,
-    tail: Optional[int] = None,
+    request_id: str | None = None,
+    log_path: str | None = None,
+    tail: int | None = None,
     follow: bool = True,
     output_stream: Optional['io.TextIOBase'] = None,
 ) -> Any:
@@ -290,11 +290,11 @@ async def stream_and_get(
 @usage_lib.entrypoint
 @annotations.client_api
 async def check(
-    infra_list: Optional[Tuple[str, ...]],
+    infra_list: tuple[str, ...] | None,
     verbose: bool,
-    workspace: Optional[str] = None,
-    stream_logs: Optional[StreamConfig] = DEFAULT_STREAM_CONFIG
-) -> Dict[str, List[str]]:
+    workspace: str | None = None,
+    stream_logs: StreamConfig | None = DEFAULT_STREAM_CONFIG
+) -> dict[str, list[str]]:
     """Async version of check() that checks the credentials to enable clouds."""
     request_id = await asyncio.to_thread(sdk.check, infra_list, verbose,
                                          workspace)
@@ -307,10 +307,9 @@ async def check(
 @usage_lib.entrypoint
 @annotations.client_api
 async def enabled_clouds(
-        workspace: Optional[str] = None,
+        workspace: str | None = None,
         expand: bool = False,
-        stream_logs: Optional[StreamConfig] = DEFAULT_STREAM_CONFIG
-) -> List[str]:
+        stream_logs: StreamConfig | None = DEFAULT_STREAM_CONFIG) -> list[str]:
     """Async version of enabled_clouds() that gets the enabled clouds."""
     request_id = await asyncio.to_thread(sdk.enabled_clouds, workspace, expand)
     if stream_logs is not None:
@@ -323,15 +322,15 @@ async def enabled_clouds(
 @annotations.client_api
 async def list_accelerators(
     gpus_only: bool = True,
-    name_filter: Optional[str] = None,
-    region_filter: Optional[str] = None,
-    quantity_filter: Optional[int] = None,
-    clouds: Optional[Union[List[str], str]] = None,
+    name_filter: str | None = None,
+    region_filter: str | None = None,
+    quantity_filter: int | None = None,
+    clouds: list[str] | str | None = None,
     all_regions: bool = False,
     require_price: bool = True,
     case_sensitive: bool = True,
-    stream_logs: Optional[StreamConfig] = DEFAULT_STREAM_CONFIG
-) -> Dict[str, List[catalog.common.InstanceTypeInfo]]:
+    stream_logs: StreamConfig | None = DEFAULT_STREAM_CONFIG
+) -> dict[str, list[catalog.common.InstanceTypeInfo]]:
     """Async version of list_accelerators() that lists the names of all
     accelerators offered by Sky."""
     request_id = await asyncio.to_thread(sdk.list_accelerators, gpus_only,
@@ -348,12 +347,12 @@ async def list_accelerators(
 @annotations.client_api
 async def list_accelerator_counts(
     gpus_only: bool = True,
-    name_filter: Optional[str] = None,
-    region_filter: Optional[str] = None,
-    quantity_filter: Optional[int] = None,
-    clouds: Optional[Union[List[str], str]] = None,
-    stream_logs: Optional[StreamConfig] = DEFAULT_STREAM_CONFIG
-) -> Dict[str, List[int]]:
+    name_filter: str | None = None,
+    region_filter: str | None = None,
+    quantity_filter: int | None = None,
+    clouds: list[str] | str | None = None,
+    stream_logs: StreamConfig | None = DEFAULT_STREAM_CONFIG
+) -> dict[str, list[int]]:
     """Async version of list_accelerator_counts() that lists all accelerators
       offered by Sky and available counts."""
     request_id = await asyncio.to_thread(sdk.list_accelerator_counts, gpus_only,
@@ -370,10 +369,8 @@ async def list_accelerator_counts(
 async def optimize(
         dag: 'sky.Dag',
         minimize: common.OptimizeTarget = common.OptimizeTarget.COST,
-        admin_policy_request_options: Optional[
-            admin_policy.RequestOptions] = None,
-        stream_logs: Optional[StreamConfig] = DEFAULT_STREAM_CONFIG
-) -> 'sky.Dag':
+        admin_policy_request_options: admin_policy.RequestOptions | None = None,
+        stream_logs: StreamConfig | None = DEFAULT_STREAM_CONFIG) -> 'sky.Dag':
     """Async version of optimize() that finds the best execution plan for the
       given DAG."""
     request_id = await asyncio.to_thread(sdk.optimize, dag, minimize,
@@ -387,8 +384,8 @@ async def optimize(
 @usage_lib.entrypoint
 @annotations.client_api
 async def workspaces(
-    stream_logs: Optional[StreamConfig] = DEFAULT_STREAM_CONFIG
-) -> Dict[str, Any]:
+        stream_logs: StreamConfig | None = DEFAULT_STREAM_CONFIG
+) -> dict[str, Any]:
     """Async version of workspaces() that gets the workspaces."""
     request_id = await asyncio.to_thread(sdk.workspaces)
     if stream_logs is not None:
@@ -401,16 +398,16 @@ async def workspaces(
 @annotations.client_api
 async def launch(
     task: Union['sky.Task', 'sky.Dag'],
-    cluster_name: Optional[str] = None,
+    cluster_name: str | None = None,
     retry_until_up: bool = False,
-    idle_minutes_to_autostop: Optional[int] = None,
+    idle_minutes_to_autostop: int | None = None,
     wait_for: Optional['autostop_lib.AutostopWaitFor'] = None,
     dryrun: bool = False,
     down: bool = False,  # pylint: disable=redefined-outer-name
     backend: Optional['backends.Backend'] = None,
     optimize_target: common.OptimizeTarget = common.OptimizeTarget.COST,
     no_setup: bool = False,
-    clone_disk_from: Optional[str] = None,
+    clone_disk_from: str | None = None,
     fast: bool = False,
     # Internal only:
     # pylint: disable=invalid-name
@@ -418,8 +415,8 @@ async def launch(
     _is_launched_by_jobs_controller: bool = False,
     _is_launched_by_sky_serve_controller: bool = False,
     _disable_controller_check: bool = False,
-    stream_logs: Optional[StreamConfig] = DEFAULT_STREAM_CONFIG,
-) -> Tuple[Optional[int], Optional['backends.ResourceHandle']]:
+    stream_logs: StreamConfig | None = DEFAULT_STREAM_CONFIG,
+) -> tuple[int | None, Optional['backends.ResourceHandle']]:
     """Async version of launch() that launches a cluster or task."""
     request_id = await asyncio.to_thread(
         sdk.launch, task, cluster_name, retry_until_up,
@@ -437,12 +434,12 @@ async def launch(
 @annotations.client_api
 async def exec(  # pylint: disable=redefined-builtin
     task: Union['sky.Task', 'sky.Dag'],
-    cluster_name: Optional[str] = None,
+    cluster_name: str | None = None,
     dryrun: bool = False,
     down: bool = False,  # pylint: disable=redefined-outer-name
     backend: Optional['backends.Backend'] = None,
-    stream_logs: Optional[StreamConfig] = DEFAULT_STREAM_CONFIG,
-) -> Tuple[Optional[int], Optional['backends.ResourceHandle']]:
+    stream_logs: StreamConfig | None = DEFAULT_STREAM_CONFIG,
+) -> tuple[int | None, Optional['backends.ResourceHandle']]:
     """Async version of exec() that executes a task on an existing cluster."""
     request_id = await asyncio.to_thread(sdk.exec, task, cluster_name, dryrun,
                                          down, backend)
@@ -455,7 +452,7 @@ async def exec(  # pylint: disable=redefined-builtin
 @usage_lib.entrypoint
 @annotations.client_api
 async def tail_logs(cluster_name: str,
-                    job_id: Optional[int],
+                    job_id: int | None,
                     follow: bool,
                     tail: int = 0,
                     output_stream: Optional['io.TextIOBase'] = None) -> int:
@@ -467,7 +464,7 @@ async def tail_logs(cluster_name: str,
 @usage_lib.entrypoint
 @annotations.client_api
 async def download_logs(cluster_name: str,
-                        job_ids: Optional[List[str]]) -> Dict[str, str]:
+                        job_ids: list[str] | None) -> dict[str, str]:
     """Async version of download_logs() that downloads the logs of jobs."""
     return await asyncio.to_thread(sdk.download_logs, cluster_name, job_ids)
 
@@ -476,12 +473,12 @@ async def download_logs(cluster_name: str,
 @annotations.client_api
 async def start(
     cluster_name: str,
-    idle_minutes_to_autostop: Optional[int] = None,
+    idle_minutes_to_autostop: int | None = None,
     wait_for: Optional['autostop_lib.AutostopWaitFor'] = None,
     retry_until_up: bool = False,
     down: bool = False,  # pylint: disable=redefined-outer-name
     force: bool = False,
-    stream_logs: Optional[StreamConfig] = DEFAULT_STREAM_CONFIG,
+    stream_logs: StreamConfig | None = DEFAULT_STREAM_CONFIG,
 ) -> 'backends.CloudVmRayResourceHandle':
     """Async version of start() that restarts a cluster."""
     request_id = await asyncio.to_thread(sdk.start, cluster_name,
@@ -499,8 +496,8 @@ async def down(
         cluster_name: str,
         purge: bool = False,
         graceful: bool = False,
-        graceful_timeout: Optional[int] = None,
-        stream_logs: Optional[StreamConfig] = DEFAULT_STREAM_CONFIG) -> None:
+        graceful_timeout: int | None = None,
+        stream_logs: StreamConfig | None = DEFAULT_STREAM_CONFIG) -> None:
     """Async version of down() that tears down a cluster."""
     request_id = await asyncio.to_thread(sdk.down, cluster_name, purge,
                                          graceful, graceful_timeout)
@@ -516,8 +513,8 @@ async def stop(
         cluster_name: str,
         purge: bool = False,
         graceful: bool = False,
-        graceful_timeout: Optional[int] = None,
-        stream_logs: Optional[StreamConfig] = DEFAULT_STREAM_CONFIG) -> None:
+        graceful_timeout: int | None = None,
+        stream_logs: StreamConfig | None = DEFAULT_STREAM_CONFIG) -> None:
     """Async version of stop() that stops a cluster."""
     request_id = await asyncio.to_thread(sdk.stop, cluster_name, purge,
                                          graceful, graceful_timeout)
@@ -534,7 +531,7 @@ async def autostop(
     idle_minutes: int,
     wait_for: Optional['autostop_lib.AutostopWaitFor'] = None,
     down: bool = False,  # pylint: disable=redefined-outer-name
-    stream_logs: Optional[StreamConfig] = DEFAULT_STREAM_CONFIG
+    stream_logs: StreamConfig | None = DEFAULT_STREAM_CONFIG
 ) -> None:
     """Async version of autostop() that schedules an autostop/autodown for a
       cluster."""
@@ -552,8 +549,8 @@ async def queue(
     cluster_name: str,
     skip_finished: bool = False,
     all_users: bool = False,
-    stream_logs: Optional[StreamConfig] = DEFAULT_STREAM_CONFIG
-) -> List[responses.ClusterJobRecord]:
+    stream_logs: StreamConfig | None = DEFAULT_STREAM_CONFIG
+) -> list[responses.ClusterJobRecord]:
     """Async version of queue() that gets the job queue of a cluster."""
     request_id = await asyncio.to_thread(sdk.queue, cluster_name, skip_finished,
                                          all_users)
@@ -567,9 +564,9 @@ async def queue(
 @annotations.client_api
 async def job_status(
     cluster_name: str,
-    job_ids: Optional[List[int]] = None,
-    stream_logs: Optional[StreamConfig] = DEFAULT_STREAM_CONFIG
-) -> Dict[Optional[int], Optional['job_lib.JobStatus']]:
+    job_ids: list[int] | None = None,
+    stream_logs: StreamConfig | None = DEFAULT_STREAM_CONFIG
+) -> dict[int | None, Optional['job_lib.JobStatus']]:
     """Async version of job_status() that gets the status of jobs on a
       cluster."""
     request_id = await asyncio.to_thread(sdk.job_status, cluster_name, job_ids)
@@ -585,10 +582,10 @@ async def cancel(
         cluster_name: str,
         all: bool = False,  # pylint: disable=redefined-builtin
         all_users: bool = False,
-        job_ids: Optional[List[int]] = None,
+        job_ids: list[int] | None = None,
         # pylint: disable=invalid-name
         _try_cancel_if_cluster_is_init: bool = False,
-        stream_logs: Optional[StreamConfig] = DEFAULT_STREAM_CONFIG) -> None:
+        stream_logs: StreamConfig | None = DEFAULT_STREAM_CONFIG) -> None:
     """Async version of cancel() that cancels jobs on a cluster."""
     request_id = await asyncio.to_thread(sdk.cancel, cluster_name, all,
                                          all_users, job_ids,
@@ -602,13 +599,13 @@ async def cancel(
 @usage_lib.entrypoint
 @annotations.client_api
 async def status(
-    cluster_names: Optional[List[str]] = None,
+    cluster_names: list[str] | None = None,
     refresh: common.StatusRefreshMode = common.StatusRefreshMode.NONE,
     all_users: bool = False,
-    stream_logs: Optional[StreamConfig] = DEFAULT_STREAM_CONFIG,
+    stream_logs: StreamConfig | None = DEFAULT_STREAM_CONFIG,
     *,
     _include_credentials: bool = False,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Async version of status() that gets cluster statuses."""
     request_id = await asyncio.to_thread(
         sdk.status,
@@ -625,10 +622,10 @@ async def status(
 @usage_lib.entrypoint
 @annotations.client_api
 async def endpoints(
-    cluster: str,
-    port: Optional[Union[int, str]] = None,
-    stream_logs: Optional[StreamConfig] = DEFAULT_STREAM_CONFIG
-) -> Dict[int, str]:
+        cluster: str,
+        port: int | str | None = None,
+        stream_logs: StreamConfig | None = DEFAULT_STREAM_CONFIG
+) -> dict[int, str]:
     """Async version of endpoints() that gets the endpoint for a given cluster
       and port number."""
     request_id = await asyncio.to_thread(sdk.endpoints, cluster, port)
@@ -641,8 +638,8 @@ async def endpoints(
 @usage_lib.entrypoint
 @annotations.client_api
 async def cost_report(
-    stream_logs: Optional[StreamConfig] = DEFAULT_STREAM_CONFIG
-) -> List[Dict[str, Any]]:
+    stream_logs: StreamConfig | None = DEFAULT_STREAM_CONFIG
+) -> list[dict[str, Any]]:
     """Async version of cost_report() that gets all cluster cost reports."""
     request_id = await asyncio.to_thread(sdk.cost_report)
     if stream_logs is not None:
@@ -654,8 +651,8 @@ async def cost_report(
 @usage_lib.entrypoint
 @annotations.client_api
 async def storage_ls(
-    stream_logs: Optional[StreamConfig] = DEFAULT_STREAM_CONFIG
-) -> List[Dict[str, Any]]:
+    stream_logs: StreamConfig | None = DEFAULT_STREAM_CONFIG
+) -> list[dict[str, Any]]:
     """Async version of storage_ls() that gets the storages."""
     request_id = await asyncio.to_thread(sdk.storage_ls)
     if stream_logs is not None:
@@ -668,7 +665,7 @@ async def storage_ls(
 @annotations.client_api
 async def storage_delete(
         name: str,
-        stream_logs: Optional[StreamConfig] = DEFAULT_STREAM_CONFIG) -> None:
+        stream_logs: StreamConfig | None = DEFAULT_STREAM_CONFIG) -> None:
     """Async version of storage_delete() that deletes a storage."""
     request_id = await asyncio.to_thread(sdk.storage_delete, name)
     if stream_logs is not None:
@@ -681,9 +678,9 @@ async def storage_delete(
 @annotations.client_api
 async def local_up(
         gpus: bool,
-        name: Optional[str] = None,
-        port_start: Optional[int] = None,
-        stream_logs: Optional[StreamConfig] = DEFAULT_STREAM_CONFIG) -> None:
+        name: str | None = None,
+        port_start: int | None = None,
+        stream_logs: StreamConfig | None = DEFAULT_STREAM_CONFIG) -> None:
     """Async version of local_up() that launches a Kubernetes cluster on
     local machines."""
     request_id = await asyncio.to_thread(sdk.local_up, gpus, name, port_start)
@@ -696,8 +693,8 @@ async def local_up(
 @usage_lib.entrypoint
 @annotations.client_api
 async def local_down(
-        name: Optional[str] = None,
-        stream_logs: Optional[StreamConfig] = DEFAULT_STREAM_CONFIG) -> None:
+        name: str | None = None,
+        stream_logs: StreamConfig | None = DEFAULT_STREAM_CONFIG) -> None:
     """Async version of local_down() that tears down the Kubernetes cluster
     started by local_up."""
     request_id = await asyncio.to_thread(sdk.local_down, name)
@@ -710,8 +707,8 @@ async def local_down(
 @usage_lib.entrypoint
 @annotations.client_api
 async def ssh_up(
-        infra: Optional[str] = None,
-        stream_logs: Optional[StreamConfig] = DEFAULT_STREAM_CONFIG) -> None:
+        infra: str | None = None,
+        stream_logs: StreamConfig | None = DEFAULT_STREAM_CONFIG) -> None:
     """Async version of ssh_up() that deploys the SSH Node Pools defined in
       ~/.sky/ssh_targets.yaml."""
     request_id = await asyncio.to_thread(sdk.ssh_up, infra)
@@ -724,8 +721,8 @@ async def ssh_up(
 @usage_lib.entrypoint
 @annotations.client_api
 async def ssh_down(
-        infra: Optional[str] = None,
-        stream_logs: Optional[StreamConfig] = DEFAULT_STREAM_CONFIG) -> None:
+        infra: str | None = None,
+        stream_logs: StreamConfig | None = DEFAULT_STREAM_CONFIG) -> None:
     """Async version of ssh_down() that tears down a Kubernetes cluster on SSH
     targets."""
     request_id = await asyncio.to_thread(sdk.ssh_down, infra)
@@ -738,12 +735,12 @@ async def ssh_down(
 @usage_lib.entrypoint
 @annotations.client_api
 async def realtime_kubernetes_gpu_availability(
-    context: Optional[str] = None,
-    name_filter: Optional[str] = None,
-    quantity_filter: Optional[int] = None,
-    is_ssh: Optional[bool] = None,
-    stream_logs: Optional[StreamConfig] = DEFAULT_STREAM_CONFIG
-) -> List[Tuple[str, List['models.RealtimeGpuAvailability']]]:
+    context: str | None = None,
+    name_filter: str | None = None,
+    quantity_filter: int | None = None,
+    is_ssh: bool | None = None,
+    stream_logs: StreamConfig | None = DEFAULT_STREAM_CONFIG
+) -> list[tuple[str, list['models.RealtimeGpuAvailability']]]:
     """Async version of realtime_kubernetes_gpu_availability() that gets the
       real-time Kubernetes GPU availability."""
     request_id = await asyncio.to_thread(
@@ -758,8 +755,8 @@ async def realtime_kubernetes_gpu_availability(
 @usage_lib.entrypoint
 @annotations.client_api
 async def kubernetes_node_info(
-    context: Optional[str] = None,
-    stream_logs: Optional[StreamConfig] = DEFAULT_STREAM_CONFIG
+    context: str | None = None,
+    stream_logs: StreamConfig | None = DEFAULT_STREAM_CONFIG
 ) -> 'models.KubernetesNodesInfo':
     """Async version of kubernetes_node_info() that gets the resource
     information for all the nodes in the cluster."""
@@ -773,10 +770,10 @@ async def kubernetes_node_info(
 @usage_lib.entrypoint
 @annotations.client_api
 async def status_kubernetes(
-    stream_logs: Optional[StreamConfig] = DEFAULT_STREAM_CONFIG
-) -> Tuple[List['kubernetes_utils.KubernetesSkyPilotClusterInfoPayload'],
-           List['kubernetes_utils.KubernetesSkyPilotClusterInfoPayload'],
-           List[Dict[str, Any]], Optional[str]]:
+    stream_logs: StreamConfig | None = DEFAULT_STREAM_CONFIG
+) -> tuple[list['kubernetes_utils.KubernetesSkyPilotClusterInfoPayload'],
+           list['kubernetes_utils.KubernetesSkyPilotClusterInfoPayload'],
+           list[dict[str, Any]], str | None]:
     """Async version of status_kubernetes() that gets all SkyPilot clusters
       and jobs in the Kubernetes cluster."""
     request_id = await asyncio.to_thread(sdk.status_kubernetes)
@@ -789,11 +786,10 @@ async def status_kubernetes(
 @usage_lib.entrypoint
 @annotations.client_api
 async def api_cancel(
-        request_ids: Optional[Union[str, List[str]]] = None,
+        request_ids: str | list[str] | None = None,
         all_users: bool = False,
         silent: bool = False,
-        stream_logs: Optional[StreamConfig] = DEFAULT_STREAM_CONFIG
-) -> List[str]:
+        stream_logs: StreamConfig | None = DEFAULT_STREAM_CONFIG) -> list[str]:
     """Async version of api_cancel() that aborts a request or all requests."""
     request_id = await asyncio.to_thread(sdk.api_cancel, request_ids, all_users,
                                          silent)
@@ -806,11 +802,11 @@ async def api_cancel(
 @usage_lib.entrypoint
 @annotations.client_api
 async def api_status(
-        request_ids: Optional[List[str]] = None,
+        request_ids: list[str] | None = None,
         all_status: bool = False,
-        limit: Optional[int] = None,
-        fields: Optional[List[str]] = None,
-        cluster_name: Optional[str] = None) -> List[payloads.RequestPayload]:
+        limit: int | None = None,
+        fields: list[str] | None = None,
+        cluster_name: str | None = None) -> list[payloads.RequestPayload]:
     """Async version of api_status() that lists all requests."""
     return await asyncio.to_thread(sdk.api_status, request_ids, all_status,
                                    limit, fields, cluster_name)
@@ -818,7 +814,7 @@ async def api_status(
 
 @usage_lib.entrypoint
 @annotations.client_api
-async def dashboard(starting_page: Optional[str] = None) -> None:
+async def dashboard(starting_page: str | None = None) -> None:
     """Async version of dashboard() that starts the dashboard for SkyPilot."""
     return await asyncio.to_thread(sdk.dashboard, starting_page)
 
@@ -840,15 +836,14 @@ async def api_stop() -> None:
 
 @usage_lib.entrypoint
 @annotations.client_api
-async def api_server_logs(follow: bool = True,
-                          tail: Optional[int] = None) -> None:
+async def api_server_logs(follow: bool = True, tail: int | None = None) -> None:
     """Async version of api_server_logs() that streams the API server logs."""
     return await asyncio.to_thread(sdk.api_server_logs, follow, tail)
 
 
 @usage_lib.entrypoint
 @annotations.client_api
-async def api_login(endpoint: Optional[str] = None,
+async def api_login(endpoint: str | None = None,
                     get_token: bool = False) -> None:
     """Async version of api_login() that logs into a SkyPilot API server."""
     return await asyncio.to_thread(sdk.api_login, endpoint, get_token)

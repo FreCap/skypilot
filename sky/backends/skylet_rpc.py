@@ -1,8 +1,10 @@
 """Cancellable Skylet gRPC transport and retry helpers."""
 import asyncio
+from collections.abc import Callable
+from collections.abc import Iterator
 import time
 import typing
-from typing import Any, Callable, Iterator, Optional, TypeVar
+from typing import Any, TypeVar
 
 from sky import exceptions
 from sky.adaptors import common as adaptors_common
@@ -75,7 +77,7 @@ def invoke_skylet_with_retries(func: Callable[..., T]) -> T:
     """Retry a unary Skylet gRPC request through transient tunnel failures."""
     max_attempts = 5
     backoff = common_utils.Backoff(initial_backoff=0.5)
-    last_exception: Optional[Exception] = None
+    last_exception: Exception | None = None
 
     for _ in range(max_attempts):
         _raise_if_ctx_canceled()
@@ -95,13 +97,12 @@ def invoke_skylet_streaming_with_retries(
     """Retry a streaming Skylet gRPC request through transient failures."""
     max_attempts = 3
     backoff = common_utils.Backoff(initial_backoff=0.5)
-    last_exception: Optional[Exception] = None
+    last_exception: Exception | None = None
 
     for _ in range(max_attempts):
         _raise_if_ctx_canceled()
         try:
-            for response in stream_func():
-                yield response
+            yield from stream_func()
             return
         except grpc.RpcError as e:
             last_exception = e

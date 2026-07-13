@@ -1,6 +1,8 @@
 """Utilities for REST API."""
 import asyncio
 import atexit
+from collections.abc import Callable
+from collections.abc import Generator
 import contextlib
 import dataclasses
 import enum
@@ -13,8 +15,7 @@ import sqlite3
 import threading
 import time
 import traceback
-from typing import (Any, Callable, Dict, Generator, List, NamedTuple, NoReturn,
-                    Optional, Set, Tuple)
+from typing import Any, NamedTuple, NoReturn
 import uuid
 
 import anyio
@@ -116,24 +117,24 @@ class RequestStatus(enum.Enum):
     CANCELLED = 'CANCELLED'
 
     def __gt__(self, other):
-        return (list(RequestStatus).index(self) >
-                list(RequestStatus).index(other))
+        return (list(RequestStatus).index(self)
+                > list(RequestStatus).index(other))
 
     def colored_str(self):
         color = _STATUS_TO_COLOR[self]
         return f'{color}{self.value}{colorama.Style.RESET_ALL}'
 
     @classmethod
-    def finished_status(cls) -> List['RequestStatus']:
+    def finished_status(cls) -> list['RequestStatus']:
         return [cls.SUCCEEDED, cls.FAILED, cls.CANCELLED]
 
     @classmethod
-    def active_statuses(cls) -> List['RequestStatus']:
+    def active_statuses(cls) -> list['RequestStatus']:
         """Statuses of requests that are not finished yet."""
         return [cls.PENDING, cls.WAITING, cls.RUNNING]
 
     @classmethod
-    def executable_statuses(cls) -> List['RequestStatus']:
+    def executable_statuses(cls) -> list['RequestStatus']:
         """Statuses from which a dequeued request may start executing.
 
         A request is enqueued as PENDING. It may also be re-enqueued while in
@@ -164,13 +165,13 @@ def _status_value_for_client(status_value: str) -> str:
     """
     remote_api_version = versions.get_remote_api_version()
     if (status_value == RequestStatus.WAITING.value and
-            remote_api_version is not None and remote_api_version <
-            server_constants.MIN_WAITING_STATUS_API_VERSION):
+            remote_api_version is not None and remote_api_version
+            < server_constants.MIN_WAITING_STATUS_API_VERSION):
         return RequestStatus.RUNNING.value
     return status_value
 
 
-def _build_error_dict(error: BaseException) -> Dict[str, Any]:
+def _build_error_dict(error: BaseException) -> dict[str, Any]:
     """Build the serializable error payload persisted for a failed request."""
     # TODO(zhwu): pickle.dump does not work well with custom exceptions if
     # it has more than 1 arguments.
@@ -242,20 +243,20 @@ class Request:
     created_at: float
     user_id: str
     return_value: Any = None
-    error: Optional[Dict[str, Any]] = None
+    error: dict[str, Any] | None = None
     # The pid of the request worker that is(was) running this request.
-    pid: Optional[int] = None
+    pid: int | None = None
     schedule_type: ScheduleType = ScheduleType.LONG
     # Resources the request operates on.
-    cluster_name: Optional[str] = None
+    cluster_name: str | None = None
     # Status message of the request, indicates the reason of current status.
-    status_msg: Optional[str] = None
+    status_msg: str | None = None
     # Whether the request should be retried.
     should_retry: bool = False
     # When the request finished.
-    finished_at: Optional[float] = None
+    finished_at: float | None = None
     # Blob ID of uploaded file mounts
-    file_mounts_blob_id: Optional[str] = None
+    file_mounts_blob_id: str | None = None
     # Enqueue flags (see the queue tuple in executor.RequestQueue). Persisted
     # so that queued requests survive a server restart and can be re-enqueued
     # with the same dispatch semantics. Server-internal: not part of
@@ -275,7 +276,7 @@ class Request:
         """Set the error."""
         self.error = _build_error_dict(error)
 
-    def get_error(self) -> Optional[Dict[str, Any]]:
+    def get_error(self) -> dict[str, Any] | None:
         """Get the error."""
         if self.error is None:
             return None
@@ -300,7 +301,7 @@ class Request:
         return decoders.get_decoder(self.name)(self.return_value)
 
     @classmethod
-    def from_row(cls, row: Tuple[Any, ...]) -> 'Request':
+    def from_row(cls, row: tuple[Any, ...]) -> 'Request':
         content = dict(zip(REQUEST_COLUMNS, row))
         # The enqueue flags are server-internal DB columns that are not part
         # of RequestPayload; pop them and set them on the decoded request.
@@ -312,13 +313,13 @@ class Request:
         request.retryable = retryable
         return request
 
-    def to_row(self) -> Tuple[Any, ...]:
+    def to_row(self) -> tuple[Any, ...]:
         payload = self.encode()
         # encode() may downgrade WAITING -> RUNNING for clients on an older API
         # version; that is a wire-only concern. to_row() feeds the database, so
         # always persist the true status regardless of the request context.
         payload.status = self.status.value
-        row: List[Any] = []
+        row: list[Any] = []
         for k in REQUEST_COLUMNS:
             if k == COL_IGNORE_RETURN_VALUE:
                 row.append(int(self.ignore_return_value))
@@ -445,7 +446,7 @@ def get_new_request_id() -> str:
     return str(uuid.uuid4())
 
 
-def encode_requests(requests: List[Request]) -> List[payloads.RequestPayload]:
+def encode_requests(requests: list[Request]) -> list[payloads.RequestPayload]:
     """Serialize the SkyPilot API request for display purposes.
 
         This function should be called on the server side to serialize the
@@ -495,8 +496,8 @@ def encode_requests(requests: List[Request]) -> List[payloads.RequestPayload]:
 
 
 def _update_request_row_fields(
-        row: Tuple[Any, ...],
-        fields: Optional[List[str]] = None) -> Tuple[Any, ...]:
+        row: tuple[Any, ...],
+        fields: list[str] | None = None) -> tuple[Any, ...]:
     """Update the request row fields."""
     if not fields:
         return row
@@ -744,15 +745,14 @@ def _log_orphaned_inflight_requests() -> None:
                        f'name={req.name!r} status={req.status.value}{cluster}')
 
 
-def _request_log_tombstones() -> List[pathlib.Path]:
+def _request_log_tombstones() -> list[pathlib.Path]:
     """List request-log tombstone dirs left by this or a previous startup."""
     log_dir = pathlib.Path(
         server_constants.REQUEST_LOG_PATH_PREFIX).expanduser()
     return list(log_dir.parent.glob(f'{log_dir.name}.deleting.*'))
 
 
-def _rmtree_in_background(
-        paths: List[pathlib.Path]) -> Optional[threading.Thread]:
+def _rmtree_in_background(paths: list[pathlib.Path]) -> threading.Thread | None:
     """Delete directories in a background thread; returns it for tests."""
     if not paths:
         return None
@@ -768,7 +768,7 @@ def _rmtree_in_background(
     return thread
 
 
-def _clear_request_logs_in_background() -> Optional[threading.Thread]:
+def _clear_request_logs_in_background() -> threading.Thread | None:
     """Clear the request-logs dir without blocking startup.
 
     The dir scales with the number of requests since the last wipe, so an
@@ -819,7 +819,7 @@ def reset_db_and_logs():
     request_storage.get_request_backend().reset_on_startup()
 
 
-def _find_interrupted_launches_to_requeue() -> List[str]:
+def _find_interrupted_launches_to_requeue() -> list[str]:
     """List interrupted launch rows that are safe to re-execute.
 
     A launch whose executor died mid-provision leaves its cluster in INIT.
@@ -855,7 +855,7 @@ def _find_interrupted_launches_to_requeue() -> List[str]:
          RequestStatus.WAITING.value))
     rows = cursor.fetchall()
     requeue_ids = []
-    cluster_status_cache: Dict[str, Optional[status_lib.ClusterStatus]] = {}
+    cluster_status_cache: dict[str, status_lib.ClusterStatus | None] = {}
     for request_id, cluster_name in rows:
         if cluster_name is None:
             continue
@@ -875,7 +875,7 @@ def _find_interrupted_launches_to_requeue() -> List[str]:
     return requeue_ids
 
 
-def _recover_requests() -> Tuple[int, int]:
+def _recover_requests() -> tuple[int, int]:
     """Reconcile request rows left over from the previous server process.
 
     All executor processes died with the previous server, so no recovered
@@ -1092,10 +1092,10 @@ def kill_cluster_requests(cluster_name: str, exclude_request_name: str):
     _kill_requests(request_ids)
 
 
-def kill_requests(request_ids: Optional[List[str]] = None,
-                  user_id: Optional[str] = None) -> List[str]:
+def kill_requests(request_ids: list[str] | None = None,
+                  user_id: str | None = None) -> list[str]:
     """Kill requests with a given request ID prefix."""
-    expanded_request_ids: Optional[List[str]] = None
+    expanded_request_ids: list[str] | None = None
     if request_ids is not None:
         expanded_request_ids = []
         for request_id in request_ids:
@@ -1116,7 +1116,7 @@ kill_requests_with_prefix = kill_requests
 
 
 def _should_kill_request(request_id: str,
-                         request_record: Optional[Request]) -> bool:
+                         request_record: Request | None) -> bool:
     if request_record is None:
         logger.debug(f'No request ID {request_id}')
         return False
@@ -1131,8 +1131,8 @@ def _should_kill_request(request_id: str,
     return True
 
 
-def _kill_requests(request_ids: Optional[List[str]] = None,
-                   user_id: Optional[str] = None) -> List[str]:
+def _kill_requests(request_ids: list[str] | None = None,
+                   user_id: str | None = None) -> list[str]:
     """Kill SkyPilot API requests and set their status to cancelled.
 
     Delegates to the registered request backend, which handles local
@@ -1156,7 +1156,7 @@ async def kill_request_async(request_id: str) -> bool:
 
 @contextlib.contextmanager
 @metrics_lib.time_me
-def update_request(request_id: str) -> Generator[Optional[Request], None, None]:
+def update_request(request_id: str) -> Generator[Request | None, None, None]:
     """Get and update a SkyPilot API request."""
     with request_storage.get_request_backend().update_request(
             request_id) as request:
@@ -1164,7 +1164,7 @@ def update_request(request_id: str) -> Generator[Optional[Request], None, None]:
 
 
 @metrics_lib.time_me
-def try_mark_running(request_id: str, pid: Optional[int]) -> bool:
+def try_mark_running(request_id: str, pid: int | None) -> bool:
     """Atomically flip a request to RUNNING if it is still executable.
 
     Returns:
@@ -1192,9 +1192,8 @@ async def update_status_msg_async(request_id: str, status_msg: str) -> None:
         request_id, status_msg)
 
 
-def _get_request_no_lock(
-        request_id: str,
-        fields: Optional[List[str]] = None) -> Optional[Request]:
+def _get_request_no_lock(request_id: str,
+                         fields: list[str] | None = None) -> Request | None:
     """Get a SkyPilot API request."""
     assert _DB is not None
     columns_str = ', '.join(REQUEST_COLUMNS)
@@ -1216,9 +1215,9 @@ def _get_request_no_lock(
     return Request.from_row(row)
 
 
-async def _get_request_no_lock_async(
-        request_id: str,
-        fields: Optional[List[str]] = None) -> Optional[Request]:
+async def _get_request_no_lock_async(request_id: str,
+                                     fields: list[str] | None = None
+                                    ) -> Request | None:
     """Async version of _get_request_no_lock."""
     assert _DB is not None
     columns_str = ', '.join(REQUEST_COLUMNS)
@@ -1237,7 +1236,7 @@ async def _get_request_no_lock_async(
 
 
 @metrics_lib.time_me
-async def get_latest_request_id_async() -> Optional[str]:
+async def get_latest_request_id_async() -> str | None:
     """Get the latest request ID."""
     return await request_storage.get_request_backend(
     ).get_latest_request_id_async()
@@ -1245,16 +1244,15 @@ async def get_latest_request_id_async() -> Optional[str]:
 
 @metrics_lib.time_me
 def get_request(request_id: str,
-                fields: Optional[List[str]] = None) -> Optional[Request]:
+                fields: list[str] | None = None) -> Request | None:
     """Get a SkyPilot API request."""
     return request_storage.get_request_backend().get_request(request_id, fields)
 
 
 @metrics_lib.time_me_async
 @asyncio_utils.shield
-async def get_request_async(
-        request_id: str,
-        fields: Optional[List[str]] = None) -> Optional[Request]:
+async def get_request_async(request_id: str,
+                            fields: list[str] | None = None) -> Request | None:
     """Async version of get_request."""
     return await request_storage.get_request_backend().get_request_async(
         request_id, fields)
@@ -1263,7 +1261,7 @@ async def get_request_async(
 @metrics_lib.time_me
 def get_requests_with_prefix(
         request_id_prefix: str,
-        fields: Optional[List[str]] = None) -> Optional[List[Request]]:
+        fields: list[str] | None = None) -> list[Request] | None:
     """Get requests with a given request ID prefix."""
     return request_storage.get_request_backend().get_requests_with_prefix(
         request_id_prefix, fields)
@@ -1273,7 +1271,7 @@ def get_requests_with_prefix(
 @asyncio_utils.shield
 async def get_requests_async_with_prefix(
         request_id_prefix: str,
-        fields: Optional[List[str]] = None) -> Optional[List[Request]]:
+        fields: list[str] | None = None) -> list[Request] | None:
     """Async version of get_request_with_prefix."""
     return await request_storage.get_request_backend(
     ).get_requests_async_with_prefix(request_id_prefix, fields)
@@ -1281,14 +1279,14 @@ async def get_requests_async_with_prefix(
 
 class StatusWithMsg(NamedTuple):
     status: RequestStatus
-    status_msg: Optional[str] = None
+    status_msg: str | None = None
 
 
 @metrics_lib.time_me_async
 async def get_request_status_async(
     request_id: str,
     include_msg: bool = False,
-) -> Optional[StatusWithMsg]:
+) -> StatusWithMsg | None:
     """Get the status of a request.
 
     Args:
@@ -1351,7 +1349,7 @@ async def create_or_refresh_internal_daemon_async(request: Request) -> bool:
 
 
 async def delete_orphan_internal_daemons_async(
-    internal_daemons: List['daemons.InternalRequestDaemon'],) -> None:
+    internal_daemons: list['daemons.InternalRequestDaemon'],) -> None:
     """Delete persisted daemon rows whose id is not in `internal_daemons`.
 
     Thin module-level wrapper. See
@@ -1389,16 +1387,16 @@ class RequestTaskFilter:
         ValueError: If both exclude_request_names and include_request_names are
             provided.
     """
-    status: Optional[List[RequestStatus]] = None
-    cluster_names: Optional[List[str]] = None
-    user_id: Optional[str] = None
-    exclude_request_names: Optional[List[str]] = None
-    include_request_names: Optional[List[str]] = None
-    finished_before: Optional[float] = None
+    status: list[RequestStatus] | None = None
+    cluster_names: list[str] | None = None
+    user_id: str | None = None
+    exclude_request_names: list[str] | None = None
+    include_request_names: list[str] | None = None
+    finished_before: float | None = None
     include_missing_finished_at: bool = False
-    finished_after: Optional[float] = None
-    limit: Optional[int] = None
-    fields: Optional[List[str]] = None
+    finished_after: float | None = None
+    limit: int | None = None
+    fields: list[str] | None = None
     sort: bool = False
 
     def __post_init__(self):
@@ -1408,14 +1406,14 @@ class RequestTaskFilter:
                 'Only one of exclude_request_names or include_request_names '
                 'can be provided, not both.')
 
-    def build_query(self) -> Tuple[str, List[Any]]:
+    def build_query(self) -> tuple[str, list[Any]]:
         """Build the SQL query and filter parameters.
 
         Returns:
             A tuple of (SQL, SQL parameters).
         """
         filters = []
-        filter_params: List[Any] = []
+        filter_params: list[Any] = []
         if self.status is not None:
             status_list_str = ','.join(
                 repr(status.value) for status in self.status)
@@ -1473,7 +1471,7 @@ class RequestTaskFilter:
 
 
 @metrics_lib.time_me
-def get_request_tasks(req_filter: RequestTaskFilter) -> List[Request]:
+def get_request_tasks(req_filter: RequestTaskFilter) -> list[Request]:
     """Get a list of requests that match the given filters.
 
     Args:
@@ -1485,14 +1483,14 @@ def get_request_tasks(req_filter: RequestTaskFilter) -> List[Request]:
 
 @metrics_lib.time_me_async
 async def get_request_tasks_async(
-        req_filter: RequestTaskFilter) -> List[Request]:
+        req_filter: RequestTaskFilter) -> list[Request]:
     """Async version of get_request_tasks."""
     return await request_storage.get_request_backend().query_requests_async(
         req_filter)
 
 
 @metrics_lib.time_me_async
-async def get_api_request_ids_start_with(incomplete: str) -> List[str]:
+async def get_api_request_ids_start_with(incomplete: str) -> list[str]:
     """Get a list of API request ids for shell completion."""
     return await request_storage.get_request_backend(
     ).get_api_request_ids_start_with(incomplete)
@@ -1520,9 +1518,8 @@ _try_mark_running_sql = (
 
 
 def _finish_request_update_sql(request_id: str, status: RequestStatus,
-                               name: Optional[str],
-                               error: Optional[BaseException],
-                               result: Optional[Any]) -> Tuple[str, List[Any]]:
+                               name: str | None, error: BaseException | None,
+                               result: Any | None) -> tuple[str, list[Any]]:
     """Build the targeted UPDATE that persists a terminal status.
 
     Only the transitioned scalar columns are written; entrypoint and
@@ -1536,7 +1533,7 @@ def _finish_request_update_sql(request_id: str, status: RequestStatus,
     (update_request / update_request_async).
     """
     set_clauses = ['status = ?', f'{COL_FINISHED_AT} = ?']
-    params: List[Any] = [status.value, time.time()]
+    params: list[Any] = [status.value, time.time()]
     if result is not None:
         assert name is not None, request_id
         serializer = return_value_serializers.get_serializer(name)
@@ -1597,7 +1594,7 @@ async def set_request_failed_async(request_id: str, e: BaseException) -> None:
         request_id, RequestStatus.FAILED, error=e)
 
 
-def set_request_succeeded(request_id: str, result: Optional[Any]) -> None:
+def set_request_succeeded(request_id: str, result: Any | None) -> None:
     """Set a request to succeeded and populate the result."""
     request_storage.get_request_backend().set_request_finished(
         request_id, RequestStatus.SUCCEEDED, result=result)
@@ -1606,7 +1603,7 @@ def set_request_succeeded(request_id: str, result: Optional[Any]) -> None:
 @metrics_lib.time_me_async
 @asyncio_utils.shield
 async def set_request_succeeded_async(request_id: str,
-                                      result: Optional[Any]) -> None:
+                                      result: Any | None) -> None:
     """Set a request to succeeded and populate the result."""
     await request_storage.get_request_backend().set_request_finished_async(
         request_id, RequestStatus.SUCCEEDED, result=result)
@@ -1627,7 +1624,7 @@ async def set_request_cancelled_async(request_id: str) -> None:
 
 
 @metrics_lib.time_me
-async def _delete_requests(request_ids: List[str]):
+async def _delete_requests(request_ids: list[str]):
     """Clean up requests by their IDs."""
     await request_storage.get_request_backend().delete_requests(request_ids)
 
@@ -1780,7 +1777,7 @@ class SqliteRequestBackend(request_storage.RequestBackend):
     @init_db
     def get_request(self,
                     request_id: str,
-                    fields: Optional[List[str]] = None) -> Optional[Request]:
+                    fields: list[str] | None = None) -> Request | None:
         with filelock.FileLock(request_lock_path(request_id)):
             return _get_request_no_lock(request_id, fields)
 
@@ -1789,13 +1786,13 @@ class SqliteRequestBackend(request_storage.RequestBackend):
     async def get_request_async(
             self,
             request_id: str,
-            fields: Optional[List[str]] = None) -> Optional[Request]:
+            fields: list[str] | None = None) -> Request | None:
         async with filelock.AsyncFileLock(request_lock_path(request_id)):
             return await _get_request_no_lock_async(request_id, fields)
 
     @contextlib.contextmanager
     def update_request(
-            self, request_id: str) -> Generator[Optional[Request], None, None]:
+            self, request_id: str) -> Generator[Request | None, None, None]:
         _ensure_db_initialized()
         with filelock.FileLock(request_lock_path(request_id)):
             request = _get_request_no_lock(request_id)
@@ -1863,7 +1860,7 @@ class SqliteRequestBackend(request_storage.RequestBackend):
     @asyncio_utils.shield
     async def delete_orphan_internal_daemons_async(
         self,
-        internal_daemons: List['daemons.InternalRequestDaemon'],
+        internal_daemons: list['daemons.InternalRequestDaemon'],
     ) -> None:
         assert _DB is not None
         keep_ids = {d.id for d in internal_daemons}
@@ -1885,7 +1882,7 @@ class SqliteRequestBackend(request_storage.RequestBackend):
         logger.info(f'Deleted orphan internal daemon rows: {stale_ids}')
 
     @init_db
-    def query_requests(self, req_filter: RequestTaskFilter) -> List[Request]:
+    def query_requests(self, req_filter: RequestTaskFilter) -> list[Request]:
         assert _DB is not None
         with _DB.conn:
             cursor = _DB.conn.cursor()
@@ -1902,7 +1899,7 @@ class SqliteRequestBackend(request_storage.RequestBackend):
 
     @init_db_async
     async def query_requests_async(
-            self, req_filter: RequestTaskFilter) -> List[Request]:
+            self, req_filter: RequestTaskFilter) -> list[Request]:
         assert _DB is not None
         async with _DB.execute_fetchall_async(
                 *req_filter.build_query()) as rows:
@@ -1917,7 +1914,7 @@ class SqliteRequestBackend(request_storage.RequestBackend):
 
     @init_db_async
     @init_db_async
-    async def delete_requests(self, request_ids: List[str]) -> None:
+    async def delete_requests(self, request_ids: list[str]) -> None:
         if not request_ids:
             return
         assert _DB is not None
@@ -1955,7 +1952,7 @@ class SqliteRequestBackend(request_storage.RequestBackend):
                 await _add_or_update_request_no_lock_async(request)
 
     @init_db
-    def try_mark_running(self, request_id: str, pid: Optional[int]) -> bool:
+    def try_mark_running(self, request_id: str, pid: int | None) -> bool:
         assert _DB is not None
         # The per-request FileLock is required for composition with
         # update_request()'s full-row read-modify-write writers (kill
@@ -1975,8 +1972,8 @@ class SqliteRequestBackend(request_storage.RequestBackend):
     def set_request_finished(self,
                              request_id: str,
                              status: RequestStatus,
-                             error: Optional[BaseException] = None,
-                             result: Optional[Any] = None) -> None:
+                             error: BaseException | None = None,
+                             result: Any | None = None) -> None:
         assert _DB is not None
         name = None
         if result is not None:
@@ -2010,8 +2007,8 @@ class SqliteRequestBackend(request_storage.RequestBackend):
     async def set_request_finished_async(self,
                                          request_id: str,
                                          status: RequestStatus,
-                                         error: Optional[BaseException] = None,
-                                         result: Optional[Any] = None) -> None:
+                                         error: BaseException | None = None,
+                                         result: Any | None = None) -> None:
         assert _DB is not None
         name = None
         if result is not None:
@@ -2032,8 +2029,8 @@ class SqliteRequestBackend(request_storage.RequestBackend):
 
     @init_db
     def kill_requests(self,
-                      request_ids: Optional[List[str]] = None,
-                      user_id: Optional[str] = None) -> List[str]:
+                      request_ids: list[str] | None = None,
+                      user_id: str | None = None) -> list[str]:
         if request_ids is None:
             request_ids = [
                 r.request_id
@@ -2077,18 +2074,18 @@ class SqliteRequestBackend(request_storage.RequestBackend):
     # --- Specialized queries ---
 
     @init_db_async
-    async def get_latest_request_id_async(self) -> Optional[str]:
+    async def get_latest_request_id_async(self) -> str | None:
         assert _DB is not None
         async with _DB.execute_fetchall_async(
-            (f'SELECT request_id FROM {REQUEST_TABLE} '
-             'ORDER BY created_at DESC LIMIT 1')) as rows:
+                f'SELECT request_id FROM {REQUEST_TABLE} '
+                'ORDER BY created_at DESC LIMIT 1') as rows:
             return rows[0][0] if rows else None
 
     @init_db
     def get_requests_with_prefix(
             self,
             request_id_prefix: str,
-            fields: Optional[List[str]] = None) -> Optional[List[Request]]:
+            fields: list[str] | None = None) -> list[Request] | None:
         assert _DB is not None
         if fields:
             columns_str = ', '.join(fields)
@@ -2111,7 +2108,7 @@ class SqliteRequestBackend(request_storage.RequestBackend):
     async def get_requests_async_with_prefix(
             self,
             request_id_prefix: str,
-            fields: Optional[List[str]] = None) -> Optional[List[Request]]:
+            fields: list[str] | None = None) -> list[Request] | None:
         assert _DB is not None
         if fields:
             columns_str = ', '.join(fields)
@@ -2130,7 +2127,7 @@ class SqliteRequestBackend(request_storage.RequestBackend):
     async def get_request_status_async(
             self,
             request_id: str,
-            include_msg: bool = False) -> Optional[StatusWithMsg]:
+            include_msg: bool = False) -> StatusWithMsg | None:
         assert _DB is not None
         columns = 'status'
         if include_msg:
@@ -2149,7 +2146,7 @@ class SqliteRequestBackend(request_storage.RequestBackend):
 
     @init_db_async
     async def get_api_request_ids_start_with(self,
-                                             incomplete: str) -> List[str]:
+                                             incomplete: str) -> list[str]:
         assert _DB is not None
         async with _DB.execute_fetchall_async(
                 f"""SELECT request_id FROM {REQUEST_TABLE}
@@ -2166,7 +2163,7 @@ class SqliteRequestBackend(request_storage.RequestBackend):
         return [row[0] for row in rows]
 
     @init_db
-    def get_active_file_mounts_blob_ids(self) -> Set[str]:
+    def get_active_file_mounts_blob_ids(self) -> set[str]:
         assert _DB is not None
         with _DB.conn:
             cursor = _DB.conn.cursor()
@@ -2179,7 +2176,7 @@ class SqliteRequestBackend(request_storage.RequestBackend):
                 f'AND {COL_FILE_MOUNTS_BLOB_ID} IS NOT NULL', active_values)
             return {row[0] for row in cursor.fetchall()}
 
-    def get_shutdown_active_requests(self) -> List[Tuple[str, str]]:
+    def get_shutdown_active_requests(self) -> list[tuple[str, str]]:
         """Get (request_id, name) pairs to wait for during graceful shutdown."""
 
         # Wait on every non-terminal request. Use active_statuses() rather than

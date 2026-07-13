@@ -1,7 +1,6 @@
 """RBAC (Role-Based Access Control) functionality for SkyPilot API Server."""
 
 import enum
-from typing import Dict, List, Optional
 
 from sky import sky_logging
 from sky import skypilot_config
@@ -332,7 +331,7 @@ class RoleName(str, enum.Enum):
     VIEWER = 'viewer'
 
 
-def get_supported_roles() -> List[str]:
+def get_supported_roles() -> list[str]:
     return [role_name.value for role_name in RoleName]
 
 
@@ -342,8 +341,8 @@ def get_default_role() -> str:
 
 
 def get_viewer_allowlist(
-    plugin_allowlist: Optional[List[Dict[str, str]]] = None
-) -> List[Dict[str, str]]:
+    plugin_allowlist: list[dict[str, str]] | None = None
+) -> list[dict[str, str]]:
     """Get the viewer role's endpoint allowlist.
 
     Composed of:
@@ -362,7 +361,7 @@ def get_viewer_allowlist(
         Combined list of `{path, method}` records.  Each record uses
         Casbin `keyMatch2` path syntax (e.g. `/users/:name`, `/x/*`).
     """
-    combined: List[Dict[str, str]] = list(_DEFAULT_VIEWER_ALLOWLIST)
+    combined: list[dict[str, str]] = list(_DEFAULT_VIEWER_ALLOWLIST)
 
     config_roles = skypilot_config.get_nested(('rbac', 'roles'),
                                               default_value={})
@@ -393,8 +392,8 @@ def get_viewer_allowlist(
 
 
 def get_role_permissions(
-    plugin_rules: Optional[Dict[str, List[Dict[str, str]]]] = None
-) -> Dict[str, Dict[str, Dict[str, List[Dict[str, str]]]]]:
+    plugin_rules: dict[str, list[dict[str, str]]] | None = None
+) -> dict[str, dict[str, dict[str, list[dict[str, str]]]]]:
     """Get all role permissions from config and plugins.
 
     Args:
@@ -463,7 +462,7 @@ def get_role_permissions(
     return config_permissions
 
 
-def get_workspace_policy_permissions() -> Dict[str, List[str]]:
+def get_workspace_policy_permissions() -> dict[str, list[str]]:
     """Get workspace policy permissions from config.
 
     Returns:

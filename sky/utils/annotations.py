@@ -1,9 +1,10 @@
 """Annotations for public APIs."""
 
+from collections.abc import Callable
 import functools
 import threading
 import time
-from typing import Callable, List, Literal, TypeVar
+from typing import Literal, TypeVar
 import weakref
 
 import cachetools
@@ -14,7 +15,7 @@ is_on_api_server = True
 _FUNCTIONS_NEED_RELOAD_CACHE_LOCK = threading.Lock()
 # Caches can be thread-local, use weakref to avoid blocking the GC when the
 # thread is destroyed.
-_FUNCTIONS_NEED_RELOAD_CACHE: List[weakref.ReferenceType] = []
+_FUNCTIONS_NEED_RELOAD_CACHE: list[weakref.ReferenceType] = []
 
 T = TypeVar('T')
 P = ParamSpec('P')

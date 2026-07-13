@@ -35,8 +35,8 @@ def _check_empty_config() -> None:
     """Check that the config is empty."""
     assert not skypilot_config.loaded(), (
         skypilot_config._global_config_context)
-    assert skypilot_config.get_nested(
-        ('aws', 'ssh_proxy_command'), None) is None
+    assert skypilot_config.get_nested(('aws', 'ssh_proxy_command'),
+                                      None) is None
     assert skypilot_config.get_nested(('aws', 'ssh_proxy_command'),
                                       'default') == 'default'
 
@@ -328,8 +328,8 @@ def test_config_get_set_nested(monkeypatch, tmp_path) -> None:
     skypilot_config.reload_config()
     assert skypilot_config.get_nested(('aws', 'vpc_name'), None) == VPC_NAME
     assert skypilot_config.get_nested(('aws', 'use_internal_ips'), None)
-    assert skypilot_config.get_nested(
-        ('aws', 'ssh_proxy_command'), None) is None
+    assert skypilot_config.get_nested(('aws', 'ssh_proxy_command'),
+                                      None) is None
     assert skypilot_config.get_nested(('gcp', 'vpc_name'), None) == VPC_NAME
     assert skypilot_config.get_nested(('gcp', 'use_internal_ips'), None)
 
@@ -343,14 +343,14 @@ def test_config_get_set_nested(monkeypatch, tmp_path) -> None:
     skypilot_config.reload_config()
     assert skypilot_config.get_nested(('aws', 'vpc_name'), None) == VPC_NAME
     assert skypilot_config.get_nested(('aws', 'use_internal_ips'), None) is None
-    assert skypilot_config.get_nested(
-        ('aws', 'ssh_proxy_command'), None) is None
+    assert skypilot_config.get_nested(('aws', 'ssh_proxy_command'),
+                                      None) is None
     # set_nested() should still work
     new_config4 = skypilot_config.set_nested(('aws', 'ssh_proxy_command'),
                                              'new_value')
     assert new_config4['aws']['ssh_proxy_command'] == 'new_value'
-    assert skypilot_config.get_nested(
-        ('aws', 'ssh_proxy_command'), None) is None
+    assert skypilot_config.get_nested(('aws', 'ssh_proxy_command'),
+                                      None) is None
 
 
 def test_config_with_env(monkeypatch, tmp_path) -> None:
@@ -617,8 +617,8 @@ def test_override_skypilot_config_without_original_config(
     # Test empty override_configs
     with skypilot_config.override_skypilot_config(None):
         assert skypilot_config.get_nested(('aws', 'vpc_name'), None) is None
-        assert skypilot_config.get_nested(
-            ('aws', 'ssh_proxy_command'), None) is None
+        assert skypilot_config.get_nested(('aws', 'ssh_proxy_command'),
+                                          None) is None
 
         assert os.environ.get(skypilot_config.ENV_VAR_SKYPILOT_CONFIG) is None
 
@@ -639,8 +639,8 @@ def test_override_skypilot_config_without_original_config(
 
     # Check values are restored
     assert skypilot_config.get_nested(('aws', 'vpc_name'), None) is None
-    assert skypilot_config.get_nested(
-        ('aws', 'ssh_proxy_command'), None) is None
+    assert skypilot_config.get_nested(('aws', 'ssh_proxy_command'),
+                                      None) is None
     assert os.environ.get(skypilot_config.ENV_VAR_SKYPILOT_CONFIG) is None
     assert not skypilot_config._get_loaded_config()
 
@@ -896,10 +896,10 @@ def test_hierarchical_server_config(monkeypatch, tmp_path):
                     env-project-config: present
             """))
     skypilot_config.reload_config()
-    assert skypilot_config.get_nested(
-        ('gcp', 'labels', 'env-user-config'), None) is None
-    assert skypilot_config.get_nested(
-        ('gcp', 'labels', 'env-project-config'), None) is None
+    assert skypilot_config.get_nested(('gcp', 'labels', 'env-user-config'),
+                                      None) is None
+    assert skypilot_config.get_nested(('gcp', 'labels', 'env-project-config'),
+                                      None) is None
 
 
 def test_kubernetes_context_configs(monkeypatch, tmp_path) -> None:
@@ -1493,8 +1493,9 @@ def test_get_effective_namespace_no_config(monkeypatch, tmp_path) -> None:
                         tmp_path / 'empty.yaml')
     skypilot_config.reload_config()
 
-    assert skypilot_config.get_effective_namespace(
-        cloud='kubernetes', region='contextA', workspace='default') is None
+    assert skypilot_config.get_effective_namespace(cloud='kubernetes',
+                                                   region='contextA',
+                                                   workspace='default') is None
     assert skypilot_config.get_effective_namespace(cloud='kubernetes',
                                                    workspace='default') is None
 

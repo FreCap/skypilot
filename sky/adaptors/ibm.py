@@ -34,8 +34,7 @@ global_process_lock = None
 
 def read_credential_file():
     try:
-        with open(os.path.expanduser(CREDENTIAL_FILE), 'r',
-                  encoding='utf-8') as f:
+        with open(os.path.expanduser(CREDENTIAL_FILE), encoding='utf-8') as f:
             return yaml.safe_load(f)
     except FileNotFoundError:
         return {}
@@ -119,7 +118,7 @@ def get_cos_client(region: str = 'us-east'):
     """
     access_key_id, secret_access_key = get_hmac_keys()
     with _get_global_process_lock():
-        return ibm_boto3.client(  # type: ignore[union-attr]
+        return ibm_boto3.client(
             service_name='s3',
             aws_access_key_id=access_key_id,
             aws_secret_access_key=secret_access_key,
@@ -140,7 +139,7 @@ def get_cos_resource(region: str = 'us-east'):
     """
     access_key_id, secret_access_key = get_hmac_keys()
     with _get_global_process_lock():
-        return ibm_boto3.resource(  # type: ignore[union-attr]
+        return ibm_boto3.resource(
             's3',
             aws_access_key_id=access_key_id,
             aws_secret_access_key=secret_access_key,

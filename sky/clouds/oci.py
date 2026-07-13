@@ -20,10 +20,11 @@ History:
  - Hysun He (hysun.he@oracle.com) @ Oct 13, 2024:
    Support more OS types additional to ubuntu for OCI resources.
 """
+from collections.abc import Iterator
 import logging
 import os
 import typing
-from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, Optional
 
 from sky import catalog
 from sky import clouds
@@ -46,7 +47,7 @@ if typing.TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_tenancy_prefix: Optional[str] = None
+_tenancy_prefix: str | None = None
 
 
 @registry.CLOUD_REGISTRY.register
@@ -57,7 +58,7 @@ class OCI(clouds.Cloud):
 
     _MAX_CLUSTER_NAME_LEN_LIMIT = 200
 
-    _regions: List[clouds.Region] = []
+    _regions: list[clouds.Region] = []
 
     _INDENT_PREFIX = '    '
 
@@ -72,8 +73,8 @@ class OCI(clouds.Cloud):
     def _unsupported_features_for_resources(
         cls,
         resources: 'resources_lib.Resources',
-        region: Optional[str] = None,
-    ) -> Dict[clouds.CloudImplementationFeatures, str]:
+        region: str | None = None,
+    ) -> dict[clouds.CloudImplementationFeatures, str]:
         unsupported_features = {
             clouds.CloudImplementationFeatures.CLONE_DISK_FROM_CLUSTER:
                 (f'Migrating disk is currently not supported on {cls._REPR}.'),
@@ -97,19 +98,19 @@ class OCI(clouds.Cloud):
         return unsupported_features
 
     @classmethod
-    def max_cluster_name_length(cls) -> Optional[int]:
+    def max_cluster_name_length(cls) -> int | None:
         return cls._MAX_CLUSTER_NAME_LEN_LIMIT
 
     @classmethod
     def regions_with_offering(
         cls,
         instance_type: str,
-        accelerators: Optional[Dict[str, int]],
+        accelerators: dict[str, int] | None,
         use_spot: bool,
-        region: Optional[str],
-        zone: Optional[str],
+        region: str | None,
+        zone: str | None,
         resources: Optional['resources_lib.Resources'] = None,
-    ) -> List[clouds.Region]:
+    ) -> list[clouds.Region]:
         del accelerators  # unused
 
         regions = catalog.get_region_zones_for_instance_type(
@@ -128,7 +129,7 @@ class OCI(clouds.Cloud):
     def get_vcpus_mem_from_instance_type(
         cls,
         instance_type: str,
-    ) -> Tuple[Optional[float], Optional[float]]:
+    ) -> tuple[float | None, float | None]:
         return catalog.get_vcpus_mem_from_instance_type(instance_type,
                                                         clouds='oci')
 
@@ -139,9 +140,9 @@ class OCI(clouds.Cloud):
         region: str,
         num_nodes: int,
         instance_type: str,
-        accelerators: Optional[Dict[str, int]] = None,
+        accelerators: dict[str, int] | None = None,
         use_spot: bool = False,
-    ) -> Iterator[List[clouds.Zone]]:
+    ) -> Iterator[list[clouds.Zone]]:
         del num_nodes  # unused
         regions = cls.regions_with_offering(instance_type,
                                             accelerators,
@@ -156,8 +157,8 @@ class OCI(clouds.Cloud):
     def instance_type_to_hourly_cost(self,
                                      instance_type: str,
                                      use_spot: bool,
-                                     region: Optional[str] = None,
-                                     zone: Optional[str] = None) -> float:
+                                     region: str | None = None,
+                                     zone: str | None = None) -> float:
         return catalog.get_hourly_cost(instance_type,
                                        use_spot=use_spot,
                                        region=region,
@@ -165,10 +166,10 @@ class OCI(clouds.Cloud):
                                        clouds='oci')
 
     def accelerators_to_hourly_cost(self,
-                                    accelerators: Dict[str, int],
+                                    accelerators: dict[str, int],
                                     use_spot: bool,
-                                    region: Optional[str] = None,
-                                    zone: Optional[str] = None) -> float:
+                                    region: str | None = None,
+                                    zone: str | None = None) -> float:
         del accelerators, use_spot, region, zone  # unused
         return 0.0
 
@@ -200,15 +201,15 @@ class OCI(clouds.Cloud):
     @classmethod
     def get_default_instance_type(
         cls,
-        cpus: Optional[str] = None,
-        memory: Optional[str] = None,
-        disk_tier: Optional[resources_utils.DiskTier] = None,
-        local_disk: Optional[str] = None,
-        region: Optional[str] = None,
-        zone: Optional[str] = None,
+        cpus: str | None = None,
+        memory: str | None = None,
+        disk_tier: resources_utils.DiskTier | None = None,
+        local_disk: str | None = None,
+        region: str | None = None,
+        zone: str | None = None,
         use_spot: bool = False,
-        max_hourly_cost: Optional[float] = None,
-    ) -> Optional[str]:
+        max_hourly_cost: float | None = None,
+    ) -> str | None:
         return catalog.get_default_instance_type(
             cpus=cpus,
             memory=memory,
@@ -224,12 +225,12 @@ class OCI(clouds.Cloud):
     def get_accelerators_from_instance_type(
         cls,
         instance_type: str,
-    ) -> Optional[Dict[str, Union[int, float]]]:
+    ) -> dict[str, int | float] | None:
         return catalog.get_accelerators_from_instance_type(instance_type,
                                                            clouds='oci')
 
     @classmethod
-    def get_zone_shell_cmd(cls) -> Optional[str]:
+    def get_zone_shell_cmd(cls) -> str | None:
         return None
 
     def make_deploy_resources_variables(
@@ -237,11 +238,11 @@ class OCI(clouds.Cloud):
         resources: 'resources_lib.Resources',
         cluster_name: resources_utils.ClusterName,
         region: Optional['clouds.Region'],
-        zones: Optional[List['clouds.Zone']],
+        zones: list['clouds.Zone'] | None,
         num_nodes: int,
         dryrun: bool = False,
-        volume_mounts: Optional[List['volume_lib.VolumeMount']] = None,
-    ) -> Dict[str, Any]:
+        volume_mounts: list['volume_lib.VolumeMount'] | None = None,
+    ) -> dict[str, Any]:
         del cluster_name, dryrun  # Unused.
         assert region is not None, resources
 
@@ -437,14 +438,14 @@ class OCI(clouds.Cloud):
 
     @classmethod
     def _check_compute_credentials(
-            cls) -> Tuple[bool, Optional[Union[str, Dict[str, str]]]]:
+            cls) -> tuple[bool, str | dict[str, str] | None]:
         """Checks if the user has access credentials to
         OCI's compute service."""
         return cls._check_credentials()
 
     @classmethod
     def _check_storage_credentials(
-            cls) -> Tuple[bool, Optional[Union[str, Dict[str, str]]]]:
+            cls) -> tuple[bool, str | dict[str, str] | None]:
         """Checks if the user has access credentials to
         OCI's storage service."""
         if oci_s3.use_s3_api():
@@ -457,7 +458,7 @@ class OCI(clouds.Cloud):
         return cls._check_credentials()
 
     @classmethod
-    def _check_credentials(cls) -> Tuple[bool, Optional[str]]:
+    def _check_credentials(cls) -> tuple[bool, str | None]:
         """Checks if the user has access credentials to this cloud."""
 
         short_credential_help_str = (
@@ -518,8 +519,8 @@ class OCI(clouds.Cloud):
 
     @classmethod
     def check_disk_tier(
-            cls, instance_type: Optional[str],
-            disk_tier: Optional[resources_utils.DiskTier]) -> Tuple[bool, str]:
+            cls, instance_type: str | None,
+            disk_tier: resources_utils.DiskTier | None) -> tuple[bool, str]:
         del instance_type  # Unused.
         if disk_tier is None or disk_tier == resources_utils.DiskTier.BEST:
             return True, ''
@@ -529,9 +530,9 @@ class OCI(clouds.Cloud):
                            'instead.')
         return True, ''
 
-    def get_credential_file_mounts(self) -> Dict[str, str]:
+    def get_credential_file_mounts(self) -> dict[str, str]:
         """Returns a dict of credential file paths to mount paths."""
-        file_mounts: Dict[str, str] = {}
+        file_mounts: dict[str, str] = {}
         if oci_s3.use_s3_api():
             # Object Storage is accessed via the S3-compatible API; the
             # native credentials below are still mounted if configured
@@ -568,7 +569,7 @@ class OCI(clouds.Cloud):
         return file_mounts
 
     @classmethod
-    def get_user_identities(cls) -> Optional[List[List[str]]]:
+    def get_user_identities(cls) -> list[list[str]] | None:
         # NOTE: used for very advanced SkyPilot functionality
         # Can implement later if desired
         # If the user switches the compartment_ocid, the existing clusters
@@ -579,11 +580,11 @@ class OCI(clouds.Cloud):
     def instance_type_exists(self, instance_type: str) -> bool:
         return catalog.instance_type_exists(instance_type, 'oci')
 
-    def validate_region_zone(self, region: Optional[str], zone: Optional[str]):
+    def validate_region_zone(self, region: str | None, zone: str | None):
         return catalog.validate_region_zone(region, zone, clouds='oci')
 
     @classmethod
-    def get_image_size(cls, image_id: str, region: Optional[str]) -> float:
+    def get_image_size(cls, image_id: str, region: str | None) -> float:
         # We ignore checking the image size because most of situations the
         # boot volume size is larger than the image size. For specific rare
         # situations, the configuration/setup commands should make sure the
@@ -592,7 +593,7 @@ class OCI(clouds.Cloud):
 
     def _get_image_id(
         self,
-        image_id: Optional[Dict[Optional[str], str]],
+        image_id: dict[str | None, str] | None,
         region_name: str,
         instance_type: str,
     ) -> str:
@@ -614,7 +615,7 @@ class OCI(clouds.Cloud):
         logger.debug(f'Got real image_id {image_id_str}')
         return image_id_str
 
-    def _get_image_str(self, image_id: Optional[Dict[Optional[str], str]],
+    def _get_image_str(self, image_id: dict[str | None, str] | None,
                        instance_type: str, region: str):
         if image_id is None:
             image_str = self._get_default_image_tag(instance_type)
@@ -637,8 +638,8 @@ class OCI(clouds.Cloud):
         return image_tag
 
     def get_vpu_from_disktier(
-            self, cpus: Optional[float],
-            disk_tier: Optional[resources_utils.DiskTier]) -> int:
+            self, cpus: float | None,
+            disk_tier: resources_utils.DiskTier | None) -> int:
         # Only normalize the disk_tier if it is not None, since OCI have
         # different default disk tier according to #vCPU.
         if disk_tier is not None:
@@ -674,9 +675,9 @@ class OCI(clouds.Cloud):
         return vpu
 
     @classmethod
-    def query_status(cls, name: str, tag_filters: Dict[str, str],
-                     region: Optional[str], zone: Optional[str],
-                     **kwargs) -> List[status_lib.ClusterStatus]:
+    def query_status(cls, name: str, tag_filters: dict[str, str],
+                     region: str | None, zone: str | None,
+                     **kwargs) -> list[status_lib.ClusterStatus]:
         del zone, kwargs  # Unused.
 
         status_list = []

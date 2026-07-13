@@ -1,7 +1,7 @@
 """Lambda Cloud instance provisioning."""
 
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
 from sky import sky_logging
 from sky.provision import common
@@ -26,7 +26,7 @@ def _get_lambda_client():
 
 def _filter_instances(
         cluster_name_on_cloud: str,
-        status_filters: Optional[List[str]]) -> Dict[str, Dict[str, Any]]:
+        status_filters: list[str] | None) -> dict[str, dict[str, Any]]:
     lambda_client = _get_lambda_client()
     instances = lambda_client.list_instances()
     possible_names = [
@@ -44,7 +44,7 @@ def _filter_instances(
     return filtered_instances
 
 
-def _get_head_instance_id(instances: Dict[str, Any]) -> Optional[str]:
+def _get_head_instance_id(instances: dict[str, Any]) -> str | None:
     head_instance_id = None
     for instance_id, instance in instances.items():
         if instance['name'].endswith('-head'):
@@ -53,7 +53,7 @@ def _get_head_instance_id(instances: Dict[str, Any]) -> Optional[str]:
     return head_instance_id
 
 
-def _get_private_ip(instance_info: Dict[str, Any], single_node: bool) -> str:
+def _get_private_ip(instance_info: dict[str, Any], single_node: bool) -> str:
     private_ip = instance_info.get('private_ip')
     if private_ip is None:
         if single_node:
@@ -156,13 +156,13 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
 
 
 def wait_instances(region: str, cluster_name_on_cloud: str,
-                   state: Optional[status_lib.ClusterStatus]) -> None:
+                   state: status_lib.ClusterStatus | None) -> None:
     del region, cluster_name_on_cloud, state  # Unused.
 
 
 def stop_instances(
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     worker_only: bool = False,
 ) -> None:
     raise NotImplementedError(
@@ -171,7 +171,7 @@ def stop_instances(
 
 def terminate_instances(
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     worker_only: bool = False,
 ) -> None:
     """See sky/provision/__init__.py"""
@@ -199,12 +199,12 @@ def terminate_instances(
 def get_cluster_info(
     region: str,
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
 ) -> common.ClusterInfo:
     del region  # unused
     running_instances = _filter_instances(cluster_name_on_cloud, ['active'])
     single_node = len(running_instances) == 1
-    instances: Dict[str, List[common.InstanceInfo]] = {}
+    instances: dict[str, list[common.InstanceInfo]] = {}
     head_instance_id = None
     for instance_id, instance_info in running_instances.items():
         instances[instance_id] = [
@@ -231,10 +231,10 @@ def get_cluster_info(
 def query_instances(
     cluster_name: str,
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     non_terminated_only: bool = True,
     retry_if_missing: bool = False,
-) -> Dict[str, Tuple[Optional['status_lib.ClusterStatus'], Optional[str]]]:
+) -> dict[str, tuple[Optional['status_lib.ClusterStatus'], str | None]]:
     """See sky/provision/__init__.py"""
     del cluster_name, retry_if_missing  # unused
     assert provider_config is not None, (cluster_name_on_cloud, provider_config)
@@ -246,8 +246,7 @@ def query_instances(
         'unhealthy': status_lib.ClusterStatus.INIT,
         'terminating': None,
     }
-    statuses: Dict[str, Tuple[Optional['status_lib.ClusterStatus'],
-                              Optional[str]]] = {}
+    statuses: dict[str, tuple[status_lib.ClusterStatus | None, str | None]] = {}
     for instance_id, instance in instances.items():
         status = status_map.get(instance['status'])
         if non_terminated_only and status is None:
@@ -257,8 +256,8 @@ def query_instances(
 
 
 def open_ports(cluster_name_on_cloud: str,
-               ports: List[str],
-               provider_config: Optional[Dict[str, Any]] = None) -> None:
+               ports: list[str],
+               provider_config: dict[str, Any] | None = None) -> None:
     """Open firewall ports for Lambda Cloud.
 
     Args:
@@ -335,8 +334,8 @@ def open_ports(cluster_name_on_cloud: str,
 
 
 def cleanup_ports(cluster_name_on_cloud: str,
-                  ports: List[str],
-                  provider_config: Optional[Dict[str, Any]] = None) -> None:
+                  ports: list[str],
+                  provider_config: dict[str, Any] | None = None) -> None:
     """Skip cleanup of firewall rules.
 
     Lambda Cloud firewall rules are global to the account, not cluster-specific.

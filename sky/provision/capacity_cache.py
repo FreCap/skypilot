@@ -1,7 +1,8 @@
 """Short-lived, process-shared hints for AWS capacity and quota storms."""
+from collections.abc import Iterable
 import json
 import time
-from typing import Iterable, NamedTuple, Set
+from typing import NamedTuple
 
 from sky.utils.db import kv_cache
 
@@ -51,7 +52,7 @@ def mark_exhausted(key: ResourceKey) -> None:
 
 
 def active_exhausted_keys(
-        candidates: Iterable[ResourceKey]) -> Set[ResourceKey]:
+        candidates: Iterable[ResourceKey]) -> set[ResourceKey]:
     """Returns candidates with an unexpired exhaustion hint."""
     return {
         key for key in candidates

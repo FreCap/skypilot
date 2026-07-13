@@ -12,7 +12,7 @@ import configparser
 import csv
 import json
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from sky.adaptors.seeweb import ecsapi
 
@@ -47,7 +47,7 @@ VRAM = {
 }
 
 
-def is_tenstorrent_gpu_name(gpu_name: Optional[str]) -> bool:
+def is_tenstorrent_gpu_name(gpu_name: str | None) -> bool:
     """Return True if the given GPU name refers to a Tenstorrent GPU.
 
     Detects by common identifiers present in normalized names (e.g., GRAYSKULL)
@@ -59,14 +59,14 @@ def is_tenstorrent_gpu_name(gpu_name: Optional[str]) -> bool:
     return 'TENSTORRENT' in upper or 'GRAYSKULL' in upper
 
 
-def is_mi300x_gpu_name(gpu_name: Optional[str]) -> bool:
+def is_mi300x_gpu_name(gpu_name: str | None) -> bool:
     """Return True if the given GPU name refers to AMD MI300X."""
     if not gpu_name:
         return False
     return 'MI300X' in str(gpu_name).upper()
 
 
-def get_api_key(path: Optional[str] = None) -> str:
+def get_api_key(path: str | None = None) -> str:
     """Get API key from config file or environment variable."""
     # Step 1: Try to get from config file
     if path is None:
@@ -106,7 +106,7 @@ def normalize_gpu_name(gpu_name: str) -> str:
     return gpu_name
 
 
-def parse_plan_info(plan: Any) -> Dict[str, Any]:
+def parse_plan_info(plan: Any) -> dict[str, Any]:
     """Parse plan information from Seeweb API response."""
     # Handle both dictionary and object formats
     if hasattr(plan, 'name'):
@@ -198,7 +198,7 @@ def get_gpu_info(gpu_count: int, gpu_name: str, gpu_vram_mb: int = 0) -> str:
     return json.dumps(gpu_info).replace('"', '\'')
 
 
-def fetch_seeweb_data(api_key: str) -> List[Dict]:
+def fetch_seeweb_data(api_key: str) -> list[dict]:
     """Fetch data from Seeweb API."""
     if ecsapi is None:
         raise ImportError('ecsapi not available')

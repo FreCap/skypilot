@@ -1,11 +1,13 @@
 """Rich status spinner utils."""
+from collections.abc import Callable
+from collections.abc import Iterator
 import contextlib
 import contextvars
 import enum
 import logging
 import threading
 import typing
-from typing import Callable, Iterator, Optional, Tuple, Union
+from typing import Optional, Union
 
 from sky import exceptions
 from sky.adaptors import common as adaptors_common
@@ -25,26 +27,26 @@ else:
 
 GeneralStatus = Union['rich_console.Status', 'EncodedStatus']
 
-_client_status: Optional[GeneralStatus] = None
-_server_status: contextvars.ContextVar[
-    Optional[GeneralStatus]] = contextvars.ContextVar('server_status',
-                                                      default=None)
+_client_status: GeneralStatus | None = None
+_server_status: contextvars.ContextVar[GeneralStatus |
+                                       None] = contextvars.ContextVar(
+                                           'server_status', default=None)
 
 
-def _get_client_status() -> Optional[GeneralStatus]:
+def _get_client_status() -> GeneralStatus | None:
     return _client_status
 
 
-def _get_server_status() -> Optional[GeneralStatus]:
+def _get_server_status() -> GeneralStatus | None:
     return _server_status.get()
 
 
-def _set_client_status(status: Optional[GeneralStatus]):
+def _set_client_status(status: GeneralStatus | None):
     global _client_status
     _client_status = status
 
 
-def _set_server_status(status: Optional[GeneralStatus]):
+def _set_server_status(status: GeneralStatus | None):
     _server_status.set(status)
 
 
@@ -67,7 +69,7 @@ class Control(enum.Enum):
         return f'<{self.value}>{msg}</{self.value}>'
 
     @classmethod
-    def decode(cls, encoded_msg: str) -> Tuple[Optional['Control'], str]:
+    def decode(cls, encoded_msg: str) -> tuple[Optional['Control'], str]:
         # Find the control code
         control_str = None
         for control in cls:
@@ -156,7 +158,7 @@ class _RevertibleStatus:
     """A wrapper for status that can revert to previous message after exit."""
 
     def __init__(self, message: str, get_status_fn: Callable[[], GeneralStatus],
-                 set_status_fn: Callable[[Optional[GeneralStatus]], None]):
+                 set_status_fn: Callable[[GeneralStatus | None], None]):
         self.previous_message = None
         self.get_status_fn = get_status_fn
         self.set_status_fn = set_status_fn
@@ -298,9 +300,8 @@ def client_status(msg: str) -> Union['rich_console.Status', _NoOpConsoleStatus]:
     return _NoOpConsoleStatus()
 
 
-def decode_rich_status(
-        response: 'requests.Response',
-        relay_rich_status: bool = False) -> Iterator[Optional[str]]:
+def decode_rich_status(response: 'requests.Response',
+                       relay_rich_status: bool = False) -> Iterator[str | None]:
     """Decode the rich status message from the response.
 
     Args:
@@ -436,8 +437,7 @@ def decode_rich_status(
 
 
 async def decode_rich_status_async(
-        response: 'aiohttp.ClientResponse'
-) -> typing.AsyncIterator[Optional[str]]:
+        response: 'aiohttp.ClientResponse') -> typing.AsyncIterator[str | None]:
     """Async version of rich_utils.decode_rich_status that decodes rich status
     messages from an aiohttp response.
 

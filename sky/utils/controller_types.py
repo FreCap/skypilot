@@ -1,8 +1,9 @@
 """Controller identities and their stable user-facing metadata."""
 
+from collections.abc import Callable
 import dataclasses
 import enum
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Optional
 
 import colorama
 
@@ -19,7 +20,7 @@ class _ControllerSpec:
     controller_type: str
     name: str
     _cluster_name_func: Callable[[], str]
-    _cluster_name_from_server: Optional[str]  # For client-side only
+    _cluster_name_from_server: str | None  # For client-side only
     in_progress_hint: Callable[[bool], str]
     decline_cancel_hint: str
     _decline_down_when_failed_to_fetch_status_hint: str
@@ -27,8 +28,8 @@ class _ControllerSpec:
     _check_cluster_name_hint: str
     default_hint_if_non_existent: str
     connection_error_hint: str
-    default_resources_config: Dict[str, Any]
-    default_autostop_config: Dict[str, Any]
+    default_resources_config: dict[str, Any]
+    default_autostop_config: dict[str, Any]
 
     @property
     def decline_down_when_failed_to_fetch_status_hint(self) -> str:
@@ -134,7 +135,7 @@ class Controllers(enum.Enum):
 
     @classmethod
     def from_name(cls,
-                  name: Optional[str],
+                  name: str | None,
                   expect_exact_match: bool = True) -> Optional['Controllers']:
         """Check if the cluster name is a controller name.
 
@@ -198,7 +199,7 @@ def get_controller_for_pool(pool: bool) -> Controllers:
     return Controllers.SKY_SERVE_CONTROLLER
 
 
-def high_availability_specified(cluster_name: Optional[str]) -> bool:
+def high_availability_specified(cluster_name: str | None) -> bool:
     """Check if the controller high availability is specified in user config.
     """
     controller = Controllers.from_name(cluster_name, expect_exact_match=False)

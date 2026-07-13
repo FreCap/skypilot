@@ -2,7 +2,6 @@
 
 import os
 import typing
-from typing import Dict, List, Optional, Set, Tuple, Union
 
 from sky import sky_logging
 from sky import skypilot_config
@@ -38,7 +37,7 @@ class SSH(kubernetes.Kubernetes):
     _REPR = 'SSH'
 
     # Keep track of contexts that have been logged as unreachable
-    logged_unreachable_contexts: Set[str] = set()
+    logged_unreachable_contexts: set[str] = set()
 
     def __repr__(self):
         return self._REPR
@@ -47,13 +46,13 @@ class SSH(kubernetes.Kubernetes):
     def _unsupported_features_for_resources(
         cls,
         resources: 'resources_lib.Resources',
-        region: Optional[str] = None,
-    ) -> Dict[kubernetes.clouds.CloudImplementationFeatures, str]:
+        region: str | None = None,
+    ) -> dict[kubernetes.clouds.CloudImplementationFeatures, str]:
         # Inherit all Kubernetes unsupported features
         return super()._unsupported_features_for_resources(resources, region)
 
     @classmethod
-    def get_ssh_node_pool_contexts(cls) -> List[str]:
+    def get_ssh_node_pool_contexts(cls) -> list[str]:
         """Get context names from ssh_node_pools.yaml file.
 
         Reads the SSH node pools configuration file and returns
@@ -67,7 +66,7 @@ class SSH(kubernetes.Kubernetes):
 
         if os.path.exists(SSH_NODE_POOLS_PATH):
             try:
-                with open(SSH_NODE_POOLS_PATH, 'r', encoding='utf-8') as f:
+                with open(SSH_NODE_POOLS_PATH, encoding='utf-8') as f:
                     ssh_config = yaml_utils.safe_load(f)
                     if ssh_config:
                         # Get cluster names and prepend 'ssh-' to match
@@ -82,7 +81,7 @@ class SSH(kubernetes.Kubernetes):
 
         return contexts
 
-    def validate_region_zone(self, region: Optional[str], zone: Optional[str]):
+    def validate_region_zone(self, region: str | None, zone: str | None):
         if region == kubernetes_adaptor.in_cluster_context_name():
             # If running incluster, we set region to IN_CLUSTER_REGION
             # since there is no context name available.
@@ -107,7 +106,7 @@ class SSH(kubernetes.Kubernetes):
     @classmethod
     @annotations.lru_cache(scope='global', maxsize=1)
     def _ssh_log_skipped_contexts_once(
-            cls, skipped_contexts: Tuple[str, ...]) -> None:
+            cls, skipped_contexts: tuple[str, ...]) -> None:
         """Log skipped contexts for only once.
 
         We don't directly cache the result of _filter_existing_allowed_contexts
@@ -125,7 +124,7 @@ class SSH(kubernetes.Kubernetes):
                 'Run `sky ssh up` to set up.')
 
     @classmethod
-    def existing_allowed_contexts(cls, silent: bool = False) -> List[str]:
+    def existing_allowed_contexts(cls, silent: bool = False) -> list[str]:
         """Get existing allowed contexts that start with 'ssh-'.
 
         Override the Kubernetes implementation to only return contexts that
@@ -185,7 +184,7 @@ class SSH(kubernetes.Kubernetes):
 
     @classmethod
     def _check_compute_credentials(
-            cls) -> Tuple[bool, Optional[Union[str, Dict[str, str]]]]:
+            cls) -> tuple[bool, str | dict[str, str] | None]:
         """Check if the user has access credentials to SSH contexts."""
         # Check for port forward dependencies - reuse Kubernetes implementation
         reasons = kubernetes_utils.check_port_forward_mode_dependencies(False)
@@ -217,7 +216,7 @@ class SSH(kubernetes.Kubernetes):
         return success, ctx2text
 
     @classmethod
-    def check_single_context(cls, context: str) -> Tuple[bool, str]:
+    def check_single_context(cls, context: str) -> tuple[bool, str]:
         """Checks if the context is valid and accessible."""
         reasons = kubernetes_utils.check_port_forward_mode_dependencies(False)
         if reasons is not None:
@@ -253,7 +252,7 @@ class SSH(kubernetes.Kubernetes):
         return (True, 'SSH Node Pool is set up.')
 
     @classmethod
-    def expand_infras(cls) -> List[str]:
+    def expand_infras(cls) -> list[str]:
         return [
             f'{cls.canonical_name()}/{common_utils.removeprefix(c, "ssh-")}'
             for c in cls.existing_allowed_contexts(silent=True)

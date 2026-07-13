@@ -2,7 +2,6 @@
 
 import collections
 import re
-from typing import Dict, List, Optional, Set, Tuple
 
 import colorama
 
@@ -26,14 +25,14 @@ def instance_type_exists(instance_type: str) -> bool:
 
 
 def get_default_instance_type(
-        cpus: Optional[str] = None,
-        memory: Optional[str] = None,
-        disk_tier: Optional[resources_utils.DiskTier] = None,
-        local_disk: Optional[str] = None,
-        region: Optional[str] = None,
-        zone: Optional[str] = None,
+        cpus: str | None = None,
+        memory: str | None = None,
+        disk_tier: resources_utils.DiskTier | None = None,
+        local_disk: str | None = None,
+        region: str | None = None,
+        zone: str | None = None,
         use_spot: bool = False,
-        max_hourly_cost: Optional[float] = None) -> Optional[str]:
+        max_hourly_cost: float | None = None) -> str | None:
     # Delete unused parameters.
     del disk_tier, zone, local_disk, use_spot, max_hourly_cost
 
@@ -56,7 +55,7 @@ def get_default_instance_type(
         # translates to omitting --mem from the sbatch script (letting Slurm
         # use its default allocation).
         # Check which clusters do NOT track memory.
-        no_mem_clusters: Dict[str, str] = {}  # cluster -> SelectTypeParams
+        no_mem_clusters: dict[str, str] = {}  # cluster -> SelectTypeParams
         clusters_to_check = ([region] if region is not None else
                              slurm_utils.get_all_slurm_cluster_names())
         for cluster in clusters_to_check:
@@ -90,12 +89,12 @@ def get_default_instance_type(
 
 def list_accelerators(
         gpus_only: bool,
-        name_filter: Optional[str],
-        region_filter: Optional[str],
-        quantity_filter: Optional[int],
+        name_filter: str | None,
+        region_filter: str | None,
+        quantity_filter: int | None,
         case_sensitive: bool = True,
         all_regions: bool = False,
-        require_price: bool = True) -> Dict[str, List[common.InstanceTypeInfo]]:
+        require_price: bool = True) -> dict[str, list[common.InstanceTypeInfo]]:
     """List accelerators in Slurm clusters.
 
     Returns a dictionary mapping GPU type to a list of InstanceTypeInfo objects.
@@ -107,13 +106,13 @@ def list_accelerators(
 
 def list_accelerators_realtime(
     gpus_only: bool = True,
-    name_filter: Optional[str] = None,
-    region_filter: Optional[str] = None,
-    quantity_filter: Optional[int] = None,
+    name_filter: str | None = None,
+    region_filter: str | None = None,
+    quantity_filter: int | None = None,
     case_sensitive: bool = True,
     all_regions: bool = False,
     require_price: bool = False,
-) -> Tuple[Dict[str, List[common.InstanceTypeInfo]], Dict[str, int], Dict[str,
+) -> tuple[dict[str, list[common.InstanceTypeInfo]], dict[str, int], dict[str,
                                                                           int]]:
     """Fetches real-time accelerator information from the Slurm cluster.
 
@@ -172,10 +171,10 @@ def list_accelerators_realtime(
         raise ValueError(err_msg)
 
     # Aggregate results into the required format
-    qtys_map: Dict[str,
-                   Set[common.InstanceTypeInfo]] = collections.defaultdict(set)
-    total_capacity: Dict[str, int] = collections.defaultdict(int)
-    total_available: Dict[str, int] = collections.defaultdict(int)
+    qtys_map: dict[str,
+                   set[common.InstanceTypeInfo]] = collections.defaultdict(set)
+    total_capacity: dict[str, int] = collections.defaultdict(int)
+    total_available: dict[str, int] = collections.defaultdict(int)
 
     for node_info in slurm_nodes_info:
         gpu_type = node_info['gpu_type']
@@ -265,7 +264,7 @@ def list_accelerators_realtime(
     return final_qtys_map, dict(total_capacity), dict(total_available)
 
 
-def _get_pricing(region: Optional[str], zone: Optional[str] = None) -> Dict:
+def _get_pricing(region: str | None, zone: str | None = None) -> dict:
     """Resolve the pricing dict for a Slurm cluster/partition from config.
 
     Each level is deep-merged into the previous so that partial overrides
@@ -276,7 +275,7 @@ def _get_pricing(region: Optional[str], zone: Optional[str] = None) -> Dict:
     For example, a cluster that only overrides ``accelerators.A100`` still
     inherits ``cpu`` and ``memory`` rates from the cloud-level default.
     """
-    paths: List[Tuple[str, ...]] = [('slurm', 'pricing')]
+    paths: list[tuple[str, ...]] = [('slurm', 'pricing')]
     if region is not None:
         paths.append(('slurm', 'cluster_configs', region, 'pricing'))
     if region is not None and zone is not None:
@@ -287,8 +286,8 @@ def _get_pricing(region: Optional[str], zone: Optional[str] = None) -> Dict:
 
 def get_hourly_cost(instance_type: str,
                     use_spot: bool,
-                    region: Optional[str] = None,
-                    zone: Optional[str] = None) -> float:
+                    region: str | None = None,
+                    zone: str | None = None) -> float:
     """Returns the hourly cost for a Slurm virtual instance type.
 
     Pricing is read from the ``slurm.pricing`` section of
@@ -306,7 +305,7 @@ def get_hourly_cost(instance_type: str,
 
 
 def validate_region_zone(
-    region_name: Optional[str],
-    zone_name: Optional[str],
-) -> Tuple[Optional[str], Optional[str]]:
+    region_name: str | None,
+    zone_name: str | None,
+) -> tuple[str | None, str | None]:
     return (region_name, zone_name)

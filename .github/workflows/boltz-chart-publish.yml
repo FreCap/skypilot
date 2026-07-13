@@ -19,7 +19,6 @@ on:
 concurrency:
   group: boltz-chart-publish
   cancel-in-progress: false
-  queue: max
 
 permissions:
   id-token: write   # OIDC -> AWS

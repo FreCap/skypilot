@@ -4,7 +4,7 @@ import dataclasses
 import re
 import shlex
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from sky import sky_logging
 from sky.skylet import constants
@@ -81,7 +81,7 @@ class DockerLoginConfig:
         return image
 
     @classmethod
-    def from_env_vars(cls, d: Dict[str, str]) -> 'DockerLoginConfig':
+    def from_env_vars(cls, d: dict[str, str]) -> 'DockerLoginConfig':
         return cls(
             username=d[constants.DOCKER_USERNAME_ENV_VAR],
             password=d[constants.DOCKER_PASSWORD_ENV_VAR],
@@ -148,8 +148,7 @@ def docker_start_cmds(
 
     # for click, used in ray cli
     env_vars = {'LC_ALL': 'C.UTF-8', 'LANG': 'C.UTF-8'}
-    env_flags = ' '.join(
-        ['-e {name}={val}'.format(name=k, val=v) for k, v in env_vars.items()])
+    env_flags = ' '.join([f'-e {k}={v}' for k, v in env_vars.items()])
 
     user_options_str = ' '.join(user_options)
     docker_run = [
@@ -157,7 +156,7 @@ def docker_start_cmds(
         'run',
         # SkyPilot: Remove --rm flag to keep the container after `ray stop`
         # is executed.
-        '--name {}'.format(container_name),
+        f'--name {container_name}',
         '-d',
         '-it',
         env_flags,
@@ -197,12 +196,12 @@ def _redact_docker_password(cmd: str) -> str:
 class DockerInitializer:
     """Initializer for docker containers on a remote node."""
 
-    def __init__(self, docker_config: Dict[str, Any],
+    def __init__(self, docker_config: dict[str, Any],
                  runner: 'command_runner.CommandRunner', log_path: str):
         self.docker_config = docker_config
         self.container_name = docker_config['container_name']
         self.runner = runner
-        self.home_dir: Optional[str] = None
+        self.home_dir: str | None = None
         self.initialized = False
         # podman is not fully tested yet.
         use_podman = docker_config.get('use_podman', False)
@@ -220,8 +219,8 @@ class DockerInitializer:
         wait_for_docker_daemon: bool = False,
         separate_stderr: bool = False,
         log_err_when_fail: bool = True,
-        flock_name: Optional[str] = None,
-        flock_args: Optional[str] = None,
+        flock_name: str | None = None,
+        flock_args: str | None = None,
     ) -> str:
 
         if run_env == 'docker':
@@ -547,7 +546,7 @@ class DockerInitializer:
 
         return string
 
-    def _configure_runtime(self, run_options: List[str]) -> List[str]:
+    def _configure_runtime(self, run_options: list[str]) -> list[str]:
         if self.docker_config.get('disable_automatic_runtime_detection'):
             return run_options
 
@@ -567,7 +566,7 @@ class DockerInitializer:
 
         return run_options
 
-    def _auto_configure_shm(self, run_options: List[str]) -> List[str]:
+    def _auto_configure_shm(self, run_options: list[str]) -> list[str]:
         if self.docker_config.get('disable_shm_size_detection'):
             return run_options
         for run_opt in run_options:

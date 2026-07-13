@@ -8,11 +8,12 @@ caches for the return value (e.g., sky/clouds/utils/gcp_utils), so they can be
 reused across cloud object creation.
 """
 import collections
+from collections.abc import Iterable
+from collections.abc import Iterator
 import enum
 import math
 import typing
-from typing import (Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple,
-                    Union)
+from typing import Any, Optional
 
 from typing_extensions import assert_never
 
@@ -77,9 +78,9 @@ ALL_CAPABILITIES = [CloudCapability.COMPUTE, CloudCapability.STORAGE]
 class Region(collections.namedtuple('Region', ['name'])):
     """A region."""
     name: str
-    zones: Optional[List['Zone']] = None
+    zones: list['Zone'] | None = None
 
-    def set_zones(self, zones: List['Zone']):
+    def set_zones(self, zones: list['Zone']):
         self.zones = zones
         for zone in self.zones:
             zone.region = self
@@ -161,7 +162,7 @@ class Cloud:
     OPEN_PORTS_VERSION = OpenPortsVersion.UPDATABLE
 
     @classmethod
-    def max_cluster_name_length(cls) -> Optional[int]:
+    def max_cluster_name_length(cls) -> int | None:
         """Returns the maximum length limit of a cluster name.
 
         This method is used by check_cluster_name_is_valid() to check if the
@@ -206,12 +207,12 @@ class Cloud:
     def regions_with_offering(
         cls,
         instance_type: str,
-        accelerators: Optional[Dict[str, int]],
+        accelerators: dict[str, int] | None,
         use_spot: bool,
-        region: Optional[str],
-        zone: Optional[str],
+        region: str | None,
+        zone: str | None,
         resources: Optional['resources_lib.Resources'] = None,
-    ) -> List[Region]:
+    ) -> list[Region]:
         """Returns the regions that offer the specified resources.
 
         The order of the regions follow the order of the regions returned by
@@ -240,9 +241,9 @@ class Cloud:
         region: str,
         num_nodes: int,
         instance_type: str,
-        accelerators: Optional[Dict[str, int]] = None,
+        accelerators: dict[str, int] | None = None,
         use_spot: bool = False,
-    ) -> Iterator[Optional[List[Zone]]]:
+    ) -> Iterator[list[Zone] | None]:
         """Loops over zones to retry for provisioning in a given region.
 
         Certain clouds' provisioners may handle batched requests, retrying for
@@ -298,21 +299,21 @@ class Cloud:
         raise NotImplementedError
 
     @classmethod
-    def get_zone_shell_cmd(cls) -> Optional[str]:
+    def get_zone_shell_cmd(cls) -> str | None:
         """Returns the shell command to obtain the zone of instance."""
         raise NotImplementedError
 
     #### Normal methods ####
 
     def instance_type_to_hourly_cost(self, instance_type: str, use_spot: bool,
-                                     region: Optional[str],
-                                     zone: Optional[str]) -> float:
+                                     region: str | None,
+                                     zone: str | None) -> float:
         """Returns the hourly on-demand/spot price for an instance type."""
         raise NotImplementedError
 
-    def accelerators_to_hourly_cost(self, accelerators: Dict[str, int],
-                                    use_spot: bool, region: Optional[str],
-                                    zone: Optional[str]) -> float:
+    def accelerators_to_hourly_cost(self, accelerators: dict[str, int],
+                                    use_spot: bool, region: str | None,
+                                    zone: str | None) -> float:
         """Returns the hourly on-demand price for accelerators."""
         raise NotImplementedError
 
@@ -331,11 +332,11 @@ class Cloud:
         resources: 'resources_lib.Resources',
         cluster_name: resources_utils.ClusterName,
         region: 'Region',
-        zones: Optional[List['Zone']],
+        zones: list['Zone'] | None,
         num_nodes: int,
         dryrun: bool = False,
-        volume_mounts: Optional[List['volume_lib.VolumeMount']] = None,
-    ) -> Dict[str, Any]:
+        volume_mounts: list['volume_lib.VolumeMount'] | None = None,
+    ) -> dict[str, Any]:
         """Converts planned sky.Resources to cloud-specific resource variables.
 
         These variables are used to fill the node type section (instance type,
@@ -351,7 +352,7 @@ class Cloud:
 
     @classmethod
     def get_vcpus_mem_from_instance_type(
-            cls, instance_type: str) -> Tuple[Optional[float], Optional[float]]:
+            cls, instance_type: str) -> tuple[float | None, float | None]:
         """Returns the #vCPUs and memory that the instance type offers."""
         raise NotImplementedError
 
@@ -359,7 +360,7 @@ class Cloud:
     def get_accelerators_from_instance_type(
         cls,
         instance_type: str,
-    ) -> Optional[Dict[str, Union[int, float]]]:
+    ) -> dict[str, int | float] | None:
         """Returns {acc: acc_count} held by 'instance_type', if any."""
         raise NotImplementedError
 
@@ -367,7 +368,7 @@ class Cloud:
     def get_arch_from_instance_type(
         cls,
         instance_type: str,
-    ) -> Optional[str]:
+    ) -> str | None:
         """Returns the arch of the instance type, if any."""
         raise NotImplementedError
 
@@ -375,7 +376,7 @@ class Cloud:
     def get_local_disk_spec_from_instance_type(
         cls,
         instance_type: str,
-    ) -> Optional[str]:
+    ) -> str | None:
         """Returns the local disk specs from instance type, if any."""
         del instance_type  # unused
         return None
@@ -383,15 +384,15 @@ class Cloud:
     @classmethod
     def get_default_instance_type(
         cls,
-        cpus: Optional[str] = None,
-        memory: Optional[str] = None,
-        disk_tier: Optional[resources_utils.DiskTier] = None,
-        local_disk: Optional[str] = None,
-        region: Optional[str] = None,
-        zone: Optional[str] = None,
+        cpus: str | None = None,
+        memory: str | None = None,
+        disk_tier: resources_utils.DiskTier | None = None,
+        local_disk: str | None = None,
+        region: str | None = None,
+        zone: str | None = None,
         use_spot: bool = False,
-        max_hourly_cost: Optional[float] = None,
-    ) -> Optional[str]:
+        max_hourly_cost: float | None = None,
+    ) -> str | None:
         """Returns the default instance type with the given #vCPUs, memory,
         disk tier, local disk, region, and zone.
 
@@ -423,7 +424,7 @@ class Cloud:
         raise NotImplementedError
 
     @classmethod
-    def is_image_tag_valid(cls, image_tag: str, region: Optional[str]) -> bool:
+    def is_image_tag_valid(cls, image_tag: str, region: str | None) -> bool:
         """Validates that the image tag is valid for this cloud."""
         return catalog.is_image_tag_valid(image_tag,
                                           region,
@@ -431,7 +432,7 @@ class Cloud:
 
     @classmethod
     def is_label_valid(cls, label_key: str,
-                       label_value: str) -> Tuple[bool, Optional[str]]:
+                       label_value: str) -> tuple[bool, str | None]:
         """Validates that the label key and value are valid for this cloud.
 
         Labels can be implemented in different ways across clouds. For example,
@@ -449,8 +450,7 @@ class Cloud:
         return True, None
 
     @classmethod
-    def is_volume_name_valid(cls,
-                             volume_name: str) -> Tuple[bool, Optional[str]]:
+    def is_volume_name_valid(cls, volume_name: str) -> tuple[bool, str | None]:
         """Validates that the volume name is valid for this cloud.
 
         Returns:
@@ -521,9 +521,9 @@ class Cloud:
         self,
         instance_type: str,
         region: str,
-        zone: Optional[str],
-        specific_reservations: Set[str],
-    ) -> Dict[str, int]:
+        zone: str | None,
+        specific_reservations: set[str],
+    ) -> dict[str, int]:
         """"
         Returns the number of available resources per reservation for the given
         instance type in the given region/zone.
@@ -535,7 +535,7 @@ class Cloud:
     @classmethod
     def check_credentials(
         cls, cloud_capability: CloudCapability
-    ) -> Tuple[bool, Optional[Union[str, Dict[str, str]]]]:
+    ) -> tuple[bool, str | dict[str, str] | None]:
         """Checks if the user has access credentials to this cloud.
 
         Returns a boolean of whether the user can access this cloud, and:
@@ -554,7 +554,7 @@ class Cloud:
 
     @classmethod
     def _check_compute_credentials(
-            cls) -> Tuple[bool, Optional[Union[str, Dict[str, str]]]]:
+            cls) -> tuple[bool, str | dict[str, str] | None]:
         """Checks if the user has access credentials to
         this cloud's compute service."""
         raise exceptions.NotSupportedError(
@@ -562,14 +562,14 @@ class Cloud:
 
     @classmethod
     def _check_storage_credentials(
-            cls) -> Tuple[bool, Optional[Union[str, Dict[str, str]]]]:
+            cls) -> tuple[bool, str | dict[str, str] | None]:
         """Checks if the user has access credentials to
         this cloud's storage service."""
         raise exceptions.NotSupportedError(
             f'{cls._REPR} does not support {CloudCapability.STORAGE.value}.')
 
     @classmethod
-    def expand_infras(cls) -> List[str]:
+    def expand_infras(cls) -> list[str]:
         """Returns a list of enabled infrastructures for this cloud.
 
         For Kubernetes and SSH, return a list of resource pools.
@@ -579,7 +579,7 @@ class Cloud:
 
     # TODO(zhwu): Make the return type immutable.
     @classmethod
-    def get_user_identities(cls) -> Optional[List[List[str]]]:
+    def get_user_identities(cls) -> list[list[str]] | None:
         """(Advanced) Returns all available user identities of this cloud.
 
         The user "identity" is associated with each SkyPilot cluster they
@@ -643,7 +643,7 @@ class Cloud:
         return None
 
     @classmethod
-    def get_active_user_identity_str(cls) -> Optional[str]:
+    def get_active_user_identity_str(cls) -> str | None:
         """Returns a user friendly representation of the active identity."""
         user_identity = cls.get_active_user_identity()
         if user_identity is None:
@@ -651,7 +651,7 @@ class Cloud:
         return ', '.join(user_identity)
 
     @classmethod
-    def get_active_user_identity(cls) -> Optional[List[str]]:
+    def get_active_user_identity(cls) -> list[str] | None:
         """Returns currently active user identity of this cloud
 
         See get_user_identities for definition of user identity.
@@ -663,7 +663,7 @@ class Cloud:
         identities = cls.get_user_identities()
         return identities[0] if identities is not None else None
 
-    def get_credential_file_mounts(self) -> Dict[str, str]:
+    def get_credential_file_mounts(self) -> dict[str, str]:
         """Returns the files necessary to access this cloud.
 
         Returns a dictionary that will be added to a task's file mounts.
@@ -675,7 +675,7 @@ class Cloud:
         return False
 
     @classmethod
-    def get_image_size(cls, image_id: str, region: Optional[str]) -> float:
+    def get_image_size(cls, image_id: str, region: str | None) -> float:
         """Check the image size from the cloud.
 
         Returns: the image size in GB.
@@ -687,9 +687,8 @@ class Cloud:
         """Returns whether the instance type exists for this cloud."""
         raise NotImplementedError
 
-    def validate_region_zone(
-            self, region: Optional[str],
-            zone: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    def validate_region_zone(self, region: str | None,
+                             zone: str | None) -> tuple[str | None, str | None]:
         """Validates whether region and zone exist in the catalog.
 
         Returns:
@@ -720,8 +719,8 @@ class Cloud:
     def check_features_are_supported(
         cls,
         resources: 'resources_lib.Resources',
-        requested_features: Set[CloudImplementationFeatures],
-        region: Optional[str] = None,
+        requested_features: set[CloudImplementationFeatures],
+        region: str | None = None,
     ) -> None:
         """Errors out if the cloud does not support all requested features.
 
@@ -772,8 +771,8 @@ class Cloud:
     def _unsupported_features_for_resources(
         cls,
         resources: 'resources_lib.Resources',
-        region: Optional[str] = None,
-    ) -> Dict[CloudImplementationFeatures, str]:
+        region: str | None = None,
+    ) -> dict[CloudImplementationFeatures, str]:
         """The features not supported based on the resources provided.
 
         This method is used by check_features_are_supported() to check if the
@@ -787,7 +786,7 @@ class Cloud:
         raise NotImplementedError
 
     @classmethod
-    def check_disk_tier_enabled(cls, instance_type: Optional[str],
+    def check_disk_tier_enabled(cls, instance_type: str | None,
                                 disk_tier: resources_utils.DiskTier) -> None:
         """Errors out if the disk tier is not supported by the cloud provider.
 
@@ -802,7 +801,7 @@ class Cloud:
 
     @classmethod
     def check_network_tier_enabled(
-            cls, instance_type: Optional[str],
+            cls, instance_type: str | None,
             network_tier: resources_utils.NetworkTier) -> None:
         """Errors out if the network tier is not supported by the
         cloud provider.
@@ -822,7 +821,7 @@ class Cloud:
 
     @classmethod
     def _translate_disk_tier(
-        cls, disk_tier: Optional[resources_utils.DiskTier]
+            cls, disk_tier: resources_utils.DiskTier | None
     ) -> resources_utils.DiskTier:
         if disk_tier is None:
             return cls._DEFAULT_DISK_TIER
@@ -843,9 +842,8 @@ class Cloud:
         resources = resources.assert_launchable()
 
         def _equal_accelerators(
-            acc_requested: Optional[Dict[str, Union[int, float]]],
-            acc_from_instance_type: Optional[Dict[str, Union[int,
-                                                             float]]]) -> bool:
+                acc_requested: dict[str, int | float] | None,
+                acc_from_instance_type: dict[str, int | float] | None) -> bool:
             """Check the requested accelerators equals to the instance type
 
             Check the requested accelerators equals to the accelerators
@@ -941,9 +939,9 @@ class Cloud:
         return True
 
     @classmethod
-    def query_status(cls, name: str, tag_filters: Dict[str, str],
-                     region: Optional[str], zone: Optional[str],
-                     **kwargs) -> List['status_lib.ClusterStatus']:
+    def query_status(cls, name: str, tag_filters: dict[str, str],
+                     region: str | None, zone: str | None,
+                     **kwargs) -> list['status_lib.ClusterStatus']:
         """Queries the latest status of the cluster from the cloud.
 
         The global_user_state caches the status of the clusters, but the
@@ -973,8 +971,7 @@ class Cloud:
     @classmethod
     def create_image_from_cluster(cls,
                                   cluster_name: resources_utils.ClusterName,
-                                  region: Optional[str],
-                                  zone: Optional[str]) -> str:
+                                  region: str | None, zone: str | None) -> str:
         """Creates an image from the cluster.
 
         Returns: the image ID.
@@ -983,8 +980,8 @@ class Cloud:
 
     @classmethod
     def maybe_move_image(cls, image_id: str, source_region: str,
-                         target_region: str, source_zone: Optional[str],
-                         target_zone: Optional[str]) -> str:
+                         target_region: str, source_zone: str | None,
+                         target_zone: str | None) -> str:
         """Move an image if required.
 
         If the image cannot be accessed in the target region, move the image
@@ -995,7 +992,7 @@ class Cloud:
         raise NotImplementedError
 
     @classmethod
-    def delete_image(cls, image_id: str, region: Optional[str]) -> None:
+    def delete_image(cls, image_id: str, region: str | None) -> None:
         """Deletes the image with image_id in the region."""
         raise NotImplementedError
 
@@ -1014,8 +1011,8 @@ class Cloud:
 
     @classmethod
     def yield_cloud_specific_failover_overrides(cls,
-                                                region: Optional[str] = None
-                                               ) -> Iterable[Dict[str, Any]]:
+                                                region: str | None = None
+                                               ) -> Iterable[dict[str, Any]]:
         """Some clouds may have configurations that require them to have
         non-region/zone failovers. This method yields override keys for the
         cluster config. Refer to the implementation for AWS for an example."""

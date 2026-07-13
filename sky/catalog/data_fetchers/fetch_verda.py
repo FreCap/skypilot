@@ -9,7 +9,6 @@ import logging
 import os
 import re
 import sys
-from typing import Dict, List, Optional, Tuple
 
 import requests
 
@@ -48,7 +47,7 @@ def _get_oauth_token(base_url: str, client_id: str, client_secret: str) -> str:
     return token_data['access_token']
 
 
-def _fetch_instance_types(base_url: str, token: str) -> List[Dict]:
+def _fetch_instance_types(base_url: str, token: str) -> list[dict]:
     """Fetch all instance types from the API.
 
     Args:
@@ -69,7 +68,7 @@ def _fetch_instance_types(base_url: str, token: str) -> List[Dict]:
 
 def _fetch_instance_availability(base_url: str,
                                  token: str,
-                                 is_spot: bool = False) -> List[Dict]:
+                                 is_spot: bool = False) -> list[dict]:
     """Fetch instance availability for different regions.
 
     Args:
@@ -91,9 +90,9 @@ def _fetch_instance_availability(base_url: str,
 
 
 def _build_availability_map(
-        base_url: str, token: str) -> Dict[str, Dict[str, Tuple[bool, bool]]]:
+        base_url: str, token: str) -> dict[str, dict[str, tuple[bool, bool]]]:
     """Build a map of instance types to regions and their availability."""
-    availability_map: Dict[str, Dict[str, Tuple[bool, bool]]] = {}
+    availability_map: dict[str, dict[str, tuple[bool, bool]]] = {}
 
     # Fetch on-demand availability
     on_demand_availability = _fetch_instance_availability(base_url,
@@ -132,7 +131,7 @@ def _build_availability_map(
     return availability_map
 
 
-def _extract_gpu_model(instance: Dict) -> str:
+def _extract_gpu_model(instance: dict) -> str:
     """Extract GPU model from instance attributes or description.
 
     Args:
@@ -231,13 +230,13 @@ def create_catalog(output_path: str) -> None:
     """
 
     # Get authentication credentials
-    client_id: Optional[str] = None
-    client_secret: Optional[str] = None
-    base_url: Optional[str] = None
+    client_id: str | None = None
+    client_secret: str | None = None
+    base_url: str | None = None
 
     config_file_path = os.path.expanduser('~/.verda/config.json')
     if os.path.exists(config_file_path):
-        with open(config_file_path, 'r', encoding='utf-8') as f:
+        with open(config_file_path, encoding='utf-8') as f:
             config = json.load(f)
             client_id = config.get('client_id', client_id)
             client_secret = config.get('client_secret', client_secret)

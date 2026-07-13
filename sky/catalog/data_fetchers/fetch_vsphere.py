@@ -327,7 +327,7 @@ def initialize_accelerators_csv():
             raise e
 
 
-def get_accelerators_from_csv() -> typing.List[typing.Dict]:
+def get_accelerators_from_csv() -> list[dict]:
     try:
         df = pd.read_csv(ACCELERATORS_CSV_PATH)
         return df.to_dict('records')
@@ -336,8 +336,7 @@ def get_accelerators_from_csv() -> typing.List[typing.Dict]:
         raise e
 
 
-def initialize_hosts_csv(csv_saving_path: str,
-                         hosts_for_csv: typing.List[typing.Dict]):
+def initialize_hosts_csv(csv_saving_path: str, hosts_for_csv: list[dict]):
     try:
         with open(csv_saving_path, 'a', encoding='utf-8') as f:
             for host in hosts_for_csv:
@@ -356,10 +355,9 @@ def initialize_hosts_csv(csv_saving_path: str,
 
 
 def summarize_by_cluster_and_gpu(
-    hosts_to_summarize: typing.List[typing.Dict],
-) -> typing.Dict[str, typing.Any]:
+    hosts_to_summarize: list[dict],) -> dict[str, typing.Any]:
     try:
-        gpu_cluster_dict: typing.Dict[str, typing.Dict[str, typing.Any]] = {}
+        gpu_cluster_dict: dict[str, dict[str, typing.Any]] = {}
         gpu_list = get_accelerators_from_csv()
         weakest_host_of_each_cluster = {}
         for host in hosts_to_summarize:
@@ -399,8 +397,8 @@ def summarize_by_cluster_and_gpu(
                 weakest_host_of_each_cluster[cluster_name] = host.get(
                     'TotalCPUcores', 0)
             else:
-                if (host.get('TotalCPUcores') and host.get('TotalCPUcores') <
-                        weakest_host_of_each_cluster[cluster_name]):
+                if (host.get('TotalCPUcores') and host.get('TotalCPUcores')
+                        < weakest_host_of_each_cluster[cluster_name]):
                     weakest_host_of_each_cluster[cluster_name] = host.get(
                         'TotalCPUcores', 0)
         return {
@@ -412,8 +410,7 @@ def summarize_by_cluster_and_gpu(
         raise e
 
 
-def initialize_vms_csv(csv_saving_path: str,
-                       hosts_for_csv: typing.List[typing.Dict],
+def initialize_vms_csv(csv_saving_path: str, hosts_for_csv: list[dict],
                        vcenter_name: str) -> None:
     try:
         with open(csv_saving_path, 'a', encoding='utf-8') as f:

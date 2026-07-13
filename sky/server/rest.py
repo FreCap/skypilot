@@ -1,6 +1,7 @@
 """REST API client of SkyPilot API server"""
 
 import asyncio
+from collections.abc import Callable
 import contextlib
 import contextvars
 import functools
@@ -9,7 +10,7 @@ import os
 import re
 import time
 import typing
-from typing import Any, Callable, cast, Optional, TypeVar
+from typing import Any, cast, TypeVar
 
 import colorama
 import urllib3.exceptions
@@ -62,8 +63,9 @@ class RetryContext:
         self.progress_count = 0
 
 
-_RETRY_CONTEXT: contextvars.ContextVar[Optional[RetryContext]] = (
-    contextvars.ContextVar('retry_context', default=None))
+_RETRY_CONTEXT: contextvars.ContextVar[RetryContext |
+                                       None] = (contextvars.ContextVar(
+                                           'retry_context', default=None))
 
 _session = requests.Session()
 # Tune connection pool size, otherwise the default max is just 10.
@@ -108,7 +110,7 @@ def _retry_in_context():
         _RETRY_CONTEXT.reset(token)
 
 
-def get_retry_context() -> Optional[RetryContext]:
+def get_retry_context() -> RetryContext | None:
     return _RETRY_CONTEXT.get()
 
 

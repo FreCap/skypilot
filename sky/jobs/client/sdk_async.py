@@ -1,7 +1,7 @@
 """Async SDK functions for managed jobs."""
 import asyncio
 import typing
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Optional, Union
 
 from sky import backends
 from sky import sky_logging
@@ -28,15 +28,15 @@ logger = sky_logging.init_logger(__name__)
 @usage_lib.entrypoint
 async def launch(
     task: Union['sky.Task', 'sky.Dag'],
-    name: Optional[str] = None,
-    pool: Optional[str] = None,
-    num_jobs: Optional[int] = None,
+    name: str | None = None,
+    pool: str | None = None,
+    num_jobs: int | None = None,
     # Internal only:
     # pylint: disable=invalid-name
     _need_confirmation: bool = False,
-    stream_logs: Optional[
-        sdk_async.StreamConfig] = sdk_async.DEFAULT_STREAM_CONFIG,
-) -> Tuple[Optional[List[int]], Optional[backends.ResourceHandle]]:
+    stream_logs: sdk_async.StreamConfig |
+    None = sdk_async.DEFAULT_STREAM_CONFIG,
+) -> tuple[list[int] | None, backends.ResourceHandle | None]:
     """Async version of launch() that launches a managed job."""
     request_id = await asyncio.to_thread(sdk.launch, task, name, pool, num_jobs,
                                          _need_confirmation)
@@ -51,12 +51,11 @@ async def queue_v2(
     refresh: bool,
     skip_finished: bool = False,
     all_users: bool = False,
-    job_ids: Optional[List[int]] = None,
-    limit: Optional[int] = None,
-    fields: Optional[List[str]] = None,
-    stream_logs: Optional[
-        sdk_async.StreamConfig] = sdk_async.DEFAULT_STREAM_CONFIG
-) -> Tuple[List[responses.ManagedJobRecord], int, Dict[str, int], int]:
+    job_ids: list[int] | None = None,
+    limit: int | None = None,
+    fields: list[str] | None = None,
+    stream_logs: sdk_async.StreamConfig | None = sdk_async.DEFAULT_STREAM_CONFIG
+) -> tuple[list[responses.ManagedJobRecord], int, dict[str, int], int]:
     """Async version of queue_v2() that gets statuses of managed jobs."""
     request_id = await asyncio.to_thread(sdk.queue_v2, refresh, skip_finished,
                                          all_users, job_ids, limit, fields)
@@ -72,12 +71,12 @@ async def queue(
     refresh: bool,
     skip_finished: bool = False,
     all_users: bool = False,
-    job_ids: Optional[List[int]] = None,
-    stream_logs: Optional[
-        sdk_async.StreamConfig] = sdk_async.DEFAULT_STREAM_CONFIG,
+    job_ids: list[int] | None = None,
+    stream_logs: sdk_async.StreamConfig |
+    None = sdk_async.DEFAULT_STREAM_CONFIG,
     version: int = 1,
-) -> Union[List[responses.ManagedJobRecord], Tuple[
-        List[responses.ManagedJobRecord], int, Dict[str, int], int]]:
+) -> list[responses.ManagedJobRecord] | tuple[list[responses.ManagedJobRecord],
+                                              int, dict[str, int], int]:
     """Async version of queue() that gets statuses of managed jobs."""
     request_id = await asyncio.to_thread(sdk.queue, refresh, skip_finished,
                                          all_users, job_ids, version)
@@ -89,15 +88,15 @@ async def queue(
 
 @usage_lib.entrypoint
 async def cancel(
-    name: Optional[str] = None,
-    job_ids: Optional[List[int]] = None,
+    name: str | None = None,
+    job_ids: list[int] | None = None,
     all: bool = False,  # pylint: disable=redefined-builtin
     all_users: bool = False,
-    pool: Optional[str] = None,
+    pool: str | None = None,
     graceful: bool = False,
-    graceful_timeout: Optional[int] = None,
-    stream_logs: Optional[
-        sdk_async.StreamConfig] = sdk_async.DEFAULT_STREAM_CONFIG,
+    graceful_timeout: int | None = None,
+    stream_logs: sdk_async.StreamConfig |
+    None = sdk_async.DEFAULT_STREAM_CONFIG,
 ) -> None:
     """Async version of cancel() that cancels managed jobs."""
     request_id = await asyncio.to_thread(sdk.cancel, name, job_ids, all,
@@ -111,13 +110,13 @@ async def cancel(
 
 @usage_lib.entrypoint
 async def wait(
-    name: Optional[str] = None,
-    job_id: Optional[int] = None,
-    timeout: Optional[int] = None,
+    name: str | None = None,
+    job_id: int | None = None,
+    timeout: int | None = None,
     poll_interval: int = 15,
-    task: Optional[Union[str, int]] = None,
-    stream_logs: Optional[
-        sdk_async.StreamConfig] = sdk_async.DEFAULT_STREAM_CONFIG,
+    task: str | int | None = None,
+    stream_logs: sdk_async.StreamConfig |
+    None = sdk_async.DEFAULT_STREAM_CONFIG,
 ) -> int:
     """Async version of wait() that waits for a managed job to finish."""
     request_id = await asyncio.to_thread(sdk.wait, name, job_id, timeout,
@@ -130,7 +129,7 @@ async def wait(
 
 @usage_lib.entrypoint
 async def tail_logs(cluster_name: str,
-                    job_id: Optional[int],
+                    job_id: int | None,
                     follow: bool,
                     tail: int = 0,
                     output_stream: Optional['io.TextIOBase'] = None) -> int:
@@ -150,11 +149,11 @@ async def tail_logs(cluster_name: str,
 
 @usage_lib.entrypoint
 async def download_logs(
-        name: Optional[str],
-        job_id: Optional[int],
+        name: str | None,
+        job_id: int | None,
         refresh: bool,
         controller: bool,
-        local_dir: str = constants.SKY_LOGS_DIRECTORY) -> Dict[int, str]:
+        local_dir: str = constants.SKY_LOGS_DIRECTORY) -> dict[int, str]:
     """Async version of download_logs() that syncs down logs of managed jobs."""
     return await asyncio.to_thread(sdk.download_logs, name, job_id, refresh,
                                    controller, local_dir)

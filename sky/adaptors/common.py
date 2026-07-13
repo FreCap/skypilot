@@ -1,10 +1,11 @@
 """Lazy import for modules to avoid import error when not used."""
+from collections.abc import Callable
 from importlib import util as importlib_util
 import functools
 import importlib
 import threading
 import types
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any
 
 
 class LazyImport(types.ModuleType):
@@ -25,10 +26,10 @@ class LazyImport(types.ModuleType):
 
     def __init__(self,
                  module_name: str,
-                 import_error_message: Optional[str] = None,
-                 set_loggers: Optional[Callable] = None):
+                 import_error_message: str | None = None,
+                 set_loggers: Callable | None = None):
         self._module_name = module_name
-        self._module: Optional[types.ModuleType] = None
+        self._module: types.ModuleType | None = None
         self._import_error_message = import_error_message
         self._set_loggers = set_loggers
         self._lock = threading.RLock()
@@ -65,7 +66,7 @@ class LazyImport(types.ModuleType):
             return lazy_submodule
 
 
-def load_lazy_modules(modules: Tuple[LazyImport, ...]):
+def load_lazy_modules(modules: tuple[LazyImport, ...]):
     """Load lazy modules before entering a function to error out quickly."""
 
     def decorator(func):
@@ -81,7 +82,7 @@ def load_lazy_modules(modules: Tuple[LazyImport, ...]):
     return decorator
 
 
-def can_import_modules(module_names: List[str]) -> bool:
+def can_import_modules(module_names: list[str]) -> bool:
     """ module availability without actually importing it to
     save memory footprint.
 

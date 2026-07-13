@@ -8,7 +8,6 @@ import os
 import re
 import threading
 import time
-from typing import Dict, List, Optional, Set, Tuple
 
 import fastapi
 from prometheus_client import core as prom_core
@@ -77,7 +76,7 @@ _REAPER_INTERVAL_SECONDS = 60
 _LIVE_GAUGE_FILE_PID_RE = re.compile(r'^gauge_live[a-z]+_([0-9]+)\.db$')
 
 
-def _scan_multiproc_pids(multiproc_dir: str) -> Set[int]:
+def _scan_multiproc_pids(multiproc_dir: str) -> set[int]:
     """Return pids that own live-gauge files in ``multiproc_dir``.
 
     Uses the same glob shape that ``mark_process_dead`` would walk, so we
@@ -85,7 +84,7 @@ def _scan_multiproc_pids(multiproc_dir: str) -> Set[int]:
     / histogram / non-live gauge) files — those are intentionally kept.
     """
     pattern = os.path.join(multiproc_dir, 'gauge_live*_*.db')
-    pids: Set[int] = set()
+    pids: set[int] = set()
     for path in glob.glob(pattern):
         m = _LIVE_GAUGE_FILE_PID_RE.match(os.path.basename(path))
         if m is not None:
@@ -267,7 +266,7 @@ _NULL_WORKSPACE_LABEL = 'default'
 _NULL_LABEL = ''
 
 
-def _label_or_default(value: Optional[str], default: str) -> str:
+def _label_or_default(value: str | None, default: str) -> str:
     return value if value else default
 
 
@@ -339,7 +338,7 @@ class ManagedJobsCollector:
 # Transient statuses we report time-in-state for. UP / STOPPED are steady
 # states by design (no upper bound on residence time, alerting on age is
 # meaningless). PENDING is display-only per status_lib.ClusterStatus.
-_TIME_IN_STATE_STATUSES: Tuple[status_lib.ClusterStatus, ...] = (
+_TIME_IN_STATE_STATUSES: tuple[status_lib.ClusterStatus, ...] = (
     status_lib.ClusterStatus.INIT,
     status_lib.ClusterStatus.AUTOSTOPPING,
 )
@@ -433,7 +432,7 @@ class WorkspaceUsageCollector:
         # in one batched DB call per status, then emit one gauge row per
         # cluster (no aggregation at the collector — alerts/dashboards can
         # max/sum however they want).
-        transient: Dict[str, List[Tuple[Tuple[str, str, str, str, str],
+        transient: dict[str, list[tuple[tuple[str, str, str, str, str],
                                         str]]] = {}
         transient_statuses = {s.name for s in _TIME_IN_STATE_STATUSES}
 
@@ -485,7 +484,7 @@ class WorkspaceUsageCollector:
         # transient status; total cost bounded by # of distinct transient
         # statuses observed (≤ |_TIME_IN_STATE_STATUSES|).
         now_seconds = int(time.time())
-        time_in_state: Dict[Tuple[str, str, str, str, str], float] = {}
+        time_in_state: dict[tuple[str, str, str, str, str], float] = {}
         for status_name, entries in transient.items():
             try:
                 status_enum = status_lib.ClusterStatus[status_name]
@@ -595,7 +594,7 @@ try:
 except ValueError:
     pass
 
-_MANAGED_JOBS_COLLECTOR: Optional[ManagedJobsCollector] = None
+_MANAGED_JOBS_COLLECTOR: ManagedJobsCollector | None = None
 
 
 def maybe_register_managed_jobs_collector():
@@ -718,7 +717,7 @@ async def gpu_metrics_debug() -> dict:
 
 def _handle_federation_result(context: str, route: str, result: object,
                               stats: metrics_utils.FederationStats,
-                              all_metrics: List[str]) -> None:
+                              all_metrics: list[str]) -> None:
     """Classifies one federation task result and records its outcome.
 
     On success appends the metrics text; on failure logs a readable, per-
@@ -773,7 +772,7 @@ async def gpu_metrics() -> fastapi.Response:
     skypilot_config.reload_config()
     annotations.clear_request_level_cache()
     contexts = core.get_all_contexts()
-    all_metrics: List[str] = []
+    all_metrics: list[str] = []
 
     remote_contexts = [
         context for context in contexts if context != 'in-cluster'
@@ -819,7 +818,7 @@ async def endpoint_metrics() -> fastapi.Response:
     skypilot_config.reload_config()
     annotations.clear_request_level_cache()
     contexts = core.get_all_contexts()
-    all_metrics: List[str] = []
+    all_metrics: list[str] = []
 
     remote_contexts = [
         context for context in contexts if context != 'in-cluster'

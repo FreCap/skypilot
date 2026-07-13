@@ -1,7 +1,6 @@
 """Global environment options for sky."""
 import enum
 import os
-from typing import Dict
 
 
 class Options(enum.Enum):
@@ -58,6 +57,6 @@ class Options(enum.Enum):
         return self.value[0]
 
     @classmethod
-    def all_options(cls) -> Dict[str, bool]:
+    def all_options(cls) -> dict[str, bool]:
         """Returns all options as a dictionary."""
         return {option.env_key: option.get() for option in list(Options)}

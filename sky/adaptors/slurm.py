@@ -4,7 +4,7 @@ import ipaddress
 import logging
 import re
 import shlex
-from typing import Dict, List, NamedTuple, Optional, Tuple
+from typing import NamedTuple
 
 from sky.adaptors import common
 from sky.utils import command_runner
@@ -44,11 +44,11 @@ class SlurmPartition(NamedTuple):
     is_default: bool
     # The maximum time a job can run in seconds.
     # None if the maximum time is unlimited.
-    maxtime: Optional[int]
+    maxtime: int | None
     # The raw Slurm time string the partition assigns when --time is omitted
     # (e.g. '01:00:00', '2-00:00:00'). None if the partition has no
     # DefaultTime configured (NONE/UNLIMITED).
-    default_time: Optional[str]
+    default_time: str | None
 
 
 # TODO(kevin): Add more API types for other client functions.
@@ -64,7 +64,7 @@ class NodeInfo(NamedTuple):
     partition: str
 
 
-def _parse_maxtime(line: str) -> Optional[int]:
+def _parse_maxtime(line: str) -> int | None:
     """Parse the maximum time a job can run from the scontrol output."""
     maxtime_match = _MAXTIME_REGEX.search(line)
     if not maxtime_match:
@@ -85,7 +85,7 @@ def _parse_maxtime(line: str) -> Optional[int]:
     return days * 86400 + h * 3600 + m * 60 + s
 
 
-def _parse_default_time(line: str) -> Optional[str]:
+def _parse_default_time(line: str) -> str | None:
     """Parse the DefaultTime a partition uses from the scontrol output.
 
     Returns the raw Slurm time string (e.g. '01:00:00', '2-00:00:00') so it
@@ -106,14 +106,14 @@ class SlurmClient:
 
     def __init__(
         self,
-        ssh_host: Optional[str] = None,
-        ssh_port: Optional[int] = None,
-        ssh_user: Optional[str] = None,
-        ssh_key: Optional[str] = None,
-        ssh_proxy_command: Optional[str] = None,
-        ssh_proxy_jump: Optional[str] = None,
+        ssh_host: str | None = None,
+        ssh_port: int | None = None,
+        ssh_user: str | None = None,
+        ssh_key: str | None = None,
+        ssh_proxy_command: str | None = None,
+        ssh_proxy_jump: str | None = None,
         is_inside_slurm_cluster: bool = False,
-        identities_only: Optional[bool] = None,
+        identities_only: bool | None = None,
     ):
         """Initialize SlurmClient.
 
@@ -160,7 +160,7 @@ class SlurmClient:
                 disable_identities_only=not identities_only,
             )
 
-    def _run_slurm_cmd(self, cmd: str) -> Tuple[int, str, str]:
+    def _run_slurm_cmd(self, cmd: str) -> tuple[int, str, str]:
         return self._runner.run(cmd,
                                 require_outputs=True,
                                 separate_stderr=True,
@@ -168,9 +168,9 @@ class SlurmClient:
 
     def query_jobs(
         self,
-        job_name: Optional[str] = None,
-        state_filters: Optional[List[str]] = None,
-    ) -> List[str]:
+        job_name: str | None = None,
+        state_filters: list[str] | None = None,
+    ) -> list[str]:
         """Query Slurm jobs by state and optional name.
 
         Args:
@@ -200,7 +200,7 @@ class SlurmClient:
 
     def cancel_jobs_by_name(self,
                             job_name: str,
-                            signal: Optional[str] = None,
+                            signal: str | None = None,
                             full: bool = False) -> None:
         """Cancel Slurm job(s) by name.
 
@@ -271,7 +271,7 @@ class SlurmClient:
             stream_logs=False)
         return stdout
 
-    def info_nodes(self) -> List[NodeInfo]:
+    def info_nodes(self) -> list[NodeInfo]:
         """Get Slurm node information.
 
         Returns node names, states, GRES (generic resources like GPUs),
@@ -308,14 +308,14 @@ class SlurmClient:
 
         return nodes
 
-    def node_details(self, node_name: str) -> Dict[str, str]:
+    def node_details(self, node_name: str) -> dict[str, str]:
         """Get detailed Slurm node information.
 
         Returns:
             A dictionary of node attributes.
         """
 
-        def _parse_scontrol_node_output(output: str) -> Dict[str, str]:
+        def _parse_scontrol_node_output(output: str) -> dict[str, str]:
             """Parses the key=value output of 'scontrol show node'."""
             node_info = {}
             # Split by space, handling values that might have spaces
@@ -340,7 +340,7 @@ class SlurmClient:
         node_info = _parse_scontrol_node_output(node_details)
         return node_info
 
-    def get_jobs_gres(self, node_name: str) -> List[str]:
+    def get_jobs_gres(self, node_name: str) -> list[str]:
         """Get the list of jobs GRES for a given node name.
 
         Returns:
@@ -357,7 +357,7 @@ class SlurmClient:
             stream_logs=False)
         return stdout.splitlines()
 
-    def get_all_jobs_gres(self) -> Dict[str, List[str]]:
+    def get_all_jobs_gres(self) -> dict[str, list[str]]:
         """Get GRES allocation for all running jobs, grouped by node.
 
         Returns:
@@ -372,7 +372,7 @@ class SlurmClient:
                                            stderr=f'{stdout}\n{stderr}',
                                            stream_logs=False)
 
-        nodes_to_gres: Dict[str, List[str]] = {}
+        nodes_to_gres: dict[str, list[str]] = {}
         for line in stdout.splitlines():
             line = line.strip()
             if not line:
@@ -390,7 +390,7 @@ class SlurmClient:
 
         return nodes_to_gres
 
-    def get_job_state(self, job_id: str) -> Optional[str]:
+    def get_job_state(self, job_id: str) -> str | None:
         """Get the state of a Slurm job.
 
         Args:
@@ -419,7 +419,7 @@ class SlurmClient:
         state = stdout.strip()
         return state if state else None
 
-    def get_jobs_state_by_name(self, job_name: str) -> List[str]:
+    def get_jobs_state_by_name(self, job_name: str) -> list[str]:
         """Get the states of all Slurm jobs by name.
         """
         cmd = f'squeue -h --name {job_name} -o "%T"'
@@ -435,7 +435,7 @@ class SlurmClient:
         return states
 
     @timeline.event
-    def get_job_reason(self, job_id: str) -> Optional[str]:
+    def get_job_reason(self, job_id: str) -> str | None:
         """Get the reason a job is in its current state
 
         Args:
@@ -459,7 +459,7 @@ class SlurmClient:
 
     def get_pending_job_count(self,
                               partition: str,
-                              exclude_job_id: Optional[str] = None) -> int:
+                              exclude_job_id: str | None = None) -> int:
         """Count pending jobs in a partition, excluding our own job.
 
         Args:
@@ -489,7 +489,7 @@ class SlurmClient:
         return bool(stdout.strip())
 
     @timeline.event
-    def get_job_nodes(self, job_id: str) -> Tuple[List[str], List[str]]:
+    def get_job_nodes(self, job_id: str) -> tuple[list[str], list[str]]:
         """Get the list of nodes and their IPs for a given job ID.
 
         The ordering is guaranteed to be stable for the lifetime of the job.
@@ -523,7 +523,7 @@ class SlurmClient:
         logger.debug(f'Successfully got nodes for job {job_id}: {stdout}')
 
         node_info = {}
-        nodes_to_resolve: List[Tuple[str, str]] = []
+        nodes_to_resolve: list[tuple[str, str]] = []
 
         for line in stdout.strip().splitlines():
             line = line.strip()
@@ -627,7 +627,7 @@ class SlurmClient:
 
         return job_id
 
-    def get_partitions_info(self) -> List[SlurmPartition]:
+    def get_partitions_info(self) -> list[SlurmPartition]:
         """Get the partitions information for the Slurm cluster.
 
         Returns:
@@ -659,7 +659,7 @@ class SlurmClient:
                                        default_time=default_time))
         return partitions
 
-    def get_default_partition(self) -> Optional[str]:
+    def get_default_partition(self) -> str | None:
         """Get the default partition name for the Slurm cluster.
 
         Returns:
@@ -671,7 +671,7 @@ class SlurmClient:
                 return partition.name
         return None
 
-    def get_partitions(self) -> List[str]:
+    def get_partitions(self) -> list[str]:
         """Get unique partition names in the Slurm cluster.
 
         Returns:
@@ -680,7 +680,7 @@ class SlurmClient:
         """
         return [partition.name for partition in self.get_partitions_info()]
 
-    def get_proctrack_type(self) -> Optional[str]:
+    def get_proctrack_type(self) -> str | None:
         """Get the ProctrackType from Slurm configuration.
 
         Returns:
@@ -699,7 +699,7 @@ class SlurmClient:
             return match.group(1)
         return None
 
-    def get_select_type_parameters(self) -> Optional[str]:
+    def get_select_type_parameters(self) -> str | None:
         """Get SelectTypeParameters from Slurm configuration.
 
         See: https://slurm.schedmd.com/slurm.conf.html#OPT_SelectTypeParameters
@@ -736,7 +736,7 @@ class SlurmClient:
         rc, _, _ = self._run_slurm_cmd(cmd)
         return rc == 0
 
-    def get_env(self) -> Dict[str, str]:
+    def get_env(self) -> dict[str, str]:
         """Fetch environment variables from the remote host.
 
         Returns:
@@ -746,7 +746,7 @@ class SlurmClient:
         if rc != 0:
             logger.warning(f'Failed to fetch remote env: {stderr}')
             return {}
-        env: Dict[str, str] = {}
+        env: dict[str, str] = {}
         for line in stdout.splitlines():
             if '=' in line:
                 key, _, value = line.partition('=')
@@ -803,7 +803,7 @@ class SlurmClient:
         rc, _, _ = self._run_slurm_cmd(cmd)
         return rc == 0
 
-    def check_dir_shared_fs(self, path: str) -> Optional[str]:
+    def check_dir_shared_fs(self, path: str) -> str | None:
         """Check the filesystem type of a directory.
 
         Args:
@@ -820,6 +820,6 @@ class SlurmClient:
             return None
         return stdout.strip().lower()
 
-    def check_homedir_shared_fs(self) -> Optional[str]:
+    def check_homedir_shared_fs(self) -> str | None:
         """Check the filesystem type of the home directory."""
         return self.check_dir_shared_fs('~')

@@ -4,7 +4,7 @@ import json
 import os
 import shlex
 import time
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any
 import uuid
 
 import requests
@@ -28,8 +28,8 @@ class PrimeintellectAPIError(Exception):
 
     def __init__(self,
                  message: str,
-                 status_code: Optional[int] = None,
-                 response_data: Optional[Dict[str, Any]] = None):
+                 status_code: int | None = None,
+                 response_data: dict[str, Any] | None = None):
         super().__init__(message)
         self.status_code = status_code
         self.response_data = response_data
@@ -40,7 +40,7 @@ class PrimeintellectResourcesUnavailableError(PrimeintellectAPIError):
     pass
 
 
-def _parse_api_error(response: Any) -> Tuple[str, bool]:
+def _parse_api_error(response: Any) -> tuple[str, bool]:
     """Parse API error response to extract meaningful error messages.
 
     Returns:
@@ -81,8 +81,8 @@ def _parse_api_error(response: Any) -> Tuple[str, bool]:
 def _try_request_with_backoff(
         method: str,
         url: str,
-        headers: Dict[str, str],
-        data: Optional[Union[str, Dict[str, Any]]] = None) -> Dict[str, Any]:
+        headers: dict[str, str],
+        data: str | dict[str, Any] | None = None) -> dict[str, Any]:
     backoff = common_utils.Backoff(initial_backoff=INITIAL_BACKOFF_SECONDS,
                                    max_backoff_factor=MAX_BACKOFF_FACTOR)
     for i in range(MAX_ATTEMPTS):
@@ -144,7 +144,7 @@ def _try_request_with_backoff(
     return {}
 
 
-def get_upstream_cloud_id(instance_type: str) -> Optional[str]:
+def get_upstream_cloud_id(instance_type: str) -> str | None:
     global _df, _lookup_dict
     if _df is None:
         _df = catalog_common.read_catalog('primeintellect/vms.csv')
@@ -159,7 +159,7 @@ class PrimeIntellectAPIClient:
     def __init__(self) -> None:
         self.credentials = os.path.expanduser(CREDENTIALS_PATH)
         assert os.path.exists(self.credentials), 'Credentials not found'
-        with open(self.credentials, 'r', encoding='utf-8') as f:
+        with open(self.credentials, encoding='utf-8') as f:
             self._credentials = json.load(f)
         self.api_key = self._credentials.get('api_key')
         self.team_id = self._credentials.get('team_id')
@@ -169,14 +169,14 @@ class PrimeIntellectAPIClient:
             'Content-Type': 'application/json'
         }
 
-    def list_instances(self, **search_kwargs) -> List[Dict[str, Any]]:
+    def list_instances(self, **search_kwargs) -> list[dict[str, Any]]:
         response = _try_request_with_backoff('get',
                                              f'{self.base_url}/api/v1/pods',
                                              headers=self.headers,
                                              data=search_kwargs)
         return response['data']
 
-    def get_instance_details(self, instance_id: str) -> Dict[str, Any]:
+    def get_instance_details(self, instance_id: str) -> dict[str, Any]:
         return _try_request_with_backoff(
             'get',
             f'{self.base_url}/api/v1/pods/{instance_id}',
@@ -189,7 +189,7 @@ class PrimeIntellectAPIClient:
                availability_zone: str,
                disk_size: int,
                vcpus: int = 0,
-               memory: int = 0) -> Dict[str, Any]:
+               memory: int = 0) -> dict[str, Any]:
         """Create a pod/instance via Prime Intellect API.
 
         Args:
@@ -251,7 +251,7 @@ class PrimeIntellectAPIClient:
             gpu_count = int(parts[0])
             gpu_type = parts[1]
 
-        payload: Dict[str, Any] = {
+        payload: dict[str, Any] = {
             'pod': {
                 'name': name,
                 'cloudId': cloud_id,
@@ -289,20 +289,20 @@ class PrimeIntellectAPIClient:
         )
         return response
 
-    def remove(self, instance_id: str) -> Dict[str, Any]:
+    def remove(self, instance_id: str) -> dict[str, Any]:
         return _try_request_with_backoff(
             'delete',
             f'{self.base_url}/api/v1/pods/{instance_id}',
             headers=self.headers,
         )
 
-    def list_ssh_keys(self) -> List[Dict[str, Any]]:
+    def list_ssh_keys(self) -> list[dict[str, Any]]:
         response = _try_request_with_backoff('get',
                                              f'{self.base_url}/api/v1/ssh_keys',
                                              headers=self.headers)
         return response['data']
 
-    def get_or_add_ssh_key(self, ssh_pub_key: str = '') -> Dict[str, str]:
+    def get_or_add_ssh_key(self, ssh_pub_key: str = '') -> dict[str, str]:
         """Add ssh key if not already added."""
         # Check if the public key is already added
         ssh_keys = self.list_ssh_keys()
@@ -325,7 +325,7 @@ class PrimeIntellectAPIClient:
         return {'name': ssh_key_name, 'ssh_key': ssh_pub_key}
 
 
-def parse_ssh_connection(ssh_connection: Any) -> Tuple[Optional[str], int]:
+def parse_ssh_connection(ssh_connection: Any) -> tuple[str | None, int]:
     """Parse and extract SSH username and port from a connection field.
 
     The provider may return the SSH connection in multiple shapes. This helper
@@ -352,11 +352,11 @@ def parse_ssh_connection(ssh_connection: Any) -> Tuple[Optional[str], int]:
         (ssh_user, ssh_port): username if found, else None; port if found,
         else 22.
     """
-    ssh_user: Optional[str] = None
+    ssh_user: str | None = None
     ssh_port: int = 22
 
     # Normalize into a list of tokens for easier processing.
-    tokens: List[str] = []
+    tokens: list[str] = []
     if isinstance(ssh_connection, str):
         try:
             tokens = shlex.split(ssh_connection)
@@ -374,7 +374,7 @@ def parse_ssh_connection(ssh_connection: Any) -> Tuple[Optional[str], int]:
         return ssh_user, ssh_port
 
     # Find the first token containing '@' as the user@host candidate.
-    user_host: Optional[str] = next((t for t in tokens if '@' in t), None)
+    user_host: str | None = next((t for t in tokens if '@' in t), None)
     if user_host:
         ssh_user = user_host.split('@', 1)[0].strip()
         # Try host:port format (after '@').

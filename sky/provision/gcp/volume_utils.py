@@ -1,5 +1,5 @@
 """Utilities for GCP volumes."""
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from sky import clouds
 from sky import exceptions
@@ -13,7 +13,7 @@ logger = sky_logging.init_logger(__name__)
 
 
 def get_data_disk_tier_mapping(
-    instance_type: Optional[str],) -> Dict[resources_utils.DiskTier, str]:
+    instance_type: str | None,) -> dict[resources_utils.DiskTier, str]:
     # Define the default mapping from disk tiers to disk types.
     # Refer to https://cloud.google.com/compute/docs/disks/hyperdisks
     # and https://cloud.google.com/compute/docs/disks/persistent-disks
@@ -40,7 +40,7 @@ def get_data_disk_tier_mapping(
         tier2name[resources_utils.DiskTier.HIGH] = 'hyperdisk-balanced'
         tier2name[resources_utils.DiskTier.MEDIUM] = 'hyperdisk-balanced'
         tier2name[resources_utils.DiskTier.LOW] = 'hyperdisk-balanced'
-        num_cpus = int(instance_type.split('-')[2])  # type: ignore
+        num_cpus = int(instance_type.split('-')[2])
         if num_cpus < 112:
             tier2name[resources_utils.DiskTier.ULTRA] = 'hyperdisk-balanced'
     elif series in ['c4', 'c4a', 'c4d']:
@@ -48,7 +48,7 @@ def get_data_disk_tier_mapping(
         tier2name[resources_utils.DiskTier.HIGH] = 'hyperdisk-balanced'
         tier2name[resources_utils.DiskTier.MEDIUM] = 'hyperdisk-balanced'
         tier2name[resources_utils.DiskTier.LOW] = 'hyperdisk-balanced'
-        num_cpus = int(instance_type.split('-')[2])  # type: ignore
+        num_cpus = int(instance_type.split('-')[2])
         if num_cpus < 64:
             tier2name[resources_utils.DiskTier.ULTRA] = 'hyperdisk-balanced'
     elif series in ['a3']:
@@ -74,7 +74,7 @@ def get_data_disk_tier_mapping(
         tier2name[resources_utils.DiskTier.HIGH] = 'hyperdisk-balanced'
         tier2name[resources_utils.DiskTier.MEDIUM] = 'pd-ssd'
         tier2name[resources_utils.DiskTier.LOW] = 'pd-balanced'
-        num_cpus = int(instance_type.split('-')[2])  # type: ignore
+        num_cpus = int(instance_type.split('-')[2])
         if num_cpus < 60:
             tier2name[resources_utils.DiskTier.ULTRA] = 'hyperdisk-balanced'
     elif series in ['c3']:
@@ -82,7 +82,7 @@ def get_data_disk_tier_mapping(
         tier2name[resources_utils.DiskTier.HIGH] = 'hyperdisk-balanced'
         tier2name[resources_utils.DiskTier.MEDIUM] = 'pd-ssd'
         tier2name[resources_utils.DiskTier.LOW] = 'pd-balanced'
-        num_cpus = int(instance_type.split('-')[2])  # type: ignore
+        num_cpus = int(instance_type.split('-')[2])
         if num_cpus < 88:
             tier2name[resources_utils.DiskTier.ULTRA] = 'hyperdisk-balanced'
     elif series in ['n4']:
@@ -104,7 +104,7 @@ def get_data_disk_tier_mapping(
         tier2name[resources_utils.DiskTier.HIGH] = 'hyperdisk-balanced'
         tier2name[resources_utils.DiskTier.MEDIUM] = 'pd-ssd'
         tier2name[resources_utils.DiskTier.LOW] = 'pd-balanced'
-        num_cpus = int(instance_type.split('-')[2])  # type: ignore
+        num_cpus = int(instance_type.split('-')[2])
         if num_cpus < 64:
             tier2name[resources_utils.DiskTier.ULTRA] = 'hyperdisk-balanced'
     elif series in ['m2']:
@@ -113,14 +113,14 @@ def get_data_disk_tier_mapping(
     elif series in ['m1']:
         tier2name[resources_utils.DiskTier.ULTRA] = 'hyperdisk-extreme'
         tier2name[resources_utils.DiskTier.HIGH] = 'hyperdisk-balanced'
-        num_cpus = int(instance_type.split('-')[2])  # type: ignore
+        num_cpus = int(instance_type.split('-')[2])
         if num_cpus < 80:
             tier2name[resources_utils.DiskTier.ULTRA] = 'hyperdisk-balanced'
     elif series in ['g2']:
         tier2name[resources_utils.DiskTier.ULTRA] = 'pd-ssd'
         tier2name[resources_utils.DiskTier.LOW] = 'pd-balanced'
     elif series in ['n2']:
-        num_cpus = int(instance_type.split('-')[2])  # type: ignore
+        num_cpus = int(instance_type.split('-')[2])
         if num_cpus < 64:
             tier2name[resources_utils.DiskTier.ULTRA] = 'pd-ssd'
         elif num_cpus >= 80:
@@ -130,8 +130,8 @@ def get_data_disk_tier_mapping(
 
 
 def validate_instance_volumes(
-    instance_type: Optional[str],
-    volumes: Optional[List[Dict[str, Any]]],
+    instance_type: str | None,
+    volumes: list[dict[str, Any]] | None,
 ) -> None:
     if not volumes:
         return
@@ -144,8 +144,8 @@ def validate_instance_volumes(
         if volume['storage_type'] == resources_utils.StorageType.INSTANCE:
             instance_volume_count += 1
     if (instance_type in constants.SSD_AUTO_ATTACH_MACHINE_TYPES and
-            instance_volume_count >
-            constants.SSD_AUTO_ATTACH_MACHINE_TYPES[instance_type]):
+            instance_volume_count
+            > constants.SSD_AUTO_ATTACH_MACHINE_TYPES[instance_type]):
         raise exceptions.ResourcesUnavailableError(
             f'The instance type {instance_type} supports'
             f' {constants.SSD_AUTO_ATTACH_MACHINE_TYPES[instance_type]}'
@@ -163,7 +163,7 @@ def translate_attach_mode(attach_mode: resources_utils.DiskAttachMode) -> str:
 
 def check_volume_name_exist_in_region(
         project_id: str, region: clouds.Region, use_mig: bool,
-        volume_name: str) -> Optional[Dict[str, Any]]:
+        volume_name: str) -> dict[str, Any] | None:
     """Check if the volume name exists and return the volume info."""
     logger.debug(f'Checking volume {volume_name} in region {region}')
     try:
@@ -233,9 +233,8 @@ def check_volume_name_exist_in_region(
         raise
 
 
-def check_volume_zone_match(volume_name: str,
-                            zones: Optional[List[clouds.Zone]],
-                            available_zones: List[str]):
+def check_volume_zone_match(volume_name: str, zones: list[clouds.Zone] | None,
+                            available_zones: list[str]):
     if zones is None:
         return None
     for zone in zones:

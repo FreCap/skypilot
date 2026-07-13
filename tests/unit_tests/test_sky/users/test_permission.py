@@ -480,8 +480,9 @@ class TestPermissionService:
         assert service.check_endpoint_permission(
             'u', '/ssh_node_pools/myPool/status', 'POST') is True
         # Sibling path -> denied.
-        assert service.check_endpoint_permission(
-            'u', '/ssh_node_pools/myPool/keys', 'GET') is True
+        assert service.check_endpoint_permission('u',
+                                                 '/ssh_node_pools/myPool/keys',
+                                                 'GET') is True
 
     def test_check_endpoint_permission_admin_wins_over_viewer(self):
         """A user with both admin and viewer roles uses admin semantics."""

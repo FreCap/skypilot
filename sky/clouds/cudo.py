@@ -1,7 +1,8 @@
 """Cudo Compute"""
+from collections.abc import Iterator
 import subprocess
 import typing
-from typing import Dict, Iterator, List, Optional, Tuple, Union
+from typing import Optional
 
 from sky import catalog
 from sky import clouds
@@ -22,11 +23,7 @@ _CREDENTIAL_FILES = [
 
 
 def _run_output(cmd):
-    proc = subprocess.run(cmd,
-                          shell=True,
-                          check=True,
-                          stderr=subprocess.PIPE,
-                          stdout=subprocess.PIPE)
+    proc = subprocess.run(cmd, shell=True, check=True, capture_output=True)
     return proc.stdout.decode('ascii')
 
 
@@ -85,14 +82,14 @@ class Cudo(clouds.Cloud):
     PROVISIONER_VERSION = clouds.ProvisionerVersion.SKYPILOT
     STATUS_VERSION = clouds.StatusVersion.SKYPILOT
 
-    _regions: List[clouds.Region] = []
+    _regions: list[clouds.Region] = []
 
     @classmethod
     def _unsupported_features_for_resources(
         cls,
         resources: 'resources_lib.Resources',
-        region: Optional[str] = None,
-    ) -> Dict[clouds.CloudImplementationFeatures, str]:
+        region: str | None = None,
+    ) -> dict[clouds.CloudImplementationFeatures, str]:
         """The features not supported based on the resources provided.
 
         This method is used by check_features_are_supported() to check if the
@@ -106,19 +103,19 @@ class Cudo(clouds.Cloud):
         return cls._CLOUD_UNSUPPORTED_FEATURES
 
     @classmethod
-    def _max_cluster_name_length(cls) -> Optional[int]:
+    def _max_cluster_name_length(cls) -> int | None:
         return cls._MAX_CLUSTER_NAME_LEN_LIMIT
 
     @classmethod
     def regions_with_offering(
         cls,
         instance_type,
-        accelerators: Optional[Dict[str, int]],
+        accelerators: dict[str, int] | None,
         use_spot: bool,
-        region: Optional[str],
-        zone: Optional[str],
+        region: str | None,
+        zone: str | None,
         resources: Optional['resources_lib.Resources'] = None,
-    ) -> List[clouds.Region]:
+    ) -> list[clouds.Region]:
         assert zone is None, 'Cudo does not support zones.'
         del accelerators, zone  # unused
         if use_spot:
@@ -135,7 +132,7 @@ class Cudo(clouds.Cloud):
     def get_vcpus_mem_from_instance_type(
         cls,
         instance_type: str,
-    ) -> Tuple[Optional[float], Optional[float]]:
+    ) -> tuple[float | None, float | None]:
 
         return catalog.get_vcpus_mem_from_instance_type(instance_type,
                                                         clouds='cudo')
@@ -146,8 +143,8 @@ class Cudo(clouds.Cloud):
         *,
         region: str,
         num_nodes: int,
-        instance_type: Optional[str] = None,
-        accelerators: Optional[Dict[str, int]] = None,
+        instance_type: str | None = None,
+        accelerators: dict[str, int] | None = None,
         use_spot: bool = False,
     ) -> Iterator[None]:
         del num_nodes  # unused
@@ -163,8 +160,8 @@ class Cudo(clouds.Cloud):
     def instance_type_to_hourly_cost(self,
                                      instance_type: str,
                                      use_spot: bool,
-                                     region: Optional[str] = None,
-                                     zone: Optional[str] = None) -> float:
+                                     region: str | None = None,
+                                     zone: str | None = None) -> float:
         return catalog.get_hourly_cost(instance_type,
                                        use_spot=use_spot,
                                        region=region,
@@ -172,10 +169,10 @@ class Cudo(clouds.Cloud):
                                        clouds='cudo')
 
     def accelerators_to_hourly_cost(self,
-                                    accelerators: Dict[str, int],
+                                    accelerators: dict[str, int],
                                     use_spot: bool,
-                                    region: Optional[str] = None,
-                                    zone: Optional[str] = None) -> float:
+                                    region: str | None = None,
+                                    zone: str | None = None) -> float:
         del accelerators, use_spot, region, zone  # unused
         return 0.0
 
@@ -187,15 +184,15 @@ class Cudo(clouds.Cloud):
     @classmethod
     def get_default_instance_type(
         cls,
-        cpus: Optional[str] = None,
-        memory: Optional[str] = None,
-        disk_tier: Optional[resources_utils.DiskTier] = None,
-        local_disk: Optional[str] = None,
-        region: Optional[str] = None,
-        zone: Optional[str] = None,
+        cpus: str | None = None,
+        memory: str | None = None,
+        disk_tier: resources_utils.DiskTier | None = None,
+        local_disk: str | None = None,
+        region: str | None = None,
+        zone: str | None = None,
         use_spot: bool = False,
-        max_hourly_cost: Optional[float] = None,
-    ) -> Optional[str]:
+        max_hourly_cost: float | None = None,
+    ) -> str | None:
         return catalog.get_default_instance_type(
             cpus=cpus,
             memory=memory,
@@ -211,12 +208,12 @@ class Cudo(clouds.Cloud):
     def get_accelerators_from_instance_type(
         cls,
         instance_type: str,
-    ) -> Optional[Dict[str, Union[int, float]]]:
+    ) -> dict[str, int | float] | None:
         return catalog.get_accelerators_from_instance_type(instance_type,
                                                            clouds='cudo')
 
     @classmethod
-    def get_zone_shell_cmd(cls) -> Optional[str]:
+    def get_zone_shell_cmd(cls) -> str | None:
         return None
 
     def make_deploy_resources_variables(
@@ -224,11 +221,11 @@ class Cudo(clouds.Cloud):
         resources: 'resources_lib.Resources',
         cluster_name: resources_utils.ClusterName,
         region: 'clouds.Region',
-        zones: Optional[List['clouds.Zone']],
+        zones: list['clouds.Zone'] | None,
         num_nodes: int,
         dryrun: bool = False,
-        volume_mounts: Optional[List['volume_lib.VolumeMount']] = None,
-    ) -> Dict[str, Optional[str]]:
+        volume_mounts: list['volume_lib.VolumeMount'] | None = None,
+    ) -> dict[str, str | None]:
         del zones, cluster_name  # unused
         resources = resources.assert_launchable()
         acc_dict = self.get_accelerators_from_instance_type(
@@ -307,7 +304,7 @@ class Cudo(clouds.Cloud):
 
     @classmethod
     def _check_compute_credentials(
-            cls) -> Tuple[bool, Optional[Union[str, Dict[str, str]]]]:
+            cls) -> tuple[bool, str | dict[str, str] | None]:
         """Checks if the user has access credentials to
         Cudo's compute service."""
         if not common.can_import_modules(['cudo_compute']):
@@ -354,14 +351,14 @@ class Cudo(clouds.Cloud):
                 f'Error calling API '
                 f'{common_utils.format_exception(e, use_bracket=True)}')
 
-    def get_credential_file_mounts(self) -> Dict[str, str]:
+    def get_credential_file_mounts(self) -> dict[str, str]:
         return {
             f'~/.config/cudo/{filename}': f'~/.config/cudo/{filename}'
             for filename in _CREDENTIAL_FILES
         }
 
     @classmethod
-    def get_user_identities(cls) -> Optional[List[List[str]]]:
+    def get_user_identities(cls) -> list[list[str]] | None:
         # NOTE: used for very advanced SkyPilot functionality
         # Can implement later if desired
         return None
@@ -369,5 +366,5 @@ class Cudo(clouds.Cloud):
     def instance_type_exists(self, instance_type: str) -> bool:
         return catalog.instance_type_exists(instance_type, 'cudo')
 
-    def validate_region_zone(self, region: Optional[str], zone: Optional[str]):
+    def validate_region_zone(self, region: str | None, zone: str | None):
         return catalog.validate_region_zone(region, zone, clouds='cudo')

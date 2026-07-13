@@ -1,5 +1,6 @@
 """Storage and Store Classes for Sky Data."""
 from abc import abstractmethod
+from collections.abc import Callable
 import dataclasses
 import enum
 import hashlib
@@ -9,7 +10,7 @@ import shlex
 import subprocess
 import time
 import typing
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Optional
 import urllib.parse
 
 import colorama
@@ -44,7 +45,7 @@ from sky.utils import status_lib
 from sky.utils import ux_utils
 
 if typing.TYPE_CHECKING:
-    from google.cloud import storage  # type: ignore
+    from google.cloud import storage
     import mypy_boto3_s3
 
 logger = sky_logging.init_logger(__name__)
@@ -52,13 +53,13 @@ logger = sky_logging.init_logger(__name__)
 StorageHandle = Any
 StorageStatus = status_lib.StorageStatus
 Path = str
-SourceType = Union[Path, List[Path]]
+SourceType = Path | list[Path]
 
 # Clouds with object storage implemented in this module. Azure Blob
 # Storage isn't supported yet (even though Azure is).
 # TODO(Doyoung): need to add clouds.CLOUDFLARE() to support
 # R2 to be an option as preferred store type
-STORE_ENABLED_CLOUDS: List[str] = [
+STORE_ENABLED_CLOUDS: list[str] = [
     str(clouds.AWS()),
     str(clouds.GCP()),
     str(clouds.Azure()),
@@ -90,7 +91,7 @@ _STORAGE_LOG_FILE_NAME = 'storage_sync.log'
 
 
 def get_cached_enabled_storage_cloud_names_or_refresh(
-        raise_if_no_cloud_access: bool = False) -> List[str]:
+        raise_if_no_cloud_access: bool = False) -> list[str]:
     # This is a temporary solution until https://github.com/skypilot-org/skypilot/issues/1943 # pylint: disable=line-too-long
     # is resolved by implementing separate 'enabled_storage_clouds'
     enabled_clouds = sky_check.get_cached_enabled_clouds_or_refresh(
@@ -153,8 +154,7 @@ class StoreType(enum.Enum):
     VOLUME = 'VOLUME'
 
     @classmethod
-    def _get_s3_compatible_store_by_cloud(cls,
-                                          cloud_name: str) -> Optional[str]:
+    def _get_s3_compatible_store_by_cloud(cls, cloud_name: str) -> str | None:
         """Get S3-compatible store type by cloud name."""
         for store_type, store_class in _S3_COMPATIBLE_STORES.items():
             config = store_class.get_config()
@@ -286,8 +286,8 @@ class StoreType(enum.Enum):
 
     @classmethod
     def get_fields_from_store_url(
-        cls, store_url: str
-    ) -> Tuple['StoreType', str, str, Optional[str], Optional[str]]:
+            cls, store_url: str
+    ) -> tuple['StoreType', str, str, str | None, str | None]:
         """Returns the store type, bucket name, and sub path from
         a store URL, and the storage account name and region if applicable.
 
@@ -372,7 +372,7 @@ class FileMountType(enum.Enum):
 # Mapping from FileMountType enum to base MountCachedConfig field values.
 # These are the "defaults" that a type provides; any explicit
 # config.mount_cached fields in the YAML override them.
-_MOUNT_CACHED_PRESET_CONFIGS: Dict['FileMountType', Dict[str, Any]] = {
+_MOUNT_CACHED_PRESET_CONFIGS: dict['FileMountType', dict[str, Any]] = {
     FileMountType.MODEL_CHECKPOINT_RO: {
         'vfs_read_chunk_streams': 16,
         'vfs_read_chunk_size': '32M',
@@ -430,32 +430,32 @@ class MountCachedConfig:
     """
     # Number of file transfers to run in parallel.
     # rclone flag: --transfers
-    transfers: Optional[int] = None
+    transfers: int | None = None
     # In-memory buffer size per transfer (e.g. "64M").
     # rclone flag: --buffer-size
-    buffer_size: Optional[str] = None
+    buffer_size: str | None = None
     # Maximum total size of the VFS cache on disk (e.g. "20G").
     # rclone flag: --vfs-cache-max-size
-    vfs_cache_max_size: Optional[str] = None
+    vfs_cache_max_size: str | None = None
     # Maximum age of objects in the VFS cache (e.g. "1h").
     # rclone flag: --vfs-cache-max-age
-    vfs_cache_max_age: Optional[str] = None
+    vfs_cache_max_age: str | None = None
     # Read-ahead bytes beyond what was requested (e.g. "128M").
     # rclone flag: --vfs-read-ahead
-    vfs_read_ahead: Optional[str] = None
+    vfs_read_ahead: str | None = None
     # Initial chunk size for each read (e.g. "32M").
     # rclone flag: --vfs-read-chunk-size
-    vfs_read_chunk_size: Optional[str] = None
+    vfs_read_chunk_size: str | None = None
     # Number of parallel streams for chunked reading.
     # When set, disables the default exponential chunk-size growth.
     # rclone flag: --vfs-read-chunk-streams
-    vfs_read_chunk_streams: Optional[int] = None
+    vfs_read_chunk_streams: int | None = None
     # Delay before writing back to remote (e.g. "5s").
     # rclone flag: --vfs-write-back
-    vfs_write_back: Optional[str] = None
+    vfs_write_back: str | None = None
     # Mount as read-only.
     # rclone flag: --read-only
-    read_only: Optional[bool] = None
+    read_only: bool | None = None
 
     def to_rclone_flags(self) -> str:
         """Convert non-None fields to rclone CLI flag string."""
@@ -492,7 +492,7 @@ class MountCachedConfig:
             flags.append('--read-only')
         return ' '.join(flags)
 
-    def to_yaml_config(self) -> Dict[str, Any]:
+    def to_yaml_config(self) -> dict[str, Any]:
         """Serialize non-None fields to a dict for YAML round-tripping."""
         result = {}
         for field in dataclasses.fields(self):
@@ -502,7 +502,7 @@ class MountCachedConfig:
         return result
 
     @classmethod
-    def from_yaml_config(cls, config: Dict[str, Any]) -> 'MountCachedConfig':
+    def from_yaml_config(cls, config: dict[str, Any]) -> 'MountCachedConfig':
         """Create from a dict parsed from YAML."""
         return cls(**config)
 
@@ -515,13 +515,13 @@ class MountConfig:
     None means "use the default" (i.e., the flag is not overridden).
     """
     # Mount as read-only.
-    read_only: Optional[bool] = None
+    read_only: bool | None = None
     # Extra CLI flags forwarded verbatim to ``hf-mount`` (Hugging Face stores
     # only; ignored by every other store). Each element is one shell token,
     # e.g. ``['--cache-dir', '/mnt/nvme/hf-cache', '--advanced-writes']``.
-    hf_mount_args: Optional[List[str]] = None
+    hf_mount_args: list[str] | None = None
 
-    def to_yaml_config(self) -> Dict[str, Any]:
+    def to_yaml_config(self) -> dict[str, Any]:
         """Serialize non-None fields to a dict for YAML round-tripping."""
         result = {}
         for field in dataclasses.fields(self):
@@ -531,7 +531,7 @@ class MountConfig:
         return result
 
     @classmethod
-    def from_yaml_config(cls, config: Dict[str, Any]) -> 'MountConfig':
+    def from_yaml_config(cls, config: dict[str, Any]) -> 'MountConfig':
         """Create from a dict parsed from YAML."""
         return cls(**config)
 
@@ -554,10 +554,10 @@ class AbstractStore:
         def __init__(self,
                      *,
                      name: str,
-                     source: Optional[SourceType],
-                     region: Optional[str] = None,
-                     is_sky_managed: Optional[bool] = None,
-                     _bucket_sub_path: Optional[str] = None):
+                     source: SourceType | None,
+                     region: str | None = None,
+                     is_sky_managed: bool | None = None,
+                     _bucket_sub_path: str | None = None):
             self.name = name
             self.source = source
             self.region = region
@@ -574,11 +574,11 @@ class AbstractStore:
 
     def __init__(self,
                  name: str,
-                 source: Optional[SourceType],
-                 region: Optional[str] = None,
-                 is_sky_managed: Optional[bool] = None,
-                 sync_on_reconstruction: Optional[bool] = True,
-                 _bucket_sub_path: Optional[str] = None):  # pylint: disable=invalid-name
+                 source: SourceType | None,
+                 region: str | None = None,
+                 is_sky_managed: bool | None = None,
+                 sync_on_reconstruction: bool | None = True,
+                 _bucket_sub_path: str | None = None):  # pylint: disable=invalid-name
         """Initialize AbstractStore
 
         Args:
@@ -609,7 +609,7 @@ class AbstractStore:
         self.sync_on_reconstruction = sync_on_reconstruction
 
         # To avoid mypy error
-        self._bucket_sub_path: Optional[str] = None
+        self._bucket_sub_path: str | None = None
         # Trigger the setter to strip any leading/trailing slashes.
         self.bucket_sub_path = _bucket_sub_path
         # Whether sky is responsible for the lifecycle of the Store.
@@ -617,13 +617,13 @@ class AbstractStore:
         self.initialize()
 
     @property
-    def bucket_sub_path(self) -> Optional[str]:
+    def bucket_sub_path(self) -> str | None:
         """Get the bucket_sub_path."""
         return self._bucket_sub_path
 
     @bucket_sub_path.setter
     # pylint: disable=invalid-name
-    def bucket_sub_path(self, bucket_sub_path: Optional[str]) -> None:
+    def bucket_sub_path(self, bucket_sub_path: str | None) -> None:
         """Set the bucket_sub_path, stripping any leading/trailing slashes."""
         if bucket_sub_path is not None:
             self._bucket_sub_path = bucket_sub_path.strip('/')
@@ -730,7 +730,7 @@ class AbstractStore:
 
     def mount_cached_command(self,
                              mount_path: str,
-                             config: Optional[MountCachedConfig] = None) -> str:
+                             config: MountCachedConfig | None = None) -> str:
         """Returns the command to mount the Store to the specified mount_path.
 
         This command is used for MOUNT_CACHED mode. Includes the setup commands
@@ -793,7 +793,7 @@ HF_BUCKET_FAIL_TO_CONNECT_MESSAGE = _BUCKET_FAIL_TO_CONNECT_MESSAGE
 HF_STORAGE_LOG_FILE_NAME = _STORAGE_LOG_FILE_NAME
 
 
-class Storage(object):
+class Storage:
     """Storage objects handle persistent and large volume storage in the sky.
 
     Storage represents an abstract data store containing large data files
@@ -823,7 +823,7 @@ class Storage(object):
         storage.delete()
     """
 
-    class StorageMetadata(object):
+    class StorageMetadata:
         """A pickle-able tuple of:
 
         - (required) Storage name.
@@ -839,14 +839,14 @@ class Storage(object):
         def __init__(
             self,
             *,
-            storage_name: Optional[str],
-            source: Optional[SourceType],
-            mode: Optional[StorageMode] = None,
-            sky_stores: Optional[Dict[StoreType,
-                                      AbstractStore.StoreMetadata]] = None,
-            mount_cached_config: Optional[MountCachedConfig] = None,
+            storage_name: str | None,
+            source: SourceType | None,
+            mode: StorageMode | None = None,
+            sky_stores: dict[StoreType, AbstractStore.StoreMetadata] |
+            None = None,
+            mount_cached_config: MountCachedConfig | None = None,
             file_mount_type: Optional['FileMountType'] = None,
-            mount_config: Optional[MountConfig] = None,
+            mount_config: MountConfig | None = None,
         ):
             self._version = self._VERSION
 
@@ -901,21 +901,21 @@ class Storage(object):
 
     def __init__(
         self,
-        name: Optional[str] = None,
-        source: Optional[SourceType] = None,
-        stores: Optional[List[StoreType]] = None,
-        persistent: Optional[bool] = True,
+        name: str | None = None,
+        source: SourceType | None = None,
+        stores: list[StoreType] | None = None,
+        persistent: bool | None = True,
         mode: StorageMode = DEFAULT_STORAGE_MODE,
         sync_on_reconstruction: bool = True,
         # pylint: disable=invalid-name
-        _is_sky_managed: Optional[bool] = None,
+        _is_sky_managed: bool | None = None,
         # pylint: disable=invalid-name
-        _bucket_sub_path: Optional[str] = None,
+        _bucket_sub_path: str | None = None,
         # pylint: disable=invalid-name
-        _store_region: Optional[str] = None,
-        mount_cached_config: Optional[MountCachedConfig] = None,
-        file_mount_type: Optional[FileMountType] = None,
-        mount_config: Optional[MountConfig] = None,
+        _store_region: str | None = None,
+        mount_cached_config: MountCachedConfig | None = None,
+        file_mount_type: FileMountType | None = None,
+        mount_config: MountConfig | None = None,
     ) -> None:
         """Initializes a Storage object.
 
@@ -976,7 +976,7 @@ class Storage(object):
         self.persistent = persistent
         self.mode = mode
         assert mode in StorageMode
-        self.stores: Dict[StoreType, Optional[AbstractStore]] = {}
+        self.stores: dict[StoreType, AbstractStore | None] = {}
         if stores is not None:
             for store in stores:
                 self.stores[store] = None
@@ -1016,7 +1016,7 @@ class Storage(object):
                     f'mode is {StorageMode.MOUNT.value}. '
                     f'Got mode={self.mode.value}.')
 
-    def resolve_mount_cached_config(self) -> Optional[MountCachedConfig]:
+    def resolve_mount_cached_config(self) -> MountCachedConfig | None:
         """Resolve file_mount_type + overrides into a final MountCachedConfig.
 
         If a file_mount_type is set, merges type defaults with any explicit
@@ -1136,7 +1136,7 @@ class Storage(object):
                     elif data_utils.is_hf_path(self.source):
                         self.add_store(StoreType.HF)
 
-                    s3_compatible_store_type: Optional[StoreType] = (
+                    s3_compatible_store_type: StoreType | None = (
                         StoreType.find_s3_compatible_config_by_prefix(
                             self.source))
                     if s3_compatible_store_type:
@@ -1151,7 +1151,7 @@ class Storage(object):
     @staticmethod
     def _validate_source(
             source: SourceType, mode: StorageMode,
-            sync_on_reconstruction: bool) -> Tuple[SourceType, bool]:
+            sync_on_reconstruction: bool) -> tuple[SourceType, bool]:
         """Validates the source path.
 
         Args:
@@ -1166,7 +1166,7 @@ class Storage(object):
           is_local_path: bool; Whether the source is a local path. False if URI.
         """
 
-        def _check_basename_conflicts(source_list: List[str]) -> None:
+        def _check_basename_conflicts(source_list: list[str]) -> None:
             """Checks if two paths in source_list have the same basename."""
             basenames = [os.path.basename(s) for s in source_list]
             conflicts = {x for x in basenames if basenames.count(x) > 1}
@@ -1261,7 +1261,7 @@ class Storage(object):
                         f'vastdata://, hf://. Got: {source}')
         return source, is_local_source
 
-    def _validate_storage_spec(self, name: Optional[str]) -> None:
+    def _validate_storage_spec(self, name: str | None) -> None:
         """Validates the storage spec and updates local fields if necessary."""
 
         def validate_name(name):
@@ -1371,7 +1371,7 @@ class Storage(object):
             f'{self.name} and mode {self.mode}. Please check the arguments.')
 
     def _add_store_from_metadata(
-            self, sky_stores: Dict[StoreType,
+            self, sky_stores: dict[StoreType,
                                    AbstractStore.StoreMetadata]) -> None:
         """Reconstructs Storage.stores from sky_stores.
 
@@ -1422,7 +1422,7 @@ class Storage(object):
                         sync_on_reconstruction=self.sync_on_reconstruction,
                         _bucket_sub_path=self._bucket_sub_path)
                 elif s_type == StoreType.OCI:
-                    oci_store_cls: Type[AbstractStore] = (
+                    oci_store_cls: type[AbstractStore] = (
                         OciS3CompatibleStore
                         if oci_s3.use_s3_api() else OciStore)
                     store = oci_store_cls.from_metadata(
@@ -1505,8 +1505,8 @@ class Storage(object):
         return storage_obj
 
     def add_store(self,
-                  store_type: Union[str, StoreType],
-                  region: Optional[str] = None) -> AbstractStore:
+                  store_type: str | StoreType,
+                  region: str | None = None) -> AbstractStore:
         """Initializes and adds a new store to the storage.
 
         Invoked by the optimizer after it has selected a store to
@@ -1536,7 +1536,7 @@ class Storage(object):
             assert store is not None, self
             return store
 
-        store_cls: Type[AbstractStore]
+        store_cls: type[AbstractStore]
         # First check if it's a registered S3-compatible store
         if store_type.value in _S3_COMPATIBLE_STORES:
             store_cls = _S3_COMPATIBLE_STORES[store_type.value]
@@ -1608,7 +1608,7 @@ class Storage(object):
                 global_user_state.add_or_update_storage(self.name, self.handle,
                                                         StorageStatus.INIT)
 
-    def delete(self, store_type: Optional[StoreType] = None) -> None:
+    def delete(self, store_type: StoreType | None = None) -> None:
         """Deletes data for all sky-managed storage objects.
 
         If a storage is not managed by sky, it is not deleted from the cloud.
@@ -1709,7 +1709,7 @@ class Storage(object):
         return obj
 
     @classmethod
-    def from_yaml_config(cls, config: Dict[str, Any]) -> 'Storage':
+    def from_yaml_config(cls, config: dict[str, Any]) -> 'Storage':
         common_utils.validate_schema(config, schemas.get_storage_schema(),
                                      'Invalid storage YAML: ')
         name = config.pop('name', None)
@@ -1781,10 +1781,10 @@ class Storage(object):
         storage_obj.force_delete = force_delete
         return storage_obj
 
-    def to_yaml_config(self) -> Dict[str, Any]:
+    def to_yaml_config(self) -> dict[str, Any]:
         config = {}
 
-        def add_if_not_none(key: str, value: Optional[Any]):
+        def add_if_not_none(key: str, value: Any | None):
             if value is not None:
                 config[key] = value
 
@@ -1815,7 +1815,7 @@ class Storage(object):
             config['_bucket_sub_path'] = self._bucket_sub_path
         if self._store_region is not None:
             config['_store_region'] = self._store_region
-        storage_config_dict: Dict[str, Any] = {}
+        storage_config_dict: dict[str, Any] = {}
         if self.mount_cached_config is not None:
             mount_cached_dict = self.mount_cached_config.to_yaml_config()
             if mount_cached_dict:
@@ -1848,29 +1848,29 @@ class S3CompatibleConfig:
     url_prefix: str  # URL prefix (e.g., "s3://", "r2://", "minio://")
 
     # Client creation
-    client_factory: Callable[[Optional[str]], Any]
+    client_factory: Callable[[str | None], Any]
     resource_factory: Callable[[str], StorageHandle]
-    split_path: Callable[[str], Tuple[str, str]]
+    split_path: Callable[[str], tuple[str, str]]
     verify_bucket: Callable[[str], bool]
 
     # CLI configuration
-    aws_profile: Optional[str] = None
-    get_endpoint_url: Optional[Callable[[], str]] = None
-    credentials_file: Optional[str] = None
-    config_file: Optional[str] = None
-    extra_cli_args: Optional[List[str]] = None
+    aws_profile: str | None = None
+    get_endpoint_url: Callable[[], str] | None = None
+    credentials_file: str | None = None
+    config_file: str | None = None
+    extra_cli_args: list[str] | None = None
     # Extra environment variables to prefix onto the AWS CLI upload commands.
     # Used by OCI to disable aws-chunked uploads (see OciS3CompatibleStore).
-    extra_cli_env: Optional[Dict[str, str]] = None
+    extra_cli_env: dict[str, str] | None = None
 
     # Provider-specific settings
     cloud_name: str = ''
-    default_region: Optional[str] = None
+    default_region: str | None = None
     access_denied_message: str = 'Access Denied'
 
     # Mounting
-    mount_cmd_factory: Optional[Callable] = None
-    mount_cached_cmd_factory: Optional[Callable] = None
+    mount_cmd_factory: Callable | None = None
+    mount_cached_cmd_factory: Callable | None = None
 
     def __post_init__(self):
         if self.extra_cli_args is None:
@@ -1981,10 +1981,10 @@ class S3CompatibleStore(AbstractStore):
     def __init__(self,
                  name: str,
                  source: str,
-                 region: Optional[str] = None,
-                 is_sky_managed: Optional[bool] = None,
+                 region: str | None = None,
+                 is_sky_managed: bool | None = None,
                  sync_on_reconstruction: bool = True,
-                 _bucket_sub_path: Optional[str] = None):
+                 _bucket_sub_path: str | None = None):
         # Initialize configuration first to get defaults
         self.config = self.__class__.get_config()
 
@@ -1993,8 +1993,8 @@ class S3CompatibleStore(AbstractStore):
             region = self.config.default_region
 
         # Initialize S3CompatibleStore specific attributes
-        self.client: 'mypy_boto3_s3.Client'
-        self.bucket: 'StorageHandle'
+        self.client: mypy_boto3_s3.Client
+        self.bucket: StorageHandle
 
         # Call parent constructor
         super().__init__(name, source, region, is_sky_managed,
@@ -2270,7 +2270,7 @@ class S3CompatibleStore(AbstractStore):
 
     def mount_cached_command(self,
                              mount_path: str,
-                             config: Optional[MountCachedConfig] = None) -> str:
+                             config: MountCachedConfig | None = None) -> str:
         """Get cached mount command. Can be overridden by subclasses."""
         if self.config.mount_cached_cmd_factory is None:
             raise exceptions.NotSupportedError(
@@ -2283,7 +2283,7 @@ class S3CompatibleStore(AbstractStore):
                                                    mount_cmd)
 
     def batch_aws_rsync(self,
-                        source_path_list: List[Path],
+                        source_path_list: list[Path],
                         create_dirs: bool = False) -> None:
         """Generic S3-compatible rsync using AWS CLI."""
         sub_path = f'/{self._bucket_sub_path}' if self._bucket_sub_path else ''
@@ -2401,7 +2401,7 @@ class S3CompatibleStore(AbstractStore):
             ux_utils.finishing_message(f'Storage synced: {sync_path}',
                                        log_path))
 
-    def _get_bucket(self) -> Tuple[StorageHandle, bool]:
+    def _get_bucket(self) -> tuple[StorageHandle, bool]:
         """Get or create bucket using S3 API."""
         bucket = self.config.resource_factory(self.name)
 
@@ -2449,7 +2449,7 @@ class S3CompatibleStore(AbstractStore):
     def _create_bucket(self, bucket_name: str) -> StorageHandle:
         """Create bucket using S3 API."""
         try:
-            create_bucket_config: Dict[str, Any] = {'Bucket': bucket_name}
+            create_bucket_config: dict[str, Any] = {'Bucket': bucket_name}
             if self.region is not None and self.region != 'us-east-1':
                 create_bucket_config['CreateBucketConfiguration'] = {
                     'LocationConstraint': self.region
@@ -2578,11 +2578,11 @@ class GcsStore(AbstractStore):
     def __init__(self,
                  name: str,
                  source: str,
-                 region: Optional[str] = 'us-central1',
-                 is_sky_managed: Optional[bool] = None,
-                 sync_on_reconstruction: Optional[bool] = True,
-                 _bucket_sub_path: Optional[str] = None):
-        self.client: 'storage.Client'
+                 region: str | None = 'us-central1',
+                 is_sky_managed: bool | None = None,
+                 sync_on_reconstruction: bool | None = True,
+                 _bucket_sub_path: str | None = None):
+        self.client: storage.Client
         self.bucket: StorageHandle
         super().__init__(name, source, region, is_sky_managed,
                          sync_on_reconstruction, _bucket_sub_path)
@@ -2790,7 +2790,7 @@ class GcsStore(AbstractStore):
         return self.client.get_bucket(self.name)
 
     def batch_gsutil_cp(self,
-                        source_path_list: List[Path],
+                        source_path_list: list[Path],
                         create_dirs: bool = False) -> None:
         """Invokes gsutil cp -n to batch upload a list of local paths
 
@@ -2837,7 +2837,7 @@ class GcsStore(AbstractStore):
                                        log_path))
 
     def batch_gsutil_rsync(self,
-                           source_path_list: List[Path],
+                           source_path_list: list[Path],
                            create_dirs: bool = False) -> None:
         """Invokes gsutil rsync to batch upload a list of local paths
 
@@ -2911,7 +2911,7 @@ class GcsStore(AbstractStore):
         elif isinstance(self.source, str) and self.source.startswith('r2://'):
             data_transfer.r2_to_gcs(self.name, self.name)
 
-    def _get_bucket(self) -> Tuple[StorageHandle, bool]:
+    def _get_bucket(self) -> tuple[StorageHandle, bool]:
         """Obtains the GCS bucket.
         If the bucket exists, this method will connect to the bucket.
 
@@ -2993,7 +2993,7 @@ class GcsStore(AbstractStore):
 
     def mount_cached_command(self,
                              mount_path: str,
-                             config: Optional[MountCachedConfig] = None) -> str:
+                             config: MountCachedConfig | None = None) -> str:
         install_cmd = mounting_utils.get_rclone_install_cmd()
         rclone_profile_name = (
             data_utils.Rclone.RcloneStores.GCS.get_profile_name(self.name))
@@ -3043,8 +3043,7 @@ class GcsStore(AbstractStore):
         self,
         bucket_name: str,
         # pylint: disable=invalid-name
-        _bucket_sub_path: Optional[str] = None
-    ) -> bool:
+        _bucket_sub_path: str | None = None) -> bool:
         """Deletes objects in GCS bucket
 
         Args:
@@ -3129,9 +3128,9 @@ class AzureBlobStore(AbstractStore):
                      *,
                      name: str,
                      storage_account_name: str,
-                     source: Optional[SourceType],
-                     region: Optional[str] = None,
-                     is_sky_managed: Optional[bool] = None):
+                     source: SourceType | None,
+                     region: str | None = None,
+                     is_sky_managed: bool | None = None):
             self.storage_account_name = storage_account_name
             super().__init__(name=name,
                              source=source,
@@ -3150,18 +3149,18 @@ class AzureBlobStore(AbstractStore):
                  name: str,
                  source: str,
                  storage_account_name: str = '',
-                 region: Optional[str] = 'eastus',
-                 is_sky_managed: Optional[bool] = None,
+                 region: str | None = 'eastus',
+                 is_sky_managed: bool | None = None,
                  sync_on_reconstruction: bool = True,
-                 _bucket_sub_path: Optional[str] = None):
-        self.storage_client: 'storage.Client'
-        self.resource_client: 'storage.Client'
+                 _bucket_sub_path: str | None = None):
+        self.storage_client: storage.Client
+        self.resource_client: storage.Client
         self.container_name: str
         # storage_account_name is not None when initializing only
         # when it is being reconstructed from the handle(metadata).
         self.storage_account_name = storage_account_name
-        self.storage_account_key: Optional[str] = None
-        self.resource_group_name: Optional[str] = None
+        self.storage_account_key: str | None = None
+        self.resource_group_name: str | None = None
         if region is None:
             region = 'eastus'
         super().__init__(name, source, region, is_sky_managed,
@@ -3362,7 +3361,7 @@ class AzureBlobStore(AbstractStore):
                 self.storage_account_name, self.resource_group_name,
                 self.storage_client, self.resource_client)
 
-    def update_storage_attributes(self, **kwargs: Dict[str, Any]):
+    def update_storage_attributes(self, **kwargs: dict[str, Any]):
         assert 'storage_account_name' in kwargs, (
             'only storage_account_name supported')
         assert isinstance(kwargs['storage_account_name'],
@@ -3371,7 +3370,7 @@ class AzureBlobStore(AbstractStore):
         self._update_storage_account_name_and_resource()
 
     @staticmethod
-    def get_default_storage_account_name(region: Optional[str]) -> str:
+    def get_default_storage_account_name(region: str | None) -> str:
         """Generates a unique default storage account name.
 
         The subscription ID is included to avoid conflicts when user switches
@@ -3407,8 +3406,7 @@ class AzureBlobStore(AbstractStore):
 
         return storage_account_name
 
-    def _get_storage_account_and_resource_group(
-            self) -> Tuple[str, Optional[str]]:
+    def _get_storage_account_and_resource_group(self) -> tuple[str, str | None]:
         """Get storage account and resource group to be used for AzureBlobStore
 
         Storage account name and resource group name of the container to be
@@ -3580,8 +3578,8 @@ class AzureBlobStore(AbstractStore):
         role_assignment_start = time.time()
         retry = 0
 
-        while (time.time() - role_assignment_start <
-               constants.WAIT_FOR_STORAGE_ACCOUNT_CREATION):
+        while (time.time() - role_assignment_start
+               < constants.WAIT_FOR_STORAGE_ACCOUNT_CREATION):
             try:
                 azure.assign_storage_account_iam_role(
                     storage_account_name=storage_account_name,
@@ -3694,7 +3692,7 @@ class AzureBlobStore(AbstractStore):
             self.resource_group_name, self.storage_account_name, self.name)
 
     def batch_az_blob_sync(self,
-                           source_path_list: List[Path],
+                           source_path_list: list[Path],
                            create_dirs: bool = False) -> None:
         """Invokes az storage blob sync to batch upload a list of local paths.
 
@@ -3774,7 +3772,7 @@ class AzureBlobStore(AbstractStore):
             ux_utils.finishing_message(f'Storage synced: {sync_path}',
                                        log_path))
 
-    def _get_bucket(self) -> Tuple[str, bool]:
+    def _get_bucket(self) -> tuple[str, bool]:
         """Obtains the AZ Container.
 
         Buckets for Azure Blob Storage are referred as Containers.
@@ -3899,7 +3897,7 @@ class AzureBlobStore(AbstractStore):
 
     def mount_cached_command(self,
                              mount_path: str,
-                             config: Optional[MountCachedConfig] = None) -> str:
+                             config: MountCachedConfig | None = None) -> str:
         install_cmd = mounting_utils.get_rclone_install_cmd()
         rclone_profile_name = (
             data_utils.Rclone.RcloneStores.AZURE.get_profile_name(self.name))
@@ -4005,12 +4003,12 @@ class IBMCosStore(AbstractStore):
     def __init__(self,
                  name: str,
                  source: str,
-                 region: Optional[str] = 'us-east',
-                 is_sky_managed: Optional[bool] = None,
+                 region: str | None = 'us-east',
+                 is_sky_managed: bool | None = None,
                  sync_on_reconstruction: bool = True,
-                 _bucket_sub_path: Optional[str] = None):
-        self.client: 'storage.Client'
-        self.bucket: 'StorageHandle'
+                 _bucket_sub_path: str | None = None):
+        self.client: storage.Client
+        self.bucket: StorageHandle
         self.rclone_profile_name = (
             data_utils.Rclone.RcloneStores.IBM.get_profile_name(self.name))
         super().__init__(name, source, region, is_sky_managed,
@@ -4198,7 +4196,7 @@ class IBMCosStore(AbstractStore):
         return self.s3_resource.Bucket(self.name)
 
     def batch_ibm_rsync(self,
-                        source_path_list: List[Path],
+                        source_path_list: list[Path],
                         create_dirs: bool = False) -> None:
         """Invokes rclone copy to batch upload a list of local paths to cos
 
@@ -4296,7 +4294,7 @@ class IBMCosStore(AbstractStore):
             ux_utils.finishing_message(f'Storage synced: {sync_path}',
                                        log_path))
 
-    def _get_bucket(self) -> Tuple[StorageHandle, bool]:
+    def _get_bucket(self) -> tuple[StorageHandle, bool]:
         """returns IBM COS bucket object if exists, otherwise creates it.
 
         Returns:
@@ -4394,17 +4392,15 @@ class IBMCosStore(AbstractStore):
         # install rclone if not installed.
         install_cmd = mounting_utils.get_rclone_install_cmd()
         rclone_config = data_utils.Rclone.RcloneStores.IBM.get_config(
-            rclone_profile_name=self.rclone_profile_name,
-            region=self.region)  # type: ignore
-        mount_cmd = (
-            mounting_utils.get_cos_mount_cmd(
-                rclone_config,
-                self.rclone_profile_name,
-                self.bucket.name,
-                mount_path,
-                self._bucket_sub_path,  # type: ignore
-                read_only=read_only,
-            ))
+            rclone_profile_name=self.rclone_profile_name, region=self.region)
+        mount_cmd = (mounting_utils.get_cos_mount_cmd(
+            rclone_config,
+            self.rclone_profile_name,
+            self.bucket.name,
+            mount_path,
+            self._bucket_sub_path,
+            read_only=read_only,
+        ))
         return mounting_utils.get_mounting_command(mount_path, install_cmd,
                                                    mount_cmd)
 
@@ -4431,7 +4427,7 @@ class IBMCosStore(AbstractStore):
                         f'{colorama.Style.RESET_ALL}')
             self.bucket = self.s3_resource.Bucket(bucket_name)
 
-        except ibm.ibm_botocore.exceptions.ClientError as e:  # type: ignore[union-attr]  # pylint: disable=line-too-long
+        except ibm.ibm_botocore.exceptions.ClientError as e:  # pylint: disable=line-too-long
             with ux_utils.print_exception_no_traceback():
                 raise exceptions.StorageBucketCreateError(
                     f'Failed to create bucket: '
@@ -4444,7 +4440,7 @@ class IBMCosStore(AbstractStore):
 
     def _delete_cos_bucket_objects(self,
                                    bucket: Any,
-                                   prefix: Optional[str] = None) -> None:
+                                   prefix: str | None = None) -> None:
         bucket_versioning = self.s3_resource.BucketVersioning(bucket.name)
         if bucket_versioning.status == 'Enabled':
             if prefix is not None:
@@ -4481,11 +4477,11 @@ class OciStore(AbstractStore):
 
     def __init__(self,
                  name: str,
-                 source: Optional[SourceType],
-                 region: Optional[str] = None,
-                 is_sky_managed: Optional[bool] = None,
-                 sync_on_reconstruction: Optional[bool] = True,
-                 _bucket_sub_path: Optional[str] = None):
+                 source: SourceType | None,
+                 region: str | None = None,
+                 is_sky_managed: bool | None = None,
+                 sync_on_reconstruction: bool | None = True,
+                 _bucket_sub_path: str | None = None):
         self.client: Any
         self.bucket: StorageHandle
         self.oci_config_file: str
@@ -4691,7 +4687,7 @@ class OciStore(AbstractStore):
                                       bucket_name=self.name).data
 
     def batch_oci_rsync(self,
-                        source_path_list: List[Path],
+                        source_path_list: list[Path],
                         create_dirs: bool = False) -> None:
         """Invokes oci sync to batch upload a list of local paths to Bucket
 
@@ -4772,7 +4768,7 @@ class OciStore(AbstractStore):
                 ux_utils.finishing_message(f'Storage synced: {sync_path}',
                                            log_path))
 
-    def _get_bucket(self) -> Tuple[StorageHandle, bool]:
+    def _get_bucket(self) -> tuple[StorageHandle, bool]:
         """Obtains the OCI bucket.
         If the bucket exists, this method will connect to the bucket.
 
@@ -5035,10 +5031,10 @@ class S3Store(S3CompatibleStore):
     def __init__(self,
                  name: str,
                  source: str,
-                 region: Optional[str] = None,
-                 is_sky_managed: Optional[bool] = None,
+                 region: str | None = None,
+                 is_sky_managed: bool | None = None,
                  sync_on_reconstruction: bool = True,
-                 _bucket_sub_path: Optional[str] = None):
+                 _bucket_sub_path: str | None = None):
         # TODO(romilb): This is purely a stopgap fix for
         #  https://github.com/skypilot-org/skypilot/issues/3405
         # We should eventually make all opt-in regions also work for S3 by
@@ -5068,7 +5064,7 @@ class S3Store(S3CompatibleStore):
 
     def mount_cached_command(self,
                              mount_path: str,
-                             config: Optional[MountCachedConfig] = None) -> str:
+                             config: MountCachedConfig | None = None) -> str:
         install_cmd = mounting_utils.get_rclone_install_cmd()
         rclone_profile_name = (
             data_utils.Rclone.RcloneStores.S3.get_profile_name(self.name))
@@ -5090,10 +5086,10 @@ class R2Store(S3CompatibleStore):
     def __init__(self,
                  name: str,
                  source: str,
-                 region: Optional[str] = 'auto',
-                 is_sky_managed: Optional[bool] = None,
+                 region: str | None = 'auto',
+                 is_sky_managed: bool | None = None,
                  sync_on_reconstruction: bool = True,
-                 _bucket_sub_path: Optional[str] = None):
+                 _bucket_sub_path: str | None = None):
         super().__init__(name, source, region, is_sky_managed,
                          sync_on_reconstruction, _bucket_sub_path)
 
@@ -5122,7 +5118,7 @@ class R2Store(S3CompatibleStore):
     def _get_r2_mount_cmd(cls,
                           bucket_name: str,
                           mount_path: str,
-                          bucket_sub_path: Optional[str],
+                          bucket_sub_path: str | None,
                           read_only: bool = False) -> str:
         """Factory method for R2 mount command."""
         endpoint_url = cloudflare.create_endpoint()
@@ -5136,7 +5132,7 @@ class R2Store(S3CompatibleStore):
 
     def mount_cached_command(self,
                              mount_path: str,
-                             config: Optional[MountCachedConfig] = None) -> str:
+                             config: MountCachedConfig | None = None) -> str:
         """R2-specific cached mount implementation using rclone."""
         install_cmd = mounting_utils.get_rclone_install_cmd()
         rclone_profile_name = (
@@ -5175,7 +5171,7 @@ class NebiusStore(S3CompatibleStore):
     def _get_nebius_mount_cmd(cls,
                               bucket_name: str,
                               mount_path: str,
-                              bucket_sub_path: Optional[str],
+                              bucket_sub_path: str | None,
                               read_only: bool = False) -> str:
         """Factory method for Nebius mount command."""
         # We need to get the endpoint URL, but since this is a static method,
@@ -5191,7 +5187,7 @@ class NebiusStore(S3CompatibleStore):
 
     def mount_cached_command(self,
                              mount_path: str,
-                             config: Optional[MountCachedConfig] = None) -> str:
+                             config: MountCachedConfig | None = None) -> str:
         """Nebius-specific cached mount implementation using rclone."""
         install_cmd = mounting_utils.get_rclone_install_cmd()
         rclone_profile_name = (
@@ -5230,7 +5226,7 @@ class CoreWeaveStore(S3CompatibleStore):
             mount_cmd_factory=cls._get_coreweave_mount_cmd,
         )
 
-    def _get_bucket(self) -> Tuple[StorageHandle, bool]:
+    def _get_bucket(self) -> tuple[StorageHandle, bool]:
         """Get or create bucket using CoreWeave's S3 API"""
         bucket = self.config.resource_factory(self.name)
 
@@ -5271,7 +5267,7 @@ class CoreWeaveStore(S3CompatibleStore):
     def _get_coreweave_mount_cmd(cls,
                                  bucket_name: str,
                                  mount_path: str,
-                                 bucket_sub_path: Optional[str],
+                                 bucket_sub_path: str | None,
                                  read_only: bool = False) -> str:
         """Factory method for CoreWeave mount command."""
         endpoint_url = coreweave.get_endpoint()
@@ -5286,7 +5282,7 @@ class CoreWeaveStore(S3CompatibleStore):
 
     def mount_cached_command(self,
                              mount_path: str,
-                             config: Optional[MountCachedConfig] = None) -> str:
+                             config: MountCachedConfig | None = None) -> str:
         """CoreWeave-specific cached mount implementation using rclone."""
         install_cmd = mounting_utils.get_rclone_install_cmd()
         rclone_profile_name = (
@@ -5347,7 +5343,7 @@ class VastDataStore(S3CompatibleStore):
     def _get_vastdata_mount_cmd(cls,
                                 bucket_name: str,
                                 mount_path: str,
-                                bucket_sub_path: Optional[str],
+                                bucket_sub_path: str | None,
                                 read_only: bool = False) -> str:
         """Factory method for VastData mount command."""
         endpoint_url = vastdata.get_endpoint()
@@ -5362,7 +5358,7 @@ class VastDataStore(S3CompatibleStore):
 
     def mount_cached_command(self,
                              mount_path: str,
-                             config: Optional[MountCachedConfig] = None) -> str:
+                             config: MountCachedConfig | None = None) -> str:
         """VastData-specific cached mount implementation using rclone."""
         install_cmd = mounting_utils.get_rclone_install_cmd()
         rclone_profile_name = (
@@ -5393,10 +5389,10 @@ class OciS3CompatibleStore(S3CompatibleStore):
     def __init__(self,
                  name: str,
                  source: str,
-                 region: Optional[str] = None,
-                 is_sky_managed: Optional[bool] = None,
+                 region: str | None = None,
+                 is_sky_managed: bool | None = None,
                  sync_on_reconstruction: bool = True,
-                 _bucket_sub_path: Optional[str] = None):
+                 _bucket_sub_path: str | None = None):
         # The native OciStore supports a <bucket>@<region> suffix. The
         # S3-compatible endpoint is pinned to a single region, so a region
         # suffix cannot be honored here. Only reject @ in source when it is
@@ -5458,7 +5454,7 @@ class OciS3CompatibleStore(S3CompatibleStore):
     def _get_oci_s3_mount_cmd(cls,
                               bucket_name: str,
                               mount_path: str,
-                              bucket_sub_path: Optional[str],
+                              bucket_sub_path: str | None,
                               read_only: bool = False) -> str:
         """Factory method for the OCI S3-compatible mount command."""
         endpoint_url = oci_s3.get_endpoint()
@@ -5474,7 +5470,7 @@ class OciS3CompatibleStore(S3CompatibleStore):
 
     def mount_cached_command(self,
                              mount_path: str,
-                             config: Optional[MountCachedConfig] = None) -> str:
+                             config: MountCachedConfig | None = None) -> str:
         """OCI S3-compatible cached mount implementation using rclone."""
         install_cmd = mounting_utils.get_rclone_install_cmd()
         rclone_profile_name = (

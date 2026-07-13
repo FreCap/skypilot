@@ -28,11 +28,12 @@ This is informed by the following boto3 docs:
 
 # pylint: disable=import-outside-toplevel
 
+from collections.abc import Callable
 import logging
 import threading
 import time
 import typing
-from typing import Any, Callable, Dict, Literal, Optional, TypeVar
+from typing import Any, Literal, TypeVar
 
 from sky import skypilot_config
 from sky.adaptors import common
@@ -107,7 +108,7 @@ def _create_aws_object(creation_fn_or_cls: Callable[[], T],
                         f'{common_utils.format_exception(e)}.')
 
 
-def get_workspace_profile() -> Optional[str]:
+def get_workspace_profile() -> str | None:
     """Get AWS profile name from workspace config."""
     return skypilot_config.get_workspace_cloud('aws').get('profile', None)
 
@@ -115,7 +116,7 @@ def get_workspace_profile() -> Optional[str]:
 # The TTL cache needs to be thread-local to avoid multiple threads sharing the
 # same session object, which is not guaranteed to be thread-safe.
 @annotations.thread_local_ttl_cache()
-def session(check_credentials: bool = True, profile: Optional[str] = None):
+def session(check_credentials: bool = True, profile: str | None = None):
     """Create an AWS session.
 
     Args:
@@ -176,7 +177,7 @@ def resource(service_name: str, **kwargs):
     """
     _assert_kwargs_builtin_type(kwargs)
 
-    max_attempts: Optional[int] = kwargs.pop('max_attempts', None)
+    max_attempts: int | None = kwargs.pop('max_attempts', None)
     if max_attempts is not None:
         config = botocore_config().Config(
             retries={'max_attempts': max_attempts})
@@ -225,11 +226,11 @@ def client(service_name: str, **kwargs):
     _assert_kwargs_builtin_type(kwargs)
 
     check_credentials = kwargs.pop('check_credentials', True)
-    connect_timeout: Optional[int] = kwargs.pop('connect_timeout', None)
-    read_timeout: Optional[int] = kwargs.pop('read_timeout', None)
-    total_max_attempts: Optional[int] = kwargs.pop('total_max_attempts', None)
+    connect_timeout: int | None = kwargs.pop('connect_timeout', None)
+    read_timeout: int | None = kwargs.pop('read_timeout', None)
+    total_max_attempts: int | None = kwargs.pop('total_max_attempts', None)
 
-    config_kwargs: Dict[str, Any] = {}
+    config_kwargs: dict[str, Any] = {}
     if connect_timeout is not None:
         config_kwargs['connect_timeout'] = connect_timeout
     if read_timeout is not None:

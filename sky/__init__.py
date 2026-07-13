@@ -6,7 +6,7 @@ import importlib.util
 import os
 import subprocess
 import sys
-from typing import Any, Dict, Optional, TYPE_CHECKING
+from typing import Any, Optional, TYPE_CHECKING
 import urllib.request
 
 from sky.utils import directory_utils
@@ -49,7 +49,7 @@ def _get_git_commit():
 _SKYPILOT_COMMIT_COUNT = '{{SKYPILOT_COMMIT_COUNT}}'
 
 
-def _get_commit_count() -> Optional[str]:
+def _get_commit_count() -> str | None:
     if 'SKYPILOT_COMMIT_COUNT' not in _SKYPILOT_COMMIT_COUNT:
         # This is a release build, the count has already been set.
         return _SKYPILOT_COMMIT_COUNT
@@ -79,7 +79,7 @@ __root_dir__ = directory_utils.get_sky_dir()
 def _set_http_proxy_env_vars() -> None:
     urllib_proxies = dict(urllib.request.getproxies())
 
-    def set_proxy_env_var(proxy_var: str, urllib_var: Optional[str]):
+    def set_proxy_env_var(proxy_var: str, urllib_var: str | None):
         """Sets proxy env vars in os.environ, consulting urllib if needed.
 
         Logic:
@@ -313,7 +313,7 @@ _CLIENT_SDK_ENTRY_POINT_GROUP = 'sky.client_sdks'
 
 
 @functools.lru_cache(maxsize=1)
-def _client_sdk_entry_points() -> Dict[str, 'EntryPoint']:
+def _client_sdk_entry_points() -> dict[str, 'EntryPoint']:
     """Map of name -> entry point in the ``sky.client_sdks`` group.
 
     Cached for the process lifetime: ``importlib.metadata.entry_points()``
@@ -325,15 +325,8 @@ def _client_sdk_entry_points() -> Dict[str, 'EntryPoint']:
     # pylint: disable-next=import-outside-toplevel
     import importlib.metadata as importlib_metadata
     all_entry_points = importlib_metadata.entry_points()
-    # ``entry_points().select(group=...)`` is the API on Python 3.10+ (and the
-    # only one on 3.12+). On 3.8/3.9 ``entry_points()`` returns a plain mapping
-    # of group name to entry points, so fall back to ``.get()`` there.
-    select = getattr(all_entry_points, 'select', None)
-    if select is not None:
-        group_entry_points = select(group=_CLIENT_SDK_ENTRY_POINT_GROUP)
-    else:
-        group_entry_points = all_entry_points.get(_CLIENT_SDK_ENTRY_POINT_GROUP,
-                                                  [])
+    group_entry_points = all_entry_points.select(
+        group=_CLIENT_SDK_ENTRY_POINT_GROUP)
     return {ep.name: ep for ep in group_entry_points}
 
 

@@ -1,8 +1,9 @@
 """ Prime Intellect Cloud. """
+from collections.abc import Iterator
 import json
 import os
 import typing
-from typing import Dict, Iterator, List, Optional, Tuple, Union
+from typing import Optional
 
 from sky import catalog
 from sky import clouds
@@ -14,7 +15,7 @@ if typing.TYPE_CHECKING:
     from sky import resources as resources_lib
     from sky.utils import volume as volume_lib
 
-CredentialCheckResult = Tuple[bool, Optional[Union[str, Dict[str, str]]]]
+CredentialCheckResult = tuple[bool, str | dict[str, str] | None]
 
 _CREDENTIAL_FILES = [
     'config.json',
@@ -48,27 +49,27 @@ class PrimeIntellect(clouds.Cloud):
     PROVISIONER_VERSION = clouds.ProvisionerVersion.SKYPILOT
     STATUS_VERSION = clouds.StatusVersion.SKYPILOT
     _MAX_CLUSTER_NAME_LEN_LIMIT = 120
-    _regions: List[clouds.Region] = []
+    _regions: list[clouds.Region] = []
 
     @classmethod
     def _cloud_unsupported_features(
-            cls) -> Dict[clouds.CloudImplementationFeatures, str]:
+            cls) -> dict[clouds.CloudImplementationFeatures, str]:
         return cls._CLOUD_UNSUPPORTED_FEATURES
 
     @classmethod
-    def _max_cluster_name_length(cls) -> Optional[int]:
+    def _max_cluster_name_length(cls) -> int | None:
         return cls._MAX_CLUSTER_NAME_LEN_LIMIT
 
     @classmethod
     def regions_with_offering(
         cls,
         instance_type: str,
-        accelerators: Optional[Dict[str, int]],
+        accelerators: dict[str, int] | None,
         use_spot: bool,
-        region: Optional[str],
-        zone: Optional[str],
+        region: str | None,
+        zone: str | None,
         resources: Optional['resources_lib.Resources'] = None,
-    ) -> List[clouds.Region]:
+    ) -> list[clouds.Region]:
         """Returns the regions that offer the specified resources."""
         del accelerators
         regions = catalog.get_region_zones_for_instance_type(
@@ -87,7 +88,7 @@ class PrimeIntellect(clouds.Cloud):
     def get_vcpus_mem_from_instance_type(
         cls,
         instance_type: str,
-    ) -> Tuple[Optional[float], Optional[float]]:
+    ) -> tuple[float | None, float | None]:
         """Returns the #vCPUs and memory that the instance type offers."""
         return catalog.get_vcpus_mem_from_instance_type(instance_type,
                                                         clouds='primeintellect')
@@ -99,9 +100,9 @@ class PrimeIntellect(clouds.Cloud):
         region: str,
         num_nodes: int,
         instance_type: str,
-        accelerators: Optional[Dict[str, int]] = None,
+        accelerators: dict[str, int] | None = None,
         use_spot: bool = False,
-    ) -> Iterator[Optional[List['clouds.Zone']]]:
+    ) -> Iterator[list['clouds.Zone'] | None]:
         """Returns an iterator over zones for provisioning."""
         regions = cls.regions_with_offering(instance_type,
                                             accelerators,
@@ -115,8 +116,8 @@ class PrimeIntellect(clouds.Cloud):
     def instance_type_to_hourly_cost(self,
                                      instance_type: str,
                                      use_spot: bool,
-                                     region: Optional[str] = None,
-                                     zone: Optional[str] = None) -> float:
+                                     region: str | None = None,
+                                     zone: str | None = None) -> float:
         """Returns the cost, or the cheapest cost among all zones for spot."""
         return catalog.get_hourly_cost(instance_type,
                                        use_spot=use_spot,
@@ -125,10 +126,10 @@ class PrimeIntellect(clouds.Cloud):
                                        clouds='primeintellect')
 
     def accelerators_to_hourly_cost(self,
-                                    accelerators: Dict[str, int],
+                                    accelerators: dict[str, int],
                                     use_spot: bool,
-                                    region: Optional[str] = None,
-                                    zone: Optional[str] = None) -> float:
+                                    region: str | None = None,
+                                    zone: str | None = None) -> float:
         """Returns the cost, or the cheapest cost among all zones for spot."""
         del accelerators, use_spot, region, zone  # Unused.
         return 0.0
@@ -142,15 +143,15 @@ class PrimeIntellect(clouds.Cloud):
     @classmethod
     def get_default_instance_type(
         cls,
-        cpus: Optional[str] = None,
-        memory: Optional[str] = None,
-        disk_tier: Optional[resources_utils.DiskTier] = None,
-        local_disk: Optional[str] = None,
-        region: Optional[str] = None,
-        zone: Optional[str] = None,
+        cpus: str | None = None,
+        memory: str | None = None,
+        disk_tier: resources_utils.DiskTier | None = None,
+        local_disk: str | None = None,
+        region: str | None = None,
+        zone: str | None = None,
         use_spot: bool = False,
-        max_hourly_cost: Optional[float] = None,
-    ) -> Optional[str]:
+        max_hourly_cost: float | None = None,
+    ) -> str | None:
         """Returns the default instance type for Prime Intellect."""
         return catalog.get_default_instance_type(
             cpus=cpus,
@@ -165,12 +166,12 @@ class PrimeIntellect(clouds.Cloud):
 
     @classmethod
     def get_accelerators_from_instance_type(
-            cls, instance_type: str) -> Optional[Dict[str, Union[int, float]]]:
+            cls, instance_type: str) -> dict[str, int | float] | None:
         return catalog.get_accelerators_from_instance_type(
             instance_type, clouds='primeintellect')
 
     @classmethod
-    def get_zone_shell_cmd(cls) -> Optional[str]:
+    def get_zone_shell_cmd(cls) -> str | None:
         return None
 
     def make_deploy_resources_variables(
@@ -178,11 +179,11 @@ class PrimeIntellect(clouds.Cloud):
         resources: 'resources_lib.Resources',
         cluster_name: resources_utils.ClusterName,
         region: 'clouds.Region',
-        zones: Optional[List['clouds.Zone']],
+        zones: list['clouds.Zone'] | None,
         num_nodes: int,
         dryrun: bool = False,
-        volume_mounts: Optional[List['volume_lib.VolumeMount']] = None
-    ) -> Dict[str, Optional[str]]:
+        volume_mounts: list['volume_lib.VolumeMount'] | None = None
+    ) -> dict[str, str | None]:
         del dryrun, cluster_name, num_nodes, volume_mounts
         assert zones is not None, (region, zones)
 
@@ -262,7 +263,7 @@ class PrimeIntellect(clouds.Cloud):
                                                  fuzzy_candidate_list, None)
 
     @classmethod
-    def _check_credentials(cls) -> Tuple[bool, Optional[str]]:
+    def _check_credentials(cls) -> tuple[bool, str | None]:
         """Verify that the user has valid credentials for Prime Intellect."""
 
         primeintellect_config_file = '~/.prime/config.json'
@@ -294,7 +295,7 @@ class PrimeIntellect(clouds.Cloud):
         compute service."""
         return cls._check_credentials()
 
-    def get_credential_file_mounts(self) -> Dict[str, str]:
+    def get_credential_file_mounts(self) -> dict[str, str]:
         """Returns a dict of credential file paths to mount paths."""
         return {
             f'~/.prime/{filename}': f'~/.prime/{filename}'
@@ -302,13 +303,13 @@ class PrimeIntellect(clouds.Cloud):
         }
 
     @classmethod
-    def get_current_user_identity(cls) -> Optional[List[str]]:
+    def get_current_user_identity(cls) -> list[str] | None:
         return None
 
     def instance_type_exists(self, instance_type: str) -> bool:
         return catalog.instance_type_exists(instance_type, 'primeintellect')
 
-    def validate_region_zone(self, region: Optional[str], zone: Optional[str]):
+    def validate_region_zone(self, region: str | None, zone: str | None):
         return catalog.validate_region_zone(region,
                                             zone,
                                             clouds='primeintellect')
@@ -317,8 +318,8 @@ class PrimeIntellect(clouds.Cloud):
     def _unsupported_features_for_resources(
         cls,
         resources: 'resources_lib.Resources',
-        region: Optional[str] = None,
-    ) -> Dict[clouds.CloudImplementationFeatures, str]:
+        region: str | None = None,
+    ) -> dict[clouds.CloudImplementationFeatures, str]:
         """The features not supported based on the resources provided.
 
         This method is used by check_features_are_supported() to check if the

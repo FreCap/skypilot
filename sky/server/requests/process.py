@@ -1,10 +1,10 @@
 """ProcessPoolExecutor with additional supports for skypilot."""
+from collections.abc import Callable
 import concurrent.futures
 import logging
 import multiprocessing
 import threading
 import time
-from typing import Callable, Dict, Optional, Tuple
 
 from sky import exceptions
 from sky.utils import atomic
@@ -102,15 +102,15 @@ class DisposableExecutor:
     """
 
     def __init__(self,
-                 max_workers: Optional[int] = None,
-                 initializer: Optional[Callable] = None,
-                 initargs: Tuple = ()):
-        self.max_workers: Optional[int] = max_workers
-        self.workers: Dict[int, multiprocessing.Process] = {}
+                 max_workers: int | None = None,
+                 initializer: Callable | None = None,
+                 initargs: tuple = ()):
+        self.max_workers: int | None = max_workers
+        self.workers: dict[int, multiprocessing.Process] = {}
         self._shutdown: bool = False
         self._lock: threading.Lock = threading.Lock()
-        self._initializer: Optional[Callable] = initializer
-        self._initargs: Tuple = initargs
+        self._initializer: Callable | None = initializer
+        self._initargs: tuple = initargs
 
     def _monitor_worker(self, process: multiprocessing.Process,
                         future: concurrent.futures.Future,
@@ -195,10 +195,10 @@ class BurstableExecutor:
     """An multiprocessing executor that supports bursting worker processes."""
 
     # _executor is a PoolExecutor that is used to run guaranteed requests.
-    _executor: Optional[PoolExecutor] = None
+    _executor: PoolExecutor | None = None
     # _burst_executor is a ProcessPoolExecutor that is used to run burst
     # requests.
-    _burst_executor: Optional[DisposableExecutor] = None
+    _burst_executor: DisposableExecutor | None = None
 
     def __init__(self,
                  garanteed_workers: int,

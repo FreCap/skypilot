@@ -9,7 +9,7 @@ import signal
 import tempfile
 import threading
 import typing
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Optional
 import uuid
 
 import colorama
@@ -63,7 +63,7 @@ _STORAGE_NAME_MAX_LENGTH = 63
 def _prepare_scoped_ephemeral_storage(
         task: 'task_lib.Task',
         resource_scope: str,
-        reuse_existing_scope: bool = False) -> Tuple[str, str, Set[str]]:
+        reuse_existing_scope: bool = False) -> tuple[str, str, set[str]]:
     """Namespace deletable storage and return remote mounts to retain."""
     existing_scope = task.metadata.get(
         serve_constants.EPHEMERAL_STORAGE_SCOPE_METADATA_KEY)
@@ -74,8 +74,8 @@ def _prepare_scoped_ephemeral_storage(
         storage_generation = existing_scope['storage_generation']
     scope_id = serve_utils.generate_ephemeral_storage_scope_id(
         resource_scope, storage_generation)
-    unowned_remote_mounts: Set[str] = set()
-    existing_owned_mounts: Set[str] = set()
+    unowned_remote_mounts: set[str] = set()
+    existing_owned_mounts: set[str] = set()
     if (reuse_existing_scope and isinstance(existing_scope, dict) and
             existing_scope.get('resource_scope') == resource_scope and
             existing_scope.get('scope_id') == scope_id):
@@ -84,7 +84,7 @@ def _prepare_scoped_ephemeral_storage(
             existing_owned_mounts = {
                 mount for mount in raw_owned_mounts if isinstance(mount, str)
             }
-    seen_storage_ids: Set[int] = set()
+    seen_storage_ids: set[int] = set()
     for mount_path, storage in task.storage_mounts.items():
         if storage.persistent:
             continue
@@ -113,7 +113,7 @@ def _prepare_scoped_ephemeral_storage(
 
 def _record_scoped_ephemeral_storage(task: 'task_lib.Task', resource_scope: str,
                                      scope_id: str, storage_generation: str,
-                                     unowned_remote_mounts: Set[str]) -> None:
+                                     unowned_remote_mounts: set[str]) -> None:
     """Persist the exact mount paths whose external resources we own."""
     owned_mounts = sorted(
         mount_path for mount_path, storage in task.storage_mounts.items()
@@ -145,13 +145,13 @@ def _persist_scoped_ephemeral_storage_intent(task: 'task_lib.Task',
 
 
 def _get_committed_storage_generations(
-        service_name: str) -> Optional[Set[Tuple[str, str]]]:
+        service_name: str) -> set[tuple[str, str]] | None:
     """Snapshot committed scoped-storage generations for one service.
 
     Returns None if any committed YAML is unreadable so callers can fail
     closed and retain the durable cleanup intent.
     """
-    committed_generations: Set[Tuple[str, str]] = set()
+    committed_generations: set[tuple[str, str]] = set()
     for version in serve_state.get_service_versions(service_name):
         yaml_content = serve_state.get_yaml_content(service_name, version)
         if yaml_content is None:
@@ -240,9 +240,9 @@ def _service_test_request_command(endpoint: str) -> str:
     return f'curl -H {header} {endpoint}'
 
 
-def _external_service_endpoint_url(
-        service_name: str,
-        resource_scope: Optional[str] = None) -> Optional[str]:
+def _external_service_endpoint_url(service_name: str,
+                                   resource_scope: str | None = None
+                                  ) -> str | None:
     """Return the HTTP-only provider LB endpoint, or None if unavailable."""
     if resource_scope is None:
         # Preserve the legacy call shape for NULL-scope rows and embedders
@@ -300,7 +300,7 @@ def _wait_for_service_registration(handle: backends.CloudVmRayResourceHandle,
 def _get_service_record(
         service_name: str, pool: bool,
         handle: backends.CloudVmRayResourceHandle,
-        backend: backends.CloudVmRayBackend) -> Optional[Dict[str, Any]]:
+        backend: backends.CloudVmRayBackend) -> dict[str, Any] | None:
     """Get the service record."""
     noun = 'pool' if pool else 'service'
 
@@ -349,7 +349,7 @@ def _get_service_record(
 # per-context config maps). The controller loses only these subtrees on a
 # pod-replacement recovery — the corresponding launch customizations, not
 # identity or workspace resolution.
-_EMBEDDED_CONFIG_CREDENTIAL_KEYS: List[Tuple[str, ...]] = [
+_EMBEDDED_CONFIG_CREDENTIAL_KEYS: list[tuple[str, ...]] = [
     ('vast', 'create_instance_kwargs'),
     ('kubernetes', 'pod_config'),
     ('kubernetes', 'context_configs', '*', 'pod_config'),
@@ -358,7 +358,7 @@ _EMBEDDED_CONFIG_CREDENTIAL_KEYS: List[Tuple[str, ...]] = [
 ]
 
 
-def _sanitized_config_bytes(local_path: str) -> Optional[bytes]:
+def _sanitized_config_bytes(local_path: str) -> bytes | None:
     """Read + sanitize the controller config yaml for the recovery embed.
 
     Returns None (skip the embed; the recovery-side service-dir mkdir still
@@ -367,14 +367,14 @@ def _sanitized_config_bytes(local_path: str) -> Optional[bytes]:
     recreate garbage.
     """
     try:
-        with open(os.path.expanduser(local_path), 'r', encoding='utf-8') as f:
+        with open(os.path.expanduser(local_path), encoding='utf-8') as f:
             config = yaml_utils.safe_load(f.read()) or {}
     except Exception as e:  # pylint: disable=broad-except
         logger.warning('Skipping HA-recovery config embed (unreadable or '
                        f'unparsable {local_path}): {e}')
         return None
 
-    def _strip(node: Any, key_path: Tuple[str, ...], trail: str) -> None:
+    def _strip(node: Any, key_path: tuple[str, ...], trail: str) -> None:
         if not isinstance(node, dict):
             return
         key, rest = key_path[0], key_path[1:]
@@ -386,8 +386,8 @@ def _sanitized_config_bytes(local_path: str) -> Optional[bytes]:
         if key in node:
             _strip_or_pop(node, key, node[key], rest, f'{trail}.{key}')
 
-    def _strip_or_pop(parent: Dict[str, Any], key: str, child: Any,
-                      rest: Tuple[str, ...], trail: str) -> None:
+    def _strip_or_pop(parent: dict[str, Any], key: str, child: Any,
+                      rest: tuple[str, ...], trail: str) -> None:
         if not rest:
             parent.pop(key)
             logger.info('Stripped credential-capable config subtree '
@@ -400,7 +400,7 @@ def _sanitized_config_bytes(local_path: str) -> Optional[bytes]:
     return yaml_utils.dump_yaml_str(config).encode('utf-8')
 
 
-def _ha_recovery_restore_cmds(files: Optional[Dict[str, bytes]]) -> List[str]:
+def _ha_recovery_restore_cmds(files: dict[str, bytes] | None) -> list[str]:
     """Shell commands recreating the given files from the given contents
     (base64-embedded, shell-quoted paths).
 
@@ -508,9 +508,9 @@ def _require_supported_service_topology(task: 'task_lib.Task',
 
 def up(
     task: 'task_lib.Task',
-    service_name: Optional[str] = None,
+    service_name: str | None = None,
     pool: bool = False,
-) -> Tuple[str, str]:
+) -> tuple[str, str]:
     """Spins up a service or pool under the cross-pod name lifecycle lock."""
     if service_name is None:
         service_name = serve_utils.generate_service_name(pool)
@@ -520,7 +520,7 @@ def up(
 
 
 def _up_impl(task: 'task_lib.Task', service_name: str, pool: bool,
-             lifecycle_lock: Any) -> Tuple[str, str]:
+             lifecycle_lock: Any) -> tuple[str, str]:
     """Run up and eagerly clean only this operation's uncommitted storage."""
     lifecycle_epoch = serve_utils.get_service_lifecycle_epoch(lifecycle_lock)
     try:
@@ -536,7 +536,7 @@ def _up_impl(task: 'task_lib.Task', service_name: str, pool: bool,
 
 
 def _up_impl_body(task: 'task_lib.Task', service_name: str, pool: bool,
-                  lifecycle_lock: Any) -> Tuple[str, str]:
+                  lifecycle_lock: Any) -> tuple[str, str]:
     """Spins up a service or a pool."""
 
     def _assert_lifecycle_lock(phase: str) -> None:
@@ -773,7 +773,7 @@ def _up_impl_body(task: 'task_lib.Task', service_name: str, pool: bool,
             # boots from the DB-committed yaml).
             # The config is additionally sanitized of known
             # credential-capable subtrees before the embed.
-            config_files: Dict[str, bytes] = {}
+            config_files: dict[str, bytes] = {}
             for remote, local in (controller_task.file_mounts or {}).items():
                 if remote != remote_config_yaml_path:
                     continue
@@ -938,7 +938,7 @@ def update(
     service_name: str,
     mode: serve_utils.UpdateMode = serve_utils.DEFAULT_UPDATE_MODE,
     pool: bool = False,
-    workers: Optional[int] = None,
+    workers: int | None = None,
 ) -> None:
     """Updates an existing service or pool."""
     # The lifecycle lock is cross-pod on PostgreSQL and lives outside the
@@ -961,7 +961,7 @@ def _assert_service_update_fence(service_name: str, pool: bool,
                                  backend: 'backends.CloudVmRayBackend',
                                  expected_service_hash: str,
                                  lifecycle_lock: Any,
-                                 phase: str) -> Dict[str, Any]:
+                                 phase: str) -> dict[str, Any]:
     """Revalidate one update before a name-scoped external mutation."""
     if not serve_utils.lifecycle_lock_is_valid(lifecycle_lock):
         raise RuntimeError(f'Lost lifecycle ownership while {phase} for '
@@ -984,8 +984,8 @@ def _update_impl(
     service_name: str,
     mode: serve_utils.UpdateMode = serve_utils.DEFAULT_UPDATE_MODE,
     pool: bool = False,
-    workers: Optional[int] = None,
-    lifecycle_lock: Optional[Any] = None,
+    workers: int | None = None,
+    lifecycle_lock: Any | None = None,
 ) -> None:
     """Run update and eagerly clean only uncommitted storage generations."""
     if lifecycle_lock is None:
@@ -1006,8 +1006,8 @@ def _update_impl_body(
     service_name: str,
     mode: serve_utils.UpdateMode = serve_utils.DEFAULT_UPDATE_MODE,
     pool: bool = False,
-    workers: Optional[int] = None,
-    lifecycle_lock: Optional[Any] = None,
+    workers: int | None = None,
+    lifecycle_lock: Any | None = None,
 ) -> None:
     noun = 'pool' if pool else 'service'
     capnoun = noun.capitalize()
@@ -1112,9 +1112,9 @@ def _update_impl_body(
                                  'preparing the update')
 
     resource_scope = service_record.get('resource_scope')
-    storage_scope_id: Optional[str] = None
-    storage_generation: Optional[str] = None
-    unowned_remote_storage_mounts: Set[str] = set()
+    storage_scope_id: str | None = None
+    storage_generation: str | None = None
+    unowned_remote_storage_mounts: set[str] = set()
     if isinstance(resource_scope, str) and resource_scope:
         (storage_scope_id, storage_generation,
          unowned_remote_storage_mounts) = (_prepare_scoped_ephemeral_storage(
@@ -1304,7 +1304,7 @@ def _update_impl_body(
 
 def apply(
     task: 'task_lib.Task',
-    workers: Optional[int],
+    workers: int | None,
     service_name: str,
     mode: serve_utils.UpdateMode = serve_utils.DEFAULT_UPDATE_MODE,
     pool: bool = False,
@@ -1360,7 +1360,7 @@ def apply(
 
 
 def _terminate_services(handle: 'backends.CloudVmRayResourceHandle',
-                        service_names: Optional[List[str]], purge: bool,
+                        service_names: list[str] | None, purge: bool,
                         pool: bool, noun: str) -> str:
     assert isinstance(handle, backends.CloudVmRayResourceHandle)
     use_legacy = not handle.is_grpc_enabled_with_flag
@@ -1388,7 +1388,7 @@ def _terminate_services(handle: 'backends.CloudVmRayResourceHandle',
 
 
 def down(
-    service_names: Optional[Union[str, List[str]]] = None,
+    service_names: str | list[str] | None = None,
     all: bool = False,  # pylint: disable=redefined-builtin
     purge: bool = False,
     pool: bool = False,
@@ -1457,15 +1457,15 @@ class _DefaultServiceStatusRunner:
         self,
         *,
         handle: 'backends.CloudVmRayResourceHandle',
-        service_names: Optional[List[str]],
+        service_names: list[str] | None,
         pool: bool,
         summary_only: bool = False,
-        include_target_num_replicas: Optional[bool] = None,
-    ) -> List[Dict[str, Any]]:
+        include_target_num_replicas: bool | None = None,
+    ) -> list[dict[str, Any]]:
         noun = 'pool' if pool else 'service'
         use_legacy = not handle.is_grpc_enabled_with_flag
 
-        service_records: List[Dict[str, Any]] = []
+        service_records: list[dict[str, Any]] = []
         if not use_legacy:
             try:
                 service_records = serve_rpc_utils.RpcRunner.get_service_status(
@@ -1509,11 +1509,11 @@ class _DefaultServiceStatusRunner:
 
 
 def status(
-    service_names: Optional[Union[str, List[str]]] = None,
+    service_names: str | list[str] | None = None,
     pool: bool = False,
     summary_only: bool = False,
-    include_target_num_replicas: Optional[bool] = None,
-) -> List[Dict[str, Any]]:
+    include_target_num_replicas: bool | None = None,
+) -> list[dict[str, Any]]:
     """Gets statuses of services or pools.
 
     summary_only skips per-replica info (returns replica_status_counts
@@ -1567,16 +1567,16 @@ def status(
     return service_records
 
 
-ServiceComponentOrStr = Union[str, serve_utils.ServiceComponent]
+ServiceComponentOrStr = str | serve_utils.ServiceComponent
 
 
 def tail_logs(
     service_name: str,
     *,
     target: ServiceComponentOrStr,
-    replica_id: Optional[int] = None,
+    replica_id: int | None = None,
     follow: bool = True,
-    tail: Optional[int] = None,
+    tail: int | None = None,
     pool: bool = False,
 ) -> None:
     """Tail logs of a service or pool."""
@@ -1639,7 +1639,7 @@ def tail_logs(
 def _get_all_replica_targets(
         service_name: str, backend: backends.CloudVmRayBackend,
         handle: backends.CloudVmRayResourceHandle,
-        pool: bool) -> Set[serve_utils.ServiceComponentTarget]:
+        pool: bool) -> set[serve_utils.ServiceComponentTarget]:
     """Helper function to get targets for all live replicas."""
     assert isinstance(handle, backends.CloudVmRayResourceHandle)
     use_legacy = not handle.is_grpc_enabled_with_flag
@@ -1688,10 +1688,9 @@ def sync_down_logs(
     service_name: str,
     *,
     local_dir: str,
-    targets: Union[ServiceComponentOrStr, List[ServiceComponentOrStr],
-                   None] = None,
-    replica_ids: Optional[List[int]] = None,
-    tail: Optional[int] = None,
+    targets: ServiceComponentOrStr | list[ServiceComponentOrStr] | None = None,
+    replica_ids: list[int] | None = None,
+    tail: int | None = None,
     pool: bool = False,
 ) -> str:
     """Sync down logs of a service or pool."""
@@ -1709,7 +1708,7 @@ def sync_down_logs(
         backend: backends.CloudVmRayBackend = (
             backend_utils.get_backend_from_handle(handle))
 
-    requested_components: Set[serve_utils.ServiceComponent] = set()
+    requested_components: set[serve_utils.ServiceComponent] = set()
     if not targets:
         # No targets specified -> request all components
         requested_components = {
@@ -1726,7 +1725,7 @@ def sync_down_logs(
                 serve_utils.ServiceComponent(t) for t in targets
             }
 
-    normalized_targets: Set[serve_utils.ServiceComponentTarget] = set()
+    normalized_targets: set[serve_utils.ServiceComponentTarget] = set()
     if serve_utils.ServiceComponent.CONTROLLER in requested_components:
         normalized_targets.add(
             serve_utils.ServiceComponentTarget(

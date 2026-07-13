@@ -16,11 +16,12 @@ autoscaler the broker's feed + grant instead of a privately measured free
 level. With a single live claim the broker's fast path reproduces the
 standalone behavior exactly.
 """
+from collections.abc import Callable
 import os
 import re
 import time
 import typing
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
 from sky import sky_logging
 from sky.catalog import kubernetes_catalog
@@ -50,8 +51,8 @@ def poll_interval_seconds() -> float:
 
 
 def zero_cost_pool_shapes(
-    zero_cost_locations: List['spot_placer_lib.Location']
-) -> Dict[Tuple[str, str], int]:
+    zero_cost_locations: list['spot_placer_lib.Location']
+) -> dict[tuple[str, str], int]:
     """Per-(context, gpu) pool shapes of the zero-cost location set.
 
     Pure spec parsing (no cluster query). Rules:
@@ -67,7 +68,7 @@ def zero_cost_pool_shapes(
       case-insensitively, so 'A100' and 'a100' entries hit the same
       pool and must dedupe to one key.
     """
-    per_key_replica_size: Dict[Tuple[str, str], int] = {}
+    per_key_replica_size: dict[tuple[str, str], int] = {}
     for location in zero_cost_locations:
         if str(location.cloud).lower() != 'kubernetes':
             continue
@@ -133,7 +134,7 @@ def query_pool_observation(
 
 
 def query_free_slots(
-        zero_cost_locations: List['spot_placer_lib.Location']) -> int:
+        zero_cost_locations: list['spot_placer_lib.Location']) -> int:
     """Free replica slots across the zero-cost locations, summed per shape.
 
     Standalone (non-broker) measurement: shapes are assumed to map to
@@ -152,8 +153,8 @@ def query_free_slots(
 
 
 def _standalone_cycle(autoscaler: 'autoscalers.Autoscaler',
-                      zero_cost: List['spot_placer_lib.Location'],
-                      keys: List[Dict[str, Any]]) -> None:
+                      zero_cost: list['spot_placer_lib.Location'],
+                      keys: list[dict[str, Any]]) -> None:
     """Pre-broker measurement cycle: private query, no arbitration."""
     # Snapshot time is captured BEFORE the (slow, cluster-wide)
     # availability query: a zero-cost replica row created while the query
@@ -178,14 +179,13 @@ def _broker_cycle(
     autoscaler: 'autoscalers.Autoscaler',
     placer: 'spot_placer_lib.SpotPlacer',
     service_name: str,
-    zero_cost: List['spot_placer_lib.Location'],
-    keys: List[Dict[str, Any]],
-    expected_service_hash: Optional[str] = None,
-    expected_controller_owner: Optional[Tuple[Optional[int],
-                                              Optional[str]]] = None
+    zero_cost: list['spot_placer_lib.Location'],
+    keys: list[dict[str, Any]],
+    expected_service_hash: str | None = None,
+    expected_controller_owner: tuple[int | None, str | None] | None = None
 ) -> None:
     """Broker-arbitrated cycle: claim heartbeat -> round -> feed+grant."""
-    fence_kwargs: Dict[str, Any] = {}
+    fence_kwargs: dict[str, Any] = {}
     if expected_service_hash is not None:
         fence_kwargs['expected_service_hash'] = expected_service_hash
     if expected_controller_owner is not None:
@@ -268,10 +268,9 @@ def _broker_cycle(
 def poller_loop(
     get_autoscaler: Callable[[], 'autoscalers.Autoscaler'],
     get_spot_placer: Callable[[], Optional['spot_placer_lib.SpotPlacer']],
-    service_name: Optional[str] = None,
-    expected_service_hash: Optional[str] = None,
-    expected_controller_owner: Optional[Tuple[Optional[int],
-                                              Optional[str]]] = None
+    service_name: str | None = None,
+    expected_service_hash: str | None = None,
+    expected_controller_owner: tuple[int | None, str | None] | None = None
 ) -> None:
     """Poll free zero-cost capacity forever, feeding the autoscaler.
 
@@ -290,7 +289,7 @@ def poller_loop(
     # so the first disabled observation still clears it. Reset to True
     # BEFORE every broker cycle (which upserts the claim).
     claim_may_exist = service_name is not None
-    fence_kwargs: Dict[str, Any] = {}
+    fence_kwargs: dict[str, Any] = {}
     if expected_service_hash is not None:
         fence_kwargs['expected_service_hash'] = expected_service_hash
     if expected_controller_owner is not None:
@@ -319,7 +318,7 @@ def poller_loop(
             fill_enabled = autoscaler.reserved_capacity_fill
             if placer is not None and fill_enabled:
                 zero_cost = placer.zero_cost_locations()
-                keys: List[Dict[str, Any]] = [
+                keys: list[dict[str, Any]] = [
                     location.to_pickleable() for location in zero_cost
                 ]
                 if service_name is None:

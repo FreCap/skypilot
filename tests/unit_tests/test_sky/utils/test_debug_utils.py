@@ -2334,9 +2334,10 @@ class TestDumpClusterInfo:
 
     @mock.patch('sky.utils.debug_utils.requests_lib.get_request_tasks',
                 return_value=[])
-    @mock.patch('sky.utils.debug_utils.debug_dump_helpers'
-                '.get_cluster_events_data',
-                return_value=[])
+    @mock.patch(
+        'sky.utils.debug_utils.debug_dump_helpers'
+        '.get_cluster_events_data',
+        return_value=[])
     @mock.patch('sky.utils.debug_utils.global_user_state'
                 '.get_cluster_from_name')
     def test_happy_path_writes_cluster_info(self, mock_get_cluster, mock_events,
@@ -2430,9 +2431,10 @@ class TestDumpClusterInfo:
         assert event_path.exists()
 
     @mock.patch('sky.utils.debug_utils.requests_lib.get_request_tasks')
-    @mock.patch('sky.utils.debug_utils.debug_dump_helpers'
-                '.get_cluster_events_data',
-                return_value=[])
+    @mock.patch(
+        'sky.utils.debug_utils.debug_dump_helpers'
+        '.get_cluster_events_data',
+        return_value=[])
     @mock.patch('sky.utils.debug_utils.global_user_state'
                 '.get_cluster_from_name')
     def test_writes_associated_requests(self, mock_get_cluster, mock_events,
@@ -2461,9 +2463,10 @@ class TestDumpClusterInfo:
 
     @mock.patch('sky.utils.debug_utils.requests_lib.get_request_tasks',
                 return_value=[])
-    @mock.patch('sky.utils.debug_utils.debug_dump_helpers'
-                '.get_cluster_events_data',
-                return_value=[])
+    @mock.patch(
+        'sky.utils.debug_utils.debug_dump_helpers'
+        '.get_cluster_events_data',
+        return_value=[])
     @mock.patch('sky.utils.debug_utils.global_user_state'
                 '.get_cluster_from_name')
     def test_up_cluster_collects_skylet_log(self, mock_get_cluster, mock_events,
@@ -2497,9 +2500,10 @@ class TestDumpClusterInfo:
 
     @mock.patch('sky.utils.debug_utils.requests_lib.get_request_tasks',
                 return_value=[])
-    @mock.patch('sky.utils.debug_utils.debug_dump_helpers'
-                '.get_cluster_events_data',
-                return_value=[])
+    @mock.patch(
+        'sky.utils.debug_utils.debug_dump_helpers'
+        '.get_cluster_events_data',
+        return_value=[])
     @mock.patch('sky.utils.debug_utils.global_user_state'
                 '.get_cluster_from_name')
     def test_stopped_cluster_skips_skylet_log(self, mock_get_cluster,
@@ -2524,9 +2528,10 @@ class TestDumpClusterInfo:
 
     @mock.patch('sky.utils.debug_utils.requests_lib.get_request_tasks',
                 return_value=[])
-    @mock.patch('sky.utils.debug_utils.debug_dump_helpers'
-                '.get_cluster_events_data',
-                return_value=[])
+    @mock.patch(
+        'sky.utils.debug_utils.debug_dump_helpers'
+        '.get_cluster_events_data',
+        return_value=[])
     @mock.patch('sky.utils.debug_utils.global_user_state'
                 '.get_cluster_from_name')
     def test_init_cluster_collects_skylet_log(self, mock_get_cluster,

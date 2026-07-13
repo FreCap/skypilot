@@ -10,7 +10,7 @@ import copy
 from datetime import datetime
 import time
 import typing
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
 from sky import exceptions
 from sky import sky_logging
@@ -34,10 +34,10 @@ logger = sky_logging.init_logger(__name__)
 def query_instances(
     cluster_name: str,
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     non_terminated_only: bool = True,
     retry_if_missing: bool = False,
-) -> Dict[str, Tuple[Optional['status_lib.ClusterStatus'], Optional[str]]]:
+) -> dict[str, tuple[Optional['status_lib.ClusterStatus'], str | None]]:
     """Query instances.
 
     Returns a dictionary of instance IDs and status.
@@ -50,8 +50,7 @@ def query_instances(
     region = provider_config['region']
 
     status_map = oci_utils.oci_config.STATE_MAPPING_OCI_TO_SKY
-    statuses: Dict[str, Tuple[Optional['status_lib.ClusterStatus'],
-                              Optional[str]]] = {}
+    statuses: dict[str, tuple[status_lib.ClusterStatus | None, str | None]] = {}
     filters = {constants.TAG_RAY_CLUSTER_NAME: cluster_name_on_cloud}
 
     instances = _get_filtered_nodes(region, filters)
@@ -246,7 +245,7 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
         logger.debug(f'Instance {inst["name"]} is RUNNING.')
 
     total_time = round(time.time() * 1000) - start_time
-    logger.debug('Total time elapsed: {0} milli-seconds.'.format(total_time))
+    logger.debug(f'Total time elapsed: {total_time} milli-seconds.')
 
     assert head_instance_id is not None, head_instance_id
 
@@ -266,7 +265,7 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
 @query_utils.debug_enabled(logger)
 def stop_instances(
     cluster_name_on_cloud: str,
-    provider_config: Dict[str, Any],
+    provider_config: dict[str, Any],
     worker_only: bool = False,
 ) -> None:
     """Stop running instances."""
@@ -286,7 +285,7 @@ def stop_instances(
 @query_utils.debug_enabled(logger)
 def terminate_instances(
     cluster_name_on_cloud: str,
-    provider_config: Dict[str, Any],
+    provider_config: dict[str, Any],
     worker_only: bool = False,
 ) -> None:
     """Terminate running or stopped instances."""
@@ -300,8 +299,8 @@ def terminate_instances(
 @query_utils.debug_enabled(logger)
 def open_ports(
     cluster_name_on_cloud: str,
-    ports: List[str],
-    provider_config: Optional[Dict[str, Any]] = None,
+    ports: list[str],
+    provider_config: dict[str, Any] | None = None,
 ) -> None:
     """Open ports for inbound traffic."""
     assert provider_config is not None, cluster_name_on_cloud
@@ -314,8 +313,8 @@ def open_ports(
 @query_utils.debug_enabled(logger)
 def cleanup_ports(
     cluster_name_on_cloud: str,
-    ports: List[str],
-    provider_config: Optional[Dict[str, Any]] = None,
+    ports: list[str],
+    provider_config: dict[str, Any] | None = None,
 ) -> None:
     """Delete any opened ports."""
     assert provider_config is not None, cluster_name_on_cloud
@@ -338,7 +337,7 @@ def wait_instances(region: str, cluster_name_on_cloud: str,
 def get_cluster_info(
     region: str,
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
 ) -> common.ClusterInfo:
     """Get the metadata of instances in a cluster."""
     filters = {constants.TAG_RAY_CLUSTER_NAME: cluster_name_on_cloud}
@@ -372,7 +371,7 @@ def get_cluster_info(
 
 
 def _get_filtered_nodes(region: str,
-                        tag_filters: Dict[str, str]) -> List[Dict[str, Any]]:
+                        tag_filters: dict[str, str]) -> list[dict[str, Any]]:
     return_nodes = []
 
     try:
@@ -398,8 +397,8 @@ def _get_filtered_nodes(region: str,
     return return_nodes
 
 
-def _get_inst_obj_with_ip(region: str, inst_info: Dict[str,
-                                                       Any]) -> Dict[str, Any]:
+def _get_inst_obj_with_ip(region: str, inst_info: dict[str,
+                                                       Any]) -> dict[str, Any]:
     get_vnic_response = query_helper.get_instance_primary_vnic(
         region, inst_info)
     internal_ip = get_vnic_response.private_ip
@@ -417,7 +416,7 @@ def _get_inst_obj_with_ip(region: str, inst_info: Dict[str,
     }
 
 
-def _get_head_instance_id(instances: List[Dict[str, Any]]) -> Optional[str]:
+def _get_head_instance_id(instances: list[dict[str, Any]]) -> str | None:
     head_instance_id = None
     head_node_tags = tuple(constants.HEAD_NODE_TAGS.items())
     for inst in instances:

@@ -1,5 +1,6 @@
 """Setup dependencies & services for instances."""
 import base64
+from collections.abc import Callable
 from concurrent import futures
 import functools
 import gzip
@@ -8,7 +9,7 @@ import json
 import os
 import shlex
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any
 
 from sky import exceptions
 from sky import logs
@@ -62,7 +63,7 @@ def _host_network_probe_b64() -> str:
     # launch command, so the read/minify/gzip cost stays off the CLI path.
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         'kubernetes', 'host_network_probe.py')
-    with open(path, 'r', encoding='utf-8') as f:
+    with open(path, encoding='utf-8') as f:
         source = f.read()
     minified = source_utils.minify_python_source(source)
     # Sanity-check: minified source must still parse.
@@ -650,10 +651,10 @@ class SSHThreadPoolExecutor(futures.ThreadPoolExecutor):
 def _parallel_ssh_with_cache(func,
                              cluster_name: str,
                              stage_name: str,
-                             digest: Optional[str],
+                             digest: str | None,
                              cluster_info: common.ClusterInfo,
-                             ssh_credentials: Dict[str, Any],
-                             max_workers: Optional[int] = None) -> List[Any]:
+                             ssh_credentials: dict[str, Any],
+                             max_workers: int | None = None) -> list[Any]:
     if max_workers is None:
         # Not using the default value of `max_workers` in ThreadPoolExecutor,
         # as 32 is too large for some machines.
@@ -682,9 +683,9 @@ def _parallel_ssh_with_cache(func,
 
 
 @common.log_function_start_end
-def initialize_docker(cluster_name: str, docker_config: Dict[str, Any],
+def initialize_docker(cluster_name: str, docker_config: dict[str, Any],
                       cluster_info: common.ClusterInfo,
-                      ssh_credentials: Dict[str, Any]) -> Optional[str]:
+                      ssh_credentials: dict[str, Any]) -> str | None:
     """Setup docker on the cluster."""
     if not docker_config:
         return None
@@ -714,9 +715,9 @@ def initialize_docker(cluster_name: str, docker_config: Dict[str, Any],
 
 @common.log_function_start_end
 @timeline.event
-def setup_runtime_on_cluster(cluster_name: str, setup_commands: List[str],
+def setup_runtime_on_cluster(cluster_name: str, setup_commands: list[str],
                              cluster_info: common.ClusterInfo,
-                             ssh_credentials: Dict[str, Any]) -> None:
+                             ssh_credentials: dict[str, Any]) -> None:
     """Setup internal dependencies."""
     _hint_worker_log_path(cluster_name, cluster_info,
                           'setup_runtime_on_cluster')
@@ -808,8 +809,8 @@ _SHARED_RAY_PORT_FLAGS = (
     '--metrics-export-port=$SKYPILOT_RAY_METRICS_EXPORT_PORT}')
 
 
-def ray_head_start_command(custom_resource: Optional[str],
-                           custom_ray_options: Optional[Dict[str, Any]]) -> str:
+def ray_head_start_command(custom_resource: str | None,
+                           custom_ray_options: dict[str, Any] | None) -> str:
     """Returns the command to start Ray on the head node."""
     ray_options = (
         # --disable-usage-stats in `ray start` saves 10 seconds of idle wait.
@@ -855,8 +856,8 @@ def ray_head_start_command(custom_resource: Optional[str],
     return cmd
 
 
-def ray_worker_start_command(custom_resource: Optional[str],
-                             custom_ray_options: Optional[Dict[str, Any]],
+def ray_worker_start_command(custom_resource: str | None,
+                             custom_ray_options: dict[str, Any] | None,
                              no_restart: bool) -> str:
     """Returns the command to start Ray on the worker node."""
     # SKYPILOT_RAY_PORT is the head's GCS port — exported as a constant
@@ -895,9 +896,9 @@ def ray_worker_start_command(custom_resource: Optional[str],
 @common.log_function_start_end
 @_auto_retry()
 @timeline.event
-def start_ray_on_head_node(cluster_name: str, custom_resource: Optional[str],
+def start_ray_on_head_node(cluster_name: str, custom_resource: str | None,
                            cluster_info: common.ClusterInfo,
-                           ssh_credentials: Dict[str, Any]) -> None:
+                           ssh_credentials: dict[str, Any]) -> None:
     """Start Ray on the head node."""
     runners = provision.get_command_runners(cluster_info.provider_name,
                                             cluster_info, **ssh_credentials)
@@ -938,9 +939,9 @@ def start_ray_on_head_node(cluster_name: str, custom_resource: Optional[str],
 @_auto_retry()
 @timeline.event
 def start_ray_on_worker_nodes(cluster_name: str, no_restart: bool,
-                              custom_resource: Optional[str], ray_port: int,
+                              custom_resource: str | None, ray_port: int,
                               cluster_info: common.ClusterInfo,
-                              ssh_credentials: Dict[str, Any]) -> None:
+                              ssh_credentials: dict[str, Any]) -> None:
     """Start Ray on the worker nodes."""
     if cluster_info.num_instances <= 1:
         return
@@ -999,7 +1000,7 @@ def start_ray_on_worker_nodes(cluster_name: str, no_restart: bool,
 
     logger.info(f'Running command on worker nodes: {cmd}')
 
-    def _setup_ray_worker(runner_and_id: Tuple[command_runner.CommandRunner,
+    def _setup_ray_worker(runner_and_id: tuple[command_runner.CommandRunner,
                                                str]):
         runner, instance_id = runner_and_id
         log_dir = metadata_utils.get_instance_log_dir(cluster_name, instance_id)
@@ -1038,7 +1039,7 @@ def start_ray_on_worker_nodes(cluster_name: str, no_restart: bool,
 @timeline.event
 def start_skylet_on_head_node(
         cluster_name: resources_utils.ClusterName,
-        cluster_info: common.ClusterInfo, ssh_credentials: Dict[str, Any],
+        cluster_info: common.ClusterInfo, ssh_credentials: dict[str, Any],
         launched_resources: resources_lib.Resources) -> None:
     """Start skylet on the head node."""
     # Avoid circular import.
@@ -1137,7 +1138,7 @@ def start_skylet_on_head_node(
 
 
 @_auto_retry()
-def _internal_file_mounts(file_mounts: Dict,
+def _internal_file_mounts(file_mounts: dict,
                           runner: command_runner.CommandRunner,
                           log_path: str) -> None:
     if not file_mounts:
@@ -1173,9 +1174,9 @@ def _internal_file_mounts(file_mounts: Dict,
 
 @common.log_function_start_end
 @timeline.event
-def internal_file_mounts(cluster_name: str, common_file_mounts: Dict[str, str],
+def internal_file_mounts(cluster_name: str, common_file_mounts: dict[str, str],
                          cluster_info: common.ClusterInfo,
-                         ssh_credentials: Dict[str, str]) -> None:
+                         ssh_credentials: dict[str, str]) -> None:
     """Executes file mounts - rsyncing internal local files"""
     _hint_worker_log_path(cluster_name, cluster_info, 'internal_file_mounts')
 
@@ -1202,7 +1203,7 @@ def internal_file_mounts(cluster_name: str, common_file_mounts: Dict[str, str],
 def setup_logging_on_cluster(logging_agent: logs.LoggingAgent,
                              cluster_name: resources_utils.ClusterName,
                              cluster_info: common.ClusterInfo,
-                             ssh_credentials: Dict[str, Any]) -> None:
+                             ssh_credentials: dict[str, Any]) -> None:
     """Setup logging agent (fluentbit) on all nodes after provisioning."""
     _hint_worker_log_path(cluster_name.name_on_cloud, cluster_info,
                           'logging_setup')

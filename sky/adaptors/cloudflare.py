@@ -4,7 +4,6 @@
 import contextlib
 import os
 import threading
-from typing import Dict, Optional, Tuple
 
 from sky import exceptions
 from sky.adaptors import common
@@ -139,7 +138,7 @@ def create_endpoint():
     """Reads accountid necessary to interact with R2"""
 
     accountid_path = os.path.expanduser(ACCOUNT_ID_PATH)
-    with open(accountid_path, 'r', encoding='utf-8') as f:
+    with open(accountid_path, encoding='utf-8') as f:
         lines = f.readlines()
         accountid = lines[0]
 
@@ -150,7 +149,7 @@ def create_endpoint():
 
 
 def check_credentials(
-        cloud_capability: cloud.CloudCapability) -> Tuple[bool, Optional[str]]:
+        cloud_capability: cloud.CloudCapability) -> tuple[bool, str | None]:
     if cloud_capability == cloud.CloudCapability.COMPUTE:
         # for backward compatibility,
         # we check storage credentials for compute.
@@ -163,7 +162,7 @@ def check_credentials(
             f'{NAME} does not support {cloud_capability}.')
 
 
-def check_storage_credentials() -> Tuple[bool, Optional[str]]:
+def check_storage_credentials() -> tuple[bool, str | None]:
     """Checks if the user has access credentials to Cloudflare R2.
 
     Returns:
@@ -203,7 +202,7 @@ def r2_profile_in_aws_cred() -> bool:
     profile_path = os.path.expanduser(R2_CREDENTIALS_PATH)
     r2_profile_exists = False
     if os.path.isfile(profile_path):
-        with open(profile_path, 'r', encoding='utf-8') as file:
+        with open(profile_path, encoding='utf-8') as file:
             for line in file:
                 if f'[{R2_PROFILE_NAME}]' in line:
                     r2_profile_exists = True
@@ -211,7 +210,7 @@ def r2_profile_in_aws_cred() -> bool:
     return r2_profile_exists
 
 
-def get_credential_file_mounts() -> Dict[str, str]:
+def get_credential_file_mounts() -> dict[str, str]:
     """Checks if aws credential file is set and update if not
        Updates file containing account ID information
 

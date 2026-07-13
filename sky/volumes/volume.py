@@ -1,5 +1,5 @@
 """Volume types and access modes."""
-from typing import Any, Dict, Optional
+from typing import Any
 
 from sky import clouds
 from sky.utils import common_utils
@@ -27,13 +27,13 @@ class Volume:
 
     def __init__(
             self,
-            name: Optional[str] = None,
-            type: Optional[str] = None,  # pylint: disable=redefined-builtin
-            infra: Optional[str] = None,
-            size: Optional[str] = None,
-            labels: Optional[Dict[str, str]] = None,
-            use_existing: Optional[bool] = None,
-            config: Optional[Dict[str, Any]] = None):
+            name: str | None = None,
+            type: str | None = None,  # pylint: disable=redefined-builtin
+            infra: str | None = None,
+            size: str | None = None,
+            labels: dict[str, str] | None = None,
+            use_existing: bool | None = None,
+            config: dict[str, Any] | None = None):
         """Initialize a Volume instance.
 
         Args:
@@ -53,14 +53,14 @@ class Volume:
         self.use_existing = use_existing
         self.config = config or {}
 
-        self.cloud: Optional[str] = None
-        self.region: Optional[str] = None
-        self.zone: Optional[str] = None
+        self.cloud: str | None = None
+        self.region: str | None = None
+        self.zone: str | None = None
 
         self._normalize_config()
 
     @classmethod
-    def from_yaml_config(cls, config: Dict[str, Any]) -> 'Volume':
+    def from_yaml_config(cls, config: dict[str, Any]) -> 'Volume':
         """Create a Volume subclass instance from a dictionary via factory."""
         vol_type_val = config.get('type')
         try:
@@ -99,7 +99,7 @@ class Volume:
 
         raise ValueError(f'Invalid volume type: {vol_type_val}')
 
-    def to_yaml_config(self) -> Dict[str, Any]:
+    def to_yaml_config(self) -> dict[str, Any]:
         """Convert the Volume to a dictionary."""
         return {
             'name': self.name,

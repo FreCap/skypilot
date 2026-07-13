@@ -1,11 +1,11 @@
 """Internal server daemons that run in the background."""
 import atexit
+from collections.abc import Callable
 import dataclasses
 import os
 import shutil
 import sys
 import time
-from typing import Callable, Optional
 
 from sky import sky_logging
 from sky import skypilot_config
@@ -66,7 +66,7 @@ def _rotate_daemon_log(log_path: str) -> None:
 # see the override rather than the user's original setting.
 #
 # Initializing inside run_event, before the override, threads the needle.
-_user_disabled_usage_collection: Optional[bool] = None
+_user_disabled_usage_collection: bool | None = None
 
 
 def _default_should_skip():
@@ -256,7 +256,7 @@ def _leader_session_alive(lock: locks.DistributedLock) -> bool:
     return True
 
 
-def _ensure_leader_lock(lock: Optional[locks.DistributedLock], lock_id: str,
+def _ensure_leader_lock(lock: locks.DistributedLock | None, lock_id: str,
                         lock_label: str) -> locks.DistributedLock:
     """Return the consolidation leader lock, held on a live session.
 

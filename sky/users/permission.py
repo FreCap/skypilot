@@ -1,11 +1,12 @@
 """Permission service for SkyPilot API Server."""
+from collections.abc import Generator
 import contextlib
 import hashlib
 import logging
 import os
 import threading
 import time
-from typing import Generator, List, Optional, Set
+from typing import Optional
 
 import casbin
 from casbin import util as casbin_util
@@ -45,10 +46,10 @@ class PermissionService:
     """Permission service for SkyPilot API Server."""
 
     def __init__(self):
-        self.enforcer: Optional[casbin.SyncedEnforcer] = None
+        self.enforcer: casbin.SyncedEnforcer | None = None
         self._lock = threading.Lock()
         # Viewer role's endpoint allowlist, materialised at boot.
-        self._viewer_allowlist: List[tuple] = []
+        self._viewer_allowlist: list[tuple] = []
 
     def initialize(self):
         self._lazy_initialize(full_initialize=True)
@@ -120,7 +121,7 @@ class PermissionService:
             logger.warning(f'Failed to get plugin RBAC rules: {e}')
             return {}
 
-    def _get_plugin_viewer_allowlist(self) -> List[dict]:
+    def _get_plugin_viewer_allowlist(self) -> list[dict]:
         """Get viewer-allowlist entries from loaded plugins.
 
         Lazily populates the module-level plugin allowlist cache if
@@ -313,7 +314,7 @@ class PermissionService:
 
     def _add_user_if_not_exists_no_lock(self,
                                         user_id: str,
-                                        role: Optional[str] = None) -> bool:
+                                        role: str | None = None) -> bool:
         """Add user role relationship without lock.
 
         Returns:
@@ -363,7 +364,7 @@ class PermissionService:
             # workspace access that was previously denied and cached.
             self.invalidate_user_permission_cache(user_id)
 
-    def get_user_roles(self, user_id: str) -> List[str]:
+    def get_user_roles(self, user_id: str) -> list[str]:
         """Get all roles for a user.
 
         This method returns all roles that the user has, including inherited
@@ -380,14 +381,14 @@ class PermissionService:
         enforcer = self._ensure_enforcer()
         return enforcer.get_roles_for_user(user_id)
 
-    def get_users_for_role(self, role: str) -> List[str]:
+    def get_users_for_role(self, role: str) -> list[str]:
         """Get all users for a role."""
         self._load_policy_no_lock()
         enforcer = self._ensure_enforcer()
         return enforcer.get_users_for_role(role)
 
     def get_accessible_workspace_names(self, user_id: str,
-                                       workspace_names: Set[str]) -> Set[str]:
+                                       workspace_names: set[str]) -> set[str]:
         """Return workspace names the user can access (batch, O(1) enforcer).
 
         Use instead of check_workspace_permission in a loop when filtering
@@ -578,7 +579,7 @@ class PermissionService:
         return False
 
     def add_workspace_policy(self, workspace_name: str,
-                             users: List[str]) -> None:
+                             users: list[str]) -> None:
         """Add workspace policy.
 
         Args:
@@ -599,7 +600,7 @@ class PermissionService:
             self.invalidate_workspace_permission_cache(workspace_name)
 
     def update_workspace_policy(self, workspace_name: str,
-                                users: List[str]) -> None:
+                                users: list[str]) -> None:
         """Update workspace policy.
 
         Args:

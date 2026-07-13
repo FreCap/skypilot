@@ -6,7 +6,7 @@ import datetime
 import logging
 import threading
 import time
-from typing import Any, Optional
+from typing import Any
 import uuid
 
 from sky import exceptions as sky_exceptions
@@ -86,7 +86,7 @@ def azure_mgmt_models(name: str):
 @annotations.lru_cache(scope='global')
 @common.load_lazy_modules(modules=_LAZY_MODULES)
 def get_client(name: str,
-               subscription_id: Optional[str] = None,
+               subscription_id: str | None = None,
                **kwargs) -> Client:
     """Creates and returns an Azure client for the specified service.
 
@@ -188,8 +188,8 @@ def get_client(name: str,
             start_time = time.time()
             role_assigned = False
 
-            while (time.time() - start_time <
-                   constants.WAIT_FOR_STORAGE_ACCOUNT_ROLE_ASSIGNMENT):
+            while (time.time() - start_time
+                   < constants.WAIT_FOR_STORAGE_ACCOUNT_ROLE_ASSIGNMENT):
                 container_client = blob.ContainerClient.from_container_url(
                     container_url, credential)
                 try:
@@ -326,8 +326,8 @@ def get_az_blob_sas_token(storage_account_name: str, storage_account_key: str,
 
 def assign_storage_account_iam_role(
         storage_account_name: str,
-        storage_account_id: Optional[str] = None,
-        resource_group_name: Optional[str] = None) -> None:
+        storage_account_id: str | None = None,
+        resource_group_name: str | None = None) -> None:
     """Assigns the Storage Blob Data Owner role to a storage account.
 
     This function retrieves the current user's object ID, then assigns the
@@ -437,9 +437,8 @@ def assign_storage_account_iam_role(
                 )
 
 
-def get_az_resource_group(
-        storage_account_name: str,
-        storage_client: Optional[Client] = None) -> Optional[str]:
+def get_az_resource_group(storage_account_name: str,
+                          storage_client: Client | None = None) -> str | None:
     """Returns the resource group name the given storage account belongs to.
 
     Args:

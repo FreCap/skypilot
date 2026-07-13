@@ -13,7 +13,7 @@ import sys
 import textwrap
 import traceback
 import typing
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Union
 
 import numpy as np
 
@@ -93,10 +93,10 @@ PRICING_TABLE_URL_FMT = 'https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws
 # divided by the total memory of an L4 will give us the fraction of the GPU.
 L4_GPU_MEMORY = 22888
 
-regions_enabled: Optional[Set[str]] = None
+regions_enabled: set[str] | None = None
 
 
-def get_enabled_regions() -> Set[str]:
+def get_enabled_regions() -> set[str]:
     # Should not be called concurrently.
     global regions_enabled
     if regions_enabled is None:
@@ -221,7 +221,7 @@ def _get_spot_pricing_table(region: str) -> 'pd.DataFrame':
     paginator = client.get_paginator('describe_spot_price_history')
     response_iterator = paginator.paginate(ProductDescriptions=['Linux/UNIX'],
                                            StartTime=datetime.datetime.utcnow())
-    ret: List['ec2_type_defs.SpotPriceTypeDef'] = []
+    ret: list[ec2_type_defs.SpotPriceTypeDef] = []
     for response in response_iterator:
         # response['SpotPriceHistory'] is a list of dicts, each dict is like:
         # {
@@ -258,7 +258,7 @@ def _get_instance_types_df(region: str) -> Union[str, 'pd.DataFrame']:
             ]
         print(f'{region} Processing dataframes')
 
-        def get_acc_info(row) -> Tuple[Optional[str], float]:
+        def get_acc_info(row) -> tuple[str | None, float]:
             accelerator = None
             for col, info_key in [('GpuInfo', 'Gpus'),
                                   ('NeuronInfo', 'NeuronDevices'),
@@ -270,7 +270,7 @@ def _get_instance_types_df(region: str) -> Union[str, 'pd.DataFrame']:
                 return None, np.nan
             return accelerator['Name'], accelerator['Count']
 
-        def get_arch(row) -> Optional[str]:
+        def get_arch(row) -> str | None:
             if 'ProcessorInfo' in row:
                 processor = row['ProcessorInfo']
                 if 'SupportedArchitectures' in processor:
@@ -296,8 +296,8 @@ def _get_instance_types_df(region: str) -> Union[str, 'pd.DataFrame']:
                 return row['MemoryInfo']['SizeInMiB'] / 1024
             return float(row['Memory'].split(' GiB')[0])
 
-        def get_local_disk_info(row) -> Dict[str, Any]:
-            info: Dict[str, Any] = {}
+        def get_local_disk_info(row) -> dict[str, Any]:
+            info: dict[str, Any] = {}
             local_disk_supported = row['InstanceStorageSupported']
             info['LocalDiskType'] = None
             info['NVMeSupported'] = False
@@ -408,7 +408,7 @@ def _get_instance_types_df(region: str) -> Union[str, 'pd.DataFrame']:
     return df
 
 
-def get_all_regions_instance_types_df(regions: Set[str]) -> 'pd.DataFrame':
+def get_all_regions_instance_types_df(regions: set[str]) -> 'pd.DataFrame':
     with mp_pool.Pool() as pool:
         df_or_regions = pool.map(_get_instance_types_df, regions)
     new_dfs = []
@@ -451,8 +451,7 @@ _GPU_DESC_UBUNTU_DATE = [
 ]
 
 
-def _fetch_image_creation_date(region: str,
-                               image_id: Optional[str]) -> Optional[str]:
+def _fetch_image_creation_date(region: str, image_id: str | None) -> str | None:
     if image_id is None:
         return None
     try:
@@ -474,10 +473,9 @@ def _fetch_image_creation_date(region: str,
     return None
 
 
-def _fetch_image_id_from_ssm_param(
-        region: str,
-        ssm_prefix: str,
-        ubuntu_version: str = '22.04') -> Optional[str]:
+def _fetch_image_id_from_ssm_param(region: str,
+                                   ssm_prefix: str,
+                                   ubuntu_version: str = '22.04') -> str | None:
     try:
         image = subprocess.check_output(f"""\
             aws ssm get-parameter --region {region} --name "{ssm_prefix}/ubuntu-{ubuntu_version}/latest/image_id" \\
@@ -501,7 +499,7 @@ def _get_image_row(
     gpu: str,
     ssm_prefix: str,
     ubuntu_version: str = '22.04'
-) -> Tuple[str, str, str, str, Optional[str], Optional[str]]:
+) -> tuple[str, str, str, str, str | None, str | None]:
     print(f'Getting image for {region}, {ssm_prefix}, {ubuntu_version}, {gpu}')
     image_id = _fetch_image_id_from_ssm_param(region, ssm_prefix,
                                               ubuntu_version)
@@ -513,7 +511,7 @@ def _get_image_row(
     return tag, region, 'ubuntu', ubuntu_version, image_id, creation_date
 
 
-def get_all_regions_images_df(regions: Set[str]) -> 'pd.DataFrame':
+def get_all_regions_images_df(regions: set[str]) -> 'pd.DataFrame':
     image_metas = [
         (r, *i) for r, i in itertools.product(regions, _GPU_DESC_UBUNTU_DATE)
     ]
@@ -539,7 +537,7 @@ def fetch_availability_zone_mappings() -> 'pd.DataFrame':
     errored_region_reasons = []
 
     def _get_availability_zones_with_error_handling(
-            region: str) -> Optional[pd.DataFrame]:
+            region: str) -> pd.DataFrame | None:
         try:
             azs = _get_availability_zones(region)
         except exceptions.AWSAzFetchingError as e:

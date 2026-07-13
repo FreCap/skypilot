@@ -1059,8 +1059,8 @@ class TestIsJobsConsolidationMode:
                        ) as mock_config, \
              mock.patch('sky.utils.controller_utils.'
                         'warn_jobs_consolidation_mode_intent') as mock_validate:
-            assert (controller_utils.is_jobs_consolidation_mode() is
-                    signal_exists)
+            assert (controller_utils.is_jobs_consolidation_mode()
+                    is signal_exists)
             mock_config.get_nested.assert_not_called()
             mock_validate.assert_not_called()
 
@@ -1100,8 +1100,8 @@ class TestIsJobsConsolidationMode:
                  'warn_jobs_consolidation_mode_intent') as mock_validate, \
              mock.patch('sky.utils.controller_utils.logger') as mock_logger:
             mock_config.get_nested.return_value = config_value
-            assert (controller_utils.is_jobs_consolidation_mode() is
-                    expected_effective)
+            assert (controller_utils.is_jobs_consolidation_mode()
+                    is expected_effective)
             mock_config.get_nested.assert_called_once_with(
                 ('jobs', 'controller', 'consolidation_mode'),
                 default_value=None)

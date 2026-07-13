@@ -4,7 +4,6 @@ import enum
 import os
 import re
 import typing
-from typing import List, Optional, Union
 
 import requests
 
@@ -43,8 +42,8 @@ class GitUrlInfo:
                  host: str,
                  path: str,
                  protocol: str,
-                 user: Optional[str] = None,
-                 port: Optional[int] = None):
+                 user: str | None = None,
+                 port: int | None = None):
         self.host = host
         # Repository path (e.g., 'user/repo' or 'org/subgroup/repo').
         # The path is the part after the host.
@@ -61,9 +60,9 @@ class GitCloneInfo:
 
     def __init__(self,
                  url: str,
-                 envs: Optional[dict] = None,
-                 token: Optional[str] = None,
-                 ssh_key: Optional[str] = None):
+                 envs: dict | None = None,
+                 token: str | None = None,
+                 ssh_key: str | None = None):
         self.url = url
         self.envs = envs
         self.token = token
@@ -76,8 +75,8 @@ class GitRepo:
     def __init__(self,
                  repo_url: str,
                  ref: str = 'main',
-                 git_token: Optional[str] = None,
-                 git_ssh_key_path: Optional[str] = None):
+                 git_token: str | None = None,
+                 git_ssh_key_path: str | None = None):
         """Initialize Git utility.
 
         Args:
@@ -324,7 +323,7 @@ class GitRepo:
             f' using either: GIT_TOKEN for token-based access, or'
             f' GIT_SSH_KEY_PATH for SSH access.')
 
-    def _parse_ssh_config(self) -> Optional[str]:
+    def _parse_ssh_config(self) -> str | None:
         """Parse SSH config file to find IdentityFile for the target host.
 
         Returns:
@@ -340,13 +339,13 @@ class GitRepo:
             try:
                 import paramiko  # pylint: disable=import-outside-toplevel
                 ssh_config = paramiko.SSHConfig()
-                with open(ssh_config_path, 'r', encoding='utf-8') as f:
+                with open(ssh_config_path, encoding='utf-8') as f:
                     ssh_config.parse(f)
                 # Get config for the target host
                 host_config = ssh_config.lookup(self._parsed_url.host)
 
                 # Look for identity files in the config
-                identity_files: Union[str, List[str]] = host_config.get(
+                identity_files: str | list[str] = host_config.get(
                     'identityfile', [])
                 if not isinstance(identity_files, list):
                     identity_files = [identity_files]
@@ -371,7 +370,7 @@ class GitRepo:
             logger.debug(f'Error parsing SSH config: {str(e)}')
             return None
 
-    def _get_ssh_key_info(self) -> Optional[tuple]:
+    def _get_ssh_key_info(self) -> tuple | None:
         """Get SSH key path and content using comprehensive strategy.
 
         Strategy:
@@ -400,7 +399,7 @@ class GitRepo:
                         f'Recommended: chmod 600 {key_path}')
 
                 # Check if it's a valid private key and read content
-                with open(key_path, 'r', encoding='utf-8') as f:
+                with open(key_path, encoding='utf-8') as f:
                     key_content = f.read()
                     if not (key_content.startswith('-----BEGIN') and
                             'PRIVATE KEY' in key_content):
@@ -417,7 +416,7 @@ class GitRepo:
         config_key_path = self._parse_ssh_config()
         if config_key_path:
             try:
-                with open(config_key_path, 'r', encoding='utf-8') as f:
+                with open(config_key_path, encoding='utf-8') as f:
                     key_content = f.read()
                 logger.debug(f'Using SSH key from config: {config_key_path}')
                 return (config_key_path, key_content)
@@ -452,7 +451,7 @@ class GitRepo:
                         f'Consider: chmod 600 {private_key_path}')
 
                 # Validate private key format and read content
-                with open(private_key_path, 'r', encoding='utf-8') as f:
+                with open(private_key_path, encoding='utf-8') as f:
                     key_content = f.read()
                     if not (key_content.startswith('-----BEGIN') and
                             'PRIVATE KEY' in key_content):

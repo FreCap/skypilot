@@ -7,7 +7,7 @@ pools, or volumes.
 """
 import os
 import time
-from typing import Any, Dict, List, Optional, Union
+from typing import Any
 
 import sqlalchemy
 from sqlalchemy import orm
@@ -58,7 +58,7 @@ _EXAMPLES_DIR = os.path.join(os.path.dirname(__file__), 'examples')
 # Default templates: maps filename (without .yaml) to metadata
 # Content is loaded from sky/recipes/examples/{filename}.yaml
 # Note: Recipe names must use letters, numbers, and dashes only
-DEFAULT_TEMPLATES: Dict[str, Dict[str, str]] = {
+DEFAULT_TEMPLATES: dict[str, dict[str, str]] = {
     'basic_cluster': {
         'name': 'basic-cluster',
         'description': 'A simple cluster with GPU resources',
@@ -95,7 +95,7 @@ def _load_example_content(filename: str) -> str:
         FileNotFoundError: If the example file doesn't exist.
     """
     filepath = os.path.join(_EXAMPLES_DIR, f'{filename}.yaml')
-    with open(filepath, 'r', encoding='utf-8') as f:
+    with open(filepath, encoding='utf-8') as f:
         return f.read()
 
 
@@ -175,15 +175,15 @@ class Recipe:
         self,
         name: str,
         content: str,
-        recipe_type: Union[RecipeType, str],
+        recipe_type: RecipeType | str,
         user_id: str,
-        description: Optional[str] = None,
+        description: str | None = None,
         pinned: bool = False,
-        user_name: Optional[str] = None,
-        created_at: Optional[float] = None,
-        updated_at: Optional[float] = None,
-        updated_by_id: Optional[str] = None,
-        updated_by_name: Optional[str] = None,
+        user_name: str | None = None,
+        created_at: float | None = None,
+        updated_at: float | None = None,
+        updated_by_id: str | None = None,
+        updated_by_name: str | None = None,
         is_editable: bool = True,
         is_pinnable: bool = True,
     ):
@@ -201,7 +201,7 @@ class Recipe:
         self.is_editable = is_editable
         self.is_pinnable = is_pinnable
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for API responses."""
         return {
             'name': self.name,
@@ -247,10 +247,10 @@ class Recipe:
 def create_recipe(
     name: str,
     content: str,
-    recipe_type: Union[RecipeType, str],
+    recipe_type: RecipeType | str,
     user_id: str,
-    user_name: Optional[str] = None,
-    description: Optional[str] = None,
+    user_name: str | None = None,
+    description: str | None = None,
 ) -> Recipe:
     """Create a new recipe.
 
@@ -312,7 +312,7 @@ def create_recipe(
     )
 
 
-def get_recipe(recipe_name: str) -> Optional[Recipe]:
+def get_recipe(recipe_name: str) -> Recipe | None:
     """Get a recipe by name.
 
     Args:
@@ -333,11 +333,11 @@ def get_recipe(recipe_name: str) -> Optional[Recipe]:
 
 
 def list_recipes(
-    user_id: Optional[str] = None,
+    user_id: str | None = None,
     pinned_only: bool = False,
     my_recipes_only: bool = False,
-    recipe_type: Optional[Union[RecipeType, str]] = None,
-) -> List[Recipe]:
+    recipe_type: RecipeType | str | None = None,
+) -> list[Recipe]:
     """List recipes with optional filters.
 
     The default behavior returns all recipes. The frontend handles
@@ -377,10 +377,10 @@ def list_recipes(
 def update_recipe(
     recipe_name: str,
     user_id: str,
-    user_name: Optional[str] = None,
-    description: Optional[str] = None,
-    content: Optional[str] = None,
-) -> Optional[Recipe]:
+    user_name: str | None = None,
+    description: str | None = None,
+    content: str | None = None,
+) -> Recipe | None:
     """Update a recipe.
 
     Anyone can update a recipe, but only if it's editable.
@@ -402,7 +402,7 @@ def update_recipe(
     engine = _db_manager.get_engine()
     # TODO(lloyd): We might want to change this in the future to change who is
     # allowed to update a recipe.
-    updates: Dict[str, Any] = {}
+    updates: dict[str, Any] = {}
     if description is not None:
         updates['description'] = description
     if content is not None:
@@ -478,7 +478,7 @@ def delete_recipe(recipe_name: str, user_id: str) -> bool:
         return False
 
 
-def toggle_pin(recipe_name: str, pinned: bool) -> Optional[Recipe]:
+def toggle_pin(recipe_name: str, pinned: bool) -> Recipe | None:
     """Toggle the pinned status of a recipe.
 
     This is an admin-only operation (authorization should be checked

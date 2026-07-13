@@ -124,6 +124,11 @@ class TestRefreshFaultIsolation:
                             'get_cluster_status_fields', _raise)
         monkeypatch.setattr(backend_utils.requests_lib, 'get_request_tasks',
                             lambda req_filter: [_Request('launching')])
+        # Pin the sweep to one thread: the ordering contract is about
+        # submission order, which is only observable through execution order
+        # when the pool is serial.
+        monkeypatch.setattr(backend_utils, '_get_cluster_refresh_parallelism',
+                            lambda: 1)
 
         backend_utils.refresh_cluster_records()
         assert attempted == ['c-2', 'c-1', 'c-3']

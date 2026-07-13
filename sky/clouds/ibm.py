@@ -1,7 +1,8 @@
 """IBM Web Services."""
+from collections.abc import Iterator
 import os
 import typing
-from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, Optional
 
 import colorama
 
@@ -33,14 +34,14 @@ class IBM(clouds.Cloud):
     # format: ray-{cluster_name}-{node_type}-{8-char-uuid}
     # it leaves 63-3-5-8=47 characters for the cluster name.
     _MAX_CLUSTER_NAME_LEN_LIMIT = 47
-    _regions: List[clouds.Region] = []
+    _regions: list[clouds.Region] = []
 
     @classmethod
     def _unsupported_features_for_resources(
         cls,
         resources: 'resources_lib.Resources',
-        region: Optional[str] = None,
-    ) -> Dict[clouds.CloudImplementationFeatures, str]:
+        region: str | None = None,
+    ) -> dict[clouds.CloudImplementationFeatures, str]:
         features = {
             clouds.CloudImplementationFeatures.CLONE_DISK_FROM_CLUSTER:
                 (f'Migrating disk is currently not supported on {cls._REPR}.'),
@@ -68,19 +69,19 @@ class IBM(clouds.Cloud):
         return features
 
     @classmethod
-    def max_cluster_name_length(cls) -> Optional[int]:
+    def max_cluster_name_length(cls) -> int | None:
         return cls._MAX_CLUSTER_NAME_LEN_LIMIT
 
     @classmethod
     def regions_with_offering(
         cls,
         instance_type: str,
-        accelerators: Optional[Dict[str, int]],
+        accelerators: dict[str, int] | None,
         use_spot: bool,
-        region: Optional[str],
-        zone: Optional[str],
+        region: str | None,
+        zone: str | None,
         resources: Optional['resources_lib.Resources'] = None,
-    ) -> List[clouds.Region]:
+    ) -> list[clouds.Region]:
         del accelerators  # unused
         if use_spot:
             return []
@@ -103,9 +104,9 @@ class IBM(clouds.Cloud):
         region: str,
         num_nodes: int,
         instance_type: str,
-        accelerators: Optional[Dict[str, int]] = None,
+        accelerators: dict[str, int] | None = None,
         use_spot: bool = False,
-    ) -> Iterator[Optional[List[clouds.Zone]]]:
+    ) -> Iterator[list[clouds.Zone] | None]:
         """Loops over (region, zones) to retry for provisioning.
 
         returning a single zone list with its region,
@@ -134,14 +135,14 @@ class IBM(clouds.Cloud):
                 yield [zone]
 
     @classmethod
-    def get_zone_shell_cmd(cls) -> Optional[str]:
+    def get_zone_shell_cmd(cls) -> str | None:
         return None
 
     def instance_type_to_hourly_cost(self,
                                      instance_type: str,
                                      use_spot: bool,
-                                     region: Optional[str] = None,
-                                     zone: Optional[str] = None) -> float:
+                                     region: str | None = None,
+                                     zone: str | None = None) -> float:
         # Currently doesn't support spot instances, hence use_spot set to False.
         del use_spot
         return catalog.get_hourly_cost(instance_type,
@@ -151,10 +152,10 @@ class IBM(clouds.Cloud):
                                        clouds='ibm')
 
     def accelerators_to_hourly_cost(self,
-                                    accelerators: Dict[str, int],
+                                    accelerators: dict[str, int],
                                     use_spot: bool,
-                                    region: Optional[str] = None,
-                                    zone: Optional[str] = None) -> float:
+                                    region: str | None = None,
+                                    zone: str | None = None) -> float:
         del accelerators, use_spot, region, zone  # unused
         # Currently Isn't implemented in the same manner by aws and azure.
         return 0
@@ -185,11 +186,11 @@ class IBM(clouds.Cloud):
         resources: 'resources_lib.Resources',
         cluster_name: 'resources_utils.ClusterName',
         region: 'clouds.Region',
-        zones: Optional[List['clouds.Zone']],
+        zones: list['clouds.Zone'] | None,
         num_nodes: int,
         dryrun: bool = False,
-        volume_mounts: Optional[List['volume_lib.VolumeMount']] = None,
-    ) -> Dict[str, Any]:
+        volume_mounts: list['volume_lib.VolumeMount'] | None = None,
+    ) -> dict[str, Any]:
         """Converts planned sky.Resources to cloud-specific resource variables.
 
         These variables are used to fill the node type section (instance type,
@@ -256,7 +257,7 @@ class IBM(clouds.Cloud):
     def get_vcpus_mem_from_instance_type(
         cls,
         instance_type: str,
-    ) -> Tuple[Optional[float], Optional[float]]:
+    ) -> tuple[float | None, float | None]:
         return catalog.get_vcpus_mem_from_instance_type(instance_type,
                                                         clouds='ibm')
 
@@ -264,7 +265,7 @@ class IBM(clouds.Cloud):
     def get_accelerators_from_instance_type(
         cls,
         instance_type: str,
-    ) -> Optional[Dict[str, Union[int, float]]]:
+    ) -> dict[str, int | float] | None:
         """Returns {acc: acc_count} held by 'instance_type', if any."""
         return catalog.get_accelerators_from_instance_type(instance_type,
                                                            clouds='ibm')
@@ -272,15 +273,15 @@ class IBM(clouds.Cloud):
     @classmethod
     def get_default_instance_type(
         cls,
-        cpus: Optional[str] = None,
-        memory: Optional[str] = None,
+        cpus: str | None = None,
+        memory: str | None = None,
         disk_tier: Optional['resources_utils.DiskTier'] = None,
-        local_disk: Optional[str] = None,
-        region: Optional[str] = None,
-        zone: Optional[str] = None,
+        local_disk: str | None = None,
+        region: str | None = None,
+        zone: str | None = None,
         use_spot: bool = False,
-        max_hourly_cost: Optional[float] = None,
-    ) -> Optional[str]:
+        max_hourly_cost: float | None = None,
+    ) -> str | None:
         return catalog.get_default_instance_type(
             cpus=cpus,
             memory=memory,
@@ -295,7 +296,7 @@ class IBM(clouds.Cloud):
     def _get_feasible_launchable_resources(
         self, resources: 'resources_lib.Resources'
     ) -> 'resources_utils.FeasibleResources':
-        fuzzy_candidate_list: List[str] = []
+        fuzzy_candidate_list: list[str] = []
         if resources.instance_type is not None:
             assert resources.is_launchable(), resources
             resources = resources.copy(accelerators=None)
@@ -388,19 +389,19 @@ class IBM(clouds.Cloud):
 
         client = ibm.client(region=region)
         # returns default image: "ibm-ubuntu-22-04" with amd architecture
-        return next((img for img in _get_image_objects() if
+        return next(img for img in _get_image_objects() if
          img['name'].startswith('ibm-ubuntu-22-04') \
             and img['operating_system']['architecture'].startswith(
-                'amd')))['id']
+                'amd'))['id']
 
     @classmethod
-    def get_image_size(cls, image_id: str, region: Optional[str]) -> float:
+    def get_image_size(cls, image_id: str, region: str | None) -> float:
         assert region is not None, (image_id, region)
         client = ibm.client(region=region)
         try:
             image_data = client.get_image(image_id).get_result()
         # pylint: disable=line-too-long
-        except ibm.ibm_cloud_sdk_core.ApiException as e:  # type: ignore[union-attr]
+        except ibm.ibm_cloud_sdk_core.ApiException as e:
             logger.error(e.message)
             with ux_utils.print_exception_no_traceback():
                 raise ValueError(
@@ -432,14 +433,14 @@ class IBM(clouds.Cloud):
 
     @classmethod
     def _check_compute_credentials(
-            cls) -> Tuple[bool, Optional[Union[str, Dict[str, str]]]]:
+            cls) -> tuple[bool, str | dict[str, str] | None]:
         """Checks if the user has access credentials to
         IBM's compute service."""
         return cls._check_credentials()
 
     @classmethod
     def _check_storage_credentials(
-            cls) -> Tuple[bool, Optional[Union[str, Dict[str, str]]]]:
+            cls) -> tuple[bool, str | dict[str, str] | None]:
         """Checks if the user has access credentials to
         IBM's storage service."""
         # TODO(seungjin): Implement separate check for
@@ -447,7 +448,7 @@ class IBM(clouds.Cloud):
         return cls._check_credentials()
 
     @classmethod
-    def _check_credentials(cls) -> Tuple[bool, Optional[str]]:
+    def _check_credentials(cls) -> tuple[bool, str | None]:
         """Checks if the user has access credentials to this cloud."""
 
         required_fields = ['iam_api_key', 'resource_group_id']
@@ -485,7 +486,7 @@ class IBM(clouds.Cloud):
         except Exception as e:
             return (False, f'{str(e)}' + help_str)
 
-    def get_credential_file_mounts(self) -> Dict[str, str]:
+    def get_credential_file_mounts(self) -> dict[str, str]:
         """Returns a {remote:local} credential path mapping
          written to the cluster's file_mounts segment
          of its yaml file (e.g., ibm-ray.yml.j2)
@@ -496,17 +497,17 @@ class IBM(clouds.Cloud):
         """Returns whether the instance type exists for this cloud."""
         return catalog.instance_type_exists(instance_type, clouds='ibm')
 
-    def validate_region_zone(self, region: Optional[str], zone: Optional[str]):
+    def validate_region_zone(self, region: str | None, zone: str | None):
         """Validates the region and zone."""
         return catalog.validate_region_zone(region, zone, clouds='ibm')
 
     @classmethod
-    def query_status(cls, name: str, tag_filters: Dict[str, str],
-                     region: Optional[str], zone: Optional[str],
-                     **kwargs) -> List['status_lib.ClusterStatus']:
+    def query_status(cls, name: str, tag_filters: dict[str, str],
+                     region: str | None, zone: str | None,
+                     **kwargs) -> list['status_lib.ClusterStatus']:
         del tag_filters, zone, kwargs  # unused
 
-        status_map: Dict[str, Any] = {
+        status_map: dict[str, Any] = {
             'pending': status_lib.ClusterStatus.INIT,
             'starting': status_lib.ClusterStatus.INIT,
             'restarting': status_lib.ClusterStatus.INIT,

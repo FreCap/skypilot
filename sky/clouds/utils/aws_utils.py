@@ -2,7 +2,6 @@
 import dataclasses
 import enum
 import time
-from typing import List
 
 import cachetools
 
@@ -41,13 +40,12 @@ def use_reservations() -> bool:
     return prioritize_reservations or specific_reservations
 
 
-@cachetools.cached(cache=cachetools.TTLCache(maxsize=100,
-                                             ttl=300,
-                                             timer=time.time))
+@cachetools.cached(
+    cache=cachetools.TTLCache(maxsize=100, ttl=300, timer=time.time))
 def list_reservations_for_instance_type(
     instance_type: str,
     region: str,
-) -> List[AWSReservation]:
+) -> list[AWSReservation]:
     if not use_reservations():
         return []
     ec2 = aws.client('ec2', region_name=region)

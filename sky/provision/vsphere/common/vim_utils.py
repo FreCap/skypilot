@@ -4,7 +4,6 @@
 import re
 import subprocess
 import time
-from typing import List, Union
 
 from sky import sky_logging
 from sky.adaptors import vsphere as vsphere_adaptor
@@ -15,8 +14,7 @@ DISPLAY_CONTROLLER_CLASS_ID_PREFIXES = ['03']
 VMWARE_VIRTUAL_DISPLAY_CONTROLLER_IDS = ['0000:00:0f.0']
 
 
-def get_objs_by_names(content, vimtype: Union[type, List[type]],
-                      names: List[str]):
+def get_objs_by_names(content, vimtype: type | list[type], names: list[str]):
     """    Get the vsphere managed object associated with a given text name
     """
     # Create a set for the names for faster lookups
@@ -262,13 +260,13 @@ def delete_object(content, mo):
     """    Deletes a vsphere managed object and
     waits for the deletion to complete
     """
-    logger.info('Deleting {0}'.format(mo._GetMoId()))  # pylint: disable=protected-access
+    logger.info(f'Deleting {mo._GetMoId()}')  # pylint: disable=protected-access
     try:
         wait_for_tasks(content, [mo.Destroy()])
-        logger.info('Deleted {0}'.format(mo._GetMoId()))  # pylint: disable=protected-access
+        logger.info(f'Deleted {mo._GetMoId()}')  # pylint: disable=protected-access
     except Exception:  # pylint: disable=broad-except
-        logger.info('Unexpected error while deleting managed object {0}'.format(
-            mo._GetMoId()))  # pylint: disable=protected-access
+        logger.info(
+            f'Unexpected error while deleting managed object {mo._GetMoId()}')  # pylint: disable=protected-access
         return False
     return True
 
@@ -279,13 +277,12 @@ def poweron_vm(content, mo):
     if not isinstance(mo, vsphere_adaptor.get_vim().VirtualMachine):
         return False
 
-    logger.info('Powering on vm {0}'.format(mo._GetMoId()))  # pylint: disable=protected-access
+    logger.info(f'Powering on vm {mo._GetMoId()}')  # pylint: disable=protected-access
     try:
         wait_for_tasks(content, [mo.PowerOn()])
-        logger.info('{0} powered on successfully'.format(mo._GetMoId()))  # pylint: disable=protected-access
+        logger.info(f'{mo._GetMoId()} powered on successfully')  # pylint: disable=protected-access
     except Exception:  # pylint: disable=broad-except
-        logger.info('Unexpected error while powering on vm {0}'.format(
-            mo._GetMoId()))  # pylint: disable=protected-access
+        logger.info(f'Unexpected error while powering on vm {mo._GetMoId()}')  # pylint: disable=protected-access
         return False
     return True
 
@@ -320,13 +317,12 @@ def poweroff_vm(content, mo):
     if not isinstance(mo, vsphere_adaptor.get_vim().VirtualMachine):
         return False
 
-    logger.info('Powering off vm {0}'.format(mo._GetMoId()))  # pylint: disable=protected-access
+    logger.info(f'Powering off vm {mo._GetMoId()}')  # pylint: disable=protected-access
     try:
         wait_for_tasks(content, [mo.PowerOff()])
-        logger.info('{0} powered off successfully'.format(mo._GetMoId()))  # pylint: disable=protected-access
+        logger.info(f'{mo._GetMoId()} powered off successfully')  # pylint: disable=protected-access
     except Exception:  # pylint: disable=broad-except
-        logger.info('Unexpected error while powering off vm {0}'.format(
-            mo._GetMoId()))  # pylint: disable=protected-access
+        logger.info(f'Unexpected error while powering off vm {mo._GetMoId()}')  # pylint: disable=protected-access
         return False
     return True
 
@@ -356,14 +352,13 @@ def wait_for_tasks(content, tasks):
 
         # Loop looking for updates till the state moves to a completed state.
         while len(task_list):
-            update = content.propertyCollector.WaitForUpdates(
-                version)  # type: ignore
+            update = content.propertyCollector.WaitForUpdates(version)
             for filter_set in update.filterSet:
                 for obj_set in filter_set.objectSet:
                     task = obj_set.obj
                     for change in obj_set.changeSet:
                         if change.name == 'info':
-                            state = change.val.state  # type: ignore
+                            state = change.val.state
                         elif change.name == 'info.state':
                             state = change.val
                         else:
@@ -391,9 +386,9 @@ def get_cluster_name_by_id(self, content, name):
         content, [vsphere_adaptor.get_vim().ClusterComputeResource], [name])
     if cluster_obj is not None:
         self.mo_id = cluster_obj['name']._GetMoId()  # pylint: disable=protected-access
-        logger.info('Cluster MoId: {0}'.format(self.mo_id))
+        logger.info(f'Cluster MoId: {self.mo_id}')
     else:
-        logger.info('Cluster: {0} not found'.format(self.cluster_name))
+        logger.info(f'Cluster: {self.cluster_name} not found')
 
 
 def create_spec_with_script(vm, script_string: str):
@@ -421,8 +416,7 @@ def create_spec_with_script(vm, script_string: str):
 
 def get_vm_uuid_from_vm():
     result = subprocess.run(['sudo', 'dmidecode', '-t', '1'],
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
+                            capture_output=True,
                             text=True,
                             check=True)
 

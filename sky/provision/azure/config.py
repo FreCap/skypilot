@@ -3,12 +3,13 @@
 Creates the resource group and deploys the configuration template to Azure for
 a cluster to be launched.
 """
+from collections.abc import Callable
 import hashlib
 import json
 from pathlib import Path
 import random
 import time
-from typing import Any, Callable, Optional, Tuple
+from typing import Any
 
 from sky import exceptions
 from sky import sky_logging
@@ -43,7 +44,7 @@ def get_azure_sdk_function(client: Any, function_name: str) -> Callable:
 
 
 def get_cluster_id_and_nsg_name(resource_group: str,
-                                cluster_name_on_cloud: str) -> Tuple[str, str]:
+                                cluster_name_on_cloud: str) -> tuple[str, str]:
     hasher = hashlib.md5(resource_group.encode('utf-8'), usedforsecurity=False)
     unique_id = hasher.hexdigest()[:UNIQUE_ID_LEN]
     # We use the cluster name + resource group hash as the
@@ -99,8 +100,8 @@ def bootstrap_instances(
             function_name='create_or_update')
         rg_creation_start = time.time()
         retry = 0
-        while (time.time() - rg_creation_start <
-               _RESOURCE_GROUP_WAIT_FOR_DELETION_TIMEOUT):
+        while (time.time() - rg_creation_start
+               < _RESOURCE_GROUP_WAIT_FOR_DELETION_TIMEOUT):
             try:
                 rg_create_or_update(resource_group_name=resource_group,
                                     parameters=params)
@@ -147,7 +148,7 @@ def bootstrap_instances(
     # load the template file
     current_path = Path(__file__).parent
     template_path = current_path.joinpath('azure-config-template.json')
-    with open(template_path, 'r', encoding='utf-8') as template_fp:
+    with open(template_path, encoding='utf-8') as template_fp:
         template = json.load(template_fp)
 
     # When using a custom MSI, remove MSI and role assignment resources
@@ -258,9 +259,9 @@ def bootstrap_instances(
     return config
 
 
-def _resolve_custom_managed_identity(remote_identity: Optional[str],
+def _resolve_custom_managed_identity(remote_identity: str | None,
                                      subscription_id: str,
-                                     resource_group: str) -> Optional[str]:
+                                     resource_group: str) -> str | None:
     """Resolve a custom managed identity name to a full resource ID.
 
     Returns None if remote_identity is not a custom identity (i.e., it is
@@ -300,9 +301,9 @@ def _remove_msi_resources_from_template(template: dict) -> None:
     template.get('outputs', {}).pop('msi', None)
 
 
-def _resolve_custom_vnet(vpc_name: Optional[str], subscription_id: str,
+def _resolve_custom_vnet(vpc_name: str | None, subscription_id: str,
                          resource_group: str,
-                         location: str) -> Optional[Tuple[str, Optional[str]]]:
+                         location: str) -> tuple[str, str | None] | None:
     """Resolve a custom VNet name to subnet and NSG resource IDs.
 
     Looks up the VNet by name in the resource group, finds the first

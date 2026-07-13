@@ -26,7 +26,7 @@ import re
 import socket
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any
 from uuid import uuid4
 
 from ray.autoscaler._private.cli_logger import cli_logger
@@ -312,7 +312,7 @@ class IBMVPCNodeProvider(NodeProvider):
 
         return nodes
 
-    def non_terminated_nodes(self, tag_filters) -> List[str]:
+    def non_terminated_nodes(self, tag_filters) -> list[str]:
         """
         returns list of ids of non terminated nodes,
         matching the specified tags. updates the nodes cache.
@@ -412,13 +412,13 @@ class IBMVPCNodeProvider(NodeProvider):
             except Exception:
                 return True
 
-    def node_tags(self, node_id) -> Dict[str, str]:
+    def node_tags(self, node_id) -> dict[str, str]:
         """returns tags of specified node id"""
 
         with self.lock:
             return self.nodes_tags.get(node_id, {})
 
-    def external_ip(self, node_id) -> Optional[str]:
+    def external_ip(self, node_id) -> str | None:
         """returns node's public ip
 
         Args:
@@ -583,7 +583,7 @@ class IBMVPCNodeProvider(NodeProvider):
         floating_ip_name = f"{RAY_RECYCLABLE}-{uuid4().hex[:4]}"
         # create a new floating ip
         logger.debug(f"Creating floating IP {floating_ip_name}")
-        floating_ip_prototype: Dict[str, Any] = {}
+        floating_ip_prototype: dict[str, Any] = {}
         floating_ip_prototype["name"] = floating_ip_name
         floating_ip_prototype["zone"] = {"name": self.zone}
         floating_ip_prototype["resource_group"] = {"id": self.resource_group_id}
@@ -691,8 +691,7 @@ class IBMVPCNodeProvider(NodeProvider):
                 "Invalid node name: pattern check for IBM VPC instance failed")
 
         # append instance name with uuid
-        name = "{name_tag}-{uuid}".format(
-            name_tag=name_tag, uuid=uuid4().hex[:INSTANCE_NAME_UUID_LEN])
+        name = f"{name_tag}-{uuid4().hex[:INSTANCE_NAME_UUID_LEN]}"
 
         # create instance in vpc
         instance = self._create_instance(name, base_config)
@@ -711,7 +710,7 @@ class IBMVPCNodeProvider(NodeProvider):
 
         return {instance["id"]: instance}
 
-    def create_node(self, base_config, tags, count) -> Dict[str, Any]:
+    def create_node(self, base_config, tags, count) -> dict[str, Any]:
         """
         returns dict of {instance_id:instance_data} of nodes.
         creates 'count' number of nodes.
@@ -803,7 +802,7 @@ class IBMVPCNodeProvider(NodeProvider):
               for any reason other then "resource not found"
         """
 
-        logger.info("Deleting VM instance {}".format(node_id))
+        logger.info(f"Deleting VM instance {node_id}")
         # avoid fetching data if specified. Skipping this optimization
         # could cause a loop if node is 'failed' since _get_cached_node()
         # would eventually invoke non_terminated_nodes()
@@ -937,5 +936,5 @@ class IBMVPCNodeProvider(NodeProvider):
         return False
 
     @staticmethod
-    def bootstrap_config(cluster_config) -> Dict[str, Any]:
+    def bootstrap_config(cluster_config) -> dict[str, Any]:
         return cluster_config

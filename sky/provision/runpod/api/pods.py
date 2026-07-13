@@ -16,8 +16,6 @@ Example:
         )
 """
 
-from typing import List, Optional
-
 
 # refer to https://graphql-spec.runpod.io/#definition-PodRentInterruptableInput
 def generate_spot_pod_deployment_mutation(
@@ -27,28 +25,28 @@ def generate_spot_pod_deployment_mutation(
     bid_per_gpu: float,
     volume_mount_path: str,
     cloud_type: str = 'ALL',
-    gpu_count: Optional[int] = None,
-    min_memory_in_gb: Optional[int] = None,
-    min_vcpu_count: Optional[int] = None,
-    container_disk_in_gb: Optional[int] = None,
-    volume_in_gb: Optional[int] = None,
-    ports: Optional[str] = None,
-    start_ssh: Optional[bool] = True,
-    start_jupyter: Optional[bool] = False,
-    env: Optional[dict] = None,
-    docker_args: Optional[str] = None,
-    support_public_ip: Optional[bool] = True,
-    terminate_after: Optional[str] = None,
-    stop_after: Optional[str] = None,
-    data_center_id: Optional[str] = None,
-    country_code: Optional[str] = None,
-    network_volume_id: Optional[str] = None,
-    allowed_cuda_versions: Optional[List[str]] = None,
-    min_download: Optional[int] = None,
-    min_upload: Optional[int] = None,
-    cuda_version: Optional[str] = None,
-    template_id: Optional[str] = None,
-    volume_key: Optional[str] = None,
+    gpu_count: int | None = None,
+    min_memory_in_gb: int | None = None,
+    min_vcpu_count: int | None = None,
+    container_disk_in_gb: int | None = None,
+    volume_in_gb: int | None = None,
+    ports: str | None = None,
+    start_ssh: bool | None = True,
+    start_jupyter: bool | None = False,
+    env: dict | None = None,
+    docker_args: str | None = None,
+    support_public_ip: bool | None = True,
+    terminate_after: str | None = None,
+    stop_after: str | None = None,
+    data_center_id: str | None = None,
+    country_code: str | None = None,
+    network_volume_id: str | None = None,
+    allowed_cuda_versions: list[str] | None = None,
+    min_download: int | None = None,
+    min_upload: int | None = None,
+    cuda_version: str | None = None,
+    template_id: str | None = None,
+    volume_key: str | None = None,
 ) -> str:
     input_fields = []
 

@@ -31,7 +31,6 @@ import configparser
 import contextlib
 import os
 import threading
-from typing import Dict, Optional, Tuple
 
 from sky import exceptions
 from sky import sky_logging
@@ -200,7 +199,7 @@ def botocore_exceptions():
     return boto_exceptions
 
 
-def _read_config_option(option: str) -> Optional[str]:
+def _read_config_option(option: str) -> str | None:
     """Reads an option from the [profile oci] section of OCI_S3_CONFIG_PATH."""
     config_path = os.path.expanduser(OCI_S3_CONFIG_PATH)
     if not os.path.isfile(config_path):
@@ -239,7 +238,7 @@ def get_endpoint() -> str:
     return endpoint
 
 
-def get_region() -> Optional[str]:
+def get_region() -> str | None:
     """Parse the OCI_S3_CONFIG_PATH to get the region, if set.
 
     The region is used for SigV4 signing and must be the OCI region
@@ -249,7 +248,7 @@ def get_region() -> Optional[str]:
 
 
 def check_credentials(
-        cloud_capability: cloud.CloudCapability) -> Tuple[bool, Optional[str]]:
+        cloud_capability: cloud.CloudCapability) -> tuple[bool, str | None]:
     if cloud_capability == cloud.CloudCapability.STORAGE:
         return check_storage_credentials()
     else:
@@ -257,7 +256,7 @@ def check_credentials(
             f'{NAME} S3-compatible API does not support {cloud_capability}.')
 
 
-def check_storage_credentials() -> Tuple[bool, Optional[str]]:
+def check_storage_credentials() -> tuple[bool, str | None]:
     """Checks credentials for OCI Object Storage via the S3-compatible API.
 
     Returns:
@@ -309,7 +308,7 @@ def oci_s3_profile_in_config() -> bool:
     conf_path = os.path.expanduser(OCI_S3_CONFIG_PATH)
     profile_exists = False
     if os.path.isfile(conf_path):
-        with open(conf_path, 'r', encoding='utf-8') as file:
+        with open(conf_path, encoding='utf-8') as file:
             for line in file:
                 if f'[profile {OCI_S3_PROFILE_NAME}]' in line:
                     profile_exists = True
@@ -322,7 +321,7 @@ def oci_s3_profile_in_cred() -> bool:
     cred_path = os.path.expanduser(OCI_S3_CREDENTIALS_PATH)
     profile_exists = False
     if os.path.isfile(cred_path):
-        with open(cred_path, 'r', encoding='utf-8') as file:
+        with open(cred_path, encoding='utf-8') as file:
             for line in file:
                 if f'[{OCI_S3_PROFILE_NAME}]' in line:
                     profile_exists = True
@@ -330,7 +329,7 @@ def oci_s3_profile_in_cred() -> bool:
     return profile_exists
 
 
-def get_credential_file_mounts() -> Dict[str, str]:
+def get_credential_file_mounts() -> dict[str, str]:
     """Returns credential file mounts for OCI S3-compatible storage.
 
     Returns:

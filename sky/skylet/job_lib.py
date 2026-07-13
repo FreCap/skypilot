@@ -2,6 +2,7 @@
 
 This is a remote utility module that provides job queue functionality.
 """
+from collections.abc import Sequence
 import enum
 import functools
 import getpass
@@ -14,7 +15,7 @@ import sqlite3
 import threading
 import time
 import typing
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Optional
 
 import colorama
 import filelock
@@ -204,7 +205,7 @@ class JobStatus(enum.Enum):
     """The job is cancelled by the user."""
 
     @classmethod
-    def nonterminal_statuses(cls) -> List['JobStatus']:
+    def nonterminal_statuses(cls) -> list['JobStatus']:
         return [cls.INIT, cls.SETTING_UP, cls.PENDING, cls.RUNNING]
 
     def is_terminal(self) -> bool:
@@ -296,14 +297,13 @@ class JobScheduler:
     @init_db
     def _run_job(self, job_id: int, run_cmd: str):
         assert _DB is not None
-        _DB.cursor.execute(
-            (f'UPDATE pending_jobs SET submit={int(time.time())} '
-             f'WHERE job_id={job_id!r}'))
+        _DB.cursor.execute(f'UPDATE pending_jobs SET submit={int(time.time())} '
+                           f'WHERE job_id={job_id!r}')
         _DB.conn.commit()
         pid = subprocess_utils.launch_new_process_tree(run_cmd)
 
-        _DB.cursor.execute((f'UPDATE jobs SET pid={pid} '
-                            f'WHERE job_id={job_id!r}'))
+        _DB.cursor.execute(f'UPDATE jobs SET pid={pid} '
+                           f'WHERE job_id={job_id!r}')
         _DB.conn.commit()
 
     def schedule_step(self, force_update_jobs: bool = False) -> None:
@@ -341,7 +341,7 @@ class JobScheduler:
                 self._run_job(job_id, run_cmd)
                 return
 
-    def _get_pending_job_ids(self) -> List[int]:
+    def _get_pending_job_ids(self) -> list[int]:
         """Returns the job ids in the pending jobs table
 
         The information contains job_id, run command, submit time,
@@ -354,7 +354,7 @@ class FIFOScheduler(JobScheduler):
     """First in first out job scheduler"""
 
     @init_db
-    def _get_pending_job_ids(self) -> List[int]:
+    def _get_pending_job_ids(self) -> list[int]:
         assert _DB is not None
         rows = _DB.cursor.execute(
             'SELECT job_id FROM pending_jobs ORDER BY job_id').fetchall()
@@ -377,7 +377,7 @@ _JOB_STATUS_TO_COLOR = {
 
 
 def make_job_command_with_user_switching(username: str,
-                                         command: str) -> List[str]:
+                                         command: str) -> list[str]:
     return ['sudo', '-H', 'su', '--login', username, '-c', command]
 
 
@@ -386,7 +386,7 @@ def add_job(job_name: str,
             username: str,
             run_timestamp: str,
             resources_str: str,
-            metadata: str = '{}') -> Tuple[int, str]:
+            metadata: str = '{}') -> tuple[int, str]:
     """Atomically reserve the next available job id for the user."""
     assert _DB is not None
     job_submitted_at = time.time()
@@ -430,7 +430,7 @@ def set_log_dir_no_lock(job_id: int, log_dir: str) -> None:
 
 
 @init_db
-def get_log_dir_for_job(job_id: int) -> Optional[str]:
+def get_log_dir_for_job(job_id: int) -> str | None:
     """Get the log directory for the job.
 
     Args:
@@ -478,7 +478,7 @@ def set_status(job_id: int, status: JobStatus) -> None:
 
 
 @init_db
-def set_exit_codes(job_id: int, exit_codes: List[int]) -> None:
+def set_exit_codes(job_id: int, exit_codes: list[int]) -> None:
     """Set exit codes for a job as comma-separated string.
 
     Args:
@@ -494,7 +494,7 @@ def set_exit_codes(job_id: int, exit_codes: List[int]) -> None:
 
 
 @init_db
-def get_exit_codes(job_id: int) -> Optional[List[int]]:
+def get_exit_codes(job_id: int) -> list[int] | None:
     """Get exit codes for a job from comma-separated string.
 
     Args:
@@ -525,7 +525,7 @@ def set_job_started(job_id: int) -> None:
 
 
 @init_db
-def get_status_no_lock(job_id: int) -> Optional[JobStatus]:
+def get_status_no_lock(job_id: int) -> JobStatus | None:
     """Get the status of the job with the given id.
 
     This function can return a stale status if there is a concurrent update.
@@ -543,7 +543,7 @@ def get_status_no_lock(job_id: int) -> Optional[JobStatus]:
     return None
 
 
-def get_status(job_id: int) -> Optional[JobStatus]:
+def get_status(job_id: int) -> JobStatus | None:
     # TODO(mraheja): remove pylint disabling when filelock version updated.
     # pylint: disable=abstract-class-instantiated
     with filelock.FileLock(_get_lock_path(job_id)):
@@ -565,12 +565,12 @@ def wait_for_job_completion(job_id: int, poll_interval: float = 1.0) -> None:
 
 
 @init_db
-def get_statuses_payload(job_ids: List[Optional[int]]) -> str:
+def get_statuses_payload(job_ids: list[int | None]) -> str:
     return message_utils.encode_payload(get_statuses(job_ids))
 
 
 @init_db
-def get_statuses(job_ids: List[int]) -> Dict[int, Optional[str]]:
+def get_statuses(job_ids: list[int]) -> dict[int, str | None]:
     assert _DB is not None
     # Per-job lock is not required here, since the staled job status will not
     # affect the caller.
@@ -578,15 +578,15 @@ def get_statuses(job_ids: List[int]) -> Dict[int, Optional[str]]:
     rows = _DB.cursor.execute(
         f'SELECT job_id, status FROM jobs WHERE job_id IN ({query_str})',
         job_ids)
-    statuses: Dict[int, Optional[str]] = {job_id: None for job_id in job_ids}
+    statuses: dict[int, str | None] = {job_id: None for job_id in job_ids}
     for (job_id, status) in rows:
         statuses[job_id] = status
     return statuses
 
 
 @init_db
-def get_jobs_info(user_hash: Optional[str] = None,
-                  all_jobs: bool = False) -> List['jobsv1_pb2.JobInfo']:
+def get_jobs_info(user_hash: str | None = None,
+                  all_jobs: bool = False) -> list['jobsv1_pb2.JobInfo']:
     """Get detailed job information.
 
     Similar to dump_job_queue but returns structured protobuf objects instead
@@ -598,7 +598,7 @@ def get_jobs_info(user_hash: Optional[str] = None,
     """
     assert _DB is not None
 
-    status_list: Optional[List[JobStatus]] = [
+    status_list: list[JobStatus] | None = [
         JobStatus.SETTING_UP, JobStatus.PENDING, JobStatus.RUNNING
     ]
     if all_jobs:
@@ -626,7 +626,7 @@ def get_jobs_info(user_hash: Optional[str] = None,
 
 
 def load_statuses_payload(
-        statuses_payload: str) -> Dict[Optional[int], Optional[JobStatus]]:
+        statuses_payload: str) -> dict[int | None, JobStatus | None]:
     original_statuses = message_utils.decode_payload(statuses_payload)
     statuses = dict()
     for job_id, status in original_statuses.items():
@@ -641,7 +641,7 @@ def load_statuses_payload(
 
 
 @init_db
-def get_latest_job_id() -> Optional[int]:
+def get_latest_job_id() -> int | None:
     assert _DB is not None
     rows = _DB.cursor.execute(
         'SELECT job_id FROM jobs ORDER BY job_id DESC LIMIT 1')
@@ -669,8 +669,8 @@ def get_job_submitted_or_ended_timestamp_payload(job_id: int,
 
 
 @init_db
-def get_job_submitted_or_ended_timestamp(
-        job_id: int, get_ended_time: bool) -> Optional[float]:
+def get_job_submitted_or_ended_timestamp(job_id: int,
+                                         get_ended_time: bool) -> float | None:
     """Get the job submitted timestamp.
 
     Returns the raw timestamp or None if job doesn't exist.
@@ -694,7 +694,7 @@ def get_ray_port():
         constants.SKY_REMOTE_RAY_PORT_FILE)
     if not os.path.exists(port_path):
         return 6379
-    port = json.load(open(port_path, 'r', encoding='utf-8'))['ray_port']
+    port = json.load(open(port_path, encoding='utf-8'))['ray_port']
     return port
 
 
@@ -708,12 +708,11 @@ def get_job_submission_port():
         constants.SKY_REMOTE_RAY_PORT_FILE)
     if not os.path.exists(port_path):
         return 8265
-    port = json.load(open(port_path, 'r',
-                          encoding='utf-8'))['ray_dashboard_port']
+    port = json.load(open(port_path, encoding='utf-8'))['ray_dashboard_port']
     return port
 
 
-def _get_records_from_rows(rows) -> List[Dict[str, Any]]:
+def _get_records_from_rows(rows) -> list[dict[str, Any]]:
     records = []
     for row in rows:
         if row[0] is None:
@@ -745,8 +744,8 @@ def _get_records_from_rows(rows) -> List[Dict[str, Any]]:
 
 @init_db
 def _get_jobs(
-        user_hash: Optional[str],
-        status_list: Optional[List[JobStatus]] = None) -> List[Dict[str, Any]]:
+        user_hash: str | None,
+        status_list: list[JobStatus] | None = None) -> list[dict[str, Any]]:
     """Returns jobs with the given fields, sorted by job_id, descending."""
     assert _DB is not None
     if status_list is None:
@@ -765,7 +764,7 @@ def _get_jobs(
 
 
 @init_db
-def _get_jobs_by_ids(job_ids: List[int]) -> List[Dict[str, Any]]:
+def _get_jobs_by_ids(job_ids: list[int]) -> list[dict[str, Any]]:
     assert _DB is not None
     rows = _DB.cursor.execute(
         f"""\
@@ -779,7 +778,7 @@ def _get_jobs_by_ids(job_ids: List[int]) -> List[Dict[str, Any]]:
 
 
 @init_db
-def _get_pending_job(job_id: int) -> Optional[Dict[str, Any]]:
+def _get_pending_job(job_id: int) -> dict[str, Any] | None:
     assert _DB is not None
     rows = _DB.cursor.execute(
         'SELECT created_time, submit, run_cmd FROM pending_jobs '
@@ -811,8 +810,8 @@ def _is_job_driver_process_running(job_pid: int, job_id: int) -> bool:
         return False
 
 
-def update_job_status(job_ids: List[int],
-                      silent: bool = False) -> List[JobStatus]:
+def update_job_status(job_ids: list[int],
+                      silent: bool = False) -> list[JobStatus]:
     """Updates and returns the job statuses matching our `JobStatus` semantics.
 
     This function queries `ray job status` and processes those results to match
@@ -994,14 +993,14 @@ def is_cluster_idle() -> bool:
     assert False, 'Should not reach here'
 
 
-def dump_job_queue(user_hash: Optional[str], all_jobs: bool) -> str:
+def dump_job_queue(user_hash: str | None, all_jobs: bool) -> str:
     """Get the job queue in encoded json format.
 
     Args:
         user_hash: The user hash to show jobs for. Show all the users if None.
         all_jobs: Whether to show all jobs, not just the pending/running ones.
     """
-    status_list: Optional[List[JobStatus]] = [
+    status_list: list[JobStatus] | None = [
         JobStatus.SETTING_UP, JobStatus.PENDING, JobStatus.RUNNING
     ]
     if all_jobs:
@@ -1015,7 +1014,7 @@ def dump_job_queue(user_hash: Optional[str], all_jobs: bool) -> str:
     return message_utils.encode_payload(jobs)
 
 
-def load_job_queue(payload: str) -> List[Dict[str, Any]]:
+def load_job_queue(payload: str) -> list[dict[str, Any]]:
     """Load the job queue from encoded json format.
 
     Args:
@@ -1034,9 +1033,9 @@ def _make_ray_job_id(sky_job_id: int) -> str:
     return f'{sky_job_id}-{getpass.getuser()}'
 
 
-def cancel_jobs_encoded_results(jobs: Optional[List[int]],
+def cancel_jobs_encoded_results(jobs: list[int] | None,
                                 cancel_all: bool = False,
-                                user_hash: Optional[str] = None) -> str:
+                                user_hash: str | None = None) -> str:
     """Cancel jobs.
 
     Args:
@@ -1053,9 +1052,9 @@ def cancel_jobs_encoded_results(jobs: Optional[List[int]],
                                                     user_hash))
 
 
-def cancel_jobs(jobs: Optional[List[int]],
+def cancel_jobs(jobs: list[int] | None,
                 cancel_all: bool = False,
-                user_hash: Optional[str] = None) -> List[int]:
+                user_hash: str | None = None) -> list[int]:
     job_records = []
     all_status = [JobStatus.PENDING, JobStatus.SETTING_UP, JobStatus.RUNNING]
     if jobs is None and not cancel_all:
@@ -1111,7 +1110,7 @@ def cancel_jobs(jobs: Optional[List[int]],
 
 
 @init_db
-def get_run_timestamp(job_id: Optional[int]) -> Optional[str]:
+def get_run_timestamp(job_id: int | None) -> str | None:
     """Returns the relative path to the log file for a job."""
     assert _DB is not None
     _DB.cursor.execute(
@@ -1126,18 +1125,18 @@ def get_run_timestamp(job_id: Optional[int]) -> Optional[str]:
 
 
 @init_db
-def get_log_dir_for_jobs(job_ids: List[Optional[str]]) -> str:
+def get_log_dir_for_jobs(job_ids: list[str | None]) -> str:
     """Returns the relative paths to the log files for jobs with globbing,
     encoded."""
     job_to_dir = get_job_log_dirs(job_ids)
-    job_to_dir_str: Dict[str, str] = {}
+    job_to_dir_str: dict[str, str] = {}
     for job_id, log_dir in job_to_dir.items():
         job_to_dir_str[str(job_id)] = log_dir
     return message_utils.encode_payload(job_to_dir_str)
 
 
 @init_db
-def get_job_log_dirs(job_ids: List[int]) -> Dict[int, str]:
+def get_job_log_dirs(job_ids: list[int]) -> dict[int, str]:
     """Returns the relative paths to the log files for jobs with globbing."""
     assert _DB is not None
     query_str = ' OR '.join(['job_id GLOB (?)'] * len(job_ids))
@@ -1146,7 +1145,7 @@ def get_job_log_dirs(job_ids: List[int]) -> Dict[int, str]:
             SELECT * FROM jobs
             WHERE {query_str}""", job_ids)
     rows = _DB.cursor.fetchall()
-    job_to_dir: Dict[int, str] = {}
+    job_to_dir: dict[int, str] = {}
     for row in rows:
         job_id = row[JobInfoLoc.JOB_ID.value]
         if row[JobInfoLoc.LOG_PATH.value]:
@@ -1175,7 +1174,7 @@ class JobLibCodeGen:
     ]
 
     @classmethod
-    def add_job(cls, job_name: Optional[str], username: str, run_timestamp: str,
+    def add_job(cls, job_name: str | None, username: str, run_timestamp: str,
                 resources_str: str, metadata: str) -> str:
         if job_name is None:
             job_name = '-'
@@ -1214,14 +1213,14 @@ class JobLibCodeGen:
                                     name: str,
                                     workspace: str,
                                     entrypoint: str,
-                                    pool: Optional[str],
-                                    pool_hash: Optional[str],
-                                    user_hash: Optional[str],
-                                    task_ids: List[int],
-                                    task_names: List[str],
+                                    pool: str | None,
+                                    pool_hash: str | None,
+                                    user_hash: str | None,
+                                    task_ids: list[int],
+                                    task_names: list[str],
                                     resources_str: str,
-                                    metadata_jsons: List[str],
-                                    is_primary_in_job_groups: List[bool],
+                                    metadata_jsons: list[str],
+                                    is_primary_in_job_groups: list[bool],
                                     execution: str,
                                     num_jobs: int = 1,
                                     is_batch: bool = False) -> str:
@@ -1311,7 +1310,7 @@ class JobLibCodeGen:
         return cls._build(code)
 
     @classmethod
-    def get_job_queue(cls, user_hash: Optional[str], all_jobs: bool) -> str:
+    def get_job_queue(cls, user_hash: str | None, all_jobs: bool) -> str:
         # TODO(SKY-1214): combine get_job_queue with get_job_statuses.
         code = [
             'job_queue = job_lib.dump_job_queue('
@@ -1322,9 +1321,9 @@ class JobLibCodeGen:
 
     @classmethod
     def cancel_jobs(cls,
-                    job_ids: Optional[List[int]],
+                    job_ids: list[int] | None,
                     cancel_all: bool = False,
-                    user_hash: Optional[str] = None) -> str:
+                    user_hash: str | None = None) -> str:
         """See job_lib.cancel_jobs()."""
         code = [
             (f'cancelled = job_lib.cancel_jobs_encoded_results('
@@ -1351,11 +1350,11 @@ class JobLibCodeGen:
 
     @classmethod
     def tail_logs(cls,
-                  job_id: Optional[int],
-                  managed_job_id: Optional[int],
+                  job_id: int | None,
+                  managed_job_id: int | None,
                   follow: bool = True,
                   tail: int = 0,
-                  tail_offset: Optional[int] = None) -> str:
+                  tail_offset: int | None = None) -> str:
         # pylint: disable=line-too-long
 
         # tail_offset is gated on SKYLET_VERSION 37+ — older skylets reject
@@ -1403,7 +1402,7 @@ class JobLibCodeGen:
         return cls._build(code)
 
     @classmethod
-    def get_job_status(cls, job_ids: Optional[List[int]] = None) -> str:
+    def get_job_status(cls, job_ids: list[int] | None = None) -> str:
         # Prints "Job <id> <status>" for UX; caller should parse the last token.
         code = [
             f'job_ids = {job_ids} if {job_ids} is not None '
@@ -1416,7 +1415,7 @@ class JobLibCodeGen:
     @classmethod
     def get_job_submitted_or_ended_timestamp_payload(
             cls,
-            job_id: Optional[int] = None,
+            job_id: int | None = None,
             get_ended_time: bool = False) -> str:
         code = [
             f'job_id = {job_id} if {job_id} is not None '
@@ -1429,7 +1428,7 @@ class JobLibCodeGen:
         return cls._build(code)
 
     @classmethod
-    def get_log_dirs_for_jobs(cls, job_ids: Optional[List[str]]) -> str:
+    def get_log_dirs_for_jobs(cls, job_ids: list[str] | None) -> str:
         code = [
             f'job_ids = {job_ids} if {job_ids} is not None '
             'else [job_lib.get_latest_job_id()]',
@@ -1442,7 +1441,7 @@ class JobLibCodeGen:
         return cls._build(code)
 
     @classmethod
-    def get_job_exit_codes(cls, job_id: Optional[int] = None) -> str:
+    def get_job_exit_codes(cls, job_id: int | None = None) -> str:
         """Generate shell command to retrieve exit codes."""
         code = [
             f'job_id = {job_id} if {job_id} is not None else job_lib.get_latest_job_id()',  # pylint: disable=line-too-long
@@ -1452,7 +1451,7 @@ class JobLibCodeGen:
         return cls._build(code)
 
     @classmethod
-    def _build(cls, code: List[str]) -> str:
+    def _build(cls, code: list[str]) -> str:
         code = cls._PREFIX + code
         code = ';'.join(code)
         return (f'{constants.ACTIVATE_SKY_REMOTE_PYTHON_ENV}; '

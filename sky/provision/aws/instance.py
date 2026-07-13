@@ -4,13 +4,14 @@ Note (dev): If API changes are made to adaptors/aws.py and the new API is used
 in this or config module, please make sure to reload it as in
 _default_ec2_resource() to avoid version mismatch issues.
 """
+from collections.abc import Callable
 import copy
 import logging
 from multiprocessing import pool
 import re
 import time
 import typing
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, TypeVar
+from typing import Any, Optional, TypeVar
 
 from sky import sky_logging
 from sky.adaptors import aws
@@ -118,7 +119,7 @@ def _default_ec2_resource(
 
 
 def _cluster_name_filter(
-        cluster_name_on_cloud: str) -> List['ec2_type_defs.FilterTypeDef']:
+        cluster_name_on_cloud: str) -> list['ec2_type_defs.FilterTypeDef']:
     return [{
         'Name': f'tag:{constants.TAG_RAY_CLUSTER_NAME}',
         'Values': [cluster_name_on_cloud],
@@ -158,12 +159,12 @@ def _ec2_call_with_retry_on_server_error(ec2_fail_fast_fn: Callable[..., _T],
     return ret
 
 
-def _format_tags(tags: Dict[str, str]) -> List:
+def _format_tags(tags: dict[str, str]) -> list:
     return [{'Key': k, 'Value': v} for k, v in tags.items()]
 
 
-def _merge_tag_specs(tag_specs: List[Dict[str, Any]],
-                     user_tag_specs: List[Dict[str, Any]]) -> None:
+def _merge_tag_specs(tag_specs: list[dict[str, Any]],
+                     user_tag_specs: list[dict[str, Any]]) -> None:
     """Merges user-provided node config tag specifications into a base
     list of node provider tag specifications. The base list of
     node provider tag specs is modified in-place.
@@ -193,7 +194,7 @@ def _merge_tag_specs(tag_specs: List[Dict[str, Any]],
             tag_specs += [user_tag_spec]
 
 
-def _is_single_zone_request(provider_config: Dict[str, Any]) -> bool:
+def _is_single_zone_request(provider_config: dict[str, Any]) -> bool:
     """Whether the provisioner explicitly targets exactly one AWS zone."""
     availability_zone = provider_config.get('availability_zone')
     if not isinstance(availability_zone, str):
@@ -207,13 +208,13 @@ def _is_single_zone_request(provider_config: Dict[str, Any]) -> bool:
 def _create_instances(
     ec2_fail_fast,
     cluster_name: str,
-    node_config: Dict[str, Any],
-    tags: Dict[str, str],
+    node_config: dict[str, Any],
+    tags: dict[str, str],
     count: int,
     associate_public_ip_address: bool,
     max_efa_interfaces: int,
     is_single_zone_request: bool = False,
-) -> List:
+) -> list:
     tags = {
         'Name': cluster_name,
         constants.TAG_RAY_CLUSTER_NAME: cluster_name,
@@ -260,7 +261,7 @@ def _create_instances(
     max_tries = max(num_subnets * (BOTO_CREATE_MAX_RETRIES // num_subnets),
                     len(subnet_ids))
     per_subnet_tries = max_tries // num_subnets
-    errors: List[Dict[str, str]] = []
+    errors: list[dict[str, str]] = []
     for i in range(max_tries):
         try:
             # Try each subnet for per_subnet_tries times.
@@ -338,7 +339,7 @@ def _create_instances(
     assert False, 'This code should not be reachable'
 
 
-def _get_head_instance_id(instances: List) -> Optional[str]:
+def _get_head_instance_id(instances: list) -> str | None:
     head_instance_id = None
     head_node_markers = tuple(constants.HEAD_NODE_TAGS.items())
 
@@ -370,13 +371,13 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
 
     region = ec2.meta.client.meta.region_name
     zone = None
-    resumed_instance_ids: List[str] = []
-    created_instance_ids: List[str] = []
+    resumed_instance_ids: list[str] = []
+    created_instance_ids: list[str] = []
     max_efa_interfaces = config.provider_config.get('max_efa_interfaces', 0)
 
     # sort tags by key to support deterministic unit test stubbing
     tags = dict(sorted(copy.deepcopy(config.tags).items()))
-    filters: List['ec2_type_defs.FilterTypeDef'] = [{
+    filters: list[ec2_type_defs.FilterTypeDef] = [{
         'Name': 'instance-state-name',
         'Values': ['pending', 'running', 'stopping', 'stopped'],
     }, {
@@ -484,8 +485,8 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
                 # SkyPilot more responsive.
                 fut = pool_.apply_async(inst.wait_until_stopped)
                 per_instance_time_start = time.time()
-                while (time.time() - per_instance_time_start <
-                       _RESUME_PER_INSTANCE_TIMEOUT):
+                while (time.time() - per_instance_time_start
+                       < _RESUME_PER_INSTANCE_TIMEOUT):
                     if fut.ready():
                         fut.get()
                         break
@@ -651,9 +652,9 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
 
 
 def _filter_instances(ec2: 'mypy_boto3_ec2.ServiceResource',
-                      filters: List['ec2_type_defs.FilterTypeDef'],
-                      included_instances: Optional[List[str]],
-                      excluded_instances: Optional[List[str]]):
+                      filters: list['ec2_type_defs.FilterTypeDef'],
+                      included_instances: list[str] | None,
+                      excluded_instances: list[str] | None):
     instances = ec2.instances.filter(Filters=filters)
     if included_instances is not None and excluded_instances is not None:
         raise ValueError('"included_instances" and "exclude_instances"'
@@ -677,10 +678,10 @@ def _filter_instances(ec2: 'mypy_boto3_ec2.ServiceResource',
 def query_instances(
     cluster_name: str,
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     non_terminated_only: bool = True,
     retry_if_missing: bool = False,
-) -> Dict[str, Tuple[Optional['status_lib.ClusterStatus'], Optional[str]]]:
+) -> dict[str, tuple[Optional['status_lib.ClusterStatus'], str | None]]:
     """See sky/provision/__init__.py"""
     del cluster_name, retry_if_missing  # unused
     assert provider_config is not None, (cluster_name_on_cloud, provider_config)
@@ -701,8 +702,7 @@ def query_instances(
         'shutting-down': None,
         'terminated': None,
     }
-    statuses: Dict[str, Tuple[Optional['status_lib.ClusterStatus'],
-                              Optional[str]]] = {}
+    statuses: dict[str, tuple[status_lib.ClusterStatus | None, str | None]] = {}
     for inst in instances:
         status = status_map[inst.state['Name']]
         if non_terminated_only and status is None:
@@ -713,14 +713,14 @@ def query_instances(
 
 def stop_instances(
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     worker_only: bool = False,
 ) -> None:
     """See sky/provision/__init__.py"""
     assert provider_config is not None, (cluster_name_on_cloud, provider_config)
     region = provider_config['region']
     ec2 = _default_ec2_resource(region)
-    filters: List['ec2_type_defs.FilterTypeDef'] = [
+    filters: list[ec2_type_defs.FilterTypeDef] = [
         {
             'Name': 'instance-state-name',
             'Values': ['pending', 'running'],
@@ -747,7 +747,7 @@ def stop_instances(
 
 def terminate_instances(
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     worker_only: bool = False,
 ) -> None:
     """See sky/provision/__init__.py"""
@@ -757,7 +757,7 @@ def terminate_instances(
     managed_by_skypilot = provider_config['security_group'].get(
         'ManagedBySkyPilot', True)
     ec2 = _default_ec2_resource(region)
-    filters: List['ec2_type_defs.FilterTypeDef'] = [
+    filters: list[ec2_type_defs.FilterTypeDef] = [
         {
             'Name': 'instance-state-name',
             # exclude 'shutting-down' or 'terminated' states
@@ -848,15 +848,15 @@ def _maybe_move_to_new_sg(
 
 def open_ports(
     cluster_name_on_cloud: str,
-    ports: List[str],
-    provider_config: Optional[Dict[str, Any]] = None,
+    ports: list[str],
+    provider_config: dict[str, Any] | None = None,
 ) -> None:
     """See sky/provision/__init__.py"""
     assert provider_config is not None, cluster_name_on_cloud
     region = provider_config['region']
     ec2 = _default_ec2_resource(region)
     sg_name = provider_config['security_group']['GroupName']
-    filters: List['ec2_type_defs.FilterTypeDef'] = [
+    filters: list[ec2_type_defs.FilterTypeDef] = [
         {
             'Name': 'instance-state-name',
             # exclude 'shutting-down' or 'terminated' states
@@ -885,7 +885,7 @@ def open_ports(
     for instance in instance_list:
         _maybe_move_to_new_sg(instance, sg)
 
-    existing_ports: Set[int] = set()
+    existing_ports: set[int] = set()
     for existing_rule in sg.ip_permissions:
         # Skip any non-tcp rules or if all traffic (-1) is specified.
         if existing_rule['IpProtocol'] not in ['tcp', '-1']:
@@ -954,8 +954,8 @@ def open_ports(
 
 def cleanup_ports(
     cluster_name_on_cloud: str,
-    ports: List[str],
-    provider_config: Optional[Dict[str, Any]] = None,
+    ports: list[str],
+    provider_config: dict[str, Any] | None = None,
 ) -> None:
     """See sky/provision/__init__.py"""
     del ports  # Unused.
@@ -996,14 +996,14 @@ def cleanup_ports(
 
 
 def wait_instances(region: str, cluster_name_on_cloud: str,
-                   state: Optional[status_lib.ClusterStatus]) -> None:
+                   state: status_lib.ClusterStatus | None) -> None:
     """See sky/provision/__init__.py"""
     # TODO(suquark): unify state for different clouds
     # possible exceptions: https://github.com/boto/boto3/issues/176
     ec2 = _default_ec2_resource(region)
     client = ec2.meta.client
 
-    filters: List['ec2_type_defs.FilterTypeDef'] = [
+    filters: list[ec2_type_defs.FilterTypeDef] = [
         {
             'Name': f'tag:{constants.TAG_RAY_CLUSTER_NAME}',
             'Values': [cluster_name_on_cloud],
@@ -1032,7 +1032,7 @@ def wait_instances(region: str, cluster_name_on_cloud: str,
         raise RuntimeError(
             f'No instances found for cluster {cluster_name_on_cloud}.')
 
-    waiter: 'botowaiter.Waiter'
+    waiter: botowaiter.Waiter
     if state == status_lib.ClusterStatus.UP:
         waiter = client.get_waiter('instance_running')
     elif state == status_lib.ClusterStatus.STOPPED:
@@ -1048,10 +1048,10 @@ def wait_instances(region: str, cluster_name_on_cloud: str,
 def get_cluster_info(
         region: str,
         cluster_name_on_cloud: str,
-        provider_config: Optional[Dict[str, Any]] = None) -> common.ClusterInfo:
+        provider_config: dict[str, Any] | None = None) -> common.ClusterInfo:
     """See sky/provision/__init__.py"""
     ec2 = _default_ec2_resource(region)
-    filters: List['ec2_type_defs.FilterTypeDef'] = [
+    filters: list[ec2_type_defs.FilterTypeDef] = [
         {
             'Name': 'instance-state-name',
             'Values': ['running'],
@@ -1090,7 +1090,7 @@ def get_cluster_info(
     )
 
 
-def _get_vpc_id(provider_config: Dict[str, Any]) -> str:
+def _get_vpc_id(provider_config: dict[str, Any]) -> str:
     region = provider_config['region']
     ec2 = _default_ec2_resource(provider_config['region'])
     if 'vpc_name' in provider_config:

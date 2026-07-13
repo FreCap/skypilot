@@ -6,7 +6,6 @@ import os
 import pathlib
 import shutil
 import time
-from typing import List, Tuple
 
 import anyio
 import filelock
@@ -71,7 +70,7 @@ class LocalFilesystemBlobStorage(bs.BlobStorage):
         target = self.get_target_dir(user_id, blob_id)
         shutil.rmtree(target, ignore_errors=True)
 
-    def list_blob_ids(self, user_id: str) -> List[Tuple[str, float]]:
+    def list_blob_ids(self, user_id: str) -> list[tuple[str, float]]:
         bd = self.blobs_dir(user_id)
         if not bd.exists():
             return []
@@ -100,7 +99,7 @@ class LocalFilesystemBlobStorage(bs.BlobStorage):
                 except OSError:
                     pass
 
-    def list_users(self) -> List[str]:
+    def list_users(self) -> list[str]:
 
         clients_dir = server_common.API_SERVER_CLIENT_DIR.expanduser().resolve()
         if not clients_dir.exists():

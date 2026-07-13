@@ -7,7 +7,7 @@ Prerequisites:
 import os
 import subprocess
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
 from sky import sky_logging
 from sky.adaptors import seeweb as seeweb_adaptor
@@ -117,7 +117,7 @@ class SeewebNodeProvider:
     # --------------------------------------------------------------------- #
     # 2. run_instances: restart or create until we reach count
     # --------------------------------------------------------------------- #
-    def run_instances(self, config: Dict, count: int) -> None:
+    def run_instances(self, config: dict, count: int) -> None:
         existing = self._query_cluster_nodes()
         del config  # unused
         running = [
@@ -189,7 +189,7 @@ class SeewebNodeProvider:
     # --------------------------------------------------------------------- #
     # 5. query_instances
     # --------------------------------------------------------------------- #
-    def query_instances(self) -> Dict[str, str]:
+    def query_instances(self) -> dict[str, str]:
         """Query instances status using both fetch_servers()
         and fetch_server_status().
 
@@ -332,8 +332,8 @@ class SeewebNodeProvider:
     def open_ports(
         self,
         cluster_name_on_cloud: str,
-        ports: List[str],
-        provider_config: Optional[Dict[str, Any]] = None,
+        ports: list[str],
+        provider_config: dict[str, Any] | None = None,
     ) -> None:
         """See sky/provision/__init__.py"""
         logger.debug(f'Skip opening ports {ports} for Seeweb instances, as all '
@@ -343,8 +343,8 @@ class SeewebNodeProvider:
     def cleanup_ports(
         self,
         cluster_name_on_cloud: str,
-        ports: List[str],
-        provider_config: Optional[Dict[str, Any]] = None,
+        ports: list[str],
+        provider_config: dict[str, Any] | None = None,
     ) -> None:
         del cluster_name_on_cloud, ports, provider_config  # Unused.
 
@@ -366,7 +366,7 @@ class SeewebNodeProvider:
                                   max_retries=_API_RETRY_MAX_RETRIES,
                                   initial_backoff=_API_RETRY_INITIAL_BACKOFF)()
 
-    def _get_head_instance_id(self) -> Optional[str]:
+    def _get_head_instance_id(self) -> str | None:
         """Return head instance id for this cluster.
 
         Prefer notes == "{cluster}-head"; fallback to first node if none
@@ -385,7 +385,7 @@ class SeewebNodeProvider:
                 continue
         return nodes[0].name if nodes else None
 
-    def get_head_instance_id(self) -> Optional[str]:
+    def get_head_instance_id(self) -> str | None:
         """Public wrapper for getting head instance id."""
         return common_utils.retry(self._get_head_instance_id,
                                   max_retries=_API_RETRY_MAX_RETRIES,
@@ -416,9 +416,7 @@ class SeewebNodeProvider:
                 'user_customize']
 
         # Build the request object expected by ecsapi
-        server_create_request_cls = (
-            seeweb_adaptor.ecsapi.ServerCreateRequest  # type: ignore
-        )
+        server_create_request_cls = (seeweb_adaptor.ecsapi.ServerCreateRequest)
         create_request = server_create_request_cls(**payload)
 
         logger.info('Creating Seeweb server %s', payload)
@@ -535,7 +533,7 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
 
 def stop_instances(
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     worker_only: bool = False,
 ) -> None:
     """Stop instances for Seeweb cluster."""
@@ -559,7 +557,7 @@ def stop_instances(
 
 def terminate_instances(
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     worker_only: bool = False,
 ) -> None:
     """Terminate instances for Seeweb cluster."""
@@ -583,7 +581,7 @@ def terminate_instances(
 def wait_instances(
     region: str,
     cluster_name_on_cloud: str,
-    state: Optional[status_lib.ClusterStatus],
+    state: status_lib.ClusterStatus | None,
 ) -> None:
     del region  # unused
     # Map ClusterStatus to Seeweb string
@@ -687,9 +685,9 @@ def _check_ssh_ready_standalone(server_ip: str) -> bool:
 def query_instances(
     cluster_name: str,
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     non_terminated_only: bool = True,
-) -> Dict[str, Tuple[Optional['status_lib.ClusterStatus'], Optional[str]]]:
+) -> dict[str, tuple[Optional['status_lib.ClusterStatus'], str | None]]:
     """Query instances status for Seeweb cluster."""
     del cluster_name  # unused
     # Use the provided provider_config or default to empty dict
@@ -725,8 +723,7 @@ def query_instances(
                        STOPPED,  # Fixed: should be STOPPED, not INIT
     }
 
-    result: Dict[str, Tuple[Optional[status_lib.ClusterStatus],
-                            Optional[str]]] = {}
+    result: dict[str, tuple[status_lib.ClusterStatus | None, str | None]] = {}
     for name, seeweb_status in seeweb_instances.items():
         if non_terminated_only and seeweb_status in ('Terminated', 'Deleted'):
             continue
@@ -742,7 +739,7 @@ def query_instances(
 def get_cluster_info(
     region: str,
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
 ) -> 'ClusterInfo':
     del region  # unused
     # Use Seeweb client to get cluster instances
@@ -794,8 +791,8 @@ def get_cluster_info(
 
 def open_ports(
     cluster_name_on_cloud: str,
-    ports: List[str],
-    provider_config: Optional[Dict[str, Any]] = None,
+    ports: list[str],
+    provider_config: dict[str, Any] | None = None,
 ) -> None:
     del provider_config  # Unused
     logger.debug(f'Seeweb: skipping open_ports for {cluster_name_on_cloud}'
@@ -805,8 +802,8 @@ def open_ports(
 
 def cleanup_ports(
     cluster_name_on_cloud: str,
-    ports: List[str],
-    provider_config: Optional[Dict[str, Any]] = None,
+    ports: list[str],
+    provider_config: dict[str, Any] | None = None,
 ) -> None:
     del cluster_name_on_cloud, ports, provider_config  # Unused.
     return

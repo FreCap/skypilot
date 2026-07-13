@@ -297,8 +297,8 @@ def test_terminate_cluster_no_record_skips_workspace_pin(
 
 
 @mock.patch('sky.jobs.utils.global_user_state.get_cluster_from_name')
-@mock.patch('sky.jobs.utils.time.sleep'
-           )  # Don't actually sleep between retries.
+@mock.patch(
+    'sky.jobs.utils.time.sleep')  # Don't actually sleep between retries.
 @mock.patch('sky.core.down')
 @mock.patch('sky.usage.usage_lib.messages.usage.set_internal')
 def test_terminate_cluster_retry_reenters_workspace_ctx(

@@ -3,7 +3,7 @@ import collections
 import random
 import threading
 import typing
-from typing import Any, Dict, List, Optional, Set
+from typing import Any
 
 from sky import sky_logging
 
@@ -21,7 +21,7 @@ class LoadBalancingPolicy:
     """Abstract class for load balancing policies."""
 
     def __init__(self) -> None:
-        self.ready_replicas: List[str] = []
+        self.ready_replicas: list[str] = []
 
     def __init_subclass__(cls, name: str, default: bool = False):
         LB_POLICIES[name] = cls
@@ -32,7 +32,7 @@ class LoadBalancingPolicy:
             DEFAULT_LB_POLICY = name
 
     @classmethod
-    def make_policy_name(cls, policy_name: Optional[str]) -> str:
+    def make_policy_name(cls, policy_name: str | None) -> str:
         """Return the policy name."""
         assert DEFAULT_LB_POLICY is not None, 'No default policy set.'
         if policy_name is None:
@@ -40,19 +40,19 @@ class LoadBalancingPolicy:
         return policy_name
 
     @classmethod
-    def make(cls, policy_name: Optional[str] = None) -> 'LoadBalancingPolicy':
+    def make(cls, policy_name: str | None = None) -> 'LoadBalancingPolicy':
         """Create a load balancing policy from a name."""
         policy_name = cls.make_policy_name(policy_name)
         if policy_name not in LB_POLICIES:
             raise ValueError(f'Unknown load balancing policy: {policy_name}')
         return LB_POLICIES[policy_name]()
 
-    def set_ready_replicas(self, ready_replicas: List[str]) -> None:
+    def set_ready_replicas(self, ready_replicas: list[str]) -> None:
         raise NotImplementedError
 
     def select_replica(self,
                        request: 'fastapi.Request',
-                       exclude: Optional[Set[str]] = None) -> Optional[str]:
+                       exclude: set[str] | None = None) -> str | None:
         """Select a replica, optionally excluding already-failed URLs.
 
         `exclude` carries the URLs that already failed THIS request's
@@ -92,10 +92,10 @@ class LoadBalancingPolicy:
     # TODO(tian): We should have an abstract class for Request to
     # compatible with all frameworks.
     def _select_replica(self, request: 'fastapi.Request',
-                        candidates: List[str]) -> Optional[str]:
+                        candidates: list[str]) -> str | None:
         raise NotImplementedError
 
-    def snapshot_in_flight(self) -> Optional[Dict[str, int]]:
+    def snapshot_in_flight(self) -> dict[str, int] | None:
         """Per-replica in-flight snapshot (url -> count), when tracked.
 
         None for policies without load accounting (round robin): the
@@ -104,7 +104,7 @@ class LoadBalancingPolicy:
         """
         return None
 
-    def set_occupancy(self, occupancy: Dict[str, int]) -> None:
+    def set_occupancy(self, occupancy: dict[str, int]) -> None:
         """Set the replica-reported async occupancy (url -> running jobs).
 
         [boltz fork] Fed by the LB's occupancy probe: async fast-ack
@@ -116,7 +116,7 @@ class LoadBalancingPolicy:
         del occupancy
 
     def pre_execute_hook(self, replica_url: str,
-                         request: 'fastapi.Request') -> Optional[Any]:
+                         request: 'fastapi.Request') -> Any | None:
         """Account an in-flight request. Returns an opaque token that the
         caller must hand back to post_execute_hook, so a release is tied
         to the exact accounting generation it incremented (a replica URL
@@ -128,7 +128,7 @@ class LoadBalancingPolicy:
     def post_execute_hook(self,
                           replica_url: str,
                           request: 'fastapi.Request',
-                          token: Optional[Any] = None) -> None:
+                          token: Any | None = None) -> None:
         del replica_url, request, token
 
 
@@ -139,7 +139,7 @@ class RoundRobinPolicy(LoadBalancingPolicy, name='round_robin'):
         super().__init__()
         self.index = 0
 
-    def set_ready_replicas(self, ready_replicas: List[str]) -> None:
+    def set_ready_replicas(self, ready_replicas: list[str]) -> None:
         if set(self.ready_replicas) == set(ready_replicas):
             return
         # If the autoscaler keeps scaling up and down the replicas,
@@ -150,7 +150,7 @@ class RoundRobinPolicy(LoadBalancingPolicy, name='round_robin'):
         self.index = 0
 
     def _select_replica(self, request: 'fastapi.Request',
-                        candidates: List[str]) -> Optional[str]:
+                        candidates: list[str]) -> str | None:
         del request  # Unused.
         if not candidates:
             return None
@@ -176,18 +176,18 @@ class LeastLoadPolicy(LoadBalancingPolicy, name='least_load', default=True):
 
     def __init__(self) -> None:
         super().__init__()
-        self.load_map: Dict[str, int] = collections.defaultdict(int)
+        self.load_map: dict[str, int] = collections.defaultdict(int)
         # url -> replica-reported running async jobs (see set_occupancy).
         # Absent url == occupancy unknown == treated as 0: an unreachable
         # probe must fall back to today's envelope-only behavior, not
         # exile the replica.
-        self.occupancy_map: Dict[str, int] = {}
+        self.occupancy_map: dict[str, int] = {}
         # url -> accounting generation; bumped whenever a key is (re)added
         # so stale releases from before a prune are ignored (ABA).
-        self._generation: Dict[str, int] = collections.defaultdict(int)
+        self._generation: dict[str, int] = collections.defaultdict(int)
         self.lock = threading.Lock()
 
-    def set_occupancy(self, occupancy: Dict[str, int]) -> None:
+    def set_occupancy(self, occupancy: dict[str, int]) -> None:
         # Replace wholesale: the probe rebuilds the map every round from
         # the current ready set, so replacement is also the prune.
         with self.lock:
@@ -201,7 +201,7 @@ class LeastLoadPolicy(LoadBalancingPolicy, name='least_load', default=True):
         return (self.load_map.get(replica_url, 0) +
                 OCCUPANCY_LOAD_WEIGHT * self.occupancy_map.get(replica_url, 0))
 
-    def set_ready_replicas(self, ready_replicas: List[str]) -> None:
+    def set_ready_replicas(self, ready_replicas: list[str]) -> None:
         if set(self.ready_replicas) == set(ready_replicas):
             return
         with self.lock:
@@ -217,7 +217,7 @@ class LeastLoadPolicy(LoadBalancingPolicy, name='least_load', default=True):
                     self._generation[replica] += 1
                     self.load_map[replica] = 0
 
-    def snapshot_in_flight(self) -> Optional[Dict[str, int]]:
+    def snapshot_in_flight(self) -> dict[str, int] | None:
         with self.lock:
             # Scoped to the READY set: an entry for a pruned replica must
             # not report phantom demand. A COPY, not the live defaultdict
@@ -229,7 +229,7 @@ class LeastLoadPolicy(LoadBalancingPolicy, name='least_load', default=True):
             }
 
     def _select_replica(self, request: 'fastapi.Request',
-                        candidates: List[str]) -> Optional[str]:
+                        candidates: list[str]) -> str | None:
         del request  # Unused.
         if not candidates:
             return None
@@ -246,7 +246,7 @@ class LeastLoadPolicy(LoadBalancingPolicy, name='least_load', default=True):
             return random.choice(candidates)
 
     def pre_execute_hook(self, replica_url: str,
-                         request: 'fastapi.Request') -> Optional[Any]:
+                         request: 'fastapi.Request') -> Any | None:
         del request  # Unused.
         with self.lock:
             # Live keys only: a replica pruned between selection and this
@@ -263,7 +263,7 @@ class LeastLoadPolicy(LoadBalancingPolicy, name='least_load', default=True):
     def post_execute_hook(self,
                           replica_url: str,
                           request: 'fastapi.Request',
-                          token: Optional[Any] = None) -> None:
+                          token: Any | None = None) -> None:
         del request  # Unused.
         with self.lock:
             # Only decrement live keys, clamped at zero: a replica pruned
@@ -302,15 +302,15 @@ class InstanceAwareLeastLoadPolicy(LeastLoadPolicy,
 
     def __init__(self) -> None:
         super().__init__()
-        self.replica_info: Dict[str, Dict[str, Any]] = {}  # replica_url -> info
-        self.target_qps_per_accelerator: Dict[str, float] = {
+        self.replica_info: dict[str, dict[str, Any]] = {}  # replica_url -> info
+        self.target_qps_per_accelerator: dict[str, float] = {
         }  # accelerator_type -> target_qps
         # Uniform per-GPU weight for services without a QPS dict
         # (concurrency-sized): consulted after the dict keys, before the
         # flat fallback. See set_default_per_gpu_target.
-        self._default_per_gpu_qps: Optional[float] = None
+        self._default_per_gpu_qps: float | None = None
 
-    def set_ready_replicas(self, ready_replicas: List[str]) -> None:
+    def set_ready_replicas(self, ready_replicas: list[str]) -> None:
         if set(self.ready_replicas) == set(ready_replicas):
             return
         with self.lock:
@@ -327,7 +327,7 @@ class InstanceAwareLeastLoadPolicy(LeastLoadPolicy,
                     self._generation[replica] += 1
                     self.load_map[replica] = 0
 
-    def set_replica_info(self, replica_info: Dict[str, Dict[str, Any]]) -> None:
+    def set_replica_info(self, replica_info: dict[str, dict[str, Any]]) -> None:
         """Set replica information including accelerator types.
 
         Args:
@@ -339,7 +339,7 @@ class InstanceAwareLeastLoadPolicy(LeastLoadPolicy,
             logger.debug('Set replica info: %s', self.replica_info)
 
     def set_target_qps_per_accelerator(
-            self, target_qps_per_accelerator: Dict[str, float]) -> None:
+            self, target_qps_per_accelerator: dict[str, float]) -> None:
         """Set target QPS for each accelerator type."""
         with self.lock:
             self.target_qps_per_accelerator = target_qps_per_accelerator
@@ -348,8 +348,7 @@ class InstanceAwareLeastLoadPolicy(LeastLoadPolicy,
             if target_qps_per_accelerator:
                 self._default_per_gpu_qps = None
 
-    def set_default_per_gpu_target(self,
-                                   per_gpu_target: Optional[float]) -> None:
+    def set_default_per_gpu_target(self, per_gpu_target: float | None) -> None:
         """Uniform per-GPU weight for services without a QPS dict.
 
         Concurrency-sized services (target_concurrency_per_replica) have
@@ -449,7 +448,7 @@ class InstanceAwareLeastLoadPolicy(LeastLoadPolicy,
         return 1.0
 
     def _select_replica(self, request: 'fastapi.Request',
-                        candidates: List[str]) -> Optional[str]:
+                        candidates: list[str]) -> str | None:
         del request  # Unused.
         if not candidates:
             return None

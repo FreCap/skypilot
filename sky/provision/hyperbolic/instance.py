@@ -1,6 +1,6 @@
 """Hyperbolic instance provisioning."""
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
 from sky import sky_logging
 from sky.provision import common
@@ -17,8 +17,8 @@ logger = sky_logging.init_logger(__name__)
 
 
 def _filter_instances(cluster_name_on_cloud: str,
-                      status_filters: Optional[List[str]],
-                      head_only: bool = False) -> Dict[str, Dict[str, Any]]:
+                      status_filters: list[str] | None,
+                      head_only: bool = False) -> dict[str, dict[str, Any]]:
     logger.debug(f'Filtering instances: cluster={cluster_name_on_cloud}, '
                  f'status={status_filters}')
     _ = head_only  # Mark as intentionally unused
@@ -33,7 +33,7 @@ def _filter_instances(cluster_name_on_cloud: str,
     if status_filters is not None:
         status_filters = [s.lower() for s in status_filters]
 
-    filtered_instances: Dict[str, Dict[str, Any]] = {}
+    filtered_instances: dict[str, dict[str, Any]] = {}
     for instance_id, instance in instances.items():
         try:
             # Check status filter
@@ -57,7 +57,7 @@ def _filter_instances(cluster_name_on_cloud: str,
     return filtered_instances
 
 
-def _get_head_instance_id(instances: Dict[str, Any]) -> Optional[str]:
+def _get_head_instance_id(instances: dict[str, Any]) -> str | None:
     """Get the instance ID from the instances dict."""
     if not instances:
         return None
@@ -208,7 +208,7 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
 
 def terminate_instances(
     cluster_name_on_cloud: str,
-    provider_config: Optional[dict] = None,
+    provider_config: dict | None = None,
     worker_only: bool = False,
 ) -> None:
     """Terminate all instances in the cluster."""
@@ -254,14 +254,19 @@ def terminate_instances(
 def get_cluster_info(
         region: str,
         cluster_name_on_cloud: str,
-        provider_config: Optional[Dict[str, Any]] = None) -> common.ClusterInfo:
+        provider_config: dict[str, Any] | None = None) -> common.ClusterInfo:
     """Returns information about the cluster."""
     del region  # unused
     running_instances = _filter_instances(
         cluster_name_on_cloud, [utils.HyperbolicInstanceStatus.ONLINE.value])
-    instances: Dict[str, List[common.InstanceInfo]] = {}
+    instances: dict[str, list[common.InstanceInfo]] = {}
     head_instance_id = None
 
+    # Default matches ssh_user in templates/hyperbolic-ray.yml.j2; overridden
+    # below when the instance sshCommand carries an explicit user. Without
+    # the default, an sshCommand with no user@host part left ssh_user unbound
+    # (NameError at ClusterInfo construction).
+    ssh_user = 'ubuntu'
     for instance_id, instance_info in running_instances.items():
         # Extract hostname and port from sshCommand
         ssh_command = instance_info.get('sshCommand', '')
@@ -308,10 +313,10 @@ def get_cluster_info(
 def query_instances(
     cluster_name: str,
     cluster_name_on_cloud: str,
-    provider_config: Optional[dict] = None,
+    provider_config: dict | None = None,
     non_terminated_only: bool = True,
     retry_if_missing: bool = False,
-) -> Dict[str, Tuple[Optional['status_lib.ClusterStatus'], Optional[str]]]:
+) -> dict[str, tuple[Optional['status_lib.ClusterStatus'], str | None]]:
     """Returns the status of the specified instances for Hyperbolic."""
     del cluster_name, provider_config, retry_if_missing  # unused
     # Fetch all instances for this cluster
@@ -323,8 +328,7 @@ def query_instances(
         # No instances found: return empty dict to indicate fully deleted
         return {}
 
-    statuses: Dict[str, Tuple[Optional['status_lib.ClusterStatus'],
-                              Optional[str]]] = {}
+    statuses: dict[str, tuple[status_lib.ClusterStatus | None, str | None]] = {}
     for instance_id, instance in instances.items():
         try:
             raw_status = instance.get('status', 'unknown').lower()
@@ -342,7 +346,7 @@ def query_instances(
 
 
 def wait_instances(region: str, cluster_name_on_cloud: str,
-                   state: Optional[status_lib.ClusterStatus]) -> None:
+                   state: status_lib.ClusterStatus | None) -> None:
     """Wait for instances to reach the desired state."""
     del region  # unused
     if state == status_lib.ClusterStatus.UP:
@@ -403,7 +407,7 @@ def wait_instances(region: str, cluster_name_on_cloud: str,
 
 def stop_instances(
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     worker_only: bool = False,
 ) -> None:
     """Stop running instances. Not supported for Hyperbolic."""
@@ -412,8 +416,8 @@ def stop_instances(
 
 def cleanup_ports(
     cluster_name_on_cloud: str,
-    provider_config: Optional[dict] = None,
-    ports: Optional[list] = None,
+    provider_config: dict | None = None,
+    ports: list | None = None,
 ) -> None:
     """Cleanup ports. Not supported for Hyperbolic."""
     raise NotImplementedError('cleanup_ports is not supported for Hyperbolic')
@@ -421,7 +425,7 @@ def cleanup_ports(
 
 def cleanup_custom_multi_network(
     cluster_name_on_cloud: str,
-    provider_config: Dict[str, Any],
+    provider_config: dict[str, Any],
     failover: bool = False,
 ) -> None:
     """Cleanup custom multi-network. Not supported for Hyperbolic."""
@@ -432,7 +436,7 @@ def cleanup_custom_multi_network(
 def open_ports(
     cluster_name_on_cloud: str,
     ports: list,
-    provider_config: Optional[dict] = None,
+    provider_config: dict | None = None,
 ) -> None:
     """Open ports. Not supported for Hyperbolic."""
     raise NotImplementedError('open_ports is not supported for Hyperbolic')

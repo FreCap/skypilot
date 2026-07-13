@@ -1,6 +1,6 @@
 """AWS CloudWatch logging agent."""
 
-from typing import Any, Dict, Optional
+from typing import Any
 
 import pydantic
 
@@ -13,12 +13,12 @@ EC2_MD_URL = '"${AWS_EC2_METADATA_SERVICE_ENDPOINT:-http://169.254.169.254/}"'
 
 class _CloudwatchLoggingConfig(pydantic.BaseModel):
     """Configuration for AWS CloudWatch logging agent."""
-    region: Optional[str] = None
-    credentials_file: Optional[str] = None
+    region: str | None = None
+    credentials_file: str | None = None
     log_group_name: str = 'skypilot-logs'
     log_stream_prefix: str = 'skypilot-'
     auto_create_group: bool = True
-    additional_tags: Optional[Dict[str, str]] = None
+    additional_tags: dict[str, str] | None = None
 
 
 class _CloudWatchOutputConfig(pydantic.BaseModel):
@@ -28,13 +28,13 @@ class _CloudWatchOutputConfig(pydantic.BaseModel):
     """
     name: str = 'cloudwatch_logs'
     match: str = '*'
-    region: Optional[str] = None
-    log_group_name: Optional[str] = None
-    log_stream_prefix: Optional[str] = None
+    region: str | None = None
+    log_group_name: str | None = None
+    log_stream_prefix: str | None = None
     auto_create_group: bool = True
-    additional_tags: Optional[Dict[str, str]] = None
+    additional_tags: dict[str, str] | None = None
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         config = self.model_dump(exclude_none=True)
         if 'auto_create_group' in config:
             config['auto_create_group'] = 'true' if config[
@@ -61,7 +61,7 @@ class CloudwatchLoggingAgent(FluentbitAgent):
     ```
     """
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: dict[str, Any]):
         """Initialize the CloudWatch logging agent.
 
         Args:
@@ -209,7 +209,7 @@ class CloudwatchLoggingAgent(FluentbitAgent):
         return yaml_utils.dump_yaml_str(cfg_dict)
 
     def fluentbit_output_config(
-            self, cluster_name: resources_utils.ClusterName) -> Dict[str, Any]:
+            self, cluster_name: resources_utils.ClusterName) -> dict[str, Any]:
         """Get the Fluent Bit output configuration for CloudWatch.
 
         Args:
@@ -232,7 +232,7 @@ class CloudwatchLoggingAgent(FluentbitAgent):
             auto_create_group=self.config.auto_create_group,
         ).to_dict()
 
-    def get_credential_file_mounts(self) -> Dict[str, str]:
+    def get_credential_file_mounts(self) -> dict[str, str]:
         """Get the credential file mounts for the CloudWatch logging agent.
 
         Returns:

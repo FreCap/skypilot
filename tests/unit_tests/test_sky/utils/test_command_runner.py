@@ -517,7 +517,11 @@ class TestSSHCommandRunnerAuthFailureDetection:
         real_open = open
 
         def mock_open_raise_on_log(path, *args, **kwargs):
-            if path == tmp_path and args and 'r' in args[0]:
+            # Reads use open(path, encoding=...) with the default mode, so
+            # dispatch on "not opened for writing" rather than an explicit
+            # 'r' positional argument.
+            mode = args[0] if args else kwargs.get('mode', 'r')
+            if path == tmp_path and not any(c in mode for c in 'wxa+'):
                 raise IOError('mock read error')
             return real_open(path, *args, **kwargs)
 

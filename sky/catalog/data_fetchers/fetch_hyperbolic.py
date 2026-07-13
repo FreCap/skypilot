@@ -4,7 +4,7 @@ import csv
 import json
 import os
 import sys
-from typing import Any, Dict
+from typing import Any
 
 import requests
 
@@ -29,7 +29,7 @@ def get_api_key(api_key=None) -> str:
     if api_key := os.environ.get('HYPERBOLIC_API_KEY'):
         return api_key
     try:
-        with open(API_KEY_PATH, 'r', encoding='utf-8') as f:
+        with open(API_KEY_PATH, encoding='utf-8') as f:
             return f.read().strip()
     except FileNotFoundError as exc:
         raise HyperbolicCatalogError(
@@ -49,7 +49,7 @@ def get_output_path() -> str:
     return os.path.join(hyperbolic_dir, 'vms.csv')
 
 
-def validate_instance_data(instance: Dict[str, Any]) -> None:
+def validate_instance_data(instance: dict[str, Any]) -> None:
     """Validate instance data has all required fields."""
     missing_fields = [
         field for field in REQUIRED_FIELDS if field not in instance
@@ -107,7 +107,7 @@ def create_catalog(api_key=None) -> None:
                                               ensure_ascii=False).replace(
                                                   '"', "'")  # pylint: disable=invalid-string-quote
                 writer.writerow(entry)
-    except (IOError, OSError) as e:
+    except OSError as e:
         raise HyperbolicCatalogError(
             f'Failed to write catalog file to {output_path}: {e}') from e
 
@@ -126,7 +126,7 @@ def main() -> int:
     except HyperbolicCatalogError as e:
         print(f'Error: {e}', file=sys.stderr)
         return 1
-    except (requests.exceptions.RequestException, json.JSONDecodeError, IOError,
+    except (requests.exceptions.RequestException, json.JSONDecodeError,
             OSError) as e:
         print(f'Unexpected error: {e}', file=sys.stderr)
         return 1

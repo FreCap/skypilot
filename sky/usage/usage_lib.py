@@ -1,5 +1,6 @@
 """Logging events to Grafana Loki."""
 
+from collections.abc import Callable
 import contextlib
 import contextvars
 import datetime
@@ -9,7 +10,7 @@ import os
 import time
 import traceback
 import typing
-from typing import Any, Callable, ClassVar, Dict, List, Optional, Union
+from typing import Any, ClassVar, Optional
 import uuid
 
 from typing_extensions import ParamSpec
@@ -59,8 +60,8 @@ class MessageToReport:
 
     def __init__(self, schema_version: int):
         self.schema_version = schema_version
-        self.start_time: Optional[int] = None
-        self.send_time: Optional[int] = None
+        self.start_time: int | None = None
+        self.send_time: int | None = None
 
     def start(self):
         if self.start_time is None:
@@ -70,7 +71,7 @@ class MessageToReport:
     def message_sent(self):
         return self.send_time is not None or self.start_time is None
 
-    def get_properties(self) -> Dict[str, Any]:
+    def get_properties(self) -> dict[str, Any]:
         properties = self.__dict__.copy()
         return {k: v for k, v in properties.items() if not k.startswith('_')}
 
@@ -88,7 +89,7 @@ class UsageMessageToReport(MessageToReport):
         self.user: str = common_utils.get_user_hash()
         # The client user hash for per-user aggregation. Only set when basic
         # auth is enabled at the API server level.
-        self.client_user_hash: Optional[str] = os.environ.get(
+        self.client_user_hash: str | None = os.environ.get(
             skylet_constants.CLIENT_USER_HASH_ENV_VAR)
         # Read SKYPILOT_USAGE_RUN_ID directly. ``os.environ`` is hijacked
         # to be SkyPilotContext aware, so this read picks up per-context
@@ -103,88 +104,83 @@ class UsageMessageToReport(MessageToReport):
         self.sky_commit: str = sky.__commit__
 
         # Entry
-        self.cmd: Optional[str] = common_utils.get_current_command()
+        self.cmd: str | None = common_utils.get_current_command()
         # The entrypoint on the client side.
-        self.client_entrypoint: Optional[str] = None
+        self.client_entrypoint: str | None = None
         # The entrypoint on the server side, where each request has a entrypoint
         # and a single client_entrypoint can have multiple server-side
         # entrypoints.
-        self.entrypoint: Optional[str] = None  # entrypoint_context
+        self.entrypoint: str | None = None  # entrypoint_context
         #: Whether entrypoint is called by sky internal code.
         self.internal: bool = False  # set_internal
 
         # Basic info for the clusters.
         #: Clusters operated by the command.
-        self.cluster_names: Optional[List[str]] = None  # update_cluster_name
+        self.cluster_names: list[str] | None = None  # update_cluster_name
         #: Number of clusters in the cluster_names list.
-        self.num_related_clusters: Optional[int] = None  # update_cluster_name
+        self.num_related_clusters: int | None = None  # update_cluster_name
         #: The final cloud of the cluster.
-        self.cloud: Optional[str] = None  # update_cluster_resources
+        self.cloud: str | None = None  # update_cluster_resources
         #: The final region of the cluster.
-        self.region: Optional[str] = None  # update_cluster_resources
+        self.region: str | None = None  # update_cluster_resources
         #: The final zone of the cluster.
-        self.zone: Optional[str] = None  # update_cluster_resources
+        self.zone: str | None = None  # update_cluster_resources
         #: The final instance_type of the cluster.
-        self.instance_type: Optional[str] = None  # update_cluster_resources
+        self.instance_type: str | None = None  # update_cluster_resources
         #: The final accelerators the cluster.
-        self.accelerators: Optional[str] = None  # update_cluster_resources
+        self.accelerators: str | None = None  # update_cluster_resources
         #: Number of accelerators per node.
-        self.num_accelerators: Optional[int] = None  # update_cluster_resources
+        self.num_accelerators: int | None = None  # update_cluster_resources
         #: Use spot
-        self.use_spot: Optional[bool] = None  # update_cluster_resources
+        self.use_spot: bool | None = None  # update_cluster_resources
         #: Resources of the cluster.
-        self.resources: Optional[Dict[str,
-                                      Any]] = None  # update_cluster_resources
+        self.resources: dict[str, Any] | None = None  # update_cluster_resources
         #: Resources of the local cluster.
-        self.local_resources: Optional[List[Dict[
-            str, Any]]] = None  # update_local_cluster_resources
+        self.local_resources: list[dict[
+            str, Any]] | None = None  # update_local_cluster_resources
         #: The number of nodes in the cluster.
-        self.num_nodes: Optional[int] = None  # update_cluster_resources
+        self.num_nodes: int | None = None  # update_cluster_resources
         #: The status of the cluster.
-        self.original_cluster_status: Optional[
-            str] = None  # update_cluster_status
-        self._original_cluster_status_specified: Optional[
-            bool] = False  # update_cluster_status
-        self.final_cluster_status: Optional[
-            str] = None  # update_final_cluster_status
+        self.original_cluster_status: str | None = None  # update_cluster_status
+        self._original_cluster_status_specified: bool | None = False  # update_cluster_status
+        self.final_cluster_status: str | None = None  # update_final_cluster_status
         #: Whether the cluster is newly launched.
         self.is_new_cluster: bool = False  # set_new_cluster
 
-        self.task_id: Optional[int] = None  # update_task_id
+        self.task_id: int | None = None  # update_task_id
         # Task requested
         #: The number of nodes requested by the task.
         #: Requested cloud
-        self.task_cloud: Optional[str] = None  # update_actual_task
+        self.task_cloud: str | None = None  # update_actual_task
         #: Requested region
-        self.task_region: Optional[str] = None  # update_actual_task
+        self.task_region: str | None = None  # update_actual_task
         #: Requested zone
-        self.task_zone: Optional[str] = None  # update_actual_task
+        self.task_zone: str | None = None  # update_actual_task
         #: Requested instance_type
-        self.task_instance_type: Optional[str] = None  # update_actual_task
+        self.task_instance_type: str | None = None  # update_actual_task
         #: Requested accelerators
-        self.task_accelerators: Optional[str] = None  # update_actual_task
+        self.task_accelerators: str | None = None  # update_actual_task
         #: Requested number of accelerators per node
-        self.task_num_accelerators: Optional[int] = None  # update_actual_task
+        self.task_num_accelerators: int | None = None  # update_actual_task
         #: Requested use_spot
-        self.task_use_spot: Optional[bool] = None  # update_actual_task
+        self.task_use_spot: bool | None = None  # update_actual_task
         #: Requested resources
-        self.task_resources: Optional[Dict[str,
-                                           Any]] = None  # update_actual_task
+        self.task_resources: dict[str, Any] | None = None  # update_actual_task
         #: Requested number of nodes
-        self.task_num_nodes: Optional[int] = None  # update_actual_task
+        self.task_num_nodes: int | None = None  # update_actual_task
         # YAMLs converted to JSON.
         # TODO: include the skypilot config used in task yaml.
-        self.user_task_yaml: Optional[List[Dict[
-            str, Any]]] = None  # update_user_task_yaml
-        self.actual_task: Optional[List[Dict[str,
-                                             Any]]] = None  # update_actual_task
-        self.ray_yamls: Optional[List[Dict[str, Any]]] = None
+        self.user_task_yaml: list[dict[
+            str, Any]] | None = None  # update_user_task_yaml
+        self.actual_task: list[dict[str,
+                                    Any]] | None = None  # update_actual_task
+        self.ray_yamls: list[dict[str, Any]] | None = None
         #: Number of Ray YAML files.
-        self.num_tried_regions: Optional[int] = None  # update_ray_yaml
-        self.runtimes: Dict[str, float] = {}  # update_runtime
-        self.exception: Optional[str] = None  # entrypoint_context
-        self.stacktrace: Optional[str] = None  # entrypoint_context
-        self.skypilot_config: Optional[Dict[str, Any]] = None
+        self.num_tried_regions: int | None = None  # update_ray_yaml
+        self.runtimes: dict[str, float] = {}  # update_runtime
+        self.exception: str | None = None  # entrypoint_context
+        self.stacktrace: str | None = None  # entrypoint_context
+        self.skypilot_config: dict[str, Any] | None = None
 
         # Whether API server is deployed remotely.
         self.using_remote_api_server: bool = (
@@ -200,7 +196,7 @@ class UsageMessageToReport(MessageToReport):
     def set_internal(self):
         self.internal = True
 
-    def update_user_task_yaml(self, yaml_config_or_path: Union[Dict, str]):
+    def update_user_task_yaml(self, yaml_config_or_path: dict | str):
         self.user_task_yaml = prepare_json_from_yaml_config(yaml_config_or_path)
 
     def update_actual_task(self, task: 'task_lib.Task'):
@@ -236,7 +232,7 @@ class UsageMessageToReport(MessageToReport):
     def update_task_id(self, task_id: int):
         self.task_id = task_id
 
-    def update_ray_yaml(self, yaml_config_or_path: Union[Dict, str]):
+    def update_ray_yaml(self, yaml_config_or_path: dict | str):
         if self.ray_yamls is None:
             self.ray_yamls = []
         if self.num_tried_regions is None:
@@ -245,7 +241,7 @@ class UsageMessageToReport(MessageToReport):
         self.ray_yamls = prepare_json_from_yaml_config(yaml_config_or_path)
         self.num_tried_regions += 1
 
-    def update_cluster_name(self, cluster_name: Union[List[str], str]):
+    def update_cluster_name(self, cluster_name: list[str] | str):
         if isinstance(cluster_name, str):
             self.cluster_names = [cluster_name]
         else:
@@ -277,7 +273,7 @@ class UsageMessageToReport(MessageToReport):
         self.resources = resources.to_yaml_config()
 
     def update_local_cluster_resources(
-            self, local_resources: List['resources_lib.Resources']):
+            self, local_resources: list['resources_lib.Resources']):
         self.local_resources = [r.to_yaml_config() for r in local_resources]
 
     def update_cluster_status(
@@ -319,17 +315,17 @@ class HeartbeatMessageToReport(MessageToReport):
         # Optional cluster placement, accelerator, and provenance context.
         # Populated by ``send_heartbeat`` callers that have this info; left
         # as ``None`` otherwise.
-        self.cloud: Optional[str] = None
-        self.region: Optional[str] = None
-        self.zone: Optional[str] = None
-        self.gpu_type: Optional[str] = None
-        self.num_nodes: Optional[int] = None
-        self.gpus_per_node: Optional[int] = None
-        self.user: Optional[str] = None
-        self.use_spot: Optional[bool] = None
-        self.instance_type: Optional[str] = None
+        self.cloud: str | None = None
+        self.region: str | None = None
+        self.zone: str | None = None
+        self.gpu_type: str | None = None
+        self.num_nodes: int | None = None
+        self.gpus_per_node: int | None = None
+        self.user: str | None = None
+        self.use_spot: bool | None = None
+        self.instance_type: str | None = None
 
-    def get_properties(self) -> Dict[str, Any]:
+    def get_properties(self) -> dict[str, Any]:
         properties = super().get_properties()
         # Prefer the run id from the env var if set (e.g. from a request
         # context in the API server, where contextvars-based isolation
@@ -338,7 +334,6 @@ class HeartbeatMessageToReport(MessageToReport):
         run_id = os.environ.get(constants.USAGE_RUN_ID_ENV_VAR)
         if not run_id:
             with open(os.path.expanduser(constants.USAGE_RUN_ID_FILE),
-                      'r',
                       encoding='utf-8') as f:
                 run_id = f.read().strip()
         properties['run_id'] = run_id
@@ -365,22 +360,22 @@ class ServerHeartbeatMessage(MessageToReport):
         plugins: Dict[str, Any] — per-plugin data from registered providers
     """
 
-    _data_providers: ClassVar[Dict[str, Callable[[], Dict[str, Any]]]] = {}
+    _data_providers: ClassVar[dict[str, Callable[[], dict[str, Any]]]] = {}
 
     def __init__(self, interval_seconds: int = 600):
         super().__init__(constants.USAGE_MESSAGE_SCHEMA_VERSION)
         import socket  # pylint: disable=import-outside-toplevel
         self.interval_seconds = interval_seconds
         self.hostname: str = socket.gethostname()
-        self.release_name: Optional[str] = (os.getenv('SKYPILOT_RELEASE_NAME')
-                                            or os.getenv('HELM_RELEASE_NAME'))
+        self.release_name: str | None = (os.getenv('SKYPILOT_RELEASE_NAME') or
+                                         os.getenv('HELM_RELEASE_NAME'))
         self.server_hash: str = common_utils.get_user_hash()
         self.sky_version: str = sky.__version__
-        self.ingress_host: Optional[str] = os.getenv('SKYPILOT_INGRESS_HOST')
+        self.ingress_host: str | None = os.getenv('SKYPILOT_INGRESS_HOST')
 
     @classmethod
     def register_provider(cls, name: str,
-                          provider: Callable[[], Dict[str, Any]]) -> None:
+                          provider: Callable[[], dict[str, Any]]) -> None:
         """Register a plugin data provider. Called during plugin install()."""
         cls._data_providers[name] = provider
 
@@ -388,7 +383,7 @@ class ServerHeartbeatMessage(MessageToReport):
     def has_providers(cls) -> bool:
         return len(cls._data_providers) > 0
 
-    def get_properties(self) -> Dict[str, Any]:
+    def get_properties(self) -> dict[str, Any]:
         properties = super().get_properties()
         plugins_data = {}
         for name, provider in self._data_providers.items():
@@ -404,12 +399,12 @@ class MessageCollection:
     """A collection of messages."""
 
     def __init__(self):
-        self._factories: Dict[MessageType, type] = {
+        self._factories: dict[MessageType, type] = {
             MessageType.USAGE: UsageMessageToReport,
             MessageType.HEARTBEAT: HeartbeatMessageToReport,
             MessageType.SERVER_HEARTBEAT: ServerHeartbeatMessage,
         }
-        self._messages: Dict[MessageType, MessageToReport] = {
+        self._messages: dict[MessageType, MessageToReport] = {
             mt: factory() for mt, factory in self._factories.items()
         }
 
@@ -459,8 +454,9 @@ class MessageCollection:
 # @contextual_async coroutines, each running inside its own copied
 # Context) get independent instances. Synchronous callers in the same
 # Context (e.g. plain CLI use) continue to share one collection.
-_messages_var: contextvars.ContextVar[Optional[MessageCollection]] = (
-    contextvars.ContextVar('usage_messages', default=None))
+_messages_var: contextvars.ContextVar[MessageCollection |
+                                      None] = (contextvars.ContextVar(
+                                          'usage_messages', default=None))
 
 
 def _get_messages() -> MessageCollection:
@@ -594,7 +590,7 @@ def _send_to_loki(message_type: MessageType):
     messages.reset(message_type)
 
 
-def _clean_yaml(yaml_info: Dict[str, Optional[str]]):
+def _clean_yaml(yaml_info: dict[str, str | None]):
     """Remove sensitive information from user YAML."""
     cleaned_yaml_info = yaml_info.copy()
     for redact_type in constants.USAGE_MESSAGE_REDACT_KEYS:
@@ -630,13 +626,13 @@ def _clean_yaml(yaml_info: Dict[str, Optional[str]]):
 
 
 def prepare_json_from_yaml_config(
-        yaml_config_or_path: Union[Dict, str]) -> List[Dict[str, Any]]:
+        yaml_config_or_path: dict | str) -> list[dict[str, Any]]:
     """Upload safe contents of YAML file to Loki."""
     if isinstance(yaml_config_or_path, dict):
         yaml_info = [yaml_config_or_path]
         comment_lines = []
     else:
-        with open(yaml_config_or_path, 'r', encoding='utf-8') as f:
+        with open(yaml_config_or_path, encoding='utf-8') as f:
             lines = f.readlines()
             comment_lines = [line for line in lines if line.startswith('#')]
         yaml_info = yaml_utils.read_yaml_all(yaml_config_or_path)
@@ -663,7 +659,7 @@ def _send_local_messages():
                              f'exception caught: {type(e)}({e})')
 
 
-def store_exception(e: Union[Exception, SystemExit, KeyboardInterrupt]) -> None:
+def store_exception(e: Exception | SystemExit | KeyboardInterrupt) -> None:
     with ux_utils.enable_traceback():
         if hasattr(e, 'stacktrace') and e.stacktrace is not None:
             messages.usage.stacktrace = e.stacktrace
@@ -678,15 +674,15 @@ def store_exception(e: Union[Exception, SystemExit, KeyboardInterrupt]) -> None:
 
 def send_heartbeat(
     interval_seconds: int = 600,
-    cloud: Optional[str] = None,
-    region: Optional[str] = None,
-    zone: Optional[str] = None,
-    gpu_type: Optional[str] = None,
-    num_nodes: Optional[int] = None,
-    gpus_per_node: Optional[int] = None,
-    user: Optional[str] = None,
-    use_spot: Optional[bool] = None,
-    instance_type: Optional[str] = None,
+    cloud: str | None = None,
+    region: str | None = None,
+    zone: str | None = None,
+    gpu_type: str | None = None,
+    num_nodes: int | None = None,
+    gpus_per_node: int | None = None,
+    user: str | None = None,
+    use_spot: bool | None = None,
+    instance_type: str | None = None,
 ):
     """Send one heartbeat record.
 
@@ -798,9 +794,9 @@ def entrypoint(name_or_fn: Callable[P, T],
 
 
 def entrypoint(
-    name_or_fn: Union[str, Callable[P, T]],
+    name_or_fn: str | Callable[P, T],
     fallback: bool = False
-) -> Union[Callable[P, T], Callable[[Callable[P, T]], Callable[P, T]]]:
+) -> Callable[P, T] | Callable[[Callable[P, T]], Callable[P, T]]:
     return common_utils.make_decorator(entrypoint_context,
                                        name_or_fn,
                                        fallback=fallback)
@@ -810,7 +806,7 @@ def entrypoint(
 
 
 def record_cluster_name_for_current_operation(
-        cluster_name: Union[List[str], str]) -> None:
+        cluster_name: list[str] | str) -> None:
     """Records cluster name(s) for the current operation.
 
     Usage:

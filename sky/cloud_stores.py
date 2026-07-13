@@ -250,8 +250,8 @@ class AzureBlobCloudStorage(CloudStorage):
         # 2. If it fails due to permission issues, try to assign a permissive
         # role for the storage account to the current Azure account
         # 3. Wait for the role assignment to propagate and retry.
-        while (time.time() - role_assignment_start <
-               constants.WAIT_FOR_STORAGE_ACCOUNT_ROLE_ASSIGNMENT):
+        while (time.time() - role_assignment_start
+               < constants.WAIT_FOR_STORAGE_ACCOUNT_ROLE_ASSIGNMENT):
             container_client = data_utils.create_az_client(
                 client_type='container',
                 container_url=container_url,

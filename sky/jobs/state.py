@@ -3,13 +3,14 @@
 # that we can easily switch to a s3-based storage.
 import asyncio
 import collections
+from collections.abc import Awaitable
+from collections.abc import Callable
 import datetime
 import enum
 import json
 import time
 import typing
-from typing import (Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple,
-                    Union)
+from typing import Any, Optional
 
 import colorama
 import sqlalchemy
@@ -43,7 +44,7 @@ else:
 # Separate callback types for sync and async contexts
 SyncCallbackType = Callable[[str], None]
 AsyncCallbackType = Callable[[str], Awaitable[Any]]
-CallbackType = Union[SyncCallbackType, AsyncCallbackType]
+CallbackType = SyncCallbackType | AsyncCallbackType
 
 logger = sky_logging.init_logger(__name__)
 
@@ -451,7 +452,7 @@ async def _retry_schedule_state_update(
 # e.g., via sky jobs queue. These may not correspond to actual
 # column names in the DB and it corresponds to the combined view
 # by joining the spot and job_info tables.
-def _get_jobs_dict(r: 'row.RowMapping') -> Dict[str, Any]:
+def _get_jobs_dict(r: 'row.RowMapping') -> dict[str, Any]:
     # WARNING: If you update these you may also need to update GetJobTable in
     # the skylet ManagedJobsServiceImpl.
     return {
@@ -616,7 +617,7 @@ class ManagedJobStatus(enum.Enum):
         return status_list.index(self) < status_list.index(other)
 
     @classmethod
-    def terminal_statuses(cls) -> List['ManagedJobStatus']:
+    def terminal_statuses(cls) -> list['ManagedJobStatus']:
         return [
             cls.SUCCEEDED,
             cls.FAILED,
@@ -628,14 +629,14 @@ class ManagedJobStatus(enum.Enum):
         ]
 
     @classmethod
-    def failure_statuses(cls) -> List['ManagedJobStatus']:
+    def failure_statuses(cls) -> list['ManagedJobStatus']:
         return [
             cls.FAILED, cls.FAILED_SETUP, cls.FAILED_PRECHECKS,
             cls.FAILED_NO_RESOURCE, cls.FAILED_CONTROLLER
         ]
 
     @classmethod
-    def processing_statuses(cls) -> List['ManagedJobStatus']:
+    def processing_statuses(cls) -> list['ManagedJobStatus']:
         # Any status that is not terminal and is not CANCELLING.
         return [
             cls.PENDING,
@@ -873,16 +874,15 @@ ControllerPidRecord = collections.namedtuple('ControllerPidRecord', [
 
 
 # === Status transition functions ===
-def set_job_info_without_job_id(
-        name: str,
-        workspace: str,
-        entrypoint: str,
-        pool: Optional[str],
-        pool_hash: Optional[str],
-        user_hash: Optional[str],
-        execution: Optional[str] = None,
-        is_batch: bool = False,
-        file_mounts_blob_id: Optional[str] = None) -> int:
+def set_job_info_without_job_id(name: str,
+                                workspace: str,
+                                entrypoint: str,
+                                pool: str | None,
+                                pool_hash: str | None,
+                                user_hash: str | None,
+                                execution: str | None = None,
+                                is_batch: bool = False,
+                                file_mounts_blob_id: str | None = None) -> int:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
@@ -928,7 +928,7 @@ def set_pending(
     task_name: str,
     resources_str: str,
     metadata: str,
-    is_primary_in_job_group: Optional[bool] = None,
+    is_primary_in_job_group: bool | None = None,
 ):
     """Set the task to pending state."""
     add_job_event(job_id, task_id, ManagedJobStatus.PENDING,
@@ -1020,11 +1020,11 @@ async def set_restarting_async(job_id: int, task_id: int, recovering: bool):
 
 def set_failed(
     job_id: int,
-    task_id: Optional[int],
+    task_id: int | None,
     failure_type: ManagedJobStatus,
     failure_reason: str,
-    callback_func: Optional[CallbackType] = None,
-    end_time: Optional[float] = None,
+    callback_func: CallbackType | None = None,
+    end_time: float | None = None,
     override_terminal: bool = False,
 ):
     """Set an entire job or task to failed.
@@ -1046,7 +1046,7 @@ def set_failed(
     assert failure_type.is_failed(), failure_type
     end_time = time.time() if end_time is None else end_time
 
-    fields_to_set: Dict[str, Any] = {
+    fields_to_set: dict[str, Any] = {
         spot_table.c.status: failure_type.value,
         spot_table.c.failure_reason: failure_reason,
     }
@@ -1140,8 +1140,7 @@ def set_pending_cancelled(job_id: int):
 
 
 @db_retries.retry
-def set_local_log_file(job_id: int, task_id: Optional[int],
-                       local_log_file: str):
+def set_local_log_file(job_id: int, task_id: int | None, local_log_file: str):
     """Set the local log file for a job."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
@@ -1155,9 +1154,9 @@ def set_local_log_file(job_id: int, task_id: Optional[int],
 
 
 # ======== utility functions ========
-def get_nonterminal_job_ids_by_name(name: Optional[str],
-                                    user_hash: Optional[str] = None,
-                                    all_users: bool = False) -> List[int]:
+def get_nonterminal_job_ids_by_name(name: str | None,
+                                    user_hash: str | None = None,
+                                    all_users: bool = False) -> list[int]:
     """Get non-terminal job ids by name.
 
     If name is None:
@@ -1205,7 +1204,7 @@ def get_nonterminal_job_ids_by_name(name: Optional[str],
         return job_ids
 
 
-def get_jobs_to_check_status(job_id: Optional[int] = None) -> List[int]:
+def get_jobs_to_check_status(job_id: int | None = None) -> list[int]:
     """Get jobs that need controller process checking.
 
     Args:
@@ -1232,7 +1231,7 @@ def get_jobs_to_check_status(job_id: Optional[int] = None) -> List[int]:
 
 
 def _get_all_task_ids_statuses(
-        job_id: int) -> List[Tuple[int, ManagedJobStatus]]:
+        job_id: int) -> list[tuple[int, ManagedJobStatus]]:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         id_statuses = session.execute(
@@ -1245,8 +1244,8 @@ def _get_all_task_ids_statuses(
 
 
 def get_all_task_ids_names_statuses_logs(
-    job_id: int
-) -> List[Tuple[int, str, ManagedJobStatus, str, Optional[float]]]:
+        job_id: int
+) -> list[tuple[int, str, ManagedJobStatus, str, float | None]]:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         id_names = session.execute(
@@ -1267,8 +1266,8 @@ def get_num_tasks(job_id: int) -> int:
 
 
 def get_latest_task_id_from_statuses(
-    id_statuses: List[Tuple[int, ManagedJobStatus]]
-) -> Tuple[Optional[int], Optional[ManagedJobStatus]]:
+    id_statuses: list[tuple[int, ManagedJobStatus]]
+) -> tuple[int | None, ManagedJobStatus | None]:
     """Returns the (task_id, status) of the latest non-terminal task.
 
     If all tasks are terminal, returns the last task. If the list is empty,
@@ -1284,7 +1283,7 @@ def get_latest_task_id_from_statuses(
 
 
 def get_latest_task_id_status(
-        job_id: int) -> Tuple[Optional[int], Optional[ManagedJobStatus]]:
+        job_id: int) -> tuple[int | None, ManagedJobStatus | None]:
     """Returns the (task id, status) of the latest task of a job.
 
     The latest means the task that is currently being executed or to be started
@@ -1298,7 +1297,7 @@ def get_latest_task_id_status(
     return get_latest_task_id_from_statuses(id_statuses)
 
 
-def get_job_controller_process(job_id: int) -> Optional[ControllerPidRecord]:
+def get_job_controller_process(job_id: int) -> ControllerPidRecord | None:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         row = session.execute(
@@ -1351,12 +1350,12 @@ def is_legacy_controller_process(job_id: int) -> bool:
         return True
 
 
-def get_status(job_id: int) -> Optional[ManagedJobStatus]:
+def get_status(job_id: int) -> ManagedJobStatus | None:
     _, status = get_latest_task_id_status(job_id)
     return status
 
 
-def get_failure_reason(job_id: int) -> Optional[str]:
+def get_failure_reason(job_id: int) -> str | None:
     """Get the failure reason of a job.
 
     If the job has multiple tasks, we return the first failure reason.
@@ -1373,7 +1372,7 @@ def get_failure_reason(job_id: int) -> Optional[str]:
         return reason[0]
 
 
-def get_managed_job_tasks(job_id: int) -> List[Dict[str, Any]]:
+def get_managed_job_tasks(job_id: int) -> list[dict[str, Any]]:
     """Get managed job tasks for a specific managed job id from the database."""
     engine = _db_manager.get_engine()
 
@@ -1420,9 +1419,9 @@ def get_managed_job_tasks(job_id: int) -> List[Dict[str, Any]]:
             yaml_path = job_dict.get('original_user_yaml_path')
             if yaml_path:
                 try:
-                    with open(yaml_path, 'r', encoding='utf-8') as f:
+                    with open(yaml_path, encoding='utf-8') as f:
                         job_dict['user_yaml'] = f.read()
-                except (FileNotFoundError, IOError, OSError) as e:
+                except (FileNotFoundError, OSError) as e:
                     logger.debug('Failed to read original user YAML for job '
                                  f'{job_id} from {yaml_path}: {e}')
 
@@ -1436,7 +1435,7 @@ def get_managed_job_tasks(job_id: int) -> List[Dict[str, Any]]:
 _STATUS_CHECK_JOB_ID_CHUNK = 500
 
 
-def _get_jobs_to_check_status_condition(job_id: Optional[int] = None):
+def _get_jobs_to_check_status_condition(job_id: int | None = None):
     """Build the filter for jobs that need controller-process checking."""
     terminal_status_values = [
         status.value for status in ManagedJobStatus.terminal_statuses()
@@ -1464,8 +1463,8 @@ def _get_jobs_to_check_status_condition(job_id: Optional[int] = None):
     return where_condition
 
 
-def _merge_jobs_status_check_rows(result: Dict[int, Dict[str, Any]],
-                                  rows: List[Any]) -> None:
+def _merge_jobs_status_check_rows(result: dict[int, dict[str, Any]],
+                                  rows: list[Any]) -> None:
     """Decode slim status-check rows into the per-job refresh snapshot."""
     for row in rows:
         mapping = row._mapping  # pylint: disable=protected-access
@@ -1496,7 +1495,7 @@ def _merge_jobs_status_check_rows(result: Dict[int, Dict[str, Any]],
 
 
 def get_jobs_to_check_status_info(
-        job_id: Optional[int] = None) -> Dict[int, Dict[str, Any]]:
+        job_id: int | None = None) -> dict[int, dict[str, Any]]:
     """One-query slim snapshot for jobs needing controller-process checking.
 
     The status-refresh sweep needs two things from the same tables:
@@ -1535,12 +1534,12 @@ def get_jobs_to_check_status_info(
                     spot_table.c.spot_job_id.desc(), spot_table.c.task_id.asc())
     with orm.Session(engine) as session:
         rows = session.execute(query).fetchall()
-    result: Dict[int, Dict[str, Any]] = {}
+    result: dict[int, dict[str, Any]] = {}
     _merge_jobs_status_check_rows(result, rows)
     return result
 
 
-def get_jobs_status_check_info(job_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+def get_jobs_status_check_info(job_ids: list[int]) -> dict[int, dict[str, Any]]:
     """Batched, slim fetch of the fields the status-refresh tick needs.
 
     ``update_managed_jobs_statuses`` only consumes a handful of small scalar
@@ -1566,7 +1565,7 @@ def get_jobs_status_check_info(job_ids: List[int]) -> Dict[int, Dict[str, Any]]:
     if not job_ids:
         return {}
     engine = _db_manager.get_engine()
-    result: Dict[int, Dict[str, Any]] = {}
+    result: dict[int, dict[str, Any]] = {}
     for start in range(0, len(job_ids), _STATUS_CHECK_JOB_ID_CHUNK):
         chunk = job_ids[start:start + _STATUS_CHECK_JOB_ID_CHUNK]
         query = sqlalchemy.select(
@@ -1592,7 +1591,7 @@ def get_jobs_status_check_info(job_ids: List[int]) -> Dict[int, Dict[str, Any]]:
     return result
 
 
-def get_job_status_check_state(job_id: int) -> Optional[Dict[str, Any]]:
+def get_job_status_check_state(job_id: int) -> dict[str, Any] | None:
     """Fetch the minimal fresh job/task state for a destructive recheck.
 
     ``update_managed_jobs_statuses`` reuses its sweep-wide task snapshot for
@@ -1658,8 +1657,8 @@ def has_jobs_requiring_recovery_grace_wait() -> bool:
     query = sqlalchemy.select(sqlalchemy.literal(True)).where(
         sqlalchemy.and_(
             job_info_table.c.schedule_state.is_not(None),
-            job_info_table.c.schedule_state !=
-            ManagedJobScheduleState.DONE.value,
+            job_info_table.c.schedule_state
+            != ManagedJobScheduleState.DONE.value,
             sqlalchemy.or_(
                 job_info_table.c.controller_pid.is_not(None),
                 sqlalchemy.not_(
@@ -1712,7 +1711,7 @@ def get_managed_jobs_total() -> int:
         return result[0] if result else 0
 
 
-def get_active_file_mounts_blob_ids() -> Set[str]:
+def get_active_file_mounts_blob_ids() -> set[str]:
     """Return blob ids referenced by jobs still in a non-terminal state.
 
     Used by the API server's blob GC so that a blob is not reclaimed while
@@ -1762,16 +1761,16 @@ def get_managed_jobs_highest_priority() -> int:
 
 
 def build_managed_jobs_with_filters_no_status_query(
-    fields: Optional[List[str]] = None,
-    job_ids: Optional[List[int]] = None,
-    accessible_workspaces: Optional[List[str]] = None,
-    workspace_match: Optional[str] = None,
-    name_match: Optional[str] = None,
-    pool_match: Optional[str] = None,
-    user_hashes: Optional[List[Optional[str]]] = None,
+    fields: list[str] | None = None,
+    job_ids: list[int] | None = None,
+    accessible_workspaces: list[str] | None = None,
+    workspace_match: str | None = None,
+    name_match: str | None = None,
+    pool_match: str | None = None,
+    user_hashes: list[str | None] | None = None,
     skip_finished: bool = False,
-    submitted_after: Optional[float] = None,
-    submitted_before: Optional[float] = None,
+    submitted_after: float | None = None,
+    submitted_before: float | None = None,
     count_only: bool = False,
     count_unique_jobs: bool = False,
     status_count: bool = False,
@@ -1885,17 +1884,17 @@ def build_managed_jobs_with_filters_no_status_query(
 
 
 def build_managed_jobs_with_filters_query(
-    fields: Optional[List[str]] = None,
-    job_ids: Optional[List[int]] = None,
-    accessible_workspaces: Optional[List[str]] = None,
-    workspace_match: Optional[str] = None,
-    name_match: Optional[str] = None,
-    pool_match: Optional[str] = None,
-    user_hashes: Optional[List[Optional[str]]] = None,
-    statuses: Optional[List[str]] = None,
+    fields: list[str] | None = None,
+    job_ids: list[int] | None = None,
+    accessible_workspaces: list[str] | None = None,
+    workspace_match: str | None = None,
+    name_match: str | None = None,
+    pool_match: str | None = None,
+    user_hashes: list[str | None] | None = None,
+    statuses: list[str] | None = None,
     skip_finished: bool = False,
-    submitted_after: Optional[float] = None,
-    submitted_before: Optional[float] = None,
+    submitted_after: float | None = None,
+    submitted_before: float | None = None,
     count_only: bool = False,
     count_unique_jobs: bool = False,
     status_expr: Optional['sqlalchemy.ColumnElement'] = None,
@@ -1929,18 +1928,18 @@ def build_managed_jobs_with_filters_query(
 
 
 def get_status_count_with_filters(
-    fields: Optional[List[str]] = None,
-    job_ids: Optional[List[int]] = None,
-    accessible_workspaces: Optional[List[str]] = None,
-    workspace_match: Optional[str] = None,
-    name_match: Optional[str] = None,
-    pool_match: Optional[str] = None,
-    user_hashes: Optional[List[Optional[str]]] = None,
+    fields: list[str] | None = None,
+    job_ids: list[int] | None = None,
+    accessible_workspaces: list[str] | None = None,
+    workspace_match: str | None = None,
+    name_match: str | None = None,
+    pool_match: str | None = None,
+    user_hashes: list[str | None] | None = None,
     skip_finished: bool = False,
-    submitted_after: Optional[float] = None,
-    submitted_before: Optional[float] = None,
+    submitted_after: float | None = None,
+    submitted_before: float | None = None,
     status_expr: Optional['sqlalchemy.ColumnElement'] = None,
-) -> Dict[str, int]:
+) -> dict[str, int]:
     """Get the status count of the managed jobs with filters.
 
     status_expr, when provided, replaces the raw ``spot.status`` column as the
@@ -1963,7 +1962,7 @@ def get_status_count_with_filters(
     status_col = (status_expr
                   if status_expr is not None else spot_table.c.status)
     query = query.group_by(status_col)
-    results: Dict[str, int] = {}
+    results: dict[str, int] = {}
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         rows = session.execute(query).fetchall()
@@ -1973,7 +1972,7 @@ def get_status_count_with_filters(
     return results
 
 
-def get_status_counts() -> Dict[str, int]:
+def get_status_counts() -> dict[str, int]:
     """Get count of tasks grouped by ManagedJobStatus.
 
     This is used by the Prometheus ManagedJobsCollector.
@@ -1986,14 +1985,14 @@ def get_status_counts() -> Dict[str, int]:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         rows = session.execute(query).fetchall()
-    results: Dict[str, int] = {}
+    results: dict[str, int] = {}
     for status_value, count in rows:
         results[str(status_value)] = int(count)
     return results
 
 
 def get_status_counts_by_workspace_user_cloud(
-) -> List[Tuple[Optional[str], Optional[str], Optional[str], str, int]]:
+) -> list[tuple[str | None, str | None, str | None, str, int]]:
     """Return task counts grouped by workspace/user/cloud/status.
 
     Each tuple is (workspace, user_hash, cloud, status, count). NULL values
@@ -2034,23 +2033,23 @@ def get_status_counts_by_workspace_user_cloud(
 
 
 def get_managed_jobs_with_filters(
-    fields: Optional[List[str]] = None,
-    job_ids: Optional[List[int]] = None,
-    accessible_workspaces: Optional[List[str]] = None,
-    workspace_match: Optional[str] = None,
-    name_match: Optional[str] = None,
-    pool_match: Optional[str] = None,
-    user_hashes: Optional[List[Optional[str]]] = None,
-    statuses: Optional[List[str]] = None,
+    fields: list[str] | None = None,
+    job_ids: list[int] | None = None,
+    accessible_workspaces: list[str] | None = None,
+    workspace_match: str | None = None,
+    name_match: str | None = None,
+    pool_match: str | None = None,
+    user_hashes: list[str | None] | None = None,
+    statuses: list[str] | None = None,
     skip_finished: bool = False,
-    submitted_after: Optional[float] = None,
-    submitted_before: Optional[float] = None,
-    page: Optional[int] = None,
-    limit: Optional[int] = None,
-    sort_by: Optional[str] = None,
-    sort_order: Optional[str] = None,
+    submitted_after: float | None = None,
+    submitted_before: float | None = None,
+    page: int | None = None,
+    limit: int | None = None,
+    sort_by: str | None = None,
+    sort_order: str | None = None,
     status_expr: Optional['sqlalchemy.ColumnElement'] = None,
-) -> Tuple[List[Dict[str, Any]], int]:
+) -> tuple[list[dict[str, Any]], int]:
     """Get managed jobs from the database with filters.
 
     status_expr, when provided, is used to match the ``statuses`` filter
@@ -2234,9 +2233,9 @@ def get_managed_jobs_with_filters(
             yaml_path = job_dict.get('original_user_yaml_path')
             if yaml_path:
                 try:
-                    with open(yaml_path, 'r', encoding='utf-8') as f:
+                    with open(yaml_path, encoding='utf-8') as f:
                         job_dict['user_yaml'] = f.read()
-                except (FileNotFoundError, IOError, OSError) as e:
+                except (FileNotFoundError, OSError) as e:
                     job_id = job_dict.get('job_id')
                     if job_id is not None:
                         logger.debug('Failed to read original user YAML for '
@@ -2262,7 +2261,7 @@ def get_task_name(job_id: int, task_id: int) -> str:
         return task_name[0]
 
 
-def get_latest_job_id() -> Optional[int]:
+def get_latest_job_id() -> int | None:
     """Get the latest job id."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
@@ -2273,7 +2272,7 @@ def get_latest_job_id() -> Optional[int]:
         return job_id[0] if job_id else None
 
 
-def get_task_specs(job_id: int, task_id: int) -> Dict[str, Any]:
+def get_task_specs(job_id: int, task_id: int) -> dict[str, Any]:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         task_specs = session.execute(
@@ -2285,13 +2284,13 @@ def get_task_specs(job_id: int, task_id: int) -> Dict[str, Any]:
         return json.loads(task_specs[0])
 
 
-def scheduler_set_waiting(job_ids: List[int],
+def scheduler_set_waiting(job_ids: list[int],
                           dag_yaml_content: str,
                           original_user_yaml_content: str,
                           env_file_content: str,
-                          config_file_content: Optional[str],
+                          config_file_content: str | None,
                           priority: int,
-                          priority_class: Optional[str] = None) -> None:
+                          priority_class: str | None = None) -> None:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         updates = {
@@ -2316,8 +2315,8 @@ def scheduler_set_waiting(job_ids: List[int],
 @db_retries.retry
 def set_job_dag_yaml_content(job_id: int,
                              dag_yaml_content: str,
-                             priority: Optional[int] = None,
-                             priority_class: Optional[str] = None) -> None:
+                             priority: int | None = None,
+                             priority_class: str | None = None) -> None:
     """Overwrite a managed job's persisted DAG YAML (and optional priority).
 
     Lets the persisted job spec be updated out of band after submission. A
@@ -2327,7 +2326,7 @@ def set_job_dag_yaml_content(job_id: int,
     """
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
-        updates: Dict[Any, Any] = {
+        updates: dict[Any, Any] = {
             job_info_table.c.dag_yaml_content: dag_yaml_content,
         }
         if priority is not None:
@@ -2339,7 +2338,7 @@ def set_job_dag_yaml_content(job_id: int,
         session.commit()
 
 
-def get_job_file_contents(job_id: int) -> Dict[str, Optional[str]]:
+def get_job_file_contents(job_id: int) -> dict[str, str | None]:
     """Return file information and stored contents for a managed job."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
@@ -2371,7 +2370,7 @@ def get_job_file_contents(job_id: int) -> Dict[str, Optional[str]]:
 
 
 @db_retries.retry
-def get_pool_from_job_id(job_id: int) -> Optional[str]:
+def get_pool_from_job_id(job_id: int) -> str | None:
     """Get the pool from the job id."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
@@ -2382,7 +2381,7 @@ def get_pool_from_job_id(job_id: int) -> Optional[str]:
 
 
 @db_retries.retry
-def get_execution_from_job_id(job_id: int) -> Optional[str]:
+def get_execution_from_job_id(job_id: int) -> str | None:
     """Get the DAG execution mode ('parallel'/'serial') from the job id.
 
     Returns None when the job is unknown or its row has no recorded execution
@@ -2410,10 +2409,10 @@ def set_current_cluster_name(job_id: int, current_cluster_name: str) -> None:
 
 @db_retries.retry
 def set_job_infra(job_id: int,
-                  cloud: Optional[str] = None,
-                  region: Optional[str] = None,
-                  zone: Optional[str] = None,
-                  current_node_names: Optional[List[str]] = None) -> None:
+                  cloud: str | None = None,
+                  region: str | None = None,
+                  zone: str | None = None,
+                  current_node_names: list[str] | None = None) -> None:
     """Update the infrastructure info for a job.
 
     This is called after a job is launched to record the cloud/region/zone
@@ -2429,7 +2428,7 @@ def set_job_infra(job_id: int,
     """
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
-        update_values: Dict[Any, Any] = {}
+        update_values: dict[Any, Any] = {}
         if cloud is not None:
             update_values[job_info_table.c.cloud] = cloud
         if region is not None:
@@ -2451,7 +2450,7 @@ def set_job_infra(job_id: int,
 
 
 @db_retries.retry
-def save_batch_states(job_id: int, batches: List[List[int]],
+def save_batch_states(job_id: int, batches: list[list[int]],
                       owner_token: str) -> bool:
     """Bulk insert all batch records (atomic).
 
@@ -2491,7 +2490,7 @@ def is_batch_job(job_id: int) -> bool:
 
 
 def _lock_batch_coordinator_row(session: orm.Session,
-                                job_id: int) -> Tuple[bool, Optional[str]]:
+                                job_id: int) -> tuple[bool, str | None]:
     """Lock and return a Batch job's current coordinator token.
 
     PostgreSQL uses a row-level ``FOR UPDATE`` lock.  SQLite ignores that
@@ -2523,7 +2522,7 @@ def _lock_batch_coordinator_owner(session: orm.Session, job_id: int,
 
 
 @db_retries.retry
-def acquire_batch_coordinator(job_id: int, owner_token: str) -> Optional[str]:
+def acquire_batch_coordinator(job_id: int, owner_token: str) -> str | None:
     """Atomically replace and return a Batch job's coordinator owner.
 
     Once this transaction commits, every attempt mutation from the previous
@@ -2567,7 +2566,7 @@ def is_batch_coordinator_owner(job_id: int, owner_token: str) -> bool:
 
 
 @db_retries.retry
-def get_batch_states(job_id: int) -> List[Dict[str, Any]]:
+def get_batch_states(job_id: int) -> list[dict[str, Any]]:
     """Read all batch records ordered by batch_idx.
 
     Returns:
@@ -2614,7 +2613,7 @@ def register_batch_worker_launch(job_id: int, owner_token: str,
 
 def _get_batch_worker_row_for_update(
         session: orm.Session, job_id: int, owner_token: str,
-        worker_cluster: str) -> Optional[sqlalchemy.engine.Row]:
+        worker_cluster: str) -> sqlalchemy.engine.Row | None:
     return session.execute(
         sqlalchemy.select(batch_worker_table).where(
             sqlalchemy.and_(
@@ -2689,7 +2688,7 @@ def record_batch_worker_job_id(job_id: int, owner_token: str,
 
 
 @db_retries.retry
-def get_batch_worker_records(job_id: int) -> List[Dict[str, Any]]:
+def get_batch_worker_records(job_id: int) -> list[dict[str, Any]]:
     """Return every durable worker launch generation for a Batch job."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
@@ -2705,7 +2704,7 @@ def get_batch_worker_records(job_id: int) -> List[Dict[str, Any]]:
 def remove_batch_worker_record(job_id: int,
                                owner_token: str,
                                worker_cluster: str,
-                               worker_job_id: Optional[int] = None) -> bool:
+                               worker_job_id: int | None = None) -> bool:
     """Forget a launch only after its exact external job was cleaned up."""
     predicates = [
         batch_worker_table.c.job_id == job_id,
@@ -2729,7 +2728,7 @@ def claim_batch(job_id: int,
                 owner_token: str,
                 worker_cluster: str,
                 lease_duration: float,
-                now: Optional[float] = None) -> Optional[Tuple[int, int]]:
+                now: float | None = None) -> tuple[int, int] | None:
     """Atomically claim an eligible PENDING batch.
 
     Returns ``(attempt_id, retry_count)`` from the claimed row, or ``None`` if
@@ -2794,7 +2793,7 @@ def renew_batch_lease(job_id: int,
                       attempt_id: int,
                       owner_token: str,
                       lease_duration: float,
-                      now: Optional[float] = None) -> bool:
+                      now: float | None = None) -> bool:
     """Extend a lease only for the current coordinator-owned attempt."""
     if not owner_token:
         raise ValueError('owner_token must be non-empty')
@@ -2828,9 +2827,9 @@ def set_batch_attempt_status(job_id: int,
                              attempt_id: int,
                              owner_token: str,
                              status: str,
-                             retry_count: Optional[int] = None,
-                             next_retry_at: Optional[float] = None,
-                             now: Optional[float] = None) -> bool:
+                             retry_count: int | None = None,
+                             next_retry_at: float | None = None,
+                             now: float | None = None) -> bool:
     """Transition the currently leased attempt using an attempt-token CAS.
 
     Stale controllers get ``False`` instead of overwriting a newer attempt.
@@ -2845,7 +2844,7 @@ def set_batch_attempt_status(job_id: int,
     if now is None:
         now = time.time()
 
-    values: Dict[str, Any] = {
+    values: dict[str, Any] = {
         'status': status,
         'worker_cluster': None,
         'lease_expires_at': None,
@@ -2876,7 +2875,7 @@ def set_batch_attempt_status(job_id: int,
 @db_retries.retry
 def requeue_expired_batch_attempts(job_id: int,
                                    owner_token: str,
-                                   now: Optional[float] = None) -> List[int]:
+                                   now: float | None = None) -> list[int]:
     """Atomically return expired DISPATCHED attempts to PENDING.
 
     The compare-and-set includes each candidate's attempt ID, so concurrent
@@ -2888,7 +2887,7 @@ def requeue_expired_batch_attempts(job_id: int,
         now = time.time()
 
     engine = _db_manager.get_engine()
-    reclaimed: List[int] = []
+    reclaimed: list[int] = []
     with orm.Session(engine) as session:
         if not _lock_batch_coordinator_owner(session, job_id, owner_token):
             session.rollback()
@@ -2948,7 +2947,7 @@ def requeue_expired_batch_attempts(job_id: int,
 
 
 def update_job_full_resources(job_id: int,
-                              full_resources_json: Dict[str, Any]) -> None:
+                              full_resources_json: dict[str, Any]) -> None:
     """Update the full_resources column for a job.
 
     This is called after scheduling to set the specific resource that was
@@ -2983,7 +2982,7 @@ async def set_job_id_on_pool_cluster_async(job_id: int,
 
 
 @db_retries.retry
-def get_pool_submit_info(job_id: int) -> Tuple[Optional[str], Optional[int]]:
+def get_pool_submit_info(job_id: int) -> tuple[str | None, int | None]:
     """Get the cluster name and job id on the pool from the managed job id."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
@@ -2999,7 +2998,7 @@ def get_pool_submit_info(job_id: int) -> Tuple[Optional[str], Optional[int]]:
 
 @db_retries.retry_async
 async def get_pool_submit_info_async(
-        job_id: int) -> Tuple[Optional[str], Optional[int]]:
+        job_id: int) -> tuple[str | None, int | None]:
     """Get the cluster name and job id on the pool from the managed job id."""
     engine = await _db_manager.get_async_engine()
     async with sql_async.AsyncSession(engine) as session:
@@ -3036,7 +3035,7 @@ def set_api_access_token_id(job_id: int, token_id: str) -> None:
 
 
 @db_retries.retry
-def get_api_access_token_id(job_id: int) -> Optional[str]:
+def get_api_access_token_id(job_id: int) -> str | None:
     """Get the API access token ID for a managed job."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
@@ -3089,8 +3088,8 @@ def scheduler_set_done(job_id: int, idempotent: bool = False) -> None:
         updated_count = session.query(job_info_table).filter(
             sqlalchemy.and_(
                 job_info_table.c.spot_job_id == job_id,
-                job_info_table.c.schedule_state !=
-                ManagedJobScheduleState.DONE.value,
+                job_info_table.c.schedule_state
+                != ManagedJobScheduleState.DONE.value,
             )).update({
                 job_info_table.c.schedule_state:
                     ManagedJobScheduleState.DONE.value
@@ -3124,7 +3123,7 @@ def get_num_launching_jobs() -> int:
                     job_info_table.c.pool.is_(None)))).fetchone()[0]
 
 
-def get_num_alive_jobs(pool: Optional[str] = None) -> int:
+def get_num_alive_jobs(pool: str | None = None) -> int:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         where_conditions = [
@@ -3181,8 +3180,8 @@ def get_pending_jobs_count_by_pool(pool: str) -> int:
 
 
 def get_nonterminal_job_ids_by_pool(pool: str,
-                                    cluster_name: Optional[str] = None
-                                   ) -> List[int]:
+                                    cluster_name: str | None = None
+                                   ) -> list[int]:
     """Get nonterminal job ids in a pool."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
@@ -3207,7 +3206,7 @@ def get_nonterminal_job_ids_by_pool(pool: str,
         return job_ids
 
 
-def get_nonterminal_job_counts_by_pool(pool: str) -> Dict[str, int]:
+def get_nonterminal_job_counts_by_pool(pool: str) -> dict[str, int]:
     """Get the number of nonterminal jobs per cluster in a pool.
 
     Returns a dict mapping cluster_name to the count of nonterminal jobs
@@ -3238,7 +3237,7 @@ def get_nonterminal_job_counts_by_pool(pool: str) -> Dict[str, int]:
 
 
 def get_nonterminal_job_ids_by_pool_grouped(
-        pool: str) -> Dict[Optional[str], List[int]]:
+        pool: str) -> dict[str | None, list[int]]:
     """Get nonterminal job ids in a pool, grouped by current_cluster_name.
 
     Equivalent to calling get_nonterminal_job_ids_by_pool once per replica
@@ -3269,7 +3268,7 @@ def get_nonterminal_job_ids_by_pool_grouped(
                         job_info_table.c.pool == pool,
                     )).order_by(spot_table.c.spot_job_id.asc())
         rows = session.execute(query).fetchall()
-        result: Dict[Optional[str], List[int]] = {}
+        result: dict[str | None, list[int]] = {}
         for cluster_name, job_id in rows:
             if job_id is None:
                 continue
@@ -3277,7 +3276,7 @@ def get_nonterminal_job_ids_by_pool_grouped(
         return result
 
 
-def _is_any_of_or_ordered(resource_config: Dict[str, Any]) -> bool:
+def _is_any_of_or_ordered(resource_config: dict[str, Any]) -> bool:
     """Check if resource config is heterogeneous (any_of or ordered).
 
     Args:
@@ -3292,7 +3291,7 @@ def _is_any_of_or_ordered(resource_config: Dict[str, Any]) -> bool:
 
 
 def _parse_job_full_resources(
-    resource_config: Optional[Dict[str, Any]]
+    resource_config: dict[str, Any] | None
 ) -> Optional['resources_lib.Resources']:
     """Parse one persisted full_resources payload."""
     if resource_config is None:
@@ -3306,7 +3305,7 @@ def _parse_job_full_resources(
 
 
 def get_pool_worker_used_resources(
-        job_ids: Set[int]) -> Optional['resources_lib.Resources']:
+        job_ids: set[int]) -> Optional['resources_lib.Resources']:
     """Get the total used resources by running jobs.
 
     Args:
@@ -3369,7 +3368,7 @@ def get_pool_worker_used_resources(
 
 
 def get_pool_worker_used_resources_by_cluster(
-        pool: str) -> Optional[Dict[Optional[str], 'resources_lib.Resources']]:
+        pool: str) -> dict[str | None, 'resources_lib.Resources'] | None:
     """Get used resources for all nonterminal jobs in a pool in one query."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
@@ -3390,8 +3389,8 @@ def get_pool_worker_used_resources_by_cluster(
                     ))
         rows = session.execute(query).fetchall()
 
-    totals: Dict[Optional[str], resources_lib.Resources] = {}
-    clusters_with_empty_request: Set[Optional[str]] = set()
+    totals: dict[str | None, resources_lib.Resources] = {}
+    clusters_with_empty_request: set[str | None] = set()
     for cluster_name, _, resource_config in rows:
         parsed = _parse_job_full_resources(resource_config)
         if parsed is None:
@@ -3415,8 +3414,8 @@ def get_pool_worker_used_resources_by_cluster(
 
 
 @db_retries.retry_async
-async def get_waiting_job_async(
-        pid: int, pid_started_at: float) -> Optional[Dict[str, Any]]:
+async def get_waiting_job_async(pid: int,
+                                pid_started_at: float) -> dict[str, Any] | None:
     """Get the next job that should transition to LAUNCHING.
 
     Selects the highest-priority WAITING or ALIVE_WAITING job and atomically
@@ -3523,7 +3522,7 @@ def get_workspace(job_id: int) -> str:
 
 
 @db_retries.retry
-def get_file_mounts_blob_id(job_id: int) -> Optional[str]:
+def get_file_mounts_blob_id(job_id: int) -> str | None:
     """Return the file_mounts_blob_id persisted for a job, if any."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
@@ -3536,7 +3535,7 @@ def get_file_mounts_blob_id(job_id: int) -> Optional[str]:
 
 
 async def get_latest_task_id_status_async(
-        job_id: int) -> Tuple[Optional[int], Optional[ManagedJobStatus]]:
+        job_id: int) -> tuple[int | None, ManagedJobStatus | None]:
     """Returns the (task id, status) of the latest task of a job."""
     id_statuses = await get_all_task_ids_statuses_async(job_id)
     return get_latest_task_id_from_statuses(id_statuses)
@@ -3544,7 +3543,7 @@ async def get_latest_task_id_status_async(
 
 @db_retries.retry_async
 async def get_all_task_ids_statuses_async(
-        job_id: int) -> List[Tuple[int, ManagedJobStatus]]:
+        job_id: int) -> list[tuple[int, ManagedJobStatus]]:
     """Returns all (task_id, status) pairs for a job (async version)."""
     engine = await _db_manager.get_async_engine()
     async with sql_async.AsyncSession(engine) as session:
@@ -3562,10 +3561,9 @@ async def set_starting_async(job_id: int,
                              run_timestamp: str,
                              submit_time: float,
                              resources_str: str,
-                             specs: Dict[str, Any],
+                             specs: dict[str, Any],
                              callback_func: AsyncCallbackType,
-                             full_resources_json: Optional[Dict[str,
-                                                                Any]] = None):
+                             full_resources_json: dict[str, Any] | None = None):
     """Set the task to starting state."""
     await add_job_event_async(job_id, task_id, ManagedJobStatus.STARTING,
                               'Job is starting')
@@ -3628,7 +3626,7 @@ async def set_started_async(job_id: int, task_id: int, start_time: float,
 
 
 def get_job_status_with_task_id(job_id: int,
-                                task_id: int) -> Optional[ManagedJobStatus]:
+                                task_id: int) -> ManagedJobStatus | None:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         result = session.execute(
@@ -3641,7 +3639,7 @@ def get_job_status_with_task_id(job_id: int,
 
 @db_retries.retry_async
 async def get_job_status_with_task_id_async(
-        job_id: int, task_id: int) -> Optional[ManagedJobStatus]:
+        job_id: int, task_id: int) -> ManagedJobStatus | None:
     engine = await _db_manager.get_async_engine()
     async with sql_async.AsyncSession(engine) as session:
         result = await session.execute(
@@ -3657,8 +3655,8 @@ async def set_recovering_async(
     task_id: int,
     force_transit_to_recovering: bool,
     callback_func: AsyncCallbackType,
-    external_failures: Optional[List[ExternalClusterFailure]] = None,
-    cluster_event_reason: Optional[str] = None,
+    external_failures: list[ExternalClusterFailure] | None = None,
+    cluster_event_reason: str | None = None,
 ):
     """Set the task to recovering state, and update the job duration."""
     # Build code and reason from external failures for the event log.
@@ -3940,11 +3938,11 @@ async def set_succeeded_async(job_id: int, task_id: int, end_time: float,
 
 async def set_failed_async(
     job_id: int,
-    task_id: Optional[int],
+    task_id: int | None,
     failure_type: ManagedJobStatus,
     failure_reason: str,
-    callback_func: Optional[AsyncCallbackType] = None,
-    end_time: Optional[float] = None,
+    callback_func: AsyncCallbackType | None = None,
+    end_time: float | None = None,
     override_terminal: bool = False,
 ):
     """Set an entire job or task to failed."""
@@ -3954,7 +3952,7 @@ async def set_failed_async(
     end_time = time.time() if end_time is None else end_time
 
     async def _op(session):
-        fields_to_set: Dict[str, Any] = {
+        fields_to_set: dict[str, Any] = {
             spot_table.c.status: failure_type.value,
             spot_table.c.failure_reason: failure_reason,
         }
@@ -4001,7 +3999,7 @@ async def set_failed_async(
 
 
 async def update_links_async(job_id: int, task_id: int,
-                             links: Dict[str, str]) -> None:
+                             links: dict[str, str]) -> None:
     """Update the links for a managed job task.
 
     Links are stored as JSON in the database. SQLAlchemy handles
@@ -4110,7 +4108,7 @@ async def remove_ha_recovery_script_async(job_id: int) -> None:
         await session.commit()
 
 
-async def get_status_async(job_id: int) -> Optional[ManagedJobStatus]:
+async def get_status_async(job_id: int) -> ManagedJobStatus | None:
     _, status = await get_latest_task_id_status_async(job_id)
     return status
 
@@ -4134,8 +4132,8 @@ async def scheduler_set_done_async(job_id: int,
             sqlalchemy.update(job_info_table).where(
                 sqlalchemy.and_(
                     job_info_table.c.spot_job_id == job_id,
-                    job_info_table.c.schedule_state !=
-                    ManagedJobScheduleState.DONE.value,
+                    job_info_table.c.schedule_state
+                    != ManagedJobScheduleState.DONE.value,
                 )).values({
                     job_info_table.c.schedule_state:
                         ManagedJobScheduleState.DONE.value
@@ -4154,10 +4152,10 @@ def set_job_info(job_id: int,
                  name: str,
                  workspace: str,
                  entrypoint: str,
-                 pool: Optional[str],
-                 pool_hash: Optional[str],
-                 user_hash: Optional[str] = None,
-                 execution: Optional[str] = None,
+                 pool: str | None,
+                 pool_hash: str | None,
+                 user_hash: str | None = None,
+                 execution: str | None = None,
                  is_batch: bool = False):
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
@@ -4193,10 +4191,10 @@ def reset_jobs_for_recovery() -> None:
             job_info_table.c.controller_pid.isnot(None),
             # Schedule state should be alive.
             job_info_table.c.schedule_state.isnot(None),
-            (job_info_table.c.schedule_state !=
-             ManagedJobScheduleState.WAITING.value),
-            (job_info_table.c.schedule_state !=
-             ManagedJobScheduleState.DONE.value),
+            (job_info_table.c.schedule_state
+             != ManagedJobScheduleState.WAITING.value),
+            (job_info_table.c.schedule_state
+             != ManagedJobScheduleState.DONE.value),
         ).update({
             job_info_table.c.controller_pid: None,
             job_info_table.c.controller_pid_started_at: None,
@@ -4220,7 +4218,7 @@ def reset_job_for_recovery(job_id: int) -> None:
         session.commit()
 
 
-def get_all_job_ids_by_name(name: Optional[str]) -> List[int]:
+def get_all_job_ids_by_name(name: str | None) -> list[int]:
     """Get all job ids by name."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
@@ -4245,7 +4243,7 @@ def get_all_job_ids_by_name(name: Optional[str]) -> List[int]:
 
 
 def get_task_logs_to_clean(retention_seconds: int,
-                           batch_size: int) -> List[Dict[str, Any]]:
+                           batch_size: int) -> list[dict[str, Any]]:
     """Get the logs of job tasks to clean.
 
     The logs of a task will only cleaned when:
@@ -4286,7 +4284,7 @@ def get_task_logs_to_clean(retention_seconds: int,
 
 
 def get_controller_logs_to_clean(retention_seconds: int,
-                                 batch_size: int) -> List[Dict[str, Any]]:
+                                 batch_size: int) -> list[dict[str, Any]]:
     """Get the controller logs to clean.
 
     The controller logs will only cleaned when:
@@ -4319,7 +4317,7 @@ def get_controller_logs_to_clean(retention_seconds: int,
         return [{'job_id': row[0]} for row in rows]
 
 
-def set_task_logs_cleaned(tasks: List[Tuple[int, int]], logs_cleaned_at: float):
+def set_task_logs_cleaned(tasks: list[tuple[int, int]], logs_cleaned_at: float):
     """Set the task logs cleaned at."""
     if not tasks:
         return
@@ -4334,7 +4332,7 @@ def set_task_logs_cleaned(tasks: List[Tuple[int, int]], logs_cleaned_at: float):
         session.commit()
 
 
-def set_controller_logs_cleaned(job_ids: List[int], logs_cleaned_at: float):
+def set_controller_logs_cleaned(job_ids: list[int], logs_cleaned_at: float):
     """Set the controller logs cleaned at."""
     if not job_ids:
         return
@@ -4349,10 +4347,10 @@ def set_controller_logs_cleaned(job_ids: List[int], logs_cleaned_at: float):
 
 
 def add_job_event(job_id: int,
-                  task_id: Optional[int],
+                  task_id: int | None,
                   new_status: ManagedJobStatus,
                   reason: str,
-                  timestamp: Optional[datetime.datetime] = None) -> None:
+                  timestamp: datetime.datetime | None = None) -> None:
     """Add a job event record to the audit log.
 
     Args:
@@ -4381,7 +4379,7 @@ def add_job_event(job_id: int,
         session.commit()
 
 
-async def _get_all_task_ids_async(job_id: int) -> List[int]:
+async def _get_all_task_ids_async(job_id: int) -> list[int]:
     """Get all task IDs for a job (async version)."""
     engine = await _db_manager.get_async_engine()
     async with sql_async.AsyncSession(engine) as session:
@@ -4395,11 +4393,11 @@ async def _get_all_task_ids_async(job_id: int) -> List[int]:
 @db_retries.retry_async
 async def add_job_event_async(
         job_id: int,
-        task_id: Optional[int],
+        task_id: int | None,
         new_status: ManagedJobStatus,
         reason: str,
-        code: Optional[str] = None,
-        timestamp: Optional[datetime.datetime] = None) -> None:
+        code: str | None = None,
+        timestamp: datetime.datetime | None = None) -> None:
     """Add a job event record to the audit log (async version).
 
     Args:
@@ -4431,8 +4429,8 @@ async def add_job_event_async(
 
 
 def get_job_events(job_id: int,
-                   task_id: Optional[int] = None,
-                   limit: Optional[int] = None) -> List[Dict[str, Any]]:
+                   task_id: int | None = None,
+                   limit: int | None = None) -> list[dict[str, Any]]:
     """Get task events for a managed job.
 
     Args:
@@ -4482,7 +4480,7 @@ def get_job_events(job_id: int,
     } for row in rows]
 
 
-def get_latest_recovery_reasons(job_ids: List[int]) -> Dict[int, str]:
+def get_latest_recovery_reasons(job_ids: list[int]) -> dict[int, str]:
     """Return {job_id: reason} for the most recent RECOVERING event per job.
 
     Only jobs with a non-empty RECOVERING reason are included. Used to surface
@@ -4504,7 +4502,7 @@ def get_latest_recovery_reasons(job_ids: List[int]) -> Dict[int, str]:
                     ManagedJobStatus.RECOVERING.value,
                 )).order_by(job_events_table.c.timestamp.desc())).fetchall()
     # rows are newest-first; keep the first (latest) non-empty reason per job.
-    reasons: Dict[int, str] = {}
+    reasons: dict[int, str] = {}
     for spot_job_id, reason in rows:
         if spot_job_id not in reasons and reason:
             reasons[spot_job_id] = reason

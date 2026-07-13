@@ -6,7 +6,6 @@ This file is imported by setup.py, so:
 - It should not import any dependencies, as they may not be installed yet.
 """
 import sys
-from typing import Dict, List
 
 clouds_with_ray = ['ibm', 'docker', 'scp']
 
@@ -47,7 +46,9 @@ install_requires = [
     'filelock >= 3.15.0',
     'packaging',
     'psutil',
-    'pulp',
+    # <4: the pulp 4.x rustcore rewrite drops the classic LpVariable
+    # keyword API (lowBound=...) that sky/optimizer.py uses.
+    'pulp<4',
     # Cython 3.0 release breaks PyYAML 5.4.*
     # (https://github.com/yaml/pyyaml/issues/601)
     # <= 3.13 may encounter https://github.com/ultralytics/yolov5/issues/414
@@ -106,14 +107,18 @@ install_requires = [
 
 # The grpc version at runtime has to be newer than the version
 # used to generate the code.
-GRPC = 'grpcio>=1.63.0'
+# Floor matches grpcio-tools 1.76 (requirements-dev.txt): its generated
+# stubs refuse to import under an older grpcio runtime.
+GRPC = 'grpcio>=1.76.0'
 # >= 5.29.6 because the runtime version can't be older than the version
 # used to generate the code (see requirements-dev.txt). Bumped from 5.26.1
 # to close CVE-2025-4565 (DoS) and CVE-2026-0994 (JSON recursion bypass).
 # < 7.0.0 because code generated for a major version V will be supported by
 # protobuf runtimes of version V and V+1.
 # https://protobuf.dev/support/cross-version-runtime-guarantee
-PROTOBUF = 'protobuf>=5.29.6, < 7.0.0'
+# Floor matches the gencode version produced by grpcio-tools 1.76 (protobuf
+# 6.33.x): generated files require a runtime at least as new as the gencode.
+PROTOBUF = 'protobuf>=6.31.1, < 7.0.0'
 
 server_dependencies = [
     # TODO: Some of these dependencies are also specified in install_requires,
@@ -181,7 +186,7 @@ kubernetes_dependencies = [
 # break our Azure storage code (storage-account create and key listing).
 AZURE_CLI = 'azure-cli>=2.65.0,<2.87.0'
 
-cloud_dependencies: Dict[str, List[str]] = {
+cloud_dependencies: dict[str, list[str]] = {
     'aws': aws_dependencies,
     # TODO(zongheng): azure-cli is huge and takes a long time to install.
     # Tracked in: https://github.com/Azure/azure-cli/issues/7387
@@ -285,14 +290,6 @@ cloud_dependencies: Dict[str, List[str]] = {
 # Calculate which clouds should be included in the [all] installation.
 clouds_for_all = set(cloud_dependencies)
 
-if sys.version_info < (3, 10):
-    # Nebius needs python3.10. If python 3.9 [all] will not install nebius
-    clouds_for_all.remove('nebius')
-    clouds_for_all.remove('seeweb')
-    # latest ibm-cloud-sdk-core installation fails on Python 3.9,
-    # so we remove it from the [all] installation.
-    clouds_for_all.remove('ibm')
-
 if sys.version_info >= (3, 12):
     # The version of ray we use does not work with >= 3.12, so avoid clouds
     # that require ray.
@@ -306,7 +303,7 @@ cloud_extras = {
     for cloud, dependencies in cloud_dependencies.items()
 }
 
-extras_require: Dict[str, List[str]] = {
+extras_require: dict[str, list[str]] = {
     # Include server_dependencies with each cloud.
     **cloud_extras,
     'all': list(set().union(*[cloud_extras[cloud] for cloud in clouds_for_all])

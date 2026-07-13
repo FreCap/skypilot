@@ -4,7 +4,7 @@ import json
 import os
 import time
 import typing
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 from sky.adaptors import common as adaptors_common
 from sky.utils import common_utils
@@ -37,17 +37,17 @@ class Metadata:
         # In case parent directory does not exist
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
 
-    def get(self, instance_id: str) -> Optional[Dict[str, Any]]:
+    def get(self, instance_id: str) -> dict[str, Any] | None:
         if not os.path.exists(self.path):
             return None
-        with open(self.path, 'r', encoding='utf-8') as f:
+        with open(self.path, encoding='utf-8') as f:
             metadata = json.load(f)
         return metadata.get(instance_id)
 
-    def set(self, instance_id: str, value: Optional[Dict[str, Any]]) -> None:
+    def set(self, instance_id: str, value: dict[str, Any] | None) -> None:
         # Read from metadata file
         if os.path.exists(self.path):
-            with open(self.path, 'r', encoding='utf-8') as f:
+            with open(self.path, encoding='utf-8') as f:
                 metadata = json.load(f)
         else:
             metadata = {}
@@ -65,11 +65,11 @@ class Metadata:
         with open(self.path, 'w', encoding='utf-8') as f:
             json.dump(metadata, f)
 
-    def refresh(self, instance_ids: List[str]) -> None:
+    def refresh(self, instance_ids: list[str]) -> None:
         """Remove all tags for instances not in instance_ids."""
         if not os.path.exists(self.path):
             return
-        with open(self.path, 'r', encoding='utf-8') as f:
+        with open(self.path, encoding='utf-8') as f:
             metadata = json.load(f)
         for instance_id in list(metadata.keys()):
             if instance_id not in instance_ids:
@@ -103,8 +103,8 @@ def raise_lambda_error(response: 'requests.Response') -> None:
 
 def _try_request_with_backoff(method: str,
                               url: str,
-                              headers: Dict[str, str],
-                              data: Optional[str] = None):
+                              headers: dict[str, str],
+                              data: str | None = None):
     backoff = common_utils.Backoff(initial_backoff=INITIAL_BACKOFF_SECONDS,
                                    max_backoff_factor=MAX_BACKOFF_FACTOR)
     for i in range(MAX_ATTEMPTS):
@@ -131,7 +131,7 @@ class LambdaCloudClient:
     def __init__(self) -> None:
         self.credentials = os.path.expanduser(CREDENTIALS_PATH)
         assert os.path.exists(self.credentials), 'Credentials not found'
-        with open(self.credentials, 'r', encoding='utf-8') as f:
+        with open(self.credentials, encoding='utf-8') as f:
             lines = [line.strip() for line in f.readlines() if ' = ' in line]
             self._credentials = {
                 line.split(' = ')[0]: line.split(' = ')[1] for line in lines
@@ -146,7 +146,7 @@ class LambdaCloudClient:
         quantity: int = 1,
         name: str = '',
         ssh_key_name: str = '',
-    ) -> List[str]:
+    ) -> list[str]:
         """Launch new instances."""
         # Optimization:
         # Most API requests are rate limited at ~1 request every second but
@@ -161,11 +161,11 @@ class LambdaCloudClient:
                 aval_reg = ' '.join(available_regions)
             else:
                 aval_reg = 'None'
-            raise LambdaCloudError(('instance-operations/launch/'
-                                    'insufficient-capacity: Not enough '
-                                    'capacity to fulfill launch request. '
-                                    'Regions with capacity available: '
-                                    f'{aval_reg}'))
+            raise LambdaCloudError('instance-operations/launch/'
+                                   'insufficient-capacity: Not enough '
+                                   'capacity to fulfill launch request. '
+                                   'Regions with capacity available: '
+                                   f'{aval_reg}')
 
         # Try to launch instance
         data = json.dumps({
@@ -183,7 +183,7 @@ class LambdaCloudClient:
         )
         return response.json().get('data', []).get('instance_ids', [])
 
-    def remove_instances(self, instance_ids: List[str]) -> Dict[str, Any]:
+    def remove_instances(self, instance_ids: list[str]) -> dict[str, Any]:
         """Terminate instances."""
         data = json.dumps({'instance_ids': instance_ids})
         response = _try_request_with_backoff(
@@ -194,14 +194,14 @@ class LambdaCloudClient:
         )
         return response.json().get('data', []).get('terminated_instances', [])
 
-    def list_instances(self) -> List[Dict[str, Any]]:
+    def list_instances(self) -> list[dict[str, Any]]:
         """List existing instances."""
         response = _try_request_with_backoff('get',
                                              f'{API_ENDPOINT}/instances',
                                              headers=self.headers)
         return response.json().get('data', [])
 
-    def list_ssh_keys(self) -> List[Dict[str, str]]:
+    def list_ssh_keys(self) -> list[dict[str, str]]:
         """List ssh keys."""
         response = _try_request_with_backoff('get',
                                              f'{API_ENDPOINT}/ssh-keys',
@@ -209,7 +209,7 @@ class LambdaCloudClient:
         return response.json().get('data', [])
 
     def get_unique_ssh_key_name(self, prefix: str,
-                                pub_key: str) -> Tuple[str, bool]:
+                                pub_key: str) -> tuple[str, bool]:
         """Returns a ssh key name with the given prefix.
 
         If no names have given prefix, return prefix. If pub_key exists and
@@ -246,14 +246,14 @@ class LambdaCloudClient:
                                   data=data,
                                   headers=self.headers)
 
-    def list_catalog(self) -> Dict[str, Any]:
+    def list_catalog(self) -> dict[str, Any]:
         """List offered instances and their availability."""
         response = _try_request_with_backoff('get',
                                              f'{API_ENDPOINT}/instance-types',
                                              headers=self.headers)
         return response.json().get('data', {})
 
-    def list_firewall_rules(self) -> List[Dict[str, Any]]:
+    def list_firewall_rules(self) -> list[dict[str, Any]]:
         """List firewall rules."""
         response = _try_request_with_backoff('get',
                                              f'{API_ENDPOINT}/firewall-rules',
@@ -261,9 +261,9 @@ class LambdaCloudClient:
         return response.json().get('data', [])
 
     def create_firewall_rule(self,
-                             port_range: List[int],
+                             port_range: list[int],
                              protocol: str = 'tcp',
-                             description: str = '') -> Dict[str, Any]:
+                             description: str = '') -> dict[str, Any]:
         """Create a firewall rule.
 
         Args:
@@ -295,7 +295,7 @@ class LambdaCloudClient:
                 rule_list.append(api_rule)
 
         # Add our new rule
-        new_rule: Dict[str, Any] = {
+        new_rule: dict[str, Any] = {
             'protocol': protocol,
             'source_network': '0.0.0.0/0',  # Allow from any IP address
             'description': description or

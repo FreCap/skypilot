@@ -1,12 +1,13 @@
 """Azure instance provisioning."""
 import base64
+from collections.abc import Callable
 import copy
 import enum
 import logging
 from multiprocessing import pool
 import time
 import typing
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Optional
 from uuid import uuid4
 
 from sky import exceptions
@@ -62,7 +63,7 @@ class AzureInstanceStatus(enum.Enum):
     DELETING = 'deleting'
 
     @classmethod
-    def power_state_map(cls) -> Dict[str, 'AzureInstanceStatus']:
+    def power_state_map(cls) -> dict[str, 'AzureInstanceStatus']:
         return {
             'starting': cls.PENDING,
             'running': cls.RUNNING,
@@ -77,7 +78,7 @@ class AzureInstanceStatus(enum.Enum):
         }
 
     @classmethod
-    def provisioning_state_map(cls) -> Dict[str, 'AzureInstanceStatus']:
+    def provisioning_state_map(cls) -> dict[str, 'AzureInstanceStatus']:
         return {
             'Creating': cls.PENDING,
             'Updating': cls.PENDING,
@@ -93,7 +94,7 @@ class AzureInstanceStatus(enum.Enum):
     @classmethod
     def cluster_status_map(
             cls
-    ) -> Dict['AzureInstanceStatus', Optional[status_lib.ClusterStatus]]:
+    ) -> dict['AzureInstanceStatus', status_lib.ClusterStatus | None]:
         return {
             cls.PENDING: status_lib.ClusterStatus.INIT,
             cls.RUNNING: status_lib.ClusterStatus.UP,
@@ -104,7 +105,7 @@ class AzureInstanceStatus(enum.Enum):
 
     @classmethod
     def from_raw_states(cls, provisioning_state: str,
-                        power_state: Optional[str]) -> 'AzureInstanceStatus':
+                        power_state: str | None) -> 'AzureInstanceStatus':
         provisioning_state_map = cls.provisioning_state_map()
         power_state_map = cls.power_state_map()
         status = None
@@ -132,7 +133,7 @@ class AzureInstanceStatus(enum.Enum):
                     f'power state ({power_state})')
         return status
 
-    def to_cluster_status(self) -> Optional[status_lib.ClusterStatus]:
+    def to_cluster_status(self) -> status_lib.ClusterStatus | None:
         return self.cluster_status_map().get(self)
 
 
@@ -148,13 +149,13 @@ def _get_azure_sdk_function(client: Any, function_name: str) -> Callable:
                    getattr(client, f'begin_{function_name}', None))
     if func is None:
         raise AttributeError(
-            '"{obj}" object has no {func} or begin_{func} attribute'.format(
-                obj={client.__name__}, func=function_name))
+            f'"{({client.__name__})}" object has no {function_name} or begin_{function_name} attribute'
+        )
     return func
 
 
 def _get_instance_ips(network_client, vm, resource_group: str,
-                      use_internal_ips: bool) -> Tuple[str, Optional[str]]:
+                      use_internal_ips: bool) -> tuple[str, str | None]:
     nic_id = vm.network_profile.network_interfaces[0].id
     nic_name = nic_id.split('/')[-1]
     nic = network_client.network_interfaces.get(
@@ -178,7 +179,7 @@ def _get_instance_ips(network_client, vm, resource_group: str,
     return (internal_ip, external_ip)
 
 
-def _get_head_instance_id(instances: List) -> Optional[str]:
+def _get_head_instance_id(instances: list) -> str | None:
     head_instance_id = None
     head_node_tags = tuple(constants.HEAD_NODE_TAGS.items())
     for inst in instances:
@@ -197,7 +198,7 @@ def _get_head_instance_id(instances: List) -> Optional[str]:
 
 def _create_network_interface(
         network_client: 'azure_network.NetworkManagementClient', vm_name: str,
-        provider_config: Dict[str,
+        provider_config: dict[str,
                               Any]) -> 'azure_network_models.NetworkInterface':
     network = azure.azure_mgmt_models('network')
     compute = azure.azure_mgmt_models('compute')
@@ -241,8 +242,8 @@ def _create_network_interface(
 
 def _create_vm(
         compute_client: 'azure_compute.ComputeManagementClient', vm_name: str,
-        node_tags: Dict[str, str], provider_config: Dict[str, Any],
-        node_config: Dict[str, Any],
+        node_tags: dict[str, str], provider_config: dict[str, Any],
+        node_config: dict[str, Any],
         network_interface_id: str) -> 'azure_compute_models.VirtualMachine':
     compute = azure.azure_mgmt_models('compute')
     logger.info(f'Start creating VM {vm_name}...')
@@ -316,9 +317,9 @@ def _create_vm(
 def _create_instances(compute_client: 'azure_compute.ComputeManagementClient',
                       network_client: 'azure_network.NetworkManagementClient',
                       cluster_name_on_cloud: str, resource_group: str,
-                      provider_config: Dict[str, Any], node_config: Dict[str,
+                      provider_config: dict[str, Any], node_config: dict[str,
                                                                          Any],
-                      tags: Dict[str, str], count: int) -> List:
+                      tags: dict[str, str], count: int) -> list:
     vm_id = uuid4().hex[:UNIQUE_ID_LEN]
     all_tags = {
         constants.TAG_RAY_CLUSTER_NAME: cluster_name_on_cloud,
@@ -373,8 +374,8 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
     compute_client = azure.get_client('compute', subscription_id)
     network_client = azure.get_client('network', subscription_id)
     instances_to_resume = []
-    resumed_instance_ids: List[str] = []
-    created_instance_ids: List[str] = []
+    resumed_instance_ids: list[str] = []
+    created_instance_ids: list[str] = []
 
     # sort tags by key to support deterministic unit test stubbing
     tags = dict(sorted(copy.deepcopy(config.tags).items()))
@@ -468,8 +469,8 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
                time.time() - time_start < _RESUME_INSTANCE_TIMEOUT):
             inst = stopping_instances.pop(0)
             per_instance_time_start = time.time()
-            while (time.time() - per_instance_time_start <
-                   _RESUME_PER_INSTANCE_TIMEOUT):
+            while (time.time() - per_instance_time_start
+                   < _RESUME_PER_INSTANCE_TIMEOUT):
                 status = _get_instance_status(compute_client, inst,
                                               resource_group)
                 if status == AzureInstanceStatus.STOPPED:
@@ -583,7 +584,7 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
 
 
 def wait_instances(region: str, cluster_name_on_cloud: str,
-                   state: Optional[status_lib.ClusterStatus]) -> None:
+                   state: status_lib.ClusterStatus | None) -> None:
     """See sky/provision/__init__.py"""
     del region, cluster_name_on_cloud, state
     # We already wait for the instances to be running in run_instances.
@@ -593,7 +594,7 @@ def wait_instances(region: str, cluster_name_on_cloud: str,
 def get_cluster_info(
         region: str,
         cluster_name_on_cloud: str,
-        provider_config: Optional[Dict[str, Any]] = None) -> common.ClusterInfo:
+        provider_config: dict[str, Any] | None = None) -> common.ClusterInfo:
     """See sky/provision/__init__.py"""
     del region
     filters = {constants.TAG_RAY_CLUSTER_NAME: cluster_name_on_cloud}
@@ -638,7 +639,7 @@ def get_cluster_info(
 
 def stop_instances(
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     worker_only: bool = False,
 ) -> None:
     """See sky/provision/__init__.py"""
@@ -661,7 +662,7 @@ def stop_instances(
 
 def terminate_instances(
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     worker_only: bool = False,
 ) -> None:
     """See sky/provision/__init__.py"""
@@ -714,7 +715,7 @@ def terminate_instances(
 
 def _get_instance_status(
         compute_client: 'azure_compute.ComputeManagementClient', vm,
-        resource_group: str) -> Optional[AzureInstanceStatus]:
+        resource_group: str) -> AzureInstanceStatus | None:
     try:
         instance = compute_client.virtual_machines.instance_view(
             resource_group_name=resource_group, vm_name=vm.name)
@@ -741,10 +742,10 @@ def _get_instance_status(
 def _filter_instances(
     compute_client: 'azure_compute.ComputeManagementClient',
     resource_group: str,
-    tag_filters: Dict[str, str],
-    status_filters: Optional[List[AzureInstanceStatus]] = None,
-    included_instances: Optional[List[str]] = None,
-) -> List['azure_compute.models.VirtualMachine']:
+    tag_filters: dict[str, str],
+    status_filters: list[AzureInstanceStatus] | None = None,
+    included_instances: list[str] | None = None,
+) -> list['azure_compute.models.VirtualMachine']:
 
     def match_tags(vm):
         for k, v in tag_filters.items():
@@ -830,7 +831,7 @@ def delete_vm_and_attached_resources(subscription_id: str, resource_group: str,
             return
         raise
 
-    filtered_resources: Dict[str, List[str]] = {
+    filtered_resources: dict[str, list[str]] = {
         _RESOURCE_VIRTUAL_MACHINE_TYPE: [],
         _RESOURCE_MANAGED_IDENTITY_TYPE: [],
         _RESOURCE_NETWORK_SECURITY_GROUP_TYPE: [],
@@ -871,7 +872,7 @@ def delete_vm_and_attached_resources(subscription_id: str, resource_group: str,
             delete_virtual_machine(resource_group_name=resource_group,
                                    vm_name=vm_name).result()
         except Exception as e:  # pylint: disable=broad-except
-            logger.warning('Failed to delete VM: {}'.format(e))
+            logger.warning(f'Failed to delete VM: {e}')
 
     for nic_name in filtered_resources[_RESOURCE_NETWORK_INTERFACE_TYPE]:
         try:
@@ -881,21 +882,21 @@ def delete_vm_and_attached_resources(subscription_id: str, resource_group: str,
             # disassociated. This takes about ~1s.
             _delete_nic_with_retries(network_client, resource_group, nic_name)
         except Exception as e:  # pylint: disable=broad-except
-            logger.warning('Failed to delete nic: {}'.format(e))
+            logger.warning(f'Failed to delete nic: {e}')
 
     for public_ip_name in filtered_resources[_RESOURCE_PUBLIC_IP_ADDRESS_TYPE]:
         try:
             delete_public_ip_addresses(resource_group_name=resource_group,
                                        public_ip_address_name=public_ip_name)
         except Exception as e:  # pylint: disable=broad-except
-            logger.warning('Failed to delete public ip: {}'.format(e))
+            logger.warning(f'Failed to delete public ip: {e}')
 
     for vnet_name in filtered_resources[_RESOURCE_VIRTUAL_NETWORK_TYPE]:
         try:
             delete_virtual_networks(resource_group_name=resource_group,
                                     virtual_network_name=vnet_name)
         except Exception as e:  # pylint: disable=broad-except
-            logger.warning('Failed to delete vnet: {}'.format(e))
+            logger.warning(f'Failed to delete vnet: {e}')
 
     for msi_name in filtered_resources[_RESOURCE_MANAGED_IDENTITY_TYPE]:
         user_assigned_identities = (
@@ -922,20 +923,20 @@ def delete_vm_and_attached_resources(subscription_id: str, resource_group: str,
                                 role_assignment_name=guid_role_assignment_name)
                         except Exception as e:  # pylint: disable=broad-except
                             logger.warning('Failed to delete role '
-                                           'assignment: {}'.format(e))
+                                           f'assignment: {e}')
                         break
         try:
             delete_managed_identity(resource_group_name=resource_group,
                                     resource_name=msi_name)
         except Exception as e:  # pylint: disable=broad-except
-            logger.warning('Failed to delete msi: {}'.format(e))
+            logger.warning(f'Failed to delete msi: {e}')
 
     for nsg_name in filtered_resources[_RESOURCE_NETWORK_SECURITY_GROUP_TYPE]:
         try:
             delete_network_security_group(resource_group_name=resource_group,
                                           network_security_group_name=nsg_name)
         except Exception as e:  # pylint: disable=broad-except
-            logger.warning('Failed to delete nsg: {}'.format(e))
+            logger.warning(f'Failed to delete nsg: {e}')
 
     delete_deployment = _get_azure_sdk_function(
         client=resource_client.deployments, function_name='begin_delete')
@@ -950,17 +951,17 @@ def delete_vm_and_attached_resources(subscription_id: str, resource_group: str,
             delete_deployment(resource_group_name=resource_group,
                               deployment_name=deployment_name)
         except Exception as e:  # pylint: disable=broad-except
-            logger.warning('Failed to delete deployment: {}'.format(e))
+            logger.warning(f'Failed to delete deployment: {e}')
 
 
 @common_utils.retry
 def query_instances(
     cluster_name: str,
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     non_terminated_only: bool = True,
     retry_if_missing: bool = False,
-) -> Dict[str, Tuple[Optional['status_lib.ClusterStatus'], Optional[str]]]:
+) -> dict[str, tuple[Optional['status_lib.ClusterStatus'], str | None]]:
     """See sky/provision/__init__.py"""
     del cluster_name, retry_if_missing  # unused
     assert provider_config is not None, cluster_name_on_cloud
@@ -970,8 +971,7 @@ def query_instances(
     filters = {constants.TAG_RAY_CLUSTER_NAME: cluster_name_on_cloud}
     compute_client = azure.get_client('compute', subscription_id)
     nodes = _filter_instances(compute_client, resource_group, filters)
-    statuses: Dict[str, Tuple[Optional['status_lib.ClusterStatus'],
-                              Optional[str]]] = {}
+    statuses: dict[str, tuple[status_lib.ClusterStatus | None, str | None]] = {}
 
     def _fetch_and_map_status(node, resource_group: str) -> None:
         compute_client = azure.get_client('compute', subscription_id)
@@ -991,8 +991,8 @@ def query_instances(
 
 def open_ports(
     cluster_name_on_cloud: str,
-    ports: List[str],
-    provider_config: Optional[Dict[str, Any]] = None,
+    ports: list[str],
+    provider_config: dict[str, Any] | None = None,
 ) -> None:
     """See sky/provision/__init__.py"""
     assert provider_config is not None, cluster_name_on_cloud
@@ -1068,8 +1068,8 @@ def open_ports(
 
 def cleanup_ports(
     cluster_name_on_cloud: str,
-    ports: List[str],
-    provider_config: Optional[Dict[str, Any]] = None,
+    ports: list[str],
+    provider_config: dict[str, Any] | None = None,
 ) -> None:
     """See sky/provision/__init__.py"""
     # Azure will automatically cleanup network security groups when cleanup

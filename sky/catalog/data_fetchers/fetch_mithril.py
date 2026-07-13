@@ -11,7 +11,7 @@ import csv
 import json
 import logging
 import os
-from typing import Any, Dict, List
+from typing import Any
 
 import requests
 
@@ -20,7 +20,7 @@ from sky.provision.mithril import utils as mithril_utils
 logger = logging.getLogger(__name__)
 
 
-def _get_headers(api_key: str) -> Dict[str, str]:
+def _get_headers(api_key: str) -> dict[str, str]:
     """Build auth headers for Mithril API requests."""
     return {
         'Authorization': f'Bearer {api_key}',
@@ -53,7 +53,7 @@ def make_gpu_info_json(gpu_name: str, gpu_count: int,
     return json.dumps(gpu_info).replace('"', '\'')
 
 
-def fetch_instance_types(api_key: str, api_url: str) -> List[Dict[str, Any]]:
+def fetch_instance_types(api_key: str, api_url: str) -> list[dict[str, Any]]:
     """Fetch instance types from Mithril API."""
     endpoint = f'{api_url}/v2/instance-types'
 
@@ -98,7 +98,7 @@ def fetch_instance_pricing(api_key: str, api_url: str,
 
 
 def fetch_spot_availability(api_key: str,
-                            api_url: str) -> Dict[str, List[Dict[str, Any]]]:
+                            api_url: str) -> dict[str, list[dict[str, Any]]]:
     """Fetch per-region spot availability and pricing.
 
     Args:
@@ -122,7 +122,7 @@ def fetch_spot_availability(api_key: str,
         raise mithril_utils.MithrilError(
             f'Failed to fetch spot availability: {e}') from e
 
-    availability: Dict[str, List[Dict[str, Any]]] = {}
+    availability: dict[str, list[dict[str, Any]]] = {}
 
     for rec in records:
         fid = rec['instance_type']
@@ -145,7 +145,7 @@ def create_catalog(output_path: str = 'mithril/vms.csv') -> None:
     logger.info('Found %d instance types.', len(instance_types))
 
     logger.info('Fetching pricing for each instance type...')
-    instance_pricing: Dict[str, float] = {}
+    instance_pricing: dict[str, float] = {}
     for inst in instance_types:
         instance_pricing[inst['fid']] = fetch_instance_pricing(
             api_key, api_url, inst['fid'])

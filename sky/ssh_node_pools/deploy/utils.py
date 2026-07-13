@@ -1,7 +1,6 @@
 """Utilities for SSH Node Pools Deployment"""
 import os
 import subprocess
-from typing import List, Optional
 
 import colorama
 
@@ -12,7 +11,7 @@ logger = sky_logging.init_logger(__name__)
 
 
 def check_ssh_cluster_dependencies(
-        raise_error: bool = True) -> Optional[List[str]]:
+        raise_error: bool = True) -> list[str] | None:
     """Checks if the dependencies for ssh cluster are installed.
 
     Args:
@@ -95,7 +94,7 @@ def run_remote(node,
                use_shell=False,
                silent=False):
     """Run a command on a remote machine via SSH."""
-    ssh_cmd: List[str]
+    ssh_cmd: list[str]
     if use_ssh_config:
         # Use SSH config for connection parameters
         ssh_cmd = ['ssh', node, cmd]

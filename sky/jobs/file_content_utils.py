@@ -7,7 +7,6 @@ helpers so controllers never have to rely on local disk state.
 """
 
 import os
-from typing import Optional
 
 from sky import sky_logging
 from sky import skypilot_config
@@ -16,7 +15,7 @@ from sky.jobs import state as managed_job_state
 logger = sky_logging.init_logger(__name__)
 
 
-def get_job_dag_content(job_id: int) -> Optional[str]:
+def get_job_dag_content(job_id: int) -> str | None:
     """Get DAG YAML content for a job from database or disk.
 
     Args:
@@ -35,12 +34,12 @@ def get_job_dag_content(job_id: int) -> Optional[str]:
     dag_yaml_path = file_info.get('dag_yaml_path')
     if dag_yaml_path and os.path.exists(dag_yaml_path):
         try:
-            with open(dag_yaml_path, 'r', encoding='utf-8') as f:
+            with open(dag_yaml_path, encoding='utf-8') as f:
                 content = f.read()
                 logger.debug('Loaded DAG YAML from disk for job %s: %s', job_id,
                              dag_yaml_path)
                 return content
-        except (FileNotFoundError, IOError, OSError) as e:
+        except (FileNotFoundError, OSError) as e:
             logger.warning(
                 f'Failed to read DAG YAML from disk {dag_yaml_path}: {e}')
 
@@ -48,7 +47,7 @@ def get_job_dag_content(job_id: int) -> Optional[str]:
     return None
 
 
-def get_job_env_content(job_id: int) -> Optional[str]:
+def get_job_env_content(job_id: int) -> str | None:
     """Get environment file content for a job from database or disk.
 
     Args:
@@ -67,12 +66,12 @@ def get_job_env_content(job_id: int) -> Optional[str]:
     env_file_path = file_info.get('env_file_path')
     if env_file_path and os.path.exists(env_file_path):
         try:
-            with open(env_file_path, 'r', encoding='utf-8') as f:
+            with open(env_file_path, encoding='utf-8') as f:
                 content = f.read()
                 logger.debug('Loaded environment file from disk for job %s: %s',
                              job_id, env_file_path)
                 return content
-        except (FileNotFoundError, IOError, OSError) as e:
+        except (FileNotFoundError, OSError) as e:
             logger.warning(
                 f'Failed to read environment file from disk {env_file_path}: '
                 f'{e}')

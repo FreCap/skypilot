@@ -1,6 +1,5 @@
 """Persistent KV cache, backed by a sqlite or postgres database."""
 import time
-from typing import Optional
 
 import sqlalchemy
 from sqlalchemy import exc as sqlalchemy_exc
@@ -119,8 +118,8 @@ def add_or_extend_cache_entry(
             kv_cache_table.c.expires_at, insert_stmt.excluded.expires_at)
         value_at_latest_expiry = sqlalchemy.case((sqlalchemy.or_(
             kv_cache_table.c.expires_at.is_(None),
-            insert_stmt.excluded.expires_at >= kv_cache_table.c.expires_at),
-                                                  insert_stmt.excluded.value),
+            insert_stmt.excluded.expires_at
+            >= kv_cache_table.c.expires_at), insert_stmt.excluded.value),
                                                  else_=kv_cache_table.c.value)
         do_update_stmt = insert_stmt.on_conflict_do_update(
             index_elements=[kv_cache_table.c.key],
@@ -134,7 +133,7 @@ def add_or_extend_cache_entry(
 
 
 @metrics_lib.time_me
-def get_cache_entry(key: str) -> Optional[str]:
+def get_cache_entry(key: str) -> str | None:
     """Get the value of the cache entry.
 
     Args:

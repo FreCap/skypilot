@@ -5,6 +5,7 @@ balancer Deployment.  This process owns and supervises the per-service
 controller child; it never starts an in-pod load balancer.
 """
 import argparse
+from collections.abc import Callable
 import json
 import multiprocessing
 import os
@@ -15,7 +16,7 @@ import sys
 import threading
 import time
 import traceback
-from typing import Any, Callable, Dict, NoReturn, Optional, Tuple, TYPE_CHECKING
+from typing import Any, NoReturn, TYPE_CHECKING
 
 import filelock
 
@@ -56,8 +57,8 @@ class ServiceOwnershipLostError(RuntimeError):
 def _handle_signal(service_name: str,
                    service_hash: str,
                    controller_pid: int,
-                   controller_ip: Optional[str],
-                   resource_scope: Optional[str] = None) -> bool:
+                   controller_ip: str | None,
+                   resource_scope: str | None = None) -> bool:
     """Handles the signal user sent to controller."""
     signal_file = pathlib.Path(
         constants.SIGNAL_FILE_PATH.format(service_name)).expanduser()
@@ -148,7 +149,7 @@ def _handle_signal(service_name: str,
 
 
 def cleanup_storage(yaml_content: str,
-                    resource_scope: Optional[str] = None) -> bool:
+                    resource_scope: str | None = None) -> bool:
     """Delete only ephemeral storage owned by ``resource_scope``.
 
     Args:
@@ -160,7 +161,7 @@ def cleanup_storage(yaml_content: str,
     """
     failed = False
     task = None
-    scope_id: Optional[str] = None
+    scope_id: str | None = None
 
     try:
         task = task_lib.Task.from_yaml_str(yaml_content)
@@ -278,8 +279,8 @@ def cleanup_storage(yaml_content: str,
 
 def cleanup_storage_intents(
         service_name: str,
-        resource_scope: Optional[str],
-        ownership_guard: Optional[Callable[[], bool]] = None) -> bool:
+        resource_scope: str | None,
+        ownership_guard: Callable[[], bool] | None = None) -> bool:
     """Clean every durable storage generation owned by one incarnation."""
     if not isinstance(resource_scope, str) or not resource_scope:
         logger.info('Retaining storage for legacy service without a durable '
@@ -328,9 +329,9 @@ def _cleanup(service_name: str,
              pool: bool,
              service_hash: str,
              controller_pid: int,
-             controller_ip: Optional[str],
+             controller_ip: str | None,
              lifecycle_lock: Any,
-             resource_scope: Optional[str] = None) -> bool:
+             resource_scope: str | None = None) -> bool:
     """Clean up all service related resources, i.e. replicas and storage."""
     expected_owner = (controller_pid, controller_ip)
     lifecycle_epoch = serve_utils.get_service_lifecycle_epoch(lifecycle_lock)
@@ -403,7 +404,7 @@ def _cleanup(service_name: str,
     # after it has durably published FAILED_CLEANUP.
     failed = False
     replica_infos = serve_state.get_replica_infos(service_name)
-    info2thr: Dict[replica_managers.ReplicaInfo,
+    info2thr: dict[replica_managers.ReplicaInfo,
                    thread_utils.SafeThread] = dict()
     for info in replica_infos:
         _assert_owner(f'before scheduling replica {info.replica_id} cleanup')
@@ -520,7 +521,7 @@ def _wait_for_controller_ready(
         host: str,
         port: int,
         timeout: int = 30,
-        process: Optional[multiprocessing.Process] = None) -> None:
+        process: multiprocessing.Process | None = None) -> None:
     """Block until the controller HTTP server is accepting connections.
 
     We must not flip DB `controller_pid`/`controller_ip` until the new
@@ -551,7 +552,7 @@ def _wait_for_controller_ready(
 
 
 def _orphan_exit(
-        controller_process: Optional[multiprocessing.Process]) -> NoReturn:
+        controller_process: multiprocessing.Process | None) -> NoReturn:
     """Quick exit path for an orphan sky.serve.service.
 
     Triggered when our self-check sees the DB owner tuple (service hash, PID,
@@ -580,7 +581,7 @@ def _orphan_exit(
 
 def _exit_on_ownership_loss(
         updated: bool, service_name: str, operation: str,
-        controller_process: Optional[multiprocessing.Process]) -> None:
+        controller_process: multiprocessing.Process | None) -> None:
     """Discard our controller and bypass cleanup after a failed owner CAS."""
     if updated:
         return
@@ -591,7 +592,7 @@ def _exit_on_ownership_loss(
 
 
 def _bail_on_boot_failure(service_name: str,
-                          controller_process: Optional[multiprocessing.Process],
+                          controller_process: multiprocessing.Process | None,
                           timeout_seconds: int,
                           boot_err: BaseException,
                           component: str = 'Controller subprocess') -> None:
@@ -643,8 +644,8 @@ def _spawn_controller(
         controller_host: str,
         controller_port: int,
         service_hash: str,
-        controller_ip: Optional[str],
-        resource_scope: Optional[str] = None,
+        controller_ip: str | None,
+        resource_scope: str | None = None,
         enforce_launch_fence: bool = False) -> multiprocessing.Process:
     """Spawn (and start) the controller server subprocess for a service.
 
@@ -675,7 +676,7 @@ def _select_controller_port(service_name: str) -> int:
     return common_utils.find_free_port(constants.CONTROLLER_PORT_START)
 
 
-def _kill_process(process: Optional[multiprocessing.Process]) -> None:
+def _kill_process(process: multiprocessing.Process | None) -> None:
     """Best-effort SIGKILL of a subprocess and its children."""
     if process is None:
         return
@@ -706,7 +707,7 @@ def _child_respawn_backoff_seconds(consecutive_failures: int) -> float:
 
 
 def _controller_child_responding(service_name: str, service_hash: str,
-                                 controller_ip: Optional[str],
+                                 controller_ip: str | None,
                                  controller_port: int) -> bool:
     """Bounded health check for a live-but-hung controller child."""
     try:
@@ -724,7 +725,7 @@ def _controller_child_responding(service_name: str, service_hash: str,
 
 def _flag_service_degraded(service_name: str, service_hash: str,
                            controller_pid: int,
-                           controller_ip: Optional[str]) -> None:
+                           controller_ip: str | None) -> None:
     """Mark the service CONTROLLER_FAILED after repeated child failures.
 
     Never overrides a teardown in progress. Best-effort: a DB failure here
@@ -754,7 +755,7 @@ def _flag_service_degraded(service_name: str, service_hash: str,
 
 def _heal_service_degraded(service_name: str, service_hash: str,
                            controller_pid: int,
-                           controller_ip: Optional[str]) -> bool:
+                           controller_ip: str | None) -> bool:
     """Clear CONTROLLER_FAILED once the children are confirmed healthy.
 
     Resets to REPLICA_INIT; the controller's next probe round recomputes the
@@ -794,12 +795,12 @@ def _respawn_controller(
     service_spec: 'service_spec_lib.SkyServiceSpec',
     version: int,
     controller_host: str,
-    dead_controller: Optional[multiprocessing.Process],
+    dead_controller: multiprocessing.Process | None,
     service_hash: str,
-    controller_ip: Optional[str] = None,
-    resource_scope: Optional[str] = None,
+    controller_ip: str | None = None,
+    resource_scope: str | None = None,
     enforce_launch_fence: bool = False,
-) -> Optional[Tuple[multiprocessing.Process, int]]:
+) -> tuple[multiprocessing.Process, int] | None:
     """Re-create a controller child that died while its parent is alive.
 
     HA recovery only re-creates a controller when the parent `controller_pid`
@@ -897,7 +898,7 @@ def _respawn_controller(
 
 
 def _should_resume_teardown(is_recovery: bool,
-                            service: Optional[Dict[str, Any]]) -> bool:
+                            service: dict[str, Any] | None) -> bool:
     """Whether a recovery run should resume teardown instead of serving.
 
     A controller that died mid-teardown left the service in a teardown status
@@ -918,8 +919,8 @@ def _run_cleanup_and_finalize(service_name: str,
                               job_id: int,
                               service_hash: str,
                               controller_pid: int,
-                              controller_ip: Optional[str],
-                              resource_scope: Optional[str] = None) -> None:
+                              controller_ip: str | None,
+                              resource_scope: str | None = None) -> None:
     """Run ``_cleanup`` and finalize the service's DB / dir state.
 
     Shared by ``_start``'s teardown ``finally`` and the recovery-resume path (a
@@ -982,9 +983,9 @@ def _run_cleanup_and_finalize_locked(
         job_id: int,
         service_hash: str,
         controller_pid: int,
-        controller_ip: Optional[str],
+        controller_ip: str | None,
         lifecycle_lock: Any,
-        resource_scope: Optional[str] = None) -> None:
+        resource_scope: str | None = None) -> None:
     """Owner-fenced cleanup while holding the service lifecycle lock."""
     expected_owner = (controller_pid, controller_ip)
     lifecycle_epoch = serve_utils.get_service_lifecycle_epoch(lifecycle_lock)
@@ -1113,8 +1114,8 @@ def _start(service_name: str,
            tmp_task_yaml: str,
            job_id: int,
            entrypoint: str,
-           requested_incarnation: Optional[str] = None,
-           lifecycle_epoch: Optional[int] = None):
+           requested_incarnation: str | None = None,
+           lifecycle_epoch: int | None = None):
     """Start the service controller and reconcile its external LB."""
     # Generate ssh key pair to avoid race condition when multiple sky.launch
     # are executed at the same time.
@@ -1138,9 +1139,9 @@ def _start(service_name: str,
     # Fence every boot-time DB publication to this exact row incarnation. A
     # service name can be purged and reused while controller/LB startup waits
     # for up to several minutes; PID alone is not globally unique across pods.
-    service_incarnation: Optional[str]
-    recovery_expected_controller_pid: Optional[int] = None
-    recovery_expected_controller_ip: Optional[str] = None
+    service_incarnation: str | None
+    recovery_expected_controller_pid: int | None = None
+    recovery_expected_controller_ip: str | None = None
     if is_recovery:
         assert service is not None
         service_incarnation = service.get('hash')
@@ -1175,10 +1176,10 @@ def _start(service_name: str,
         raise RuntimeError(
             f'Service {service_name!r} has no durable incarnation hash.')
     # Pod IP for full controller-owner fencing, including teardown recovery.
-    pod_ip: Optional[str] = os.environ.get('POD_IP')
+    pod_ip: str | None = os.environ.get('POD_IP')
 
     def _read_yaml_content(yaml_path: str) -> str:
-        with open(os.path.expanduser(yaml_path), 'r', encoding='utf-8') as f:
+        with open(os.path.expanduser(yaml_path), encoding='utf-8') as f:
             return f.read()
 
     # On recovery, resume the latest COMMITTED service version (one whose yaml
@@ -1650,8 +1651,8 @@ def _start(service_name: str,
                     else:
                         controller_unresponsive_checks += 1
                         controller_needs_respawn = (
-                            controller_unresponsive_checks >=
-                            _CHILD_UNRESPONSIVE_CHECKS_BEFORE_RESPAWN)
+                            controller_unresponsive_checks
+                            >= _CHILD_UNRESPONSIVE_CHECKS_BEFORE_RESPAWN)
                 if controller_needs_respawn:
                     if now >= child_retry_at:
                         result = _respawn_controller(

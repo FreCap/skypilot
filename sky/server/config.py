@@ -4,7 +4,7 @@ import dataclasses
 import enum
 import functools
 import os
-from typing import Literal, Optional
+from typing import Literal
 
 from sky import sky_logging
 from sky.server import constants as server_constants
@@ -89,9 +89,9 @@ class ServerConfig:
 
 def compute_server_config(
         deploy: bool,
-        max_db_connections: Optional[int] = None,
+        max_db_connections: int | None = None,
         quiet: bool = False,
-        reserved_memory_mb: Optional[float] = None) -> ServerConfig:
+        reserved_memory_mb: float | None = None) -> ServerConfig:
     """Compute the server config based on environment.
 
     We have different assumptions for the resources in different deployment

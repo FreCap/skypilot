@@ -1,8 +1,9 @@
 """Nebius cloud adaptor."""
 import asyncio
+from collections.abc import Awaitable
 import os
 import threading
-from typing import Any, Awaitable, List, Optional
+from typing import Any
 
 from sky import sky_logging
 from sky import skypilot_config
@@ -74,7 +75,7 @@ def credentials_path() -> str:
     return _get_default_credentials_path()
 
 
-def _get_workspace_credentials_path() -> Optional[str]:
+def _get_workspace_credentials_path() -> str | None:
     """Get credentials path if explicitly set in workspace config."""
     workspace_cred_path = skypilot_config.get_workspace_cloud('nebius').get(
         'credentials_file_path', None)
@@ -86,7 +87,7 @@ def _get_default_credentials_path() -> str:
     return '~/.nebius/credentials.json'
 
 
-def api_domain() -> Optional[str]:
+def api_domain() -> str | None:
     domain_in_ws_config = skypilot_config.get_workspace_cloud('nebius').get(
         'domain', None)
     if domain_in_ws_config is not None:
@@ -239,7 +240,7 @@ def sdk():
 
 
 @annotations.lru_cache(scope='request')
-def _sdk(token: Optional[str], cred_path: Optional[str]):
+def _sdk(token: str | None, cred_path: str | None):
     # Exactly one of token or cred_path must be provided
     assert (token is None) != (cred_path is None), (token, cred_path)
     if token is not None:
@@ -329,7 +330,7 @@ def botocore_exceptions():
     return exceptions
 
 
-def get_credential_file_paths() -> List[str]:
+def get_credential_file_paths() -> list[str]:
     """Get the list of credential file paths based on current configuration."""
     paths = {
         # Always include tenant ID and IAM token paths

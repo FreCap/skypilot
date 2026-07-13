@@ -8,7 +8,6 @@ import shlex
 import shutil
 import subprocess
 import textwrap
-from typing import Dict, List, Optional, Tuple
 import uuid
 
 from sky import sky_logging
@@ -25,7 +24,7 @@ _OPENSSH_SETENV_MIN_VERSION = (7, 8)
 
 
 @annotations.lru_cache(scope='global', maxsize=1)
-def _get_local_openssh_version() -> Optional[Tuple[int, ...]]:
+def _get_local_openssh_version() -> tuple[int, ...] | None:
     """Get the local OpenSSH client version.
 
     Parses the output of `ssh -V`, which looks like:
@@ -100,7 +99,7 @@ def _convert_wsl_path_to_windows(wsl_path: str) -> str:
     return wsl_path
 
 
-def _get_windows_userprofile_via_cmd() -> Optional[str]:
+def _get_windows_userprofile_via_cmd() -> str | None:
     """Query Windows USERPROFILE via cmd.exe.
 
     Returns:
@@ -125,7 +124,7 @@ def _get_windows_userprofile_via_cmd() -> Optional[str]:
 
 
 @annotations.lru_cache(scope='global', maxsize=1)
-def get_wsl_windows_home() -> Optional[str]:
+def get_wsl_windows_home() -> str | None:
     """Get the Windows user's home directory path when running in WSL.
 
     Returns:
@@ -186,8 +185,8 @@ class SSHConfigHelper:
     def _get_generated_config(cls, autogen_comment: str,
                               cluster_name_on_cloud: str, host_name: str,
                               ip: str, username: str, ssh_key_path: str,
-                              proxy_command: Optional[str], port: int,
-                              docker_proxy_command: Optional[str]):
+                              proxy_command: str | None, port: int,
+                              docker_proxy_command: str | None):
         if proxy_command is not None:
             # Already checked in resources
             assert docker_proxy_command is None, (
@@ -231,7 +230,7 @@ class SSHConfigHelper:
         return codegen
 
     @classmethod
-    def _get_windows_ssh_paths(cls) -> Optional[Tuple[str, str, str]]:
+    def _get_windows_ssh_paths(cls) -> tuple[str, str, str] | None:
         """Get Windows SSH config paths when running in WSL.
 
         Returns:
@@ -272,11 +271,11 @@ class SSHConfigHelper:
         cls,
         cluster_name: str,
         cluster_name_on_cloud: str,
-        ips: List[str],
+        ips: list[str],
         username: str,
         key_path: str,
-        ports: List[int],
-        proxy_command: Optional[str],
+        ports: list[int],
+        proxy_command: str | None,
         uses_docker: bool,
     ) -> None:
         """Add cluster SSH config to Windows SSH config when running in WSL.
@@ -299,7 +298,7 @@ class SSHConfigHelper:
         windows_ssh_config, windows_sky_ssh_dir, windows_home = windows_paths
 
         # Convert proxy command for Windows if present
-        windows_proxy_command: Optional[str] = None
+        windows_proxy_command: str | None = None
         if proxy_command is not None:
             windows_proxy_command = cls._convert_proxy_command_for_windows(
                 proxy_command)
@@ -335,7 +334,7 @@ class SSHConfigHelper:
                           opener=functools.partial(os.open, mode=0o644)) as f:
                     f.write('\n')
 
-            with open(windows_ssh_config, 'r', encoding='utf-8') as f:
+            with open(windows_ssh_config, encoding='utf-8') as f:
                 config = f.readlines()
 
             # Add Include directive for SkyPilot configs if not present
@@ -416,7 +415,7 @@ class SSHConfigHelper:
 
     @classmethod
     def generate_local_key_file(cls, cluster_name: str,
-                                auth_config: Dict[str, str]) -> str:
+                                auth_config: dict[str, str]) -> str:
         key_content = auth_config.pop('ssh_private_key_content', None)
         if key_content is not None:
             cluster_private_key_path = cls.ssh_cluster_key_path.format(
@@ -442,11 +441,11 @@ class SSHConfigHelper:
         cls,
         cluster_name: str,
         cluster_name_on_cloud: str,
-        ips: List[str],
-        auth_config: Dict[str, str],
-        ports: List[int],
-        docker_user: Optional[str] = None,
-        ssh_user: Optional[str] = None,
+        ips: list[str],
+        auth_config: dict[str, str],
+        ports: list[int],
+        docker_user: str | None = None,
+        ssh_user: str | None = None,
     ):
         """Add authentication information for cluster to local SSH config file.
 
@@ -497,7 +496,7 @@ class SSHConfigHelper:
                       opener=functools.partial(os.open, mode=0o644)) as f:
                 f.writelines(config)
 
-        with open(config_path, 'r', encoding='utf-8') as f:
+        with open(config_path, encoding='utf-8') as f:
             config = f.readlines()
 
         ssh_dir = cls.ssh_cluster_path.format('')
@@ -594,8 +593,8 @@ class SSHConfigHelper:
         cls,
         cluster_name: str,
         ip: str,
-        auth_config: Dict[str, str],
-        docker_user: Optional[str] = None,
+        auth_config: dict[str, str],
+        docker_user: str | None = None,
     ):
         """Remove authentication information for cluster from local SSH config.
 
@@ -614,7 +613,7 @@ class SSHConfigHelper:
         if not os.path.exists(config_path):
             return
 
-        with open(config_path, 'r', encoding='utf-8') as f:
+        with open(config_path, encoding='utf-8') as f:
             config = f.readlines()
 
         start_line_idx = None
@@ -673,7 +672,7 @@ class SSHConfigHelper:
         # Delete include statement if it exists in the config.
         sky_autogen_comment = ('# Added by sky (use `sky stop/down '
                                f'{cluster_name}` to remove)')
-        with open(config_path, 'r', encoding='utf-8') as f:
+        with open(config_path, encoding='utf-8') as f:
             config = f.readlines()
 
         for i, line in enumerate(config):
@@ -714,7 +713,7 @@ class SSHConfigHelper:
                 cls._remove_cluster_from_windows_ssh_config(cluster_name)
 
     @classmethod
-    def list_cluster_names(cls) -> List[str]:
+    def list_cluster_names(cls) -> list[str]:
         """List all names of clusters with SSH config set up."""
         cluster_config_dir = os.path.expanduser(cls.ssh_cluster_path.format(''))
         return [

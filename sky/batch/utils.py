@@ -3,6 +3,7 @@
 Includes function serialization and cloud storage helpers.
 """
 import base64
+from collections.abc import Callable
 import hashlib
 import inspect
 import json
@@ -12,7 +13,7 @@ import subprocess
 import tempfile
 import textwrap
 import typing
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any
 
 from sky.adaptors import aws
 from sky.adaptors import gcp
@@ -20,7 +21,7 @@ from sky.batch import constants
 from sky.data import data_utils
 
 if typing.TYPE_CHECKING:
-    from sky.batch import io_formats
+    pass
 
 
 def serialize_function(fn: Callable) -> str:
@@ -131,7 +132,7 @@ def deserialize_function(serialized: str) -> Callable:
             f'Expected {fn_name} to be a callable function, but got '
             f'{type(fn).__name__}')
 
-    return fn  # type: ignore[return-value]
+    return fn
 
 
 def cloud_path_exists(path: str) -> bool:
@@ -151,7 +152,7 @@ def cloud_path_exists(path: str) -> bool:
             try:
                 s3_client.head_object(Bucket=bucket, Key=key)
                 return True
-            except s3_client.exceptions.NoSuchKey:  # type: ignore[attr-defined]
+            except s3_client.exceptions.NoSuchKey:
                 return False
         elif provider == 'gs':
             client = gcp.storage_client()
@@ -165,7 +166,7 @@ def cloud_path_exists(path: str) -> bool:
         return False
 
 
-def parse_cloud_path(path: str) -> Tuple[str, str, str]:
+def parse_cloud_path(path: str) -> tuple[str, str, str]:
     """Parse a cloud storage path into provider, bucket, and key.
 
     Args:
@@ -226,7 +227,7 @@ def count_jsonl_lines_from_cloud(path: str) -> int:
             os.remove(temp_path)
 
 
-def load_jsonl_from_cloud(path: str) -> List[Dict[str, Any]]:
+def load_jsonl_from_cloud(path: str) -> list[dict[str, Any]]:
     """Load a JSONL file from cloud storage.
 
     Args:
@@ -380,7 +381,7 @@ def copy_cloud_file(source_path: str, destination_path: str) -> None:
         raise ValueError(f'Unsupported provider: {source_provider}')
 
 
-def _load_jsonl_file(path: str) -> List[Dict[str, Any]]:
+def _load_jsonl_file(path: str) -> list[dict[str, Any]]:
     """Load a local JSONL file.
 
     Args:
@@ -390,7 +391,7 @@ def _load_jsonl_file(path: str) -> List[Dict[str, Any]]:
         List of dictionaries, one per line.
     """
     data = []
-    with open(path, 'r', encoding='utf-8') as f:
+    with open(path, encoding='utf-8') as f:
         for line_num, line in enumerate(f, 1):
             line = line.strip()
             if not line:
@@ -403,7 +404,7 @@ def _load_jsonl_file(path: str) -> List[Dict[str, Any]]:
     return data
 
 
-def save_jsonl_to_cloud(data: List[Dict[str, Any]], cloud_path: str) -> None:
+def save_jsonl_to_cloud(data: list[dict[str, Any]], cloud_path: str) -> None:
     """Save data as a JSONL file to cloud storage.
 
     Args:
@@ -428,7 +429,7 @@ def save_jsonl_to_cloud(data: List[Dict[str, Any]], cloud_path: str) -> None:
 def get_input_batch_path(output_path: str,
                          start_idx: int,
                          end_idx: int,
-                         job_id: Optional[str] = None) -> str:
+                         job_id: str | None = None) -> str:
     """Generate an input batch file path for intermediate input data.
 
     Args:
@@ -465,7 +466,7 @@ def get_input_batch_path(output_path: str,
 def get_batch_path(output_path: str,
                    start_idx: int,
                    end_idx: int,
-                   job_id: Optional[str] = None) -> str:
+                   job_id: str | None = None) -> str:
     """Generate a batch file path for intermediate results.
 
     Args:
@@ -577,8 +578,7 @@ def get_attempt_image_path(output_path: str, global_idx: int, job_id: str,
             f'{global_idx:08d}.png')
 
 
-def list_batch_files(output_path: str,
-                     job_id: Optional[str] = None) -> List[str]:
+def list_batch_files(output_path: str, job_id: str | None = None) -> list[str]:
     """List all batch files for a job.
 
     Args:
@@ -633,7 +633,7 @@ def _extract_batch_start_index(batch_path: str) -> int:
     return 0
 
 
-def _list_s3_objects(bucket: str, prefix: str) -> List[str]:
+def _list_s3_objects(bucket: str, prefix: str) -> list[str]:
     """List objects in an S3 bucket with a prefix."""
     s3 = aws.client('s3')
     paginator = s3.get_paginator('list_objects_v2')
@@ -644,7 +644,7 @@ def _list_s3_objects(bucket: str, prefix: str) -> List[str]:
     return keys
 
 
-def _list_gcs_objects(bucket: str, prefix: str) -> List[str]:
+def _list_gcs_objects(bucket: str, prefix: str) -> list[str]:
     """List objects in a GCS bucket with a prefix."""
     client = gcp.storage_client()
     bucket_obj = client.bucket(bucket)
@@ -652,7 +652,7 @@ def _list_gcs_objects(bucket: str, prefix: str) -> List[str]:
     return [blob.name for blob in blobs]
 
 
-def delete_batch_files(output_path: str, job_id: Optional[str] = None) -> None:
+def delete_batch_files(output_path: str, job_id: str | None = None) -> None:
     """Delete all batch files for a specific job.
 
     IMPORTANT: Always provide job_id to avoid deleting files from other jobs
@@ -679,7 +679,7 @@ def delete_batch_files(output_path: str, job_id: Optional[str] = None) -> None:
 
 
 def delete_input_batch_files(output_path: str,
-                             job_id: Optional[str] = None) -> None:
+                             job_id: str | None = None) -> None:
     """Delete all input batch files for a specific job.
 
     IMPORTANT: Always provide job_id to avoid deleting files from other jobs
@@ -764,7 +764,7 @@ def _delete_gcs_object(bucket: str, key: str) -> None:
 
 
 def concatenate_batches_to_output(output_path: str,
-                                  job_id: Optional[str] = None) -> None:
+                                  job_id: str | None = None) -> None:
     """Concatenate all batch files into the final output file.
 
     IMPORTANT: Always provide job_id to ensure only this job's temp files are
@@ -796,7 +796,7 @@ def concatenate_batches_to_output(output_path: str,
 
 
 def concatenate_batch_files_to_output(output_path: str,
-                                      batch_files: List[str]) -> None:
+                                      batch_files: list[str]) -> None:
     """Concatenate an explicit ordered list of JSONL batch objects."""
     if not batch_files:
         raise ValueError('batch_files must not be empty')

@@ -1,4 +1,5 @@
 """Google Cloud Platform."""
+from collections.abc import Iterator
 import enum
 import json
 import os
@@ -7,7 +8,7 @@ import shutil
 import subprocess
 import time
 import typing
-from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union
+from typing import Any, Optional
 
 import colorama
 
@@ -133,11 +134,7 @@ _DEFAULT_GPU_DIRECT_IMAGE_ID = 'skypilot:gpu-direct-cos'
 
 
 def _run_output(cmd):
-    proc = subprocess.run(cmd,
-                          shell=True,
-                          check=True,
-                          stderr=subprocess.PIPE,
-                          stdout=subprocess.PIPE)
+    proc = subprocess.run(cmd, shell=True, check=True, capture_output=True)
     return proc.stdout.decode('ascii')
 
 
@@ -150,15 +147,14 @@ def _get_default():
 
 
 @annotations.ttl_cache(scope='request', timer=time.time, maxsize=10, ttl=5)
-def _list_enabled_services(project_id: str) -> Set[str]:
+def _list_enabled_services(project_id: str) -> set[str]:
     # requires serviceusage.services.list
     proc = subprocess.run(
         f'gcloud services list --project {project_id} '
         '--format="value(config.name)"',
         check=True,
         shell=True,
-        stderr=subprocess.PIPE,
-        stdout=subprocess.PIPE)
+        capture_output=True)
     return set(proc.stdout.decode().strip().splitlines())
 
 
@@ -242,8 +238,8 @@ class GCP(clouds.Cloud):
     def _unsupported_features_for_resources(
         cls,
         resources: 'resources.Resources',
-        region: Optional[str] = None,
-    ) -> Dict[clouds.CloudImplementationFeatures, str]:
+        region: str | None = None,
+    ) -> dict[clouds.CloudImplementationFeatures, str]:
         unsupported = {}
         if gcp_utils.is_tpu_vm_pod(resources):
             unsupported = {
@@ -283,7 +279,7 @@ class GCP(clouds.Cloud):
         return unsupported
 
     @classmethod
-    def max_cluster_name_length(cls) -> Optional[int]:
+    def max_cluster_name_length(cls) -> int | None:
         return cls._MAX_CLUSTER_NAME_LEN_LIMIT
 
     #### Regions/Zones ####
@@ -291,12 +287,12 @@ class GCP(clouds.Cloud):
     def regions_with_offering(
         cls,
         instance_type: str,
-        accelerators: Optional[Dict[str, int]],
+        accelerators: dict[str, int] | None,
         use_spot: bool,
-        region: Optional[str],
-        zone: Optional[str],
+        region: str | None,
+        zone: str | None,
         resources: Optional['resources.Resources'] = None,
-    ) -> List[clouds.Region]:
+    ) -> list[clouds.Region]:
         if accelerators is None:
             regions = catalog.get_region_zones_for_instance_type(instance_type,
                                                                  use_spot,
@@ -351,9 +347,9 @@ class GCP(clouds.Cloud):
         region: str,
         num_nodes: int,
         instance_type: str,
-        accelerators: Optional[Dict[str, int]] = None,
+        accelerators: dict[str, int] | None = None,
         use_spot: bool = False,
-    ) -> Iterator[List[clouds.Zone]]:
+    ) -> Iterator[list[clouds.Zone]]:
         del num_nodes  # Unused.
         regions = cls.regions_with_offering(instance_type,
                                             accelerators,
@@ -367,7 +363,7 @@ class GCP(clouds.Cloud):
                 yield [zone]
 
     @classmethod
-    def get_zone_shell_cmd(cls) -> Optional[str]:
+    def get_zone_shell_cmd(cls) -> str | None:
         # The command for getting the current zone is from:
         # https://cloud.google.com/compute/docs/metadata/querying-metadata
         command_str = (
@@ -380,8 +376,8 @@ class GCP(clouds.Cloud):
     def instance_type_to_hourly_cost(self,
                                      instance_type: str,
                                      use_spot: bool,
-                                     region: Optional[str] = None,
-                                     zone: Optional[str] = None) -> float:
+                                     region: str | None = None,
+                                     zone: str | None = None) -> float:
         return catalog.get_hourly_cost(instance_type,
                                        use_spot=use_spot,
                                        region=region,
@@ -389,10 +385,10 @@ class GCP(clouds.Cloud):
                                        clouds='gcp')
 
     def accelerators_to_hourly_cost(self,
-                                    accelerators: Dict[str, int],
+                                    accelerators: dict[str, int],
                                     use_spot: bool,
-                                    region: Optional[str] = None,
-                                    zone: Optional[str] = None) -> float:
+                                    region: str | None = None,
+                                    zone: str | None = None) -> float:
         assert len(accelerators) == 1, accelerators
         acc, acc_count = list(accelerators.items())[0]
         return catalog.get_accelerator_hourly_cost(acc,
@@ -469,22 +465,22 @@ class GCP(clouds.Cloud):
             raise
 
     @classmethod
-    def get_image_size(cls, image_id: str, region: Optional[str]) -> float:
+    def get_image_size(cls, image_id: str, region: str | None) -> float:
         del region  # Unused.
         return cls._get_image_size(image_id)
 
     @classmethod
     def get_default_instance_type(
         cls,
-        cpus: Optional[str] = None,
-        memory: Optional[str] = None,
-        disk_tier: Optional[resources_utils.DiskTier] = None,
-        local_disk: Optional[str] = None,
-        region: Optional[str] = None,
-        zone: Optional[str] = None,
+        cpus: str | None = None,
+        memory: str | None = None,
+        disk_tier: resources_utils.DiskTier | None = None,
+        local_disk: str | None = None,
+        region: str | None = None,
+        zone: str | None = None,
         use_spot: bool = False,
-        max_hourly_cost: Optional[float] = None,
-    ) -> Optional[str]:
+        max_hourly_cost: float | None = None,
+    ) -> str | None:
         return catalog.get_default_instance_type(
             cpus=cpus,
             memory=memory,
@@ -498,9 +494,9 @@ class GCP(clouds.Cloud):
 
     @classmethod
     def failover_disk_tier(
-        cls, instance_type: Optional[str],
-        disk_tier: Optional[resources_utils.DiskTier]
-    ) -> Optional[resources_utils.DiskTier]:
+        cls, instance_type: str | None,
+        disk_tier: resources_utils.DiskTier | None
+    ) -> resources_utils.DiskTier | None:
         if (disk_tier is not None and
                 disk_tier != resources_utils.DiskTier.BEST):
             return disk_tier
@@ -536,11 +532,11 @@ class GCP(clouds.Cloud):
         resources: 'resources.Resources',
         cluster_name: resources_utils.ClusterName,
         region: 'clouds.Region',
-        zones: Optional[List['clouds.Zone']],
+        zones: list['clouds.Zone'] | None,
         num_nodes: int,
         dryrun: bool = False,
-        volume_mounts: Optional[List['volume_lib.VolumeMount']] = None,
-    ) -> Dict[str, Optional[str]]:
+        volume_mounts: list['volume_lib.VolumeMount'] | None = None,
+    ) -> dict[str, str | None]:
         assert zones is not None, (region, zones)
 
         region_name = region.name
@@ -613,8 +609,7 @@ class GCP(clouds.Cloud):
                 elif acc in ('H200',):
                     resources_vars['gpu'] = f'nvidia-{acc.lower()}-141gb'
                 else:
-                    resources_vars['gpu'] = 'nvidia-tesla-{}'.format(
-                        acc.lower())
+                    resources_vars['gpu'] = f'nvidia-tesla-{acc.lower()}'
                 resources_vars['gpu_count'] = acc_count
                 if enable_gpu_direct or network_tier == resources_utils.NetworkTier.BEST:
                     # The actual image id is set in resources.py (see _try_validate_image_id)
@@ -845,7 +840,7 @@ class GCP(clouds.Cloud):
     def get_accelerators_from_instance_type(
         cls,
         instance_type: str,
-    ) -> Optional[Dict[str, Union[int, float]]]:
+    ) -> dict[str, int | float] | None:
         # GCP handles accelerators separately from regular instance types.
         # This method supports automatically inferring the GPU type for
         # the instance type that come with GPUs pre-attached.
@@ -856,7 +851,7 @@ class GCP(clouds.Cloud):
     def get_vcpus_mem_from_instance_type(
         cls,
         instance_type: str,
-    ) -> Tuple[Optional[float], Optional[float]]:
+    ) -> tuple[float | None, float | None]:
         return catalog.get_vcpus_mem_from_instance_type(instance_type,
                                                         clouds='gcp')
 
@@ -880,7 +875,7 @@ class GCP(clouds.Cloud):
 
     @classmethod
     def _check_compute_credentials(
-            cls) -> Tuple[bool, Optional[Union[str, Dict[str, str]]]]:
+            cls) -> tuple[bool, str | dict[str, str] | None]:
         """Checks if the user has access credentials to this cloud's compute service."""
         return cls._check_credentials(
             [
@@ -893,7 +888,7 @@ class GCP(clouds.Cloud):
 
     @classmethod
     def _check_storage_credentials(
-            cls) -> Tuple[bool, Optional[Union[str, Dict[str, str]]]]:
+            cls) -> tuple[bool, str | dict[str, str] | None]:
         """Checks if the user has access credentials to this cloud's storage service."""
         return cls._check_credentials(
             [('storage', 'Cloud Storage')],
@@ -901,13 +896,13 @@ class GCP(clouds.Cloud):
 
     @classmethod
     def _check_credentials(
-            cls, apis: List[Tuple[str, str]],
-            gcp_minimal_permissions: List[str]) -> Tuple[bool, Optional[str]]:
+            cls, apis: list[tuple[str, str]],
+            gcp_minimal_permissions: list[str]) -> tuple[bool, str | None]:
         """Checks if the user has access credentials to this cloud."""
         try:
             # pylint: disable=import-outside-toplevel,unused-import
             # Check google-api-python-client installation.
-            from google import auth  # type: ignore
+            from google import auth
             import googleapiclient
 
             if shutil.which('gcloud') is None:
@@ -1038,7 +1033,7 @@ class GCP(clouds.Cloud):
 
         return True, None
 
-    def get_credential_file_mounts(self) -> Dict[str, str]:
+    def get_credential_file_mounts(self) -> dict[str, str]:
         # Excluding the symlink to the python executable created by the gcp
         # credential, which causes problem for ray up multiple nodes, tracked
         # in #494, #496, #483.
@@ -1069,7 +1064,7 @@ class GCP(clouds.Cloud):
                 identity_type.can_credential_expire())
 
     @classmethod
-    def _get_identity_type(cls) -> Optional[GCPIdentityType]:
+    def _get_identity_type(cls) -> GCPIdentityType | None:
         try:
             account = cls.get_active_user_identity()
         except exceptions.CloudUserIdentityError:
@@ -1082,7 +1077,7 @@ class GCP(clouds.Cloud):
         return GCPIdentityType.SHARED_CREDENTIALS_FILE
 
     @classmethod
-    def get_user_identities(cls) -> List[List[str]]:
+    def get_user_identities(cls) -> list[list[str]]:
         """Returns the email address + project id of the active user."""
         gcp_workspace_config = json.dumps(
             skypilot_config.get_workspace_cloud('gcp'), sort_keys=True)
@@ -1090,8 +1085,8 @@ class GCP(clouds.Cloud):
 
     @classmethod
     @annotations.lru_cache(scope='request', maxsize=5)
-    def _get_user_identities(
-            cls, workspace_config: Optional[str]) -> List[List[str]]:
+    def _get_user_identities(cls,
+                             workspace_config: str | None) -> list[list[str]]:
         # We add workspace_config in args to avoid caching the GCP identity
         # for when different workspace configs are used. Use json.dumps to
         # ensure the config is hashable.
@@ -1132,7 +1127,7 @@ class GCP(clouds.Cloud):
         return [[f'{account} [project_id={project_id}]']]
 
     @classmethod
-    def get_active_user_identity_str(cls) -> Optional[str]:
+    def get_active_user_identity_str(cls) -> str | None:
         user_identity = cls.get_active_user_identity()
         if user_identity is None:
             return None
@@ -1179,13 +1174,13 @@ class GCP(clouds.Cloud):
     @classmethod
     def check_disk_tier(
         cls,
-        instance_type: Optional[str],  # pylint: disable=unused-argument
-        disk_tier: Optional[resources_utils.DiskTier]  # pylint: disable=unused-argument
-    ) -> Tuple[bool, str]:
+        instance_type: str | None,  # pylint: disable=unused-argument
+        disk_tier: resources_utils.DiskTier | None  # pylint: disable=unused-argument
+    ) -> tuple[bool, str]:
         return True, ''
 
     @classmethod
-    def check_disk_tier_enabled(cls, instance_type: Optional[str],
+    def check_disk_tier_enabled(cls, instance_type: str | None,
                                 disk_tier: resources_utils.DiskTier) -> None:
         ok, msg = cls.check_disk_tier(instance_type, disk_tier)
         if not ok:
@@ -1195,15 +1190,15 @@ class GCP(clouds.Cloud):
     @classmethod
     def _get_disk_type(
         cls,
-        instance_type: Optional[str],
-        disk_tier: Optional[resources_utils.DiskTier],
+        instance_type: str | None,
+        disk_tier: resources_utils.DiskTier | None,
     ) -> str:
 
         def _propagate_disk_type(
-            lowest: Optional[str] = None,
-            highest: Optional[str] = None,
-            # pylint: disable=redefined-builtin
-            all: Optional[str] = None) -> None:
+                lowest: str | None = None,
+                highest: str | None = None,
+                # pylint: disable=redefined-builtin
+                all: str | None = None) -> None:
             if lowest is not None:
                 tier2name[resources_utils.DiskTier.LOW] = lowest
             if highest is not None:
@@ -1242,7 +1237,7 @@ class GCP(clouds.Cloud):
 
         # Series specific handling
         if series == 'n2':
-            num_cpus = int(instance_type.split('-')[2])  # type: ignore
+            num_cpus = int(instance_type.split('-')[2])
             if num_cpus < 64:
                 # n2 series with less than 64 vCPUs doesn't support pd-extreme, use pd-ssd for ULTRA.
                 _propagate_disk_type(
@@ -1257,8 +1252,8 @@ class GCP(clouds.Cloud):
     @classmethod
     def _get_data_disk_type(
         cls,
-        instance_type: Optional[str],
-        disk_tier: Optional[resources_utils.DiskTier],
+        instance_type: str | None,
+        disk_tier: resources_utils.DiskTier | None,
     ) -> str:
 
         tier = cls._translate_disk_tier(disk_tier)
@@ -1267,9 +1262,9 @@ class GCP(clouds.Cloud):
 
     @classmethod
     def _get_disk_specs(
-            cls, instance_type: Optional[str],
-            disk_tier: Optional[resources_utils.DiskTier]) -> Dict[str, Any]:
-        specs: Dict[str, Any] = {
+            cls, instance_type: str | None,
+            disk_tier: resources_utils.DiskTier | None) -> dict[str, Any]:
+        specs: dict[str, Any] = {
             'disk_tier': cls._get_disk_type(instance_type, disk_tier)
         }
         if (disk_tier == resources_utils.DiskTier.ULTRA and
@@ -1283,12 +1278,12 @@ class GCP(clouds.Cloud):
     def _get_volumes_specs(
         cls,
         region: 'clouds.Region',
-        zones: Optional[List['clouds.Zone']],
-        instance_type: Optional[str],
-        volumes: Optional[List[Dict[str, Any]]],
+        zones: list['clouds.Zone'] | None,
+        instance_type: str | None,
+        volumes: list[dict[str, Any]] | None,
         use_mig: bool,
         tpu_vm: bool,
-    ) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
+    ) -> tuple[list[dict[str, Any]], dict[str, str]]:
         if volumes is None:
             return [], {}
 
@@ -1296,8 +1291,8 @@ class GCP(clouds.Cloud):
 
         volume_utils.validate_instance_volumes(instance_type, volumes)
 
-        volumes_specs: List[Dict[str, Any]] = []
-        device_mount_points: Dict[str, str] = {}
+        volumes_specs: list[dict[str, Any]] = []
+        device_mount_points: dict[str, str] = {}
         ssd_index = 0
         # TPU data disk index starts from 1, 0 is the boot disk
         tpu_disk_index = 1
@@ -1373,7 +1368,7 @@ class GCP(clouds.Cloud):
         return volumes_specs, device_mount_points
 
     @classmethod
-    def _label_filter_str(cls, tag_filters: Dict[str, str]) -> str:
+    def _label_filter_str(cls, tag_filters: dict[str, str]) -> str:
         return ' '.join(f'labels.{k}={v}' for k, v in tag_filters.items())
 
     @classmethod
@@ -1439,9 +1434,9 @@ class GCP(clouds.Cloud):
         self,
         instance_type: str,
         region: str,
-        zone: Optional[str],
-        specific_reservations: Set[str],
-    ) -> Dict[str, int]:
+        zone: str | None,
+        specific_reservations: set[str],
+    ) -> dict[str, int]:
         del region  # Unused
         if zone is None:
             # For backward compatibility, the cluster in INIT state launched
@@ -1458,9 +1453,9 @@ class GCP(clouds.Cloud):
         }
 
     @classmethod
-    def query_status(cls, name: str, tag_filters: Dict[str, str],
-                     region: Optional[str], zone: Optional[str],
-                     **kwargs) -> List['status_lib.ClusterStatus']:
+    def query_status(cls, name: str, tag_filters: dict[str, str],
+                     region: str | None, zone: str | None,
+                     **kwargs) -> list['status_lib.ClusterStatus']:
         """Query the status of a cluster."""
         # TODO(suquark): deprecate this method
         assert False, 'This code path should not be used.'
@@ -1468,8 +1463,7 @@ class GCP(clouds.Cloud):
     @classmethod
     def create_image_from_cluster(cls,
                                   cluster_name: resources_utils.ClusterName,
-                                  region: Optional[str],
-                                  zone: Optional[str]) -> str:
+                                  region: str | None, zone: str | None) -> str:
         del region  # unused
         assert zone is not None
         # TODO(zhwu): This assumes the cluster is created with the
@@ -1539,14 +1533,14 @@ class GCP(clouds.Cloud):
 
     @classmethod
     def maybe_move_image(cls, image_id: str, source_region: str,
-                         target_region: str, source_zone: Optional[str],
-                         target_zone: Optional[str]) -> str:
+                         target_region: str, source_zone: str | None,
+                         target_zone: str | None) -> str:
         del source_region, target_region, source_zone, target_zone  # Unused.
         # GCP images are global, so no need to move.
         return image_id
 
     @classmethod
-    def delete_image(cls, image_id: str, region: Optional[str]) -> None:
+    def delete_image(cls, image_id: str, region: str | None) -> None:
         del region  # Unused.
         image_name = image_id.rpartition('/')[2]
         delete_image_cmd = f'gcloud compute images delete {image_name} --quiet'
@@ -1563,7 +1557,7 @@ class GCP(clouds.Cloud):
 
     @classmethod
     def is_label_valid(cls, label_key: str,
-                       label_value: str) -> Tuple[bool, Optional[str]]:
+                       label_value: str) -> tuple[bool, str | None]:
         key_regex = re.compile(r'^[a-z]([a-z0-9_-]{0,62})?$')
         value_regex = re.compile(r'^[a-z0-9_-]{0,63}$')
         key_valid = bool(key_regex.match(label_key))

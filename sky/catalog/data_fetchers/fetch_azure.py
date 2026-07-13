@@ -8,7 +8,6 @@ from multiprocessing import pool as mp_pool
 import os
 import subprocess
 import typing
-from typing import List, Optional, Set
 import urllib
 
 import numpy as np
@@ -72,7 +71,7 @@ FAMILY_NAME_TO_SKYPILOT_GPU_NAME = {
 }
 
 
-def get_regions() -> List[str]:
+def get_regions() -> list[str]:
     """Get all available regions."""
     proc = subprocess.run(
         'az account list-locations  --query "[?not_null(metadata.latitude)] '
@@ -109,7 +108,7 @@ USEFUL_COLUMNS = [
 ]
 
 
-def get_pricing_url(region: Optional[str] = None) -> str:
+def get_pricing_url(region: str | None = None) -> str:
     filters = [
         'serviceName eq \'Virtual Machines\'',
         'priceType eq \'Consumption\'',
@@ -120,7 +119,7 @@ def get_pricing_url(region: Optional[str] = None) -> str:
     return f'https://prices.azure.com/api/retail/prices?$filter={filters_str}'
 
 
-def get_pricing_df(region: Optional[str] = None) -> 'pd.DataFrame':
+def get_pricing_df(region: str | None = None) -> 'pd.DataFrame':
     all_items = []
     url = get_pricing_url(region)
     print(f'Getting pricing for {region}, url: {url}')
@@ -149,7 +148,7 @@ def get_pricing_df(region: Optional[str] = None) -> 'pd.DataFrame':
         & (df['unitPrice'] > 0)]
 
 
-def get_sku_df(region_set: Set[str]) -> 'pd.DataFrame':
+def get_sku_df(region_set: set[str]) -> 'pd.DataFrame':
     print('Fetching SKU list')
     # To get a complete list, --all option is necessary.
     proc = subprocess.run(
@@ -173,7 +172,7 @@ def get_sku_df(region_set: Set[str]) -> 'pd.DataFrame':
     return df
 
 
-def get_gpu_name(family: str) -> Optional[str]:
+def get_gpu_name(family: str) -> str | None:
     # NP-series offer Xilinx U250 FPGAs which are not GPUs,
     # so we do not include them here.
     # https://docs.microsoft.com/en-us/azure/virtual-machines/np-series
@@ -181,7 +180,7 @@ def get_gpu_name(family: str) -> Optional[str]:
     return FAMILY_NAME_TO_SKYPILOT_GPU_NAME.get(family)
 
 
-def get_all_regions_instance_types_df(region_set: Set[str]):
+def get_all_regions_instance_types_df(region_set: set[str]):
     if SINGLE_THREADED:
         dfs = [get_pricing_df(region) for region in region_set]
         df_sku = get_sku_df(region_set)

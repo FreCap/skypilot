@@ -7,7 +7,6 @@ field. Pair with ``gzip`` + ``base64`` at the call site.
 import io
 import token
 import tokenize
-from typing import List
 
 
 def minify_python_source(source: str) -> str:
@@ -18,7 +17,7 @@ def minify_python_source(source: str) -> str:
     dropped. Identifiers, non-docstring string literals, and control
     flow are untouched.
     """
-    out: List[str] = []
+    out: list[str] = []
     prev_toktype = token.INDENT
     last_lineno = -1
     last_col = 0

@@ -3,7 +3,7 @@ import copy
 import logging
 import time
 import typing
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any
 
 from typing_extensions import TypedDict
 
@@ -40,7 +40,7 @@ def _skypilot_log_error_and_exit_for_failover(error_code: str,
 def wait_for_crm_operation(operation, crm):
     """Poll for cloud resource manager operation until finished."""
     logger.info('wait_for_crm_operation: '
-                'Waiting for operation {} to finish...'.format(operation))
+                f'Waiting for operation {operation} to finish...')
 
     for _ in range(constants.MAX_POLLS):
         result = crm.operations().get(name=operation['name']).execute()
@@ -374,9 +374,10 @@ def _configure_iam_role(config: common.ProvisionConfig, crm, iam) -> dict:
             service_account = ray_service_account
             satisfied = ray_satisfied
         elif service_account is None:
-            logger.info('_configure_iam_role: '
-                        'Creating new service account {}'.format(
-                            constants.SKYPILOT_SERVICE_ACCOUNT_ID))
+            logger.info(
+                '_configure_iam_role: '
+                f'Creating new service account {constants.SKYPILOT_SERVICE_ACCOUNT_ID}'
+            )
             # SkyPilot: a GCP user without the permission to create a service
             # account will fail here.
             service_account = _create_service_account(
@@ -403,7 +404,7 @@ def _configure_iam_role(config: common.ProvisionConfig, crm, iam) -> dict:
         # account is limited by the IAM rights specified below.
         'scopes': ['https://www.googleapis.com/auth/cloud-platform'],
     }
-    iam_role: Dict[str, Any]
+    iam_role: dict[str, Any]
     if (instance_utils.get_node_type(
             config.node_config) == instance_utils.GCPNodeType.TPU):
         # SKY: The API for TPU VM is slightly different from normal compute
@@ -418,7 +419,9 @@ def _configure_iam_role(config: common.ProvisionConfig, crm, iam) -> dict:
     return iam_role
 
 
-AllowedList = TypedDict('AllowedList', {'IPProtocol': str, 'ports': List[str]})
+class AllowedList(TypedDict):
+    IPProtocol: str
+    ports: list[str]
 
 
 def _check_firewall_rules(cluster_name: str, vpc_name: str, project_id: str,
@@ -434,7 +437,7 @@ def _check_firewall_rules(cluster_name: str, vpc_name: str, project_id: str,
     effective_rules = response['firewalls']
 
     def _merge_and_refine_rule(
-            rules) -> Dict[Tuple[str, str], Dict[str, Set[int]]]:
+            rules) -> dict[tuple[str, str], dict[str, set[int]]]:
         """Returns the reformatted rules from the firewall rules
 
         The function translates firewall rules fetched from the cloud provider
@@ -471,8 +474,8 @@ def _check_firewall_rules(cluster_name: str, vpc_name: str, project_id: str,
                 ('INGRESS', '0.0.0.0/0'): {'tcp': {22}},
             }
         """
-        source2rules: Dict[Tuple[str, str], Dict[str, Set[int]]] = {}
-        source2allowed_list: Dict[Tuple[str, str], List[AllowedList]] = {}
+        source2rules: dict[tuple[str, str], dict[str, set[int]]] = {}
+        source2allowed_list: dict[tuple[str, str], list[AllowedList]] = {}
         for rule in rules:
             # Rules applied to specific VM (targetTags) may not work for the
             # current VM, so should be skipped.
@@ -582,15 +585,15 @@ def _create_rules(project_id: str,
         wait_for_compute_global_operation(project_id, op, compute)
 
 
-def _network_interface_to_vpc_name(network_interface: Dict[str, str]) -> str:
+def _network_interface_to_vpc_name(network_interface: dict[str, str]) -> str:
     """Returns the VPC name of a network interface."""
     return network_interface['network'].split('/')[-1]
 
 
 def _get_subnets_with_names(
-    subnets: List['google.cloud.compute_v1.types.compute.Subnetwork'],
-    subnet_names: List[str],
-) -> List['google.cloud.compute_v1.types.compute.Subnetwork']:
+    subnets: list['google.cloud.compute_v1.types.compute.Subnetwork'],
+    subnet_names: list[str],
+) -> list['google.cloud.compute_v1.types.compute.Subnetwork']:
     """Returns matching subnets in user-specified order."""
     ordered_names = list(dict.fromkeys(subnet_names))
     subnets_by_name = {subnet['name']: subnet for subnet in subnets}
@@ -606,7 +609,7 @@ def get_usable_vpc_and_subnet(
     region: str,
     config: common.ProvisionConfig,
     compute,
-) -> Tuple[str, 'google.cloud.compute_v1.types.compute.Subnetwork']:
+) -> tuple[str, 'google.cloud.compute_v1.types.compute.Subnetwork']:
     """Return a usable VPC and the subnet in it.
 
     If config.provider_config['vpc_name'] or
@@ -770,7 +773,7 @@ def get_gpu_direct_usable_vpcs_and_subnets(
     region: str,
     config: common.ProvisionConfig,
     compute,
-) -> List[Tuple[str, 'google.cloud.compute_v1.types.compute.Subnetwork']]:
+) -> list[tuple[str, 'google.cloud.compute_v1.types.compute.Subnetwork']]:
     """Return a list of usable VPCs and subnets for GPU Direct."""
     project_id = config.provider_config['project_id']
     vpc_subnet_pairs = []
@@ -886,8 +889,8 @@ def _configure_placement_policy(region: str, cluster_name: str,
     # resource policies is not supported.'}]
     mig_configuration = config.provider_config.get('use_managed_instance_group',
                                                    False)
-    if (group_placement_policy is None or group_placement_policy.lower() !=
-            constants.COMPACT_GROUP_PLACEMENT_POLICY or mig_configuration):
+    if (group_placement_policy is None or group_placement_policy.lower()
+            != constants.COMPACT_GROUP_PLACEMENT_POLICY or mig_configuration):
         return config
 
     policy_name = f'{cluster_name}-placement-policy'
@@ -1039,7 +1042,7 @@ def _list_subnets(
         region: str,
         compute,
         network=None
-) -> List['google.cloud.compute_v1.types.compute.Subnetwork']:
+) -> list['google.cloud.compute_v1.types.compute.Subnetwork']:
     response = (compute.subnetworks().list(
         project=project_id,
         region=region,
@@ -1085,8 +1088,7 @@ def _create_project(project_id: str, crm):
 
 
 def _get_service_account(account: str, project_id: str, iam):
-    full_name = 'projects/{project_id}/serviceAccounts/{account}'.format(
-        project_id=project_id, account=account)
+    full_name = f'projects/{project_id}/serviceAccounts/{account}'
     try:
         service_account = iam.projects().serviceAccounts().get(
             name=full_name).execute()
@@ -1104,7 +1106,7 @@ def _get_service_account(account: str, project_id: str, iam):
 def _create_service_account(account_id: str, account_config, project_id: str,
                             iam):
     service_account = (iam.projects().serviceAccounts().create(
-        name='projects/{project_id}'.format(project_id=project_id),
+        name=f'projects/{project_id}',
         body={
             'accountId': account_id,
             'serviceAccount': account_config,

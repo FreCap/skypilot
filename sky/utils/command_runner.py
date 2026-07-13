@@ -1,4 +1,6 @@
 """Runner for commands to be executed on the cluster."""
+from collections.abc import Callable
+from collections.abc import Iterable
 import enum
 import fcntl
 import hashlib
@@ -15,8 +17,7 @@ import tempfile
 import termios
 import threading
 import time
-from typing import (Any, Callable, Dict, Iterable, List, Optional, Tuple, Type,
-                    Union)
+from typing import Any
 import uuid
 
 import colorama
@@ -83,7 +84,7 @@ _SSH_AUTH_FAILURE_PATTERNS = [
 ]
 
 
-def _ssh_control_path(ssh_control_filename: Optional[str]) -> Optional[str]:
+def _ssh_control_path(ssh_control_filename: str | None) -> str | None:
     """Returns a temporary path to be used as the ssh control path."""
     if ssh_control_filename is None:
         return None
@@ -116,7 +117,7 @@ ALIAS_SUDO_TO_EMPTY_FOR_ROOT_CMD = (
 
 
 def _proxyjump_to_proxycommand(proxy_jump: str,
-                               ssh_log_file: Optional[str] = None) -> str:
+                               ssh_log_file: str | None = None) -> str:
     """Convert ProxyJump spec to an equivalent implicit ProxyCommand.
 
     This mirrors OpenSSH's behavior when converting ProxyJump to ProxyCommand:
@@ -130,7 +131,7 @@ def _proxyjump_to_proxycommand(proxy_jump: str,
     if not hops:
         raise ValueError(f'Invalid ProxyJump: {proxy_jump!r}')
 
-    def parse_hop(dest: str) -> Tuple[Optional[str], str, Optional[int]]:
+    def parse_hop(dest: str) -> tuple[str | None, str, int | None]:
         # Parse [user@]host[:port]
         user = None
         hostport = dest
@@ -200,19 +201,19 @@ def _proxyjump_to_proxycommand(proxy_jump: str,
 
 
 def ssh_options_list(
-    ssh_private_key: Optional[str],
-    ssh_control_name: Optional[str],
+    ssh_private_key: str | None,
+    ssh_control_name: str | None,
     *,
-    ssh_proxy_command: Optional[str] = None,
-    ssh_proxy_jump: Optional[str] = None,
-    docker_ssh_proxy_command: Optional[str] = None,
-    connect_timeout: Optional[int] = None,
+    ssh_proxy_command: str | None = None,
+    ssh_proxy_jump: str | None = None,
+    docker_ssh_proxy_command: str | None = None,
+    connect_timeout: int | None = None,
     port: int = 22,
-    disable_control_master: Optional[bool] = False,
+    disable_control_master: bool | None = False,
     escape_percent_expand: bool = False,
-    ssh_log_file: Optional[str] = None,
+    ssh_log_file: str | None = None,
     disable_identities_only: bool = False,
-) -> List[str]:
+) -> list[str]:
     """Returns a list of sane options for 'ssh'."""
     if connect_timeout is None:
         connect_timeout = _DEFAULT_CONNECT_TIMEOUT
@@ -312,8 +313,7 @@ def ssh_options_list(
 
     return ssh_key_option + [
         x for y in (['-o', f'{k}={v}']
-                    for k, v in arg_dict.items()
-                    if v is not None) for x in y
+                    for k, v in arg_dict.items() if v is not None) for x in y
     ]
 
 
@@ -331,7 +331,7 @@ class SshMode(enum.Enum):
 class CommandRunner:
     """Runner for commands to be executed on the cluster."""
 
-    def __init__(self, node: Tuple[Any, Any], **kwargs):
+    def __init__(self, node: tuple[Any, Any], **kwargs):
         del kwargs  # Unused.
         self.node = node
 
@@ -363,7 +363,7 @@ class CommandRunner:
 
     def _get_command_to_run(
         self,
-        cmd: Union[str, List[str]],
+        cmd: str | list[str],
         process_stream: bool,
         separate_stderr: bool,
         skip_num_lines: int,
@@ -449,16 +449,16 @@ class CommandRunner:
             self,
             source: str,
             target: str,
-            node_destination: Optional[str],
+            node_destination: str | None,
             up: bool,
-            rsh_option: Optional[str],
+            rsh_option: str | None,
             # Advanced options.
             log_path: str = os.devnull,
             stream_logs: bool = True,
             max_retry: int = 1,
-            prefix_command: Optional[str] = None,
+            prefix_command: str | None = None,
             get_remote_home_dir: Callable[[], str] = lambda: '~',
-            timeout: Optional[int] = None) -> None:
+            timeout: int | None = None) -> None:
         """Builds the rsync command."""
         # Build command.
         rsync_command = []
@@ -541,7 +541,7 @@ class CommandRunner:
         deadline = (time.monotonic() + timeout) if timeout is not None else None
         timed_out = False
         while max_retry >= 0:
-            attempt_timeout: Optional[int] = None
+            attempt_timeout: int | None = None
             if deadline is not None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -606,7 +606,7 @@ class CommandRunner:
     @timeline.event
     def run(
             self,
-            cmd: Union[str, List[str]],
+            cmd: str | list[str],
             *,
             require_outputs: bool = False,
             # Advanced options.
@@ -616,11 +616,11 @@ class CommandRunner:
             stream_logs: bool = True,
             ssh_mode: SshMode = SshMode.NON_INTERACTIVE,
             separate_stderr: bool = False,
-            connect_timeout: Optional[int] = None,
+            connect_timeout: int | None = None,
             source_bashrc: bool = False,
             skip_num_lines: int = 0,
             run_in_background: bool = False,
-            **kwargs) -> Union[int, Tuple[int, str, str]]:
+            **kwargs) -> int | tuple[int, str, str]:
         """Runs the command on the cluster.
 
         Args:
@@ -649,9 +649,9 @@ class CommandRunner:
 
     def run_driver(
         self,
-        cmd: Union[str, List[str]],
+        cmd: str | list[str],
         **kwargs,
-    ) -> Union[int, Tuple[int, str, str]]:
+    ) -> int | tuple[int, str, str]:
         """Runs the command for executing the job driver on the cluster.
 
         On most clouds, this is equivalent to run(). For Slurm with containers,
@@ -672,9 +672,9 @@ class CommandRunner:
 
     def run_setup(
         self,
-        cmd: Union[str, List[str]],
+        cmd: str | list[str],
         **kwargs,
-    ) -> Union[int, Tuple[int, str, str]]:
+    ) -> int | tuple[int, str, str]:
         """Runs the setup command on the cluster.
 
         On most clouds, this is equivalent to run(). For Slurm with containers,
@@ -703,7 +703,7 @@ class CommandRunner:
         log_path: str = os.devnull,
         stream_logs: bool = True,
         max_retry: int = 1,
-        timeout: Optional[int] = None,
+        timeout: int | None = None,
     ) -> None:
         """Uses 'rsync' to sync 'source' to 'target'.
 
@@ -735,7 +735,7 @@ class CommandRunner:
         log_path: str = os.devnull,
         stream_logs: bool = True,
         max_retry: int = 1,
-        timeout: Optional[int] = None,
+        timeout: int | None = None,
     ) -> None:
         """Rsync files related to the job driver execution.
 
@@ -774,7 +774,7 @@ class CommandRunner:
         log_path: str = os.devnull,
         stream_logs: bool = True,
         max_retry: int = 1,
-        timeout: Optional[int] = None,
+        timeout: int | None = None,
     ) -> None:
         """Rsync files for setting up the SkyPilot runtime on the cluster.
 
@@ -805,10 +805,10 @@ class CommandRunner:
 
     @classmethod
     def make_runner_list(
-        cls: Type['CommandRunner'],
+        cls: type['CommandRunner'],
         node_list: Iterable[Any],
         **kwargs,
-    ) -> List['CommandRunner']:
+    ) -> list['CommandRunner']:
         """Helper function for creating runners with the same credentials"""
         return [cls(node, **kwargs) for node in node_list]
 
@@ -823,9 +823,9 @@ class CommandRunner:
 
     def port_forward_command(
             self,
-            port_forward: List[Tuple[int, int]],
+            port_forward: list[tuple[int, int]],
             connect_timeout: int = 1,
-            ssh_mode: SshMode = SshMode.INTERACTIVE) -> List[str]:
+            ssh_mode: SshMode = SshMode.INTERACTIVE) -> list[str]:
         """Command for forwarding ports from localhost to the remote machine.
 
         Args:
@@ -845,9 +845,9 @@ class CommandRunner:
         # Advanced options.
         log_path: str = os.devnull,
         stream_logs: bool = True,
-        connect_timeout: Optional[int] = None,
+        connect_timeout: int | None = None,
         max_retry: int = 1,
-        envs_and_secrets: Optional[Dict[str, str]] = None,
+        envs_and_secrets: dict[str, str] | None = None,
     ) -> None:
         """Clones a Git repository on the remote machine using git_clone.sh.
 
@@ -941,15 +941,15 @@ class SSHCommandRunner(CommandRunner):
 
     def __init__(
         self,
-        node: Tuple[str, int],
+        node: tuple[str, int],
         ssh_user: str,
-        ssh_private_key: Optional[str],
-        ssh_control_name: Optional[str] = DEFAULT_SSH_CONTROL_NAME,
-        ssh_proxy_command: Optional[str] = None,
-        ssh_proxy_jump: Optional[str] = None,
-        docker_user: Optional[str] = None,
-        disable_control_master: Optional[bool] = False,
-        port_forward_execute_remote_command: Optional[bool] = False,
+        ssh_private_key: str | None,
+        ssh_control_name: str | None = DEFAULT_SSH_CONTROL_NAME,
+        ssh_proxy_command: str | None = None,
+        ssh_proxy_jump: str | None = None,
+        docker_user: str | None = None,
+        disable_control_master: bool | None = False,
+        port_forward_execute_remote_command: bool | None = False,
         enable_interactive_auth: bool = False,
         disable_identities_only: bool = False,
     ):
@@ -998,7 +998,7 @@ class SSHCommandRunner(CommandRunner):
         # docker branch below bakes the (possibly bypassed) proxy into the
         # inner-hop command at construction, which would make the bypass
         # irreversible for this runner's lifetime.
-        self._ssm_bypassed_proxy_command: Optional[str] = None
+        self._ssm_bypassed_proxy_command: str | None = None
         self._ssm_bypass_key = (ip, port or 22)
         if ssh_proxy_command is not None and docker_user is None:
             bypassed = ssm_direct.maybe_bypass_proxy(ip, port or 22,
@@ -1068,9 +1068,9 @@ class SSHCommandRunner(CommandRunner):
 
     def port_forward_command(
             self,
-            port_forward: List[Tuple[int, int]],
+            port_forward: list[tuple[int, int]],
             connect_timeout: int = 1,
-            ssh_mode: SshMode = SshMode.INTERACTIVE) -> List[str]:
+            ssh_mode: SshMode = SshMode.INTERACTIVE) -> list[str]:
         """Command for forwarding ports from localhost to the remote machine.
 
         Args:
@@ -1091,9 +1091,9 @@ class SSHCommandRunner(CommandRunner):
     def ssh_base_command(self,
                          *,
                          ssh_mode: SshMode,
-                         port_forward: Optional[List[Tuple[int, int]]],
-                         connect_timeout: Optional[int],
-                         ssh_log_file: Optional[str] = None) -> List[str]:
+                         port_forward: list[tuple[int, int]] | None,
+                         connect_timeout: int | None,
+                         ssh_log_file: str | None = None) -> list[str]:
         ssh = ['ssh']
         if ssh_log_file is not None:
             # -E is needed to capture debug logs from the ControlMaster process
@@ -1138,10 +1138,10 @@ class SSHCommandRunner(CommandRunner):
         ) + [f'{self.ssh_user}@{self.ip}']
 
     def _retry_with_interactive_auth(
-            self, session_id: str, command: List[str], log_path: str,
+            self, session_id: str, command: list[str], log_path: str,
             require_outputs: bool, process_stream: bool, stream_logs: bool,
             executable: str,
-            **kwargs) -> Union[int, Tuple[int, str, str], Tuple[int, int]]:
+            **kwargs) -> int | tuple[int, str, str] | tuple[int, int]:
         """Retries command with interactive auth.
 
         This handles SSH connections requiring keyboard-interactive
@@ -1204,7 +1204,7 @@ class SSHCommandRunner(CommandRunner):
                     # We don't need to block here to wait for the websocket
                     # handler, as SSH will continue by itself once auth
                     # is complete.
-                except socket.timeout:
+                except TimeoutError:
                     logger.debug(
                         'Timeout waiting for interactive auth connection')
                 except Exception as e:  # pylint: disable=broad-except
@@ -1285,10 +1285,10 @@ class SSHCommandRunner(CommandRunner):
     @context_utils.cancellation_guard
     def run(
             self,
-            cmd: Union[str, List[str]],
+            cmd: str | list[str],
             *,
             require_outputs: bool = False,
-            port_forward: Optional[List[Tuple[int, int]]] = None,
+            port_forward: list[tuple[int, int]] | None = None,
             # Advanced options.
             log_path: str = os.devnull,
             # If False, do not redirect stdout/stderr to optimize performance.
@@ -1296,11 +1296,11 @@ class SSHCommandRunner(CommandRunner):
             stream_logs: bool = True,
             ssh_mode: SshMode = SshMode.NON_INTERACTIVE,
             separate_stderr: bool = False,
-            connect_timeout: Optional[int] = None,
+            connect_timeout: int | None = None,
             source_bashrc: bool = False,
             skip_num_lines: int = 0,
             run_in_background: bool = False,
-            **kwargs) -> Union[int, Tuple[int, str, str]]:
+            **kwargs) -> int | tuple[int, str, str]:
         """Uses 'ssh' to run 'cmd' on a node with ip.
 
         Args:
@@ -1405,7 +1405,7 @@ class SSHCommandRunner(CommandRunner):
             ssh_log_content = ''
             if ssh_log_file is not None:
                 try:
-                    with open(ssh_log_file, 'r', encoding='utf-8') as f:
+                    with open(ssh_log_file, encoding='utf-8') as f:
                         ssh_log_content = f.read()
                     has_auth_failure = any(
                         pattern in ssh_log_content
@@ -1447,7 +1447,7 @@ class SSHCommandRunner(CommandRunner):
         stream_logs: bool = True,
         max_retry: int = 1,
         get_remote_home_dir: Callable[[], str] = lambda: '~',
-        timeout: Optional[int] = None,
+        timeout: int | None = None,
     ) -> None:
         """Uses 'rsync' to sync 'source' to 'target'.
 
@@ -1540,9 +1540,9 @@ class KubernetesCommandRunner(CommandRunner):
 
     def __init__(
         self,
-        node: Tuple[Tuple[str, Optional[str]], str],
-        deployment: Optional[str] = None,
-        container: Optional[str] = None,
+        node: tuple[tuple[str, str | None], str],
+        deployment: str | None = None,
+        container: str | None = None,
         **kwargs,
     ):
         """Initialize KubernetesCommandRunner.
@@ -1581,9 +1581,9 @@ class KubernetesCommandRunner(CommandRunner):
 
     def port_forward_command(
             self,
-            port_forward: List[Tuple[int, int]],
+            port_forward: list[tuple[int, int]],
             connect_timeout: int = 1,
-            ssh_mode: SshMode = SshMode.INTERACTIVE) -> List[str]:
+            ssh_mode: SshMode = SshMode.INTERACTIVE) -> list[str]:
         """Command for forwarding ports from localhost to the remote machine.
 
         Args:
@@ -1626,9 +1626,9 @@ class KubernetesCommandRunner(CommandRunner):
     @context_utils.cancellation_guard
     def run(
             self,
-            cmd: Union[str, List[str]],
+            cmd: str | list[str],
             *,
-            port_forward: Optional[List[int]] = None,
+            port_forward: list[int] | None = None,
             require_outputs: bool = False,
             # Advanced options.
             log_path: str = os.devnull,
@@ -1637,11 +1637,11 @@ class KubernetesCommandRunner(CommandRunner):
             stream_logs: bool = True,
             ssh_mode: SshMode = SshMode.NON_INTERACTIVE,
             separate_stderr: bool = False,
-            connect_timeout: Optional[int] = None,
+            connect_timeout: int | None = None,
             source_bashrc: bool = False,
             skip_num_lines: int = 0,
             run_in_background: bool = False,
-            **kwargs) -> Union[int, Tuple[int, str, str]]:
+            **kwargs) -> int | tuple[int, str, str]:
         """Uses 'kubectl exec' to run 'cmd' on a pod or deployment by its
         name and namespace.
 
@@ -1781,7 +1781,7 @@ class KubernetesCommandRunner(CommandRunner):
         'container not found',
     )
 
-    def _diagnose_dead_pod(self, stderr: str) -> Optional[str]:
+    def _diagnose_dead_pod(self, stderr: str) -> str | None:
         """Return a termination reason for this runner's pod if `stderr`
         indicates the exec target pod is gone, else None.
 
@@ -1816,7 +1816,7 @@ class KubernetesCommandRunner(CommandRunner):
         log_path: str = os.devnull,
         stream_logs: bool = True,
         max_retry: int = 1,
-        timeout: Optional[int] = None,
+        timeout: int | None = None,
     ) -> None:
         """Uses 'rsync' to sync 'source' to 'target'.
 
@@ -1877,10 +1877,10 @@ class LocalProcessCommandRunner(CommandRunner):
     @context_utils.cancellation_guard
     def run(
             self,
-            cmd: Union[str, List[str]],
+            cmd: str | list[str],
             *,
             require_outputs: bool = False,
-            port_forward: Optional[List[Tuple[int, int]]] = None,
+            port_forward: list[tuple[int, int]] | None = None,
             # Advanced options.
             log_path: str = os.devnull,
             # If False, do not redirect stdout/stderr to optimize performance.
@@ -1888,11 +1888,11 @@ class LocalProcessCommandRunner(CommandRunner):
             stream_logs: bool = True,
             ssh_mode: SshMode = SshMode.NON_INTERACTIVE,
             separate_stderr: bool = False,
-            connect_timeout: Optional[int] = None,
+            connect_timeout: int | None = None,
             source_bashrc: bool = False,
             skip_num_lines: int = 0,
             run_in_background: bool = False,
-            **kwargs) -> Union[int, Tuple[int, str, str]]:
+            **kwargs) -> int | tuple[int, str, str]:
         """Use subprocess to run the command.
 
         Unlike the SSH/Slurm runners, this spawns the command in-process via
@@ -1968,7 +1968,7 @@ class LocalProcessCommandRunner(CommandRunner):
         log_path: str = os.devnull,
         stream_logs: bool = True,
         max_retry: int = 1,
-        timeout: Optional[int] = None,
+        timeout: int | None = None,
     ) -> None:
         """Use rsync to sync the source to the target."""
         self._rsync(source,
@@ -1997,15 +1997,15 @@ class SlurmCommandRunner(SSHCommandRunner):
 
     def __init__(
         self,
-        node: Tuple[str, int],
+        node: tuple[str, int],
         ssh_user: str,
-        ssh_private_key: Optional[str],
+        ssh_private_key: str | None,
         *,
         sky_dir: str,
         skypilot_runtime_dir: str,
         job_id: str,
         slurm_node: str,
-        container_args: Optional[str],
+        container_args: str | None,
         **kwargs,
     ):
         """Initialize SlurmCommandRunner.
@@ -2054,7 +2054,7 @@ class SlurmCommandRunner(SSHCommandRunner):
         log_path: str = os.devnull,
         stream_logs: bool = True,
         max_retry: int = 1,
-        timeout: Optional[int] = None,
+        timeout: int | None = None,
     ) -> None:
         """Rsyncs files via srun, either to host or into container.
 
@@ -2118,10 +2118,10 @@ exec {ssh_command} srun --unbuffered --quiet --overlap {extra_srun_args}\\
 
     def _run_via_srun(
         self,
-        cmd: Union[str, List[str]],
+        cmd: str | list[str],
         in_container: bool,
         **kwargs,
-    ) -> Union[int, Tuple[int, str, str]]:
+    ) -> int | tuple[int, str, str]:
         """Run command via srun, either on host or in container.
 
         Args:
@@ -2165,7 +2165,7 @@ exec {ssh_command} srun --unbuffered --quiet --overlap {extra_srun_args}\\
         log_path: str = os.devnull,
         stream_logs: bool = True,
         max_retry: int = 1,
-        timeout: Optional[int] = None,
+        timeout: int | None = None,
     ) -> None:
         # Default: run in container if container_args set, otherwise on host
         in_container = self.container_args is not None
@@ -2182,25 +2182,25 @@ exec {ssh_command} srun --unbuffered --quiet --overlap {extra_srun_args}\\
     @context_utils.cancellation_guard
     def run(
         self,
-        cmd: Union[str, List[str]],
+        cmd: str | list[str],
         **kwargs,
-    ) -> Union[int, Tuple[int, str, str]]:
+    ) -> int | tuple[int, str, str]:
         in_container = self.container_args is not None
         return self._run_via_srun(cmd, in_container=in_container, **kwargs)
 
     def run_driver(
         self,
-        cmd: Union[str, List[str]],
+        cmd: str | list[str],
         **kwargs,
-    ) -> Union[int, Tuple[int, str, str]]:
+    ) -> int | tuple[int, str, str]:
         # Host only: driver uses srun internally to launch work in containers.
         return self._run_via_srun(cmd, in_container=False, **kwargs)
 
     def run_setup(
         self,
-        cmd: Union[str, List[str]],
+        cmd: str | list[str],
         **kwargs,
-    ) -> Union[int, Tuple[int, str, str]]:
+    ) -> int | tuple[int, str, str]:
         # Both host and container: ensure environment is consistent.
         result = self._run_via_srun(cmd, in_container=False, **kwargs)
         if self.container_args:
@@ -2219,7 +2219,7 @@ exec {ssh_command} srun --unbuffered --quiet --overlap {extra_srun_args}\\
         log_path: str = os.devnull,
         stream_logs: bool = True,
         max_retry: int = 1,
-        timeout: Optional[int] = None,
+        timeout: int | None = None,
     ) -> None:
         # Host only: driver runs on host and uses srun internally.
         self._rsync_via_srun(source=source,
@@ -2240,7 +2240,7 @@ exec {ssh_command} srun --unbuffered --quiet --overlap {extra_srun_args}\\
         log_path: str = os.devnull,
         stream_logs: bool = True,
         max_retry: int = 1,
-        timeout: Optional[int] = None,
+        timeout: int | None = None,
     ) -> None:
         # Both host and container: ensure environment is consistent.
         self._rsync_via_srun(source=source,

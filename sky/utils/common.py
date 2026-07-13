@@ -1,9 +1,9 @@
 """Common enumerators and classes."""
 
+from collections.abc import Generator
 import contextlib
 import enum
 import os
-from typing import Generator
 
 from sky import models
 from sky.skylet import constants

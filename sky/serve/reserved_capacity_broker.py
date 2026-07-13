@@ -30,12 +30,14 @@ Design invariants (see the 2026-07-08 design doc):
 This module owns allocation logic only; all SQL lives in serve_state (the
 shared serve DB every controller in the api-server pod already uses).
 """
+from collections.abc import Callable
+from collections.abc import Mapping
 import dataclasses
 import json
 import math
 import os
 import time
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Any
 
 from sky import sky_logging
 from sky.serve import constants
@@ -75,7 +77,7 @@ def make_pool_key(context: str, gpu_name: str) -> str:
     return json.dumps([context, gpu_name.lower()])
 
 
-def parse_pool_key(pool_key: str) -> Tuple[str, str]:
+def parse_pool_key(pool_key: str) -> tuple[str, str]:
     context, gpu_name = json.loads(pool_key)
     return context, gpu_name
 
@@ -90,8 +92,8 @@ class PoolObservation:
     reported for the pool's context; empty on a successful query means the
     claimed GPU resolves to no labeled nodes (phantom pool).
     """
-    free_slots: Optional[int]
-    gpu_names: Tuple[str, ...] = ()
+    free_slots: int | None
+    gpu_names: tuple[str, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -108,7 +110,7 @@ class ClaimInput:
     # feed need: a floor the service cannot actually launch
     # (floor > cap) must not absorb entitlement or feed -- the excess
     # joins the burst remainder (work conservation).
-    effective_cap: Optional[int] = None
+    effective_cap: int | None = None
 
     def attainable_floor(self) -> int:
         """The floor, clamped to what the claimant can materialize."""
@@ -122,7 +124,7 @@ class ClaimInput:
 class Allocation:
     """One service's slice of the latest round."""
     # None = single-claimant fast path: no ceiling (#108 identity).
-    grant: Optional[int]
+    grant: int | None
     feed: int
     round_id: int
     epoch: int
@@ -136,7 +138,7 @@ class Allocation:
 # DB read per demand launch would be a hot-path regression. A None grant
 # (single-claimant fast path) and a missing/stale entry read the same --
 # both leave the gate inert.
-_GRANT_CACHE: Dict[str, Tuple[Optional[int], float]] = {}
+_GRANT_CACHE: dict[str, tuple[int | None, float]] = {}
 
 
 def clear_caches() -> None:
@@ -144,8 +146,7 @@ def clear_caches() -> None:
     _GRANT_CACHE.clear()
 
 
-def get_cached_grant(service_name: str,
-                     max_age_seconds: float) -> Optional[int]:
+def get_cached_grant(service_name: str, max_age_seconds: float) -> int | None:
     entry = _GRANT_CACHE.get(service_name)
     if entry is None:
         return None
@@ -161,7 +162,7 @@ def get_cached_grant(service_name: str,
 _FENCE_PENDING_EPOCH = -1
 
 
-def current_epoch(pool_key: str) -> Optional[int]:
+def current_epoch(pool_key: str) -> int | None:
     """The POOL's current fencing epoch (cheap single-row DB read).
 
     Per-pool by design: rounds and grants are per-pool, so the launch
@@ -193,9 +194,8 @@ def persist_fill_replica(
     *,
     pool_key: str,
     expected_epoch: int,
-    expected_service_hash: Optional[str] = None,
-    expected_controller_owner: Optional[Tuple[Optional[int],
-                                              Optional[str]]] = None
+    expected_service_hash: str | None = None,
+    expected_controller_owner: tuple[int | None, str | None] | None = None
 ) -> bool:
     """Atomically persists a fill replica row, excluded from broker rounds.
 
@@ -240,7 +240,7 @@ def persist_fill_replica(
 
 
 def _largest_remainder_round(amounts: Mapping[str, float],
-                             total: int) -> Dict[str, int]:
+                             total: int) -> dict[str, int]:
     """Rounds fractional shares to integers summing exactly to `total`.
 
     Floor everything, then hand the leftover units to the largest
@@ -255,7 +255,7 @@ def _largest_remainder_round(amounts: Mapping[str, float],
     return base
 
 
-def scale_floors(total: int, floors: Mapping[str, int]) -> Dict[str, int]:
+def scale_floors(total: int, floors: Mapping[str, int]) -> dict[str, int]:
     """Floors, proportionally scaled down when oversubscribed.
 
     Sum(floors) <= total returns floors unchanged; otherwise each floor is
@@ -273,7 +273,7 @@ def scale_floors(total: int, floors: Mapping[str, int]) -> Dict[str, int]:
 
 
 def water_fill(amount: int, weights: Mapping[str, float],
-               caps: Mapping[str, Optional[int]]) -> Dict[str, int]:
+               caps: Mapping[str, int | None]) -> dict[str, int]:
     """Weighted integer water-fill of `amount` with per-service caps.
 
     Iteratively hands out weight-proportional shares (largest-remainder
@@ -326,7 +326,7 @@ def water_fill(amount: int, weights: Mapping[str, float],
 
 
 def compute_entitlements(total: int,
-                         claims: Mapping[str, ClaimInput]) -> Dict[str, int]:
+                         claims: Mapping[str, ClaimInput]) -> dict[str, int]:
     """Per-service entitlements: floors first, then weighted water-fill.
 
     total is the whole-pool fill capacity this round (debited observed free
@@ -342,26 +342,25 @@ def compute_entitlements(total: int,
     (effective_cap minus the attainable floor, derived here rather than
     stored) so the whole entitlement never exceeds effective_cap either.
     """
-    floors = scale_floors(
-        total,
-        {name: claim.attainable_floor() for name, claim in claims.items()})
+    floors = scale_floors(total, {
+        name: claim.attainable_floor() for name, claim in claims.items()
+    })
     remainder = max(0, total) - sum(floors.values())
-    caps: Dict[str, Optional[int]] = {}
+    caps: dict[str, int | None] = {}
     for name, claim in claims.items():
         if claim.effective_cap is None:
             caps[name] = None
         else:
             caps[name] = max(0, claim.effective_cap - claim.attainable_floor())
-    shares = water_fill(remainder,
-                        {name: claim.weight for name, claim in claims.items()},
-                        caps)
+    shares = water_fill(remainder, {
+        name: claim.weight for name, claim in claims.items()
+    }, caps)
     return {name: floors[name] + shares[name] for name in claims}
 
 
-def damp_grants(raw: Mapping[str, int], prev_grants: Optional[Mapping[str,
-                                                                      int]],
-                prev_raw: Optional[Mapping[str, int]],
-                holdings_shrank: bool) -> Dict[str, int]:
+def damp_grants(raw: Mapping[str, int], prev_grants: Mapping[str, int] | None,
+                prev_raw: Mapping[str, int] | None,
+                holdings_shrank: bool) -> dict[str, int]:
     """Two-round persistence for grant moves (mirrors #108's poll damping).
 
     Up-moves and observed-free-driven down-moves apply only when two
@@ -378,7 +377,7 @@ def damp_grants(raw: Mapping[str, int], prev_grants: Optional[Mapping[str,
     """
     if prev_grants is None:
         return dict(raw)
-    damped: Dict[str, int] = {}
+    damped: dict[str, int] = {}
     prev_raw = prev_raw or {}
     for name, proposed in raw.items():
         prev = prev_grants.get(name)
@@ -408,11 +407,11 @@ def compute_feeds(
     observed_free: int,
     grants: Mapping[str, int],
     claims: Mapping[str, ClaimInput],
-    sticky_state: Mapping[str, Dict[str, Any]],
+    sticky_state: Mapping[str, dict[str, Any]],
     now: float,
     sticky_window_seconds: float,
-    raw_grants: Optional[Mapping[str, int]] = None,
-) -> Tuple[Dict[str, int], Dict[str, Dict[str, Any]]]:
+    raw_grants: Mapping[str, int] | None = None,
+) -> tuple[dict[str, int], dict[str, dict[str, Any]]]:
     """Splits OBSERVED FREE among launchable under-holders.
 
     Sum(feeds) <= observed_free by construction, so a peer's slow graceful
@@ -475,15 +474,15 @@ def compute_feeds(
         free -= give
     # Pass 2: water-fill the remaining free among eligible under-holders.
     if free > 0 and eligible:
-        extra = water_fill(
-            free, {name: claims[name].weight for name in eligible},
-            {name: need[name] - feeds[name] for name in eligible})
+        extra = water_fill(free,
+                           {name: claims[name].weight for name in eligible},
+                           {name: need[name] - feeds[name] for name in eligible})
         for name, give in extra.items():
             feeds[name] += give
     # New sticky state: only positive feeds carry a streak; `since` is kept
     # from an unexpired previous entry (streak continues) and reset
     # otherwise (fresh assignment starts a new window).
-    new_sticky: Dict[str, Dict[str, Any]] = {}
+    new_sticky: dict[str, dict[str, Any]] = {}
     for name, feed in feeds.items():
         if feed <= 0:
             continue
@@ -512,10 +511,9 @@ def upsert_claim(
     gpus_per_replica: int,
     holdings_fill: int,
     launchable: bool,
-    effective_cap: Optional[int] = None,
-    expected_service_hash: Optional[str] = None,
-    expected_controller_owner: Optional[Tuple[Optional[int],
-                                              Optional[str]]] = None
+    effective_cap: int | None = None,
+    expected_service_hash: str | None = None,
+    expected_controller_owner: tuple[int | None, str | None] | None = None
 ) -> bool:
     """Upserts this service's claim (the per-poll heartbeat)."""
     return serve_state.upsert_reserved_fill_claim(
@@ -534,9 +532,8 @@ def upsert_claim(
 
 def remove_claim(
     service_name: str,
-    expected_service_hash: Optional[str] = None,
-    expected_controller_owner: Optional[Tuple[Optional[int],
-                                              Optional[str]]] = None
+    expected_service_hash: str | None = None,
+    expected_controller_owner: tuple[int | None, str | None] | None = None
 ) -> bool:
     removed = serve_state.remove_reserved_fill_claim(
         service_name,
@@ -547,7 +544,7 @@ def remove_claim(
     return removed
 
 
-def _claim_input(row: Dict[str, Any]) -> ClaimInput:
+def _claim_input(row: dict[str, Any]) -> ClaimInput:
     effective_cap = row.get('effective_cap')
     weight = float(row['weight'] or 1.0)
     if not math.isfinite(weight):
@@ -579,8 +576,8 @@ def _claim_input(row: Dict[str, Any]) -> ClaimInput:
 
 
 def _reject_mixed_gpus_per_replica(
-        pool_key: str, rows: Dict[str, Dict[str,
-                                            Any]]) -> Dict[str, Dict[str, Any]]:
+        pool_key: str, rows: dict[str, dict[str,
+                                            Any]]) -> dict[str, dict[str, Any]]:
     """Rejects claims disagreeing on gpus_per_replica (v1 uniform pools).
 
     Integer replica-slot bookkeeping is only sound when every claimant of a
@@ -593,9 +590,9 @@ def _reject_mixed_gpus_per_replica(
     if len(sizes) <= 1:
         return rows
     counts = {
-        size: sum(1 for row in rows.values()
-                  if int(row['gpus_per_replica'] or 1) == size)
-        for size in sizes
+        size: sum(1
+                  for row in rows.values()
+                  if int(row['gpus_per_replica'] or 1) == size) for size in sizes
     }
     winner = max(sizes, key=lambda size: (counts[size], -size))
     losers = [
@@ -652,8 +649,8 @@ def _row_was_launched(info: Any) -> bool:
 
 
 def _occupying_debit(
-        claim_names: List[str], pool_key: str,
-        snapshot_time: float) -> Tuple[int, int, Dict[str, int], int]:
+        claim_names: list[str], pool_key: str,
+        snapshot_time: float) -> tuple[int, int, dict[str, int], int]:
     """Row-consistent scan of every service's replica rows on the pool.
 
     Mirrors the #108 occupied-slot subtraction at broker level. The scan
@@ -737,7 +734,7 @@ def _occupying_debit(
     context, gpu_name = parse_pool_key(pool_key)
     feed_debit = 0
     entitlement_debit = 0
-    live_fill: Dict[str, int] = {}
+    live_fill: dict[str, int] = {}
     unclaimed_fill = 0
     scan_names = set(claim_names)
     try:
@@ -805,7 +802,7 @@ def _occupying_debit(
 
 
 def _allocation_from_round(service_name: str,
-                           round_row: Dict[str, Any]) -> Optional[Allocation]:
+                           round_row: dict[str, Any]) -> Allocation | None:
     grants = json.loads(round_row['grants'] or '{}')
     if service_name not in grants:
         # Claimed after this round was published: no allocation until the
@@ -821,7 +818,7 @@ def _allocation_from_round(service_name: str,
     return allocation
 
 
-def get_my_allocation(service_name: str) -> Optional[Allocation]:
+def get_my_allocation(service_name: str) -> Allocation | None:
     """This service's slice of the latest published round, or None.
 
     None when the service has no live claim (expired/rejected) or the
@@ -841,8 +838,8 @@ def get_my_allocation(service_name: str) -> Optional[Allocation]:
 
 
 def run_round_if_stale(service_name: str, pool_key: str,
-                       query_fn: Callable[[], Optional[PoolObservation]],
-                       poll_interval_seconds: float) -> Optional[Allocation]:
+                       query_fn: Callable[[], PoolObservation | None],
+                       poll_interval_seconds: float) -> Allocation | None:
     """Reads the pool's round, driving a fresh one if it went stale.
 
     The caller (a service's capacity poller) must have upserted its claim
@@ -881,8 +878,8 @@ def run_round_if_stale(service_name: str, pool_key: str,
 
 
 def _run_round_locked(service_name: str, pool_key: str,
-                      query_fn: Callable[[], Optional[PoolObservation]],
-                      poll_interval_seconds: float) -> Optional[Allocation]:
+                      query_fn: Callable[[], PoolObservation | None],
+                      poll_interval_seconds: float) -> Allocation | None:
     now = time.time()
     pruned = serve_state.prune_reserved_fill_claims(now - claim_ttl_seconds())
     if pruned:
@@ -898,8 +895,8 @@ def _run_round_locked(service_name: str, pool_key: str,
         # (and re-trip any validation, loudly) next interval.
         return None
     round_row = serve_state.get_reserved_fill_round(pool_key)
-    if (round_row is not None and now - float(round_row['snapshot_time']) <
-            _ROUND_FRESH_FRACTION * poll_interval_seconds):
+    if (round_row is not None and now - float(round_row['snapshot_time'])
+            < _ROUND_FRESH_FRACTION * poll_interval_seconds):
         return _allocation_from_round(service_name, round_row)
 
     # ---- Drive a new round: ownership token FIRST. ----
@@ -952,7 +949,7 @@ def _run_round_locked(service_name: str, pool_key: str,
     # counted free, and the created_at > snapshot_time debit only catches it
     # if the snapshot predates the row.
     snapshot_time = time.time()
-    observation: Optional[PoolObservation] = None
+    observation: PoolObservation | None = None
     try:
         observation = query_fn()
     except Exception as e:  # pylint: disable=broad-except
@@ -980,8 +977,8 @@ def _run_round_locked(service_name: str, pool_key: str,
             # the round as a measurement blackout: feed 0 (conservative),
             # release nothing, keep the claims.
             phantom_streak = prev_phantom_streak + 1
-            if (phantom_streak >=
-                    constants.RESERVED_FILL_PHANTOM_CONFIRM_ROUNDS):
+            if (phantom_streak
+                    >= constants.RESERVED_FILL_PHANTOM_CONFIRM_ROUNDS):
                 logger.error(
                     f'Reserved-fill broker: pool {pool_key} is phantom (the '
                     'realtime query reports no such accelerator in the '
@@ -1015,19 +1012,19 @@ def _run_round_locked(service_name: str, pool_key: str,
 
     claims = {name: _claim_input(row) for name, row in claim_rows.items()}
     names = sorted(claims)
-    prev_grants_json: Dict[str, Any] = (json.loads(round_row['grants'] or '{}')
+    prev_grants_json: dict[str, Any] = (json.loads(round_row['grants'] or '{}')
                                         if round_row is not None else {})
-    prev_raw: Dict[str, int] = (json.loads(round_row['raw_grants'] or '{}')
+    prev_raw: dict[str, int] = (json.loads(round_row['raw_grants'] or '{}')
                                 if round_row is not None else {})
-    sticky: Dict[str, Dict[str, Any]] = (json.loads(
+    sticky: dict[str, dict[str, Any]] = (json.loads(
         round_row['feed_state'] or '{}') if round_row is not None else {})
-    last_free: Optional[int] = (round_row['last_observed_free']
-                                if round_row is not None else None)
-    last_free_ts: Optional[float] = (round_row['last_observed_free_ts']
-                                     if round_row is not None else None)
+    last_free: int | None = (round_row['last_observed_free']
+                             if round_row is not None else None)
+    last_free_ts: float | None = (round_row['last_observed_free_ts']
+                                  if round_row is not None else None)
     sum_holdings = sum(claim.holdings_fill for claim in claims.values())
 
-    grants: Dict[str, Optional[int]]
+    grants: dict[str, int | None]
     if len(claims) == 1:
         # SINGLE-CLAIMANT FAST PATH: #108 identity. No ceiling, feed = raw
         # measured free (a failed query reads 0 free, exactly like the
@@ -1043,8 +1040,8 @@ def _run_round_locked(service_name: str, pool_key: str,
             last_free, last_free_ts = free, snapshot_time
         grants = {service_name: None}
         feeds = {service_name: free}
-        raw_grants: Dict[str, int] = {}
-        new_sticky: Dict[str, Dict[str, Any]] = {}
+        raw_grants: dict[str, int] = {}
+        new_sticky: dict[str, dict[str, Any]] = {}
         # No debit scan on the fast path (#108 identity), so no draining
         # term either; harmless -- a single-claimant round's stored sum is
         # never a damping baseline (its None grant carries no integer
@@ -1052,7 +1049,7 @@ def _run_round_locked(service_name: str, pool_key: str,
         # candidate is dropped for the same reason: with the peers gone
         # there is no damping bypass left to confirm.
         published_sum_holdings = sum_holdings
-        new_shrink_baseline: Optional[int] = None
+        new_shrink_baseline: int | None = None
     else:
         # The debit scan runs on blind rounds too (replica rows are DB
         # reads, not cluster queries): draining rows keep occupying the
@@ -1076,8 +1073,8 @@ def _run_round_locked(service_name: str, pool_key: str,
         if live_fill:
             claims = {
                 name: (dataclasses.replace(claim, holdings_fill=live_fill[name])
-                       if name in live_fill else claim)
-                for name, claim in claims.items()
+                       if name in live_fill else claim
+                      ) for name, claim in claims.items()
             }
             sum_holdings = sum(claim.holdings_fill for claim in claims.values())
         # Conservation invariant: the whole-pool total is observed free +
@@ -1092,7 +1089,7 @@ def _run_round_locked(service_name: str, pool_key: str,
         conserved_holdings = sum_holdings + unclaimed_fill
         # Previous single-claimant None grants carry no integer baseline:
         # drop them so damping treats the service as newly-baselined.
-        prev_published: Optional[Dict[str, int]] = None
+        prev_published: dict[str, int] | None = None
         if round_row is not None:
             prev_published = {
                 name: value

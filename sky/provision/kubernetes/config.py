@@ -1,9 +1,10 @@
 """Kubernetes-specific configuration for the provisioner."""
+from collections.abc import Callable
 import copy
 import logging
 import math
 import os
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any
 
 from sky.adaptors import kubernetes
 from sky.provision import common
@@ -128,7 +129,7 @@ def not_provided_msg(resource_type: str) -> str:
     return f'no {resource_type} config provided, must already exist'
 
 
-def fillout_resources_kubernetes(config: Dict[str, Any]) -> Dict[str, Any]:
+def fillout_resources_kubernetes(config: dict[str, Any]) -> dict[str, Any]:
     """Fills CPU and GPU resources in the ray cluster config.
 
     For each node type and each of CPU/GPU, looks at container's resources
@@ -162,7 +163,7 @@ def fillout_resources_kubernetes(config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def get_autodetected_resources(
-        container_data: Dict[str, Any]) -> Dict[str, Any]:
+        container_data: dict[str, Any]) -> dict[str, Any]:
     container_resources = container_data.get('resources', None)
     if container_resources is None:
         return {'CPU': 0, 'GPU': 0}
@@ -178,7 +179,7 @@ def get_autodetected_resources(
     return node_type_resources
 
 
-def get_resource(container_resources: Dict[str, Any],
+def get_resource(container_resources: dict[str, Any],
                  resource_name: str) -> int:
     request = _get_resource(container_resources,
                             resource_name,
@@ -203,8 +204,8 @@ def get_resource(container_resources: Dict[str, Any],
         return rounded_count
 
 
-def _get_resource(container_resources: Dict[str, Any], resource_name: str,
-                  field_name: str) -> Union[int, float]:
+def _get_resource(container_resources: dict[str, Any], resource_name: str,
+                  field_name: str) -> int | float:
     """Returns the resource quantity.
 
     The amount of resource is rounded up to nearest integer.
@@ -245,8 +246,8 @@ def _create_or_patch_resource(
     name: str,
     create_fn: Callable[[], Any],
     list_fn: Callable[[], Any],
-    patch_fn: Optional[Callable[[], None]],
-    needs_update_fn: Optional[Callable[[Any], bool]],
+    patch_fn: Callable[[], None] | None,
+    needs_update_fn: Callable[[Any], bool] | None,
 ) -> None:
     """Creates a K8s resource with upsert semantics and 409 race handling.
 
@@ -287,8 +288,8 @@ def _create_or_patch_resource(
 
 
 def _configure_autoscaler_service_account(
-        namespace: str, context: Optional[str],
-        provider_config: Dict[str, Any]) -> None:
+        namespace: str, context: str | None,
+        provider_config: dict[str, Any]) -> None:
     log_prefix = '_configure_autoscaler_service_account'
     resource_field = 'autoscaler_service_account'
     if resource_field not in provider_config:
@@ -320,8 +321,8 @@ def _configure_autoscaler_service_account(
     )
 
 
-def _configure_autoscaler_role(namespace: str, context: Optional[str],
-                               provider_config: Dict[str, Any],
+def _configure_autoscaler_role(namespace: str, context: str | None,
+                               provider_config: dict[str, Any],
                                resource_field: str) -> None:
     """ Reads the role from the provider config, creates if it does not exist.
 
@@ -362,11 +363,11 @@ def _configure_autoscaler_role(namespace: str, context: Optional[str],
 
 def _configure_autoscaler_role_binding(
         namespace: str,
-        context: Optional[str],
-        provider_config: Dict[str, Any],
+        context: str | None,
+        provider_config: dict[str, Any],
         resource_field: str,
-        override_name: Optional[str] = None,
-        override_subject_namespace: Optional[str] = None) -> None:
+        override_name: str | None = None,
+        override_subject_namespace: str | None = None) -> None:
     """ Reads the role binding from the config, creates if it does not exist.
 
     Args:
@@ -422,7 +423,7 @@ def _configure_autoscaler_role_binding(
 
 
 def _configure_autoscaler_cluster_role(namespace, context,
-                                       provider_config: Dict[str, Any]) -> None:
+                                       provider_config: dict[str, Any]) -> None:
     log_prefix = '_configure_autoscaler_cluster_role'
     resource_field = 'autoscaler_cluster_role'
     if resource_field not in provider_config:
@@ -455,7 +456,7 @@ def _configure_autoscaler_cluster_role(namespace, context,
 
 
 def _configure_autoscaler_cluster_role_binding(
-        namespace, context, provider_config: Dict[str, Any]) -> None:
+        namespace, context, provider_config: dict[str, Any]) -> None:
     log_prefix = '_configure_autoscaler_cluster_role_binding'
     resource_field = 'autoscaler_cluster_role_binding'
     if resource_field not in provider_config:
@@ -498,7 +499,7 @@ def _configure_autoscaler_cluster_role_binding(
 
 
 def _configure_skypilot_system_namespace(
-        provider_config: Dict[str, Any]) -> None:
+        provider_config: dict[str, Any]) -> None:
     """Creates the namespace for skypilot-system mounting if it does not exist.
 
     Also patches the SkyPilot service account to have the necessary permissions
@@ -535,7 +536,7 @@ def _configure_skypilot_system_namespace(
         override_subject_namespace=svc_account_namespace)
 
 
-def _configure_fuse_mounting(provider_config: Dict[str, Any]) -> None:
+def _configure_fuse_mounting(provider_config: dict[str, Any]) -> None:
     """Creates the privileged daemonset required for FUSE mounting.
 
     FUSE mounting in Kubernetes without privileged containers requires us to
@@ -566,7 +567,7 @@ def _configure_fuse_mounting(provider_config: Dict[str, Any]) -> None:
     logger.info('_configure_fuse_mounting: Creating daemonset.')
     daemonset_path = os.path.join(
         root_dir, 'kubernetes/manifests/fusermount-server-daemonset.yaml')
-    with open(daemonset_path, 'r', encoding='utf-8') as file:
+    with open(daemonset_path, encoding='utf-8') as file:
         daemonset = yaml_utils.safe_load(file)
     kubernetes_utils.merge_custom_metadata(daemonset['metadata'])
     try:
@@ -606,8 +607,8 @@ def _configure_fuse_mounting(provider_config: Dict[str, Any]) -> None:
                 f'in namespace {fuse_proxy_namespace!r}')
 
 
-def _configure_services(namespace: str, context: Optional[str],
-                        provider_config: Dict[str, Any]) -> None:
+def _configure_services(namespace: str, context: str | None,
+                        provider_config: dict[str, Any]) -> None:
     service_field = 'services'
     if service_field not in provider_config:
         logger.info(f'_configure_services: {not_provided_msg(service_field)}')
@@ -648,8 +649,6 @@ def _configure_services(namespace: str, context: Optional[str],
 
 class KubernetesError(Exception):
 
-    def __init__(self,
-                 *args,
-                 insufficent_resources: Optional[List[str]] = None):
+    def __init__(self, *args, insufficent_resources: list[str] | None = None):
         self.insufficent_resources = insufficent_resources
         super().__init__(*args)

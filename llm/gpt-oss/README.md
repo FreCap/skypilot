@@ -8,7 +8,7 @@ The `gpt-oss-120b` model achieves near-parity with OpenAI o4-mini on core reason
 
 This guide walks through how to run and host gpt-oss models on any infrastructure using SkyPilot and vLLM, from local GPU workstations to Kubernetes clusters and public clouds (16+ clouds supported).
 
-If you're looking to finetune `gpt-oss` models, check out [the finetuning example](../training/gpt-oss-finetuning.md)
+If you're looking to finetune `gpt-oss` models, check out [the finetuning example](https://github.com/skypilot-org/skypilot/tree/master/llm/gpt-oss-finetuning).
 
 ![Cloud Logos](https://raw.githubusercontent.com/skypilot-org/skypilot/master/docs/source/images/cloud-logos-dark.png)
 

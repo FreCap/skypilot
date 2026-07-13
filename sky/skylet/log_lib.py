@@ -2,6 +2,8 @@
 
 This is a remote utility module that provides logging functionality.
 """
+from collections.abc import Iterable
+from collections.abc import Iterator
 import copy
 import functools
 import io
@@ -15,8 +17,7 @@ import tempfile
 import textwrap
 import threading
 import time
-from typing import (Dict, Iterable, Iterator, List, Optional, TextIO, Tuple,
-                    Union)
+from typing import TextIO
 
 import colorama
 
@@ -53,11 +54,11 @@ class _ProcessingArgs:
                  log_path: str,
                  stream_logs: bool,
                  start_streaming_at: str = '',
-                 end_streaming_at: Optional[str] = None,
-                 skip_lines: Optional[List[str]] = None,
+                 end_streaming_at: str | None = None,
+                 skip_lines: list[str] | None = None,
                  replace_crlf: bool = False,
-                 line_processor: Optional[log_utils.LineProcessor] = None,
-                 streaming_prefix: Optional[str] = None) -> None:
+                 line_processor: log_utils.LineProcessor | None = None,
+                 streaming_prefix: str | None = None) -> None:
         self.log_path = log_path
         self.stream_logs = stream_logs
         self.start_streaming_at = start_streaming_at
@@ -134,7 +135,7 @@ def _handle_io_stream(io_stream, out_stream, args: _ProcessingArgs):
 
 
 def process_subprocess_stream(proc, stdout_stream_handler,
-                              stderr_stream_handler) -> Tuple[str, str]:
+                              stderr_stream_handler) -> tuple[str, str]:
     """Process the stream of a process in threads, blocking."""
     if proc.stderr is not None:
         # Asyncio does not work as the output processing can be executed in a
@@ -156,23 +157,23 @@ def process_subprocess_stream(proc, stdout_stream_handler,
 
 
 def run_with_log(
-    cmd: Union[List[str], str],
+    cmd: list[str] | str,
     log_path: str,
     *,
     require_outputs: bool = False,
     stream_logs: bool = False,
     start_streaming_at: str = '',
-    end_streaming_at: Optional[str] = None,
-    skip_lines: Optional[List[str]] = None,
+    end_streaming_at: str | None = None,
+    skip_lines: list[str] | None = None,
     shell: bool = False,
     with_ray: bool = False,
     process_stream: bool = True,
-    line_processor: Optional[log_utils.LineProcessor] = None,
-    streaming_prefix: Optional[str] = None,
+    line_processor: log_utils.LineProcessor | None = None,
+    streaming_prefix: str | None = None,
     log_cmd: bool = False,
-    timeout: Optional[int] = None,
+    timeout: int | None = None,
     **kwargs,
-) -> Union[int, Tuple[int, str, str], Tuple[int, int]]:
+) -> int | tuple[int, str, str] | tuple[int, int]:
     """Runs a command and logs its output to a file.
 
     Args:
@@ -355,7 +356,7 @@ def run_with_log(
 
 
 def make_task_bash_script(codegen: str,
-                          env_vars: Optional[Dict[str, str]] = None) -> str:
+                          env_vars: dict[str, str] | None = None) -> str:
     # set -a is used for exporting all variables functions to the environment
     # so that bash `user_script` can access `conda activate`. Detail: #436.
     # Reference: https://www.gnu.org/software/bash/manual/html_node/The-Set-Builtin.html # pylint: disable=line-too-long
@@ -385,8 +386,7 @@ def make_task_bash_script(codegen: str,
     return script
 
 
-def add_ray_env_vars(
-        env_vars: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+def add_ray_env_vars(env_vars: dict[str, str] | None = None) -> dict[str, str]:
     # Adds Ray-related environment variables.
     if env_vars is None:
         env_vars = {}
@@ -403,10 +403,10 @@ def add_ray_env_vars(
 
 def run_bash_command_with_log(bash_command: str,
                               log_path: str,
-                              env_vars: Optional[Dict[str, str]] = None,
+                              env_vars: dict[str, str] | None = None,
                               stream_logs: bool = False,
                               with_ray: bool = False,
-                              streaming_prefix: Optional[str] = None):
+                              streaming_prefix: str | None = None):
     with tempfile.NamedTemporaryFile('w', prefix='sky_app_',
                                      delete=False) as fp:
         bash_command = make_task_bash_script(bash_command, env_vars=env_vars)
@@ -428,10 +428,10 @@ def run_bash_command_with_log(bash_command: str,
 def run_bash_command_with_log_and_return_pid(
         bash_command: str,
         log_path: str,
-        env_vars: Optional[Dict[str, str]] = None,
+        env_vars: dict[str, str] | None = None,
         stream_logs: bool = False,
         with_ray: bool = False,
-        streaming_prefix: Optional[str] = None):
+        streaming_prefix: str | None = None):
     return_code = run_bash_command_with_log(bash_command,
                                             log_path,
                                             env_vars,
@@ -499,7 +499,7 @@ _TAIL_BLOCK_SIZE = 64 * 1024
 
 def tail_lines_from_end(path: str,
                         tail: int,
-                        offset: int = 0) -> Tuple[List[str], int]:
+                        offset: int = 0) -> tuple[list[str], int]:
     """Return the last ``tail`` lines from ``path``, skipping ``offset``.
 
     Reads backwards in fixed-size blocks from EOF so cost is O(tail *
@@ -521,7 +521,7 @@ def tail_lines_from_end(path: str,
     """
     assert tail > 0
     needed = tail + max(offset, 0)
-    chunks: List[bytes] = []
+    chunks: list[bytes] = []
     line_count = 0
     pos = 0
     end_pos = 0
@@ -552,7 +552,7 @@ def tail_lines_from_end(path: str,
     return lines[-tail:], end_pos
 
 
-def _peek_head_lines(log_file: TextIO) -> List[str]:
+def _peek_head_lines(log_file: TextIO) -> list[str]:
     """Peek the head of the file."""
     lines = [
         log_file.readline() for _ in range(PEEK_HEAD_LINES_FOR_START_STREAM)
@@ -562,7 +562,7 @@ def _peek_head_lines(log_file: TextIO) -> List[str]:
     return [line for line in lines if line]
 
 
-def _should_stream_the_whole_tail_lines(head_lines_of_log_file: List[str],
+def _should_stream_the_whole_tail_lines(head_lines_of_log_file: list[str],
                                         tail_lines: Iterable[str],
                                         start_stream_at: str) -> bool:
     """Check if the entire tail lines should be streamed."""
@@ -586,9 +586,9 @@ def _should_stream_the_whole_tail_lines(head_lines_of_log_file: List[str],
     return False
 
 
-def tail_logs(job_id: Optional[int],
-              log_dir: Optional[str],
-              managed_job_id: Optional[int] = None,
+def tail_logs(job_id: int | None,
+              log_dir: str | None,
+              managed_job_id: int | None = None,
               follow: bool = True,
               tail: int = 0,
               tail_offset: int = 0) -> None:
@@ -652,7 +652,7 @@ def tail_logs(job_id: Optional[int],
         start_streaming = False
         end_pos = 0
         if tail > 0:
-            with open(log_path, 'r', newline='', encoding='utf-8') as peek:
+            with open(log_path, newline='', encoding='utf-8') as peek:
                 head_lines_of_log_file = _peek_head_lines(peek)
             tail_lines, end_pos = tail_lines_from_end(log_path, tail,
                                                       tail_offset)
@@ -664,7 +664,7 @@ def tail_logs(job_id: Optional[int],
                 if start_streaming:
                     print(line, end='')
             print(end='', flush=True)
-        with open(log_path, 'r', newline='', encoding='utf-8') as log_file:
+        with open(log_path, newline='', encoding='utf-8') as log_file:
             log_file.seek(end_pos)
             for line in _follow_job_logs(log_file,
                                          job_id=job_id,
@@ -675,7 +675,7 @@ def tail_logs(job_id: Optional[int],
         try:
             start_streaming = False
             if tail > 0:
-                with open(log_path, 'r', encoding='utf-8') as peek:
+                with open(log_path, encoding='utf-8') as peek:
                     head_lines_of_log_file = _peek_head_lines(peek)
                 tail_lines, _ = tail_lines_from_end(log_path, tail, tail_offset)
                 start_streaming = _should_stream_the_whole_tail_lines(
@@ -686,7 +686,7 @@ def tail_logs(job_id: Optional[int],
                     if start_streaming:
                         print(line, end='', flush=True)
             else:
-                with open(log_path, 'r', encoding='utf-8') as log_file:
+                with open(log_path, encoding='utf-8') as log_file:
                     for line in log_file:
                         if start_stream_at in line:
                             start_streaming = True
@@ -703,9 +703,9 @@ def tail_logs(job_id: Optional[int],
                   f' {status.value}) does not exist.{colorama.Style.RESET_ALL}')
 
 
-def tail_logs_iter(job_id: Optional[int],
-                   log_dir: Optional[str],
-                   managed_job_id: Optional[int] = None,
+def tail_logs_iter(job_id: int | None,
+                   log_dir: str | None,
+                   managed_job_id: int | None = None,
                    follow: bool = True,
                    tail: int = 0,
                    tail_offset: int = 0) -> Iterator[str]:
@@ -762,7 +762,7 @@ def tail_logs_iter(job_id: Optional[int],
         start_streaming = False
         end_pos = 0
         if tail > 0:
-            with open(log_path, 'r', newline='', encoding='utf-8') as peek:
+            with open(log_path, newline='', encoding='utf-8') as peek:
                 head_lines_of_log_file = _peek_head_lines(peek)
             tail_lines, end_pos = tail_lines_from_end(log_path, tail,
                                                       tail_offset)
@@ -773,7 +773,7 @@ def tail_logs_iter(job_id: Optional[int],
                     start_streaming = True
                 if start_streaming:
                     yield line
-        with open(log_path, 'r', newline='', encoding='utf-8') as log_file:
+        with open(log_path, newline='', encoding='utf-8') as log_file:
             log_file.seek(end_pos)
             for line in _follow_job_logs(log_file,
                                          job_id=job_id,
@@ -784,7 +784,7 @@ def tail_logs_iter(job_id: Optional[int],
         try:
             start_streaming = False
             if tail > 0:
-                with open(log_path, 'r', encoding='utf-8') as peek:
+                with open(log_path, encoding='utf-8') as peek:
                     head_lines_of_log_file = _peek_head_lines(peek)
                 tail_lines, _ = tail_lines_from_end(log_path, tail, tail_offset)
                 start_streaming = _should_stream_the_whole_tail_lines(
@@ -795,7 +795,7 @@ def tail_logs_iter(job_id: Optional[int],
                     if start_streaming:
                         yield line
             else:
-                with open(log_path, 'r', encoding='utf-8') as log_file:
+                with open(log_path, encoding='utf-8') as log_file:
                     for line in log_file:
                         if start_stream_at in line:
                             start_streaming = True

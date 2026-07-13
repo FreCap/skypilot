@@ -16,7 +16,6 @@ Example:
             bid_per_gpu=0.3
         )
 """
-from typing import List, Optional
 
 from sky.adaptors import runpod
 from sky.provision.runpod.api.pods import generate_spot_pod_deployment_mutation
@@ -32,28 +31,28 @@ def create_spot_pod(
     bid_per_gpu: float,
     cloud_type: str = 'ALL',
     volume_mount_path: str = '/runpod-volume',
-    gpu_count: Optional[int] = 1,
-    min_memory_in_gb: Optional[int] = 1,
-    min_vcpu_count: Optional[int] = 1,
-    container_disk_in_gb: Optional[int] = None,
-    volume_in_gb: Optional[int] = 0,
-    ports: Optional[str] = None,
-    start_ssh: Optional[bool] = True,
-    start_jupyter: Optional[bool] = False,
-    env: Optional[dict] = None,
-    docker_args: Optional[str] = '',
-    support_public_ip: Optional[bool] = True,
-    terminate_after: Optional[str] = None,
-    stop_after: Optional[str] = None,
-    data_center_id: Optional[str] = None,
-    country_code: Optional[str] = None,
-    network_volume_id: Optional[str] = None,
-    allowed_cuda_versions: Optional[List[str]] = None,
-    min_download: Optional[int] = None,
-    min_upload: Optional[int] = None,
-    cuda_version: Optional[str] = None,
-    template_id: Optional[str] = None,
-    volume_key: Optional[str] = None,
+    gpu_count: int | None = 1,
+    min_memory_in_gb: int | None = 1,
+    min_vcpu_count: int | None = 1,
+    container_disk_in_gb: int | None = None,
+    volume_in_gb: int | None = 0,
+    ports: str | None = None,
+    start_ssh: bool | None = True,
+    start_jupyter: bool | None = False,
+    env: dict | None = None,
+    docker_args: str | None = '',
+    support_public_ip: bool | None = True,
+    terminate_after: str | None = None,
+    stop_after: str | None = None,
+    data_center_id: str | None = None,
+    country_code: str | None = None,
+    network_volume_id: str | None = None,
+    allowed_cuda_versions: list[str] | None = None,
+    min_download: int | None = None,
+    min_upload: int | None = None,
+    cuda_version: str | None = None,
+    template_id: str | None = None,
+    volume_key: str | None = None,
 ) -> dict:
     """This module provides functions to generate GraphQL mutations for
     deploying spot instance Pods on RunPod.

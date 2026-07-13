@@ -2,7 +2,6 @@
 
 import functools
 import os
-from typing import Tuple
 
 import filelock
 
@@ -21,7 +20,7 @@ MAX_TRIALS = 64
 _SSH_KEY_PATH_PREFIX = '~/.sky/clients/{user_hash}/ssh'
 
 
-def get_ssh_key_and_lock_path(user_hash: str) -> Tuple[str, str, str]:
+def get_ssh_key_and_lock_path(user_hash: str) -> tuple[str, str, str]:
     user_ssh_key_prefix = _SSH_KEY_PATH_PREFIX.format(user_hash=user_hash)
 
     os.makedirs(os.path.expanduser(user_ssh_key_prefix),
@@ -33,7 +32,7 @@ def get_ssh_key_and_lock_path(user_hash: str) -> Tuple[str, str, str]:
     return private_key_path, public_key_path, lock_path
 
 
-def _generate_rsa_key_pair() -> Tuple[str, str]:
+def _generate_rsa_key_pair() -> tuple[str, str]:
     # Keep the import of the cryptography local to avoid expensive
     # third-party imports when not needed.
     # pylint: disable=import-outside-toplevel
@@ -111,7 +110,7 @@ def _save_key_pair(private_key_path: str, public_key_path: str,
     _ensure_key_permissions(private_key_path, public_key_path)
 
 
-def get_or_generate_keys() -> Tuple[str, str]:
+def get_or_generate_keys() -> tuple[str, str]:
     """Returns the absolute private and public key paths."""
     user_hash = common_utils.get_user_hash()
     private_key_path, public_key_path, lock_path = get_ssh_key_and_lock_path(

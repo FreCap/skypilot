@@ -25,7 +25,6 @@ import tempfile
 import textwrap
 import traceback
 import typing
-from typing import List, Optional, Tuple
 
 from sky import clouds as sky_clouds
 from sky import sky_logging
@@ -141,9 +140,9 @@ def _get_job_address(job_name: str,
 
 def _generate_k8s_dns_mappings(
     job_group_name: str,
-    tasks_handles: List[Tuple['task_lib.Task',
+    tasks_handles: list[tuple['task_lib.Task',
                               'cloud_vm_ray_backend.CloudVmRayResourceHandle']]
-) -> List[Tuple[str, str]]:
+) -> list[tuple[str, str]]:
     """Generate K8s DNS to hostname mappings for background updater.
 
     Args:
@@ -156,7 +155,7 @@ def _generate_k8s_dns_mappings(
     # pylint: disable-next=import-outside-toplevel
     from sky.jobs import runtime as managed_job_runtime
 
-    mappings: List[Tuple[str, str]] = []
+    mappings: list[tuple[str, str]] = []
     for task, handle in tasks_handles:
         if handle is None or not _is_kubernetes(handle):
             continue
@@ -185,7 +184,7 @@ def _generate_k8s_dns_mappings(
 def dns_addresses_for_task(
     task: 'task_lib.Task',
     job_id: int,
-) -> Optional[List[str]]:
+) -> list[str] | None:
     """K8s DNS addresses for this task, or ``None``."""
     # pylint: disable-next=import-outside-toplevel
     from sky.jobs import runtime as managed_job_runtime
@@ -197,11 +196,11 @@ def dns_addresses_for_task(
 
 def _generate_k8s_dns_mappings_from_runtime(
     job_group_name: str,
-    tasks: List['task_lib.Task'],
+    tasks: list['task_lib.Task'],
     job_id: int,
-) -> List[Tuple[str, str]]:
+) -> list[tuple[str, str]]:
     """Build K8s DNS mappings from runtime-supplied addresses."""
-    mappings: List[Tuple[str, str]] = []
+    mappings: list[tuple[str, str]] = []
     for task in tasks:
         addresses = dns_addresses_for_task(task, job_id)
         if addresses is None:
@@ -216,7 +215,7 @@ def _generate_k8s_dns_mappings_from_runtime(
 
 def generate_inline_networking_setup_script(
     job_group_name: str,
-    tasks: List['task_lib.Task'],
+    tasks: list['task_lib.Task'],
     job_id: int,
 ) -> str:
     """Bash to prepend to task.run that starts the JobGroup DNS updater
@@ -244,7 +243,7 @@ def generate_inline_networking_setup_script(
 
 def _generate_hosts_entries(
     job_group_name: str,
-    tasks_handles: List[Tuple['task_lib.Task',
+    tasks_handles: list[tuple['task_lib.Task',
                               'cloud_vm_ray_backend.CloudVmRayResourceHandle']]
 ) -> str:
     """Generate /etc/hosts entries for SSH cloud nodes.
@@ -325,7 +324,7 @@ async def _inject_hosts_on_node(
         return False
 
 
-def generate_k8s_dns_updater_script(dns_mappings: List[Tuple[str, str]],
+def generate_k8s_dns_updater_script(dns_mappings: list[tuple[str, str]],
                                     job_group_name: str) -> str:
     """Generate background script to update /etc/hosts with K8s DNS IPs.
 
@@ -404,7 +403,7 @@ def generate_k8s_dns_updater_script(dns_mappings: List[Tuple[str, str]],
 
 async def _start_k8s_dns_updater_on_node(
     runner: 'command_runner.CommandRunner',
-    dns_mappings: List[Tuple[str, str]],
+    dns_mappings: list[tuple[str, str]],
     job_group_name: str,
 ) -> bool:
     """Start background DNS updater on a K8s node.
@@ -498,7 +497,7 @@ class NetworkConfigurator:
     @staticmethod
     async def setup(
         job_group_name: str,
-        tasks_handles: List[Tuple[
+        tasks_handles: list[tuple[
             'task_lib.Task', 'cloud_vm_ray_backend.CloudVmRayResourceHandle']],
     ) -> bool:
         """Set up network configuration for JobGroup.
@@ -516,7 +515,7 @@ class NetworkConfigurator:
     @staticmethod
     async def _inject_etc_hosts(
         job_group_name: str,
-        tasks_handles: List[Tuple[
+        tasks_handles: list[tuple[
             'task_lib.Task', 'cloud_vm_ray_backend.CloudVmRayResourceHandle']],
     ) -> bool:
         """Inject /etc/hosts entries for all clusters in the JobGroup.
@@ -540,7 +539,7 @@ class NetworkConfigurator:
                                                       tasks_handles)
 
         # Each entry: (coroutine, task_name, node_idx, is_k8s)
-        setup_tasks: List[Tuple] = []
+        setup_tasks: list[tuple] = []
         for task, handle in tasks_handles:
             if handle is None:
                 continue
@@ -613,7 +612,7 @@ class NetworkConfigurator:
 
 async def setup_job_group_networking(
     job_group_name: str,
-    tasks_handles: List[Tuple['task_lib.Task',
+    tasks_handles: list[tuple['task_lib.Task',
                               'cloud_vm_ray_backend.CloudVmRayResourceHandle']],
 ) -> bool:
     """Set up networking for all tasks in a JobGroup.
@@ -648,7 +647,7 @@ def get_network_ready_marker_path(job_group_name: str) -> str:
 
 
 def generate_wait_for_networking_script(job_group_name: str,
-                                        other_job_names: List[str]) -> str:
+                                        other_job_names: list[str]) -> str:
     """Generate a bash script to wait for network setup.
 
     This script should be prepended to task.setup to ensure networking

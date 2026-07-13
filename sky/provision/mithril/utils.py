@@ -3,7 +3,7 @@
 import json
 import os
 import time
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Literal
 from urllib.parse import quote
 
 from sky import sky_logging
@@ -12,12 +12,23 @@ from sky.utils import common_utils
 from sky.utils import status_lib
 
 # Mithril API status values
-MithrilStatus = Literal['STATUS_NEW', 'STATUS_CONFIRMED', 'STATUS_SCHEDULED',
-                        'STATUS_INITIALIZING', 'STATUS_STARTING',
-                        'STATUS_RUNNING', 'STATUS_STOPPING', 'STATUS_STOPPED',
-                        'STATUS_TERMINATED', 'STATUS_RELOCATING',
-                        'STATUS_PREEMPTING', 'STATUS_PREEMPTED',
-                        'STATUS_REPLACED', 'STATUS_PAUSED', 'STATUS_ERROR',]
+MithrilStatus = Literal[
+    'STATUS_NEW',
+    'STATUS_CONFIRMED',
+    'STATUS_SCHEDULED',
+    'STATUS_INITIALIZING',
+    'STATUS_STARTING',
+    'STATUS_RUNNING',
+    'STATUS_STOPPING',
+    'STATUS_STOPPED',
+    'STATUS_TERMINATED',
+    'STATUS_RELOCATING',
+    'STATUS_PREEMPTING',
+    'STATUS_PREEMPTED',
+    'STATUS_REPLACED',
+    'STATUS_PAUSED',
+    'STATUS_ERROR',
+]
 
 # Lazy imports to avoid dependency issues
 requests = adaptors_common.LazyImport('requests')
@@ -68,13 +79,13 @@ class MithrilHttpError(MithrilError):
 
 
 def to_cluster_status(
-        raw_status: MithrilStatus) -> Optional[status_lib.ClusterStatus]:
+        raw_status: MithrilStatus) -> status_lib.ClusterStatus | None:
     """Map Mithril API status to ClusterStatus.
 
     Returns None for terminated instances so they are filtered out when
     query_instances is called with non_terminated_only=True.
     """
-    mapping: Dict[MithrilStatus, Optional[status_lib.ClusterStatus]] = {
+    mapping: dict[MithrilStatus, status_lib.ClusterStatus | None] = {
         'STATUS_NEW': status_lib.ClusterStatus.INIT,
         'STATUS_CONFIRMED': status_lib.ClusterStatus.INIT,
         'STATUS_SCHEDULED': status_lib.ClusterStatus.INIT,
@@ -97,7 +108,7 @@ def to_cluster_status(
     return mapping.get(raw_status)
 
 
-def _load_file_config() -> Optional[Dict[str, Any]]:
+def _load_file_config() -> dict[str, Any] | None:
     """Load Mithril config file if present.
 
     Returns:
@@ -108,7 +119,7 @@ def _load_file_config() -> Optional[Dict[str, Any]]:
         logger.debug(f'Mithril config file not found at {config_path}')
         return None
     logger.debug(f'Loading Mithril config from {config_path}')
-    with open(config_path, 'r', encoding='utf-8') as f:
+    with open(config_path, encoding='utf-8') as f:
         try:
             # safe_load returns None for empty files; normalize to {}.
             return yaml.safe_load(f) or {}
@@ -118,7 +129,7 @@ def _load_file_config() -> Optional[Dict[str, Any]]:
                 f'{e}') from e
 
 
-def get_current_profile() -> Optional[str]:
+def get_current_profile() -> str | None:
     """Get the currently active profile.
 
     Returns the profile from MITHRIL_PROFILE env var or current_profile
@@ -133,8 +144,8 @@ def get_current_profile() -> Optional[str]:
     return None
 
 
-def _build_config(api_key: Optional[str], project_id: Optional[str],
-                  api_url: Optional[str]) -> Dict[str, str]:
+def _build_config(api_key: str | None, project_id: str | None,
+                  api_url: str | None) -> dict[str, str]:
     """Validate required fields and return a Mithril config dict.
 
     Raises MithrilError if api_key or project_id is missing. Falls back
@@ -155,7 +166,7 @@ def _build_config(api_key: Optional[str], project_id: Optional[str],
     }
 
 
-def resolve_current_config() -> Dict[str, str]:
+def resolve_current_config() -> dict[str, str]:
     """Resolve Mithril config from environment variables and active profile.
 
     Environment variables take precedence over profile values. Works without
@@ -163,7 +174,7 @@ def resolve_current_config() -> Dict[str, str]:
     """
     file_config = _load_file_config()
     profile = get_current_profile()
-    profile_config: Dict[str, Any] = {}
+    profile_config: dict[str, Any] = {}
     if profile and file_config is not None:
         profiles = file_config.get('profiles', {})
         if profile not in profiles:
@@ -178,7 +189,7 @@ def resolve_current_config() -> Dict[str, str]:
     return _build_config(api_key, project_id, api_url)
 
 
-def get_profile_config(profile: str) -> Dict[str, str]:
+def get_profile_config(profile: str) -> dict[str, str]:
     """Get Mithril config for a named profile from the config file.
 
     Raises MithrilError if the config file or profile is not found.
@@ -209,9 +220,9 @@ def _is_retryable_status(status_code: int) -> bool:
 def _make_request(
     method: str,
     endpoint: str,
-    payload: Optional[Dict[str, Any]] = None,
-    params: Optional[Dict[str, Any]] = None,
-    config: Optional[Dict[str, str]] = None,
+    payload: dict[str, Any] | None = None,
+    params: dict[str, Any] | None = None,
+    config: dict[str, str] | None = None,
 ) -> Any:
     """Make an API request to Mithril with retry and backoff."""
     if config is None:
@@ -231,7 +242,7 @@ def _make_request(
 
     backoff = common_utils.Backoff(initial_backoff=INITIAL_BACKOFF_SECONDS,
                                    max_backoff_factor=MAX_BACKOFF_FACTOR)
-    last_exception: Optional[Exception] = None
+    last_exception: Exception | None = None
 
     for attempt in range(MAX_ATTEMPTS):
         try:
@@ -306,7 +317,7 @@ def _make_request(
 
 def get_or_add_ssh_key(
     public_key: str,
-    config: Optional[Dict[str, str]] = None,
+    config: dict[str, str] | None = None,
 ) -> str:
     """Get or create a Mithril SSH key and return its key ID."""
     if config is None:
@@ -315,7 +326,7 @@ def get_or_add_ssh_key(
     params = {'project': config['project_id']}
 
     # Get existing SSH keys
-    key_list: List[Dict[str, Any]] = _make_request('GET',
+    key_list: list[dict[str, Any]] = _make_request('GET',
                                                    endpoint,
                                                    params=params)
 
@@ -356,7 +367,7 @@ def _wait_for_bid_instances(
     expected_count: int,
     project_id: str,
     timeout: int = TIMEOUT,
-) -> List[str]:
+) -> list[str]:
     """Wait for a spot bid to create the expected number of instances.
 
     Args:
@@ -404,7 +415,7 @@ def wait_for_bid(
     project_id: str,
     bid_timeout: int = TIMEOUT,
     ssh_ip_timeout: int = TIMEOUT,
-) -> List[str]:
+) -> list[str]:
     """Wait for a bid to create instances and for them to have SSH destinations.
 
     Args:
@@ -444,9 +455,9 @@ def wait_for_bid(
 
 
 def list_instances(
-    status: Optional[str] = None,
-    config: Optional[Dict[str, str]] = None,
-) -> Dict[str, Dict[str, Any]]:
+    status: str | None = None,
+    config: dict[str, str] | None = None,
+) -> dict[str, dict[str, Any]]:
     """List all instances, optionally filtered by status.
 
     Handles pagination using next_cursor if present in API response.
@@ -459,11 +470,11 @@ def list_instances(
     if config is None:
         config = resolve_current_config()
     endpoint = '/v2/instances'
-    base_params: Dict[str, Any] = ({
+    base_params: dict[str, Any] = ({
         'project': quote(config['project_id'])
     } if config['project_id'] else {})
-    instances: Dict[str, Dict[str, Any]] = {}
-    cursor: Optional[str] = None
+    instances: dict[str, dict[str, Any]] = {}
+    cursor: str | None = None
 
     try:
         while True:
@@ -509,7 +520,7 @@ def list_instances(
         raise MithrilError(f'Failed to list instances: {str(e)}') from e
 
 
-def get_spot_availability() -> List[Dict[str, Any]]:
+def get_spot_availability() -> list[dict[str, Any]]:
     """Get spot availability for all instance types.
 
     Returns:
@@ -520,7 +531,7 @@ def get_spot_availability() -> List[Dict[str, Any]]:
     return _make_request('GET', '/v2/spot/availability')
 
 
-def get_instance_types() -> Dict[str, Dict[str, Any]]:
+def get_instance_types() -> dict[str, dict[str, Any]]:
     """Get all instance types.
 
     Returns:
@@ -528,7 +539,7 @@ def get_instance_types() -> Dict[str, Dict[str, Any]]:
         Each record contains: fid, name, num_cpus, gpu_type, num_gpus, etc.
         Note: The same name can appear with different FIDs (one per region).
     """
-    instance_types: List[Dict[str,
+    instance_types: list[dict[str,
                               Any]] = _make_request('GET', '/v2/instance-types')
     return {it['fid']: it for it in instance_types}
 
@@ -536,10 +547,10 @@ def get_instance_types() -> Dict[str, Dict[str, Any]]:
 def launch_instances(
     instance_type: str,
     name: str,
-    region: Optional[str],
-    ssh_keys: List[str],
+    region: str | None,
+    ssh_keys: list[str],
     instance_quantity: int = 1,
-) -> Tuple[str, List[str]]:
+) -> tuple[str, list[str]]:
     """Launch instances by creating a spot bid and waiting for them to be ready.
 
     Returns:
@@ -553,9 +564,10 @@ def launch_instances(
 
     # Build region -> FID mapping for the requested instance type name
     region_to_fid = {
-        rec['region']:
-        rec['instance_type'] for rec in availability if instance_types.get(
-            rec['instance_type'], {}).get('name') == instance_type
+        rec['region']: rec['instance_type']
+        for rec in availability
+        if instance_types.get(rec['instance_type'], {}).get('name') ==
+        instance_type
     }
 
     if not region_to_fid:
@@ -619,8 +631,8 @@ def launch_instances(
 
 def get_bid(
     bid_name: str,
-    config: Optional[Dict[str, str]] = None,
-) -> Optional[Dict[str, Any]]:
+    config: dict[str, str] | None = None,
+) -> dict[str, Any] | None:
     """Get a bid by its exact name.
 
     Args:
@@ -650,7 +662,7 @@ def get_bid(
 
 def cancel_bid(
     bid_id: str,
-    config: Optional[Dict[str, str]] = None,
+    config: dict[str, str] | None = None,
 ) -> bool:
     """Cancel a spot bid by its FID.
 
@@ -683,8 +695,8 @@ def cancel_bid(
 def update_bid(
     bid_id: str,
     paused: bool,
-    config: Optional[Dict[str, str]] = None,
-) -> Dict[str, Any]:
+    config: dict[str, str] | None = None,
+) -> dict[str, Any]:
     """Update a spot bid to pause or unpause it.
 
     Args:

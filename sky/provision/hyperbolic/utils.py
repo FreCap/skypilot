@@ -3,7 +3,7 @@ import enum
 import json
 import os
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 import requests
 
@@ -44,7 +44,7 @@ class HyperbolicInstanceStatus(enum.Enum):
     @classmethod
     def cluster_status_map(
         cls
-    ) -> Dict['HyperbolicInstanceStatus', Optional[status_lib.ClusterStatus]]:
+    ) -> dict['HyperbolicInstanceStatus', status_lib.ClusterStatus | None]:
         return {
             cls.CREATING: status_lib.ClusterStatus.INIT,
             cls.STARTING: status_lib.ClusterStatus.INIT,
@@ -67,7 +67,7 @@ class HyperbolicInstanceStatus(enum.Enum):
         except ValueError as exc:
             raise HyperbolicError(f'Unknown instance status: {status}') from exc
 
-    def to_cluster_status(self) -> Optional[status_lib.ClusterStatus]:
+    def to_cluster_status(self) -> status_lib.ClusterStatus | None:
         """Convert to SkyPilot cluster status."""
         return self.cluster_status_map().get(self)
 
@@ -80,16 +80,15 @@ class HyperbolicClient:
         cred_path = os.path.expanduser(API_KEY_PATH)
         if not os.path.exists(cred_path):
             raise RuntimeError(f'API key not found at {cred_path}')
-        with open(cred_path, 'r', encoding='utf-8') as f:
+        with open(cred_path, encoding='utf-8') as f:
             self.api_key = f.read().strip()
         self.headers = {'Authorization': f'Bearer {self.api_key}'}
         self.api_url = BASE_URL
 
-    def _make_request(
-            self,
-            method: str,
-            endpoint: str,
-            payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def _make_request(self,
+                      method: str,
+                      endpoint: str,
+                      payload: dict[str, Any] | None = None) -> dict[str, Any]:
         """Make an API request to Hyperbolic."""
         url = f'{BASE_URL}{endpoint}'
         headers = {
@@ -148,7 +147,7 @@ class HyperbolicClient:
                 f'Unexpected error during API request: {str(e)}') from e
 
     def launch_instance(self, gpu_model: str, gpu_count: int,
-                        name: str) -> Tuple[str, str]:
+                        name: str) -> tuple[str, str]:
         """Launch a new instance with the specified configuration."""
         # Initialize config with basic instance info
         config = {
@@ -208,9 +207,9 @@ class HyperbolicClient:
 
     def list_instances(
         self,
-        status: Optional[str] = None,
-        metadata: Optional[Dict[str, Dict[str, str]]] = None
-    ) -> Dict[str, Dict[str, Any]]:
+        status: str | None = None,
+        metadata: dict[str, dict[str, str]] | None = None
+    ) -> dict[str, dict[str, Any]]:
         """List all instances, optionally filtered by status and metadata."""
         endpoint = '/v1/marketplace/instances'
         try:
@@ -236,7 +235,7 @@ class HyperbolicClient:
                     continue
 
                 if metadata:
-                    skypilot_metadata: Dict[str,
+                    skypilot_metadata: dict[str,
                                             str] = metadata.get('skypilot', {})
                     cluster_name = skypilot_metadata.get('cluster_name', '')
                     instance_skypilot = instance.get('userMetadata',
@@ -348,15 +347,15 @@ def get_client() -> HyperbolicClient:
 
 # Backward-compatible wrapper functions
 def launch_instance(gpu_model: str, gpu_count: int,
-                    name: str) -> Tuple[str, str]:
+                    name: str) -> tuple[str, str]:
     """Launch a new instance with the specified configuration."""
     return get_client().launch_instance(gpu_model, gpu_count, name)
 
 
 def list_instances(
-    status: Optional[str] = None,
-    metadata: Optional[Dict[str, Dict[str, str]]] = None
-) -> Dict[str, Dict[str, Any]]:
+    status: str | None = None,
+    metadata: dict[str, dict[str, str]] | None = None
+) -> dict[str, dict[str, Any]]:
     """List all instances, optionally filtered by status and metadata."""
     return get_client().list_instances(status=status, metadata=metadata)
 

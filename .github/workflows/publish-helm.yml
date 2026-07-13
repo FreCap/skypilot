@@ -47,11 +47,6 @@ on:
         required: false
         type: string
         default: "skypilot-nightly"
-    secrets:
-      DOCKER_USERNAME:
-        required: true
-      HELM_DEPLOY_KEY:
-        required: true
 
 jobs:
   publish-helm:

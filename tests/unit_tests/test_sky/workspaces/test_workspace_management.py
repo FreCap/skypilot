@@ -626,8 +626,8 @@ class TestWorkspaceManagement(unittest.TestCase):
         mock_check_resources.assert_called_once_with([('test-workspace',
                                                        'update')])
 
-    @mock.patch('sky.utils.resource_checker.check_no_active_resources_for_users'
-               )
+    @mock.patch(
+        'sky.utils.resource_checker.check_no_active_resources_for_users')
     @mock.patch('sky.workspaces.core._compare_workspace_configs')
     def test_validate_workspace_config_changes_no_removed_users(
             self, mock_compare_configs, mock_check_resources):

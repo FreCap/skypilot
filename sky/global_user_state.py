@@ -14,7 +14,7 @@ import pickle
 import re
 import time
 import typing
-from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
+from typing import Any, Literal, Optional
 import uuid
 
 import sqlalchemy
@@ -471,10 +471,9 @@ initialize_and_get_db = _db_manager.get_engine
 
 @metrics_lib.time_me
 def add_or_update_user(
-    user: models.User,
-    allow_duplicate_name: bool = True,
-    return_user: bool = False
-) -> typing.Union[bool, typing.Tuple[bool, models.User]]:
+        user: models.User,
+        allow_duplicate_name: bool = True,
+        return_user: bool = False) -> bool | tuple[bool, models.User]:
     """Store the mapping from user hash to user name for display purposes.
 
     Returns:
@@ -634,7 +633,7 @@ def add_or_update_user(
 
 
 @metrics_lib.time_me
-def get_user(user_id: str) -> Optional[models.User]:
+def get_user(user_id: str) -> models.User | None:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         row = session.query(user_table).filter_by(id=user_id).first()
@@ -651,7 +650,7 @@ def get_user(user_id: str) -> Optional[models.User]:
 
 
 @metrics_lib.time_me
-def get_users(user_ids: Set[str]) -> Dict[str, models.User]:
+def get_users(user_ids: set[str]) -> dict[str, models.User]:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         rows = session.query(user_table).filter(
@@ -669,7 +668,7 @@ def get_users(user_ids: Set[str]) -> Dict[str, models.User]:
 
 
 @metrics_lib.time_me
-def get_user_by_name(username: str) -> List[models.User]:
+def get_user_by_name(username: str) -> list[models.User]:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         rows = session.query(user_table).filter_by(name=username).all()
@@ -688,7 +687,7 @@ def get_user_by_name(username: str) -> List[models.User]:
 
 
 @metrics_lib.time_me
-def get_user_by_name_match(username_match: str) -> List[models.User]:
+def get_user_by_name_match(username_match: str) -> list[models.User]:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         rows = session.query(user_table).filter(
@@ -713,7 +712,7 @@ def delete_user(user_id: str) -> None:
 
 
 @metrics_lib.time_me
-def get_all_users() -> List[models.User]:
+def get_all_users() -> list[models.User]:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         rows = session.query(user_table).all()
@@ -731,8 +730,7 @@ def get_all_users() -> List[models.User]:
 
 @db_retries.retry
 @metrics_lib.time_me
-def set_user_preferred_workspace(user_id: str,
-                                 workspace: Optional[str]) -> bool:
+def set_user_preferred_workspace(user_id: str, workspace: str | None) -> bool:
     """Sets (or clears with None) the user's preferred workspace.
 
     This is the raw DB write; RBAC validation that the user has access to the
@@ -753,17 +751,17 @@ def set_user_preferred_workspace(user_id: str,
 @metrics_lib.time_me
 def add_or_update_cluster(cluster_name: str,
                           cluster_handle: 'backends.ResourceHandle',
-                          requested_resources: Optional[Set[Any]],
+                          requested_resources: set[Any] | None,
                           ready: bool,
                           is_launch: bool = True,
-                          config_hash: Optional[str] = None,
-                          task_config: Optional[Dict[str, Any]] = None,
+                          config_hash: str | None = None,
+                          task_config: dict[str, Any] | None = None,
                           is_managed: bool = False,
-                          provision_log_path: Optional[str] = None,
-                          existing_cluster_hash: Optional[str] = None,
-                          workload_type: Optional[str] = None,
-                          workload_id: Optional[str] = None,
-                          workload_task_id: Optional[int] = None):
+                          provision_log_path: str | None = None,
+                          existing_cluster_hash: str | None = None,
+                          workload_type: str | None = None,
+                          workload_id: str | None = None,
+                          workload_task_id: int | None = None):
     """Adds or updates cluster_name -> cluster_handle mapping.
 
     Args:
@@ -813,7 +811,7 @@ def add_or_update_cluster(cluster_name: str,
     # the dashboard's External Links section (mirrors the managed-job flow in
     # sky/jobs/recovery_strategy.py).
     current_names = None
-    instance_links: Optional[Dict[str, str]] = None
+    instance_links: dict[str, str] | None = None
     if hasattr(cluster_handle, 'cached_cluster_info'):
         ci = cluster_handle.cached_cluster_info
         if ci is not None:
@@ -866,7 +864,7 @@ def add_or_update_cluster(cluster_name: str,
     history_workspace = active_workspace
     history_hash = user_hash
 
-    conditional_values: Dict[str, Any] = {}
+    conditional_values: dict[str, Any] = {}
     if is_launch:
         conditional_values.update({
             'launched_at': cluster_launched_at,
@@ -908,8 +906,8 @@ def add_or_update_cluster(cluster_name: str,
             conditional_values.update({
                 'workspace': active_workspace,
             })
-        if is_launch and (cluster_row is None or cluster_row.status !=
-                          status_lib.ClusterStatus.UP.value):
+        if is_launch and (cluster_row is None or cluster_row.status
+                          != status_lib.ClusterStatus.UP.value):
             conditional_values.update({
                 'last_creation_yaml': yaml_utils.dump_yaml_str(task_config)
                                       if task_config else None,
@@ -931,7 +929,7 @@ def add_or_update_cluster(cluster_name: str,
         if instance_links:
             existing_links = (cluster_row.links
                               if cluster_row is not None else None) or {}
-            merged_links: Dict[str, str] = {}
+            merged_links: dict[str, str] = {}
             if isinstance(existing_links, dict):
                 merged_links.update(existing_links)
             merged_links.update(instance_links)
@@ -1094,13 +1092,13 @@ def add_or_update_cluster(cluster_name: str,
 @db_retries.retry
 @metrics_lib.time_me
 def add_cluster_event(cluster_name: str,
-                      new_status: Optional[status_lib.ClusterStatus],
+                      new_status: status_lib.ClusterStatus | None,
                       reason: str,
                       event_type: ClusterEventType,
                       nop_if_duplicate: bool = False,
-                      duplicate_regex: Optional[str] = None,
+                      duplicate_regex: str | None = None,
                       expose_duplicate_error: bool = False,
-                      transitioned_at: Optional[int] = None) -> None:
+                      transitioned_at: int | None = None) -> None:
     """Add a cluster event.
 
     Args:
@@ -1173,7 +1171,7 @@ def add_cluster_event(cluster_name: str,
 
 
 def get_last_cluster_event(cluster_hash: str,
-                           event_type: ClusterEventType) -> Optional[str]:
+                           event_type: ClusterEventType) -> str | None:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         row = session.query(cluster_event_table).filter_by(
@@ -1184,8 +1182,7 @@ def get_last_cluster_event(cluster_hash: str,
     return row.reason
 
 
-def get_terminal_or_last_status_change_event(
-        cluster_hash: str) -> Optional[str]:
+def get_terminal_or_last_status_change_event(cluster_hash: str) -> str | None:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         # Order by type (TERMINAL first, STATUS_CHANGE after),
@@ -1207,7 +1204,7 @@ def get_terminal_or_last_status_change_event(
 
 
 def _get_last_or_terminal_cluster_event_multiple(
-        cluster_hashes: Set[str]) -> Dict[str, str]:
+        cluster_hashes: set[str]) -> dict[str, str]:
     """Returns the last or terminal cluster event for each cluster."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
@@ -1245,8 +1242,8 @@ def _get_last_or_terminal_cluster_event_multiple(
 
 
 def get_last_cluster_event_of_type_multiple(
-        cluster_hashes: Set[str],
-        event_type: ClusterEventType) -> Dict[str, str]:
+        cluster_hashes: set[str],
+        event_type: ClusterEventType) -> dict[str, str]:
     """Returns the latest event of `event_type` per cluster_hash.
 
     Mirrors _get_last_or_terminal_cluster_event_multiple but filters to a
@@ -1278,8 +1275,8 @@ def get_last_cluster_event_of_type_multiple(
 
 
 def get_last_status_change_times(
-        cluster_hashes: Set[str],
-        ending_status: status_lib.ClusterStatus) -> Dict[str, int]:
+        cluster_hashes: set[str],
+        ending_status: status_lib.ClusterStatus) -> dict[str, int]:
     """Latest STATUS_CHANGE.transitioned_at per cluster for an ending_status.
 
     Returns a mapping from cluster_hash to the epoch-seconds at which that
@@ -1294,7 +1291,7 @@ def get_last_status_change_times(
         return {}
     engine = _db_manager.get_engine()
     hashes_list = list(cluster_hashes)
-    result: Dict[str, int] = {}
+    result: dict[str, int] = {}
     with orm.Session(engine) as session:
         for offset in range(0, len(hashes_list), _CLUSTER_IN_QUERY_CHUNK_SIZE):
             batch = hashes_list[offset:offset + _CLUSTER_IN_QUERY_CHUNK_SIZE]
@@ -1330,8 +1327,8 @@ def cleanup_cluster_events_with_retention(retention_hours: float,
     # Once for events with type STATUS_CHANGE.
     with orm.Session(engine) as session:
         query = session.query(cluster_event_table).filter(
-            cluster_event_table.c.transitioned_at <
-            time.time() - retention_hours * 3600,
+            cluster_event_table.c.transitioned_at
+            < time.time() - retention_hours * 3600,
             cluster_event_table.c.type == event_type.value)
         logger.debug(f'Deleting {query.count()} cluster events.')
         query.delete()
@@ -1390,45 +1387,44 @@ async def cluster_event_retention_daemon():
 
 @typing.overload
 def get_cluster_events(
-    cluster_name: Optional[str],
-    cluster_hash: Optional[str],
-    event_type: Union[ClusterEventType, List[ClusterEventType]],
+    cluster_name: str | None,
+    cluster_hash: str | None,
+    event_type: ClusterEventType | list[ClusterEventType],
     include_timestamps: Literal[False] = False,
-    limit: Optional[int] = ...,
-) -> List[str]:
+    limit: int | None = ...,
+) -> list[str]:
     ...
 
 
 @typing.overload
 def get_cluster_events(
-    cluster_name: Optional[str],
-    cluster_hash: Optional[str],
-    event_type: Union[ClusterEventType, List[ClusterEventType]],
+    cluster_name: str | None,
+    cluster_hash: str | None,
+    event_type: ClusterEventType | list[ClusterEventType],
     include_timestamps: Literal[True],
-    limit: Optional[int] = ...,
-) -> List[Dict[str, Union[str, int]]]:
+    limit: int | None = ...,
+) -> list[dict[str, str | int]]:
     ...
 
 
 @typing.overload
 def get_cluster_events(
-    cluster_name: Optional[str],
-    cluster_hash: Optional[str],
-    event_type: Union[ClusterEventType, List[ClusterEventType]],
+    cluster_name: str | None,
+    cluster_hash: str | None,
+    event_type: ClusterEventType | list[ClusterEventType],
     include_timestamps: bool = ...,
-    limit: Optional[int] = ...,
-) -> Union[List[str], List[Dict[str, Union[str, int]]]]:
+    limit: int | None = ...,
+) -> list[str] | list[dict[str, str | int]]:
     ...
 
 
 @db_retries.retry
 def get_cluster_events(
-    cluster_name: Optional[str],
-    cluster_hash: Optional[str],
-    event_type: Union[ClusterEventType, List[ClusterEventType]],
-    include_timestamps: bool = False,
-    limit: Optional[int] = None
-) -> Union[List[str], List[Dict[str, Union[str, int]]]]:
+        cluster_name: str | None,
+        cluster_hash: str | None,
+        event_type: ClusterEventType | list[ClusterEventType],
+        include_timestamps: bool = False,
+        limit: int | None = None) -> list[str] | list[dict[str, str | int]]:
     """Returns the cluster events for the cluster.
 
     Args:
@@ -1488,9 +1484,9 @@ def get_cluster_events(
 @db_retries.retry
 def get_cluster_events_by_name(
     cluster_name: str,
-    event_types: List[ClusterEventType],
-    limit: Optional[int] = None,
-) -> List[Dict[str, Union[str, int]]]:
+    event_types: list[ClusterEventType],
+    limit: int | None = None,
+) -> list[dict[str, str | int]]:
     """Returns cluster events looked up by the persisted cluster name.
 
     Unlike get_cluster_events, this filters on the cluster_events ``name``
@@ -1529,7 +1525,7 @@ def get_cluster_events_by_name(
     } for row in rows]
 
 
-def _get_user_hash_or_current_user(user_hash: Optional[str]) -> str:
+def _get_user_hash_or_current_user(user_hash: str | None) -> str:
     """Returns the user hash or the current user hash, if user_hash is None.
 
     This is to ensure that the clusters created before the client-server
@@ -1554,7 +1550,7 @@ def update_cluster_handle(cluster_name: str,
         if ci is not None:
             current_names = ci.get_node_names()
 
-    update_dict: Dict[Any, Any] = {cluster_table.c.handle: handle}
+    update_dict: dict[Any, Any] = {cluster_table.c.handle: handle}
 
     with orm.Session(engine) as session:
         if current_names is not None:
@@ -1645,12 +1641,12 @@ def get_handle_from_cluster_name(
 
 @metrics_lib.time_me
 def get_handles_from_cluster_names(
-        cluster_names: Set[str]
-) -> Dict[str, Optional['backends.ResourceHandle']]:
+        cluster_names: set[str]
+) -> dict[str, Optional['backends.ResourceHandle']]:
     # Chunk the IN list to stay under SQLite's SQLITE_MAX_VARIABLE_NUMBER
     # (default 999 on sqlite < 3.32) and avoid huge IN-clause planning on
     # PostgreSQL. See _CLUSTER_IN_QUERY_CHUNK_SIZE for the rationale.
-    result: Dict[str, Optional['backends.ResourceHandle']] = {}
+    result: dict[str, backends.ResourceHandle | None] = {}
     if not cluster_names:
         return result
     engine = _db_manager.get_engine()
@@ -1669,8 +1665,8 @@ def get_handles_from_cluster_names(
 
 @metrics_lib.time_me
 def get_cluster_name_to_handle_map(
-    is_managed: Optional[bool] = None,
-) -> Dict[str, Optional['backends.ResourceHandle']]:
+    is_managed: bool | None = None,
+) -> dict[str, Optional['backends.ResourceHandle']]:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         query = session.query(cluster_table.c.name, cluster_table.c.handle)
@@ -1688,7 +1684,7 @@ def get_cluster_name_to_handle_map(
 
 @metrics_lib.time_me
 async def get_status_from_cluster_name_async(
-        cluster_name: str) -> Optional[status_lib.ClusterStatus]:
+        cluster_name: str) -> status_lib.ClusterStatus | None:
     """Get the status of a cluster."""
     engine = await _db_manager.get_async_engine()
     assert cluster_name is not None, 'cluster_name cannot be None'
@@ -1705,7 +1701,7 @@ async def get_status_from_cluster_name_async(
 
 @metrics_lib.time_me
 def get_status_from_cluster_name(
-        cluster_name: str) -> Optional[status_lib.ClusterStatus]:
+        cluster_name: str) -> status_lib.ClusterStatus | None:
     engine = _db_manager.get_engine()
     assert cluster_name is not None, 'cluster_name cannot be None'
     with orm.Session(engine) as session:
@@ -1719,7 +1715,7 @@ def get_status_from_cluster_name(
 @metrics_lib.time_me
 def get_glob_cluster_names(
         cluster_name: str,
-        workspaces_filter: Optional[Set[str]] = None) -> List[str]:
+        workspaces_filter: set[str] | None = None) -> list[str]:
     engine = _db_manager.get_engine()
     assert cluster_name is not None, 'cluster_name cannot be None'
     with orm.Session(engine) as session:
@@ -1783,7 +1779,7 @@ def set_cluster_autostop_value(cluster_name: str, idle_minutes: int,
 
 
 @metrics_lib.time_me
-def get_cluster_launch_time(cluster_name: str) -> Optional[int]:
+def get_cluster_launch_time(cluster_name: str) -> int | None:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         row = session.query(
@@ -1794,7 +1790,7 @@ def get_cluster_launch_time(cluster_name: str) -> Optional[int]:
 
 
 @metrics_lib.time_me
-def get_cluster_info(cluster_name: str) -> Optional[Dict[str, Any]]:
+def get_cluster_info(cluster_name: str) -> dict[str, Any] | None:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         row = session.query(
@@ -1805,7 +1801,7 @@ def get_cluster_info(cluster_name: str) -> Optional[Dict[str, Any]]:
 
 
 @metrics_lib.time_me
-def get_cluster_provision_log_path(cluster_name: str) -> Optional[str]:
+def get_cluster_provision_log_path(cluster_name: str) -> str | None:
     """Returns provision_log_path from clusters table, if recorded."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
@@ -1816,7 +1812,7 @@ def get_cluster_provision_log_path(cluster_name: str) -> Optional[str]:
 
 
 @metrics_lib.time_me
-def get_cluster_history_provision_log_path(cluster_name: str) -> Optional[str]:
+def get_cluster_history_provision_log_path(cluster_name: str) -> str | None:
     """Returns provision_log_path from cluster_history for this name.
 
     If the cluster currently exists, we use its hash. Otherwise, we look up
@@ -1857,7 +1853,7 @@ def get_cluster_history_provision_log_path(cluster_name: str) -> Optional[str]:
 
 
 @metrics_lib.time_me
-def set_cluster_info(cluster_name: str, metadata: Dict[str, Any]) -> None:
+def set_cluster_info(cluster_name: str, metadata: dict[str, Any]) -> None:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         count = session.query(cluster_table).filter_by(
@@ -1871,7 +1867,7 @@ def set_cluster_info(cluster_name: str, metadata: Dict[str, Any]) -> None:
 
 @metrics_lib.time_me
 def get_cluster_storage_mounts_metadata(
-        cluster_name: str) -> Optional[Dict[str, Any]]:
+        cluster_name: str) -> dict[str, Any] | None:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         row = (session.query(cluster_table.c.storage_mounts_metadata).filter_by(
@@ -1883,7 +1879,7 @@ def get_cluster_storage_mounts_metadata(
 
 @metrics_lib.time_me
 def set_cluster_storage_mounts_metadata(
-        cluster_name: str, storage_mounts_metadata: Dict[str, Any]) -> None:
+        cluster_name: str, storage_mounts_metadata: dict[str, Any]) -> None:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         count = session.query(cluster_table).filter_by(
@@ -1899,7 +1895,7 @@ def set_cluster_storage_mounts_metadata(
 
 @metrics_lib.time_me
 def get_cluster_skylet_ssh_tunnel_metadata(
-        cluster_name: str) -> Optional[Tuple[int, int]]:
+        cluster_name: str) -> tuple[int, int] | None:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         row = session.query(
@@ -1913,7 +1909,7 @@ def get_cluster_skylet_ssh_tunnel_metadata(
 @metrics_lib.time_me
 def set_cluster_skylet_ssh_tunnel_metadata(
         cluster_name: str,
-        skylet_ssh_tunnel_metadata: Optional[Tuple[int, int]]) -> None:
+        skylet_ssh_tunnel_metadata: tuple[int, int] | None) -> None:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         value = pickle.dumps(
@@ -1930,8 +1926,7 @@ def set_cluster_skylet_ssh_tunnel_metadata(
 
 @metrics_lib.time_me
 def _get_cluster_usage_intervals(
-        cluster_hash: Optional[str]
-) -> Optional[List[Tuple[int, Optional[int]]]]:
+        cluster_hash: str | None) -> list[tuple[int, int | None]] | None:
     engine = _db_manager.get_engine()
     if cluster_hash is None:
         return None
@@ -1944,15 +1939,14 @@ def _get_cluster_usage_intervals(
 
 
 def _get_cluster_launch_time(
-    usage_intervals: Optional[List[Tuple[int,
-                                         Optional[int]]]]) -> Optional[int]:
+        usage_intervals: list[tuple[int, int | None]] | None) -> int | None:
     if usage_intervals is None:
         return None
     return usage_intervals[0][0]
 
 
 def _get_cluster_duration(
-        usage_intervals: Optional[List[Tuple[int, Optional[int]]]]) -> int:
+        usage_intervals: list[tuple[int, int | None]] | None) -> int:
     total_duration = 0
 
     if usage_intervals is None:
@@ -1971,8 +1965,7 @@ def _get_cluster_duration(
 
 
 def _get_cluster_last_activity_time(
-    usage_intervals: Optional[List[Tuple[int,
-                                         Optional[int]]]]) -> Optional[int]:
+        usage_intervals: list[tuple[int, int | None]] | None) -> int | None:
     last_activity_time = None
     if usage_intervals:
         last_interval = usage_intervals[-1]
@@ -1983,8 +1976,8 @@ def _get_cluster_last_activity_time(
 
 @metrics_lib.time_me
 def _set_cluster_usage_intervals(
-        cluster_hash: str, usage_intervals: List[Tuple[int,
-                                                       Optional[int]]]) -> None:
+        cluster_hash: str, usage_intervals: list[tuple[int,
+                                                       int | None]]) -> None:
     engine = _db_manager.get_engine()
 
     # Calculate last_activity_time from usage_intervals
@@ -2007,7 +2000,7 @@ def _set_cluster_usage_intervals(
 
 @metrics_lib.time_me
 def set_owner_identity_for_cluster(cluster_name: str,
-                                   owner_identity: Optional[List[str]]) -> None:
+                                   owner_identity: list[str] | None) -> None:
     engine = _db_manager.get_engine()
     if owner_identity is None:
         return
@@ -2023,7 +2016,7 @@ def set_owner_identity_for_cluster(cluster_name: str,
 
 
 @metrics_lib.time_me
-def _get_hash_for_existing_cluster(cluster_name: str) -> Optional[str]:
+def _get_hash_for_existing_cluster(cluster_name: str) -> str | None:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         row = (session.query(
@@ -2033,8 +2026,8 @@ def _get_hash_for_existing_cluster(cluster_name: str) -> Optional[str]:
     return row.cluster_hash
 
 
-def _resolve_cluster_hash(cluster_hash: Optional[str] = None,
-                          cluster_name: Optional[str] = None) -> Optional[str]:
+def _resolve_cluster_hash(cluster_hash: str | None = None,
+                          cluster_name: str | None = None) -> str | None:
     """Resolve cluster_hash from either cluster_hash or cluster_name.
 
     Validates that exactly one of cluster_hash or cluster_name is provided,
@@ -2067,7 +2060,7 @@ def _resolve_cluster_hash(cluster_hash: Optional[str] = None,
 
 @metrics_lib.time_me
 def get_launched_resources_from_cluster_hash(
-        cluster_hash: str) -> Optional[Tuple[int, Any]]:
+        cluster_hash: str) -> tuple[int, Any] | None:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         row = session.query(
@@ -2085,7 +2078,7 @@ def get_launched_resources_from_cluster_hash(
     return num_nodes, launched_resources
 
 
-def _load_owner(record_owner: Optional[str]) -> Optional[List[str]]:
+def _load_owner(record_owner: str | None) -> list[str] | None:
     if record_owner is None:
         return None
     try:
@@ -2106,8 +2099,8 @@ def _load_owner(record_owner: Optional[str]) -> Optional[List[str]]:
 
 
 def _load_storage_mounts_metadata(
-    record_storage_mounts_metadata: Optional[bytes]
-) -> Optional[Dict[str, 'Storage.StorageMetadata']]:
+    record_storage_mounts_metadata: bytes | None
+) -> dict[str, 'Storage.StorageMetadata'] | None:
     if not record_storage_mounts_metadata:
         return None
     return pickle.loads(record_storage_mounts_metadata)
@@ -2117,10 +2110,10 @@ def _load_storage_mounts_metadata(
 @metrics_lib.time_me
 @context_utils.cancellation_guard
 def get_cluster_from_name(
-        cluster_name: Optional[str],
+        cluster_name: str | None,
         *,
         include_user_info: bool = True,
-        summary_response: bool = False) -> Optional[Dict[str, Any]]:
+        summary_response: bool = False) -> dict[str, Any] | None:
     engine = _db_manager.get_engine()
     query_fields = [
         cluster_table.c.name,
@@ -2195,10 +2188,10 @@ _CLUSTER_IN_QUERY_CHUNK_SIZE = 500
 
 @metrics_lib.time_me
 def get_clusters_from_names(
-    cluster_names: List[str],
+    cluster_names: list[str],
     *,
     include_user_info: bool = False,
-) -> Dict[str, Optional[Dict[str, Any]]]:
+) -> dict[str, dict[str, Any] | None]:
     """Batched ``get_cluster_from_name`` for many cluster names at once.
 
     Returns records in the same shape as
@@ -2217,9 +2210,9 @@ def get_clusters_from_names(
         Dict mapping ``cluster_name`` to its record, or to ``None`` for
         names that don't exist in the cluster table.
     """
-    result: Dict[str,
-                 Optional[Dict[str,
-                               Any]]] = {name: None for name in cluster_names}
+    result: dict[str, dict[str, Any] | None] = {
+        name: None for name in cluster_names
+    }
     if not cluster_names:
         return result
     engine = _db_manager.get_engine()
@@ -2248,7 +2241,7 @@ def get_clusters_from_names(
             rows = session.query(*query_fields).filter(
                 cluster_table.c.name.in_(batch)).all()
             for row in rows:
-                record: Dict[str, Any] = {
+                record: dict[str, Any] = {
                     'name': row.name,
                     'launched_at': row.launched_at,
                     'handle': pickle.loads(row.handle),
@@ -2277,8 +2270,7 @@ def get_clusters_from_names(
 
 @metrics_lib.time_me
 def get_cluster_status_fields(
-    cluster_names: List[str],
-) -> Dict[str, Tuple[Optional[str], Optional[int]]]:
+    cluster_names: list[str],) -> dict[str, tuple[str | None, int | None]]:
     """Returns the raw (status, status_updated_at) columns for clusters.
 
     Unlike ``get_clusters_from_names``, this reads only plain columns and
@@ -2286,7 +2278,7 @@ def get_cluster_status_fields(
     or enum conversion), so a corrupt row cannot make the lookup raise.
     Names not present in the cluster table are omitted from the result.
     """
-    result: Dict[str, Tuple[Optional[str], Optional[int]]] = {}
+    result: dict[str, tuple[str | None, int | None]] = {}
     if not cluster_names:
         return result
     engine = _db_manager.get_engine()
@@ -2318,11 +2310,11 @@ def cluster_with_name_exists(cluster_name: str) -> bool:
 def get_clusters(
     *,  # keyword only separator
     exclude_managed_clusters: bool = False,
-    workspaces_filter: Optional[Set[str]] = None,
-    user_hashes_filter: Optional[Set[str]] = None,
-    cluster_names: Optional[List[str]] = None,
+    workspaces_filter: set[str] | None = None,
+    user_hashes_filter: set[str] | None = None,
+    cluster_names: list[str] | None = None,
     summary_response: bool = False,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Get clusters from the database.
 
     Args:
@@ -2380,8 +2372,8 @@ def get_clusters(
                 # If current_user_hash is in user_hashes_filter, we include
                 # clusters that have a null user_hash.
                 query = query.filter(
-                    (cluster_table.c.user_hash.in_(user_hashes_filter) |
-                     (cluster_table.c.user_hash is None)))
+                    cluster_table.c.user_hash.in_(user_hashes_filter) |
+                    (cluster_table.c.user_hash is None))
             else:
                 query = query.filter(
                     cluster_table.c.user_hash.in_(user_hashes_filter))
@@ -2477,7 +2469,7 @@ def get_clusters(
 
 
 @metrics_lib.time_me
-def get_cluster_names(exclude_managed_clusters: bool = False,) -> List[str]:
+def get_cluster_names(exclude_managed_clusters: bool = False,) -> list[str]:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         query = session.query(cluster_table.c.name)
@@ -2488,7 +2480,7 @@ def get_cluster_names(exclude_managed_clusters: bool = False,) -> List[str]:
 
 
 @metrics_lib.time_me
-def get_cluster_names_by_status(status: status_lib.ClusterStatus) -> List[str]:
+def get_cluster_names_by_status(status: status_lib.ClusterStatus) -> list[str]:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         rows = session.query(cluster_table.c.name).filter(
@@ -2498,11 +2490,11 @@ def get_cluster_names_by_status(status: status_lib.ClusterStatus) -> List[str]:
 
 @metrics_lib.time_me
 def get_clusters_from_history(
-        days: Optional[int] = None,
+        days: int | None = None,
         abbreviate_response: bool = False,
-        cluster_hashes: Optional[List[str]] = None,
-        cluster_names: Optional[List[str]] = None,
-        exclude_managed_clusters: bool = False) -> List[Dict[str, Any]]:
+        cluster_hashes: list[str] | None = None,
+        cluster_names: list[str] | None = None,
+        exclude_managed_clusters: bool = False) -> list[dict[str, Any]]:
     """Get cluster reports from history.
 
     Args:
@@ -2578,8 +2570,8 @@ def get_clusters_from_history(
         # If days is not specified, we include all clusters by setting
         # cutoff_time to 0.
         query = query.filter(
-            (cluster_table.c.status.isnot(None) |
-             (cluster_history_table.c.last_activity_time >= cutoff_time)))
+            cluster_table.c.status.isnot(None) |
+            (cluster_history_table.c.last_activity_time >= cutoff_time))
 
         # Order by launched_at descending (most recent first)
         query = query.order_by(
@@ -2605,7 +2597,7 @@ def get_clusters_from_history(
     usage_intervals_dict = {}
     row_to_user_hash = {}
     for row in rows:
-        row_usage_intervals: List[Tuple[int, Optional[int]]] = []
+        row_usage_intervals: list[tuple[int, int | None]] = []
         if row.usage_intervals:
             try:
                 row_usage_intervals = pickle.loads(row.usage_intervals)
@@ -2629,9 +2621,9 @@ def get_clusters_from_history(
         user_name = user.name if user is not None else None
         last_event = last_cluster_event_dict.get(row.cluster_hash, None)
         launched_at = row.launched_at
-        usage_intervals: Optional[List[Tuple[
-            int,
-            Optional[int]]]] = usage_intervals_dict.get(row.cluster_hash, None)
+        usage_intervals: list[tuple[int, int |
+                                    None]] | None = usage_intervals_dict.get(
+                                        row.cluster_hash, None)
         duration = _get_cluster_duration(usage_intervals)
 
         # Parse status
@@ -2688,7 +2680,7 @@ def get_clusters_from_history(
 
 
 @metrics_lib.time_me
-def get_cluster_names_start_with(starts_with: str) -> List[str]:
+def get_cluster_names_start_with(starts_with: str) -> list[str]:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         rows = session.query(cluster_table.c.name).filter(
@@ -2698,7 +2690,7 @@ def get_cluster_names_start_with(starts_with: str) -> List[str]:
 
 @metrics_lib.time_me
 def get_cached_enabled_clouds(cloud_capability: 'cloud.CloudCapability',
-                              workspace: str) -> List['clouds.Cloud']:
+                              workspace: str) -> list['clouds.Cloud']:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         row = session.query(config_table).filter_by(
@@ -2706,7 +2698,7 @@ def get_cached_enabled_clouds(cloud_capability: 'cloud.CloudCapability',
     ret = []
     if row:
         ret = json.loads(row.value)
-    enabled_clouds: List['clouds.Cloud'] = []
+    enabled_clouds: list[clouds.Cloud] = []
     for c in ret:
         try:
             cloud = registry.CLOUD_REGISTRY.from_str(c)
@@ -2722,7 +2714,7 @@ def get_cached_enabled_clouds(cloud_capability: 'cloud.CloudCapability',
 
 
 @metrics_lib.time_me
-def set_enabled_clouds(enabled_clouds: List[str],
+def set_enabled_clouds(enabled_clouds: list[str],
                        cloud_capability: 'cloud.CloudCapability',
                        workspace: str) -> None:
     engine = _db_manager.get_engine()
@@ -2758,7 +2750,7 @@ def _get_check_results_key(workspace: str) -> str:
 
 @metrics_lib.time_me
 def get_cached_check_results(
-        workspace: str) -> Dict[str, Dict[str, Dict[str, Any]]]:
+        workspace: str) -> dict[str, dict[str, dict[str, Any]]]:
     """Return the persisted check_results dict for a workspace, or {}.
 
     Shape:
@@ -2781,7 +2773,7 @@ def get_cached_check_results(
 
 @metrics_lib.time_me
 def set_check_results(
-    results: Dict[str, Dict[str, Dict[str, Any]]],
+    results: dict[str, dict[str, dict[str, Any]]],
     workspace: str,
     *,
     is_full_workspace_run: bool,
@@ -2828,7 +2820,7 @@ def set_check_results(
             # correctness, switch to `with_for_update()` (postgres) and
             # an explicit BEGIN IMMEDIATE (sqlite).
             row = session.query(config_table).filter_by(key=key).first()
-            existing: Dict[str, Dict[str, Dict[str, Any]]] = {}
+            existing: dict[str, dict[str, dict[str, Any]]] = {}
             if row is not None and row.value is not None:
                 try:
                     existing = json.loads(row.value)
@@ -2854,7 +2846,7 @@ def set_check_results(
 
 
 @metrics_lib.time_me
-def get_allowed_clouds(workspace: str) -> List[str]:
+def get_allowed_clouds(workspace: str) -> list[str]:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         row = session.query(config_table).filter_by(
@@ -2865,7 +2857,7 @@ def get_allowed_clouds(workspace: str) -> List[str]:
 
 
 @metrics_lib.time_me
-def set_allowed_clouds(allowed_clouds: List[str], workspace: str) -> None:
+def set_allowed_clouds(allowed_clouds: list[str], workspace: str) -> None:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
@@ -2953,7 +2945,7 @@ def set_storage_status(storage_name: str,
 
 
 @metrics_lib.time_me
-def get_storage_status(storage_name: str) -> Optional[status_lib.StorageStatus]:
+def get_storage_status(storage_name: str) -> status_lib.StorageStatus | None:
     engine = _db_manager.get_engine()
     assert storage_name is not None, 'storage_name cannot be None'
     with orm.Session(engine) as session:
@@ -2979,7 +2971,7 @@ def set_storage_handle(storage_name: str,
 
 @metrics_lib.time_me
 def get_handle_from_storage_name(
-        storage_name: Optional[str]) -> Optional['Storage.StorageMetadata']:
+        storage_name: str | None) -> Optional['Storage.StorageMetadata']:
     engine = _db_manager.get_engine()
     if storage_name is None:
         return None
@@ -2991,7 +2983,7 @@ def get_handle_from_storage_name(
 
 
 @metrics_lib.time_me
-def get_glob_storage_name(storage_name: str) -> List[str]:
+def get_glob_storage_name(storage_name: str) -> list[str]:
     engine = _db_manager.get_engine()
     assert storage_name is not None, 'storage_name cannot be None'
     with orm.Session(engine) as session:
@@ -3009,7 +3001,7 @@ def get_glob_storage_name(storage_name: str) -> List[str]:
 
 
 @metrics_lib.time_me
-def get_storage_names_start_with(starts_with: str) -> List[str]:
+def get_storage_names_start_with(starts_with: str) -> list[str]:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         rows = session.query(storage_table).filter(
@@ -3018,7 +3010,7 @@ def get_storage_names_start_with(starts_with: str) -> List[str]:
 
 
 @metrics_lib.time_me
-def get_storage() -> List[Dict[str, Any]]:
+def get_storage() -> list[dict[str, Any]]:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         rows = session.query(storage_table).all()
@@ -3036,7 +3028,7 @@ def get_storage() -> List[Dict[str, Any]]:
 
 
 @metrics_lib.time_me
-def get_volume_names_start_with(starts_with: str) -> List[str]:
+def get_volume_names_start_with(starts_with: str) -> list[str]:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         rows = session.query(volume_table).filter(
@@ -3045,7 +3037,7 @@ def get_volume_names_start_with(starts_with: str) -> List[str]:
 
 
 @metrics_lib.time_me
-def get_volumes(is_ephemeral: Optional[bool] = None) -> List[Dict[str, Any]]:
+def get_volumes(is_ephemeral: bool | None = None) -> list[dict[str, Any]]:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         if is_ephemeral is None:
@@ -3078,7 +3070,7 @@ def get_volumes(is_ephemeral: Optional[bool] = None) -> List[Dict[str, Any]]:
 
 
 @metrics_lib.time_me
-def get_volume_by_name(name: str) -> Optional[Dict[str, Any]]:
+def get_volume_by_name(name: str) -> dict[str, Any] | None:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         row = session.query(volume_table).filter_by(name=name).first()
@@ -3110,7 +3102,7 @@ def add_volume(
     config: models.VolumeConfig,
     status: status_lib.VolumeStatus,
     is_ephemeral: bool = False,
-    creation_yaml: Optional[str] = None,
+    creation_yaml: str | None = None,
 ) -> None:
     engine = _db_manager.get_engine()
     volume_launched_at = int(time.time())
@@ -3174,9 +3166,9 @@ def update_volume(name: str, last_attached_at: int,
 @metrics_lib.time_me
 def update_volume_status(name: str,
                          status: status_lib.VolumeStatus,
-                         error_message: Optional[str] = None,
-                         usedby_pods: Optional[List[str]] = None,
-                         usedby_clusters: Optional[List[str]] = None) -> None:
+                         error_message: str | None = None,
+                         usedby_pods: list[str] | None = None,
+                         usedby_clusters: list[str] | None = None) -> None:
     """Update volume status and related fields.
 
     Args:
@@ -3188,7 +3180,7 @@ def update_volume_status(name: str,
     """
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
-        update_dict: Dict[str, Any] = {
+        update_dict: dict[str, Any] = {
             volume_table.c.status: status.value,
         }
         # Always update error_message (None clears it)
@@ -3212,7 +3204,7 @@ def delete_volume(name: str) -> None:
 
 
 @metrics_lib.time_me
-def get_ssh_keys(user_hash: str) -> Tuple[str, str, bool]:
+def get_ssh_keys(user_hash: str) -> tuple[str, str, bool]:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         row = session.query(ssh_key_table).filter_by(
@@ -3253,7 +3245,7 @@ def add_service_account_token(token_id: str,
                               token_hash: str,
                               creator_user_hash: str,
                               service_account_user_id: str,
-                              expires_at: Optional[int] = None) -> None:
+                              expires_at: int | None = None) -> None:
     """Add a service account token to the database."""
     engine = _db_manager.get_engine()
     created_at = int(time.time())
@@ -3280,7 +3272,7 @@ def add_service_account_token(token_id: str,
 
 
 @metrics_lib.time_me
-def get_service_account_token(token_id: str) -> Optional[Dict[str, Any]]:
+def get_service_account_token(token_id: str) -> dict[str, Any] | None:
     """Get a service account token by token_id."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
@@ -3301,8 +3293,7 @@ def get_service_account_token(token_id: str) -> Optional[Dict[str, Any]]:
 
 
 @metrics_lib.time_me
-def get_service_account_token_by_hash(
-        token_hash: str) -> Optional[Dict[str, Any]]:
+def get_service_account_token_by_hash(token_hash: str) -> dict[str, Any] | None:
     """Get a service account token by its sha256 hash.
 
     Used by the request-auth middleware: hashing the incoming bearer token
@@ -3329,7 +3320,7 @@ def get_service_account_token_by_hash(
 
 
 @metrics_lib.time_me
-def get_user_service_account_tokens(user_hash: str) -> List[Dict[str, Any]]:
+def get_user_service_account_tokens(user_hash: str) -> list[dict[str, Any]]:
     """Get all service account tokens for a user (as creator)."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
@@ -3379,7 +3370,7 @@ def delete_service_account_token(token_id: str) -> bool:
 @metrics_lib.time_me
 def rotate_service_account_token(token_id: str,
                                  new_token_hash: str,
-                                 new_expires_at: Optional[int] = None) -> None:
+                                 new_expires_at: int | None = None) -> None:
     """Rotate a service account token by updating its hash and expiration.
 
     Args:
@@ -3408,7 +3399,7 @@ def rotate_service_account_token(token_id: str,
 
 @db_retries.retry
 @metrics_lib.time_me
-def get_cluster_yaml_str(cluster_yaml_path: Optional[str]) -> Optional[str]:
+def get_cluster_yaml_str(cluster_yaml_path: str | None) -> str | None:
     """Get the cluster yaml from the database or the local file system.
     If the cluster yaml is not in the database, check if it exists on the
     local file system and migrate it to the database.
@@ -3428,7 +3419,7 @@ def get_cluster_yaml_str(cluster_yaml_path: Optional[str]) -> Optional[str]:
     return row.yaml
 
 
-def get_cluster_yaml_str_multiple(cluster_yaml_paths: List[str]) -> List[str]:
+def get_cluster_yaml_str_multiple(cluster_yaml_paths: list[str]) -> list[str]:
     """Get the cluster yaml from the database or the local file system.
     """
     engine = _db_manager.get_engine()
@@ -3455,7 +3446,7 @@ def get_cluster_yaml_str_multiple(cluster_yaml_paths: List[str]) -> List[str]:
 
 
 def _set_cluster_yaml_from_file(cluster_yaml_path: str,
-                                cluster_name: str) -> Optional[str]:
+                                cluster_name: str) -> str | None:
     """Set the cluster yaml in the database from a file."""
     # If the cluster yaml is not in the database, check if it exists
     # on the local file system and migrate it to the database.
@@ -3473,14 +3464,14 @@ def _set_cluster_yaml_from_file(cluster_yaml_path: str,
         if os.path.exists(debug_path):
             path_to_read = debug_path
         if path_to_read is not None:
-            with open(path_to_read, 'r', encoding='utf-8') as f:
+            with open(path_to_read, encoding='utf-8') as f:
                 yaml_str = f.read()
             set_cluster_yaml(cluster_name, yaml_str)
             return yaml_str
     return None
 
 
-def get_cluster_yaml_dict(cluster_yaml_path: Optional[str]) -> Dict[str, Any]:
+def get_cluster_yaml_dict(cluster_yaml_path: str | None) -> dict[str, Any]:
     """Get the cluster yaml as a dictionary from the database.
 
     It is assumed that the cluster yaml file is named as <cluster_name>.yml.
@@ -3492,7 +3483,7 @@ def get_cluster_yaml_dict(cluster_yaml_path: Optional[str]) -> Dict[str, Any]:
 
 
 def get_cluster_yaml_dict_multiple(
-        cluster_yaml_paths: List[str]) -> List[Dict[str, Any]]:
+        cluster_yaml_paths: list[str]) -> list[dict[str, Any]]:
     """Get the cluster yaml as a dictionary from the database."""
     yaml_strs = get_cluster_yaml_str_multiple(cluster_yaml_paths)
     yaml_dicts = []
@@ -3536,7 +3527,7 @@ def remove_cluster_yaml(cluster_name: str):
 
 @metrics_lib.time_me
 def get_expired_service_account_tokens_by_name_prefix(
-        name_prefix: str, now: int) -> List[Dict[str, Any]]:
+        name_prefix: str, now: int) -> list[dict[str, Any]]:
     """Return service-account tokens that have expired and match a name prefix.
 
     Tokens with no expiration are excluded. The LIKE pattern is built with
@@ -3569,7 +3560,7 @@ def get_expired_service_account_tokens_by_name_prefix(
 
 
 @metrics_lib.time_me
-def get_all_service_account_tokens() -> List[Dict[str, Any]]:
+def get_all_service_account_tokens() -> list[dict[str, Any]]:
     """Get all service account tokens across all users (for admin access)."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
@@ -3587,7 +3578,7 @@ def get_all_service_account_tokens() -> List[Dict[str, Any]]:
 
 
 @metrics_lib.time_me
-def get_system_config(config_key: str) -> Optional[str]:
+def get_system_config(config_key: str) -> str | None:
     """Get a system configuration value by key."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
@@ -3629,7 +3620,7 @@ def set_system_config(config_key: str, config_value: str) -> None:
         session.commit()
 
 
-def get_max_db_connections() -> Optional[int]:
+def get_max_db_connections() -> int | None:
     """Get the maximum number of connections for the engine."""
     engine = _db_manager.get_engine()
     if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:

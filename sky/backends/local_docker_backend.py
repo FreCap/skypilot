@@ -2,7 +2,7 @@
 import subprocess
 import tempfile
 import typing
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Optional
 
 import colorama
 
@@ -103,7 +103,7 @@ class LocalDockerBackend(backends.Backend['LocalDockerResourceHandle']):
         }
     }
 
-    def __init__(self, use_gpu: Union[bool, str] = 'auto'):
+    def __init__(self, use_gpu: bool | str = 'auto'):
         """Local docker backend.
 
         Args:
@@ -115,12 +115,12 @@ class LocalDockerBackend(backends.Backend['LocalDockerResourceHandle']):
         """
         self._use_gpu = backend_utils.check_local_gpus() if use_gpu == 'auto' \
             else use_gpu
-        self.volume_mounts: Dict[LocalDockerResourceHandle, Dict[str, Any]] = {
+        self.volume_mounts: dict[LocalDockerResourceHandle, dict[str, Any]] = {
         }  # Stores the LocalDockerResourceHandle->volume mounts map
-        self.images: Dict[LocalDockerResourceHandle, Tuple[str, Dict[
+        self.images: dict[LocalDockerResourceHandle, tuple[str, dict[
             str, str]]] = {
             }  # Stores the LocalDockerResourceHandle->[image_tag, metadata] map
-        self.containers: Dict[LocalDockerResourceHandle, Any] = {}
+        self.containers: dict[LocalDockerResourceHandle, Any] = {}
         self.client = docker.from_env()
         self._update_state()
 
@@ -139,7 +139,7 @@ class LocalDockerBackend(backends.Backend['LocalDockerResourceHandle']):
         cluster_name: str,
         retry_until_up: bool = False,
         skip_unnecessary_provisioning: bool = False,
-    ) -> Tuple[Optional[LocalDockerResourceHandle], bool]:
+    ) -> tuple[LocalDockerResourceHandle | None, bool]:
         """Builds docker image for the task and returns cluster name as handle.
 
         Since resource demands are ignored, There's no provisioning in local
@@ -178,8 +178,8 @@ class LocalDockerBackend(backends.Backend['LocalDockerResourceHandle']):
         return handle, False
 
     def _sync_workdir(self, handle: LocalDockerResourceHandle,
-                      workdir: Union[Path, Dict[str, Any]],
-                      envs_and_secrets: Dict[str, str]) -> None:
+                      workdir: Path | dict[str, Any],
+                      envs_and_secrets: dict[str, str]) -> None:
         """Workdir is sync'd by adding to the docker image.
 
         This happens in the execute step.
@@ -201,8 +201,8 @@ class LocalDockerBackend(backends.Backend['LocalDockerResourceHandle']):
     def _sync_file_mounts(
         self,
         handle: LocalDockerResourceHandle,
-        all_file_mounts: Optional[Dict[Path, Path]],
-        storage_mounts: Optional[Dict[Path, storage_lib.Storage]],
+        all_file_mounts: dict[Path, Path] | None,
+        storage_mounts: dict[Path, storage_lib.Storage] | None,
     ) -> None:
         """File mounts in Docker are implemented with volume mounts (-v)."""
         assert not storage_mounts, \

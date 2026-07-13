@@ -3,7 +3,7 @@ import json
 import math
 import os
 import textwrap
-from typing import Any, Dict, List, Optional, Union
+from typing import Any
 
 from sky import serve
 from sky import sky_logging
@@ -30,29 +30,29 @@ class SkyServiceSpec:
         endpoint_probe_interval_seconds: int,
         lb_stream_timeout_seconds: int,
         min_replicas: int,
-        lb_retriable_status_codes: Optional[List[int]] = None,
-        lb_max_retries: Optional[int] = None,
-        lb_retry_initial_backoff_seconds: Optional[float] = None,
-        max_replicas: Optional[int] = None,
-        num_overprovision: Optional[int] = None,
-        ports: Optional[str] = None,
-        target_qps_per_replica: Optional[Union[float, Dict[str, float]]] = None,
-        target_concurrency_per_replica: Optional[float] = None,
-        reserved_capacity_fill: Optional[Union[bool, Dict[str, Any]]] = None,
-        post_data: Optional[Dict[str, Any]] = None,
-        tls_credential: Optional[serve_utils.TLSCredential] = None,
-        readiness_headers: Optional[Dict[str, str]] = None,
-        dynamic_ondemand_fallback: Optional[bool] = None,
-        base_ondemand_fallback_replicas: Optional[int] = None,
-        spot_placer: Optional[str] = None,
-        upscale_delay_seconds: Optional[int] = None,
-        downscale_delay_seconds: Optional[int] = None,
-        load_balancing_policy: Optional[str] = None,
-        pool: Optional[bool] = None,
-        queue_length_threshold: Optional[int] = None,
-        consecutive_failure_threshold_timeout: Optional[int] = None,
-        graceful_drain_seconds: Optional[int] = None,
-        graceful_drain_async_occupancy: Optional[bool] = None,
+        lb_retriable_status_codes: list[int] | None = None,
+        lb_max_retries: int | None = None,
+        lb_retry_initial_backoff_seconds: float | None = None,
+        max_replicas: int | None = None,
+        num_overprovision: int | None = None,
+        ports: str | None = None,
+        target_qps_per_replica: float | dict[str, float] | None = None,
+        target_concurrency_per_replica: float | None = None,
+        reserved_capacity_fill: bool | dict[str, Any] | None = None,
+        post_data: dict[str, Any] | None = None,
+        tls_credential: serve_utils.TLSCredential | None = None,
+        readiness_headers: dict[str, str] | None = None,
+        dynamic_ondemand_fallback: bool | None = None,
+        base_ondemand_fallback_replicas: int | None = None,
+        spot_placer: str | None = None,
+        upscale_delay_seconds: int | None = None,
+        downscale_delay_seconds: int | None = None,
+        load_balancing_policy: str | None = None,
+        pool: bool | None = None,
+        queue_length_threshold: int | None = None,
+        consecutive_failure_threshold_timeout: int | None = None,
+        graceful_drain_seconds: int | None = None,
+        graceful_drain_async_occupancy: bool | None = None,
     ) -> None:
         if pool:
             # For pools, max_replicas should never be specified directly by the
@@ -250,8 +250,8 @@ class SkyServiceSpec:
         if graceful_drain_seconds is not None and (
                 not isinstance(graceful_drain_seconds, int) or
                 isinstance(graceful_drain_seconds, bool) or
-                graceful_drain_seconds < 0 or graceful_drain_seconds >
-                constants.LB_OFF_READY_OCCUPANCY_RETENTION_SECONDS):
+                graceful_drain_seconds < 0 or graceful_drain_seconds
+                > constants.LB_OFF_READY_OCCUPANCY_RETENTION_SECONDS):
             # The upper bound keeps the drain within the window the LB
             # retains (and reports) a retiring replica's unknown async
             # occupancy; a longer cap could end early once that retention
@@ -267,47 +267,45 @@ class SkyServiceSpec:
         self._endpoint_probe_interval_seconds: int = (
             endpoint_probe_interval_seconds)
         self._lb_stream_timeout_seconds: int = lb_stream_timeout_seconds
-        self._lb_retriable_status_codes: Optional[List[int]] = (
+        self._lb_retriable_status_codes: list[int] | None = (
             lb_retriable_status_codes)
-        self._lb_max_retries: Optional[int] = lb_max_retries
-        self._lb_retry_initial_backoff_seconds: Optional[float] = (
+        self._lb_max_retries: int | None = lb_max_retries
+        self._lb_retry_initial_backoff_seconds: float | None = (
             lb_retry_initial_backoff_seconds)
-        self._graceful_drain_seconds: Optional[int] = graceful_drain_seconds
+        self._graceful_drain_seconds: int | None = graceful_drain_seconds
         # Declares fast-ack work whose lifetime outlives its HTTP envelope.
         # The LB must treat a missing occupancy sample as unknown from the
         # first request, rather than inferring capability from a successful
         # probe (which cannot protect a never-probed replica).
-        self._graceful_drain_async_occupancy: Optional[bool] = (
+        self._graceful_drain_async_occupancy: bool | None = (
             graceful_drain_async_occupancy)
         self._min_replicas: int = min_replicas
-        self._max_replicas: Optional[int] = max_replicas
-        self._num_overprovision: Optional[int] = num_overprovision
-        self._ports: Optional[str] = ports
-        self._target_qps_per_replica: Optional[Union[float, Dict[
-            str, float]]] = target_qps_per_replica
+        self._max_replicas: int | None = max_replicas
+        self._num_overprovision: int | None = num_overprovision
+        self._ports: str | None = ports
+        self._target_qps_per_replica: float | dict[
+            str, float] | None = target_qps_per_replica
         # Per-GPU target concurrency: replica capacity = knob * gpu_count.
-        self._target_concurrency_per_replica: Optional[float] = (
+        self._target_concurrency_per_replica: float | None = (
             target_concurrency_per_replica)
         # Opt-in: allow scaling up onto free reserved (zero-cost) capacity.
         # Absent/False means no behavior change. Bool form or object form
         # ({floor_replicas, weight}); object form implies enabled.
-        self._reserved_capacity_fill: Optional[Union[bool, Dict[
-            str, Any]]] = reserved_capacity_fill
-        self._post_data: Optional[Dict[str, Any]] = post_data
-        self._tls_credential: Optional[serve_utils.TLSCredential] = (
+        self._reserved_capacity_fill: bool | dict[
+            str, Any] | None = reserved_capacity_fill
+        self._post_data: dict[str, Any] | None = post_data
+        self._tls_credential: serve_utils.TLSCredential | None = (
             tls_credential)
-        self._readiness_headers: Optional[Dict[str, str]] = readiness_headers
-        self._dynamic_ondemand_fallback: Optional[
-            bool] = dynamic_ondemand_fallback
-        self._base_ondemand_fallback_replicas: Optional[
-            int] = base_ondemand_fallback_replicas
-        self._spot_placer: Optional[str] = spot_placer
-        self._upscale_delay_seconds: Optional[int] = upscale_delay_seconds
-        self._downscale_delay_seconds: Optional[int] = downscale_delay_seconds
-        self._load_balancing_policy: Optional[str] = load_balancing_policy
-        self._pool: Optional[bool] = pool
-        self._queue_length_threshold: Optional[int] = queue_length_threshold
-        self._consecutive_failure_threshold_timeout: Optional[int] = (
+        self._readiness_headers: dict[str, str] | None = readiness_headers
+        self._dynamic_ondemand_fallback: bool | None = dynamic_ondemand_fallback
+        self._base_ondemand_fallback_replicas: int | None = base_ondemand_fallback_replicas
+        self._spot_placer: str | None = spot_placer
+        self._upscale_delay_seconds: int | None = upscale_delay_seconds
+        self._downscale_delay_seconds: int | None = downscale_delay_seconds
+        self._load_balancing_policy: str | None = load_balancing_policy
+        self._pool: bool | None = pool
+        self._queue_length_threshold: int | None = queue_length_threshold
+        self._consecutive_failure_threshold_timeout: int | None = (
             consecutive_failure_threshold_timeout)
 
         self._use_ondemand_fallback: bool = (
@@ -316,7 +314,7 @@ class SkyServiceSpec:
                 self.base_ondemand_fallback_replicas is not None and
                 self.base_ondemand_fallback_replicas > 0)
 
-    def __setstate__(self, state: Dict[str, Any]) -> None:
+    def __setstate__(self, state: dict[str, Any]) -> None:
         """Set state from pickled state, for backward compatibility."""
         # These fields were added after earlier releases had already persisted
         # SkyServiceSpec objects in the serve DB.
@@ -339,7 +337,7 @@ class SkyServiceSpec:
         self.__dict__.update(state)
 
     @staticmethod
-    def from_yaml_config(config: Dict[str, Any]) -> 'SkyServiceSpec':
+    def from_yaml_config(config: dict[str, Any]) -> 'SkyServiceSpec':
         common_utils.validate_schema(config, schemas.get_service_schema(),
                                      'Invalid service YAML: ')
         if 'replicas' in config and 'replica_policy' in config:
@@ -348,7 +346,7 @@ class SkyServiceSpec:
                     'Cannot specify both `replicas` and `replica_policy` in '
                     'the service YAML. Please use one of them.')
 
-        service_config: Dict[str, Any] = {}
+        service_config: dict[str, Any] = {}
 
         readiness_section = config.get('readiness_probe', '/')
         if isinstance(readiness_section, str):
@@ -636,15 +634,15 @@ class SkyServiceSpec:
 
     @staticmethod
     def from_yaml(yaml_path: str) -> 'SkyServiceSpec':
-        with open(os.path.expanduser(yaml_path), 'r', encoding='utf-8') as f:
+        with open(os.path.expanduser(yaml_path), encoding='utf-8') as f:
             yaml_content = f.read()
         return SkyServiceSpec.from_yaml_str(yaml_content)
 
-    def to_yaml_config(self) -> Dict[str, Any]:
-        config: Dict[str, Any] = {}
+    def to_yaml_config(self) -> dict[str, Any]:
+        config: dict[str, Any] = {}
 
         def add_if_not_none(section: str,
-                            key: Optional[str],
+                            key: str | None,
                             value: Any,
                             no_empty: bool = False):
             if no_empty and not value:
@@ -688,16 +686,16 @@ class SkyServiceSpec:
                         self.readiness_timeout_seconds)
         # Omit default-valued newer fields to preserve compatibility with
         # older controllers that do not recognize them during serve update.
-        if (self.endpoint_probe_interval_seconds !=
-                constants.DEFAULT_ENDPOINT_PROBE_INTERVAL_SECONDS):
+        if (self.endpoint_probe_interval_seconds
+                != constants.DEFAULT_ENDPOINT_PROBE_INTERVAL_SECONDS):
             add_if_not_none('readiness_probe',
                             'endpoint_probe_interval_seconds',
                             self.endpoint_probe_interval_seconds)
         add_if_not_none('readiness_probe',
                         'consecutive_failure_threshold_timeout',
                         self.consecutive_failure_threshold_timeout)
-        if (self.lb_stream_timeout_seconds !=
-                constants.DEFAULT_LB_STREAM_TIMEOUT):
+        if (self.lb_stream_timeout_seconds
+                != constants.DEFAULT_LB_STREAM_TIMEOUT):
             add_if_not_none('load_balancer', 'stream_timeout_seconds',
                             self.lb_stream_timeout_seconds)
         add_if_not_none('load_balancer', 'retriable_status_codes',
@@ -717,10 +715,10 @@ class SkyServiceSpec:
         # no_empty: omit both None and False so older controllers never see
         # the field unless the user opted in. Canonicalize: an object form
         # carrying only default knobs collapses to the plain bool form.
-        reserved_fill_config: Optional[Union[bool, Dict[str, Any]]] = (
+        reserved_fill_config: bool | dict[str, Any] | None = (
             self._reserved_capacity_fill)
         if isinstance(self._reserved_capacity_fill, dict):
-            fill_obj: Dict[str, Any] = {}
+            fill_obj: dict[str, Any] = {}
             if self.reserved_fill_floor_replicas != 0:
                 fill_obj['floor_replicas'] = self.reserved_fill_floor_replicas
             if self.reserved_fill_weight != 1.0:
@@ -757,7 +755,7 @@ class SkyServiceSpec:
         return f'{method}{headers}'
 
     def spot_policy_str(self) -> str:
-        policy_strs: List[str] = []
+        policy_strs: list[str] = []
         if (self.dynamic_ondemand_fallback is not None and
                 self.dynamic_ondemand_fallback):
             if self.spot_placer is not None:
@@ -865,23 +863,23 @@ class SkyServiceSpec:
         return self._lb_stream_timeout_seconds
 
     @property
-    def lb_retriable_status_codes(self) -> Optional[List[int]]:
+    def lb_retriable_status_codes(self) -> list[int] | None:
         return self._lb_retriable_status_codes
 
     @property
-    def graceful_drain_seconds(self) -> Optional[int]:
+    def graceful_drain_seconds(self) -> int | None:
         return self._graceful_drain_seconds
 
     @property
-    def graceful_drain_async_occupancy(self) -> Optional[bool]:
+    def graceful_drain_async_occupancy(self) -> bool | None:
         return self._graceful_drain_async_occupancy
 
     @property
-    def lb_max_retries(self) -> Optional[int]:
+    def lb_max_retries(self) -> int | None:
         return self._lb_max_retries
 
     @property
-    def lb_retry_initial_backoff_seconds(self) -> Optional[float]:
+    def lb_retry_initial_backoff_seconds(self) -> float | None:
         return self._lb_retry_initial_backoff_seconds
 
     @property
@@ -889,25 +887,24 @@ class SkyServiceSpec:
         return self._min_replicas
 
     @property
-    def max_replicas(self) -> Optional[int]:
+    def max_replicas(self) -> int | None:
         # If None, treated as having the same value of min_replicas.
         return self._max_replicas
 
     @property
-    def num_overprovision(self) -> Optional[int]:
+    def num_overprovision(self) -> int | None:
         return self._num_overprovision
 
     @property
-    def ports(self) -> Optional[str]:
+    def ports(self) -> str | None:
         return self._ports
 
     @property
-    def target_qps_per_replica(
-            self) -> Optional[Union[float, Dict[str, float]]]:
+    def target_qps_per_replica(self) -> float | dict[str, float] | None:
         return self._target_qps_per_replica
 
     @property
-    def target_concurrency_per_replica(self) -> Optional[float]:
+    def target_concurrency_per_replica(self) -> float | None:
         # Per GPU: replica capacity = knob * gpu_count. Guarded with getattr
         # semantics via __setstate__ for specs unpickled from old DB rows.
         return self._target_concurrency_per_replica
@@ -938,40 +935,39 @@ class SkyServiceSpec:
         return 1.0
 
     @property
-    def post_data(self) -> Optional[Dict[str, Any]]:
+    def post_data(self) -> dict[str, Any] | None:
         return self._post_data
 
     @property
-    def tls_credential(self) -> Optional[serve_utils.TLSCredential]:
+    def tls_credential(self) -> serve_utils.TLSCredential | None:
         return self._tls_credential
 
     @tls_credential.setter
-    def tls_credential(self,
-                       value: Optional[serve_utils.TLSCredential]) -> None:
+    def tls_credential(self, value: serve_utils.TLSCredential | None) -> None:
         self._tls_credential = value
 
     @property
-    def readiness_headers(self) -> Optional[Dict[str, str]]:
+    def readiness_headers(self) -> dict[str, str] | None:
         return self._readiness_headers
 
     @property
-    def base_ondemand_fallback_replicas(self) -> Optional[int]:
+    def base_ondemand_fallback_replicas(self) -> int | None:
         return self._base_ondemand_fallback_replicas
 
     @property
-    def dynamic_ondemand_fallback(self) -> Optional[bool]:
+    def dynamic_ondemand_fallback(self) -> bool | None:
         return self._dynamic_ondemand_fallback
 
     @property
-    def spot_placer(self) -> Optional[str]:
+    def spot_placer(self) -> str | None:
         return self._spot_placer
 
     @property
-    def upscale_delay_seconds(self) -> Optional[int]:
+    def upscale_delay_seconds(self) -> int | None:
         return self._upscale_delay_seconds
 
     @property
-    def downscale_delay_seconds(self) -> Optional[int]:
+    def downscale_delay_seconds(self) -> int | None:
         return self._downscale_delay_seconds
 
     @property
@@ -991,11 +987,11 @@ class SkyServiceSpec:
         return bool(self._pool)
 
     @property
-    def queue_length_threshold(self) -> Optional[int]:
+    def queue_length_threshold(self) -> int | None:
         return self._queue_length_threshold
 
     @property
-    def consecutive_failure_threshold_timeout(self) -> Optional[int]:
+    def consecutive_failure_threshold_timeout(self) -> int | None:
         return self._consecutive_failure_threshold_timeout
 
     def copy(self, **override) -> 'SkyServiceSpec':

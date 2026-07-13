@@ -1,4 +1,5 @@
 """ReplicaManager: handles the creation and deletion of endpoint replicas."""
+from collections.abc import Callable
 import contextlib
 import dataclasses
 import functools
@@ -9,7 +10,7 @@ import threading
 import time
 import traceback
 import typing
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Optional
 
 import colorama
 import filelock
@@ -43,7 +44,6 @@ from sky.utils import ux_utils
 from sky.utils import yaml_utils
 
 if typing.TYPE_CHECKING:
-    import logging
 
     from sky.serve import service_spec
 
@@ -100,13 +100,13 @@ def launch_cluster(replica_id: int,
                    replica_to_request_id: thread_utils.ThreadSafeDict[int, str],
                    replica_to_launch_cancelled: thread_utils.ThreadSafeDict[
                        int, bool],
-                   resources_override: Optional[Dict[str, Any]] = None,
+                   resources_override: dict[str, Any] | None = None,
                    retry_until_up: bool = True,
                    max_retry: int = _DEFAULT_LAUNCH_MAX_RETRY,
-                   availability_max_retry: Optional[int] = None,
-                   pre_launch_guard: Optional[Callable[[], bool]] = None,
-                   continue_guard: Optional[Callable[[], bool]] = None,
-                   launch_fence: Optional[Dict[str, Any]] = None) -> None:
+                   availability_max_retry: int | None = None,
+                   pre_launch_guard: Callable[[], bool] | None = None,
+                   continue_guard: Callable[[], bool] | None = None,
+                   launch_fence: dict[str, Any] | None = None) -> None:
     """Launch a sky serve replica cluster.
 
     This function will not wait for the job starts running. It will return
@@ -162,7 +162,7 @@ def launch_cluster(replica_id: int,
 
     ownership_lost = threading.Event()
 
-    def _guard_allows(guard: Optional[Callable[[], bool]]) -> bool:
+    def _guard_allows(guard: Callable[[], bool] | None) -> bool:
         if guard is None:
             return True
         try:
@@ -238,7 +238,7 @@ def launch_cluster(replica_id: int,
             # cheap fence for an already-running request.
             _assert_launch_authorized()
             usage_lib.messages.usage.set_internal()
-            launch_kwargs: Dict[str, Any] = {}
+            launch_kwargs: dict[str, Any] = {}
             if launch_fence is not None:
                 launch_kwargs['_extra_launch_context'] = launch_fence
             request_id = sdk.launch(task,
@@ -320,7 +320,7 @@ def launch_cluster(replica_id: int,
 
 
 def _wait_for_drain(drain_deadline: float,
-                    drain_complete: Optional[Callable[[], bool]]) -> None:
+                    drain_complete: Callable[[], bool] | None) -> None:
     """Wait for a retiring replica to drain, bounded by the deadline.
 
     The deadline is anchored at the moment the replica's SHUTTING_DOWN
@@ -389,7 +389,7 @@ class _ReplicaDrainTracker:
         self._drain_started = drain_started
         self._seen = False
         self._unknown_tainted = False
-        self._session: Optional[str] = None
+        self._session: str | None = None
 
     def __call__(self) -> bool:
         report = self._manager._lb_in_flight_report  # pylint: disable=protected-access
@@ -401,8 +401,8 @@ class _ReplicaDrainTracker:
             return False
         if routing_urls is None:
             return False
-        if (time.monotonic() - received_at >
-                _IN_FLIGHT_REPORT_STALENESS_SECONDS):
+        if (time.monotonic() - received_at
+                > _IN_FLIGHT_REPORT_STALENESS_SECONDS):
             return False
         url = self._replica_url
         if session != self._session:
@@ -435,14 +435,13 @@ class _ReplicaDrainTracker:
 # TODO(tian): Combine this with
 # sky/spot/recovery_strategy.py::terminate_cluster
 @context.contextual
-def terminate_cluster(
-        cluster_name: str,
-        log_file: str,
-        replica_drain_delay_seconds: int = 0,
-        max_retry: int = 3,
-        drain_deadline: Optional[float] = None,
-        drain_complete: Optional[Callable[[], bool]] = None,
-        continue_guard: Optional[Callable[[], bool]] = None) -> None:
+def terminate_cluster(cluster_name: str,
+                      log_file: str,
+                      replica_drain_delay_seconds: int = 0,
+                      max_retry: int = 3,
+                      drain_deadline: float | None = None,
+                      drain_complete: Callable[[], bool] | None = None,
+                      continue_guard: Callable[[], bool] | None = None) -> None:
     """Terminate the sky serve replica cluster."""
     from sky import core  # pylint: disable=import-outside-toplevel
 
@@ -515,7 +514,7 @@ def _get_resources_ports(yaml_content: str) -> str:
 
 
 def _should_use_spot(yaml_content: str,
-                     resource_override: Optional[Dict[str, Any]]) -> bool:
+                     resource_override: dict[str, Any] | None) -> bool:
     """Get whether the task should use spot."""
     if resource_override is not None:
         use_spot_override = resource_override.get('use_spot')
@@ -568,9 +567,9 @@ class ReplicaStatusProperty:
     service_ready_now: bool = False
     # None means readiness probe is not succeeded yet;
     # -1 means the initial delay seconds is exceeded.
-    first_ready_time: Optional[float] = None
+    first_ready_time: float | None = None
     # None means sky.down is not called yet.
-    sky_down_status: Optional[common_utils.ProcessStatus] = None
+    sky_down_status: common_utils.ProcessStatus | None = None
     # Whether the termination is caused by autoscaler's decision
     is_scale_down: bool = False
     # The replica's spot instance was preempted.
@@ -587,7 +586,7 @@ class ReplicaStatusProperty:
     # a crash and silently substitute the 120s default). None on purge
     # and failure teardowns, and on rows written before this field
     # existed (read via getattr for unpickle back-compat).
-    drain_cap_seconds: Optional[int] = None
+    drain_cap_seconds: int | None = None
 
     def unrecoverable_failure(self) -> bool:
         """Whether the replica fails and cannot be recovered.
@@ -674,8 +673,6 @@ class ReplicaStatusProperty:
             if self.sky_down_status == common_utils.ProcessStatus.RUNNING:
                 # sky.down is running
                 return serve_state.ReplicaStatus.SHUTTING_DOWN
-            if self.sky_launch_status == common_utils.ProcessStatus.INTERRUPTED:
-                return serve_state.ReplicaStatus.SHUTTING_DOWN
             if self.sky_down_status == common_utils.ProcessStatus.FAILED:
                 # sky.down failed
                 return serve_state.ReplicaStatus.FAILED_CLEANUP
@@ -731,9 +728,9 @@ class ReplicaInfo:
     _VERSION = 6
 
     def __init__(self, replica_id: int, cluster_name: str, replica_port: str,
-                 is_spot: bool, location: Optional[spot_placer.Location],
-                 version: int, resources_override: Optional[Dict[str,
-                                                                 Any]]) -> None:
+                 is_spot: bool, location: spot_placer.Location | None,
+                 version: int,
+                 resources_override: dict[str, Any] | None) -> None:
         self._version = self._VERSION
         self.replica_id: int = replica_id
         self.cluster_name: str = cluster_name
@@ -746,14 +743,14 @@ class ReplicaInfo:
         # snapshot time to debit replicas that landed on the zero-cost tier
         # after the snapshot was taken (see
         # Autoscaler._fill_row_occupies_free_slot).
-        self.created_at: Optional[float] = time.time()
-        self.first_not_ready_time: Optional[float] = None
-        self.consecutive_failure_times: List[float] = []
+        self.created_at: float | None = time.time()
+        self.first_not_ready_time: float | None = None
+        self.consecutive_failure_times: list[float] = []
         self.status_property: ReplicaStatusProperty = ReplicaStatusProperty()
         self.is_spot: bool = is_spot
-        self.location: Optional[Dict[str, Optional[str]]] = (
+        self.location: dict[str, str | None] | None = (
             location.to_pickleable() if location is not None else None)
-        self.resources_override: Optional[Dict[str, Any]] = resources_override
+        self.resources_override: dict[str, Any] | None = resources_override
         # Launch-origin attribution: True only for sentinel (fill)
         # launches; set by _launch_replica before the row is persisted.
         # The broker's holdings split and the grant ceiling's demand
@@ -765,13 +762,13 @@ class ReplicaInfo:
         # read as demand-placed and stay ceiling-exempt for its lifetime.
         self.reserved_fill: bool = False
 
-    def get_spot_location(self) -> Optional[spot_placer.Location]:
+    def get_spot_location(self) -> spot_placer.Location | None:
         return spot_placer.Location.from_pickleable(self.location)
 
     def handle(
         self,
-        cluster_record: Optional[Dict[str, Any]] = None
-    ) -> Optional[backends.CloudVmRayResourceHandle]:
+        cluster_record: dict[str, Any] | None = None
+    ) -> backends.CloudVmRayResourceHandle | None:
         """Get the handle of the cluster.
 
         Args:
@@ -800,9 +797,9 @@ class ReplicaInfo:
     def _resolve_url(
         self,
         cluster_record: Any = _NOT_PROVIDED,
-        handle: Optional[backends.CloudVmRayResourceHandle] = None,
-        provider_config: Optional[Dict[str, Any]] = None,
-    ) -> Optional[str]:
+        handle: backends.CloudVmRayResourceHandle | None = None,
+        provider_config: dict[str, Any] | None = None,
+    ) -> str | None:
         if handle is None:
             if cluster_record is _NOT_PROVIDED:
                 handle = self.handle()
@@ -841,7 +838,7 @@ class ReplicaInfo:
         return endpoint
 
     @property
-    def url(self) -> Optional[str]:
+    def url(self) -> str | None:
         return self._resolve_url()
 
     @property
@@ -855,7 +852,7 @@ class ReplicaInfo:
     def to_info_dict(self,
                      with_handle: bool,
                      with_url: bool = True,
-                     cluster_record: Any = _NOT_PROVIDED) -> Dict[str, Any]:
+                     cluster_record: Any = _NOT_PROVIDED) -> dict[str, Any]:
         """Build the dashboard/CLI view dict for this replica.
 
         Args:
@@ -929,7 +926,7 @@ class ReplicaInfo:
                 f'launched_at={info_dict["launched_at"]}{handle_str})')
         return info
 
-    def probe_pool(self) -> Tuple['ReplicaInfo', bool, float]:
+    def probe_pool(self) -> tuple['ReplicaInfo', bool, float]:
         """Probe the replica for pool management.
 
         This function will check the first job status of the cluster, which is a
@@ -959,10 +956,10 @@ class ReplicaInfo:
     def probe(
         self,
         readiness_path: str,
-        post_data: Optional[Dict[str, Any]],
+        post_data: dict[str, Any] | None,
         timeout: int,
-        headers: Optional[Dict[str, str]],
-    ) -> Tuple['ReplicaInfo', bool, float]:
+        headers: dict[str, str] | None,
+    ) -> tuple['ReplicaInfo', bool, float]:
         """Probe the readiness of the replica.
 
         Returns:
@@ -1060,10 +1057,10 @@ class ReplicaManager:
                  service_name: str,
                  spec: 'service_spec.SkyServiceSpec',
                  version: int,
-                 resource_scope: Optional[str] = None,
-                 service_hash: Optional[str] = None,
-                 controller_pid: Optional[int] = None,
-                 controller_ip: Optional[str] = None,
+                 resource_scope: str | None = None,
+                 service_hash: str | None = None,
+                 controller_pid: int | None = None,
+                 controller_ip: str | None = None,
                  enforce_launch_fence: bool = True) -> None:
         self.lock = threading.Lock()
         self._next_replica_id: int = 1
@@ -1075,7 +1072,7 @@ class ReplicaManager:
                                   controller_pid is not None or
                                   controller_ip is not None else None)
         self._enforce_launch_fence = enforce_launch_fence
-        self._uptime: Optional[float] = None
+        self._uptime: float | None = None
         self._update_mode = serve_utils.DEFAULT_UPDATE_MODE
         self._is_pool: bool = spec.pool
         # Freshest (received_at, {url: in_flight}, routing_urls,
@@ -1087,10 +1084,9 @@ class ReplicaManager:
         # replica's url. Written by whole-tuple replace and read without
         # a lock (atomic in CPython); None until the first report (old
         # LB / pool: never).
-        self._lb_in_flight_report: Optional[Tuple[float, Dict[str, int],
-                                                  Optional[Set[str]], Set[str],
-                                                  Set[str],
-                                                  Optional[str]]] = None
+        self._lb_in_flight_report: tuple[float, dict[str, int], set[str] | None,
+                                         set[str], set[str],
+                                         str | None] | None = None
         header_keys = None
         if spec.readiness_headers is not None:
             header_keys = list(spec.readiness_headers.keys())
@@ -1107,11 +1103,11 @@ class ReplicaManager:
         self.least_recent_version: int = version
 
     def update_lb_in_flight(self,
-                            in_flight_by_url: Optional[Dict[str, int]],
-                            routing_urls: Optional[List[str]] = None,
-                            unknown_urls: Optional[List[str]] = None,
-                            draining_urls: Optional[List[str]] = None,
-                            lb_session_id: Optional[str] = None) -> None:
+                            in_flight_by_url: dict[str, int] | None,
+                            routing_urls: list[str] | None = None,
+                            unknown_urls: list[str] | None = None,
+                            draining_urls: list[str] | None = None,
+                            lb_session_id: str | None = None) -> None:
         """Publish the LB's url-keyed in-flight gauge from a sync.
 
         A None gauge means the LB sent none (old LB version, or a policy
@@ -1145,7 +1141,7 @@ class ReplicaManager:
         return getattr(self, '_spot_placer', None)
 
     def scale_up(self,
-                 resources_override: Optional[Dict[str, Any]] = None) -> None:
+                 resources_override: dict[str, Any] | None = None) -> None:
         """Scale up the service by 1 replica with resources_override.
         resources_override is of the same format with resources section
         in skypilot task yaml
@@ -1153,7 +1149,7 @@ class ReplicaManager:
         raise NotImplementedError
 
     def scale_up_batch(
-            self, resources_overrides: List[Optional[Dict[str, Any]]]) -> None:
+            self, resources_overrides: list[dict[str, Any] | None]) -> None:
         """Scale up by len(resources_overrides) replicas in one batch.
 
         Subclasses may override to amortize per-call synchronization; the
@@ -1170,7 +1166,7 @@ class ReplicaManager:
                        update_mode: serve_utils.UpdateMode) -> None:
         raise NotImplementedError
 
-    def get_active_replica_urls(self) -> List[str]:
+    def get_active_replica_urls(self) -> list[str]:
         """Get the urls of the active replicas."""
         raise NotImplementedError
 
@@ -1187,9 +1183,9 @@ class SkyPilotReplicaManager(ReplicaManager):
             whether it is still responding to requests.
     """
 
-    def _db_fence_kwargs(self) -> Dict[str, Any]:
+    def _db_fence_kwargs(self) -> dict[str, Any]:
         """Exact owner predicates, omitted for legacy/direct test managers."""
-        kwargs: Dict[str, Any] = {}
+        kwargs: dict[str, Any] = {}
         service_hash = getattr(self, '_service_hash', None)
         if service_hash is not None:
             kwargs['expected_service_hash'] = service_hash
@@ -1198,7 +1194,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             kwargs['expected_controller_owner'] = controller_owner
         return kwargs
 
-    def _service_launch_authorization(self) -> Optional[bool]:
+    def _service_launch_authorization(self) -> bool | None:
         """Return True/False for proven authority/loss, None if unverifiable."""
         service_hash = getattr(self, '_service_hash', None)
         if service_hash is None:
@@ -1238,7 +1234,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         ownership_lost = getattr(self, '_ownership_lost', None)
         return ownership_lost is None or not ownership_lost.is_set()
 
-    def _replica_launch_fence_context(self) -> Optional[Dict[str, Any]]:
+    def _replica_launch_fence_context(self) -> dict[str, Any] | None:
         """Owner tuple validated by the API executor before provisioning."""
         if not getattr(self, '_enforce_launch_fence', True):
             # A legacy/non-consolidated controller owns a different Serve DB;
@@ -1288,7 +1284,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 f'persisting replica {replica_id}.')
 
     def _persist_replicas(self,
-                          replica_infos: List[Tuple[int, ReplicaInfo]]) -> None:
+                          replica_infos: list[tuple[int, ReplicaInfo]]) -> None:
         persisted = serve_state.add_or_update_replicas(
             self._service_name, replica_infos, **self._db_fence_kwargs())
         if persisted is False:
@@ -1308,10 +1304,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                  service_name: str,
                  spec: 'service_spec.SkyServiceSpec',
                  version: int,
-                 resource_scope: Optional[str] = None,
-                 service_hash: Optional[str] = None,
-                 controller_pid: Optional[int] = None,
-                 controller_ip: Optional[str] = None,
+                 resource_scope: str | None = None,
+                 service_hash: str | None = None,
+                 controller_pid: int | None = None,
+                 controller_ip: str | None = None,
                  enforce_launch_fence: bool = True) -> None:
         # Keep the historical three-argument base-init call for embedders that
         # replace it, then restore the scope it initializes to the legacy
@@ -1329,7 +1325,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             f'yaml content not found for {service_name} version {version}')
         self.yaml_content: str = yaml_content
         task = task_lib.Task.from_yaml_str(self.yaml_content)
-        self._spot_placer: Optional[spot_placer.SpotPlacer] = (
+        self._spot_placer: spot_placer.SpotPlacer | None = (
             spot_placer.SpotPlacer.from_task(spec, task))
         self._fill_skip_last_log_time: float = 0.0
         # TODO(tian): Store launch/down request id in the replica table, to make
@@ -1355,8 +1351,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         # per tick. Scoping it to a tick keeps it single-threaded (only the
         # prober thread touches it) and never reuses a spec across ticks, so it
         # cannot go stale even if a version's spec row is later rewritten.
-        self._tick_version_spec_cache: Dict[int,
-                                            'service_spec.SkyServiceSpec'] = {}
+        self._tick_version_spec_cache: dict[int,
+                                            service_spec.SkyServiceSpec] = {}
 
         # Run recovery in its own thread, but only start the daemon threads
         # once recovery HOLDS the manager lock. Two hazards shaped this:
@@ -1567,7 +1563,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # gone (or partially gone), and the persisted preempted bit
                 # is itself sufficient to classify this as scale-down cleanup
                 # even if the crash preceded the is_scale_down write.
-                drain_cap: Optional[int] = None
+                drain_cap: int | None = None
                 status_property = replica_info.status_property
                 if replica_info.cluster_name in orphaned_spot_clusters:
                     logger.warning(
@@ -1628,8 +1624,8 @@ class SkyPilotReplicaManager(ReplicaManager):
     def _launch_replica(
         self,
         replica_id: int,
-        resources_override: Optional[Dict[str, Any]] = None,
-        existing_replica_infos: Optional[List['ReplicaInfo']] = None,
+        resources_override: dict[str, Any] | None = None,
+        existing_replica_infos: list['ReplicaInfo'] | None = None,
         prior_reserved_fill: bool = False,
     ) -> bool:
         """Enqueue one replica launch.
@@ -1659,8 +1655,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         # fill-selection path (nor re-run the epoch fence: its round is
         # long gone and the row already exists).
         zero_cost_only = False
-        fill_grant_epoch: Optional[int] = None
-        fill_pool_key: Optional[str] = None
+        fill_grant_epoch: int | None = None
+        fill_pool_key: str | None = None
         if (resources_override is not None and
                 serve_constants.RESERVED_CAPACITY_FILL_OVERRIDE_KEY
                 in resources_override):
@@ -1704,7 +1700,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             # conflict with the spot placer's selection.
             if resources_override is None:
                 resources_override = {}
-            current_spot_locations: List[spot_placer.Location] = []
+            current_spot_locations: list[spot_placer.Location] = []
             # The per-launch replica scan is O(total rows) of unpickling;
             # bulk callers (recovery re-enqueueing hundreds of launches)
             # pass one snapshot instead of paying it per launch.
@@ -1879,8 +1875,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         return True
 
     def _demand_should_skip_zero_cost(
-            self,
-            existing_replica_infos: Optional[List['ReplicaInfo']]) -> bool:
+            self, existing_replica_infos: list['ReplicaInfo'] | None) -> bool:
         """Broker demand-placement gate: stop NEW squatting at the grant.
 
         When this service already holds at least its broker grant on the
@@ -1941,9 +1936,8 @@ class SkyPilotReplicaManager(ReplicaManager):
 
     def _scale_up_one_locked(
             self,
-            resources_override: Optional[Dict[str, Any]],
-            existing_replica_infos: Optional[List['ReplicaInfo']] = None
-    ) -> None:
+            resources_override: dict[str, Any] | None,
+            existing_replica_infos: list['ReplicaInfo'] | None = None) -> None:
         """Allocate an id and enqueue one replica launch. Lock must be held."""
         # Defensive: never hand `_launch_replica` an id that still has a
         # durable replica row. `add_or_update_replica` is an upsert keyed on
@@ -1974,12 +1968,12 @@ class SkyPilotReplicaManager(ReplicaManager):
 
     @with_lock
     def scale_up(self,
-                 resources_override: Optional[Dict[str, Any]] = None) -> None:
+                 resources_override: dict[str, Any] | None = None) -> None:
         self._scale_up_one_locked(resources_override)
 
     @with_lock
     def scale_up_batch(
-            self, resources_overrides: List[Optional[Dict[str, Any]]]) -> None:
+            self, resources_overrides: list[dict[str, Any] | None]) -> None:
         """Enqueue a batch of replica launches under ONE lock acquisition.
 
         The manager lock is held by the readiness-probe round for tens of
@@ -2008,7 +2002,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                       existing_replica_infos)
 
     def _batch_needs_placement_snapshot(
-            self, resources_overrides: List[Optional[Dict[str, Any]]]) -> bool:
+            self, resources_overrides: list[dict[str, Any] | None]) -> bool:
         """Whether any launch in a batch will ask the placer for a location."""
         if self._spot_placer is None or not resources_overrides:
             return False
@@ -2027,7 +2021,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 _should_use_spot(self.yaml_content, resource_override=None))
 
     def _handle_sky_down_finish(self, info: ReplicaInfo,
-                                format_exc: Optional[str]) -> None:
+                                format_exc: str | None) -> None:
         if format_exc is not None:
             logger.error(f'Down thread for replica {info.replica_id} '
                          f'exited abnormally with exception {format_exc}.')
@@ -2082,7 +2076,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             replica_drain_delay_seconds: int,
             is_scale_down: bool = False,
             purge: bool = False,
-            in_flight_drain_cap_seconds: Optional[int] = None) -> None:
+            in_flight_drain_cap_seconds: int | None = None) -> None:
         left_in_record = not (is_scale_down or purge)
         if left_in_record:
             assert sync_down_logs, (
@@ -2126,8 +2120,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                         # It's possible that the launch thread immediately
                         # finished after we check. Exit the loop now.
                         break
-                    if (time.time() - start_wait_time >
-                            _WAIT_LAUNCH_THREAD_TIMEOUT_SECONDS):
+                    if (time.time() - start_wait_time
+                            > _WAIT_LAUNCH_THREAD_TIMEOUT_SECONDS):
                         timeout_reached = True
                         break
                     time.sleep(0.1)
@@ -2170,7 +2164,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             if os.path.exists(launch_log_file_name):
                 with open(log_file_name, 'w',
                           encoding='utf-8') as replica_log_file, open(
-                              launch_log_file_name, 'r',
+                              launch_log_file_name,
                               encoding='utf-8') as launch_file:
                     replica_log_file.write(launch_file.read())
                 with contextlib.suppress(FileNotFoundError):
@@ -2200,7 +2194,6 @@ class SkyPilotReplicaManager(ReplicaManager):
                 with open(log_file_name, 'a',
                           encoding='utf-8') as replica_log_file, open(
                               os.path.expanduser(job_log_file_name),
-                              'r',
                               encoding='utf-8') as job_file:
                     replica_log_file.write(job_file.read())
             else:
@@ -2243,8 +2236,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             common_utils.ProcessStatus.SCHEDULED)
         info.status_property.drain_cap_seconds = in_flight_drain_cap_seconds
         self._persist_replica(replica_id, info)
-        drain_deadline: Optional[float] = None
-        drain_complete: Optional[Callable[[], bool]] = None
+        drain_deadline: float | None = None
+        drain_complete: Callable[[], bool] | None = None
         if (in_flight_drain_cap_seconds is not None and
                 in_flight_drain_cap_seconds > 0):
             drain_started = time.monotonic()
@@ -2430,9 +2423,9 @@ class SkyPilotReplicaManager(ReplicaManager):
         # None of that needs the lock -- holding it here would stall every
         # other service's admission pass (and `sky serve up`) for the whole
         # walk. Only the admission pass below needs the lock.
-        launch_to_admit: List[Tuple[int, thread_utils.SafeThread,
+        launch_to_admit: list[tuple[int, thread_utils.SafeThread,
                                     ReplicaInfo]] = []
-        pending_launches: List[Tuple[int, thread_utils.SafeThread,
+        pending_launches: list[tuple[int, thread_utils.SafeThread,
                                      ReplicaInfo]] = []
         for replica_id, t in launch_thread_pool_snapshot:
             if t.is_alive():
@@ -2519,7 +2512,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         # Snapshot AFTER the finished-launch pass so down threads it scheduled
         # (via _terminate_replica for failed launches) are admitted this tick.
         down_thread_pool_snapshot = list(self._down_thread_pool.items())
-        down_to_admit: List[Tuple[int, thread_utils.SafeThread,
+        down_to_admit: list[tuple[int, thread_utils.SafeThread,
                                   ReplicaInfo]] = []
         for replica_id, t in down_thread_pool_snapshot:
             if t.is_alive():
@@ -2799,7 +2792,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             # completion, we need the info.probe function to return the info
             # object as well, so that we could update the info object in the
             # same order.
-            probe_results: List[Tuple[ReplicaInfo, bool, float]] = [
+            probe_results: list[tuple[ReplicaInfo, bool, float]] = [
                 future.get() for future in probe_futures
             ]
 
@@ -2820,7 +2813,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 info for info, probe_succeeded, _ in probe_results
                 if not probe_succeeded and info.is_spot
             ]
-            possibly_preempted_ids: Set[int] = set()
+            possibly_preempted_ids: set[int] = set()
             if failed_spot_infos:
                 num_workers = min(self._PREEMPTION_PREFILTER_PARALLELISM,
                                   len(failed_spot_infos))
@@ -2832,8 +2825,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                         failed_spot_infos, alive_flags) if not alive
                 }
 
-            pending_writes: List[Tuple[int, ReplicaInfo]] = []
-            replicas_to_teardown: List[int] = []
+            pending_writes: list[tuple[int, ReplicaInfo]] = []
+            replicas_to_teardown: list[int] = []
             for future_result in probe_results:
                 info, probe_succeeded, probe_time = future_result
                 info.status_property.service_ready_now = probe_succeeded
@@ -2953,7 +2946,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             # TODO(MaoZiming): Probe cloud for early preemption warning.
             time.sleep(self._get_endpoint_probe_interval_seconds())
 
-    def get_active_replica_urls(self) -> List[str]:
+    def get_active_replica_urls(self) -> list[str]:
         """Get the urls of all active replicas."""
         record = serve_state.get_service_from_name(self._service_name)
         assert record is not None, (f'{self._service_name} not found on '
@@ -3026,8 +3019,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                                                    {}).pop('any_of', [])
 
                 if (resources_utils.normalize_any_of_resources_config(
-                        old_config_any_of) != resources_utils.
-                        normalize_any_of_resources_config(new_config_any_of)):
+                        old_config_any_of)
+                        != resources_utils.normalize_any_of_resources_config(
+                            new_config_any_of)):
                     logger.info('Replica config changed (any_of), skipping. '
                                 f'old: {old_config_any_of}, '
                                 f'new: {new_config_any_of}')
@@ -3061,10 +3055,10 @@ class SkyPilotReplicaManager(ReplicaManager):
     def _get_readiness_path(self, version: int) -> str:
         return self._get_version_spec(version).readiness_path
 
-    def _get_post_data(self, version: int) -> Optional[Dict[str, Any]]:
+    def _get_post_data(self, version: int) -> dict[str, Any] | None:
         return self._get_version_spec(version).post_data
 
-    def _get_readiness_headers(self, version: int) -> Optional[Dict[str, str]]:
+    def _get_readiness_headers(self, version: int) -> dict[str, str] | None:
         return self._get_version_spec(version).readiness_headers
 
     def _get_initial_delay_seconds(self, version: int) -> int:

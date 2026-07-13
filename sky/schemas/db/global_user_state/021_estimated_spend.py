@@ -6,7 +6,7 @@ Create Date: 2026-07-10
 
 """
 # pylint: disable=invalid-name
-from typing import Sequence, Union
+from collections.abc import Sequence
 
 from alembic import op
 import sqlalchemy as sa
@@ -16,9 +16,9 @@ from sky.utils.db import db_utils
 
 # revision identifiers, used by Alembic.
 revision: str = '021'
-down_revision: Union[str, Sequence[str], None] = '020'
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+down_revision: str | Sequence[str] | None = '020'
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 _USAGE_UPDATED_INDEX = 'ix_cluster_history_usage_updated_at'
 

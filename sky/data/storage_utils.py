@@ -5,7 +5,7 @@ import pathlib
 import shlex
 import stat
 import subprocess
-from typing import List, Optional, Set, TextIO, Union
+from typing import TextIO
 import warnings
 import zipfile
 
@@ -22,17 +22,17 @@ _USE_SKYIGNORE_HINT = (
     'To avoid using .gitignore, you can create a .skyignore file instead.')
 
 
-def get_excluded_files_from_skyignore(src_dir_path: str) -> List[str]:
+def get_excluded_files_from_skyignore(src_dir_path: str) -> list[str]:
     """List files and patterns ignored by the .skyignore file
     in the given source directory.
     """
-    excluded_list: Set[str] = set()
+    excluded_list: set[str] = set()
     expand_src_dir_path = os.path.expanduser(src_dir_path)
     skyignore_path = os.path.join(expand_src_dir_path,
                                   constants.SKY_IGNORE_FILE)
 
     try:
-        with open(skyignore_path, 'r', encoding='utf-8') as f:
+        with open(skyignore_path, encoding='utf-8') as f:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith('#'):
@@ -51,14 +51,14 @@ def get_excluded_files_from_skyignore(src_dir_path: str) -> List[str]:
                         matching_files[i] = os.path.relpath(
                             matching_files[i], expand_src_dir_path)
                     excluded_list.update(matching_files)
-    except IOError as e:
+    except OSError as e:
         logger.warning(f'Error reading {skyignore_path}: '
                        f'{common_utils.format_exception(e, use_bracket=True)}')
 
     return list(excluded_list)
 
 
-def get_excluded_files_from_gitignore(src_dir_path: str) -> List[str]:
+def get_excluded_files_from_gitignore(src_dir_path: str) -> list[str]:
     """ Lists files and patterns ignored by git in the source directory
 
     Runs `git ls-files --ignored ...` which returns a list of excluded files and
@@ -87,8 +87,7 @@ def get_excluded_files_from_gitignore(src_dir_path: str) -> List[str]:
     try:
         submodules_output = subprocess.run(submodules_cmd,
                                            shell=True,
-                                           stdout=subprocess.PIPE,
-                                           stderr=subprocess.PIPE,
+                                           capture_output=True,
                                            check=True,
                                            text=True)
     except subprocess.CalledProcessError as e:
@@ -131,7 +130,7 @@ def get_excluded_files_from_gitignore(src_dir_path: str) -> List[str]:
         submodule for submodule in submodules if not submodule.startswith('../')
     ]
 
-    excluded_list: List[str] = []
+    excluded_list: list[str] = []
     for repo in all_git_repos:
         # repo is the path relative to src_dir_path. Get the full path.
         repo_path = os.path.join(expand_src_dir_path, repo)
@@ -150,8 +149,7 @@ def get_excluded_files_from_gitignore(src_dir_path: str) -> List[str]:
                       '--others --ignore --exclude-standard --directory')
         output = subprocess.run(filter_cmd,
                                 shell=True,
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE,
+                                capture_output=True,
                                 check=True,
                                 text=True)
         # Don't catch any errors. We would only expect to see errors during the
@@ -177,7 +175,7 @@ def get_excluded_files_from_gitignore(src_dir_path: str) -> List[str]:
     return excluded_list
 
 
-def get_excluded_files(src_dir_path: str) -> List[str]:
+def get_excluded_files(src_dir_path: str) -> list[str]:
     # TODO: this could return a huge list of files,
     # should think of ways to optimize.
     """List files and directories to be excluded.
@@ -212,12 +210,12 @@ def get_excluded_files(src_dir_path: str) -> List[str]:
     return excluded_paths
 
 
-def zip_files_and_folders(items: List[str],
-                          output_file: Union[str, pathlib.Path],
-                          log_file: Optional[TextIO] = None,
+def zip_files_and_folders(items: list[str],
+                          output_file: str | pathlib.Path,
+                          log_file: TextIO | None = None,
                           relative_to_items: bool = False,
                           compression: int = zipfile.ZIP_DEFLATED,
-                          compresslevel: Optional[int] = None):
+                          compresslevel: int | None = None):
     """Zip files and folders.
 
     Args:

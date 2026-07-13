@@ -48,6 +48,8 @@ then:
     skypilot_config.get_nested(('a', 'nonexist'), None)  # ==> None
     skypilot_config.get_nested(('a',), None)             # ==> None
 """
+from collections.abc import Callable
+from collections.abc import Iterator
 import contextlib
 import copy
 import json
@@ -57,7 +59,7 @@ import re
 import tempfile
 import threading
 import typing
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any
 
 import filelock
 import sqlalchemy
@@ -133,12 +135,16 @@ config_yaml_table = sqlalchemy.Table(
 
 
 class ConfigContext:
+    """Config state (loaded config, path, override flag) for one context."""
 
     def __init__(self,
-                 config: config_utils.Config = config_utils.Config(),
-                 config_path: Optional[str] = None,
+                 config: config_utils.Config | None = None,
+                 config_path: str | None = None,
                  config_overridden: bool = False):
-        self.config = config
+        # A default of config_utils.Config() would be evaluated once at
+        # function definition, silently sharing one mutable Config between
+        # every context created without an explicit config.
+        self.config = config if config is not None else config_utils.Config()
         self.config_path = config_path
         self.config_overridden = config_overridden
 
@@ -184,7 +190,7 @@ def _set_loaded_config(config: config_utils.Config) -> None:
     _get_config_context().config = config
 
 
-def _get_loaded_config_path() -> List[Optional[str]]:
+def _get_loaded_config_path() -> list[str | None]:
     serialized = _get_config_context().config_path
     if not serialized:
         return []
@@ -194,8 +200,7 @@ def _get_loaded_config_path() -> List[Optional[str]]:
     return config_paths
 
 
-def _set_loaded_config_path(
-        path: Optional[Union[str, List[Optional[str]]]]) -> None:
+def _set_loaded_config_path(path: str | list[str | None] | None) -> None:
     if not path:
         _get_config_context().config_path = None
     if isinstance(path, str):
@@ -203,7 +208,7 @@ def _set_loaded_config_path(
     _get_config_context().config_path = json.dumps(path)
 
 
-def _set_loaded_config_path_serialized(path: Optional[str]) -> None:
+def _set_loaded_config_path_serialized(path: str | None) -> None:
     _get_config_context().config_path = path
 
 
@@ -220,13 +225,13 @@ def get_user_config_path() -> str:
     return _GLOBAL_CONFIG_PATH
 
 
-def _get_config_from_path(path: Optional[str]) -> config_utils.Config:
+def _get_config_from_path(path: str | None) -> config_utils.Config:
     if path is None:
         return config_utils.Config()
     return parse_and_validate_config_file(path)
 
 
-def resolve_user_config_path() -> Optional[str]:
+def resolve_user_config_path() -> str | None:
     # find the user config file path, None if not resolved.
     user_config_path = _get_config_file_path(ENV_VAR_GLOBAL_CONFIG)
     if user_config_path:
@@ -254,7 +259,7 @@ def get_user_config() -> config_utils.Config:
     return _get_config_from_path(resolve_user_config_path())
 
 
-def _resolve_project_config_path() -> Optional[str]:
+def _resolve_project_config_path() -> str | None:
     # find the project config file
     project_config_path = _get_config_file_path(ENV_VAR_PROJECT_CONFIG)
     if project_config_path:
@@ -278,7 +283,7 @@ def _resolve_project_config_path() -> Optional[str]:
     return None
 
 
-def _resolve_server_config_path() -> Optional[str]:
+def _resolve_server_config_path() -> str | None:
     # find the server config file
     server_config_path = _get_config_file_path(ENV_VAR_GLOBAL_CONFIG)
     if server_config_path:
@@ -315,7 +320,7 @@ def _overlay_db_config(server_config: config_utils.Config,
     logger.debug('retrieving config from database')
     del db_url  # Connection resolved via the env var by the engine.
 
-    def _get_config_yaml_from_db(key: str) -> Optional[config_utils.Config]:
+    def _get_config_yaml_from_db(key: str) -> config_utils.Config | None:
         with orm.Session(_db_manager.get_engine()) as session:
             row = session.query(config_yaml_table).filter_by(key=key).first()
         if row:
@@ -351,9 +356,9 @@ def get_effective_server_config() -> config_utils.Config:
     return server_config
 
 
-def get_nested(keys: Tuple[str, ...],
+def get_nested(keys: tuple[str, ...],
                default_value: Any,
-               override_configs: Optional[Dict[str, Any]] = None) -> Any:
+               override_configs: dict[str, Any] | None = None) -> Any:
     """Gets a nested key.
 
     If any key is not found, or any intermediate key does not point to a dict
@@ -381,11 +386,11 @@ def get_nested(keys: Tuple[str, ...],
 
 def get_effective_workspace_region_config(
         cloud: str,
-        keys: Tuple[str, ...],
-        region: Optional[str] = None,
-        default_value: Optional[Any] = None,
-        workspace: Optional[str] = None,
-        override_configs: Optional[Dict[str, Any]] = None) -> Any:
+        keys: tuple[str, ...],
+        region: str | None = None,
+        default_value: Any | None = None,
+        workspace: str | None = None,
+        override_configs: dict[str, Any] | None = None) -> Any:
     if workspace is None:
         workspace = get_active_workspace()
     workspaced_config_value = None
@@ -409,11 +414,10 @@ def get_effective_workspace_region_config(
 
 
 def get_effective_region_config(cloud: str,
-                                keys: Tuple[str, ...],
-                                region: Optional[str] = None,
-                                default_value: Optional[Any] = None,
-                                override_configs: Optional[Dict[str,
-                                                                Any]] = None,
+                                keys: tuple[str, ...],
+                                region: str | None = None,
+                                default_value: Any | None = None,
+                                override_configs: dict[str, Any] | None = None,
                                 merge_dicts: bool = False) -> Any:
     """Returns the nested key value by reading from config
     Order to get the property_name value:
@@ -438,7 +442,7 @@ def get_effective_region_config(cloud: str,
 
 
 def get_workspace_cloud(cloud: str,
-                        workspace: Optional[str] = None) -> config_utils.Config:
+                        workspace: str | None = None) -> config_utils.Config:
     """Returns the workspace cloud config, deep-merged with global cloud config.
 
     Workspace-specific values override global values. Fields not set in the
@@ -506,7 +510,7 @@ def local_active_workspace_ctx(workspace: str) -> Iterator[None]:
     # workspace resolver gate to silently skip and fall back to the
     # literal 'default' (broken for users without 'default' access).
     had_workspace = hasattr(_active_workspace_context, 'workspace')
-    prior_value: Optional[str] = None
+    prior_value: str | None = None
     if had_workspace:
         prior_value = _active_workspace_context.workspace
     _active_workspace_context.workspace = workspace
@@ -567,7 +571,7 @@ def is_active_workspace_set() -> bool:
                       default_value=None) is not None
 
 
-def set_nested(keys: Tuple[str, ...], value: Any) -> Dict[str, Any]:
+def set_nested(keys: tuple[str, ...], value: Any) -> dict[str, Any]:
     """Returns a deep-copied config with the nested key set to value.
 
     Like get_nested(), if any key is not found, this will not raise an error.
@@ -582,14 +586,14 @@ def to_dict() -> config_utils.Config:
     return copy.deepcopy(_get_loaded_config())
 
 
-def _get_config_file_path(envvar: str) -> Optional[str]:
+def _get_config_file_path(envvar: str) -> str | None:
     config_path_via_env_var = os.environ.get(envvar)
     if config_path_via_env_var is not None:
         return os.path.expanduser(config_path_via_env_var)
     return None
 
 
-def _validate_config(config: Dict[str, Any], config_source: str) -> None:
+def _validate_config(config: dict[str, Any], config_source: str) -> None:
     """Validates the config."""
     common_utils.validate_schema(
         config,
@@ -601,7 +605,7 @@ def _validate_config(config: Dict[str, Any], config_source: str) -> None:
     _validate_dashboard_external_links(config, config_source)
 
 
-def _validate_dashboard_external_links(config: Dict[str, Any],
+def _validate_dashboard_external_links(config: dict[str, Any],
                                        config_source: str) -> None:
     """Ensures every dashboard.external_links regex is compilable."""
     dashboard = config.get('dashboard') if isinstance(config, dict) else None
@@ -626,8 +630,8 @@ def _validate_dashboard_external_links(config: Dict[str, Any],
 
 
 def overlay_skypilot_config(
-        original_config: Optional[config_utils.Config],
-        override_configs: Optional[config_utils.Config]) -> config_utils.Config:
+        original_config: config_utils.Config | None,
+        override_configs: config_utils.Config | None) -> config_utils.Config:
     """Overlays the override configs on the original configs."""
     if original_config is None:
         original_config = config_utils.Config()
@@ -685,7 +689,7 @@ def parse_and_validate_config_file(config_path: str) -> config_utils.Config:
     return config
 
 
-def _parse_dotlist(dotlist: List[str]) -> config_utils.Config:
+def _parse_dotlist(dotlist: list[str]) -> config_utils.Config:
     """Parse a single key-value pair into a dictionary.
 
     Args:
@@ -766,7 +770,7 @@ def _reload_config_as_client() -> None:
     _set_loaded_config(config_utils.Config())
     _set_loaded_config_path(None)
 
-    overrides: List[config_utils.Config] = []
+    overrides: list[config_utils.Config] = []
     user_config_path = resolve_user_config_path()
     user_config = _get_config_from_path(user_config_path)
     if user_config:
@@ -789,7 +793,7 @@ def _reload_config_as_client() -> None:
     _set_loaded_config_path([user_config_path, project_config_path])
 
 
-def loaded_config_path() -> Optional[str]:
+def loaded_config_path() -> str | None:
     """Returns the path to the loaded config file, or '<overridden>' if the
     config is overridden."""
     path = [p for p in set(_get_loaded_config_path()) if p is not None]
@@ -803,7 +807,7 @@ def loaded_config_path() -> Optional[str]:
     return f'<{header} ({path_str})>'
 
 
-def loaded_config_path_serialized() -> Optional[str]:
+def loaded_config_path_serialized() -> str | None:
     """Returns the json serialized config path list"""
     return _get_config_context().config_path
 
@@ -819,9 +823,8 @@ def loaded() -> bool:
 
 @contextlib.contextmanager
 def override_skypilot_config(
-        override_configs: Optional[Dict[str, Any]],
-        override_config_path_serialized: Optional[str] = None
-) -> Iterator[None]:
+        override_configs: dict[str, Any] | None,
+        override_config_path_serialized: str | None = None) -> Iterator[None]:
     """Overrides the user configurations."""
     # TODO(SKY-1215): allow admin user to extend the disallowed keys or specify
     # allowed keys.
@@ -942,7 +945,7 @@ def replace_skypilot_config(new_configs: config_utils.Config) -> Iterator[None]:
         yield
 
 
-_QUEUE_NAME_KEYS: List[Tuple[str, ...]] = [
+_QUEUE_NAME_KEYS: list[tuple[str, ...]] = [
     # Order matters: `get_effective_queue_name` returns the first hit at a
     # given scope, so `quota.queue` wins over `kueue.local_queue_name` when
     # both are set.
@@ -950,14 +953,14 @@ _QUEUE_NAME_KEYS: List[Tuple[str, ...]] = [
     ('kueue', 'local_queue_name'),
 ]
 
-_NAMESPACE_KEYS: List[Tuple[str, ...]] = [('namespace',)]
+_NAMESPACE_KEYS: list[tuple[str, ...]] = [('namespace',)]
 
 # Hooks invoked at the end of `update_api_server_config_no_lock`, after the
 # new config has been persisted and reloaded in-process. Plugins use this to
 # invalidate caches that were derived from the config (e.g. a request that
 # memoized the result of `get_nested(...)` for a TTL). Registered at server
 # startup during single-threaded plugin loading, so no lock is needed.
-_CONFIG_UPDATE_HOOKS: List[Callable[[], None]] = []
+_CONFIG_UPDATE_HOOKS: list[Callable[[], None]] = []
 
 
 def register_config_update_hook(fn: Callable[[], None]) -> None:
@@ -974,10 +977,10 @@ def register_config_update_hook(fn: Callable[[], None]) -> None:
 
 def _get_effective_k8s_config_value(
         cloud: str,
-        property_keys: List[Tuple[str, ...]],
-        region: Optional[str] = None,
-        workspace: Optional[str] = None,
-        override_configs: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        property_keys: list[tuple[str, ...]],
+        region: str | None = None,
+        workspace: str | None = None,
+        override_configs: dict[str, Any] | None = None) -> str | None:
     """Generic Kubernetes config-value resolver.
 
     Resolution precedence (most specific first):
@@ -1000,7 +1003,7 @@ def _get_effective_k8s_config_value(
     # `override_configs` are cloud-level; looking up relative to a scope
     # (rather than prefixing the scope into `keys`) ensures they apply at
     # the correct depth even when the scope is a workspace subtree.
-    scope_configs: List[config_utils.Config] = []
+    scope_configs: list[config_utils.Config] = []
     if workspace is not None:
         ws_config = get_nested(keys=('workspaces', workspace),
                                default_value=None)
@@ -1033,9 +1036,9 @@ def _get_effective_k8s_config_value(
 
 def get_effective_queue_name(
         cloud: str,
-        region: Optional[str] = None,
-        workspace: Optional[str] = None,
-        override_configs: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        region: str | None = None,
+        workspace: str | None = None,
+        override_configs: dict[str, Any] | None = None) -> str | None:
     """Returns the effective Kueue local queue name from config.
 
     Supports two equivalent spellings, ``kueue.local_queue_name`` and
@@ -1052,9 +1055,9 @@ def get_effective_queue_name(
 
 def get_effective_namespace(
         cloud: str,
-        region: Optional[str] = None,
-        workspace: Optional[str] = None,
-        override_configs: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        region: str | None = None,
+        workspace: str | None = None,
+        override_configs: dict[str, Any] | None = None) -> str | None:
     """Returns the effective Kubernetes namespace from config.
 
     Resolution precedence, most specific first:
@@ -1072,7 +1075,7 @@ def get_effective_namespace(
                                            override_configs=override_configs)
 
 
-def register_queue_name_key(key: Tuple[str, ...]) -> None:
+def register_queue_name_key(key: tuple[str, ...]) -> None:
     """Register a new queue name key to be removed from the config.
 
     This is called during plugin loading at server startup, which is
@@ -1087,14 +1090,14 @@ def remove_queue_name_from_config() -> Iterator[None]:
     """Removes the local_queue_name from the config."""
     config = to_dict()
 
-    def update_to_none_if_set(keys: Tuple[str, ...]) -> None:
+    def update_to_none_if_set(keys: tuple[str, ...]) -> None:
         for queue_key in _QUEUE_NAME_KEYS:
             if config.get_nested(keys + queue_key, None) is not None:
                 logger.debug(f'removing local queue name: setting '
                              f'{keys + queue_key} to None')
                 config.set_nested(keys + queue_key, None)
 
-    def remove_from_context_configs(keys: Tuple[str, ...]) -> None:
+    def remove_from_context_configs(keys: tuple[str, ...]) -> None:
         for context_name, _ in config.get_nested((*keys, 'context_configs'),
                                                  {}).items():
             update_to_none_if_set((*keys, 'context_configs', context_name))
@@ -1113,7 +1116,7 @@ def remove_queue_name_from_config() -> Iterator[None]:
         yield
 
 
-def _compose_cli_config(cli_config: Optional[List[str]]) -> config_utils.Config:
+def _compose_cli_config(cli_config: list[str] | None) -> config_utils.Config:
     """Composes the skypilot CLI config.
     CLI config can either be:
     - A path to a config file
@@ -1146,7 +1149,7 @@ def _compose_cli_config(cli_config: Optional[List[str]]) -> config_utils.Config:
     return parsed_config
 
 
-def apply_cli_config(cli_config: Optional[List[str]]) -> Dict[str, Any]:
+def apply_cli_config(cli_config: list[str] | None) -> dict[str, Any]:
     """Applies the CLI provided config.
     SAFETY:
     This function directly modifies the global _dict variable.

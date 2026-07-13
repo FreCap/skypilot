@@ -5,7 +5,8 @@ Plugins can register callbacks here to react to events emitted by core code
 by a callback is logged and swallowed so it cannot affect the originating
 operation.
 """
-from typing import Callable, Dict, TYPE_CHECKING
+from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 from sky import sky_logging
 
@@ -16,7 +17,7 @@ logger = sky_logging.init_logger(__name__)
 
 VolumeDeletedHook = Callable[[str, 'models.VolumeConfig'], None]
 
-_VOLUME_DELETED_HOOKS: Dict[str, VolumeDeletedHook] = {}
+_VOLUME_DELETED_HOOKS: dict[str, VolumeDeletedHook] = {}
 
 
 def register_volume_deleted_hook(hook_id: str, fn: VolumeDeletedHook) -> None:

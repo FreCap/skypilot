@@ -4,12 +4,12 @@ The timeline follows the trace event format defined here:
 https://docs.google.com/document/d/1CvAClvFfyA5R-PhYUmn5OOQtYMH4h6I0nSsKchNAySU/preview
 """  # pylint: disable=line-too-long
 import atexit
+from collections.abc import Callable
 import json
 import os
 import threading
 import time
 import traceback
-from typing import Callable, Optional, Union
 
 from sky.utils import common_utils
 
@@ -28,7 +28,7 @@ class Event:
         message: The message attached to the event.
     """
 
-    def __init__(self, name: str, message: Optional[str] = None):
+    def __init__(self, name: str, message: str | None = None):
         self._skipped = False
         if not _get_events_file_path():
             self._skipped = True
@@ -82,7 +82,7 @@ class Event:
         self.end()
 
 
-def event(name_or_fn: Union[str, Callable], message: Optional[str] = None):
+def event(name_or_fn: str | Callable, message: str | None = None):
     return common_utils.make_decorator(Event, name_or_fn, message=message)
 
 

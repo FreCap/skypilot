@@ -15,7 +15,7 @@ from sky.provision.vsphere.common.vim_utils import get_obj_by_mo_id
 logger = sky_logging.init_logger(__name__)
 
 
-class ClsApiHelper(object):
+class ClsApiHelper:
     """Helper class to perform commonly used operations
     using Content Library API.
     """
@@ -58,7 +58,7 @@ class ClsApiHelper(object):
         # Create a local content library backed the VC datastore
         library_id = self.client.local_library_service.create(
             create_spec=create_spec, client_token=generate_random_uuid())
-        logger.info('Local library created, ID: {0}'.format(library_id))
+        logger.info(f'Local library created, ID: {library_id}')
 
         return library_id
 
@@ -77,7 +77,7 @@ class ClsApiHelper(object):
             item_type='iso',
         )
         assert library_item_id is not None
-        logger.info('Library item created id: {0}'.format(library_item_id))
+        logger.info(f'Library item created id: {library_item_id}')
 
         # Upload an iso file to above library item, use the filename as the
         # item_filename
@@ -85,8 +85,7 @@ class ClsApiHelper(object):
                                               disk_filename=iso_filename)
         self.upload_files(library_item_id=library_item_id,
                           files_map=iso_files_map)
-        logger.info(
-            'Uploaded iso file to library item {0}'.format(library_item_id))
+        logger.info(f'Uploaded iso file to library item {library_item_id}')
         return library_item_id
 
     def get_iso_file_map(self, item_filename, disk_filename):
@@ -181,7 +180,7 @@ class ClsApiHelper(object):
                                           local_file)
                 request.add_header('Cache-Control', 'no-cache')
                 request.add_header('Content-Length',
-                                   '{0}'.format(os.path.getsize(f_path)))
+                                   f'{os.path.getsize(f_path)}')
                 request.add_header('Content-Type', 'text/ovf')
                 if self.skip_verification and hasattr(
                         ssl, '_create_unverified_context'):
@@ -263,8 +262,8 @@ class ClsApiHelper(object):
             else:
                 time.sleep(sleep_interval)
         raise Exception(
-            'timed out after waiting {0} seconds for file {1} to reach'
-            ' a terminal state'.format(timeout, file_name))
+            f'timed out after waiting {timeout} seconds for file {file_name} to reach'
+            ' a terminal state')
 
     def get_item_id_by_name(self, name):
         """        Returns the identifier of the item with the given name.
@@ -280,9 +279,9 @@ class ClsApiHelper(object):
         item_ids = self.client.library_item_service.find(find_spec)
         item_id = item_ids[0] if item_ids else None
         if item_id:
-            logger.info('Library item ID: {0}'.format(item_id))
+            logger.info(f'Library item ID: {item_id}')
         else:
-            logger.info('Library item with name \'{0}\' not found'.format(name))
+            logger.info(f'Library item with name \'{name}\' not found')
         return item_id
 
     def deploy_ovf_template(self, vm_name, lib_item_id, ovf_summary,
@@ -314,13 +313,13 @@ class ClsApiHelper(object):
         # deployment result.
         if result.succeeded:
             logger.info(
-                'Deployment successful. Result resource: {0}, ID: {1}'.format(
-                    result.resource_id.type, result.resource_id.id))
+                f'Deployment successful. Result resource: {result.resource_id.type}, ID: {result.resource_id.id}'
+            )
             self.vm_id = result.resource_id.id
             error = result.error
             if error is not None:
                 for warning in error.warnings:
-                    logger.info('OVF warning: {}'.format(warning.message))
+                    logger.info(f'OVF warning: {warning.message}')
 
             # Power on the VM and wait  for the power on operation to be
             # completed
@@ -332,4 +331,4 @@ class ClsApiHelper(object):
         else:
             logger.info('Deployment failed.')
             for error in result.error.errors:
-                logger.info('OVF error: {}'.format(error.message))
+                logger.info(f'OVF error: {error.message}')

@@ -23,7 +23,7 @@ not held on the hot path (post-init reads short-circuit before the
 """
 import threading
 import typing
-from typing import Any, Dict, List, Optional, Protocol
+from typing import Any, Protocol
 
 from sky import sky_logging
 
@@ -47,15 +47,15 @@ class ServiceStatusRunner(Protocol):
         self,
         *,
         handle: 'backends.CloudVmRayResourceHandle',
-        service_names: Optional[List[str]],
+        service_names: list[str] | None,
         pool: bool,
         summary_only: bool = False,
-        include_target_num_replicas: Optional[bool] = None,
-    ) -> List[Dict[str, Any]]:
+        include_target_num_replicas: bool | None = None,
+    ) -> list[dict[str, Any]]:
         ...
 
 
-_current: Optional[ServiceStatusRunner] = None
+_current: ServiceStatusRunner | None = None
 _lock = threading.Lock()
 
 

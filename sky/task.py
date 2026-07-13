@@ -1,11 +1,12 @@
 """Task: a coarse-grained stage in an application."""
 import collections
+from collections.abc import Callable
+from collections.abc import Iterable
 import dataclasses
 import json
 import os
 import re
-from typing import (Any, Callable, Dict, Iterable, List, Optional, Set, Tuple,
-                    Union)
+from typing import Any, Union
 
 import colorama
 from pydantic import SecretStr
@@ -30,7 +31,7 @@ from sky.utils import yaml_utils
 
 logger = sky_logging.init_logger(__name__)
 
-_task_validators: List[Callable[['Task'], None]] = []
+_task_validators: list[Callable[['Task'], None]] = []
 
 
 def register_task_validator(fn: Callable[['Task'], None]) -> None:
@@ -54,7 +55,7 @@ _RUN_FN_CHECK_FAIL_MSG = (
     'a list of node ip addresses (List[str]). Got {run_sig}')
 
 
-def _is_valid_name(name: Optional[str]) -> bool:
+def _is_valid_name(name: str | None) -> bool:
     """Checks if the task name is valid.
 
     Valid is defined as either NoneType or str with ASCII characters which may
@@ -81,9 +82,9 @@ def _is_valid_name(name: Optional[str]) -> bool:
 
 
 def _fill_in_env_vars(
-    yaml_field: Dict[str, Any],
-    task_envs: Dict[str, str],
-) -> Dict[str, Any]:
+    yaml_field: dict[str, Any],
+    task_envs: dict[str, str],
+) -> dict[str, Any]:
     """Detects env vars in yaml field and fills them with task_envs.
 
     Use cases of env vars in file_mounts:
@@ -126,8 +127,8 @@ def _fill_in_env_vars(
     return json.loads(yaml_field_str)
 
 
-def _check_docker_login_config(task_envs: Dict[str, str],
-                               task_secrets: Dict[str, SecretStr]) -> bool:
+def _check_docker_login_config(task_envs: dict[str, str],
+                               task_secrets: dict[str, SecretStr]) -> bool:
     """Validates a valid docker login config in task_envs and task_secrets.
 
     Docker login variables must be specified together either in envs OR secrets,
@@ -185,11 +186,10 @@ def _check_docker_login_config(task_envs: Dict[str, str],
 
 
 def _with_docker_login_config(
-    resources: Union[Set['resources_lib.Resources'],
-                     List['resources_lib.Resources']],
-    task_envs: Dict[str, str],
-    task_secrets: Dict[str, SecretStr],
-) -> Union[Set['resources_lib.Resources'], List['resources_lib.Resources']]:
+    resources: set['resources_lib.Resources'] | list['resources_lib.Resources'],
+    task_envs: dict[str, str],
+    task_secrets: dict[str, SecretStr],
+) -> set['resources_lib.Resources'] | list['resources_lib.Resources']:
     if not _check_docker_login_config(task_envs, task_secrets):
         return resources
     envs = task_envs.copy()
@@ -224,11 +224,10 @@ def _with_docker_login_config(
 
 
 def _with_docker_username_for_runpod(
-    resources: Union[Set['resources_lib.Resources'],
-                     List['resources_lib.Resources']],
-    task_envs: Dict[str, str],
-    task_secrets: Dict[str, SecretStr],
-) -> Union[Set['resources_lib.Resources'], List['resources_lib.Resources']]:
+    resources: set['resources_lib.Resources'] | list['resources_lib.Resources'],
+    task_envs: dict[str, str],
+    task_secrets: dict[str, SecretStr],
+) -> set['resources_lib.Resources'] | list['resources_lib.Resources']:
     envs = task_envs.copy()
     for key, value in task_secrets.items():
         envs[key] = value.get_secret_value()
@@ -245,14 +244,14 @@ def _with_docker_username_for_runpod(
 
 
 def get_plaintext_envs_and_secrets(
-    envs_and_secrets: Dict[str, Union[str, SecretStr]],) -> Dict[str, str]:
+    envs_and_secrets: dict[str, str | SecretStr],) -> dict[str, str]:
     return {
         k: v.get_secret_value() if isinstance(v, SecretStr) else v
         for k, v in envs_and_secrets.items()
     }
 
 
-def get_plaintext_secrets(secrets: Dict[str, SecretStr]) -> Dict[str, str]:
+def get_plaintext_secrets(secrets: dict[str, SecretStr]) -> dict[str, str]:
     return {k: v.get_secret_value() for k, v in secrets.items()}
 
 
@@ -283,11 +282,11 @@ def _parse_secret_name(raw_name: str):
 class ManagedSecretRef:
     """A reference to a secret in task YAML."""
     name: str
-    mount_path: Optional[str] = None
-    scope_override: Optional[str] = None  # 'personal', 'workspace', or 'global'
+    mount_path: str | None = None
+    scope_override: str | None = None  # 'personal', 'workspace', or 'global'
 
 
-def redact_task_yaml_dict(task_yaml: Dict[str, Any]) -> None:
+def redact_task_yaml_dict(task_yaml: dict[str, Any]) -> None:
     """Redact secrets and credentials from a parsed task YAML config dict.
 
     Modifies task_yaml in-place. Secret refs (secrets: prefix) in array
@@ -316,30 +315,30 @@ class Task:
 
     def __init__(
         self,
-        name: Optional[str] = None,
+        name: str | None = None,
         *,
-        setup: Optional[Union[str, List[str]]] = None,
-        run: Optional[Union[str, List[str]]] = None,
-        envs: Optional[Dict[str, str]] = None,
-        secrets: Optional[Dict[str, str]] = None,
-        workdir: Optional[Union[str, Dict[str, Any]]] = None,
-        num_nodes: Optional[int] = None,
-        file_mounts: Optional[Dict[str, str]] = None,
-        storage_mounts: Optional[Dict[str, storage_lib.Storage]] = None,
-        volumes: Optional[Dict[str, Union[str, Dict[str, Any]]]] = None,
-        resources: Optional[Union['resources_lib.Resources',
-                                  List['resources_lib.Resources'],
-                                  Set['resources_lib.Resources']]] = None,
+        setup: str | list[str] | None = None,
+        run: str | list[str] | None = None,
+        envs: dict[str, str] | None = None,
+        secrets: dict[str, str] | None = None,
+        workdir: str | dict[str, Any] | None = None,
+        num_nodes: int | None = None,
+        file_mounts: dict[str, str] | None = None,
+        storage_mounts: dict[str, storage_lib.Storage] | None = None,
+        volumes: dict[str, str | dict[str, Any]] | None = None,
+        resources: Union['resources_lib.Resources',
+                         list['resources_lib.Resources'],
+                         set['resources_lib.Resources']] | None = None,
         # Advanced:
-        docker_image: Optional[str] = None,
-        event_callback: Optional[str] = None,
-        blocked_resources: Optional[Iterable['resources_lib.Resources']] = None,
+        docker_image: str | None = None,
+        event_callback: str | None = None,
+        blocked_resources: Iterable['resources_lib.Resources'] | None = None,
         # Internal use only.
         api_server_access: bool = True,
-        _file_mounts_mapping: Optional[Dict[str, str]] = None,
-        _volume_mounts: Optional[List[volume_lib.VolumeMount]] = None,
-        _metadata: Optional[Dict[str, Any]] = None,
-        _user_specified_yaml: Optional[str] = None,
+        _file_mounts_mapping: dict[str, str] | None = None,
+        _volume_mounts: list[volume_lib.VolumeMount] | None = None,
+        _metadata: dict[str, Any] | None = None,
+        _user_specified_yaml: str | None = None,
     ):
         """Initializes a Task.
 
@@ -432,19 +431,19 @@ class Task:
             YAML config.
         """
         self.name = name
-        self.storage_mounts: Dict[str, storage_lib.Storage] = {}
-        self.storage_plans: Dict[storage_lib.Storage,
+        self.storage_mounts: dict[str, storage_lib.Storage] = {}
+        self.storage_plans: dict[storage_lib.Storage,
                                  storage_lib.StoreType] = {}
         self._envs = envs or {}
         self._secrets = {}
         if secrets is not None:
             self._secrets = {k: SecretStr(v) for k, v in secrets.items()}
         self._volumes = volumes or {}
-        self._managed_secret_refs: List[ManagedSecretRef] = []
+        self._managed_secret_refs: list[ManagedSecretRef] = []
         self._api_server_access = api_server_access
 
         # concatenate commands if given as list
-        def _concat(commands: Optional[Union[str, List[str]]]) -> Optional[str]:
+        def _concat(commands: str | list[str] | None) -> str | None:
             if isinstance(commands, list):
                 return '\n'.join(commands)
             return commands
@@ -464,40 +463,37 @@ class Task:
         # Ignore type error due to a mypy bug.
         # https://github.com/python/mypy/issues/3004
         self._num_nodes = 1
-        self.num_nodes = num_nodes  # type: ignore
+        self.num_nodes = num_nodes
 
-        self.inputs: Optional[str] = None
-        self.outputs: Optional[str] = None
-        self.estimated_inputs_size_gigabytes: Optional[float] = None
-        self.estimated_outputs_size_gigabytes: Optional[float] = None
+        self.inputs: str | None = None
+        self.outputs: str | None = None
+        self.estimated_inputs_size_gigabytes: float | None = None
+        self.estimated_outputs_size_gigabytes: float | None = None
         # Default to CPU VM
-        self.resources: Union[List['resources_lib.Resources'],
-                              Set['resources_lib.Resources']] = {
-                                  resources_lib.Resources()
-                              }
-        self._service: Optional[service_spec.SkyServiceSpec] = None
+        self.resources: list[resources_lib.Resources] | set[
+            resources_lib.Resources] = {resources_lib.Resources()}
+        self._service: service_spec.SkyServiceSpec | None = None
 
         # Resources that this task cannot run on.
         self.blocked_resources = blocked_resources
 
-        self.time_estimator_func: Optional[Callable[['resources_lib.Resources'],
-                                                    int]] = None
-        self.file_mounts: Optional[Dict[str, str]] = None
+        self.time_estimator_func: Callable[[resources_lib.Resources],
+                                           int] | None = None
+        self.file_mounts: dict[str, str] | None = None
 
         # Only set when 'self' is a jobs controller task: 'self.managed_job_dag'
         # is the underlying managed job dag (sky.Dag object).
-        self.managed_job_dag: Optional['dag_lib.Dag'] = None
+        self.managed_job_dag: dag_lib.Dag | None = None
 
         # Only set when 'self' is a sky serve controller task.
-        self.service_name: Optional[str] = None
+        self.service_name: str | None = None
 
         # Filled in by the optimizer.  If None, this Task is not planned.
-        self.best_resources: Optional['resources_lib.Resources'] = None
+        self.best_resources: resources_lib.Resources | None = None
 
         # For internal use only.
-        self.file_mounts_mapping: Optional[Dict[str,
-                                                str]] = _file_mounts_mapping
-        self.volume_mounts: Optional[List[volume_lib.VolumeMount]] = (
+        self.file_mounts_mapping: dict[str, str] | None = _file_mounts_mapping
+        self.volume_mounts: list[volume_lib.VolumeMount] | None = (
             _volume_mounts)
 
         self._metadata = _metadata if _metadata is not None else {}
@@ -643,9 +639,9 @@ class Task:
 
     @staticmethod
     def from_yaml_config(
-        config: Dict[str, Any],
-        env_overrides: Optional[List[Tuple[str, str]]] = None,
-        secrets_overrides: Optional[List[Tuple[str, str]]] = None,
+        config: dict[str, Any],
+        env_overrides: list[tuple[str, str]] | None = None,
+        secrets_overrides: list[tuple[str, str]] | None = None,
     ) -> 'Task':
         user_specified_yaml = config.pop('_user_specified_yaml',
                                          yaml_utils.dump_yaml_str(config))
@@ -654,7 +650,7 @@ class Task:
         # as int causing validate_schema() to fail.
         envs = config.get('envs')
         if envs is not None and isinstance(envs, dict):
-            new_envs: Dict[str, Optional[str]] = {}
+            new_envs: dict[str, str | None] = {}
             for k, v in envs.items():
                 if v is not None:
                     new_envs[str(k)] = str(v)
@@ -667,7 +663,7 @@ class Task:
         # parsed as int causing validate_schema() to fail.
         secrets = config.get('secrets')
         if secrets is not None and isinstance(secrets, dict):
-            new_secrets: Dict[str, Optional[str]] = {}
+            new_secrets: dict[str, str | None] = {}
             for k, v in secrets.items():
                 if v is not None:
                     new_secrets[str(k)] = str(v)
@@ -695,7 +691,7 @@ class Task:
             existing = config.get('secrets')
             if isinstance(existing, list):
                 # Convert list form to dict to merge CLI overrides
-                merged: Dict[str, Optional[str]] = {}
+                merged: dict[str, str | None] = {}
                 for item in existing:
                     merged[str(item)] = None
                 merged.update(secrets_overrides)
@@ -872,7 +868,7 @@ class Task:
                                          f'{dst_path}:{src}')
             task.set_file_mounts(copy_mounts)
 
-        task_storage_mounts: Dict[str, storage_lib.Storage] = {}
+        task_storage_mounts: dict[str, storage_lib.Storage] = {}
         all_storages = fm_storages
         for storage in all_storages:
             mount_path = storage[0]
@@ -1000,7 +996,7 @@ class Task:
           ValueError: if the path gets loaded into a str instead of a dict; or
             if there are any other parsing errors.
         """
-        with open(os.path.expanduser(yaml_path), 'r', encoding='utf-8') as f:
+        with open(os.path.expanduser(yaml_path), encoding='utf-8') as f:
             user_specified_yaml = f.read()
             return Task.from_yaml_str(user_specified_yaml)
 
@@ -1042,7 +1038,7 @@ class Task:
             return None
         if not self._volumes:
             return None
-        volume_mounts: List[volume_lib.VolumeMount] = []
+        volume_mounts: list[volume_lib.VolumeMount] = []
         for dst_path, vol in self._volumes.items():
             self._validate_mount_path(dst_path, location='volumes')
             self._validate_mount_dest_is_absolute(dst_path, location='volumes')
@@ -1083,7 +1079,7 @@ class Task:
         # TODO(aylei): generalize access mode to all volume types
         # Record the required topology and the volume that requires it, e.g.
         # {'cloud': ('volume_name', 'aws')}
-        topology: Dict[str, Tuple[str, Optional[str]]] = {
+        topology: dict[str, tuple[str, str | None]] = {
             'cloud': ('', None),
             'region': ('', None),
             'zone': ('', None),
@@ -1143,7 +1139,7 @@ class Task:
         return self._num_nodes
 
     @num_nodes.setter
-    def num_nodes(self, num_nodes: Optional[int]) -> None:
+    def num_nodes(self, num_nodes: int | None) -> None:
         if num_nodes is None:
             num_nodes = 1
         if not isinstance(num_nodes, int) or num_nodes <= 0:
@@ -1153,7 +1149,7 @@ class Task:
         self._num_nodes = num_nodes
 
     @property
-    def metadata(self) -> Dict[str, Any]:
+    def metadata(self) -> dict[str, Any]:
         return self._metadata
 
     @property
@@ -1161,15 +1157,15 @@ class Task:
         return json.dumps(self._metadata)
 
     @property
-    def envs(self) -> Dict[str, str]:
+    def envs(self) -> dict[str, str]:
         return self._envs
 
     @property
-    def secrets(self) -> Dict[str, SecretStr]:
+    def secrets(self) -> dict[str, SecretStr]:
         return self._secrets
 
     @property
-    def managed_secret_refs(self) -> List['ManagedSecretRef']:
+    def managed_secret_refs(self) -> list['ManagedSecretRef']:
         return self._managed_secret_refs
 
     @property
@@ -1177,11 +1173,10 @@ class Task:
         return self._api_server_access
 
     @property
-    def volumes(self) -> Dict[str, Union[str, Dict[str, Any]]]:
+    def volumes(self) -> dict[str, str | dict[str, Any]]:
         return self._volumes
 
-    def set_volumes(self, volumes: Dict[str, Union[str, Dict[str,
-                                                             Any]]]) -> None:
+    def set_volumes(self, volumes: dict[str, str | dict[str, Any]]) -> None:
         """Sets the volumes for this task.
 
         Args:
@@ -1191,14 +1186,13 @@ class Task:
         """
         self._volumes = volumes
 
-    def update_volumes(self, volumes: Dict[str, Union[str, Dict[str,
-                                                                Any]]]) -> None:
+    def update_volumes(self, volumes: dict[str, str | dict[str, Any]]) -> None:
         """Updates the volumes for this task."""
         self._volumes.update(volumes)
 
     def update_envs(
-            self, envs: Union[None, List[Tuple[str, str]],
-                              Dict[str, str]]) -> 'Task':
+            self,
+            envs: None | list[tuple[str, str]] | dict[str, str]) -> 'Task':
         """Updates environment variables for use inside the setup/run commands.
 
         Args:
@@ -1245,8 +1239,8 @@ class Task:
         return self
 
     def update_secrets(
-            self, secrets: Union[None, List[Tuple[str, str]],
-                                 Dict[str, str]]) -> 'Task':
+            self,
+            secrets: None | list[tuple[str, str]] | dict[str, str]) -> 'Task':
         """Updates secret env vars for use inside the setup/run commands.
 
         Args:
@@ -1296,7 +1290,7 @@ class Task:
         return any(r.use_spot for r in self.resources)
 
     @property
-    def envs_and_secrets(self) -> Dict[str, Union[str, SecretStr]]:
+    def envs_and_secrets(self) -> dict[str, str | SecretStr]:
         envs = self.envs.copy()
         envs.update(self.secrets)
         return envs
@@ -1308,10 +1302,10 @@ class Task:
         self.estimated_inputs_size_gigabytes = estimated_size_gigabytes
         return self
 
-    def get_inputs(self) -> Optional[str]:
+    def get_inputs(self) -> str | None:
         return self.inputs
 
-    def get_estimated_inputs_size_gigabytes(self) -> Optional[float]:
+    def get_estimated_inputs_size_gigabytes(self) -> float | None:
         return self.estimated_inputs_size_gigabytes
 
     def get_inputs_cloud(self):
@@ -1333,16 +1327,16 @@ class Task:
         self.estimated_outputs_size_gigabytes = estimated_size_gigabytes
         return self
 
-    def get_outputs(self) -> Optional[str]:
+    def get_outputs(self) -> str | None:
         return self.outputs
 
-    def get_estimated_outputs_size_gigabytes(self) -> Optional[float]:
+    def get_estimated_outputs_size_gigabytes(self) -> float | None:
         return self.estimated_outputs_size_gigabytes
 
     @staticmethod
     def _ensure_consistent_priority(
-        resources: Union[List['resources_lib.Resources'],
-                         Set['resources_lib.Resources']]
+        resources: list['resources_lib.Resources'] |
+        set['resources_lib.Resources']
     ) -> None:
         priority = None
         for r in resources:
@@ -1357,8 +1351,8 @@ class Task:
 
     def set_resources(
         self, resources: Union['resources_lib.Resources',
-                               List['resources_lib.Resources'],
-                               Set['resources_lib.Resources'], Dict[str, Any]]
+                               list['resources_lib.Resources'],
+                               set['resources_lib.Resources'], dict[str, Any]]
     ) -> 'Task':
         """Sets the required resources to execute this task.
 
@@ -1393,7 +1387,7 @@ class Task:
 
         return self
 
-    def set_resources_override(self, override_params: Dict[str, Any]) -> 'Task':
+    def set_resources_override(self, override_params: dict[str, Any]) -> 'Task':
         """Sets the override parameters for the resources."""
         new_resources_list = []
         for res in list(self.resources):
@@ -1403,16 +1397,16 @@ class Task:
         self.set_resources(type(self.resources)(new_resources_list))
         return self
 
-    def get_resource_config(self) -> Dict[str, Any]:
+    def get_resource_config(self) -> dict[str, Any]:
         return _resources_to_config(self.resources,
                                     factor_out_common_fields=True)
 
     @property
-    def service(self) -> Optional[service_spec.SkyServiceSpec]:
+    def service(self) -> service_spec.SkyServiceSpec | None:
         return self._service
 
     def set_service(self,
-                    service: Optional[service_spec.SkyServiceSpec]) -> 'Task':
+                    service: service_spec.SkyServiceSpec | None) -> 'Task':
         """Sets the service spec for this task.
 
         Args:
@@ -1444,7 +1438,7 @@ class Task:
                 'call set_time_estimator() first')
         return self.time_estimator_func(resources)
 
-    def set_file_mounts(self, file_mounts: Optional[Dict[str, str]]) -> 'Task':
+    def set_file_mounts(self, file_mounts: dict[str, str] | None) -> 'Task':
         """Sets the file mounts for this task.
 
         Useful for syncing datasets, dotfiles, etc.
@@ -1476,7 +1470,7 @@ class Task:
         self.file_mounts = file_mounts
         return self
 
-    def update_file_mounts(self, file_mounts: Dict[str, str]) -> 'Task':
+    def update_file_mounts(self, file_mounts: dict[str, str]) -> 'Task':
         """Updates the file mounts for this task.
 
         Different from set_file_mounts(), this function updates into the
@@ -1513,7 +1507,7 @@ class Task:
 
     def set_storage_mounts(
         self,
-        storage_mounts: Optional[Dict[str, storage_lib.Storage]],
+        storage_mounts: dict[str, storage_lib.Storage] | None,
     ) -> 'Task':
         """Sets the storage mounts for this task.
 
@@ -1579,7 +1573,7 @@ class Task:
         return self
 
     def update_storage_mounts(
-            self, storage_mounts: Dict[str, storage_lib.Storage]) -> 'Task':
+            self, storage_mounts: dict[str, storage_lib.Storage]) -> 'Task':
         """Updates the storage mounts for this task.
 
         Different from set_storage_mounts(), this function updates into the
@@ -1605,8 +1599,7 @@ class Task:
         task_storage_mounts.update(storage_mounts)
         return self.set_storage_mounts(task_storage_mounts)
 
-    def _get_preferred_store(
-            self) -> Tuple[storage_lib.StoreType, Optional[str]]:
+    def _get_preferred_store(self) -> tuple[storage_lib.StoreType, str | None]:
         """Returns the preferred store type and region for this task."""
         # TODO(zhwu, romilb): The optimizer should look at the source and
         #  destination to figure out the right stores to use. For now, we
@@ -1652,7 +1645,7 @@ class Task:
 
     def sync_storage_mounts(
         self,
-        on_storage_plan_prepared: Optional[Callable[['Task'], None]] = None,
+        on_storage_plan_prepared: Callable[['Task'], None] | None = None,
     ) -> None:
         """(INTERNAL) Eagerly syncs storage mounts to cloud storage.
 
@@ -1861,7 +1854,7 @@ class Task:
                 # _maybe_translate_local_file_mounts_and_sync_up(), which still
                 # needs the storage, but not the file_mounts.
 
-    def get_local_to_remote_file_mounts(self) -> Optional[Dict[str, str]]:
+    def get_local_to_remote_file_mounts(self) -> dict[str, str] | None:
         """Returns file mounts of the form (dst=VM path, src=local path).
 
         Any cloud object store URIs (gs://, s3://, etc.), either as source or
@@ -1882,7 +1875,7 @@ class Task:
         """Returns whether this task is a jobs/serve controller process."""
         return self.managed_job_dag is not None or self.service_name is not None
 
-    def get_cloud_to_remote_file_mounts(self) -> Optional[Dict[str, str]]:
+    def get_cloud_to_remote_file_mounts(self) -> dict[str, str] | None:
         """Returns file mounts of the form (dst=VM path, src=cloud URL).
 
         Local-to-remote file mounts are excluded (handled by
@@ -1899,8 +1892,8 @@ class Task:
                 d[k] = v
         return d
 
-    def update_workdir(self, workdir: Optional[str], git_url: Optional[str],
-                       git_ref: Optional[str]) -> 'Task':
+    def update_workdir(self, workdir: str | None, git_url: str | None,
+                       git_ref: str | None) -> 'Task':
         """Updates the task workdir.
 
         Args:
@@ -1963,7 +1956,7 @@ class Task:
         return self
 
     def to_yaml_config(self,
-                       use_user_specified_yaml: bool = False) -> Dict[str, Any]:
+                       use_user_specified_yaml: bool = False) -> dict[str, Any]:
         """Returns a yaml-style dict representation of the task.
 
         INTERNAL: this method is internal-facing.
@@ -1976,7 +1969,7 @@ class Task:
             return config
         return self._to_yaml_config()
 
-    def _to_yaml_config(self, redact_secrets: bool = False) -> Dict[str, Any]:
+    def _to_yaml_config(self, redact_secrets: bool = False) -> dict[str, Any]:
         config = {}
 
         def add_if_not_none(key, value, no_empty: bool = False):
@@ -1999,7 +1992,7 @@ class Task:
         # under ``config.hooks`` so round-trips through to_yaml/from_yaml
         # don't trip the rejection that catches a misplaced
         # ``resources.hooks`` in user YAML.
-        task_hooks: Optional[List[Dict[str, Any]]] = None
+        task_hooks: list[dict[str, Any]] | None = None
         for r in self.resources:
             if r.hooks:
                 task_hooks = [dict(h) for h in r.hooks]
@@ -2050,9 +2043,7 @@ class Task:
             }
             if inline:
                 if not redact_secrets:
-                    inline = {
-                        k: v.get_secret_value() for k, v in inline.items()
-                    }
+                    inline = {k: v.get_secret_value() for k, v in inline.items()}
                 else:
                     inline = {k: '<redacted>' for k in inline}
                 config['secrets'] = inline
@@ -2115,7 +2106,7 @@ class Task:
         return config
 
     def get_required_cloud_features(
-            self) -> Set[clouds.CloudImplementationFeatures]:
+            self) -> set[clouds.CloudImplementationFeatures]:
         """Returns the required features for this task (but not for resources).
 
         Features required by the resources are checked separately in
@@ -2181,12 +2172,12 @@ class Task:
         return s
 
 
-def _resources_to_config(resources: Union[List['resources_lib.Resources'],
-                                          Set['resources_lib.Resources']],
+def _resources_to_config(resources: list['resources_lib.Resources'] |
+                         set['resources_lib.Resources'],
                          factor_out_common_fields: bool = False,
-                         redact_secrets: bool = False) -> Dict[str, Any]:
+                         redact_secrets: bool = False) -> dict[str, Any]:
     if len(resources) > 1:
-        resource_list: List[Dict[str, Union[str, int]]] = []
+        resource_list: list[dict[str, str | int]] = []
         for r in resources:
             resource_list.append(
                 r.to_yaml_config(redact_secrets=redact_secrets))
@@ -2198,11 +2189,10 @@ def _resources_to_config(resources: Union[List['resources_lib.Resources'],
         return list(resources)[0].to_yaml_config(redact_secrets=redact_secrets)
 
 
-def _factor_out_common_resource_fields(configs: List[Dict[str, Union[str,
-                                                                     int]]],
-                                       group_key: str) -> Dict[str, Any]:
+def _factor_out_common_resource_fields(configs: list[dict[str, str | int]],
+                                       group_key: str) -> dict[str, Any]:
     """Factors out the fields that are common to all resources."""
-    return_config: Dict[str, Any] = configs[0].copy()
+    return_config: dict[str, Any] = configs[0].copy()
     if len(configs) > 1:
         for config in configs[1:]:
             for key, value in config.items():

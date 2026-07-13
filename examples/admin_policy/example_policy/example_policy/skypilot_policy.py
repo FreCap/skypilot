@@ -331,8 +331,8 @@ class RateLimitLaunchPolicy(sky.AdminPolicy):
     def validate_and_mutate(
             cls, user_request: sky.UserRequest) -> sky.MutatedUserRequest:
         """Rate limit cluster launch requests."""
-        if (user_request.at_client_side or user_request.request_name !=
-                sky.AdminPolicyRequestName.CLUSTER_LAUNCH):
+        if (user_request.at_client_side or user_request.request_name
+                != sky.AdminPolicyRequestName.CLUSTER_LAUNCH):
             return sky.MutatedUserRequest(
                 task=user_request.task,
                 skypilot_config=user_request.skypilot_config)
@@ -442,8 +442,8 @@ class GPUStaticQuotaPolicy(sky.AdminPolicy):
 
         # If the request is at client side or not a cluster launch request,
         # do not enforce GPU quota.
-        if (user_request.at_client_side or user_request.request_name !=
-                sky.AdminPolicyRequestName.CLUSTER_LAUNCH):
+        if (user_request.at_client_side or user_request.request_name
+                != sky.AdminPolicyRequestName.CLUSTER_LAUNCH):
             return sky.MutatedUserRequest(
                 task=user_request.task,
                 skypilot_config=user_request.skypilot_config)
@@ -675,8 +675,8 @@ class SlurmFilesystemRoutingPolicy(sky.AdminPolicy):
     def validate_and_mutate(
             cls, user_request: sky.UserRequest) -> sky.MutatedUserRequest:
         """Narrows slurm.allowed_clusters to those with all required paths."""
-        if (user_request.at_client_side or user_request.request_name !=
-                sky.AdminPolicyRequestName.OPTIMIZE):
+        if (user_request.at_client_side or user_request.request_name
+                != sky.AdminPolicyRequestName.OPTIMIZE):
             return sky.MutatedUserRequest(user_request.task,
                                           user_request.skypilot_config)
 

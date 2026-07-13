@@ -1,11 +1,12 @@
 """Slurm instance provisioning."""
 
+from collections.abc import Callable
 import os
 import shlex
 import tempfile
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any
 
 import colorama
 
@@ -56,7 +57,7 @@ _SBATCH_PROTECTED_OPTIONS = frozenset({
 })
 
 
-def _build_custom_sbatch_directives(sbatch_options: Dict[str, Any]) -> str:
+def _build_custom_sbatch_directives(sbatch_options: dict[str, Any]) -> str:
     """Build #SBATCH directive lines from user-supplied sbatch_options.
 
     Args:
@@ -109,7 +110,7 @@ def _build_custom_sbatch_directives(sbatch_options: Dict[str, Any]) -> str:
     return '\n' + '\n'.join(lines)
 
 
-def _compute_time_directive(sbatch_options: Dict[str, Any],
+def _compute_time_directive(sbatch_options: dict[str, Any],
                             partition_info: 'slurm.SlurmPartition',
                             partition: str) -> str:
     """Compute the auto-generated ``#SBATCH --time=...`` directive.
@@ -159,7 +160,7 @@ def _compute_time_directive(sbatch_options: Dict[str, Any],
     return ''
 
 
-def _build_sbatch_directives(sbatch_options: Dict[str, Any],
+def _build_sbatch_directives(sbatch_options: dict[str, Any],
                              partition_info: 'slurm.SlurmPartition',
                              partition: str) -> str:
     """Combine auto-generated and user-supplied ``#SBATCH`` directives.
@@ -182,7 +183,7 @@ def _wait_for_job_nodes(
     job_id: str,
     timeout: int,
     partition: str,
-    on_pending: Callable[[str, Optional[str], Optional[int]], None],
+    on_pending: Callable[[str, str | None, int | None], None],
 ) -> None:
     """Wait for a Slurm job to have nodes allocated.
 
@@ -217,7 +218,7 @@ def _wait_for_job_nodes(
         if state in ('PENDING', 'CONFIGURING') and on_pending is not None:
             try:
                 reason = client.get_job_reason(job_id)
-                pending_count: Optional[int] = None
+                pending_count: int | None = None
                 if partition is not None:
                     pending_count = client.get_pending_job_count(
                         partition, exclude_job_id=job_id)
@@ -256,7 +257,7 @@ def _sbatch_provision_script_path(base_dir: str,
                         f'{cluster_name_on_cloud}.sh')
 
 
-def _skypilot_runtime_dir(tmpdir: Optional[str],
+def _skypilot_runtime_dir(tmpdir: str | None,
                           cluster_name_on_cloud: str) -> str:
     """Returns the SkyPilot runtime directory path on the Slurm cluster."""
     tmp = tmpdir if tmpdir is not None else '/tmp'
@@ -388,8 +389,8 @@ def _create_virtual_instance(
     num_nodes = config.count
     last_status_msg = None
 
-    def _on_pending(state: str, reason: Optional[str],
-                    pending_count: Optional[int]) -> None:
+    def _on_pending(state: str, reason: str | None,
+                    pending_count: int | None) -> None:
         nonlocal last_status_msg
         del state  # unused
         parts = []
@@ -772,10 +773,10 @@ touch {sky_cluster_home_dir}/.hushlogin
 def query_instances(
     cluster_name: str,
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     non_terminated_only: bool = True,
     retry_if_missing: bool = False,
-) -> Dict[str, Tuple[Optional[status_lib.ClusterStatus], Optional[str]]]:
+) -> dict[str, tuple[status_lib.ClusterStatus | None, str | None]]:
     """See sky/provision/__init__.py"""
     del cluster_name, retry_if_missing  # Unused for Slurm
     assert provider_config is not None, (cluster_name_on_cloud, provider_config)
@@ -816,8 +817,7 @@ def query_instances(
         'node_fail': None,
     }
 
-    statuses: Dict[str, Tuple[Optional[status_lib.ClusterStatus],
-                              Optional[str]]] = {}
+    statuses: dict[str, tuple[status_lib.ClusterStatus | None, str | None]] = {}
     for state, sky_status in status_map.items():
         jobs = client.query_jobs(
             cluster_name_on_cloud,
@@ -860,7 +860,7 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
 
 
 def wait_instances(region: str, cluster_name_on_cloud: str,
-                   state: Optional[status_lib.ClusterStatus]) -> None:
+                   state: status_lib.ClusterStatus | None) -> None:
     """See sky/provision/__init__.py"""
     del region, cluster_name_on_cloud, state
     # We already wait for the instances to be running in run_instances.
@@ -870,7 +870,7 @@ def wait_instances(region: str, cluster_name_on_cloud: str,
 def get_cluster_info(
         region: str,
         cluster_name_on_cloud: str,
-        provider_config: Optional[Dict[str, Any]] = None) -> common.ClusterInfo:
+        provider_config: dict[str, Any] | None = None) -> common.ClusterInfo:
     del region
     assert provider_config is not None, cluster_name_on_cloud
 
@@ -946,7 +946,7 @@ def get_cluster_info(
 
 def stop_instances(
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     worker_only: bool = False,
 ) -> None:
     """Keep the Slurm virtual instances running."""
@@ -955,7 +955,7 @@ def stop_instances(
 
 def terminate_instances(
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     worker_only: bool = False,
 ) -> None:
     """See sky/provision/__init__.py"""
@@ -1052,8 +1052,8 @@ def terminate_instances(
 
 def open_ports(
     cluster_name_on_cloud: str,
-    ports: List[str],
-    provider_config: Optional[Dict[str, Any]] = None,
+    ports: list[str],
+    provider_config: dict[str, Any] | None = None,
 ) -> None:
     """See sky/provision/__init__.py"""
     del cluster_name_on_cloud, ports, provider_config
@@ -1062,8 +1062,8 @@ def open_ports(
 
 def cleanup_ports(
     cluster_name_on_cloud: str,
-    ports: List[str],
-    provider_config: Optional[Dict[str, Any]] = None,
+    ports: list[str],
+    provider_config: dict[str, Any] | None = None,
 ) -> None:
     """See sky/provision/__init__.py"""
     del cluster_name_on_cloud, ports, provider_config
@@ -1076,16 +1076,16 @@ def cleanup_ports(
 # allocation are stable for the lifetime of the job, so a short TTL only
 # delays visibility of a re-provisioned allocation.
 _QUERY_PORTS_CACHE_TTL_SECONDS = 60
-_query_ports_cache: Dict[str, Tuple[float, str]] = {}
+_query_ports_cache: dict[str, tuple[float, str]] = {}
 _query_ports_cache_lock = threading.Lock()
 
 
 def query_ports(
     cluster_name_on_cloud: str,
-    ports: List[str],
-    head_ip: Optional[str] = None,
-    provider_config: Optional[Dict[str, Any]] = None,
-) -> Dict[int, List[common.Endpoint]]:
+    ports: list[str],
+    head_ip: str | None = None,
+    provider_config: dict[str, Any] | None = None,
+) -> dict[int, list[common.Endpoint]]:
     """See sky/provision/__init__.py
 
     The head_ip recorded for Slurm clusters is the login node (the SSH
@@ -1137,8 +1137,8 @@ def _build_pyxis_args(cluster_name_on_cloud: str) -> str:
 
 def get_command_runners(
     cluster_info: common.ClusterInfo,
-    **credentials: Dict[str, Any],
-) -> List[command_runner.SlurmCommandRunner]:
+    **credentials: dict[str, Any],
+) -> list[command_runner.SlurmCommandRunner]:
     """Get a command runner for the given cluster."""
     # For Slurm, we use the login node credentials from provider_config['ssh']
     # instead of `credentials` which is for ssh'ing to the SkyPilot cluster.

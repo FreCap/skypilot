@@ -1,5 +1,5 @@
 """Kubernetes network provisioning."""
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from sky import sky_logging
 from sky.adaptors import kubernetes
@@ -18,8 +18,8 @@ _LOADBALANCER_SERVICE_NAME = '{cluster_name_on_cloud}--skypilot-lb'
 
 def open_ports(
     cluster_name_on_cloud: str,
-    ports: List[str],
-    provider_config: Optional[Dict[str, Any]] = None,
+    ports: list[str],
+    provider_config: dict[str, Any] | None = None,
 ) -> None:
     """See sky/provision/__init__.py"""
     assert provider_config is not None, 'provider_config is required'
@@ -43,8 +43,8 @@ def open_ports(
 
 def _open_ports_using_loadbalancer(
     cluster_name_on_cloud: str,
-    ports: List[int],
-    provider_config: Dict[str, Any],
+    ports: list[int],
+    provider_config: dict[str, Any],
 ) -> None:
     service_name = _LOADBALANCER_SERVICE_NAME.format(
         cluster_name_on_cloud=cluster_name_on_cloud)
@@ -76,8 +76,8 @@ def _open_ports_using_loadbalancer(
 
 def _open_ports_using_ingress(
     cluster_name_on_cloud: str,
-    ports: List[int],
-    provider_config: Dict[str, Any],
+    ports: list[int],
+    provider_config: dict[str, Any],
 ) -> None:
     context = kubernetes_utils.get_context_from_config(provider_config)
     namespace = kubernetes_utils.get_namespace_from_config(provider_config)
@@ -148,8 +148,8 @@ def _open_ports_using_ingress(
 
 def cleanup_ports(
     cluster_name_on_cloud: str,
-    ports: List[str],
-    provider_config: Optional[Dict[str, Any]] = None,
+    ports: list[str],
+    provider_config: dict[str, Any] | None = None,
 ) -> None:
     """See sky/provision/__init__.py"""
     assert provider_config is not None, 'provider_config is required'
@@ -172,7 +172,7 @@ def cleanup_ports(
 
 def _cleanup_ports_for_loadbalancer(
     cluster_name_on_cloud: str,
-    provider_config: Dict[str, Any],
+    provider_config: dict[str, Any],
 ) -> None:
     service_name = _LOADBALANCER_SERVICE_NAME.format(
         cluster_name_on_cloud=cluster_name_on_cloud)
@@ -189,8 +189,8 @@ def _cleanup_ports_for_loadbalancer(
 
 def _cleanup_ports_for_ingress(
     cluster_name_on_cloud: str,
-    ports: List[int],
-    provider_config: Dict[str, Any],
+    ports: list[int],
+    provider_config: dict[str, Any],
 ) -> None:
     # Delete services for each port
     context = provider_config.get(
@@ -215,10 +215,10 @@ def _cleanup_ports_for_ingress(
 
 def query_ports(
     cluster_name_on_cloud: str,
-    ports: List[str],
-    head_ip: Optional[str] = None,
-    provider_config: Optional[Dict[str, Any]] = None,
-) -> Dict[int, List[common.Endpoint]]:
+    ports: list[str],
+    head_ip: str | None = None,
+    provider_config: dict[str, Any] | None = None,
+) -> dict[int, list[common.Endpoint]]:
     """See sky/provision/__init__.py"""
     del head_ip  # unused
     assert provider_config is not None, 'provider_config is required'
@@ -256,11 +256,11 @@ def query_ports(
 
 def _query_ports_for_loadbalancer(
     cluster_name_on_cloud: str,
-    ports: List[int],
-    provider_config: Dict[str, Any],
-) -> Dict[int, List[common.Endpoint]]:
+    ports: list[int],
+    provider_config: dict[str, Any],
+) -> dict[int, list[common.Endpoint]]:
     logger.debug(f'Getting loadbalancer IP for cluster {cluster_name_on_cloud}')
-    result: Dict[int, List[common.Endpoint]] = {}
+    result: dict[int, list[common.Endpoint]] = {}
     service_name = _LOADBALANCER_SERVICE_NAME.format(
         cluster_name_on_cloud=cluster_name_on_cloud)
     context = provider_config.get(
@@ -288,9 +288,9 @@ def _query_ports_for_loadbalancer(
 
 def _query_ports_for_ingress(
     cluster_name_on_cloud: str,
-    ports: List[int],
-    provider_config: Dict[str, Any],
-) -> Dict[int, List[common.Endpoint]]:
+    ports: list[int],
+    provider_config: dict[str, Any],
+) -> dict[int, list[common.Endpoint]]:
     context = provider_config.get(
         'context', kubernetes_utils.get_current_kube_config_context_name())
     ingress_details = network_utils.get_ingress_external_ip_and_ports(context)
@@ -301,7 +301,7 @@ def _query_ports_for_ingress(
     namespace = provider_config.get(
         'namespace',
         kubernetes_utils.get_kube_config_context_namespace(context))
-    result: Dict[int, List[common.Endpoint]] = {}
+    result: dict[int, list[common.Endpoint]] = {}
     for port in ports:
         path_prefix = _PATH_PREFIX.format(
             cluster_name_on_cloud=cluster_name_on_cloud,
@@ -324,9 +324,9 @@ def _query_ports_for_ingress(
 
 def _query_ports_for_podip(
     cluster_name_on_cloud: str,
-    ports: List[int],
-    provider_config: Dict[str, Any],
-) -> Dict[int, List[common.Endpoint]]:
+    ports: list[int],
+    provider_config: dict[str, Any],
+) -> dict[int, list[common.Endpoint]]:
     context = provider_config.get(
         'context', kubernetes_utils.get_current_kube_config_context_name())
     namespace = provider_config.get(
@@ -335,7 +335,7 @@ def _query_ports_for_podip(
     pod_name = kubernetes_utils.get_head_pod_name(cluster_name_on_cloud)
     pod_ip = network_utils.get_pod_ip(context, namespace, pod_name)
 
-    result: Dict[int, List[common.Endpoint]] = {}
+    result: dict[int, list[common.Endpoint]] = {}
     if pod_ip is None:
         return {}
 

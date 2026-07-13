@@ -2,7 +2,7 @@
 import os
 import time
 import typing
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any
 
 from sky import exceptions
 from sky import sky_logging
@@ -26,9 +26,8 @@ _INGRESS_TEMPLATE_NAME = 'kubernetes-ingress.yml.j2'
 _LOADBALANCER_TEMPLATE_NAME = 'kubernetes-loadbalancer.yml.j2'
 
 
-def get_port_mode(
-        mode_str: Optional[str],
-        context: Optional[str]) -> kubernetes_enums.KubernetesPortMode:
+def get_port_mode(mode_str: str | None,
+                  context: str | None) -> kubernetes_enums.KubernetesPortMode:
     """Get the port mode from the provider config."""
 
     curr_kube_config = kubernetes_utils.get_current_kube_config_context_name()
@@ -57,19 +56,19 @@ def get_port_mode(
 
 def fill_loadbalancer_template(
         namespace: str,
-        context: Optional[str],
+        context: str | None,
         service_name: str,
-        ports: List[int],
+        ports: list[int],
         selector_key: str,
         selector_value: str,
-        cluster_config_overrides: Optional[Dict[str, Any]] = None) -> Dict:
+        cluster_config_overrides: dict[str, Any] | None = None) -> dict:
     template_path = os.path.join(directory_utils.get_sky_dir(), 'templates',
                                  _LOADBALANCER_TEMPLATE_NAME)
     if not os.path.exists(template_path):
         raise FileNotFoundError(
             f'Template "{_LOADBALANCER_TEMPLATE_NAME}" does not exist.')
 
-    with open(template_path, 'r', encoding='utf-8') as fin:
+    with open(template_path, encoding='utf-8') as fin:
         template = fin.read()
     context, cloud_str = kubernetes_utils.get_cleaned_context_and_cloud_str(
         context)
@@ -101,18 +100,18 @@ def fill_loadbalancer_template(
 
 def fill_ingress_template(
         namespace: str,
-        context: Optional[str],
-        service_details: List[Tuple[str, int, str]],
+        context: str | None,
+        service_details: list[tuple[str, int, str]],
         ingress_name: str,
         selector_key: str,
         selector_value: str,
-        cluster_config_overrides: Optional[Dict[str, Any]] = None) -> Dict:
+        cluster_config_overrides: dict[str, Any] | None = None) -> dict:
     template_path = os.path.join(directory_utils.get_sky_dir(), 'templates',
                                  _INGRESS_TEMPLATE_NAME)
     if not os.path.exists(template_path):
         raise FileNotFoundError(
             f'Template "{_INGRESS_TEMPLATE_NAME}" does not exist.')
-    with open(template_path, 'r', encoding='utf-8') as fin:
+    with open(template_path, encoding='utf-8') as fin:
         template = fin.read()
     context, cloud_str = kubernetes_utils.get_cleaned_context_and_cloud_str(
         context)
@@ -152,8 +151,8 @@ def fill_ingress_template(
 
 
 def create_or_replace_namespaced_ingress(
-        namespace: str, context: Optional[str], ingress_name: str,
-        ingress_spec: Dict[str, Union[str, int]]) -> None:
+        namespace: str, context: str | None, ingress_name: str,
+        ingress_spec: dict[str, str | int]) -> None:
     """Creates an ingress resource for the specified service."""
     networking_api = kubernetes.networking_api(context)
 
@@ -176,7 +175,7 @@ def create_or_replace_namespaced_ingress(
         _request_timeout=kubernetes.API_TIMEOUT)
 
 
-def delete_namespaced_ingress(namespace: str, context: Optional[str],
+def delete_namespaced_ingress(namespace: str, context: str | None,
                               ingress_name: str) -> None:
     """Deletes an ingress resource."""
     networking_api = kubernetes.networking_api(context)
@@ -191,8 +190,8 @@ def delete_namespaced_ingress(namespace: str, context: Optional[str],
 
 
 def create_or_replace_namespaced_service(
-        namespace: str, context: Optional[str], service_name: str,
-        service_spec: Dict[str, Union[str, int]]) -> None:
+        namespace: str, context: str | None, service_name: str,
+        service_spec: dict[str, str | int]) -> None:
     """Creates a service resource for the specified service."""
     core_api = kubernetes.core_api(context)
 
@@ -214,7 +213,7 @@ def create_or_replace_namespaced_service(
                                         _request_timeout=kubernetes.API_TIMEOUT)
 
 
-def delete_namespaced_service(context: Optional[str], namespace: str,
+def delete_namespaced_service(context: str | None, namespace: str,
                               service_name: str) -> None:
     """Deletes a service resource."""
     core_api = kubernetes.core_api(context)
@@ -229,7 +228,7 @@ def delete_namespaced_service(context: Optional[str], namespace: str,
         raise e
 
 
-def ingress_controller_exists(context: Optional[str],
+def ingress_controller_exists(context: str | None,
                               ingress_class_name: str = 'nginx') -> bool:
     """Checks if an ingress controller exists in the cluster."""
     networking_api = kubernetes.networking_api(context)
@@ -241,9 +240,9 @@ def ingress_controller_exists(context: Optional[str],
 
 
 def get_ingress_external_ip_and_ports(
-    context: Optional[str],
+    context: str | None,
     namespace: str = 'ingress-nginx'
-) -> Tuple[Optional[str], Optional[Tuple[int, int]]]:
+) -> tuple[str | None, tuple[int, int] | None]:
     """Returns external ip and ports for the ingress controller."""
     core_api = kubernetes.core_api(context)
     ingress_services = [
@@ -279,10 +278,10 @@ def get_ingress_external_ip_and_ports(
     return external_ip, None
 
 
-def get_loadbalancer_ip(context: Optional[str],
+def get_loadbalancer_ip(context: str | None,
                         namespace: str,
                         service_name: str,
-                        timeout: int = 0) -> Optional[str]:
+                        timeout: int = 0) -> str | None:
     """Returns the IP address of the load balancer."""
     core_api = kubernetes.core_api(context)
 
@@ -305,8 +304,8 @@ def get_loadbalancer_ip(context: Optional[str],
     return ip
 
 
-def get_pod_ip(context: Optional[str], namespace: str,
-               pod_name: str) -> Optional[str]:
+def get_pod_ip(context: str | None, namespace: str,
+               pod_name: str) -> str | None:
     """Returns the IP address of the pod."""
     core_api = kubernetes.core_api(context)
     pod = core_api.read_namespaced_pod(pod_name,

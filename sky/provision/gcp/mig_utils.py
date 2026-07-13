@@ -1,7 +1,7 @@
 """Managed Instance Group Utils"""
 import re
 import subprocess
-from typing import Any, Dict
+from typing import Any
 
 from sky import sky_logging
 from sky.adaptors import gcp
@@ -46,7 +46,7 @@ def check_instance_template_exits(project_id: str, region: str,
 
 def create_region_instance_template(cluster_name_on_cloud: str, project_id: str,
                                     region: str, template_name: str,
-                                    node_config: Dict[str, Any]) -> dict:
+                                    node_config: dict[str, Any]) -> dict:
     """Create a regional instance template."""
     logger.debug(f'Creating regional instance template {template_name!r}.')
     compute = gcp.build('compute',
@@ -197,8 +197,7 @@ def wait_for_managed_group_to_be_stable(project_id: str, zone: str,
             f'Waiting for MIG {group_name} to be stable with command:\n{cmd}')
         proc = subprocess.run(
             f'yes | {cmd}',
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             shell=True,
             check=True,
         )

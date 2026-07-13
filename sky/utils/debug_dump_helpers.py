@@ -7,7 +7,7 @@ Extracted to avoid a circular import:
 """
 import copy
 import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 from sky import global_user_state
 from sky import task as task_lib
@@ -16,13 +16,13 @@ from sky.utils import yaml_utils
 
 # Sensitive config paths to redact in debug dumps, following the same
 # pattern as provision/common.py:ProvisionConfig.get_redacted_config().
-_SENSITIVE_CONFIG_KEYS: List[Tuple[str, ...]] = [
+_SENSITIVE_CONFIG_KEYS: list[tuple[str, ...]] = [
     ('api_server', 'endpoint'),
     ('api_server', 'service_account_token'),
 ]
 
 
-def redact_config(config: Dict[str, Any]) -> Dict[str, Any]:
+def redact_config(config: dict[str, Any]) -> dict[str, Any]:
     """Return a copy of config with sensitive values replaced by '<redacted>'.
 
     Used by both the client (sdk.py) and the server (debug_utils.py) when
@@ -36,7 +36,7 @@ def redact_config(config: Dict[str, Any]) -> Dict[str, Any]:
     return dict(**config_copy)
 
 
-def epoch_to_human(epoch: Optional[float]) -> Optional[str]:
+def epoch_to_human(epoch: float | None) -> str | None:
     """Convert epoch timestamp to human-readable ISO format."""
     if epoch is None:
         return None
@@ -62,14 +62,14 @@ def redact_task_yaml(yaml_str: str) -> str:
     return yaml_utils.dump_yaml_str(docs)
 
 
-def serialize_cluster_record(cluster_record: Dict[str, Any]) -> Dict[str, Any]:
+def serialize_cluster_record(cluster_record: dict[str, Any]) -> dict[str, Any]:
     """Serialize a cluster DB record to a JSON-friendly dict.
 
     Shared by the API server dump (_dump_cluster_info in debug_utils.py) and
     the controller manifest (_collect_cluster_debug_manifest in jobs/utils.py).
     """
     handle = cluster_record.get('handle')
-    handle_info: Dict[str, Any] = {}
+    handle_info: dict[str, Any] = {}
     if handle:
         handle_info = {
             'cluster_name': getattr(handle, 'cluster_name', None),
@@ -116,13 +116,13 @@ def serialize_cluster_record(cluster_record: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def get_cluster_events_data(cluster_hash: str) -> List[Dict[str, Any]]:
+def get_cluster_events_data(cluster_hash: str) -> list[dict[str, Any]]:
     """Get cluster events for all event types.
 
     Returns a list of dicts with 'event_type' and 'events' keys for non-empty
     event types. Shared by the API server dump and the controller manifest.
     """
-    results: List[Dict[str, Any]] = []
+    results: list[dict[str, Any]] = []
     for event_type in list(global_user_state.ClusterEventType):
         events = global_user_state.get_cluster_events(cluster_name=None,
                                                       cluster_hash=cluster_hash,

@@ -1,13 +1,12 @@
 """Service account token authentication for SkyPilot client."""
 
 import os
-from typing import Optional
 
 from sky import skypilot_config
 from sky.skylet import constants
 
 
-def _get_service_account_token() -> Optional[str]:
+def _get_service_account_token() -> str | None:
     """Get service account token from environment variable or config file.
 
     Priority order:

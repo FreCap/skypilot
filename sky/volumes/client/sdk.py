@@ -1,7 +1,6 @@
 """SDK functions for volumes."""
 import json
 import typing
-from typing import List, Optional
 
 from sky import exceptions
 from sky import sky_logging
@@ -30,7 +29,7 @@ logger = sky_logging.init_logger(__name__)
 @annotations.client_api
 def apply(
     volume: volume_lib.Volume,
-    creation_yaml: Optional[str] = None,
+    creation_yaml: str | None = None,
 ) -> server_common.RequestId[None]:
     """Creates or registers a volume.
 
@@ -126,7 +125,7 @@ def validate(volume: volume_lib.Volume) -> None:
 @annotations.client_api
 def ls(
     refresh: bool = False
-) -> server_common.RequestId[List[responses.VolumeRecord]]:
+) -> server_common.RequestId[list[responses.VolumeRecord]]:
     """Lists all volumes.
 
     Args:
@@ -153,7 +152,7 @@ def ls(
 @usage_lib.entrypoint
 @server_common.check_server_healthy_or_start
 @annotations.client_api
-def delete(names: List[str],
+def delete(names: list[str],
            purge: bool = False) -> server_common.RequestId[None]:
     """Deletes volumes.
 

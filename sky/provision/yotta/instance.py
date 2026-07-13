@@ -1,6 +1,6 @@
 """Yotta instance provisioning."""
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 from sky import sky_logging
 from sky.provision import common
@@ -21,7 +21,7 @@ HEAD_NODE_SUFFIX = '-head'
 WORKER_NODE_SUFFIX = '-worker'
 
 
-def _format_instances(instances: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _format_instances(instances: dict[str, Any]) -> list[dict[str, Any]]:
     return [{
         'id': inst_id,
         'podName': inst.get('podName'),
@@ -30,8 +30,8 @@ def _format_instances(instances: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _filter_instances(cluster_name_on_cloud: str,
-                      status_filters: Optional[List[PodStatusEnum]] = None,
-                      head_only: bool = False) -> Dict[str, Any]:
+                      status_filters: list[PodStatusEnum] | None = None,
+                      head_only: bool = False) -> dict[str, Any]:
 
     instances = yotta_client.list_instances(cluster_name_on_cloud)
     possible_names = [f'{cluster_name_on_cloud}{HEAD_NODE_SUFFIX}']
@@ -60,7 +60,7 @@ def _filter_instances(cluster_name_on_cloud: str,
     return filtered_instances
 
 
-def _get_head_instance_id(instances: Dict[str, Any]) -> Optional[str]:
+def _get_head_instance_id(instances: dict[str, Any]) -> str | None:
     head_instance_id = None
     for inst_id, inst in instances.items():
         if inst['name'].endswith(HEAD_NODE_SUFFIX):
@@ -197,13 +197,13 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
 
 
 def wait_instances(region: str, cluster_name_on_cloud: str,
-                   state: Optional[status_lib.ClusterStatus]) -> None:
+                   state: status_lib.ClusterStatus | None) -> None:
     del region, cluster_name_on_cloud, state
 
 
 def stop_instances(
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     worker_only: bool = False,
 ) -> None:
     raise NotImplementedError()
@@ -211,7 +211,7 @@ def stop_instances(
 
 def terminate_instances(
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     worker_only: bool = False,
 ) -> None:
     """See sky/provision/__init__.py"""
@@ -247,11 +247,11 @@ def terminate_instances(
 def get_cluster_info(
         region: str,
         cluster_name_on_cloud: str,
-        provider_config: Optional[Dict[str, Any]] = None) -> common.ClusterInfo:
+        provider_config: dict[str, Any] | None = None) -> common.ClusterInfo:
     del region  # unused
     running_instances = _filter_instances(cluster_name_on_cloud,
                                           [PodStatusEnum.RUNNING])
-    instances: Dict[str, List[common.InstanceInfo]] = {}
+    instances: dict[str, list[common.InstanceInfo]] = {}
     head_instance_id = None
     for instance_id, instance_info in running_instances.items():
         port = yotta_utils.get_ssh_port(instance_info)
@@ -281,10 +281,10 @@ def get_cluster_info(
 def query_instances(
     cluster_name: str,
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     non_terminated_only: bool = True,
     retry_if_missing: bool = False,
-) -> Dict[str, Tuple[Optional[status_lib.ClusterStatus], Optional[str]]]:
+) -> dict[str, tuple[status_lib.ClusterStatus | None, str | None]]:
     """See sky/provision/__init__.py"""
     del cluster_name, retry_if_missing  # unused
     assert provider_config is not None, (cluster_name_on_cloud, provider_config)
@@ -299,8 +299,7 @@ def query_instances(
         PodStatusEnum.PAUSING: status_lib.ClusterStatus.UP,
         PodStatusEnum.PAUSED: status_lib.ClusterStatus.STOPPED,
     }
-    statuses: Dict[str, Tuple[Optional[status_lib.ClusterStatus],
-                              Optional[str]]] = {}
+    statuses: dict[str, tuple[status_lib.ClusterStatus | None, str | None]] = {}
     for inst_id, instance in instances.items():
         status = status_map[PodStatusEnum(instance.get('status'))]
         if non_terminated_only and status is None:
@@ -311,18 +310,18 @@ def query_instances(
 
 def cleanup_ports(
     cluster_name_on_cloud: str,
-    ports: List[str],
-    provider_config: Optional[Dict[str, Any]] = None,
+    ports: list[str],
+    provider_config: dict[str, Any] | None = None,
 ) -> None:
     del cluster_name_on_cloud, ports, provider_config  # Unused.
 
 
 def query_ports(
     cluster_name_on_cloud: str,
-    ports: List[str],
-    head_ip: Optional[str] = None,
-    provider_config: Optional[Dict[str, Any]] = None,
-) -> Dict[int, List[common.Endpoint]]:
+    ports: list[str],
+    head_ip: str | None = None,
+    provider_config: dict[str, Any] | None = None,
+) -> dict[int, list[common.Endpoint]]:
     """See sky/provision/__init__.py"""
     del head_ip, provider_config  # Unused.
     # Yotta ports sometimes take a while to be ready.
@@ -338,7 +337,7 @@ def query_ports(
         if not instances:
             return {}
         head_instance = list(instances.values())[0]
-        ready_ports: Dict[int, List[common.Endpoint]] = {
+        ready_ports: dict[int, list[common.Endpoint]] = {
             port: [common.SocketEndpoint(**endpoint)]
             for port, endpoint in head_instance['port2endpoint'].items()
             if port in ports_to_query

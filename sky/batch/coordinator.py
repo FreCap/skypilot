@@ -31,7 +31,7 @@ import sys
 import textwrap
 import threading
 import time
-from typing import Any, Deque, Dict, List, Optional, Set, Tuple
+from typing import Any, Optional
 import uuid
 
 import sky
@@ -63,10 +63,10 @@ class BatchCoordinator:
                  batch_size: int,
                  pool_name: str,
                  serialized_fn: str,
-                 input_format_dict: Dict[str, Any],
-                 output_formats_dict: List[Dict[str, Any]],
+                 input_format_dict: dict[str, Any],
+                 output_formats_dict: list[dict[str, Any]],
                  activate_env: str = '',
-                 job_id: Optional[int] = None,
+                 job_id: int | None = None,
                  is_resume: bool = False):
         self.dataset_path = dataset_path
         self.output_path = output_path
@@ -92,13 +92,13 @@ class BatchCoordinator:
             self._managed_job_id = int(raw)
 
         # Batch metadata: list of [start_idx, end_idx] tuples.
-        self.batches: List[List[int]] = []
-        self.pending_batches: Deque[int] = collections.deque()
-        self._pending_ready_at: Dict[int, float] = {}
+        self.batches: list[list[int]] = []
+        self.pending_batches: collections.deque[int] = collections.deque()
+        self._pending_ready_at: dict[int, float] = {}
         self._pending_lock = threading.Lock()
 
         # Worker tracking: cluster_name → worker_job_id
-        self._active_workers: Dict[str, int] = {}
+        self._active_workers: dict[str, int] = {}
         self._active_workers_lock = threading.Lock()
 
         # Cancellation flag for inline (controller) mode.
@@ -109,7 +109,7 @@ class BatchCoordinator:
         # It prevents an older controller from feeding or shutting down a
         # replacement service after an API-server/controller restart.
         self._worker_token = uuid.uuid4().hex
-        self._stale_worker_tokens: Set[str] = set()
+        self._stale_worker_tokens: set[str] = set()
         self._stale_attempt_leases_drained = False
 
         # Inline coordinators share a process with unrelated managed jobs and
@@ -207,7 +207,7 @@ class BatchCoordinator:
         deadline = loop.time() + max(0, timeout)
 
         async def _run_call(label, func, *args,
-                            **kwargs) -> Tuple[bool, bool, Any]:
+                            **kwargs) -> tuple[bool, bool, Any]:
             """Return (within_deadline, succeeded, result)."""
             remaining = deadline - loop.time()
             if remaining <= 0:
@@ -399,7 +399,7 @@ class BatchCoordinator:
             self.pending_batches.append(batch_idx)
             self._pending_ready_at[batch_idx] = ready_at
 
-    def _pop_ready_batch(self) -> Tuple[Optional[int], Optional[float]]:
+    def _pop_ready_batch(self) -> tuple[int | None, float | None]:
         """Pop an eligible batch and return a wait time for delayed work.
 
         ``(None, None)`` means the queue is empty.  ``(None, seconds)`` means
@@ -409,7 +409,7 @@ class BatchCoordinator:
         with self._pending_lock:
             if not self.pending_batches:
                 return None, None
-            min_wait: Optional[float] = None
+            min_wait: float | None = None
             for _ in range(len(self.pending_batches)):
                 batch_idx = self.pending_batches.popleft()
                 ready_at = self._pending_ready_at[batch_idx]
@@ -601,7 +601,7 @@ class BatchCoordinator:
                         wait_seconds, len(old_live_attempts))
             time.sleep(wait_seconds)
 
-    def _sync_batch_progress_from_db(self) -> Tuple[int, Set[str], List[int]]:
+    def _sync_batch_progress_from_db(self) -> tuple[int, set[str], list[int]]:
         """Return durable progress and discover PENDING work.
 
         ``leased_workers`` prevents a replacement coordinator from starting a
@@ -612,7 +612,7 @@ class BatchCoordinator:
         self._assert_coordinator_owner()
         records = managed_job_state.get_batch_states(self._managed_job_id)
         completed_count = 0
-        leased_workers: Set[str] = set()
+        leased_workers: set[str] = set()
         failed_batches = []
         for rec in records:
             batch_idx = rec['batch_idx']
@@ -631,7 +631,7 @@ class BatchCoordinator:
 
     def _start_batch_lease_renewer(
         self, batch_idx: int, attempt_id: int
-    ) -> Tuple[threading.Event, threading.Event, threading.Thread]:
+    ) -> tuple[threading.Event, threading.Event, threading.Thread]:
         """Keep a batch lease alive while SDK calls may be blocking."""
         stop_event = threading.Event()
         lost_event = threading.Event()
@@ -698,7 +698,7 @@ class BatchCoordinator:
         self._workers = workers
         logger.info(f'Discovered {len(workers)} ready workers')
 
-    def _fetch_pool_status(self) -> Optional[Dict[str, Any]]:
+    def _fetch_pool_status(self) -> dict[str, Any] | None:
         """Fetch pool status via the SDK.
 
         Returns the first matching pool record dict, or None.
@@ -712,14 +712,14 @@ class BatchCoordinator:
             logger.warning(f'Failed to fetch pool status: {e}')
         return None
 
-    def _get_ready_workers(self) -> List[str]:
+    def _get_ready_workers(self) -> list[str]:
         """Return cluster names for dispatchable replicas via SDK."""
         status = self._fetch_pool_status()
         if status is None:
             return []
         replica_infos = status.get('replica_info', [])
         ready = []
-        unavailable_summary: List[str] = []
+        unavailable_summary: list[str] = []
         for info in replica_infos:
             raw_status = info.get('status', '')
             # status may be a ReplicaStatus enum or a string; normalise.
@@ -728,8 +728,8 @@ class BatchCoordinator:
             name = info.get('name')
             if replica_status == 'READY':
                 replica_info_version = info.get('replica_info_version')
-                if (replica_info_version is None or replica_info_version <
-                        server_constants.MIN_BATCH_REPLICA_INFO_VERSION):
+                if (replica_info_version is None or replica_info_version
+                        < server_constants.MIN_BATCH_REPLICA_INFO_VERSION):
                     raise RuntimeError(
                         f'Pool replica {name!r} uses worker runtime version '
                         f'{replica_info_version}; Sky Batch requires version '
@@ -801,7 +801,7 @@ class BatchCoordinator:
         return f'{base}.{uuid.uuid4().hex}{ext}'
 
     def _generate_worker_startup_code(self,
-                                      failure_marker_path: Optional[str] = None
+                                      failure_marker_path: str | None = None
                                      ) -> str:
         """Generate code to start the long-running worker service."""
         job_id = str(self._managed_job_id)
@@ -851,8 +851,9 @@ class BatchCoordinator:
             ' 2>&1 | tee /tmp/sky_batch_worker.log
             """)
 
-    def _generate_worker_health_check_code(
-            self, failure_marker_path: Optional[str] = None) -> str:
+    def _generate_worker_health_check_code(self,
+                                           failure_marker_path: str |
+                                           None = None) -> str:
         """Generate code that waits for the worker to report healthy."""
         port = constants.WORKER_SERVICE_PORT
         timeout = constants.WORKER_SERVICE_STARTUP_TIMEOUT
@@ -946,7 +947,7 @@ class BatchCoordinator:
                                'attempt leases are drained')
         self._cleanup_worker_services_for_token(worker_token, [cluster_name])
 
-    def _resolve_worker_job_id(self, record: Dict[str, Any]) -> Optional[int]:
+    def _resolve_worker_job_id(self, record: dict[str, Any]) -> int | None:
         """Resolve one launch intent without guessing among duplicate names."""
         worker_job_id = record.get('worker_job_id')
         if worker_job_id is not None:
@@ -998,7 +999,7 @@ class BatchCoordinator:
             record['worker_cluster'], worker_job_id)
         return worker_job_id
 
-    def _cancel_worker_record(self, record: Dict[str, Any]) -> None:
+    def _cancel_worker_record(self, record: dict[str, Any]) -> None:
         """Cancel one durable worker record by exactly one external job ID."""
         worker_job_id = self._resolve_worker_job_id(record)
         if worker_job_id is None:
@@ -1009,10 +1010,10 @@ class BatchCoordinator:
                     worker_job_id, record['coordinator_token'],
                     record['worker_cluster'])
 
-    def _cleanup_worker_services_for_token(
-            self,
-            worker_token: str,
-            workers: Optional[List[str]] = None) -> None:
+    def _cleanup_worker_services_for_token(self,
+                                           worker_token: str,
+                                           workers: list[str] | None = None
+                                          ) -> None:
         """Clean durable records for one token, one exact job ID at a time."""
         worker_filter = set(workers) if workers is not None else None
         for record in managed_job_state.get_batch_worker_records(
@@ -1025,7 +1026,7 @@ class BatchCoordinator:
             self._cancel_worker_record(record)
 
     def _cleanup_stale_worker_services(self,
-                                       workers: Optional[List[str]] = None,
+                                       workers: list[str] | None = None,
                                        strict: bool = False) -> None:
         """Clean exact old-token workers after their attempt leases expire."""
         self._refresh_stale_worker_tokens()
@@ -1144,7 +1145,7 @@ class BatchCoordinator:
 
     def _shutdown_worker(self,
                          cluster_name: str,
-                         worker_job_id: Optional[int] = None) -> None:
+                         worker_job_id: int | None = None) -> None:
         """Send shutdown signal and cancel worker job."""
         shutdown_code = self._generate_shutdown_code()
         task = sky.Task(name=(f'batch-shutdown-{self._managed_job_id}-'
@@ -1330,8 +1331,8 @@ class BatchCoordinator:
         failures are tolerated as long as other workers can pick up the
         remaining batches.
         """
-        active_threads: Dict[str, threading.Thread] = {}
-        errors: List[Exception] = []
+        active_threads: dict[str, threading.Thread] = {}
+        errors: list[Exception] = []
 
         def _dispatch_wrapper(cname: str) -> None:
             try:
@@ -1434,7 +1435,7 @@ class BatchCoordinator:
     # Result merging
     # ------------------------------------------------------------------
 
-    def _get_completed_batch_attempts(self) -> List[io_formats.BatchAttempt]:
+    def _get_completed_batch_attempts(self) -> list[io_formats.BatchAttempt]:
         records = managed_job_state.get_batch_states(self._managed_job_id)
         attempts = []
         for rec in records:

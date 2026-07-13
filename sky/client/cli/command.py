@@ -24,6 +24,8 @@ listed in "sky --help".  Take care to put logically connected commands close to
 each other.
 """
 import collections
+from collections.abc import Callable
+from collections.abc import Generator
 import concurrent.futures
 import datetime
 import fnmatch
@@ -40,8 +42,7 @@ import tempfile
 import time
 import traceback
 import typing
-from typing import (Any, Callable, Dict, Generator, List, Optional, Set, Tuple,
-                    TypeVar, Union)
+from typing import Any, Optional, TypeVar, Union
 import urllib.parse
 
 import click
@@ -170,7 +171,7 @@ def _get_ws_proxy_command() -> str:
     return f'{escaped_executable_path} {escaped_websocket_proxy_path}'
 
 
-def _write_ssh_config_for_cluster(handle: Any, credentials: Dict[str, Any],
+def _write_ssh_config_for_cluster(handle: Any, credentials: dict[str, Any],
                                   ws_proxy_cmd: str) -> None:
     """Write a single cluster's entry into ``~/.ssh/config``.
 
@@ -185,8 +186,8 @@ def _write_ssh_config_for_cluster(handle: Any, credentials: Dict[str, Any],
         # Replace the proxy command to proxy through the SkyPilot API
         # server with websocket.
         escaped_key_path = shlex.quote(
-            (cluster_utils.SSHConfigHelper.generate_local_key_file(
-                handle.cluster_name, credentials)))
+            cluster_utils.SSHConfigHelper.generate_local_key_file(
+                handle.cluster_name, credentials))
         # Instead of directly use websocket_proxy.py, we add an
         # additional proxy, so that ssh can use the head pod in the
         # cluster to jump to worker pods.
@@ -229,7 +230,7 @@ def _write_ssh_config_for_cluster(handle: Any, credentials: Dict[str, Any],
 
 
 def _set_ssh_config_from_launch_response(handle: Any,
-                                         credentials: Dict[str, Any]) -> None:
+                                         credentials: dict[str, Any]) -> None:
     """Write SSH config for a single just-launched cluster.
 
     Used when the server bundled credentials with the launch response
@@ -253,11 +254,11 @@ def _set_ssh_config_from_launch_response(handle: Any,
 
 
 def _get_cluster_records_and_set_ssh_config(
-    clusters: Optional[List[str]],
+    clusters: list[str] | None,
     refresh: common.StatusRefreshMode = common.StatusRefreshMode.NONE,
     all_users: bool = False,
     verbose: bool = False,
-) -> List[responses.StatusResponse]:
+) -> list[responses.StatusResponse]:
     """Returns a list of clusters that match the glob pattern.
 
     Args:
@@ -309,7 +310,7 @@ def _get_cluster_records_and_set_ssh_config(
     # removing clusters, because SkyPilot has no idea whether to remove
     # ssh config of a cluster from another user.
     clusters_exists = set(record['name'] for record in cluster_records)
-    clusters_to_remove: Set[str] = set()
+    clusters_to_remove: set[str] = set()
     if clusters is not None:
         clusters_to_remove = set(clusters) - clusters_exists
     elif all_users:
@@ -322,9 +323,9 @@ def _get_cluster_records_and_set_ssh_config(
     return cluster_records
 
 
-def _get_glob_matches(candidate_names: List[str],
-                      glob_patterns: List[str],
-                      resource_type: str = 'Storage') -> List[str]:
+def _get_glob_matches(candidate_names: list[str],
+                      glob_patterns: list[str],
+                      resource_type: str = 'Storage') -> list[str]:
     """Returns a list of names that match the glob pattern."""
     glob_storages = []
     for glob_pattern in glob_patterns:
@@ -375,8 +376,8 @@ def _async_call_or_wait(request_id: server_common.RequestId[T],
 
 
 def _merge_cli_and_file_vars(
-        env_dicts: List[Optional[Dict[str, str]]],
-        env_list: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+        env_dicts: list[dict[str, str] | None],
+        env_list: list[tuple[str, str]]) -> list[tuple[str, str]]:
     """Merges all values from env_list and env_dicts. Priority is
     as follows: env_list has highest priority, and env_dict with
     higher index has more priority than that of lower index."""
@@ -392,7 +393,7 @@ def _merge_cli_and_file_vars(
 
 
 def _complete_cluster_name(ctx: click.Context, param: click.Parameter,
-                           incomplete: str) -> List[str]:
+                           incomplete: str) -> list[str]:
     """Handle shell completion for cluster names."""
     del ctx, param  # Unused.
     # TODO(zhwu): we send requests to API server for completion, which can cause
@@ -408,7 +409,7 @@ def _complete_cluster_name(ctx: click.Context, param: click.Parameter,
 
 
 def _complete_storage_name(ctx: click.Context, param: click.Parameter,
-                           incomplete: str) -> List[str]:
+                           incomplete: str) -> list[str]:
     """Handle shell completion for storage names."""
     del ctx, param  # Unused.
     response = server_common.make_authenticated_request(
@@ -422,7 +423,7 @@ def _complete_storage_name(ctx: click.Context, param: click.Parameter,
 
 
 def _complete_volume_name(ctx: click.Context, param: click.Parameter,
-                          incomplete: str) -> List[str]:
+                          incomplete: str) -> list[str]:
     """Handle shell completion for volume names."""
     del ctx, param  # Unused.
     response = server_common.make_authenticated_request(
@@ -436,7 +437,7 @@ def _complete_volume_name(ctx: click.Context, param: click.Parameter,
 
 
 def _complete_api_request(ctx: click.Context, param: click.Parameter,
-                          incomplete: str) -> List[str]:
+                          incomplete: str) -> list[str]:
     """Handle shell completion for API requests."""
     del ctx, param  # Unused.
     response = server_common.make_authenticated_request(
@@ -454,7 +455,7 @@ def _complete_api_request(ctx: click.Context, param: click.Parameter,
 
 
 def _complete_file_name(ctx: click.Context, param: click.Parameter,
-                        incomplete: str) -> List[str]:
+                        incomplete: str) -> list[str]:
     """Handle shell completion for file names.
 
     Returns a special completion marker that tells click to use
@@ -468,7 +469,7 @@ _VALID_HOOK_EVENTS = ('stop', 'preemption', 'down')
 
 
 def _validate_hook_event(ctx: click.Context, param: click.Parameter,
-                         value: Optional[str]) -> Optional[str]:
+                         value: str | None) -> str | None:
     """Pass-through validator for ``sky logs --hook [event]``.
 
     Accepts any string. The user-facing form ``sky logs --hook
@@ -556,8 +557,8 @@ def _install_shell_completion(ctx: click.Context, param: click.Parameter,
     bashrc_diff = ('\n# For SkyPilot shell completion'
                    '\n. ~/.sky/.sky-complete.bash')
 
-    cmd: Optional[str] = None
-    reload_cmd: Optional[str] = None
+    cmd: str | None = None
+    reload_cmd: str | None = None
 
     if value == 'bash':
         install_cmd = f'_SKY_COMPLETE=bash_source sky > \
@@ -622,8 +623,8 @@ def _uninstall_shell_completion(ctx: click.Context, param: click.Parameter,
         else:
             value = os.path.basename(os.environ['SHELL'])
 
-    cmd: Optional[str] = None
-    reload_cmd: Optional[str] = None
+    cmd: str | None = None
+    reload_cmd: str | None = None
 
     if value == 'bash':
         cmd = 'sed -i"" -e "/# For SkyPilot shell completion/d" ~/.bashrc && \
@@ -663,7 +664,7 @@ def _uninstall_shell_completion(ctx: click.Context, param: click.Parameter,
     ctx.exit()
 
 
-def _add_click_options(options: List[click.Option]):
+def _add_click_options(options: list[click.Option]):
     """A decorator for adding a list of click option decorators."""
 
     def _add_options(func):
@@ -675,25 +676,25 @@ def _add_click_options(options: List[click.Option]):
 
 
 def _parse_override_params(
-    cloud: Optional[str] = None,
-    region: Optional[str] = None,
-    zone: Optional[str] = None,
-    gpus: Optional[str] = None,
-    cpus: Optional[str] = None,
-    memory: Optional[str] = None,
-    instance_type: Optional[str] = None,
-    use_spot: Optional[bool] = None,
-    image_id: Optional[str] = None,
-    disk_size: Optional[int] = None,
-    disk_tier: Optional[str] = None,
-    network_tier: Optional[str] = None,
-    local_disk: Optional[str] = None,
-    ports: Optional[Tuple[str, ...]] = None,
-    priority: Optional[str] = None,
-    config_override: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+    cloud: str | None = None,
+    region: str | None = None,
+    zone: str | None = None,
+    gpus: str | None = None,
+    cpus: str | None = None,
+    memory: str | None = None,
+    instance_type: str | None = None,
+    use_spot: bool | None = None,
+    image_id: str | None = None,
+    disk_size: int | None = None,
+    disk_tier: str | None = None,
+    network_tier: str | None = None,
+    local_disk: str | None = None,
+    ports: tuple[str, ...] | None = None,
+    priority: str | None = None,
+    config_override: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Parses the override parameters into a dictionary."""
-    override_params: Dict[str, Any] = {}
+    override_params: dict[str, Any] = {}
     if cloud is not None:
         if cloud.lower() == 'none' or cloud == '*':
             override_params['cloud'] = None
@@ -779,14 +780,14 @@ def _parse_override_params(
 
 
 def _check_yaml_only(
-        entrypoint: str) -> Tuple[bool, Optional[Dict[str, Any]], bool, str]:
+        entrypoint: str) -> tuple[bool, dict[str, Any] | None, bool, str]:
     """Checks if entrypoint is a readable YAML file without confirmation.
 
     Args:
         entrypoint: Path to a YAML file.
     """
     is_yaml = True
-    config: Optional[List[Dict[str, Any]]] = None
+    config: list[dict[str, Any]] | None = None
     result = None
     shell_splits = shlex.split(entrypoint)
     yaml_file_provided = (len(shell_splits) == 1 and
@@ -794,7 +795,7 @@ def _check_yaml_only(
                            shell_splits[0].endswith('.yml')))
     invalid_reason = ''
     try:
-        with open(entrypoint, 'r', encoding='utf-8') as f:
+        with open(entrypoint, encoding='utf-8') as f:
             try:
                 config = list(yaml_utils.safe_load_all(f))
                 if config:
@@ -838,7 +839,7 @@ def _check_yaml_only(
     return is_yaml, result, yaml_file_provided, invalid_reason
 
 
-def _check_yaml(entrypoint: str) -> Tuple[bool, Optional[Dict[str, Any]]]:
+def _check_yaml(entrypoint: str) -> tuple[bool, dict[str, Any] | None]:
     """Checks if entrypoint is a readable YAML file.
 
     Args:
@@ -857,7 +858,7 @@ def _check_yaml(entrypoint: str) -> Tuple[bool, Optional[Dict[str, Any]]]:
     return is_yaml, result
 
 
-def _check_recipe_reference(entrypoint: str) -> Tuple[bool, Optional[str]]:
+def _check_recipe_reference(entrypoint: str) -> tuple[bool, str | None]:
     """Check if entrypoint is a recipe reference like 'recipes:my-recipe'.
 
     Args:
@@ -879,7 +880,7 @@ def _check_recipe_reference(entrypoint: str) -> Tuple[bool, Optional[str]]:
 
 
 def _pop_and_ignore_fields_in_override_params(
-        params: Dict[str, Any], field_to_ignore: List[str]) -> None:
+        params: dict[str, Any], field_to_ignore: list[str]) -> None:
     """Pops and ignores fields in override params.
 
     Args:
@@ -897,7 +898,7 @@ def _pop_and_ignore_fields_in_override_params(
                             fg='yellow')
 
 
-def _get_recipe_yaml(entrypoint: str) -> Optional[str]:
+def _get_recipe_yaml(entrypoint: str) -> str | None:
     """Checks if entrypoint is a recipe reference and returns the recipe YAML.
 
     Fetches the recipe content from the API server.
@@ -918,8 +919,8 @@ def _get_recipe_yaml(entrypoint: str) -> Optional[str]:
             body = payloads.RecipeGetBody(recipe_name=recipe_name)
             response = server_common.make_authenticated_request(
                 'POST', '/recipes/get', json=body.model_dump())
-            request_id: server_common.RequestId[Optional[Dict[
-                str, Any]]] = server_common.get_request_id(response)
+            request_id: server_common.RequestId[dict[
+                str, Any] | None] = server_common.get_request_id(response)
             recipe = sdk.get(request_id)
         except requests_lib.exceptions.ConnectionError as e:
             raise click.UsageError(
@@ -952,34 +953,34 @@ def _get_recipe_yaml(entrypoint: str) -> Optional[str]:
 # entry point to cover the majority of cases.
 @annotations.client_api
 def _make_task_or_dag_from_entrypoint_with_overrides(
-    entrypoint: Tuple[str, ...],
+    entrypoint: tuple[str, ...],
     *,
-    name: Optional[str] = None,
-    workdir: Optional[str] = None,
-    cloud: Optional[str] = None,
-    region: Optional[str] = None,
-    zone: Optional[str] = None,
-    gpus: Optional[str] = None,
-    cpus: Optional[str] = None,
-    memory: Optional[str] = None,
-    instance_type: Optional[str] = None,
-    num_nodes: Optional[int] = None,
-    use_spot: Optional[bool] = None,
-    image_id: Optional[str] = None,
-    disk_size: Optional[int] = None,
-    disk_tier: Optional[str] = None,
-    network_tier: Optional[str] = None,
-    local_disk: Optional[str] = None,
-    ports: Optional[Tuple[str, ...]] = None,
-    priority: Optional[str] = None,
-    env: Optional[List[Tuple[str, str]]] = None,
-    secret: Optional[List[Tuple[str, str]]] = None,
-    field_to_ignore: Optional[List[str]] = None,
+    name: str | None = None,
+    workdir: str | None = None,
+    cloud: str | None = None,
+    region: str | None = None,
+    zone: str | None = None,
+    gpus: str | None = None,
+    cpus: str | None = None,
+    memory: str | None = None,
+    instance_type: str | None = None,
+    num_nodes: int | None = None,
+    use_spot: bool | None = None,
+    image_id: str | None = None,
+    disk_size: int | None = None,
+    disk_tier: str | None = None,
+    network_tier: str | None = None,
+    local_disk: str | None = None,
+    ports: tuple[str, ...] | None = None,
+    priority: str | None = None,
+    env: list[tuple[str, str]] | None = None,
+    secret: list[tuple[str, str]] | None = None,
+    field_to_ignore: list[str] | None = None,
     # job launch specific
-    job_recovery: Optional[str] = None,
-    config_override: Optional[Dict[str, Any]] = None,
-    git_url: Optional[str] = None,
-    git_ref: Optional[str] = None,
+    job_recovery: str | None = None,
+    config_override: dict[str, Any] | None = None,
+    git_url: str | None = None,
+    git_ref: str | None = None,
 ) -> Union['task_lib.Task', 'dag_lib.Dag']:
     """Creates a task or a dag from an entrypoint with overrides.
 
@@ -999,7 +1000,7 @@ def _make_task_or_dag_from_entrypoint_with_overrides(
 
     is_yaml, _ = _check_yaml(entrypoint)
 
-    entrypoint: Optional[str]
+    entrypoint: str | None
     if is_yaml:
         # Treat entrypoint as a yaml.
         click.secho('YAML to run: ', fg='cyan', nl=False)
@@ -1158,7 +1159,7 @@ def cli():
     pass
 
 
-def _warn_if_name_looks_like_file_path(name: Optional[str], yes: bool,
+def _warn_if_name_looks_like_file_path(name: str | None, yes: bool,
                                        name_label: str,
                                        command_hint: str) -> None:
     """Warns or prompts if a name looks like a file path."""
@@ -1173,10 +1174,10 @@ def _warn_if_name_looks_like_file_path(name: Optional[str], yes: bool,
         click.confirm(f'{warning}\nProceed anyway?', abort=True)
 
 
-def _handle_infra_cloud_region_zone_options(infra: Optional[str],
-                                            cloud: Optional[str],
-                                            region: Optional[str],
-                                            zone: Optional[str]):
+def _handle_infra_cloud_region_zone_options(infra: str | None,
+                                            cloud: str | None,
+                                            region: str | None,
+                                            zone: str | None):
     """Handle the backward compatibility for --infra and --cloud/region/zone.
 
     Returns:
@@ -1316,46 +1317,46 @@ def _handle_infra_cloud_region_zone_options(infra: Optional[str],
                     '`--config active_workspace=<name>`.'))
 @usage_lib.entrypoint
 def launch(
-    entrypoint: Tuple[str, ...],
-    cluster: Optional[str],
+    entrypoint: tuple[str, ...],
+    cluster: str | None,
     dryrun: bool,
     detach_run: bool,
-    backend_name: Optional[str],
-    name: Optional[str],
-    workdir: Optional[str],
-    infra: Optional[str],
-    cloud: Optional[str],
-    region: Optional[str],
-    zone: Optional[str],
-    gpus: Optional[str],
-    cpus: Optional[str],
-    memory: Optional[str],
-    instance_type: Optional[str],
-    num_nodes: Optional[int],
-    use_spot: Optional[bool],
-    image_id: Optional[str],
-    env_file: Optional[Dict[str, str]],
-    env: List[Tuple[str, str]],
-    secret_file: Optional[Dict[str, str]],
-    secret: List[Tuple[str, str]],
-    disk_size: Optional[int],
-    disk_tier: Optional[str],
-    network_tier: Optional[str],
-    local_disk: Optional[str],
-    ports: Tuple[str, ...],
-    priority: Optional[str],
-    idle_minutes_to_autostop: Optional[int],
-    wait_for: Optional[str],
+    backend_name: str | None,
+    name: str | None,
+    workdir: str | None,
+    infra: str | None,
+    cloud: str | None,
+    region: str | None,
+    zone: str | None,
+    gpus: str | None,
+    cpus: str | None,
+    memory: str | None,
+    instance_type: str | None,
+    num_nodes: int | None,
+    use_spot: bool | None,
+    image_id: str | None,
+    env_file: dict[str, str] | None,
+    env: list[tuple[str, str]],
+    secret_file: dict[str, str] | None,
+    secret: list[tuple[str, str]],
+    disk_size: int | None,
+    disk_tier: str | None,
+    network_tier: str | None,
+    local_disk: str | None,
+    ports: tuple[str, ...],
+    priority: str | None,
+    idle_minutes_to_autostop: int | None,
+    wait_for: str | None,
     down: bool,  # pylint: disable=redefined-outer-name
     retry_until_up: bool,
     yes: bool,
     no_setup: bool,
-    clone_disk_from: Optional[str],
+    clone_disk_from: str | None,
     fast: bool,
     async_call: bool,
-    config_override: Optional[Dict[str, Any]] = None,
-    git_url: Optional[str] = None,
-    git_ref: Optional[str] = None,
+    config_override: dict[str, Any] | None = None,
+    git_url: str | None = None,
+    git_ref: str | None = None,
 ):
     """Launch a cluster or task.
 
@@ -1468,7 +1469,7 @@ def launch(
         # New servers (>= MIN_LAUNCH_CREDENTIALS_API_VERSION) return a
         # 3-tuple. Old servers return the legacy 2-tuple — detect via
         # length so we stay compatible against any server version.
-        launch_credentials: Optional[Dict[str, Any]] = None
+        launch_credentials: dict[str, Any] | None = None
         if isinstance(job_id_handle, tuple) and len(job_id_handle) == 3:
             job_id, handle, launch_credentials = job_id_handle
         else:
@@ -1540,36 +1541,36 @@ def launch(
 @usage_lib.entrypoint
 # pylint: disable=redefined-builtin
 def exec(
-    cluster: Optional[str],
-    cluster_option: Optional[str],
-    entrypoint: Tuple[str, ...],
+    cluster: str | None,
+    cluster_option: str | None,
+    entrypoint: tuple[str, ...],
     detach_run: bool,
-    name: Optional[str],
-    infra: Optional[str],
-    cloud: Optional[str],
-    region: Optional[str],
-    zone: Optional[str],
-    workdir: Optional[str],
-    gpus: Optional[str],
-    ports: Tuple[str],
-    instance_type: Optional[str],
-    num_nodes: Optional[int],
-    use_spot: Optional[bool],
-    image_id: Optional[str],
-    env_file: Optional[Dict[str, str]],
-    env: List[Tuple[str, str]],
-    secret_file: Optional[Dict[str, str]],
-    secret: List[Tuple[str, str]],
-    cpus: Optional[str],
-    memory: Optional[str],
-    disk_size: Optional[int],
-    disk_tier: Optional[str],
-    network_tier: Optional[str],
-    local_disk: Optional[str],
+    name: str | None,
+    infra: str | None,
+    cloud: str | None,
+    region: str | None,
+    zone: str | None,
+    workdir: str | None,
+    gpus: str | None,
+    ports: tuple[str],
+    instance_type: str | None,
+    num_nodes: int | None,
+    use_spot: bool | None,
+    image_id: str | None,
+    env_file: dict[str, str] | None,
+    env: list[tuple[str, str]],
+    secret_file: dict[str, str] | None,
+    secret: list[tuple[str, str]],
+    cpus: str | None,
+    memory: str | None,
+    disk_size: int | None,
+    disk_tier: str | None,
+    network_tier: str | None,
+    local_disk: str | None,
     async_call: bool,
-    config_override: Optional[Dict[str, Any]] = None,
-    git_url: Optional[str] = None,
-    git_ref: Optional[str] = None,
+    config_override: dict[str, Any] | None = None,
+    git_url: str | None = None,
+    git_ref: str | None = None,
 ):
     # NOTE(dev): Keep the docstring consistent between the Python API and CLI.
     """Execute a task or command on an existing cluster.
@@ -1693,19 +1694,19 @@ def exec(
 
 
 def _handle_jobs_queue_request(
-    request_id: server_common.RequestId[Union[
-        List[responses.ManagedJobRecord],
-        Tuple[List[responses.ManagedJobRecord], int, Dict[str, int], int]]],
+    request_id: server_common.RequestId[list[responses.ManagedJobRecord] |
+                                        tuple[list[responses.ManagedJobRecord],
+                                              int, dict[str, int], int]],
     show_all: bool,
     show_user: bool,
-    max_num_jobs_to_show: Optional[int],
-    pool_status_request_id: Optional[server_common.RequestId[List[Dict[
-        str, Any]]]] = None,
+    max_num_jobs_to_show: int | None,
+    pool_status_request_id: server_common.RequestId[list[dict[str, Any]]] |
+    None = None,
     is_called_by_user: bool = False,
     only_in_progress: bool = False,
     queue_result_version: cli_utils.QueueResultVersion = cli_utils.
     QueueResultVersion.V1,
-) -> Tuple[Optional[int], str]:
+) -> tuple[int | None, str]:
     """Get the in-progress managed jobs.
 
     Args:
@@ -1730,7 +1731,7 @@ def _handle_jobs_queue_request(
     # TODO(SKY-980): remove unnecessary fallbacks on the client side.
     num_in_progress_jobs = None
     msg = ''
-    status_counts: Optional[Dict[str, int]] = None
+    status_counts: dict[str, int] | None = None
     pool_status_result = None
     try:
         if not is_called_by_user:
@@ -1826,13 +1827,13 @@ def _handle_jobs_queue_request(
 
 
 def _handle_services_request(
-    request_id: server_common.RequestId[List[Dict[str, Any]]],
-    service_names: Optional[List[str]],
+    request_id: server_common.RequestId[list[dict[str, Any]]],
+    service_names: list[str] | None,
     show_all: bool,
     show_endpoint: bool,
     pool: bool = False,  # pylint: disable=redefined-outer-name
     is_called_by_user: bool = False
-) -> Tuple[Optional[int], str]:
+) -> tuple[int | None, str]:
     """Get service statuses.
 
     Args:
@@ -1939,9 +1940,9 @@ def _handle_services_request(
     return num_services, msg
 
 
-def _show_endpoint(query_clusters: Optional[List[str]],
-                   cluster_records: List[responses.StatusResponse], ip: bool,
-                   endpoints: bool, endpoint: Optional[int]) -> None:
+def _show_endpoint(query_clusters: list[str] | None,
+                   cluster_records: list[responses.StatusResponse], ip: bool,
+                   endpoints: bool, endpoint: int | None) -> None:
     show_endpoints = endpoints or endpoint is not None
     show_single_endpoint = endpoint is not None
     if len(cluster_records) != 1:
@@ -2008,8 +2009,8 @@ def _show_endpoint(query_clusters: Optional[List[str]],
 
 
 def _show_enabled_infra(
-        active_workspace: Optional[str], show_workspace: bool,
-        enabled_clouds_request_id: server_common.RequestId[List[str]]):
+        active_workspace: str | None, show_workspace: bool,
+        enabled_clouds_request_id: server_common.RequestId[list[str]]):
     """Show the enabled infrastructure.
 
     ``active_workspace`` is the workspace label to annotate the title
@@ -2087,11 +2088,11 @@ def status(verbose: bool,
            refresh: bool,
            ip: bool,
            endpoints: bool,
-           endpoint: Optional[int],
+           endpoint: int | None,
            show_managed_jobs: bool,
            show_services: bool,
            show_pools: bool,
-           clusters: List[str],
+           clusters: list[str],
            all_users: bool,
            output_format: str = 'table'):
     # NOTE(dev): Keep the docstring consistent between the Python API and CLI.
@@ -2164,7 +2165,7 @@ def status(verbose: bool,
     show_single_endpoint = endpoint is not None
     show_services = show_services and not any([clusters, ip, endpoints])
 
-    query_clusters: Optional[List[str]] = None if not clusters else clusters
+    query_clusters: list[str] | None = None if not clusters else clusters
     refresh_mode = common.StatusRefreshMode.NONE
     if refresh:
         refresh_mode = common.StatusRefreshMode.FORCE
@@ -2218,18 +2219,17 @@ def status(verbose: bool,
         )
 
     def submit_services(
-    ) -> Optional[server_common.RequestId[List[Dict[str, Any]]]]:
+    ) -> server_common.RequestId[list[dict[str, Any]]] | None:
         return serve_lib.status(service_names=None)
 
-    def submit_pools(
-    ) -> Optional[server_common.RequestId[List[Dict[str, Any]]]]:
+    def submit_pools() -> server_common.RequestId[list[dict[str, Any]]] | None:
         try:
             return managed_jobs.pool_status(pool_names=None)
         except exceptions.APINotSupportedError as e:
             logger.debug(f'Pools are not supported in the remote server: {e}')
             return None
 
-    def submit_workspace() -> Optional[server_common.RequestId[Dict[str, Any]]]:
+    def submit_workspace() -> server_common.RequestId[dict[str, Any]] | None:
         return sdk.workspaces()
 
     if skypilot_config.is_active_workspace_set():
@@ -2240,7 +2240,7 @@ def status(verbose: bool,
     def submit_enabled_clouds():
         return sdk.enabled_clouds(workspace=active_workspace, expand=True)
 
-    def fetch_resolved_workspace() -> Optional[str]:
+    def fetch_resolved_workspace() -> str | None:
         # Only needed when the client did not set active_workspace —
         # otherwise the resolver picks whatever the user chose and the
         # display path uses `active_workspace` directly. Failure here is
@@ -2256,7 +2256,7 @@ def status(verbose: bool,
     service_status_request_id = None
     workspace_request_id = None
     pool_status_request_id = None
-    resolved_workspace: Optional[str] = None
+    resolved_workspace: str | None = None
 
     # `--ip` and `--endpoints` short-circuit to `_show_endpoint` and skip
     # the main status table. Any request whose only consumer is that
@@ -2537,7 +2537,7 @@ def cost_report(
 
     - Clusters that were terminated/stopped on the cloud console.
     """
-    days_to_query: Optional[int] = days
+    days_to_query: int | None = days
     if days == 0:
         days_to_query = None
     cluster_records = sdk.get(sdk.cost_report(days=days_to_query))
@@ -2627,7 +2627,7 @@ def cost_report(
                 **_get_shell_complete_args(_complete_cluster_name))
 @flags.output_format_option()
 @usage_lib.entrypoint
-def queue(clusters: List[str],
+def queue(clusters: list[str],
           skip_finished: bool,
           all_users: bool,
           output_format: str = 'table'):
@@ -2643,7 +2643,7 @@ def queue(clusters: List[str],
     unsupported_clusters = []
     logger.info(f'Fetching job queue for: {", ".join(clusters)}')
     job_tables = {}
-    job_records: Dict[str, list] = {}
+    job_records: dict[str, list] = {}
 
     def _get_job_queue(cluster):
         try:
@@ -2744,12 +2744,12 @@ def queue(clusters: List[str],
 # TODO(zhwu): support logs by job name
 @usage_lib.entrypoint
 def logs(
-    cluster: Optional[str],
-    job_ids: Tuple[str, ...],
+    cluster: str | None,
+    job_ids: tuple[str, ...],
     provision: bool,
-    hook_event: Optional[str],
+    hook_event: str | None,
     autostop_alias: bool,
-    worker: Optional[int],
+    worker: int | None,
     sync_down: bool,
     status: bool,  # pylint: disable=redefined-outer-name
     follow: bool,
@@ -2880,8 +2880,8 @@ def logs(
         return
 
     assert job_ids is None or len(job_ids) <= 1, job_ids
-    job_id: Optional[int] = None
-    job_ids_to_query: Optional[List[int]] = None
+    job_id: int | None = None
+    job_ids_to_query: list[int] | None = None
     if job_ids:
         # Already check that len(job_ids) <= 1. This variable is used later
         # in sdk.tail_logs.
@@ -2893,7 +2893,7 @@ def logs(
         job_ids_to_query = [int(job_ids[0])]
     else:
         # job_ids is either None or empty list, so it is safe to cast it here.
-        job_ids_to_query = typing.cast(Optional[List[int]], job_ids)
+        job_ids_to_query = typing.cast(list[int] | None, job_ids)
     if status:
         job_statuses = sdk.stream_and_get(
             sdk.job_status(cluster, job_ids_to_query))
@@ -2948,7 +2948,7 @@ def cancel(
     cluster: str,
     all: bool,  # pylint: disable=redefined-builtin
     all_users: bool,
-    jobs: List[int],  # pylint: disable=redefined-outer-name
+    jobs: list[int],  # pylint: disable=redefined-outer-name
     yes: bool,
     async_call: bool,
 ):  # pylint: disable=redefined-builtin
@@ -3072,12 +3072,12 @@ def cancel(
 @_add_click_options(flags.GRACEFUL_OPTIONS + flags.COMMON_OPTIONS)
 @usage_lib.entrypoint
 def stop(
-    clusters: List[str],
+    clusters: list[str],
     all: bool,  # pylint: disable=redefined-builtin
     all_users: bool,
     yes: bool,
     graceful: bool,
-    graceful_timeout: Optional[int],
+    graceful_timeout: int | None,
     async_call: bool,
 ):
     # NOTE(dev): Keep the docstring consistent between the Python API and CLI.
@@ -3153,11 +3153,11 @@ def stop(
 @_add_click_options(flags.COMMON_OPTIONS)
 @usage_lib.entrypoint
 def autostop(
-    clusters: List[str],
+    clusters: list[str],
     all: bool,  # pylint: disable=redefined-builtin
     all_users: bool,
-    idle_minutes: Optional[int],
-    wait_for: Optional[str],
+    idle_minutes: int | None,
+    wait_for: str | None,
     cancel: bool,  # pylint: disable=redefined-outer-name
     down: bool,  # pylint: disable=redefined-outer-name
     yes: bool,
@@ -3286,11 +3286,11 @@ def autostop(
 @usage_lib.entrypoint
 # pylint: disable=redefined-builtin
 def start(
-    clusters: List[str],
+    clusters: list[str],
     all: bool,
     yes: bool,
-    idle_minutes_to_autostop: Optional[int],
-    wait_for: Optional[str],
+    idle_minutes_to_autostop: int | None,
+    wait_for: str | None,
     down: bool,  # pylint: disable=redefined-outer-name
     retry_until_up: bool,
     force: bool,
@@ -3496,13 +3496,13 @@ def start(
 @_add_click_options(flags.GRACEFUL_OPTIONS + flags.COMMON_OPTIONS)
 @usage_lib.entrypoint
 def down(
-    clusters: List[str],
+    clusters: list[str],
     all: bool,  # pylint: disable=redefined-builtin
     all_users: bool,
     yes: bool,
     purge: bool,
     graceful: bool,
-    graceful_timeout: Optional[int],
+    graceful_timeout: int | None,
     async_call: bool,
 ):
     # NOTE(dev): Keep the docstring consistent between the Python API and CLI.
@@ -3561,8 +3561,8 @@ def _hint_or_raise_for_down_jobs_controller(controller_name: str,
         controller_name, expect_exact_match=False)
     assert controller is not None, controller_name
 
-    status_counts: Optional[Dict[str, int]] = None
-    managed_jobs_: List[responses.ManagedJobRecord] = []
+    status_counts: dict[str, int] | None = None
+    managed_jobs_: list[responses.ManagedJobRecord] = []
     with rich_utils.client_status(
             '[bold cyan]Checking for in-progress managed jobs and pools[/]'):
         try:
@@ -3577,7 +3577,7 @@ def _hint_or_raise_for_down_jobs_controller(controller_name: str,
             if queue_result_version.v2():
                 managed_jobs_, _, status_counts, _ = result
             else:
-                managed_jobs_ = typing.cast(List[responses.ManagedJobRecord],
+                managed_jobs_ = typing.cast(list[responses.ManagedJobRecord],
                                             result)
             request_id_pools = managed_jobs.pool_status(pool_names=None)
             pools_ = sdk.stream_and_get(request_id_pools)
@@ -3696,16 +3696,16 @@ def _controller_to_hint_or_raise(
 
 
 def _down_or_stop_clusters(
-        names: List[str],
+        names: list[str],
         apply_to_all: bool = False,
         all_users: bool = False,
         down: bool = False,  # pylint: disable=redefined-outer-name
         no_confirm: bool = True,
         purge: bool = False,
         graceful: bool = False,
-        graceful_timeout: Optional[int] = None,
-        idle_minutes_to_autostop: Optional[int] = None,
-        wait_for: Optional[autostop_lib.AutostopWaitFor] = None,
+        graceful_timeout: int | None = None,
+        idle_minutes_to_autostop: int | None = None,
+        wait_for: autostop_lib.AutostopWaitFor | None = None,
         async_call: bool = False) -> None:
     """Tears down or (auto-)stops a cluster (or all clusters).
 
@@ -3869,8 +3869,8 @@ def _down_or_stop_clusters(
 
     request_ids = []
 
-    successes: List[str] = []
-    failures: List[Tuple[str, str]] = []
+    successes: list[str] = []
+    failures: list[tuple[str, str]] = []
 
     def _down_or_stop(name: str):
         success_progress = False
@@ -4012,9 +4012,9 @@ def _down_or_stop_clusters(
 @flags.output_format_option()
 @usage_lib.entrypoint
 # pylint: disable=redefined-outer-name
-def check(infra_list: Tuple[str],
+def check(infra_list: tuple[str],
           verbose: bool,
-          workspace: Optional[str] = None,
+          workspace: str | None = None,
           output_format: str = 'table'):
     """Check which clouds are available to use.
 
@@ -4091,11 +4091,11 @@ def check(infra_list: Tuple[str],
 @catalog.fallback_to_default_catalog
 @usage_lib.entrypoint
 def show_gpus(
-        accelerator_str: Optional[str],
+        accelerator_str: str | None,
         all: bool,  # pylint: disable=redefined-builtin
-        infra: Optional[str],
-        cloud: Optional[str],
-        region: Optional[str],
+        infra: str | None,
+        cloud: str | None,
+        region: str | None,
         all_regions: bool,
         verbose: bool):
     """Show supported GPU/TPU/accelerators and their prices.
@@ -4154,11 +4154,11 @@ def show_gpus(
 
 
 def _show_gpus_impl(
-        accelerator_str: Optional[str],
+        accelerator_str: str | None,
         all: bool,  # pylint: disable=redefined-builtin
-        infra: Optional[str],
-        cloud: Optional[str],
-        region: Optional[str],
+        infra: str | None,
+        cloud: str | None,
+        region: str | None,
         all_regions: bool,
         verbose: bool = False,
         output_format: str = 'table'):
@@ -4237,8 +4237,8 @@ def _show_gpus_impl(
                                   case_sensitive=False,
                                   all_regions=all_regions))
         json_result = {
-            gpu: [item._asdict() for item in items
-                 ] for gpu, items in result.items()
+            gpu: [item._asdict() for item in items]
+            for gpu, items in result.items()
         }
         click.echo(json.dumps(json_result, indent=2))
         return
@@ -4256,12 +4256,12 @@ def _show_gpus_impl(
     # TODO(zhwu,romilb): We should move most of these kubernetes related
     # queries into the backend, especially behind the server.
     def _get_kubernetes_realtime_gpu_tables(
-        context: Optional[str] = None,
-        name_filter: Optional[str] = None,
-        quantity_filter: Optional[int] = None,
+        context: str | None = None,
+        name_filter: str | None = None,
+        quantity_filter: int | None = None,
         is_ssh: bool = False,
-    ) -> Tuple[List[Tuple[str, 'prettytable.PrettyTable']],
-               Optional['prettytable.PrettyTable'], List[Tuple[
+    ) -> tuple[list[tuple[str, 'prettytable.PrettyTable']],
+               Optional['prettytable.PrettyTable'], list[tuple[
                    str, 'models.KubernetesNodesInfo']]]:
         if quantity_filter:
             qty_header = 'QTY_FILTER'
@@ -4298,7 +4298,7 @@ def _show_gpus_impl(
         no_permissions_str = '<no permissions>'
         realtime_gpu_infos = []
         # Stores per-GPU totals as [ready_capacity, available, not_ready].
-        total_gpu_info: Dict[str, List[int]] = collections.defaultdict(
+        total_gpu_info: dict[str, list[int]] = collections.defaultdict(
             lambda: [0, 0, 0])
         all_nodes_info = []
 
@@ -4312,9 +4312,9 @@ def _show_gpus_impl(
 
         def _count_not_ready_gpus(
             nodes_info: Optional['models.KubernetesNodesInfo']
-        ) -> Dict[str, int]:
+        ) -> dict[str, int]:
             """Return counts of GPUs on not ready nodes keyed by GPU type."""
-            not_ready_counts: Dict[str, int] = collections.defaultdict(int)
+            not_ready_counts: dict[str, int] = collections.defaultdict(int)
             if nodes_info is None:
                 return not_ready_counts
 
@@ -4411,11 +4411,11 @@ def _show_gpus_impl(
         return realtime_gpu_infos, total_realtime_gpu_table, all_nodes_info
 
     def _get_slurm_realtime_gpu_tables(
-        name_filter: Optional[str] = None,
-        quantity_filter: Optional[int] = None,
-        slurm_cluster_name: Optional[str] = None,
-    ) -> Tuple[List[Tuple[str, 'prettytable.PrettyTable']],
-               Optional['prettytable.PrettyTable'], List[Tuple[str, str]]]:
+        name_filter: str | None = None,
+        quantity_filter: int | None = None,
+        slurm_cluster_name: str | None = None,
+    ) -> tuple[list[tuple[str, 'prettytable.PrettyTable']],
+               Optional['prettytable.PrettyTable'], list[tuple[str, str]]]:
         """Get Slurm GPU availability tables.
 
         Args:
@@ -4450,8 +4450,8 @@ def _show_gpus_impl(
             raise ValueError(err_msg + debug_msg)
 
         realtime_gpu_infos = []
-        failed_infos: List[Tuple[str, str]] = []
-        total_gpu_info: Dict[str, List[int]] = collections.defaultdict(
+        failed_infos: list[tuple[str, str]] = []
+        total_gpu_info: dict[str, list[int]] = collections.defaultdict(
             lambda: [0, 0])
 
         for entry in realtime_gpu_availability_lists:
@@ -4504,7 +4504,7 @@ def _show_gpus_impl(
         return realtime_gpu_infos, total_realtime_gpu_table, failed_infos
 
     def _format_kubernetes_node_info_combined(
-            contexts_info: List[Tuple[str, 'models.KubernetesNodesInfo']],
+            contexts_info: list[tuple[str, 'models.KubernetesNodesInfo']],
             cloud_str: str = 'Kubernetes',
             context_title_str: str = 'CONTEXT') -> str:
         node_table = log_utils.create_table([
@@ -4590,7 +4590,7 @@ def _show_gpus_impl(
                 if untolerated_taints:
                     # Group taints by effect: 'NoSchedule Taint [key1, key2],
                     # NoExecute Taint [key3]'
-                    taints_by_effect: Dict[str, List[str]] = {}
+                    taints_by_effect: dict[str, list[str]] = {}
                     for taint in untolerated_taints:
                         effect = taint['effect']
                         key = taint['key']
@@ -4620,7 +4620,7 @@ def _show_gpus_impl(
                 f'{colorama.Style.RESET_ALL}\n'
                 f'{node_table.get_string()}')
 
-    def _format_slurm_partition_info(slurm_cluster_names: List[str]) -> str:
+    def _format_slurm_partition_info(slurm_cluster_names: list[str]) -> str:
         partition_table = log_utils.create_table([
             'CLUSTER',
             'PARTITION',
@@ -4636,8 +4636,8 @@ def _show_gpus_impl(
         failed_clusters = []
         # Aggregate GPU counts by (cluster, partition, gpu_type).
         # Each value is [total_gpus, free_gpus].
-        gpu_counts: Dict[Tuple[str, str, str],
-                         List[int]] = collections.defaultdict(lambda: [0, 0])
+        gpu_counts: dict[tuple[str, str, str],
+                         list[int]] = collections.defaultdict(lambda: [0, 0])
         for cluster_name, request_id in request_ids:
             try:
                 nodes_info = sdk.stream_and_get(request_id)
@@ -4680,7 +4680,7 @@ def _show_gpus_impl(
                 f'{partition_table.get_string()}')
 
     def _get_labeled_zero_gpu_hint(
-            all_nodes_info: List[Tuple[str,
+            all_nodes_info: list[tuple[str,
                                        'models.KubernetesNodesInfo']]) -> str:
         """Returns a hint if any nodes have GPU labels but 0 GPU resources."""
         # Collect nodes with GPU labels but 0 GPU resources
@@ -4705,8 +4705,8 @@ def _show_gpus_impl(
 
     def _format_kubernetes_realtime_gpu(
             total_table: Optional['prettytable.PrettyTable'],
-            k8s_realtime_infos: List[Tuple[str, 'prettytable.PrettyTable']],
-            all_nodes_info: List[Tuple[str, 'models.KubernetesNodesInfo']],
+            k8s_realtime_infos: list[tuple[str, 'prettytable.PrettyTable']],
+            all_nodes_info: list[tuple[str, 'models.KubernetesNodesInfo']],
             show_node_info: bool, is_ssh: bool) -> Generator[str, None, None]:
         identity = 'SSH Node Pool' if is_ssh else 'Kubernetes'
         yield (f'{colorama.Fore.GREEN}{colorama.Style.BRIGHT}'
@@ -4741,7 +4741,7 @@ def _show_gpus_impl(
 
     def _possibly_show_k8s_like_realtime(
             is_ssh: bool = False
-    ) -> Generator[str, None, Tuple[bool, bool, str]]:
+    ) -> Generator[str, None, tuple[bool, bool, str]]:
         # If cloud is kubernetes, we want to show real-time capacity
         k8s_messages = ''
         print_section_titles = False
@@ -4797,9 +4797,9 @@ def _show_gpus_impl(
         return False, print_section_titles, k8s_messages
 
     def _possibly_show_k8s_like_realtime_for_acc(
-            name: Optional[str],
-            quantity: Optional[int],
-            is_ssh: bool = False) -> Generator[str, None, Tuple[bool, bool]]:
+            name: str | None,
+            quantity: int | None,
+            is_ssh: bool = False) -> Generator[str, None, tuple[bool, bool]]:
         k8s_messages = ''
         print_section_titles = False
         if (is_ssh and query_ssh_realtime_gpu or
@@ -4891,7 +4891,7 @@ def _show_gpus_impl(
         # Optimization - do not poll for Kubernetes API for fetching
         # common GPUs because that will be fetched later for the table after
         # common GPUs.
-        clouds_to_list: Union[Optional[str], List[str]] = cloud_name
+        clouds_to_list: str | None | list[str] = cloud_name
         if cloud_name is None:
             clouds_to_list = [
                 c for c in constants.ALL_CLOUDS
@@ -5099,7 +5099,7 @@ def _show_gpus_impl(
         #   - Group by cloud
         #   - Sort within each group by prices
         #   - Sort groups by each cloud's (min price, min spot price)
-        new_result: Dict[str, List[catalog_common.InstanceTypeInfo]] = {}
+        new_result: dict[str, list[catalog_common.InstanceTypeInfo]] = {}
         for i, (gpu, items) in enumerate(list_accelerators_result.items()):
             df = pd.DataFrame([t._asdict() for t in items])
             # Determine the minimum prices for each cloud.
@@ -5234,11 +5234,11 @@ def gpus_cli():
 @catalog.fallback_to_default_catalog
 @usage_lib.entrypoint
 def gpus_list(
-        accelerator_str: Optional[str],
+        accelerator_str: str | None,
         all: bool,  # pylint: disable=redefined-builtin
-        infra: Optional[str],
-        cloud: Optional[str],
-        region: Optional[str],
+        infra: str | None,
+        cloud: str | None,
+        region: str | None,
         all_regions: bool,
         verbose: bool,
         output_format: str = 'table'):
@@ -5314,7 +5314,7 @@ def gpus_list(
               default=False,
               help='Do not wait for GPU labeling to complete.')
 @usage_lib.entrypoint
-def gpus_label(context: Optional[str], cleanup: bool, async_mode: bool):
+def gpus_label(context: str | None, cleanup: bool, async_mode: bool):
     """Label GPU nodes in a Kubernetes cluster for use with SkyPilot.
 
     This command runs on the API server to label GPU nodes with
@@ -5395,7 +5395,7 @@ def storage_ls(verbose: bool):
               help='Skip confirmation prompt.')
 @_add_click_options(flags.COMMON_OPTIONS)
 @usage_lib.entrypoint
-def storage_delete(names: List[str], all: bool, yes: bool, async_call: bool):  # pylint: disable=redefined-builtin
+def storage_delete(names: list[str], all: bool, yes: bool, async_call: bool):  # pylint: disable=redefined-builtin
     """Delete storage objects.
 
     Examples:
@@ -5502,12 +5502,12 @@ cli.add_command(volumes, name='volume')
 @_add_click_options(flags.COMMON_OPTIONS)
 @usage_lib.entrypoint
 def volumes_apply(
-        entrypoint: Optional[Tuple[str, ...]],
-        name: Optional[str],
-        infra: Optional[str],
-        type: Optional[str],  # pylint: disable=redefined-builtin
-        size: Optional[str],
-        use_existing: Optional[bool],
+        entrypoint: tuple[str, ...] | None,
+        name: str | None,
+        infra: str | None,
+        type: str | None,  # pylint: disable=redefined-builtin
+        size: str | None,
+        use_existing: bool | None,
         yes: bool,
         async_call: bool):
     """Apply a volume.
@@ -5529,8 +5529,8 @@ def volumes_apply(
     # pylint: disable=import-outside-toplevel
     from sky.volumes import volume as volume_lib
 
-    volume_config_dict: Dict[str, Any] = {}
-    creation_yaml: Optional[str] = None
+    volume_config_dict: dict[str, Any] = {}
+    creation_yaml: str | None = None
     if entrypoint is not None and len(entrypoint) > 0:
         entrypoint_str = ' '.join(entrypoint)
 
@@ -5587,14 +5587,14 @@ def volumes_apply(
 
 
 def _build_volume_override_config(
-    name: Optional[str],
-    infra: Optional[str],
-    volume_type: Optional[str],
-    size: Optional[str],
-    use_existing: Optional[bool],
-) -> Dict[str, Any]:
+    name: str | None,
+    infra: str | None,
+    volume_type: str | None,
+    size: str | None,
+    use_existing: bool | None,
+) -> dict[str, Any]:
     """Parse the volume override config."""
-    override_config: Dict[str, Any] = {}
+    override_config: dict[str, Any] = {}
     if name is not None:
         override_config['name'] = name
     if infra is not None:
@@ -5663,7 +5663,7 @@ def volumes_ls(verbose: bool, refresh: bool):
 @_add_click_options(flags.COMMON_OPTIONS)
 @usage_lib.entrypoint
 def volumes_delete(
-        names: List[str],
+        names: list[str],
         all: bool,  # pylint: disable=redefined-builtin
         purge: bool,
         yes: bool,
@@ -5779,40 +5779,40 @@ def jobs():
 @timeline.event
 @usage_lib.entrypoint
 def jobs_launch(
-    entrypoint: Tuple[str, ...],
-    name: Optional[str],
-    cluster: Optional[str],
-    workdir: Optional[str],
-    infra: Optional[str],
-    cloud: Optional[str],
-    region: Optional[str],
-    zone: Optional[str],
-    gpus: Optional[str],
-    cpus: Optional[str],
-    memory: Optional[str],
-    instance_type: Optional[str],
-    num_nodes: Optional[int],
-    use_spot: Optional[bool],
-    image_id: Optional[str],
-    job_recovery: Optional[str],
-    env_file: Optional[Dict[str, str]],
-    env: List[Tuple[str, str]],
-    secret_file: Optional[Dict[str, str]],
-    secret: List[Tuple[str, str]],
-    disk_size: Optional[int],
-    disk_tier: Optional[str],
-    network_tier: Optional[str],
-    local_disk: Optional[str],
-    ports: Tuple[str],
-    priority: Optional[str],
+    entrypoint: tuple[str, ...],
+    name: str | None,
+    cluster: str | None,
+    workdir: str | None,
+    infra: str | None,
+    cloud: str | None,
+    region: str | None,
+    zone: str | None,
+    gpus: str | None,
+    cpus: str | None,
+    memory: str | None,
+    instance_type: str | None,
+    num_nodes: int | None,
+    use_spot: bool | None,
+    image_id: str | None,
+    job_recovery: str | None,
+    env_file: dict[str, str] | None,
+    env: list[tuple[str, str]],
+    secret_file: dict[str, str] | None,
+    secret: list[tuple[str, str]],
+    disk_size: int | None,
+    disk_tier: str | None,
+    network_tier: str | None,
+    local_disk: str | None,
+    ports: tuple[str],
+    priority: str | None,
     detach_run: bool,
     yes: bool,
-    pool: Optional[str],  # pylint: disable=redefined-outer-name
-    num_jobs: Optional[int],
+    pool: str | None,  # pylint: disable=redefined-outer-name
+    num_jobs: int | None,
     async_call: bool,
-    config_override: Optional[Dict[str, Any]] = None,
-    git_url: Optional[str] = None,
-    git_ref: Optional[str] = None,
+    config_override: dict[str, Any] | None = None,
+    git_url: str | None = None,
+    git_ref: str | None = None,
 ):
     """Launch a managed job from a YAML or a command.
 
@@ -6106,10 +6106,10 @@ def _parse_datetime_to_epoch(value: str) -> float:
 def jobs_queue(verbose: bool,
                refresh: bool,
                skip_finished: bool,
-               statuses: Tuple[List[str], ...],
-               since: Optional[str],
-               after: Optional[str],
-               before: Optional[str],
+               statuses: tuple[list[str], ...],
+               since: str | None,
+               after: str | None,
+               before: str | None,
                all_users: bool,
                all: bool,
                limit: int,
@@ -6328,11 +6328,11 @@ def jobs_queue(verbose: bool,
 @usage_lib.entrypoint
 # pylint: disable=redefined-builtin
 def jobs_cancel(
-    name: Optional[str],
-    pool: Optional[str],  # pylint: disable=redefined-outer-name
-    job_ids: Tuple[int],
+    name: str | None,
+    pool: str | None,  # pylint: disable=redefined-outer-name
+    job_ids: tuple[int],
     graceful: bool,
-    graceful_timeout: Optional[int],
+    graceful_timeout: int | None,
     all: bool,
     yes: bool,
     all_users: bool,
@@ -6356,9 +6356,9 @@ def jobs_cancel(
       $ sky jobs cancel -p my-pool
     """
     job_id_str = ','.join(map(str, job_ids))
-    if sum([
-            bool(job_ids), name is not None, pool is not None, all or all_users
-    ]) != 1:
+    if sum(
+        [bool(job_ids), name is not None, pool is not None, all or
+         all_users]) != 1:
         arguments = []
         arguments += [f'--job-ids {job_id_str}'] if job_ids else []
         arguments += [f'--name {name}'] if name is not None else []
@@ -6430,9 +6430,9 @@ def jobs_cancel(
 @click.argument('job_id', required=False, type=int)
 @click.argument('task', required=False, type=str, default=None)
 @usage_lib.entrypoint
-def jobs_logs(name: Optional[str], job_id: Optional[int], follow: bool,
+def jobs_logs(name: str | None, job_id: int | None, follow: bool,
               controller: bool, refresh: bool, sync_down: bool, tail: int,
-              task: Optional[str]):
+              task: str | None):
     """Tail or sync down the log of a managed job.
 
     TASK can be a task ID (integer) or task name. Numeric values are treated
@@ -6465,7 +6465,7 @@ def jobs_logs(name: Optional[str], job_id: Optional[int], follow: bool,
                 '--tail is not supported with --sync-down. Use '
                 '`sky jobs logs --no-follow --tail N <id>` to view the tail, '
                 'or redirect stdout to save it to a file.')
-        tail_lines: Optional[int] = None
+        tail_lines: int | None = None
     else:
         n = _apply_default_tail(tail, follow=follow)
         tail_lines = n if n > 0 else None
@@ -6482,7 +6482,7 @@ def jobs_logs(name: Optional[str], job_id: Optional[int], follow: bool,
             # Falls back to legacy download_logs when the streaming
             # download returns zero bytes (terminal job whose worker
             # cluster is already torn down — tail_logs has no source).
-            log_local_path_dict: Optional[Dict[int, str]] = None
+            log_local_path_dict: dict[int, str] | None = None
             try:
                 with rich_utils.client_status(
                         ux_utils.spinner_message(
@@ -6518,7 +6518,7 @@ def jobs_logs(name: Optional[str], job_id: Optional[int], follow: bool,
         else:
             # Parse task argument: if numeric, treat as task ID (int),
             # otherwise treat as task name (str)
-            parsed_task: Optional[Union[str, int]] = None
+            parsed_task: str | int | None = None
             if task is not None:
                 parsed_task = int(task) if task.isdigit() else task
             returncode = managed_jobs.tail_logs(name=name,
@@ -6584,31 +6584,31 @@ def pool():
 @timeline.event
 @usage_lib.entrypoint
 def jobs_pool_apply(
-    pool_yaml: Optional[Tuple[str, ...]],
-    pool: Optional[str],  # pylint: disable=redefined-outer-name
-    workdir: Optional[str],
-    infra: Optional[str],
-    cloud: Optional[str],
-    region: Optional[str],
-    zone: Optional[str],
-    num_nodes: Optional[int],
-    use_spot: Optional[bool],
-    image_id: Optional[str],
-    env_file: Optional[Dict[str, str]],
-    env: List[Tuple[str, str]],
-    secret_file: Optional[Dict[str, str]],
-    secret: List[Tuple[str, str]],
-    gpus: Optional[str],
-    instance_type: Optional[str],
-    ports: Tuple[str],
-    cpus: Optional[str],
-    memory: Optional[str],
-    disk_size: Optional[int],
-    disk_tier: Optional[str],
-    network_tier: Optional[str],
-    local_disk: Optional[str],
+    pool_yaml: tuple[str, ...] | None,
+    pool: str | None,  # pylint: disable=redefined-outer-name
+    workdir: str | None,
+    infra: str | None,
+    cloud: str | None,
+    region: str | None,
+    zone: str | None,
+    num_nodes: int | None,
+    use_spot: bool | None,
+    image_id: str | None,
+    env_file: dict[str, str] | None,
+    env: list[tuple[str, str]],
+    secret_file: dict[str, str] | None,
+    secret: list[tuple[str, str]],
+    gpus: str | None,
+    instance_type: str | None,
+    ports: tuple[str],
+    cpus: str | None,
+    memory: str | None,
+    disk_size: int | None,
+    disk_tier: str | None,
+    network_tier: str | None,
+    local_disk: str | None,
     mode: str,
-    workers: Optional[int],
+    workers: int | None,
     yes: bool,
     async_call: bool,
 ):
@@ -6706,13 +6706,13 @@ def jobs_pool_apply(
               default=False,
               help='Show all workers.')
 @usage_lib.entrypoint
-def jobs_pool_status(verbose: bool, pool_names: List[str], show_all: bool):
+def jobs_pool_status(verbose: bool, pool_names: list[str], show_all: bool):
     """Show statuses of pools.
 
     Show detailed statuses of one or more pools. If POOL_NAME is not
     provided, show all pools' status.
     """
-    pool_names_to_query: Optional[List[str]] = pool_names
+    pool_names_to_query: list[str] | None = pool_names
     if not pool_names:
         pool_names_to_query = None
     with rich_utils.client_status('[cyan]Checking pools[/]'):
@@ -6743,7 +6743,7 @@ def jobs_pool_status(verbose: bool, pool_names: List[str], show_all: bool):
 @usage_lib.entrypoint
 # pylint: disable=redefined-builtin
 def jobs_pool_down(
-    pool_names: List[str],
+    pool_names: list[str],
     all: bool,
     purge: bool,
     yes: bool,
@@ -6763,8 +6763,8 @@ def jobs_pool_down(
         raise click.UsageError('Can only specify one of POOL_NAMES or --all. '
                                f'Provided {argument_str!r}.')
 
-    def _get_nonterminal_jobs(pool_names: List[str],
-                              all: bool) -> List[responses.ManagedJobRecord]:
+    def _get_nonterminal_jobs(pool_names: list[str],
+                              all: bool) -> list[responses.ManagedJobRecord]:
         # Get nonterminal jobs for this pool using managed_jobs.queue
         request_id, queue_result_version = cli_utils.get_managed_job_queue(
             refresh=False,
@@ -6776,11 +6776,11 @@ def jobs_pool_down(
         jobs_result = sdk.stream_and_get(request_id)
 
         # Handle both tuple and list responses
-        jobs_list: List[responses.ManagedJobRecord]
+        jobs_list: list[responses.ManagedJobRecord]
         if queue_result_version.v2():
             jobs_list = jobs_result[0]
         else:
-            jobs_list = typing.cast(List[responses.ManagedJobRecord],
+            jobs_list = typing.cast(list[responses.ManagedJobRecord],
                                     jobs_result)
 
         def _should_include_job(job: responses.ManagedJobRecord) -> bool:
@@ -6879,9 +6879,9 @@ def _handle_serve_logs(
         follow: bool,
         controller: bool,
         load_balancer: bool,
-        replica_ids: Tuple[int, ...],
+        replica_ids: tuple[int, ...],
         sync_down: bool,
-        tail: Optional[int],
+        tail: int | None,
         pool: bool,  # pylint: disable=redefined-outer-name
 ):
     noun = 'pool' if pool else 'service'
@@ -6898,7 +6898,7 @@ def _handle_serve_logs(
                 '--tail and --follow cannot be used together. '
                 f'Changed the mode to --no-follow.{colorama.Style.RESET_ALL}')
 
-    chosen_components: Set[serve_lib.ServiceComponent] = set()
+    chosen_components: set[serve_lib.ServiceComponent] = set()
     if controller:
         chosen_components.add(serve_lib.ServiceComponent.CONTROLLER)
     if load_balancer:
@@ -6978,7 +6978,7 @@ def _handle_serve_logs(
     assert len(chosen_components) == 1
     assert len(replica_ids) in [0, 1]
     target_component = chosen_components.pop()
-    target_replica_id: Optional[int] = replica_ids[0] if replica_ids else None
+    target_replica_id: int | None = replica_ids[0] if replica_ids else None
 
     try:
         if pool:
@@ -7032,9 +7032,9 @@ def jobs_pool_logs(
     pool_name: str,
     follow: bool,
     controller: bool,
-    worker_ids: Tuple[int, ...],
+    worker_ids: tuple[int, ...],
     sync_down: bool,
-    tail: Optional[int],
+    tail: int | None,
 ):
     """Tail or sync down logs of a pool.
 
@@ -7097,31 +7097,31 @@ def serve():
 
 def _generate_task_with_service(
     service_name: str,
-    service_yaml_args: Tuple[str, ...],
-    workdir: Optional[str],
-    cloud: Optional[str],
-    region: Optional[str],
-    zone: Optional[str],
-    num_nodes: Optional[int],
-    use_spot: Optional[bool],
-    image_id: Optional[str],
-    env_file: Optional[Dict[str, str]],
-    env: List[Tuple[str, str]],
-    secret_file: Optional[Dict[str, str]],
-    secret: List[Tuple[str, str]],
-    gpus: Optional[str],
-    instance_type: Optional[str],
-    ports: Optional[Tuple[str]],
-    cpus: Optional[str],
-    memory: Optional[str],
-    disk_size: Optional[int],
-    disk_tier: Optional[str],
-    network_tier: Optional[str],
-    local_disk: Optional[str],
+    service_yaml_args: tuple[str, ...],
+    workdir: str | None,
+    cloud: str | None,
+    region: str | None,
+    zone: str | None,
+    num_nodes: int | None,
+    use_spot: bool | None,
+    image_id: str | None,
+    env_file: dict[str, str] | None,
+    env: list[tuple[str, str]],
+    secret_file: dict[str, str] | None,
+    secret: list[tuple[str, str]],
+    gpus: str | None,
+    instance_type: str | None,
+    ports: tuple[str] | None,
+    cpus: str | None,
+    memory: str | None,
+    disk_size: int | None,
+    disk_tier: str | None,
+    network_tier: str | None,
+    local_disk: str | None,
     not_supported_cmd: str,
     pool: bool,  # pylint: disable=redefined-outer-name
-    git_url: Optional[str] = None,
-    git_ref: Optional[str] = None,
+    git_url: str | None = None,
+    git_ref: str | None = None,
 ) -> task_lib.Task:
     """Generate a task with service section from a service YAML file."""
     is_yaml, _ = _check_yaml(''.join(service_yaml_args))
@@ -7174,7 +7174,7 @@ def _generate_task_with_service(
         return task
 
     # NOTE(yi): we only allow one service port now.
-    service_port: Optional[int] = int(
+    service_port: int | None = int(
         task.service.ports) if task.service.ports is not None else None
     if service_port is None:
         for requested_resources in list(task.resources):
@@ -7256,33 +7256,33 @@ def _generate_task_with_service(
 @timeline.event
 @usage_lib.entrypoint
 def serve_up(
-    service_yaml: Tuple[str, ...],
-    service_name: Optional[str],
-    workdir: Optional[str],
-    infra: Optional[str],
-    cloud: Optional[str],
-    region: Optional[str],
-    zone: Optional[str],
-    num_nodes: Optional[int],
-    use_spot: Optional[bool],
-    image_id: Optional[str],
-    env_file: Optional[Dict[str, str]],
-    env: List[Tuple[str, str]],
-    secret_file: Optional[Dict[str, str]],
-    secret: List[Tuple[str, str]],
-    gpus: Optional[str],
-    instance_type: Optional[str],
-    ports: Tuple[str],
-    cpus: Optional[str],
-    memory: Optional[str],
-    disk_size: Optional[int],
-    disk_tier: Optional[str],
-    network_tier: Optional[str],
-    local_disk: Optional[str],
+    service_yaml: tuple[str, ...],
+    service_name: str | None,
+    workdir: str | None,
+    infra: str | None,
+    cloud: str | None,
+    region: str | None,
+    zone: str | None,
+    num_nodes: int | None,
+    use_spot: bool | None,
+    image_id: str | None,
+    env_file: dict[str, str] | None,
+    env: list[tuple[str, str]],
+    secret_file: dict[str, str] | None,
+    secret: list[tuple[str, str]],
+    gpus: str | None,
+    instance_type: str | None,
+    ports: tuple[str],
+    cpus: str | None,
+    memory: str | None,
+    disk_size: int | None,
+    disk_tier: str | None,
+    network_tier: str | None,
+    local_disk: str | None,
     yes: bool,
     async_call: bool,
-    git_url: Optional[str] = None,
-    git_ref: Optional[str] = None,
+    git_url: str | None = None,
+    git_ref: str | None = None,
 ):
     """Launch a SkyServe service.
 
@@ -7386,16 +7386,16 @@ def serve_up(
 @timeline.event
 @usage_lib.entrypoint
 def serve_update(
-        service_name: str, service_yaml: Tuple[str, ...],
-        workdir: Optional[str], infra: Optional[str], cloud: Optional[str],
-        region: Optional[str], zone: Optional[str], num_nodes: Optional[int],
-        use_spot: Optional[bool], image_id: Optional[str],
-        env_file: Optional[Dict[str, str]], env: List[Tuple[str, str]],
-        secret_file: Optional[Dict[str, str]], secret: List[Tuple[str, str]],
-        gpus: Optional[str], instance_type: Optional[str], ports: Tuple[str],
-        cpus: Optional[str], memory: Optional[str], disk_size: Optional[int],
-        disk_tier: Optional[str], network_tier: Optional[str],
-        local_disk: Optional[str], mode: str, yes: bool, async_call: bool):
+        service_name: str, service_yaml: tuple[str, ...], workdir: str | None,
+        infra: str | None, cloud: str | None, region: str | None,
+        zone: str | None, num_nodes: int | None, use_spot: bool | None,
+        image_id: str | None, env_file: dict[str, str] | None,
+        env: list[tuple[str, str]], secret_file: dict[str, str] | None,
+        secret: list[tuple[str,
+                           str]], gpus: str | None, instance_type: str | None,
+        ports: tuple[str], cpus: str | None, memory: str | None,
+        disk_size: int | None, disk_tier: str | None, network_tier: str | None,
+        local_disk: str | None, mode: str, yes: bool, async_call: bool):
     """Update a SkyServe service.
 
     service_yaml must point to a valid YAML file.
@@ -7482,7 +7482,7 @@ def serve_update(
 @click.argument('service_names', required=False, type=str, nargs=-1)
 @usage_lib.entrypoint
 # pylint: disable=redefined-builtin
-def serve_status(verbose: bool, endpoint: bool, service_names: List[str]):
+def serve_status(verbose: bool, endpoint: bool, service_names: list[str]):
     """Show statuses of SkyServe services.
 
     Show detailed statuses of one or more services. If SERVICE_NAME is not
@@ -7574,7 +7574,7 @@ def serve_status(verbose: bool, endpoint: bool, service_names: List[str]):
       # Only show status of my-service
       sky serve status my-service
     """
-    service_names_to_query: Optional[List[str]] = service_names
+    service_names_to_query: list[str] | None = service_names
     if not service_names:
         service_names_to_query = None
     # This won't pollute the output of --endpoint.
@@ -7610,11 +7610,11 @@ def serve_status(verbose: bool, endpoint: bool, service_names: List[str]):
 @usage_lib.entrypoint
 # pylint: disable=redefined-builtin
 def serve_down(
-    service_names: List[str],
+    service_names: list[str],
     all: bool,
     purge: bool,
     yes: bool,
-    replica_id: Optional[int],
+    replica_id: int | None,
     async_call: bool,
 ) -> None:
     """Teardown service(s).
@@ -7738,9 +7738,9 @@ def serve_logs(
     follow: bool,
     controller: bool,
     load_balancer: bool,
-    replica_ids: Tuple[int, ...],
+    replica_ids: tuple[int, ...],
     sync_down: bool,
-    tail: Optional[int],
+    tail: int | None,
 ):
     """Tail or sync down logs of a service.
 
@@ -7806,7 +7806,7 @@ def local():
 @flags.config_option(expose_value=False)
 @_add_click_options(flags.COMMON_OPTIONS)
 @usage_lib.entrypoint
-def local_up(gpus: bool, name: Optional[str], port_start: Optional[int],
+def local_up(gpus: bool, name: str | None, port_start: int | None,
              async_call: bool):
     """Creates a local cluster."""
     request_id = sdk.local_up(gpus, name, port_start)
@@ -7821,7 +7821,7 @@ def local_up(gpus: bool, name: Optional[str], port_start: Optional[int],
 @flags.config_option(expose_value=False)
 @_add_click_options(flags.COMMON_OPTIONS)
 @usage_lib.entrypoint
-def local_down(name: Optional[str], async_call: bool):
+def local_down(name: str | None, async_call: bool):
     """Deletes a local cluster."""
     request_id = sdk.local_down(name)
     _async_call_or_wait(request_id, async_call, request_name='sky.local.down')
@@ -7911,8 +7911,8 @@ def api_stop():
               required=False,
               help='Follow the logs.')
 @usage_lib.entrypoint
-def api_logs(request_id: Optional[str], server_logs: bool,
-             log_path: Optional[str], tail: Optional[int], follow: bool):
+def api_logs(request_id: str | None, server_logs: bool, log_path: str | None,
+             tail: int | None, follow: bool):
     """Stream the logs of a request running on SkyPilot API server."""
     if not server_logs and request_id is None and log_path is None:
         # TODO(zhwu): get the latest request ID.
@@ -7943,7 +7943,7 @@ def api_logs(request_id: Optional[str], server_logs: bool,
 @flags.yes_option()
 @usage_lib.entrypoint
 # pylint: disable=redefined-builtin
-def api_cancel(request_ids: Optional[List[str]], all: bool, all_users: bool,
+def api_cancel(request_ids: list[str] | None, all: bool, all_users: bool,
                yes: bool):
     """Cancel a request running on SkyPilot API server."""
     if all or all_users:
@@ -8021,11 +8021,11 @@ INT_OR_NONE = IntOrNone()
 @flags.output_format_option()
 @usage_lib.entrypoint
 # pylint: disable=redefined-builtin
-def api_status(request_id_prefixes: Optional[List[str]],
+def api_status(request_id_prefixes: list[str] | None,
                all_status: bool,
                verbose: bool,
-               limit: Optional[int],
-               cluster: Optional[str],
+               limit: int | None,
+               cluster: str | None,
                output_format: str = 'table'):
     """List requests on SkyPilot API server."""
     if not request_id_prefixes:
@@ -8100,8 +8100,8 @@ def api_status(request_id_prefixes: Optional[List[str]],
               'auth URL and wait for the user to open it manually. Useful '
               'on headless machines (SSH sessions, containers, etc.).')
 @usage_lib.entrypoint
-def api_login(endpoint: Optional[str], relogin: bool,
-              service_account_token: Optional[str], no_browser: bool):
+def api_login(endpoint: str | None, relogin: bool,
+              service_account_token: str | None, no_browser: bool):
     """Logs into a SkyPilot API server.
 
     If your remote API server has enabled OAuth2 authentication, you can use
@@ -8234,7 +8234,7 @@ def workspace():
               help='Clear the saved preferred workspace.')
 @flags.config_option(expose_value=False)
 @usage_lib.entrypoint
-def workspace_use(name: Optional[str], clear: bool):
+def workspace_use(name: str | None, clear: bool):
     """Sets (or clears with --clear) your default workspace on the server.
 
     This default is picked up by ``sky launch`` / ``sky jobs launch`` when
@@ -8342,7 +8342,7 @@ def ssh():
               '-f',
               required=False,
               help='The file containing the SSH targets.')
-def ssh_up(infra: Optional[str], async_call: bool, file: Optional[str]):
+def ssh_up(infra: str | None, async_call: bool, file: str | None):
     """Set up a cluster using SSH targets from a file. If not specified,
     ~/.sky/ssh_node_pools.yaml will be used.
 
@@ -8405,11 +8405,11 @@ def ssh_down(infra, async_call):
               help='Run the command asynchronously.')
 @usage_lib.entrypoint
 def debug_dump(
-    request_ids: Tuple[str, ...],
-    cluster_names: Tuple[str, ...],
-    job_ids: Tuple[int, ...],
-    recent_minutes: Optional[float],
-    output: Optional[str],
+    request_ids: tuple[str, ...],
+    cluster_names: tuple[str, ...],
+    job_ids: tuple[int, ...],
+    recent_minutes: float | None,
+    output: str | None,
     async_call: bool,
 ):
     """Create a debug dump for troubleshooting. Creates a zip file containing

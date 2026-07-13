@@ -3,7 +3,7 @@ import abc
 import dataclasses
 import functools
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 from sky import sky_logging
 from sky.utils import config_utils
@@ -26,11 +26,13 @@ logger = sky_logging.init_logger(__name__)
 
 class ProvisionerError(RuntimeError):
     """Exception for provisioner."""
-    errors: List[Dict[str, str]]
+    # Values are not always strings: GCP TPU operations report integer gRPC
+    # status codes (e.g. 3/8/9) and some producers store None.
+    errors: list[dict[str, Any]]
     # Number of instances in the failed provider request, when known. This lets
     # higher layers distinguish a full-demand failure from filling a partial or
     # orphaned cluster without parsing provider-specific messages.
-    requested_count: Optional[int] = None
+    requested_count: int | None = None
 
 
 class StopFailoverError(Exception):
@@ -43,14 +45,14 @@ class StopFailoverError(Exception):
 
 # These fields are sensitive and should be redacted from the config for logging
 # purposes.
-SENSITIVE_FIELDS: List[Tuple[str, ...]] = [
+SENSITIVE_FIELDS: list[tuple[str, ...]] = [
     ('docker_config', 'docker_login_config', 'password'),
     ('provider_config', 'create_instance_kwargs', 'login'),
     ('provider_config', 'create_instance_kwargs', 'api_key'),
 ]
 
 
-def register_sensitive_fields(fields: List[Tuple[str, ...]]) -> None:
+def register_sensitive_fields(fields: list[tuple[str, ...]]) -> None:
     """Register additional sensitive fields for redaction."""
     SENSITIVE_FIELDS.extend(fields)
 
@@ -59,23 +61,23 @@ def register_sensitive_fields(fields: List[Tuple[str, ...]]) -> None:
 class ProvisionConfig:
     """Configuration for provisioning."""
     # Global configurations for the cloud provider.
-    provider_config: Dict[str, Any]
+    provider_config: dict[str, Any]
     # Configurations for the authentication.
-    authentication_config: Dict[str, Any]
+    authentication_config: dict[str, Any]
     # Configurations for the docker container to be run on the instance.
-    docker_config: Dict[str, Any]
+    docker_config: dict[str, Any]
     # Configurations for each instance.
-    node_config: Dict[str, Any]
+    node_config: dict[str, Any]
     # Number of instances to start.
     count: int
     # Tags for the instances.
-    tags: Dict[str, str]
+    tags: dict[str, str]
     # Whether or not to resume stopped instances.
     resume_stopped_nodes: bool
     # Optional ports to open on launch of the cluster.
-    ports_to_open_on_launch: Optional[List[int]]
+    ports_to_open_on_launch: list[int] | None
 
-    def get_redacted_config(self) -> Dict[str, Any]:
+    def get_redacted_config(self) -> dict[str, Any]:
         """Get the redacted config."""
         config = dataclasses.asdict(self)
 
@@ -135,16 +137,16 @@ class ProvisionRecord:
     region: str
     # The name of the sub-zone in the region. It must be a single zone.
     # It can also be None if the cloud provider does not support zones.
-    zone: Optional[str]
+    zone: str | None
     # The name of the cluster.
     cluster_name: str
     # The unique identifier of the head instance, i.e., the
     # `instance_info.instance_id` of the head node.
     head_instance_id: InstanceId
     # The IDs of all just resumed instances.
-    resumed_instance_ids: List[InstanceId]
+    resumed_instance_ids: list[InstanceId]
     # The IDs of all just created instances.
-    created_instance_ids: List[InstanceId]
+    created_instance_ids: list[InstanceId]
     # Metadata about the runtime materialized by provisioning.
     runtime_metadata: ProvisionRuntimeMetadata = dataclasses.field(
         default_factory=ProvisionRuntimeMetadata)
@@ -163,15 +165,15 @@ class InstanceInfo:
     """Instance information."""
     instance_id: InstanceId
     internal_ip: str
-    external_ip: Optional[str]
-    tags: Dict[str, str]
+    external_ip: str | None
+    tags: dict[str, str]
     ssh_port: int = 22
     # The internal service address of the instance on Kubernetes.
-    internal_svc: Optional[str] = None
+    internal_svc: str | None = None
     # The infrastructure node name for display in dashboard.
     # For Kubernetes: the k8s node name the pod runs on.
     # For clouds: the instance name (e.g., from AWS Name tag, GCP name).
-    node_name: Optional[str] = None
+    node_name: str | None = None
 
     def get_feasible_ip(self) -> str:
         """Get the most feasible IPs of the instance. This function returns
@@ -184,25 +186,25 @@ class InstanceInfo:
 @dataclasses.dataclass
 class ClusterInfo:
     """Cluster Information."""
-    instances: Dict[InstanceId, List[InstanceInfo]]
+    instances: dict[InstanceId, list[InstanceInfo]]
     # The unique identifier of the head instance, i.e., the
     # `instance_info.instance_id` of the head node.
-    head_instance_id: Optional[InstanceId]
+    head_instance_id: InstanceId | None
     # Provider related information.
     provider_name: str
-    provider_config: Optional[Dict[str, Any]] = None
+    provider_config: dict[str, Any] | None = None
 
-    docker_user: Optional[str] = None
+    docker_user: str | None = None
     # Override the ssh_user from the cluster config.
-    ssh_user: Optional[str] = None
-    custom_ray_options: Optional[Dict[str, Any]] = None
+    ssh_user: str | None = None
+    custom_ray_options: dict[str, Any] | None = None
 
     @property
     def num_instances(self) -> int:
         """Get the number of instances in the cluster."""
         return sum(len(instances) for instances in self.instances.values())
 
-    def get_head_instance(self) -> Optional[InstanceInfo]:
+    def get_head_instance(self) -> InstanceInfo | None:
         """Get the instance metadata of the head node"""
         if self.head_instance_id is None:
             return None
@@ -211,7 +213,7 @@ class ClusterInfo:
                              f'ClusterInfo: {self.__dict__}')
         return self.instances[self.head_instance_id][0]
 
-    def get_worker_instances(self) -> List[InstanceInfo]:
+    def get_worker_instances(self) -> list[InstanceInfo]:
         """Get all worker instances."""
         worker_instances = []
         for inst_id, instances in self.instances.items():
@@ -221,7 +223,7 @@ class ClusterInfo:
                 worker_instances.extend(instances)
         return worker_instances
 
-    def ip_tuples(self) -> List[Tuple[str, Optional[str]]]:
+    def ip_tuples(self) -> list[tuple[str, str | None]]:
         """Get IP tuples of all instances. Make sure that list always
         starts with head node IP, if head node exists.
 
@@ -240,7 +242,7 @@ class ClusterInfo:
             other_ips.append(pair)
         return head_instance_ip + other_ips
 
-    def instance_ids(self) -> List[str]:
+    def instance_ids(self) -> list[str]:
         """Return the instance ids in the same order of ip_tuples."""
         id_list = []
         if self.head_instance_id is not None:
@@ -260,7 +262,7 @@ class ClusterInfo:
             return False
         return ip_tuples[0][1] is not None
 
-    def _get_ips(self, use_internal_ips: bool) -> List[str]:
+    def _get_ips(self, use_internal_ips: bool) -> list[str]:
         """Get public or private/internal IPs of all instances.
 
         It returns the IP of the head node first.
@@ -281,14 +283,14 @@ class ClusterInfo:
                 ip_list.append(public_ip)
         return ip_list
 
-    def get_feasible_ips(self, force_internal_ips: bool = False) -> List[str]:
+    def get_feasible_ips(self, force_internal_ips: bool = False) -> list[str]:
         """Get internal or external IPs depends on the settings."""
         use_internal_ips = (self.provider_config is not None and
                             self.provider_config.get('use_internal_ips', False))
         return self._get_ips(use_internal_ips or not self.has_external_ips() or
                              force_internal_ips)
 
-    def get_ssh_ports(self) -> List[int]:
+    def get_ssh_ports(self) -> list[int]:
         """Get the SSH port of all the instances."""
         head_instance = self.get_head_instance()
 
@@ -302,7 +304,7 @@ class ClusterInfo:
         ]
         return head_instance_port + worker_instance_ports
 
-    def get_node_names(self) -> Optional[List[str]]:
+    def get_node_names(self) -> list[str] | None:
         """Get current node names as a list, head first.
 
         Returns:
@@ -310,7 +312,7 @@ class ClusterInfo:
             For Kubernetes, this is the k8s node name the pod runs on.
             For clouds, this is the instance name.
         """
-        node_names: List[str] = []
+        node_names: list[str] = []
         head = self.get_head_instance()
         if head is not None and head.node_name:
             node_names.append(head.node_name)
@@ -324,17 +326,17 @@ class Endpoint:
     pass
 
     @abc.abstractmethod
-    def url(self, override_ip: Optional[str] = None) -> str:
+    def url(self, override_ip: str | None = None) -> str:
         raise NotImplementedError
 
 
 @dataclasses.dataclass
 class SocketEndpoint(Endpoint):
     """Socket endpoint accessible via a host and a port."""
-    port: Optional[int]
+    port: int | None
     host: str = ''
 
-    def url(self, override_ip: Optional[str] = None) -> str:
+    def url(self, override_ip: str | None = None) -> str:
         host = override_ip if override_ip else self.host
         if env_options.Options.RUNNING_IN_BUILDKITE.get(
         ) and 'localhost' in host:
@@ -353,7 +355,7 @@ class HTTPEndpoint(SocketEndpoint):
     """HTTP endpoint accessible via a url."""
     path: str = ''
 
-    def url(self, override_ip: Optional[str] = None) -> str:
+    def url(self, override_ip: str | None = None) -> str:
         host = override_ip if override_ip else self.host
         return f'http://{os.path.join(super().url(host), self.path)}'
 
@@ -363,21 +365,21 @@ class HTTPSEndpoint(SocketEndpoint):
     """HTTPS endpoint accessible via a url."""
     path: str = ''
 
-    def url(self, override_ip: Optional[str] = None) -> str:
+    def url(self, override_ip: str | None = None) -> str:
         host = override_ip if override_ip else self.host
         return f'https://{os.path.join(super().url(host), self.path)}'
 
 
 def query_ports_passthrough(
-    ports: List[str],
-    head_ip: Optional[str],
-) -> Dict[int, List[Endpoint]]:
+    ports: list[str],
+    head_ip: str | None,
+) -> dict[int, list[Endpoint]]:
     """Common function to get endpoints for AWS, GCP and Azure.
 
     Returns a list of socket endpoint using head_ip and ports."""
     assert head_ip is not None, head_ip
     ports = list(resources_utils.port_ranges_to_set(ports))
-    result: Dict[int, List[Endpoint]] = {}
+    result: dict[int, list[Endpoint]] = {}
     for port in ports:
         result[port] = [SocketEndpoint(port=port, host=head_ip)]
     return result

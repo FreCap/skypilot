@@ -1,7 +1,8 @@
 """Implementation of SDK for SkyServe."""
+from collections.abc import Sequence
 import json
 import typing
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Optional, Union
 
 import click
 
@@ -26,7 +27,7 @@ def up(
     # Internal only:
     # pylint: disable=invalid-name
     _need_confirmation: bool = False
-) -> server_common.RequestId[Tuple[str, str]]:
+) -> server_common.RequestId[tuple[str, str]]:
     assert not pool, 'Command `up` is not supported for pool.'
     # Avoid circular import.
     from sky.client import sdk  # pylint: disable=import-outside-toplevel
@@ -114,8 +115,8 @@ def update(
 
 
 def apply(
-    task: Optional[Union['sky.Task', 'sky.Dag']],
-    workers: Optional[int],
+    task: Union['sky.Task', 'sky.Dag'] | None,
+    workers: int | None,
     service_name: str,
     mode: 'serve_utils.UpdateMode',
     pool: bool = False,
@@ -189,7 +190,7 @@ def apply(
 
 
 def down(
-    service_names: Optional[Union[str, List[str]]],
+    service_names: str | list[str] | None,
     all: bool = False,  # pylint: disable=redefined-builtin
     purge: bool = False,
     pool: bool = False,
@@ -215,10 +216,10 @@ def down(
 
 
 def status(
-    service_names: Optional[Union[str, List[str]]],
+    service_names: str | list[str] | None,
     pool: bool = False,
     summary_only: bool = False,
-) -> server_common.RequestId[List[Dict[str, Any]]]:
+) -> server_common.RequestId[list[dict[str, Any]]]:
     if pool:
         body = payloads.JobsPoolStatusBody(pool_names=service_names)
     else:
@@ -234,10 +235,10 @@ def status(
 
 def tail_logs(service_name: str,
               target: Union[str, 'serve_utils.ServiceComponent'],
-              replica_id: Optional[int] = None,
+              replica_id: int | None = None,
               follow: bool = True,
               output_stream: Optional['io.TextIOBase'] = None,
-              tail: Optional[int] = None,
+              tail: int | None = None,
               pool: bool = False) -> None:
     # Avoid circular import.
     from sky.client import sdk  # pylint: disable=import-outside-toplevel
@@ -273,16 +274,16 @@ def tail_logs(service_name: str,
                         get_result=follow)
 
 
-def sync_down_logs(service_name: str,
-                   local_dir: str,
-                   *,
-                   targets: Optional[Union[
-                       str, 'serve_utils.ServiceComponent',
-                       Sequence[Union[str,
-                                      'serve_utils.ServiceComponent']]]] = None,
-                   replica_ids: Optional[List[int]] = None,
-                   tail: Optional[int] = None,
-                   pool: bool = False) -> None:
+def sync_down_logs(
+        service_name: str,
+        local_dir: str,
+        *,
+        targets: Union[str, 'serve_utils.ServiceComponent',
+                       Sequence[Union[str, 'serve_utils.ServiceComponent']]] |
+    None = None,
+        replica_ids: list[int] | None = None,
+        tail: int | None = None,
+        pool: bool = False) -> None:
     # Avoid circular import.
     from sky.client import sdk  # pylint: disable=import-outside-toplevel
 

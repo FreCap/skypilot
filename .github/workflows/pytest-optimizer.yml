@@ -16,7 +16,7 @@ jobs:
   python-test-optimizer:
     strategy:
       matrix:
-        python-version: ["3.9"]
+        python-version: ["3.14"]
         test-path:
           - "tests/test_optimizer_dryruns.py -k \"partial\""
           - "tests/test_optimizer_dryruns.py -k \"not partial and not accelerator_memory and not accelerator_manufacturer\""
@@ -42,3 +42,4 @@ jobs:
           python-version: ${{ matrix.python-version }}
           test-path: ${{ matrix.test-path }}
           test-name: ${{ matrix.test-name }}
+          buildkite-analytics-token: ${{ secrets.BUILDKITE_ANALYTICS_TOKEN }}

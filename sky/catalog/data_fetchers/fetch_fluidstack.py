@@ -7,7 +7,6 @@ Usage:
 import csv
 import json
 import os
-from typing import List
 
 import requests
 
@@ -193,7 +192,7 @@ GPU_MAP = {
 }
 
 
-def get_regions(plans: List) -> dict:
+def get_regions(plans: list) -> dict:
     """Return a list of regions where the plan is available."""
     regions = {}
     for plan in plans:
@@ -203,7 +202,7 @@ def get_regions(plans: List) -> dict:
 
 
 def create_catalog(output_dir: str) -> None:
-    with open(DEFAULT_FLUIDSTACK_API_KEY_PATH, 'r', encoding='UTF-8') as f:
+    with open(DEFAULT_FLUIDSTACK_API_KEY_PATH, encoding='UTF-8') as f:
         api_key = f.read().strip()
     response = requests.get(ENDPOINT, headers={'api-key': api_key})
     if not response.ok:

@@ -3,7 +3,6 @@
 import abc
 import multiprocessing
 import queue as queue_lib
-from typing import List, Optional, Tuple
 
 from sky import sky_logging
 from sky.server.requests import requests as api_requests
@@ -18,18 +17,18 @@ class QueueBackend(abc.ABC):
     """Abstract queue backend."""
 
     @abc.abstractmethod
-    def put(self, item: Tuple[str, bool, bool]) -> None:
+    def put(self, item: tuple[str, bool, bool]) -> None:
         """Put a (request_id, ignore_return_value, retryable) tuple."""
         raise NotImplementedError
 
-    async def put_async(self, item: Tuple[str, bool, bool]) -> None:
+    async def put_async(self, item: tuple[str, bool, bool]) -> None:
         """Async version of put."""
         # By default we assume put is not blocking and can be
         # called directly in event loop
         self.put(item)
 
     @abc.abstractmethod
-    def get(self) -> Optional[Tuple[str, bool, bool]]:
+    def get(self) -> tuple[str, bool, bool] | None:
         """Non-blocking get. Returns None if queue is empty."""
         raise NotImplementedError
 
@@ -51,7 +50,7 @@ class QueueBackendFactory(abc.ABC):
         """
         raise NotImplementedError
 
-    def start(self) -> Optional[multiprocessing.Process]:
+    def start(self) -> multiprocessing.Process | None:
         """Start any required background infrastructure.
 
         Returns:
@@ -60,7 +59,7 @@ class QueueBackendFactory(abc.ABC):
         """
         return None
 
-    def stop(self, process: Optional[multiprocessing.Process]) -> None:
+    def stop(self, process: multiprocessing.Process | None) -> None:
         """Cleanup infrastructure."""
         if process is not None:
             process.kill()
@@ -73,10 +72,10 @@ class LocalQueueBackend(QueueBackend):
         super().__init__()
         self._queue = local_queue.get_queue(queue_name)
 
-    def put(self, item: Tuple[str, bool, bool]) -> None:
+    def put(self, item: tuple[str, bool, bool]) -> None:
         self._queue.put(item)
 
-    def get(self) -> Optional[Tuple[str, bool, bool]]:
+    def get(self) -> tuple[str, bool, bool] | None:
         try:
             return self._queue.get(block=False)
         except queue_lib.Empty:
@@ -95,10 +94,10 @@ class MultiprocessingQueueBackend(QueueBackend):
         super().__init__()
         self._queue = mp_queue.get_queue(queue_name, port)
 
-    def put(self, item: Tuple[str, bool, bool]) -> None:
+    def put(self, item: tuple[str, bool, bool]) -> None:
         self._queue.put(item)
 
-    def get(self) -> Optional[Tuple[str, bool, bool]]:
+    def get(self) -> tuple[str, bool, bool] | None:
         try:
             return self._queue.get(block=False)
         except queue_lib.Empty:
@@ -118,7 +117,7 @@ class LocalQueueFactory(QueueBackendFactory):
 class MultiprocessingQueueFactory(QueueBackendFactory):
     """Factory for multiprocessing queues with a shared manager."""
 
-    def __init__(self, port: Optional[int] = None):
+    def __init__(self, port: int | None = None):
         super().__init__()
         self._port = (port if port is not None else
                       mp_queue.DEFAULT_QUEUE_MANAGER_PORT)
@@ -126,7 +125,7 @@ class MultiprocessingQueueFactory(QueueBackendFactory):
     def create_queue(self, schedule_type: str) -> QueueBackend:
         return MultiprocessingQueueBackend(schedule_type, self._port)
 
-    def start(self) -> Optional[multiprocessing.Process]:
+    def start(self) -> multiprocessing.Process | None:
 
         if not common_utils.is_port_available(self._port):
             raise RuntimeError(
@@ -143,11 +142,11 @@ class MultiprocessingQueueFactory(QueueBackendFactory):
         return process
 
     @staticmethod
-    def _get_queue_names() -> List[str]:
+    def _get_queue_names() -> list[str]:
         return [st.value for st in api_requests.ScheduleType]
 
 
-_queue_backend_factory: Optional[QueueBackendFactory] = None
+_queue_backend_factory: QueueBackendFactory | None = None
 
 
 def get_queue_backend_factory() -> QueueBackendFactory:

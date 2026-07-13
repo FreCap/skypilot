@@ -1,12 +1,13 @@
 """Kubernetes instance provisioning."""
+from collections.abc import Callable
+from collections.abc import Mapping
 import copy
 import datetime
 import json
 import re
 import sys
 import time
-from typing import (Any, Callable, Dict, List, Mapping, Optional, Set, Tuple,
-                    TYPE_CHECKING, Union)
+from typing import Any, Optional, TYPE_CHECKING
 
 from sky import exceptions
 from sky import global_user_state
@@ -78,7 +79,7 @@ _SSH_USER_PATTERN = re.compile(r'SKYPILOT_SSH_USER: ([^\s\n]+)')
 logger = sky_logging.init_logger(__name__)
 
 
-def ray_tag_filter(cluster_name: str) -> Dict[str, str]:
+def ray_tag_filter(cluster_name: str) -> dict[str, str]:
     return {k8s_constants.TAG_RAY_CLUSTER_NAME: cluster_name}
 
 
@@ -86,7 +87,7 @@ def _is_head(pod) -> bool:
     return pod.metadata.labels.get(constants.TAG_RAY_NODE_KIND) == 'head'
 
 
-def _get_head_pod_name(pods: Dict[str, Any]) -> Optional[str]:
+def _get_head_pod_name(pods: dict[str, Any]) -> str | None:
     return next((pod_name for pod_name, pod in pods.items() if _is_head(pod)),
                 None)
 
@@ -130,14 +131,14 @@ def _get_deployment_name(cluster_name: str) -> str:
     return f'{cluster_name}-deployment'
 
 
-def _head_service_selector(cluster_name: str) -> Dict[str, str]:
+def _head_service_selector(cluster_name: str) -> dict[str, str]:
     return {'component': f'{cluster_name}-head'}
 
 
 def is_high_availability_cluster_by_kubectl(
         cluster_name: str,
-        context: Optional[str] = None,
-        namespace: Optional[str] = None) -> bool:
+        context: str | None = None,
+        namespace: str | None = None) -> bool:
     """Check if a cluster is a high availability controller by calling
     `kubectl get deployment`.
 
@@ -157,7 +158,7 @@ def is_high_availability_cluster_by_kubectl(
     return bool(deployment_list.items)
 
 
-def _formatted_resource_requirements(pod_or_spec: Union[Any, dict]) -> str:
+def _formatted_resource_requirements(pod_or_spec: Any | dict) -> str:
     # Returns a formatted string of resource requirements for a pod.
     resource_requirements = {}
 
@@ -186,7 +187,7 @@ def _formatted_resource_requirements(pod_or_spec: Union[Any, dict]) -> str:
                      for resource, value in resource_requirements.items())
 
 
-def _formatted_node_selector(pod_or_spec: Union[Any, dict]) -> Optional[str]:
+def _formatted_node_selector(pod_or_spec: Any | dict) -> str | None:
     # Returns a formatted string of node selectors for a pod.
     node_selectors = []
 
@@ -204,9 +205,9 @@ def _formatted_node_selector(pod_or_spec: Union[Any, dict]) -> Optional[str]:
 
 
 def _lack_resource_msg(resource: str,
-                       pod_or_spec: Union[Any, dict],
-                       extra_msg: Optional[str] = None,
-                       details: Optional[str] = None) -> str:
+                       pod_or_spec: Any | dict,
+                       extra_msg: str | None = None,
+                       details: str | None = None) -> str:
     resource_requirements = _formatted_resource_requirements(pod_or_spec)
     node_selectors = _formatted_node_selector(pod_or_spec)
     node_selector_str = f' and labels ({node_selectors})' if (
@@ -223,7 +224,7 @@ def _lack_resource_msg(resource: str,
     return msg
 
 
-def _format_pvc_binding_error(pvc_details: Optional[str], pvc_names: List[str],
+def _format_pvc_binding_error(pvc_details: str | None, pvc_names: list[str],
                               namespace: str) -> str:
     """Format a PVC binding error message.
 
@@ -252,8 +253,8 @@ def _format_pvc_binding_error(pvc_details: Optional[str], pvc_names: List[str],
             '\n'.join(debug_lines))
 
 
-def _get_pvc_binding_status(namespace: str, context: Optional[str],
-                            pod: Any) -> Optional[str]:
+def _get_pvc_binding_status(namespace: str, context: str | None,
+                            pod: Any) -> str | None:
     """Check if any PVCs used by a pod are pending/unbound.
 
     Returns an error message if any PVC is pending, None otherwise.
@@ -543,8 +544,8 @@ def _cluster_maybe_autoscaling(namespace, context, search_start) -> bool:
         return False
 
 
-def _update_spinner_message(*, iteration: int, pods: List[Any],
-                            context: Optional[str], namespace: str,
+def _update_spinner_message(*, iteration: int, pods: list[Any],
+                            context: str | None, namespace: str,
                             cluster_name_on_cloud: str,
                             cluster_name: str) -> None:
     del iteration, pods, context, namespace  #unused
@@ -593,7 +594,7 @@ def _wait_for_pods_to_schedule(namespace, context, new_nodes, timeout: int,
     # autoscaler nodes. Heuristic FailedScheduling detection (Karpenter) does
     # NOT set this — extending a deadline by 15 min based on FailedScheduling
     # alone would mask real failures (oversized requests, taints, etc.).
-    autoscale_detected_time: Optional[float] = None
+    autoscale_detected_time: float | None = None
 
     # If the user configured an autoscaler but left provision_timeout too
     # short, bump the initial timeout up to the minimum so the Cluster
@@ -729,7 +730,7 @@ def _wait_for_pods_to_run(namespace, context, cluster_name, new_pods):
     # Create a set of pod names we're waiting for
     expected_pod_names = {pod.metadata.name for pod in new_pods}
 
-    def _check_init_containers(pod) -> Optional[Tuple[str, int, int]]:
+    def _check_init_containers(pod) -> tuple[str, int, int] | None:
         """Check init containers for errors and return running container info.
 
         Returns (name, 1-based index, total) of the currently running init
@@ -738,7 +739,7 @@ def _wait_for_pods_to_run(namespace, context, cluster_name, new_pods):
         """
         init_statuses = pod.status.init_container_statuses
         total = len(init_statuses)
-        running_info: Optional[Tuple[str, int, int]] = None
+        running_info: tuple[str, int, int] | None = None
         for idx, init_status in enumerate(init_statuses):
             init_terminated = init_status.state.terminated
             if init_terminated:
@@ -795,7 +796,7 @@ def _wait_for_pods_to_run(namespace, context, cluster_name, new_pods):
             # Today's raise block -- control flow preserved, message enriched
             # via _unmask_crashloopbackoff_reason when the waiting state is
             # CrashLoopBackOff. msg body (waiting.message) is always preserved.
-            init_reason: Optional[str] = None
+            init_reason: str | None = None
             if container_statuses is not None:
                 for container_status in container_statuses:
                     if not container_status.state:
@@ -834,8 +835,8 @@ def _wait_for_pods_to_run(namespace, context, cluster_name, new_pods):
             # since events can retain stale "Pulling image" entries long
             # after the pull completed.  Otherwise, Tier 1 (container
             # status) wins; fall back to Tier 2/3 events.
-            reason: Optional[str] = init_reason or container_reason
-            event_message: Optional[str] = None
+            reason: str | None = init_reason or container_reason
+            event_message: str | None = None
             if reason is None:
                 pending_reason = _get_pod_pending_reason(
                     context, namespace, pod.metadata.name)
@@ -864,7 +865,7 @@ def _wait_for_pods_to_run(namespace, context, cluster_name, new_pods):
         return False, container_reason
 
     missing_pods_retry = 0
-    last_status_msg: Optional[str] = None
+    last_status_msg: str | None = None
     while True:
         # Get all pods in a single API call
         cluster_name_on_cloud = new_pods[0].metadata.labels[
@@ -914,7 +915,7 @@ def _wait_for_pods_to_run(namespace, context, cluster_name, new_pods):
                                                         _NUM_THREADS)
 
         all_pods_running = True
-        pending_reasons_count: Dict[str, int] = {}
+        pending_reasons_count: dict[str, int] = {}
         for is_running, pending_reason in pod_statuses:
             if not is_running:
                 all_pods_running = False
@@ -958,7 +959,7 @@ def _wait_for_pods_to_run(namespace, context, cluster_name, new_pods):
 
 
 @timeline.event
-def pre_init(namespace: str, context: Optional[str], new_nodes: List) -> None:
+def pre_init(namespace: str, context: str | None, new_nodes: list) -> None:
     """Pre-initialization step for SkyPilot pods.
     This step is run in the pod right after it is created and before the
     SkyPilot runtime is setup.
@@ -1102,8 +1103,8 @@ def pre_init(namespace: str, context: Optional[str], new_nodes: List) -> None:
     subprocess_utils.run_in_parallel(_pre_init_thread, new_nodes, _NUM_THREADS)
 
 
-def _label_pod(namespace: str, context: Optional[str], pod_name: str,
-               label: Dict[str, str]) -> None:
+def _label_pod(namespace: str, context: str | None, pod_name: str,
+               label: dict[str, str]) -> None:
     """Label a pod."""
     kubernetes.core_api(context).patch_namespaced_pod(
         pod_name,
@@ -1114,7 +1115,7 @@ def _label_pod(namespace: str, context: Optional[str], pod_name: str,
 
 
 def _force_remove_terminating_pod(pod_name: str, namespace: str,
-                                  context: Optional[str]) -> None:
+                                  context: str | None) -> None:
     """Force-removes a stuck-terminating pod so a same-named pod can be created.
 
     A terminating pod can block recreation with 409 ``object is being deleted``
@@ -1130,7 +1131,7 @@ def _force_remove_terminating_pod(pod_name: str, namespace: str,
     A force-delete with grace period 0 removes the object from the API server
     before the call returns, so the caller can recreate the same name at once.
     """
-    finalizers: List[str] = []
+    finalizers: list[str] = []
     try:
         pod = kubernetes.core_api(context).read_namespaced_pod(
             pod_name, namespace)
@@ -1187,7 +1188,7 @@ def _force_remove_terminating_pod(pod_name: str, namespace: str,
 
 @timeline.event
 def _create_namespaced_pod_with_retries(namespace: str, pod_spec: dict,
-                                        context: Optional[str]) -> Any:
+                                        context: str | None) -> Any:
     """Attempts to create a Kubernetes Pod and handle any errors.
 
     Currently, we handle errors due to the AppArmor annotation and retry if
@@ -1295,7 +1296,7 @@ def _create_namespaced_pod_with_retries(namespace: str, pod_spec: dict,
 def _wait_for_deployment_pod(context,
                              namespace,
                              deployment,
-                             timeout=300) -> List:
+                             timeout=300) -> list:
     label_selector = ','.join([
         f'{key}={value}'
         for key, value in deployment.spec.selector.match_labels.items()
@@ -1326,7 +1327,7 @@ def _wait_for_deployment_pod(context,
         'ready.')
 
 
-def _configure_runtime_class(pod_spec: Dict[str,
+def _configure_runtime_class(pod_spec: dict[str,
                                             Any], nvidia_runtime_exists: bool,
                              needs_gpus_nvidia: bool) -> None:
     """Sets or strips runtimeClassName on the pod spec in-place.
@@ -1347,7 +1348,7 @@ def _configure_runtime_class(pod_spec: Dict[str,
         spec['runtimeClassName'] = 'nvidia'
 
 
-def _validate_cluster_name_annotations(pods: Dict[str, Any], cluster_name: str,
+def _validate_cluster_name_annotations(pods: dict[str, Any], cluster_name: str,
                                        cluster_name_on_cloud: str) -> None:
     """Refuse to adopt Pods owned by a different full cluster name."""
     for pod in pods.values():
@@ -1419,11 +1420,11 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
     # volume + volumeMount are added per-pod inside _create_resource_thread (so
     # that each pod can have its own subPath).
     raw_docker_config = provider_config.get('docker_config')
-    docker_config: Optional[kubernetes_utils.DockerConfig] = None
+    docker_config: kubernetes_utils.DockerConfig | None = None
     if raw_docker_config:
         docker_config = kubernetes_utils.DockerConfig.from_dict(
             raw_docker_config)
-    docker_pvc_name: Optional[str] = None
+    docker_pvc_name: str | None = None
     if docker_config and docker_config.cache_volume:
         cache_vol_name = docker_config.cache_volume
         vol_record = global_user_state.get_volume_by_name(cache_vol_name)
@@ -1803,13 +1804,13 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
 
 
 def wait_instances(region: str, cluster_name_on_cloud: str,
-                   state: Optional[status_lib.ClusterStatus]) -> None:
+                   state: status_lib.ClusterStatus | None) -> None:
     del region, cluster_name_on_cloud, state
 
 
 def stop_instances(
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     worker_only: bool = False,
 ) -> None:
     raise NotImplementedError()
@@ -1817,7 +1818,7 @@ def stop_instances(
 
 def _delete_services(name_prefix: str,
                      namespace: str,
-                     context: Optional[str],
+                     context: str | None,
                      skip_ssh_service: bool = False) -> None:
     """Delete services with the given name prefix.
 
@@ -1835,17 +1836,17 @@ def _delete_services(name_prefix: str,
         # https://github.com/pylint-dev/pylint/issues/5263.
         # pylint: disable=cell-var-from-loop
         kubernetes_utils.delete_k8s_resource_with_retry(
-            delete_func=lambda: kubernetes.core_api(
-                context).delete_namespaced_service(name=service_name,
-                                                   namespace=namespace,
-                                                   _request_timeout=config_lib.
-                                                   DELETION_TIMEOUT),
+            delete_func=lambda: kubernetes.core_api(context).
+            delete_namespaced_service(
+                name=service_name,  # noqa: B023
+                namespace=namespace,
+                _request_timeout=config_lib.DELETION_TIMEOUT),
             resource_type='service',
             resource_name=service_name)
 
 
 def _delete_cluster_services(cluster_name: str, namespace: str,
-                             context: Optional[str]) -> None:
+                             context: str | None) -> None:
     """Delete all services associated with a cluster using label selector.
 
     This is a fallback cleanup mechanism that works even when pods have been
@@ -1869,7 +1870,7 @@ def _delete_cluster_services(cluster_name: str, namespace: str,
 
 
 def _terminate_node(namespace: str,
-                    context: Optional[str],
+                    context: str | None,
                     pod_name: str,
                     is_head: bool = False) -> None:
     """Terminate a pod and its associated services."""
@@ -1900,7 +1901,7 @@ def _terminate_node(namespace: str,
 
 
 def _terminate_deployment(cluster_name: str, namespace: str,
-                          context: Optional[str]) -> None:
+                          context: str | None) -> None:
     """Terminate a deployment."""
     # Delete services first
     _delete_services(f'{cluster_name}-head', namespace, context)
@@ -1933,7 +1934,7 @@ def _terminate_deployment(cluster_name: str, namespace: str,
 
 def terminate_instances(
     cluster_name_on_cloud: str,
-    provider_config: Dict[str, Any],
+    provider_config: dict[str, Any],
     worker_only: bool = False,
 ) -> None:
     """See sky/provision/__init__.py"""
@@ -1971,7 +1972,7 @@ def terminate_instances(
 
 def cleanup_cluster_resources(
     cluster_name_on_cloud: str,
-    provider_config: Dict[str, Any],
+    provider_config: dict[str, Any],
 ) -> None:
     """Cleanup Kubernetes resources for a cluster.
 
@@ -1998,8 +1999,8 @@ _HOST_NETWORK_SSHD_WAIT_INTERVAL_S = 2
 
 
 def _read_host_network_sshd_ports(cluster_name_on_cloud: str, namespace: str,
-                                  context: Optional[str],
-                                  expected_pods: List[str]) -> Dict[str, int]:
+                                  context: str | None,
+                                  expected_pods: list[str]) -> dict[str, int]:
     """Read each pod's probed sshd port from the hostNetwork ConfigMap.
 
     Polls until every entry in ``expected_pods`` is present (or the
@@ -2012,7 +2013,7 @@ def _read_host_network_sshd_ports(cluster_name_on_cloud: str, namespace: str,
     expected = set(expected_pods)
     deadline = time.monotonic() + _HOST_NETWORK_SSHD_WAIT_TIMEOUT_S
     while True:
-        out: Dict[str, int] = {}
+        out: dict[str, int] = {}
         try:
             cm = kubernetes.core_api(context).read_namespaced_config_map(
                 name=name, namespace=namespace)
@@ -2050,7 +2051,7 @@ def _read_host_network_sshd_ports(cluster_name_on_cloud: str, namespace: str,
 def get_cluster_info(
         region: str,
         cluster_name_on_cloud: str,
-        provider_config: Optional[Dict[str, Any]] = None) -> common.ClusterInfo:
+        provider_config: dict[str, Any] | None = None) -> common.ClusterInfo:
     del region  # unused
     assert provider_config is not None
     namespace = kubernetes_utils.get_namespace_from_config(provider_config)
@@ -2060,7 +2061,7 @@ def get_cluster_info(
         namespace, context, ray_tag_filter(cluster_name_on_cloud), ['Running'])
     logger.debug(f'Running pods: {list(running_pods.keys())}')
 
-    pods: Dict[str, List[common.InstanceInfo]] = {}
+    pods: dict[str, list[common.InstanceInfo]] = {}
     head_pod_name = None
 
     port = 22
@@ -2171,12 +2172,12 @@ def get_cluster_info(
 class NodeHealthInfo:
     """Health info for a single Kubernetes node."""
 
-    def __init__(self, issue: str, pods: List[str]):
+    def __init__(self, issue: str, pods: list[str]):
         self.issue = issue
         self.pods = pods
 
 
-def _get_pod_health_issues(pod: Any) -> Optional[str]:
+def _get_pod_health_issues(pod: Any) -> str | None:
     """Check a Running pod for health issues.
 
     Examines pod conditions and container statuses to detect problems
@@ -2240,9 +2241,9 @@ def _get_pod_health_issues(pod: Any) -> Optional[str]:
 
 
 def _check_nodes_health(
-    context: Optional[str],
-    node_names: Set[str],
-) -> Dict[str, str]:
+    context: str | None,
+    node_names: set[str],
+) -> dict[str, str]:
     """Check health of specific Kubernetes nodes.
 
     Tries the NodeInfoSource plugin first (fast, cached), then falls back
@@ -2259,7 +2260,7 @@ def _check_nodes_health(
     if not node_names:
         return {}
 
-    issues: Dict[str, str] = {}
+    issues: dict[str, str] = {}
 
     # Try NodeInfoSource plugin first (node-info-service sidecar).
     # get() safely returns None when no provider is registered.
@@ -2281,7 +2282,7 @@ def _check_nodes_health(
         return issues
 
     # Fallback: direct Kubernetes API (parallelized)
-    def _check_single_node(name: str) -> Optional[Tuple[str, str]]:
+    def _check_single_node(name: str) -> tuple[str, str] | None:
         try:
             node = kubernetes.core_api(context).read_node(
                 name, _request_timeout=kubernetes.API_TIMEOUT)
@@ -2309,9 +2310,9 @@ def _check_nodes_health(
 
 def get_node_health_for_cluster(
     cluster_name_on_cloud: str,
-    provider_config: Dict[str, Any],
-    unhealthy_pod_names: List[str],
-) -> Dict[str, NodeHealthInfo]:
+    provider_config: dict[str, Any],
+    unhealthy_pod_names: list[str],
+) -> dict[str, NodeHealthInfo]:
     """Check node health for specific unhealthy pods in a cluster.
 
     Fetches pods to determine which nodes they run on, then checks
@@ -2337,7 +2338,7 @@ def get_node_health_for_cluster(
 
     # Build pod -> node mapping for unhealthy pods
     unhealthy_set = set(unhealthy_pod_names)
-    pod_node_map: Dict[str, Optional[str]] = {}
+    pod_node_map: dict[str, str | None] = {}
     for pod in pods:
         name = pod.metadata.name
         if name in unhealthy_set:
@@ -2352,7 +2353,7 @@ def get_node_health_for_cluster(
         return {}
 
     # Build structured result: node -> NodeHealthInfo
-    result: Dict[str, NodeHealthInfo] = {}
+    result: dict[str, NodeHealthInfo] = {}
     for pod_name, node_name in pod_node_map.items():
         if node_name and node_name in node_issues:
             if node_name not in result:
@@ -2462,8 +2463,8 @@ def _condensed_pod_reason(pod: 'V1Pod') -> str:
     return kubernetes_utils.get_condensed_pod_reason(pod)
 
 
-def _get_pod_events(context: Optional[str], namespace: str,
-                    pod_name: str) -> List[Any]:
+def _get_pod_events(context: str | None, namespace: str,
+                    pod_name: str) -> list[Any]:
     """Get the events for a pod, sorted by timestamp, most recent first."""
     pod_field_selector = (
         f'involvedObject.kind=Pod,involvedObject.name={pod_name}')
@@ -2494,14 +2495,14 @@ _SPECIFIC_FAILURE_REASON_SUBSTRINGS = tuple(
                                                     'Preempted', 'Disrupted')
 
 
-def _reason_lacks_specific_cause(reason: Optional[str]) -> bool:
+def _reason_lacks_specific_cause(reason: str | None) -> bool:
     """Whether `reason` does not already name a specific failure cause."""
     return not reason or not any(s in reason
                                  for s in _SPECIFIC_FAILURE_REASON_SUBSTRINGS)
 
 
-def _get_pod_failure_reason_from_events(context: Optional[str], namespace: str,
-                                        pod_name: str) -> Optional[str]:
+def _get_pod_failure_reason_from_events(context: str | None, namespace: str,
+                                        pod_name: str) -> str | None:
     """Best-effort failure reason from the pod's most recent kubelet event.
 
     Some failures (notably evictions for ephemeral-storage / disk / memory
@@ -2521,8 +2522,8 @@ def _get_pod_failure_reason_from_events(context: Optional[str], namespace: str,
     return None
 
 
-def _get_pod_failure_reason_from_status(context: Optional[str], namespace: str,
-                                        pod_name: str) -> Optional[str]:
+def _get_pod_failure_reason_from_status(context: str | None, namespace: str,
+                                        pod_name: str) -> str | None:
     """Best-effort durable failure reason from the pod's terminated states.
 
     A run-phase OOMKilled is recorded in the container's
@@ -2548,9 +2549,8 @@ def _get_pod_failure_reason_from_status(context: Optional[str], namespace: str,
 
 
 def _first_pod_failure_reason(
-    provider_config: Dict[str, Any], pod_names: List[str],
-    per_pod_fn: Callable[[Optional[str], str, str], Optional[str]]
-) -> Optional[str]:
+        provider_config: dict[str, Any], pod_names: list[str],
+        per_pod_fn: Callable[[str | None, str, str], str | None]) -> str | None:
     """Return the first non-None ``per_pod_fn(context, namespace, pod)``.
 
     Resolves namespace/context from the provider config and probes each pod in
@@ -2566,8 +2566,8 @@ def _first_pod_failure_reason(
     return None
 
 
-def get_cluster_failure_reason_from_events(
-        provider_config: Dict[str, Any], pod_names: List[str]) -> Optional[str]:
+def get_cluster_failure_reason_from_events(provider_config: dict[str, Any],
+                                           pod_names: list[str]) -> str | None:
     """First pod eviction reason from kubelet events (status lags), or None.
 
     An eviction (ephemeral-storage / disk / memory pressure) is emitted as a
@@ -2578,8 +2578,8 @@ def get_cluster_failure_reason_from_events(
                                      _get_pod_failure_reason_from_events)
 
 
-def get_cluster_failure_reason_from_pods(provider_config: Dict[str, Any],
-                                         pod_names: List[str]) -> Optional[str]:
+def get_cluster_failure_reason_from_pods(provider_config: dict[str, Any],
+                                         pod_names: list[str]) -> str | None:
     """First pod's durable terminated-state reason (e.g. a restarted OOM).
 
     See _get_pod_failure_reason_from_status. Complements the events lookup:
@@ -2600,7 +2600,7 @@ def get_cluster_failure_reason_from_pods(provider_config: Dict[str, Any],
 AUTOSTOP_EVENT_REASON = 'SkyPilotAutodown'
 
 
-def emit_autostop_event_best_effort(provider_config: Dict[str, Any],
+def emit_autostop_event_best_effort(provider_config: dict[str, Any],
                                     cluster_name_on_cloud: str) -> None:
     """Emit a Kubernetes Event marking that the cluster is autodowning.
 
@@ -2643,9 +2643,9 @@ def emit_autostop_event_best_effort(provider_config: Dict[str, Any],
 
 
 def get_cluster_autostop_event(
-        provider_config: Dict[str, Any],
+        provider_config: dict[str, Any],
         cluster_name_on_cloud: str,
-        since: Optional[float] = None) -> Optional[Dict[str, Any]]:
+        since: float | None = None) -> dict[str, Any] | None:
     """Most recent autodown breadcrumb for the cluster, or None.
 
     Reads the Kubernetes Event emitted by skylet (see
@@ -2675,7 +2675,7 @@ def get_cluster_autostop_event(
                      f'{cluster_name_on_cloud}: {e}')
         return None
 
-    def _event_unix_time(event: Any) -> Optional[int]:
+    def _event_unix_time(event: Any) -> int | None:
         ts = (event.last_timestamp or event.event_time or
               event.metadata.creation_timestamp)
         if ts is None:
@@ -2709,7 +2709,7 @@ def get_cluster_autostop_event(
     }
 
 
-def _unmask_crashloopbackoff_reason(cs: Any) -> Optional[str]:
+def _unmask_crashloopbackoff_reason(cs: Any) -> str | None:
     """Return `last_state.terminated.reason` iff cs is in CrashLoopBackOff
     and a previous terminated reason is available; else None.
 
@@ -2724,7 +2724,7 @@ def _unmask_crashloopbackoff_reason(cs: Any) -> Optional[str]:
     return last_term.reason
 
 
-def _get_pod_pending_reason_from_container_status(pod: Any) -> Optional[str]:
+def _get_pod_pending_reason_from_container_status(pod: Any) -> str | None:
     """Tier-1 sweep: derive a pending reason from pod.status.container_statuses.
 
     For each container in turn:
@@ -2773,8 +2773,8 @@ def _get_pod_pending_reason_from_container_status(pod: Any) -> Optional[str]:
     return None
 
 
-def _get_pod_pending_reason(context: Optional[str], namespace: str,
-                            pod_name: str) -> Optional[Tuple[str, str]]:
+def _get_pod_pending_reason(context: str | None, namespace: str,
+                            pod_name: str) -> tuple[str, str] | None:
     """Get the reason why a pod is pending from its events.
 
     Two-pass scan over the event list (sorted newest-first by _get_pod_events):
@@ -2810,9 +2810,9 @@ def _get_pod_pending_reason(context: Optional[str], namespace: str,
 
 
 def _format_pod_missing_reason(
-        *, context: Optional[str], pod_name: str, event: Any, cluster_name: str,
+        *, context: str | None, pod_name: str, event: Any, cluster_name: str,
         transitioned_at: int,
-        first_pod: bool) -> Tuple[str, global_user_state.ClusterEventType]:
+        first_pod: bool) -> tuple[str, global_user_state.ClusterEventType]:
     """Format pod missing reason.
 
     Args:
@@ -2835,9 +2835,9 @@ def _format_pod_missing_reason(
     return event_str, event_type
 
 
-def _get_pod_missing_reason(context: Optional[str], namespace: str,
+def _get_pod_missing_reason(context: str | None, namespace: str,
                             cluster_name: str, pod_name: str,
-                            first_pod: bool) -> Optional[str]:
+                            first_pod: bool) -> str | None:
     """Get events for missing pod and write to cluster events."""
     logger.debug(f'Analyzing events for pod {pod_name}')
     pod_events = _get_pod_events(context, namespace, pod_name)
@@ -2966,9 +2966,9 @@ def _get_pod_missing_reason(context: Optional[str], namespace: str,
     return failure_reason
 
 
-def list_namespaced_pod(context: Optional[str], namespace: str,
+def list_namespaced_pod(context: str | None, namespace: str,
                         cluster_name_on_cloud: str, is_ssh: bool, identity: str,
-                        label_selector: str) -> List[Any]:
+                        label_selector: str) -> list[Any]:
     # Get all the pods with the label skypilot-cluster-name: <cluster_name>
     try:
         # log the query parameters we pass to the k8s api
@@ -3037,12 +3037,12 @@ def list_namespaced_pod(context: Optional[str], namespace: str,
 def query_instances(
     cluster_name: str,
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     non_terminated_only: bool = True,
     retry_if_missing: bool = False,
-    status_map_overrides: Optional[Mapping[
-        str, Optional['status_lib.ClusterStatus']]] = None,
-) -> Dict[str, Tuple[Optional['status_lib.ClusterStatus'], Optional[str]]]:
+    status_map_overrides: Mapping[str, Optional['status_lib.ClusterStatus']] |
+    None = None,
+) -> dict[str, tuple[Optional['status_lib.ClusterStatus'], str | None]]:
     # Mapping from pod phase to skypilot status. These are the only valid pod
     # phases.
     # https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-phase
@@ -3089,8 +3089,8 @@ def query_instances(
                         f'{attempts} retries.')
 
     # Check if the pods are running or pending
-    cluster_status: Dict[str, Tuple[Optional['status_lib.ClusterStatus'],
-                                    Optional[str]]] = {}
+    cluster_status: dict[str, tuple[status_lib.ClusterStatus | None,
+                                    str | None]] = {}
     for pod in pods:
         phase = pod.status.phase
         is_terminating = pod.metadata.deletion_timestamp is not None
@@ -3146,8 +3146,8 @@ def query_instances(
 
 def get_command_runners(
     cluster_info: common.ClusterInfo,
-    **credentials: Dict[str, Any],
-) -> List[command_runner.CommandRunner]:
+    **credentials: dict[str, Any],
+) -> list[command_runner.CommandRunner]:
     """Get a command runner for the given cluster."""
     assert cluster_info.provider_config is not None, cluster_info
     instances = cluster_info.instances
@@ -3156,7 +3156,7 @@ def get_command_runners(
     context = kubernetes_utils.get_context_from_config(
         cluster_info.provider_config)
 
-    runners: List[command_runner.CommandRunner] = []
+    runners: list[command_runner.CommandRunner] = []
     if cluster_info.head_instance_id is not None:
         pod_name = cluster_info.head_instance_id
 

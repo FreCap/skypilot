@@ -7,8 +7,8 @@ thread, so the worker is freed meanwhile. Subclass to own the polling/backoff/
 fallback policy; instances are pickled onto the exception, so keep state
 picklable and define subclasses in a module importable by the scheduler.
 """
+from collections.abc import Callable
 import time
-from typing import Callable
 
 
 class ContinueCondition:

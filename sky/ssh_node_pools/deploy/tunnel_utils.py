@@ -4,7 +4,6 @@ import random
 import re
 import subprocess
 import sys
-from typing import Set
 
 import colorama
 
@@ -18,7 +17,7 @@ logger = sky_logging.init_logger(__name__)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-def _get_used_localhost_ports() -> Set[int]:
+def _get_used_localhost_ports() -> set[int]:
     """Get SSH port forwardings already in use on localhost"""
     used_ports = set()
 

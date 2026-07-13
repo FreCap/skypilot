@@ -1,4 +1,5 @@
 """Kubernetes."""
+from collections.abc import Iterator
 import concurrent.futures
 import fnmatch
 import math
@@ -7,7 +8,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union
+from typing import Any, Optional
 
 import colorama
 
@@ -59,7 +60,7 @@ _PREEMPTION_GRACE_CAP_SECONDS = 600
 
 
 def _compute_preemption_hook_timeout(
-        hooks: Optional[List[Dict[str, Any]]]) -> Optional[int]:
+        hooks: list[dict[str, Any]] | None) -> int | None:
     """Sum of timeouts for all preemption-event hooks, capped.
 
     Returns ``None`` when no hook declares the ``preemption`` event,
@@ -104,9 +105,9 @@ def _compute_preemption_hook_timeout(
 
 def warn_if_preemption_grace_change_requires_relaunch(
     cloud: Optional['clouds.Cloud'],
-    prior_hooks: Optional[List[Dict[str, Any]]],
-    new_hooks: Optional[List[Dict[str, Any]]],
-) -> Optional[str]:
+    prior_hooks: list[dict[str, Any]] | None,
+    new_hooks: list[dict[str, Any]] | None,
+) -> str | None:
     """Return a warning string if a re-launch would need more K8s grace.
 
     Pod ``terminationGracePeriodSeconds`` is set at pod-creation time
@@ -142,7 +143,7 @@ def warn_if_preemption_grace_change_requires_relaunch(
 
 
 def cap_preemption_hook_timeouts(
-    hooks: Optional[List[Dict[str, Any]]],) -> Optional[List[Dict[str, Any]]]:
+    hooks: list[dict[str, Any]] | None,) -> list[dict[str, Any]] | None:
     """Cap each preemption-event hook's ``timeout`` to the K8s grace cap.
 
     On Kubernetes the pod's ``terminationGracePeriodSeconds`` is
@@ -158,7 +159,7 @@ def cap_preemption_hook_timeouts(
     """
     if not hooks:
         return hooks
-    out: List[Dict[str, Any]] = []
+    out: list[dict[str, Any]] = []
     for entry in hooks:
         events = list(entry.get('events') or [])
         timeout = entry.get('timeout', constants.DEFAULT_HOOK_TIMEOUT_SECONDS)
@@ -247,14 +248,14 @@ class Kubernetes(clouds.Cloud):
     _INDENT_PREFIX = ' ' * 4
 
     # Set of contexts that has logged as temporarily unreachable
-    logged_unreachable_contexts: Set[str] = set()
+    logged_unreachable_contexts: set[str] = set()
 
     @classmethod
     def _unsupported_features_for_resources(
         cls,
         resources: 'resources_lib.Resources',
-        region: Optional[str] = None,
-    ) -> Dict[clouds.CloudImplementationFeatures, str]:
+        region: str | None = None,
+    ) -> dict[clouds.CloudImplementationFeatures, str]:
         # TODO(aylei): features need to be regional (per context) to make
         # multi-kubernetes selection/failover work.
         unsupported_features = cls._CLOUD_UNSUPPORTED_FEATURES.copy()
@@ -298,12 +299,12 @@ class Kubernetes(clouds.Cloud):
         return unsupported_features
 
     @classmethod
-    def max_cluster_name_length(cls) -> Optional[int]:
+    def max_cluster_name_length(cls) -> int | None:
         return cls._MAX_CLUSTER_NAME_LEN_LIMIT
 
     @classmethod
     @annotations.lru_cache(scope='global', maxsize=1)
-    def _log_skipped_contexts_once(cls, skipped_contexts: Tuple[str,
+    def _log_skipped_contexts_once(cls, skipped_contexts: tuple[str,
                                                                 ...]) -> None:
         """Log skipped contexts for only once.
 
@@ -317,7 +318,7 @@ class Kubernetes(clouds.Cloud):
                 'Ignoring these contexts.')
 
     @classmethod
-    def existing_allowed_contexts(cls, silent: bool = False) -> List[str]:
+    def existing_allowed_contexts(cls, silent: bool = False) -> list[str]:
         """Get existing allowed contexts.
 
         If None is returned in the list, it means that we are running in a pod
@@ -405,7 +406,7 @@ class Kubernetes(clouds.Cloud):
     @classmethod
     def _log_unreachable_context(cls,
                                  context: str,
-                                 reason: Optional[str] = None) -> None:
+                                 reason: str | None = None) -> None:
         """Logs a Kubernetes context as unreachable.
 
         Args:
@@ -435,13 +436,13 @@ class Kubernetes(clouds.Cloud):
     @classmethod
     def regions_with_offering(
         cls,
-        instance_type: Optional[str],
-        accelerators: Optional[Dict[str, int]],
+        instance_type: str | None,
+        accelerators: dict[str, int] | None,
         use_spot: bool,
-        region: Optional[str],
-        zone: Optional[str],
+        region: str | None,
+        zone: str | None,
         resources: Optional['resources_lib.Resources'] = None,
-    ) -> List[clouds.Region]:
+    ) -> list[clouds.Region]:
         del accelerators, zone, use_spot  # unused
         existing_contexts = cls.existing_allowed_contexts()
 
@@ -528,18 +529,18 @@ class Kubernetes(clouds.Cloud):
     def instance_type_to_hourly_cost(self,
                                      instance_type: str,
                                      use_spot: bool,
-                                     region: Optional[str] = None,
-                                     zone: Optional[str] = None) -> float:
+                                     region: str | None = None,
+                                     zone: str | None = None) -> float:
         # pylint: disable=import-outside-toplevel
         from sky.catalog import kubernetes_catalog
         return kubernetes_catalog.get_hourly_cost(instance_type, use_spot,
                                                   region, zone)
 
     def accelerators_to_hourly_cost(self,
-                                    accelerators: Dict[str, int],
+                                    accelerators: dict[str, int],
                                     use_spot: bool,
-                                    region: Optional[str] = None,
-                                    zone: Optional[str] = None) -> float:
+                                    region: str | None = None,
+                                    zone: str | None = None) -> float:
         del accelerators, use_spot, region, zone  # unused
         return 0.0
 
@@ -552,14 +553,14 @@ class Kubernetes(clouds.Cloud):
     @classmethod
     def get_default_instance_type(
         cls,
-        cpus: Optional[str] = None,
-        memory: Optional[str] = None,
+        cpus: str | None = None,
+        memory: str | None = None,
         disk_tier: Optional['resources_utils.DiskTier'] = None,
-        local_disk: Optional[str] = None,
-        region: Optional[str] = None,
-        zone: Optional[str] = None,
+        local_disk: str | None = None,
+        region: str | None = None,
+        zone: str | None = None,
         use_spot: bool = False,
-        max_hourly_cost: Optional[float] = None,
+        max_hourly_cost: float | None = None,
     ) -> str:
         # TODO(romilb): In the future, we may want to move the instance type
         #  selection + availability checking to a kubernetes_catalog module.
@@ -586,7 +587,7 @@ class Kubernetes(clouds.Cloud):
     def get_accelerators_from_instance_type(
         cls,
         instance_type: str,
-    ) -> Optional[Dict[str, Union[int, float]]]:
+    ) -> dict[str, int | float] | None:
         inst = kubernetes_utils.KubernetesInstanceType.from_instance_type(
             instance_type)
         return {
@@ -596,7 +597,7 @@ class Kubernetes(clouds.Cloud):
 
     @classmethod
     def get_vcpus_mem_from_instance_type(
-            cls, instance_type: str) -> Tuple[Optional[float], Optional[float]]:
+            cls, instance_type: str) -> tuple[float | None, float | None]:
         """Returns the #vCPUs and memory that the instance type offers."""
         try:
             k = kubernetes_utils.KubernetesInstanceType.from_instance_type(
@@ -618,19 +619,19 @@ class Kubernetes(clouds.Cloud):
         region: str,
         num_nodes: int,
         instance_type: str,
-        accelerators: Optional[Dict[str, int]] = None,
+        accelerators: dict[str, int] | None = None,
         use_spot: bool = False,
-    ) -> Iterator[Optional[List[clouds.Zone]]]:
+    ) -> Iterator[list[clouds.Zone] | None]:
         # Always yield None for zones, since Kubernetes does not have zones, and
         # we should allow any region get to this point.
         yield None
 
     @classmethod
-    def get_zone_shell_cmd(cls) -> Optional[str]:
+    def get_zone_shell_cmd(cls) -> str | None:
         return None
 
     @classmethod
-    def get_image_size(cls, image_id: str, region: Optional[str]) -> int:
+    def get_image_size(cls, image_id: str, region: str | None) -> int:
         del image_id, region  # Unused.
         # We don't limit the image by its size compared to the disk size, as
         # we don't have a notion of disk size in Kubernetes.
@@ -639,7 +640,7 @@ class Kubernetes(clouds.Cloud):
     @staticmethod
     def _calculate_provision_timeout(
         num_nodes: int,
-        volume_mounts: Optional[List['volume_lib.VolumeMount']],
+        volume_mounts: list['volume_lib.VolumeMount'] | None,
         enable_flex_start: bool,
         is_using_queueing: bool,
     ) -> int:
@@ -691,11 +692,11 @@ class Kubernetes(clouds.Cloud):
         resources: 'resources_lib.Resources',
         cluster_name: 'resources_utils.ClusterName',
         region: Optional['clouds.Region'],
-        zones: Optional[List['clouds.Zone']],
+        zones: list['clouds.Zone'] | None,
         num_nodes: int,
         dryrun: bool = False,
-        volume_mounts: Optional[List['volume_lib.VolumeMount']] = None,
-    ) -> Dict[str, Optional[str]]:
+        volume_mounts: list['volume_lib.VolumeMount'] | None = None,
+    ) -> dict[str, str | None]:
         del zones  # Unused.
         if region is None:
             context = kubernetes_utils.get_current_kube_config_context_name()
@@ -906,8 +907,8 @@ class Kubernetes(clouds.Cloud):
                 region=context,
                 keys=('autoscaler',),
                 default_value=None)
-            if (autoscaler_type !=
-                    kubernetes_enums.KubernetesAutoscalerType.GKE.value):
+            if (autoscaler_type
+                    != kubernetes_enums.KubernetesAutoscalerType.GKE.value):
                 raise ValueError(
                     f'DWS is only supported in GKE, but the autoscaler type '
                     f'for context {context} is {autoscaler_type}')
@@ -1158,7 +1159,7 @@ class Kubernetes(clouds.Cloud):
         # TODO(zhwu): This needs to be updated to return the correct region
         # (context) that has enough resources.
         self._warn_on_disk_size(resources)
-        fuzzy_candidate_list: List[str] = []
+        fuzzy_candidate_list: list[str] = []
         if resources.instance_type is not None:
             assert resources.is_launchable(), resources
             regions = self.regions_with_offering(
@@ -1242,7 +1243,7 @@ class Kubernetes(clouds.Cloud):
                                                  [], None)
 
     @classmethod
-    def _check_single_context(cls, context: str) -> Tuple[bool, str]:
+    def _check_single_context(cls, context: str) -> tuple[bool, str]:
         """Check if the user has access credentials to a single SSH context."""
 
         def _red_color(str_to_format: str) -> str:
@@ -1278,7 +1279,7 @@ class Kubernetes(clouds.Cloud):
 
     @classmethod
     def _check_compute_credentials(
-            cls) -> Tuple[bool, Optional[Union[str, Dict[str, str]]]]:
+            cls) -> tuple[bool, str | dict[str, str] | None]:
         """Checks if the user has access credentials to
         Kubernetes."""
         # Check for port forward dependencies
@@ -1317,8 +1318,8 @@ class Kubernetes(clouds.Cloud):
         return success, ctx2text
 
     @classmethod
-    def _format_credential_check_results(cls, hints: List[str],
-                                         reasons: List[str]) -> str:
+    def _format_credential_check_results(cls, hints: list[str],
+                                         reasons: list[str]) -> str:
         """Format credential check results with hints and reasons.
 
         Args:
@@ -1344,7 +1345,7 @@ class Kubernetes(clouds.Cloud):
                 f'\n{cls._INDENT_PREFIX}  '.join(reasons))
         return ''.join(message_parts)
 
-    def get_credential_file_mounts(self) -> Dict[str, str]:
+    def get_credential_file_mounts(self) -> dict[str, str]:
         credential_paths = kubernetes_utils.get_kubeconfig_paths()
         if credential_paths:
             # For single kubeconfig path, keep the original path.
@@ -1374,7 +1375,7 @@ class Kubernetes(clouds.Cloud):
         return kubernetes_utils.KubernetesInstanceType.is_valid_instance_type(
             instance_type)
 
-    def validate_region_zone(self, region: Optional[str], zone: Optional[str]):
+    def validate_region_zone(self, region: str | None, zone: str | None):
         if region == kubernetes.in_cluster_context_name():
             # If running incluster, we set region to IN_CLUSTER_REGION
             # since there is no context name available.
@@ -1412,8 +1413,7 @@ class Kubernetes(clouds.Cloud):
         return identity_str
 
     @classmethod
-    def get_identity_from_context_name(cls,
-                                       context: str) -> Optional[List[str]]:
+    def get_identity_from_context_name(cls, context: str) -> list[str] | None:
         """Returns the user identity for a specific Kubernetes context.
 
         Args:
@@ -1443,7 +1443,7 @@ class Kubernetes(clouds.Cloud):
         return [cls.get_identity_from_context(context_map[context])]
 
     @classmethod
-    def get_user_identities(cls) -> Optional[List[List[str]]]:
+    def get_user_identities(cls) -> list[list[str]] | None:
         identities = []
         k8s = kubernetes.kubernetes
         try:
@@ -1464,8 +1464,7 @@ class Kubernetes(clouds.Cloud):
         return identities if identities else None
 
     @classmethod
-    def is_volume_name_valid(cls,
-                             volume_name: str) -> Tuple[bool, Optional[str]]:
+    def is_volume_name_valid(cls, volume_name: str) -> tuple[bool, str | None]:
         """Validates that the volume name is valid for this cloud.
 
         Follows Kubernetes DNS-1123 subdomain rules:
@@ -1490,7 +1489,7 @@ class Kubernetes(clouds.Cloud):
 
     @classmethod
     def is_label_valid(cls, label_key: str,
-                       label_value: str) -> Tuple[bool, Optional[str]]:
+                       label_value: str) -> tuple[bool, str | None]:
         # Kubernetes labels can be of the format <domain>/<key>: <value>
         key_regex = re.compile(
             # Look-ahead to ensure proper domain formatting up to a slash
@@ -1519,7 +1518,7 @@ class Kubernetes(clouds.Cloud):
         return True, None
 
     @classmethod
-    def expand_infras(cls) -> List[str]:
+    def expand_infras(cls) -> list[str]:
         return [
             f'{cls.canonical_name()}/{c}'
             for c in cls.existing_allowed_contexts(silent=True)
@@ -1530,10 +1529,10 @@ class Kubernetes(clouds.Cloud):
         cls,
         context: str,
         network_tier: Optional['resources_utils.NetworkTier'] = None,
-        k8s_acc_label_key: Optional[str] = None,
-        k8s_resource_key: Optional[str] = None,
-        acc_count: Optional[int] = None,
-    ) -> Tuple[KubernetesHighPerformanceNetworkType, Optional[Dict[str, Any]]]:
+        k8s_acc_label_key: str | None = None,
+        k8s_resource_key: str | None = None,
+        acc_count: int | None = None,
+    ) -> tuple[KubernetesHighPerformanceNetworkType, dict[str, Any] | None]:
         """Detect the type of Kubernetes network based on node labels.
 
         Args:
@@ -1586,7 +1585,7 @@ class Kubernetes(clouds.Cloud):
                              'topology.ebs.csi.aws.com')):
                             network_type = (
                                 KubernetesHighPerformanceNetworkType.AWS_EFA)
-                            metadata: Optional[Dict[str, Any]] = None
+                            metadata: dict[str, Any] | None = None
                             # Only check for AWS EFA count if GPU is specified
                             if (not k8s_acc_label_key or not k8s_resource_key or
                                     not acc_count):
@@ -1595,8 +1594,8 @@ class Kubernetes(clouds.Cloud):
                                     k8s_resource_key
                                     not in node.status.allocatable or
                                     int(node.status.
-                                        allocatable[k8s_resource_key]) <
-                                    acc_count):
+                                        allocatable[k8s_resource_key])
+                                    < acc_count):
                                 continue
                             # Calculate EFA count proportionally
                             if AWS_EFA_RESOURCE_KEY in node.status.allocatable:
@@ -1691,8 +1690,8 @@ class Kubernetes(clouds.Cloud):
             region=context,
             keys=('autoscaler',),
             default_value=None)
-        if (autoscaler_type !=
-                kubernetes_enums.KubernetesAutoscalerType.GKE.value):
+        if (autoscaler_type
+                != kubernetes_enums.KubernetesAutoscalerType.GKE.value):
             return KubernetesHighPerformanceNetworkType.NONE, None
         autoscaler = kubernetes_utils.get_autoscaler(
             kubernetes_enums.KubernetesAutoscalerType(autoscaler_type))

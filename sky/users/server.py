@@ -1,12 +1,13 @@
 """REST API for workspace management."""
 
+from collections.abc import Generator
 import contextlib
 import hashlib
 import os
 import re
 import secrets
 import time
-from typing import Any, Dict, Generator, List, Optional, Set
+from typing import Any
 
 import fastapi
 import filelock
@@ -72,7 +73,7 @@ def get_user_type(user: models.User) -> str:
 # TODO(aylei): make these async once we have the global_user_state async
 # support.
 @router.get('')
-def users() -> List[Dict[str, Any]]:
+def users() -> list[dict[str, Any]]:
     """Gets all users."""
     all_users = []
     user_list = global_user_state.get_all_users()
@@ -119,7 +120,7 @@ def get_current_user_role(request: fastapi.Request):
 def set_user_preferred_workspace(
     request: fastapi.Request,
     body: payloads.UserPreferredWorkspaceBody,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Sets (or clears with `preferred: null`) the user's preferred workspace.
 
     Echoes the new preferred value on success. Callers that need the
@@ -146,8 +147,8 @@ def set_user_preferred_workspace(
 @context.contextual
 def get_user_workspace(
     request: fastapi.Request,
-    requested: Optional[str] = None,
-) -> Dict[str, Any]:
+    requested: str | None = None,
+) -> dict[str, Any]:
     """Returns workspace state for the calling user.
 
     One stop for everything ``sky workspace info`` / dashboard pages /
@@ -222,7 +223,7 @@ def get_user_workspace(
     if requested is None and skypilot_config.is_active_workspace_set():
         requested = skypilot_config.get_active_workspace()
     accessible = sorted(workspaces_core.get_accessible_workspace_names())
-    response: Dict[str, Any] = {
+    response: dict[str, Any] = {
         'workspace': None,
         'source': None,
         'note': None,
@@ -384,7 +385,7 @@ def user_update(request: fastapi.Request,
 @router.post('/batch_update')
 @context.contextual
 def user_batch_update(request: fastapi.Request,
-                      body: payloads.UserBatchUpdateBody) -> Dict[str, Any]:
+                      body: payloads.UserBatchUpdateBody) -> dict[str, Any]:
     """Updates the role for a batch of users.
 
     Returns a per-user result with ``succeeded`` and ``failed`` lists so the
@@ -418,13 +419,13 @@ def user_batch_update(request: fastapi.Request,
     # Pre-fetch the per-user role state ONCE for the whole batch so the
     # per-user loop is O(1) dict lookups instead of N * casbin
     # get_user_roles.
-    users_to_role: Dict[str, str] = {}
+    users_to_role: dict[str, str] = {}
     for supported_role in supported_roles:
         for uid in permission.permission_service.get_users_for_role(
                 supported_role):
             users_to_role[uid] = supported_role
 
-    batch_workspaces_allowed_users: Optional[Dict[str, Set[str]]] = None
+    batch_workspaces_allowed_users: dict[str, set[str]] | None = None
     if role == rbac.RoleName.ADMIN.value:
         # Promotion -> nobody needs the demotion check, so we only need
         # user info for the batch's user_ids (one targeted IN query,
@@ -450,8 +451,8 @@ def user_batch_update(request: fastapi.Request,
         batch_workspaces_allowed_users = (
             resolver.resolve_workspaces_allowed_users(batch_workspaces))
 
-    succeeded: List[str] = []
-    failed: List[Dict[str, str]] = []
+    succeeded: list[str] = []
+    failed: list[dict[str, str]] = []
 
     for user_id in user_ids:
         try:
@@ -540,7 +541,7 @@ def user_delete(request: fastapi.Request,
 
 
 @router.post('/import')
-def user_import(user_import_body: payloads.UserImportBody) -> Dict[str, Any]:
+def user_import(user_import_body: payloads.UserImportBody) -> dict[str, Any]:
     """Import users from CSV content."""
     csv_content = user_import_body.csv_content
 
@@ -663,7 +664,7 @@ def user_import(user_import_body: payloads.UserImportBody) -> Dict[str, Any]:
 
 
 @router.get('/export')
-def user_export() -> Dict[str, Any]:
+def user_export() -> dict[str, Any]:
     """Export all users as CSV content."""
     try:
         # Get all users
@@ -728,7 +729,7 @@ def _user_lock(user_id: str) -> Generator[None, None, None]:
 
 @router.get('/service-account-tokens')
 def get_service_account_tokens(
-        request: fastapi.Request) -> List[Dict[str, Any]]:
+        request: fastapi.Request) -> list[dict[str, Any]]:
     """Get service account tokens. All users can see all tokens."""
     auth_user = request.state.auth_user
     if auth_user is None:
@@ -780,7 +781,7 @@ def _generate_service_account_user_id() -> str:
 @router.post('/service-account-tokens')
 def create_service_account_token(
         request: fastapi.Request,
-        token_body: payloads.ServiceAccountTokenCreateBody) -> Dict[str, Any]:
+        token_body: payloads.ServiceAccountTokenCreateBody) -> dict[str, Any]:
     """Create a new service account token."""
     auth_user = request.state.auth_user
     if auth_user is None:
@@ -869,7 +870,7 @@ def create_service_account_token(
 @router.post('/service-account-tokens/delete')
 def delete_service_account_token(
         request: fastapi.Request,
-        token_body: payloads.ServiceAccountTokenDeleteBody) -> Dict[str, str]:
+        token_body: payloads.ServiceAccountTokenDeleteBody) -> dict[str, str]:
     """Delete a service account token.
 
     Admins can delete any token, users can only delete their own.
@@ -910,7 +911,7 @@ def delete_service_account_token(
 @router.post('/service-account-tokens/get-role')
 def get_service_account_role(
         request: fastapi.Request,
-        role_body: payloads.ServiceAccountTokenRoleBody) -> Dict[str, Any]:
+        role_body: payloads.ServiceAccountTokenRoleBody) -> dict[str, Any]:
     """Get the role of a service account."""
     auth_user = request.state.auth_user
     if auth_user is None:
@@ -947,7 +948,7 @@ def get_service_account_role(
 def update_service_account_role(
         request: fastapi.Request,
         role_body: payloads.ServiceAccountTokenUpdateRoleBody
-) -> Dict[str, str]:
+) -> dict[str, str]:
     """Update the role of a service account."""
     auth_user = request.state.auth_user
     if auth_user is None:
@@ -989,7 +990,7 @@ def update_service_account_role(
 @router.post('/service-account-tokens/rotate')
 def rotate_service_account_token(
         request: fastapi.Request,
-        token_body: payloads.ServiceAccountTokenRotateBody) -> Dict[str, Any]:
+        token_body: payloads.ServiceAccountTokenRotateBody) -> dict[str, Any]:
     """Rotate a service account token.
 
     Generates a new token value for an existing service account while keeping

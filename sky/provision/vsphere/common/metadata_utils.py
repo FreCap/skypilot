@@ -2,7 +2,6 @@
 """
 import json
 import os
-from typing import List, Optional
 
 METADATA_PATH = '~/.vsphere/metadata'
 
@@ -13,15 +12,15 @@ class Metadata:
     def __init__(self) -> None:
         self.path = os.path.expanduser(METADATA_PATH)
         if os.path.exists(self.path):
-            with open(self.path, 'r', encoding='utf-8') as f:
+            with open(self.path, encoding='utf-8') as f:
                 self.metadata = json.load(f)
         else:
             self.metadata = {}
 
-    def get(self, cluster_name: str) -> Optional[List[str]]:
+    def get(self, cluster_name: str) -> list[str] | None:
         return self.metadata.get(cluster_name)
 
-    def set(self, cluster_name: str, instance_ids: List[str]) -> None:
+    def set(self, cluster_name: str, instance_ids: list[str]) -> None:
         self.metadata[cluster_name] = instance_ids
 
     def pop(self, cluster_name: str) -> None:

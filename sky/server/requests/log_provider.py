@@ -1,7 +1,7 @@
 """Provider for request logs."""
 import abc
+from collections.abc import AsyncGenerator
 import pathlib
-from typing import AsyncGenerator, Optional
 
 from sky import sky_logging
 from sky.server import stream_utils
@@ -19,7 +19,7 @@ class LogProvider(abc.ABC):
         log_path: pathlib.Path,
         *,
         plain_logs: bool = False,
-        tail: Optional[int] = None,
+        tail: int | None = None,
         follow: bool = True,
         polling_interval: float = stream_utils.DEFAULT_POLL_INTERVAL,
     ) -> AsyncGenerator[str, None]:
@@ -49,7 +49,7 @@ class LocalLogProvider(LogProvider):
         log_path: pathlib.Path,
         *,
         plain_logs: bool = False,
-        tail: Optional[int] = None,
+        tail: int | None = None,
         follow: bool = True,
         polling_interval: float = stream_utils.DEFAULT_POLL_INTERVAL,
     ) -> AsyncGenerator[str, None]:
@@ -63,7 +63,7 @@ class LocalLogProvider(LogProvider):
             yield chunk
 
 
-_log_provider: Optional[LogProvider] = None
+_log_provider: LogProvider | None = None
 
 
 def get_log_provider() -> LogProvider:

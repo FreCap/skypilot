@@ -1,9 +1,11 @@
 """Logging utils."""
+from collections.abc import Callable
+from collections.abc import Iterator
 import enum
 import time
 import types
 import typing
-from typing import Callable, Iterator, List, Optional, TextIO, Type
+from typing import TextIO
 
 import colorama
 import prettytable
@@ -23,7 +25,7 @@ else:
     pendulum = adaptors_common.LazyImport('pendulum')
 
 
-class LineProcessor(object):
+class LineProcessor:
     """A processor for log lines."""
 
     def __enter__(self) -> None:
@@ -32,9 +34,9 @@ class LineProcessor(object):
     def process_line(self, log_line: str) -> None:
         pass
 
-    def __exit__(self, except_type: Optional[Type[BaseException]],
-                 except_value: Optional[BaseException],
-                 traceback: Optional[types.TracebackType]) -> None:
+    def __exit__(self, except_type: type[BaseException] | None,
+                 except_value: BaseException | None,
+                 traceback: types.TracebackType | None) -> None:
         del except_type, except_value, traceback  # unused
         pass
 
@@ -47,7 +49,7 @@ class RayUpLineProcessor(LineProcessor):
         RUNTIME_SETUP = 1
         PULLING_DOCKER_IMAGES = 2
 
-    def __init__(self, log_path: str, cluster_name: Optional[str] = None):
+    def __init__(self, log_path: str, cluster_name: str | None = None):
         self.log_path = log_path
         self.cluster_name = cluster_name
 
@@ -86,9 +88,9 @@ class RayUpLineProcessor(LineProcessor):
                     cluster_name=self.cluster_name))
             self.state = self.ProvisionStatus.RUNTIME_SETUP
 
-    def __exit__(self, except_type: Optional[Type[BaseException]],
-                 except_value: Optional[BaseException],
-                 traceback: Optional[types.TracebackType]) -> None:
+    def __exit__(self, except_type: type[BaseException] | None,
+                 except_value: BaseException | None,
+                 traceback: types.TracebackType | None) -> None:
         del except_type, except_value, traceback  # unused
         self.status_display.stop()
 
@@ -191,14 +193,14 @@ class SkyLocalUpLineProcessor(LineProcessor):
                                          log_path=self.log_path,
                                          is_local=self.is_local))
 
-    def __exit__(self, except_type: Optional[Type[BaseException]],
-                 except_value: Optional[BaseException],
-                 traceback: Optional[types.TracebackType]) -> None:
+    def __exit__(self, except_type: type[BaseException] | None,
+                 except_value: BaseException | None,
+                 traceback: types.TracebackType | None) -> None:
         del except_type, except_value, traceback  # unused
         self.status_display.stop()
 
 
-def create_table(field_names: List[str], **kwargs) -> prettytable.PrettyTable:
+def create_table(field_names: list[str], **kwargs) -> prettytable.PrettyTable:
     """Creates table with default style."""
     border = kwargs.pop('border', False)
     align = kwargs.pop('align', 'l')
@@ -211,8 +213,8 @@ def create_table(field_names: List[str], **kwargs) -> prettytable.PrettyTable:
     return table
 
 
-def readable_time_duration(start: Optional[float],
-                           end: Optional[float] = None,
+def readable_time_duration(start: float | None,
+                           end: float | None = None,
                            absolute: bool = False) -> str:
     """Human readable time duration from timestamps.
 
@@ -263,7 +265,7 @@ def readable_time_duration(start: Optional[float],
     return diff
 
 
-def human_duration(start: int, end: Optional[int] = None) -> str:
+def human_duration(start: int, end: int | None = None) -> str:
     """Calculates the time elapsed between two timestamps and returns
        it as a human-readable string, similar to Kubernetes' duration format.
 
@@ -336,8 +338,8 @@ def follow_logs(
     *,
     should_stop: Callable[[], bool],
     stop_on_eof: bool = False,
-    process_line: Optional[Callable[[str], Iterator[str]]] = None,
-    idle_timeout_seconds: Optional[int] = None,
+    process_line: Callable[[str], Iterator[str]] | None = None,
+    idle_timeout_seconds: int | None = None,
 ) -> Iterator[str]:
     """Streams and processes logs line by line from a file.
 

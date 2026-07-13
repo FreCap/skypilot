@@ -330,8 +330,8 @@ class TestSSHMakeDeployResourcesVariables(unittest.TestCase):
         self.region.name = "ssh-my-cluster"
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
-    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
-          )
+    @patch(
+        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
     @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_keys')
     @patch('sky.provision.kubernetes.utils.is_kubeconfig_exec_auth')
@@ -425,8 +425,8 @@ class TestSSHMakeDeployResourcesVariables(unittest.TestCase):
         self.assertEqual(deploy_vars['timeout'], '7200')
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
-    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
-          )
+    @patch(
+        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
     @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_keys')
     @patch('sky.provision.kubernetes.utils.is_kubeconfig_exec_auth')
@@ -515,8 +515,8 @@ class TestSSHMakeDeployResourcesVariables(unittest.TestCase):
         self.assertEqual(deploy_vars['timeout'], '9000')
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
-    @patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name'
-          )
+    @patch(
+        'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
     @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
     @patch('sky.provision.kubernetes.utils.get_accelerator_label_keys')
     @patch('sky.provision.kubernetes.utils.is_kubeconfig_exec_auth')

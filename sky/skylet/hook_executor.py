@@ -13,7 +13,7 @@ guarantee is per-node.
 import fcntl
 import os
 import subprocess
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from sky import sky_logging
 from sky.skylet import constants
@@ -66,10 +66,10 @@ def try_claim_teardown(event: str) -> bool:
             os.close(fd)
 
 
-def current_teardown_event() -> Optional[str]:
+def current_teardown_event() -> str | None:
     """Return the claimed teardown event on this node, or None."""
     try:
-        with open(CLAIM_FILE, 'r', encoding='utf-8') as f:
+        with open(CLAIM_FILE, encoding='utf-8') as f:
             value = f.read().strip()
             return value or None
     except FileNotFoundError:
@@ -127,7 +127,7 @@ def _run_script(script: str, log_path: str, timeout: int, event: str) -> int:
         return 1
 
 
-def run(event: str, hooks: Optional[List[Dict[str, Any]]]) -> None:
+def run(event: str, hooks: list[dict[str, Any]] | None) -> None:
     """Run every hook whose `events` list contains `event`, in order.
 
     The per-event log file ``~/.sky/hooks/<event>.log`` is truncated

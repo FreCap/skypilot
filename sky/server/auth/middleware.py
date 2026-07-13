@@ -7,7 +7,6 @@ import hmac
 import json
 import os
 import time
-from typing import Optional
 
 import fastapi
 import jwt as pyjwt
@@ -111,7 +110,7 @@ class RBACMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
         return await call_next(request)
 
 
-def _extract_identity_from_jwt(jwt_token: str, claim: str) -> Optional[str]:
+def _extract_identity_from_jwt(jwt_token: str, claim: str) -> str | None:
     """Extract identity claim from a JWT token without verification.
 
     This is for trusted proxy scenarios where the external proxy has already
@@ -145,7 +144,7 @@ def _extract_identity_from_jwt(jwt_token: str, claim: str) -> Optional[str]:
 def _extract_user_from_header(
     request: fastapi.Request,
     proxy_config: server_config.ExternalProxyConfig,
-) -> Optional[models.User]:
+) -> models.User | None:
     """Extract user identity from request header.
 
     Supports both plaintext headers (e.g., X-Auth-Request-Email) and
@@ -180,7 +179,7 @@ def _extract_user_from_header(
                            user_type=models.UserType.SSO.value)
 
 
-def _get_auth_user_header(request: fastapi.Request) -> Optional[models.User]:
+def _get_auth_user_header(request: fastapi.Request) -> models.User | None:
     """Legacy function for backward compatibility.
 
     This function is used by _generate_auth_token() which does not have
@@ -460,7 +459,7 @@ class InternalServeControllerSyncAuthMiddleware(
                 })
 
         authorization = request.headers.get('authorization')
-        presented_token: Optional[str] = None
+        presented_token: str | None = None
         if authorization is not None:
             scheme, separator, token_value = authorization.partition(' ')
             if (separator and scheme.lower() == 'bearer' and token_value and

@@ -9,7 +9,6 @@ import socket
 import subprocess
 import time
 import traceback
-from typing import Dict, List, Optional, Tuple
 
 import colorama
 
@@ -130,13 +129,13 @@ def _bulk_provision(
 def bulk_provision(
     cloud: clouds.Cloud,
     region: clouds.Region,
-    zones: Optional[List[clouds.Zone]],
+    zones: list[clouds.Zone] | None,
     cluster_name: resources_utils.ClusterName,
     num_nodes: int,
     cluster_yaml: str,
     prev_cluster_ever_up: bool,
     log_dir: str,
-    ports_to_open_on_launch: Optional[List[int]] = None,
+    ports_to_open_on_launch: list[int] | None = None,
 ) -> provision_common.ProvisionRecord:
     """Provisions a cluster and wait until fully provisioned.
 
@@ -245,7 +244,7 @@ def bulk_provision(
 
 
 def teardown_cluster(cloud_name: str, cluster_name: resources_utils.ClusterName,
-                     terminate: bool, provider_config: Dict) -> None:
+                     terminate: bool, provider_config: dict) -> None:
     """Deleting or stopping a cluster.
 
     Raises:
@@ -277,7 +276,7 @@ def _ssh_probe_command(ip: str,
                        ssh_user: str,
                        ssh_private_key: str,
                        ssh_probe_timeout: int,
-                       ssh_proxy_command: Optional[str] = None) -> List[str]:
+                       ssh_proxy_command: str | None = None) -> list[str]:
     # NOTE: Ray uses 'uptime' command, we use the same setting here.
     command = [
         'ssh',
@@ -317,9 +316,9 @@ def _wait_ssh_connection_direct(ip: str,
                                 ssh_user: str,
                                 ssh_private_key: str,
                                 ssh_probe_timeout: int,
-                                ssh_control_name: Optional[str] = None,
-                                ssh_proxy_command: Optional[str] = None,
-                                **kwargs) -> Tuple[bool, str]:
+                                ssh_control_name: str | None = None,
+                                ssh_proxy_command: str | None = None,
+                                **kwargs) -> tuple[bool, str]:
     """Wait for SSH connection using raw sockets, and a SSH connection.
 
     Using raw socket is more efficient than using SSH command to probe the
@@ -348,7 +347,7 @@ def _wait_ssh_connection_direct(ip: str,
                                                  ssh_probe_timeout,
                                                  ssh_control_name,
                                                  ssh_proxy_command)
-    except socket.timeout:  # this is the most expected exception
+    except TimeoutError:  # this is the most expected exception
         stderr = f'Timeout: SSH connection to {ip} is not ready.'
     except Exception as e:  # pylint: disable=broad-except
         stderr = f'Error: {common_utils.format_exception(e)}'
@@ -365,9 +364,9 @@ def _wait_ssh_connection_indirect(ip: str,
                                   ssh_user: str,
                                   ssh_private_key: str,
                                   ssh_probe_timeout: int,
-                                  ssh_control_name: Optional[str] = None,
-                                  ssh_proxy_command: Optional[str] = None,
-                                  **kwargs) -> Tuple[bool, str]:
+                                  ssh_control_name: str | None = None,
+                                  ssh_proxy_command: str | None = None,
+                                  **kwargs) -> tuple[bool, str]:
     """Wait for SSH connection using SSH command.
 
     Returns:
@@ -399,7 +398,7 @@ def _wait_ssh_connection_indirect(ip: str,
 
 @timeline.event
 def wait_for_ssh(cluster_info: provision_common.ClusterInfo,
-                 ssh_credentials: Dict[str, str]):
+                 ssh_credentials: dict[str, str]):
     """Wait until SSH is ready.
 
     Raises:
@@ -442,7 +441,7 @@ def wait_for_ssh(cluster_info: provision_common.ClusterInfo,
     # stall the wait when only SSM works.
     max_exclusive_direct_failures = 5
 
-    def _retry_ssh_thread(ip_ssh_port: Tuple[str, int]):
+    def _retry_ssh_thread(ip_ssh_port: tuple[str, int]):
         ip, ssh_port = ip_ssh_port
         success = False
         ssh_probe_timeout = skypilot_config.get_nested(
@@ -504,7 +503,7 @@ def _post_provision_setup(
         launched_resources: resources_lib.Resources,
         cluster_name: resources_utils.ClusterName, handle_cluster_yaml: str,
         provision_record: provision_common.ProvisionRecord,
-        custom_resource: Optional[str]) -> provision_common.ClusterInfo:
+        custom_resource: str | None) -> provision_common.ClusterInfo:
     config_from_yaml = global_user_state.get_cluster_yaml_dict(
         handle_cluster_yaml)
     provider_config = config_from_yaml.get('provider')
@@ -677,7 +676,7 @@ def _post_provision_setup(
                     num_active_nodes += 1
             return num_active_nodes == expected_num_nodes
 
-        def check_ray_port_and_cluster_healthy() -> Tuple[int, bool, bool]:
+        def check_ray_port_and_cluster_healthy() -> tuple[int, bool, bool]:
             head_ray_needs_restart = True
             ray_cluster_healthy = False
             ray_port = constants.SKY_REMOTE_RAY_PORT
@@ -804,7 +803,7 @@ def post_provision_runtime_setup(
         launched_resources: resources_lib.Resources,
         cluster_name: resources_utils.ClusterName, handle_cluster_yaml: str,
         provision_record: provision_common.ProvisionRecord,
-        custom_resource: Optional[str],
+        custom_resource: str | None,
         log_dir: str) -> provision_common.ClusterInfo:
     """Run internal setup commands after provisioning and before user setup.
 

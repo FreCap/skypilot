@@ -1,6 +1,6 @@
 """SkyServe core APIs."""
 import typing
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Optional
 
 from sky import backends
 from sky import exceptions
@@ -27,8 +27,8 @@ logger = sky_logging.init_logger(__name__)
 @usage_lib.entrypoint
 def up(
     task: 'sky.Task',
-    service_name: Optional[str] = None,
-) -> Tuple[str, str]:
+    service_name: str | None = None,
+) -> tuple[str, str]:
     """Spins up a service.
 
     Please refer to the sky.cli.serve_up for the document.
@@ -49,7 +49,7 @@ def up(
 def update(task: Optional['sky.Task'],
            service_name: str,
            mode: serve_utils.UpdateMode = serve_utils.DEFAULT_UPDATE_MODE,
-           workers: Optional[int] = None) -> None:
+           workers: int | None = None) -> None:
     """Updates an existing service.
 
     Please refer to the sky.cli.serve_update for the document.
@@ -68,7 +68,7 @@ def update(task: Optional['sky.Task'],
 @usage_lib.entrypoint
 # pylint: disable=redefined-builtin
 def down(
-    service_names: Optional[Union[str, List[str]]] = None,
+    service_names: str | list[str] | None = None,
     all: bool = False,
     purge: bool = False,
 ) -> None:
@@ -151,10 +151,10 @@ def terminate_replica(service_name: str, replica_id: int, purge: bool) -> None:
 
 @usage_lib.entrypoint
 def status(
-    service_names: Optional[Union[str, List[str]]] = None,
+    service_names: str | list[str] | None = None,
     summary_only: bool = False,
-    include_target_num_replicas: Optional[bool] = None,
-) -> List[Dict[str, Any]]:
+    include_target_num_replicas: bool | None = None,
+) -> list[dict[str, Any]]:
     """Gets service statuses.
 
     If service_names is given, return those services. Otherwise, return all
@@ -228,7 +228,7 @@ def status(
                        include_target_num_replicas=include_target_num_replicas)
 
 
-ServiceComponentOrStr = Union[str, serve_utils.ServiceComponent]
+ServiceComponentOrStr = str | serve_utils.ServiceComponent
 
 
 @usage_lib.entrypoint
@@ -236,9 +236,9 @@ def tail_logs(
     service_name: str,
     *,
     target: ServiceComponentOrStr,
-    replica_id: Optional[int] = None,
+    replica_id: int | None = None,
     follow: bool = True,
-    tail: Optional[int] = None,
+    tail: int | None = None,
 ) -> None:
     """Tails logs for a service.
 
@@ -286,10 +286,9 @@ def sync_down_logs(
     service_name: str,
     *,
     local_dir: str,
-    targets: Union[ServiceComponentOrStr, List[ServiceComponentOrStr],
-                   None] = None,
-    replica_ids: Optional[List[int]] = None,
-    tail: Optional[int] = None,
+    targets: ServiceComponentOrStr | list[ServiceComponentOrStr] | None = None,
+    replica_ids: list[int] | None = None,
+    tail: int | None = None,
 ) -> str:
     """Sync down logs from the controller for the given service.
 

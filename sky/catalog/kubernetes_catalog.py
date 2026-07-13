@@ -7,7 +7,6 @@ import collections
 import re
 import time
 import typing
-from typing import Dict, List, Optional, Set, Tuple
 
 from sky import check as sky_check
 from sky import clouds as sky_clouds
@@ -36,7 +35,7 @@ _image_df = common.read_catalog('kubernetes/images.csv',
 #   clouds/kubernetes.py to kubernetes_catalog.py
 
 
-def get_image_id_from_tag(tag: str, region: Optional[str]) -> Optional[str]:
+def get_image_id_from_tag(tag: str, region: str | None) -> str | None:
     """Returns the image id from the tag."""
     global _image_df
     image_id = common.get_image_id_from_tag_impl(_image_df, tag, region)
@@ -50,7 +49,7 @@ def get_image_id_from_tag(tag: str, region: Optional[str]) -> Optional[str]:
     return image_id
 
 
-def is_image_tag_valid(tag: str, region: Optional[str]) -> bool:
+def is_image_tag_valid(tag: str, region: str | None) -> bool:
     """Returns whether the image tag is valid."""
     return common.is_image_tag_valid_impl(_image_df, tag, region)
 
@@ -71,11 +70,11 @@ def is_image_tag_valid(tag: str, region: Optional[str]) -> bool:
 @annotations.ttl_cache(scope='request', timer=time.time, maxsize=10, ttl=30)
 def _list_accelerators_cached(
     gpus_only: bool,
-    name_filter: Optional[str],
-    region_filter: Optional[str],
-    quantity_filter: Optional[int],
+    name_filter: str | None,
+    region_filter: str | None,
+    quantity_filter: int | None,
     case_sensitive: bool,
-) -> Dict[str, List[common.InstanceTypeInfo]]:
+) -> dict[str, list[common.InstanceTypeInfo]]:
     return _list_accelerators(gpus_only,
                               name_filter,
                               region_filter,
@@ -86,12 +85,12 @@ def _list_accelerators_cached(
 
 def list_accelerators(
         gpus_only: bool,
-        name_filter: Optional[str],
-        region_filter: Optional[str],
-        quantity_filter: Optional[int],
+        name_filter: str | None,
+        region_filter: str | None,
+        quantity_filter: int | None,
         case_sensitive: bool = True,
         all_regions: bool = False,
-        require_price: bool = True) -> Dict[str, List[common.InstanceTypeInfo]]:
+        require_price: bool = True) -> dict[str, list[common.InstanceTypeInfo]]:
     # all_regions and require_price do not affect the result (see
     # _list_accelerators, which discards them); keep them out of the cache key
     # so logically identical calls share a single cache entry.
@@ -102,13 +101,13 @@ def list_accelerators(
 
 def list_accelerators_realtime(
     gpus_only: bool,
-    name_filter: Optional[str],
-    region_filter: Optional[str],
-    quantity_filter: Optional[int],
+    name_filter: str | None,
+    region_filter: str | None,
+    quantity_filter: int | None,
     case_sensitive: bool = True,
     all_regions: bool = False,
     require_price: bool = True
-) -> Tuple[Dict[str, List[common.InstanceTypeInfo]], Dict[str, int], Dict[str,
+) -> tuple[dict[str, list[common.InstanceTypeInfo]], dict[str, int], dict[str,
                                                                           int]]:
     return _list_accelerators(gpus_only,
                               name_filter,
@@ -122,14 +121,14 @@ def list_accelerators_realtime(
 
 def _list_accelerators(
     gpus_only: bool,
-    name_filter: Optional[str],
-    region_filter: Optional[str],
-    quantity_filter: Optional[int],
+    name_filter: str | None,
+    region_filter: str | None,
+    quantity_filter: int | None,
     case_sensitive: bool = True,
     all_regions: bool = False,
     require_price: bool = True,
     realtime: bool = False
-) -> Tuple[Dict[str, List[common.InstanceTypeInfo]], Dict[str, int], Dict[str,
+) -> tuple[dict[str, list[common.InstanceTypeInfo]], dict[str, int], dict[str,
                                                                           int]]:
     """List accelerators in the Kubernetes cluster.
 
@@ -188,7 +187,7 @@ def _list_accelerators(
     if not lf:
         return {}, {}, {}
 
-    accelerators_qtys: Set[Tuple[str, int]] = set()
+    accelerators_qtys: set[tuple[str, int]] = set()
     keys = lf.get_label_keys()
     nodes = kubernetes_utils.get_kubernetes_nodes(context=context)
 
@@ -203,7 +202,7 @@ def _list_accelerators(
             break
 
     # Only fetch pods if we have accelerator nodes and realtime is requested
-    allocated_qty_by_node: Dict[str, int] = collections.defaultdict(int)
+    allocated_qty_by_node: dict[str, int] = collections.defaultdict(int)
     error_on_get_allocated_gpu_qty_by_node = False
     if realtime and has_accelerator_nodes:
         # Get the allocated GPU quantity by each node
@@ -221,9 +220,9 @@ def _list_accelerators(
             else:
                 raise
     # Total number of GPUs in the cluster
-    total_accelerators_capacity: Dict[str, int] = {}
+    total_accelerators_capacity: dict[str, int] = {}
     # Total number of GPUs currently available in the cluster
-    total_accelerators_available: Dict[str, int] = {}
+    total_accelerators_available: dict[str, int] = {}
     min_quantity_filter = quantity_filter if quantity_filter else 1
 
     configured_tolerations = kubernetes_utils.get_configured_tolerations(
@@ -286,9 +285,8 @@ def _list_accelerators(
                         # Add the accelerator count if it's not already in the
                         # set (e.g., if there's 12 GPUs, we should have qtys 1,
                         # 2, 4, 8, 12)
-                        if accelerator_count not in accelerators_qtys:
-                            accelerators_qtys.add(
-                                (accelerator_name, accelerator_count))
+                        accelerators_qtys.add(
+                            (accelerator_name, accelerator_count))
 
                 if accelerator_count >= min_quantity_filter:
                     quantized_count = (
@@ -368,9 +366,9 @@ def _list_accelerators(
     return qtys_map, total_accelerators_capacity, total_accelerators_available
 
 
-def _get_pricing(region: Optional[str]) -> Dict:
+def _get_pricing(region: str | None) -> dict:
     """Resolve the pricing dict for a Kubernetes context from config."""
-    paths: List[Tuple[str, ...]] = [('kubernetes', 'pricing')]
+    paths: list[tuple[str, ...]] = [('kubernetes', 'pricing')]
     if region is not None:
         paths.append(('kubernetes', 'context_configs', region, 'pricing'))
     return common.resolve_pricing_config(*paths)
@@ -378,8 +376,8 @@ def _get_pricing(region: Optional[str]) -> Dict:
 
 def get_hourly_cost(instance_type: str,
                     use_spot: bool,
-                    region: Optional[str] = None,
-                    zone: Optional[str] = None) -> float:
+                    region: str | None = None,
+                    zone: str | None = None) -> float:
     """Returns the hourly cost for a Kubernetes virtual instance type.
 
     Pricing is read from the ``kubernetes.pricing`` section of
@@ -398,8 +396,8 @@ def get_hourly_cost(instance_type: str,
 
 
 def validate_region_zone(
-    region_name: Optional[str],
-    zone_name: Optional[str],
+    region_name: str | None,
+    zone_name: str | None,
     clouds: CloudFilter = None  # pylint: disable=unused-argument
-) -> Tuple[Optional[str], Optional[str]]:
+) -> tuple[str | None, str | None]:
     return (region_name, zone_name)

@@ -4,7 +4,7 @@ import base64
 import enum
 import json
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 import uuid
 
 import requests
@@ -54,7 +54,7 @@ def get_key_suffix():
     return str(uuid.uuid4()).replace('-', '')[:8]
 
 
-def _load_credentials() -> Tuple[str, str]:
+def _load_credentials() -> tuple[str, str]:
     """Reads the credentials file and returns orgId and apiKey."""
     credentials_file_path = os.path.expanduser(CREDENTIAL_FILE)
 
@@ -63,7 +63,7 @@ def _load_credentials() -> Tuple[str, str]:
             f'Credentials file not found at {credentials_file_path}')
 
     try:
-        with open(credentials_file_path, 'r', encoding='utf-8') as f:
+        with open(credentials_file_path, encoding='utf-8') as f:
             credentials = {}
             for line in f:
                 if '=' in line:
@@ -161,9 +161,9 @@ class YottaClient:
         return check_result['data']
 
     def list_instances(self,
-                       cluster_name_on_cloud: str) -> Dict[str, Dict[str, Any]]:
+                       cluster_name_on_cloud: str) -> dict[str, dict[str, Any]]:
         url = f'{ENDPOINT}/v1/skypilot/cluster/pods/list'
-        all_records: List[Dict[str, Any]] = []
+        all_records: list[dict[str, Any]] = []
         request_data = {
             'clusterName': cluster_name_on_cloud,
             'source': ClusterSourceEnum.SKY_PILOT.value
@@ -202,9 +202,8 @@ class YottaClient:
         return unique_records
 
     def create_cluster(self, cluster_name: str, instance_type: str, region: str,
-                       image_name: str, ports: Optional[List[int]],
-                       disk_size: int, public_key: str, ssh_user: str,
-                       node_num: int) -> str:
+                       image_name: str, ports: list[int] | None, disk_size: int,
+                       public_key: str, ssh_user: str, node_num: int) -> str:
         url = f'{ENDPOINT}/v1/skypilot/cluster/create'
         expose = []
         if ports is not None:
@@ -250,8 +249,8 @@ class YottaClient:
         return response.json()['data']['status']
 
     def launch(self, cluster_name: str, cluster_id: str, name: str,
-               image_name: str, docker_login_config: Optional[Dict[str, Any]],
-               ports: Optional[List[int]], public_key: str) -> str:
+               image_name: str, docker_login_config: dict[str, Any] | None,
+               ports: list[int] | None, public_key: str) -> str:
         """Launches an instance with the given parameters."""
         url = f'{ENDPOINT}/v1/skypilot/cluster/create/pod'
 

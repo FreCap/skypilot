@@ -51,6 +51,18 @@ confidence=
 # no Warning level messages displayed, use"--disable=all --enable=classes
 # --disable=W"
 disable=R,
+        # --- pylint 4.x ratchet: new checks with many pre-existing sites; ---
+        # --- do not add new violations, burn these down over time.       ---
+        line-too-long,
+        superfluous-parens,
+        invalid-name,
+        unidiomatic-typecheck,
+        logging-not-lazy,
+        missing-timeout,
+        possibly-used-before-assignment,
+        assignment-from-no-return,
+        broad-exception-raised,
+        # --- end ratchet ---
         abstract-method,
         apply-builtin,
         arguments-differ,
@@ -304,7 +316,7 @@ notes=TODO
 
 # This flag controls whether inconsistent-quotes generates a warning when the
 # character used as a quote delimiter is used inconsistently within a module.
-check-quote-consistency=yes
+check-quote-consistency=no
 
 
 [VARIABLES]
@@ -429,13 +441,9 @@ valid-metaclass-classmethod-first-arg=mcs
 
 # Exceptions that will emit a warning when being caught. Defaults to
 # "Exception"
-overgeneral-exceptions=StandardError,
-                       Exception,
-                       BaseException
+overgeneral-exceptions=builtins.Exception,
+                       builtins.BaseException
 
 #######
 
 # https://github.com/edaniszewski/pylint-quotes#configuration
-string-quote=single
-triple-quote=double
-docstring-quote=double

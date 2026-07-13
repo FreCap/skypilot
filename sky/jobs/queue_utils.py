@@ -1,10 +1,10 @@
 """Managed-jobs queue query and formatting helpers."""
 import collections
+from collections.abc import Iterable
 import enum
 import time
 import typing
-from typing import (Any, Dict, Iterable, List, Literal, Optional, Set, Tuple,
-                    Union)
+from typing import Any, Literal, Optional
 
 from sky import backends
 from sky import global_user_state
@@ -65,20 +65,20 @@ class ManagedJobQueueResultType(enum.Enum):
 
 def dump_managed_job_queue(
     skip_finished: bool = False,
-    accessible_workspaces: Optional[List[str]] = None,
-    job_ids: Optional[List[int]] = None,
-    workspace_match: Optional[str] = None,
-    name_match: Optional[str] = None,
-    pool_match: Optional[str] = None,
-    page: Optional[int] = None,
-    limit: Optional[int] = None,
-    user_hashes: Optional[List[Optional[str]]] = None,
-    statuses: Optional[List[str]] = None,
-    fields: Optional[List[str]] = None,
-    sort_by: Optional[str] = None,
-    sort_order: Optional[str] = None,
-    submitted_after: Optional[float] = None,
-    submitted_before: Optional[float] = None,
+    accessible_workspaces: list[str] | None = None,
+    job_ids: list[int] | None = None,
+    workspace_match: str | None = None,
+    name_match: str | None = None,
+    pool_match: str | None = None,
+    page: int | None = None,
+    limit: int | None = None,
+    user_hashes: list[str | None] | None = None,
+    statuses: list[str] | None = None,
+    fields: list[str] | None = None,
+    sort_by: str | None = None,
+    sort_order: str | None = None,
+    submitted_after: float | None = None,
+    submitted_before: float | None = None,
 ) -> str:
     return message_utils.encode_payload(
         get_managed_job_queue(skip_finished, accessible_workspaces, job_ids,
@@ -87,7 +87,7 @@ def dump_managed_job_queue(
                               sort_order, submitted_after, submitted_before))
 
 
-def _update_fields(fields: List[str],) -> Tuple[List[str], bool]:
+def _update_fields(fields: list[str],) -> tuple[list[str], bool]:
     """Update the fields list to include the necessary fields.
 
     Args:
@@ -163,7 +163,7 @@ def _update_fields(fields: List[str],) -> Tuple[List[str], bool]:
     return new_fields, cluster_handle_required
 
 
-def _cluster_handle_not_required(fields: List[str]) -> bool:
+def _cluster_handle_not_required(fields: list[str]) -> bool:
     """Determine if cluster handle is not required.
 
     Args:
@@ -178,9 +178,9 @@ def _cluster_handle_not_required(fields: List[str]) -> bool:
 
 
 def _format_job_details(*,
-                        job: Dict[str, Any],
+                        job: dict[str, Any],
                         highest_blocking_priority: int,
-                        recovery_reason: Optional[str] = None) -> None:
+                        recovery_reason: str | None = None) -> None:
     """Add details about schedule state / backoff / recovery."""
     state_details = None
     if job['schedule_state'] == 'ALIVE_BACKOFF':
@@ -223,7 +223,7 @@ def _format_job_details(*,
 
 
 def _populate_job_records_from_handles(
-        jobs_with_handle: List[Dict[str, Any]]) -> None:
+        jobs_with_handle: list[dict[str, Any]]) -> None:
     """Populate the job records from the handles."""
     for job_with_handle in jobs_with_handle:
         _populate_job_record_from_handle(
@@ -233,7 +233,7 @@ def _populate_job_records_from_handles(
 
 
 def _populate_job_record_from_handle(
-        *, job: Dict[str, Any], cluster_name: str,
+        *, job: dict[str, Any], cluster_name: str,
         handle: 'backends.CloudVmRayResourceHandle') -> None:
     """Populate the job record from the handle."""
     del cluster_name
@@ -268,22 +268,22 @@ def _populate_job_record_from_handle(
 
 def get_managed_job_queue(
     skip_finished: bool = False,
-    accessible_workspaces: Optional[List[str]] = None,
-    job_ids: Optional[List[int]] = None,
-    workspace_match: Optional[str] = None,
-    name_match: Optional[str] = None,
-    pool_match: Optional[str] = None,
-    page: Optional[int] = None,
-    limit: Optional[int] = None,
-    user_hashes: Optional[List[Optional[str]]] = None,
-    statuses: Optional[List[str]] = None,
-    fields: Optional[List[str]] = None,
-    sort_by: Optional[str] = None,
-    sort_order: Optional[str] = None,
-    submitted_after: Optional[float] = None,
-    submitted_before: Optional[float] = None,
+    accessible_workspaces: list[str] | None = None,
+    job_ids: list[int] | None = None,
+    workspace_match: str | None = None,
+    name_match: str | None = None,
+    pool_match: str | None = None,
+    page: int | None = None,
+    limit: int | None = None,
+    user_hashes: list[str | None] | None = None,
+    statuses: list[str] | None = None,
+    fields: list[str] | None = None,
+    sort_by: str | None = None,
+    sort_order: str | None = None,
+    submitted_after: float | None = None,
+    submitted_before: float | None = None,
     status_expr: Optional['sqlalchemy.ColumnElement'] = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Get the managed job queue.
 
     Args:
@@ -446,7 +446,7 @@ def get_managed_job_queue(
     # pod), so it can be surfaced in `details`. Scoped to RECOVERING jobs (a
     # small, transient subset) and done in one query to stay off the per-job
     # path. `job['status']` is already stringified above.
-    recovery_reasons: Dict[int, str] = {}
+    recovery_reasons: dict[int, str] = {}
     if not fields or 'details' in fields:
         recovering_job_ids = [
             job['job_id'] for job in jobs if job['status'] ==
@@ -475,16 +475,16 @@ def get_managed_job_queue(
 
 
 def filter_jobs(
-    jobs: List[Dict[str, Any]],
-    workspace_match: Optional[str],
-    name_match: Optional[str],
-    pool_match: Optional[str],
-    page: Optional[int],
-    limit: Optional[int],
-    user_match: Optional[str] = None,
+    jobs: list[dict[str, Any]],
+    workspace_match: str | None,
+    name_match: str | None,
+    pool_match: str | None,
+    page: int | None,
+    limit: int | None,
+    user_match: str | None = None,
     enable_user_match: bool = False,
-    statuses: Optional[List[str]] = None,
-) -> Tuple[List[Dict[str, Any]], int, Dict[str, int]]:
+    statuses: list[str] | None = None,
+) -> tuple[list[dict[str, Any]], int, dict[str, int]]:
     """Filter jobs based on the given criteria.
 
     Args:
@@ -507,8 +507,8 @@ def filter_jobs(
     # TODO(hailong): refactor the whole function including the
     # `dump_managed_job_queue()` to use DB filtering.
 
-    def _pattern_matches(job: Dict[str, Any], key: str,
-                         pattern: Optional[str]) -> bool:
+    def _pattern_matches(job: dict[str, Any], key: str,
+                         pattern: str | None) -> bool:
         if pattern is None:
             return True
         if key not in job:
@@ -519,10 +519,10 @@ def filter_jobs(
         return pattern in str(value)
 
     def _handle_page_and_limit(
-        result: List[Dict[str, Any]],
-        page: Optional[int],
-        limit: Optional[int],
-    ) -> List[Dict[str, Any]]:
+        result: list[dict[str, Any]],
+        page: int | None,
+        limit: int | None,
+    ) -> list[dict[str, Any]]:
         if page is None and limit is None:
             return result
         assert page is not None and limit is not None, (page, limit)
@@ -531,7 +531,7 @@ def filter_jobs(
         end = min(start + limit, len(result))
         return result[start:end]
 
-    status_counts: Dict[str, int] = collections.defaultdict(int)
+    status_counts: dict[str, int] = collections.defaultdict(int)
     result = []
     checks = [
         ('workspace', workspace_match),
@@ -558,14 +558,14 @@ def filter_jobs(
 
 def load_managed_job_queue(
     payload: str
-) -> Tuple[List[Dict[str, Any]], int, ManagedJobQueueResultType, int, Dict[
+) -> tuple[list[dict[str, Any]], int, ManagedJobQueueResultType, int, dict[
         str, int]]:
     """Load job queue from json string."""
     result = message_utils.decode_payload(payload)
     result_type = ManagedJobQueueResultType.DICT
-    status_counts: Dict[str, int] = {}
+    status_counts: dict[str, int] = {}
     if isinstance(result, dict):
-        jobs: List[Dict[str, Any]] = result['jobs']
+        jobs: list[dict[str, Any]] = result['jobs']
         total: int = result['total']
         status_counts = result.get('status_counts', {})
         total_no_filter: int = result.get('total_no_filter', total)
@@ -587,8 +587,8 @@ def load_managed_job_queue(
 
 
 def _get_job_status_from_tasks(
-    job_tasks: Union[List[responses.ManagedJobRecord], List[Dict[str, Any]]]
-) -> Tuple[managed_job_state.ManagedJobStatus, int]:
+    job_tasks: list[responses.ManagedJobRecord] | list[dict[str, Any]]
+) -> tuple[managed_job_state.ManagedJobStatus, int]:
     """Get the current task status and the current task id for a job.
 
     For job groups with primary/auxiliary tasks, the job status is determined
@@ -605,10 +605,8 @@ def _get_job_status_from_tasks(
         t.get('is_primary_in_job_group') is True  # Primary task in job group
     ]
     # Use primary tasks for status; fall back to all tasks if none match
-    job_tasks_for_status: Union[List[responses.ManagedJobRecord],
-                                List[Dict[str, Any]]] = (primary_job_tasks
-                                                         if primary_job_tasks
-                                                         else job_tasks)
+    job_tasks_for_status: list[responses.ManagedJobRecord] | list[dict[
+        str, Any]] = (primary_job_tasks if primary_job_tasks else job_tasks)
 
     managed_task_status = managed_job_state.ManagedJobStatus.SUCCEEDED
     current_task_id = 0
@@ -632,39 +630,39 @@ def _get_job_status_from_tasks(
 
 @typing.overload
 def format_job_table(
-    tasks: List[Dict[str, Any]],
+    tasks: list[dict[str, Any]],
     show_all: bool,
     show_user: bool,
     return_rows: Literal[False] = False,
-    pool_status: Optional[List[Dict[str, Any]]] = None,
-    max_jobs: Optional[int] = None,
-    job_status_counts: Optional[Dict[str, int]] = None,
+    pool_status: list[dict[str, Any]] | None = None,
+    max_jobs: int | None = None,
+    job_status_counts: dict[str, int] | None = None,
 ) -> str:
     ...
 
 
 @typing.overload
 def format_job_table(
-    tasks: List[Dict[str, Any]],
+    tasks: list[dict[str, Any]],
     show_all: bool,
     show_user: bool,
     return_rows: Literal[True],
-    pool_status: Optional[List[Dict[str, Any]]] = None,
-    max_jobs: Optional[int] = None,
-    job_status_counts: Optional[Dict[str, int]] = None,
-) -> List[List[str]]:
+    pool_status: list[dict[str, Any]] | None = None,
+    max_jobs: int | None = None,
+    job_status_counts: dict[str, int] | None = None,
+) -> list[list[str]]:
     ...
 
 
 def format_job_table(
-    tasks: List[Dict[str, Any]],
+    tasks: list[dict[str, Any]],
     show_all: bool,
     show_user: bool,
     return_rows: bool = False,
-    pool_status: Optional[List[Dict[str, Any]]] = None,
-    max_jobs: Optional[int] = None,
-    job_status_counts: Optional[Dict[str, int]] = None,
-) -> Union[str, List[List[str]]]:
+    pool_status: list[dict[str, Any]] | None = None,
+    max_jobs: int | None = None,
+    job_status_counts: dict[str, int] | None = None,
+) -> str | list[list[str]]:
     """Returns managed jobs as a formatted string.
 
     Args:
@@ -692,7 +690,7 @@ def format_job_table(
         return task['job_id']
 
     def _get_job_id_to_worker_map(
-            pool_status: Optional[List[Dict[str, Any]]]) -> Dict[int, int]:
+            pool_status: list[dict[str, Any]] | None) -> dict[int, int]:
         """Create a mapping from job_id to worker replica_id.
 
         Jobs that appear on multiple workers (e.g. batch coordinators
@@ -705,8 +703,8 @@ def format_job_table(
         Returns:
             Dictionary mapping job_id to replica_id (worker ID).
         """
-        job_to_worker: Dict[int, int] = {}
-        multi_worker_jobs: Set[int] = set()
+        job_to_worker: dict[int, int] = {}
+        multi_worker_jobs: set[int] = set()
         if pool_status is None:
             return job_to_worker
         for pool in pool_status:
@@ -737,7 +735,7 @@ def format_job_table(
 
     show_workspace = len(workspaces) > 1 or show_all
 
-    user_cols: List[str] = []
+    user_cols: list[str] = []
     if show_user:
         user_cols = ['USER']
         if show_all:
@@ -791,7 +789,7 @@ def format_job_table(
         columns.insert(0, 'USER')
     job_table = log_utils.create_table(columns)
 
-    status_counts: Dict[str, int] = collections.defaultdict(int)
+    status_counts: dict[str, int] = collections.defaultdict(int)
     if job_status_counts:
         for status_value, count in job_status_counts.items():
             status = managed_job_state.ManagedJobStatus(status_value)
@@ -811,16 +809,16 @@ def format_job_table(
         # by the task_id.
         jobs[get_hash(task)].append(task)
 
-    def generate_details(details: Optional[str],
-                         failure_reason: Optional[str]) -> str:
+    def generate_details(details: str | None,
+                         failure_reason: str | None) -> str:
         if details is not None:
             return details
         if failure_reason is not None:
             return f'Failure: {failure_reason}'
         return '-'
 
-    def get_user_column_values(task: Dict[str, Any]) -> List[str]:
-        user_values: List[str] = []
+    def get_user_column_values(task: dict[str, Any]) -> list[str]:
+        user_values: list[str] = []
         if show_user:
             user_name = '-'  # default value
 
@@ -851,7 +849,7 @@ def format_job_table(
             job_name = job_tasks[0]['job_name']
             job_duration = 0
             submitted_at = None
-            end_at: Optional[int] = 0
+            end_at: int | None = 0
             recovery_cnt = 0
             managed_job_status, current_task_id = _get_job_status_from_tasks(
                 job_tasks)
@@ -1037,7 +1035,7 @@ def format_job_table(
 
 def decode_managed_job_protos(
     job_protos: Iterable['managed_jobsv1_pb2.ManagedJobInfo']
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Decode job protos to dicts. Similar to load_managed_job_queue."""
     user_hash_to_user = global_user_state.get_users(
         set(job.user_hash for job in job_protos if job.user_hash))
@@ -1056,7 +1054,7 @@ def decode_managed_job_protos(
 
 
 def _job_proto_to_dict(
-        job_proto: 'managed_jobsv1_pb2.ManagedJobInfo') -> Dict[str, Any]:
+        job_proto: 'managed_jobsv1_pb2.ManagedJobInfo') -> dict[str, Any]:
     job_dict = json_format.MessageToDict(
         job_proto,
         always_print_fields_with_no_presence=True,

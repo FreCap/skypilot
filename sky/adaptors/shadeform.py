@@ -2,7 +2,7 @@
 
 import functools
 import socket
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import requests
 
@@ -39,7 +39,7 @@ def shadeform():
     return _shadeform_sdk
 
 
-def list_ssh_keys() -> List[Dict[str, Any]]:
+def list_ssh_keys() -> list[dict[str, Any]]:
     """List all SSH keys in Shadeform account."""
     try:
         response = shadeform_utils.get_ssh_keys()
@@ -49,7 +49,7 @@ def list_ssh_keys() -> List[Dict[str, Any]]:
         return []
 
 
-def add_ssh_key_to_shadeform(public_key: str) -> Optional[str]:
+def add_ssh_key_to_shadeform(public_key: str) -> str | None:
     """Add SSH key to Shadeform if it doesn't already exist.
 
     Args:

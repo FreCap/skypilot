@@ -5,13 +5,14 @@ VMs, GPUs, and TPUs. The script takes about 1-2 minutes to run.
 """
 
 import argparse
+from collections.abc import Callable
 import io
 import multiprocessing
 import os
 import textwrap
 import time
 import typing
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any
 
 import google.auth
 from googleapiclient import discovery
@@ -218,11 +219,11 @@ gcp_client = discovery.build('compute', 'v1')
 tpu_client = discovery.build('tpu', 'v1')
 
 SINGLE_THREADED = False
-ZONES: Set[str] = set()
-EXCLUDED_REGIONS: Set[str] = set()
+ZONES: set[str] = set()
+EXCLUDED_REGIONS: set[str] = set()
 
 
-def get_skus(service_id: str) -> List[Dict[str, Any]]:
+def get_skus(service_id: str) -> list[dict[str, Any]]:
     # Get the SKUs from the GCP API.
     cb = discovery.build('cloudbilling', 'v1')
     service_name = f'services/{service_id}'
@@ -269,7 +270,7 @@ def get_skus(service_id: str) -> List[Dict[str, Any]]:
     return new_skus
 
 
-def _get_unit_price(sku: Dict[str, Any]) -> float:
+def _get_unit_price(sku: dict[str, Any]) -> float:
     pricing_info = sku['pricingInfo'][0]['pricingExpression']
     unit_price = pricing_info['tieredRates'][0]['unitPrice']
     units = int(unit_price['units'])
@@ -277,13 +278,13 @@ def _get_unit_price(sku: Dict[str, Any]) -> float:
     return units + nanos
 
 
-def filter_zones(func: Callable[[], List[str]]) -> Callable[[], List[str]]:
+def filter_zones(func: Callable[[], list[str]]) -> Callable[[], list[str]]:
     """Decorator to filter the zones returned by the decorated function.
     It first intersects the result with the global ZONES (if defined) and then
     removes any zones present in the global EXCLUDED_REGIONS (if defined).
     """
 
-    def wrapper(*args, **kwargs) -> List[str]:  # pylint: disable=redefined-outer-name
+    def wrapper(*args, **kwargs) -> list[str]:  # pylint: disable=redefined-outer-name
         original_zones = set(func(*args, **kwargs))
         if ZONES:
             original_zones &= ZONES
@@ -298,7 +299,7 @@ def filter_zones(func: Callable[[], List[str]]) -> Callable[[], List[str]]:
 
 @filter_zones
 @annotations.lru_cache(scope='global', maxsize=None)
-def _get_all_zones() -> List[str]:
+def _get_all_zones() -> list[str]:
     zones_request = gcp_client.zones().list(project=project_id)
     zones = []
     while zones_request is not None:
@@ -342,7 +343,7 @@ def _get_machine_types(region_prefix: str) -> 'pd.DataFrame':
     return machine_df
 
 
-def get_vm_df(skus: List[Dict[str, Any]], region_prefix: str) -> 'pd.DataFrame':
+def get_vm_df(skus: list[dict[str, Any]], region_prefix: str) -> 'pd.DataFrame':
     df = _get_machine_types(region_prefix)
     if df.empty:
         return df
@@ -353,7 +354,7 @@ def get_vm_df(skus: List[Dict[str, Any]], region_prefix: str) -> 'pd.DataFrame':
     df = df[~df['AvailabilityZone'].str.startswith(tuple(TPU_V4_ZONES))]
 
     # TODO(woosuk): Make this more efficient.
-    def get_vm_price(row: pd.Series, spot: bool) -> Optional[float]:
+    def get_vm_price(row: pd.Series, spot: bool) -> float | None:
         series = row['InstanceType'].split('-')[0].lower()
 
         ondemand_or_spot = 'OnDemand' if not spot else 'Preemptible'
@@ -494,7 +495,7 @@ def _get_gpus_for_zone(zone: str) -> 'pd.DataFrame':
     return pd.DataFrame(new_gpus).reset_index(drop=True)
 
 
-def _gpu_info_from_name(name: str) -> Optional[Dict[str, List[Dict[str, Any]]]]:
+def _gpu_info_from_name(name: str) -> dict[str, list[dict[str, Any]]] | None:
     """Hard-codes the GPU memory info for certain GPUs.
 
     Reference: https://cloud.google.com/compute/docs/gpus
@@ -533,7 +534,7 @@ def _get_gpus(region_prefix: str) -> 'pd.DataFrame':
     return gpu_df
 
 
-def get_gpu_df(skus: List[Dict[str, Any]],
+def get_gpu_df(skus: list[dict[str, Any]],
                region_prefix: str) -> 'pd.DataFrame':
     gpu_skus = [
         sku for sku in skus if sku['category']['resourceGroup'] == 'GPU'
@@ -542,7 +543,7 @@ def get_gpu_df(skus: List[Dict[str, Any]],
     if df.empty:
         return df
 
-    def get_gpu_price(row: pd.Series, spot: bool) -> Optional[float]:
+    def get_gpu_price(row: pd.Series, spot: bool) -> float | None:
         ondemand_or_spot = 'OnDemand' if not spot else 'Preemptible'
         gpu_price = None
         for sku in gpu_skus:
@@ -682,8 +683,8 @@ def _get_tpus() -> 'pd.DataFrame':
 
 
 # TODO: the TPUs fetched fails to contain us-east1
-def get_tpu_df(gce_skus: List[Dict[str, Any]],
-               tpu_skus: List[Dict[str, Any]]) -> 'pd.DataFrame':
+def get_tpu_df(gce_skus: list[dict[str, Any]],
+               tpu_skus: list[dict[str, Any]]) -> 'pd.DataFrame':
     df = _get_tpus()
     if df.empty:
         return df
@@ -700,7 +701,7 @@ def get_tpu_df(gce_skus: List[Dict[str, Any]],
             return 'TpuV6e'
         return f'Tpu-{tpu_version}'
 
-    def get_tpu_price(row: pd.Series, spot: bool) -> Optional[float]:
+    def get_tpu_price(row: pd.Series, spot: bool) -> float | None:
         assert row['AcceleratorCount'] == 1, row
         tpu_price = None
         tpu_region = row['Region']

@@ -24,7 +24,7 @@ Example usage in core SkyPilot:
     cleared = ExternalFailureSource.clear(cluster_name='my-cluster')
 """
 import dataclasses
-from typing import Any, Dict, List, Optional, Protocol
+from typing import Any, Protocol
 
 from sky import sky_logging
 
@@ -44,8 +44,8 @@ class ExternalClusterFailure:
 
     @classmethod
     def from_failure_list(
-            cls, failures: List[Dict[str,
-                                     Any]]) -> List['ExternalClusterFailure']:
+            cls, failures: list[dict[str,
+                                     Any]]) -> list['ExternalClusterFailure']:
         """Create a list of ExternalClusterFailure from failure dicts.
 
         Args:
@@ -66,8 +66,8 @@ class GetClusterFailuresFunc(Protocol):
     """Protocol for get_cluster_failures function."""
 
     def __call__(self,
-                 cluster_hash: Optional[str] = None,
-                 cluster_name: Optional[str] = None) -> List[Dict[str, Any]]:
+                 cluster_hash: str | None = None,
+                 cluster_name: str | None = None) -> list[dict[str, Any]]:
         ...
 
 
@@ -75,8 +75,8 @@ class ClearClusterFailuresFunc(Protocol):
     """Protocol for clear_cluster_failures function."""
 
     def __call__(self,
-                 cluster_hash: Optional[str] = None,
-                 cluster_name: Optional[str] = None) -> List[Dict[str, Any]]:
+                 cluster_hash: str | None = None,
+                 cluster_name: str | None = None) -> list[dict[str, Any]]:
         ...
 
 
@@ -93,8 +93,8 @@ class ExternalFailureSource:
     the implementation.
     """
 
-    _get_func: Optional[GetClusterFailuresFunc] = None
-    _clear_func: Optional[ClearClusterFailuresFunc] = None
+    _get_func: GetClusterFailuresFunc | None = None
+    _clear_func: ClearClusterFailuresFunc | None = None
 
     @classmethod
     def register(cls, get_failures: GetClusterFailuresFunc,
@@ -128,8 +128,8 @@ class ExternalFailureSource:
 
     @classmethod
     def get(cls,
-            cluster_hash: Optional[str] = None,
-            cluster_name: Optional[str] = None) -> List[Dict[str, Any]]:
+            cluster_hash: str | None = None,
+            cluster_name: str | None = None) -> list[dict[str, Any]]:
         """Get active cluster failures from the registered failure source.
 
         Args:
@@ -153,8 +153,8 @@ class ExternalFailureSource:
 
     @classmethod
     def clear(cls,
-              cluster_hash: Optional[str] = None,
-              cluster_name: Optional[str] = None) -> List[Dict[str, Any]]:
+              cluster_hash: str | None = None,
+              cluster_name: str | None = None) -> list[dict[str, Any]]:
         """Clear cluster failures via the registered failure source.
 
         Args:

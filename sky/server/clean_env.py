@@ -12,12 +12,11 @@ subprocesses (consolidation-mode controllers) so they don't inherit
 per-request env pollution from `override_request_env_and_config`.
 """
 import os
-from typing import Dict, Optional
 
 # Set once via capture_clean_server_env() in the main API server process, and
 # once per worker via executor_initializer (forwarded from the main process's
 # snapshot through initargs). Reads happen via get_clean_server_env().
-_clean_server_env: Optional[Dict[str, str]] = None
+_clean_server_env: dict[str, str] | None = None
 
 
 def capture_clean_server_env() -> None:
@@ -33,7 +32,7 @@ def capture_clean_server_env() -> None:
         _clean_server_env = dict(os.environ)
 
 
-def set_clean_server_env(env: Dict[str, str]) -> None:
+def set_clean_server_env(env: dict[str, str]) -> None:
     """Adopt an externally-provided clean env snapshot. Idempotent.
 
     Used by worker processes to install the snapshot they received from the
@@ -44,7 +43,7 @@ def set_clean_server_env(env: Dict[str, str]) -> None:
         _clean_server_env = dict(env)
 
 
-def get_clean_server_env() -> Optional[Dict[str, str]]:
+def get_clean_server_env() -> dict[str, str] | None:
     """Return a copy of the server's pre-request-pollution env, or None.
 
     None means no snapshot was captured in this process — which is the

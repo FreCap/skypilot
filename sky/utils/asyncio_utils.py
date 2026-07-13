@@ -2,9 +2,8 @@
 
 import asyncio
 import functools
-from typing import Set
 
-_background_tasks: Set[asyncio.Task] = set()
+_background_tasks: set[asyncio.Task] = set()
 
 
 def shield(func):

@@ -1,5 +1,7 @@
 """Utils for sky databases."""
 import asyncio
+from collections.abc import Callable
+from collections.abc import Iterable
 import contextlib
 import enum
 import os
@@ -7,7 +9,7 @@ import pathlib
 import sqlite3
 import threading
 import typing
-from typing import Any, Callable, Dict, Iterable, Literal, Optional, Union
+from typing import Any, Literal
 
 import aiosqlite
 import aiosqlite.context
@@ -93,8 +95,8 @@ def add_column_to_table(
     table_name: str,
     column_name: str,
     column_type: str,
-    copy_from: Optional[str] = None,
-    value_to_replace_existing_entries: Optional[Any] = None,
+    copy_from: str | None = None,
+    value_to_replace_existing_entries: Any | None = None,
 ):
     """Add a column to a table."""
     for row in cursor.execute(f'PRAGMA table_info({table_name})'):
@@ -126,7 +128,7 @@ def add_column_to_table(
 
 def add_all_tables_to_db_sqlalchemy(
     metadata: sqlalchemy.MetaData,
-    engine: Union[sqlalchemy.Engine, sqlalchemy.engine.Connection],
+    engine: sqlalchemy.Engine | sqlalchemy.engine.Connection,
 ):
     """Add tables to the database."""
     for table in metadata.tables.values():
@@ -142,7 +144,7 @@ def add_all_tables_to_db_sqlalchemy(
 
 def add_table_to_db_sqlalchemy(
     metadata: sqlalchemy.MetaData,
-    engine: Union[sqlalchemy.Engine, sqlalchemy.engine.Connection],
+    engine: sqlalchemy.Engine | sqlalchemy.engine.Connection,
     table_name: str,
 ):
     """Add a specific table to the database."""
@@ -166,9 +168,9 @@ def add_column_to_table_sqlalchemy(
     table_name: str,
     column_name: str,
     column_type: sqlalchemy.types.TypeEngine,
-    default_statement: Optional[str] = None,
-    copy_from: Optional[str] = None,
-    value_to_replace_existing_entries: Optional[Any] = None,
+    default_statement: str | None = None,
+    copy_from: str | None = None,
+    value_to_replace_existing_entries: Any | None = None,
 ):
     """Add a column to a table."""
     # column type may be different for different dialects.
@@ -211,10 +213,10 @@ def add_column_to_table_alembic(
     table_name: str,
     column_name: str,
     column_type: sqlalchemy.types.TypeEngine,
-    server_default: Optional[str] = None,
-    copy_from: Optional[str] = None,
-    value_to_replace_existing_entries: Optional[Any] = None,
-    index: Optional[bool] = None,
+    server_default: str | None = None,
+    copy_from: str | None = None,
+    value_to_replace_existing_entries: Any | None = None,
+    index: bool | None = None,
 ):
     """Add a column to a table using Alembic operations.
 
@@ -312,8 +314,8 @@ class SQLiteConn(threading.local):
         self.conn = sqlite3.connect(db_path, timeout=_DB_TIMEOUT_S)
         self.cursor = self.conn.cursor()
         create_table(self.cursor, self.conn)
-        self._async_conn: Optional[aiosqlite.Connection] = None
-        self._async_conn_lock: Optional[asyncio.Lock] = None
+        self._async_conn: aiosqlite.Connection | None = None
+        self._async_conn_lock: asyncio.Lock | None = None
 
     async def _get_async_conn(self) -> aiosqlite.Connection:
         """Get the shared aiosqlite connection for current thread.
@@ -352,15 +354,15 @@ class SQLiteConn(threading.local):
 
     async def execute_and_commit_async(self,
                                        sql: str,
-                                       parameters: Optional[
-                                           Iterable[Any]] = None) -> None:
+                                       parameters: Iterable[Any] | None = None
+                                      ) -> None:
         """Execute the sql and commit the transaction in a sync block."""
         conn = await self._get_async_conn()
 
         if parameters is None:
             parameters = []
 
-        def exec_and_commit(sql: str, parameters: Optional[Iterable[Any]]):
+        def exec_and_commit(sql: str, parameters: Iterable[Any] | None):
             # pylint: disable=protected-access
             with safe_cursor_on_connection(conn._conn) as cursor:
                 cursor.execute(sql, parameters)
@@ -369,15 +371,15 @@ class SQLiteConn(threading.local):
         await conn._execute(exec_and_commit, sql, parameters)
 
     @aiosqlite.context.contextmanager
-    async def execute_fetchall_async(self,
-                                     sql: str,
-                                     parameters: Optional[Iterable[Any]] = None
-                                    ) -> Iterable[sqlite3.Row]:
+    async def execute_fetchall_async(
+            self,
+            sql: str,
+            parameters: Iterable[Any] | None = None) -> Iterable[sqlite3.Row]:
         conn = await self._get_async_conn()
         if parameters is None:
             parameters = []
 
-        def exec_fetch_all(sql: str, parameters: Optional[Iterable[Any]]):
+        def exec_fetch_all(sql: str, parameters: Iterable[Any] | None):
             # pylint: disable=protected-access
             with safe_cursor_on_connection(conn._conn) as cursor:
                 cursor.execute(sql, parameters)
@@ -392,15 +394,14 @@ class SQLiteConn(threading.local):
     async def execute_get_returning_value_async(
             self,
             sql: str,
-            parameters: Optional[Iterable[Any]] = None
-    ) -> Optional[sqlite3.Row]:
+            parameters: Iterable[Any] | None = None) -> sqlite3.Row | None:
         conn = await self._get_async_conn()
 
         if parameters is None:
             parameters = []
 
         def exec_and_get_returning_value(sql: str,
-                                         parameters: Optional[Iterable[Any]]):
+                                         parameters: Iterable[Any] | None):
             # pylint: disable=protected-access
             with safe_cursor_on_connection(conn._conn) as cursor:
                 cursor.execute(sql, parameters)
@@ -430,15 +431,14 @@ class DatabaseManager:
         self,
         db_name: str,
         create_table_fn: Callable[[sqlalchemy.engine.Engine], Any],
-        post_init_fn: Optional[Callable[[sqlalchemy.engine.Engine],
-                                        Any]] = None,
+        post_init_fn: Callable[[sqlalchemy.engine.Engine], Any] | None = None,
     ):
         self._db_name = db_name
         self._create_table_fn = create_table_fn
         self._post_init_fn = post_init_fn
         self._lock = threading.Lock()
-        self._engine: Optional[sqlalchemy.engine.Engine] = None
-        self._engine_async: Optional[sqlalchemy_async.AsyncEngine] = None
+        self._engine: sqlalchemy.engine.Engine | None = None
+        self._engine_async: sqlalchemy_async.AsyncEngine | None = None
 
     def get_engine(self) -> sqlalchemy.engine.Engine:
         """Lazy sync engine init with double-checked locking."""
@@ -477,8 +477,8 @@ class DatabaseManager:
 
 
 _max_connections = 0
-_postgres_engine_cache: Dict[str, sqlalchemy.engine.Engine] = {}
-_sqlite_engine_cache: Dict[str, sqlalchemy.engine.Engine] = {}
+_postgres_engine_cache: dict[str, sqlalchemy.engine.Engine] = {}
+_sqlite_engine_cache: dict[str, sqlalchemy.engine.Engine] = {}
 
 _db_creation_lock = threading.Lock()
 
@@ -526,21 +526,21 @@ def _make_asyncpg_creator(dsn: str) -> Callable[[], Any]:
 
 @typing.overload
 def get_engine(
-        db_name: Optional[str],
+        db_name: str | None,
         async_engine: Literal[False] = False) -> sqlalchemy.engine.Engine:
     ...
 
 
 @typing.overload
-def get_engine(db_name: Optional[str],
+def get_engine(db_name: str | None,
                async_engine: Literal[True]) -> sqlalchemy_async.AsyncEngine:
     ...
 
 
 def get_engine(
-    db_name: Optional[str],
+    db_name: str | None,
     async_engine: bool = False
-) -> Union[sqlalchemy.engine.Engine, sqlalchemy_async.AsyncEngine]:
+) -> sqlalchemy.engine.Engine | sqlalchemy_async.AsyncEngine:
     """Get the engine for the given database name.
 
     Args:

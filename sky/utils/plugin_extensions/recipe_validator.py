@@ -21,7 +21,7 @@ Example usage in core SkyPilot::
     # Validate recipe content (raises ValueError on failure)
     RecipeValidator.validate('custom', yaml_content)
 """
-from typing import Callable, Dict
+from collections.abc import Callable
 
 from sky import sky_logging
 
@@ -34,7 +34,7 @@ ValidateFn = Callable[[str], None]
 class RecipeValidator:
     """Registry for plugin recipe-type validators."""
 
-    _validators: Dict[str, ValidateFn] = {}
+    _validators: dict[str, ValidateFn] = {}
 
     @classmethod
     def register(cls, recipe_type: str, validate_fn: ValidateFn) -> None:

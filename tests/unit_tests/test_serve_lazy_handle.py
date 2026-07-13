@@ -394,8 +394,8 @@ class TestServerConstantsBump:
     """Guard against accidental rollback of the version bump."""
 
     def test_min_lazy_replica_handle_api_version_matches_api_version(self):
-        assert (server_constants.MIN_LAZY_REPLICA_HANDLE_API_VERSION <=
-                server_constants.API_VERSION)
+        assert (server_constants.MIN_LAZY_REPLICA_HANDLE_API_VERSION
+                <= server_constants.API_VERSION)
 
     def test_api_version_is_at_least_51(self):
         assert server_constants.API_VERSION >= 51

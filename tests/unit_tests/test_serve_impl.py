@@ -592,8 +592,8 @@ class TestSanitizedConfigBytes:
         assert parsed['vast']['datacenter_only'] is True
 
     def test_unreadable_returns_none(self, tmp_path):
-        assert impl._sanitized_config_bytes(str(
-            tmp_path / 'nope.yaml')) is (None)
+        assert impl._sanitized_config_bytes(str(tmp_path /
+                                                'nope.yaml')) is (None)
 
     def test_unparsable_returns_none(self, tmp_path):
         cfg = tmp_path / 'bad.yaml'

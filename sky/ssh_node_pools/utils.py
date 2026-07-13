@@ -1,8 +1,9 @@
 """Utility functions for managing SSH node pools."""
+from collections.abc import Callable
 import os
 import re
 import subprocess
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any
 import uuid
 
 import colorama
@@ -72,29 +73,29 @@ class UniqueKeySafeLoader(yaml.SafeLoader):
         return super().construct_mapping(node, deep)
 
 
-def load_ssh_targets(file_path: str) -> Dict[str, Any]:
+def load_ssh_targets(file_path: str) -> dict[str, Any]:
     """Load SSH targets from YAML file."""
     if not os.path.exists(file_path):
         with ux_utils.print_exception_no_traceback():
             raise ValueError(f'SSH Node Pools file not found: {file_path}')
 
     try:
-        with open(file_path, 'r', encoding='utf-8') as f:
+        with open(file_path, encoding='utf-8') as f:
             targets = yaml.load(f, Loader=UniqueKeySafeLoader)
         return targets
     except yaml.constructor.ConstructorError as e:
         with ux_utils.print_exception_no_traceback():
             raise ValueError(e.note) from e
-    except (yaml.YAMLError, IOError, OSError) as e:
+    except (yaml.YAMLError, OSError) as e:
         with ux_utils.print_exception_no_traceback():
             raise ValueError(f'Error loading SSH Node Pools file: {e}') from e
 
 
 def get_cluster_config(
-        targets: Dict[str, Any],
-        cluster_name: Optional[str] = None,
+        targets: dict[str, Any],
+        cluster_name: str | None = None,
         file_path: str = constants.DEFAULT_SSH_NODE_POOLS_PATH
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Get configuration for specific clusters or all clusters."""
     if not targets:
         with ux_utils.print_exception_no_traceback():
@@ -114,9 +115,9 @@ def get_cluster_config(
 
 def prepare_hosts_info(
     cluster_name: str,
-    cluster_config: Dict[str, Any],
-    upload_ssh_key_func: Optional[Callable[[str, str], str]] = None
-) -> List[Dict[str, str]]:
+    cluster_config: dict[str, Any],
+    upload_ssh_key_func: Callable[[str, str], str] | None = None
+) -> list[dict[str, str]]:
     """Prepare list of hosts with resolved user, identity_file, and password.
 
     Args:

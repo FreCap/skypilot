@@ -1,5 +1,6 @@
 """Miscellaneous Utils for Sky Data
 """
+from collections.abc import Callable
 import concurrent.futures
 import enum
 from multiprocessing import pool
@@ -8,7 +9,7 @@ import re
 import subprocess
 import textwrap
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any
 import urllib.parse
 
 from filelock import FileLock
@@ -44,7 +45,7 @@ AZURE_CONTAINER_URL = (
 _STORAGE_ACCOUNT_KEY_RETRIEVE_MAX_ATTEMPT = 5
 
 
-def split_s3_path(s3_path: str) -> Tuple[str, str]:
+def split_s3_path(s3_path: str) -> tuple[str, str]:
     """Splits S3 Path into Bucket name and Relative Path to Bucket
 
     Args:
@@ -56,7 +57,7 @@ def split_s3_path(s3_path: str) -> Tuple[str, str]:
     return bucket, key
 
 
-def split_gcs_path(gcs_path: str) -> Tuple[str, str]:
+def split_gcs_path(gcs_path: str) -> tuple[str, str]:
     """Splits GCS Path into Bucket name and Relative Path to Bucket
 
     Args:
@@ -68,7 +69,7 @@ def split_gcs_path(gcs_path: str) -> Tuple[str, str]:
     return bucket, key
 
 
-def split_az_path(az_path: str) -> Tuple[str, str, str]:
+def split_az_path(az_path: str) -> tuple[str, str, str]:
     """Splits Path into Storage account and Container names and Relative Path
 
     Args:
@@ -90,7 +91,7 @@ def split_az_path(az_path: str) -> Tuple[str, str, str]:
     return storage_account_name, container_name, path
 
 
-def split_r2_path(r2_path: str) -> Tuple[str, str]:
+def split_r2_path(r2_path: str) -> tuple[str, str]:
     """Splits R2 Path into Bucket name and Relative Path to Bucket
 
     Args:
@@ -102,7 +103,7 @@ def split_r2_path(r2_path: str) -> Tuple[str, str]:
     return bucket, key
 
 
-def split_nebius_path(nebius_path: str) -> Tuple[str, str]:
+def split_nebius_path(nebius_path: str) -> tuple[str, str]:
     """Splits Nebius Path into Bucket name and Relative Path to Bucket
 
     Args:
@@ -124,7 +125,7 @@ def is_hf_bucket_path(source: str) -> bool:
     return source.startswith(huggingface.HF_BUCKETS_URL_PREFIX)
 
 
-def split_hf_path(hf_path: str) -> Tuple[str, str]:
+def split_hf_path(hf_path: str) -> tuple[str, str]:
     """Splits an HF Buckets URL into (bucket_id, sub_path).
 
     ``bucket_id`` follows the ``<namespace>/<bucket-name>`` format (e.g.
@@ -146,7 +147,7 @@ def split_hf_path(hf_path: str) -> Tuple[str, str]:
     return bucket_id, sub_path
 
 
-def split_hf_repo_path(hf_path: str) -> Tuple[str, str, Optional[str], str]:
+def split_hf_repo_path(hf_path: str) -> tuple[str, str, str | None, str]:
     """Splits an HF repo URL into ``(repo_type, repo_id, revision, sub_path)``.
 
     ``repo_type`` is one of ``'model'``, ``'dataset'``, or ``'space'``.
@@ -184,7 +185,7 @@ def split_hf_repo_path(hf_path: str) -> Tuple[str, str, Optional[str], str]:
     sub_path = parts[2] if len(parts) == 3 else ''
 
     # Extract optional ``@<revision>`` suffix from the repo name.
-    revision: Optional[str] = None
+    revision: str | None = None
     if '@' in name_rev:
         name, revision = name_rev.split('@', 1)
         if not revision:
@@ -213,7 +214,7 @@ def verify_hf_bucket(bucket_id: str) -> bool:
         return True
     except Exception as e:  # pylint: disable=broad-except
         errors = huggingface.hf_hub_errors()
-        explicit_not_found_types: Tuple[type, ...] = tuple(cls for cls in (
+        explicit_not_found_types: tuple[type, ...] = tuple(cls for cls in (
             getattr(errors, 'RepositoryNotFoundError', None),
             getattr(errors, 'EntryNotFoundError', None),
         ) if cls is not None)
@@ -229,7 +230,7 @@ def verify_hf_bucket(bucket_id: str) -> bool:
         raise
 
 
-def split_cos_path(s3_path: str) -> Tuple[str, str, str]:
+def split_cos_path(s3_path: str) -> tuple[str, str, str]:
     """returns extracted region, bucket name and bucket path to data
         from the specified cos bucket's url.
         url expected format: "cos://region/bucket_name/optional_data_path"
@@ -258,7 +259,7 @@ def split_cos_path(s3_path: str) -> Tuple[str, str, str]:
     return bucket_name, data_path, region
 
 
-def create_s3_client(region: Optional[str] = None) -> Client:
+def create_s3_client(region: str | None = None) -> Client:
     """Helper method that connects to Boto3 client for S3 Bucket
 
     Args:
@@ -352,10 +353,10 @@ def verify_az_bucket(storage_account_name: str, container_name: str) -> bool:
 
 def get_az_storage_account_key(
     storage_account_name: str,
-    resource_group_name: Optional[str] = None,
-    storage_client: Optional[Client] = None,
-    resource_client: Optional[Client] = None,
-) -> Optional[str]:
+    resource_group_name: str | None = None,
+    storage_client: Client | None = None,
+    resource_client: Client | None = None,
+) -> str | None:
     """Returns access key of the given name of storage account.
 
     Args:
@@ -522,7 +523,7 @@ def _get_ibm_cos_bucket_region(region, bucket_name):
         tmp_client = ibm.get_cos_client(region)
         tmp_client.head_bucket(Bucket=bucket_name)
         return region
-    except ibm.ibm_botocore.exceptions.ClientError as e:  # type: ignore[union-attr] # pylint: disable=line-too-long
+    except ibm.ibm_botocore.exceptions.ClientError as e:  # pylint: disable=line-too-long
         if e.response['Error']['Code'] == '404':
             logger.debug(f'bucket {bucket_name} was not found '
                          f'in {region}')
@@ -574,7 +575,7 @@ def is_cloud_store_url(url):
 
 
 def _group_files_by_dir(
-        source_list: List[str]) -> Tuple[Dict[str, List[str]], List[str]]:
+        source_list: list[str]) -> tuple[dict[str, list[str]], list[str]]:
     """Groups a list of paths based on their directory
 
     Given a list of paths, generates a dict of {dir_name: List[file_name]}
@@ -588,7 +589,7 @@ def _group_files_by_dir(
     Args:
         source_list: List[str]; List of paths to group
     """
-    grouped_files: Dict[str, List[str]] = {}
+    grouped_files: dict[str, list[str]] = {}
     dirs = []
     for source in source_list:
         source = os.path.abspath(os.path.expanduser(source))
@@ -603,14 +604,14 @@ def _group_files_by_dir(
     return grouped_files, dirs
 
 
-def parallel_upload(source_path_list: List[str],
-                    filesync_command_generator: Callable[[str, List[str]], str],
+def parallel_upload(source_path_list: list[str],
+                    filesync_command_generator: Callable[[str, list[str]], str],
                     dirsync_command_generator: Callable[[str, str], str],
                     log_path: str,
                     bucket_name: str,
                     access_denied_message: str,
                     create_dirs: bool = False,
-                    max_concurrent_uploads: Optional[int] = None) -> None:
+                    max_concurrent_uploads: int | None = None) -> None:
     """Helper function to run parallel uploads for a list of paths.
 
     Used by S3Store, GCSStore, and R2Store to run rsync commands in parallel by
@@ -658,7 +659,7 @@ def parallel_upload(source_path_list: List[str],
                 [bucket_name] * len(commands), [log_path] * len(commands)))
 
 
-def get_gsutil_command() -> Tuple[str, str]:
+def get_gsutil_command() -> tuple[str, str]:
     """Gets the alias'd command for gsutil and a command to define the alias.
 
     This is required for applying platform-specific flags to gsutil.
@@ -724,7 +725,7 @@ def run_upload_cli(command: str, access_denied_message: str, bucket_name: str,
                      'because all files already exist on the cloud.')
 
 
-def get_cos_regions() -> List[str]:
+def get_cos_regions() -> list[str]:
     return [
         'us-south', 'us-east', 'eu-de', 'eu-gb', 'eu-es', 'ca-tor', 'au-syd',
         'br-sao', 'jp-osa', 'jp-tok'
@@ -772,11 +773,11 @@ class Rclone:
             return f'{profile_prefix[self]}-{bucket_name}'
 
         def get_config(self,
-                       bucket_name: Optional[str] = None,
-                       rclone_profile_name: Optional[str] = None,
-                       region: Optional[str] = None,
-                       storage_account_name: Optional[str] = None,
-                       storage_account_key: Optional[str] = None) -> str:
+                       bucket_name: str | None = None,
+                       rclone_profile_name: str | None = None,
+                       region: str | None = None,
+                       storage_account_name: str | None = None,
+                       storage_account_key: str | None = None) -> str:
             """Generates an Rclone configuration for a specific storage type.
 
             This method creates an Rclone configuration string based on the
@@ -1013,7 +1014,7 @@ class Rclone:
         """
         rclone_profile = cloud.get_profile_name(bucket_name)
         rclone_config_path = os.path.expanduser(constants.RCLONE_CONFIG_PATH)
-        with open(rclone_config_path, 'r', encoding='utf-8') as file:
+        with open(rclone_config_path, encoding='utf-8') as file:
             bucket_profile_found = False
             for line in file:
                 if line.lstrip().startswith('#'):  # skip user's comments.
@@ -1055,7 +1056,7 @@ class Rclone:
 
     @staticmethod
     def _remove_bucket_profile_rclone(bucket_name: str,
-                                      cloud: RcloneStores) -> List[str]:
+                                      cloud: RcloneStores) -> list[str]:
         """Returns rclone profiles without ones matching [prefix+bucket_name].
 
         Args:
@@ -1068,7 +1069,7 @@ class Rclone:
         rclone_profile_name = cloud.get_profile_name(bucket_name)
         rclone_config_path = os.path.expanduser(constants.RCLONE_CONFIG_PATH)
 
-        with open(rclone_config_path, 'r', encoding='utf-8') as file:
+        with open(rclone_config_path, encoding='utf-8') as file:
             lines = file.readlines()  # returns a list of the file's lines
             # delete existing bucket profile matching:
             # '[profile_prefix+bucket_name]'
@@ -1094,7 +1095,7 @@ class Rclone:
         return lines_to_keep
 
 
-def split_oci_path(oci_path: str) -> Tuple[str, str]:
+def split_oci_path(oci_path: str) -> tuple[str, str]:
     """Splits OCI Path into Bucket name and Relative Path to Bucket
     Args:
       oci_path: str; OCI Path, e.g. oci://imagenet/train/
@@ -1132,7 +1133,7 @@ def create_coreweave_client() -> Client:
     return coreweave.client('s3')
 
 
-def split_coreweave_path(coreweave_path: str) -> Tuple[str, str]:
+def split_coreweave_path(coreweave_path: str) -> tuple[str, str]:
     """Splits CoreWeave Path into Bucket name and Relative Path to Bucket
 
     Args:
@@ -1163,7 +1164,7 @@ def verify_coreweave_bucket(name: str, retry: int = 0) -> bool:
                     f'{retry_count} retries ({retry_count * 5} seconds)')
             return True
 
-        except coreweave.botocore.exceptions.ClientError as e:  # type: ignore[union-attr] # pylint: disable=line-too-long:
+        except coreweave.botocore.exceptions.ClientError as e:  # pylint: disable=line-too-long:
             error_code = e.response['Error']['Code']
             if error_code == '403':
                 logger.error(f'Access denied to bucket {name}')
@@ -1201,7 +1202,7 @@ def create_vastdata_client() -> Client:
     return vastdata.client('s3')
 
 
-def split_vastdata_path(vastdata_path: str) -> Tuple[str, str]:
+def split_vastdata_path(vastdata_path: str) -> tuple[str, str]:
     """Splits VastData Path into Bucket name and Relative Path to Bucket
 
     Args:

@@ -1,8 +1,9 @@
 """Resource checking utilities for finding active clusters and managed jobs."""
 
 import collections
+from collections.abc import Callable
 import concurrent.futures
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Optional
 
 from sky import exceptions
 from sky import global_user_state
@@ -14,7 +15,7 @@ logger = sky_logging.init_logger(__name__)
 
 
 def check_no_active_resources_for_users(
-        user_operations: List[Tuple[str, str]]) -> None:
+        user_operations: list[tuple[str, str]]) -> None:
     """Check if users have active clusters or managed jobs.
 
     Args:
@@ -35,7 +36,7 @@ def check_no_active_resources_for_users(
 
 
 def check_no_active_resources_for_workspaces(
-        workspace_operations: List[Tuple[str, str]]) -> None:
+        workspace_operations: list[tuple[str, str]]) -> None:
     """Check if workspaces have active clusters or managed jobs.
 
     Args:
@@ -58,9 +59,9 @@ def check_no_active_resources_for_workspaces(
                             'workspace')
 
 
-def _check_active_resources(resource_operations: List[Tuple[str, str]],
+def _check_active_resources(resource_operations: list[tuple[str, str]],
                             filter_factory: Callable[[str],
-                                                     Callable[[Dict[str, Any]],
+                                                     Callable[[dict[str, Any]],
                                                               bool]],
                             resource_type: str) -> None:
     """Check if resource entities have active clusters or managed jobs.
@@ -141,10 +142,10 @@ def _check_active_resources(resource_operations: List[Tuple[str, str]],
 
 
 def check_users_workspaces_active_resources(
-    user_ids: List[str],
-    workspace_names: List[str],
+    user_ids: list[str],
+    workspace_names: list[str],
     resources: Optional['ResourceSnapshot'] = None,
-) -> Tuple[str, List[str], Dict[str, str]]:
+) -> tuple[str, list[str], dict[str, str]]:
     """Check if all the active clusters or managed jobs in workspaces
        belong to the user_ids. If not, return the error message.
 
@@ -229,8 +230,8 @@ def check_users_workspaces_active_resources(
 
 
 def _get_active_resources_for_workspaces(
-    workspace_names: List[str]
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    workspace_names: list[str]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Get active clusters or managed jobs for workspaces.
 
     Args:
@@ -243,7 +244,7 @@ def _get_active_resources_for_workspaces(
     if not workspace_names:
         return [], []
 
-    def filter_by_workspaces(workspace_names: List[str]):
+    def filter_by_workspaces(workspace_names: list[str]):
         return lambda resource: (resource.get(
             'workspace', constants.SKYPILOT_DEFAULT_WORKSPACE) in
                                  workspace_names)
@@ -252,9 +253,9 @@ def _get_active_resources_for_workspaces(
 
 
 def _get_active_resources_by_names(
-    resource_names: List[str],
-    filter_factory: Callable[[List[str]], Callable[[Dict[str, Any]], bool]]
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    resource_names: list[str],
+    filter_factory: Callable[[list[str]], Callable[[dict[str, Any]], bool]]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Get active clusters or managed jobs.
 
     Args:
@@ -304,16 +305,15 @@ class ResourceSnapshot:
 
     def __init__(
         self,
-        clusters: List[Dict[str, Any]],
-        managed_jobs: List[Dict[str, Any]],
+        clusters: list[dict[str, Any]],
+        managed_jobs: list[dict[str, Any]],
     ):
         self._clusters = clusters
         self._managed_jobs = managed_jobs
-        self._by_workspace: Optional[Dict[str, Tuple[List[Dict[str, Any]],
-                                                     List[Dict[str,
-                                                               Any]]]]] = None
-        self._by_user: Optional[Tuple[Dict[str, List[Dict[str, Any]]],
-                                      Dict[str, List[Dict[str, Any]]]]] = None
+        self._by_workspace: dict[str, tuple[list[dict[str, Any]],
+                                            list[dict[str, Any]]]] | None = None
+        self._by_user: tuple[dict[str, list[dict[str, Any]]],
+                             dict[str, list[dict[str, Any]]]] | None = None
 
     @classmethod
     def fetch_all(cls) -> 'ResourceSnapshot':
@@ -322,30 +322,30 @@ class ResourceSnapshot:
 
     @classmethod
     def fetch_for_workspaces(cls,
-                             workspace_names: List[str]) -> 'ResourceSnapshot':
+                             workspace_names: list[str]) -> 'ResourceSnapshot':
         """Fetch active resources filtered to the given workspaces."""
         return cls(*_get_active_resources_for_workspaces(workspace_names))
 
     @property
-    def clusters(self) -> List[Dict[str, Any]]:
+    def clusters(self) -> list[dict[str, Any]]:
         return self._clusters
 
     @property
-    def managed_jobs(self) -> List[Dict[str, Any]]:
+    def managed_jobs(self) -> list[dict[str, Any]]:
         return self._managed_jobs
 
     def for_user(
             self,
-            user_id: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+            user_id: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Return ``(clusters, jobs)`` owned by ``user_id``.
 
         Index is built lazily on first call.
         """
         if self._by_user is None:
-            clusters_by_user: Dict[str, List[Dict[
+            clusters_by_user: dict[str, list[dict[
                 str, Any]]] = collections.defaultdict(list)
-            jobs_by_user: Dict[str,
-                               List[Dict[str,
+            jobs_by_user: dict[str,
+                               list[dict[str,
                                          Any]]] = collections.defaultdict(list)
             for cluster in self._clusters:
                 uh = cluster.get('user_hash')
@@ -361,16 +361,16 @@ class ResourceSnapshot:
 
     def for_workspace(
         self, workspace_name: str
-    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Return ``(clusters, jobs)`` in the given workspace.
 
         Index is built lazily on first call.
         """
         if self._by_workspace is None:
-            clusters_by_ws: Dict[str, List[Dict[
+            clusters_by_ws: dict[str, list[dict[
                 str, Any]]] = collections.defaultdict(list)
-            jobs_by_ws: Dict[str,
-                             List[Dict[str,
+            jobs_by_ws: dict[str,
+                             list[dict[str,
                                        Any]]] = collections.defaultdict(list)
             for cluster in self._clusters:
                 ws = cluster.get('workspace',
@@ -386,7 +386,7 @@ class ResourceSnapshot:
         return self._by_workspace.get(workspace_name, ([], []))
 
 
-def load_fresh_workspaces() -> Dict[str, Any]:
+def load_fresh_workspaces() -> dict[str, Any]:
     """Reload the skypilot config from disk and return the workspaces dict.
 
     Exposed so batch callers can do the reload + read once and pass the
@@ -402,9 +402,9 @@ def load_fresh_workspaces() -> Dict[str, Any]:
 
 def check_user_role_demotion(
         user: models.User,
-        workspaces: Optional[Dict[str, Any]] = None,
-        resources: Optional[ResourceSnapshot] = None,
-        workspaces_allowed_users: Optional[Dict[str, Set[str]]] = None) -> None:
+        workspaces: dict[str, Any] | None = None,
+        resources: ResourceSnapshot | None = None,
+        workspaces_allowed_users: dict[str, set[str]] | None = None) -> None:
     """Check whether an admin can be safely demoted to a regular user.
 
     After demotion the user loses implicit access to all private workspaces
@@ -457,7 +457,7 @@ def check_user_role_demotion(
     if not workspaces:
         return
 
-    inaccessible_workspaces: List[str] = []
+    inaccessible_workspaces: list[str] = []
     for workspace_name, workspace_config in workspaces.items():
         if not workspace_config.get('private', False):
             continue
@@ -484,7 +484,7 @@ def check_user_role_demotion(
     user_clusters, user_jobs = resources.for_user(user_id)
 
     workspace_set = set(inaccessible_workspaces)
-    workspace_resources: Dict[str, Dict[str, List[str]]] = {}
+    workspace_resources: dict[str, dict[str, list[str]]] = {}
     for cluster in user_clusters:
         ws = cluster.get('workspace', constants.SKYPILOT_DEFAULT_WORKSPACE)
         if ws not in workspace_set:
@@ -525,7 +525,7 @@ def check_user_role_demotion(
 
 
 def _get_active_resources(
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Get all active clusters and managed jobs.
 
     Returns:
@@ -533,13 +533,13 @@ def _get_active_resources(
         all_managed_jobs: List[Dict[str, Any]]
     """
 
-    def get_all_clusters() -> List[Dict[str, Any]]:
+    def get_all_clusters() -> list[dict[str, Any]]:
         # Exclude is_managed=True clusters: those are the clusters that
         # back managed jobs and are already represented (and labeled) by
         # the managed-jobs queue below.
         return global_user_state.get_clusters(exclude_managed_clusters=True)
 
-    def get_all_managed_jobs() -> List[Dict[str, Any]]:
+    def get_all_managed_jobs() -> list[dict[str, Any]]:
         # pylint: disable=import-outside-toplevel
         from sky.jobs.server import core as managed_jobs_core
         try:

@@ -20,7 +20,7 @@ default + plugin-provided runner are registered (sequentially), so no
 lock is needed.
 """
 import typing
-from typing import Any, Dict, List, Optional, Protocol, Tuple, Union
+from typing import Any, Protocol
 
 from sky import sky_logging
 
@@ -40,22 +40,22 @@ class ManagedJobRunner(Protocol):
         handle: 'backends.CloudVmRayResourceHandle',
         backend: 'backends.CloudVmRayBackend',
         skip_finished: bool,
-        accessible_workspaces: List[str],
-        job_ids: Optional[List[int]],
-        workspace_match: Optional[str],
-        name_match: Optional[str],
-        pool_match: Optional[str],
-        page: Optional[int],
-        limit: Optional[int],
-        user_hashes: Optional[List[Optional[str]]],
-        statuses: Optional[List[str]],
-        fields: Optional[List[str]],
-        sort_by: Optional[str],
-        sort_order: Optional[str],
-        submitted_after: Optional[float],
-        submitted_before: Optional[float],
-    ) -> Tuple[List[Dict[str, Any]], int,
-               'managed_job_utils.ManagedJobQueueResultType', int, Dict[str,
+        accessible_workspaces: list[str],
+        job_ids: list[int] | None,
+        workspace_match: str | None,
+        name_match: str | None,
+        pool_match: str | None,
+        page: int | None,
+        limit: int | None,
+        user_hashes: list[str | None] | None,
+        statuses: list[str] | None,
+        fields: list[str] | None,
+        sort_by: str | None,
+        sort_order: str | None,
+        submitted_after: float | None,
+        submitted_before: float | None,
+    ) -> tuple[list[dict[str, Any]], int,
+               'managed_job_utils.ManagedJobQueueResultType', int, dict[str,
                                                                         int]]:
         ...
 
@@ -66,11 +66,11 @@ class ManagedJobRunner(Protocol):
         backend: 'backends.CloudVmRayBackend',
         all_users: bool,
         all: bool,  # pylint: disable=redefined-builtin
-        job_ids: Optional[List[int]],
-        name: Optional[str],
-        pool: Optional[str],
+        job_ids: list[int] | None,
+        name: str | None,
+        pool: str | None,
         graceful: bool,
-        graceful_timeout: Optional[int],
+        graceful_timeout: int | None,
     ) -> str:
         ...
 
@@ -79,18 +79,18 @@ class ManagedJobRunner(Protocol):
         *,
         handle: 'backends.CloudVmRayResourceHandle',
         backend: 'backends.CloudVmRayBackend',
-        job_id: Optional[int],
-        job_name: Optional[str],
+        job_id: int | None,
+        job_name: str | None,
         follow: bool,
         controller: bool,
-        tail: Optional[int],
-        tail_offset: Optional[int] = None,
-        task: Optional[Union[str, int]],
+        tail: int | None,
+        tail_offset: int | None = None,
+        task: str | int | None,
     ) -> int:
         ...
 
 
-_current: Optional[ManagedJobRunner] = None
+_current: ManagedJobRunner | None = None
 
 
 def register(runner: ManagedJobRunner) -> None:

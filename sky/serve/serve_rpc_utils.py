@@ -1,7 +1,7 @@
 """Rpc Utilities for SkyServe"""
 
 import typing
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 from sky import backends
 from sky.adaptors import common as adaptors_common
@@ -23,10 +23,10 @@ class GetServiceStatusRequestConverter:
     @classmethod
     def to_proto(
         cls,
-        service_names: Optional[List[str]],
+        service_names: list[str] | None,
         pool: bool,
         summary_only: bool = False,
-        include_target_num_replicas: Optional[bool] = None,
+        include_target_num_replicas: bool | None = None,
     ) -> 'servev1_pb2.GetServiceStatusRequest':
         request = servev1_pb2.GetServiceStatusRequest()
         request.pool = pool
@@ -40,7 +40,7 @@ class GetServiceStatusRequestConverter:
     @classmethod
     def from_proto(
         cls, proto: 'servev1_pb2.GetServiceStatusRequest'
-    ) -> Tuple[Optional[List[str]], bool, bool, Optional[bool]]:
+    ) -> tuple[list[str] | None, bool, bool, bool | None]:
         pool = proto.pool
         if proto.HasField('service_names'):
             service_names = list(proto.service_names.names)
@@ -60,7 +60,7 @@ class GetServiceStatusResponseConverter:
     @classmethod
     def to_proto(
         cls,
-        statuses: List[Dict[str,
+        statuses: list[dict[str,
                             str]]) -> 'servev1_pb2.GetServiceStatusResponse':
         response = servev1_pb2.GetServiceStatusResponse()
         for status in statuses:
@@ -71,7 +71,7 @@ class GetServiceStatusResponseConverter:
     @classmethod
     def from_proto(
             cls, proto: 'servev1_pb2.GetServiceStatusResponse'
-    ) -> List[Dict[str, str]]:
+    ) -> list[dict[str, str]]:
         pickled = [dict(status.status) for status in proto.statuses]
         return pickled
 
@@ -80,7 +80,7 @@ class TerminateServicesRequestConverter:
     """Converter for TerminateServicesRequest"""
 
     @classmethod
-    def to_proto(cls, service_names: Optional[List[str]], purge: bool,
+    def to_proto(cls, service_names: list[str] | None, purge: bool,
                  pool: bool) -> 'servev1_pb2.TerminateServicesRequest':
         request = servev1_pb2.TerminateServicesRequest()
         request.purge = purge
@@ -92,7 +92,7 @@ class TerminateServicesRequestConverter:
     @classmethod
     def from_proto(
         cls, proto: 'servev1_pb2.TerminateServicesRequest'
-    ) -> Tuple[Optional[List[str]], bool, bool]:
+    ) -> tuple[list[str] | None, bool, bool]:
         purge = proto.purge
         pool = proto.pool
         if proto.HasField('service_names'):
@@ -123,11 +123,11 @@ class RpcRunner:
     def get_service_status(
         cls,
         handle: backends.CloudVmRayResourceHandle,
-        service_names: Optional[List[str]],
+        service_names: list[str] | None,
         pool: bool,
         summary_only: bool = False,
-        include_target_num_replicas: Optional[bool] = None
-    ) -> List[Dict[str, Any]]:
+        include_target_num_replicas: bool | None = None
+    ) -> list[dict[str, Any]]:
         assert handle.is_grpc_enabled_with_flag
         request = GetServiceStatusRequestConverter.to_proto(
             service_names,
@@ -152,7 +152,7 @@ class RpcRunner:
 
     @classmethod
     def terminate_services(cls, handle: backends.CloudVmRayResourceHandle,
-                           service_names: Optional[List[str]], purge: bool,
+                           service_names: list[str] | None, purge: bool,
                            pool: bool) -> str:
         assert handle.is_grpc_enabled_with_flag
         request = TerminateServicesRequestConverter.to_proto(

@@ -6,7 +6,6 @@ to remote clusters.
 import os
 import pathlib
 import shlex
-from typing import Dict, List, Optional, Tuple
 
 from sky import sky_logging
 from sky.server import plugins
@@ -31,7 +30,7 @@ def _wheel_name_prefix(wheel_filename: str) -> str:
     return wheel_filename.split('-', 1)[0] + '-'
 
 
-def _build_guarded_install_script(wheels: List[Tuple[str, str]]) -> str:
+def _build_guarded_install_script(wheels: list[tuple[str, str]]) -> str:
     """Build a shell script that installs each wheel at most once.
 
     For each wheel, the script:
@@ -85,7 +84,7 @@ def _build_guarded_install_script(wheels: List[Tuple[str, str]]) -> str:
 )"""
 
 
-def get_plugin_mounts_and_commands() -> Tuple[Dict[str, str], str]:
+def get_plugin_mounts_and_commands() -> tuple[dict[str, str], str]:
     """Get file mounts and installation commands for plugin wheels.
 
     This function reads the controller wheel directory path from the plugin
@@ -137,8 +136,8 @@ def get_plugin_mounts_and_commands() -> Tuple[Dict[str, str], str]:
             f'No .whl files found in controller wheel directory: {wheel_dir}')
         return {}, ''
 
-    file_mounts: Dict[str, str] = {}
-    wheels: List[Tuple[str, str]] = []
+    file_mounts: dict[str, str] = {}
+    wheels: list[tuple[str, str]] = []
 
     for wheel_path in wheel_files:
         # File mount: upload the wheel file directly to the remote cluster
@@ -151,7 +150,7 @@ def get_plugin_mounts_and_commands() -> Tuple[Dict[str, str], str]:
     return file_mounts, _build_guarded_install_script(wheels)
 
 
-def get_filtered_plugins_config_path() -> Optional[str]:
+def get_filtered_plugins_config_path() -> str | None:
     """Return the path to remote_plugins.yaml if it exists.
 
     The controller should only attempt to load plugins that are specified in

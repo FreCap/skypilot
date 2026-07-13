@@ -1,4 +1,7 @@
 """Amazon Web Services."""
+from collections.abc import Callable
+from collections.abc import Iterable
+from collections.abc import Iterator
 import enum
 import fnmatch
 import functools
@@ -9,8 +12,7 @@ import re
 import subprocess
 import time
 import typing
-from typing import (Any, Callable, Dict, Iterable, Iterator, List, Literal,
-                    Optional, Set, Tuple, TypeVar, Union)
+from typing import Any, Literal, Optional, TypeVar
 
 import colorama
 from typing_extensions import ParamSpec
@@ -165,7 +167,7 @@ def _is_efa_instance_type(instance_type: str) -> bool:
 
 
 @annotations.lru_cache(scope='global', maxsize=128)
-def _get_efa_image_id(region_name: str) -> Optional[str]:
+def _get_efa_image_id(region_name: str) -> str | None:
     """Get the EFA image id for the given region."""
     try:
         client = aws.client('ec2', region_name=region_name)
@@ -303,7 +305,7 @@ class AWS(clouds.Cloud):
 
     _SUPPORTS_SERVICE_ACCOUNT_ON_REMOTE = True
 
-    _regions: List[clouds.Region] = []
+    _regions: list[clouds.Region] = []
 
     _INDENT_PREFIX = '    '
     _STATIC_CREDENTIAL_HELP_STR = (
@@ -322,8 +324,8 @@ class AWS(clouds.Cloud):
     def _unsupported_features_for_resources(
         cls,
         resources: 'resources_lib.Resources',
-        region: Optional[str] = None,
-    ) -> Dict[clouds.CloudImplementationFeatures, str]:
+        region: str | None = None,
+    ) -> dict[clouds.CloudImplementationFeatures, str]:
         unsupported_features = {}
         if resources.use_spot:
             unsupported_features[clouds.CloudImplementationFeatures.STOP] = (
@@ -344,7 +346,7 @@ class AWS(clouds.Cloud):
         return unsupported_features
 
     @classmethod
-    def max_cluster_name_length(cls) -> Optional[int]:
+    def max_cluster_name_length(cls) -> int | None:
         return cls._MAX_CLUSTER_NAME_LEN_LIMIT
 
     @classmethod
@@ -367,12 +369,12 @@ class AWS(clouds.Cloud):
     def regions_with_offering(
         cls,
         instance_type: str,
-        accelerators: Optional[Dict[str, int]],
+        accelerators: dict[str, int] | None,
         use_spot: bool,
-        region: Optional[str],
-        zone: Optional[str],
+        region: str | None,
+        zone: str | None,
         resources: Optional['resources_lib.Resources'] = None,
-    ) -> List[clouds.Region]:
+    ) -> list[clouds.Region]:
         del accelerators  # unused
         regions = catalog.get_region_zones_for_instance_type(
             instance_type, use_spot, 'aws')
@@ -397,9 +399,9 @@ class AWS(clouds.Cloud):
         region: str,
         num_nodes: int,
         instance_type: str,
-        accelerators: Optional[Dict[str, int]] = None,
+        accelerators: dict[str, int] | None = None,
         use_spot: bool = False,
-    ) -> Iterator[List[clouds.Zone]]:
+    ) -> Iterator[list[clouds.Zone]]:
         # TODO(suquark): Now we can return one zone at a time,
         # like other clouds,
         # because the new provisioner can failover to other zones pretty fast.
@@ -477,7 +479,7 @@ class AWS(clouds.Cloud):
     @classmethod
     def _get_image_id(
         cls,
-        image_id: Optional[Dict[Optional[str], str]],
+        image_id: dict[str | None, str] | None,
         region_name: str,
         instance_type: str,
         enable_efa: bool,
@@ -574,7 +576,7 @@ class AWS(clouds.Cloud):
         raise RuntimeError('Unreachable')
 
     @classmethod
-    def get_image_size(cls, image_id: str, region: Optional[str]) -> float:
+    def get_image_size(cls, image_id: str, region: str | None) -> float:
         if image_id.startswith('skypilot:'):
             return DEFAULT_AMI_GB
         assert region is not None, (image_id, region)
@@ -619,7 +621,7 @@ class AWS(clouds.Cloud):
     @aws_profile_aware_lru_cache(scope='request',
                                  maxsize=_AWS_PROFILE_SCOPED_FUNC_CACHE_SIZE)
     def get_image_root_device_name(cls, image_id: str,
-                                   region: Optional[str]) -> str:
+                                   region: str | None) -> str:
         if image_id.startswith('skypilot:'):
             return DEFAULT_ROOT_DEVICE_NAME
         assert region is not None, (image_id, region)
@@ -658,7 +660,7 @@ class AWS(clouds.Cloud):
         return root_device_name
 
     @classmethod
-    def get_zone_shell_cmd(cls) -> Optional[str]:
+    def get_zone_shell_cmd(cls) -> str | None:
         # The command for getting the current zone is from:
         # https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-identity-documents.html  # pylint: disable=line-too-long
         command_str = (
@@ -675,8 +677,8 @@ class AWS(clouds.Cloud):
     def instance_type_to_hourly_cost(self,
                                      instance_type: str,
                                      use_spot: bool,
-                                     region: Optional[str] = None,
-                                     zone: Optional[str] = None) -> float:
+                                     region: str | None = None,
+                                     zone: str | None = None) -> float:
         return catalog.get_hourly_cost(instance_type,
                                        use_spot=use_spot,
                                        region=region,
@@ -684,10 +686,10 @@ class AWS(clouds.Cloud):
                                        clouds='aws')
 
     def accelerators_to_hourly_cost(self,
-                                    accelerators: Dict[str, int],
+                                    accelerators: dict[str, int],
                                     use_spot: bool,
-                                    region: Optional[str] = None,
-                                    zone: Optional[str] = None) -> float:
+                                    region: str | None = None,
+                                    zone: str | None = None) -> float:
         del accelerators, use_spot, region, zone  # unused
         # AWS includes accelerators as part of the instance type.  Implementing
         # this is also necessary for e.g., the instance may have 4 GPUs, while
@@ -720,15 +722,15 @@ class AWS(clouds.Cloud):
     @classmethod
     def get_default_instance_type(
         cls,
-        cpus: Optional[str] = None,
-        memory: Optional[str] = None,
-        disk_tier: Optional[resources_utils.DiskTier] = None,
-        local_disk: Optional[str] = None,
-        region: Optional[str] = None,
-        zone: Optional[str] = None,
+        cpus: str | None = None,
+        memory: str | None = None,
+        disk_tier: resources_utils.DiskTier | None = None,
+        local_disk: str | None = None,
+        region: str | None = None,
+        zone: str | None = None,
         use_spot: bool = False,
-        max_hourly_cost: Optional[float] = None,
-    ) -> Optional[str]:
+        max_hourly_cost: float | None = None,
+    ) -> str | None:
         return catalog.get_default_instance_type(
             cpus=cpus,
             memory=memory,
@@ -746,7 +748,7 @@ class AWS(clouds.Cloud):
     def get_accelerators_from_instance_type(
         cls,
         instance_type: str,
-    ) -> Optional[Dict[str, Union[int, float]]]:
+    ) -> dict[str, int | float] | None:
         return catalog.get_accelerators_from_instance_type(instance_type,
                                                            clouds='aws')
 
@@ -754,14 +756,14 @@ class AWS(clouds.Cloud):
     def get_arch_from_instance_type(
         cls,
         instance_type: str,
-    ) -> Optional[str]:
+    ) -> str | None:
         return catalog.get_arch_from_instance_type(instance_type, clouds='aws')
 
     @classmethod
     def get_local_disk_spec_from_instance_type(
         cls,
         instance_type: str,
-    ) -> Optional[str]:
+    ) -> str | None:
         return catalog.get_local_disk_from_instance_type(instance_type,
                                                          clouds='aws')
 
@@ -769,7 +771,7 @@ class AWS(clouds.Cloud):
     def get_vcpus_mem_from_instance_type(
         cls,
         instance_type: str,
-    ) -> Tuple[Optional[float], Optional[float]]:
+    ) -> tuple[float | None, float | None]:
         return catalog.get_vcpus_mem_from_instance_type(instance_type,
                                                         clouds='aws')
 
@@ -778,11 +780,11 @@ class AWS(clouds.Cloud):
         resources: 'resources_lib.Resources',
         cluster_name: resources_utils.ClusterName,
         region: 'clouds.Region',
-        zones: Optional[List['clouds.Zone']],
+        zones: list['clouds.Zone'] | None,
         num_nodes: int,
         dryrun: bool = False,
-        volume_mounts: Optional[List['volume_lib.VolumeMount']] = None,
-    ) -> Dict[str, Any]:
+        volume_mounts: list['volume_lib.VolumeMount'] | None = None,
+    ) -> dict[str, Any]:
         del dryrun  # unused
         assert zones is not None, (region, zones)
 
@@ -984,7 +986,7 @@ class AWS(clouds.Cloud):
 
     @classmethod
     def _check_compute_credentials(
-            cls) -> Tuple[bool, Optional[Union[str, Dict[str, str]]]]:
+            cls) -> tuple[bool, str | dict[str, str] | None]:
         """Checks if the user has access credentials to this AWS's compute service."""
         credentials_exist, identity_str, hints = cls._check_credentials_exist()
         if not credentials_exist:
@@ -1010,7 +1012,7 @@ class AWS(clouds.Cloud):
 
     @classmethod
     def _check_storage_credentials(
-            cls) -> Tuple[bool, Optional[Union[str, Dict[str, str]]]]:
+            cls) -> tuple[bool, str | dict[str, str] | None]:
         """Checks if the user has access credentials to this AWS's storage service."""
         credentials_exist, identity_str, hints = cls._check_credentials_exist()
         if not credentials_exist:
@@ -1037,8 +1039,7 @@ class AWS(clouds.Cloud):
     # Cache since getting identity is slow.
     @aws_profile_aware_lru_cache(scope='request',
                                  maxsize=_AWS_PROFILE_SCOPED_FUNC_CACHE_SIZE)
-    def _check_credentials_exist(
-            cls) -> Tuple[bool, Optional[str], Optional[str]]:
+    def _check_credentials_exist(cls) -> tuple[bool, str | None, str | None]:
         """Checks if the user has access credentials to AWS.
 
         Returns:
@@ -1059,8 +1060,7 @@ class AWS(clouds.Cloud):
         proc = subprocess.run('aws --version',
                               shell=True,
                               check=False,
-                              stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE)
+                              capture_output=True)
         if proc.returncode != 0:
             return False, None, dependency_installation_hints
 
@@ -1141,7 +1141,7 @@ class AWS(clouds.Cloud):
         return True, identity_str, hints
 
     @classmethod
-    def _current_identity_type(cls) -> Optional[AWSIdentityType]:
+    def _current_identity_type(cls) -> AWSIdentityType | None:
         stdout = cls._aws_configure_list()
         if stdout is None:
             return None
@@ -1200,7 +1200,7 @@ class AWS(clouds.Cloud):
     @classmethod
     @aws_profile_aware_lru_cache(scope='request',
                                  maxsize=_AWS_PROFILE_SCOPED_FUNC_CACHE_SIZE)
-    def _aws_configure_list(cls) -> Optional[bytes]:
+    def _aws_configure_list(cls) -> bytes | None:
         cmd = 'aws configure list'
         # Profile takes precedence over default configs.
         profile = aws.get_workspace_profile()
@@ -1220,7 +1220,7 @@ class AWS(clouds.Cloud):
     # Cache since getting identity is slow.
     @aws_profile_aware_lru_cache(scope='request',
                                  maxsize=_AWS_PROFILE_SCOPED_FUNC_CACHE_SIZE)
-    def _sts_get_caller_identity(cls) -> Optional[List[List[str]]]:
+    def _sts_get_caller_identity(cls) -> list[list[str]] | None:
         try:
             sts = aws.client('sts', check_credentials=False)
             # The caller identity contains 3 fields: UserId, Account, Arn.
@@ -1304,7 +1304,7 @@ class AWS(clouds.Cloud):
     # Cache since getting identity is slow.
     @aws_profile_aware_lru_cache(scope='request',
                                  maxsize=_AWS_PROFILE_SCOPED_FUNC_CACHE_SIZE)
-    def get_user_identities(cls) -> Optional[List[List[str]]]:
+    def get_user_identities(cls) -> list[list[str]] | None:
         """Returns a [UserId, Account] list that uniquely identifies the user.
 
         These fields come from `aws sts get-caller-identity` and are cached
@@ -1357,7 +1357,7 @@ class AWS(clouds.Cloud):
             f'aws/.cache/user-identity-{config_hash}.txt')
         if os.path.exists(cache_path):
             try:
-                with open(cache_path, 'r', encoding='utf-8') as f:
+                with open(cache_path, encoding='utf-8') as f:
                     return json.loads(f.read())
             except json.JSONDecodeError:
                 # cache is invalid, ignore it and fetch identity again
@@ -1372,14 +1372,14 @@ class AWS(clouds.Cloud):
         return result
 
     @classmethod
-    def get_active_user_identity_str(cls) -> Optional[str]:
+    def get_active_user_identity_str(cls) -> str | None:
         user_identity = cls.get_active_user_identity()
         if user_identity is None:
             return None
         identity_str = f'{user_identity[0]} [account={user_identity[1]}]'
         return identity_str
 
-    def get_credential_file_mounts(self) -> Dict[str, str]:
+    def get_credential_file_mounts(self) -> dict[str, str]:
         # The credentials file should not be uploaded if the user identity is
         # not SHARED_CREDENTIALS_FILE, since we cannot be sure if the currently
         # active user identity is the same as the one encoded in the credentials
@@ -1451,8 +1451,7 @@ class AWS(clouds.Cloud):
 
     @classmethod
     def _get_disk_specs(
-            cls,
-            disk_tier: Optional[resources_utils.DiskTier]) -> Dict[str, Any]:
+            cls, disk_tier: resources_utils.DiskTier | None) -> dict[str, Any]:
         tier = cls._translate_disk_tier(disk_tier)
         tier2iops = {
             resources_utils.DiskTier.ULTRA: 20000,
@@ -1530,9 +1529,9 @@ class AWS(clouds.Cloud):
         self,
         instance_type: str,
         region: str,
-        zone: Optional[str],
-        specific_reservations: Set[str],
-    ) -> Dict[str, int]:
+        zone: str | None,
+        specific_reservations: set[str],
+    ) -> dict[str, int]:
         if zone is None:
             # For backward compatibility, the cluster in INIT state launched
             # before #2352 may not have zone information. In this case, we
@@ -1558,17 +1557,16 @@ class AWS(clouds.Cloud):
         return reservation_available_resources
 
     @classmethod
-    def query_status(cls, name: str, tag_filters: Dict[str, str],
-                     region: Optional[str], zone: Optional[str],
-                     **kwargs) -> List['status_lib.ClusterStatus']:
+    def query_status(cls, name: str, tag_filters: dict[str, str],
+                     region: str | None, zone: str | None,
+                     **kwargs) -> list['status_lib.ClusterStatus']:
         # TODO(suquark): deprecate this method
         assert False, 'This code path should not be used.'
 
     @classmethod
     def create_image_from_cluster(cls,
                                   cluster_name: resources_utils.ClusterName,
-                                  region: Optional[str],
-                                  zone: Optional[str]) -> str:
+                                  region: str | None, zone: str | None) -> str:
         assert region is not None, (cluster_name.display_name,
                                     cluster_name.name_on_cloud, region)
         del zone  # unused
@@ -1632,8 +1630,8 @@ class AWS(clouds.Cloud):
 
     @classmethod
     def maybe_move_image(cls, image_id: str, source_region: str,
-                         target_region: str, source_zone: Optional[str],
-                         target_zone: Optional[str]) -> str:
+                         target_region: str, source_zone: str | None,
+                         target_zone: str | None) -> str:
         del source_zone, target_zone  # unused
         if source_region == target_region:
             return image_id
@@ -1682,7 +1680,7 @@ class AWS(clouds.Cloud):
         return target_image_id
 
     @classmethod
-    def delete_image(cls, image_id: str, region: Optional[str]) -> None:
+    def delete_image(cls, image_id: str, region: str | None) -> None:
         assert region is not None, (image_id, region)
         delete_image_cmd = (f'aws ec2 deregister-image --region {region} '
                             f'--image-id {image_id}')
@@ -1699,7 +1697,7 @@ class AWS(clouds.Cloud):
 
     @classmethod
     def is_label_valid(cls, label_key: str,
-                       label_value: str) -> Tuple[bool, Optional[str]]:
+                       label_value: str) -> tuple[bool, str | None]:
         key_regex = re.compile(r'^(?!aws:)[\S]{1,127}$')
         value_regex = re.compile(r'^[\S]{0,255}$')
         key_valid = bool(key_regex.match(label_key))
@@ -1718,8 +1716,8 @@ class AWS(clouds.Cloud):
 
     @classmethod
     def yield_cloud_specific_failover_overrides(cls,
-                                                region: Optional[str] = None
-                                               ) -> Iterable[Dict[str, Any]]:
+                                                region: str | None = None
+                                               ) -> Iterable[dict[str, Any]]:
         vpc_names = skypilot_config.get_effective_region_config(
             cloud='aws', region=region, keys=('vpc_names',), default_value=None)
         if vpc_names:

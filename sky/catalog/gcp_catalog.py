@@ -4,7 +4,6 @@ For now this service catalog is manually coded. In the future it should be
 queried from GCP API.
 """
 import typing
-from typing import Dict, List, Optional, Tuple
 
 from sky import exceptions
 from sky import sky_logging
@@ -229,7 +228,7 @@ def _closest_power_of_two(x: int) -> int:
     return 1 << ((x - 1).bit_length() - 1)
 
 
-def get_quota_code(accelerator: str, use_spot: bool) -> Optional[str]:
+def get_quota_code(accelerator: str, use_spot: bool) -> str | None:
     """Get the quota code based on `accelerator` and `use_spot`.
 
     The quota code is fetched from `_quotas_df` based on the accelerator
@@ -260,8 +259,8 @@ def instance_type_exists(instance_type: str) -> bool:
 def get_hourly_cost(
     instance_type: str,
     use_spot: bool = False,
-    region: Optional[str] = None,
-    zone: Optional[str] = None,
+    region: str | None = None,
+    zone: str | None = None,
 ) -> float:
     if instance_type == 'TPU-VM':
         # Currently the host VM of TPU does not cost extra.
@@ -271,7 +270,7 @@ def get_hourly_cost(
 
 
 def get_vcpus_mem_from_instance_type(
-        instance_type: str) -> Tuple[Optional[float], Optional[float]]:
+        instance_type: str) -> tuple[float | None, float | None]:
     # The number of vCPUs and memory size provided with a TPU VM is not
     # officially documented.
     if instance_type == 'TPU-VM':
@@ -280,14 +279,14 @@ def get_vcpus_mem_from_instance_type(
 
 
 def get_default_instance_type(
-        cpus: Optional[str] = None,
-        memory: Optional[str] = None,
-        disk_tier: Optional[resources_utils.DiskTier] = None,
-        local_disk: Optional[str] = None,
-        region: Optional[str] = None,
-        zone: Optional[str] = None,
+        cpus: str | None = None,
+        memory: str | None = None,
+        disk_tier: resources_utils.DiskTier | None = None,
+        local_disk: str | None = None,
+        region: str | None = None,
+        zone: str | None = None,
         use_spot: bool = False,
-        max_hourly_cost: Optional[float] = None) -> Optional[str]:
+        max_hourly_cost: float | None = None) -> str | None:
     del local_disk  # unused
     if cpus is None and memory is None:
         cpus = f'{_DEFAULT_NUM_VCPUS}+'
@@ -312,7 +311,7 @@ def get_default_instance_type(
 
 
 def get_accelerators_from_instance_type(
-        instance_type: str) -> Optional[Dict[str, int]]:
+        instance_type: str) -> dict[str, int] | None:
     """Infer the GPU type from the instance type.
 
     This inference logic is GCP-specific. Unlike other clouds, we don't call
@@ -332,16 +331,16 @@ def get_accelerators_from_instance_type(
 
 
 def get_instance_type_for_accelerator(
-    acc_name: str,
-    acc_count: int,
-    cpus: Optional[str] = None,
-    memory: Optional[str] = None,
-    use_spot: bool = False,
-    local_disk: Optional[str] = None,
-    region: Optional[str] = None,
-    zone: Optional[str] = None,
-    max_hourly_cost: Optional[float] = None
-) -> Tuple[Optional[List[str]], List[str]]:
+        acc_name: str,
+        acc_count: int,
+        cpus: str | None = None,
+        memory: str | None = None,
+        use_spot: bool = False,
+        local_disk: str | None = None,
+        region: str | None = None,
+        zone: str | None = None,
+        max_hourly_cost: float | None = None
+) -> tuple[list[str] | None, list[str]]:
     """Fetch instance types with similar CPU count for given accelerator.
 
     Return: a list with a single matched instance type and a list of candidates
@@ -393,14 +392,13 @@ def get_instance_type_for_accelerator(
     return [instance_type], []
 
 
-def validate_region_zone(
-        region: Optional[str],
-        zone: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+def validate_region_zone(region: str | None,
+                         zone: str | None) -> tuple[str | None, str | None]:
     return common.validate_region_zone_impl('gcp', _df, region, zone)
 
 
 def get_region_zones_for_instance_type(instance_type: str,
-                                       use_spot: bool) -> List['cloud.Region']:
+                                       use_spot: bool) -> list['cloud.Region']:
     df = _df[_df['InstanceType'] == instance_type]
     return common.get_region_zones(df, use_spot)
 
@@ -409,8 +407,8 @@ def _get_accelerator(
     df: 'pd.DataFrame',
     accelerator: str,
     count: int,
-    region: Optional[str],
-    zone: Optional[str] = None,
+    region: str | None,
+    zone: str | None = None,
 ) -> 'pd.DataFrame':
     idx = (df['AcceleratorName'].str.fullmatch(
         accelerator, case=False)) & (df['AcceleratorCount'] == count)
@@ -424,8 +422,8 @@ def _get_accelerator(
 def get_accelerator_hourly_cost(accelerator: str,
                                 count: int,
                                 use_spot: bool = False,
-                                region: Optional[str] = None,
-                                zone: Optional[str] = None) -> float:
+                                region: str | None = None,
+                                zone: str | None = None) -> float:
 
     df = _get_accelerator(_df, accelerator, count, region, zone)
     if region is not None:
@@ -444,20 +442,20 @@ def get_accelerator_hourly_cost(accelerator: str,
 
 def list_accelerators(
     gpus_only: bool,
-    name_filter: Optional[str] = None,
-    region_filter: Optional[str] = None,
-    quantity_filter: Optional[int] = None,
+    name_filter: str | None = None,
+    region_filter: str | None = None,
+    quantity_filter: int | None = None,
     case_sensitive: bool = True,
     all_regions: bool = False,
     require_price: bool = True,
-) -> Dict[str, List[common.InstanceTypeInfo]]:
+) -> dict[str, list[common.InstanceTypeInfo]]:
     """Returns all instance types in GCP offering GPUs."""
 
     # This is a simplified version of get_instance_type_for_accelerator, as it
     # has to be applied to all the entries in acc_host_df, and the input is more
     # restricted.
     def _get_host_instance_type(acc_name: str, acc_count: int, region: str,
-                                zone: str) -> Optional[str]:
+                                zone: str) -> str | None:
         df = _df[(_df['Region'].str.lower() == region.lower()) &
                  (_df['AvailabilityZone'].str.lower() == zone.lower()) &
                  (_df['InstanceType'].notna())]
@@ -575,15 +573,15 @@ def get_region_zones_for_accelerators(
     accelerator: str,
     count: int,
     use_spot: bool = False,
-) -> List['cloud.Region']:
+) -> list['cloud.Region']:
     """Returns a list of regions for a given accelerators."""
     df = _get_accelerator(_df, accelerator, count, region=None)
     return common.get_region_zones(df, use_spot)
 
 
 def check_accelerator_attachable_to_host(instance_type: str,
-                                         accelerators: Optional[Dict[str, int]],
-                                         zone: Optional[str] = None) -> None:
+                                         accelerators: dict[str, int] | None,
+                                         zone: str | None = None) -> None:
     """Check if the accelerators can be attached to the host.
 
     This function checks the max CPU count and memory of the host that
@@ -683,7 +681,7 @@ def check_accelerator_attachable_to_host(instance_type: str,
                 'Please refer to: https://cloud.google.com/compute/docs/gpus')
 
 
-def get_image_id_from_tag(tag: str, region: Optional[str]) -> Optional[str]:
+def get_image_id_from_tag(tag: str, region: str | None) -> str | None:
     """Returns the image id from the tag."""
     global _image_df
 
@@ -698,7 +696,7 @@ def get_image_id_from_tag(tag: str, region: Optional[str]) -> Optional[str]:
     return image_id
 
 
-def is_image_tag_valid(tag: str, region: Optional[str]) -> bool:
+def is_image_tag_valid(tag: str, region: str | None) -> bool:
     """Returns whether the image tag is valid."""
     # GCP images are not region-specific.
     del region  # unused

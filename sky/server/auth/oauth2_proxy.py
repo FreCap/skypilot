@@ -5,7 +5,6 @@ import hashlib
 import http
 import os
 import traceback
-from typing import Optional
 import urllib
 
 import aiohttp
@@ -200,8 +199,8 @@ class OAuth2ProxyMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
                     status_code=auth_response.status,
                     content={'detail': 'oauth2-proxy error'})
 
-    def get_auth_user(
-            self, response: aiohttp.ClientResponse) -> Optional[models.User]:
+    def get_auth_user(self,
+                      response: aiohttp.ClientResponse) -> models.User | None:
         """Extract user info from OAuth2 proxy response headers."""
         email_header = response.headers.get('X-Auth-Request-Email')
         if email_header:

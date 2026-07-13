@@ -1,8 +1,9 @@
 """Utility functions for threads."""
 
+from collections.abc import Callable
 import threading
 import time
-from typing import Any, Callable, Dict, Generic, Optional, overload, TypeVar
+from typing import Any, Generic, overload, TypeVar
 
 from sky import sky_logging
 from sky.utils import common_utils
@@ -16,7 +17,7 @@ def start_supervised_thread(
     target: Callable[[], Any],
     name: str,
     restart_backoff_seconds: float = _DEFAULT_THREAD_RESTART_BACKOFF_SECONDS,
-    stop_event: Optional[threading.Event] = None,
+    stop_event: threading.Event | None = None,
 ) -> threading.Thread:
     """Run ``target`` in a background thread, restarting it if it ever exits.
 
@@ -90,7 +91,7 @@ class SafeThread(threading.Thread):
             self._exc = e
 
     @property
-    def format_exc(self) -> Optional[str]:
+    def format_exc(self) -> str | None:
         if self._exc is None:
             return None
         return common_utils.format_exception(self._exc)
@@ -109,7 +110,7 @@ class ThreadSafeDict(Generic[KeyType, ValueType]):
     """A thread-safe dict."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        self._dict: Dict[KeyType, ValueType] = dict(*args, **kwargs)
+        self._dict: dict[KeyType, ValueType] = dict(*args, **kwargs)
         self._lock = threading.Lock()
 
     def __getitem__(self, key: KeyType) -> ValueType:
@@ -147,15 +148,15 @@ class ThreadSafeDict(Generic[KeyType, ValueType]):
     @overload
     def get(self,
             key: KeyType,
-            default: Optional[ValueType] = None) -> Optional[ValueType]:
+            default: ValueType | None = None) -> ValueType | None:
         ...
 
     def get(self,
             key: KeyType,
-            default: Optional[ValueType] = None) -> Optional[ValueType]:
+            default: ValueType | None = None) -> ValueType | None:
         with self._lock:
             return self._dict.get(key, default)
 
-    def pop(self, key: KeyType) -> Optional[ValueType]:
+    def pop(self, key: KeyType) -> ValueType | None:
         with self._lock:
             return self._dict.pop(key, None)

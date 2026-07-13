@@ -8,7 +8,6 @@ import shlex
 import shutil
 import tempfile
 import textwrap
-from typing import List, Optional
 
 import colorama
 import yaml
@@ -45,7 +44,7 @@ def force_update_status(message):
 
 
 def run(cleanup: bool = False,
-        infra: Optional[str] = None,
+        infra: str | None = None,
         kubeconfig_path: str = constants.DEFAULT_KUBECONFIG_PATH):
     """Deploy a Kubernetes cluster on SSH targets.
 
@@ -93,7 +92,7 @@ def run(cleanup: bool = False,
 
 
 def deploy_multiple_clusters(
-        infra: Optional[str],
+        infra: str | None,
         ssh_node_pools_file: str = constants.DEFAULT_SSH_NODE_POOLS_PATH,
         kubeconfig_path: str = constants.DEFAULT_KUBECONFIG_PATH,
         cleanup: bool = True):
@@ -139,7 +138,7 @@ def deploy_multiple_clusters(
             history = None
             if os.path.exists(history_yaml_file):
                 logger.debug(f'Loading history from {history_yaml_file}')
-                with open(history_yaml_file, 'r', encoding='utf-8') as f:
+                with open(history_yaml_file, encoding='utf-8') as f:
                     history = yaml.safe_load(f)
             else:
                 logger.debug(f'No history found for {context_name}.')
@@ -281,7 +280,7 @@ def deploy_single_cluster(cluster_name,
                           worker_hosts=None,
                           history_worker_nodes=None,
                           history_workers_info=None,
-                          history_use_ssh_config=None) -> List[str]:
+                          history_use_ssh_config=None) -> list[str]:
     """Deploy or clean up a single Kubernetes cluster.
 
     Returns: List of unsuccessful worker nodes.
@@ -678,7 +677,7 @@ def deploy_single_cluster(cluster_name,
 
         # Modify the temporary kubeconfig to update server address and context name
         modified_config = os.path.join(temp_dir, 'modified_config')
-        with open(temp_kubeconfig, 'r', encoding='utf-8') as f_in:
+        with open(temp_kubeconfig, encoding='utf-8') as f_in:
             with open(modified_config, 'w', encoding='utf-8') as f_out:
                 in_cluster = False
                 in_user = False
@@ -763,8 +762,7 @@ def deploy_single_cluster(cluster_name,
                             )
 
                             # Quick validation of PEM format
-                            with open(cert_file_path, 'r',
-                                      encoding='utf-8') as f:
+                            with open(cert_file_path, encoding='utf-8') as f:
                                 content = f.readlines()
                                 first_line = content[0].strip(
                                 ) if content else ''
@@ -850,8 +848,7 @@ def deploy_single_cluster(cluster_name,
                             )
 
                             # Quick validation of PEM format
-                            with open(key_file_path, 'r',
-                                      encoding='utf-8') as f:
+                            with open(key_file_path, encoding='utf-8') as f:
                                 content = f.readlines()
                                 first_line = content[0].strip(
                                 ) if content else ''

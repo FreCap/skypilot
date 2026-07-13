@@ -11,7 +11,8 @@ operates on plain ``Dict[str, Any]`` workspace configs, so it does not
 introduce a dependency on the ``sky.workspaces`` package.
 """
 import collections
-from typing import Any, Dict, Iterable, List, Optional, Set
+from collections.abc import Iterable
+from typing import Any
 
 from sky import global_user_state
 from sky import models
@@ -43,14 +44,14 @@ class UserResolver:
 
     def __init__(
         self,
-        all_users: Optional[List[models.User]] = None,
-        admin_user_ids: Optional[List[str]] = None,
+        all_users: list[models.User] | None = None,
+        admin_user_ids: list[str] | None = None,
     ):
         if all_users is None:
             all_users = global_user_state.get_all_users()
         self._all_users = all_users
-        self._id_to_user: Dict[str, models.User] = {u.id: u for u in all_users}
-        self._name_to_ids: Dict[str, List[str]] = collections.defaultdict(list)
+        self._id_to_user: dict[str, models.User] = {u.id: u for u in all_users}
+        self._name_to_ids: dict[str, list[str]] = collections.defaultdict(list)
         for u in all_users:
             if u.name:
                 self._name_to_ids[u.name].append(u.id)
@@ -59,7 +60,7 @@ class UserResolver:
         self._admin_user_ids = admin_user_ids
 
     @property
-    def admin_user_ids(self) -> List[str]:
+    def admin_user_ids(self) -> list[str]:
         """User IDs currently assigned the admin role.
 
         Lazily fetched from the casbin policy on first access so callers
@@ -72,18 +73,18 @@ class UserResolver:
         return self._admin_user_ids
 
     @property
-    def id_to_user(self) -> Dict[str, models.User]:
+    def id_to_user(self) -> dict[str, models.User]:
         """Mapping from user_id -> ``User``. Read-only; do not mutate."""
         return self._id_to_user
 
-    def get_user(self, user_id: str) -> Optional[models.User]:
+    def get_user(self, user_id: str) -> models.User | None:
         """Return the ``User`` for ``user_id`` or ``None`` if not present."""
         return self._id_to_user.get(user_id)
 
     def has_id(self, user_id: str) -> bool:
         return user_id in self._id_to_user
 
-    def preferred_entry(self, user_id: str) -> Optional[str]:
+    def preferred_entry(self, user_id: str) -> str | None:
         """Return the preferred ``allowed_users`` entry for a user_id.
 
         Prefers the username when it uniquely resolves back to
@@ -97,7 +98,7 @@ class UserResolver:
             return user.name
         return user_id
 
-    def entries_for(self, user_id: str) -> List[str]:
+    def entries_for(self, user_id: str) -> list[str]:
         """Return all ``allowed_users`` entries that resolve to ``user_id``.
 
         Includes both the user_id itself and the username (when unique).
@@ -112,7 +113,7 @@ class UserResolver:
             entries.append(user.name)
         return entries
 
-    def resolve_allowed_entries(self, allowed: Iterable[str]) -> List[str]:
+    def resolve_allowed_entries(self, allowed: Iterable[str]) -> list[str]:
         """Resolve raw ``allowed_users`` entries to user_ids.
 
         Each entry can be either a user_id or a username; usernames are
@@ -120,7 +121,7 @@ class UserResolver:
         Raises ``ValueError`` if a username collides with multiple
         user_ids.
         """
-        out: List[str] = []
+        out: list[str] = []
         for entry in allowed:
             if entry in self._id_to_user:
                 out.append(entry)
@@ -137,8 +138,8 @@ class UserResolver:
             out.append(ids[0])
         return out
 
-    def resolve_workspace_users(self, workspace_config: Dict[str,
-                                                             Any]) -> List[str]:
+    def resolve_workspace_users(self, workspace_config: dict[str,
+                                                             Any]) -> list[str]:
         """Resolve a workspace's effective user_id list.
 
         For private workspaces, resolves ``allowed_users`` (mix of
@@ -151,13 +152,13 @@ class UserResolver:
             workspace_config.get('allowed_users', []))
 
     def resolve_workspaces_allowed_users(
-            self, workspaces: Dict[str, Dict[str, Any]]) -> Dict[str, Set[str]]:
+            self, workspaces: dict[str, dict[str, Any]]) -> dict[str, set[str]]:
         """Pre-resolve each private workspace's allowed_users -> user_id set.
 
         Returned map only contains private workspaces. Useful when the
         same set of workspaces is consulted repeatedly in a batch.
         """
-        out: Dict[str, Set[str]] = {}
+        out: dict[str, set[str]] = {}
         for ws_name, ws_cfg in workspaces.items():
             if ws_cfg.get('private', False):
                 out[ws_name] = set(

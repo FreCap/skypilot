@@ -8,9 +8,11 @@ Preconditions are introduced so that:
 """
 import abc
 import asyncio
+from collections.abc import Awaitable
+from collections.abc import Callable
 import inspect
 import time
-from typing import Any, Awaitable, Callable, Optional, Tuple, Union
+from typing import Any
 
 from sky import exceptions
 from sky import global_user_state
@@ -56,8 +58,7 @@ class Precondition(abc.ABC):
 
     async def wait_async(
         self,
-        on_condition_met: Optional[Callable[[], Union[None,
-                                                      Awaitable[Any]]]] = None
+        on_condition_met: Callable[[], None | Awaitable[Any]] | None = None
     ) -> None:
         """Wait for the precondition and execute the callback when met.
 
@@ -72,7 +73,7 @@ class Precondition(abc.ABC):
                 await result
 
     @abc.abstractmethod
-    async def check(self) -> Tuple[bool, Optional[str]]:
+    async def check(self) -> tuple[bool, str | None]:
         """Check if the precondition is met.
 
         Note that compared to _request_execution_wrapper, the env vars and
@@ -156,7 +157,7 @@ class ClusterStartCompletePrecondition(Precondition):
         super().__init__(request_id=request_id, **kwargs)
         self.cluster_name = cluster_name
 
-    async def check(self) -> Tuple[bool, Optional[str]]:
+    async def check(self) -> tuple[bool, str | None]:
         # Use the async DB read: this runs on the api-server event loop (the
         # precondition is polled ~once per second per pending launch), so the
         # sync variant would block the loop for every concurrent waiter. The
@@ -203,15 +204,14 @@ class ServiceReplicaLaunchPrecondition(Precondition):
     """
 
     def __init__(self, request_id: str, service_name: str, service_hash: str,
-                 controller_pid: Optional[int],
-                 controller_ip: Optional[str]) -> None:
+                 controller_pid: int | None, controller_ip: str | None) -> None:
         super().__init__(request_id=request_id, timeout=0)
         self.service_name = service_name
         self.service_hash = service_hash
         self.controller_pid = controller_pid
         self.controller_ip = controller_ip
 
-    async def check(self) -> Tuple[bool, Optional[str]]:
+    async def check(self) -> tuple[bool, str | None]:
         owner = await asyncio.to_thread(
             serve_state.get_service_controller_owner, self.service_name)
         authorized = (

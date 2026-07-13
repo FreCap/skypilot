@@ -1,6 +1,6 @@
 """Utilities for nested config."""
 import copy
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 from sky import sky_logging
 
@@ -38,17 +38,17 @@ _PATCH_MERGE_KEYS = {
 }
 
 
-class Config(Dict[str, Any]):
+class Config(dict[str, Any]):
     """SkyPilot config that supports setting/getting values with nested keys."""
 
     def get_nested(
-        self,
-        keys: Tuple[str, ...],
-        default_value: Any,
-        override_configs: Optional[Dict[str, Any]] = None,
-        allowed_override_keys: Optional[List[Tuple[str, ...]]] = None,
-        disallowed_override_keys: Optional[List[Tuple[str,
-                                                      ...]]] = None) -> Any:
+            self,
+            keys: tuple[str, ...],
+            default_value: Any,
+            override_configs: dict[str, Any] | None = None,
+            allowed_override_keys: list[tuple[str, ...]] | None = None,
+            disallowed_override_keys: list[tuple[str, ...]] | None = None
+    ) -> Any:
         """Gets a nested key.
 
         If any key is not found, or any intermediate key does not point to a
@@ -74,7 +74,7 @@ class Config(Dict[str, Any]):
                                        disallowed_override_keys)
         return _get_nested(config, keys, default_value, pop=False)
 
-    def set_nested(self, keys: Tuple[str, ...], value: Any) -> None:
+    def set_nested(self, keys: tuple[str, ...], value: Any) -> None:
         """In-place sets a nested key to value.
 
         Like get_nested(), if any key is not found, this will not raise an
@@ -88,12 +88,12 @@ class Config(Dict[str, Any]):
                 override = {key: override}
         _recursive_update(self, override)
 
-    def pop_nested(self, keys: Tuple[str, ...], default_value: Any) -> Any:
+    def pop_nested(self, keys: tuple[str, ...], default_value: Any) -> Any:
         """Pops a nested key."""
         return _get_nested(self, keys, default_value, pop=True)
 
     @classmethod
-    def from_dict(cls, config: Optional[Dict[str, Any]]) -> 'Config':
+    def from_dict(cls, config: dict[str, Any] | None) -> 'Config':
         if config is None:
             return cls()
         return cls(**config)
@@ -101,11 +101,11 @@ class Config(Dict[str, Any]):
 
 def _check_allowed_and_disallowed_override_keys(
     key: str,
-    allowed_override_keys: Optional[List[Tuple[str, ...]]] = None,
-    disallowed_override_keys: Optional[List[Tuple[str, ...]]] = None
-) -> Tuple[Optional[List[Tuple[str, ...]]], Optional[List[Tuple[str, ...]]]]:
-    allowed_keys_with_matched_prefix: Optional[List[Tuple[str, ...]]] = []
-    disallowed_keys_with_matched_prefix: Optional[List[Tuple[str, ...]]] = []
+    allowed_override_keys: list[tuple[str, ...]] | None = None,
+    disallowed_override_keys: list[tuple[str, ...]] | None = None
+) -> tuple[list[tuple[str, ...]] | None, list[tuple[str, ...]] | None]:
+    allowed_keys_with_matched_prefix: list[tuple[str, ...]] | None = []
+    disallowed_keys_with_matched_prefix: list[tuple[str, ...]] | None = []
     if allowed_override_keys is not None:
         for nested_key in allowed_override_keys:
             if key == nested_key[0]:
@@ -138,18 +138,18 @@ def _check_allowed_and_disallowed_override_keys(
 
 def _recursive_update(
         base_config: Config,
-        override_config: Dict[str, Any],
-        allowed_override_keys: Optional[List[Tuple[str, ...]]] = None,
-        disallowed_override_keys: Optional[List[Tuple[str,
-                                                      ...]]] = None) -> Config:
+        override_config: dict[str, Any],
+        allowed_override_keys: list[tuple[str, ...]] | None = None,
+        disallowed_override_keys: list[tuple[str, ...]] | None = None
+) -> Config:
     """Recursively updates base configuration with override configuration"""
 
     def _update_k8s_config(
         base_config: Config,
-        override_config: Dict[str, Any],
-        allowed_override_keys: Optional[List[Tuple[str, ...]]] = None,
-        disallowed_override_keys: Optional[List[Tuple[str,
-                                                      ...]]] = None) -> Config:
+        override_config: dict[str, Any],
+        allowed_override_keys: list[tuple[str, ...]] | None = None,
+        disallowed_override_keys: list[tuple[str, ...]] | None = None
+    ) -> Config:
         """Updates the top-level k8s config with the override config."""
         for key, value in override_config.items():
             (next_allowed_override_keys, next_disallowed_override_keys
@@ -186,8 +186,8 @@ def _recursive_update(
     return base_config
 
 
-def _get_nested(configs: Optional[Dict[str, Any]],
-                keys: Tuple[str, ...],
+def _get_nested(configs: dict[str, Any] | None,
+                keys: tuple[str, ...],
                 default_value: Any,
                 pop: bool = False) -> Any:
     if configs is None:
@@ -206,11 +206,10 @@ def _get_nested(configs: Optional[Dict[str, Any]],
 
 
 def merge_k8s_configs(
-        base_config: Dict[Any, Any],
-        override_config: Dict[Any, Any],
-        allowed_override_keys: Optional[List[Tuple[str, ...]]] = None,
-        disallowed_override_keys: Optional[List[Tuple[str,
-                                                      ...]]] = None) -> None:
+        base_config: dict[Any, Any],
+        override_config: dict[Any, Any],
+        allowed_override_keys: list[tuple[str, ...]] | None = None,
+        disallowed_override_keys: list[tuple[str, ...]] | None = None) -> None:
     """Merge two configs into the base_config.
 
     Updates nested dictionaries instead of replacing them.
@@ -281,13 +280,13 @@ def merge_k8s_configs(
             base_config[key] = value
 
 
-def get_cloud_config_value_from_dict(dict_config: Dict[str, Any],
+def get_cloud_config_value_from_dict(dict_config: dict[str, Any],
                                      cloud: str,
-                                     keys: Tuple[str, ...],
-                                     region: Optional[str] = None,
-                                     default_value: Optional[Any] = None,
-                                     override_configs: Optional[Dict[
-                                         str, Any]] = None,
+                                     keys: tuple[str, ...],
+                                     region: str | None = None,
+                                     default_value: Any | None = None,
+                                     override_configs: dict[str, Any] |
+                                     None = None,
                                      merge_dicts: bool = False) -> Any:
     """Returns the nested key value by reading from config
     Order to get the property_name value:

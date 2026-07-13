@@ -12,7 +12,6 @@ import csv
 from datetime import datetime
 import json
 import os
-from typing import Dict, List, Optional, Tuple
 
 import requests
 import yaml
@@ -22,14 +21,14 @@ REGIONS_ENDPOINT = f'https://us-south.iaas.cloud.ibm.com/v1/regions?version={dat
 DEFAULT_IBM_CREDENTIALS_PATH = os.path.expanduser('~/.ibm/credentials.yaml')
 
 
-def _fetch_token(api_key: Optional[str] = None,
-                 api_key_path: Optional[str] = None,
-                 ibm_token: Optional[str] = None) -> str:
+def _fetch_token(api_key: str | None = None,
+                 api_key_path: str | None = None,
+                 ibm_token: str | None = None) -> str:
     if ibm_token is None:
         if api_key is None:
             if api_key_path is None:
                 api_key_path = DEFAULT_IBM_CREDENTIALS_PATH
-            with open(api_key_path, mode='r', encoding='utf-8') as f:
+            with open(api_key_path, encoding='utf-8') as f:
                 ibm_cred_yaml = yaml.safe_load(f)
                 api_key = ibm_cred_yaml['iam_api_key']
 
@@ -46,7 +45,7 @@ def _fetch_token(api_key: Optional[str] = None,
         return ibm_token
 
 
-def _fetch_regions(ibm_token: str) -> List[str]:
+def _fetch_regions(ibm_token: str) -> list[str]:
     headers = {
         'Authorization': f'Bearer {ibm_token}',
         'Accept': 'application/json',
@@ -60,8 +59,8 @@ def _fetch_regions(ibm_token: str) -> List[str]:
     return regions
 
 
-def _fetch_instance_profiles(regions: List[str],
-                             ibm_token: str) -> Dict[str, Tuple[List, List]]:
+def _fetch_instance_profiles(regions: list[str],
+                             ibm_token: str) -> dict[str, tuple[list, list]]:
     """Fetch instance profiles by region (map):
     {
         "region_name": (
@@ -94,7 +93,7 @@ def _fetch_instance_profiles(regions: List[str],
     return result
 
 
-def create_catalog(region_profile: Dict[str, Tuple[List, List]],
+def create_catalog(region_profile: dict[str, tuple[list, list]],
                    output_path: str) -> None:
     print(f'Create catalog file {output_path} based on the fetched profiles')
     with open(output_path, mode='w', encoding='utf-8') as f:
@@ -109,10 +108,10 @@ def create_catalog(region_profile: Dict[str, Tuple[List, List]],
             print(f'  adding region {region} instances')
             for profile in profiles:
                 vm = profile['name']
-                gpu: Optional[str] = None
-                gpu_cnt: Optional[int] = None
-                gpu_manufacturer: Optional[str] = None
-                gpu_memory: Optional[int] = None
+                gpu: str | None = None
+                gpu_cnt: int | None = None
+                gpu_manufacturer: str | None = None
+                gpu_memory: int | None = None
                 if 'gpu_model' in profile:
                     gpu = profile['gpu_model']['values'][0]
                 if 'gpu_count' in profile:
@@ -131,9 +130,9 @@ def create_catalog(region_profile: Dict[str, Tuple[List, List]],
                 #       https://globalcatalog.cloud.ibm.com/api/v1?q=kind:instance.profile # pylint: disable=line-too-long
                 #       https://globalcatalog.cloud.ibm.com/api/v1/gx2-16x128x1v100/plan # pylint: disable=line-too-long
                 price = 0.0
-                gpuinfo: Optional[str] = None
-                gpu_memory_mb: Optional[int] = None
-                gpu_memory_total_mb: Optional[int] = None
+                gpuinfo: str | None = None
+                gpu_memory_mb: int | None = None
+                gpu_memory_total_mb: int | None = None
                 if gpu_memory is not None:
                     gpu_memory_mb = gpu_memory * 1024
                     if gpu_cnt is not None:

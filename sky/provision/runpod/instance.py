@@ -1,7 +1,7 @@
 """RunPod instance provisioning."""
 import time
 import traceback
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
 from sky import sky_logging
 from sky.provision import common
@@ -18,8 +18,8 @@ logger = sky_logging.init_logger(__name__)
 
 
 def _filter_instances(cluster_name_on_cloud: str,
-                      status_filters: Optional[List[str]],
-                      head_only: bool = False) -> Dict[str, Any]:
+                      status_filters: list[str] | None,
+                      head_only: bool = False) -> dict[str, Any]:
 
     instances = utils.list_instances()
     possible_names = [f'{cluster_name_on_cloud}-head']
@@ -36,7 +36,7 @@ def _filter_instances(cluster_name_on_cloud: str,
     return filtered_instances
 
 
-def _get_head_instance_id(instances: Dict[str, Any]) -> Optional[str]:
+def _get_head_instance_id(instances: dict[str, Any]) -> str | None:
     head_instance_id = None
     for inst_id, inst in instances.items():
         if inst['name'].endswith('-head'):
@@ -150,13 +150,13 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
 
 
 def wait_instances(region: str, cluster_name_on_cloud: str,
-                   state: Optional[status_lib.ClusterStatus]) -> None:
+                   state: status_lib.ClusterStatus | None) -> None:
     del region, cluster_name_on_cloud, state
 
 
 def stop_instances(
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     worker_only: bool = False,
 ) -> None:
     raise NotImplementedError()
@@ -164,7 +164,7 @@ def stop_instances(
 
 def terminate_instances(
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     worker_only: bool = False,
 ) -> None:
     """See sky/provision/__init__.py"""
@@ -193,10 +193,10 @@ def terminate_instances(
 def get_cluster_info(
         region: str,
         cluster_name_on_cloud: str,
-        provider_config: Optional[Dict[str, Any]] = None) -> common.ClusterInfo:
+        provider_config: dict[str, Any] | None = None) -> common.ClusterInfo:
     del region  # unused
     running_instances = _filter_instances(cluster_name_on_cloud, ['RUNNING'])
-    instances: Dict[str, List[common.InstanceInfo]] = {}
+    instances: dict[str, list[common.InstanceInfo]] = {}
     head_instance_id = None
     for instance_id, instance_info in running_instances.items():
         instances[instance_id] = [
@@ -217,7 +217,7 @@ def get_cluster_info(
     # on RunPod nodes using cgroup v2, causing it to see all host CPUs
     # instead of the container's allocation and spawning too many workers.
 
-    custom_ray_options: Optional[Dict[str, Any]] = None
+    custom_ray_options: dict[str, Any] | None = None
     if head_instance_id is not None:
         head_info = running_instances.get(head_instance_id, {})
         vcpu_count = head_info.get('vcpu_count')
@@ -238,10 +238,10 @@ def get_cluster_info(
 def query_instances(
     cluster_name: str,
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     non_terminated_only: bool = True,
     retry_if_missing: bool = False,
-) -> Dict[str, Tuple[Optional['status_lib.ClusterStatus'], Optional[str]]]:
+) -> dict[str, tuple[Optional['status_lib.ClusterStatus'], str | None]]:
     """See sky/provision/__init__.py"""
     del cluster_name, retry_if_missing  # unused
     assert provider_config is not None, (cluster_name_on_cloud, provider_config)
@@ -253,8 +253,7 @@ def query_instances(
         'PAUSED': status_lib.ClusterStatus.INIT,
         'RUNNING': status_lib.ClusterStatus.UP,
     }
-    statuses: Dict[str, Tuple[Optional['status_lib.ClusterStatus'],
-                              Optional[str]]] = {}
+    statuses: dict[str, tuple[status_lib.ClusterStatus | None, str | None]] = {}
     for inst_id, inst in instances.items():
         status = status_map[inst['status']]
         if non_terminated_only and status is None:
@@ -265,18 +264,18 @@ def query_instances(
 
 def cleanup_ports(
     cluster_name_on_cloud: str,
-    ports: List[str],
-    provider_config: Optional[Dict[str, Any]] = None,
+    ports: list[str],
+    provider_config: dict[str, Any] | None = None,
 ) -> None:
     del cluster_name_on_cloud, ports, provider_config  # Unused.
 
 
 def query_ports(
     cluster_name_on_cloud: str,
-    ports: List[str],
-    head_ip: Optional[str] = None,
-    provider_config: Optional[Dict[str, Any]] = None,
-) -> Dict[int, List[common.Endpoint]]:
+    ports: list[str],
+    head_ip: str | None = None,
+    provider_config: dict[str, Any] | None = None,
+) -> dict[int, list[common.Endpoint]]:
     """See sky/provision/__init__.py"""
     del head_ip, provider_config  # Unused.
     # RunPod ports sometimes take a while to be ready.
@@ -293,7 +292,7 @@ def query_ports(
         if not instances:
             return {}
         head_inst = list(instances.values())[0]
-        ready_ports: Dict[int, List[common.Endpoint]] = {
+        ready_ports: dict[int, list[common.Endpoint]] = {
             port: [common.SocketEndpoint(**endpoint)]
             for port, endpoint in head_inst['port2endpoint'].items()
             if port in ports_to_query

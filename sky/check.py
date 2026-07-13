@@ -1,11 +1,12 @@
 """Credential checks: check cloud credentials and enable clouds."""
 import collections
+from collections.abc import Callable
+from collections.abc import Iterable
 import os
 import re
 import traceback
 from types import ModuleType
-from typing import (Any, Callable, Dict, Iterable, List, Optional, Set, Tuple,
-                    Union)
+from typing import Any
 
 import click
 import colorama
@@ -42,16 +43,16 @@ def _strip_ansi(s: str) -> str:
 
 
 def _build_check_results(
-    cloud2ctx2text: Dict[str, Dict[str, str]],
-    check_results_dict: Dict[Any, List[Tuple]],
-) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    cloud2ctx2text: dict[str, dict[str, str]],
+    check_results_dict: dict[Any, list[tuple]],
+) -> dict[str, dict[str, dict[str, Any]]]:
     """Construct the persistable {cloud: {ctx: {enabled, reason}}} dict.
 
     Combines two sources because cloud2ctx2text is only populated for
     per-context (k8s/SSH) checks; non-k8s clouds' string reasons live in
     check_results_dict.
     """
-    out: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    out: dict[str, dict[str, dict[str, Any]]] = {}
 
     # Per-context entries (k8s, SSH).
     for cloud_repr, ctx2text in cloud2ctx2text.items():
@@ -96,7 +97,7 @@ def _build_check_results(
     return out
 
 
-def _get_workspace_allowed_clouds(workspace: str) -> List[str]:
+def _get_workspace_allowed_clouds(workspace: str) -> list[str]:
     # Use allowed_clouds from config if it exists, otherwise check all
     # clouds. Also validate names with get_cloud_tuple.
     config_allowed_cloud_names = skypilot_config.get_nested(
@@ -120,8 +121,7 @@ def _get_workspace_allowed_clouds(workspace: str) -> List[str]:
 
 
 def _get_workspace_cloud_capabilities(
-        workspace: str,
-        cloud: str) -> Optional[List[sky_cloud.CloudCapability]]:
+        workspace: str, cloud: str) -> list[sky_cloud.CloudCapability] | None:
     """Get the capabilities for a cloud in a workspace.
 
     Returns:
@@ -148,19 +148,19 @@ def _get_workspace_cloud_capabilities(
 def check_capabilities(
     quiet: bool = False,
     verbose: bool = False,
-    clouds: Optional[Iterable[str]] = None,
-    capabilities: Optional[List[sky_cloud.CloudCapability]] = None,
-    workspace: Optional[str] = None,
-) -> Dict[str, Dict[str, List[sky_cloud.CloudCapability]]]:
+    clouds: Iterable[str] | None = None,
+    capabilities: list[sky_cloud.CloudCapability] | None = None,
+    workspace: str | None = None,
+) -> dict[str, dict[str, list[sky_cloud.CloudCapability]]]:
     # pylint: disable=import-outside-toplevel
     from sky.workspaces import core
 
     echo = (lambda *_args, **_kwargs: None
            ) if quiet else lambda *args, **kwargs: click.echo(
                *args, **kwargs, color=True)
-    all_workspaces_results: Dict[str,
-                                 Dict[str,
-                                      List[sky_cloud.CloudCapability]]] = {}
+    all_workspaces_results: dict[str,
+                                 dict[str,
+                                      list[sky_cloud.CloudCapability]]] = {}
     available_workspaces = list(core.get_accessible_workspace_names())
     hide_workspace_str = (available_workspaces == [
         constants.SKYPILOT_DEFAULT_WORKSPACE
@@ -174,7 +174,7 @@ def check_capabilities(
         capabilities = sky_cloud.ALL_CAPABILITIES
     assert capabilities is not None
 
-    def get_all_clouds() -> Tuple[str, ...]:
+    def get_all_clouds() -> tuple[str, ...]:
         return tuple([repr(c) for c in registry.CLOUD_REGISTRY.values()] +
                      list(STORAGE_ONLY_CLOUDS))
 
@@ -182,17 +182,17 @@ def check_capabilities(
         current_workspace_name: str,
         hide_per_cloud_details: bool,
         hide_workspace_str: bool,
-    ) -> Dict[str, List[sky_cloud.CloudCapability]]:
+    ) -> dict[str, list[sky_cloud.CloudCapability]]:
         nonlocal echo, verbose, clouds, quiet
 
-        enabled_clouds: Dict[str, List[sky_cloud.CloudCapability]] = {}
-        disabled_clouds: Dict[str, List[sky_cloud.CloudCapability]] = {}
+        enabled_clouds: dict[str, list[sky_cloud.CloudCapability]] = {}
+        disabled_clouds: dict[str, list[sky_cloud.CloudCapability]] = {}
 
         def check_one_cloud_one_capability(
-            payload: Tuple[Tuple[str, Union[sky_clouds.Cloud, ModuleType]],
+            payload: tuple[tuple[str, sky_clouds.Cloud | ModuleType],
                            sky_cloud.CloudCapability, bool]
-        ) -> Optional[Tuple[sky_cloud.CloudCapability, bool, Optional[Union[
-                str, Dict[str, str]]]]]:
+        ) -> tuple[sky_cloud.CloudCapability, bool, str | dict[str, str] |
+                   None] | None:
             cloud_tuple, capability, allowed = payload
             if not allowed:
                 return (capability, False, f'{cloud_tuple[0]} is not included '
@@ -213,8 +213,7 @@ def check_capabilities(
                 return (capability, ok, reason)
 
         def get_cloud_tuple(
-                cloud_name: str
-        ) -> Tuple[str, Union[sky_clouds.Cloud, ModuleType]]:
+                cloud_name: str) -> tuple[str, sky_clouds.Cloud | ModuleType]:
             # Validates cloud_name and returns a tuple of the cloud's name and
             # the cloud object. Includes special handling for storage-only
             # providers (Cloudflare, CoreWeave, VastData, HuggingFace).
@@ -255,8 +254,8 @@ def check_capabilities(
 
         # filter out the clouds that are disabled in the workspace config
         workspace_disabled_clouds = []
-        workspace_cloud_capabilities: Dict[
-            str, List[sky_cloud.CloudCapability]] = {}
+        workspace_cloud_capabilities: dict[
+            str, list[sky_cloud.CloudCapability]] = {}
         for cloud in config_allowed_cloud_names:
             cloud_config = skypilot_config.get_workspace_cloud(
                 cloud, workspace=current_workspace_name)
@@ -304,7 +303,7 @@ def check_capabilities(
                         c[0], capabilities):
                     combinations.append((c, capability, allowed))
 
-        cloud2ctx2text: Dict[str, Dict[str, str]] = {}
+        cloud2ctx2text: dict[str, dict[str, str]] = {}
 
         workspace_str = f' for workspace: {current_workspace_name!r}'
         if hide_workspace_str:
@@ -315,11 +314,10 @@ def check_capabilities(
             check_results = subprocess_utils.run_in_parallel(
                 check_one_cloud_one_capability, combinations)
 
-        check_results_dict: Dict[
-            Tuple[str, Union[sky_clouds.Cloud, ModuleType]],
-            List[Tuple[sky_cloud.CloudCapability, bool,
-                       Optional[Union[str, Dict[str, str]]]]]] = (
-                           collections.defaultdict(list))
+        check_results_dict: dict[tuple[str, sky_clouds.Cloud | ModuleType],
+                                 list[tuple[sky_cloud.CloudCapability, bool,
+                                            str | dict[str, str] | None]]] = (
+                                                collections.defaultdict(list))
         for combination, check_result in zip(combinations, check_results):
             if check_result is None:
                 continue
@@ -346,7 +344,7 @@ def check_capabilities(
         # config_allowed_clouds, if specified in config.yaml.
         # This means that if a cloud is already enabled and is not included in
         # allowed_clouds in config.yaml, it will be disabled.
-        all_enabled_clouds: Set[str] = set()
+        all_enabled_clouds: set[str] = set()
         for capability in capabilities:
             # Cloudflare, CoreWeave, VastData, and HuggingFace are not real
             # clouds in registry.CLOUD_REGISTRY, and should not be inserted
@@ -460,9 +458,9 @@ def check_capability(
     capability: sky_cloud.CloudCapability,
     quiet: bool = False,
     verbose: bool = False,
-    clouds: Optional[Iterable[str]] = None,
-    workspace: Optional[str] = None,
-) -> Dict[str, List[str]]:
+    clouds: Iterable[str] | None = None,
+    workspace: str | None = None,
+) -> dict[str, list[str]]:
     clouds_with_capability = collections.defaultdict(list)
     workspace_enabled_clouds = check_capabilities(quiet, verbose, clouds,
                                                   [capability], workspace)
@@ -476,9 +474,9 @@ def check_capability(
 def check(
     quiet: bool = False,
     verbose: bool = False,
-    clouds: Optional[Iterable[str]] = None,
-    workspace: Optional[str] = None,
-) -> Dict[str, Dict[str, List[str]]]:
+    clouds: Iterable[str] | None = None,
+    workspace: str | None = None,
+) -> dict[str, dict[str, list[str]]]:
     if workspace is not None:
         # Import here to avoid circular import:
         # pylint: disable=import-outside-toplevel
@@ -489,18 +487,18 @@ def check(
                                              sky_cloud.ALL_CAPABILITIES,
                                              workspace)
     # Convert CloudCapability enums to strings for JSON serialization.
-    result: Dict[str, Dict[str, List[str]]] = {}
+    result: dict[str, dict[str, list[str]]] = {}
     for ws_name, clouds_with_caps in capabilities_result.items():
         result[ws_name] = {
-            cloud: [cap.value for cap in caps
-                   ] for cloud, caps in clouds_with_caps.items()
+            cloud: [cap.value for cap in caps]
+            for cloud, caps in clouds_with_caps.items()
         }
     return result
 
 
 def get_cached_enabled_clouds_or_refresh(
         capability: sky_cloud.CloudCapability,
-        raise_if_no_cloud_access: bool = False) -> List[sky_clouds.Cloud]:
+        raise_if_no_cloud_access: bool = False) -> list[sky_clouds.Cloud]:
     """Returns cached enabled clouds and if no cloud is enabled, refresh.
 
     This function will perform a refresh if no public cloud is enabled.
@@ -546,8 +544,7 @@ def get_cached_enabled_clouds_or_refresh(
 
 
 def get_cloud_credential_file_mounts(
-        excluded_clouds: Optional[Iterable[sky_clouds.Cloud]]
-) -> Dict[str, str]:
+        excluded_clouds: Iterable[sky_clouds.Cloud] | None) -> dict[str, str]:
     """Returns the files necessary to access all clouds.
 
     Returns a dictionary that will be added to a task's file mounts
@@ -597,10 +594,10 @@ def get_cloud_credential_file_mounts(
 def _print_checked_cloud(
     echo: Callable,
     verbose: bool,
-    cloud_tuple: Tuple[str, Union[sky_clouds.Cloud, ModuleType]],
-    cloud_capabilities: List[Tuple[sky_cloud.CloudCapability, bool,
-                                   Optional[Union[str, Dict[str, str]]]]],
-    ctx2text: Dict[str, str],
+    cloud_tuple: tuple[str, sky_clouds.Cloud | ModuleType],
+    cloud_capabilities: list[tuple[sky_cloud.CloudCapability, bool,
+                                   str | dict[str, str] | None]],
+    ctx2text: dict[str, str],
 ) -> None:
     """Prints whether a cloud is enabled, and the capabilities that are enabled.
     If any hints (for enabled capabilities) or
@@ -621,9 +618,9 @@ def _print_checked_cloud(
     cloud_repr, cloud = cloud_tuple
     # Print the capabilities for the cloud.
     # consider cloud enabled if any capability is enabled.
-    enabled_capabilities: List[sky_cloud.CloudCapability] = []
-    hints_to_capabilities: Dict[str, List[sky_cloud.CloudCapability]] = {}
-    reasons_to_capabilities: Dict[str, List[sky_cloud.CloudCapability]] = {}
+    enabled_capabilities: list[sky_cloud.CloudCapability] = []
+    hints_to_capabilities: dict[str, list[sky_cloud.CloudCapability]] = {}
+    reasons_to_capabilities: dict[str, list[sky_cloud.CloudCapability]] = {}
     for capability, ok, reason in cloud_capabilities:
         if ok:
             enabled_capabilities.append(capability)
@@ -651,7 +648,7 @@ def _print_checked_cloud(
     status_msg: str = 'disabled'
     capability_string: str = ''
     detail_string: str = ''
-    activated_account: Optional[str] = None
+    activated_account: str | None = None
     if enabled_capabilities:
         style_str = f'{colorama.Fore.GREEN}{colorama.Style.NORMAL}'
         status_msg = 'enabled'
@@ -680,9 +677,9 @@ def _green_color(str_to_format: str) -> str:
     return f'{colorama.Fore.GREEN}{str_to_format}{colorama.Style.RESET_ALL}'
 
 
-def _format_context_details(cloud: Union[str, sky_clouds.Cloud],
+def _format_context_details(cloud: str | sky_clouds.Cloud,
                             show_details: bool,
-                            ctx2text: Optional[Dict[str, str]] = None) -> str:
+                            ctx2text: dict[str, str] | None = None) -> str:
     if isinstance(cloud, str):
         cloud_type = registry.CLOUD_REGISTRY.from_str(cloud)
         assert cloud_type is not None
@@ -775,8 +772,8 @@ def _format_context_details(cloud: Union[str, sky_clouds.Cloud],
 
 
 def _format_enabled_cloud(cloud_name: str,
-                          capabilities: List[sky_cloud.CloudCapability],
-                          ctx2text: Optional[Dict[str, str]] = None) -> str:
+                          capabilities: list[sky_cloud.CloudCapability],
+                          ctx2text: dict[str, str] | None = None) -> str:
     """Format the summary of enabled cloud and its enabled capabilities.
 
     Args:
@@ -800,11 +797,11 @@ def _format_enabled_cloud(cloud_name: str,
 
 
 def _summary_message(
-    enabled_clouds: Dict[str, List[sky_cloud.CloudCapability]],
-    cloud2ctx2text: Dict[str, Dict[str, str]],
+    enabled_clouds: dict[str, list[sky_cloud.CloudCapability]],
+    cloud2ctx2text: dict[str, dict[str, str]],
     current_workspace_name: str,
     hide_workspace_str: bool,
-    disallowed_cloud_names: List[str],
+    disallowed_cloud_names: list[str],
 ) -> str:
     if not enabled_clouds:
         enabled_clouds_str = '\n  No infra to check/enabled.'

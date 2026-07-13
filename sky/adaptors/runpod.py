@@ -2,7 +2,7 @@
 
 import os
 import time
-from typing import Any, Dict, Optional
+from typing import Any
 
 from sky.adaptors import common
 
@@ -33,7 +33,7 @@ def _get_api_key() -> str:
 
 def rest_request(method: str,
                  path: str,
-                 json: Optional[Dict[str, Any]] = None) -> Any:
+                 json: dict[str, Any] | None = None) -> Any:
     url = f'{_REST_BASE}{path}'
     headers = {
         'Authorization': f'Bearer {_get_api_key()}',

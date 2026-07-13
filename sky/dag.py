@@ -3,7 +3,6 @@ import enum
 import pprint
 import threading
 import typing
-from typing import Dict, List, Optional, Union
 
 if typing.TYPE_CHECKING:
     from sky import task
@@ -38,25 +37,25 @@ class Dag:
     """
 
     def __init__(self) -> None:
-        self.tasks: List['task.Task'] = []
+        self.tasks: list[task.Task] = []
         import networkx as nx  # pylint: disable=import-outside-toplevel
 
         self.graph = nx.DiGraph()
-        self.name: Optional[str] = None
+        self.name: str | None = None
         self.policy_applied: bool = False
-        self.pool: Optional[str] = None
+        self.pool: str | None = None
 
         # Execution mode for multi-task DAGs
-        self.execution: Optional[DagExecution] = None
+        self.execution: DagExecution | None = None
 
         # Primary/auxiliary task support for job groups
         # If set, only the named tasks are "primary"; others are "auxiliary".
         # When all primary tasks complete, auxiliary tasks are terminated.
-        self.primary_tasks: Optional[List[str]] = None
+        self.primary_tasks: list[str] | None = None
         # Termination delay for auxiliary tasks when primary tasks complete.
         # Can be a string like "30s" (applies to all auxiliary tasks) or
         # a dict like {"default": "30s", "replay-buffer": "1m"}.
-        self.termination_delay: Optional[Union[str, Dict[str, str]]] = None
+        self.termination_delay: str | dict[str, str] | None = None
 
     def add(self, task: 'task.Task') -> None:
         self.graph.add_node(task)
@@ -140,7 +139,7 @@ class Dag:
         # pylint: disable=unsupported-membership-test
         return task_name in self.primary_tasks
 
-    def get_auxiliary_task_names(self) -> typing.List[str]:
+    def get_auxiliary_task_names(self) -> list[str]:
         """Get the names of all auxiliary (non-primary) tasks.
 
         Returns:
@@ -201,15 +200,15 @@ class Dag:
 
 class _DagContext(threading.local):
     """A thread-local stack of Dags."""
-    _current_dag: Optional[Dag] = None
-    _previous_dags: List[Dag] = []
+    _current_dag: Dag | None = None
+    _previous_dags: list[Dag] = []
 
     def push_dag(self, dag: Dag):
         if self._current_dag is not None:
             self._previous_dags.append(self._current_dag)
         self._current_dag = dag
 
-    def pop_dag(self) -> Optional[Dag]:
+    def pop_dag(self) -> Dag | None:
         old_dag = self._current_dag
         if self._previous_dags:
             self._current_dag = self._previous_dags.pop()
@@ -217,7 +216,7 @@ class _DagContext(threading.local):
             self._current_dag = None
         return old_dag
 
-    def get_current_dag(self) -> Optional[Dag]:
+    def get_current_dag(self) -> Dag | None:
         return self._current_dag
 
 

@@ -82,8 +82,12 @@ def test_batch_attempt_fences_stale_transitions_and_persists_backoff(
                                 lease_duration=10,
                                 now=100)
     assert claim_1 == (1, 0)
-    assert state.claim_batch(
-        7, 0, 'owner-a', 'worker-b', lease_duration=10, now=100) is None
+    assert state.claim_batch(7,
+                             0,
+                             'owner-a',
+                             'worker-b',
+                             lease_duration=10,
+                             now=100) is None
     assert not state.set_batch_attempt_status(
         7, 0, 2, 'owner-a', 'COMPLETED', now=101)
     assert state.renew_batch_lease(7,
@@ -101,8 +105,12 @@ def test_batch_attempt_fences_stale_transitions_and_persists_backoff(
                                           retry_count=1,
                                           next_retry_at=120,
                                           now=106)
-    assert state.claim_batch(
-        7, 0, 'owner-a', 'worker-b', lease_duration=10, now=119) is None
+    assert state.claim_batch(7,
+                             0,
+                             'owner-a',
+                             'worker-b',
+                             lease_duration=10,
+                             now=119) is None
     claim_2 = state.claim_batch(7,
                                 0,
                                 'owner-a',

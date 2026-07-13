@@ -1,7 +1,6 @@
 """Flags for the CLI."""
 
 import os
-from typing import Dict, Optional, Tuple
 
 import click
 import dotenv
@@ -12,7 +11,7 @@ from sky.skylet import constants
 from sky.utils import resources_utils
 
 
-def _parse_dotenv_file(path: str) -> Dict[str, Optional[str]]:
+def _parse_dotenv_file(path: str) -> dict[str, str | None]:
     """Parse a dotenv file, erroring if the path does not exist.
 
     The raw `dotenv.dotenv_values` accepts a non-existent path and returns
@@ -26,7 +25,7 @@ def _parse_dotenv_file(path: str) -> Dict[str, Optional[str]]:
     return dotenv.dotenv_values(path)
 
 
-def _parse_env_var(env_var: str) -> Tuple[str, str]:
+def _parse_env_var(env_var: str) -> tuple[str, str]:
     """Parse env vars into a (KEY, VAL) pair."""
     if '=' not in env_var:
         value = os.environ.get(env_var)
@@ -42,7 +41,7 @@ def _parse_env_var(env_var: str) -> Tuple[str, str]:
     return ret[0], ret[1]
 
 
-def _parse_secret_var(secret_var: str) -> Tuple[str, str]:
+def _parse_secret_var(secret_var: str) -> tuple[str, str]:
     """Parse secret vars into a (KEY, VAL) pair."""
     if '=' not in secret_var:
         value = os.environ.get(secret_var)
@@ -389,7 +388,7 @@ def apply_workspace_option_callback(ctx, param, value):
     return value
 
 
-def yes_option(helptext: Optional[str] = None):
+def yes_option(helptext: str | None = None):
     """A decorator for the --yes/-y option."""
     if helptext is None:
         helptext = 'Skip confirmation prompt.'
@@ -405,7 +404,7 @@ def yes_option(helptext: Optional[str] = None):
     return return_option_decorator
 
 
-def verbose_option(helptext: Optional[str] = None):
+def verbose_option(helptext: str | None = None):
     """A decorator for the --verbose/-v option."""
 
     if helptext is None:
@@ -422,7 +421,7 @@ def verbose_option(helptext: Optional[str] = None):
     return return_option_decorator
 
 
-def all_option(helptext: Optional[str] = None):
+def all_option(helptext: str | None = None):
     """A decorator for the --all option."""
 
     def return_option_decorator(func):
@@ -436,7 +435,7 @@ def all_option(helptext: Optional[str] = None):
     return return_option_decorator
 
 
-def all_users_option(helptext: Optional[str] = None):
+def all_users_option(helptext: str | None = None):
     """A decorator for the --all-users option."""
 
     def return_option_decorator(func):
@@ -470,7 +469,7 @@ OUTPUT_FORMAT_JSON = 'json'
 OUTPUT_FORMAT_CHOICES = [OUTPUT_FORMAT_TABLE, OUTPUT_FORMAT_JSON]
 
 
-def output_format_option(helptext: Optional[str] = None):
+def output_format_option(helptext: str | None = None):
     """A decorator for the --output/-o option.
 
     This decorator adds an output format option to CLI commands.

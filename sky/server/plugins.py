@@ -5,7 +5,7 @@ import enum
 import importlib
 import os
 import typing
-from typing import Any, ClassVar, Dict, FrozenSet, List, Optional, Tuple
+from typing import Any, ClassVar
 
 from fastapi import FastAPI
 
@@ -62,7 +62,7 @@ class PluginContext(enum.Enum):
 
 # All known contexts. Used as the default for ``BasePlugin.load_contexts`` so
 # that plugins which don't opt in stay loaded in every context.
-ALL_PLUGIN_CONTEXTS: FrozenSet[PluginContext] = frozenset(PluginContext)
+ALL_PLUGIN_CONTEXTS: frozenset[PluginContext] = frozenset(PluginContext)
 
 
 class ManagedSecretsProvider(abc.ABC):
@@ -98,8 +98,8 @@ class ResolvedFileMount:
 @dataclasses.dataclass
 class ResolvedSecrets:
     """Result of resolving managed secret references."""
-    env_vars: Dict[str, str] = dataclasses.field(default_factory=dict)
-    file_mounts: List[ResolvedFileMount] = dataclasses.field(
+    env_vars: dict[str, str] = dataclasses.field(default_factory=dict)
+    file_mounts: list[ResolvedFileMount] = dataclasses.field(
         default_factory=list)
 
 
@@ -120,12 +120,12 @@ class ExtensionContext:
         self,
         # Default exists for backward compatibility.
         context: PluginContext = PluginContext.UVICORN,
-        app: Optional[FastAPI] = None,
+        app: FastAPI | None = None,
     ):
         self.context = context
         self.app = app
-        self.rbac_rules: List[Tuple[str, RBACRule]] = []
-        self._managed_secrets_provider: Optional[ManagedSecretsProvider] = None
+        self.rbac_rules: list[tuple[str, RBACRule]] = []
+        self._managed_secrets_provider: ManagedSecretsProvider | None = None
 
     def register_managed_secrets_provider(
         self,
@@ -135,7 +135,7 @@ class ExtensionContext:
         self._managed_secrets_provider = provider
 
     @property
-    def managed_secrets_provider(self,) -> Optional[ManagedSecretsProvider]:
+    def managed_secrets_provider(self,) -> ManagedSecretsProvider | None:
         return self._managed_secrets_provider
 
     def register_request_storage(
@@ -177,7 +177,7 @@ class ExtensionContext:
     def register_rbac_rule(self,
                            path: str,
                            method: str,
-                           description: Optional[str] = None,
+                           description: str | None = None,
                            role: str = 'user') -> None:
         """Register an RBAC rule for this plugin.
 
@@ -221,7 +221,7 @@ class RBACRule:
     """
     path: str
     method: str
-    description: Optional[str] = None
+    description: str | None = None
 
 
 class BasePlugin(abc.ABC):
@@ -229,7 +229,7 @@ class BasePlugin(abc.ABC):
 
     # Process contexts in which this plugin should be loaded. Defaults to all
     # known contexts so existing plugins keep loading everywhere.
-    load_contexts: ClassVar[FrozenSet[PluginContext]] = ALL_PLUGIN_CONTEXTS
+    load_contexts: ClassVar[frozenset[PluginContext]] = ALL_PLUGIN_CONTEXTS
 
     @classmethod
     def should_load(cls, context: PluginContext) -> bool:
@@ -237,12 +237,12 @@ class BasePlugin(abc.ABC):
         return context in cls.load_contexts
 
     @property
-    def name(self) -> Optional[str]:
+    def name(self) -> str | None:
         """Plugin name for display purposes."""
         return None
 
     @property
-    def js_extension_path(self) -> Optional[str]:
+    def js_extension_path(self) -> str | None:
         """Optional API route to the JavaScript extension to load."""
         return None
 
@@ -258,12 +258,12 @@ class BasePlugin(abc.ABC):
         return False
 
     @property
-    def version(self) -> Optional[str]:
+    def version(self) -> str | None:
         """Plugin version."""
         return None
 
     @property
-    def commit(self) -> Optional[str]:
+    def commit(self) -> str | None:
         """Plugin git commit hash."""
         return None
 
@@ -277,7 +277,7 @@ class BasePlugin(abc.ABC):
         return False
 
     @property
-    def rbac_rules(self) -> List[Tuple[str, 'RBACRule']]:
+    def rbac_rules(self) -> list[tuple[str, 'RBACRule']]:
         """RBAC rules for this plugin.
 
         Override this property to declare RBAC rules that should be
@@ -301,7 +301,7 @@ class BasePlugin(abc.ABC):
         return []
 
     @property
-    def viewer_allowlist(self) -> List['RBACRule']:
+    def viewer_allowlist(self) -> list['RBACRule']:
         """Endpoints this plugin exposes to viewer-role users.
 
         Override this property to opt the plugin's read endpoints in to
@@ -409,7 +409,7 @@ def _remote_config_schema():
     }
 
 
-def _load_plugin_config() -> Optional[config_utils.Config]:
+def _load_plugin_config() -> config_utils.Config | None:
     """Load plugin config."""
     config_path = os.getenv(_PLUGINS_CONFIG_ENV_VAR,
                             _DEFAULT_PLUGINS_CONFIG_PATH)
@@ -423,7 +423,7 @@ def _load_plugin_config() -> Optional[config_utils.Config]:
     return config_utils.Config.from_dict(config)
 
 
-def _load_remote_plugin_config() -> Optional[config_utils.Config]:
+def _load_remote_plugin_config() -> config_utils.Config | None:
     """Load remote plugin config from remote_plugins.yaml."""
     config_path = os.getenv(_REMOTE_PLUGINS_CONFIG_ENV_VAR,
                             _DEFAULT_REMOTE_PLUGINS_CONFIG_PATH)
@@ -438,7 +438,7 @@ def _load_remote_plugin_config() -> Optional[config_utils.Config]:
     return config_utils.Config.from_dict(config)
 
 
-def get_remote_plugin_packages() -> List[Dict[str, Any]]:
+def get_remote_plugin_packages() -> list[dict[str, Any]]:
     """Get the list of remote plugin packages with their configurations.
 
     Returns:
@@ -454,7 +454,7 @@ def get_remote_plugin_packages() -> List[Dict[str, Any]]:
     return [dict(p) for p in plugin_configs]
 
 
-def get_remote_controller_wheel_path() -> Optional[str]:
+def get_remote_controller_wheel_path() -> str | None:
     """Get the controller wheel path from the plugin config.
 
     Returns:
@@ -467,7 +467,7 @@ def get_remote_controller_wheel_path() -> Optional[str]:
     return config.get('controller_wheel_path')
 
 
-def get_remote_plugins_config_path() -> Optional[str]:
+def get_remote_plugins_config_path() -> str | None:
     """Get the path to the remote plugins config file.
 
     Returns:
@@ -482,8 +482,8 @@ def get_remote_plugins_config_path() -> Optional[str]:
     return config_path
 
 
-_PLUGINS: Dict[str, BasePlugin] = {}
-_EXTENSION_CONTEXT: Optional[ExtensionContext] = None
+_PLUGINS: dict[str, BasePlugin] = {}
+_EXTENSION_CONTEXT: ExtensionContext | None = None
 
 # Whether plugins have finished loading. On the server, schema validation
 # should only enforce additionalProperties: False after plugins have had
@@ -539,15 +539,15 @@ def load_plugins(extension_context: ExtensionContext):
     _plugins_loaded = True
 
 
-def get_plugins() -> List[BasePlugin]:
+def get_plugins() -> list[BasePlugin]:
     """Return shallow copies of the registered plugins."""
     return list(_PLUGINS.values())
 
 
-_PLUGIN_RBAC_RULES: Dict[str, List[Dict[str, str]]] = {}
+_PLUGIN_RBAC_RULES: dict[str, list[dict[str, str]]] = {}
 
 
-def load_plugin_rbac_rules() -> Dict[str, List[Dict[str, str]]]:
+def load_plugin_rbac_rules() -> dict[str, list[dict[str, str]]]:
     """Load RBAC rules from plugins without calling install().
 
     This is called in the main process before permission service
@@ -564,7 +564,7 @@ def load_plugin_rbac_rules() -> Dict[str, List[Dict[str, str]]]:
     if not config:
         return {}
 
-    rules_by_role: Dict[str, List[Dict[str, str]]] = {}
+    rules_by_role: dict[str, list[dict[str, str]]] = {}
 
     for plugin_config in config.get('plugins', []):
         class_path = plugin_config['class']
@@ -597,7 +597,7 @@ def load_plugin_rbac_rules() -> Dict[str, List[Dict[str, str]]]:
     return rules_by_role
 
 
-def get_plugin_rbac_rules() -> Dict[str, List[Dict[str, str]]]:
+def get_plugin_rbac_rules() -> dict[str, list[dict[str, str]]]:
     """Collect RBAC rules from all loaded plugins.
 
     Returns rules collected by load_plugin_rbac_rules() which runs in the
@@ -616,10 +616,10 @@ def get_plugin_rbac_rules() -> Dict[str, List[Dict[str, str]]]:
     return _PLUGIN_RBAC_RULES
 
 
-_PLUGIN_VIEWER_ALLOWLIST: List[Dict[str, str]] = []
+_PLUGIN_VIEWER_ALLOWLIST: list[dict[str, str]] = []
 
 
-def load_plugin_viewer_allowlist() -> List[Dict[str, str]]:
+def load_plugin_viewer_allowlist() -> list[dict[str, str]]:
     """Load viewer-allowlist entries from plugins without calling install().
 
     Mirrors `load_plugin_rbac_rules`: instantiates each configured
@@ -640,7 +640,7 @@ def load_plugin_viewer_allowlist() -> List[Dict[str, str]]:
     if not config:
         return []
 
-    allowlist: List[Dict[str, str]] = []
+    allowlist: list[dict[str, str]] = []
 
     for plugin_config in config.get('plugins', []):
         class_path = plugin_config['class']
@@ -674,11 +674,11 @@ def load_plugin_viewer_allowlist() -> List[Dict[str, str]]:
     return allowlist
 
 
-def get_plugin_viewer_allowlist() -> List[Dict[str, str]]:
+def get_plugin_viewer_allowlist() -> list[dict[str, str]]:
     """Return the cached viewer-allowlist entries collected from plugins."""
     return _PLUGIN_VIEWER_ALLOWLIST
 
 
-def get_extension_context() -> Optional[ExtensionContext]:
+def get_extension_context() -> ExtensionContext | None:
     """Return the extension context created during plugin loading."""
     return _EXTENSION_CONTEXT

@@ -9,7 +9,7 @@ import copy
 import json
 import textwrap
 import time
-from typing import Any, Dict
+from typing import Any
 import uuid
 
 import requests
@@ -174,7 +174,7 @@ class IBMVPCProvider:
                             f"Matching the zone name: {zone_name} to create "
                             "a subnet")
 
-        subnet_prototype: Dict[str, Any] = {}
+        subnet_prototype: dict[str, Any] = {}
         subnet_prototype["zone"] = {"name": zone_name}
         subnet_prototype["ip_version"] = "ipv4"
         subnet_prototype["name"] = subnet_name
@@ -188,7 +188,7 @@ class IBMVPCProvider:
 
     def create_public_gateway(self, vpc_id, zone_name, subnet_data):
 
-        gateway_prototype: Dict[str, Any] = {}
+        gateway_prototype: dict[str, Any] = {}
         gateway_prototype["vpc"] = {"id": vpc_id}
         gateway_prototype["zone"] = {"name": zone_name}
         gateway_prototype["name"] = f"{subnet_data['name']}-gw"

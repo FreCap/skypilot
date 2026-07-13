@@ -1,6 +1,6 @@
 """SSH Node Pool management API endpoints."""
 import re
-from typing import Any, Dict, List
+from typing import Any
 
 import fastapi
 
@@ -15,7 +15,7 @@ router = fastapi.APIRouter()
 
 
 @router.get('')
-def get_ssh_node_pools() -> Dict[str, Any]:
+def get_ssh_node_pools() -> dict[str, Any]:
     """Get all SSH Node Pool configurations."""
     try:
         return core.get_all_pools()
@@ -27,7 +27,7 @@ def get_ssh_node_pools() -> Dict[str, Any]:
 
 
 @router.post('')
-def update_ssh_node_pools(pools_config: Dict[str, Any]) -> Dict[str, str]:
+def update_ssh_node_pools(pools_config: dict[str, Any]) -> dict[str, str]:
     """Update SSH Node Pool configurations."""
     try:
         core.update_pools(pools_config)
@@ -39,7 +39,7 @@ def update_ssh_node_pools(pools_config: Dict[str, Any]) -> Dict[str, str]:
 
 
 @router.delete('/{pool_name}')
-def delete_ssh_node_pool(pool_name: str) -> Dict[str, str]:
+def delete_ssh_node_pool(pool_name: str) -> dict[str, str]:
     """Delete a SSH Node Pool configuration."""
     try:
         if core.delete_pool(pool_name):
@@ -57,7 +57,7 @@ def delete_ssh_node_pool(pool_name: str) -> Dict[str, str]:
 
 
 @router.post('/keys')
-async def upload_ssh_key(request: fastapi.Request) -> Dict[str, str]:
+async def upload_ssh_key(request: fastapi.Request) -> dict[str, str]:
     """Upload SSH private key."""
     try:
         form = await request.form()
@@ -82,7 +82,7 @@ async def upload_ssh_key(request: fastapi.Request) -> Dict[str, str]:
 
 
 @router.get('/keys')
-def list_ssh_keys() -> List[str]:
+def list_ssh_keys() -> list[str]:
     """List available SSH keys."""
     try:
         return core.list_ssh_keys()
@@ -94,7 +94,7 @@ def list_ssh_keys() -> List[str]:
 
 @router.post('/{pool_name}/deploy')
 async def deploy_ssh_node_pool(request: fastapi.Request,
-                               pool_name: str) -> Dict[str, str]:
+                               pool_name: str) -> dict[str, str]:
     """Deploy SSH Node Pool using existing ssh_up functionality."""
     try:
         ssh_up_body = payloads.SSHUpBody(infra=pool_name, cleanup=False)
@@ -121,7 +121,7 @@ async def deploy_ssh_node_pool(request: fastapi.Request,
 @router.post('/deploy')
 async def deploy_ssh_node_pool_general(
         request: fastapi.Request,
-        ssh_up_body: payloads.SSHUpBody) -> Dict[str, str]:
+        ssh_up_body: payloads.SSHUpBody) -> dict[str, str]:
     """Deploys all SSH Node Pools."""
     try:
         await executor.schedule_request_async(
@@ -147,7 +147,7 @@ async def deploy_ssh_node_pool_general(
 
 @router.post('/{pool_name}/down')
 async def down_ssh_node_pool(request: fastapi.Request,
-                             pool_name: str) -> Dict[str, str]:
+                             pool_name: str) -> dict[str, str]:
     """Cleans up a SSH Node Pools."""
     try:
         ssh_up_body = payloads.SSHUpBody(infra=pool_name, cleanup=True)
@@ -175,7 +175,7 @@ async def down_ssh_node_pool(request: fastapi.Request,
 @router.post('/down')
 async def down_ssh_node_pool_general(
         request: fastapi.Request,
-        ssh_up_body: payloads.SSHUpBody) -> Dict[str, str]:
+        ssh_up_body: payloads.SSHUpBody) -> dict[str, str]:
     """Cleans up all SSH Node Pools."""
     try:
         # Set cleanup=True for down operation
@@ -203,7 +203,7 @@ async def down_ssh_node_pool_general(
 
 
 @router.get('/{pool_name}/status')
-def get_ssh_node_pool_status(pool_name: str) -> Dict[str, str]:
+def get_ssh_node_pool_status(pool_name: str) -> dict[str, str]:
     """Get the status of a specific SSH Node Pool."""
     try:
         # Call ssh_status to check the context

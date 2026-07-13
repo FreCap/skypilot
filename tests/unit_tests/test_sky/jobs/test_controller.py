@@ -58,8 +58,8 @@ class TestNormalJobRecovery:
             task_id = 0
 
             is_resume = False
-            if (latest_task_id is not None and last_task_prev_status !=
-                    managed_job_state.ManagedJobStatus.PENDING):
+            if (latest_task_id is not None and last_task_prev_status
+                    != managed_job_state.ManagedJobStatus.PENDING):
                 assert latest_task_id >= task_id
                 if latest_task_id > task_id:
                     pass  # Already executed
@@ -83,8 +83,8 @@ class TestNormalJobRecovery:
             task_id = 0
 
             is_resume = False
-            if (latest_task_id is not None and last_task_prev_status !=
-                    managed_job_state.ManagedJobStatus.PENDING):
+            if (latest_task_id is not None and last_task_prev_status
+                    != managed_job_state.ManagedJobStatus.PENDING):
                 if latest_task_id > task_id:
                     pass
                 elif latest_task_id == task_id:
@@ -107,8 +107,8 @@ class TestNormalJobRecovery:
             task_id = 0
 
             is_resume = False
-            if (latest_task_id is not None and last_task_prev_status !=
-                    managed_job_state.ManagedJobStatus.PENDING):
+            if (latest_task_id is not None and last_task_prev_status
+                    != managed_job_state.ManagedJobStatus.PENDING):
                 assert latest_task_id >= task_id
                 if latest_task_id > task_id:
                     pass
@@ -132,8 +132,8 @@ class TestNormalJobRecovery:
             task_id = 0
 
             is_resume = False
-            if (latest_task_id is not None and last_task_prev_status !=
-                    managed_job_state.ManagedJobStatus.PENDING):
+            if (latest_task_id is not None and last_task_prev_status
+                    != managed_job_state.ManagedJobStatus.PENDING):
                 assert latest_task_id >= task_id
                 if latest_task_id > task_id:
                     pass
@@ -157,8 +157,8 @@ class TestNormalJobRecovery:
             task_id = 0
 
             is_resume = False
-            if (latest_task_id is not None and last_task_prev_status !=
-                    managed_job_state.ManagedJobStatus.PENDING):
+            if (latest_task_id is not None and last_task_prev_status
+                    != managed_job_state.ManagedJobStatus.PENDING):
                 assert latest_task_id >= task_id
                 if latest_task_id > task_id:
                     pass
@@ -183,8 +183,8 @@ class TestNormalJobRecovery:
 
         should_skip = False
         is_resume = False
-        if (latest_task_id is not None and last_task_prev_status !=
-                managed_job_state.ManagedJobStatus.PENDING):
+        if (latest_task_id is not None and last_task_prev_status
+                != managed_job_state.ManagedJobStatus.PENDING):
             if latest_task_id > task_id:
                 should_skip = True
             elif latest_task_id == task_id:
@@ -238,8 +238,8 @@ class TestPipelineJobRecovery:
             # Simulate the loop in run()
             task_actions: Dict[int, str] = {}  # 'skip', 'resume', 'launch'
             for task_id, task in enumerate(mock_pipeline_dag.tasks):
-                if (latest_task_id is not None and last_task_prev_status !=
-                        managed_job_state.ManagedJobStatus.PENDING):
+                if (latest_task_id is not None and last_task_prev_status
+                        != managed_job_state.ManagedJobStatus.PENDING):
                     if latest_task_id > task_id:
                         task_actions[task_id] = 'skip'
                         continue
@@ -268,8 +268,8 @@ class TestPipelineJobRecovery:
 
             task_actions: Dict[int, str] = {}
             for task_id, task in enumerate(mock_pipeline_dag.tasks):
-                if (latest_task_id is not None and last_task_prev_status !=
-                        managed_job_state.ManagedJobStatus.PENDING):
+                if (latest_task_id is not None and last_task_prev_status
+                        != managed_job_state.ManagedJobStatus.PENDING):
                     if latest_task_id > task_id:
                         task_actions[task_id] = 'skip'
                         continue
@@ -297,8 +297,8 @@ class TestPipelineJobRecovery:
 
             task_actions: Dict[int, str] = {}
             for task_id, task in enumerate(mock_pipeline_dag.tasks):
-                if (latest_task_id is not None and last_task_prev_status !=
-                        managed_job_state.ManagedJobStatus.PENDING):
+                if (latest_task_id is not None and last_task_prev_status
+                        != managed_job_state.ManagedJobStatus.PENDING):
                     if latest_task_id > task_id:
                         task_actions[task_id] = 'skip'
                         continue
@@ -344,8 +344,8 @@ class TestPipelineJobRecovery:
 
             task_actions: Dict[int, str] = {}
             for task_id, task in enumerate(mock_pipeline_dag.tasks):
-                if (latest_task_id is not None and last_task_prev_status !=
-                        managed_job_state.ManagedJobStatus.PENDING):
+                if (latest_task_id is not None and last_task_prev_status
+                        != managed_job_state.ManagedJobStatus.PENDING):
                     if latest_task_id > task_id:
                         task_actions[task_id] = 'skip'
                         continue
@@ -373,8 +373,8 @@ class TestPipelineJobRecovery:
 
             task_actions: Dict[int, str] = {}
             for task_id, task in enumerate(mock_pipeline_dag.tasks):
-                if (latest_task_id is not None and last_task_prev_status !=
-                        managed_job_state.ManagedJobStatus.PENDING):
+                if (latest_task_id is not None and last_task_prev_status
+                        != managed_job_state.ManagedJobStatus.PENDING):
                     if latest_task_id > task_id:
                         task_actions[task_id] = 'skip'
                         continue
@@ -402,8 +402,8 @@ class TestPipelineJobRecovery:
 
             task_actions: Dict[int, str] = {}
             for task_id, task in enumerate(mock_pipeline_dag.tasks):
-                if (latest_task_id is not None and last_task_prev_status !=
-                        managed_job_state.ManagedJobStatus.PENDING):
+                if (latest_task_id is not None and last_task_prev_status
+                        != managed_job_state.ManagedJobStatus.PENDING):
                     if latest_task_id > task_id:
                         task_actions[task_id] = 'skip'
                         continue

@@ -1,12 +1,13 @@
 """Common utilities for service catalog."""
 import ast
+from collections.abc import Callable
 import difflib
 import hashlib
 import os
 import tempfile
 import time
 import typing
-from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import Any, NamedTuple
 
 import filelock
 
@@ -68,12 +69,12 @@ class InstanceTypeInfo(NamedTuple):
     - region: Region where this instance type belongs to.
     """
     cloud: str
-    instance_type: Optional[str]
+    instance_type: str | None
     accelerator_name: str
     accelerator_count: float
-    cpu_count: Optional[float]
-    device_memory: Optional[float]
-    memory: Optional[float]
+    cpu_count: float | None
+    device_memory: float | None
+    memory: float | None
     price: float
     spot_price: float
     region: str
@@ -87,7 +88,7 @@ def get_catalog_path(filename: str) -> str:
     return os.path.join(_ABSOLUTE_VERSIONED_CATALOG_DIR, filename)
 
 
-def hosted_catalog_base_urls() -> Tuple[str, str]:
+def hosted_catalog_base_urls() -> tuple[str, str]:
     """Primary and fallback base URLs for the hosted catalog.
 
     SKYPILOT_HOSTED_CATALOG_DIR_URL overrides both (a self-hosted mirror,
@@ -105,7 +106,7 @@ def hosted_catalog_base_urls() -> Tuple[str, str]:
             constants.HOSTED_CATALOG_DIR_URL_S3_MIRROR)
 
 
-def hosted_catalog_request_headers() -> Dict[str, str]:
+def hosted_catalog_request_headers() -> dict[str, str]:
     """HTTP headers for hosted-catalog fetches.
 
     SKYPILOT_HOSTED_CATALOG_TOKEN authenticates against a private mirror
@@ -127,7 +128,7 @@ def is_catalog_modified(filename: str) -> bool:
     md5_filepath = meta_path + '.md5'
     if os.path.exists(md5_filepath):
         file_md5 = common_utils.hash_file(catalog_path, 'md5').hexdigest()
-        with open(md5_filepath, 'r', encoding='utf-8') as f:
+        with open(md5_filepath, encoding='utf-8') as f:
             last_md5 = f.read()
         return file_md5 != last_md5
     else:
@@ -136,7 +137,7 @@ def is_catalog_modified(filename: str) -> bool:
         return True
 
 
-def get_modified_catalog_file_mounts() -> Dict[str, str]:
+def get_modified_catalog_file_mounts() -> dict[str, str]:
     """Returns a dict of catalogs which have been modified locally.
 
     The dictionary maps the remote catalog path (relative) to the local path of
@@ -147,7 +148,7 @@ def get_modified_catalog_file_mounts() -> Dict[str, str]:
     are provisioned.
     """
 
-    def _get_modified_catalogs() -> List[str]:
+    def _get_modified_catalogs() -> list[str]:
         """Returns a list of modified catalogs relative to the catalog dir."""
         modified_catalogs = []
         for cloud_name in constants.ALL_CLOUDS:
@@ -195,7 +196,7 @@ class LazyDataFrame:
 
     def __init__(self, filename: str, update_if_stale_func: Callable[[], bool]):
         self._filename = filename
-        self._df: Optional['pd.DataFrame'] = None
+        self._df: pd.DataFrame | None = None
         self._update_if_stale_func = update_if_stale_func
 
     @annotations.lru_cache(scope='request')
@@ -224,7 +225,7 @@ class LazyDataFrame:
 
 
 def read_catalog(filename: str,
-                 pull_frequency_hours: Optional[int] = None) -> LazyDataFrame:
+                 pull_frequency_hours: int | None = None) -> LazyDataFrame:
     """Reads the catalog from a local CSV file.
 
     If the file does not exist, download the up-to-date catalog that matches
@@ -265,12 +266,12 @@ def read_catalog(filename: str,
         # by design and are deliberately not affected (handled above).
         source_path = meta_path + '.source'
         if os.path.exists(source_path):
-            with open(source_path, 'r', encoding='utf-8') as f:
+            with open(source_path, encoding='utf-8') as f:
                 cached_source = f.read().strip()
             if cached_source != hosted_catalog_base_urls()[0]:
                 return True
-        elif (hosted_catalog_base_urls()[0] !=
-              constants.HOSTED_CATALOG_DIR_URL):
+        elif (hosted_catalog_base_urls()[0]
+              != constants.HOSTED_CATALOG_DIR_URL):
             # Catalog predates source tracking (no .source recorded). With a
             # mirror override configured we cannot prove the cached file came
             # from the mirror, so refetch once; the download records .source
@@ -367,8 +368,8 @@ def read_catalog(filename: str,
 def _get_instance_type(
     df: 'pd.DataFrame',
     instance_type: str,
-    region: Optional[str],
-    zone: Optional[str] = None,
+    region: str | None,
+    zone: str | None = None,
 ) -> 'pd.DataFrame':
     idx = df['InstanceType'] == instance_type
     if region is not None:
@@ -385,8 +386,8 @@ def instance_type_exists_impl(df: 'pd.DataFrame', instance_type: str) -> bool:
 
 
 def validate_region_zone_impl(
-        cloud_name: str, df: 'pd.DataFrame', region: Optional[str],
-        zone: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+        cloud_name: str, df: 'pd.DataFrame', region: str | None,
+        zone: str | None) -> tuple[str | None, str | None]:
     """Validates whether region and zone exist in the catalog.
 
     Returns:
@@ -396,7 +397,7 @@ def validate_region_zone_impl(
         ValueError: If region or zone is invalid or not supported.
     """
 
-    def _get_candidate_str(loc: str, all_loc: List[str]) -> str:
+    def _get_candidate_str(loc: str, all_loc: list[str]) -> str:
         candidate_loc = difflib.get_close_matches(loc, all_loc, n=5, cutoff=0.6)
         candidate_loc = sorted(candidate_loc)
         candidate_strs = ''
@@ -407,7 +408,7 @@ def validate_region_zone_impl(
         return candidate_strs
 
     def _get_all_supported_regions_str() -> str:
-        all_regions: List[str] = sorted(
+        all_regions: list[str] = sorted(
             df['Region'].dropna().str.lower().unique().tolist())
         return (f'\nList of supported {cloud_name} regions: '
                 f'{", ".join(all_regions)!r}')
@@ -460,8 +461,8 @@ def get_hourly_cost_impl(
     df: 'pd.DataFrame',
     instance_type: str,
     use_spot: bool,
-    region: Optional[str],
-    zone: Optional[str],
+    region: str | None,
+    zone: str | None,
 ) -> float:
     """Returns the hourly price of a VM instance in the given region and zone.
 
@@ -508,7 +509,7 @@ def _get_value(value):
 def get_vcpus_mem_from_instance_type_impl(
     df: 'pd.DataFrame',
     instance_type: str,
-) -> Tuple[Optional[float], Optional[float]]:
+) -> tuple[float | None, float | None]:
     df = _get_instance_type(df, instance_type, None)
     if df.empty:
         with ux_utils.print_exception_no_traceback():
@@ -527,8 +528,7 @@ def get_vcpus_mem_from_instance_type_impl(
     return _get_value(vcpus), _get_value(mem)
 
 
-def _filter_with_cpus(df: 'pd.DataFrame',
-                      cpus: Optional[str]) -> 'pd.DataFrame':
+def _filter_with_cpus(df: 'pd.DataFrame', cpus: str | None) -> 'pd.DataFrame':
     if cpus is None:
         return df
 
@@ -552,7 +552,7 @@ def _filter_with_cpus(df: 'pd.DataFrame',
 
 
 def _filter_with_mem(df: 'pd.DataFrame',
-                     memory_gb_or_ratio: Optional[str]) -> 'pd.DataFrame':
+                     memory_gb_or_ratio: str | None) -> 'pd.DataFrame':
     if memory_gb_or_ratio is None:
         return df
 
@@ -578,7 +578,7 @@ def _filter_with_mem(df: 'pd.DataFrame',
 
 
 def filter_with_local_disk(df: 'pd.DataFrame',
-                           local_disk: Optional[str]) -> 'pd.DataFrame':
+                           local_disk: str | None) -> 'pd.DataFrame':
     if local_disk is None:
         return df
 
@@ -605,8 +605,8 @@ def filter_with_local_disk(df: 'pd.DataFrame',
     return df
 
 
-def _filter_region_zone(df: 'pd.DataFrame', region: Optional[str],
-                        zone: Optional[str]) -> 'pd.DataFrame':
+def _filter_region_zone(df: 'pd.DataFrame', region: str | None,
+                        zone: str | None) -> 'pd.DataFrame':
     if region is not None:
         df = df[df['Region'].str.lower() == region.lower()]
     if zone is not None:
@@ -616,12 +616,12 @@ def _filter_region_zone(df: 'pd.DataFrame', region: Optional[str],
 
 def get_instance_type_for_cpus_mem_impl(
         df: 'pd.DataFrame',
-        cpus: Optional[str],
-        memory_gb_or_ratio: Optional[str],
-        region: Optional[str] = None,
-        zone: Optional[str] = None,
+        cpus: str | None,
+        memory_gb_or_ratio: str | None,
+        region: str | None = None,
+        zone: str | None = None,
         use_spot: bool = False,
-        max_hourly_cost: Optional[float] = None) -> Optional[str]:
+        max_hourly_cost: float | None = None) -> str | None:
     """Returns the cheapest instance type that satisfies the requirements.
 
     Note: `use_spot` only takes into effect if `max_hourly_cost` is also
@@ -671,7 +671,7 @@ def get_instance_type_for_cpus_mem_impl(
 def get_accelerators_from_instance_type_impl(
     df: 'pd.DataFrame',
     instance_type: str,
-) -> Optional[Dict[str, Union[int, float]]]:
+) -> dict[str, int | float] | None:
     df = _get_instance_type(df, instance_type, None)
     if df.empty:
         with ux_utils.print_exception_no_traceback():
@@ -692,7 +692,7 @@ def get_accelerators_from_instance_type_impl(
 def get_arch_from_instance_type_impl(
     df: 'pd.DataFrame',
     instance_type: str,
-) -> Optional[str]:
+) -> str | None:
     df = _get_instance_type(df, instance_type, None)
     if df.empty:
         with ux_utils.print_exception_no_traceback():
@@ -708,7 +708,7 @@ def get_arch_from_instance_type_impl(
 
 
 def get_local_disk_from_instance_type_impl(df: 'pd.DataFrame',
-                                           instance_type: str) -> Optional[str]:
+                                           instance_type: str) -> str | None:
     df = _get_instance_type(df, instance_type, None)
     if df.empty:
         with ux_utils.print_exception_no_traceback():
@@ -740,14 +740,14 @@ def get_local_disk_from_instance_type_impl(df: 'pd.DataFrame',
 def get_instance_type_for_accelerator_impl(
     df: 'pd.DataFrame',
     acc_name: str,
-    acc_count: Union[int, float],
-    cpus: Optional[str] = None,
-    memory: Optional[str] = None,
+    acc_count: int | float,
+    cpus: str | None = None,
+    memory: str | None = None,
     use_spot: bool = False,
-    region: Optional[str] = None,
-    zone: Optional[str] = None,
-    max_hourly_cost: Optional[float] = None,
-) -> Tuple[Optional[List[str]], List[str]]:
+    region: str | None = None,
+    zone: str | None = None,
+    max_hourly_cost: float | None = None,
+) -> tuple[list[str] | None, list[str]]:
     """Filter the instance types based on resource requirements.
 
     Returns a list of instance types satisfying the required count of
@@ -797,12 +797,12 @@ def list_accelerators_impl(
         cloud: str,
         df: 'pd.DataFrame',
         gpus_only: bool,
-        name_filter: Optional[str],
-        region_filter: Optional[str],
-        quantity_filter: Optional[int],
+        name_filter: str | None,
+        region_filter: str | None,
+        quantity_filter: int | None,
         case_sensitive: bool = True,
         all_regions: bool = False,
-        require_price: bool = True) -> Dict[str, List[InstanceTypeInfo]]:
+        require_price: bool = True) -> dict[str, list[InstanceTypeInfo]]:
     """Lists accelerators offered in a cloud service catalog.
 
     `name_filter` is a regular expression used to filter accelerator names
@@ -890,7 +890,7 @@ def list_accelerators_impl(
 
 
 def get_region_zones(df: 'pd.DataFrame',
-                     use_spot: bool) -> List[cloud_lib.Region]:
+                     use_spot: bool) -> list[cloud_lib.Region]:
     """Returns a list of regions/zones from a dataframe."""
     price_str = 'SpotPrice' if use_spot else 'Price'
     sort_keys = [price_str, 'Region']
@@ -910,7 +910,7 @@ def get_region_zones(df: 'pd.DataFrame',
 
 # Images
 def get_image_id_from_tag_impl(df: 'pd.DataFrame', tag: str,
-                               region: Optional[str]) -> Optional[str]:
+                               region: str | None) -> str | None:
     """Returns the image ID for the given tag and region.
 
     If region is None, there must be only one image with the given tag.
@@ -931,7 +931,7 @@ def get_image_id_from_tag_impl(df: 'pd.DataFrame', tag: str,
 
 
 def is_image_tag_valid_impl(df: 'pd.DataFrame', tag: str,
-                            region: Optional[str]) -> bool:
+                            region: str | None) -> bool:
     """Returns True if the image tag is valid."""
     df = df[df['Tag'] == tag]
     df = _filter_region_zone(df, region, zone=None)
@@ -944,8 +944,8 @@ def is_image_tag_valid_impl(df: 'pd.DataFrame', tag: str,
 # ---------------------------------------------------------------------------
 
 
-def merge_pricing_dicts(base: Dict[str, Any],
-                        override: Dict[str, Any]) -> Dict[str, Any]:
+def merge_pricing_dicts(base: dict[str, Any],
+                        override: dict[str, Any]) -> dict[str, Any]:
     """Deep-merge *override* into *base*, returning a new dict.
 
     Top-level scalar keys (``cpu``, ``memory``) are replaced.
@@ -964,7 +964,7 @@ def merge_pricing_dicts(base: Dict[str, Any],
 
 
 def resolve_pricing_config(
-        *config_key_paths: Tuple[str, ...]) -> Dict[str, Any]:
+        *config_key_paths: tuple[str, ...]) -> dict[str, Any]:
     """Fetch pricing from config key paths and merge in priority order.
 
     Each path is a tuple of strings looked up via
@@ -980,7 +980,7 @@ def resolve_pricing_config(
     """
     from sky import skypilot_config  # pylint: disable=import-outside-toplevel
 
-    pricing: Dict[str, Any] = {}
+    pricing: dict[str, Any] = {}
     for path in config_key_paths:
         level = skypilot_config.get_nested(path, default_value=None)
         if level is not None:
@@ -989,11 +989,11 @@ def resolve_pricing_config(
 
 
 def get_hourly_cost_from_pricing(
-    pricing: Dict[str, Any],
+    pricing: dict[str, Any],
     cpus: float,
     memory: float,
-    accelerator_name: Optional[str],
-    accelerator_count: Optional[int],
+    accelerator_name: str | None,
+    accelerator_count: int | None,
 ) -> float:
     """Compute hourly cost from a pricing config dict.
 

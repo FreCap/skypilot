@@ -1,6 +1,5 @@
 """Cudo Compute library wrapper for SkyPilot."""
 import time
-from typing import Dict
 
 from sky import sky_logging
 from sky.adaptors import cudo
@@ -11,7 +10,7 @@ logger = sky_logging.init_logger(__name__)
 
 def launch(name: str, data_center_id: str, ssh_key: str, machine_type: str,
            memory_gib: int, vcpu_count: int, gpu_count: int,
-           tags: Dict[str, str], disk_size: int):
+           tags: dict[str, str], disk_size: int):
     """Launches an instance with the given parameters."""
 
     request = cudo.cudo.CreateVMBody(
@@ -61,13 +60,12 @@ def remove(instance_id: str):
         time.sleep(retry_interval)
     else:
         raise Exception(
-            'Timeout error, could not terminate due to VM state: {}'.format(
-                state))
+            f'Timeout error, could not terminate due to VM state: {state}')
 
     api.terminate_vm(project_id, instance_id)
 
 
-def set_tags(instance_id: str, tags: Dict):
+def set_tags(instance_id: str, tags: dict):
     """Sets the tags for the given instance."""
     api = cudo.cudo.cudo_api.virtual_machines()
     api.update_vm_metadata(

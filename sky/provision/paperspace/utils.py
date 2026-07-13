@@ -4,7 +4,7 @@ import json
 import os
 import time
 import typing
-from typing import Any, Dict, List, Optional, Union
+from typing import Any
 
 from sky import sky_logging
 from sky.adaptors import common as adaptors_common
@@ -52,8 +52,8 @@ def raise_paperspace_api_error(response: 'requests.Response') -> None:
 def _try_request_with_backoff(
         method: str,
         url: str,
-        headers: Dict[str, str],
-        data: Optional[Union[str, Dict[str, Any]]] = None) -> Dict[str, Any]:
+        headers: dict[str, str],
+        data: str | dict[str, Any] | None = None) -> dict[str, Any]:
     backoff = common_utils.Backoff(initial_backoff=INITIAL_BACKOFF_SECONDS,
                                    max_backoff_factor=MAX_BACKOFF_FACTOR)
     for i in range(MAX_ATTEMPTS):
@@ -85,7 +85,7 @@ class PaperspaceCloudClient:
     def __init__(self) -> None:
         self.credentials = os.path.expanduser(CREDENTIALS_PATH)
         assert os.path.exists(self.credentials), 'Credentials not found'
-        with open(self.credentials, 'r', encoding='utf-8') as f:
+        with open(self.credentials, encoding='utf-8') as f:
             self._credentials = json.load(f)
         self.api_key = self._credentials['apiKey']
         self.headers = {
@@ -94,7 +94,7 @@ class PaperspaceCloudClient:
         }
 
     def list_endpoint(self, endpoint: str,
-                      **search_kwargs) -> List[Dict[str, Any]]:
+                      **search_kwargs) -> list[dict[str, Any]]:
         items = []
         response = _try_request_with_backoff('get',
                                              f'{API_ENDPOINT}/{endpoint}',
@@ -113,8 +113,8 @@ class PaperspaceCloudClient:
             items.extend(response['items'])
         return items
 
-    def list_startup_scripts(
-            self, name: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list_startup_scripts(self,
+                             name: str | None = None) -> list[dict[str, Any]]:
         return self.list_endpoint(
             endpoint='startup-scripts',
             name=name,
@@ -163,13 +163,13 @@ class PaperspaceCloudClient:
                                           'isRunOnce': True,
                                       }))
 
-    def get_network(self, network_name: str) -> Dict[str, Any]:
+    def get_network(self, network_name: str) -> dict[str, Any]:
         return self.list_endpoint(
             endpoint='private-networks',
             name=network_name,
         )[0]
 
-    def setup_network(self, cluster_name: str, region: str) -> Dict[str, Any]:
+    def setup_network(self, cluster_name: str, region: str) -> dict[str, Any]:
         """Attempts to find an existing network with a name matching to
         the cluster name otherwise create a new network.
         """
@@ -186,18 +186,18 @@ class PaperspaceCloudClient:
                 }))
         return network
 
-    def delete_network(self, network_id: str) -> Dict[str, Any]:
+    def delete_network(self, network_id: str) -> dict[str, Any]:
         return _try_request_with_backoff(
             'delete',
             f'{API_ENDPOINT}/private-networks/{network_id}',
             headers=self.headers,
         )
 
-    def list_instances(self) -> List[Dict[str, Any]]:
+    def list_instances(self) -> list[dict[str, Any]]:
         return self.list_endpoint(endpoint='machines')
 
     def launch(self, name: str, instance_type: str, network_id: str,
-               region: str, disk_size: int) -> Dict[str, Any]:
+               region: str, disk_size: int) -> dict[str, Any]:
         response = _try_request_with_backoff(
             'post',
             f'{API_ENDPOINT}/machines',
@@ -217,28 +217,28 @@ class PaperspaceCloudClient:
             }))
         return response
 
-    def start(self, instance_id: str) -> Dict[str, Any]:
+    def start(self, instance_id: str) -> dict[str, Any]:
         return _try_request_with_backoff(
             'patch',
             f'{API_ENDPOINT}/machines/{instance_id}/start',
             headers={'Authorization': f'Bearer {self.api_key}'},
         )
 
-    def stop(self, instance_id: str) -> Dict[str, Any]:
+    def stop(self, instance_id: str) -> dict[str, Any]:
         return _try_request_with_backoff(
             'patch',
             f'{API_ENDPOINT}/machines/{instance_id}/stop',
             headers={'Authorization': f'Bearer {self.api_key}'},
         )
 
-    def remove(self, instance_id: str) -> Dict[str, Any]:
+    def remove(self, instance_id: str) -> dict[str, Any]:
         return _try_request_with_backoff(
             'delete',
             f'{API_ENDPOINT}/machines/{instance_id}',
             headers=self.headers,
         )
 
-    def rename(self, instance_id: str, name: str) -> Dict[str, Any]:
+    def rename(self, instance_id: str, name: str) -> dict[str, Any]:
         return _try_request_with_backoff(
             'put',
             f'{API_ENDPOINT}/machines/{instance_id}',

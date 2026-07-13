@@ -1,12 +1,14 @@
 """Eventually consistent, best-effort compute spend estimates."""
 
 import asyncio
+from collections.abc import Iterable
+from collections.abc import Mapping
 import datetime
 import enum
 import math
 import pickle
 import time
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, Union
+from typing import Any
 
 import sqlalchemy
 from sqlalchemy import orm
@@ -51,11 +53,11 @@ def _utc_day_start(timestamp: int) -> int:
     return int(timestamp) // SECONDS_PER_DAY * SECONDS_PER_DAY
 
 
-def _split_interval_by_utc_day(start: int, end: int) -> Dict[int, int]:
+def _split_interval_by_utc_day(start: int, end: int) -> dict[int, int]:
     """Split a half-open epoch interval into UTC-day overlap seconds."""
     if end <= start:
         return {}
-    overlaps: Dict[int, int] = {}
+    overlaps: dict[int, int] = {}
     cursor = start
     while cursor < end:
         day_start = _utc_day_start(cursor)
@@ -78,7 +80,7 @@ def _safe_unpickle(value: Any) -> Any:
         return None
 
 
-def _resource_cloud(resources: Any) -> Optional[str]:
+def _resource_cloud(resources: Any) -> str | None:
     if resources is None:
         return None
     cloud = getattr(resources, 'cloud', None)
@@ -86,8 +88,8 @@ def _resource_cloud(resources: Any) -> Optional[str]:
 
 
 def _get_pricing(
-        resources: Any, cloud: Optional[str], num_nodes: int,
-        rate_cache: Dict[str, float]) -> Tuple[Optional[float], Optional[str]]:
+        resources: Any, cloud: str | None, num_nodes: int,
+        rate_cache: dict[str, float]) -> tuple[float | None, str | None]:
     """Return total cluster hourly rate and an exclusion reason."""
     if cloud is not None and cloud.casefold() == 'kubernetes':
         return None, 'kubernetes'
@@ -108,7 +110,7 @@ def _get_pricing(
 
 def _build_daily_rows(source: Mapping[str,
                                       Any], as_of: int, recompute_start: int,
-                      rate_cache: Dict[str, float]) -> List[Dict[str, Any]]:
+                      rate_cache: dict[str, float]) -> list[dict[str, Any]]:
     """Materialize one cluster-history row over a bounded time window."""
     usage_intervals = _safe_unpickle(source.get('usage_intervals'))
     if not isinstance(usage_intervals, list):
@@ -128,7 +130,7 @@ def _build_daily_rows(source: Mapping[str,
     use_spot = (bool(getattr(resources, 'use_spot', False))
                 if resources is not None else None)
 
-    overlap_by_day: Dict[int, int] = {}
+    overlap_by_day: dict[int, int] = {}
     for interval in usage_intervals:
         if not isinstance(interval, (tuple, list)) or len(interval) != 2:
             continue
@@ -177,7 +179,7 @@ def _build_daily_rows(source: Mapping[str,
     return rows
 
 
-def _source_columns() -> List[Any]:
+def _source_columns() -> list[Any]:
     table = global_user_state.cluster_history_table
     return [
         table.c.cluster_hash,
@@ -199,7 +201,7 @@ def _source_columns() -> List[Any]:
     ]
 
 
-def _rows_as_mappings(rows: Iterable[Any]) -> List[Mapping[str, Any]]:
+def _rows_as_mappings(rows: Iterable[Any]) -> list[Mapping[str, Any]]:
     return [row._mapping for row in rows]  # pylint: disable=protected-access
 
 
@@ -223,14 +225,14 @@ def _fetch_source_rows(
     state: Mapping[str, Any],
     as_of: int,
     cutoff: int,
-) -> Tuple[List[Tuple[Mapping[str, Any], int]], Dict[str, Any]]:
+) -> tuple[list[tuple[Mapping[str, Any], int]], dict[str, Any]]:
     """Fetch active, changed, and one bounded historical backfill batch."""
     history = global_user_state.cluster_history_table
     clusters = global_user_state.cluster_table
     columns = _source_columns()
     joined = history.outerjoin(
         clusters, history.c.cluster_hash == clusters.c.cluster_hash)
-    sources: Dict[str, Tuple[Mapping[str, Any], int]] = {}
+    sources: dict[str, tuple[Mapping[str, Any], int]] = {}
 
     active_cursor_hash = state.get('active_cursor_hash')
     active_conditions = [clusters.c.status != 'STOPPED']
@@ -279,7 +281,7 @@ def _fetch_source_rows(
         next_watermark_hash = _HASH_END_SENTINEL
 
     backfill_complete = bool(state.get('backfill_complete'))
-    backfill_rows: List[Mapping[str, Any]] = []
+    backfill_rows: list[Mapping[str, Any]] = []
     backfill_cursor_launched_at = state.get('backfill_cursor_launched_at')
     backfill_cursor_hash = state.get('backfill_cursor_hash')
     if not backfill_complete:
@@ -335,7 +337,7 @@ def _insert_function(engine: sqlalchemy.engine.Engine):
 
 def _persist_replacements(
     engine: sqlalchemy.engine.Engine,
-    replacements: List[Tuple[str, int, List[Dict[str, Any]]]],
+    replacements: list[tuple[str, int, list[dict[str, Any]]]],
     as_of: int,
 ) -> None:
     table = global_user_state.estimated_spend_daily_table
@@ -349,8 +351,8 @@ def _persist_replacements(
                     sqlalchemy.delete(table).where(
                         sqlalchemy.and_(
                             table.c.cluster_hash == cluster_hash,
-                            table.c.day_start_utc >=
-                            _utc_day_start(recompute_start),
+                            table.c.day_start_utc
+                            >= _utc_day_start(recompute_start),
                             table.c.day_start_utc <= current_day)))
                 for row in rows:
                     insert_stmt = insert_func(table).values(**row)
@@ -398,8 +400,8 @@ def _update_state(engine: sqlalchemy.engine.Engine, **values: Any) -> None:
 
 
 def run_rollup_once(
-        now: Optional[int] = None,
-        lookback_days: int = ROLLUP_LOOKBACK_DAYS) -> Dict[str, Any]:
+        now: int | None = None,
+        lookback_days: int = ROLLUP_LOOKBACK_DAYS) -> dict[str, Any]:
     """Run one bounded, idempotent rollup sweep."""
     as_of = int(time.time()) if now is None else int(now)
     lookback_days = max(1, min(int(lookback_days), MAX_LOOKBACK_DAYS))
@@ -419,7 +421,7 @@ def run_rollup_once(
                 sources, state_updates = _fetch_source_rows(
                     session, state, as_of, cutoff)
 
-            rate_cache: Dict[str, float] = {}
+            rate_cache: dict[str, float] = {}
             replacements = []
             for source, recompute_start in sources:
                 rows = _build_daily_rows(source, as_of, recompute_start,
@@ -464,7 +466,7 @@ def _sum_expression(column: Any) -> Any:
     return sqlalchemy.func.coalesce(sqlalchemy.func.sum(column), 0)
 
 
-def _aggregate_columns(daily: Any) -> List[Any]:
+def _aggregate_columns(daily: Any) -> list[Any]:
     priced_seconds = sqlalchemy.case((sqlalchemy.and_(
         daily.c.exclusion_reason.is_(None),
         daily.c.estimated_cost.is_not(None)), daily.c.machine_seconds),
@@ -491,7 +493,7 @@ def _purchase_option_expression(daily: Any) -> Any:
                            else_='unknown')
 
 
-def _row_to_breakdown(row: Any, key_names: Tuple[str, ...]) -> Dict[str, Any]:
+def _row_to_breakdown(row: Any, key_names: tuple[str, ...]) -> dict[str, Any]:
     result = {name: getattr(row, name) for name in key_names}
     result.update({
         'estimated_cost': float(row.estimated_cost or 0),
@@ -503,7 +505,7 @@ def _row_to_breakdown(row: Any, key_names: Tuple[str, ...]) -> Dict[str, Any]:
     return result
 
 
-def _normalize_group_by(group_by: Union[str, GroupBy]) -> GroupBy:
+def _normalize_group_by(group_by: str | GroupBy) -> GroupBy:
     try:
         return GroupBy(group_by)
     except ValueError as e:
@@ -511,7 +513,7 @@ def _normalize_group_by(group_by: Union[str, GroupBy]) -> GroupBy:
         raise ValueError(f'group_by must be one of: {options}') from e
 
 
-def _group_key(group_by: GroupBy, row: Any) -> Tuple[Any, ...]:
+def _group_key(group_by: GroupBy, row: Any) -> tuple[Any, ...]:
     if group_by == GroupBy.JOB:
         return (row.workload_type, row.workload_id)
     if group_by == GroupBy.USER:
@@ -519,7 +521,7 @@ def _group_key(group_by: GroupBy, row: Any) -> Tuple[Any, ...]:
     return (row.purchase_option,)
 
 
-def _group_key_names(group_by: GroupBy) -> Tuple[str, ...]:
+def _group_key_names(group_by: GroupBy) -> tuple[str, ...]:
     if group_by == GroupBy.JOB:
         return ('workload_type', 'workload_id')
     if group_by == GroupBy.USER:
@@ -528,7 +530,7 @@ def _group_key_names(group_by: GroupBy) -> Tuple[str, ...]:
 
 
 def _get_group_rows(session: orm.Session, daily: Any, base_filter: Any,
-                    workload_rows: List[Any], group_by: GroupBy) -> List[Any]:
+                    workload_rows: list[Any], group_by: GroupBy) -> list[Any]:
     if group_by == GroupBy.JOB:
         return workload_rows
 
@@ -571,7 +573,7 @@ def _group_match_condition(daily: Any, group_by: GroupBy, row: Any) -> Any:
 
 def _get_daily_group_rows(session: orm.Session, daily: Any, base_filter: Any,
                           group_by: GroupBy,
-                          top_group_rows: List[Any]) -> List[Any]:
+                          top_group_rows: list[Any]) -> list[Any]:
     if not top_group_rows:
         return []
     match_conditions = [
@@ -597,13 +599,13 @@ def _get_daily_group_rows(session: orm.Session, daily: Any, base_filter: Any,
     return session.execute(query).fetchall()
 
 
-def _build_series(group_by: GroupBy, top_group_rows: List[Any],
-                  daily_group_rows: List[Any],
-                  days_response: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    costs_by_group_and_day = {(_group_key(group_by,
-                                          row), int(row.day_start_utc)):
-                              float(row.estimated_cost or 0)
-                              for row in daily_group_rows}
+def _build_series(group_by: GroupBy, top_group_rows: list[Any],
+                  daily_group_rows: list[Any],
+                  days_response: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    costs_by_group_and_day = {
+        (_group_key(group_by, row), int(row.day_start_utc)): float(
+            row.estimated_cost or 0) for row in daily_group_rows
+    }
     displayed_by_day = {int(day['day_start_utc']): 0.0 for day in days_response}
     series = []
     for row in top_group_rows:
@@ -635,8 +637,8 @@ def _build_series(group_by: GroupBy, top_group_rows: List[Any],
 
 def get_estimated_spend(
     days: int = DEFAULT_LOOKBACK_DAYS,
-    group_by: Union[str, GroupBy] = GroupBy.JOB,
-) -> Dict[str, Any]:
+    group_by: str | GroupBy = GroupBy.JOB,
+) -> dict[str, Any]:
     """Read the last materialized admin estimate using aggregate SQL only."""
     days = max(1, min(int(days), MAX_LOOKBACK_DAYS))
     normalized_group_by = _normalize_group_by(group_by)
@@ -705,7 +707,7 @@ def get_estimated_spend(
             'excluded_machine_seconds': int(row.excluded_machine_seconds or 0),
         } for row in day_rows
     }
-    days_response: List[Dict[str, Any]] = []
+    days_response: list[dict[str, Any]] = []
     for offset in range(days):
         day_start = first_day + offset * SECONDS_PER_DAY
         values = by_day.get(

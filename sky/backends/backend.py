@@ -1,6 +1,6 @@
 """Sky backend interface."""
 import typing
-from typing import Any, Dict, Generic, Optional, Tuple, Union
+from typing import Any, Generic, Optional
 
 from sky.usage import usage_lib
 from sky.utils import cluster_utils
@@ -51,10 +51,10 @@ class Backend(Generic[_ResourceHandleType]):
         to_provision: Optional['resources.Resources'],
         dryrun: bool,
         stream_logs: bool,
-        cluster_name: Optional[str] = None,
+        cluster_name: str | None = None,
         retry_until_up: bool = False,
         skip_unnecessary_provisioning: bool = False,
-    ) -> Tuple[Optional[_ResourceHandleType], bool]:
+    ) -> tuple[_ResourceHandleType | None, bool]:
         """Provisions resources for the given task.
 
         Args:
@@ -91,8 +91,8 @@ class Backend(Generic[_ResourceHandleType]):
     @timeline.event
     @usage_lib.messages.usage.update_runtime('sync_workdir')
     def sync_workdir(self, handle: _ResourceHandleType,
-                     workdir: Union[Path, Dict[str, Any]],
-                     envs_and_secrets: Dict[str, str]) -> None:
+                     workdir: Path | dict[str, Any],
+                     envs_and_secrets: dict[str, str]) -> None:
         return self._sync_workdir(handle, workdir, envs_and_secrets)
 
     @timeline.event
@@ -106,8 +106,8 @@ class Backend(Generic[_ResourceHandleType]):
     def sync_file_mounts(
         self,
         handle: _ResourceHandleType,
-        all_file_mounts: Optional[Dict[Path, Path]],
-        storage_mounts: Optional[Dict[Path, 'storage_lib.Storage']],
+        all_file_mounts: dict[Path, Path] | None,
+        storage_mounts: dict[Path, 'storage_lib.Storage'] | None,
     ) -> None:
         return self._sync_file_mounts(handle, all_file_mounts, storage_mounts)
 
@@ -126,7 +126,7 @@ class Backend(Generic[_ResourceHandleType]):
     def execute(self,
                 handle: _ResourceHandleType,
                 task: 'task_lib.Task',
-                dryrun: bool = False) -> Optional[int]:
+                dryrun: bool = False) -> int | None:
         """Execute the task on the cluster.
 
         Returns:
@@ -169,12 +169,12 @@ class Backend(Generic[_ResourceHandleType]):
         cluster_name: str,
         retry_until_up: bool = False,
         skip_unnecessary_provisioning: bool = False,
-    ) -> Tuple[Optional[_ResourceHandleType], bool]:
+    ) -> tuple[_ResourceHandleType | None, bool]:
         raise NotImplementedError
 
     def _sync_workdir(self, handle: _ResourceHandleType,
-                      workdir: Union[Path, Dict[str, Any]],
-                      envs_and_secrets: Dict[str, str]) -> None:
+                      workdir: Path | dict[str, Any],
+                      envs_and_secrets: dict[str, str]) -> None:
         raise NotImplementedError
 
     def _download_file(self, handle: _ResourceHandleType, local_file_path: str,
@@ -184,8 +184,8 @@ class Backend(Generic[_ResourceHandleType]):
     def _sync_file_mounts(
         self,
         handle: _ResourceHandleType,
-        all_file_mounts: Optional[Dict[Path, Path]],
-        storage_mounts: Optional[Dict[Path, 'storage_lib.Storage']],
+        all_file_mounts: dict[Path, Path] | None,
+        storage_mounts: dict[Path, 'storage_lib.Storage'] | None,
     ) -> None:
         raise NotImplementedError
 
@@ -196,7 +196,7 @@ class Backend(Generic[_ResourceHandleType]):
     def _execute(self,
                  handle: _ResourceHandleType,
                  task: 'task_lib.Task',
-                 dryrun: bool = False) -> Optional[int]:
+                 dryrun: bool = False) -> int | None:
         raise NotImplementedError
 
     def _post_execute(self, handle: _ResourceHandleType, down: bool) -> None:

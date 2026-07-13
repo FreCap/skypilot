@@ -1,7 +1,12 @@
 """SkyPilot context for threads and coroutines."""
 
 import asyncio
+from collections.abc import Callable
+from collections.abc import Coroutine
+from collections.abc import Iterable
+from collections.abc import Iterator
 from collections.abc import Mapping
+from collections.abc import MutableMapping
 import contextvars
 import copy
 import fcntl
@@ -12,15 +17,13 @@ import pathlib
 import subprocess
 import sys
 import threading
-from typing import (Any, Callable, Coroutine, Dict, Iterable, Iterator, List,
-                    MutableMapping, NamedTuple, Optional, TextIO, TYPE_CHECKING,
-                    TypeVar)
+from typing import Any, NamedTuple, TextIO, TYPE_CHECKING, TypeVar
 import uuid
 
 from typing_extensions import ParamSpec
 
 if TYPE_CHECKING:
-    from sky.skypilot_config import ConfigContext
+    pass
 
 _PROCESS_GLOBAL_VARS = {}
 
@@ -47,7 +50,7 @@ class RequestLogTruncationMarker(NamedTuple):
 
 
 def parse_request_log_truncation_marker(
-        prefix: bytes) -> Optional[RequestLogTruncationMarker]:
+        prefix: bytes) -> RequestLogTruncationMarker | None:
     """Parse a bounded request-log marker, if present."""
     marker_prefix = REQUEST_LOG_TRUNCATION_MARKER_PREFIX.encode('utf-8')
     if not prefix.startswith(marker_prefix):
@@ -186,7 +189,7 @@ class _TruncatingLogFile:
         return getattr(self._file, name)
 
 
-class SkyPilotContext(object):
+class SkyPilotContext:
     """SkyPilot typed context vars for threads and coroutines.
 
     This is a wrapper around `contextvars.ContextVar` that provides a typed
@@ -240,7 +243,7 @@ class SkyPilotContext(object):
         # propagate cancellation into blocking sync work that cannot poll
         # is_canceled() — e.g. a gRPC streaming iterator stuck in
         # threading.Condition.wait() inside __next__.
-        self._cancel_callbacks: List[Callable[[], None]] = []
+        self._cancel_callbacks: list[Callable[[], None]] = []
         self._cancel_callbacks_lock = threading.Lock()
 
     def cancel(self):
@@ -290,8 +293,8 @@ class SkyPilotContext(object):
                 pass
 
     def redirect_log(self,
-                     log_file: Optional[pathlib.Path],
-                     max_bytes: Optional[int] = None) -> Optional[pathlib.Path]:
+                     log_file: pathlib.Path | None,
+                     max_bytes: int | None = None) -> pathlib.Path | None:
         """Redirect the stdout and stderr of current context to a file.
 
         Args:
@@ -325,7 +328,7 @@ class SkyPilotContext(object):
         else:
             return self._log_file_handle
 
-    def override_envs(self, envs: Dict[str, str]):
+    def override_envs(self, envs: dict[str, str]):
         for k, v in envs.items():
             self.env_overrides[k] = v
 
@@ -338,7 +341,7 @@ class SkyPilotContext(object):
     def set_var(self, key: str, value: Any):
         self.vars[key] = value
 
-    def get_var(self, key: str) -> Optional[Any]:
+    def get_var(self, key: str) -> Any | None:
         return self.vars.get(key)
 
     def __enter__(self):
@@ -364,11 +367,11 @@ class SkyPilotContext(object):
         return new_context
 
 
-_CONTEXT = contextvars.ContextVar[Optional[SkyPilotContext]]('sky_context',
-                                                             default=None)
+_CONTEXT = contextvars.ContextVar[SkyPilotContext | None]('sky_context',
+                                                          default=None)
 
 
-def get() -> Optional[SkyPilotContext]:
+def get() -> SkyPilotContext | None:
     """Get the current SkyPilot context.
 
     If the context is not initialized, get() will return None. This helps
@@ -515,7 +518,7 @@ class ContextualEnviron(MutableMapping[str, str]):
             f'{key!r}: {value!r}' for key, value in self.items())
         return f'ctx_environ({{{formatted_items}}})'
 
-    def copy(self) -> Dict[str, str]:
+    def copy(self) -> dict[str, str]:
         copied = self._environ.copy()
         ctx = get()
         if ctx is not None:
@@ -618,8 +621,7 @@ def contextual_async(
     return wrapper
 
 
-def initialize(
-        base_context: Optional[SkyPilotContext] = None) -> SkyPilotContext:
+def initialize(base_context: SkyPilotContext | None = None) -> SkyPilotContext:
     """Initialize the current SkyPilot context."""
     new_context = base_context.copy(
     ) if base_context is not None else SkyPilotContext()

@@ -25,7 +25,7 @@ sky.server.versions module for more details.
 """
 import os
 import typing
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any
 
 from sky import admin_policy
 from sky import serve
@@ -82,7 +82,7 @@ _SERVER_OWNED_ENV_VARS = frozenset({
 })
 
 
-def remove_server_owned_env_vars(env_vars: Dict[str, str]) -> None:
+def remove_server_owned_env_vars(env_vars: dict[str, str]) -> None:
     """Remove deployment-owned variables from a client environment in place."""
     for env_var in tuple(env_vars):
         if (env_var.startswith(constants.SKYPILOT_SERVER_ENV_VAR_PREFIX) or
@@ -128,7 +128,7 @@ def request_body_env_vars() -> dict:
     return env_vars
 
 
-def get_override_skypilot_config_from_client() -> Dict[str, Any]:
+def get_override_skypilot_config_from_client() -> dict[str, Any]:
     """Returns the override configs from the client."""
     if annotations.is_on_api_server:
         return {}
@@ -143,7 +143,7 @@ def get_override_skypilot_config_from_client() -> Dict[str, Any]:
     return config
 
 
-def get_override_skypilot_config_path_from_client() -> Optional[str]:
+def get_override_skypilot_config_path_from_client() -> str | None:
     """Returns the override config path from the client."""
     if annotations.is_on_api_server:
         return None
@@ -167,14 +167,14 @@ class BasePayload(pydantic.BaseModel):
 
 class RequestBody(BasePayload):
     """The request body for the SkyPilot API."""
-    env_vars: Dict[str, str] = {}
+    env_vars: dict[str, str] = {}
     entrypoint: str = ''
     entrypoint_command: str = ''
     using_remote_api_server: bool = False
-    override_skypilot_config: Optional[Dict[str, Any]] = {}
-    override_skypilot_config_path: Optional[str] = None
+    override_skypilot_config: dict[str, Any] | None = {}
+    override_skypilot_config_path: str | None = None
     # Blob ID for uploaded file mounts
-    file_mounts_blob_id: Optional[str] = None
+    file_mounts_blob_id: str | None = None
     # The client's API_VERSION as captured server-side from the
     # `X-SkyPilot-API-Version` request header in `prepare_request_async`
     # (the FastAPI dispatch context, where the `_remote_api_version`
@@ -187,7 +187,7 @@ class RequestBody(BasePayload):
     # dashboard apiClient also sets it) gets the right value without
     # client-specific code. `None` means the request arrived without
     # the header — i.e. an old client.
-    client_api_version: Optional[int] = None
+    client_api_version: int | None = None
 
     def __init__(self, **data):
         data['env_vars'] = data.get('env_vars', request_body_env_vars())
@@ -207,7 +207,7 @@ class RequestBody(BasePayload):
             get_override_skypilot_config_path_from_client())
         super().__init__(**data)
 
-    def to_kwargs(self) -> Dict[str, Any]:
+    def to_kwargs(self) -> dict[str, Any]:
         """Convert the request body to a kwargs dictionary on API server.
 
         This converts the request body into kwargs for the underlying SkyPilot
@@ -225,32 +225,32 @@ class RequestBody(BasePayload):
         return kwargs
 
     @property
-    def user_hash(self) -> Optional[str]:
+    def user_hash(self) -> str | None:
         return self.env_vars.get(constants.USER_ID_ENV_VAR)
 
 
 class CheckBody(RequestBody):
     """The request body for the check endpoint."""
-    clouds: Optional[Tuple[str, ...]] = None
+    clouds: tuple[str, ...] | None = None
     verbose: bool = False
-    workspace: Optional[str] = None
+    workspace: str | None = None
 
 
 class EnabledCloudsBody(RequestBody):
     """The request body for the enabled clouds endpoint."""
-    workspace: Optional[str] = None
+    workspace: str | None = None
     expand: bool = False
 
 
 class EnabledCloudsBatchBody(RequestBody):
     """The request body for the batch enabled clouds endpoint."""
-    workspaces: List[str]
+    workspaces: list[str]
     expand: bool = False
 
 
 class KubernetesLabelGpusBody(RequestBody):
     """The request body for the GPU labeling endpoint."""
-    context: Optional[str] = None
+    context: str | None = None
     cleanup_only: bool = False
     wait_for_completion: bool = True
 
@@ -259,7 +259,7 @@ class DagRequestBody(RequestBody):
     """Request body base class for endpoints with a dag."""
     dag: str
 
-    def to_kwargs(self) -> Dict[str, Any]:
+    def to_kwargs(self) -> dict[str, Any]:
         # Import here to avoid requirement of the whole SkyPilot dependency on
         # local clients.
         # pylint: disable=import-outside-toplevel
@@ -277,9 +277,9 @@ class DagRequestBody(RequestBody):
 
 class DagRequestBodyWithRequestOptions(DagRequestBody):
     """Request body base class for endpoints with a dag and request options."""
-    request_options: Optional[admin_policy.RequestOptions]
+    request_options: admin_policy.RequestOptions | None
 
-    def get_request_options(self) -> Optional[admin_policy.RequestOptions]:
+    def get_request_options(self) -> admin_policy.RequestOptions | None:
         """Get the request options."""
         if self.request_options is None:
             return None
@@ -287,7 +287,7 @@ class DagRequestBodyWithRequestOptions(DagRequestBody):
             return admin_policy.RequestOptions(**self.request_options)
         return self.request_options
 
-    def to_kwargs(self) -> Dict[str, Any]:
+    def to_kwargs(self) -> dict[str, Any]:
         kwargs = super().to_kwargs()
         kwargs['request_options'] = self.get_request_options()
         return kwargs
@@ -310,14 +310,14 @@ class LaunchBody(RequestBody):
     cluster_name: str
     retry_until_up: bool = False
     # TODO(aylei): remove this field in v0.12.0
-    idle_minutes_to_autostop: Optional[int] = None
+    idle_minutes_to_autostop: int | None = None
     dryrun: bool = False
     # TODO(aylei): remove this field in v0.12.0
     down: bool = False
-    backend: Optional[str] = None
+    backend: str | None = None
     optimize_target: common_lib.OptimizeTarget = common_lib.OptimizeTarget.COST
     no_setup: bool = False
-    clone_disk_from: Optional[str] = None
+    clone_disk_from: str | None = None
     fast: bool = False
     # Internal only:
     # pylint: disable=invalid-name
@@ -325,7 +325,7 @@ class LaunchBody(RequestBody):
     is_launched_by_jobs_controller: bool = False
     is_launched_by_sky_serve_controller: bool = False
     disable_controller_check: bool = False
-    extra_launch_context: Dict[str, Any] = {}
+    extra_launch_context: dict[str, Any] = {}
     # When True and the server supports it (API_VERSION >=
     # MIN_LAUNCH_CREDENTIALS_API_VERSION), the launch result will be a
     # 3-tuple (job_id, handle, credentials) instead of (job_id, handle).
@@ -334,7 +334,7 @@ class LaunchBody(RequestBody):
     # set against any server.
     include_credentials: bool = False
 
-    def to_kwargs(self) -> Dict[str, Any]:
+    def to_kwargs(self) -> dict[str, Any]:
 
         kwargs = super().to_kwargs()
         dag = common.process_mounts_in_task_on_api_server(
@@ -365,9 +365,9 @@ class ExecBody(RequestBody):
     cluster_name: str
     dryrun: bool = False
     down: bool = False
-    backend: Optional[str] = None
+    backend: str | None = None
 
-    def to_kwargs(self) -> Dict[str, Any]:
+    def to_kwargs(self) -> dict[str, Any]:
 
         kwargs = super().to_kwargs()
         dag = common.process_mounts_in_task_on_api_server(
@@ -386,12 +386,12 @@ class StopOrDownBody(RequestBody):
     cluster_name: str
     purge: bool = False
     graceful: bool = False
-    graceful_timeout: Optional[int] = None
+    graceful_timeout: int | None = None
 
 
 class StatusBody(RequestBody):
     """The request body for the status endpoint."""
-    cluster_names: Optional[List[str]] = None
+    cluster_names: list[str] | None = None
     refresh: common_lib.StatusRefreshMode = common_lib.StatusRefreshMode.NONE
     all_users: bool = True
     # TODO (kyuds): default to False post 0.12.0
@@ -406,8 +406,8 @@ class StatusBody(RequestBody):
 class StartBody(RequestBody):
     """The request body for the start endpoint."""
     cluster_name: str
-    idle_minutes_to_autostop: Optional[int] = None
-    wait_for: Optional[autostop_lib.AutostopWaitFor] = None
+    idle_minutes_to_autostop: int | None = None
+    wait_for: autostop_lib.AutostopWaitFor | None = None
     retry_until_up: bool = False
     down: bool = False
     force: bool = False
@@ -417,10 +417,10 @@ class AutostopBody(RequestBody):
     """The request body for the autostop endpoint."""
     cluster_name: str
     idle_minutes: int
-    wait_for: Optional[autostop_lib.AutostopWaitFor] = None
+    wait_for: autostop_lib.AutostopWaitFor | None = None
     down: bool = False
-    hook: Optional[str] = None
-    hook_timeout: Optional[int] = None
+    hook: str | None = None
+    hook_timeout: int | None = None
 
 
 class QueueBody(RequestBody):
@@ -433,14 +433,14 @@ class QueueBody(RequestBody):
 class CancelBody(RequestBody):
     """The request body for the cancel endpoint."""
     cluster_name: str
-    job_ids: Optional[List[int]]
+    job_ids: list[int] | None
     all: bool = False
     all_users: bool = False
     # Internal only. We cannot use prefix `_` because pydantic will not
     # include it in the request body.
     try_cancel_if_cluster_is_init: bool = False
 
-    def to_kwargs(self) -> Dict[str, Any]:
+    def to_kwargs(self) -> dict[str, Any]:
         kwargs = super().to_kwargs()
         kwargs['_try_cancel_if_cluster_is_init'] = kwargs.pop(
             'try_cancel_if_cluster_is_init')
@@ -450,7 +450,7 @@ class CancelBody(RequestBody):
 class ProvisionLogsBody(RequestBody):
     """Cluster node."""
     cluster_name: str
-    worker: Optional[int] = None
+    worker: int | None = None
 
 
 class HookLogsBody(RequestBody):
@@ -460,7 +460,7 @@ class HookLogsBody(RequestBody):
     whichever per-event log exists on the cluster.
     """
     cluster_name: str
-    event: Optional[str] = None
+    event: str | None = None
     follow: bool = True
     tail: int = 0
 
@@ -468,7 +468,7 @@ class HookLogsBody(RequestBody):
 class ClusterJobBody(RequestBody):
     """The request body for the cluster job endpoint."""
     cluster_name: str
-    job_id: Optional[int]
+    job_id: int | None
     follow: bool = True
     tail: int = 0
 
@@ -476,13 +476,13 @@ class ClusterJobBody(RequestBody):
 class ClusterJobsBody(RequestBody):
     """The request body for the cluster jobs endpoint."""
     cluster_name: str
-    job_ids: Optional[List[str]]
+    job_ids: list[str] | None
 
 
 class ClusterJobsDownloadLogsBody(RequestBody):
     """The request body for the cluster jobs download logs endpoint."""
     cluster_name: str
-    job_ids: Optional[List[str]]
+    job_ids: list[str] | None
     local_dir: str = constants.SKY_LOGS_DIRECTORY
 
 
@@ -490,7 +490,7 @@ class UserCreateBody(RequestBody):
     """The request body for the user create endpoint."""
     username: str
     password: str
-    role: Optional[str] = None
+    role: str | None = None
 
 
 class UserDeleteBody(RequestBody):
@@ -501,8 +501,8 @@ class UserDeleteBody(RequestBody):
 class UserUpdateBody(RequestBody):
     """The request body for the user update endpoint."""
     user_id: str
-    role: Optional[str] = None
-    password: Optional[str] = None
+    role: str | None = None
+    password: str | None = None
 
 
 class UserImportBody(RequestBody):
@@ -512,14 +512,14 @@ class UserImportBody(RequestBody):
 
 class UserBatchUpdateBody(RequestBody):
     """The request body for the user batch update endpoint."""
-    user_ids: List[str]
+    user_ids: list[str]
     role: str
 
 
 class ServiceAccountTokenCreateBody(RequestBody):
     """The request body for creating a service account token."""
     token_name: str
-    expires_in_days: Optional[int] = None
+    expires_in_days: int | None = None
 
 
 class ServiceAccountTokenDeleteBody(RequestBody):
@@ -546,12 +546,12 @@ class ServiceAccountTokenUpdateRoleBody(RequestBody):
 class ServiceAccountTokenRotateBody(RequestBody):
     """The request body for rotating a service account token."""
     token_id: str
-    expires_in_days: Optional[int] = None
+    expires_in_days: int | None = None
 
 
 class DownloadBody(RequestBody):
     """The request body for the download endpoint."""
-    folder_paths: List[str]
+    folder_paths: list[str]
 
 
 class StorageBody(RequestBody):
@@ -564,18 +564,18 @@ class VolumeApplyBody(RequestBody):
     name: str
     volume_type: str
     cloud: str
-    region: Optional[str] = None
-    zone: Optional[str] = None
-    size: Optional[str] = None
-    config: Optional[Dict[str, Any]] = None
-    labels: Optional[Dict[str, str]] = None
-    use_existing: Optional[bool] = None
-    creation_yaml: Optional[str] = None
+    region: str | None = None
+    zone: str | None = None
+    size: str | None = None
+    config: dict[str, Any] | None = None
+    labels: dict[str, str] | None = None
+    use_existing: bool | None = None
+    creation_yaml: str | None = None
 
 
 class VolumeDeleteBody(RequestBody):
     """The request body for the volume delete endpoint."""
-    names: List[str]
+    names: list[str]
     purge: bool = False
 
 
@@ -586,40 +586,40 @@ class VolumeListBody(RequestBody):
 
 class VolumeValidateBody(RequestBody):
     """The request body for the volume validate endpoint."""
-    name: Optional[str] = None
-    volume_type: Optional[str] = None
-    infra: Optional[str] = None
-    size: Optional[str] = None
-    labels: Optional[Dict[str, str]] = None
-    config: Optional[Dict[str, Any]] = None
-    use_existing: Optional[bool] = None
+    name: str | None = None
+    volume_type: str | None = None
+    infra: str | None = None
+    size: str | None = None
+    labels: dict[str, str] | None = None
+    config: dict[str, Any] | None = None
+    use_existing: bool | None = None
 
 
 class EndpointsBody(RequestBody):
     """The request body for the endpoint."""
     cluster: str
-    port: Optional[Union[int, str]] = None
+    port: int | str | None = None
 
 
 class ServeEndpointBody(RequestBody):
     """The request body for the serve controller endpoint."""
-    port: Optional[Union[int, str]] = None
+    port: int | str | None = None
 
 
 class JobStatusBody(RequestBody):
     """The request body for the job status endpoint."""
     cluster_name: str
-    job_ids: Optional[List[int]]
+    job_ids: list[int] | None
 
 
 class JobsLaunchBody(RequestBody):
     """The request body for the jobs launch endpoint."""
     task: str
-    name: Optional[str]
-    pool: Optional[str] = None
-    num_jobs: Optional[int] = None
+    name: str | None
+    pool: str | None = None
+    num_jobs: int | None = None
 
-    def to_kwargs(self) -> Dict[str, Any]:
+    def to_kwargs(self) -> dict[str, Any]:
         kwargs = super().to_kwargs()
         kwargs['task'] = common.process_mounts_in_task_on_api_server(
             self.task,
@@ -638,7 +638,7 @@ class JobsQueueBody(RequestBody):
     refresh: bool = False
     skip_finished: bool = False
     all_users: bool = False
-    job_ids: Optional[List[int]] = None
+    job_ids: list[int] | None = None
 
 
 class JobsQueueV2Body(RequestBody):
@@ -646,79 +646,79 @@ class JobsQueueV2Body(RequestBody):
     refresh: bool = False
     skip_finished: bool = False
     all_users: bool = False
-    job_ids: Optional[List[int]] = None
-    user_match: Optional[str] = None
-    workspace_match: Optional[str] = None
-    name_match: Optional[str] = None
-    pool_match: Optional[str] = None
-    page: Optional[int] = None
-    limit: Optional[int] = None
-    statuses: Optional[List[str]] = None
+    job_ids: list[int] | None = None
+    user_match: str | None = None
+    workspace_match: str | None = None
+    name_match: str | None = None
+    pool_match: str | None = None
+    page: int | None = None
+    limit: int | None = None
+    statuses: list[str] | None = None
     # The fields to return in the response.
     # Refer to the fields in the `class ManagedJobRecord` in `response.py`
-    fields: Optional[List[str]] = None
+    fields: list[str] | None = None
     # Sorting parameters, added in ManagedJobsService v14.
-    sort_by: Optional[str] = None  # Field to sort by (e.g., 'job_id', 'name')
-    sort_order: Optional[str] = None  # 'asc' or 'desc'
+    sort_by: str | None = None  # Field to sort by (e.g., 'job_id', 'name')
+    sort_order: str | None = None  # 'asc' or 'desc'
     # Time-range filter on submitted_at (epoch seconds).
-    submitted_after: Optional[float] = None
-    submitted_before: Optional[float] = None
+    submitted_after: float | None = None
+    submitted_before: float | None = None
 
 
 class JobsCancelBody(RequestBody):
     """The request body for the jobs cancel endpoint."""
-    name: Optional[str] = None
-    job_ids: Optional[List[int]] = None
+    name: str | None = None
+    job_ids: list[int] | None = None
     all: bool = False
     all_users: bool = False
-    pool: Optional[str] = None
+    pool: str | None = None
     graceful: bool = False
-    graceful_timeout: Optional[int] = None
+    graceful_timeout: int | None = None
 
 
 class JobsLogsBody(RequestBody):
     """The request body for the jobs logs endpoint."""
-    name: Optional[str] = None
-    job_id: Optional[int] = None
+    name: str | None = None
+    job_id: int | None = None
     follow: bool = True
     controller: bool = False
     refresh: bool = False
-    tail: Optional[int] = None
+    tail: int | None = None
     # Skip the last `tail_offset` lines from the end of the file before
     # taking `tail` lines. Used by the dashboard live-tail UI to fetch
     # progressively older windows without re-reading the whole file.
-    tail_offset: Optional[int] = None
+    tail_offset: int | None = None
     # Task identifier: int for task_id, str for task_name
-    task: Optional[Union[str, int]] = None
+    task: str | int | None = None
 
 
 class JobsWaitBody(RequestBody):
     """The request body for the jobs wait endpoint."""
-    name: Optional[str] = None
-    job_id: Optional[int] = None
+    name: str | None = None
+    job_id: int | None = None
     # Timeout in seconds. None means wait forever.
-    timeout: Optional[int] = None
+    timeout: int | None = None
     # Polling interval in seconds. Minimum 5, default 15.
     poll_interval: int = 15
     # Task identifier for JobGroups: int for task_id, str for task_name.
     # If None, waits for all tasks.
-    task: Optional[Union[str, int]] = None
+    task: str | int | None = None
 
 
 class RequestCancelBody(RequestBody):
     """The request body for the API request cancellation endpoint."""
     # Kill all requests if request_ids is None.
-    request_ids: Optional[List[str]] = None
-    user_id: Optional[str] = None
+    request_ids: list[str] | None = None
+    user_id: str | None = None
 
 
 class RequestStatusBody(pydantic.BaseModel):
     """The request body for the API request status endpoint."""
-    request_ids: Optional[List[str]] = None
+    request_ids: list[str] | None = None
     all_status: bool = False
-    limit: Optional[int] = None
-    fields: Optional[List[str]] = None
-    cluster_name: Optional[str] = None
+    limit: int | None = None
+    fields: list[str] | None = None
+    cluster_name: str | None = None
 
 
 class ServeUpBody(RequestBody):
@@ -726,7 +726,7 @@ class ServeUpBody(RequestBody):
     task: str
     service_name: str
 
-    def to_kwargs(self) -> Dict[str, Any]:
+    def to_kwargs(self) -> dict[str, Any]:
         kwargs = super().to_kwargs()
         dag = common.process_mounts_in_task_on_api_server(
             self.task,
@@ -746,7 +746,7 @@ class ServeUpdateBody(RequestBody):
     service_name: str
     mode: serve.UpdateMode
 
-    def to_kwargs(self) -> Dict[str, Any]:
+    def to_kwargs(self) -> dict[str, Any]:
         kwargs = super().to_kwargs()
         dag = common.process_mounts_in_task_on_api_server(
             self.task,
@@ -762,7 +762,7 @@ class ServeUpdateBody(RequestBody):
 
 class ServeDownBody(RequestBody):
     """The request body for the serve down endpoint."""
-    service_names: Optional[Union[str, List[str]]]
+    service_names: str | list[str] | None
     all: bool = False
     purge: bool = False
 
@@ -770,59 +770,59 @@ class ServeDownBody(RequestBody):
 class ServeLogsBody(RequestBody):
     """The request body for the serve logs endpoint."""
     service_name: str
-    target: Union[str, serve.ServiceComponent]
-    replica_id: Optional[int] = None
+    target: str | serve.ServiceComponent
+    replica_id: int | None = None
     follow: bool = True
-    tail: Optional[int] = None
+    tail: int | None = None
 
 
 class ServeDownloadLogsBody(RequestBody):
     """The request body for the serve download logs endpoint."""
     service_name: str
     local_dir: str
-    targets: Optional[Union[str, serve.ServiceComponent,
-                            List[Union[str, serve.ServiceComponent]]]]
-    replica_ids: Optional[List[int]] = None
-    tail: Optional[int] = None
+    targets: str | serve.ServiceComponent | list[str |
+                                                 serve.ServiceComponent] | None
+    replica_ids: list[int] | None = None
+    tail: int | None = None
 
 
 class ServeStatusBody(RequestBody):
     """The request body for the serve status endpoint."""
-    service_names: Optional[Union[str, List[str]]]
+    service_names: str | list[str] | None
     # Skip per-replica info; return cheap replica_status_counts instead.
     # Used by the dashboard for fast list/header rendering at fleet scale.
     summary_only: bool = False
     # Optional override for target_num_replicas. If unset, the server keeps
     # full status behavior (include targets) but leaves summary-only requests
     # on the cheap DB-only path.
-    include_target_num_replicas: Optional[bool] = None
+    include_target_num_replicas: bool | None = None
 
 
 class RealtimeGpuAvailabilityRequestBody(RequestBody):
     """The request body for the realtime GPU availability endpoint."""
-    context: Optional[str] = None
-    name_filter: Optional[str] = None
-    quantity_filter: Optional[int] = None
-    is_ssh: Optional[bool] = None
+    context: str | None = None
+    name_filter: str | None = None
+    quantity_filter: int | None = None
+    is_ssh: bool | None = None
 
 
 class KubernetesNodeInfoRequestBody(RequestBody):
     """The request body for the kubernetes node info endpoint."""
-    context: Optional[str] = None
+    context: str | None = None
 
 
 class SlurmNodeInfoRequestBody(RequestBody):
     """The request body for the slurm node info endpoint."""
-    slurm_cluster_name: Optional[str] = None
+    slurm_cluster_name: str | None = None
 
 
 class ListAcceleratorsBody(RequestBody):
     """The request body for the list accelerators endpoint."""
     gpus_only: bool = True
-    name_filter: Optional[str] = None
-    region_filter: Optional[str] = None
-    quantity_filter: Optional[int] = None
-    clouds: Optional[Union[List[str], str]] = None
+    name_filter: str | None = None
+    region_filter: str | None = None
+    quantity_filter: int | None = None
+    clouds: list[str] | str | None = None
     all_regions: bool = False
     require_price: bool = True
     case_sensitive: bool = True
@@ -831,27 +831,27 @@ class ListAcceleratorsBody(RequestBody):
 class ListAcceleratorCountsBody(RequestBody):
     """The request body for the list accelerator counts endpoint."""
     gpus_only: bool = True
-    name_filter: Optional[str] = None
-    region_filter: Optional[str] = None
-    quantity_filter: Optional[int] = None
-    clouds: Optional[Union[List[str], str]] = None
+    name_filter: str | None = None
+    region_filter: str | None = None
+    quantity_filter: int | None = None
+    clouds: list[str] | str | None = None
 
 
 class LocalUpBody(RequestBody):
     """The request body for the local up endpoint."""
     gpus: bool = True
-    name: Optional[str] = None
-    port_start: Optional[int] = None
+    name: str | None = None
+    port_start: int | None = None
 
 
 class LocalDownBody(RequestBody):
     """The request body for the local down endpoint."""
-    name: Optional[str] = None
+    name: str | None = None
 
 
 class SSHUpBody(RequestBody):
     """The request body for the SSH up/down endpoints."""
-    infra: Optional[str] = None
+    infra: str | None = None
     cleanup: bool = False
 
 
@@ -864,21 +864,21 @@ class ServeTerminateReplicaBody(RequestBody):
 
 class KillRequestProcessesBody(RequestBody):
     """The request body for the kill request processes endpoint."""
-    request_ids: List[str]
+    request_ids: list[str]
 
 
 class StreamBody(pydantic.BaseModel):
     """The request body for the stream endpoint."""
-    request_id: Optional[str] = None
-    log_path: Optional[str] = None
-    tail: Optional[int] = None
+    request_id: str | None = None
+    log_path: str | None = None
+    tail: int | None = None
     plain_logs: bool = True
 
 
 class JobsDownloadLogsBody(RequestBody):
     """The request body for the jobs download logs endpoint."""
-    name: Optional[str]
-    job_id: Optional[int]
+    name: str | None
+    job_id: int | None
     refresh: bool = False
     controller: bool = False
     local_dir: str = constants.SKY_LOGS_DIRECTORY
@@ -886,12 +886,12 @@ class JobsDownloadLogsBody(RequestBody):
 
 class JobsPoolApplyBody(RequestBody):
     """The request body for the jobs pool apply endpoint."""
-    task: Optional[str] = None
-    workers: Optional[int] = None
+    task: str | None = None
+    workers: int | None = None
     pool_name: str
     mode: serve.UpdateMode
 
-    def to_kwargs(self) -> Dict[str, Any]:
+    def to_kwargs(self) -> dict[str, Any]:
         kwargs = super().to_kwargs()
         if self.task is not None:
             dag = common.process_mounts_in_task_on_api_server(
@@ -910,51 +910,51 @@ class JobsPoolApplyBody(RequestBody):
 
 class JobsPoolDownBody(RequestBody):
     """The request body for the jobs pool down endpoint."""
-    pool_names: Optional[Union[str, List[str]]]
+    pool_names: str | list[str] | None
     all: bool = False
     purge: bool = False
 
 
 class JobsPoolStatusBody(RequestBody):
     """The request body for the jobs pool status endpoint."""
-    pool_names: Optional[Union[str, List[str]]]
+    pool_names: str | list[str] | None
 
 
 class JobsPoolLogsBody(RequestBody):
     """The request body for the jobs pool logs endpoint."""
     pool_name: str
-    target: Union[str, serve.ServiceComponent]
-    worker_id: Optional[int] = None
+    target: str | serve.ServiceComponent
+    worker_id: int | None = None
     follow: bool = True
-    tail: Optional[int] = None
+    tail: int | None = None
 
 
 class JobsPoolDownloadLogsBody(RequestBody):
     """The request body for the jobs pool download logs endpoint."""
     pool_name: str
     local_dir: str
-    targets: Optional[Union[str, serve.ServiceComponent,
-                            List[Union[str, serve.ServiceComponent]]]]
-    worker_ids: Optional[List[int]] = None
-    tail: Optional[int] = None
+    targets: str | serve.ServiceComponent | list[str |
+                                                 serve.ServiceComponent] | None
+    worker_ids: list[int] | None = None
+    tail: int | None = None
 
 
 class UploadZipFileResponse(pydantic.BaseModel):
     """The response body for the upload zip file endpoint."""
     status: str
-    missing_chunks: Optional[List[str]] = None
+    missing_chunks: list[str] | None = None
 
 
 class UpdateWorkspaceBody(RequestBody):
     """The request body for updating a specific workspace configuration."""
     workspace_name: str = ''  # Will be set from path parameter
-    config: Dict[str, Any]
+    config: dict[str, Any]
 
 
 class CreateWorkspaceBody(RequestBody):
     """The request body for creating a new workspace."""
     workspace_name: str = ''  # Will be set from path parameter
-    config: Dict[str, Any]
+    config: dict[str, Any]
 
 
 class DeleteWorkspaceBody(RequestBody):
@@ -964,19 +964,19 @@ class DeleteWorkspaceBody(RequestBody):
 
 class WorkspaceBatchAddUsersBody(RequestBody):
     """The request body for adding users to multiple workspaces."""
-    workspace_names: List[str]
-    user_ids: List[str]
+    workspace_names: list[str]
+    user_ids: list[str]
 
 
 class WorkspaceBatchRemoveUsersBody(RequestBody):
     """The request body for removing users from multiple workspaces."""
-    workspace_names: List[str]
-    user_ids: List[str]
+    workspace_names: list[str]
+    user_ids: list[str]
 
 
 class UpdateConfigBody(RequestBody):
     """The request body for updating the entire SkyPilot configuration."""
-    config: Dict[str, Any]
+    config: dict[str, Any]
 
 
 class GetConfigBody(RequestBody):
@@ -991,20 +991,20 @@ class UserPreferredWorkspaceBody(RequestBody):
     to clear the preference. RBAC is validated server-side in
     sky/workspaces/core.set_user_preferred_workspace().
     """
-    preferred: Optional[str] = None
+    preferred: str | None = None
 
 
 class CostReportBody(RequestBody):
     """The request body for the cost report endpoint."""
-    days: Optional[int] = 30
+    days: int | None = 30
     # we use hashes instead of names to avoid the case where
     # the name is not unique
-    cluster_hashes: Optional[List[str]] = None
+    cluster_hashes: list[str] | None = None
     # Filter by cluster name. Useful for the dashboard, which routes a
     # torn-down cluster's detail page by name (the URL param is the
     # cluster name, not the hash). When both cluster_hashes and
     # cluster_names are set, rows matching either are returned.
-    cluster_names: Optional[List[str]] = None
+    cluster_names: list[str] | None = None
     # Only return fields that are needed for the dashboard
     # summary page
     dashboard_summary_response: bool = False
@@ -1016,12 +1016,12 @@ class CostReportBody(RequestBody):
 
 class CreateDebugDumpBody(RequestBody):
     """The request body for the debug dump init endpoint."""
-    request_ids: Optional[List[str]] = None
-    cluster_names: Optional[List[str]] = None
-    managed_job_ids: Optional[List[int]] = None
-    recent_minutes: Optional[float] = None
+    request_ids: list[str] | None = None
+    cluster_names: list[str] | None = None
+    managed_job_ids: list[int] | None = None
+    recent_minutes: float | None = None
     # Client-side info for troubleshooting (version, config, environment)
-    client_info: Optional[Dict[str, Any]] = None
+    client_info: dict[str, Any] | None = None
 
 
 class RequestPayload(BasePayload):
@@ -1036,28 +1036,28 @@ class RequestPayload(BasePayload):
     user_id: str
     return_value: str
     error: str
-    pid: Optional[int]
+    pid: int | None
     schedule_type: str
-    user_name: Optional[str] = None
+    user_name: str | None = None
     # Resources the request operates on.
-    cluster_name: Optional[str] = None
-    status_msg: Optional[str] = None
+    cluster_name: str | None = None
+    status_msg: str | None = None
     should_retry: bool = False
-    finished_at: Optional[float] = None
-    file_mounts_blob_id: Optional[str] = None
+    finished_at: float | None = None
+    file_mounts_blob_id: str | None = None
 
 
 class SlurmGpuAvailabilityRequestBody(RequestBody):
     """Request body for getting Slurm real-time GPU availability."""
-    slurm_cluster_name: Optional[str] = None
-    name_filter: Optional[str] = None
-    quantity_filter: Optional[int] = None
+    slurm_cluster_name: str | None = None
+    name_filter: str | None = None
+    quantity_filter: int | None = None
 
 
 class ClusterEventsBody(RequestBody):
     """The request body for the cluster events endpoint."""
-    cluster_name: Optional[str] = None
-    cluster_hash: Optional[str] = None
+    cluster_name: str | None = None
+    cluster_hash: str | None = None
     # Event type to retrieve (e.g. 'STATUS_CHANGE' or 'DEBUG'). Multiple types
     # may be requested as a comma-separated string (e.g.
     # 'STATUS_CHANGE,LAUNCH_PROGRESS'); results are merged by timestamp.
@@ -1066,15 +1066,14 @@ class ClusterEventsBody(RequestBody):
     # so callers don't have to encode the list as a comma-separated string.
     event_type: str
     include_timestamps: bool = False
-    limit: Optional[
-        int] = None  # If specified, returns at most this many events
+    limit: int | None = None  # If specified, returns at most this many events
 
 
 class GetJobEventsBody(RequestBody):
     """The request body for the get job task events endpoint."""
     job_id: int
-    task_id: Optional[int] = None
-    limit: Optional[int] = 10  # Default to 10 most recent task events
+    task_id: int | None = None
+    limit: int | None = 10  # Default to 10 most recent task events
     # When True, merge in launch-progress events from the job's underlying
     # cluster (e.g. image pulling) so the timeline shows provisioning
     # milestones between STARTING and RUNNING. Defaults to False to keep the
@@ -1091,10 +1090,9 @@ class RecipeListBody(RequestBody):
     """The request body for listing recipes."""
     pinned_only: bool = False
     my_recipes_only: bool = False
-    recipe_type: Optional[
-        str] = None  # See RecipeType: 'cluster', 'job', 'pool', 'volume'
+    recipe_type: str | None = None  # See RecipeType: 'cluster', 'job', 'pool', 'volume'
 
-    def to_kwargs(self) -> Dict[str, Any]:
+    def to_kwargs(self) -> dict[str, Any]:
         kwargs = super().to_kwargs()
         # Inject user_id from env_vars for filtering by user
         # Fallback to 'local' for unauthenticated local servers
@@ -1113,10 +1111,10 @@ class RecipeCreateBody(RequestBody):
     name: str
     content: str
     recipe_type: str  # See RecipeType: 'cluster', 'job', 'pool', 'volume'
-    description: Optional[str] = None
-    owner_name: Optional[str] = None  # Override user_name for unauthenticated
+    description: str | None = None
+    owner_name: str | None = None  # Override user_name for unauthenticated
 
-    def to_kwargs(self) -> Dict[str, Any]:
+    def to_kwargs(self) -> dict[str, Any]:
         kwargs = super().to_kwargs()
         # Inject user_id and user_name from env_vars
         # Fallback to 'local' for unauthenticated local servers
@@ -1137,10 +1135,10 @@ class RecipeCreateBody(RequestBody):
 class RecipeUpdateBody(RequestBody):
     """The request body for updating an existing recipe."""
     recipe_name: str
-    description: Optional[str] = None
-    content: Optional[str] = None
+    description: str | None = None
+    content: str | None = None
 
-    def to_kwargs(self) -> Dict[str, Any]:
+    def to_kwargs(self) -> dict[str, Any]:
         kwargs = super().to_kwargs()
         # Inject user_id and user_name from env_vars
         # Fallback to 'local' for unauthenticated local servers
@@ -1154,7 +1152,7 @@ class RecipeDeleteBody(RequestBody):
     """The request body for deleting a recipe."""
     recipe_name: str
 
-    def to_kwargs(self) -> Dict[str, Any]:
+    def to_kwargs(self) -> dict[str, Any]:
         kwargs = super().to_kwargs()
         # Inject user_id from env_vars for ownership check
         # Fallback to 'local' for unauthenticated local servers

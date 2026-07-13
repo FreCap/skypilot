@@ -4,7 +4,6 @@ import os
 import re
 import shutil
 import tempfile
-from typing import Dict, List, Optional, Tuple
 
 import colorama
 
@@ -49,7 +48,7 @@ class HuggingFaceStore(AbstractStore):
     # mapped to the URL path segment that prefixes ``<ns>/<name>`` in an
     # ``hf://`` URL and in the ``hf-mount`` CLI argument. Models have no
     # prefix; datasets/spaces do.
-    _REPO_TYPE_TO_URL_PREFIX: Dict[str, str] = {
+    _REPO_TYPE_TO_URL_PREFIX: dict[str, str] = {
         'model': '',
         'dataset': 'datasets/',
         'space': 'spaces/',
@@ -80,16 +79,16 @@ class HuggingFaceStore(AbstractStore):
 
     def __init__(self,
                  name: str,
-                 source: Optional[SourceType],
-                 region: Optional[str] = None,
-                 is_sky_managed: Optional[bool] = None,
-                 sync_on_reconstruction: Optional[bool] = True,
-                 _bucket_sub_path: Optional[str] = None):
+                 source: SourceType | None,
+                 region: str | None = None,
+                 is_sky_managed: bool | None = None,
+                 sync_on_reconstruction: bool | None = True,
+                 _bucket_sub_path: str | None = None):
         # Classify bucket vs repo up front so we can dispatch in _validate /
         # validate_name / initialize. ``_repo_type`` is None for buckets and
         # one of the keys of ``_REPO_TYPE_TO_URL_PREFIX`` for repos.
-        self._repo_type: Optional[str] = None
-        self._revision: Optional[str] = None
+        self._repo_type: str | None = None
+        self._revision: str | None = None
         # ``_hf_id`` is the identifier passed to ``hf-mount`` (bucket id for
         # buckets; for repos it's e.g. ``datasets/ns/name`` - matching the
         # argument format ``hf-mount repo`` expects).
@@ -183,7 +182,7 @@ class HuggingFaceStore(AbstractStore):
                     'HF_TOKEN or run `hf auth login` to authenticate.')
 
     @classmethod
-    def validate_name(cls, name: str, repo_type: Optional[str] = None) -> str:
+    def validate_name(cls, name: str, repo_type: str | None = None) -> str:
         """Validates a Hugging Face bucket or repo identifier.
 
         Bucket ids are ``<namespace>/<bucket-name>``. Repo ids may additionally
@@ -290,7 +289,7 @@ class HuggingFaceStore(AbstractStore):
                     f'Failed to connect to Hugging Face {self._repo_type} '
                     f'{self._hf_id!r}: {e}') from e
 
-    def _get_bucket(self) -> Tuple[StorageHandle, bool]:
+    def _get_bucket(self) -> tuple[StorageHandle, bool]:
         """Gets the bucket, creating it if needed and allowed.
 
         Returns:
@@ -397,7 +396,7 @@ class HuggingFaceStore(AbstractStore):
                 f'Upload failed for store {self.name}') from e
 
     def _sync_local_sources(self,
-                            source_path_list: List[str],
+                            source_path_list: list[str],
                             create_dirs: bool = False) -> None:
         """Uploads local files/directories to the HF bucket.
 
@@ -423,8 +422,8 @@ class HuggingFaceStore(AbstractStore):
                                          log_path=log_path)):
             # Classify all sources up front so we fail loud on any missing
             # path before kicking off uploads.
-            dir_uploads: List[Tuple[str, str]] = []
-            files_to_add: List[Tuple[str, str]] = []
+            dir_uploads: list[tuple[str, str]] = []
+            files_to_add: list[tuple[str, str]] = []
             for raw_path in source_path_list:
                 path = os.path.abspath(os.path.expanduser(str(raw_path)))
                 if os.path.isdir(path):
@@ -573,7 +572,7 @@ class HuggingFaceStore(AbstractStore):
                                         files=[(remote_path, local_path)],
                                         token=self._token)
 
-    def _allow_patterns_for_sub_path(self) -> Optional[List[str]]:
+    def _allow_patterns_for_sub_path(self) -> list[str] | None:
         """Translates ``_bucket_sub_path`` into ``snapshot_download`` glob."""
         if not self._bucket_sub_path:
             return None
@@ -582,7 +581,7 @@ class HuggingFaceStore(AbstractStore):
     def mount_command(self,
                       mount_path: str,
                       read_only: bool = False,
-                      hf_mount_args: Optional[List[str]] = None) -> str:
+                      hf_mount_args: list[str] | None = None) -> str:
         """Returns a command to mount the HF bucket/repo at ``mount_path``.
 
         Uses the ``hf-mount`` NFS backend. The token file is expected to be
@@ -608,7 +607,7 @@ class HuggingFaceStore(AbstractStore):
 
     def mount_cached_command(self,
                              mount_path: str,
-                             config: Optional[MountCachedConfig] = None) -> str:
+                             config: MountCachedConfig | None = None) -> str:
         """Returns a command to mount the HF bucket/repo with local caching.
 
         ``hf-mount`` already provides an on-disk chunk cache (configured via

@@ -13,11 +13,13 @@ that can escape SQLAlchemy, and retry with exponential backoff + jitter.
 """
 
 import asyncio
+from collections.abc import Awaitable
+from collections.abc import Callable
 import functools
 import logging
 import socket
 import time
-from typing import Awaitable, Callable, Tuple, Type, TypeVar
+from typing import TypeVar
 
 import sqlalchemy.exc
 
@@ -28,12 +30,12 @@ logger = logging.getLogger(__name__)
 T = TypeVar('T')
 
 
-def _build_retryable_exceptions() -> Tuple[Type[BaseException], ...]:
+def _build_retryable_exceptions() -> tuple[type[BaseException], ...]:
     # `psycopg2.OperationalError` is the raw driver error; SQLAlchemy
     # wraps it for normal session.execute() paths, but anything that
     # uses `engine.raw_connection()` (notably `PostgresLock`) raises
     # the unwrapped class. Import lazily so sqlite-only installs work.
-    psycopg2_excs: Tuple[Type[BaseException], ...] = ()
+    psycopg2_excs: tuple[type[BaseException], ...] = ()
     try:
         import psycopg2  # pylint: disable=import-outside-toplevel
 

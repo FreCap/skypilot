@@ -1,7 +1,6 @@
 """Utilities for building middlewares."""
 import enum
 import http
-from typing import Type
 
 import fastapi
 import starlette.middleware.base
@@ -20,7 +19,7 @@ class WebSocketDecision(enum.Enum):
 
 
 def websocket_aware(
-        middleware_cls: Type[starlette.middleware.base.BaseHTTPMiddleware]):
+        middleware_cls: type[starlette.middleware.base.BaseHTTPMiddleware]):
     """Decorator to adapt BaseHTTPMiddleware to handle WebSockets.
 
     It assembles an HTTP-style request like the HTTP upgrade request during

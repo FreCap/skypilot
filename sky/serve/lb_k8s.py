@@ -23,6 +23,7 @@ Lifecycle/reaper helpers remain no-ops when the platform feature is disabled;
 starting a real service calls :func:`require_external_lb_runtime` and fails
 closed instead of falling back to an in-pod LB.
 """
+from collections.abc import Callable
 import copy
 import hashlib
 import ipaddress
@@ -32,7 +33,7 @@ import os
 import re
 import sys
 import time
-from typing import Any, Callable, Dict, NamedTuple, Optional, Set, Tuple
+from typing import Any, NamedTuple
 import urllib.parse
 
 from sky import sky_logging
@@ -114,12 +115,12 @@ class LbPodAuthority(NamedTuple):
     readiness has been withdrawn.
     """
 
-    ready_nonterminating_uids: Set[str]
-    live_uids: Set[str]
+    ready_nonterminating_uids: set[str]
+    live_uids: set[str]
 
 
 def _strategic_merge_patch(context: str, resource_path: str, response_type: str,
-                           name: str, namespace: str, body: Dict[str,
+                           name: str, namespace: str, body: dict[str,
                                                                  Any]) -> Any:
     """Patch a Kubernetes object with an explicit strategic-merge type.
 
@@ -155,7 +156,7 @@ def _strategic_merge_patch(context: str, resource_path: str, response_type: str,
 
 def lb_termination_grace_period_seconds(
         stream_timeout_seconds: float,
-        graceful_drain_seconds: Optional[float]) -> int:
+        graceful_drain_seconds: float | None) -> int:
     """Kubelet SIGKILL budget for an external LB pod.
 
     The pod first needs time to leave Service endpoints, then Uvicorn must be
@@ -187,8 +188,7 @@ def _sanitize(service_name: str) -> str:
     return re.sub(r'[^a-z0-9-]+', '-', service_name.lower()).strip('-')
 
 
-def lb_base_name(service_name: str,
-                 resource_scope: Optional[str] = None) -> str:
+def lb_base_name(service_name: str, resource_scope: str | None = None) -> str:
     """Deterministic RFC1123-compliant base name for the LB objects.
 
     Lowercase, only ``[a-z0-9-]``, starts/ends alphanumeric, <=63 chars. A short
@@ -216,18 +216,18 @@ def lb_base_name(service_name: str,
 
 
 def lb_deployment_name(service_name: str,
-                       resource_scope: Optional[str] = None) -> str:
+                       resource_scope: str | None = None) -> str:
     """RFC1123 name of the LB Deployment for ``service_name``."""
     return lb_base_name(service_name, resource_scope)
 
 
 def lb_service_name(service_name: str,
-                    resource_scope: Optional[str] = None) -> str:
+                    resource_scope: str | None = None) -> str:
     """RFC1123 name of the LB Service for ``service_name``."""
     return lb_base_name(service_name, resource_scope)
 
 
-def _service_load_balancer_address(service: Any) -> Optional[str]:
+def _service_load_balancer_address(service: Any) -> str | None:
     """Return the first hostname/IP published on a LoadBalancer Service."""
     if isinstance(service, dict):
         status = service.get('status', {}) or {}
@@ -305,7 +305,7 @@ def _api_deployment_name() -> str:
         'chart with serve.externalLoadBalancer.enabled=true.')
 
 
-def _cleanup_lb_namespace() -> Optional[str]:
+def _cleanup_lb_namespace() -> str | None:
     """Resolve the owner namespace even after external LB is disabled.
 
     Helm may remove feature-specific configuration before the recovery sweep
@@ -377,9 +377,9 @@ def require_external_lb_runtime() -> None:
             'serve.externalLoadBalancer.auth.lbDataPlane to be configured.')
 
 
-def lb_service_endpoint_or_none(
-        service_name: str,
-        resource_scope: Optional[str] = None) -> Optional[str]:
+def lb_service_endpoint_or_none(service_name: str,
+                                resource_scope: str |
+                                None = None) -> str | None:
     """The LB Service endpoint (host:port, no scheme), or None if unavailable.
 
     Returns None outside the installed external-LB platform. Real service
@@ -404,8 +404,7 @@ def lb_service_endpoint_or_none(
     return f'{address}:{constants.LOAD_BALANCER_PORT_START}'
 
 
-def _object_labels(service_name: str,
-                   service_hash: Optional[str] = None) -> dict:
+def _object_labels(service_name: str, service_hash: str | None = None) -> dict:
     labels = {
         PARENT_LABEL_KEY: PARENT_LABEL_VALUE,
         SERVE_LB_LABEL_KEY: service_name,
@@ -426,7 +425,7 @@ def _read_controller_pod(namespace: str, context: str):
 
 def _resolve_lb_image(namespace: str,
                       context: str,
-                      pod=None) -> Tuple[str, str, Optional[str]]:
+                      pod=None) -> tuple[str, str, str | None]:
     """Resolve the controller image used for the external LB.
 
     Reads the controller pod (name from ``POD_NAME_ENV_VAR``) and returns its
@@ -473,7 +472,7 @@ def _resolve_lb_image(namespace: str,
                                'IfNotPresent'), digest_reference)
 
 
-def _resolved_image_reference(image: str, image_id: str) -> Optional[str]:
+def _resolved_image_reference(image: str, image_id: str) -> str | None:
     """Return an immutable image reference from a runtime ``imageID``.
 
     Kubernetes runtimes commonly report either a full pullable reference
@@ -510,7 +509,7 @@ def _resolved_image_reference(image: str, image_id: str) -> Optional[str]:
     return f'{repository}@{digest.lower()}'
 
 
-def _image_repository(image: str) -> Optional[str]:
+def _image_repository(image: str) -> str | None:
     """Extract a repository from a declared image without confusing ports."""
     if not isinstance(image, str):
         return None
@@ -526,7 +525,7 @@ def _image_repository(image: str) -> Optional[str]:
     return _valid_image_repository(reference)
 
 
-def _valid_image_repository(repository: str) -> Optional[str]:
+def _valid_image_repository(repository: str) -> str | None:
     """Validate the minimal repository grammar needed for safe composition."""
     if (not repository or repository.startswith('/') or
             repository.endswith('/') or '://' in repository or
@@ -587,7 +586,7 @@ def _api_deployment_owner_reference(context: str, namespace: str) -> dict:
     }
 
 
-def _owner_reference_identity(owner_reference) -> Tuple[Any, Any, Any, Any]:
+def _owner_reference_identity(owner_reference) -> tuple[Any, Any, Any, Any]:
     return (
         _owner_reference_value(owner_reference, 'apiVersion', 'api_version'),
         _owner_reference_value(owner_reference, 'kind', 'kind'),
@@ -597,7 +596,7 @@ def _owner_reference_identity(owner_reference) -> Tuple[Any, Any, Any, Any]:
 
 
 def _live_deployment_owner_uid(context: str, namespace: str,
-                               deployment_name: str) -> Optional[str]:
+                               deployment_name: str) -> str | None:
     """Return a referenced Deployment's live UID, or None after deletion."""
     try:
         deployment = kubernetes.apps_api(context).read_namespaced_deployment(
@@ -708,7 +707,7 @@ def _controller_container_status(pod, container):
 
 
 def _portable_lb_runtime_contract(pod_spec,
-                                  controller_container) -> Tuple[dict, dict]:
+                                  controller_container) -> tuple[dict, dict]:
     """Return the whitelisted Pod/container runtime fields for the LB.
 
     The spawned LB must remain schedulable wherever the owning API Pod runs and
@@ -750,7 +749,7 @@ def _portable_lb_runtime_contract(pod_spec,
     container_security = getattr(controller_container, 'security_context', None)
     if container_security is not None:
         serialized = _serialize_k8s_object(container_security)
-        container_sanitized: Dict[str, Any] = {
+        container_sanitized: dict[str, Any] = {
             key: serialized[key]
             for key in ('runAsUser', 'runAsGroup')
             if key in serialized
@@ -777,7 +776,7 @@ def _portable_lb_runtime_contract(pod_spec,
 def _resolve_lb_auth_projection(
         namespace: str,
         context: str,
-        pod=None) -> Tuple[list, list, list, list, dict, dict, bool]:
+        pod=None) -> tuple[list, list, list, list, dict, dict, bool]:
     """Return LB auth, image-pull, and portable API-Pod runtime fields.
 
     The controller-admin projection is deliberately not copied. Projected
@@ -884,10 +883,10 @@ def _build_deployment_dict(service_name: str,
                            container_runtime_fields: dict,
                            image_pull_policy: str,
                            termination_grace_period_seconds: int,
-                           controller_image_digest: Optional[str] = None,
-                           service_hash: Optional[str] = None,
-                           resources: Optional[dict] = None,
-                           owner_reference: Optional[dict] = None) -> dict:
+                           controller_image_digest: str | None = None,
+                           service_hash: str | None = None,
+                           resources: dict | None = None,
+                           owner_reference: dict | None = None) -> dict:
     container = {
         'name': 'load-balancer',
         'image': image,
@@ -1020,8 +1019,8 @@ def _build_deployment_dict(service_name: str,
 def _build_service_dict(service_name: str,
                         service_name_k8s: str,
                         deployment_name: str,
-                        service_hash: Optional[str] = None,
-                        owner_reference: Optional[dict] = None) -> dict:
+                        service_hash: str | None = None,
+                        owner_reference: dict | None = None) -> dict:
     return {
         'apiVersion': 'v1',
         'kind': 'Service',
@@ -1062,7 +1061,7 @@ def _service_has_desired_routing(service, desired: dict) -> bool:
         ports = getattr(spec, 'ports', None) or []
         service_type = getattr(spec, 'type', None) or 'ClusterIP'
 
-    def _port_tuple(port) -> Tuple[Any, Any, Any]:
+    def _port_tuple(port) -> tuple[Any, Any, Any]:
         if isinstance(port, dict):
             return (port.get('port'), port.get('targetPort'),
                     port.get('protocol', 'TCP'))
@@ -1113,7 +1112,7 @@ def _wait_for_lb_deployment_ready(
         context: str,
         namespace: str,
         deployment_name: str,
-        continue_guard: Optional[Callable[[], bool]] = None) -> None:
+        continue_guard: Callable[[], bool] | None = None) -> None:
     """Wait until the desired LB rollout has an available updated Pod."""
     deadline = time.monotonic() + constants.LB_DEPLOYMENT_READY_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
@@ -1138,7 +1137,7 @@ def _wait_for_lb_service_endpoint(
         core_api: Any,
         namespace: str,
         service_name: str,
-        continue_guard: Optional[Callable[[], bool]] = None) -> None:
+        continue_guard: Callable[[], bool] | None = None) -> None:
     """Wait until a LoadBalancer Service publishes a routable address."""
     deadline = (time.monotonic() +
                 constants.LB_SERVICE_ENDPOINT_READY_TIMEOUT_SECONDS)
@@ -1164,12 +1163,12 @@ def _wait_for_lb_service_endpoint(
         'cloud load balancer controller logs.')
 
 
-def create_lb_deployment_and_service(
-        service_name: str,
-        termination_grace_period_seconds: int,
-        service_hash: str,
-        continue_guard: Optional[Callable[[], bool]] = None,
-        resource_scope: Optional[str] = None) -> None:
+def create_lb_deployment_and_service(service_name: str,
+                                     termination_grace_period_seconds: int,
+                                     service_hash: str,
+                                     continue_guard: Callable[[], bool] |
+                                     None = None,
+                                     resource_scope: str | None = None) -> None:
     """Create the per-service LB Deployment + Service (idempotent).
 
     New objects are created with the stable Helm API Deployment as their
@@ -1448,8 +1447,8 @@ def create_lb_deployment_and_service(
 def ensure_lb_objects_exist(service_name: str,
                             termination_grace_period_seconds: int,
                             service_hash: str,
-                            controller_ip: Optional[str] = None,
-                            resource_scope: Optional[str] = None) -> bool:
+                            controller_ip: str | None = None,
+                            resource_scope: str | None = None) -> bool:
     """Recreate the per-service LB Deployment + Service if either is missing.
 
     Self-heal for out-of-band deletion: the k8s Deployment only heals its own
@@ -1562,7 +1561,7 @@ def ensure_lb_objects_exist(service_name: str,
     return True
 
 
-def get_lb_pod_authority(service_name: str) -> Optional[LbPodAuthority]:
+def get_lb_pod_authority(service_name: str) -> LbPodAuthority | None:
     """Return the Ready and live LB Pod identities from one Kubernetes list.
 
     The query is scoped to this service's collision-resistant Deployment
@@ -1595,8 +1594,8 @@ def get_lb_pod_authority(service_name: str) -> Optional[LbPodAuthority]:
                        f'{service_name!r}: {e}; load balancer reports will '
                        'fail closed.')
         return None
-    live_uids: Set[str] = set()
-    ready_nonterminating_uids: Set[str] = set()
+    live_uids: set[str] = set()
+    ready_nonterminating_uids: set[str] = set()
     try:
         for pod in pods.items:
             metadata = getattr(pod, 'metadata', None)
@@ -1627,7 +1626,7 @@ def get_lb_pod_authority(service_name: str) -> Optional[LbPodAuthority]:
     return LbPodAuthority(ready_nonterminating_uids, live_uids)
 
 
-def stream_lb_logs(service_name: str, follow: bool, tail: Optional[int]) -> str:
+def stream_lb_logs(service_name: str, follow: bool, tail: int | None) -> str:
     """Print logs from the current external LB Pod.
 
     The former in-pod implementation wrote ``load_balancer.log`` beside the
@@ -1718,8 +1717,7 @@ def _lb_object_deletion_timeout_seconds(obj: Any, kind: str) -> float:
                grace_seconds + _LB_FOREGROUND_GC_MARGIN_SECONDS)
 
 
-def get_api_deployment_owner_uid(
-        require_runtime: bool = False) -> Optional[str]:
+def get_api_deployment_owner_uid(require_runtime: bool = False) -> str | None:
     """Resolve the current Helm API Deployment UID for fenced LB deletion."""
     if not kubernetes_utils.is_incluster_config_available():
         if require_runtime:
@@ -1829,12 +1827,11 @@ def _delete_lb_object_if_owned(read_fn, delete_fn, name: str, namespace: str,
         time.sleep(0.2)
 
 
-def delete_lb_objects(
-        service_name: str,
-        expected_service_hash: str,
-        resource_scope: Optional[str] = None,
-        require_runtime: bool = False,
-        expected_api_deployment_uid: Optional[str] = None) -> None:
+def delete_lb_objects(service_name: str,
+                      expected_service_hash: str,
+                      resource_scope: str | None = None,
+                      require_runtime: bool = False,
+                      expected_api_deployment_uid: str | None = None) -> None:
     """Delete one incarnation's LB objects with Kubernetes preconditions.
 
     No-op outside in-cluster mode. Cleanup deliberately does not consult the
@@ -1896,7 +1893,7 @@ def delete_lb_objects(
         raise errors[0]
 
 
-def reconcile_lb_objects(live_service_names: Set[str]) -> None:
+def reconcile_lb_objects(live_service_names: set[str]) -> None:
     """Reap LB objects whose owning service is no longer live.
 
     No-op outside in-cluster mode and independent of the feature flag. It can

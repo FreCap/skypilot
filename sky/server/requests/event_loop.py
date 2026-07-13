@@ -1,14 +1,14 @@
 """Executor event loop to process tasks in coroutines."""
 import asyncio
+from collections.abc import Coroutine
 import concurrent.futures
 import threading
-from typing import Coroutine, Optional
 
 # Dedicated event loop for requests, isolated with the event loop managed
 # by uvicorn. This is responsible for light-weight async tasks or sub-tasks,
 # refer to `executor.py` for more details about cooperation between the event
 # loop and executor process pool.
-_EVENT_LOOP: Optional[asyncio.AbstractEventLoop] = None
+_EVENT_LOOP: asyncio.AbstractEventLoop | None = None
 _LOCK = threading.Lock()
 
 

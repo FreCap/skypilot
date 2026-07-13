@@ -4,7 +4,6 @@ import os
 import signal
 import subprocess
 import sys
-from typing import List, Optional, Tuple
 
 import filelock
 import psutil
@@ -50,14 +49,14 @@ def _is_running_skylet_process(pid: int) -> bool:
         return False
 
 
-def _find_running_skylet_pids() -> List[int]:
+def _find_running_skylet_pids() -> list[int]:
     if os.path.exists(PID_FILE):
         try:
-            with open(PID_FILE, 'r', encoding='utf-8') as pid_file:
+            with open(PID_FILE, encoding='utf-8') as pid_file:
                 pid = int(pid_file.read().strip())
             if _is_running_skylet_process(pid):
                 return [pid]
-        except (OSError, ValueError, IOError) as e:
+        except (OSError, ValueError) as e:
             # Don't fallback to grep-based detection as the existence of the
             # PID file implies that we are on the new version, and there is
             # possibility of there being multiple skylet processes running,
@@ -89,19 +88,19 @@ def _find_running_skylet_pids() -> List[int]:
         return pids
 
 
-def _check_version_match() -> Tuple[bool, Optional[str]]:
+def _check_version_match() -> tuple[bool, str | None]:
     """Check if the version file matches the current skylet version.
 
     Returns:
         Tuple of (version_match: bool, version: str or None)
     """
-    version: Optional[str] = None
+    version: str | None = None
     if os.path.exists(VERSION_FILE):
         try:
-            with open(VERSION_FILE, 'r', encoding='utf-8') as f:
+            with open(VERSION_FILE, encoding='utf-8') as f:
                 version = f.read().strip()
                 return version == constants.SKYLET_VERSION, version
-        except (OSError, IOError):
+        except OSError:
             pass
     return False, version
 

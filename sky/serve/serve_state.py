@@ -5,7 +5,7 @@ import json
 import pickle
 import time
 import typing
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Optional
 import uuid
 
 import colorama
@@ -286,7 +286,7 @@ def create_table(engine: sqlalchemy.engine.Engine):
 
 
 def claim_service_lifecycle_epoch(service_name: str,
-                                  lock_connection: Optional[Any] = None) -> int:
+                                  lock_connection: Any | None = None) -> int:
     """Advance and return the durable fencing token for ``service_name``.
 
     PostgreSQL callers pass the DBAPI connection that owns the name's
@@ -359,7 +359,7 @@ def service_lifecycle_epoch_matches(service_name: str, epoch: int) -> bool:
 
 
 def _lifecycle_epoch_matches_in_session(session: orm.Session, service_name: str,
-                                        epoch: Optional[int]) -> bool:
+                                        epoch: int | None) -> bool:
     """Lock and validate a lifecycle fence row inside a mutation txn."""
     if epoch is None:
         # Compatibility for old direct/unit-test callers. Production lifecycle
@@ -451,19 +451,19 @@ class ReplicaStatus(enum.Enum):
     UNKNOWN = 'UNKNOWN'
 
     @classmethod
-    def failed_statuses(cls) -> List['ReplicaStatus']:
+    def failed_statuses(cls) -> list['ReplicaStatus']:
         return [
             cls.FAILED, cls.FAILED_CLEANUP, cls.FAILED_INITIAL_DELAY,
             cls.FAILED_PROBING, cls.FAILED_PROVISION, cls.UNKNOWN
         ]
 
     @classmethod
-    def terminal_statuses(cls) -> List['ReplicaStatus']:
+    def terminal_statuses(cls) -> list['ReplicaStatus']:
         return [cls.SHUTTING_DOWN, cls.PREEMPTED, cls.UNKNOWN
                ] + cls.failed_statuses()
 
     @classmethod
-    def scale_down_decision_order(cls) -> List['ReplicaStatus']:
+    def scale_down_decision_order(cls) -> list['ReplicaStatus']:
         # Scale down replicas in the order of replica initialization
         return [
             cls.PENDING, cls.PROVISIONING, cls.STARTING, cls.NOT_READY,
@@ -521,11 +521,11 @@ class ServiceStatus(enum.Enum):
     NO_REPLICA = 'NO_REPLICA'
 
     @classmethod
-    def failed_statuses(cls) -> List['ServiceStatus']:
+    def failed_statuses(cls) -> list['ServiceStatus']:
         return [cls.CONTROLLER_FAILED, cls.FAILED_CLEANUP]
 
     @classmethod
-    def terminal_statuses(cls) -> List['ServiceStatus']:
+    def terminal_statuses(cls) -> list['ServiceStatus']:
         """States in which the service is either dying or already broken
         and cannot accept new operations like update/apply. SHUTTING_DOWN
         is included because it's a transient state that the service may
@@ -534,7 +534,7 @@ class ServiceStatus(enum.Enum):
         return [cls.CONTROLLER_FAILED, cls.FAILED_CLEANUP, cls.SHUTTING_DOWN]
 
     @classmethod
-    def replica_launch_blocking_statuses(cls) -> List['ServiceStatus']:
+    def replica_launch_blocking_statuses(cls) -> list['ServiceStatus']:
         """States that durably fence new replica provisioning.
 
         CONTROLLER_FAILED is intentionally excluded: it is a recoverable data
@@ -549,7 +549,7 @@ class ServiceStatus(enum.Enum):
 
     @classmethod
     def from_replica_statuses(
-            cls, replica_statuses: List[ReplicaStatus]) -> 'ServiceStatus':
+            cls, replica_statuses: list[ReplicaStatus]) -> 'ServiceStatus':
         status2num = collections.Counter(replica_statuses)
         # If one replica is READY, the service is READY.
         if status2num[ReplicaStatus.READY] > 0:
@@ -588,7 +588,7 @@ class OrphanedVersionRecordsError(RuntimeError):
 
 
 def _ephemeral_storage_generation_from_yaml(
-        yaml_content: Optional[str]) -> Optional[str]:
+        yaml_content: str | None) -> str | None:
     """Read the scoped storage generation without constructing a Task."""
     if yaml_content is None:
         return None
@@ -621,10 +621,10 @@ def add_service(name: str,
                 entrypoint: str,
                 spec: Optional['service_spec.SkyServiceSpec'],
                 yaml_content: str,
-                controller_ip: Optional[str] = None,
-                service_hash: Optional[str] = None,
-                lifecycle_epoch: Optional[int] = None,
-                resource_scope: Optional[str] = None) -> bool:
+                controller_ip: str | None = None,
+                service_hash: str | None = None,
+                lifecycle_epoch: int | None = None,
+                resource_scope: str | None = None) -> bool:
     """Atomically add a service and its initial version to the database.
 
     The `services` row and the initial `version_specs` row (at
@@ -711,8 +711,8 @@ def add_service(name: str,
                 where(
                     ephemeral_storage_cleanup_intents_table.c.service_name ==
                     name,
-                    ephemeral_storage_cleanup_intents_table.c.resource_scope !=
-                    resource_scope).distinct()).scalars().all()
+                    ephemeral_storage_cleanup_intents_table.c.resource_scope
+                    != resource_scope).distinct()).scalars().all()
             if orphan_storage_scopes:
                 session.rollback()
                 raise OrphanedStorageCleanupIntentsError(
@@ -789,11 +789,12 @@ def add_service(name: str,
     return True
 
 
-def update_service_controller_pid_if_owner(
-        service_name: str, expected_service_hash: Optional[str],
-        expected_controller_pid: Optional[int],
-        expected_controller_ip: Optional[str], controller_pid: int,
-        controller_ip: Optional[str]) -> bool:
+def update_service_controller_pid_if_owner(service_name: str,
+                                           expected_service_hash: str | None,
+                                           expected_controller_pid: int | None,
+                                           expected_controller_ip: str | None,
+                                           controller_pid: int,
+                                           controller_ip: str | None) -> bool:
     """Preclaim recovery only if the incarnation and old owner still match.
 
     A name-only preclaim can overwrite a service that was purged and recreated
@@ -819,10 +820,10 @@ def update_service_controller_pid_if_owner(
 
 
 def update_service_controller_pid_ip_and_port(
-        service_name: str, controller_pid: int, controller_ip: Optional[str],
-        controller_port: int, expected_service_hash: Optional[str],
-        expected_controller_pid: Optional[int],
-        expected_controller_ip: Optional[str]) -> bool:
+        service_name: str, controller_pid: int, controller_ip: str | None,
+        controller_port: int, expected_service_hash: str | None,
+        expected_controller_pid: int | None,
+        expected_controller_ip: str | None) -> bool:
     """CAS-publish controller pid + IP + port for one service incarnation.
 
     Used during HA recovery: the controller subprocess on the new pod must be
@@ -857,7 +858,7 @@ def update_service_controller_pid_ip_and_port(
 
 
 def set_service_controller_ip(service_name: str,
-                              controller_ip: Optional[str]) -> None:
+                              controller_ip: str | None) -> None:
     """Sets the controller IP of a service."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
@@ -880,8 +881,7 @@ def remove_service(service_name: str) -> None:
 def service_owner_matches(
     service_name: str,
     expected_service_hash: str,
-    expected_controller_owner: Optional[Tuple[Optional[int],
-                                              Optional[str]]] = None
+    expected_controller_owner: tuple[int | None, str | None] | None = None
 ) -> bool:
     """Whether the exact service incarnation (and optional owner) exists."""
     if not expected_service_hash:
@@ -907,9 +907,8 @@ def service_owner_matches(
 def remove_service_completely(
     service_name: str,
     expected_service_hash: str,
-    expected_controller_owner: Optional[Tuple[Optional[int],
-                                              Optional[str]]] = None,
-    expected_lifecycle_epoch: Optional[int] = None,
+    expected_controller_owner: tuple[int | None, str | None] | None = None,
+    expected_lifecycle_epoch: int | None = None,
 ) -> bool:
     """Atomically remove one exact service incarnation and all child rows.
 
@@ -989,9 +988,8 @@ def remove_service_completely(
 def set_service_uptime(
     service_name: str,
     uptime: int,
-    expected_service_hash: Optional[str] = None,
-    expected_controller_owner: Optional[Tuple[Optional[int],
-                                              Optional[str]]] = None
+    expected_service_hash: str | None = None,
+    expected_controller_owner: tuple[int | None, str | None] | None = None
 ) -> bool:
     """Set uptime, optionally fenced to one service incarnation."""
     engine = _db_manager.get_engine()
@@ -1014,7 +1012,7 @@ def set_service_uptime(
 def set_service_status_and_active_versions(
         service_name: str,
         status: ServiceStatus,
-        active_versions: Optional[List[int]] = None) -> None:
+        active_versions: list[int] | None = None) -> None:
     """Sets the service status."""
     engine = _db_manager.get_engine()
     update_dict = {services_table.c.status: status.value}
@@ -1031,12 +1029,12 @@ def set_service_status_and_active_versions(
 def set_service_status_and_active_versions_if_owner(
         service_name: str,
         expected_service_hash: str,
-        expected_controller_pid: Optional[int],
-        expected_controller_ip: Optional[str],
+        expected_controller_pid: int | None,
+        expected_controller_ip: str | None,
         status: ServiceStatus,
-        active_versions: Optional[List[int]] = None,
-        expected_status: Optional[ServiceStatus] = None,
-        expected_lifecycle_epoch: Optional[int] = None) -> bool:
+        active_versions: list[int] | None = None,
+        expected_status: ServiceStatus | None = None,
+        expected_lifecycle_epoch: int | None = None) -> bool:
     """CAS a status write on the exact hash/PID/IP controller owner."""
     update_dict = {services_table.c.status: status.value}
     if active_versions is not None:
@@ -1071,9 +1069,9 @@ def set_service_status_and_active_versions_if_hash(
         service_name: str,
         expected_service_hash: str,
         status: ServiceStatus,
-        active_versions: Optional[List[int]] = None,
-        expected_status: Optional[ServiceStatus] = None,
-        expected_lifecycle_epoch: Optional[int] = None) -> bool:
+        active_versions: list[int] | None = None,
+        expected_status: ServiceStatus | None = None,
+        expected_lifecycle_epoch: int | None = None) -> bool:
     """CAS a status write on a durable service incarnation."""
     update_dict = {services_table.c.status: status.value}
     if active_versions is not None:
@@ -1114,9 +1112,9 @@ def set_service_controller_port(service_name: str,
 
 
 def set_service_controller_port_if_owner(service_name: str,
-                                         expected_service_hash: Optional[str],
+                                         expected_service_hash: str | None,
                                          controller_pid: int,
-                                         controller_ip: Optional[str],
+                                         controller_ip: str | None,
                                          controller_port: int) -> bool:
     """Sets the controller port only if `controller_pid` still owns the row.
 
@@ -1144,7 +1142,7 @@ def set_service_controller_port_if_owner(service_name: str,
 
 def acknowledge_service_controller_teardown_if_owner(
         service_name: str, expected_service_hash: str, controller_pid: int,
-        controller_ip: Optional[str]) -> bool:
+        controller_ip: str | None) -> bool:
     """Atomically enter teardown and publish that the child is gone.
 
     Unexpected parent failures can reach finalization from a routable status
@@ -1170,11 +1168,11 @@ def acknowledge_service_controller_teardown_if_owner(
 def claim_orphaned_service_teardown(
         service_name: str,
         expected_service_hash: str,
-        expected_controller_pid: Optional[int],
-        expected_controller_ip: Optional[str],
+        expected_controller_pid: int | None,
+        expected_controller_ip: str | None,
         controller_pid: int,
-        controller_ip: Optional[str],
-        expected_lifecycle_epoch: Optional[int] = None) -> bool:
+        controller_ip: str | None,
+        expected_lifecycle_epoch: int | None = None) -> bool:
     """Claim a terminal row that has no recovery script or live child.
 
     Callers must establish the absence of a recovery script while holding the
@@ -1210,11 +1208,11 @@ def claim_orphaned_service_teardown(
 def claim_unrecoverable_service_teardown(
         service_name: str,
         expected_service_hash: str,
-        expected_controller_pid: Optional[int],
-        expected_controller_ip: Optional[str],
+        expected_controller_pid: int | None,
+        expected_controller_ip: str | None,
         controller_pid: int,
-        controller_ip: Optional[str],
-        expected_lifecycle_epoch: Optional[int] = None) -> bool:
+        controller_ip: str | None,
+        expected_lifecycle_epoch: int | None = None) -> bool:
     """Claim a terminal service that has no bootable version.
 
     A recovery script cannot make progress without a committed yaml version.
@@ -1316,10 +1314,11 @@ def mark_unrecoverable_service_for_cleanup(service_name: str,
     return True
 
 
-def set_service_load_balancer_port_if_owner(
-        service_name: str, expected_service_hash: Optional[str],
-        controller_pid: int, controller_ip: Optional[str],
-        load_balancer_port: int) -> bool:
+def set_service_load_balancer_port_if_owner(service_name: str,
+                                            expected_service_hash: str | None,
+                                            controller_pid: int,
+                                            controller_ip: str | None,
+                                            load_balancer_port: int) -> bool:
     """Sets the load balancer port only if `controller_pid` owns the row.
 
     Compare-and-swap for external-LB port publication: the plain setter below
@@ -1355,7 +1354,7 @@ def set_service_load_balancer_port(service_name: str,
         session.commit()
 
 
-def _get_service_from_row(r: 'row.RowMapping') -> Dict[str, Any]:
+def _get_service_from_row(r: 'row.RowMapping') -> dict[str, Any]:
     # Get the max_version from the first column (from the subquery)
     current_version = r['max_version']
 
@@ -1395,7 +1394,7 @@ def _get_service_from_row(r: 'row.RowMapping') -> Dict[str, Any]:
 
 
 def _build_services_with_latest_version_query(
-        service_name: Optional[str] = None) -> sqlalchemy.sql.Select:
+        service_name: str | None = None) -> sqlalchemy.sql.Select:
     """Build a query joining services with their latest version metadata.
 
     Args:
@@ -1431,7 +1430,7 @@ def _build_services_with_latest_version_query(
     return query
 
 
-def get_services() -> List[Dict[str, Any]]:
+def get_services() -> list[dict[str, Any]]:
     """Get all existing service records."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
@@ -1452,7 +1451,7 @@ def get_num_services() -> int:
                              ).select_from(services_table)).fetchone()[0]
 
 
-def get_service_from_name(service_name: str) -> Optional[Dict[str, Any]]:
+def get_service_from_name(service_name: str) -> dict[str, Any] | None:
     """Get all existing service records."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
@@ -1465,7 +1464,7 @@ def get_service_from_name(service_name: str) -> Optional[Dict[str, Any]]:
 
 def get_service_controller_owner(
         service_name: str,
-        require_version: bool = False) -> Optional[Dict[str, Any]]:
+        require_version: bool = False) -> dict[str, Any] | None:
     """Get only the fields needed to route to a service controller.
 
     Unlike :func:`get_service_from_name`, this hot-path lookup does not join
@@ -1505,7 +1504,7 @@ def get_service_controller_owner(
     }
 
 
-def get_service_hash(service_name: str) -> Optional[str]:
+def get_service_hash(service_name: str) -> str | None:
     """Get the hash of a service."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
@@ -1516,7 +1515,7 @@ def get_service_hash(service_name: str) -> Optional[str]:
 
 
 def get_service_mode_and_hash(
-        service_name: str) -> Optional[Tuple[bool, Optional[str]]]:
+        service_name: str) -> tuple[bool, str | None] | None:
     """Read the raw mode/hash identity without joining version metadata."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
@@ -1588,7 +1587,7 @@ def add_ephemeral_storage_cleanup_intent(service_name: str, resource_scope: str,
 
 def ensure_committed_ephemeral_storage_intent_for_version(
         service_name: str, yaml_content: str, expected_service_hash: str,
-        expected_controller_owner: Tuple[Optional[int], Optional[str]]) -> bool:
+        expected_controller_owner: tuple[int | None, str | None]) -> bool:
     """Backfill cleanup inventory before retiring its only version YAML."""
     storage_generation = _ephemeral_storage_generation_from_yaml(yaml_content)
     if storage_generation is None:
@@ -1660,9 +1659,9 @@ def ensure_committed_ephemeral_storage_intent_for_version(
 
 def get_ephemeral_storage_cleanup_intents(
         service_name: str,
-        resource_scope: Optional[str] = None,
-        lifecycle_epoch: Optional[int] = None,
-        provisional: Optional[bool] = None) -> List[Dict[str, Any]]:
+        resource_scope: str | None = None,
+        lifecycle_epoch: int | None = None,
+        provisional: bool | None = None) -> list[dict[str, Any]]:
     """Return durable scoped storage cleanup manifests."""
     predicates = [
         ephemeral_storage_cleanup_intents_table.c.service_name == service_name
@@ -1710,7 +1709,7 @@ def remove_provisional_ephemeral_storage_cleanup_intents(
 
 
 def get_orphaned_service_child_names(
-        service_names: Optional[List[str]] = None) -> List[str]:
+        service_names: list[str] | None = None) -> list[str]:
     """Get resource-bearing child names with no authoritative service row.
 
     HA scripts and reserved-capacity claims carry no external resource or
@@ -1739,9 +1738,9 @@ def get_orphaned_service_child_names(
     return sorted(set(rows))
 
 
-def get_orphaned_service_child_mode(service_name: str) -> Optional[bool]:
+def get_orphaned_service_child_mode(service_name: str) -> bool | None:
     """Infer a child-only name's pool bit, failing closed on ambiguity."""
-    modes: Set[bool] = set()
+    modes: set[bool] = set()
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         intent_modes = session.execute(
@@ -1813,7 +1812,7 @@ def remove_orphaned_service_children(service_name: str,
     return True
 
 
-def get_service_versions(service_name: str) -> List[int]:
+def get_service_versions(service_name: str) -> list[int]:
     """Gets all versions of a service."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
@@ -1823,8 +1822,8 @@ def get_service_versions(service_name: str) -> List[int]:
     return [row[0] for row in rows]
 
 
-def get_glob_service_names(service_names: Optional[List[str]] = None,
-                           pool: Optional[bool] = None) -> List[str]:
+def get_glob_service_names(service_names: list[str] | None = None,
+                           pool: bool | None = None) -> list[str]:
     """Get service names matching the glob patterns.
 
     Args:
@@ -1859,7 +1858,7 @@ def get_glob_service_names(service_names: Optional[List[str]] = None,
     return list({row[0] for row in rows})
 
 
-def get_service_pool_from_db(service_name: str) -> Optional[bool]:
+def get_service_pool_from_db(service_name: str) -> bool | None:
     """Reads the raw `pool` flag for a service straight from the services row.
 
     Unlike `get_service_from_name`, this does NOT inner-join `version_specs`,
@@ -1886,10 +1885,9 @@ def add_or_update_replica(
     service_name: str,
     replica_id: int,
     replica_info: 'replica_managers.ReplicaInfo',
-    expected_service_hash: Optional[str] = None,
-    expected_lifecycle_epoch: Optional[int] = None,
-    expected_controller_owner: Optional[Tuple[Optional[int],
-                                              Optional[str]]] = None
+    expected_service_hash: str | None = None,
+    expected_lifecycle_epoch: int | None = None,
+    expected_controller_owner: tuple[int | None, str | None] | None = None
 ) -> bool:
     """Adds a replica to the database."""
     engine = _db_manager.get_engine()
@@ -1941,11 +1939,10 @@ def add_or_update_replica(
 
 def add_or_update_replicas(
     service_name: str,
-    replica_infos: List[Tuple[int, 'replica_managers.ReplicaInfo']],
-    expected_service_hash: Optional[str] = None,
-    expected_lifecycle_epoch: Optional[int] = None,
-    expected_controller_owner: Optional[Tuple[Optional[int],
-                                              Optional[str]]] = None
+    replica_infos: list[tuple[int, 'replica_managers.ReplicaInfo']],
+    expected_service_hash: str | None = None,
+    expected_lifecycle_epoch: int | None = None,
+    expected_controller_owner: tuple[int | None, str | None] | None = None
 ) -> bool:
     """Upserts a batch of replicas in one statement/transaction.
 
@@ -2014,10 +2011,9 @@ def add_or_update_replicas(
 def remove_replica(
     service_name: str,
     replica_id: int,
-    expected_service_hash: Optional[str] = None,
-    expected_lifecycle_epoch: Optional[int] = None,
-    expected_controller_owner: Optional[Tuple[Optional[int],
-                                              Optional[str]]] = None
+    expected_service_hash: str | None = None,
+    expected_lifecycle_epoch: int | None = None,
+    expected_controller_owner: tuple[int | None, str | None] | None = None
 ) -> bool:
     """Remove a replica, optionally fenced to one lifecycle/incarnation."""
     engine = _db_manager.get_engine()
@@ -2072,7 +2068,7 @@ def get_replica_info_from_id(
 
 
 def get_replica_infos(
-        service_name: str) -> List['replica_managers.ReplicaInfo']:
+        service_name: str) -> list['replica_managers.ReplicaInfo']:
     """Gets all replica infos of a service."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
@@ -2082,7 +2078,7 @@ def get_replica_infos(
     return [pickle.loads(row[0]) for row in rows]
 
 
-def get_replica_service_names() -> List[str]:
+def get_replica_service_names() -> list[str]:
     """Every service that currently has any replica row (a cheap DISTINCT).
 
     Used by the reserved-fill broker's round debit to scan rows of FORMER
@@ -2110,7 +2106,7 @@ def total_number_terminating_replicas() -> int:
     return terminating_count
 
 
-def get_replica_launch_budget_counts() -> Tuple[int, int]:
+def get_replica_launch_budget_counts() -> tuple[int, int]:
     """Returns provisioning and terminating replica counts in one scan.
 
     Replica state is stored as a pickled object, so neither count can be
@@ -2128,7 +2124,7 @@ def get_replica_launch_budget_counts() -> Tuple[int, int]:
     provisioning_count = 0
     terminating_count = 0
     for row in rows:
-        replica_info: 'replica_managers.ReplicaInfo' = pickle.loads(row[0])
+        replica_info: replica_managers.ReplicaInfo = pickle.loads(row[0])
         if replica_info.status == ReplicaStatus.PROVISIONING:
             provisioning_count += 1
         if (replica_info.status_property.sky_down_status ==
@@ -2156,8 +2152,8 @@ def _lock_service_for_version_mutation(session: orm.Session,
 
 
 def add_version(service_name: str,
-                expected_service_hash: Optional[str] = None,
-                expected_lifecycle_epoch: Optional[int] = None) -> int:
+                expected_service_hash: str | None = None,
+                expected_lifecycle_epoch: int | None = None) -> int:
     """Add a version, optionally fenced to one lifecycle/incarnation."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
@@ -2217,14 +2213,13 @@ def add_or_update_version(
     version: int,
     spec: 'service_spec.SkyServiceSpec',
     yaml_content: str,
-    expected_service_hash: Optional[str] = None,
-    expected_lifecycle_epoch: Optional[int] = None,
-    expected_controller_owner: Optional[Tuple[Optional[int],
-                                              Optional[str]]] = None
+    expected_service_hash: str | None = None,
+    expected_lifecycle_epoch: int | None = None,
+    expected_controller_owner: tuple[int | None, str | None] | None = None
 ) -> bool:
     engine = _db_manager.get_engine()
     storage_generation = _ephemeral_storage_generation_from_yaml(yaml_content)
-    resource_scope: Optional[str] = None
+    resource_scope: str | None = None
     with orm.Session(engine) as session:
         _begin_immediate_if_sqlite(session, engine)
         if not _lock_service_for_version_mutation(session, service_name):
@@ -2310,8 +2305,8 @@ def get_spec(service_name: str,
 
 
 def get_specs(
-        service_name: str, versions: List[int]
-) -> Dict[int, Optional['service_spec.SkyServiceSpec']]:
+        service_name: str, versions: list[int]
+) -> dict[int, Optional['service_spec.SkyServiceSpec']]:
     """Gets specs for a service's versions in one query."""
     if not versions:
         return {}
@@ -2329,7 +2324,7 @@ def get_specs(
     return {row[0]: pickle.loads(row[1]) for row in rows}
 
 
-def get_yaml_content(service_name: str, version: int) -> Optional[str]:
+def get_yaml_content(service_name: str, version: int) -> str | None:
     """Gets the yaml content of a version."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
@@ -2344,9 +2339,8 @@ def get_yaml_content(service_name: str, version: int) -> Optional[str]:
 def delete_version(
     service_name: str,
     version: int,
-    expected_service_hash: Optional[str] = None,
-    expected_controller_owner: Optional[Tuple[Optional[int],
-                                              Optional[str]]] = None
+    expected_service_hash: str | None = None,
+    expected_controller_owner: tuple[int | None, str | None] | None = None
 ) -> bool:
     """Delete a version, optionally fenced to one service incarnation."""
     engine = _db_manager.get_engine()
@@ -2387,7 +2381,7 @@ def delete_all_versions(service_name: str) -> None:
         session.commit()
 
 
-def get_latest_version(service_name: str) -> Optional[int]:
+def get_latest_version(service_name: str) -> int | None:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         result = session.execute(
@@ -2398,7 +2392,7 @@ def get_latest_version(service_name: str) -> Optional[int]:
     return result[0] if result else None
 
 
-def get_latest_committed_version(service_name: str) -> Optional[int]:
+def get_latest_committed_version(service_name: str) -> int | None:
     """Returns the latest version whose yaml was fully committed.
 
     `add_version` inserts a placeholder row (spec=pickle.dumps(None),
@@ -2421,7 +2415,7 @@ def get_latest_committed_version(service_name: str) -> Optional[int]:
     return result[0] if result else None
 
 
-def get_ha_recovery_script(service_name: str) -> Optional[str]:
+def get_ha_recovery_script(service_name: str) -> str | None:
     """Gets the HA recovery script for a service."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
@@ -2432,10 +2426,9 @@ def get_ha_recovery_script(service_name: str) -> Optional[str]:
     return result[0] if result else None
 
 
-def set_ha_recovery_script(
-        service_name: str,
-        script: str,
-        expected_lifecycle_epoch: Optional[int] = None) -> bool:
+def set_ha_recovery_script(service_name: str,
+                           script: str,
+                           expected_lifecycle_epoch: int | None = None) -> bool:
     """Set the recovery script only for the current lifecycle epoch."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
@@ -2477,8 +2470,8 @@ def remove_ha_recovery_script(service_name: str) -> None:
 
 def remove_ha_recovery_script_if_owner(
         service_name: str, expected_service_hash: str,
-        expected_controller_pid: Optional[int],
-        expected_controller_ip: Optional[str]) -> bool:
+        expected_controller_pid: int | None,
+        expected_controller_ip: str | None) -> bool:
     """Delete a recovery script only while the exact controller owns DB."""
     owner_exists = sqlalchemy.exists().where(
         services_table.c.name == service_name,
@@ -2518,12 +2511,11 @@ def upsert_reserved_fill_claim(
     floor_replicas: int,
     gpus_per_replica: int,
     holdings_fill: int,
-    effective_cap: Optional[int],
+    effective_cap: int | None,
     launchable: bool,
     heartbeat_ts: float,
-    expected_service_hash: Optional[str] = None,
-    expected_controller_owner: Optional[Tuple[Optional[int],
-                                              Optional[str]]] = None
+    expected_service_hash: str | None = None,
+    expected_controller_owner: tuple[int | None, str | None] | None = None
 ) -> bool:
     """Upserts a service's reserved-fill claim (the per-poll heartbeat)."""
     engine = _db_manager.get_engine()
@@ -2569,9 +2561,8 @@ def upsert_reserved_fill_claim(
 
 def remove_reserved_fill_claim(
     service_name: str,
-    expected_service_hash: Optional[str] = None,
-    expected_controller_owner: Optional[Tuple[Optional[int],
-                                              Optional[str]]] = None
+    expected_service_hash: str | None = None,
+    expected_controller_owner: tuple[int | None, str | None] | None = None
 ) -> bool:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
@@ -2606,7 +2597,7 @@ def remove_reserved_fill_claims_for_pool(pool_key: str) -> None:
         session.commit()
 
 
-def prune_reserved_fill_claims(expired_before: float) -> List[str]:
+def prune_reserved_fill_claims(expired_before: float) -> list[str]:
     """Deletes claims whose heartbeat predates `expired_before`.
 
     Returns the actually-pruned service names (for loud logging by the
@@ -2622,8 +2613,8 @@ def prune_reserved_fill_claims(expired_before: float) -> List[str]:
         candidates = [
             row[0] for row in session.execute(
                 sqlalchemy.select(reserved_fill_claims_table.c.service_name).
-                where(reserved_fill_claims_table.c.heartbeat_ts < expired_before
-                     )).fetchall()
+                where(reserved_fill_claims_table.c.heartbeat_ts <
+                      expired_before)).fetchall()
         ]
         if not candidates:
             session.commit()
@@ -2642,7 +2633,7 @@ def prune_reserved_fill_claims(expired_before: float) -> List[str]:
 
 
 def get_reserved_fill_claims(
-        pool_key: Optional[str] = None) -> List[Dict[str, Any]]:
+        pool_key: str | None = None) -> list[dict[str, Any]]:
     """All claim rows (optionally restricted to one pool), as dicts."""
     engine = _db_manager.get_engine()
     query = sqlalchemy.select(reserved_fill_claims_table)
@@ -2653,7 +2644,7 @@ def get_reserved_fill_claims(
     return [dict(row._mapping) for row in rows]  # pylint: disable=protected-access
 
 
-def get_reserved_fill_round(pool_key: str) -> Optional[Dict[str, Any]]:
+def get_reserved_fill_round(pool_key: str) -> dict[str, Any] | None:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         row = session.execute(
@@ -2663,7 +2654,7 @@ def get_reserved_fill_round(pool_key: str) -> Optional[Dict[str, Any]]:
 
 
 def acquire_reserved_fill_lease_token(
-        *, now: float, expires_at: float) -> Optional[Tuple[int, bool]]:
+        *, now: float, expires_at: float) -> tuple[int, bool] | None:
     """Reads, expiry-checks and CAS-advances the global lease atomically.
 
     TOKEN-FIRST ordering invariant (the other half lives in
@@ -2746,11 +2737,10 @@ def publish_reserved_fill_round(pool_key: str, *, round_id: int,
                                 snapshot_time: float, epoch: int, grants: str,
                                 feeds: str, raw_grants: str, feed_state: str,
                                 sum_holdings: int,
-                                last_observed_free: Optional[int],
-                                last_observed_free_ts: Optional[float],
+                                last_observed_free: int | None,
+                                last_observed_free_ts: float | None,
                                 phantom_streak: int,
-                                shrink_baseline: Optional[int],
-                                lease_token: int,
+                                shrink_baseline: int | None, lease_token: int,
                                 lease_expires_at: float) -> bool:
     """Publishes a round iff the lease still holds the writer's token.
 
@@ -2838,9 +2828,8 @@ def add_replica_if_round_epoch(
     *,
     pool_key: str,
     expected_epoch: int,
-    expected_service_hash: Optional[str] = None,
-    expected_controller_owner: Optional[Tuple[Optional[int],
-                                              Optional[str]]] = None
+    expected_service_hash: str | None = None,
+    expected_controller_owner: tuple[int | None, str | None] | None = None
 ) -> bool:
     """Persists a fill replica row iff the launch's allocation is current.
 
@@ -2946,9 +2935,9 @@ def add_replica_if_round_epoch(
     stale_round = sqlalchemy.select(
         reserved_fill_rounds_table.c.pool_key).where(
             reserved_fill_rounds_table.c.pool_key == pool_key,
-            sqlalchemy.or_(
-                reserved_fill_rounds_table.c.epoch != expected_epoch,
-                reserved_fill_rounds_table.c.fence_pending != 0)).exists()
+            sqlalchemy.or_(reserved_fill_rounds_table.c.epoch != expected_epoch,
+                           reserved_fill_rounds_table.c.fence_pending
+                           != 0)).exists()
     live_claim = sqlalchemy.select(
         reserved_fill_claims_table.c.service_name).where(
             reserved_fill_claims_table.c.service_name == service_name,

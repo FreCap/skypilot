@@ -11,7 +11,6 @@ import argparse
 import csv
 import json
 import os
-from typing import Dict
 
 import requests
 
@@ -19,7 +18,7 @@ ENDPOINT = 'https://api.shadeform.ai/v1/instances/types'
 DEFAULT_SHADEFORM_API_KEY_PATH = os.path.expanduser('~/.shadeform/api_key')
 
 
-def parse_gpu_info(gpu_type: str, num_gpus: int, ram_per_gpu: int) -> Dict:
+def parse_gpu_info(gpu_type: str, num_gpus: int, ram_per_gpu: int) -> dict:
     """Parse GPU information for the catalog."""
 
     manufacturer = 'NVIDIA'
@@ -116,14 +115,11 @@ def get_api_key(cmdline_args: argparse.Namespace) -> str:
     api_key = cmdline_args.api_key
     if api_key is None:
         if cmdline_args.api_key_path is not None:
-            with open(cmdline_args.api_key_path, mode='r',
-                      encoding='utf-8') as f:
+            with open(cmdline_args.api_key_path, encoding='utf-8') as f:
                 api_key = f.read().strip()
         else:
             # Read from ~/.shadeform/api_key
-            with open(DEFAULT_SHADEFORM_API_KEY_PATH,
-                      mode='r',
-                      encoding='utf-8') as f:
+            with open(DEFAULT_SHADEFORM_API_KEY_PATH, encoding='utf-8') as f:
                 api_key = f.read().strip()
     assert api_key is not None, (
         f'API key not found. Please provide via --api-key or place in '

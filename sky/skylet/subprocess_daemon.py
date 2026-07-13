@@ -7,7 +7,6 @@ import os
 import signal
 import sys
 import time
-from typing import List, Optional
 
 import psutil
 
@@ -43,7 +42,7 @@ def daemonize():
     # This process is now fully detached from the original parent and terminal
 
 
-def get_pgid_if_leader(pid) -> Optional[int]:
+def get_pgid_if_leader(pid) -> int | None:
     """Get the process group ID of the target process if it is the leader."""
     try:
         pgid = os.getpgid(pid)
@@ -80,7 +79,7 @@ def kill_process_group(pgid: int) -> bool:
 
 
 def kill_process_tree(process: psutil.Process,
-                      children: List[psutil.Process]) -> bool:
+                      children: list[psutil.Process]) -> bool:
     """Kill the process tree of the target process."""
     if process is not None:
         # Kill the target process first to avoid having more children, or fail
@@ -144,7 +143,7 @@ def main():
             except (psutil.NoSuchProcess, ValueError):
                 pass
 
-    pgid: Optional[int] = None
+    pgid: int | None = None
     if os.environ.get(USE_KILL_PG_ENV_VAR) == '1':
         # Use kill_pg on UNIX system if allowed to reduce the resource usage.
         # Note that both implementations might leave subprocessed uncancelled:

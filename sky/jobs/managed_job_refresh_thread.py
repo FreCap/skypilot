@@ -5,7 +5,6 @@ import signal
 import threading
 import time
 import typing
-from typing import Optional
 
 from sky import sky_logging
 from sky.jobs import constants as managed_job_constants
@@ -50,7 +49,7 @@ class ManagedJobRefreshDaemonThread(threading.Thread):
         # daemon=True: when the main interpreter exits we want this thread
         # to go with it; the leader role is meant to track main's lifecycle.
         super().__init__(name='managed-job-refresh', daemon=True)
-        self._lock: Optional[locks.DistributedLock] = None
+        self._lock: locks.DistributedLock | None = None
 
     def run(self) -> None:
         self._lock = locks.get_lock(

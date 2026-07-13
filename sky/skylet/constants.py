@@ -1,6 +1,5 @@
 """Constants for SkyPilot."""
 import enum
-from typing import List, Tuple
 
 from packaging import version
 
@@ -537,7 +536,7 @@ RCLONE_CACHE_REFRESH_INTERVAL = 10
 
 # The keys that can be overridden in the `~/.sky/config.yaml` file. The
 # overrides are specified in task YAMLs.
-OVERRIDEABLE_CONFIG_KEYS_IN_TASK: List[Tuple[str, ...]] = [
+OVERRIDEABLE_CONFIG_KEYS_IN_TASK: list[tuple[str, ...]] = [
     ('docker', 'run_options'),
     ('nvidia_gpus', 'disable_ecc'),
     ('ssh', 'custom_metadata'),
@@ -570,7 +569,7 @@ OVERRIDEABLE_CONFIG_KEYS_IN_TASK: List[Tuple[str, ...]] = [
 # we skip the following keys because they are meant to be client-side configs.
 # Also, we skip the consolidation mode config as those should be only set on
 # the API server side.
-SKIPPED_CLIENT_OVERRIDE_KEYS: List[Tuple[str, ...]] = [
+SKIPPED_CLIENT_OVERRIDE_KEYS: list[tuple[str, ...]] = [
     ('api_server',),
     ('allowed_clouds',),
     ('workspaces',),

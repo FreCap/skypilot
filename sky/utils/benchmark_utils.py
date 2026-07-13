@@ -1,18 +1,18 @@
 """Utility functions for benchmarking."""
 
+from collections.abc import Callable
 import functools
 import logging
 import time
-from typing import Callable, Optional
 
 from sky import sky_logging
 
 logger = sky_logging.init_logger(__name__)
 
 
-def log_execution_time(func: Optional[Callable] = None,
+def log_execution_time(func: Callable | None = None,
                        *,
-                       name: Optional[str] = None,
+                       name: str | None = None,
                        level: int = logging.DEBUG,
                        precision: int = 4) -> Callable:
     """Mark a function and log its execution time.

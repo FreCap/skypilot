@@ -1,6 +1,6 @@
 """Shadeform instance provisioning."""
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
 import requests
 
@@ -24,7 +24,7 @@ SHADEFORM_STATUS_MAP = {
 }
 
 
-def _get_cluster_instances(cluster_name_on_cloud: str) -> Dict[str, Any]:
+def _get_cluster_instances(cluster_name_on_cloud: str) -> dict[str, Any]:
     """Get all instances belonging to a cluster."""
     try:
         response = shadeform_utils.get_instances()
@@ -45,7 +45,7 @@ def _get_cluster_instances(cluster_name_on_cloud: str) -> Dict[str, Any]:
         return {}
 
 
-def _get_head_instance_id(instances: Dict[str, Any]) -> Optional[str]:
+def _get_head_instance_id(instances: dict[str, Any]) -> str | None:
     """Get the head instance ID from a list of instances."""
     for instance_id, instance in instances.items():
         if instance.get('name', '').endswith('-head'):
@@ -220,7 +220,7 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
 
 
 def wait_instances(region: str, cluster_name_on_cloud: str,
-                   state: Optional[status_lib.ClusterStatus]) -> None:
+                   state: status_lib.ClusterStatus | None) -> None:
     """Wait for instances to reach the specified state."""
     del region, cluster_name_on_cloud, state  # unused
     # For Shadeform, instances are ready when they reach 'active' status
@@ -228,7 +228,7 @@ def wait_instances(region: str, cluster_name_on_cloud: str,
 
 
 def stop_instances(cluster_name_on_cloud: str,
-                   provider_config: Optional[Dict[str, Any]] = None,
+                   provider_config: dict[str, Any] | None = None,
                    worker_only: bool = False) -> None:
     """Stop instances (not supported by Shadeform)."""
     del cluster_name_on_cloud, provider_config, worker_only  # unused
@@ -237,7 +237,7 @@ def stop_instances(cluster_name_on_cloud: str,
 
 
 def terminate_instances(cluster_name_on_cloud: str,
-                        provider_config: Optional[Dict[str, Any]] = None,
+                        provider_config: dict[str, Any] | None = None,
                         worker_only: bool = False) -> None:
     """Terminate instances."""
     del provider_config  # unused
@@ -270,7 +270,7 @@ def terminate_instances(cluster_name_on_cloud: str,
 def get_cluster_info(
         region: str,
         cluster_name_on_cloud: str,
-        provider_config: Optional[Dict[str, Any]] = None) -> common.ClusterInfo:
+        provider_config: dict[str, Any] | None = None) -> common.ClusterInfo:
     """Get cluster information."""
     del region, provider_config  # unused
     instances = _get_cluster_instances(cluster_name_on_cloud)
@@ -310,9 +310,9 @@ def get_cluster_info(
 def query_instances(
     cluster_name: str,
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     non_terminated_only: bool = True,
-) -> Dict[str, Tuple[Optional['status_lib.ClusterStatus'], Optional[str]]]:
+) -> dict[str, tuple[Optional['status_lib.ClusterStatus'], str | None]]:
     """Query the status of instances."""
     del cluster_name, provider_config  # unused
     instances = _get_cluster_instances(cluster_name_on_cloud)
@@ -320,8 +320,8 @@ def query_instances(
     if not instances:
         return {}
 
-    status_map: Dict[str, Tuple[Optional['status_lib.ClusterStatus'],
-                                Optional[str]]] = {}
+    status_map: dict[str, tuple[status_lib.ClusterStatus | None,
+                                str | None]] = {}
     for instance_id, instance in instances.items():
         shadeform_status = instance.get('status', 'unknown')
         sky_status = SHADEFORM_STATUS_MAP.get(shadeform_status,
@@ -337,16 +337,16 @@ def query_instances(
 
 
 def open_ports(cluster_name_on_cloud: str,
-               ports: List[str],
-               provider_config: Optional[Dict[str, Any]] = None) -> None:
+               ports: list[str],
+               provider_config: dict[str, Any] | None = None) -> None:
     """Open ports (not supported by Shadeform)."""
     del cluster_name_on_cloud, ports, provider_config  # unused
     raise NotImplementedError()
 
 
 def cleanup_ports(cluster_name_on_cloud: str,
-                  ports: List[str],
-                  provider_config: Optional[Dict[str, Any]] = None) -> None:
+                  ports: list[str],
+                  provider_config: dict[str, Any] | None = None) -> None:
     """Cleanup ports (not supported by Shadeform)."""
     del cluster_name_on_cloud, ports, provider_config  # unused
     # Nothing to cleanup since we don't support dynamic port opening

@@ -9,7 +9,7 @@ import json
 import logging
 import os
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from sky.adaptors import nebius
 from sky.adaptors.nebius import billing
@@ -56,8 +56,8 @@ class PresetInfo:
     vcpu: int
     gpu_memory_gibibytes: int
     memory_gib: int
-    accelerator_manufacturer: Optional[str]
-    accelerator_name: Optional[str]
+    accelerator_manufacturer: str | None
+    accelerator_name: str | None
     price_hourly: decimal.Decimal
     spot_price: decimal.Decimal
 
@@ -81,8 +81,8 @@ def _format_decimal(value: decimal.Decimal) -> str:
     return f'{integer_part}.{decimal_part}'
 
 
-def _estimate_platforms(platforms: List[Any], parent_id: str,
-                        region: str) -> List[PresetInfo]:
+def _estimate_platforms(platforms: list[Any], parent_id: str,
+                        region: str) -> list[PresetInfo]:
     """Collects specifications for all presets on the given platforms to form a
     batch price request. It then sends the request and processes the responses
     to create a list of PresetInfo objects.
@@ -173,7 +173,7 @@ def _estimate_platforms(platforms: List[Any], parent_id: str,
     return result
 
 
-def _write_preset_prices(presets: List[PresetInfo], output_file: str) -> None:
+def _write_preset_prices(presets: list[PresetInfo], output_file: str) -> None:
     """Writes the provided preset information to a CSV file.
 
     Args:
@@ -230,7 +230,7 @@ def _write_preset_prices(presets: List[PresetInfo], output_file: str) -> None:
             })
 
 
-def _fetch_platforms_for_project(project_id: str) -> List[Any]:
+def _fetch_platforms_for_project(project_id: str) -> list[Any]:
     """Fetches all available compute platforms for a given project.
 
     Args:
@@ -250,7 +250,7 @@ def _fetch_platforms_for_project(project_id: str) -> List[Any]:
     return platform_response.items
 
 
-def _get_regions_map() -> Dict[str, str]:
+def _get_regions_map() -> dict[str, str]:
     """Maps region codes to their full names by iterating through tenants and
      projects.
 
@@ -278,7 +278,7 @@ def _get_regions_map() -> Dict[str, str]:
     return result
 
 
-def _get_all_platform_prices() -> List[PresetInfo]:
+def _get_all_platform_prices() -> list[PresetInfo]:
     """Orchestrates fetching specifications and prices for all platforms across
      all regions.
 

@@ -1,6 +1,7 @@
 """Utilities for sky status."""
+from collections.abc import Callable
 import typing
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any
 
 import click
 import colorama
@@ -20,9 +21,9 @@ COMMAND_TRUNC_LENGTH = 25
 NUM_COST_REPORT_LINES = 5
 
 # A record in global_user_state's 'clusters' table.
-_ClusterRecord = Dict[str, Any]
+_ClusterRecord = dict[str, Any]
 # A record returned by core.cost_report(); see its docstr for all fields.
-_ClusterCostReportRecord = Dict[str, Any]
+_ClusterCostReportRecord = dict[str, Any]
 
 
 class StatusColumn:
@@ -43,10 +44,10 @@ class StatusColumn:
         return val
 
 
-def show_status_table(cluster_records: List[responses.StatusResponse],
+def show_status_table(cluster_records: list[responses.StatusResponse],
                       show_all: bool,
                       show_user: bool,
-                      query_clusters: Optional[List[str]] = None,
+                      query_clusters: list[str] | None = None,
                       show_workspaces: bool = False) -> int:
     """Compute cluster table values and display.
 
@@ -119,7 +120,7 @@ def show_status_table(cluster_records: List[responses.StatusResponse],
 
 
 def get_total_cost_of_displayed_records(
-        cluster_records: List[_ClusterCostReportRecord], display_all: bool):
+        cluster_records: list[_ClusterCostReportRecord], display_all: bool):
     """Compute total cost of records to be displayed in cost report."""
     cluster_records.sort(
         key=lambda report: -_get_status_value_for_cost_report(report))
@@ -132,10 +133,10 @@ def get_total_cost_of_displayed_records(
     return total_cost
 
 
-def show_cost_report_table(cluster_records: List[_ClusterCostReportRecord],
+def show_cost_report_table(cluster_records: list[_ClusterCostReportRecord],
                            show_all: bool,
-                           controller_name: Optional[str] = None,
-                           days: Optional[int] = None):
+                           controller_name: str | None = None,
+                           days: int | None = None):
     """Compute cluster table values and display for cost report.
 
     For each cluster, this shows: cluster name, resources, launched time,
@@ -228,7 +229,7 @@ _get_name = (lambda cluster_record, _: cluster_record['name'])
 _get_user_hash = (lambda cluster_record, _: cluster_record['user_hash'])
 
 
-def get_user_display_name(user_name: str, user_id: Optional[str] = None) -> str:
+def get_user_display_name(user_name: str, user_id: str | None = None) -> str:
     """ Appends SA to the user name if the user is a service account. """
     if user_id and user_id.lower().startswith('sa-'):
         return f'{user_name} (SA)'
@@ -438,7 +439,7 @@ def _get_estimated_cost_for_cost_report(
 
 
 def show_kubernetes_cluster_status_table(
-        clusters: List['kubernetes_utils.KubernetesSkyPilotClusterInfoPayload'],
+        clusters: list['kubernetes_utils.KubernetesSkyPilotClusterInfoPayload'],
         show_all: bool) -> None:
     """Compute cluster table values and display for Kubernetes clusters."""
     status_columns = [

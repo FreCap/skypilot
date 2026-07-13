@@ -5,7 +5,7 @@ import itertools
 import json
 import math
 import typing
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any
 
 from sky import skypilot_config
 from sky.skylet import constants
@@ -36,7 +36,7 @@ class DiskTier(enum.Enum):
     BEST = 'best'
 
     @classmethod
-    def supported_tiers(cls) -> List[str]:
+    def supported_tiers(cls) -> list[str]:
         # 'none' is a special tier for overriding
         # the tier specified in task YAML.
         return [tier.value for tier in cls] + ['none']
@@ -60,7 +60,7 @@ class NetworkTier(enum.Enum):
     BEST = 'best'
 
     @classmethod
-    def supported_tiers(cls) -> List[str]:
+    def supported_tiers(cls) -> list[str]:
         return [tier.value for tier in cls]
 
     @classmethod
@@ -178,7 +178,7 @@ def normalize_local_disk(local_disk: str) -> str:
     return f'{mode}:{size_str}'
 
 
-def parse_local_disk_str(local_disk: str) -> Tuple[str, float, bool]:
+def parse_local_disk_str(local_disk: str) -> tuple[str, float, bool]:
     """Parse a normalized local_disk string.
 
     Args:
@@ -200,8 +200,7 @@ def parse_local_disk_str(local_disk: str) -> Tuple[str, float, bool]:
     return (mode, size, at_least)
 
 
-def local_disk_satisfied(requested: Optional[str],
-                         launched: Optional[str]) -> bool:
+def local_disk_satisfied(requested: str | None, launched: str | None) -> bool:
     #  pylint: disable=line-too-long
     """Check if launched local disk satisfies the requested requirement.
 
@@ -264,7 +263,7 @@ def check_port_range_str(port_range: str) -> None:
             raise ValueError(_PORT_RANGE_HINT_MSG.format(port_range))
 
 
-def port_ranges_to_set(ports: Optional[List[str]]) -> Set[int]:
+def port_ranges_to_set(ports: list[str] | None) -> set[int]:
     """Parse a list of port ranges into a set that containing no duplicates.
 
     For example, ['1-3', '5-7'] will be parsed to {1, 2, 3, 5, 6, 7}.
@@ -283,7 +282,7 @@ def port_ranges_to_set(ports: Optional[List[str]]) -> Set[int]:
     return port_set
 
 
-def port_set_to_ranges(port_set: Optional[Set[int]]) -> List[str]:
+def port_set_to_ranges(port_set: set[int] | None) -> list[str]:
     """Parse a set of ports into the skypilot ports format.
 
     This function will group consecutive ports together into a range,
@@ -292,7 +291,7 @@ def port_set_to_ranges(port_set: Optional[Set[int]]) -> List[str]:
     """
     if port_set is None:
         return []
-    ports: List[str] = []
+    ports: list[str] = []
     # Group consecutive ports together.
     # This algorithm is based on one observation: consecutive numbers
     # in a sorted list will have the same difference with their indices.
@@ -309,7 +308,7 @@ def port_set_to_ranges(port_set: Optional[Set[int]]) -> List[str]:
     return ports
 
 
-def simplify_ports(ports: List[str]) -> List[str]:
+def simplify_ports(ports: list[str]) -> list[str]:
     """Simplify a list of ports.
 
     For example, ['1-2', '3', '5-6', '7'] will be simplified to ['1-3', '5-7'].
@@ -318,7 +317,7 @@ def simplify_ports(ports: List[str]) -> List[str]:
 
 
 def format_resource(resource: 'resources_lib.Resources',
-                    simplified_only: bool = False) -> Tuple[str, Optional[str]]:
+                    simplified_only: bool = False) -> tuple[str, str | None]:
     resource = resource.assert_launchable()
     is_k8s = resource.cloud.canonical_name() == 'kubernetes'
     vcpu, mem = None, None
@@ -383,7 +382,7 @@ def format_resource(resource: 'resources_lib.Resources',
 
 def get_readable_resources_repr(
         handle: 'backends.CloudVmRayResourceHandle',
-        simplified_only: bool = False) -> Tuple[str, Optional[str]]:
+        simplified_only: bool = False) -> tuple[str, str | None]:
     resource_str_simple, resource_str_full = format_resource(
         handle.launched_resources, simplified_only)
     if not simplified_only:
@@ -398,7 +397,7 @@ def get_readable_resources_repr(
 
 
 def make_ray_custom_resources_str(
-        resource_dict: Optional[Dict[str, Union[int, float]]]) -> Optional[str]:
+        resource_dict: dict[str, int | float] | None) -> str | None:
     """Convert resources to Ray custom resources format."""
     if resource_dict is None:
         return None
@@ -420,9 +419,9 @@ class FeasibleResources:
     search in the catalog that are offered in the location. E.g.,
     ['A100-80GB:1', 'A100-80GB:2', 'A100-80GB:4', 'A100:8']
     """
-    resources_list: List['resources_lib.Resources']
-    fuzzy_candidate_list: List[str]
-    hint: Optional[str]
+    resources_list: list['resources_lib.Resources']
+    fuzzy_candidate_list: list[str]
+    hint: str | None
 
 
 def need_to_query_reservations() -> bool:
@@ -457,7 +456,7 @@ def need_to_query_reservations() -> bool:
 def make_launchables_for_valid_region_zones(
     launchable_resources: 'resources_lib.Resources',
     override_optimize_by_zone: bool = False,
-) -> List['resources_lib.Resources']:
+) -> list['resources_lib.Resources']:
     assert launchable_resources.is_launchable()
     # In principle, all provisioning requests should be made at the granularity
     # of a single zone. However, for on-demand instances, we batch the requests
@@ -505,7 +504,7 @@ def make_launchables_for_valid_region_zones(
     return launchables
 
 
-def parse_memory_resource(resource_qty_str: Union[str, int, float],
+def parse_memory_resource(resource_qty_str: str | int | float,
                           field_name: str,
                           ret_type: type = int,
                           unit: str = 'gb',
@@ -575,7 +574,7 @@ def parse_memory_resource(resource_qty_str: Union[str, int, float],
         raise ValueError(error_msg)
 
 
-def _parse_time_with_units(time: str, time_units: Dict[str, int]) -> int:
+def _parse_time_with_units(time: str, time_units: dict[str, int]) -> int:
     """Parse a time string using the given unit multipliers.
 
     Args:
@@ -641,7 +640,7 @@ def parse_time_seconds(time: str) -> int:
 
 
 def normalize_any_of_resources_config(
-        any_of: List[Dict[str, Any]]) -> Tuple[str, ...]:
+        any_of: list[dict[str, Any]]) -> tuple[str, ...]:
     """Normalize a list of any_of resources config to a canonical form.
 
     Args:

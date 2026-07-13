@@ -1176,8 +1176,7 @@ class TestServiceStatusEndpointSnapshot:
             info.cluster_name: {
                 'launched_at': idx,
                 'handle': handle,
-            }
-            for idx, (info, handle) in enumerate(replicas_and_handles, start=1)
+            } for idx, (info, handle) in enumerate(replicas_and_handles, start=1)
         }
         endpoint_calls = []
 

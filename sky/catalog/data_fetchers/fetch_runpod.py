@@ -16,7 +16,7 @@ import json
 import os
 import sys
 import traceback
-from typing import Any, Dict, List, Optional, Union
+from typing import Any
 
 import pandas as pd
 import runpod
@@ -30,7 +30,7 @@ from runpod.api import graphql
 # 3. Otherwise, the minimum of the returned# vCPU count from the API
 # The max count of GPUs per pod is set to 8 apart from A40 at 10
 DEFAULT_MAX_GPUS = 8
-DEFAULT_GPU_INFO: Dict[str, Dict[str, Union[int, float]]] = {
+DEFAULT_GPU_INFO: dict[str, dict[str, int | float]] = {
     'A100-80GB': {
         'vcpus': 8.0,
         'memory': 117.0,
@@ -280,7 +280,7 @@ REGION_ZONES = {
 }
 
 
-def get_gpu_details(gpu_id: str, gpu_count: int = 1) -> Dict[str, Any]:
+def get_gpu_details(gpu_id: str, gpu_count: int = 1) -> dict[str, Any]:
     """Get detailed GPU information using GraphQL query.
 
     This uses a custom graphql query because runpod.get_gpu(id) does not include
@@ -333,7 +333,7 @@ def get_gpu_details(gpu_id: str, gpu_count: int = 1) -> Dict[str, Any]:
     return gpu_query_result
 
 
-def query_cpu_id(cpu_id: str) -> List[Dict[str, Any]]:
+def query_cpu_id(cpu_id: str) -> list[dict[str, Any]]:
     query = f"""
     query SecureCpuTypes {{
       cpuFlavors(input: {{id: "{cpu_id}"}}) {{
@@ -363,7 +363,7 @@ def query_cpu_id(cpu_id: str) -> List[Dict[str, Any]]:
 
 def query_cpu_specifics(cpu_id: str,
                         cpu_spec_id: str,
-                        data_center_id: str = '') -> List[Dict[str, Any]]:
+                        data_center_id: str = '') -> list[dict[str, Any]]:
     query = f"""
     query SecureCpuTypes {{
       cpuFlavors(input: {{id: "{cpu_id}"}}) {{
@@ -397,7 +397,7 @@ def format_price(price: float) -> float:
     return round(price, 2)
 
 
-def format_gpu_name(gpu_type: Dict[str, Any]) -> str:
+def format_gpu_name(gpu_type: dict[str, Any]) -> str:
     """Format GPU name to match the required format.
 
     Programmatically generates the name from RunPod's GPU display name.
@@ -420,8 +420,8 @@ def format_gpu_name(gpu_type: Dict[str, Any]) -> str:
     return base_name
 
 
-def get_gpu_info(base_gpu_name: str, gpu_type: Dict[str, Any],
-                 gpu_count: int) -> Optional[Dict[str, Any]]:
+def get_gpu_info(base_gpu_name: str, gpu_type: dict[str, Any],
+                 gpu_count: int) -> dict[str, Any] | None:
     """Extract relevant GPU information from RunPod GPU type data."""
 
     # Use minVcpu & minMemory in the lowestPrice info if defaults not available
@@ -472,7 +472,7 @@ def get_gpu_info(base_gpu_name: str, gpu_type: Dict[str, Any],
     }
 
 
-def get_cpu_instance_configurations(cpu_id: str) -> List[Dict[str, Any]]:
+def get_cpu_instance_configurations(cpu_id: str) -> list[dict[str, Any]]:
     """Retrieves available CPU instance configurations for a CPU ID.
     This function queries the available vCPU and memory combinations
     for given CPU types over all supported regions and zones.
@@ -536,7 +536,7 @@ def get_cpu_instance_configurations(cpu_id: str) -> List[Dict[str, Any]]:
     return instances
 
 
-def get_gpu_instance_configurations(gpu_id: str) -> List[Dict[str, Any]]:
+def get_gpu_instance_configurations(gpu_id: str) -> list[dict[str, Any]]:
     """Retrieves available GPU instance configurations for a given GPU ID.
     Only secure cloud instances are included (community cloud instances
     are skipped).  Each configuration includes pricing (spot and base), region,
@@ -649,7 +649,7 @@ def fetch_runpod_catalog(no_gpu: bool, no_cpu: bool) -> pd.DataFrame:
         raise
 
 
-def save_catalog(instances: List[Dict[str, Any]], output_file: str) -> None:
+def save_catalog(instances: list[dict[str, Any]], output_file: str) -> None:
     """Save the catalog to a CSV file."""
 
     # Create DataFrame

@@ -2,7 +2,7 @@
 import collections
 import importlib
 import typing
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import Optional, Union
 
 from sky.catalog.config import fallback_to_default_catalog
 from sky.skylet import constants
@@ -13,7 +13,7 @@ if typing.TYPE_CHECKING:
     from sky.catalog import common
     from sky.clouds import cloud
 
-CloudFilter = Optional[Union[List[str], str]]
+CloudFilter = list[str] | str | None
 
 
 def _map_clouds_catalog(clouds: CloudFilter, method_name: str, *args, **kwargs):
@@ -56,14 +56,14 @@ def _map_clouds_catalog(clouds: CloudFilter, method_name: str, *args, **kwargs):
 @fallback_to_default_catalog
 def list_accelerators(
     gpus_only: bool = True,
-    name_filter: Optional[str] = None,
-    region_filter: Optional[str] = None,
-    quantity_filter: Optional[int] = None,
+    name_filter: str | None = None,
+    region_filter: str | None = None,
+    quantity_filter: int | None = None,
     clouds: CloudFilter = None,
     case_sensitive: bool = True,
     all_regions: bool = False,
     require_price: bool = True,
-) -> 'Dict[str, List[common.InstanceTypeInfo]]':
+) -> 'dict[str, list[common.InstanceTypeInfo]]':
     """Lists the names of all accelerators offered by Sky.
 
     This will include all accelerators offered by Sky, including those
@@ -77,8 +77,8 @@ def list_accelerators(
                                   case_sensitive, all_regions, require_price)
     if not isinstance(results, list):
         results = [results]
-    ret: Dict[str,
-              List['common.InstanceTypeInfo']] = collections.defaultdict(list)
+    ret: dict[str,
+              list[common.InstanceTypeInfo]] = collections.defaultdict(list)
     for result in results:
         for gpu, items in result.items():
             ret[gpu] += items
@@ -87,11 +87,11 @@ def list_accelerators(
 
 def list_accelerator_counts(
     gpus_only: bool = True,
-    name_filter: Optional[str] = None,
-    region_filter: Optional[str] = None,
-    quantity_filter: Optional[int] = None,
+    name_filter: str | None = None,
+    region_filter: str | None = None,
+    quantity_filter: int | None = None,
     clouds: CloudFilter = None,
-) -> Dict[str, List[float]]:
+) -> dict[str, list[float]]:
     """Lists all accelerators offered by Sky and available counts.
 
     Returns: A dictionary of canonical accelerator names mapped to a list
@@ -107,12 +107,12 @@ def list_accelerator_counts(
                                   require_price=False)
     if not isinstance(results, list):
         results = [results]
-    accelerator_counts: Dict[str, Set[float]] = collections.defaultdict(set)
+    accelerator_counts: dict[str, set[float]] = collections.defaultdict(set)
     for result in results:
         for gpu, items in result.items():
             for item in items:
                 accelerator_counts[gpu].add(item.accelerator_count)
-    ret: Dict[str, List[float]] = {}
+    ret: dict[str, list[float]] = {}
     for gpu, counts in accelerator_counts.items():
         ret[gpu] = sorted(counts)
     return ret
@@ -120,12 +120,12 @@ def list_accelerator_counts(
 
 def list_accelerator_realtime(
     gpus_only: bool = True,
-    name_filter: Optional[str] = None,
-    region_filter: Optional[str] = None,
-    quantity_filter: Optional[int] = None,
+    name_filter: str | None = None,
+    region_filter: str | None = None,
+    quantity_filter: int | None = None,
     clouds: CloudFilter = None,
     case_sensitive: bool = True,
-) -> Tuple[Dict[str, List[int]], Dict[str, int], Dict[str, int]]:
+) -> tuple[dict[str, list[int]], dict[str, int], dict[str, int]]:
     """Lists all accelerators offered by Sky with their realtime availability.
     Realtime availability is the total number of accelerators in the cluster
     and number of accelerators available at the time of the call.
@@ -146,7 +146,7 @@ def list_accelerator_realtime(
                             case_sensitive=case_sensitive,
                             all_regions=False,
                             require_price=False))
-    accelerator_counts: Dict[str, List[int]] = collections.defaultdict(list)
+    accelerator_counts: dict[str, list[int]] = collections.defaultdict(list)
     for gpu, items in qtys_map.items():
         for item in items:
             accelerator_counts[gpu].append(item.accelerator_count)
@@ -162,15 +162,15 @@ def instance_type_exists(instance_type: str,
 
 
 def validate_region_zone(
-        region_name: Optional[str],
-        zone_name: Optional[str],
-        clouds: CloudFilter = None) -> Tuple[Optional[str], Optional[str]]:
+        region_name: str | None,
+        zone_name: str | None,
+        clouds: CloudFilter = None) -> tuple[str | None, str | None]:
     """Returns the zone by name."""
     return _map_clouds_catalog(clouds, 'validate_region_zone', region_name,
                                zone_name)
 
 
-def regions(clouds: CloudFilter = None) -> 'List[cloud.Region]':
+def regions(clouds: CloudFilter = None) -> 'list[cloud.Region]':
     """Returns the list of regions in a Cloud's catalog.
     Each Region object contains a list of Zones, if available.
     """
@@ -180,7 +180,7 @@ def regions(clouds: CloudFilter = None) -> 'List[cloud.Region]':
 def get_region_zones_for_instance_type(
         instance_type: str,
         use_spot: bool,
-        clouds: CloudFilter = None) -> 'List[cloud.Region]':
+        clouds: CloudFilter = None) -> 'list[cloud.Region]':
     """Returns a list of regions for a given instance type."""
     return _map_clouds_catalog(clouds, 'get_region_zones_for_instance_type',
                                instance_type, use_spot)
@@ -188,8 +188,8 @@ def get_region_zones_for_instance_type(
 
 def get_hourly_cost(instance_type: str,
                     use_spot: bool,
-                    region: Optional[str],
-                    zone: Optional[str],
+                    region: str | None,
+                    zone: str | None,
                     clouds: CloudFilter = None) -> float:
     """Returns the hourly price of a VM instance in the given region and zone.
 
@@ -208,22 +208,21 @@ def get_hourly_cost(instance_type: str,
 
 def get_vcpus_mem_from_instance_type(
         instance_type: str,
-        clouds: CloudFilter = None) -> Tuple[Optional[float], Optional[float]]:
+        clouds: CloudFilter = None) -> tuple[float | None, float | None]:
     """Returns the number of virtual CPUs from a instance type."""
     return _map_clouds_catalog(clouds, 'get_vcpus_mem_from_instance_type',
                                instance_type)
 
 
-def get_default_instance_type(cpus: Optional[str] = None,
-                              memory: Optional[str] = None,
-                              disk_tier: Optional[
-                                  resources_utils.DiskTier] = None,
-                              local_disk: Optional[str] = None,
-                              region: Optional[str] = None,
-                              zone: Optional[str] = None,
+def get_default_instance_type(cpus: str | None = None,
+                              memory: str | None = None,
+                              disk_tier: resources_utils.DiskTier | None = None,
+                              local_disk: str | None = None,
+                              region: str | None = None,
+                              zone: str | None = None,
                               use_spot: bool = False,
-                              max_hourly_cost: Optional[float] = None,
-                              clouds: CloudFilter = None) -> Optional[str]:
+                              max_hourly_cost: float | None = None,
+                              clouds: CloudFilter = None) -> str | None:
     """Returns the cloud's default instance type for given #vCPUs and memory.
 
     For example, if cpus='4', this method returns the default instance type
@@ -242,22 +241,21 @@ def get_default_instance_type(cpus: Optional[str] = None,
 
 def get_accelerators_from_instance_type(
         instance_type: str,
-        clouds: CloudFilter = None) -> Optional[Dict[str, Union[int, float]]]:
+        clouds: CloudFilter = None) -> dict[str, int | float] | None:
     """Returns the accelerators from a instance type."""
     return _map_clouds_catalog(clouds, 'get_accelerators_from_instance_type',
                                instance_type)
 
 
 def get_arch_from_instance_type(instance_type: str,
-                                clouds: CloudFilter = None) -> Optional[str]:
+                                clouds: CloudFilter = None) -> str | None:
     """Returns the arch from a instance type."""
     return _map_clouds_catalog(clouds, 'get_arch_from_instance_type',
                                instance_type)
 
 
 def get_local_disk_from_instance_type(instance_type: str,
-                                      clouds: CloudFilter = None
-                                     ) -> Optional[str]:
+                                      clouds: CloudFilter = None) -> str | None:
     """Returns the local disk spec (normalized) from an instance type."""
     return _map_clouds_catalog(clouds, 'get_local_disk_from_instance_type',
                                instance_type)
@@ -265,16 +263,16 @@ def get_local_disk_from_instance_type(instance_type: str,
 
 def get_instance_type_for_accelerator(
     acc_name: str,
-    acc_count: Union[int, float],
-    cpus: Optional[str] = None,
-    memory: Optional[str] = None,
+    acc_count: int | float,
+    cpus: str | None = None,
+    memory: str | None = None,
     use_spot: bool = False,
-    local_disk: Optional[str] = None,
-    region: Optional[str] = None,
-    zone: Optional[str] = None,
-    max_hourly_cost: Optional[float] = None,
+    local_disk: str | None = None,
+    region: str | None = None,
+    zone: str | None = None,
+    max_hourly_cost: float | None = None,
     clouds: CloudFilter = None,
-) -> Tuple[Optional[List[str]], List[str]]:
+) -> tuple[list[str] | None, list[str]]:
     """Filter the instance types based on resource requirements.
 
     Returns a list of instance types satisfying the required count of
@@ -289,8 +287,8 @@ def get_accelerator_hourly_cost(
     acc_name: str,
     acc_count: int,
     use_spot: bool,
-    region: Optional[str] = None,
-    zone: Optional[str] = None,
+    region: str | None = None,
+    zone: str | None = None,
     clouds: CloudFilter = None,
 ) -> float:
     """Returns the hourly price of the accelerator in the given region and zone.
@@ -317,15 +315,15 @@ def get_region_zones_for_accelerators(
         acc_name: str,
         acc_count: int,
         use_spot: bool,
-        clouds: CloudFilter = None) -> 'List[cloud.Region]':
+        clouds: CloudFilter = None) -> 'list[cloud.Region]':
     """Returns a list of regions for a given accelerators."""
     return _map_clouds_catalog(clouds, 'get_region_zones_for_accelerators',
                                acc_name, acc_count, use_spot)
 
 
 def check_accelerator_attachable_to_host(instance_type: str,
-                                         accelerators: Optional[Dict[str, int]],
-                                         zone: Optional[str] = None,
+                                         accelerators: dict[str, int] | None,
+                                         zone: str | None = None,
                                          clouds: CloudFilter = None) -> None:
     """GCP only: Check if the accelerators can be attached to the host VM.
 
@@ -337,7 +335,7 @@ def check_accelerator_attachable_to_host(instance_type: str,
                         instance_type, accelerators, zone)
 
 
-def get_common_gpus() -> List[str]:
+def get_common_gpus() -> list[str]:
     """Returns a list of commonly used GPU names."""
     return [
         'A10',
@@ -356,7 +354,7 @@ def get_common_gpus() -> List[str]:
     ]
 
 
-def get_tpus() -> List[str]:
+def get_tpus() -> list[str]:
     """Returns a list of TPU names."""
     # TODO(wei-lin): refactor below hard-coded list.
     # There are many TPU configurations available, we show the some smallest
@@ -370,14 +368,14 @@ def get_tpus() -> List[str]:
 
 
 def get_image_id_from_tag(tag: str,
-                          region: Optional[str] = None,
+                          region: str | None = None,
                           clouds: CloudFilter = None) -> str:
     """Returns the image ID from the tag."""
     return _map_clouds_catalog(clouds, 'get_image_id_from_tag', tag, region)
 
 
 def is_image_tag_valid(tag: str,
-                       region: Optional[str],
+                       region: str | None,
                        clouds: CloudFilter = None) -> bool:
     """Validates the image tag."""
     return _map_clouds_catalog(clouds, 'is_image_tag_valid', tag, region)

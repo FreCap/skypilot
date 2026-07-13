@@ -20,7 +20,16 @@ addopts = "-s -n 16 -q --tb=short --dist loadgroup --disable-warnings"
 asyncio_default_fixture_loop_scope = "function"
 
 [tool.mypy]
-python_version = "3.9"
+python_version = "3.14"
+# CI and the production image are linux; pin the platform so
+# warn_unused_ignores gives the same answer on macOS dev machines.
+platform = "linux"
+# Hardening: keep type: ignore comments honest, casts meaningful, and flag
+# comparisons that can never be true.
+warn_unused_ignores = true
+warn_redundant_casts = true
+strict_equality = true
+no_implicit_optional = true
 follow_imports = "skip"
 ignore_missing_imports = true
 allow_redefinition = true
@@ -32,3 +41,75 @@ line_length = 80
 multi_line_output = 0
 combine_as_imports = true
 use_parentheses = true
+
+[tool.ruff]
+# py310, not py314: the deployment is 3.14-only, but the sky wheel is also
+# installed into the cluster workers' Python 3.10 runtime (see
+# requires_python in setup.py), so code modernization must stop at 3.10
+# syntax.
+target-version = "py310"
+# yapf owns formatting; ruff runs as a bug-finding linter only.
+extend-exclude = ["sky/schemas/generated", "build", "sky/dashboard"]
+
+[tool.ruff.lint]
+select = [
+    "F",       # pyflakes: undefined names, unused vars, f-string bugs
+    "B",       # bugbear: mutable defaults, loop-var capture, except bugs
+    "PLE",     # pylint error-severity rules
+    "RUF006",  # asyncio.create_task without a saved reference (GC hazard)
+    "ASYNC1",  # async correctness (busy-wait, timeout misuse)
+    "ASYNC2",  # blocking calls in async functions
+    "UP",      # pyupgrade: keep code on modern (>=3.10) idioms
+    "ISC001",  # implicit single-line str concat (missing-comma bugs)
+]
+ignore = [
+    # Ratchet list: real hygiene issues with too many existing sites to fix
+    # in one pass. Do not add new violations; burn these down over time.
+    "F401",     # unused imports (many are facade re-exports/registrations)
+    "B007",     # unused loop control variable
+    "B009",     # getattr with constant: used to bypass pylint/mypy on
+    "B010",     # dynamic attributes; removing them breaks both linters
+    "B008",     # function call in default argument
+    "B011",     # assert-False (intentional fail-fast in several places)
+    "B027",     # empty method in abstract class without abstract decorator
+    "B028",     # warnings.warn without stacklevel
+    "B904",     # raise without from inside except (66 sites)
+    "B905",     # zip without strict= (31 sites)
+    "ASYNC109", # async function with a timeout parameter
+    "ASYNC230", # blocking open() in async function (18 sites)
+    "ASYNC240", # blocking path method in async function
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Runtime-formatted template: `{placeholders}` are substituted via .format()
+# before execution, so names are undefined in the file itself.
+"sky/backends/monkey_patches/monkey_patch_ray_up.py" = ["F821"]
+
+[tool.importlinter]
+root_package = "sky"
+include_external_packages = false
+
+# These contracts lock in deliberate architecture decisions (leaf modules and
+# layer boundaries). Direct imports only (allow_indirect_imports): the goal
+# is to catch a module regaining a dependency that was deliberately removed,
+# not to forbid transitive reachability through facades.
+[[tool.importlinter.contracts]]
+name = "skylet_rpc stays a leaf below backend_utils"
+type = "forbidden"
+allow_indirect_imports = true
+source_modules = ["sky.backends.skylet_rpc"]
+forbidden_modules = ["sky.backends.backend_utils"]
+
+[[tool.importlinter.contracts]]
+name = "cloud providers do not depend on execution layers"
+type = "forbidden"
+allow_indirect_imports = true
+source_modules = ["sky.clouds"]
+forbidden_modules = ["sky.backends", "sky.serve", "sky.jobs", "sky.server"]
+
+[[tool.importlinter.contracts]]
+name = "skylet (on-cluster agent) does not import the API server"
+type = "forbidden"
+allow_indirect_imports = true
+source_modules = ["sky.skylet"]
+forbidden_modules = ["sky.server"]

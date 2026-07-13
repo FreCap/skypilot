@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.9"]
+        python-version: ["3.14"]
     steps:
     - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3.6.0
     - name: Install the latest version of uv
@@ -34,6 +34,10 @@ jobs:
         source ~/test-env/bin/activate
         uv pip install mypy==$(grep mypy requirements-dev.txt | cut -d'=' -f3)
         uv pip install $(grep types- requirements-dev.txt | tr '\n' ' ')
+        # boto3-stubs is not matched by the types- grep but several
+        # type: ignore comments are only meaningful with it installed
+        # (warn_unused_ignores flags them otherwise).
+        uv pip install "$(grep boto3-stubs requirements-dev.txt)"
     - name: Running mypy
       run: |
         source ~/test-env/bin/activate

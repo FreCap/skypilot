@@ -7,7 +7,6 @@ import re
 import select
 import subprocess
 import time
-from typing import List, Optional, Tuple
 
 import httpx
 import prometheus_client as prom
@@ -301,11 +300,11 @@ class FederationStats:
     """
 
     def __init__(self) -> None:
-        self.port_forward_seconds: Optional[float] = None
-        self.federate_seconds: Optional[float] = None
-        self.body_bytes: Optional[int] = None
-        self.wire_bytes: Optional[int] = None
-        self.content_encoding: Optional[str] = None
+        self.port_forward_seconds: float | None = None
+        self.federate_seconds: float | None = None
+        self.body_bytes: int | None = None
+        self.wire_bytes: int | None = None
+        self.content_encoding: str | None = None
 
     def summary(self) -> str:
         """A compact 'port_forward=..s, federate=..' breakdown for logs.
@@ -376,7 +375,7 @@ def time_me_async(func):
 
 
 def start_svc_port_forward(context: str, namespace: str, service: str,
-                           service_port: int) -> Tuple[subprocess.Popen, int]:
+                           service_port: int) -> tuple[subprocess.Popen, int]:
     """Starts a port forward to a service in a Kubernetes cluster.
     Args:
         context: Kubernetes context name
@@ -508,10 +507,10 @@ async def send_metrics_request_with_port_forward(
         service: str,
         service_port: int,
         endpoint_path: str = '/federate',
-        match_patterns: Optional[List[str]] = None,
+        match_patterns: list[str] | None = None,
         timeout: float = 30.0,
         route: str = 'gpu-metrics',
-        stats: Optional[FederationStats] = None) -> str:
+        stats: FederationStats | None = None) -> str:
     """Sends a metrics request to a Prometheus endpoint via port forwarding.
     Args:
         context: Kubernetes context name
@@ -650,8 +649,7 @@ GPU_METRICS_MATCH_PATTERNS = [
 
 
 async def get_metrics_for_context(context: str,
-                                  stats: Optional[FederationStats] = None
-                                 ) -> str:
+                                  stats: FederationStats | None = None) -> str:
     """Get GPU metrics for a single Kubernetes context.
     Args:
         context: Kubernetes context name
@@ -694,8 +692,9 @@ ENDPOINT_METRICS_MATCH_PATTERNS = [
 ]
 
 
-async def get_endpoint_metrics_for_context(
-        context: str, stats: Optional[FederationStats] = None) -> str:
+async def get_endpoint_metrics_for_context(context: str,
+                                           stats: FederationStats | None = None
+                                          ) -> str:
     """Get Sky Endpoint serving-engine metrics for a single K8s context.
 
     Mirrors get_metrics_for_context() but federates the serving engines'

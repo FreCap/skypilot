@@ -3,7 +3,6 @@ from http.server import BaseHTTPRequestHandler
 from http.server import HTTPServer
 import threading
 import time
-from typing import Dict, Optional
 
 from sky.server import constants as server_constants
 
@@ -11,7 +10,7 @@ from sky.server import constants as server_constants
 class _AuthCallbackHandler(BaseHTTPRequestHandler):
     """HTTP request handler for OAuth callback."""
 
-    def __init__(self, token_container: Dict[str, Optional[str]],
+    def __init__(self, token_container: dict[str, str | None],
                  remote_endpoint: str, *args, **kwargs):
         self.token_container = token_container
         self.remote_endpoint = remote_endpoint
@@ -46,7 +45,7 @@ class _AuthCallbackHandler(BaseHTTPRequestHandler):
 
 def start_local_auth_server(
         port: int,
-        token_store: Dict[str, Optional[str]],
+        token_store: dict[str, str | None],
         remote_endpoint: str,
         timeout: int = server_constants.AUTH_SESSION_TIMEOUT_SECONDS
 ) -> HTTPServer:

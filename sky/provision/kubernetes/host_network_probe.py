@@ -24,14 +24,14 @@ import socket
 import ssl
 import sys
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 import urllib.error
 import urllib.request
 
 # SKYPILOT_RAY_PORT is the head's GCS port; the worker template already
 # uses that name to dial the head, so we reuse it rather than introduce
 # a parallel SKYPILOT_RAY_GCS_PORT.
-_ENV_VAR_FOR_PORT: Dict[str, str] = {
+_ENV_VAR_FOR_PORT: dict[str, str] = {
     'gcs': 'SKYPILOT_RAY_PORT',
     'dashboard': 'SKYPILOT_RAY_DASHBOARD_PORT',
     'node_manager': 'SKYPILOT_RAY_NODE_MANAGER_PORT',
@@ -45,10 +45,10 @@ _ENV_VAR_FOR_PORT: Dict[str, str] = {
     'sshd': 'SKYPILOT_SSHD_PORT',
 }
 
-_HEAD_PORT_NAMES: List[str] = list(_ENV_VAR_FOR_PORT)
+_HEAD_PORT_NAMES: list[str] = list(_ENV_VAR_FOR_PORT)
 
 # Workers don't run GCS/dashboard/ray-client-server, but they DO run sshd.
-_WORKER_PORT_NAMES: List[str] = [
+_WORKER_PORT_NAMES: list[str] = [
     'node_manager',
     'object_manager',
     'dashboard_agent_listen',
@@ -107,18 +107,18 @@ def _api_ssl_context() -> ssl.SSLContext:
     return ssl.create_default_context(cafile=_SA_CA_PATH)
 
 
-def _bind_ephemeral_port() -> Tuple[socket.socket, int]:
+def _bind_ephemeral_port() -> tuple[socket.socket, int]:
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.bind(('0.0.0.0', 0))
     return s, s.getsockname()[1]
 
 
 def _probe_ports(
-        names: List[str]) -> Tuple[List[socket.socket], Dict[str, int]]:
+        names: list[str]) -> tuple[list[socket.socket], dict[str, int]]:
     """Bind one ephemeral socket per name; caller must keep them alive
     until just before ``ray start`` rebinds the ports."""
-    held: List[socket.socket] = []
-    ports: Dict[str, int] = {}
+    held: list[socket.socket] = []
+    ports: dict[str, int] = {}
     for name in names:
         sock, port = _bind_ephemeral_port()
         held.append(sock)
@@ -126,7 +126,7 @@ def _probe_ports(
     return held, ports
 
 
-def _write_env_file(ports: Dict[str, int], path: str) -> None:
+def _write_env_file(ports: dict[str, int], path: str) -> None:
     lines = [
         f'export {_ENV_VAR_FOR_PORT[name]}={port}'
         for name, port in ports.items()
@@ -135,10 +135,9 @@ def _write_env_file(ports: Dict[str, int], path: str) -> None:
         f.write('\n'.join(lines) + '\n')
 
 
-def _k8s_api_request(
-        method: str,
-        path: str,
-        body: Optional[Dict[str, Any]] = None) -> Tuple[int, bytes]:
+def _k8s_api_request(method: str,
+                     path: str,
+                     body: dict[str, Any] | None = None) -> tuple[int, bytes]:
     api_host = os.environ['KUBERNETES_SERVICE_HOST']
     api_port = os.environ['KUBERNETES_SERVICE_PORT']
     headers = {
@@ -163,8 +162,8 @@ def _k8s_api_request(
         return e.code, e.read()
 
 
-def _configmap_data_for_ports(podname: str, ports: Dict[str,
-                                                        int]) -> Dict[str, str]:
+def _configmap_data_for_ports(podname: str, ports: dict[str,
+                                                        int]) -> dict[str, str]:
     """Translate probe port names into ConfigMap data keys.
 
     The 'sshd' port is rewritten to ``sshd_<podname>`` because every pod
@@ -172,22 +171,22 @@ def _configmap_data_for_ports(podname: str, ports: Dict[str,
     ConfigMap. Other keys are head-owned Ray ports and stay flat so the
     worker probe can look up the head's GCS by the bare key 'gcs'.
     """
-    out: Dict[str, str] = {}
+    out: dict[str, str] = {}
     for name, port in ports.items():
         key = f'{SSHD_KEY_PREFIX}{podname}' if name == 'sshd' else name
         out[key] = str(port)
     return out
 
 
-def _head_ports_from_configmap_data(data: Dict[str, str],
-                                    podname: str) -> Optional[Dict[str, int]]:
+def _head_ports_from_configmap_data(data: dict[str, str],
+                                    podname: str) -> dict[str, int] | None:
     """Reconstruct the head's probed ports from a ConfigMap's data.
 
     Inverse of _configmap_data_for_ports for the head's own keys. Returns
     None if any expected head port is missing or non-integer, so the
     caller falls back to a fresh probe rather than reusing a partial set.
     """
-    ports: Dict[str, int] = {}
+    ports: dict[str, int] = {}
     for name in _HEAD_PORT_NAMES:
         key = f'{SSHD_KEY_PREFIX}{podname}' if name == 'sshd' else name
         raw = data.get(key)
@@ -200,9 +199,9 @@ def _head_ports_from_configmap_data(data: Dict[str, str],
     return ports
 
 
-def _build_configmap_body(name: str, namespace: str, ports: Dict[str, int],
+def _build_configmap_body(name: str, namespace: str, ports: dict[str, int],
                           owner_pod_name: str,
-                          owner_pod_uid: str) -> Dict[str, Any]:
+                          owner_pod_uid: str) -> dict[str, Any]:
     """Build the ConfigMap body, including the ownerReference that ties its
     lifetime to the head pod so K8s garbage-collects it on `sky down`."""
     return {
@@ -237,7 +236,7 @@ def _format_api_error(action: str, name: str, namespace: str, status: int,
             f'status={status} body={body}')
 
 
-def _get_configmap(name: str, namespace: str) -> Dict[str, Any]:
+def _get_configmap(name: str, namespace: str) -> dict[str, Any]:
     """GET a ConfigMap, returning its parsed body. Raises on non-200."""
     base = f'/api/v1/namespaces/{namespace}/configmaps/{name}'
     status, resp = _k8s_api_request('GET', base)
@@ -247,7 +246,7 @@ def _get_configmap(name: str, namespace: str) -> Dict[str, Any]:
     return json.loads(resp)
 
 
-def _try_get_configmap(name: str, namespace: str) -> Optional[Dict[str, Any]]:
+def _try_get_configmap(name: str, namespace: str) -> dict[str, Any] | None:
     """GET a ConfigMap, returning None if it doesn't exist (404)."""
     base = f'/api/v1/namespaces/{namespace}/configmaps/{name}'
     status, resp = _k8s_api_request('GET', base)
@@ -259,7 +258,7 @@ def _try_get_configmap(name: str, namespace: str) -> Optional[Dict[str, Any]]:
     return json.loads(resp)
 
 
-def _publish_configmap(name: str, namespace: str, ports: Dict[str,
+def _publish_configmap(name: str, namespace: str, ports: dict[str,
                                                               int]) -> None:
     """Create or update a ConfigMap with the head's chosen ports.
 
@@ -296,7 +295,7 @@ def _merge_sshd_port(name: str, namespace: str, podname: str,
     """
     base = f'/api/v1/namespaces/{namespace}/configmaps/{name}'
     key = f'{SSHD_KEY_PREFIX}{podname}'
-    last_err: Optional[str] = None
+    last_err: str | None = None
     for attempt in range(_MERGE_RETRY_LIMIT):
         existing = _get_configmap(name, namespace)
         data = dict(existing.get('data') or {})
@@ -320,7 +319,7 @@ def _merge_sshd_port(name: str, namespace: str, podname: str,
         f'{_MERGE_RETRY_LIMIT} attempts: {last_err}')
 
 
-def _read_configmap_with_retry(name: str, namespace: str) -> Dict[str, str]:
+def _read_configmap_with_retry(name: str, namespace: str) -> dict[str, str]:
     """Poll a ConfigMap until it exists, returning its ``data`` field.
 
     Doubles as the "head is up" sync barrier for workers — the same
@@ -346,7 +345,7 @@ def _read_configmap_with_retry(name: str, namespace: str) -> Dict[str, str]:
 def _wait_head_gcs_tcp(host: str, port: int) -> None:
     """Block until the head's GCS port answers on TCP."""
     deadline = time.monotonic() + _HEAD_GCS_TCP_WAIT_TIMEOUT_S
-    last_err: Optional[Exception] = None
+    last_err: Exception | None = None
     while time.monotonic() < deadline:
         try:
             with socket.create_connection((host, port), timeout=2):
@@ -360,7 +359,7 @@ def _wait_head_gcs_tcp(host: str, port: int) -> None:
 
 
 def _existing_head_ports_to_reuse(name: str,
-                                  namespace: str) -> Optional[Dict[str, int]]:
+                                  namespace: str) -> dict[str, int] | None:
     """Ports to reuse if this head pod's ConfigMap already exists.
 
     A *container* restart (crash, OOM, ``ray stop``-then-up) keeps the
@@ -395,7 +394,7 @@ def _run_head(env_file: str, configmap_name: str,
         # This head pod's container restarted; keep the published ports
         # so in-flight workers / SSH stay valid. Nothing to hold — ray
         # rebinds the same ports the dead process vacated.
-        held: List[socket.socket] = []
+        held: list[socket.socket] = []
         ports = reused
     else:
         held, ports = _probe_ports(_HEAD_PORT_NAMES)
@@ -433,7 +432,7 @@ def _run_worker(env_file: str, configmap_name: str,
         _wait_head_gcs_tcp(head_ip, int(head_gcs))
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     # No description: __doc__ is stripped by source_utils.minify_python_source
     # before the script is inlined into the pod bootstrap.
     parser = argparse.ArgumentParser()

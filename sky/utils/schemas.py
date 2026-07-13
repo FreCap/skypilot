@@ -5,7 +5,7 @@ https://json-schema.org/
 """
 import enum
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 from sky.skylet import autostop_lib
 from sky.skylet import constants
@@ -21,10 +21,10 @@ get_service_schema.__module__ = __name__
 # are registered so additionalProperties is False. On the client (or
 # before plugins load), additionalProperties is True to let plugin
 # config pass through for server-side validation.
-_extra_job_recovery_properties: Dict[str, Any] = {}
+_extra_job_recovery_properties: dict[str, Any] = {}
 
 
-def register_job_recovery_property(name: str, schema: Dict[str, Any]) -> None:
+def register_job_recovery_property(name: str, schema: dict[str, Any]) -> None:
     """Register an additional property for the job_recovery schema.
 
     This allows plugins to extend the job_recovery dict schema with
@@ -40,16 +40,16 @@ def register_job_recovery_property(name: str, schema: Dict[str, Any]) -> None:
     _extra_job_recovery_properties[name] = schema
 
 
-_extra_jobs_properties: Dict[str, Any] = {}
+_extra_jobs_properties: dict[str, Any] = {}
 
-_extra_kubernetes_properties: Dict[str, Any] = {}
+_extra_kubernetes_properties: dict[str, Any] = {}
 
 # Registry for plugin-provided properties under the top-level
 # `plugins:` config section. Keyed by plugin name.
-_extra_plugin_properties: Dict[str, Any] = {}
+_extra_plugin_properties: dict[str, Any] = {}
 
 
-def register_plugin_property(name: str, schema: Dict[str, Any]) -> None:
+def register_plugin_property(name: str, schema: dict[str, Any]) -> None:
     """Register a sub-property of the top-level `plugins:` config section."""
     if name in _extra_plugin_properties:
         raise ValueError(f'Plugin property {name!r} is already registered.')
@@ -71,7 +71,7 @@ def _allow_additional_properties() -> bool:
     return not plugins.plugins_loaded()
 
 
-def register_jobs_property(name: str, schema: Dict[str, Any]) -> None:
+def register_jobs_property(name: str, schema: dict[str, Any]) -> None:
     """Register an additional property for the jobs controller schema.
 
     This allows plugins to extend the ``jobs`` config section with
@@ -89,7 +89,7 @@ def register_jobs_property(name: str, schema: Dict[str, Any]) -> None:
     _extra_jobs_properties[name] = schema
 
 
-def register_kubernetes_property(name: str, schema: Dict[str, Any]) -> None:
+def register_kubernetes_property(name: str, schema: dict[str, Any]) -> None:
     """Register an additional property for the kubernetes schema.
 
     This allows plugins to extend the kubernetes dict schema with
@@ -895,7 +895,7 @@ def get_volume_mount_schema():
     }
 
 
-def _filter_schema(schema: dict, keys_to_keep: List[Tuple[str, ...]]) -> dict:
+def _filter_schema(schema: dict, keys_to_keep: list[tuple[str, ...]]) -> dict:
     """Recursively filter a schema to include only certain keys.
 
     Args:
@@ -906,7 +906,7 @@ def _filter_schema(schema: dict, keys_to_keep: List[Tuple[str, ...]]) -> dict:
         The filtered schema.
     """
     # Convert list of tuples to a dictionary for easier access
-    paths_dict: Dict[str, Any] = {}
+    paths_dict: dict[str, Any] = {}
     for path in keys_to_keep:
         current = paths_dict
         for step in path:
@@ -1572,8 +1572,8 @@ def get_config_schema():
     resources_schema['properties'].pop('ports')
 
     def _get_controller_schema(
-        extra_properties: Optional[Dict[str, Any]] = None,
-        extra_controller_properties: Optional[Dict[str, Any]] = None,
+        extra_properties: dict[str, Any] | None = None,
+        extra_controller_properties: dict[str, Any] | None = None,
     ):
         controller_properties = {
             'resources': resources_schema,
@@ -1596,7 +1596,7 @@ def get_config_schema():
         }
         if extra_controller_properties:
             controller_properties.update(extra_controller_properties)
-        props: Dict[str, Any] = {
+        props: dict[str, Any] = {
             'controller': {
                 'type': 'object',
                 'required': [],
@@ -2124,7 +2124,7 @@ def get_config_schema():
         }
     }
 
-    daemon_schema: Dict[str, Any] = {
+    daemon_schema: dict[str, Any] = {
         'type': 'object',
         'required': [],
         'additionalProperties': False,

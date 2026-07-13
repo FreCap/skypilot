@@ -1,7 +1,7 @@
 """Utilities for formatting tables for CLI output."""
 import abc
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import prettytable
 
@@ -16,7 +16,7 @@ from sky.utils import volume
 logger = sky_logging.init_logger(__name__)
 
 
-def format_job_queue(jobs: List[responses.ClusterJobRecord]):
+def format_job_queue(jobs: list[responses.ClusterJobRecord]):
     """Format the job queue for display.
 
     Usage:
@@ -45,7 +45,7 @@ def format_job_queue(jobs: List[responses.ClusterJobRecord]):
     return job_table
 
 
-def format_storage_table(storages: List[responses.StorageRecord],
+def format_storage_table(storages: list[responses.StorageRecord],
                          show_all: bool = False) -> str:
     """Format the storage table for display.
 
@@ -89,12 +89,12 @@ def format_storage_table(storages: List[responses.StorageRecord],
 
 
 def format_job_table(
-    jobs: List[responses.ManagedJobRecord],
+    jobs: list[responses.ManagedJobRecord],
     show_all: bool,
     show_user: bool,
-    pool_status: Optional[List[Dict[str, Any]]] = None,
-    max_jobs: Optional[int] = None,
-    status_counts: Optional[Dict[str, int]] = None,
+    pool_status: list[dict[str, Any]] | None = None,
+    max_jobs: int | None = None,
+    status_counts: dict[str, int] | None = None,
 ):
     jobs = [job.model_dump() for job in jobs]
     return managed_jobs.format_job_table(
@@ -121,8 +121,8 @@ _BASIC_COLUMNS = [
 ]
 
 
-def _get_infra_str(cloud: Optional[str], region: Optional[str],
-                   zone: Optional[str]) -> str:
+def _get_infra_str(cloud: str | None, region: str | None,
+                   zone: str | None) -> str:
     """Get the infrastructure string for the volume."""
     infra = ''
     if cloud:
@@ -138,7 +138,7 @@ class VolumeTable(abc.ABC):
     """The volume table."""
 
     def __init__(self,
-                 volumes: List[responses.VolumeRecord],
+                 volumes: list[responses.VolumeRecord],
                  show_all: bool = False):
         super().__init__()
         self.table = self._create_table(show_all)
@@ -146,7 +146,7 @@ class VolumeTable(abc.ABC):
 
     def _get_row_base_columns(self,
                               row: responses.VolumeRecord,
-                              show_all: bool = False) -> List[str]:
+                              show_all: bool = False) -> list[str]:
         """Get the base columns for a row."""
         # Convert last_attached_at timestamp to human readable string
         last_attached_at = row.get('last_attached_at')
@@ -192,7 +192,7 @@ class VolumeTable(abc.ABC):
         raise NotImplementedError
 
     def _add_rows(self,
-                  volumes: List[responses.VolumeRecord],
+                  volumes: list[responses.VolumeRecord],
                   show_all: bool = False) -> None:
         """Add rows to the volume table."""
         raise NotImplementedError
@@ -207,7 +207,7 @@ class PVCVolumeTable(VolumeTable):
     """The PVC volume table."""
 
     def __init__(self,
-                 volumes: List[responses.VolumeRecord],
+                 volumes: list[responses.VolumeRecord],
                  show_all: bool = False):
         # Check if any volume has an error before creating the table
         self._has_errors = any(row.get('error_message') for row in volumes)
@@ -242,7 +242,7 @@ class PVCVolumeTable(VolumeTable):
         return table
 
     def _add_rows(self,
-                  volumes: List[responses.VolumeRecord],
+                  volumes: list[responses.VolumeRecord],
                   show_all: bool = False) -> None:
         """Add rows to the PVC volume table."""
         for row in volumes:
@@ -282,7 +282,7 @@ class HostPathVolumeTable(VolumeTable):
         return table
 
     def _add_rows(self,
-                  volumes: List[responses.VolumeRecord],
+                  volumes: list[responses.VolumeRecord],
                   show_all: bool = False) -> None:
         """Add rows to the hostPath volume table."""
         for row in volumes:
@@ -316,7 +316,7 @@ class RunPodVolumeTable(VolumeTable):
         return table
 
     def _add_rows(self,
-                  volumes: List[responses.VolumeRecord],
+                  volumes: list[responses.VolumeRecord],
                   show_all: bool = False) -> None:
         """Add rows to the RunPod volume table."""
         for row in volumes:
@@ -331,7 +331,7 @@ class RunPodVolumeTable(VolumeTable):
         return 'RunPod Network Volumes:\n' + str(self.table)
 
 
-def format_volume_table(volumes: List[responses.VolumeRecord],
+def format_volume_table(volumes: list[responses.VolumeRecord],
                         show_all: bool = False) -> str:
     """Format the volume table for display.
 
@@ -341,7 +341,7 @@ def format_volume_table(volumes: List[responses.VolumeRecord],
     Returns:
         str: The formatted volume table.
     """
-    volumes_per_type: Dict[str, List[responses.VolumeRecord]] = {}
+    volumes_per_type: dict[str, list[responses.VolumeRecord]] = {}
     supported_volume_types = [
         volume_type.value for volume_type in volume.VolumeType
     ]

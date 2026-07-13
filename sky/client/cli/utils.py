@@ -1,7 +1,6 @@
 """Utility functions for the CLI."""
 import enum
 import typing
-from typing import Dict, List, Optional, Tuple, Union
 
 from sky import exceptions
 from sky import jobs as managed_jobs
@@ -36,15 +35,14 @@ def get_managed_job_queue(
     refresh: bool,
     skip_finished: bool = False,
     all_users: bool = False,
-    job_ids: Optional[List[int]] = None,
-    limit: Optional[int] = None,
-    fields: Optional[List[str]] = None,
-    statuses: Optional[List[str]] = None,
-    submitted_after: Optional[float] = None,
-    submitted_before: Optional[float] = None,
-) -> Tuple[server_common.RequestId[Union[List[responses.ManagedJobRecord],
-                                         Tuple[List[responses.ManagedJobRecord],
-                                               int, Dict[str, int], int]]],
+    job_ids: list[int] | None = None,
+    limit: int | None = None,
+    fields: list[str] | None = None,
+    statuses: list[str] | None = None,
+    submitted_after: float | None = None,
+    submitted_before: float | None = None,
+) -> tuple[server_common.RequestId[list[responses.ManagedJobRecord] | tuple[
+        list[responses.ManagedJobRecord], int, dict[str, int], int]],
            QueueResultVersion]:
     """Gets statuses of managed jobs.
 
@@ -74,10 +72,9 @@ def get_managed_job_queue(
     """
     try:
         return typing.cast(
-            server_common.RequestId[
-                Union[List[responses.ManagedJobRecord],
-                      Tuple[List[responses.ManagedJobRecord], int,
-                            Dict[str, int], int]]],
+            server_common.RequestId[list[responses.ManagedJobRecord] |
+                                    tuple[list[responses.ManagedJobRecord], int,
+                                          dict[str, int], int]],
             managed_jobs.queue_v2(
                 refresh,
                 skip_finished,
@@ -99,10 +96,5 @@ def get_managed_job_queue(
                 'Filtering by submission time is not supported in your API '
                 'server. Please upgrade to a newer API server to use '
                 '--since/--after/--before. Showing all jobs.')
-        return typing.cast(
-            server_common.RequestId[
-                Union[List[responses.ManagedJobRecord],
-                      Tuple[List[responses.ManagedJobRecord], int,
-                            Dict[str, int], int]]],
-            managed_jobs.queue(refresh, skip_finished, all_users,
-                               job_ids)), QueueResultVersion.V1
+        return managed_jobs.queue(refresh, skip_finished, all_users,
+                                  job_ids), QueueResultVersion.V1

@@ -7,7 +7,6 @@ expire after a configurable timeout. Uses SQLite for cross-worker access.
 import os
 import sqlite3
 import time
-from typing import Optional
 
 from sky.server import constants as server_constants
 from sky.utils import common_utils
@@ -58,7 +57,7 @@ class AuthSessionStore:
                 '(code_challenge, token, created_at) VALUES (?, ?, ?)',
                 (code_challenge, token, time.time()))
 
-    def poll_session(self, code_verifier: str) -> Optional[str]:
+    def poll_session(self, code_verifier: str) -> str | None:
         """Poll a session for its token using code_verifier.
 
         Computes code_challenge from code_verifier to look up the session.

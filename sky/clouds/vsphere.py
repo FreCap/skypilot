@@ -1,6 +1,7 @@
 """Vsphere cloud implementation."""
+from collections.abc import Iterator
 import typing
-from typing import Dict, Iterator, List, Optional, Tuple, Union
+from typing import Optional
 
 from sky import catalog
 from sky import clouds
@@ -68,7 +69,7 @@ class Vsphere(clouds.Cloud):
     _MAX_CLUSTER_NAME_LEN_LIMIT = 80  # The name can't exceeds 80 characters
     # for vsphere.
 
-    _regions: List[clouds.Region] = []
+    _regions: list[clouds.Region] = []
 
     PROVISIONER_VERSION = clouds.ProvisionerVersion.SKYPILOT
     STATUS_VERSION = clouds.StatusVersion.SKYPILOT
@@ -77,25 +78,25 @@ class Vsphere(clouds.Cloud):
     def _unsupported_features_for_resources(
         cls,
         resources: 'resources_lib.Resources',
-        region: Optional[str] = None,
-    ) -> Dict[clouds.CloudImplementationFeatures, str]:
+        region: str | None = None,
+    ) -> dict[clouds.CloudImplementationFeatures, str]:
         features = cls._CLOUD_UNSUPPORTED_FEATURES
         return features
 
     @classmethod
-    def max_cluster_name_length(cls) -> Optional[int]:
+    def max_cluster_name_length(cls) -> int | None:
         return cls._MAX_CLUSTER_NAME_LEN_LIMIT
 
     @classmethod
     def regions_with_offering(
         cls,
         instance_type: str,
-        accelerators: Optional[Dict[str, int]],
+        accelerators: dict[str, int] | None,
         use_spot: bool,
-        region: Optional[str],
-        zone: Optional[str],
+        region: str | None,
+        zone: str | None,
         resources: Optional['resources_lib.Resources'] = None,
-    ) -> List[clouds.Region]:
+    ) -> list[clouds.Region]:
         del accelerators, zone  # unused
         regions = catalog.get_region_zones_for_instance_type(
             instance_type, use_spot, _CLOUD_VSPHERE)
@@ -111,9 +112,9 @@ class Vsphere(clouds.Cloud):
         region: str,
         num_nodes: int,  # pylint: disable=unused-argument
         instance_type: str,
-        accelerators: Optional[Dict[str, int]] = None,
+        accelerators: dict[str, int] | None = None,
         use_spot: bool = False,
-    ) -> Iterator[List[clouds.Zone]]:
+    ) -> Iterator[list[clouds.Zone]]:
         regions = cls.regions_with_offering(instance_type,
                                             accelerators,
                                             use_spot,
@@ -129,17 +130,17 @@ class Vsphere(clouds.Cloud):
         self,
         instance_type: str,
         use_spot: bool,
-        region: Optional[str] = None,
-        zone: Optional[str] = None,
+        region: str | None = None,
+        zone: str | None = None,
     ) -> float:
         return 0.0
 
     def accelerators_to_hourly_cost(
         self,
-        accelerators: Dict[str, int],
+        accelerators: dict[str, int],
         use_spot: bool,
-        region: Optional[str] = None,
-        zone: Optional[str] = None,
+        region: str | None = None,
+        zone: str | None = None,
     ) -> float:
         # Always return 0 for vSphere cases.
         return 0.0
@@ -154,15 +155,15 @@ class Vsphere(clouds.Cloud):
     @classmethod
     def get_default_instance_type(
         cls,
-        cpus: Optional[str] = None,
-        memory: Optional[str] = None,
-        disk_tier: Optional[resources_utils.DiskTier] = None,
-        local_disk: Optional[str] = None,
-        region: Optional[str] = None,
-        zone: Optional[str] = None,
+        cpus: str | None = None,
+        memory: str | None = None,
+        disk_tier: resources_utils.DiskTier | None = None,
+        local_disk: str | None = None,
+        region: str | None = None,
+        zone: str | None = None,
         use_spot: bool = False,
-        max_hourly_cost: Optional[float] = None,
-    ) -> Optional[str]:
+        max_hourly_cost: float | None = None,
+    ) -> str | None:
         return catalog.get_default_instance_type(
             cpus=cpus,
             memory=memory,
@@ -178,7 +179,7 @@ class Vsphere(clouds.Cloud):
     def get_accelerators_from_instance_type(
         cls,
         instance_type: str,
-    ) -> Optional[Dict[str, Union[int, float]]]:
+    ) -> dict[str, int | float] | None:
         return catalog.get_accelerators_from_instance_type(
             instance_type, clouds=_CLOUD_VSPHERE)
 
@@ -186,12 +187,12 @@ class Vsphere(clouds.Cloud):
     def get_vcpus_mem_from_instance_type(
         cls,
         instance_type: str,
-    ) -> Tuple[Optional[float], Optional[float]]:
+    ) -> tuple[float | None, float | None]:
         return catalog.get_vcpus_mem_from_instance_type(instance_type,
                                                         clouds=_CLOUD_VSPHERE)
 
     @classmethod
-    def get_zone_shell_cmd(cls) -> Optional[str]:
+    def get_zone_shell_cmd(cls) -> str | None:
         return None
 
     def make_deploy_resources_variables(
@@ -199,11 +200,11 @@ class Vsphere(clouds.Cloud):
         resources: 'resources_lib.Resources',
         cluster_name: resources_utils.ClusterName,
         region: 'clouds.Region',
-        zones: Optional[List['clouds.Zone']],
+        zones: list['clouds.Zone'] | None,
         num_nodes: int,
         dryrun: bool = False,
-        volume_mounts: Optional[List['volume_lib.VolumeMount']] = None,
-    ) -> Dict[str, Optional[str]]:
+        volume_mounts: list['volume_lib.VolumeMount'] | None = None,
+    ) -> dict[str, str | None]:
         # TODO get image id here.
         del cluster_name, dryrun  # unused
         assert zones is not None, (region, zones)
@@ -291,7 +292,7 @@ class Vsphere(clouds.Cloud):
 
     @classmethod
     def _check_compute_credentials(
-            cls) -> Tuple[bool, Optional[Union[str, Dict[str, str]]]]:
+            cls) -> tuple[bool, str | dict[str, str] | None]:
         """Checks if the user has access credentials to
         vSphere's compute service."""
         dependency_error_msg = (
@@ -335,14 +336,14 @@ class Vsphere(clouds.Cloud):
             return False, (error_message)  # TODO: Add url of guide.
         return True, None
 
-    def get_credential_file_mounts(self) -> Dict[str, str]:
+    def get_credential_file_mounts(self) -> dict[str, str]:
         return {
             f'~/.vsphere/{filename}': f'~/.vsphere/{filename}'
             for filename in _CREDENTIAL_FILES
         }
 
     @classmethod
-    def get_user_identities(cls) -> Optional[List[List[str]]]:
+    def get_user_identities(cls) -> list[list[str]] | None:
         # NOTE: used for very advanced SkyPilot functionality
         # Can implement later if desired
         return None
@@ -350,5 +351,5 @@ class Vsphere(clouds.Cloud):
     def instance_type_exists(self, instance_type: str) -> bool:
         return catalog.instance_type_exists(instance_type, _CLOUD_VSPHERE)
 
-    def validate_region_zone(self, region: Optional[str], zone: Optional[str]):
+    def validate_region_zone(self, region: str | None, zone: str | None):
         return catalog.validate_region_zone(region, zone, clouds=_CLOUD_VSPHERE)

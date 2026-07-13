@@ -21,10 +21,9 @@ provider. See the comments in setup_lambda_authentication)
 import copy
 import os
 import re
-import socket
 import subprocess
 import sys
-from typing import Any, Dict
+from typing import Any
 import uuid
 
 import colorama
@@ -61,9 +60,9 @@ logger = sky_logging.init_logger(__name__)
 # development.
 
 
-def configure_ssh_info(config: Dict[str, Any]) -> Dict[str, Any]:
+def configure_ssh_info(config: dict[str, Any]) -> dict[str, Any]:
     _, public_key_path = auth_utils.get_or_generate_keys()
-    with open(public_key_path, 'r', encoding='utf-8') as f:
+    with open(public_key_path, encoding='utf-8') as f:
         public_key = f.read().strip()
     config_str = yaml_utils.dump_yaml_str(config)
     config_str = config_str.replace('skypilot:ssh_user',
@@ -99,7 +98,7 @@ def parse_gcp_project_oslogin(project):
 # avoid duplicated codes.
 # Retry for the GCP as sometimes there will be connection reset by peer error.
 @common_utils.retry
-def setup_gcp_authentication(config: Dict[str, Any]) -> Dict[str, Any]:
+def setup_gcp_authentication(config: dict[str, Any]) -> dict[str, Any]:
     _, public_key_path = auth_utils.get_or_generate_keys()
     config = copy.deepcopy(config)
 
@@ -144,7 +143,7 @@ def setup_gcp_authentication(config: Dict[str, Any]) -> Dict[str, Any]:
     except gcp.auth_error_exception() as e:
         raise exceptions.InvalidCloudCredentials(
             f'{common_utils.format_exception(e)}')
-    except socket.timeout:
+    except TimeoutError:
         logger.error('Socket timed out when trying to get the GCP project. '
                      'Please check your network connection.')
         raise
@@ -182,7 +181,7 @@ def setup_gcp_authentication(config: Dict[str, Any]) -> Dict[str, Any]:
             # within their google workspace after the os-login credentials
             # were established.
             config_path = os.path.expanduser(clouds.gcp.GCP_CONFIG_PATH)
-            with open(config_path, 'r', encoding='utf-8') as infile:
+            with open(config_path, encoding='utf-8') as infile:
                 for line in infile:
                     if line.startswith('account'):
                         account = line.split('=')[1].strip()
@@ -223,14 +222,14 @@ def setup_gcp_authentication(config: Dict[str, Any]) -> Dict[str, Any]:
     return configure_ssh_info(config)
 
 
-def setup_lambda_authentication(config: Dict[str, Any]) -> Dict[str, Any]:
+def setup_lambda_authentication(config: dict[str, Any]) -> dict[str, Any]:
 
     auth_utils.get_or_generate_keys()
 
     # Ensure ssh key is registered with Lambda Cloud
     lambda_client = lambda_utils.LambdaCloudClient()
     _, public_key_path = auth_utils.get_or_generate_keys()
-    with open(public_key_path, 'r', encoding='utf-8') as f:
+    with open(public_key_path, encoding='utf-8') as f:
         public_key = f.read().strip()
     prefix = f'sky-key-{common_utils.get_user_hash()}'
 
@@ -246,7 +245,7 @@ def setup_lambda_authentication(config: Dict[str, Any]) -> Dict[str, Any]:
     return config
 
 
-def setup_ibm_authentication(config: Dict[str, Any]) -> Dict[str, Any]:
+def setup_ibm_authentication(config: dict[str, Any]) -> dict[str, Any]:
     """ registers keys if they do not exist in sky folder
     and updates config file.
     keys default location: '~/.ssh/sky-key' and '~/.ssh/sky-key.pub'
@@ -262,7 +261,6 @@ def setup_ibm_authentication(config: Dict[str, Any]) -> Dict[str, Any]:
 
     _, public_key_path = auth_utils.get_or_generate_keys()
     with open(os.path.abspath(os.path.expanduser(public_key_path)),
-              'r',
               encoding='utf-8') as file:
         ssh_key_data = file.read().strip()
     # pylint: disable=E1136
@@ -299,7 +297,7 @@ def setup_ibm_authentication(config: Dict[str, Any]) -> Dict[str, Any]:
     return config
 
 
-def setup_kubernetes_authentication(config: Dict[str, Any]) -> Dict[str, Any]:
+def setup_kubernetes_authentication(config: dict[str, Any]) -> dict[str, Any]:
     context = kubernetes_utils.get_context_from_config(config['provider'])
     namespace = kubernetes_utils.get_namespace_from_config(config['provider'])
     private_key_path, _ = auth_utils.get_or_generate_keys()
@@ -339,26 +337,26 @@ def setup_kubernetes_authentication(config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ---------------------------------- RunPod ---------------------------------- #
-def setup_runpod_authentication(config: Dict[str, Any]) -> Dict[str, Any]:
+def setup_runpod_authentication(config: dict[str, Any]) -> dict[str, Any]:
     """Sets up SSH authentication for RunPod.
     - Generates a new SSH key pair if one does not exist.
     - Adds the public SSH key to the user's RunPod account.
     """
     _, public_key_path = auth_utils.get_or_generate_keys()
-    with open(public_key_path, 'r', encoding='UTF-8') as pub_key_file:
+    with open(public_key_path, encoding='UTF-8') as pub_key_file:
         public_key = pub_key_file.read().strip()
         runpod.runpod.cli.groups.ssh.functions.add_ssh_key(public_key)
 
     return configure_ssh_info(config)
 
 
-def setup_vast_authentication(config: Dict[str, Any]) -> Dict[str, Any]:
+def setup_vast_authentication(config: dict[str, Any]) -> dict[str, Any]:
     """Sets up SSH authentication for Vast.
     - Generates a new SSH key pair if one does not exist.
     - Adds the public SSH key to the user's Vast account.
     """
     _, public_key_path = auth_utils.get_or_generate_keys()
-    with open(public_key_path, 'r', encoding='UTF-8') as pub_key_file:
+    with open(public_key_path, encoding='UTF-8') as pub_key_file:
         public_key = pub_key_file.read().strip()
         try:
             current_key_list = vast.vast().show_ssh_keys()  # pylint: disable=assignment-from-no-return
@@ -378,13 +376,13 @@ def setup_vast_authentication(config: Dict[str, Any]) -> Dict[str, Any]:
     return configure_ssh_info(config)
 
 
-def setup_verda_authentication(config: Dict[str, Any]) -> Dict[str, Any]:
+def setup_verda_authentication(config: dict[str, Any]) -> dict[str, Any]:
     """Sets up SSH authentication for Verda Cloud.
     - Generates a new SSH key pair if one does not exist.
     - Adds the public SSH key to the user's Cloud account.
     """
     _, public_key_path = auth_utils.get_or_generate_keys()
-    with open(public_key_path, 'r', encoding='UTF-8') as pub_key_file:
+    with open(public_key_path, encoding='UTF-8') as pub_key_file:
         public_key = pub_key_file.read().strip()
         verda_config = verda.get_verda_configuration()
         if not verda_config[0]:
@@ -401,23 +399,23 @@ def setup_verda_authentication(config: Dict[str, Any]) -> Dict[str, Any]:
     return configure_ssh_info(config)
 
 
-def setup_fluidstack_authentication(config: Dict[str, Any]) -> Dict[str, Any]:
+def setup_fluidstack_authentication(config: dict[str, Any]) -> dict[str, Any]:
 
     _, public_key_path = auth_utils.get_or_generate_keys()
 
     client = fluidstack_utils.FluidstackClient()
     public_key = None
-    with open(public_key_path, 'r', encoding='utf-8') as f:
+    with open(public_key_path, encoding='utf-8') as f:
         public_key = f.read()
     client.get_or_add_ssh_key(public_key)
     config['auth']['ssh_public_key'] = public_key_path
     return configure_ssh_info(config)
 
 
-def setup_hyperbolic_authentication(config: Dict[str, Any]) -> Dict[str, Any]:
+def setup_hyperbolic_authentication(config: dict[str, Any]) -> dict[str, Any]:
     """Sets up SSH authentication for Hyperbolic."""
     _, public_key_path = auth_utils.get_or_generate_keys()
-    with open(public_key_path, 'r', encoding='utf-8') as f:
+    with open(public_key_path, encoding='utf-8') as f:
         public_key = f.read().strip()
 
     # TODO: adjust below to use public_keys instead of
@@ -432,7 +430,7 @@ def setup_hyperbolic_authentication(config: Dict[str, Any]) -> Dict[str, Any]:
     return configure_ssh_info(config)
 
 
-def setup_shadeform_authentication(config: Dict[str, Any]) -> Dict[str, Any]:
+def setup_shadeform_authentication(config: dict[str, Any]) -> dict[str, Any]:
     """Sets up SSH authentication for Shadeform.
     - Generates a new SSH key pair if one does not exist.
     - Adds the public SSH key to the user's Shadeform account.
@@ -444,7 +442,7 @@ def setup_shadeform_authentication(config: Dict[str, Any]) -> Dict[str, Any]:
     _, public_key_path = auth_utils.get_or_generate_keys()
     ssh_key_id = None
 
-    with open(public_key_path, 'r', encoding='utf-8') as f:
+    with open(public_key_path, encoding='utf-8') as f:
         public_key = f.read().strip()
 
     try:
@@ -475,14 +473,14 @@ def setup_shadeform_authentication(config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def setup_primeintellect_authentication(
-        config: Dict[str, Any]) -> Dict[str, Any]:
+        config: dict[str, Any]) -> dict[str, Any]:
     """Sets up SSH authentication for Prime Intellect.
     - Generates a new SSH key pair if one does not exist.
     - Adds the public SSH key to the user's Prime Intellect account.
     """
     # Ensure local SSH keypair exists and fetch public key content
     _, public_key_path = auth_utils.get_or_generate_keys()
-    with open(public_key_path, 'r', encoding='utf-8') as f:
+    with open(public_key_path, encoding='utf-8') as f:
         public_key = f.read().strip()
 
     # Register the public key with Prime Intellect (no-op if already exists)
@@ -498,13 +496,13 @@ def setup_primeintellect_authentication(
     return configure_ssh_info(config)
 
 
-def setup_mithril_authentication(config: Dict[str, Any]) -> Dict[str, Any]:
+def setup_mithril_authentication(config: dict[str, Any]) -> dict[str, Any]:
     """Sets up SSH authentication for Mithril.
     - Generates a new SSH key pair if one does not exist.
     - Adds the public SSH key to the user's Mithril account.
     """
     _, public_key_path = auth_utils.get_or_generate_keys()
-    with open(public_key_path, 'r', encoding='utf-8') as f:
+    with open(public_key_path, encoding='utf-8') as f:
         public_key = f.read().strip()
 
     # Register the public key with Mithril (no-op if already exists).
@@ -520,14 +518,14 @@ def setup_mithril_authentication(config: Dict[str, Any]) -> Dict[str, Any]:
     return configure_ssh_info(config)
 
 
-def setup_seeweb_authentication(config: Dict[str, Any]) -> Dict[str, Any]:
+def setup_seeweb_authentication(config: dict[str, Any]) -> dict[str, Any]:
     """Registers the public key with Seeweb and notes the remote name."""
     # 1. local key pair
     auth_utils.get_or_generate_keys()
 
     # 2. public key
     _, public_key_path = auth_utils.get_or_generate_keys()
-    with open(public_key_path, 'r', encoding='utf-8') as f:
+    with open(public_key_path, encoding='utf-8') as f:
         public_key = f.read().strip()
 
     # 3. Seeweb API client

@@ -1,9 +1,10 @@
 """Optimizer: assigns best resources to user tasks."""
 import collections
+from collections.abc import Iterable
 import copy
 import json
 import typing
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any
 
 import colorama
 import numpy as np
@@ -42,15 +43,15 @@ _DUMMY_SOURCE_NAME = 'skypilot-dummy-source'
 _DUMMY_SINK_NAME = 'skypilot-dummy-sink'
 
 # task -> resources -> estimated cost or time.
-_TaskToCostMap = Dict[task_lib.Task, Dict[resources_lib.Resources, float]]
+_TaskToCostMap = dict[task_lib.Task, dict[resources_lib.Resources, float]]
 # cloud -> list of resources that have the same accelerators.
-_PerCloudCandidates = Dict[clouds.Cloud, List[resources_lib.Resources]]
+_PerCloudCandidates = dict[clouds.Cloud, list[resources_lib.Resources]]
 # task -> per-cloud candidates
-_TaskToPerCloudCandidates = Dict[task_lib.Task, _PerCloudCandidates]
+_TaskToPerCloudCandidates = dict[task_lib.Task, _PerCloudCandidates]
 
 
 # For logging purposes.
-def _create_table(field_names: List[str]) -> prettytable.PrettyTable:
+def _create_table(field_names: list[str]) -> prettytable.PrettyTable:
     table_kwargs = {
         'hrules': prettytable.FRAME,
         'vrules': prettytable.NONE,
@@ -108,8 +109,8 @@ class Optimizer:
     @usage_lib.entrypoint('sky.optimizer.optimize')
     def optimize(dag: 'dag_lib.Dag',
                  minimize: common.OptimizeTarget = common.OptimizeTarget.COST,
-                 blocked_resources: Optional[Iterable[
-                     resources_lib.Resources]] = None,
+                 blocked_resources: Iterable[resources_lib.Resources] |
+                 None = None,
                  quiet: bool = False) -> 'dag_lib.Dag':
         """Find the best execution plan for the given DAG.
 
@@ -130,7 +131,7 @@ class Optimizer:
             # node.best_resources if it is None.
             Optimizer._add_dummy_source_sink_nodes(dag)
             try:
-                unused_best_plan = Optimizer._optimize_dag(
+                _ = Optimizer._optimize_dag(
                     dag=dag,
                     minimize_cost=minimize == common.OptimizeTarget.COST,
                     blocked_resources=blocked_resources,
@@ -198,7 +199,7 @@ class Optimizer:
         parent_resources: resources_lib.Resources,
         node: task_lib.Task,
         resources: resources_lib.Resources,
-    ) -> Tuple[Optional[clouds.Cloud], Optional[clouds.Cloud], Optional[float]]:
+    ) -> tuple[clouds.Cloud | None, clouds.Cloud | None, float | None]:
         if isinstance(parent_resources.cloud, clouds.DummyCloud):
             # Special case.  The current 'node' is a real
             # source node, and its input may be on a different
@@ -237,11 +238,11 @@ class Optimizer:
 
     @staticmethod
     def _estimate_nodes_cost_or_time(
-        topo_order: List[task_lib.Task],
+        topo_order: list[task_lib.Task],
         minimize_cost: bool = True,
-        blocked_resources: Optional[Iterable[resources_lib.Resources]] = None,
+        blocked_resources: Iterable[resources_lib.Resources] | None = None,
         quiet: bool = False
-    ) -> Tuple[_TaskToCostMap, _TaskToPerCloudCandidates]:
+    ) -> tuple[_TaskToCostMap, _TaskToPerCloudCandidates]:
         """Estimates the cost/time of each task-resource mapping in the DAG.
 
         Note that the egress cost/time is not considered in this function.
@@ -257,9 +258,9 @@ class Optimizer:
         node_to_candidate_map: _TaskToPerCloudCandidates = {}
 
         def get_available_reservations(
-            launchable_resources: Dict[resources_lib.Resources,
-                                       List[resources_lib.Resources]]
-        ) -> Dict[resources_lib.Resources, int]:
+            launchable_resources: dict[resources_lib.Resources,
+                                       list[resources_lib.Resources]]
+        ) -> dict[resources_lib.Resources, int]:
             if not resources_utils.need_to_query_reservations():
                 return {}
 
@@ -270,7 +271,7 @@ class Optimizer:
                 num_available_reserved_nodes_per_resource[resources] = sum(
                     resources.get_reservations_available_resources().values())
 
-            launchable_resources_list: List[resources_lib.Resources] = sum(
+            launchable_resources_list: list[resources_lib.Resources] = sum(
                 launchable_resources.values(), [])
             with rich_utils.safe_status(
                     ux_utils.spinner_message('Checking reserved resources')):
@@ -291,7 +292,7 @@ class Optimizer:
             # Don't print for the last node, Sink.
             do_print = node_i != len(topo_order) - 1
 
-            fuzzy_candidates: List[str] = []
+            fuzzy_candidates: list[str] = []
             if node_i < len(topo_order) - 1:
                 # Convert partial resource labels to launchable resources.
                 (launchable_resources, cloud_candidates, fuzzy_candidates,
@@ -303,7 +304,7 @@ class Optimizer:
                 # Has to call the printing after the launchable resources are
                 # computed, because the missing fields of the resources are
                 # inferred in the _fill_in_launchable_resources function.
-                logger.debug('#### {} ####'.format(node))
+                logger.debug(f'#### {node} ####')
             else:
                 # Dummy sink node.
                 launchable_resources = {
@@ -427,17 +428,17 @@ class Optimizer:
 
     @staticmethod
     def _optimize_by_dp(
-        topo_order: List[task_lib.Task],
+        topo_order: list[task_lib.Task],
         node_to_cost_map: _TaskToCostMap,
         minimize_cost: bool = True,
-    ) -> Tuple[Dict[task_lib.Task, resources_lib.Resources], float]:
+    ) -> tuple[dict[task_lib.Task, resources_lib.Resources], float]:
         """Optimizes a chain DAG using a dynamic programming algorithm."""
         # node -> { resources -> best estimated cost }
-        dp_best_objective: Dict[task_lib.Task,
-                                Dict[resources_lib.Resources,
+        dp_best_objective: dict[task_lib.Task,
+                                dict[resources_lib.Resources,
                                      float]] = collections.defaultdict(dict)
         # node -> { resources -> best parent resources }
-        dp_point_backs: Dict[task_lib.Task, Dict[
+        dp_point_backs: dict[task_lib.Task, dict[
             resources_lib.Resources,
             resources_lib.Resources]] = collections.defaultdict(dict)
 
@@ -489,10 +490,10 @@ class Optimizer:
     @staticmethod
     def _optimize_by_ilp(
         graph: 'nx.DiGraph',
-        topo_order: List[task_lib.Task],
+        topo_order: list[task_lib.Task],
         node_to_cost_map: _TaskToCostMap,
         minimize_cost: bool = True,
-    ) -> Tuple[Dict[task_lib.Task, resources_lib.Resources], float]:
+    ) -> tuple[dict[task_lib.Task, resources_lib.Resources], float]:
         """Optimizes a general DAG using an ILP solver.
 
         Notations:
@@ -554,7 +555,7 @@ class Optimizer:
             node: list(resource_cost_map.values())
             for node, resource_cost_map in node_to_cost_map.items()
         }
-        F: Dict[Any, Dict[Any, List[float]]] = collections.defaultdict(dict)  # pylint: disable=invalid-name
+        F: dict[Any, dict[Any, list[float]]] = collections.defaultdict(dict)  # pylint: disable=invalid-name
         for u, v in E:
             F[u][v] = []
             for r_u in node_to_cost_map[u].keys():
@@ -569,9 +570,9 @@ class Optimizer:
             for v in V
         }
 
-        e: Dict[Any,
-                Dict[Any,
-                     List[pulp.LpVariable]]] = collections.defaultdict(dict)
+        e: dict[Any,
+                dict[Any,
+                     list[pulp.LpVariable]]] = collections.defaultdict(dict)
         for u, v in E:
             num_vars = len(c[u]) * len(c[v])
             e[u][v] = pulp.LpVariable.matrix(f'({u.name}->{v.name})',
@@ -614,8 +615,9 @@ class Optimizer:
                 v: pulp.LpVariable(f'lat({v})', lowBound=0) for v in V
             }
             for u, v in E:
-                prob += finish_time[v] >= (pulp.lpDot(
-                    c[v], k[v]) + finish_time[u] + pulp.lpDot(e[u][v], F[u][v]))
+                prob += finish_time[v] >= (pulp.lpDot(c[v], k[v]) +
+                                           finish_time[u] +
+                                           pulp.lpDot(e[u][v], F[u][v]))
             sink_node = V[-1]
             objective = finish_time[sink_node]
         prob += objective
@@ -639,11 +641,11 @@ class Optimizer:
     @staticmethod
     def _compute_total_time(
         graph,
-        topo_order: List[task_lib.Task],
-        plan: Dict[task_lib.Task, resources_lib.Resources],
+        topo_order: list[task_lib.Task],
+        plan: dict[task_lib.Task, resources_lib.Resources],
     ) -> float:
         """Estimates the total time of running the DAG by the plan."""
-        cache_finish_time: Dict[task_lib.Task, float] = {}
+        cache_finish_time: dict[task_lib.Task, float] = {}
 
         def finish_time(node):
             if node in cache_finish_time:
@@ -673,8 +675,8 @@ class Optimizer:
     @staticmethod
     def _compute_total_cost(
         graph,
-        topo_order: List[task_lib.Task],
-        plan: Dict[task_lib.Task, resources_lib.Resources],
+        topo_order: list[task_lib.Task],
+        plan: dict[task_lib.Task, resources_lib.Resources],
     ) -> float:
         """Estimates the total cost of running the DAG by the plan."""
         total_cost = 0.
@@ -737,8 +739,8 @@ class Optimizer:
     @staticmethod
     def print_optimized_plan(
         graph,
-        topo_order: List[task_lib.Task],
-        best_plan: Dict[task_lib.Task, resources_lib.Resources],
+        topo_order: list[task_lib.Task],
+        best_plan: dict[task_lib.Task, resources_lib.Resources],
         total_time: float,
         total_cost: float,
         node_to_cost_map: _TaskToCostMap,
@@ -788,7 +790,7 @@ class Optimizer:
             return instance_type
 
         def _get_resources_element_list(
-                resources: 'resources_lib.Resources') -> List[str]:
+                resources: 'resources_lib.Resources') -> list[str]:
             accelerators = resources.get_accelerators_str()
             spot = resources.get_spot_str()
             cloud = resources.cloud
@@ -798,7 +800,7 @@ class Optimizer:
             vcpus_, mem_ = cloud.get_vcpus_mem_from_instance_type(
                 resources.instance_type)
 
-            def format_number(x: Optional[float]) -> str:
+            def format_number(x: float | None) -> str:
                 if x is None:
                     return '-'
                 elif x.is_integer():
@@ -835,7 +837,7 @@ class Optimizer:
             vcpus_, mem_ = cloud.get_vcpus_mem_from_instance_type(
                 resources.instance_type)
 
-            def format_number(x: Optional[float]) -> str:
+            def format_number(x: float | None) -> str:
                 if x is None:
                     return '-'
                 elif x.is_integer():
@@ -922,7 +924,7 @@ class Optimizer:
             # Only print 1 row per cloud.
             # The following code is to generate the table
             # of optimizer table for display purpose.
-            best_per_resource_group: Dict[str, Tuple[resources_lib.Resources,
+            best_per_resource_group: dict[str, tuple[resources_lib.Resources,
                                                      float]] = {}
             for resources, cost in v.items():
                 resource_table_key = _get_resource_group_hash(resources)
@@ -976,8 +978,8 @@ class Optimizer:
                 row_in_list = []
                 if row.chosen_str != '':
                     for _, cell in enumerate(row):
-                        row_in_list.append((f'{colorama.Style.BRIGHT}{cell}'
-                                            f'{colorama.Style.RESET_ALL}'))
+                        row_in_list.append(f'{colorama.Style.BRIGHT}{cell}'
+                                           f'{colorama.Style.RESET_ALL}')
                 else:
                     row_in_list = list(row)
                 row_list.append(row_in_list)
@@ -1037,8 +1039,7 @@ class Optimizer:
     def optimize_job_group(
             dag: 'dag_lib.Dag',
             minimize: common.OptimizeTarget = common.OptimizeTarget.COST,
-            blocked_resources: Optional[Iterable[
-                resources_lib.Resources]] = None,
+            blocked_resources: Iterable[resources_lib.Resources] | None = None,
             quiet: bool = False) -> 'dag_lib.Dag':
         """Optimize a JobGroup DAG.
 
@@ -1073,11 +1074,10 @@ class Optimizer:
                                               quiet)
 
     @staticmethod
-    def _optimize_independent(dag: 'dag_lib.Dag',
-                              minimize: common.OptimizeTarget,
-                              blocked_resources: Optional[Iterable[
-                                  resources_lib.Resources]],
-                              quiet: bool) -> 'dag_lib.Dag':
+    def _optimize_independent(
+            dag: 'dag_lib.Dag', minimize: common.OptimizeTarget,
+            blocked_resources: Iterable[resources_lib.Resources] | None,
+            quiet: bool) -> 'dag_lib.Dag':
         """Optimize each task in the JobGroup independently."""
         for task in dag.tasks:
             # Create a temporary single-task DAG for optimization
@@ -1091,11 +1091,10 @@ class Optimizer:
         return dag
 
     @staticmethod
-    def _optimize_same_infra(dag: 'dag_lib.Dag',
-                             minimize: common.OptimizeTarget,
-                             blocked_resources: Optional[Iterable[
-                                 resources_lib.Resources]],
-                             quiet: bool) -> 'dag_lib.Dag':
+    def _optimize_same_infra(
+            dag: 'dag_lib.Dag', minimize: common.OptimizeTarget,
+            blocked_resources: Iterable[resources_lib.Resources] | None,
+            quiet: bool) -> 'dag_lib.Dag':
         """Optimize JobGroup with SAME_INFRA constraint.
 
         Find a common cloud+region that can satisfy all tasks.
@@ -1105,7 +1104,7 @@ class Optimizer:
         # Step 1: Get feasible resources for each task
         # Use launchable_resources (with regions) instead of cloud_candidates
         # (without regions) to ensure proper region constraints.
-        task_launchables: Dict[task_lib.Task, _PerCloudCandidates] = {}
+        task_launchables: dict[task_lib.Task, _PerCloudCandidates] = {}
 
         for task in tasks:
             # Get launchable resources for this task
@@ -1184,7 +1183,7 @@ class Optimizer:
                     # persists through YAML serialization to the controller.
                     # Without this, the controller would re-optimize each
                     # task independently, placing them on different infras.
-                    override_params: Dict[str, Any] = {}
+                    override_params: dict[str, Any] = {}
                     if resources.cloud is not None:
                         override_params['cloud'] = resources.cloud
                     if resources.region is not None:
@@ -1200,7 +1199,7 @@ class Optimizer:
         return dag
 
     @staticmethod
-    def _print_job_group_plan(tasks: List[task_lib.Task]) -> None:
+    def _print_job_group_plan(tasks: list[task_lib.Task]) -> None:
         """Print the optimizer table for a job group."""
         resource_fields = ['INFRA', 'INSTANCE', 'vCPUs', 'Mem(GB)', 'GPUS']
         table = _create_table(['TASK', '#NODES'] + resource_fields)
@@ -1260,8 +1259,8 @@ class Optimizer:
 
     @staticmethod
     def _find_common_infras(
-        task_candidates: Dict[task_lib.Task, _PerCloudCandidates]
-    ) -> List[Tuple[clouds.Cloud, Optional[str]]]:
+        task_candidates: dict[task_lib.Task, _PerCloudCandidates]
+    ) -> list[tuple[clouds.Cloud, str | None]]:
         """Find cloud+region combinations that satisfy all tasks.
 
         Returns:
@@ -1271,10 +1270,10 @@ class Optimizer:
             return []
 
         # Collect infras per task
-        infras_per_task: List[Set[Tuple[str, Optional[str]]]] = []
+        infras_per_task: list[set[tuple[str, str | None]]] = []
 
         for _, cloud_candidates in task_candidates.items():
-            task_infras: Set[Tuple[str, Optional[str]]] = set()
+            task_infras: set[tuple[str, str | None]] = set()
             for cloud, resources_list in cloud_candidates.items():
                 cloud_name = str(cloud)
                 for resources in resources_list:
@@ -1292,7 +1291,7 @@ class Optimizer:
             common_infras = common_infras & infra_set
 
         # Convert back to (Cloud, region) tuples
-        result: List[Tuple[clouds.Cloud, Optional[str]]] = []
+        result: list[tuple[clouds.Cloud, str | None]] = []
         for cloud_name, region in common_infras:
             # Get Cloud object from name
             cloud_obj = None
@@ -1310,10 +1309,10 @@ class Optimizer:
 
     @staticmethod
     def _select_best_infra(
-            common_infras: List[Tuple[clouds.Cloud, Optional[str]]],
-            task_candidates: Dict[task_lib.Task, _PerCloudCandidates],
-            tasks: List[task_lib.Task],
-            minimize_cost: bool) -> Tuple[clouds.Cloud, Optional[str]]:
+            common_infras: list[tuple[clouds.Cloud, str | None]],
+            task_candidates: dict[task_lib.Task, _PerCloudCandidates],
+            tasks: list[task_lib.Task],
+            minimize_cost: bool) -> tuple[clouds.Cloud, str | None]:
         """Select the best infrastructure from common options.
 
         Args:
@@ -1329,7 +1328,7 @@ class Optimizer:
             return common_infras[0]
 
         # Estimate total cost/time for each infra
-        best_infra: Optional[Tuple[clouds.Cloud, Optional[str]]] = None
+        best_infra: tuple[clouds.Cloud, str | None] | None = None
         best_score = float('inf')
 
         for cloud, region in common_infras:
@@ -1381,9 +1380,9 @@ class Optimizer:
     def _optimize_dag(
         dag: 'dag_lib.Dag',
         minimize_cost: bool = True,
-        blocked_resources: Optional[Iterable[resources_lib.Resources]] = None,
+        blocked_resources: Iterable[resources_lib.Resources] | None = None,
         quiet: bool = False,
-    ) -> Dict[task_lib.Task, resources_lib.Resources]:
+    ) -> dict[task_lib.Task, resources_lib.Resources]:
         """Finds the optimal task-resource mapping for the entire DAG.
 
         The optimal mapping should consider the egress cost/time so that
@@ -1559,12 +1558,12 @@ def _check_specified_clouds(dag: 'dag_lib.Dag') -> None:
         capability=sky_cloud.CloudCapability.COMPUTE,
         raise_if_no_cloud_access=True)
 
-    global_disabled_clouds: Set[str] = set()
+    global_disabled_clouds: set[str] = set()
     for task in dag.tasks:
         # Recheck the enabled clouds if the task's requested resources are on a
         # cloud that is not enabled in the cached enabled_clouds.
-        all_clouds_specified: Set[str] = set()
-        clouds_need_recheck: Set[str] = set()
+        all_clouds_specified: set[str] = set()
+        clouds_need_recheck: set[str] = set()
         for resources in task.resources:
             cloud_str = str(resources.cloud)
             if (resources.cloud is not None and not clouds.cloud_in_iterable(
@@ -1670,11 +1669,11 @@ def _check_specified_regions(task: task_lib.Task) -> None:
 
 def _fill_in_launchable_resources(
     task: task_lib.Task,
-    blocked_resources: Optional[Iterable[resources_lib.Resources]],
+    blocked_resources: Iterable[resources_lib.Resources] | None,
     quiet: bool = False
-) -> Tuple[Dict[resources_lib.Resources, List[resources_lib.Resources]],
-           _PerCloudCandidates, List[str], Dict[resources_lib.Resources,
-                                                List[str]]]:
+) -> tuple[dict[resources_lib.Resources, list[resources_lib.Resources]],
+           _PerCloudCandidates, list[str], dict[resources_lib.Resources,
+                                                list[str]]]:
     """Fills in the launchable resources for the task.
 
     Returns:
@@ -1693,12 +1692,12 @@ def _fill_in_launchable_resources(
         capability=sky_cloud.CloudCapability.COMPUTE,
         raise_if_no_cloud_access=True)
 
-    launchable: Dict[resources_lib.Resources, List[resources_lib.Resources]] = (
+    launchable: dict[resources_lib.Resources, list[resources_lib.Resources]] = (
         collections.defaultdict(list))
     all_fuzzy_candidates = set()
     cloud_candidates: _PerCloudCandidates = collections.defaultdict(list)
-    resource_hints: Dict[resources_lib.Resources,
-                         List[str]] = collections.defaultdict(list)
+    resource_hints: dict[resources_lib.Resources,
+                         list[str]] = collections.defaultdict(list)
     if blocked_resources is None:
         blocked_resources = []
     for resources in task.resources:
@@ -1714,7 +1713,7 @@ def _fill_in_launchable_resources(
         clouds_list = ([resources.cloud]
                        if resources.cloud is not None else enabled_clouds)
         # If clouds provide hints, store them for later printing.
-        hints: Dict[clouds.Cloud, str] = {}
+        hints: dict[clouds.Cloud, str] = {}
 
         feasible_list = subprocess_utils.run_in_parallel(
             lambda cloud, r=resources, n=task.num_nodes:
@@ -1796,7 +1795,7 @@ def _fill_in_launchable_resources(
 def optimize_job_group(
         dag: 'dag_lib.Dag',
         minimize: common.OptimizeTarget = common.OptimizeTarget.COST,
-        blocked_resources: Optional[Iterable[resources_lib.Resources]] = None,
+        blocked_resources: Iterable[resources_lib.Resources] | None = None,
         quiet: bool = False) -> 'dag_lib.Dag':
     """Optimize a JobGroup DAG with SAME_INFRA constraint.
 

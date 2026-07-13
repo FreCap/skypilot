@@ -9,7 +9,6 @@ from shared Serve state for every sync.
 
 import asyncio
 import ipaddress
-from typing import Optional, Tuple
 
 import aiohttp
 import fastapi
@@ -32,7 +31,7 @@ _CONTROLLER_SYNC_TARGET_PATH = '/controller/load_balancer_sync'
 # (durable service incarnation, controller process, normalized IP, port).
 # Every member participates in the before/after comparison so same-name
 # replacement, PID reuse, and controller migration all fail closed.
-_ControllerOwner = Tuple[str, int, str, int]
+_ControllerOwner = tuple[str, int, str, int]
 
 
 def is_controller_sync_path(path: str) -> bool:
@@ -45,7 +44,7 @@ def is_controller_sync_path(path: str) -> bool:
     return bool(service_name) and '/' not in service_name
 
 
-def _get_controller_owner(service_name: str) -> Optional[_ControllerOwner]:
+def _get_controller_owner(service_name: str) -> _ControllerOwner | None:
     """Read and validate the service controller's authoritative address."""
     record = serve_state.get_service_controller_owner(service_name)
     if record is None:
@@ -95,8 +94,7 @@ def _service_unavailable(detail: str) -> fastapi.responses.JSONResponse:
                                           content={'detail': detail})
 
 
-async def _read_controller_owner(
-        service_name: str) -> Optional[_ControllerOwner]:
+async def _read_controller_owner(service_name: str) -> _ControllerOwner | None:
     # Serve state uses synchronous SQLAlchemy.  Keep that I/O off the API
     # server event loop, especially because every running LB syncs regularly.
     return await asyncio.to_thread(_get_controller_owner, service_name)

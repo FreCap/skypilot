@@ -1,7 +1,7 @@
 """FluidStack instance provisioning."""
 import os
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
 from sky import exceptions
 from sky import sky_logging
@@ -24,7 +24,7 @@ POLL_INTERVAL = 5
 logger = sky_logging.init_logger(__name__)
 
 
-def get_internal_ip(node_info: Dict[str, Any]) -> None:
+def get_internal_ip(node_info: dict[str, Any]) -> None:
     node_info['internal_ip'] = node_info['ip_address']
 
     private_key_path, _ = auth_utils.get_or_generate_keys()
@@ -48,8 +48,8 @@ def get_internal_ip(node_info: Dict[str, Any]) -> None:
 
 def _filter_instances(
         cluster_name_on_cloud: str,
-        status_filters: Optional[List[str]],
-        include_instances: Optional[List[str]] = None) -> Dict[str, Any]:
+        status_filters: list[str] | None,
+        include_instances: list[str] | None = None) -> dict[str, Any]:
 
     instances = utils.FluidstackClient().list_instances()
     possible_names = [
@@ -69,7 +69,7 @@ def _filter_instances(
     return filtered_instances
 
 
-def _get_head_instance_id(instances: Dict[str, Any]) -> Optional[str]:
+def _get_head_instance_id(instances: dict[str, Any]) -> str | None:
     head_instance_id = None
     for inst_id, inst in instances.items():
         if inst['name'].endswith('-head'):
@@ -220,13 +220,13 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
 
 
 def wait_instances(region: str, cluster_name_on_cloud: str,
-                   state: Optional[status_lib.ClusterStatus]) -> None:
+                   state: status_lib.ClusterStatus | None) -> None:
     del region, cluster_name_on_cloud, state
 
 
 def stop_instances(
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     worker_only: bool = False,
 ) -> None:
     raise NotImplementedError()
@@ -234,7 +234,7 @@ def stop_instances(
 
 def terminate_instances(
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     worker_only: bool = False,
 ) -> None:
     """See sky/provision/__init__.py"""
@@ -257,10 +257,10 @@ def terminate_instances(
 def get_cluster_info(
         region: str,
         cluster_name_on_cloud: str,
-        provider_config: Optional[Dict[str, Any]] = None) -> common.ClusterInfo:
+        provider_config: dict[str, Any] | None = None) -> common.ClusterInfo:
     del region  # unused
     running_instances = _filter_instances(cluster_name_on_cloud, ['running'])
-    instances: Dict[str, List[common.InstanceInfo]] = {}
+    instances: dict[str, list[common.InstanceInfo]] = {}
 
     subprocess_utils.run_in_parallel(get_internal_ip,
                                      list(running_instances.values()))
@@ -290,10 +290,10 @@ def get_cluster_info(
 def query_instances(
     cluster_name: str,
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     non_terminated_only: bool = True,
     retry_if_missing: bool = False,
-) -> Dict[str, Tuple[Optional['status_lib.ClusterStatus'], Optional[str]]]:
+) -> dict[str, tuple[Optional['status_lib.ClusterStatus'], str | None]]:
     """See sky/provision/__init__.py"""
     del cluster_name, retry_if_missing  # unused
     assert provider_config is not None, (cluster_name_on_cloud, provider_config)
@@ -306,8 +306,7 @@ def query_instances(
         'failed': status_lib.ClusterStatus.INIT,
         'terminated': None,
     }
-    statuses: Dict[str, Tuple[Optional['status_lib.ClusterStatus'],
-                              Optional[str]]] = {}
+    statuses: dict[str, tuple[status_lib.ClusterStatus | None, str | None]] = {}
     for inst_id, inst in instances.items():
         if inst['status'] not in status_map:
             with ux_utils.print_exception_no_traceback():
@@ -322,16 +321,16 @@ def query_instances(
 
 def cleanup_ports(
     cluster_name_on_cloud: str,
-    ports: List[str],
-    provider_config: Optional[Dict[str, Any]] = None,
+    ports: list[str],
+    provider_config: dict[str, Any] | None = None,
 ) -> None:
     del cluster_name_on_cloud, ports, provider_config
 
 
 def open_ports(
     cluster_name_on_cloud: str,
-    ports: List[str],
-    provider_config: Optional[Dict[str, Any]] = None,
+    ports: list[str],
+    provider_config: dict[str, Any] | None = None,
 ) -> None:
     del cluster_name_on_cloud, provider_config
     logger.debug(f'Skip opening ports {ports} for Fluidstack instances, as all '

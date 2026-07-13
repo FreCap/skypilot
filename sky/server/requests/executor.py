@@ -19,6 +19,8 @@ The number of the workers is determined by the system resources.
 See the [README.md](../README.md) for detailed architecture of the executor.
 """
 import asyncio
+from collections.abc import Callable
+from collections.abc import Generator
 import concurrent.futures
 import contextlib
 import multiprocessing
@@ -28,7 +30,7 @@ import sys
 import threading
 import time
 import typing
-from typing import Any, Callable, Dict, Generator, List, Optional, TextIO, Tuple
+from typing import Any, Optional, ParamSpec, TextIO
 
 import psutil
 import setproctitle
@@ -72,12 +74,6 @@ from sky.workspaces import core as workspaces_core
 if typing.TYPE_CHECKING:
     import types
 
-# pylint: disable=ungrouped-imports
-if sys.version_info >= (3, 10):
-    from typing import ParamSpec
-else:
-    from typing_extensions import ParamSpec
-
 P = ParamSpec('P')
 logger = sky_logging.init_logger(__name__)
 
@@ -102,7 +98,7 @@ _REQUEST_THREAD_EXECUTOR_LOCK = threading.Lock()
 # avoid:
 # 1. blocking the event loop;
 # 2. exhausting the default thread pool executor of event loop;
-_REQUEST_THREAD_EXECUTOR: Optional[threads.OnDemandThreadExecutor] = None
+_REQUEST_THREAD_EXECUTOR: threads.OnDemandThreadExecutor | None = None
 
 
 def get_request_thread_executor() -> threads.OnDemandThreadExecutor:
@@ -128,7 +124,7 @@ class RequestQueue:
     def __init__(self, queue_backend_impl: queue_base.QueueBackend) -> None:
         self._backend = queue_backend_impl
 
-    def put(self, request: Tuple[str, bool, bool]) -> None:
+    def put(self, request: tuple[str, bool, bool]) -> None:
         """Put a request to the queue.
 
         Args:
@@ -136,7 +132,7 @@ class RequestQueue:
         """
         self._backend.put(request)
 
-    async def put_async(self, request: Tuple[str, bool, bool]) -> None:
+    async def put_async(self, request: tuple[str, bool, bool]) -> None:
         """Put a request to the queue, async.
 
         Args:
@@ -144,7 +140,7 @@ class RequestQueue:
         """
         await self._backend.put_async(request)
 
-    def get(self) -> Optional[Tuple[str, bool, bool]]:
+    def get(self) -> tuple[str, bool, bool] | None:
         """Get a request from the queue.
 
         It is non-blocking if the queue is empty, and returns None.
@@ -160,11 +156,11 @@ class RequestQueue:
 
 
 # The active queue factory, set during start().
-_queue_factory: Optional[queue_base.QueueBackendFactory] = None
+_queue_factory: queue_base.QueueBackendFactory | None = None
 
 
 def executor_initializer(proc_group: str,
-                         clean_env: Optional[Dict[str, str]] = None):
+                         clean_env: dict[str, str] | None = None):
     setproctitle.setproctitle(f'SkyPilot:executor:{proc_group}:'
                               f'{multiprocessing.current_process().pid}')
     # This runs in a child process of the API server. If the main process
@@ -226,7 +222,7 @@ class RequestWorker:
         self.burstable_parallelism = config.burstable_parallelism
         self.num_db_connections_per_worker = (
             config.num_db_connections_per_worker)
-        self._thread: Optional[threading.Thread] = None
+        self._thread: threading.Thread | None = None
         self._cancel_event = threading.Event()
 
     def __str__(self) -> str:
@@ -247,8 +243,8 @@ class RequestWorker:
 
     def process_request(self, executor: process.BurstableExecutor,
                         queue: RequestQueue) -> None:
-        request_id: Optional[str] = None
-        fut: Optional[concurrent.futures.Future] = None
+        request_id: str | None = None
+        fut: concurrent.futures.Future | None = None
         try:
             request_element = queue.get()
             if request_element is None:
@@ -351,7 +347,7 @@ class RequestWorker:
             metrics_utils.SKY_APISERVER_SHORT_EXECUTORS.inc()
 
     def handle_task_result(self, fut: concurrent.futures.Future,
-                           request_element: Tuple[str, bool, bool]) -> None:
+                           request_element: tuple[str, bool, bool]) -> None:
         try:
             try:
                 fut.result()
@@ -512,7 +508,7 @@ _SILENT_WORKSPACE_RESOLUTION_SOURCES = {
 
 
 def _should_apply_workspace_resolver(is_daemon: bool,
-                                     client_api_version: Optional[int]) -> bool:
+                                     client_api_version: int | None) -> bool:
     """Returns True iff the per-user workspace resolver should run for
     this request. Three gates, in order:
 
@@ -536,8 +532,8 @@ def _should_apply_workspace_resolver(is_daemon: bool,
     """
     if is_daemon:
         return False
-    if (client_api_version is None or client_api_version <
-            server_constants.MIN_PREFERRED_WORKSPACE_API_VERSION):
+    if (client_api_version is None or client_api_version
+            < server_constants.MIN_PREFERRED_WORKSPACE_API_VERSION):
         return False
     return not skypilot_config.is_active_workspace_set()
 
@@ -1059,10 +1055,10 @@ async def prepare_request_async(
     request_name: request_names.RequestName,
     request_body: payloads.RequestBody,
     func: Callable[P, Any],
-    request_cluster_name: Optional[str] = None,
+    request_cluster_name: str | None = None,
     schedule_type: api_requests.ScheduleType = (api_requests.ScheduleType.LONG),
     is_skypilot_system: bool = False,
-    auth_user: Optional[models.User] = None,
+    auth_user: models.User | None = None,
     ignore_return_value: bool = False,
     retryable: bool = False,
 ) -> api_requests.Request:
@@ -1124,19 +1120,19 @@ async def prepare_request_async(
     return request
 
 
-async def schedule_request_async(
-        request_id: str,
-        request_name: request_names.RequestName,
-        request_body: payloads.RequestBody,
-        func: Callable[P, Any],
-        request_cluster_name: Optional[str] = None,
-        ignore_return_value: bool = False,
-        schedule_type: api_requests.ScheduleType = (
-            api_requests.ScheduleType.LONG),
-        is_skypilot_system: bool = False,
-        precondition: Optional[preconditions.Precondition] = None,
-        retryable: bool = False,
-        auth_user: Optional[models.User] = None) -> None:
+async def schedule_request_async(request_id: str,
+                                 request_name: request_names.RequestName,
+                                 request_body: payloads.RequestBody,
+                                 func: Callable[P, Any],
+                                 request_cluster_name: str | None = None,
+                                 ignore_return_value: bool = False,
+                                 schedule_type: api_requests.ScheduleType = (
+                                     api_requests.ScheduleType.LONG),
+                                 is_skypilot_system: bool = False,
+                                 precondition: preconditions.Precondition |
+                                 None = None,
+                                 retryable: bool = False,
+                                 auth_user: models.User | None = None) -> None:
     """Enqueue a request to the request queue.
 
     Args:
@@ -1206,8 +1202,8 @@ async def schedule_internal_daemon_async(
 
 async def schedule_prepared_request(request_task: api_requests.Request,
                                     ignore_return_value: bool = False,
-                                    precondition: Optional[
-                                        preconditions.Precondition] = None,
+                                    precondition: preconditions.Precondition |
+                                    None = None,
                                     retryable: bool = False) -> None:
     """Enqueue a request to the request queue
 
@@ -1241,7 +1237,7 @@ async def schedule_prepared_request(request_task: api_requests.Request,
 
 def start(
     config: server_config.ServerConfig
-) -> Tuple[Optional[multiprocessing.Process], List[RequestWorker]]:
+) -> tuple[multiprocessing.Process | None, list[RequestWorker]]:
     """Start the request workers.
 
     Request workers run in background, schedule the requests and delegate the

@@ -4,7 +4,7 @@
 from sky.provision.vsphere.common import service_manager as service_manager_lib
 
 
-class ServiceManagerFactory(object):
+class ServiceManagerFactory:
     """Factory class for getting service manager for a management node.
     """
 

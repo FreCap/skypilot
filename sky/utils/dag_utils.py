@@ -2,7 +2,7 @@
 import copy
 import os
 import re
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any
 
 from sky import dag as dag_lib
 from sky import sky_logging
@@ -53,7 +53,7 @@ def convert_entrypoint_to_dag(entrypoint: Any) -> 'dag_lib.Dag':
     # Not suppressing stacktrace: when calling this via API user may want to
     # see their own program in the stacktrace. Our CLI impl would not trigger
     # these errors.
-    converted_dag: 'dag_lib.Dag'
+    converted_dag: dag_lib.Dag
     if isinstance(entrypoint, str):
         with ux_utils.print_exception_no_traceback():
             raise TypeError(_ENTRYPOINT_STRING_AS_DAG_MESSAGE)
@@ -75,10 +75,9 @@ def convert_entrypoint_to_dag(entrypoint: Any) -> 'dag_lib.Dag':
 
 
 def _load_chain_dag(
-        configs: List[Dict[str, Any]],
-        env_overrides: Optional[List[Tuple[str, str]]] = None,
-        secrets_overrides: Optional[List[Tuple[str,
-                                               str]]] = None) -> dag_lib.Dag:
+        configs: list[dict[str, Any]],
+        env_overrides: list[tuple[str, str]] | None = None,
+        secrets_overrides: list[tuple[str, str]] | None = None) -> dag_lib.Dag:
     """Loads a chain DAG (pipeline) from a list of YAML configs.
 
     A pipeline YAML can have an optional header as the first document with:
@@ -138,8 +137,8 @@ def _load_chain_dag(
 
 def load_chain_dag_from_yaml(
     path: str,
-    env_overrides: Optional[List[Tuple[str, str]]] = None,
-    secret_overrides: Optional[List[Tuple[str, str]]] = None,
+    env_overrides: list[tuple[str, str]] | None = None,
+    secret_overrides: list[tuple[str, str]] | None = None,
 ) -> dag_lib.Dag:
     """Loads a chain DAG from a YAML file.
 
@@ -159,7 +158,7 @@ def load_chain_dag_from_yaml(
       trivial task).
     """
     try:
-        with open(os.path.expanduser(path), 'r', encoding='utf-8') as f:
+        with open(os.path.expanduser(path), encoding='utf-8') as f:
             yaml_str = f.read()
     except UnicodeDecodeError as e:
         with ux_utils.print_exception_no_traceback():
@@ -189,8 +188,8 @@ def load_chain_dag_from_yaml(
 
 def load_chain_dag_from_yaml_str(
     yaml_str: str,
-    env_overrides: Optional[List[Tuple[str, str]]] = None,
-    secrets_overrides: Optional[List[Tuple[str, str]]] = None,
+    env_overrides: list[tuple[str, str]] | None = None,
+    secrets_overrides: list[tuple[str, str]] | None = None,
 ) -> dag_lib.Dag:
     """Loads a chain DAG from a YAML string.
 
@@ -283,8 +282,8 @@ def dump_dag_to_yaml(dag: dag_lib.Dag,
 
 def load_dag_from_yaml_str(
     yaml_str: str,
-    env_overrides: Optional[List[Tuple[str, str]]] = None,
-    secrets_overrides: Optional[List[Tuple[str, str]]] = None,
+    env_overrides: list[tuple[str, str]] | None = None,
+    secrets_overrides: list[tuple[str, str]] | None = None,
 ) -> dag_lib.Dag:
     """Loads a DAG from a YAML string, auto-detecting the type.
 
@@ -309,8 +308,8 @@ def load_dag_from_yaml_str(
 
 def load_dag_from_yaml(
     path: str,
-    env_overrides: Optional[List[Tuple[str, str]]] = None,
-    secrets_overrides: Optional[List[Tuple[str, str]]] = None,
+    env_overrides: list[tuple[str, str]] | None = None,
+    secrets_overrides: list[tuple[str, str]] | None = None,
 ) -> dag_lib.Dag:
     """Loads a DAG from a YAML file, auto-detecting the type.
 
@@ -357,8 +356,7 @@ def maybe_infer_and_fill_dag_and_task_names(dag: dag_lib.Dag) -> None:
 
 
 def fill_default_config_in_dag_for_job_launch(dag: dag_lib.Dag,
-                                              pool: Optional[str] = None
-                                             ) -> None:
+                                              pool: str | None = None) -> None:
     for task_ in dag.tasks:
 
         new_resources_list = []
@@ -379,7 +377,7 @@ def fill_default_config_in_dag_for_job_launch(dag: dag_lib.Dag,
             default_strategy = 'FAILOVER'
         for resources in list(task_.resources):
             original_job_recovery = resources.job_recovery
-            job_recovery: Dict[str, Optional[Union[str, int]]] = {
+            job_recovery: dict[str, str | int | None] = {
                 'strategy': default_strategy
             }
             if isinstance(original_job_recovery, str):
@@ -389,7 +387,7 @@ def fill_default_config_in_dag_for_job_launch(dag: dag_lib.Dag,
                 strategy = job_recovery.get('strategy')
                 if strategy is None:
                     job_recovery['strategy'] = default_strategy
-            change_default_value: Dict[str, Any] = {
+            change_default_value: dict[str, Any] = {
                 'job_recovery': job_recovery
             }
 
@@ -428,7 +426,7 @@ def is_job_group_yaml_str(yaml_str: str) -> bool:
     return _is_job_group_configs(configs)
 
 
-def _is_job_group_configs(configs: List[Dict[str, Any]]) -> bool:
+def _is_job_group_configs(configs: list[dict[str, Any]]) -> bool:
     """Check if configs represent a JobGroup.
 
     A YAML is a JobGroup if and only if execution is set to 'parallel'.
@@ -447,7 +445,7 @@ def _is_job_group_configs(configs: List[Dict[str, Any]]) -> bool:
     return execution == dag_lib.DagExecution.PARALLEL.value
 
 
-def is_job_group_execution(execution: Optional[str]) -> bool:
+def is_job_group_execution(execution: str | None) -> bool:
     """Return whether a recorded execution mode denotes a JobGroup.
 
     Mirrors `_is_job_group_configs`: a DAG is a JobGroup iff its execution mode
@@ -460,8 +458,8 @@ def is_job_group_execution(execution: Optional[str]) -> bool:
 
 def load_job_group_from_yaml(
     path: str,
-    env_overrides: Optional[List[Tuple[str, str]]] = None,
-    secrets_overrides: Optional[List[Tuple[str, str]]] = None,
+    env_overrides: list[tuple[str, str]] | None = None,
+    secrets_overrides: list[tuple[str, str]] | None = None,
 ) -> dag_lib.Dag:
     """Load a JobGroup from a multi-document YAML file.
 
@@ -499,8 +497,8 @@ def load_job_group_from_yaml(
 
 def load_job_group_from_yaml_str(
     yaml_str: str,
-    env_overrides: Optional[List[Tuple[str, str]]] = None,
-    secrets_overrides: Optional[List[Tuple[str, str]]] = None,
+    env_overrides: list[tuple[str, str]] | None = None,
+    secrets_overrides: list[tuple[str, str]] | None = None,
 ) -> dag_lib.Dag:
     """Load a JobGroup from a multi-document YAML string."""
     configs = yaml_utils.read_yaml_all_str(yaml_str)
@@ -508,9 +506,9 @@ def load_job_group_from_yaml_str(
 
 
 def _load_job_group(
-    configs: List[Dict[str, Any]],
-    env_overrides: Optional[List[Tuple[str, str]]] = None,
-    secrets_overrides: Optional[List[Tuple[str, str]]] = None,
+    configs: list[dict[str, Any]],
+    env_overrides: list[tuple[str, str]] | None = None,
+    secrets_overrides: list[tuple[str, str]] | None = None,
 ) -> dag_lib.Dag:
     """Load a JobGroup from parsed YAML configs.
 
@@ -709,7 +707,7 @@ def dump_job_group_to_yaml_str(dag: dag_lib.Dag,
     assert dag.is_job_group(), 'DAG is not a JobGroup'
 
     # Build header
-    header: Dict[str, Any] = {
+    header: dict[str, Any] = {
         'name': dag.name,
     }
     if dag.execution is not None:
@@ -720,7 +718,7 @@ def dump_job_group_to_yaml_str(dag: dag_lib.Dag,
         header['termination_delay'] = dag.termination_delay
 
     # Build job configs
-    configs: List[Dict[str, Any]] = [header]
+    configs: list[dict[str, Any]] = [header]
     for task in dag.tasks:
         job_config = task.to_yaml_config(
             use_user_specified_yaml=use_user_specified_yaml)

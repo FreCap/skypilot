@@ -17,7 +17,8 @@ Example usage in core SkyPilot:
     # Get cached pod info (returns None if not registered or unavailable)
     pods = PodInfoSource.get(context='my-k8s-context')
 """
-from typing import Any, Callable, List, Optional
+from collections.abc import Callable
+from typing import Any
 
 from sky import sky_logging
 
@@ -28,7 +29,7 @@ logger = sky_logging.init_logger(__name__)
 # Returns a list of V1Pod-compatible objects if available, None otherwise.
 # Returning None means "no cached data, fall through to direct API".
 # Returning [] means "checked cache, no SkyPilot pods found" (valid result).
-PodInfoProviderFunc = Callable[[str], Optional[List[Any]]]
+PodInfoProviderFunc = Callable[[str], list[Any] | None]
 
 
 class PodInfoSource:
@@ -44,7 +45,7 @@ class PodInfoSource:
     cached pod info before falling back to direct Kubernetes API calls.
     """
 
-    _provider_func: Optional[PodInfoProviderFunc] = None
+    _provider_func: PodInfoProviderFunc | None = None
 
     @classmethod
     def register(cls, provider: PodInfoProviderFunc) -> None:
@@ -68,7 +69,7 @@ class PodInfoSource:
         return cls._provider_func is not None
 
     @classmethod
-    def get(cls, context: str) -> Optional[List[Any]]:
+    def get(cls, context: str) -> list[Any] | None:
         """Get pod info from the registered provider.
 
         Args:

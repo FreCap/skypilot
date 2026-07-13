@@ -9,7 +9,7 @@ import platform
 import shutil
 import time
 import traceback
-from typing import Any, Dict, List, Optional, Set, Tuple, TypedDict
+from typing import Any, TypedDict
 import zipfile
 
 import sky
@@ -64,7 +64,7 @@ _SENSITIVE_ENV_VARS = {
 # Maps request name → field names containing task/dag YAML to redact.
 # Empty tuple means include body verbatim (no YAML fields).
 # Requests not in this dict have their body excluded entirely.
-_REQUEST_BODY_ALLOWLIST: Dict[str, Tuple[str, ...]] = {
+_REQUEST_BODY_ALLOWLIST: dict[str, tuple[str, ...]] = {
     # Category 1: verbatim (metadata only — cluster names, job IDs, flags, etc.)
     'sky.check': (),
     'sky.enabled_clouds': (),
@@ -167,9 +167,9 @@ _MANAGED_JOB_REQUEST_NAMES = frozenset({
 
 class DebugDumpContext(TypedDict):
     """The context for a debug dump."""
-    request_ids: Set[str]
-    cluster_names: Set[str]
-    managed_job_ids: Set[int]
+    request_ids: set[str]
+    cluster_names: set[str]
+    managed_job_ids: set[int]
     # Provenance sidecars: requests added by a cross-link helper because
     # they reference a job (resp. cluster). When we later iterate
     # request_ids to expand the context further, we skip these to break
@@ -177,9 +177,9 @@ class DebugDumpContext(TypedDict):
     # these, an over-broad matcher (body.name, body.all_users, body.all,
     # or any cluster touching many requests) drags unrelated resources
     # into the dump.
-    request_ids_via_job: Set[str]
-    request_ids_via_cluster: Set[str]
-    errors: List[Dict[str, str]]
+    request_ids_via_job: set[str]
+    request_ids_via_cluster: set[str]
+    errors: list[dict[str, str]]
 
 
 def _get_requests_from_clusters(debug_dump_context: DebugDumpContext) -> None:
@@ -226,8 +226,8 @@ def _get_requests_from_managed_jobs(
         f'managed jobs')
 
     # Fetch job details to enable matching by name and user
-    job_names: Set[str] = set()
-    job_user_hashes: Set[str] = set()
+    job_names: set[str] = set()
+    job_user_hashes: set[str] = set()
     try:
         jobs, _, _, _ = managed_jobs_core.queue_v2(
             refresh=False,
@@ -257,7 +257,7 @@ def _get_requests_from_managed_jobs(
                 fields=['request_id', 'name', 'request_body', 'return_value']))
 
         for request in requests:
-            match_reason: Optional[str] = None
+            match_reason: str | None = None
             # Match by request body fields (job_id, job_ids, name, etc.)
             body = request.request_body
             if body is not None:
@@ -537,10 +537,10 @@ def _populate_recent_context(debug_dump_context: DebugDumpContext,
 
 
 def _dump_server_info(dump_dir: str,
-                      errors: Optional[List[Dict[str, str]]] = None) -> None:
+                      errors: list[dict[str, str]] | None = None) -> None:
     """Collect server metadata."""
     logger.debug('Entering _dump_server_info')
-    server_info: Dict[str, Any] = {
+    server_info: dict[str, Any] = {
         'skypilot_version': sky.__version__,
         'skypilot_commit': getattr(sky, '__commit__', 'unknown'),
         'api_version': server_constants.API_VERSION,
@@ -612,7 +612,7 @@ def _dump_server_info(dump_dir: str,
     logger.debug('Exiting _dump_server_info')
 
 
-def _sanitize_request_body(request) -> Optional[Dict[str, Any]]:
+def _sanitize_request_body(request) -> dict[str, Any] | None:
     """Sanitize a request body for inclusion in a debug dump.
 
     Returns None if the request type is not in the allowlist or has no body.
@@ -641,10 +641,9 @@ def _sanitize_request_body(request) -> Optional[Dict[str, Any]]:
     return data
 
 
-def _dump_request_id_info(
-        request_ids: Set[str],
-        dump_dir: str,
-        errors: Optional[List[Dict[str, str]]] = None) -> None:
+def _dump_request_id_info(request_ids: set[str],
+                          dump_dir: str,
+                          errors: list[dict[str, str]] | None = None) -> None:
     """Collect request logs and metadata."""
     if not request_ids:
         logger.debug('No requests to dump')
@@ -663,7 +662,7 @@ def _dump_request_id_info(
         try:
             request = requests_lib.get_request(request_id)
             if request is not None:
-                request_info: Dict[str, Any] = {
+                request_info: dict[str, Any] = {
                     'request_id': request.request_id,
                     'name': request.name,
                     'status': request.status.value if request.status else None,
@@ -766,10 +765,9 @@ _collect_cluster_skylet_log = debug_dump_cluster.collect_cluster_skylet_log
 _dump_cluster_info = debug_dump_cluster.dump_cluster_info
 
 
-def _dump_managed_job_info(
-        managed_job_ids: Set[int],
-        dump_dir: str,
-        errors: Optional[List[Dict[str, str]]] = None) -> None:
+def _dump_managed_job_info(managed_job_ids: set[int],
+                           dump_dir: str,
+                           errors: list[dict[str, str]] | None = None) -> None:
     """Collect managed job state and logs."""
     if not managed_job_ids:
         logger.debug('No managed jobs to dump')
@@ -792,9 +790,9 @@ def _dump_managed_job_info(
 
 
 def _dump_managed_job_queue_info(
-        managed_job_ids: Set[int],
+        managed_job_ids: set[int],
         jobs_dir: str,
-        errors: Optional[List[Dict[str, str]]] = None) -> None:
+        errors: list[dict[str, str]] | None = None) -> None:
     """Collect managed job info from queue_v2.
 
     This works in both consolidation and non-consolidation modes.
@@ -815,7 +813,7 @@ def _dump_managed_job_queue_info(
         return
 
     # Group records by job_id (multi-task jobs return multiple records).
-    jobs_by_id: Dict[int, list] = collections.defaultdict(list)
+    jobs_by_id: dict[int, list] = collections.defaultdict(list)
     for record in all_records:
         jobs_by_id[record.get('job_id')].append(record)
 
@@ -830,10 +828,9 @@ def _dump_managed_job_queue_info(
 
         for task_idx, job in enumerate(tasks):
             job_info = {
-                k: (str(v) if not isinstance(v,
-                                             (str, int, float, bool, type(None),
-                                              list, dict)) else v)
-                for k, v in job.items()
+                k: (str(v) if not isinstance(v, (str, int, float, bool,
+                                                 type(None), list, dict)) else v
+                   ) for k, v in job.items()
             }
             suffix = f'_task{task_idx}' if len(tasks) > 1 else ''
             job_info_path = os.path.join(job_dir, f'job_info{suffix}.json')
@@ -843,9 +840,9 @@ def _dump_managed_job_queue_info(
 
 
 def _collect_controller_debug_data(
-        job_ids: List[int],
+        job_ids: list[int],
         dump_dir: str,
-        errors: Optional[List[Dict[str, str]]] = None) -> None:
+        errors: list[dict[str, str]] | None = None) -> None:
     """Collect controller-side debug data via CodeGen manifest + rsync.
 
     Phase 1: Run CodeGen on the controller to get a manifest containing:
@@ -998,9 +995,9 @@ def _collect_controller_debug_data(
 def _build_debug_dump(
     dump_dir: str,
     debug_dump_context: DebugDumpContext,
-    recent_minutes: Optional[float],
-    client_info: Optional[Dict[str, Any]],
-    requested: Dict[str, Any],
+    recent_minutes: float | None,
+    client_info: dict[str, Any] | None,
+    requested: dict[str, Any],
 ) -> None:
     """Build the debug dump contents in dump_dir.
 
@@ -1057,7 +1054,7 @@ def _build_debug_dump(
         json.dump(errors, f, indent=2, default=str)
 
     # Write summary file
-    summary: Dict[str, Any] = {
+    summary: dict[str, Any] = {
         'requested': requested,
         'collected': {
             'request_count': len(debug_dump_context['request_ids']),
@@ -1075,11 +1072,11 @@ def _build_debug_dump(
 
 
 def create_debug_dump(
-    request_ids: Optional[List[str]] = None,
-    cluster_names: Optional[List[str]] = None,
-    managed_job_ids: Optional[List[int]] = None,
-    recent_minutes: Optional[float] = None,
-    client_info: Optional[Dict[str, Any]] = None,
+    request_ids: list[str] | None = None,
+    cluster_names: list[str] | None = None,
+    managed_job_ids: list[int] | None = None,
+    recent_minutes: float | None = None,
+    client_info: dict[str, Any] | None = None,
 ) -> pathlib.Path:
     """Create a debug dump for troubleshooting.
 
@@ -1103,7 +1100,7 @@ def create_debug_dump(
 
     # Resolve request ID prefixes to full IDs (same pattern as
     # sky api status in server.py)
-    resolved_request_ids: Set[str] = set()
+    resolved_request_ids: set[str] = set()
     if request_ids:
         for rid in request_ids:
             matches = requests_lib.get_requests_with_prefix(

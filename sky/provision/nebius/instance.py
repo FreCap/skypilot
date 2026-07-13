@@ -1,6 +1,6 @@
 """Nebius instance provisioning."""
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
 from sky import sky_logging
 from sky.provision import common
@@ -21,9 +21,9 @@ logger = sky_logging.init_logger(__name__)
 
 def _filter_instances(region: str,
                       cluster_name_on_cloud: str,
-                      status_filters: Optional[List[str]],
+                      status_filters: list[str] | None,
                       head_only: bool = False,
-                      project_id: Optional[str] = None) -> Dict[str, Any]:
+                      project_id: str | None = None) -> dict[str, Any]:
     if project_id is None:
         project_id = utils.get_project_by_region(region)
     instances = utils.list_instances(project_id)
@@ -42,7 +42,7 @@ def _filter_instances(region: str,
     return filtered_instances
 
 
-def _get_head_instance_id(instances: Dict[str, Any]) -> Optional[str]:
+def _get_head_instance_id(instances: dict[str, Any]) -> str | None:
     head_instance_id = None
     for inst_id, inst in instances.items():
         if inst['name'].endswith('-head'):
@@ -198,7 +198,7 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
 
 
 def wait_instances(region: str, cluster_name_on_cloud: str,
-                   state: Optional[status_lib.ClusterStatus]) -> None:
+                   state: status_lib.ClusterStatus | None) -> None:
     project_id = utils.get_project_by_region(region)
     _wait_until_no_pending(region, cluster_name_on_cloud, project_id=project_id)
     if state is not None:
@@ -225,7 +225,7 @@ def wait_instances(region: str, cluster_name_on_cloud: str,
 
 def stop_instances(
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     worker_only: bool = False,
 ) -> None:
     assert provider_config is not None
@@ -241,7 +241,7 @@ def stop_instances(
 
 def terminate_instances(
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     worker_only: bool = False,
 ) -> None:
     """See sky/provision/__init__.py"""
@@ -299,7 +299,7 @@ def terminate_instances(
 def get_cluster_info(
         region: str,
         cluster_name_on_cloud: str,
-        provider_config: Optional[Dict[str, Any]] = None) -> common.ClusterInfo:
+        provider_config: dict[str, Any] | None = None) -> common.ClusterInfo:
     project_id = (provider_config or {}).get('project_id')
     if project_id is None:
         project_id = utils.get_project_by_region(region)
@@ -307,7 +307,7 @@ def get_cluster_info(
     running_instances = _filter_instances(region,
                                           cluster_name_on_cloud, ['RUNNING'],
                                           project_id=project_id)
-    instances: Dict[str, List[common.InstanceInfo]] = {}
+    instances: dict[str, list[common.InstanceInfo]] = {}
     head_instance_id = None
     for instance_id, instance_info in running_instances.items():
         instances[instance_id] = [
@@ -333,10 +333,10 @@ def get_cluster_info(
 def query_instances(
     cluster_name: str,
     cluster_name_on_cloud: str,
-    provider_config: Optional[Dict[str, Any]] = None,
+    provider_config: dict[str, Any] | None = None,
     non_terminated_only: bool = True,
     retry_if_missing: bool = False,
-) -> Dict[str, Tuple[Optional['status_lib.ClusterStatus'], Optional[str]]]:
+) -> dict[str, tuple[Optional['status_lib.ClusterStatus'], str | None]]:
     """See sky/provision/__init__.py"""
     del cluster_name, retry_if_missing  # unused
     assert provider_config is not None, (cluster_name_on_cloud, provider_config)
@@ -352,8 +352,7 @@ def query_instances(
         'STOPPING': status_lib.ClusterStatus.STOPPED,
         'DELETING': status_lib.ClusterStatus.STOPPED,
     }
-    statuses: Dict[str, Tuple[Optional['status_lib.ClusterStatus'],
-                              Optional[str]]] = {}
+    statuses: dict[str, tuple[status_lib.ClusterStatus | None, str | None]] = {}
     for inst_id, inst in instances.items():
         status = status_map[inst['status']]
         if non_terminated_only and status is None:
@@ -364,8 +363,8 @@ def query_instances(
 
 def open_ports(
     cluster_name_on_cloud: str,
-    ports: List[str],
-    provider_config: Optional[Dict[str, Any]] = None,
+    ports: list[str],
+    provider_config: dict[str, Any] | None = None,
 ) -> None:
     """See sky/provision/__init__.py"""
     assert provider_config is not None
@@ -407,8 +406,8 @@ def open_ports(
 
 def cleanup_ports(
     cluster_name_on_cloud: str,
-    ports: List[str],
-    provider_config: Optional[Dict[str, Any]] = None,
+    ports: list[str],
+    provider_config: dict[str, Any] | None = None,
 ) -> None:
     """See sky/provision/__init__.py"""
     # Intentional no-op. The cluster-specific security group is owned by

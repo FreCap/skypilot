@@ -587,10 +587,9 @@ class EvaluationHead:
                     "id": sid,
                     "requests": metrics["requests"],
                     "last_seen": metrics["last_seen"].isoformat(),
-                    "status":
-                        "active" if
-                        (datetime.now() - metrics["last_seen"]).seconds < 10
-                        else "inactive"
+                    "status": "active" if
+                              (datetime.now() - metrics["last_seen"]).seconds
+                              < 10 else "inactive"
                 } for sid, metrics in self.server_metrics.items()],
                 "history": list(self.metrics_history)
             }
@@ -756,10 +755,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     "id": sid,
                     "requests": metrics["requests"],
                     "last_seen": metrics["last_seen"].isoformat(),
-                    "status":
-                        "active" if
-                        (datetime.now() - metrics["last_seen"]).seconds < 10
-                        else "inactive"
+                    "status": "active" if
+                              (datetime.now() - metrics["last_seen"]).seconds
+                              < 10 else "inactive"
                 } for sid, metrics in eval_head.server_metrics.items()],
                 "history": list(eval_head.metrics_history)
             }

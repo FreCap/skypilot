@@ -5,7 +5,6 @@ from json import load as json_load
 from json import loads
 import os
 import time
-from typing import List, Optional, Tuple
 
 import requests
 
@@ -20,7 +19,7 @@ class VerdaConfiguration:
 
 
 def get_verda_configuration(
-) -> Tuple[bool, Optional[str], Optional[VerdaConfiguration]]:
+) -> tuple[bool, str | None, VerdaConfiguration | None]:
     """Checks known config file exists and is valid.
     Also supports using env vars instead.
     """
@@ -78,7 +77,7 @@ def get_verda_configuration(
             )
 
         # Try to read the API key
-        with open(config_file_path, 'r', encoding='utf-8') as f:
+        with open(config_file_path, encoding='utf-8') as f:
             config = json_load(f)
 
             if 'client_id' not in config or not config.get('client_id'):
@@ -114,7 +113,7 @@ def get_verda_configuration(
                     default_region=config.get('default_region', 'FIN-03'),
                 ),
 
-    except (OSError, IOError) as e:
+    except OSError as e:
         return (
             False,
             ('Error reading Verda Cloud credentials from '
@@ -318,8 +317,8 @@ class _HTTPClient:
 
     def post(self,
              url: str,
-             body: Optional[dict] = None,
-             params: Optional[dict] = None,
+             body: dict | None = None,
+             params: dict | None = None,
              **kwargs) -> requests.Response:
         """Sends a POST request.
 
@@ -355,8 +354,8 @@ class _HTTPClient:
 
     def put(self,
             url: str,
-            body: Optional[dict] = None,
-            params: Optional[dict] = None,
+            body: dict | None = None,
+            params: dict | None = None,
             **kwargs) -> requests.Response:
         """Sends a PUT request.
 
@@ -392,7 +391,7 @@ class _HTTPClient:
 
     def get(self,
             url: str,
-            params: Optional[dict] = None,
+            params: dict | None = None,
             **kwargs) -> requests.Response:
         """Sends a GET request.
 
@@ -420,7 +419,7 @@ class _HTTPClient:
 
         return response
 
-    def patch(self, url: str, body: Optional[dict], params: Optional[dict],
+    def patch(self, url: str, body: dict | None, params: dict | None,
               **kwargs) -> requests.Response:
         """Sends a PATCH request.
 
@@ -456,8 +455,8 @@ class _HTTPClient:
 
     def delete(self,
                url: str,
-               body: Optional[dict] = None,
-               params: Optional[dict] = None,
+               body: dict | None = None,
+               params: dict | None = None,
                **kwargs) -> requests.Response:
         """Sends a DELETE request.
 
@@ -576,9 +575,9 @@ class VerdaClient:
     """A client for the Verda Cloud API."""
 
     def __init__(self) -> None:
-        self.http_client: Optional[_HTTPClient] = None
+        self.http_client: _HTTPClient | None = None
 
-    def instances_get(self) -> List[Instance]:
+    def instances_get(self) -> list[Instance]:
         """Get all instances."""
         if self.http_client is None:
             self.http_client = _HTTPClient()
@@ -592,7 +591,7 @@ class VerdaClient:
         response = self.http_client.get(f'/instances/{instance_id}').json()
         return Instance(response)
 
-    def ssh_keys_get(self) -> List[SSHKey]:
+    def ssh_keys_get(self) -> list[SSHKey]:
         """Get all ssh keys."""
         if self.http_client is None:
             self.http_client = _HTTPClient()

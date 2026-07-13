@@ -34,13 +34,13 @@ class RequestOptions(pydantic.BaseModel):
         down: If true, use autodown rather than autostop.
         dryrun: Is the request a dryrun?
     """
-    cluster_name: Optional[str]
+    cluster_name: str | None
     # Keep these two fields for backward compatibility. The values are copied
     # from task.resources.autostop_config, so that legacy admin policy plugins
     # can still read the correct autostop config from request options before
     # we drop the compatibility.
     # TODO(aylei): remove these fields after 0.12.0
-    idle_minutes_to_autostop: Optional[int]
+    idle_minutes_to_autostop: int | None
     down: bool
     dryrun: bool
 
@@ -52,12 +52,12 @@ class _UserRequestBody(pydantic.BaseModel):
     task: str
     skypilot_config: str
     request_name: str
-    request_options: Optional[RequestOptions] = None
+    request_options: RequestOptions | None = None
     at_client_side: bool = False
     user: str
     # Client version information (server-side only)
-    client_api_version: Optional[int] = None
-    client_version: Optional[str] = None
+    client_api_version: int | None = None
+    client_version: str | None = None
 
 
 @dataclasses.dataclass
@@ -96,8 +96,8 @@ class UserRequest:
     request_options: Optional['RequestOptions'] = None
     at_client_side: bool = False
     user: Optional['models.User'] = None
-    client_api_version: Optional[int] = None
-    client_version: Optional[str] = None
+    client_api_version: int | None = None
+    client_version: str | None = None
 
     def encode(self) -> str:
         return _UserRequestBody(

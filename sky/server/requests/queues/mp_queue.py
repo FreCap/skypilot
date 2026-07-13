@@ -3,7 +3,6 @@ import multiprocessing
 from multiprocessing import managers
 import queue
 import time
-from typing import List
 
 from sky import sky_logging
 from sky.server import watchdog
@@ -21,7 +20,7 @@ class QueueManager(managers.BaseManager):
     pass
 
 
-def start_queue_manager(queue_names: List[str],
+def start_queue_manager(queue_names: list[str],
                         port: int = DEFAULT_QUEUE_MANAGER_PORT) -> None:
     # This runs in a child process of the API server. If the main process
     # dies abruptly (kill -9, OOM), exit with it instead of holding the
@@ -65,7 +64,7 @@ def get_queue(queue_name: str,
     return getattr(manager, queue_name)()
 
 
-def wait_for_queues_to_be_ready(queue_names: List[str],
+def wait_for_queues_to_be_ready(queue_names: list[str],
                                 queue_server: multiprocessing.Process,
                                 port: int = DEFAULT_QUEUE_MANAGER_PORT) -> None:
     """Wait for the queues to be ready after queue manager is just started."""
