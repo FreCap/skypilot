@@ -86,10 +86,15 @@ class _ReleasingStreamingResponse(fastapi.responses.StreamingResponse):
 
         async def _release_all() -> None:
             nonlocal released
-            await upstream_release()
-            if not released:
-                released = True
-                await release()
+            try:
+                await upstream_release()
+            finally:
+                # The admission slot must be returned even when the upstream
+                # stream release raises, or dispatch capacity leaks for the
+                # lifetime of the load balancer.
+                if not released:
+                    released = True
+                    await release()
 
         self._release = _release_all
 
@@ -658,6 +663,12 @@ class SkyServeLoadBalancer:
             self._request_queue_condition = condition
         deadline = time.monotonic() + config['timeout_seconds']
         async with condition:
+            # A controller sync may disable the queue while this coroutine
+            # was waiting for the condition lock. Fall back to unqueued
+            # dispatch instead of tripping the assert in
+            # _request_queue_limits.
+            if self._request_queue_config is None:
+                return False
             dispatch_limit, queue_size = self._request_queue_limits()
             if self._current_dispatch_load() < dispatch_limit:
                 self._active_request_count += 1
