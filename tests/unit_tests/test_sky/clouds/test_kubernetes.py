@@ -3203,6 +3203,48 @@ class TestKubernetesRegionsWithOffering(unittest.TestCase):
         self.assertEqual(len(regions), 0)
 
 
+class TestGetAcceleratorLabelKeyValues(unittest.TestCase):
+    """Tests accelerator label discovery across heterogeneous GPU nodes."""
+
+    def _get_gfd_label_values(self, node_labels):
+        with mock.patch(
+                'sky.skypilot_config.get_effective_region_config',
+                return_value=None
+        ), mock.patch(
+                'sky.provision.kubernetes.utils.detect_accelerator_resource',
+                return_value=(True, {'nvidia.com/gpu'})), mock.patch(
+                    'sky.provision.kubernetes.utils.detect_gpu_label_formatter',
+                    return_value=(kubernetes_utils.GFDLabelFormatter(),
+                                  node_labels)):
+            return kubernetes_utils.get_accelerator_label_key_values(
+                context='test-context', acc_type='A100-80GB', acc_count=1)
+
+    def test_collects_distinct_matching_gfd_label_values(self):
+        node_labels = {
+            'node-1': [('nvidia.com/gpu.product', 'NVIDIA-A100-SXM4-80GB')],
+            'node-2': [('nvidia.com/gpu.product', 'NVIDIA-A100-PCIE-80GB')],
+            'node-3': [('nvidia.com/gpu.product', 'NVIDIA-A100-SXM4-80GB')],
+            'node-4': [('nvidia.com/gpu.product', 'NVIDIA-A100-SXM4-40GB')],
+        }
+
+        result = self._get_gfd_label_values(node_labels)
+
+        self.assertEqual(result, ('nvidia.com/gpu.product', [
+            'NVIDIA-A100-SXM4-80GB', 'NVIDIA-A100-PCIE-80GB'
+        ], None, None))
+
+    def test_preserves_single_matching_gfd_label_value(self):
+        node_labels = {
+            'node-1': [('nvidia.com/gpu.product', 'NVIDIA-A100-SXM4-80GB')],
+        }
+
+        result = self._get_gfd_label_values(node_labels)
+
+        self.assertEqual(
+            result,
+            ('nvidia.com/gpu.product', ['NVIDIA-A100-SXM4-80GB'], None, None))
+
+
 class TestKubernetesDetectNetworkType(unittest.TestCase):
     """Test cases for Kubernetes._detect_network_type method."""
 
