@@ -13,6 +13,7 @@ from unittest import mock
 import jsonschema
 import pytest
 
+from sky import exceptions
 from sky import skypilot_config
 from sky.serve import replica_managers
 from sky.serve import service_spec as service_spec_lib
@@ -140,6 +141,61 @@ class TestWaitForDrain:
                     'svc-1', '/tmp/replica.log', max_retry=2)
 
         assert observed_workspaces == ['mt_hybrid', 'mt_hybrid']
+
+    def test_terminate_missing_record_downs_without_workspace_ctx(self):
+        context = mock.MagicMock()
+        observed_workspaces = []
+
+        def _down(cluster_name):
+            observed_workspaces.append(skypilot_config.get_active_workspace())
+            raise exceptions.ClusterDoesNotExist(cluster_name)
+
+        with mock.patch.object(replica_managers.context,
+                               'get',
+                               return_value=context), \
+             mock.patch.object(replica_managers.global_user_state,
+                               'get_cluster_from_name',
+                               return_value=None), \
+             mock.patch.object(replica_managers.usage_lib.messages.usage,
+                               'set_internal'), \
+             mock.patch('sky.core.down', side_effect=_down), \
+             mock.patch.object(replica_managers.time, 'sleep'):
+            with skypilot_config.local_active_workspace_ctx('default'):
+                # No cluster record: teardown must not enter a workspace
+                # context, and ClusterDoesNotExist must return cleanly
+                # without retries.
+                replica_managers.terminate_cluster.__wrapped__(
+                    'svc-1', '/tmp/replica.log', max_retry=1)
+
+        assert observed_workspaces == ['default']
+
+    def test_terminate_plain_value_error_retries_then_raises(self):
+        # ValueErrors other than ClusterDoesNotExist must NOT be treated
+        # as "already terminated": they retry and ultimately fail loudly.
+        context = mock.MagicMock()
+        down = mock.MagicMock(side_effect=ValueError('malformed handle'))
+
+        with mock.patch.object(replica_managers.context,
+                               'get',
+                               return_value=context), \
+             mock.patch.object(replica_managers.global_user_state,
+                               'get_cluster_from_name',
+                               return_value={
+                                   'name': 'svc-1',
+                                   'workspace': 'mt_hybrid',
+                               }), \
+             mock.patch.object(replica_managers.usage_lib.messages.usage,
+                               'set_internal'), \
+             mock.patch('sky.core.down', down), \
+             mock.patch.object(replica_managers.common_utils.Backoff,
+                               'current_backoff',
+                               return_value=0), \
+             mock.patch.object(replica_managers.time, 'sleep'):
+            with pytest.raises(RuntimeError, match='Failed to terminate'):
+                replica_managers.terminate_cluster.__wrapped__(
+                    'svc-1', '/tmp/replica.log', max_retry=2)
+
+        assert down.call_count == 2
 
 
 def _manager(is_pool=False):
