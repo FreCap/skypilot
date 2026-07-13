@@ -116,3 +116,28 @@ it('streamManagedJobLogs flushes dangling incomplete bytes at EOF', async () => 
   });
   expect(received.join('')).toBe('A�');
 });
+
+it('constructs exactly one decoder for each sibling log stream', async () => {
+  const Decoder = jest.fn(() => new NodeTextDecoder());
+  global.TextDecoder = Decoder;
+  const chunks = Array.from({ length: 128 }, () => new Uint8Array([0x78]));
+  apiClient.fetchImmediate.mockResolvedValue(makeStreamResponse(chunks));
+  jest
+    .spyOn(global, 'fetch')
+    .mockImplementation(async () => makeStreamResponse(chunks));
+
+  await streamManagedJobLogs({
+    jobId: '1',
+    onNewLog: jest.fn(),
+  });
+  await streamSSHDeploymentLogs({
+    requestId: 'req-1',
+    onNewLog: jest.fn(),
+  });
+  await streamSSHOperationLogs({
+    requestId: 'req-2',
+    onNewLog: jest.fn(),
+  });
+
+  expect(Decoder).toHaveBeenCalledTimes(3);
+});
