@@ -638,6 +638,7 @@ export function useClusterData(options = {}) {
   const [error, setError] = useState(null);
   const [isServerPagination, setIsServerPagination] = useState(false);
   const isInitialMount = useRef(true);
+  const requestVersionRef = useRef(0);
 
   // Reset to page 1 when filters change, but skip on initial mount
   // so the page number read from the URL isn't overwritten.
@@ -652,126 +653,152 @@ export function useClusterData(options = {}) {
   /**
    * Fetch clusters using server-side pagination (plugin path)
    */
-  const fetchServerSide = useCallback(async () => {
-    console.log('[useClusterData] Using server-side pagination');
-    const pluginFetch = getPaginationFetch();
+  const fetchServerSide = useCallback(
+    async (isCurrentRequest) => {
+      console.log('[useClusterData] Using server-side pagination');
+      const pluginFetch = getPaginationFetch();
 
-    const result = await dashboardCache.get(pluginFetch, [
-      {
-        page,
-        limit,
-        showHistory,
-        historyDays,
-        sortBy,
-        sortOrder,
-        filters,
-      },
-    ]);
+      const result = await dashboardCache.get(pluginFetch, [
+        {
+          page,
+          limit,
+          showHistory,
+          historyDays,
+          sortBy,
+          sortOrder,
+          filters,
+        },
+      ]);
+      if (!isCurrentRequest()) {
+        return;
+      }
 
-    const resultTotal = result.total || 0;
-    const resultTotalPages = result.totalPages || result.total_pages || 1;
-    const resultHasNext = result.hasNext || result.has_next || false;
-    const resultHasPrev = result.hasPrev || result.has_prev || false;
-    const resultData = result.items || result.data || [];
+      const resultTotal = result.total || 0;
+      const resultTotalPages = result.totalPages || result.total_pages || 1;
+      const resultHasNext = result.hasNext || result.has_next || false;
+      const resultHasPrev = result.hasPrev || result.has_prev || false;
+      const resultData = result.items || result.data || [];
 
-    setData(resultData);
-    setFullData(resultData);
-    setTotal(resultTotal);
-    setTotalPages(resultTotalPages);
-    setHasNext(resultHasNext);
-    setHasPrev(resultHasPrev);
-    setIsServerPagination(true);
+      setData(resultData);
+      setFullData(resultData);
+      setTotal(resultTotal);
+      setTotalPages(resultTotalPages);
+      setHasNext(resultHasNext);
+      setHasPrev(resultHasPrev);
+      setIsServerPagination(true);
 
-    // Prefetch next page in background if there is one
-    if (resultHasNext) {
-      const nextPageOptions = {
-        page: page + 1,
-        limit,
-        showHistory,
-        historyDays,
-        sortBy,
-        sortOrder,
-        filters,
-      };
-      dashboardCache
-        .get(pluginFetch, [nextPageOptions], { ttl: 30000 })
-        .then(() => console.log('[useClusterData] Prefetched page', page + 1))
-        .catch((err) => console.warn('[useClusterData] Prefetch failed:', err));
-    }
-  }, [page, limit, showHistory, historyDays, sortBy, sortOrder, filters]);
+      // Prefetch next page in background if there is one
+      if (resultHasNext) {
+        const nextPageOptions = {
+          page: page + 1,
+          limit,
+          showHistory,
+          historyDays,
+          sortBy,
+          sortOrder,
+          filters,
+        };
+        dashboardCache
+          .get(pluginFetch, [nextPageOptions], { ttl: 30000 })
+          .then(() => console.log('[useClusterData] Prefetched page', page + 1))
+          .catch((err) =>
+            console.warn('[useClusterData] Prefetch failed:', err)
+          );
+      }
+    },
+    [page, limit, showHistory, historyDays, sortBy, sortOrder, filters]
+  );
 
   /**
    * Fetch clusters using client-side pagination (default path)
    */
-  const fetchClientSide = useCallback(async () => {
-    console.log('[useClusterData] Using client-side pagination');
+  const fetchClientSide = useCallback(
+    async (isCurrentRequest) => {
+      console.log('[useClusterData] Using client-side pagination');
 
-    let allClusters;
-    if (showHistory) {
-      let historyClusters = [];
-      try {
-        historyClusters = await dashboardCache.get(getClusterHistory, [
-          null,
-          historyDays,
-        ]);
-      } catch (historyError) {
-        console.error('Error fetching cluster history:', historyError);
+      let allClusters;
+      if (showHistory) {
+        let historyClusters = [];
+        try {
+          historyClusters = await dashboardCache.get(getClusterHistory, [
+            null,
+            historyDays,
+          ]);
+        } catch (historyError) {
+          if (isCurrentRequest()) {
+            console.error('Error fetching cluster history:', historyError);
+          }
+        }
+
+        // "Show history" surfaces only truly terminated clusters within the
+        // selected time window. cost_report also returns active clusters, so
+        // drop anything still present in cluster_table (status !== TERMINATED).
+        allClusters = historyClusters
+          .filter((c) => c.status === 'TERMINATED')
+          .map((c) => ({ ...c, isHistorical: true }));
+      } else {
+        const activeClusters = await dashboardCache.get(getClusters);
+        allClusters = activeClusters.map((c) => ({
+          ...c,
+          isHistorical: false,
+        }));
+      }
+      if (!isCurrentRequest()) {
+        return;
       }
 
-      // "Show history" surfaces only truly terminated clusters within the
-      // selected time window. cost_report also returns active clusters, so
-      // drop anything still present in cluster_table (status !== TERMINATED).
-      allClusters = historyClusters
-        .filter((c) => c.status === 'TERMINATED')
-        .map((c) => ({ ...c, isHistorical: true }));
-    } else {
-      const activeClusters = await dashboardCache.get(getClusters);
-      allClusters = activeClusters.map((c) => ({
-        ...c,
-        isHistorical: false,
-      }));
-    }
+      const clientTotal = allClusters.length;
+      const clientTotalPages = Math.ceil(clientTotal / limit) || 1;
+      const startIndex = (page - 1) * limit;
+      const paginatedData = allClusters.slice(startIndex, startIndex + limit);
 
-    const clientTotal = allClusters.length;
-    const clientTotalPages = Math.ceil(clientTotal / limit) || 1;
-    const startIndex = (page - 1) * limit;
-    const paginatedData = allClusters.slice(startIndex, startIndex + limit);
-
-    setData(paginatedData);
-    setFullData(allClusters);
-    setTotal(clientTotal);
-    setTotalPages(clientTotalPages);
-    setHasNext(page < clientTotalPages);
-    setHasPrev(page > 1);
-    setIsServerPagination(false);
-  }, [showHistory, historyDays, page, limit]);
+      setData(paginatedData);
+      setFullData(allClusters);
+      setTotal(clientTotal);
+      setTotalPages(clientTotalPages);
+      setHasNext(page < clientTotalPages);
+      setHasPrev(page > 1);
+      setIsServerPagination(false);
+    },
+    [showHistory, historyDays, page, limit]
+  );
 
   /**
    * Main fetch function - chooses server or client path
    */
   const fetchData = useCallback(async () => {
+    const requestVersion = requestVersionRef.current + 1;
+    requestVersionRef.current = requestVersion;
+    const isCurrentRequest = () => requestVersionRef.current === requestVersion;
     setLoading(true);
     setError(null);
 
     try {
       if (isPaginationPluginAvailable()) {
-        await fetchServerSide();
+        await fetchServerSide(isCurrentRequest);
       } else {
-        await fetchClientSide();
+        await fetchClientSide(isCurrentRequest);
       }
     } catch (fetchError) {
-      console.error('[useClusterData] Error fetching clusters:', fetchError);
-      setError(fetchError);
-      setData([]);
-      setFullData([]);
+      if (isCurrentRequest()) {
+        console.error('[useClusterData] Error fetching clusters:', fetchError);
+        setError(fetchError);
+        setData([]);
+        setFullData([]);
+      }
+    } finally {
+      if (isCurrentRequest()) {
+        setLoading(false);
+      }
     }
-
-    setLoading(false);
   }, [fetchServerSide, fetchClientSide]);
 
   // Fetch data on mount and when dependencies change
   useEffect(() => {
     fetchData();
+    return () => {
+      requestVersionRef.current += 1;
+    };
   }, [fetchData]);
 
   // Auto-refresh

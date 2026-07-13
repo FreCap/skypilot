@@ -16,6 +16,7 @@ import dashboardCache from '@/lib/cache';
 import {
   getClusterJobs,
   getClusters,
+  useClusterData,
   useClusterDetails,
 } from '@/data/connectors/clusters';
 
@@ -228,5 +229,193 @@ describe('useClusterDetails request ownership', () => {
     expect(dashboardCache.get).toHaveBeenNthCalledWith(2, getClusterJobs, [
       { clusterName: 'cluster-a', workspace: 'workspace-a' },
     ]);
+  });
+});
+
+describe('useClusterData request ownership', () => {
+  const stableOptions = {
+    sortConfig: { key: null, direction: 'ascending' },
+    filters: [],
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    delete window.__skyPaginationFetch;
+  });
+
+  afterEach(() => {
+    delete window.__skyPaginationFetch;
+    jest.restoreAllMocks();
+  });
+
+  it('keeps the latest server page and suppresses a stale prefetch', async () => {
+    const firstPage = deferred();
+    const secondPage = deferred();
+    window.__skyPaginationFetch = jest.fn();
+    dashboardCache.get
+      .mockImplementationOnce(() => firstPage.promise)
+      .mockImplementationOnce(() => secondPage.promise)
+      .mockResolvedValue({ items: [] });
+
+    const { result } = renderHook(() => useClusterData(stableOptions));
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(1));
+
+    act(() => result.current.setPage(2));
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      secondPage.resolve({
+        items: [{ cluster: 'fresh-page-2' }],
+        total: 11,
+        totalPages: 2,
+        hasNext: false,
+        hasPrev: true,
+      });
+      await secondPage.promise;
+    });
+    expect(result.current.data).toEqual([{ cluster: 'fresh-page-2' }]);
+    expect(result.current.loading).toBe(false);
+
+    await act(async () => {
+      firstPage.resolve({
+        items: [{ cluster: 'stale-page-1' }],
+        total: 20,
+        totalPages: 2,
+        hasNext: true,
+        hasPrev: false,
+      });
+      await firstPage.promise;
+    });
+
+    expect(result.current.data).toEqual([{ cluster: 'fresh-page-2' }]);
+    expect(result.current.page).toBe(2);
+    expect(result.current.total).toBe(11);
+    expect(result.current.hasPrev).toBe(true);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps the latest server refresh loading when an older request fails', async () => {
+    const initialRequest = deferred();
+    const refreshedRequest = deferred();
+    const consoleError = jest
+      .spyOn(console, 'error')
+      .mockImplementation(() => {});
+    window.__skyPaginationFetch = jest.fn();
+    dashboardCache.get
+      .mockImplementationOnce(() => initialRequest.promise)
+      .mockImplementationOnce(() => refreshedRequest.promise);
+
+    const { result } = renderHook(() => useClusterData(stableOptions));
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(1));
+
+    let refreshPromise;
+    act(() => {
+      refreshPromise = result.current.refresh();
+    });
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      initialRequest.reject(new Error('superseded request failed'));
+      await initialRequest.promise.catch(() => {});
+    });
+    expect(result.current.loading).toBe(true);
+    expect(result.current.error).toBeNull();
+    expect(consoleError).not.toHaveBeenCalled();
+
+    await act(async () => {
+      refreshedRequest.resolve({
+        items: [{ cluster: 'fresh' }],
+        total: 1,
+      });
+      await refreshPromise;
+    });
+    expect(result.current.data).toEqual([{ cluster: 'fresh' }]);
+    expect(result.current.loading).toBe(false);
+  });
+
+  it('keeps the latest client refresh when an older request resolves last', async () => {
+    const initialRequest = deferred();
+    const refreshedRequest = deferred();
+    dashboardCache.get
+      .mockImplementationOnce(() => initialRequest.promise)
+      .mockImplementationOnce(() => refreshedRequest.promise);
+
+    const { result } = renderHook(() => useClusterData(stableOptions));
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(1));
+
+    let refreshPromise;
+    act(() => {
+      refreshPromise = result.current.refresh();
+    });
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      refreshedRequest.resolve([{ cluster: 'fresh' }]);
+      await refreshPromise;
+    });
+    expect(result.current.data).toEqual([
+      { cluster: 'fresh', isHistorical: false },
+    ]);
+
+    await act(async () => {
+      initialRequest.resolve([{ cluster: 'stale' }]);
+      await initialRequest.promise;
+    });
+    expect(result.current.data).toEqual([
+      { cluster: 'fresh', isHistorical: false },
+    ]);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not prefetch after the hook unmounts', async () => {
+    const initialRequest = deferred();
+    window.__skyPaginationFetch = jest.fn();
+    dashboardCache.get
+      .mockImplementationOnce(() => initialRequest.promise)
+      .mockResolvedValue({ items: [] });
+
+    const { unmount } = renderHook(() => useClusterData(stableOptions));
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(1));
+    unmount();
+
+    await act(async () => {
+      initialRequest.resolve({
+        items: [{ cluster: 'stale' }],
+        total: 20,
+        totalPages: 2,
+        hasNext: true,
+      });
+      await initialRequest.promise;
+    });
+
+    expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps one foreground read and one prefetch for the current page', async () => {
+    window.__skyPaginationFetch = jest.fn();
+    dashboardCache.get
+      .mockResolvedValueOnce({
+        items: [{ cluster: 'page-1' }],
+        total: 20,
+        totalPages: 2,
+        hasNext: true,
+      })
+      .mockResolvedValueOnce({ items: [{ cluster: 'page-2' }] });
+
+    const { result } = renderHook(() => useClusterData(stableOptions));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(2));
+
+    expect(dashboardCache.get).toHaveBeenNthCalledWith(
+      2,
+      window.__skyPaginationFetch,
+      [
+        expect.objectContaining({
+          page: 2,
+          limit: 10,
+        }),
+      ],
+      { ttl: 30000 }
+    );
   });
 });
