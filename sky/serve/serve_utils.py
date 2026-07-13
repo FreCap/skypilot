@@ -1702,7 +1702,7 @@ def _get_service_status(
         with_replica_info: bool = True,
         with_replica_counts: bool = False,
         with_yaml: bool = True,
-        with_target_num_replicas: bool = True) -> dict[str, Any] | None:
+        with_target_num_replicas: bool = False) -> dict[str, Any] | None:
     """Get the status dict of the service.
 
     Args:
@@ -1717,6 +1717,13 @@ def _get_service_status(
             pools, secret-redacted ``service_yaml`` for services). Liveness
             callers can skip the parse/dump work when they only need
             controller metadata.
+        with_target_num_replicas: Whether to fetch autoscaler info
+            (``target_num_replicas`` and request stats) from the controller.
+            This is an HTTP round-trip to the controller process, so it is
+            opt-in: control and liveness paths (HA recovery, termination,
+            registration polling) must never block on a possibly-dead
+            controller's connect timeout for fields they do not read. Only
+            user-facing status rendering should pass True.
 
     Returns:
         A dictionary describing the status of the service if the service exists.
@@ -1932,9 +1939,8 @@ def get_service_status_pickled(
             'pool': pool,
             'with_replica_info': not summary_only,
             'with_replica_counts': summary_only,
+            'with_target_num_replicas': include_target_num_replicas,
         }
-        if not include_target_num_replicas:
-            kwargs['with_target_num_replicas'] = False
         return parent_ctx.copy().run(_get_service_status, name, **kwargs)
 
     max_workers = min(len(service_names), _STATUS_FANOUT_MAX_WORKERS)
