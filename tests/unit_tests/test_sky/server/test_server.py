@@ -2,12 +2,17 @@
 
 import argparse
 import asyncio
+import contextlib
+import io
 import json
 import os
 import pathlib
+import shutil
 import threading
 import time
+import types
 from unittest import mock
+import zipfile
 
 import fastapi
 import pytest
@@ -16,6 +21,7 @@ import uvicorn
 from sky import models
 from sky.server import common as server_common
 from sky.server import constants as server_constants
+from sky.server import file_mount_uploads
 from sky.server import server
 from sky.server.requests import executor
 from sky.skylet import constants
@@ -506,6 +512,71 @@ async def test_legacy_serve_launch_without_owner_context_remains_compatible():
 
 
 # --- Tests for cleanup_unreferenced_file_mounts ---
+
+
+@pytest.mark.parametrize(
+    ('path', 'method', 'endpoint'),
+    [
+        ('/upload', 'POST', server.upload_zip_file),
+        ('/upload_v2/blob', 'GET', server.check_blob_exists),
+        ('/upload_v2', 'POST', server.upload_blob),
+    ],
+)
+def test_file_mount_upload_routes_preserve_server_import_surface(
+        path, method, endpoint):
+    operation = server.app.openapi()['paths'][path][method.lower()]
+    assert endpoint.__name__ in operation['operationId']
+
+
+@pytest.mark.asyncio
+async def test_upload_blob_publishes_extracted_content(tmp_path):
+    blob_id = 'b' * 64
+
+    class _TestBlobStorage:
+
+        def blobs_dir(self, user_id):
+            return tmp_path / user_id / 'blobs'
+
+        def get_staging_dir(self, user_id, current_blob_id):
+            return self.blobs_dir(user_id) / '.staging' / current_blob_id
+
+        def get_target_dir(self, user_id, current_blob_id):
+            return self.blobs_dir(user_id) / current_blob_id
+
+        @contextlib.asynccontextmanager
+        async def acquire_upload_lock(self, user_id, current_blob_id):
+            del user_id, current_blob_id
+            yield
+
+        def assemble_on_upload(self):
+            return True
+
+        def extract_on_upload(self):
+            return True
+
+        async def store_blob(self, user_id, current_blob_id, staging_dir):
+            shutil.move(staging_dir,
+                        self.get_target_dir(user_id, current_blob_id))
+
+    zip_bytes = io.BytesIO()
+    with zipfile.ZipFile(zip_bytes, 'w') as archive:
+        archive.writestr('payload.txt', 'payload')
+
+    async def _stream():
+        yield zip_bytes.getvalue()
+
+    request = types.SimpleNamespace(state=types.SimpleNamespace(auth_user=None),
+                                    stream=_stream)
+    storage = _TestBlobStorage()
+    with mock.patch.object(file_mount_uploads.bs,
+                           'get_blob_storage',
+                           return_value=storage):
+        response = await server.upload_blob(request, 'user', blob_id, 0, 1)
+
+    assert response.status == 'completed'
+    assert (storage.get_target_dir('user', blob_id) /
+            'payload.txt').read_text() == 'payload'
+
 
 # A deterministic 64-char hex string used as a blob ID in tests.
 _BLOB_HEX = 'a' * 64

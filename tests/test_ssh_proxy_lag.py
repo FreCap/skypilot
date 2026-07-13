@@ -446,7 +446,8 @@ async def test_endpoint_upload(monitor):
     print("\n🔍 Testing: /upload")
 
     async def test_func():
-        with mock.patch('sky.server.server.unzip_file') as mock_unzip:
+        with mock.patch(
+                'sky.server.file_mount_uploads.unzip_file') as mock_unzip:
 
             async def async_unzip(*args):
                 await asyncio.sleep(0.001)
