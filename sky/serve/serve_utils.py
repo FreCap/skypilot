@@ -3276,9 +3276,8 @@ def stream_replica_logs(service_name: str, replica_id: int, follow: bool,
         return (f'{colorama.Fore.RED}{caprepnoun} {replica_id} doesn\'t exist.'
                 f'{colorama.Style.RESET_ALL}')
 
-    replica_infos = serve_state.get_replica_infos(service_name)
-    matching_info = next(
-        (info for info in replica_infos if info.replica_id == replica_id), None)
+    matching_info = serve_state.get_replica_info_from_id(
+        service_name, replica_id)
     recorded_cluster_name = (getattr(matching_info, 'cluster_name', None)
                              if matching_info is not None else None)
     replica_cluster_name = (recorded_cluster_name if isinstance(
@@ -3286,9 +3285,12 @@ def stream_replica_logs(service_name: str, replica_id: int, follow: bool,
             service_name, replica_id, resource_scope))
 
     def _get_replica_status() -> serve_state.ReplicaStatus:
-        for info in serve_state.get_replica_infos(service_name):
-            if info.replica_id == replica_id:
-                return info.status
+        # Single-row lookup: this runs on every poll of the follow loop
+        # below, so scanning (and unpickling) every replica of the service
+        # per poll is O(replicas) wasted work at fleet scale.
+        info = serve_state.get_replica_info_from_id(service_name, replica_id)
+        if info is not None:
+            return info.status
         with ux_utils.print_exception_no_traceback():
             raise ValueError(
                 _FAILED_TO_FIND_REPLICA_MSG.format(replica_id=replica_id))

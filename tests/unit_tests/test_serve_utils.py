@@ -1275,8 +1275,8 @@ class TestStreamReplicaLogsZeroByteFallback:
                  'sky.serve.serve_utils.generate_replica_launch_log_file_name',
                  return_value=str(launch_log)), \
              mock.patch(
-                 'sky.serve.serve_utils.serve_state.get_replica_infos',
-                 return_value=[mock.Mock(replica_id=1, status='READY')]), \
+                 'sky.serve.serve_utils.serve_state.get_replica_info_from_id',
+                 return_value=mock.Mock(replica_id=1, status='READY')), \
              mock.patch(
                  'sky.serve.serve_utils._follow_logs_with_provision_expanding',
                  return_value=iter(['LAUNCH-CONTENT\n'])), \
