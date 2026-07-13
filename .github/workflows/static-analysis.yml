@@ -76,6 +76,14 @@ jobs:
           source ~/worker-env/bin/activate
           uv pip install -e .
           python -c "import sky, sky.skylet.constants, sky.jobs.state, sky.data.storage; print(sky.__version__)"
+      - name: Compile the whole package on the cluster-worker Python
+        # The imports above only reach modules on those four import paths; a
+        # 3.11+ syntax construct anywhere else in the package would still
+        # install fine and only explode when a worker first imports it.
+        # compileall parses every shipped module with the 3.10 grammar.
+        run: |
+          source ~/worker-env/bin/activate
+          python -m compileall -q -x 'schemas/generated' sky
 
   actionlint:
     runs-on: ubuntu-latest
