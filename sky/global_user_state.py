@@ -1114,11 +1114,6 @@ def add_cluster_event(cluster_name: str,
         transitioned_at: If provided, use this timestamp for the event.
     """
     engine = _db_manager.get_engine()
-    cluster_hash = _get_hash_for_existing_cluster(cluster_name)
-    if cluster_hash is None:
-        logger.debug(f'Hash for cluster {cluster_name} not found. '
-                     'Skipping event.')
-        return
     if transitioned_at is None:
         transitioned_at = int(time.time())
     with orm.Session(engine) as session:
@@ -1131,9 +1126,18 @@ def add_cluster_event(cluster_name: str,
             session.rollback()
             raise ValueError('Unsupported database dialect')
 
-        cluster_row = session.query(cluster_table).filter_by(name=cluster_name)
-        last_status = cluster_row.first(
-        ).status if cluster_row and cluster_row.first() is not None else None
+        # Read hash and status in a single query so they come from the same
+        # row snapshot (a separate hash pre-fetch could pair a stale hash
+        # with a newer status under concurrent removal/re-creation).
+        cluster_row = session.query(
+            cluster_table.c.cluster_hash,
+            cluster_table.c.status).filter_by(name=cluster_name).first()
+        if cluster_row is None or cluster_row.cluster_hash is None:
+            logger.debug(f'Hash for cluster {cluster_name} not found. '
+                         'Skipping event.')
+            return
+        cluster_hash = cluster_row.cluster_hash
+        last_status = cluster_row.status
         if nop_if_duplicate:
             last_event = get_last_cluster_event(cluster_hash,
                                                 event_type=event_type)
