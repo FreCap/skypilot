@@ -9,6 +9,7 @@ import pytest
 
 from sky.backends import cloud_vm_ray_backend
 from sky.exceptions import ClusterDoesNotExist
+from sky.jobs import state
 from sky.jobs import utils
 from sky.utils import controller_utils
 
@@ -353,21 +354,16 @@ def test_terminate_cluster_retry_reenters_workspace_ctx(
 def test_cancel_signal_file_no_graceful():
     """Test that cancel_jobs_by_id writes an empty signal file (touch)
     for non-graceful cancels on the new controller."""
+    snapshot = state.JobCancellationState(state.ManagedJobStatus.RUNNING,
+                                          'default', False)
     with tempfile.TemporaryDirectory() as tmpdir:
         with mock.patch('sky.jobs.constants.CONSOLIDATED_SIGNAL_PATH', tmpdir):
             with mock.patch(
-                    'sky.jobs.state.is_legacy_controller_process',
-                    return_value=False), \
-                 mock.patch(
-                    'sky.jobs.state.get_status',
-                    return_value=mock.MagicMock(
-                        is_terminal=mock.MagicMock(return_value=False),
-                        __eq__=mock.MagicMock(return_value=False))), \
+                    'sky.jobs.state.get_job_cancellation_states',
+                    return_value={42: snapshot}), \
                  mock.patch(
                     'sky.jobs.utils.update_managed_jobs_statuses'), \
-                 mock.patch(
-                    'sky.jobs.state.get_workspace',
-                    return_value='default'):
+                 mock.patch('sky.jobs.state.set_pending_cancelled'):
                 utils.cancel_jobs_by_id(job_ids=[42],
                                         current_workspace='default',
                                         graceful=False)
@@ -379,23 +375,76 @@ def test_cancel_signal_file_no_graceful():
                     f'Expected empty file for non-graceful, got: {content!r}')
 
 
+def test_cancel_pending_wrong_workspace_is_not_mutated():
+    snapshot = state.JobCancellationState(state.ManagedJobStatus.PENDING,
+                                          'team-b', False)
+    with mock.patch('sky.jobs.state.get_job_cancellation_states',
+                    return_value={42: snapshot}), \
+         mock.patch('sky.jobs.state.set_pending_cancelled') as set_cancelled, \
+         mock.patch('sky.jobs.utils.update_managed_jobs_statuses') as refresh:
+        result = utils.cancel_jobs_by_id(job_ids=[42],
+                                         current_workspace='team-a')
+
+    assert result.startswith('No job to cancel.')
+    set_cancelled.assert_not_called()
+    refresh.assert_not_called()
+
+
+def test_cancel_skips_job_that_finishes_during_status_refresh(tmp_path):
+    running = state.JobCancellationState(state.ManagedJobStatus.RUNNING,
+                                         'default', False)
+    succeeded = state.JobCancellationState(state.ManagedJobStatus.SUCCEEDED,
+                                           'default', False)
+    with mock.patch('sky.jobs.constants.CONSOLIDATED_SIGNAL_PATH', tmp_path), \
+         mock.patch('sky.jobs.state.get_job_cancellation_states',
+                    side_effect=[{42: running}, {42: succeeded}]) as snapshots, \
+         mock.patch('sky.jobs.state.set_pending_cancelled') as set_cancelled, \
+         mock.patch('sky.jobs.utils.update_managed_jobs_statuses') as refresh:
+        result = utils.cancel_jobs_by_id(job_ids=[42],
+                                         current_workspace='default')
+
+    assert result == 'No job to cancel.'
+    assert not (tmp_path / '42').exists()
+    assert snapshots.call_count == 2
+    set_cancelled.assert_not_called()
+    refresh.assert_called_once_with(42)
+
+
+def test_cancel_batches_state_reads_for_multiple_running_jobs(tmp_path):
+    job_ids = list(range(1, 21))
+    running = state.JobCancellationState(state.ManagedJobStatus.RUNNING,
+                                         'default', False)
+    snapshot = {job_id: running for job_id in job_ids}
+    with mock.patch('sky.jobs.constants.CONSOLIDATED_SIGNAL_PATH', tmp_path), \
+         mock.patch('sky.jobs.state.get_job_cancellation_states',
+                    side_effect=[snapshot, snapshot]) as snapshots, \
+         mock.patch('sky.jobs.state.get_status') as point_status, \
+         mock.patch('sky.jobs.state.get_workspace') as point_workspace, \
+         mock.patch('sky.jobs.state.is_legacy_controller_process') as point_legacy, \
+         mock.patch('sky.jobs.utils.update_managed_jobs_statuses'):
+        result = utils.cancel_jobs_by_id(job_ids=job_ids,
+                                         current_workspace='default')
+
+    assert result.startswith('Jobs with IDs 1, 2, 3')
+    assert snapshots.call_args_list == [mock.call(job_ids), mock.call(job_ids)]
+    point_status.assert_not_called()
+    point_workspace.assert_not_called()
+    point_legacy.assert_not_called()
+    assert all((tmp_path / str(job_id)).exists() for job_id in job_ids)
+
+
 def test_cancel_signal_file_graceful():
     """Test that cancel_jobs_by_id writes 'graceful' to signal file."""
+    snapshot = state.JobCancellationState(state.ManagedJobStatus.RUNNING,
+                                          'default', False)
     with tempfile.TemporaryDirectory() as tmpdir:
         with mock.patch('sky.jobs.constants.CONSOLIDATED_SIGNAL_PATH', tmpdir):
             with mock.patch(
-                    'sky.jobs.state.is_legacy_controller_process',
-                    return_value=False), \
-                 mock.patch(
-                    'sky.jobs.state.get_status',
-                    return_value=mock.MagicMock(
-                        is_terminal=mock.MagicMock(return_value=False),
-                        __eq__=mock.MagicMock(return_value=False))), \
+                    'sky.jobs.state.get_job_cancellation_states',
+                    return_value={42: snapshot}), \
                  mock.patch(
                     'sky.jobs.utils.update_managed_jobs_statuses'), \
-                 mock.patch(
-                    'sky.jobs.state.get_workspace',
-                    return_value='default'):
+                 mock.patch('sky.jobs.state.set_pending_cancelled'):
                 utils.cancel_jobs_by_id(job_ids=[42],
                                         current_workspace='default',
                                         graceful=True)
@@ -409,21 +458,16 @@ def test_cancel_signal_file_graceful():
 def test_cancel_signal_file_graceful_with_timeout():
     """Test that cancel_jobs_by_id writes 'graceful:<timeout>' to signal
     file."""
+    snapshot = state.JobCancellationState(state.ManagedJobStatus.RUNNING,
+                                          'default', False)
     with tempfile.TemporaryDirectory() as tmpdir:
         with mock.patch('sky.jobs.constants.CONSOLIDATED_SIGNAL_PATH', tmpdir):
             with mock.patch(
-                    'sky.jobs.state.is_legacy_controller_process',
-                    return_value=False), \
-                 mock.patch(
-                    'sky.jobs.state.get_status',
-                    return_value=mock.MagicMock(
-                        is_terminal=mock.MagicMock(return_value=False),
-                        __eq__=mock.MagicMock(return_value=False))), \
+                    'sky.jobs.state.get_job_cancellation_states',
+                    return_value={42: snapshot}), \
                  mock.patch(
                     'sky.jobs.utils.update_managed_jobs_statuses'), \
-                 mock.patch(
-                    'sky.jobs.state.get_workspace',
-                    return_value='default'):
+                 mock.patch('sky.jobs.state.set_pending_cancelled'):
                 utils.cancel_jobs_by_id(job_ids=[42],
                                         current_workspace='default',
                                         graceful=True,

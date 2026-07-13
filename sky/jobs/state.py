@@ -873,6 +873,13 @@ ControllerPidRecord = collections.namedtuple('ControllerPidRecord', [
 ])
 
 
+class JobCancellationState(typing.NamedTuple):
+    """State needed to authorize and route a managed-job cancellation."""
+    status: ManagedJobStatus
+    workspace: str
+    is_legacy_controller: bool
+
+
 # === Status transition functions ===
 def set_job_info_without_job_id(name: str,
                                 workspace: str,
@@ -1327,6 +1334,20 @@ def get_job_controller_process(job_id: int) -> ControllerPidRecord | None:
     return get_job_controller_processes([job_id]).get(job_id)
 
 
+def _is_legacy_controller_record(pid: int | None,
+                                 started_at: float | None) -> bool:
+    if pid is None:
+        # Job is from before #4485, so controller_pid is not set.
+        return True
+    if started_at is not None:
+        # controller_pid_started_at is only set after #7847.
+        return False
+    # Between #7051 and #7847, a negative pid identified the consolidated
+    # controller. Positive pids without a start time belong to legacy
+    # single-job controllers.
+    return pid >= 0
+
+
 def is_legacy_controller_process(job_id: int) -> bool:
     """Check if the controller process is a legacy single-job controller process
 
@@ -1345,21 +1366,7 @@ def is_legacy_controller_process(job_id: int) -> bool:
                     job_info_table.c.spot_job_id == job_id)).fetchone()
         if row is None:
             raise ValueError(f'Job {job_id} not found')
-        if row[0] is None:
-            # Job is from before #4485, so controller_pid is not set
-            # This is a legacy single-job controller process (running in ray!)
-            return True
-        started_at = row[1]
-        if started_at is not None:
-            # controller_pid_started_at is only set after #7847, so we know this
-            # must be a non-legacy multi-job controller process.
-            return False
-        pid = row[0]
-        if pid < 0:
-            # Between #7051 and #7847, the controller pid was negative to
-            # indicate a non-legacy multi-job controller process.
-            return False
-        return True
+        return _is_legacy_controller_record(row[0], row[1])
 
 
 def get_status(job_id: int) -> ManagedJobStatus | None:
@@ -1648,6 +1655,59 @@ def get_job_status_check_state(job_id: int) -> dict[str, Any] | None:
         'controller_pid_started_at': row[2],
         'all_tasks_terminal': task_count > 0 and nonterminal_task_count == 0,
     }
+
+
+def get_job_cancellation_states(
+        job_ids: list[int]) -> dict[int, JobCancellationState]:
+    """Return slim, batched snapshots for managed-job cancellation.
+
+    Cancellation needs the currently executable task's status together with
+    workspace authorization and the controller generation used to choose the
+    signal path. Reading those fields together avoids three point queries per
+    job and prevents decisions assembled from different lifecycle snapshots.
+    """
+    if not job_ids:
+        return {}
+
+    unique_job_ids = list(dict.fromkeys(job_ids))
+    engine = _db_manager.get_engine()
+    task_states: dict[int, list[tuple[int, ManagedJobStatus]]] = (
+        collections.defaultdict(list))
+    job_metadata: dict[int, tuple[str | None, int | None, float | None]] = {}
+    for start in range(0, len(unique_job_ids), _STATUS_CHECK_JOB_ID_CHUNK):
+        chunk = unique_job_ids[start:start + _STATUS_CHECK_JOB_ID_CHUNK]
+        query = sqlalchemy.select(
+            spot_table.c.spot_job_id,
+            spot_table.c.task_id,
+            spot_table.c.status,
+            job_info_table.c.workspace,
+            job_info_table.c.controller_pid,
+            job_info_table.c.controller_pid_started_at,
+        ).select_from(
+            spot_table.outerjoin(
+                job_info_table, spot_table.c.spot_job_id ==
+                job_info_table.c.spot_job_id)).where(
+                    spot_table.c.spot_job_id.in_(chunk)).order_by(
+                        spot_table.c.spot_job_id.asc(),
+                        spot_table.c.task_id.asc())
+        with orm.Session(engine) as session:
+            rows = session.execute(query).fetchall()
+        for job_id, task_id, status, workspace, pid, started_at in rows:
+            task_states[job_id].append((task_id, ManagedJobStatus(status)))
+            job_metadata[job_id] = (workspace, pid, started_at)
+
+    snapshots: dict[int, JobCancellationState] = {}
+    for job_id, statuses in task_states.items():
+        _, status = get_latest_task_id_from_statuses(statuses)
+        assert status is not None, job_id
+        workspace, pid, started_at = job_metadata[job_id]
+        snapshots[job_id] = JobCancellationState(
+            status=status,
+            workspace=(constants.SKYPILOT_DEFAULT_WORKSPACE
+                       if workspace is None else workspace),
+            is_legacy_controller=_is_legacy_controller_record(pid, started_at),
+        )
+    return snapshots
 
 
 def has_jobs_requiring_recovery_grace_wait() -> bool:

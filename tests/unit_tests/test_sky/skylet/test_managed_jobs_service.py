@@ -655,6 +655,20 @@ class TestCancelJobs:
         )
         context_mock.abort.assert_not_called()
 
+    def test_cancel_pending_job_by_id_wrong_workspace_preserves_job(self):
+        job_id = self.job_ids['job_id1']
+        request = managed_jobsv1_pb2.CancelJobsRequest(
+            job_ids=managed_jobsv1_pb2.JobIds(ids=[job_id]),
+            current_workspace='ws9',
+        )
+        context_mock = mock.Mock()
+
+        response = self.service.CancelJobs(request, context_mock)
+
+        assert 'no job to cancel' in response.message.lower()
+        assert state.get_status(job_id) == state.ManagedJobStatus.PENDING
+        context_mock.abort.assert_not_called()
+
     def test_cancel_jobs_by_pool_success(self):
         """Test successful job cancellation by pool using real seed data."""
         # Use the pool name from seed data

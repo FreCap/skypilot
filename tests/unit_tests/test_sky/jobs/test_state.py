@@ -166,6 +166,64 @@ def test_get_job_controller_process_reuses_bulk_reader(monkeypatch):
     assert calls == [[7], [8]]
 
 
+def test_get_job_cancellation_states_batches_lifecycle_snapshot(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    active_job = state.set_job_info_without_job_id(
+        name='active',
+        workspace='team-a',
+        entrypoint='entry',
+        pool=None,
+        pool_hash=None,
+        user_hash='u',
+    )
+    completed_job = state.set_job_info_without_job_id(
+        name='completed',
+        workspace='team-b',
+        entrypoint='entry',
+        pool=None,
+        pool_hash=None,
+        user_hash='u',
+    )
+    legacy_job = _insert_job_info(engine)
+    _set_controller_process(engine, active_job, 101, 1001.5)
+    _set_controller_process(engine, completed_job, -202, None)
+
+    _insert_task(engine, active_job, 0, status=state.ManagedJobStatus.SUCCEEDED)
+    _insert_task(engine, active_job, 1, status=state.ManagedJobStatus.RUNNING)
+    _insert_task(engine, active_job, 2, status=state.ManagedJobStatus.PENDING)
+    _insert_task(engine,
+                 completed_job,
+                 0,
+                 status=state.ManagedJobStatus.SUCCEEDED)
+    _insert_task(engine, completed_job, 1, status=state.ManagedJobStatus.FAILED)
+    _insert_task(engine, legacy_job, 0, status=state.ManagedJobStatus.STARTING)
+
+    with _count_sql_statements(engine) as counts:
+        snapshots = state.get_job_cancellation_states(
+            [active_job, completed_job, legacy_job, 999999, active_job])
+
+    assert snapshots == {
+        active_job: state.JobCancellationState(state.ManagedJobStatus.RUNNING,
+                                               'team-a', False),
+        completed_job: state.JobCancellationState(state.ManagedJobStatus.FAILED,
+                                                  'team-b', False),
+        legacy_job: state.JobCancellationState(state.ManagedJobStatus.STARTING,
+                                               'default', True),
+    }
+    assert counts['n'] == 1, counts
+
+
+def test_get_job_cancellation_states_empty_input_uses_no_query(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+
+    with _count_sql_statements(engine) as counts:
+        assert not state.get_job_cancellation_states([])
+
+    assert counts['n'] == 0, counts
+
+
 def test_get_task_logs_to_clean_basic(_mock_managed_jobs_db_conn):
     now = time.time()
     retention = 60
