@@ -191,6 +191,40 @@ def test_get_specs_batches_requested_versions_in_one_query(_mock_serve_db):
     assert specs[2].graceful_drain_async_occupancy is True
 
 
+def test_get_yaml_contents_batches_requested_versions_in_one_query(
+        _mock_serve_db):
+    assert _add_minimal_service('svc-yamls') is True
+    serve_state.add_or_update_version(
+        'svc-yamls',
+        1,
+        types.SimpleNamespace(graceful_drain_async_occupancy=False),
+        'yaml: v1',
+    )
+    serve_state.add_or_update_version(
+        'svc-yamls',
+        2,
+        types.SimpleNamespace(graceful_drain_async_occupancy=True),
+        'yaml: v2',
+    )
+
+    with _count_sql_statements(_mock_serve_db) as counts:
+        yamls = serve_state.get_yaml_contents('svc-yamls', [2, 1, 2, 3])
+
+    assert counts['n'] == 1, counts
+    assert yamls == {
+        1: 'yaml: v1',
+        2: 'yaml: v2',
+    }
+
+
+def test_get_yaml_contents_empty_versions_skips_query(_mock_serve_db):
+    with _count_sql_statements(_mock_serve_db) as counts:
+        yamls = serve_state.get_yaml_contents('svc-yamls', [])
+
+    assert counts['n'] == 0, counts
+    assert yamls == {}
+
+
 def test_get_service_from_name_uses_joined_spec_in_single_query(_mock_serve_db):
     spec = _FakeSpec('qps=2', 'least_load')
     assert _add_minimal_service('svc-read', spec=spec) is True

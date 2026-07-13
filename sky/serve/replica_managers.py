@@ -3011,28 +3011,42 @@ class SkyPilotReplicaManager(ReplicaManager):
             return
         for key in ['service', 'pool', '_user_specified_yaml']:
             new_config.pop(key, None)
-        new_config_any_of = new_config.get('resources', {}).pop('any_of', [])
+        new_config_any_of = (resources_utils.normalize_any_of_resources_config(
+            new_config.get('resources', {}).pop('any_of', [])))
 
         replica_infos = serve_state.get_replica_infos(self._service_name)
+        prior_versions = sorted({
+            info.version
+            for info in replica_infos
+            if info.version < version and not info.is_terminal
+        })
+        prior_yaml_contents = (serve_state.get_yaml_contents(
+            self._service_name, prior_versions) if prior_versions else {})
+        prior_configs = {}
+        prior_any_of = {}
+        for prior_version in prior_versions:
+            yaml_content = prior_yaml_contents.get(prior_version)
+            if yaml_content is None:
+                raise ValueError('yaml content not found for '
+                                 f'{self._service_name} version '
+                                 f'{prior_version}')
+            old_config = yaml_utils.safe_load(yaml_content)
+            for key in ['service', 'pool', '_user_specified_yaml']:
+                old_config.pop(key, None)
+            prior_configs[prior_version] = old_config
+            prior_any_of[prior_version] = (
+                resources_utils.normalize_any_of_resources_config(
+                    old_config.get('resources', {}).pop('any_of', [])))
         for info in replica_infos:
             if info.version < version and not info.is_terminal:
-                # Assume user does not change the yaml file on the controller.
-                old_yaml_content = serve_state.get_yaml_content(
-                    self._service_name, info.version)
-                old_config = yaml_utils.safe_load(old_yaml_content)
-                for key in ['service', 'pool', '_user_specified_yaml']:
-                    old_config.pop(key, None)
+                old_config = prior_configs[info.version]
                 # Bump replica version if all fields except for service are
                 # the same.
                 # Here, we manually convert the any_of field to a set to avoid
                 # only the difference in the random order of the any_of fields.
-                old_config_any_of = old_config.get('resources',
-                                                   {}).pop('any_of', [])
+                old_config_any_of = prior_any_of[info.version]
 
-                if (resources_utils.normalize_any_of_resources_config(
-                        old_config_any_of)
-                        != resources_utils.normalize_any_of_resources_config(
-                            new_config_any_of)):
+                if old_config_any_of != new_config_any_of:
                     logger.info('Replica config changed (any_of), skipping. '
                                 f'old: {old_config_any_of}, '
                                 f'new: {new_config_any_of}')
