@@ -17,17 +17,33 @@ jest.mock('chart.js', () => ({
   Tooltip: {},
 }));
 jest.mock('react-chartjs-2', () => ({
-  Bar: ({ data, options }) => (
-    <div
-      data-testid="chart"
-      data-x-stacked={String(options.scales.x.stacked)}
-      data-y-stacked={String(options.scales.y.stacked)}
-    >
-      {data.datasets
-        .map((dataset) => `${dataset.label}:${dataset.data.join(',')}`)
-        .join('|')}
-    </div>
-  ),
+  Bar: ({ data, options }) => {
+    const positiveContext = {
+      dataset: { label: 'Cluster alpha' },
+      parsed: { y: 1.25 },
+    };
+    const zeroContext = {
+      dataset: { label: 'Cluster zero' },
+      parsed: { y: 0 },
+    };
+    return (
+      <div
+        data-testid="chart"
+        data-x-stacked={String(options.scales.x.stacked)}
+        data-y-stacked={String(options.scales.y.stacked)}
+        data-tooltip-label={options.plugins.tooltip.callbacks.label(
+          positiveContext
+        )}
+        data-tooltip-shows-zero={String(
+          options.plugins.tooltip.filter(zeroContext)
+        )}
+      >
+        {data.datasets
+          .map((dataset) => `${dataset.label}:${dataset.data.join(',')}`)
+          .join('|')}
+      </div>
+    );
+  },
 }));
 jest.mock('@/data/connectors/client', () => ({
   getCurrentUserRole: jest.fn(),
@@ -38,7 +54,11 @@ jest.mock('@/data/connectors/estimated_spend', () => ({
 
 import { getCurrentUserRole } from '@/data/connectors/client';
 import { getEstimatedSpend } from '@/data/connectors/estimated_spend';
-import { EstimatedSpend } from '@/components/estimated-spend';
+import {
+  EstimatedSpend,
+  shiftUtcDate,
+  utcDateString,
+} from '@/components/estimated-spend';
 
 function deferred() {
   let resolve;
@@ -67,6 +87,14 @@ function response(days, estimatedCost) {
     series: [],
     excluded_by_reason: {},
     requested_days: days,
+  };
+}
+
+function rollingRange(days, endOffset = 0) {
+  const endDate = shiftUtcDate(utcDateString(), endOffset);
+  return {
+    startDate: shiftUtcDate(endDate, -(days - 1)),
+    endDate,
   };
 }
 
@@ -131,14 +159,14 @@ test('groups the chart and table by user with purchase-option costs', async () =
 
   render(<EstimatedSpend />);
   await waitFor(() =>
-    expect(getEstimatedSpend).toHaveBeenCalledWith(30, 'job')
+    expect(getEstimatedSpend).toHaveBeenCalledWith(30, 'job', rollingRange(30))
   );
 
   fireEvent.change(screen.getByLabelText('Group spend by'), {
     target: { value: 'user' },
   });
   await waitFor(() =>
-    expect(getEstimatedSpend).toHaveBeenCalledWith(30, 'user')
+    expect(getEstimatedSpend).toHaveBeenCalledWith(30, 'user', rollingRange(30))
   );
 
   const aliceRow = (await screen.findByText('Alice')).closest('tr');
@@ -192,7 +220,11 @@ test('shows spot and on-demand as purchase-option groups', async () => {
   });
 
   await waitFor(() =>
-    expect(getEstimatedSpend).toHaveBeenCalledWith(30, 'purchase_option')
+    expect(getEstimatedSpend).toHaveBeenCalledWith(
+      30,
+      'purchase_option',
+      rollingRange(30)
+    )
   );
   expect(await screen.findByText('Spend by purchase option')).toBeTruthy();
   expect(screen.getByTestId('chart')).toHaveTextContent('Spot:4');
@@ -201,6 +233,92 @@ test('shows spot and on-demand as purchase-option groups', async () => {
   expect(
     screen.queryByRole('columnheader', { name: 'On-demand' })
   ).not.toBeTruthy();
+});
+
+test('selects today and yesterday as exact UTC ranges', async () => {
+  getCurrentUserRole.mockResolvedValue({ role: 'admin' });
+  getEstimatedSpend.mockResolvedValue(response(1, 10));
+
+  render(<EstimatedSpend />);
+  await waitFor(() =>
+    expect(getEstimatedSpend).toHaveBeenCalledWith(30, 'job', rollingRange(30))
+  );
+
+  fireEvent.click(screen.getByRole('button', { name: 'Today' }));
+  await waitFor(() =>
+    expect(getEstimatedSpend).toHaveBeenCalledWith(1, 'job', rollingRange(1))
+  );
+
+  fireEvent.click(screen.getByRole('button', { name: 'Yesterday' }));
+  await waitFor(() =>
+    expect(getEstimatedSpend).toHaveBeenCalledWith(
+      1,
+      'job',
+      rollingRange(1, -1)
+    )
+  );
+  expect(await screen.findByText('Yesterday estimate (UTC)')).toBeTruthy();
+});
+
+test('applies an arbitrary inclusive UTC date range', async () => {
+  getCurrentUserRole.mockResolvedValue({ role: 'admin' });
+  getEstimatedSpend.mockResolvedValue(response(3, 10));
+  const startDate = shiftUtcDate(utcDateString(), -4);
+  const endDate = shiftUtcDate(utcDateString(), -2);
+
+  render(<EstimatedSpend />);
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: 'Apply' })).toBeEnabled()
+  );
+  fireEvent.change(screen.getByLabelText('Start date (UTC)'), {
+    target: { value: startDate },
+  });
+  fireEvent.change(screen.getByLabelText('End date (UTC)'), {
+    target: { value: endDate },
+  });
+  fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
+
+  await waitFor(() =>
+    expect(getEstimatedSpend).toHaveBeenCalledWith(3, 'job', {
+      startDate,
+      endDate,
+    })
+  );
+  expect(await screen.findByText('Selected range estimate')).toBeTruthy();
+});
+
+test('rejects an invalid custom range without fetching', async () => {
+  getCurrentUserRole.mockResolvedValue({ role: 'admin' });
+  getEstimatedSpend.mockResolvedValue(response(30, 10));
+
+  render(<EstimatedSpend />);
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: 'Apply' })).toBeEnabled()
+  );
+  getEstimatedSpend.mockClear();
+  fireEvent.change(screen.getByLabelText('Start date (UTC)'), {
+    target: { value: utcDateString() },
+  });
+  fireEvent.change(screen.getByLabelText('End date (UTC)'), {
+    target: { value: shiftUtcDate(utcDateString(), -1) },
+  });
+  fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
+
+  expect(
+    await screen.findByText('The start date must be on or before the end date.')
+  ).toBeTruthy();
+  expect(getEstimatedSpend).not.toHaveBeenCalled();
+});
+
+test('names tooltip entries and hides zero-valued series', async () => {
+  getCurrentUserRole.mockResolvedValue({ role: 'admin' });
+  getEstimatedSpend.mockResolvedValue(response(30, 10));
+
+  render(<EstimatedSpend />);
+
+  const chart = await screen.findByTestId('chart');
+  expect(chart).toHaveAttribute('data-tooltip-label', 'Cluster alpha: $1.25');
+  expect(chart).toHaveAttribute('data-tooltip-shows-zero', 'false');
 });
 
 test('treats a failed role lookup as an error, not a permission denial', async () => {

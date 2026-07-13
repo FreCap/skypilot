@@ -46,7 +46,15 @@ import { getCurrentUserRole } from '@/data/connectors/client';
 
 ChartJS.register(CategoryScale, LinearScale, BarElement, Tooltip, Legend);
 
-const RANGE_OPTIONS = [7, 30, 90];
+const MAX_RANGE_DAYS = 90;
+const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000;
+const RANGE_OPTIONS = [
+  { key: 'today', label: 'Today', days: 1, endOffset: 0 },
+  { key: 'yesterday', label: 'Yesterday', days: 1, endOffset: -1 },
+  { key: '7d', label: '7d', days: 7, endOffset: 0 },
+  { key: '30d', label: '30d', days: 30, endOffset: 0 },
+  { key: '90d', label: '90d', days: 90, endOffset: 0 },
+];
 const AUTO_REFRESH_MS = 60 * 1000;
 const GROUP_OPTIONS = [
   { value: 'job', label: 'Job / workload' },
@@ -72,6 +80,7 @@ const OTHER_COLOR = ['rgba(148, 163, 184, 0.62)', 'rgb(100, 116, 139)'];
 
 export function formatCurrency(value) {
   const number = Number(value || 0);
+  if (number > 0 && number < 0.01) return '<$0.01';
   if (number >= 10000) {
     return `$${number.toLocaleString(undefined, { maximumFractionDigits: 0 })}`;
   }
@@ -79,6 +88,70 @@ export function formatCurrency(value) {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   })}`;
+}
+
+export function utcDateString(date = new Date()) {
+  return date.toISOString().slice(0, 10);
+}
+
+export function shiftUtcDate(dateString, days) {
+  const date = new Date(`${dateString}T00:00:00Z`);
+  date.setUTCDate(date.getUTCDate() + days);
+  return utcDateString(date);
+}
+
+function inclusiveRangeDays(startDate, endDate) {
+  const start = Date.parse(`${startDate}T00:00:00Z`);
+  const end = Date.parse(`${endDate}T00:00:00Z`);
+  return Math.floor((end - start) / MILLISECONDS_PER_DAY) + 1;
+}
+
+export function validateDateRange(startDate, endDate, today = utcDateString()) {
+  if (!startDate || !endDate) return 'Choose both a start and end date.';
+  if (startDate > endDate) {
+    return 'The start date must be on or before the end date.';
+  }
+  if (endDate > today) return 'The end date cannot be in the future.';
+  const earliestDate = shiftUtcDate(today, -(MAX_RANGE_DAYS - 1));
+  if (startDate < earliestDate) {
+    return `Choose a date within the last ${MAX_RANGE_DAYS} UTC days.`;
+  }
+  if (inclusiveRangeDays(startDate, endDate) > MAX_RANGE_DAYS) {
+    return `The selected range cannot exceed ${MAX_RANGE_DAYS} UTC days.`;
+  }
+  return null;
+}
+
+function rangeForPreset(option, today = utcDateString()) {
+  const endDate = shiftUtcDate(today, option.endOffset);
+  return {
+    startDate: shiftUtcDate(endDate, -(option.days - 1)),
+    endDate,
+    days: option.days,
+    preset: option.key,
+  };
+}
+
+function formatUtcDate(dateString, options) {
+  return new Date(`${dateString}T00:00:00Z`).toLocaleDateString(undefined, {
+    timeZone: 'UTC',
+    ...options,
+  });
+}
+
+function estimateTitle(dateRange) {
+  if (dateRange.preset === 'today') return 'Today estimate (UTC)';
+  if (dateRange.preset === 'yesterday') return 'Yesterday estimate (UTC)';
+  if (dateRange.preset?.endsWith('d')) {
+    return `${dateRange.days}-day estimate`;
+  }
+  if (dateRange.startDate === dateRange.endDate) {
+    return `${formatUtcDate(dateRange.startDate, {
+      month: 'short',
+      day: 'numeric',
+    })} estimate (UTC)`;
+  }
+  return 'Selected range estimate';
 }
 
 export function formatHours(seconds) {
@@ -171,7 +244,16 @@ function EmptyEstimate() {
 }
 
 export function EstimatedSpend() {
-  const [rangeDays, setRangeDays] = useState(30);
+  const [dateRange, setDateRange] = useState(() =>
+    rangeForPreset(RANGE_OPTIONS.find((option) => option.key === '30d'))
+  );
+  const [draftStartDate, setDraftStartDate] = useState(
+    () => rangeForPreset(RANGE_OPTIONS[3]).startDate
+  );
+  const [draftEndDate, setDraftEndDate] = useState(
+    () => rangeForPreset(RANGE_OPTIONS[3]).endDate
+  );
+  const [dateRangeError, setDateRangeError] = useState(null);
   const [groupBy, setGroupBy] = useState('job');
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -198,7 +280,10 @@ export function EstimatedSpend() {
         return;
       }
       setForbidden(false);
-      const estimate = await getEstimatedSpend(rangeDays, groupBy);
+      const estimate = await getEstimatedSpend(dateRange.days, groupBy, {
+        startDate: dateRange.startDate,
+        endDate: dateRange.endDate,
+      });
       if (generation !== requestGeneration.current) return;
       if (!estimate.group_by && groupBy !== 'job') {
         setGroupBy('job');
@@ -217,7 +302,34 @@ export function EstimatedSpend() {
         setLoading(false);
       }
     }
-  }, [groupBy, rangeDays]);
+  }, [dateRange, groupBy]);
+
+  const selectPreset = useCallback((option) => {
+    const nextRange = rangeForPreset(option);
+    setDateRange(nextRange);
+    setDraftStartDate(nextRange.startDate);
+    setDraftEndDate(nextRange.endDate);
+    setDateRangeError(null);
+  }, []);
+
+  const applyCustomRange = useCallback(
+    (event) => {
+      event.preventDefault();
+      const validationError = validateDateRange(draftStartDate, draftEndDate);
+      if (validationError) {
+        setDateRangeError(validationError);
+        return;
+      }
+      setDateRange({
+        startDate: draftStartDate,
+        endDate: draftEndDate,
+        days: inclusiveRangeDays(draftStartDate, draftEndDate),
+        preset: null,
+      });
+      setDateRangeError(null);
+    },
+    [draftEndDate, draftStartDate]
+  );
 
   useEffect(() => {
     fetchData();
@@ -281,8 +393,10 @@ export function EstimatedSpend() {
       plugins: {
         legend: { display: chartData.datasets.length > 1, position: 'bottom' },
         tooltip: {
+          filter: (context) => Number(context.parsed.y) > 0,
           callbacks: {
-            label: (context) => formatCurrency(context.parsed.y),
+            label: (context) =>
+              `${context.dataset.label}: ${formatCurrency(context.parsed.y)}`,
           },
         },
       },
@@ -316,7 +430,7 @@ export function EstimatedSpend() {
   }
 
   const totals = data?.totals || {};
-  const today = data?.days?.[data.days.length - 1];
+  const latestDay = data?.days?.[data.days.length - 1];
   const kubernetesSeconds = data?.excluded_by_reason?.kubernetes || 0;
   const lastSuccess = data?.last_successful_refresh_at
     ? new Date(data.last_successful_refresh_at * 1000)
@@ -337,6 +451,23 @@ export function EstimatedSpend() {
     supportsBreakdowns && displayedGroupBy !== 'purchase_option';
   const clouds = data?.clouds || [];
   const totalCost = Number(totals.estimated_cost || 0);
+  const todayUtc = utcDateString();
+  const earliestDate = shiftUtcDate(todayUtc, -(MAX_RANGE_DAYS - 1));
+  const selectedRangeDetail = `${formatUtcDate(dateRange.startDate, {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+  })} to ${formatUtcDate(dateRange.endDate, {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+  })}`;
+  const latestDayTitle = latestDay
+    ? `${formatUtcDate(latestDay.date, {
+        month: 'short',
+        day: 'numeric',
+      })} (UTC)`
+    : 'Latest selected day';
 
   return (
     <div className="mx-auto max-w-7xl space-y-6">
@@ -374,21 +505,54 @@ export function EstimatedSpend() {
             </label>
           )}
           <div className="inline-flex rounded-md border bg-background p-1">
-            {RANGE_OPTIONS.map((days) => (
+            {RANGE_OPTIONS.map((option) => (
               <button
-                key={days}
+                key={option.key}
                 type="button"
-                onClick={() => setRangeDays(days)}
+                onClick={() => selectPreset(option)}
                 className={`rounded px-3 py-1.5 text-sm transition-colors ${
-                  rangeDays === days
+                  dateRange.preset === option.key
                     ? 'bg-blue-600 text-white'
                     : 'text-muted-foreground hover:bg-muted'
                 }`}
               >
-                {days}d
+                {option.label}
               </button>
             ))}
           </div>
+          <form
+            className="flex flex-wrap items-center gap-2"
+            onSubmit={applyCustomRange}
+          >
+            <label>
+              <span className="sr-only">Start date (UTC)</span>
+              <input
+                aria-label="Start date (UTC)"
+                type="date"
+                min={earliestDate}
+                max={todayUtc}
+                value={draftStartDate}
+                onChange={(event) => setDraftStartDate(event.target.value)}
+                className="h-9 rounded-md border border-input bg-background px-2 text-sm text-foreground shadow-sm focus:outline-none focus:ring-2 focus:ring-ring"
+              />
+            </label>
+            <span className="text-sm text-muted-foreground">to</span>
+            <label>
+              <span className="sr-only">End date (UTC)</span>
+              <input
+                aria-label="End date (UTC)"
+                type="date"
+                min={earliestDate}
+                max={todayUtc}
+                value={draftEndDate}
+                onChange={(event) => setDraftEndDate(event.target.value)}
+                className="h-9 rounded-md border border-input bg-background px-2 text-sm text-foreground shadow-sm focus:outline-none focus:ring-2 focus:ring-ring"
+              />
+            </label>
+            <Button type="submit" variant="outline" disabled={loading}>
+              Apply
+            </Button>
+          </form>
           <Button variant="outline" onClick={fetchData} disabled={loading}>
             <RefreshCw
               className={`mr-2 h-4 w-4 ${loading ? 'animate-spin' : ''}`}
@@ -397,6 +561,12 @@ export function EstimatedSpend() {
           </Button>
         </div>
       </div>
+
+      {dateRangeError && (
+        <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800 dark:border-red-900 dark:bg-red-950/30 dark:text-red-200">
+          {dateRangeError}
+        </div>
+      )}
 
       <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-950 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-100">
         Kubernetes usage and reservation, Savings Plan, or committed-use
@@ -423,15 +593,19 @@ export function EstimatedSpend() {
         <>
           <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
             <MetricCard
-              title={`${rangeDays}-day estimate`}
+              title={estimateTitle(dateRange)}
               value={formatCurrency(totalCost)}
-              detail="Compute catalog rates only"
+              detail={`${selectedRangeDetail} UTC`}
               icon={DollarSign}
             />
             <MetricCard
-              title="Today (UTC)"
-              value={formatCurrency(today?.estimated_cost)}
-              detail="Updates about every five minutes"
+              title={latestDayTitle}
+              value={formatCurrency(latestDay?.estimated_cost)}
+              detail={
+                dateRange.endDate === todayUtc
+                  ? 'Updates about every five minutes'
+                  : 'Latest day in the selected range'
+              }
               icon={Clock3}
             />
             <MetricCard
@@ -454,8 +628,10 @@ export function EstimatedSpend() {
                 Daily estimate by {groupOption?.label.toLowerCase() || 'group'}
               </CardTitle>
               <CardDescription>
-                Stacked catalog-priced cost split at UTC midnight. The current
-                day is partial; lower-cost groups are combined as Other.
+                Stacked catalog-priced cost split at UTC midnight.{' '}
+                {dateRange.endDate === todayUtc &&
+                  'The current day is partial; '}
+                lower-cost groups are combined as Other.
               </CardDescription>
             </CardHeader>
             <CardContent>
@@ -628,7 +804,7 @@ export function EstimatedSpend() {
         </span>
         <span>
           Page refreshed:{' '}
-          {lastFetchedAt ? lastFetchedAt.toLocaleTimeString() : '—'}
+          {lastFetchedAt ? lastFetchedAt.toLocaleTimeString() : 'not yet'}
         </span>
       </div>
     </div>

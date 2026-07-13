@@ -1842,6 +1842,8 @@ def estimated_spend(
     request: fastapi.Request,
     days: int = estimated_spend_lib.DEFAULT_LOOKBACK_DAYS,
     group_by: estimated_spend_lib.GroupBy = estimated_spend_lib.GroupBy.JOB,
+    start_date: datetime.date | None = None,
+    end_date: datetime.date | None = None,
 ) -> dict[str, Any]:
     """Returns the materialized compute-cost estimate to admins only."""
     auth_user = request.state.auth_user
@@ -1850,7 +1852,15 @@ def estimated_spend(
         if rbac.RoleName.ADMIN.value not in roles:
             raise fastapi.HTTPException(
                 status_code=403, detail='Only admins can view estimated spend.')
-    return estimated_spend_lib.get_estimated_spend(days=days, group_by=group_by)
+    try:
+        return estimated_spend_lib.get_estimated_spend(
+            days=days,
+            group_by=group_by,
+            start_date=start_date,
+            end_date=end_date,
+        )
+    except estimated_spend_lib.InvalidDateRangeError as e:
+        raise fastapi.HTTPException(status_code=422, detail=str(e)) from e
 
 
 @app.post('/cluster_events')
