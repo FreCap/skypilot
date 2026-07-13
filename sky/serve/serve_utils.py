@@ -36,6 +36,7 @@ from sky import skypilot_config
 from sky.adaptors import common as adaptors_common
 from sky.client import sdk
 from sky.jobs import state as managed_job_state
+from sky.serve import auth_tokens
 from sky.serve import constants
 from sky.serve import serve_state
 from sky.serve import spot_placer
@@ -72,6 +73,26 @@ else:
 
 logger = sky_logging.init_logger(__name__)
 
+# Keep the established serve_utils import and pickle identities while the
+# security-sensitive implementation lives in its own low-state module.
+AuthTokenConfigurationError = auth_tokens.AuthTokenConfigurationError
+is_lb_data_plane_auth_enabled = auth_tokens.is_lb_data_plane_auth_enabled
+validate_controller_auth_token_isolation = (
+    auth_tokens.validate_controller_auth_token_isolation)
+get_lb_sync_auth_tokens = auth_tokens.get_lb_sync_auth_tokens
+get_controller_admin_auth_tokens = auth_tokens.get_controller_admin_auth_tokens
+get_lb_auth_tokens = auth_tokens.get_lb_auth_tokens
+for _auth_token_symbol in (
+        AuthTokenConfigurationError,
+        is_lb_data_plane_auth_enabled,
+        validate_controller_auth_token_isolation,
+        get_lb_sync_auth_tokens,
+        get_controller_admin_auth_tokens,
+        get_lb_auth_tokens,
+):
+    _auth_token_symbol.__module__ = __name__
+del _auth_token_symbol
+
 # Retry settings for cross-pod controller HTTP calls. The DB row update of
 # `controller_ip` is atomic w.r.t. controller readiness (sky.serve.service
 # only flips DB after _wait_for_controller_ready), so the only failure modes
@@ -103,10 +124,6 @@ _CONTROLLER_HTTP_TIMEOUT_SECONDS = (1.0, 10.0)
 _STATUS_FANOUT_MAX_WORKERS = 8
 
 
-class AuthTokenConfigurationError(ValueError):
-    """A required Serve auth ring is absent or cannot be parsed safely."""
-
-
 class ControllerOwnerError(RuntimeError):
     """The intended service incarnation has no safe controller target."""
 
@@ -118,8 +135,6 @@ class _PurgeResult:
     completed: bool
     message: str | None = None
 
-
-_AUTH_TOKEN_PATTERN = re.compile(r'[A-Za-z0-9._~+/=-]+')
 
 _ControllerOwner = tuple[str, int, str | None, int]
 
@@ -722,138 +737,6 @@ def is_external_load_balancer_mode() -> bool:
     """
     return (os.environ.get(constants.EXTERNAL_LB_ENABLED_ENV_VAR,
                            '').lower() == 'true')
-
-
-def is_lb_data_plane_auth_enabled() -> bool:
-    """Whether inference requests require the LB-only bearer credential.
-
-    New charts inject an explicit capability value. If it is absent during a
-    mixed-version rollout, preserve the legacy behavior by treating configured
-    data-plane token material as enabled. An explicit false is authoritative
-    even while stale Secret files are being removed from an existing pod.
-    """
-    configured = os.environ.get(constants.LB_DATA_PLANE_AUTH_ENABLED_ENV_VAR)
-    if configured is None:
-        return bool(
-            os.environ.get(constants.LB_AUTH_TOKENS_FILE_ENV_VAR) or
-            os.environ.get(constants.LB_AUTH_TOKEN_ENV_VAR))
-    if configured == 'true':
-        return True
-    if configured == 'false':
-        return False
-    raise AuthTokenConfigurationError(
-        f'{constants.LB_DATA_PLANE_AUTH_ENABLED_ENV_VAR} must be exactly '
-        '"true" or "false".')
-
-
-def _get_auth_tokens(file_env_var: str,
-                     legacy_token_env_var: str | None,
-                     ring_name: str,
-                     required: bool = False) -> tuple[str, ...]:
-    """Read a newline-delimited bearer-token ring without caching it.
-
-    The configured file is authoritative and is read fresh on every call so a
-    projected Secret rotation is live. A final newline is accepted; blank
-    lines, whitespace-bearing/non-ASCII tokens, an empty file, and I/O/UTF-8
-    errors are rejected instead of silently falling back to the legacy env
-    token. When a legacy singleton env name is supplied, it is consulted only
-    when no file is configured. Callers can omit that fallback for trust
-    domains where sharing the legacy credential would be unsafe.
-    """
-    token_file = os.environ.get(file_env_var)
-    if token_file:
-        try:
-            contents = pathlib.Path(token_file).expanduser().read_text(
-                encoding='utf-8')
-        except (OSError, UnicodeError) as e:
-            raise AuthTokenConfigurationError(
-                f'Cannot read {ring_name} token ring from {token_file!r}: '
-                f'{common_utils.format_exception(e)}') from e
-        tokens = tuple(contents.splitlines())
-        if not tokens:
-            raise AuthTokenConfigurationError(
-                f'{ring_name} token ring {token_file!r} is empty.')
-        for token in tokens:
-            if _AUTH_TOKEN_PATTERN.fullmatch(token) is None:
-                raise AuthTokenConfigurationError(
-                    f'{ring_name} token ring {token_file!r} contains an '
-                    'empty or malformed token.')
-        return tokens
-
-    legacy_token = (os.environ.get(legacy_token_env_var)
-                    if legacy_token_env_var is not None else None)
-    if legacy_token:
-        if _AUTH_TOKEN_PATTERN.fullmatch(legacy_token) is None:
-            assert legacy_token_env_var is not None
-            raise AuthTokenConfigurationError(
-                f'{legacy_token_env_var} contains a malformed token.')
-        return (legacy_token,)
-    if required:
-        if legacy_token_env_var is not None:
-            missing_sources = (f'neither {file_env_var} nor '
-                               f'{legacy_token_env_var} is configured')
-        else:
-            missing_sources = f'{file_env_var} is not configured'
-        raise AuthTokenConfigurationError(
-            f'{ring_name} authentication is required, but '
-            f'{missing_sources}.')
-    return ()
-
-
-def _get_controller_auth_token_rings(
-        sync_required: bool = False,
-        admin_required: bool = False
-) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """Read both controller rings and reject any cross-domain credential.
-
-    Each ring may contain multiple credentials for an overlap rotation within
-    that trust domain. A credential may never appear in both rings: otherwise
-    an external LB holding the sync ring could invoke destructive controller
-    administration routes. Both files are read on every call so an unsafe
-    Secret rotation fails closed immediately, not only at process startup.
-
-    The legacy singleton remains an admin-only fallback. In particular, it is
-    never returned as an LB-sync credential.
-    """
-    sync_tokens = _get_auth_tokens(constants.LB_SYNC_AUTH_TOKENS_FILE_ENV_VAR,
-                                   None,
-                                   'load-balancer sync',
-                                   required=sync_required)
-    admin_tokens = _get_auth_tokens(
-        constants.CONTROLLER_ADMIN_AUTH_TOKENS_FILE_ENV_VAR,
-        constants.CONTROLLER_AUTH_TOKEN_ENV_VAR,
-        'controller admin',
-        required=admin_required)
-    if not set(sync_tokens).isdisjoint(admin_tokens):
-        raise AuthTokenConfigurationError(
-            'Load-balancer sync and controller-admin token rings must be '
-            'disjoint.')
-    return sync_tokens, admin_tokens
-
-
-def validate_controller_auth_token_isolation(required: bool = False) -> None:
-    """Validate the controller trust-domain boundary without exposing tokens."""
-    _get_controller_auth_token_rings(sync_required=required,
-                                     admin_required=required)
-
-
-def get_lb_sync_auth_tokens(required: bool = False) -> tuple[str, ...]:
-    """Credentials accepted on, and presented to, the LB sync endpoint."""
-    sync_tokens, _ = _get_controller_auth_token_rings(sync_required=required)
-    return sync_tokens
-
-
-def get_controller_admin_auth_tokens(required: bool = False) -> tuple[str, ...]:
-    """Credentials accepted by trusted controller administration callers."""
-    _, admin_tokens = _get_controller_auth_token_rings(admin_required=required)
-    return admin_tokens
-
-
-def get_lb_auth_tokens(required: bool = False) -> tuple[str, ...]:
-    """Credentials accepted by the external LB inference data plane."""
-    return _get_auth_tokens(constants.LB_AUTH_TOKENS_FILE_ENV_VAR,
-                            constants.LB_AUTH_TOKEN_ENV_VAR,
-                            'load-balancer data plane', required)
 
 
 def ha_recovery_for_consolidation_mode(pool: bool,

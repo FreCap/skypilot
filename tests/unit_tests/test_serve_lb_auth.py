@@ -15,6 +15,8 @@ Logic-only: no assertions on log or exception message text.
 """
 # pylint: disable=invalid-name,protected-access
 import asyncio
+import inspect
+import pickle
 from unittest import mock
 
 import aiohttp
@@ -64,6 +66,33 @@ def _authorized(scope) -> bool:
 
 def _edge_auth(token: str):
     return {constants.LB_AUTHORIZATION_HEADER: f'Bearer {token}'}
+
+
+def test_auth_token_public_facade_contract():
+    symbols = (
+        serve_utils.AuthTokenConfigurationError,
+        serve_utils.is_lb_data_plane_auth_enabled,
+        serve_utils.validate_controller_auth_token_isolation,
+        serve_utils.get_lb_sync_auth_tokens,
+        serve_utils.get_controller_admin_auth_tokens,
+        serve_utils.get_lb_auth_tokens,
+    )
+    assert all(symbol.__module__ == serve_utils.__name__ for symbol in symbols)
+
+    assert not inspect.signature(
+        serve_utils.is_lb_data_plane_auth_enabled).parameters
+    for getter in symbols[2:]:
+        parameters = inspect.signature(getter).parameters
+        assert tuple(parameters) == ('required',)
+        assert parameters['required'].default is False
+
+
+def test_auth_token_configuration_error_pickle_round_trip():
+    error = serve_utils.AuthTokenConfigurationError('invalid token ring')
+    restored = pickle.loads(pickle.dumps(error))
+
+    assert type(restored) is serve_utils.AuthTokenConfigurationError
+    assert restored.args == error.args
 
 
 # --------------------------------------------------------------------------- #
