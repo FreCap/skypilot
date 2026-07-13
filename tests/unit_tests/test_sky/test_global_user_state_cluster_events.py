@@ -1,6 +1,9 @@
 """Unit tests for cluster_event accessors in global_user_state."""
 import time
 
+import sqlalchemy
+from sqlalchemy import orm
+
 from sky import global_user_state
 from sky.skylet import constants
 from sky.utils import status_lib
@@ -244,3 +247,101 @@ def test_get_cluster_events_multiple_types_merged_and_ordered(
     assert global_user_state.get_cluster_events(
         cluster_name=None, cluster_hash=cluster_hash, event_type=both,
         limit=2) == ['Launching (pulling)', 'Cluster provisioned']
+
+
+def _count_cluster_table_selects(engine):
+    """Attach a listener counting SELECTs that touch the clusters table."""
+    counter = {'n': 0}
+
+    def _before_cursor_execute(conn, cursor, statement, parameters, context,
+                               executemany):
+        del conn, cursor, parameters, context, executemany
+        lowered = statement.lower()
+        if lowered.lstrip().startswith('select') and 'clusters' in lowered:
+            counter['n'] += 1
+
+    sqlalchemy.event.listen(engine, 'before_cursor_execute',
+                            _before_cursor_execute)
+    return counter
+
+
+def test_add_cluster_event_single_cluster_read(tmp_path, monkeypatch):
+    """add_cluster_event must read the cluster row exactly once.
+
+    Regression: it used to issue a hash pre-fetch plus two identical
+    full-row queries (three SELECTs on the clusters table) per event.
+    """
+    _fresh_db(tmp_path, monkeypatch)
+    _add_cluster('c-single')
+
+    engine = global_user_state._db_manager.get_engine()
+    counter = _count_cluster_table_selects(engine)
+    global_user_state.add_cluster_event(
+        'c-single',
+        new_status=status_lib.ClusterStatus.UP,
+        reason='single-read',
+        event_type=global_user_state.ClusterEventType.STATUS_CHANGE,
+    )
+    assert counter['n'] == 1
+
+
+def test_add_cluster_event_records_starting_status(tmp_path, monkeypatch):
+    """starting_status must reflect the cluster's current status at insert."""
+    _fresh_db(tmp_path, monkeypatch)
+    cluster_hash = _add_cluster('c-status')
+    global_user_state.set_cluster_status('c-status',
+                                         status_lib.ClusterStatus.UP)
+
+    global_user_state.add_cluster_event(
+        'c-status',
+        new_status=status_lib.ClusterStatus.STOPPED,
+        reason='stopping',
+        event_type=global_user_state.ClusterEventType.STATUS_CHANGE,
+    )
+
+    engine = global_user_state._db_manager.get_engine()
+    with orm.Session(engine) as session:
+        row = session.query(global_user_state.cluster_event_table).filter_by(
+            cluster_hash=cluster_hash).first()
+    assert row is not None
+    assert row.starting_status == status_lib.ClusterStatus.UP.value
+    assert row.ending_status == status_lib.ClusterStatus.STOPPED.value
+
+
+def test_add_cluster_event_missing_cluster_is_noop(tmp_path, monkeypatch):
+    """Events for unknown clusters are silently dropped, not inserted."""
+    _fresh_db(tmp_path, monkeypatch)
+
+    global_user_state.add_cluster_event(
+        'no-such-cluster',
+        new_status=None,
+        reason='ghost',
+        event_type=global_user_state.ClusterEventType.STATUS_CHANGE,
+    )
+
+    engine = global_user_state._db_manager.get_engine()
+    with orm.Session(engine) as session:
+        count = session.query(global_user_state.cluster_event_table).count()
+    assert count == 0
+
+
+def test_add_cluster_event_nop_if_duplicate_still_single_read(
+        tmp_path, monkeypatch):
+    """The duplicate short-circuit still works with the single-read path."""
+    _fresh_db(tmp_path, monkeypatch)
+    cluster_hash = _add_cluster('c-dup')
+
+    for _ in range(2):
+        global_user_state.add_cluster_event(
+            'c-dup',
+            new_status=None,
+            reason='same-reason',
+            event_type=global_user_state.ClusterEventType.STATUS_CHANGE,
+            nop_if_duplicate=True,
+        )
+
+    engine = global_user_state._db_manager.get_engine()
+    with orm.Session(engine) as session:
+        count = session.query(global_user_state.cluster_event_table).filter_by(
+            cluster_hash=cluster_hash).count()
+    assert count == 1
