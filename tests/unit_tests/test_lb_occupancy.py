@@ -62,6 +62,15 @@ class TestOccupancyRouting(unittest.TestCase):
         policy.set_occupancy({B: 1})
         self.assertEqual(policy._select_replica(mock.MagicMock(), [A, B]), A)
 
+    def test_incremental_occupancy_update_preserves_other_replicas(self):
+        policy = lb_policies.LeastLoadPolicy()
+        policy.set_ready_replicas([A, B])
+        policy.set_occupancy({A: 1, B: 2})
+        policy.set_occupancy_for_replica(A, 3)
+        self.assertEqual(policy.occupancy_map, {A: 3, B: 2})
+        policy.set_occupancy_for_replica(A, None)
+        self.assertEqual(policy.occupancy_map, {B: 2})
+
     def test_instance_aware_folds_occupancy_before_normalization(self):
         policy = lb_policies.InstanceAwareLeastLoadPolicy()
         policy.set_ready_replicas([A, B])

@@ -39,6 +39,7 @@ def _request(method='POST'):
 
 
 class TestRetryExclusion(unittest.TestCase):
+    """Retry selection excludes failed URLs without losing fallbacks."""
 
     def _busy_policy(self):
         policy = lb_policies.LeastLoadPolicy()
@@ -72,6 +73,22 @@ class TestRetryExclusion(unittest.TestCase):
             policy.select_replica(_request(), exclude={'http://dead:8080'}),
             'http://busy:8080')
 
+    def test_empty_eligibility_never_falls_back_to_ready_set(self):
+        policy = lb_policies.LeastLoadPolicy()
+        policy.set_ready_replicas(['http://full:8080'])
+        self.assertIsNone(policy.select_replica(_request(), eligible=set()))
+
+    def test_instance_aware_eligibility_is_strict_before_load_scoring(self):
+        policy = lb_policies.InstanceAwareLeastLoadPolicy()
+        policy.set_ready_replicas(['http://full:8080', 'http://free:8080'])
+        # The full URL otherwise wins least-load. Capacity eligibility must be
+        # authoritative rather than a soft score.
+        policy.load_map['http://full:8080'] = 0
+        policy.load_map['http://free:8080'] = 10
+        self.assertEqual(
+            policy.select_replica(_request(), eligible={'http://free:8080'}),
+            'http://free:8080')
+
     def test_proxy_loop_excludes_failed_urls(self):
         policy = self._busy_policy()
         balancer = object.__new__(lb_module.SkyServeLoadBalancer)
@@ -99,6 +116,7 @@ class TestRetryExclusion(unittest.TestCase):
 
 
 class TestRetriableStatusCodes(unittest.TestCase):
+    """Configured response statuses participate safely in retry routing."""
 
     def _balancer(self, retriable, client):
         balancer = object.__new__(lb_module.SkyServeLoadBalancer)
@@ -388,20 +406,25 @@ class TestRetryShortCircuit(unittest.TestCase):
     def test_post_ambiguous_transport_failure_is_not_retried(self):
         # A read/protocol failure may have followed acceptance. Replaying the
         # POST on another replica would silently create a duplicate job.
+        def _proxy_for(proxy_error):
+            attempts = []
+
+            async def _proxy(url, request):
+                del request
+                attempts.append(url)
+                if len(attempts) == 1:
+                    return proxy_error
+                return fastapi.responses.Response(status_code=202)
+
+            return attempts, _proxy
+
         for error in (httpx.ReadError('reset after send'),
                       httpx.RemoteProtocolError('bad response after send')):
             with self.subTest(error=type(error).__name__):
-                attempts = []
-
-                async def _proxy(url, request):
-                    del request
-                    attempts.append(url)
-                    if len(attempts) == 1:
-                        return error
-                    return fastapi.responses.Response(status_code=202)
+                attempts, proxy = _proxy_for(error)
 
                 balancer = self._balancer(['http://a:8080', 'http://b:8080'],
-                                          _proxy)
+                                          proxy)
                 with mock.patch('sky.serve.load_balancer.asyncio.sleep',
                                 new=mock.AsyncMock()):
                     with self.assertRaises(fastapi.HTTPException) as ctx:

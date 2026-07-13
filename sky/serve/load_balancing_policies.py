@@ -52,8 +52,9 @@ class LoadBalancingPolicy:
 
     def select_replica(self,
                        request: 'fastapi.Request',
-                       exclude: set[str] | None = None) -> str | None:
-        """Select a replica, optionally excluding already-failed URLs.
+                       exclude: set[str] | None = None,
+                       eligible: set[str] | None = None) -> str | None:
+        """Select a replica from an optional strict eligibility set.
 
         `exclude` carries the URLs that already failed THIS request's
         earlier retry attempts. Without it, least-load retries are a
@@ -64,8 +65,14 @@ class LoadBalancingPolicy:
         the corpse. Falls back to the full set when every candidate has
         failed — a lone replica with a transient blip deserves the
         remaining attempts more than a guaranteed error.
+
+        `eligible` is a strict capacity filter. Unlike `exclude`, an empty
+        eligible set never falls back to all ready replicas: callers use it
+        when an occupancy sample proves that only a subset has a free slot.
         """
         candidates = self.ready_replicas
+        if eligible is not None:
+            candidates = [url for url in candidates if url in eligible]
         if exclude:
             filtered = [url for url in candidates if url not in exclude]
             if filtered:
@@ -114,6 +121,16 @@ class LoadBalancingPolicy:
         into selection; policies without load accounting ignore it.
         """
         del occupancy
+
+    def set_occupancy_for_replica(self, replica_url: str,
+                                  occupancy: int | None) -> None:
+        """Update one replica's occupancy on the routing hot path.
+
+        Full probe rounds use `set_occupancy`. Optimistic async reservations
+        change one URL at a time and use this method to avoid rebuilding an
+        O(fleet-size) dictionary for every dispatch.
+        """
+        del replica_url, occupancy
 
     def pre_execute_hook(self, replica_url: str,
                          request: 'fastapi.Request') -> Any | None:
@@ -192,6 +209,14 @@ class LeastLoadPolicy(LoadBalancingPolicy, name='least_load', default=True):
         # the current ready set, so replacement is also the prune.
         with self.lock:
             self.occupancy_map = dict(occupancy)
+
+    def set_occupancy_for_replica(self, replica_url: str,
+                                  occupancy: int | None) -> None:
+        with self.lock:
+            if occupancy is None:
+                self.occupancy_map.pop(replica_url, None)
+            else:
+                self.occupancy_map[replica_url] = occupancy
 
     def _effective_load(self, replica_url: str) -> float:
         """Selection score: envelope in-flight + weighted async occupancy.

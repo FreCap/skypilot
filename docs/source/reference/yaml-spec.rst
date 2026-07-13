@@ -1564,7 +1564,13 @@ per ready replica before new arrivals wait in the queue, while
 When ``use_async_occupancy`` is true, dispatch concurrency is also clamped by
 the fresh free-slot total reported by occupancy-capable replicas. Unknown
 occupancy contributes no free capacity, and occupancy probe updates wake
-waiting requests.
+waiting requests. Each dispatched request reserves one reported slot until a
+new, non-racing occupancy probe reconciles it. Other reported slots on the
+same replica remain available, which allows one SkyServe replica backed by a
+multi-GPU instance to accept work for each free model worker even when requests
+return an asynchronous acknowledgement. ``max_concurrency_per_replica``
+remains a safety ceiling; set it at least as high as the largest replica's
+reported predict concurrency to use every slot.
 
 The queue accepts at most 3,000 waiting requests, 128 concurrent requests,
 and 16 MiB per request body. The product of ``max_concurrency`` and
