@@ -610,7 +610,7 @@ def update_managed_jobs_statuses(job_id: Optional[int] = None):
         on the failure path and keeps cleanup keyed off ``task_name``, which is
         what the controller uses to name task clusters.
         """
-        error_msg = None
+        error_msgs = []
         if pool is not None:
             return None
         for task in tasks:
@@ -628,7 +628,10 @@ def update_managed_jobs_statuses(job_id: Optional[int] = None):
                         f'Failed to terminate cluster {cluster_name}: '
                         f'{common_utils.format_exception(e, use_bracket=True)}')
                     logger.exception(error_msg, exc_info=e)
-        return error_msg
+                    error_msgs.append(error_msg)
+        if not error_msgs:
+            return None
+        return '; '.join(error_msgs)
 
     # Fetch the jobs that need checking together with the small per-job fields
     # the loop consumes. This keeps the refresh tick on a single slim query
