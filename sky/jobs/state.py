@@ -1297,22 +1297,34 @@ def get_latest_task_id_status(
     return get_latest_task_id_from_statuses(id_statuses)
 
 
-def get_job_controller_process(job_id: int) -> ControllerPidRecord | None:
+def get_job_controller_processes(
+        job_ids: list[int]) -> dict[int, ControllerPidRecord]:
+    """Return controller process records for the requested jobs."""
+    if not job_ids:
+        return {}
+
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
-        row = session.execute(
+        rows = session.execute(
             sqlalchemy.select(
-                job_info_table.c.controller_pid,
+                job_info_table.c.spot_job_id, job_info_table.c.controller_pid,
                 job_info_table.c.controller_pid_started_at).where(
-                    job_info_table.c.spot_job_id == job_id)).fetchone()
-        if row is None or row[0] is None:
-            return None
-        pid = row[0]
+                    job_info_table.c.spot_job_id.in_(job_ids))).fetchall()
+
+    records: dict[int, ControllerPidRecord] = {}
+    for job_id, pid, started_at in rows:
+        if pid is None:
+            continue
         if pid < 0:
             # Between #7051 and #7847, the controller pid was negative to
             # indicate a controller process that can handle multiple jobs.
             pid = -pid
-        return ControllerPidRecord(pid=pid, started_at=row[1])
+        records[job_id] = ControllerPidRecord(pid=pid, started_at=started_at)
+    return records
+
+
+def get_job_controller_process(job_id: int) -> ControllerPidRecord | None:
+    return get_job_controller_processes([job_id]).get(job_id)
 
 
 def is_legacy_controller_process(job_id: int) -> bool:

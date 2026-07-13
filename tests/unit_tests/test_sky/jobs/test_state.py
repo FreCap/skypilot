@@ -105,6 +105,67 @@ def _count_sql_statements(engine):
         sqlalchemy.event.remove(engine, 'before_cursor_execute', _count)
 
 
+def _set_controller_process(engine, job_id, pid, started_at):
+    with orm.Session(engine) as session:
+        session.execute(
+            sqlalchemy.update(state.job_info_table).where(
+                state.job_info_table.c.spot_job_id == job_id).values(
+                    controller_pid=pid,
+                    controller_pid_started_at=started_at,
+                ))
+        session.commit()
+
+
+def test_get_job_controller_processes_batches_and_normalizes(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    current_job = _insert_job_info(engine)
+    legacy_job = _insert_job_info(engine)
+    no_controller_job = _insert_job_info(engine)
+    _set_controller_process(engine, current_job, 101, 1001.5)
+    _set_controller_process(engine, legacy_job, -202, None)
+
+    with _count_sql_statements(engine) as counts:
+        records = state.get_job_controller_processes([
+            current_job,
+            legacy_job,
+            no_controller_job,
+            999999,
+            current_job,
+        ])
+
+    assert records == {
+        current_job: state.ControllerPidRecord(pid=101, started_at=1001.5),
+        legacy_job: state.ControllerPidRecord(pid=202, started_at=None),
+    }
+    assert counts['n'] == 1, counts
+
+
+def test_get_job_controller_processes_empty_input_uses_no_query(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+
+    with _count_sql_statements(engine) as counts:
+        assert not state.get_job_controller_processes([])
+
+    assert counts['n'] == 0, counts
+
+
+def test_get_job_controller_process_reuses_bulk_reader(monkeypatch):
+    record = state.ControllerPidRecord(pid=101, started_at=1001.5)
+    calls = []
+
+    def reader(job_ids):
+        calls.append(job_ids)
+        return {7: record} if job_ids == [7] else {}
+
+    monkeypatch.setattr(state, 'get_job_controller_processes', reader)
+
+    assert state.get_job_controller_process(7) == record
+    assert state.get_job_controller_process(8) is None
+    assert calls == [[7], [8]]
+
+
 def test_get_task_logs_to_clean_basic(_mock_managed_jobs_db_conn):
     now = time.time()
     retention = 60

@@ -299,9 +299,10 @@ def submit_jobs(job_ids: list[int],
 
     The user hash should be set (e.g. via SKYPILOT_USER_ID) before calling this.
     """
+    controller_processes = state.get_job_controller_processes(job_ids)
     job_ids_without_controller_process = []
     for job_id in job_ids:
-        controller_process = state.get_job_controller_process(job_id)
+        controller_process = controller_processes.get(job_id)
         if controller_process is not None:
             # why? TODO(cooperc): figure out why this is needed, fix it, and
             # remove
@@ -313,6 +314,8 @@ def submit_jobs(job_ids: list[int],
                 continue
         job_ids_without_controller_process.append(job_id)
     job_ids = job_ids_without_controller_process
+    if not job_ids:
+        return
 
     with open(dag_yaml_path, encoding='utf-8') as dag_file:
         dag_yaml_content = dag_file.read()
