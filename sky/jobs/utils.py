@@ -1206,7 +1206,7 @@ def cancel_jobs_by_id(job_ids: list[int] | None,
     if job_ids is None:
         job_ids = managed_job_state.get_nonterminal_job_ids_by_name(
             None, user_hash, all_users)
-    job_ids = list(set(job_ids))
+    job_ids = list(dict.fromkeys(job_ids))
     if not job_ids:
         return 'No job to cancel.'
     if current_workspace is None:
@@ -1214,18 +1214,21 @@ def cancel_jobs_by_id(job_ids: list[int] | None,
 
     cancelled_job_ids: list[int] = []
     wrong_workspace_job_ids: list[int] = []
+    jobs_to_refresh: list[int] = []
+    initial_states = managed_job_state.get_job_cancellation_states(job_ids)
     for job_id in job_ids:
-        # Check the status of the managed job status. If it is in
-        # terminal state, we can safely skip it.
-        job_status = managed_job_state.get_status(job_id)
-        if job_status is None:
+        snapshot = initial_states.get(job_id)
+        if snapshot is None:
             logger.info(f'Job {job_id} not found. Skipped.')
             continue
-        elif job_status.is_terminal():
+        if snapshot.status.is_terminal():
             logger.info(f'Job {job_id} is already in terminal state '
-                        f'{job_status.value}. Skipped.')
+                        f'{snapshot.status.value}. Skipped.')
             continue
-        elif job_status == managed_job_state.ManagedJobStatus.PENDING:
+        if snapshot.workspace != current_workspace:
+            wrong_workspace_job_ids.append(job_id)
+            continue
+        if snapshot.status == managed_job_state.ManagedJobStatus.PENDING:
             # the "if PENDING" is a short circuit, this will be atomic.
             cancelled = managed_job_state.set_pending_cancelled(job_id)
             if cancelled:
@@ -1233,13 +1236,26 @@ def cancel_jobs_by_id(job_ids: list[int] | None,
                 continue
 
         update_managed_jobs_statuses(job_id)
+        jobs_to_refresh.append(job_id)
 
-        job_workspace = managed_job_state.get_workspace(job_id)
-        if current_workspace is not None and job_workspace != current_workspace:
+    fresh_states = managed_job_state.get_job_cancellation_states(
+        jobs_to_refresh)
+    for job_id in jobs_to_refresh:
+        snapshot = fresh_states.get(job_id)
+        if snapshot is None:
+            logger.info(
+                f'Job {job_id} not found after status refresh. Skipped.')
+            continue
+        if snapshot.status.is_terminal():
+            logger.info(f'Job {job_id} reached terminal state '
+                        f'{snapshot.status.value} during status refresh. '
+                        'Skipped.')
+            continue
+        if snapshot.workspace != current_workspace:
             wrong_workspace_job_ids.append(job_id)
             continue
 
-        if managed_job_state.is_legacy_controller_process(job_id):
+        if snapshot.is_legacy_controller:
             # The job is running on a legacy single-job controller process.
             # TODO(cooperc): Remove this handling for 0.13.0
 
