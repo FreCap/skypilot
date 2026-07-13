@@ -714,7 +714,7 @@ def _controller_child_responding(service_name: str, service_hash: str,
             service_name,
             (service_hash, os.getpid(), controller_ip, controller_port),
             constants.CONTROLLER_HEALTH_ENDPOINT_PATH,
-            timeout=(0.5, 1.0))
+            timeout=(0.5, constants.CONTROLLER_HEALTH_READ_TIMEOUT_SECONDS))
         return response.status_code == 200
     except Exception as e:  # pylint: disable=broad-except
         logger.warning(f'Controller health check failed for {service_name}: '

@@ -33,7 +33,7 @@ class TestControllerHealth:
         get.assert_called_once_with(
             'svc', ('incarnation-a', service.os.getpid(), '10.0.0.2', 20001),
             constants.CONTROLLER_HEALTH_ENDPOINT_PATH,
-            timeout=(0.5, 1.0))
+            timeout=(0.5, constants.CONTROLLER_HEALTH_READ_TIMEOUT_SECONDS))
 
     def test_failed_health_check_is_unhealthy(self):
         with mock.patch.object(service.serve_utils,

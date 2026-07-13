@@ -159,6 +159,12 @@ LB_CONTROLLER_PROXY_TIMEOUT_SECONDS = 55
 # /autoscaler/info for liveness: serializing a large fleet is legitimate work
 # and can exceed the parent's tight health-check timeout during launch storms.
 CONTROLLER_HEALTH_ENDPOINT_PATH = '/controller/health'
+# A fleet-scale readiness sweep can briefly starve the controller event loop
+# even though the constant-time health handler is healthy.  Keep local connect
+# failure detection tight, but allow the lightweight response enough time to
+# run before the parent counts a liveness miss.  Three consecutive misses are
+# still required before a child is replaced.
+CONTROLLER_HEALTH_READ_TIMEOUT_SECONDS = 5
 
 # [boltz fork] Cadence of the LB's per-replica async-occupancy probe (the
 # `async_capacity` action). The HTTP-envelope in-flight accounting reads ~0
