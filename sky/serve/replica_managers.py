@@ -78,6 +78,29 @@ _WAIT_LAUNCH_THREAD_TIMEOUT_SECONDS = 15
 # back-compat callers like ReplicaInfo.__repr__.
 _NOT_PROVIDED: Any = object()
 
+
+def _remove_nonmaterial_empty_storage_scope_metadata(
+        config: dict[str, Any]) -> None:
+    """Ignore generated storage identity when it owns no storage mounts.
+
+    Every service update gets a fresh ephemeral-storage generation, even when
+    the task has no Sky-managed storage.  Treating that generated identity as
+    a replica config change turns a service-policy-only update into a full
+    rolling replacement.  An empty owned-mount list makes the identity
+    operationally irrelevant; the actual file mounts and volumes remain in
+    the config comparison and still prevent unsafe replica reuse.
+    """
+    metadata = config.get('_metadata')
+    if not isinstance(metadata, dict):
+        return
+    scope = metadata.get(serve_constants.EPHEMERAL_STORAGE_SCOPE_METADATA_KEY)
+    if not isinstance(scope, dict) or scope.get('storage_mounts') != []:
+        return
+    metadata.pop(serve_constants.EPHEMERAL_STORAGE_SCOPE_METADATA_KEY)
+    if not metadata:
+        config.pop('_metadata')
+
+
 # TODO(tian): Backward compatibility. Remove this after 3 minor release, i.e.
 # 0.13.0. We move the ProcessStatus to common_utils.ProcessStatus in #6666, but
 # old ReplicaInfo in database will still tries to unpickle using ProcessStatus
@@ -3011,6 +3034,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             return
         for key in ['service', 'pool', '_user_specified_yaml']:
             new_config.pop(key, None)
+        _remove_nonmaterial_empty_storage_scope_metadata(new_config)
         new_config_any_of = (resources_utils.normalize_any_of_resources_config(
             new_config.get('resources', {}).pop('any_of', [])))
 
@@ -3033,6 +3057,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             old_config = yaml_utils.safe_load(yaml_content)
             for key in ['service', 'pool', '_user_specified_yaml']:
                 old_config.pop(key, None)
+            _remove_nonmaterial_empty_storage_scope_metadata(old_config)
             prior_configs[prior_version] = old_config
             prior_any_of[prior_version] = (
                 resources_utils.normalize_any_of_resources_config(

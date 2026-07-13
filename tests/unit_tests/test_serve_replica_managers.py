@@ -620,6 +620,95 @@ class TestUpdateVersionBatchesPriorVersionYamls:
 
             get_old_yamls.assert_not_called()
 
+    @pytest.mark.parametrize('old_scope_id,new_scope_id', [
+        ('old-scope', 'new-scope'),
+        ('old-scope', None),
+    ])
+    def test_reuses_replica_when_only_empty_storage_scope_changes(
+            self, old_scope_id, new_scope_id):
+        mgr = _make_manager()
+        mgr.latest_version = 1
+        mgr.yaml_content = 'old: yaml'
+        mgr._update_mode = None
+        persisted = []
+        mgr._persist_replica = lambda replica_id, info: persisted.append(
+            (replica_id, info.version))
+        info = mock.Mock(replica_id=1, version=1, is_terminal=False)
+
+        def _yaml(scope_id):
+            metadata = ''
+            if scope_id is not None:
+                metadata = ('_metadata:\n'
+                            '  sky_serve_ephemeral_storage_scope:\n'
+                            '    resource_scope: incarnation\n'
+                            f'    scope_id: {scope_id}\n'
+                            f'    storage_generation: {scope_id}-generation\n'
+                            '    storage_mounts: []\n')
+            return ('resources: {}\n'
+                    'file_mounts: {}\n'
+                    'volumes: {}\n'
+                    'service: {readiness_probe: /}\n' + metadata)
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_yaml_content',
+                return_value=_yaml(new_scope_id)), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_yaml_contents',
+                 return_value={1: _yaml(old_scope_id)}), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_replica_infos',
+                 return_value=[info]):
+            mgr.update_version(2,
+                               mock.Mock(),
+                               update_mode=serve_utils.UpdateMode.ROLLING)
+
+        assert persisted == [(1, 2)]
+        assert info.version == 2
+
+    def test_storage_scope_with_owned_mount_still_forces_replacement(self):
+        mgr = _make_manager()
+        mgr.latest_version = 1
+        mgr.yaml_content = 'old: yaml'
+        mgr._update_mode = None
+        persisted = []
+        mgr._persist_replica = lambda replica_id, info: persisted.append(
+            (replica_id, info.version))
+        info = mock.Mock(replica_id=1, version=1, is_terminal=False)
+
+        def _yaml(scope_id):
+            return ('resources: {}\n'
+                    'file_mounts: {}\n'
+                    'volumes: {}\n'
+                    'service: {readiness_probe: /}\n'
+                    '_metadata:\n'
+                    '  sky_serve_ephemeral_storage_scope:\n'
+                    '    resource_scope: incarnation\n'
+                    f'    scope_id: {scope_id}\n'
+                    f'    storage_generation: {scope_id}-generation\n'
+                    '    storage_mounts: [/data]\n')
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_yaml_content',
+                return_value=_yaml('new-scope')), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_yaml_contents',
+                 return_value={1: _yaml('old-scope')}), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_replica_infos',
+                 return_value=[info]):
+            mgr.update_version(2,
+                               mock.Mock(),
+                               update_mode=serve_utils.UpdateMode.ROLLING)
+
+        assert not persisted
+        assert info.version == 1
+
 
 class TestLaunchOwnershipFence:
     """A stale manager must never start work that was only queued locally."""
