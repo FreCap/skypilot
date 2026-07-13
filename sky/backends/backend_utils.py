@@ -1,5 +1,6 @@
 """Util constants/functions for the backends."""
 import asyncio
+from collections.abc import Callable
 from collections.abc import Sequence
 from datetime import datetime
 import enum
@@ -2459,11 +2460,17 @@ def tag_filter_for_cluster(cluster_name: str) -> dict[str, str]:
 def _query_cluster_status_via_cloud_api(
     handle: 'cloud_vm_ray_backend.CloudVmRayResourceHandle',
     retry_if_missing: bool,
+    get_ray_config: Callable[[], dict[str, Any]] | None = None,
 ) -> dict[str, tuple[status_lib.ClusterStatus, str | None]]:
     """Returns a dict mapping instance/pod name to (status, reason).
 
     For the new provisioner API, keys are instance IDs (e.g., pod names
     on Kubernetes). For the legacy query_status API, keys are str(index).
+
+    Args:
+        get_ray_config: optional zero-arg callable returning the parsed
+          cluster YAML. Callers that already hold (or memoize) the parsed
+          YAML pass this to avoid a redundant DB read + YAML parse per call.
 
     Raises:
         exceptions.ClusterStatusFetchingError: the cluster status cannot be
@@ -2476,7 +2483,11 @@ def _query_cluster_status_via_cloud_api(
     # Use region and zone from the cluster config, instead of the
     # handle.launched_resources, because the latter may not be set
     # correctly yet.
-    ray_config = global_user_state.get_cluster_yaml_dict(handle.cluster_yaml)
+    if get_ray_config is not None:
+        ray_config = get_ray_config()
+    else:
+        ray_config = global_user_state.get_cluster_yaml_dict(
+            handle.cluster_yaml)
     provider_config = ray_config['provider']
 
     # Query the cloud provider.
@@ -2721,8 +2732,22 @@ def _update_cluster_status(
         return record
     cluster_name = handle.cluster_name
 
+    # The cluster YAML is immutable while the per-cluster lock is held, so
+    # read + parse it at most once per refresh and share it across the
+    # cloud-API queries and the Kubernetes diagnostics branches below.
+    cached_ray_config: dict[str, Any] | None = None
+
+    def _get_ray_config() -> dict[str, Any]:
+        nonlocal cached_ray_config
+        if cached_ray_config is None:
+            cached_ray_config = global_user_state.get_cluster_yaml_dict(
+                handle.cluster_yaml)
+        return cached_ray_config
+
     node_statuses = _query_cluster_status_via_cloud_api(
-        handle, retry_if_missing=retry_if_missing)
+        handle,
+        retry_if_missing=retry_if_missing,
+        get_ray_config=_get_ray_config)
 
     all_nodes_up = (all(status[0] == status_lib.ClusterStatus.UP
                         for status in node_statuses.values()) and
@@ -2995,7 +3020,7 @@ def _update_cluster_status(
             # See https://github.com/skypilot-org/skypilot/issues/4431.
             time.sleep(_LAUNCH_DOUBLE_CHECK_DELAY)
             node_statuses = _query_cluster_status_via_cloud_api(
-                handle, retry_if_missing=False)
+                handle, retry_if_missing=False, get_ray_config=_get_ray_config)
             # Note: even if all the node_statuses are UP now, we will still
             # consider this cluster abnormal, and its status will be INIT.
 
@@ -3079,8 +3104,7 @@ def _update_cluster_status(
             ]
             if unhealthy_pods:
                 try:
-                    ray_config = global_user_state.get_cluster_yaml_dict(
-                        handle.cluster_yaml)
+                    ray_config = _get_ray_config()
                     node_health = k8s_instance.get_node_health_for_cluster(
                         handle.cluster_name_on_cloud, ray_config['provider'],
                         unhealthy_pods)
@@ -3105,8 +3129,7 @@ def _update_cluster_status(
         if not status_reason and isinstance(launched_resources.cloud,
                                             clouds.Kubernetes):
             try:
-                ray_config = global_user_state.get_cluster_yaml_dict(
-                    handle.cluster_yaml)
+                ray_config = _get_ray_config()
                 if ray_config and 'provider' in ray_config:
                     pod_names = list(node_statuses.keys())
                     status_reason = (
@@ -3312,8 +3335,7 @@ def _update_cluster_status(
     if (record['autostop'] >= 0 and to_terminate and
             isinstance(launched_resources.cloud, clouds.Kubernetes)):
         try:
-            ray_config = global_user_state.get_cluster_yaml_dict(
-                handle.cluster_yaml)
+            ray_config = _get_ray_config()
             if ray_config and 'provider' in ray_config:
                 autostop_event = k8s_instance.get_cluster_autostop_event(
                     ray_config['provider'],
