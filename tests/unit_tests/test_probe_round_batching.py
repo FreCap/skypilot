@@ -26,10 +26,12 @@ def _replica_info(replica_id, probe_result):
     info.consecutive_failure_times = []
     info.first_not_ready_time = None
     info.probe = mock.Mock(return_value=(info, probe_result, 2.0))
+    info.probe_pool = mock.Mock(return_value=(info, probe_result, 2.0))
     return info
 
 
 class TestProbeRoundBatching(unittest.TestCase):
+    """Probe rounds snapshot shared state and persist bookkeeping in bulk."""
 
     def _make_manager(self):
         manager = object.__new__(replica_managers.SkyPilotReplicaManager)
@@ -58,6 +60,8 @@ class TestProbeRoundBatching(unittest.TestCase):
         calls = []
         with mock.patch.object(serve_state, 'get_replica_infos',
                                return_value=infos), \
+             mock.patch.object(serve_state, 'get_specs',
+                               return_value={1: mock.Mock()}), \
              mock.patch.object(
                 serve_state, 'add_or_update_replicas',
                 side_effect=lambda *a: calls.append('batch')) as mock_batch, \
@@ -74,3 +78,89 @@ class TestProbeRoundBatching(unittest.TestCase):
         written = mock_batch.call_args.args[1]
         self.assertEqual(sorted(rid for rid, _ in written), [1, 2])
         self.assertEqual(calls, ['batch', 'teardown'])
+
+    def test_preloads_distinct_version_specs_in_one_query(self):
+        manager = self._make_manager()
+        infos = [
+            _replica_info(1, True),
+            _replica_info(2, True),
+            _replica_info(3, True),
+        ]
+        infos[0].version = 2
+        infos[1].version = 1
+        infos[2].version = 2
+        specs = {
+            version: mock.Mock(readiness_path=f'/ready/{version}',
+                               post_data=None,
+                               readiness_timeout_seconds=15,
+                               readiness_headers=None) for version in (1, 2)
+        }
+        for method_name in ('_get_readiness_path', '_get_post_data',
+                            '_get_readiness_timeout_seconds',
+                            '_get_readiness_headers'):
+            delattr(manager, method_name)
+
+        with mock.patch.object(serve_state, 'get_replica_infos',
+                               return_value=infos), \
+             mock.patch.object(serve_state, 'get_specs',
+                               return_value=specs) as mock_get_specs, \
+             mock.patch.object(
+                 serve_state, 'get_spec',
+                 side_effect=AssertionError(
+                     'a probe round must not read specs one at a time')), \
+             mock.patch.object(serve_state, 'add_or_update_replicas'), \
+             mock.patch.object(serve_state, 'set_service_uptime'):
+            manager._probe_all_replicas()
+
+        mock_get_specs.assert_called_once_with('svc', [1, 2])
+        self.assertEqual(manager._tick_version_spec_cache, specs)
+
+    def test_missing_version_fails_before_any_probe(self):
+        manager = self._make_manager()
+        info = _replica_info(1, True)
+        info.version = 7
+
+        with mock.patch.object(serve_state, 'get_replica_infos',
+                               return_value=[info]), \
+             mock.patch.object(serve_state, 'get_specs',
+                               return_value={7: None}), \
+             mock.patch.object(
+                 serve_state, 'add_or_update_replicas') as persist:
+            with self.assertRaisesRegex(ValueError, 'Version 7 not found'):
+                manager._probe_all_replicas()
+
+        info.probe.assert_not_called()
+        persist.assert_not_called()
+
+    def test_pool_probe_skips_service_spec_lookup(self):
+        manager = self._make_manager()
+        manager._is_pool = True
+        info = _replica_info(1, True)
+
+        with mock.patch.object(serve_state, 'get_replica_infos',
+                               return_value=[info]), \
+             mock.patch.object(serve_state, 'get_specs') as mock_get_specs, \
+             mock.patch.object(serve_state, 'add_or_update_replicas'), \
+             mock.patch.object(serve_state, 'set_service_uptime'):
+            manager._probe_all_replicas()
+
+        mock_get_specs.assert_not_called()
+        info.probe_pool.assert_called_once_with()
+
+    def test_no_tracked_replicas_skips_probe_round_work(self):
+        manager = self._make_manager()
+        info = _replica_info(1, True)
+        info.status_property.should_track_service_status.return_value = False
+
+        with mock.patch.object(serve_state, 'get_replica_infos',
+                               return_value=[info]), \
+             mock.patch.object(serve_state, 'get_specs') as mock_get_specs, \
+             mock.patch.object(serve_state,
+                               'add_or_update_replicas') as persist, \
+             mock.patch.object(replica_managers.mp_pool,
+                               'ThreadPool') as thread_pool:
+            manager._probe_all_replicas()
+
+        mock_get_specs.assert_not_called()
+        persist.assert_not_called()
+        thread_pool.assert_not_called()

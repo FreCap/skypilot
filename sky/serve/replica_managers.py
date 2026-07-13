@@ -2744,16 +2744,37 @@ class SkyPilotReplicaManager(ReplicaManager):
         probe_futures = []
         replica_to_probe = []
         infos = serve_state.get_replica_infos(self._service_name)
+        infos_to_probe = [
+            info for info in infos
+            if info.status_property.should_track_service_status()
+        ]
+        if not infos_to_probe:
+            return
+        if not self._is_pool:
+            versions = {info.version for info in infos_to_probe}
+            specs = {
+                version: spec
+                for version, spec in serve_state.get_specs(
+                    self._service_name, sorted(versions)).items()
+                if spec is not None
+            }
+            missing_versions = versions - specs.keys()
+            if missing_versions:
+                missing_versions_str = ', '.join(
+                    str(version) for version in sorted(missing_versions))
+                version_label = ('Version'
+                                 if len(missing_versions) == 1 else 'Versions')
+                raise ValueError(
+                    f'{version_label} {missing_versions_str} not found.')
+            self._tick_version_spec_cache.update(specs)
         # Probes are pure I/O (HTTP GET/POST with a several-second timeout):
         # the default ThreadPool size (cpu_count) turns a large fleet into
         # dozens of sequential probe waves and the round overruns its 10s
         # period. Size the pool to the fleet, capped to bound thread cost.
-        num_probe_threads = min(max(len(infos), 1),
+        num_probe_threads = min(len(infos_to_probe),
                                 self._PROBE_ROUND_MAX_PARALLELISM)
         with mp_pool.ThreadPool(num_probe_threads) as pool:
-            for info in infos:
-                if not info.status_property.should_track_service_status():
-                    continue
+            for info in infos_to_probe:
                 if self._is_pool:
                     replica_to_probe.append(f'replica_{info.replica_id}(cluster'
                                             f'_name={info.cluster_name})')
