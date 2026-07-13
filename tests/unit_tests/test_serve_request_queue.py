@@ -241,3 +241,47 @@ def test_request_body_bound_handles_chunked_uploads():
         assert exc.value.status_code == 413
 
     asyncio.run(_run())
+
+
+def test_acquire_survives_config_disable_during_lock_wait():
+    """A controller sync may disable the queue while an acquire is waiting
+    to take the condition lock; the request must fall back to unqueued
+    dispatch instead of crashing."""
+
+    async def _run():
+        lb = _make_lb()
+        lb._load_balancing_policy.set_ready_replicas(['http://worker:8000'])
+
+        class _DisablingCondition(asyncio.Condition):
+
+            async def __aenter__(self):
+                lb._request_queue_config = None
+                return await super().__aenter__()
+
+        lb._request_queue_condition = _DisablingCondition()
+        request = mock.MagicMock()
+        request.headers = {}
+        assert await lb._acquire_request_slot(request) is False
+
+    asyncio.run(_run())
+
+
+def test_admission_slot_released_when_upstream_release_raises():
+    """The chained admission release must run even if the upstream stream
+    release raises, or dispatch capacity leaks permanently."""
+
+    async def _run():
+        lb = _make_lb()
+        lb._active_request_count = 1
+
+        async def _upstream_release():
+            raise RuntimeError('aclose failed')
+
+        response = load_balancer._ReleasingStreamingResponse(
+            content=iter(()), release=_upstream_release)
+        response.hold_admission_slot_until_complete(lb._release_request_slot)
+        with pytest.raises(RuntimeError):
+            await response._release()
+        assert lb._active_request_count == 0
+
+    asyncio.run(_run())
