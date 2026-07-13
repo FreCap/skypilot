@@ -3,6 +3,7 @@
 
 import pytest
 from sqlalchemy import create_engine
+from sqlalchemy import event
 
 from sky.serve import serve_state
 
@@ -66,3 +67,43 @@ def test_get_glob_service_names_applies_mode_filter_to_patterns(_mock_serve_db):
                                                          'pool-alpha',
                                                          'pool-beta',
                                                      ]
+
+
+def test_get_glob_service_names_multi_pattern_union(_mock_serve_db):
+    del _mock_serve_db
+    _add_service('serve-alpha', pool=False)
+    _add_service('serve-beta', pool=False)
+    _add_service('pool-alpha', pool=True)
+
+    # Union across patterns, with overlapping matches deduplicated.
+    assert sorted(serve_state.get_glob_service_names(['serve-*',
+                                                      '*alpha'])) == [
+                                                          'pool-alpha',
+                                                          'serve-alpha',
+                                                          'serve-beta',
+                                                      ]
+    assert not serve_state.get_glob_service_names([])
+    assert not serve_state.get_glob_service_names(['no-such-*'])
+
+
+def test_get_glob_service_names_issues_single_query(_mock_serve_db):
+    engine = _mock_serve_db
+    _add_service('serve-alpha', pool=False)
+    _add_service('serve-beta', pool=False)
+    _add_service('pool-alpha', pool=True)
+
+    statements = []
+
+    @event.listens_for(engine, 'before_cursor_execute')
+    def _count(unused_conn, unused_cursor, statement, *unused_args):
+        if statement.lstrip().upper().startswith('SELECT'):
+            statements.append(statement)
+
+    try:
+        names = serve_state.get_glob_service_names(
+            ['serve-*', 'pool-*', '*alpha'])
+    finally:
+        event.remove(engine, 'before_cursor_execute', _count)
+
+    assert sorted(names) == ['pool-alpha', 'serve-alpha', 'serve-beta']
+    assert len(statements) == 1
