@@ -3,10 +3,14 @@ import os
 import pathlib
 import tempfile
 import threading
+import types
 from unittest import mock
 
 import pytest
 import requests.exceptions as requests_exceptions
+import sqlalchemy
+from sqlalchemy import create_engine
+from sqlalchemy import orm
 
 from sky import clouds
 from sky.resources import Resources
@@ -18,6 +22,45 @@ from sky.serve import serve_utils
 # mock.patch needs the dotted path to the attribute being patched.
 _SIGNAL_FILE_CONST = (
     'sky.jobs.constants.JOBS_CONSOLIDATION_RELOADED_SIGNAL_FILE')
+
+
+@contextlib.contextmanager
+def _count_sql_statements(engine):
+    counts = {'n': 0}
+
+    def _count(*args, **kwargs):
+        del args, kwargs
+        counts['n'] += 1
+
+    sqlalchemy.event.listen(engine, 'before_cursor_execute', _count)
+    try:
+        yield counts
+    finally:
+        sqlalchemy.event.remove(engine, 'before_cursor_execute', _count)
+
+
+@pytest.fixture
+def _mock_serve_db(tmp_path, monkeypatch):
+    """Point serve_state at a fresh sqlite DB for the duration of one test."""
+    db_path = tmp_path / 'serve_utils_testing.db'
+    engine = create_engine(f'sqlite:///{db_path}')
+
+    monkeypatch.setattr(serve_state._db_manager, '_engine', engine)
+    serve_state.Base.metadata.create_all(engine)
+    yield engine
+
+
+def _insert_version_spec(engine, service_name: str, version: int,
+                         min_replicas: int) -> None:
+    spec = types.SimpleNamespace(min_replicas=min_replicas)
+    with orm.Session(engine) as session:
+        session.execute(serve_state.version_specs_table.insert().values(
+            service_name=service_name,
+            version=version,
+            spec=serve_state.pickle.dumps(spec),
+            yaml_content=f'yaml: v{version}',
+        ))
+        session.commit()
 
 
 def test_lifecycle_lock_detection_failure_is_fail_closed():
@@ -1724,6 +1767,80 @@ def test_set_service_status_from_replica_active_versions_ready_only():
              'set_service_status_and_active_versions_if_owner') as set_st:
         serve_utils.set_service_status_and_active_versions_from_replica(
             'svc', replica_infos, serve_utils.UpdateMode.ROLLING)
+    set_st.assert_called_once()
+    assert set_st.call_args.args[4] == serve_state.ServiceStatus.READY
+    assert set_st.call_args.kwargs['active_versions'] == [2]
+
+
+def test_get_latest_version_with_min_replicas_batches_spec_reads(
+        _mock_serve_db):
+    _insert_version_spec(_mock_serve_db, 'svc', 1, min_replicas=1)
+    _insert_version_spec(_mock_serve_db, 'svc', 2, min_replicas=2)
+    _insert_version_spec(_mock_serve_db, 'svc', 3, min_replicas=4)
+    replica_infos = [
+        _FakeReplicaInfo(serve_state.ReplicaStatus.READY, version=1),
+        _FakeReplicaInfo(serve_state.ReplicaStatus.READY, version=2),
+        _FakeReplicaInfo(serve_state.ReplicaStatus.READY, version=2),
+        _FakeReplicaInfo(serve_state.ReplicaStatus.READY, version=3),
+        _FakeReplicaInfo(serve_state.ReplicaStatus.READY, version=3),
+        _FakeReplicaInfo(serve_state.ReplicaStatus.READY, version=3),
+    ]
+
+    with _count_sql_statements(_mock_serve_db) as counts:
+        chosen = serve_utils.get_latest_version_with_min_replicas(
+            'svc', replica_infos)
+
+    assert chosen == 2
+    assert counts['n'] == 1, counts
+
+
+def test_get_latest_version_with_min_replicas_falls_back_to_oldest_ready(
+        _mock_serve_db):
+    _insert_version_spec(_mock_serve_db, 'svc', 1, min_replicas=2)
+    _insert_version_spec(_mock_serve_db, 'svc', 2, min_replicas=4)
+    replica_infos = [
+        _FakeReplicaInfo(serve_state.ReplicaStatus.READY, version=1),
+        _FakeReplicaInfo(serve_state.ReplicaStatus.READY, version=2),
+        _FakeReplicaInfo(serve_state.ReplicaStatus.READY, version=2),
+        _FakeReplicaInfo(serve_state.ReplicaStatus.READY, version=3),
+        _FakeReplicaInfo(serve_state.ReplicaStatus.READY, version=3),
+        _FakeReplicaInfo(serve_state.ReplicaStatus.READY, version=3),
+    ]
+
+    chosen = serve_utils.get_latest_version_with_min_replicas(
+        'svc', replica_infos)
+
+    assert chosen == 1
+
+
+def test_set_service_status_from_replica_blue_green_uses_chosen_version(
+        _mock_serve_db):
+    _insert_version_spec(_mock_serve_db, 'svc', 1, min_replicas=1)
+    _insert_version_spec(_mock_serve_db, 'svc', 2, min_replicas=3)
+    _insert_version_spec(_mock_serve_db, 'svc', 3, min_replicas=5)
+    replica_infos = [
+        _FakeReplicaInfo(serve_state.ReplicaStatus.READY, version=2),
+        _FakeReplicaInfo(serve_state.ReplicaStatus.READY, version=2),
+        _FakeReplicaInfo(serve_state.ReplicaStatus.READY, version=2),
+        _FakeReplicaInfo(serve_state.ReplicaStatus.READY, version=3),
+        _FakeReplicaInfo(serve_state.ReplicaStatus.READY, version=3),
+        _FakeReplicaInfo(serve_state.ReplicaStatus.PROVISIONING, version=4),
+    ]
+    record = {
+        'status': serve_state.ServiceStatus.READY,
+        'hash': 'incarnation-a',
+        'controller_pid': 123,
+        'controller_ip': '10.0.0.1',
+    }
+    with mock.patch.object(serve_state,
+                           'get_service_controller_owner',
+                           return_value=record), \
+         mock.patch.object(
+             serve_state,
+             'set_service_status_and_active_versions_if_owner') as set_st:
+        serve_utils.set_service_status_and_active_versions_from_replica(
+            'svc', replica_infos, serve_utils.UpdateMode.BLUE_GREEN)
+
     set_st.assert_called_once()
     assert set_st.call_args.args[4] == serve_state.ServiceStatus.READY
     assert set_st.call_args.kwargs['active_versions'] == [2]
