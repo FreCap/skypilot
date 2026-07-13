@@ -211,6 +211,26 @@ LB_503_RETRY_AFTER_SECONDS = 10
 # load_balancer.retry_initial_backoff_seconds.
 LB_RETRY_INITIAL_BACKOFF_SECONDS = 1
 
+# Opt-in bounded request queue defaults. The queue is sized dynamically as
+# max(min_size, ready_replicas * size_per_replica), then clipped to max_size.
+# max_size is an absolute task-count bound; max_request_body_bytes bounds the
+# largest payload a queued/retried request may retain, so the load balancer's
+# memory exposure stays finite under overload.
+LB_REQUEST_QUEUE_MIN_SIZE = 10
+LB_REQUEST_QUEUE_SIZE_PER_REPLICA = 3
+LB_REQUEST_QUEUE_MAX_SIZE = 1000
+LB_REQUEST_QUEUE_CONCURRENCY_PER_REPLICA = 1
+LB_REQUEST_QUEUE_MAX_CONCURRENCY = 32
+LB_REQUEST_QUEUE_TIMEOUT_SECONDS = 120
+LB_REQUEST_QUEUE_MAX_BODY_BYTES = 1 * 1024 * 1024
+# Hard configuration ceilings, calibrated below the external LB's default
+# 512Mi memory limit. The aggregate body budget leaves room for transient
+# bytearray->bytes copies, queued ASGI receive buffers, clients, and Python.
+LB_REQUEST_QUEUE_MAX_SIZE_LIMIT = 2000
+LB_REQUEST_QUEUE_MAX_CONCURRENCY_LIMIT = 128
+LB_REQUEST_QUEUE_MAX_BODY_BYTES_LIMIT = 16 * 1024 * 1024
+LB_REQUEST_QUEUE_BODY_MEMORY_BUDGET_BYTES = 128 * 1024 * 1024
+
 # The timeout in seconds for load balancer to wait for a response from replica.
 # Large LLMs like Llama2-70b is able to process the request within ~30 seconds.
 # We set the timeout to 120s to be safe. For reference, FastChat uses 100s:

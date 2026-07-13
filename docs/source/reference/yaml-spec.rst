@@ -1516,6 +1516,14 @@ Controls request proxy behavior for the SkyServe load balancer.
     service:
       load_balancer:
         stream_timeout_seconds: 300
+        request_queue:
+          min_size: 10
+          size_per_replica: 3
+          max_size: 1000
+          max_concurrency_per_replica: 1
+          max_concurrency: 32
+          timeout_seconds: 120
+          max_request_body_bytes: 1048576
 
 
 .. _yaml-spec-service-load-balancer-stream-timeout-seconds:
@@ -1534,6 +1542,42 @@ to a ready replica.
     service:
       load_balancer:
         stream_timeout_seconds: 300
+
+
+.. _yaml-spec-service-load-balancer-request-queue:
+
+``service.load_balancer.request_queue``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Enables a bounded request queue in the load balancer. The effective queue size
+is ``min(max_size, max(min_size, ready_replicas * size_per_replica))``. An
+empty object enables the defaults shown below. Requests beyond the effective
+queue size receive HTTP 503, requests that wait longer than
+``timeout_seconds`` receive HTTP 503, and bodies larger than
+``max_request_body_bytes`` receive HTTP 413.
+
+``max_size`` and ``max_request_body_bytes`` are hard memory-safety bounds.
+``max_concurrency_per_replica`` controls how many requests may be dispatched
+per ready replica before new arrivals wait in the queue, while
+``max_concurrency`` is the absolute load-balancer-wide dispatch ceiling.
+The queue accepts at most 2,000 waiting requests, 128 concurrent requests,
+and 16 MiB per request body. The product of ``max_concurrency`` and
+``max_request_body_bytes`` must stay within a 128 MiB aggregate buffering
+budget, leaving headroom under the external load balancer's default 512 MiB
+limit.
+
+.. code-block:: yaml
+
+    service:
+      load_balancer:
+        request_queue:
+          min_size: 10
+          size_per_replica: 3
+          max_size: 1000
+          max_concurrency_per_replica: 1
+          max_concurrency: 32
+          timeout_seconds: 120
+          max_request_body_bytes: 1048576
 
 
 .. _yaml-spec-service-replica-policy:

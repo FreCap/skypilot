@@ -762,6 +762,7 @@ class SkyServeController:
             'max_retries': service_spec.lb_max_retries,
             'retry_initial_backoff_seconds':
                 (service_spec.lb_retry_initial_backoff_seconds),
+            'request_queue': getattr(service_spec, 'lb_request_queue', None),
         }
 
     def _get_routing_spec(self) -> dict[str, Any] | None:

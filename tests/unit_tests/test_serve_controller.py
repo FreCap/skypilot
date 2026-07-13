@@ -152,6 +152,7 @@ class TestGetRoutingSpec:
             'retriable_status_codes': [503],
             'max_retries': 3,
             'retry_initial_backoff_seconds': 0.5,
+            'request_queue': None,
         }
 
     def test_routing_spec_repeated_calls_do_not_hit_db(self):
@@ -221,6 +222,7 @@ class TestGetRoutingSpec:
                 'retriable_status_codes': None,
                 'max_retries': None,
                 'retry_initial_backoff_seconds': None,
+                'request_queue': None,
             }
             resume_runtime_transition.set()
             updater.join(timeout=5)
@@ -236,6 +238,7 @@ class TestGetRoutingSpec:
             'retriable_status_codes': None,
             'max_retries': None,
             'retry_initial_backoff_seconds': None,
+            'request_queue': None,
         }
 
 
