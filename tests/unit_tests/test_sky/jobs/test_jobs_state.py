@@ -845,11 +845,12 @@ class TestGetLatestRecoveryReasons:
             2: 'preempted',
         }
 
-    def test_empty_reason_skipped(self, _mock_managed_jobs_db_conn):
+    def test_latest_empty_reason_clears_stale_detail(
+            self, _mock_managed_jobs_db_conn):
         early = datetime.datetime(2026, 1, 1, 0, 0, 0)
         late = datetime.datetime(2026, 1, 1, 0, 5, 0)
-        # The most recent RECOVERING event has an empty reason -> fall back to
-        # the most recent non-empty one.
+        # The newest RECOVERING event cleared the reason, so older reasons must
+        # not leak into the current details view.
         state.add_job_event(1,
                             0,
                             state.ManagedJobStatus.RECOVERING,
@@ -860,7 +861,22 @@ class TestGetLatestRecoveryReasons:
                             state.ManagedJobStatus.RECOVERING,
                             '',
                             timestamp=late)
-        assert state.get_latest_recovery_reasons([1]) == {1: 'real reason'}
+        assert state.get_latest_recovery_reasons([1]) == {}
+
+    def test_same_timestamp_uses_latest_event_id(self,
+                                                 _mock_managed_jobs_db_conn):
+        same_time = datetime.datetime(2026, 1, 1, 0, 0, 0)
+        state.add_job_event(1,
+                            0,
+                            state.ManagedJobStatus.RECOVERING,
+                            'older reason',
+                            timestamp=same_time)
+        state.add_job_event(1,
+                            0,
+                            state.ManagedJobStatus.RECOVERING,
+                            'later reason',
+                            timestamp=same_time)
+        assert state.get_latest_recovery_reasons([1]) == {1: 'later reason'}
 
     def test_no_recovering_events_returns_empty(self,
                                                 _mock_managed_jobs_db_conn):
