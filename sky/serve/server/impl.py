@@ -144,6 +144,34 @@ def _persist_scoped_ephemeral_storage_intent(task: 'task_lib.Task',
                            f'{service_name!r}.')
 
 
+def _get_committed_storage_generations(
+        service_name: str) -> Optional[Set[Tuple[str, str]]]:
+    """Snapshot committed scoped-storage generations for one service.
+
+    Returns None if any committed YAML is unreadable so callers can fail
+    closed and retain the durable cleanup intent.
+    """
+    committed_generations: Set[Tuple[str, str]] = set()
+    for version in serve_state.get_service_versions(service_name):
+        yaml_content = serve_state.get_yaml_content(service_name, version)
+        if yaml_content is None:
+            continue
+        try:
+            version_task = task_lib.Task.from_yaml_str(yaml_content)
+        except Exception:  # pylint: disable=broad-except
+            return None
+        metadata = version_task.metadata.get(
+            serve_constants.EPHEMERAL_STORAGE_SCOPE_METADATA_KEY)
+        if not isinstance(metadata, dict):
+            continue
+        resource_scope = metadata.get('resource_scope')
+        storage_generation = metadata.get('storage_generation')
+        if (isinstance(resource_scope, str) and
+                isinstance(storage_generation, str)):
+            committed_generations.add((resource_scope, storage_generation))
+    return committed_generations
+
+
 def _cleanup_provisional_storage_intents(service_name: str,
                                          failed_lifecycle_epoch: int,
                                          lifecycle_lock: Any) -> None:
@@ -161,31 +189,16 @@ def _cleanup_provisional_storage_intents(service_name: str,
         # the version scan below.
         cleanup_epoch = serve_utils.advance_service_lifecycle_epoch(
             lifecycle_lock)
-
-        def _generation_is_committed(intent: Dict[str, Any]) -> bool:
-            for version in serve_state.get_service_versions(service_name):
-                yaml_content = serve_state.get_yaml_content(
-                    service_name, version)
-                if yaml_content is None:
-                    continue
-                try:
-                    version_task = task_lib.Task.from_yaml_str(yaml_content)
-                except Exception:  # pylint: disable=broad-except
-                    # Unreadable committed metadata is not proof that a resource
-                    # is unowned. Keep the durable cleanup intent fail-closed.
-                    return True
-                metadata = version_task.metadata.get(
-                    serve_constants.EPHEMERAL_STORAGE_SCOPE_METADATA_KEY)
-                if (isinstance(metadata, dict) and
-                        metadata.get('resource_scope')
-                        == intent['resource_scope'] and
-                        metadata.get('storage_generation')
-                        == intent['storage_generation']):
-                    return True
-            return False
-
+        committed_generations = _get_committed_storage_generations(service_name)
+        if committed_generations is None:
+            logger.info('Retaining provisional storage cleanup intent(s) for '
+                        f'{service_name!r}: committed service metadata was '
+                        'unreadable.')
+            return
         cleanable = [
-            intent for intent in intents if not _generation_is_committed(intent)
+            intent for intent in intents
+            if (intent['resource_scope'],
+                intent['storage_generation']) not in committed_generations
         ]
         if not cleanable:
             logger.info('Retaining provisional storage cleanup intent(s) for '
