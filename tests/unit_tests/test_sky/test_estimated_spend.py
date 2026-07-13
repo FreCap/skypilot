@@ -43,6 +43,18 @@ class _FakeResources:
                 f'cloud={self.cloud!r}, use_spot={self.use_spot!r})')
 
 
+class _ZonalFakeResources(_FakeResources):
+    """Priced resource whose display repr intentionally omits placement."""
+
+    def __init__(self, hourly_cost: float, region: str, zone: str | None):
+        super().__init__(hourly_cost, use_spot=True)
+        self.region = region
+        self.zone = zone
+
+    def __repr__(self) -> str:
+        return '_ZonalFakeResources(g6.4xlarge[Spot])'
+
+
 class _MinimalHandle:
     """Just enough cluster state for attribution persistence tests."""
 
@@ -185,6 +197,24 @@ def test_estimate_hourly_cost_uses_actual_purchase_option_and_nodes():
     kubernetes_resources = _FakeResources(99.0, cloud='Kubernetes')
     assert estimated_spend.estimate_hourly_cost(kubernetes_resources) == (
         None, 'kubernetes')
+
+
+def test_estimate_hourly_cost_cache_distinguishes_region_and_zone():
+    rate_cache = {}
+    resources = [
+        _ZonalFakeResources(0.3, 'ap-south-1', 'ap-south-1a'),
+        _ZonalFakeResources(0.3189, 'ap-south-1', 'ap-south-1b'),
+        _ZonalFakeResources(0.6899, 'eu-west-2', None),
+        _ZonalFakeResources(0.5161, 'ap-northeast-2', None),
+    ]
+
+    hourly_costs = [
+        estimated_spend.estimate_hourly_cost(resource, rate_cache=rate_cache)[0]
+        for resource in resources
+    ]
+
+    assert hourly_costs == [0.3, 0.3189, 0.6899, 0.5161]
+    assert len(rate_cache) == 4
 
 
 def test_corrupt_resource_pickle_does_not_block_rollup(tmp_path, monkeypatch):

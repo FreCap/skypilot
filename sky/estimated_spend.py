@@ -148,7 +148,10 @@ def _get_pricing(
         return None, 'kubernetes'
     if resources is None:
         return None, 'unknown_price'
-    cache_key = f'{resources!r}|nodes={num_nodes}'
+    region = getattr(resources, 'region', None)
+    zone = getattr(resources, 'zone', None)
+    cache_key = (f'{resources!r}|region={region!r}|zone={zone!r}|'
+                 f'nodes={num_nodes}')
     if cache_key in rate_cache:
         return rate_cache[cache_key], None
     try:
