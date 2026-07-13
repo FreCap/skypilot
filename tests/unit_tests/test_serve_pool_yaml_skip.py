@@ -2,6 +2,8 @@
 
 from unittest import mock
 
+import pytest
+
 from sky.serve import serve_state
 from sky.serve import serve_utils
 
@@ -64,4 +66,50 @@ def test_update_pool_status_liveness_skips_pool_yaml():
     get_status.assert_called_once_with('pool-a',
                                        pool=True,
                                        with_replica_info=False,
-                                       with_yaml=False)
+                                       with_yaml=False,
+                                       with_target_num_replicas=False)
+
+
+@pytest.mark.parametrize(
+    ('controller_pid', 'controller_alive', 'expected_status_writes'),
+    [(123, True, 0), (None, False, 1)],
+)
+def test_update_status_liveness_skips_target_fetch(controller_pid,
+                                                   controller_alive,
+                                                   expected_status_writes):
+    record = {
+        'name': 'serve-a',
+        'pool': False,
+        'status': serve_state.ServiceStatus.READY,
+        'controller_pid': controller_pid,
+        'controller_ip': '127.0.0.1',
+        'controller_job_id': None,
+        'hash': 'incarnation-a',
+        'resource_scope': 'scope-a',
+    }
+    with mock.patch.object(serve_state,
+                           'get_glob_service_names',
+                           return_value=['serve-a']), \
+         mock.patch.object(serve_state,
+                           'get_service_from_name',
+                           return_value=record), \
+         mock.patch.object(
+             serve_utils, '_get_to_controller_with_retry') as target_fetch, \
+         mock.patch.object(serve_utils,
+                           '_controller_process_alive',
+                           return_value=controller_alive), \
+         mock.patch.object(
+             serve_state,
+             'set_service_status_and_active_versions_if_owner') as status_write:
+        serve_utils.update_service_status(pool=False)
+
+    target_fetch.assert_not_called()
+    assert status_write.call_count == expected_status_writes
+    if expected_status_writes:
+        status_write.assert_called_once_with(
+            'serve-a',
+            'incarnation-a',
+            controller_pid,
+            '127.0.0.1',
+            serve_state.ServiceStatus.CONTROLLER_FAILED,
+            expected_status=serve_state.ServiceStatus.READY)
