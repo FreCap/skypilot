@@ -176,6 +176,70 @@ describe('current user cache', () => {
     expect(getRequestActivitySnapshot().inFlight).toBe(0);
   });
 
+  it('releases stream accounting when the response is not ok', async () => {
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+    global.fetch.mockResolvedValue({ ok: false, status: 502 });
+
+    await expect(apiClient.stream('/stream', {}, jest.fn())).rejects.toThrow(
+      'status 502'
+    );
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+    expect(getRequestActivitySnapshot().inFlight).toBe(0);
+  });
+
+  it('releases stream accounting when the reader aborts mid-stream', async () => {
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+    const abortError = new Error('aborted');
+    abortError.name = 'AbortError';
+    global.fetch.mockResolvedValue({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: jest
+            .fn()
+            .mockResolvedValueOnce({
+              done: false,
+              value: Uint8Array.from([104, 105]),
+            })
+            .mockRejectedValueOnce(abortError),
+        }),
+      },
+    });
+
+    await expect(
+      apiClient.stream('/stream', {}, jest.fn())
+    ).rejects.toMatchObject({ name: 'AbortError' });
+    expect(getRequestActivitySnapshot().inFlight).toBe(0);
+  });
+
+  it('ignores caller trackRequest overrides on stream requests', async () => {
+    const inFlightSeen = [];
+    global.fetch.mockImplementation(async () => {
+      inFlightSeen.push(getRequestActivitySnapshot().inFlight);
+      return {
+        ok: true,
+        body: {
+          getReader: () => ({
+            read: jest.fn().mockResolvedValue({ done: true }),
+          }),
+        },
+      };
+    });
+
+    await apiClient.stream('/stream', {}, jest.fn(), { trackRequest: true });
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+    expect(inFlightSeen).toEqual([1]);
+    expect(getRequestActivitySnapshot().inFlight).toBe(0);
+  });
+
+  it('releases stream accounting when the response has no body', async () => {
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+    global.fetch.mockResolvedValue({ ok: true, body: null });
+
+    await expect(apiClient.stream('/stream', {}, jest.fn())).rejects.toThrow();
+    expect(getRequestActivitySnapshot().inFlight).toBe(0);
+  });
+
   it('dedupes concurrent role and info lookups to one request', async () => {
     let resolveResponse;
     global.fetch.mockImplementation(
