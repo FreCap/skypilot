@@ -79,6 +79,20 @@ class _ReleasingStreamingResponse(fastapi.responses.StreamingResponse):
         finally:
             await self._release()
 
+    def hold_admission_slot_until_complete(self, release: Any) -> None:
+        """Chain an idempotent admission release onto the ASGI lifetime."""
+        upstream_release = self._release
+        released = False
+
+        async def _release_all() -> None:
+            nonlocal released
+            await upstream_release()
+            if not released:
+                released = True
+                await release()
+
+        self._release = _release_all
+
 
 def _is_dead_connection_error(exc: Exception) -> bool:
     """Whether a proxy failure indicates a DEAD replica vs a saturated one.
@@ -277,6 +291,10 @@ class SkyServeLoadBalancer:
     # _prune_reject_window (the single funnel every read and write goes
     # through), so instances cannot leak reject state into one another.
     _queue_depth: int = 0
+    _request_queue_config: dict[str, Any] | None = None
+    _request_queue_condition: asyncio.Condition | None = None
+    _active_request_count: int = 0
+    _waiting_request_count: int = 0
     _reject_last_seen: dict[str, float] | None = None
     _reject_fallback_seq: int = 0
     _capacity_hint: dict[str, Any] | None = None
@@ -367,6 +385,14 @@ class SkyServeLoadBalancer:
         self._max_retries = constants.LB_MAX_RETRY
         self._retry_initial_backoff_seconds = (
             constants.LB_RETRY_INITIAL_BACKOFF_SECONDS)
+        # Opt-in bounded admission queue. The config arrives over controller
+        # sync so service updates take effect without restarting an external
+        # LB. Counts are guarded by the asyncio condition on the single
+        # uvicorn event loop.
+        self._request_queue_config = None
+        self._request_queue_condition = asyncio.Condition()
+        self._active_request_count = 0
+        self._waiting_request_count = 0
         # TODO(tian): httpx.Client has a resource limit of 100 max connections
         # for each client. We should wait for feedback on the best max
         # connections.
@@ -590,6 +616,134 @@ class SkyServeLoadBalancer:
         self._retry_initial_backoff_seconds = (
             backoff_seconds if backoff_seconds is not None else
             constants.LB_RETRY_INITIAL_BACKOFF_SECONDS)
+        request_queue = routing_spec.get('request_queue')
+        self._request_queue_config = (dict(request_queue) if isinstance(
+            request_queue, dict) else None)
+
+    def _request_queue_limits(self) -> tuple[int, int]:
+        """Return (dispatch concurrency, queue size) for the ready fleet."""
+        config = self._request_queue_config
+        assert config is not None
+        with self._client_pool_lock:
+            ready_replicas = len(self._load_balancing_policy.ready_replicas)
+        dispatch_limit = min(
+            config['max_concurrency'],
+            ready_replicas * config['max_concurrency_per_replica'])
+        queue_size = max(config['min_size'],
+                         ready_replicas * config['size_per_replica'])
+        return dispatch_limit, min(config['max_size'], queue_size)
+
+    def _current_dispatch_load(self) -> int:
+        """Conservative live request count, including returned streams."""
+        # A streaming response transfers its admission release to its ASGI
+        # lifetime below, so this count includes selecting handlers, upstream
+        # awaits, and returned streams exactly once.
+        return self._active_request_count
+
+    async def _notify_request_queue(self) -> None:
+        condition = self._request_queue_condition
+        if condition is None:
+            return
+        async with condition:
+            condition.notify_all()
+
+    async def _acquire_request_slot(self, request: fastapi.Request) -> bool:
+        """Wait for bounded dispatch capacity. Returns False when disabled."""
+        config = self._request_queue_config
+        if config is None:
+            return False
+        condition = self._request_queue_condition
+        if condition is None:
+            condition = asyncio.Condition()
+            self._request_queue_condition = condition
+        deadline = time.monotonic() + config['timeout_seconds']
+        async with condition:
+            dispatch_limit, queue_size = self._request_queue_limits()
+            if self._current_dispatch_load() < dispatch_limit:
+                self._active_request_count += 1
+                return True
+            if self._waiting_request_count >= queue_size:
+                self._record_rejection(request)
+                raise fastapi.HTTPException(
+                    status_code=503,
+                    detail=(f'Load balancer request queue is full '
+                            f'({queue_size} waiting request(s)).'),
+                    headers={
+                        'Retry-After': str(constants.LB_503_RETRY_AFTER_SECONDS)
+                    })
+            self._waiting_request_count += 1
+            try:
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        self._record_rejection(request)
+                        raise fastapi.HTTPException(
+                            status_code=503,
+                            detail='Timed out waiting in the load balancer '
+                            'request queue.',
+                            headers={
+                                'Retry-After': str(
+                                    constants.LB_503_RETRY_AFTER_SECONDS)
+                            })
+                    try:
+                        await asyncio.wait_for(condition.wait(), remaining)
+                    except asyncio.TimeoutError:
+                        self._record_rejection(request)
+                        raise fastapi.HTTPException(
+                            status_code=503,
+                            detail='Timed out waiting in the load balancer '
+                            'request queue.',
+                            headers={
+                                'Retry-After': str(
+                                    constants.LB_503_RETRY_AFTER_SECONDS)
+                            }) from None
+                    if self._request_queue_config is None:
+                        return False
+                    dispatch_limit, _ = self._request_queue_limits()
+                    if self._current_dispatch_load() < dispatch_limit:
+                        self._active_request_count += 1
+                        return True
+            finally:
+                self._waiting_request_count -= 1
+
+    async def _release_request_slot(self) -> None:
+        condition = self._request_queue_condition
+        if condition is None:
+            return
+        async with condition:
+            self._active_request_count = max(0, self._active_request_count - 1)
+            condition.notify_all()
+
+    async def _request_body(self, request: fastapi.Request) -> bytes:
+        """Read a request body with the configured hard memory bound."""
+        config = self._request_queue_config
+        if config is None:
+            return await request.body()
+        cached = getattr(request, '_skyserve_bounded_body', None)
+        if cached is not None:
+            return cached
+        limit = config['max_request_body_bytes']
+        content_length = request.headers.get('content-length')
+        if content_length is not None:
+            try:
+                if int(content_length) > limit:
+                    raise fastapi.HTTPException(
+                        status_code=413,
+                        detail=f'Request body exceeds the {limit}-byte load '
+                        'balancer limit.')
+            except ValueError:
+                pass
+        body = bytearray()
+        async for chunk in request.stream():
+            if len(body) + len(chunk) > limit:
+                raise fastapi.HTTPException(
+                    status_code=413,
+                    detail=f'Request body exceeds the {limit}-byte load '
+                    'balancer limit.')
+            body.extend(chunk)
+        result = bytes(body)
+        setattr(request, '_skyserve_bounded_body', result)
+        return result
 
     def _is_ready_to_serve(self) -> bool:
         """Readiness: true only once synced at least once and not draining."""
@@ -1454,6 +1608,9 @@ class SkyServeLoadBalancer:
                 # First successful sync -> ready to serve (readiness gate).
                 self._ready = True
                 self._last_sync_time = time.monotonic()
+                # Ready-replica count changes resize the dynamic queue and
+                # dispatch limit. Wake waiters to re-evaluate immediately.
+                await self._notify_request_queue()
             finally:
                 if not request_batch_accepted:
                     self._request_aggregator.restore(request_batch)
@@ -1595,7 +1752,7 @@ class SkyServeLoadBalancer:
                 request.method,
                 worker_url,
                 headers=request.headers.raw,
-                content=await request.body(),
+                content=await self._request_body(request),
                 # A scalar here would ALSO set the connect timeout: with a
                 # long stream timeout (sync model servers send no bytes
                 # until compute completes, so read must cover the whole
@@ -1634,6 +1791,7 @@ class SkyServeLoadBalancer:
                 finally:
                     slot_policy.post_execute_hook(url, request, slot_token)
                     _drop_client_refcount()
+                    await self._notify_request_queue()
 
             async def _stream_with_release():
                 try:
@@ -1702,9 +1860,19 @@ class SkyServeLoadBalancer:
         # here. Plain int is safe: single uvicorn event loop, no await
         # between each read and its paired write.
         self._queue_depth += 1
+        acquired_slot = False
         try:
-            return await self._proxy_with_retries_inner(request)
+            acquired_slot = await self._acquire_request_slot(request)
+            response = await self._proxy_with_retries_inner(request)
+            if (acquired_slot and
+                    isinstance(response, _ReleasingStreamingResponse)):
+                response.hold_admission_slot_until_complete(
+                    self._release_request_slot)
+                acquired_slot = False
+            return response
         finally:
+            if acquired_slot:
+                await self._release_request_slot()
             self._queue_depth -= 1
 
     async def _proxy_with_retries_inner(

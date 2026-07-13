@@ -33,6 +33,7 @@ class SkyServiceSpec:
         lb_retriable_status_codes: list[int] | None = None,
         lb_max_retries: int | None = None,
         lb_retry_initial_backoff_seconds: float | None = None,
+        lb_request_queue: dict[str, Any] | None = None,
         max_replicas: int | None = None,
         num_overprovision: int | None = None,
         ports: str | None = None,
@@ -261,6 +262,75 @@ class SkyServiceSpec:
                     'graceful_drain_seconds must be an integer between 0 and '
                     f'{constants.LB_OFF_READY_OCCUPANCY_RETENTION_SECONDS}. '
                     f'Got: {graceful_drain_seconds!r}')
+        if lb_request_queue is not None:
+            queue_defaults = {
+                'min_size': constants.LB_REQUEST_QUEUE_MIN_SIZE,
+                'size_per_replica': constants.LB_REQUEST_QUEUE_SIZE_PER_REPLICA,
+                'max_size': constants.LB_REQUEST_QUEUE_MAX_SIZE,
+                'max_concurrency_per_replica':
+                    constants.LB_REQUEST_QUEUE_CONCURRENCY_PER_REPLICA,
+                'max_concurrency': constants.LB_REQUEST_QUEUE_MAX_CONCURRENCY,
+                'timeout_seconds': constants.LB_REQUEST_QUEUE_TIMEOUT_SECONDS,
+                'max_request_body_bytes':
+                    constants.LB_REQUEST_QUEUE_MAX_BODY_BYTES,
+            }
+            queue_defaults.update(lb_request_queue)
+            for field in ('min_size', 'size_per_replica', 'max_size',
+                          'max_concurrency_per_replica', 'max_concurrency',
+                          'max_request_body_bytes'):
+                value = queue_defaults[field]
+                minimum = 0 if field in ('min_size', 'size_per_replica') else 1
+                if (not isinstance(value, int) or isinstance(value, bool) or
+                        value < minimum):
+                    with ux_utils.print_exception_no_traceback():
+                        raise ValueError(
+                            f'load_balancer.request_queue.{field} must be an '
+                            f'integer >= {minimum}. Got: {value!r}')
+            field_maximums = {
+                'min_size': constants.LB_REQUEST_QUEUE_MAX_SIZE_LIMIT,
+                'size_per_replica': constants.LB_REQUEST_QUEUE_MAX_SIZE_LIMIT,
+                'max_size': constants.LB_REQUEST_QUEUE_MAX_SIZE_LIMIT,
+                'max_concurrency_per_replica':
+                    constants.LB_REQUEST_QUEUE_MAX_CONCURRENCY_LIMIT,
+                'max_concurrency':
+                    constants.LB_REQUEST_QUEUE_MAX_CONCURRENCY_LIMIT,
+                'max_request_body_bytes':
+                    constants.LB_REQUEST_QUEUE_MAX_BODY_BYTES_LIMIT,
+            }
+            for field, maximum in field_maximums.items():
+                value = queue_defaults[field]
+                if value > maximum:
+                    with ux_utils.print_exception_no_traceback():
+                        raise ValueError(
+                            f'load_balancer.request_queue.{field} must be <= '
+                            f'{maximum}. Got: {value}')
+            timeout_seconds = queue_defaults['timeout_seconds']
+            if (not isinstance(timeout_seconds, (int, float)) or
+                    isinstance(timeout_seconds, bool) or timeout_seconds <= 0 or
+                    not math.isfinite(timeout_seconds)):
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        'load_balancer.request_queue.timeout_seconds must be '
+                        f'a finite number > 0. Got: {timeout_seconds!r}')
+            if queue_defaults['min_size'] > queue_defaults['max_size']:
+                min_size = queue_defaults['min_size']
+                max_size = queue_defaults['max_size']
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        'load_balancer.request_queue.min_size must not exceed '
+                        f'max_size. Got: min_size={min_size}, '
+                        f'max_size={max_size}')
+            body_memory = (queue_defaults['max_concurrency'] *
+                           queue_defaults['max_request_body_bytes'])
+            if (body_memory
+                    > constants.LB_REQUEST_QUEUE_BODY_MEMORY_BUDGET_BYTES):
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        'load_balancer.request_queue max_concurrency * '
+                        'max_request_body_bytes must not exceed the '
+                        f'{constants.LB_REQUEST_QUEUE_BODY_MEMORY_BUDGET_BYTES}'
+                        f'-byte buffering budget. Got: {body_memory}')
+            lb_request_queue = queue_defaults
         self._readiness_path: str = readiness_path
         self._initial_delay_seconds: int = initial_delay_seconds
         self._readiness_timeout_seconds: int = readiness_timeout_seconds
@@ -272,6 +342,7 @@ class SkyServiceSpec:
         self._lb_max_retries: int | None = lb_max_retries
         self._lb_retry_initial_backoff_seconds: float | None = (
             lb_retry_initial_backoff_seconds)
+        self._lb_request_queue: dict[str, Any] | None = lb_request_queue
         self._graceful_drain_seconds: int | None = graceful_drain_seconds
         # Declares fast-ack work whose lifetime outlives its HTTP envelope.
         # The LB must treat a missing occupancy sample as unknown from the
@@ -325,6 +396,7 @@ class SkyServiceSpec:
         state.setdefault('_lb_retriable_status_codes', None)
         state.setdefault('_lb_max_retries', None)
         state.setdefault('_lb_retry_initial_backoff_seconds', None)
+        state.setdefault('_lb_request_queue', None)
         state.setdefault('_consecutive_failure_threshold_timeout', None)
         # Added with the concurrency autoscaler; old DB rows predate it.
         state.setdefault('_target_concurrency_per_replica', None)
@@ -406,6 +478,8 @@ class SkyServiceSpec:
             service_config['lb_retry_initial_backoff_seconds'] = (
                 load_balancer_section.get('retry_initial_backoff_seconds',
                                           None))
+            service_config['lb_request_queue'] = load_balancer_section.get(
+                'request_queue', None)
         if isinstance(post_data, str):
             try:
                 post_data = json.loads(post_data)
@@ -703,6 +777,7 @@ class SkyServiceSpec:
         add_if_not_none('load_balancer', 'max_retries', self.lb_max_retries)
         add_if_not_none('load_balancer', 'retry_initial_backoff_seconds',
                         self.lb_retry_initial_backoff_seconds)
+        add_if_not_none('load_balancer', 'request_queue', self.lb_request_queue)
         add_if_not_none('readiness_probe', 'headers', self._readiness_headers)
         add_if_not_none('replica_policy', 'min_replicas', self.min_replicas)
         add_if_not_none('replica_policy', 'max_replicas', self.max_replicas)
@@ -883,6 +958,10 @@ class SkyServiceSpec:
         return self._lb_retry_initial_backoff_seconds
 
     @property
+    def lb_request_queue(self) -> dict[str, Any] | None:
+        return self._lb_request_queue
+
+    @property
     def min_replicas(self) -> int:
         return self._min_replicas
 
@@ -1012,6 +1091,8 @@ class SkyServiceSpec:
             lb_retry_initial_backoff_seconds=override.pop(
                 'lb_retry_initial_backoff_seconds',
                 self._lb_retry_initial_backoff_seconds),
+            lb_request_queue=override.pop('lb_request_queue',
+                                          self._lb_request_queue),
             graceful_drain_seconds=override.pop('graceful_drain_seconds',
                                                 self._graceful_drain_seconds),
             graceful_drain_async_occupancy=override.pop(

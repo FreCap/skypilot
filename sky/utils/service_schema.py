@@ -101,6 +101,48 @@ def get_service_schema():
                         'type': 'number',
                         'exclusiveMinimum': 0,
                     },
+                    # Effective queue size is min(max_size, max(min_size,
+                    # ready_replicas * size_per_replica)).
+                    'request_queue': {
+                        'type': 'object',
+                        'additionalProperties': False,
+                        'properties': {
+                            'min_size': {
+                                'type': 'integer',
+                                'minimum': 0,
+                                'maximum': 2000,
+                            },
+                            'size_per_replica': {
+                                'type': 'integer',
+                                'minimum': 0,
+                                'maximum': 2000,
+                            },
+                            'max_size': {
+                                'type': 'integer',
+                                'minimum': 1,
+                                'maximum': 2000,
+                            },
+                            'max_concurrency_per_replica': {
+                                'type': 'integer',
+                                'minimum': 1,
+                                'maximum': 128,
+                            },
+                            'max_concurrency': {
+                                'type': 'integer',
+                                'minimum': 1,
+                                'maximum': 128,
+                            },
+                            'timeout_seconds': {
+                                'type': 'number',
+                                'exclusiveMinimum': 0,
+                            },
+                            'max_request_body_bytes': {
+                                'type': 'integer',
+                                'minimum': 1,
+                                'maximum': 16777216,
+                            },
+                        },
+                    },
                 },
             },
             'pool': {
