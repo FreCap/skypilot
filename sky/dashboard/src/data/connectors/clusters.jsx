@@ -425,57 +425,74 @@ export async function getClusterJobs({ clusterName, workspace }) {
   }
 }
 
-export function useClusterDetails({ cluster, job = null }) {
+export function useClusterDetails({ cluster }) {
   const [clusterData, setClusterData] = useState(null);
   const [clusterJobData, setClusterJobData] = useState(null);
   const [loadingClusterData, setLoadingClusterData] = useState(true);
   const [loadingClusterJobData, setLoadingClusterJobData] = useState(true);
+  const clusterRequestVersionRef = useRef(0);
+  const clusterJobsRequestVersionRef = useRef(0);
+  const activeClusterRef = useRef(cluster);
 
   // Separate loading states - cluster details vs cluster jobs
   const clusterDetailsLoading = loadingClusterData;
   const clusterJobsLoading = loadingClusterJobData;
 
-  const fetchClusterData = useCallback(async () => {
-    if (cluster) {
+  const fetchClusterData = useCallback(
+    async (requestVersion) => {
+      const isCurrentRequest = () =>
+        clusterRequestVersionRef.current === requestVersion;
       try {
         setLoadingClusterData(true);
         // Use dashboard cache for cluster data
         const data = await dashboardCache.get(getClusters, [
           { clusterNames: [cluster] },
         ]);
+        if (!isCurrentRequest()) {
+          return null;
+        }
         if (data.length > 0) {
           setClusterData(data[0]); // Assuming getClusters returns an array
           return data[0]; // Return the data for use in fetchClusterJobData
-        } else {
-          console.error('No cluster data found for cluster:', cluster);
-          return null;
         }
+        console.error('No cluster data found for cluster:', cluster);
+        return null;
       } catch (error) {
-        console.error('Error fetching cluster data:', error);
+        if (isCurrentRequest()) {
+          console.error('Error fetching cluster data:', error);
+        }
         return null;
       } finally {
-        setLoadingClusterData(false);
+        if (isCurrentRequest()) {
+          setLoadingClusterData(false);
+        }
       }
-    }
-    return null;
-  }, [cluster]);
+    },
+    [cluster]
+  );
 
   const fetchClusterJobData = useCallback(
-    async (workspace) => {
-      if (cluster) {
-        try {
-          setLoadingClusterJobData(true);
-          // Use dashboard cache for cluster jobs
-          const data = await dashboardCache.get(getClusterJobs, [
-            {
-              clusterName: cluster,
-              workspace: workspace || 'default',
-            },
-          ]);
+    async (workspace, requestVersion) => {
+      const isCurrentRequest = () =>
+        clusterJobsRequestVersionRef.current === requestVersion;
+      try {
+        setLoadingClusterJobData(true);
+        // Use dashboard cache for cluster jobs
+        const data = await dashboardCache.get(getClusterJobs, [
+          {
+            clusterName: cluster,
+            workspace: workspace || 'default',
+          },
+        ]);
+        if (isCurrentRequest()) {
           setClusterJobData(data);
-        } catch (error) {
+        }
+      } catch (error) {
+        if (isCurrentRequest()) {
           console.error('Error fetching cluster job data:', error);
-        } finally {
+        }
+      } finally {
+        if (isCurrentRequest()) {
           setLoadingClusterJobData(false);
         }
       }
@@ -483,25 +500,58 @@ export function useClusterDetails({ cluster, job = null }) {
     [cluster]
   );
 
+  const fetchData = useCallback(
+    async ({ invalidateJobs = false } = {}) => {
+      const clusterRequestVersion = clusterRequestVersionRef.current + 1;
+      clusterRequestVersionRef.current = clusterRequestVersion;
+      const clusterJobsRequestVersion =
+        clusterJobsRequestVersionRef.current + 1;
+      clusterJobsRequestVersionRef.current = clusterJobsRequestVersion;
+
+      if (!cluster) {
+        setClusterData(null);
+        setClusterJobData(null);
+        setLoadingClusterData(false);
+        setLoadingClusterJobData(false);
+        return;
+      }
+
+      // The jobs request cannot start until the cluster workspace is known, but
+      // its loading state belongs to this request chain immediately.
+      setLoadingClusterJobData(true);
+      const clusterInfo = await fetchClusterData(clusterRequestVersion);
+      if (clusterInfo) {
+        if (invalidateJobs) {
+          dashboardCache.invalidate(getClusterJobs, [
+            {
+              clusterName: cluster,
+              workspace: clusterInfo.workspace || 'default',
+            },
+          ]);
+        }
+        await fetchClusterJobData(
+          clusterInfo.workspace,
+          clusterJobsRequestVersion
+        );
+      } else if (
+        clusterJobsRequestVersionRef.current === clusterJobsRequestVersion
+      ) {
+        setLoadingClusterJobData(false);
+      }
+    },
+    [cluster, fetchClusterData, fetchClusterJobData]
+  );
+
   const refreshData = useCallback(async () => {
     // Invalidate cache for fresh data
     dashboardCache.invalidate(getClusters, [{ clusterNames: [cluster] }]);
-
-    const clusterInfo = await fetchClusterData();
-    if (clusterInfo) {
-      // Invalidate cluster jobs cache for fresh data
-      dashboardCache.invalidate(getClusterJobs, [
-        {
-          clusterName: cluster,
-          workspace: clusterInfo.workspace || 'default',
-        },
-      ]);
-      await fetchClusterJobData(clusterInfo.workspace);
-    }
-  }, [fetchClusterData, fetchClusterJobData, cluster]);
+    await fetchData({ invalidateJobs: true });
+  }, [fetchData, cluster]);
 
   const refreshClusterJobsOnly = useCallback(async () => {
     if (clusterData) {
+      const requestVersion = clusterJobsRequestVersionRef.current + 1;
+      clusterJobsRequestVersionRef.current = requestVersion;
       // Invalidate only cluster jobs cache for fresh data
       dashboardCache.invalidate(getClusterJobs, [
         {
@@ -509,20 +559,22 @@ export function useClusterDetails({ cluster, job = null }) {
           workspace: clusterData.workspace || 'default',
         },
       ]);
-      await fetchClusterJobData(clusterData.workspace);
+      await fetchClusterJobData(clusterData.workspace, requestVersion);
     }
   }, [fetchClusterJobData, clusterData, cluster]);
 
   useEffect(() => {
-    const initializeData = async () => {
-      const clusterInfo = await fetchClusterData();
-      if (clusterInfo) {
-        // Start loading cluster jobs independently
-        fetchClusterJobData(clusterInfo.workspace);
-      }
+    if (activeClusterRef.current !== cluster) {
+      activeClusterRef.current = cluster;
+      setClusterData(null);
+      setClusterJobData(null);
+    }
+    fetchData();
+    return () => {
+      clusterRequestVersionRef.current += 1;
+      clusterJobsRequestVersionRef.current += 1;
     };
-    initializeData();
-  }, [cluster, job, fetchClusterData, fetchClusterJobData]);
+  }, [cluster, fetchData]);
 
   return {
     clusterData,

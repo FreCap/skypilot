@@ -29,6 +29,7 @@ jobs:
           src/components/elements/deployment-version.test.jsx \
           src/components/elements/request-activity-indicator.test.jsx \
           src/data/connectors/client.test.js \
+          src/data/connectors/clusters.test.jsx \
           src/data/connectors/services.test.jsx \
           src/data/connectors/jobs.test.jsx \
           src/data/connectors/jobs-download-logs.test.jsx \
