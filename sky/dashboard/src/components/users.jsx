@@ -1654,6 +1654,7 @@ export function UsersTable({
   }, [refreshDataRef, fetchDataAndProcess]);
 
   useEffect(() => {
+    let disposed = false;
     const initializeData = async () => {
       // Reset loading state when component mounts
       setHasInitiallyLoaded(false);
@@ -1662,6 +1663,7 @@ export function UsersTable({
       // Trigger cache preloading for users page and background preload other pages
       await cachePreloader.preloadForPage('users');
 
+      if (disposed) return;
       fetchDataAndProcess(true); // Show loading on initial load
     };
 
@@ -1674,6 +1676,7 @@ export function UsersTable({
     }, refreshInterval);
     const state = refreshState.current;
     return () => {
+      disposed = true;
       clearInterval(interval);
       state.generation += 1;
       state.active = null;
