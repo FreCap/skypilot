@@ -295,6 +295,46 @@ describe('DashboardCache', () => {
 
       expect(mockFetch.mock.calls.length).toBeGreaterThanOrEqual(2);
     });
+
+    test('synchronous background failure preserves the cache hit and retries later', async () => {
+      let shouldThrow = false;
+      const mockFetch = jest.fn(() => {
+        if (shouldThrow) {
+          throw new Error('sync background failure');
+        }
+        return Promise.resolve({ data: 'seeded' });
+      });
+      const consoleWarn = jest
+        .spyOn(console, 'warn')
+        .mockImplementation(() => {});
+
+      await cache.get(mockFetch, ['x']);
+      shouldThrow = true;
+
+      // A fresh cache hit must not fail just because its best-effort
+      // background revalidation throws before returning a promise.
+      await expect(cache.get(mockFetch, ['x'])).resolves.toEqual({
+        data: 'seeded',
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+      expect(cache.backgroundJobs.size).toBe(0);
+
+      // Cleanup must leave the key live: the next eligible hit starts exactly
+      // one new background refresh instead of being suppressed forever.
+      shouldThrow = false;
+      await cache.get(mockFetch, ['x']);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(mockFetch).toHaveBeenCalledTimes(3);
+      expect(cache.backgroundJobs.size).toBe(0);
+      consoleWarn.mockRestore();
+    });
   });
 
   describe('Real-world scenario: Jobs page load', () => {
