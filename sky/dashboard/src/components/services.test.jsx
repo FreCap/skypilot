@@ -1,5 +1,5 @@
 import React from 'react';
-import { render, act } from '@testing-library/react';
+import { render, act, screen } from '@testing-library/react';
 
 // Mock the shared dashboard cache so we can count fetch invocations
 // without hitting the network.
@@ -16,7 +16,7 @@ jest.mock('@/lib/cache', () => ({
 }));
 
 import dashboardCache from '@/lib/cache';
-import { Services } from '@/components/services';
+import { Services, ServicesTable } from '@/components/services';
 
 const SERVICES_RESPONSE = {
   services: [
@@ -35,6 +35,23 @@ const SERVICES_RESPONSE = {
   ],
   controllerStopped: false,
 };
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  return { promise, resolve, reject };
+}
+
+function responseFor(name) {
+  return {
+    ...SERVICES_RESPONSE,
+    services: [{ ...SERVICES_RESPONSE.services[0], name }],
+  };
+}
 
 // Flush the pending fetch promise chain and any state updates it causes.
 // Repeated rounds give an unstable-callback fetch loop (fetch -> state
@@ -88,5 +105,94 @@ describe('Services fetch wiring', () => {
     });
     await flushFetches();
     expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps the latest interval request in control when an older success finishes', async () => {
+    const oldRequest = deferred();
+    const currentRequest = deferred();
+    dashboardCache.get
+      .mockReturnValueOnce(oldRequest.promise)
+      .mockReturnValueOnce(currentRequest.promise);
+
+    render(<Services />);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      jest.advanceTimersByTime(30000);
+    });
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      oldRequest.resolve(responseFor('stale-service'));
+      await oldRequest.promise;
+    });
+
+    expect(screen.queryByText('stale-service')).not.toBeInTheDocument();
+    expect(screen.getAllByText('Loading...').length).toBeGreaterThan(0);
+
+    await act(async () => {
+      currentRequest.resolve(responseFor('current-service'));
+      await currentRequest.promise;
+    });
+
+    expect(screen.getByText('current-service')).toBeInTheDocument();
+    expect(screen.queryByText('Loading...')).not.toBeInTheDocument();
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not let an older failure erase a newer interval result', async () => {
+    const oldRequest = deferred();
+    const currentRequest = deferred();
+    const consoleError = jest.spyOn(console, 'error').mockImplementation();
+    dashboardCache.get
+      .mockReturnValueOnce(oldRequest.promise)
+      .mockReturnValueOnce(currentRequest.promise);
+
+    render(<Services />);
+    await act(async () => {
+      jest.advanceTimersByTime(30000);
+      currentRequest.resolve(responseFor('current-service'));
+      await currentRequest.promise;
+    });
+    expect(screen.getByText('current-service')).toBeInTheDocument();
+
+    await act(async () => {
+      oldRequest.reject(new Error('stale failure'));
+      await oldRequest.promise.catch(() => {});
+    });
+
+    expect(screen.getByText('current-service')).toBeInTheDocument();
+    expect(consoleError).not.toHaveBeenCalled();
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+    consoleError.mockRestore();
+  });
+
+  it('invalidates request ownership when the table unmounts', async () => {
+    const pendingRequest = deferred();
+    const setLoading = jest.fn();
+    const onFetched = jest.fn();
+    dashboardCache.get.mockReturnValueOnce(pendingRequest.promise);
+
+    const { unmount } = render(
+      <ServicesTable
+        refreshInterval={30000}
+        loading={false}
+        setLoading={setLoading}
+        refreshDataRef={{ current: null }}
+        onFetched={onFetched}
+      />
+    );
+    expect(setLoading).toHaveBeenCalledWith(true);
+    setLoading.mockClear();
+
+    unmount();
+    await act(async () => {
+      pendingRequest.resolve(SERVICES_RESPONSE);
+      await pendingRequest.promise;
+    });
+
+    expect(onFetched).not.toHaveBeenCalled();
+    expect(setLoading).not.toHaveBeenCalled();
+    expect(dashboardCache.get).toHaveBeenCalledTimes(1);
   });
 });
