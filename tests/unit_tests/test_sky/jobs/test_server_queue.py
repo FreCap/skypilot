@@ -764,6 +764,9 @@ class TestDumpManagedJobQueue:
                             'get_managed_jobs_highest_priority',
                             fake_get_managed_jobs_highest_priority)
         monkeypatch.setattr(jobs_utils.managed_job_state,
+                            'get_latest_recovery_and_pending_reasons',
+                            lambda recovering_ids, pending_ids: ({}, {}))
+        monkeypatch.setattr(jobs_utils.managed_job_state,
                             'get_pool_from_job_id', fake_get_pool_from_job_id)
         monkeypatch.setattr(jobs_utils.managed_job_state,
                             'get_pool_submit_info', fake_get_pool_submit_info)
@@ -1017,3 +1020,24 @@ class TestDumpManagedJobQueue:
 
         job = decoded['jobs'][0]
         assert 'In backoff, waiting for resources' in job['details']
+
+    def test_dump_managed_job_queue_pending_reason(self, monkeypatch):
+        jobs = [
+            self._make_test_job(
+                1,
+                status=managed_job_state.ManagedJobStatus.PENDING,
+                schedule_state=managed_job_state.ManagedJobScheduleState.ALIVE,
+            ),
+        ]
+        self._patch_dependencies(monkeypatch, jobs)
+        monkeypatch.setattr(
+            jobs_utils.managed_job_state,
+            'get_latest_recovery_and_pending_reasons',
+            lambda recovering_ids, pending_ids: ({}, {
+                1: 'Job is in backoff'
+            }))
+
+        result = jobs_utils.dump_managed_job_queue()
+        decoded = jobs_utils.message_utils.decode_payload(result)
+
+        assert decoded['jobs'][0]['details'] == 'Job is in backoff'

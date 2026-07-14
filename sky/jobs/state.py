@@ -3133,6 +3133,27 @@ async def scheduler_set_launching_async(job_id: int):
         await session.commit()
 
 
+async def scheduler_set_backoff_async(job_id: int) -> None:
+    """Transition a launching job to resource backoff."""
+
+    async def _op(session: sql_async.AsyncSession) -> int:
+        result = await session.execute(
+            sqlalchemy.update(job_info_table).where(
+                sqlalchemy.and_(
+                    job_info_table.c.spot_job_id == job_id,
+                    job_info_table.c.schedule_state ==
+                    ManagedJobScheduleState.LAUNCHING.value,
+                )).values({
+                    job_info_table.c.schedule_state:
+                        ManagedJobScheduleState.ALIVE_BACKOFF.value
+                }))
+        return result.rowcount
+
+    await _retry_schedule_state_update(job_id,
+                                       ManagedJobScheduleState.ALIVE_BACKOFF,
+                                       _op)
+
+
 async def scheduler_set_alive_async(job_id: int) -> None:
     """Do not call without holding the scheduler lock."""
 
@@ -4552,36 +4573,41 @@ def get_job_events(job_id: int,
     } for row in rows]
 
 
-def get_latest_recovery_reasons(job_ids: list[int]) -> dict[int, str]:
-    """Return {job_id: reason} for the most recent RECOVERING event per job.
+def _get_latest_event_reasons(
+    job_ids_by_status: dict[ManagedJobStatus, list[int]]
+) -> dict[ManagedJobStatus, dict[int, str]]:
+    """Return the latest event reason for each requested status and job."""
+    reasons: dict[ManagedJobStatus, dict[int, str]] = {
+        status: {} for status in job_ids_by_status
+    }
+    conditions = [
+        sqlalchemy.and_(
+            job_events_table.c.new_status == status.value,
+            job_events_table.c.spot_job_id.in_(job_ids),
+        ) for status, job_ids in job_ids_by_status.items() if job_ids
+    ]
+    if not conditions:
+        return reasons
 
-    Only jobs with a non-empty RECOVERING reason are included. Used to surface
-    why a job is currently recovering (e.g. an OOMKilled pod) in the
-    `details` column. A single batched query keeps this off the per-job path.
-    """
-    if not job_ids:
-        return {}
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         ranked_events = sqlalchemy.select(
             job_events_table.c.spot_job_id.label('spot_job_id'),
+            job_events_table.c.new_status.label('new_status'),
             job_events_table.c.reason.label('reason'),
             sqlalchemy.func.row_number().over(
-                partition_by=job_events_table.c.spot_job_id,
+                partition_by=(job_events_table.c.spot_job_id,
+                              job_events_table.c.new_status),
                 order_by=(
                     job_events_table.c.timestamp.desc(),
                     job_events_table.c.id.desc(),
                 ),
             ).label('rank'),
-        ).where(
-            sqlalchemy.and_(
-                job_events_table.c.spot_job_id.in_(job_ids),
-                job_events_table.c.new_status ==
-                ManagedJobStatus.RECOVERING.value,
-            )).subquery('ranked_recovery_events')
+        ).where(sqlalchemy.or_(*conditions)).subquery('ranked_job_events')
         rows = session.execute(
             sqlalchemy.select(
                 ranked_events.c.spot_job_id,
+                ranked_events.c.new_status,
                 ranked_events.c.reason,
             ).where(
                 sqlalchemy.and_(
@@ -4589,7 +4615,27 @@ def get_latest_recovery_reasons(job_ids: list[int]) -> dict[int, str]:
                     ranked_events.c.reason.is_not(None),
                     ranked_events.c.reason != '',
                 ))).fetchall()
-    return {spot_job_id: reason for spot_job_id, reason in rows}
+    for spot_job_id, new_status, reason in rows:
+        reasons[ManagedJobStatus(new_status)][spot_job_id] = reason
+    return reasons
+
+
+def get_latest_recovery_and_pending_reasons(
+        recovering_job_ids: list[int],
+        pending_job_ids: list[int]) -> tuple[dict[int, str], dict[int, str]]:
+    """Return latest recovery and pending reasons in one database query."""
+    reasons = _get_latest_event_reasons({
+        ManagedJobStatus.RECOVERING: recovering_job_ids,
+        ManagedJobStatus.PENDING: pending_job_ids,
+    })
+    return (reasons[ManagedJobStatus.RECOVERING],
+            reasons[ManagedJobStatus.PENDING])
+
+
+def get_latest_recovery_reasons(job_ids: list[int]) -> dict[int, str]:
+    """Return {job_id: reason} for the latest RECOVERING event per job."""
+    recovery_reasons, _ = get_latest_recovery_and_pending_reasons(job_ids, [])
+    return recovery_reasons
 
 
 async def cleanup_job_events_with_retention_async(

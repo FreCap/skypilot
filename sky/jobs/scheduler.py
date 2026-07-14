@@ -54,6 +54,7 @@ import uuid
 
 import filelock
 
+from sky import exceptions
 from sky import sky_logging
 from sky import skypilot_config
 from sky.adaptors import common as adaptors_common
@@ -422,8 +423,9 @@ async def scheduled_launch(
 
     try:
         yield
-    except Exception as e:
-        raise e
+    except exceptions.NoClusterLaunchedError:
+        await state.scheduler_set_backoff_async(job_id)
+        raise
     else:
         await state.scheduler_set_alive_async(job_id)
     finally:
