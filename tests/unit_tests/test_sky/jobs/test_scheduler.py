@@ -6,9 +6,13 @@ moment another replica's refresh daemon could acquire the consolidation
 lock. The helper must be best-effort — it runs on shutdown paths where
 raising would either prevent SIGTERM or stall drain.
 """
+import asyncio
 import signal
 from unittest import mock
 
+import pytest
+
+from sky import exceptions
 from sky.jobs import scheduler
 from sky.jobs import state as managed_job_state
 
@@ -25,6 +29,41 @@ def _submission_files(tmp_path):
     user.write_text('name: user\n', encoding='utf-8')
     env.write_text('KEY=value\n', encoding='utf-8')
     return dag, user, env
+
+
+@pytest.mark.asyncio
+async def test_scheduled_launch_records_backoff_and_releases_slot():
+    starting: set[int] = set()
+    starting_lock = asyncio.Lock()
+    starting_signal = asyncio.Condition(starting_lock)
+
+    with mock.patch.object(scheduler.state,
+                           'get_pool_from_job_id',
+                           return_value=None), mock.patch.object(
+                               scheduler.state,
+                               'get_execution_from_job_id',
+                               return_value=None), mock.patch.object(
+                                   scheduler.state,
+                                   'scheduler_set_launching_async',
+                                   new_callable=mock.AsyncMock) as set_launching, \
+            mock.patch.object(
+                scheduler.state,
+                'scheduler_set_backoff_async',
+                new_callable=mock.AsyncMock) as set_backoff, \
+            mock.patch.object(
+                scheduler.state,
+                'scheduler_set_alive_async',
+                new_callable=mock.AsyncMock) as set_alive:
+        with pytest.raises(exceptions.NoClusterLaunchedError):
+            async with scheduler.scheduled_launch(7, starting, starting_lock,
+                                                  starting_signal):
+                assert starting == {7}
+                raise exceptions.NoClusterLaunchedError()
+
+    assert starting == set()
+    set_launching.assert_awaited_once_with(7)
+    set_backoff.assert_awaited_once_with(7)
+    set_alive.assert_not_awaited()
 
 
 def test_submit_jobs_uses_one_snapshot_and_filters_live_controllers(tmp_path):

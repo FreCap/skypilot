@@ -180,8 +180,9 @@ def _cluster_handle_not_required(fields: list[str]) -> bool:
 def _format_job_details(*,
                         job: dict[str, Any],
                         highest_blocking_priority: int,
-                        recovery_reason: str | None = None) -> None:
-    """Add details about schedule state / backoff / recovery."""
+                        recovery_reason: str | None = None,
+                        pending_reason: str | None = None) -> None:
+    """Add details about schedule state, failures, and pending reasons."""
     state_details = None
     if job['schedule_state'] == 'ALIVE_BACKOFF':
         state_details = 'In backoff, waiting for resources'
@@ -218,6 +219,8 @@ def _format_job_details(*,
             if hint is not None:
                 detail += f' ({hint})'
         job['details'] = detail
+    elif pending_reason:
+        job['details'] = ' '.join(pending_reason.split())
     else:
         job['details'] = None
 
@@ -442,25 +445,32 @@ def get_managed_job_queue(
 
     _populate_job_records_from_handles(jobs_with_handle)
 
-    # Batch-fetch the reason a recovering job is recovering (e.g. an OOMKilled
-    # pod), so it can be surfaced in `details`. Scoped to RECOVERING jobs (a
-    # small, transient subset) and done in one query to stay off the per-job
+    # Batch-fetch why a job is recovering or still pending. Both reasons are
+    # persisted as job events and fetched together to stay off the per-job
     # path. `job['status']` is already stringified above.
     recovery_reasons: dict[int, str] = {}
+    pending_reasons: dict[int, str] = {}
     if not fields or 'details' in fields:
         recovering_job_ids = [
             job['job_id'] for job in jobs if job['status'] ==
             managed_job_state.ManagedJobStatus.RECOVERING.value
         ]
-        recovery_reasons = managed_job_state.get_latest_recovery_reasons(
-            recovering_job_ids)
+        pending_job_ids = [
+            job['job_id']
+            for job in jobs
+            if job['status'] == managed_job_state.ManagedJobStatus.PENDING.value
+        ]
+        recovery_reasons, pending_reasons = (
+            managed_job_state.get_latest_recovery_and_pending_reasons(
+                recovering_job_ids, pending_job_ids))
 
     for job in jobs:
         if not fields or 'details' in fields:
             _format_job_details(
                 job=job,
                 highest_blocking_priority=highest_blocking_priority,
-                recovery_reason=recovery_reasons.get(job['job_id']))
+                recovery_reason=recovery_reasons.get(job['job_id']),
+                pending_reason=pending_reasons.get(job['job_id']))
 
         # Derive is_job_group from execution column
         job['is_job_group'] = (

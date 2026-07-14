@@ -440,6 +440,30 @@ class TestGetManagedJobsHighestPriority:
         assert priority == 250
 
 
+class TestSchedulerBackoffState:
+    """Tests for scheduler launch-backoff transitions."""
+
+    def test_launching_transitions_to_backoff(self, _mock_managed_jobs_db_conn):
+        job_id = state.set_job_info_without_job_id(name='job1',
+                                                   workspace='ws1',
+                                                   entrypoint='ep1',
+                                                   pool=None,
+                                                   pool_hash=None,
+                                                   user_hash='user1')
+        state.set_pending(job_id, 0, 'task0', '{}', '{}')
+        state.scheduler_set_waiting([job_id], '/tmp/dag.yaml', '/tmp/user.yaml',
+                                    '/tmp/env', None, 100)
+
+        async def _transition():
+            await state.scheduler_set_launching_async(job_id)
+            await state.scheduler_set_backoff_async(job_id)
+
+        asyncio.run(_transition())
+
+        assert (state.get_job_schedule_state(job_id) ==
+                state.ManagedJobScheduleState.ALIVE_BACKOFF)
+
+
 class TestBuildManagedJobsWithFiltersNoStatusQuery:
     """Test class for build_managed_jobs_with_filters_no_status_query function."""
 
@@ -807,6 +831,33 @@ class TestGetLatestRecoveryReasons:
 
     def test_empty_job_ids(self, _mock_managed_jobs_db_conn):
         assert state.get_latest_recovery_reasons([]) == {}
+        assert state.get_latest_recovery_and_pending_reasons([], []) == ({}, {})
+
+    def test_recovery_and_pending_reasons_share_one_query(
+            self, _mock_managed_jobs_db_conn):
+        early = datetime.datetime(2026, 1, 1, 0, 0, 0)
+        late = datetime.datetime(2026, 1, 1, 0, 5, 0)
+        state.add_job_event(1,
+                            0,
+                            state.ManagedJobStatus.PENDING,
+                            'Job submitted to queue',
+                            timestamp=early)
+        state.add_job_event(1,
+                            0,
+                            state.ManagedJobStatus.PENDING,
+                            'Job is in backoff',
+                            timestamp=late)
+        state.add_job_event(2,
+                            0,
+                            state.ManagedJobStatus.RECOVERING,
+                            'preempted',
+                            timestamp=late)
+
+        recovery, pending = (state.get_latest_recovery_and_pending_reasons([2],
+                                                                           [1]))
+
+        assert recovery == {2: 'preempted'}
+        assert pending == {1: 'Job is in backoff'}
 
     def test_latest_reason_wins_and_filters(self, _mock_managed_jobs_db_conn):
         early = datetime.datetime(2026, 1, 1, 0, 0, 0)
