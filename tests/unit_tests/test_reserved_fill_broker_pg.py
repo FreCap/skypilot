@@ -193,6 +193,58 @@ class TestGroupedReplicaSnapshotPG:
         assert all(len(infos) == 2 for infos in grouped.values())
 
 
+class TestServiceLivenessSnapshotPG:
+    """The slim liveness query is portable to the production DB dialect."""
+
+    def test_filters_mode_and_requires_version_row(self, broker_engine,
+                                                   monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        assert serve_state.add_service(name='serve-a',
+                                       controller_job_id=1,
+                                       policy='policy',
+                                       requested_resources_str='1x[CPU:1+]',
+                                       load_balancing_policy='round_robin',
+                                       status=serve_state.ServiceStatus.READY,
+                                       tls_encrypted=False,
+                                       pool=False,
+                                       controller_pid=11,
+                                       entrypoint='entry',
+                                       spec=None,
+                                       yaml_content='service: {}',
+                                       controller_ip='10.0.0.1',
+                                       service_hash='hash-a',
+                                       resource_scope='scope-a')
+        assert serve_state.add_service(name='pool-a',
+                                       controller_job_id=2,
+                                       policy='policy',
+                                       requested_resources_str='1x[CPU:1+]',
+                                       load_balancing_policy='round_robin',
+                                       status=serve_state.ServiceStatus.READY,
+                                       tls_encrypted=False,
+                                       pool=True,
+                                       controller_pid=22,
+                                       entrypoint='entry',
+                                       spec=None,
+                                       yaml_content='service: {}')
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            session.execute(serve_state.services_table.insert().values(
+                name='serve-orphan',
+                controller_job_id=3,
+                status=serve_state.ServiceStatus.READY.value,
+                requested_resources_str='1x[CPU:1+]',
+                pool=0,
+                controller_pid=33,
+                hash='orphan-hash',
+                entrypoint='entry'))
+            session.commit()
+
+        records = serve_state.get_service_liveness_snapshots(pool=False)
+
+        assert [record['name'] for record in records] == ['serve-a']
+        assert records[0]['status'] == serve_state.ServiceStatus.READY
+
+
 # TestSqliteFenceBusySkip is deliberately not re-collected here: it pins
 # sqlite-only busy-degradation semantics (the PG fence blocks on the FOR
 # SHARE row lock instead of returning False).

@@ -321,28 +321,20 @@ class TestServeModeFilteredSweeps:
         scanned = []
         status_updates = []
 
-        def _get_glob_service_names(names, pool=None):
-            if pool is None:
-                return list(mixed_names)
-            return [
-                name for name in mixed_names if name.startswith('pool-') == pool
-            ]
-
-        def _fake_status(name, *, pool, **kwargs):
-            del kwargs
-            scanned.append(name)
-            return {
+        def _get_liveness_snapshots(pool):
+            records = [{
                 'name': name,
                 'status': serve_state.ServiceStatus.READY,
                 'controller_pid': None,
                 'controller_ip': None,
                 'hash': f'hash-{name}',
-                'pool': pool,
-            }
+                'resource_scope': 'scope-a',
+            } for name in mixed_names if name.startswith('pool-') == pool]
+            scanned.extend(record['name'] for record in records)
+            return records
 
-        monkeypatch.setattr(serve_state, 'get_glob_service_names',
-                            _get_glob_service_names)
-        monkeypatch.setattr(serve_utils, '_get_service_status', _fake_status)
+        monkeypatch.setattr(serve_state, 'get_service_liveness_snapshots',
+                            _get_liveness_snapshots)
         monkeypatch.setattr(
             serve_state, 'set_service_status_and_active_versions_if_owner',
             lambda *args, **kwargs: status_updates.append((args, kwargs)))

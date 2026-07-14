@@ -45,6 +45,7 @@ def test_ha_recovery_pool_liveness_skips_pool_yaml(tmp_path):
 
 def test_update_pool_status_liveness_skips_pool_yaml():
     record = {
+        'name': 'pool-a',
         'status': serve_state.ServiceStatus.READY,
         'controller_pid': 123,
         'controller_ip': '127.0.0.1',
@@ -53,21 +54,17 @@ def test_update_pool_status_liveness_skips_pool_yaml():
         'resource_scope': 'scope-a',
     }
     with mock.patch.object(serve_state,
-                           'get_glob_service_names',
-                           return_value=['pool-a']), \
+                           'get_service_liveness_snapshots',
+                           return_value=[record]) as snapshot, \
          mock.patch.object(serve_utils,
-                           '_get_service_status',
-                           return_value=record) as get_status, \
+                           '_get_service_status') as full_status, \
          mock.patch.object(serve_utils,
                            '_controller_process_alive',
                            return_value=True):
         serve_utils.update_service_status(pool=True)
 
-    get_status.assert_called_once_with('pool-a',
-                                       pool=True,
-                                       with_replica_info=False,
-                                       with_yaml=False,
-                                       with_target_num_replicas=False)
+    snapshot.assert_called_once_with(pool=True)
+    full_status.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -88,11 +85,8 @@ def test_update_status_liveness_skips_target_fetch(controller_pid,
         'resource_scope': 'scope-a',
     }
     with mock.patch.object(serve_state,
-                           'get_glob_service_names',
-                           return_value=['serve-a']), \
-         mock.patch.object(serve_state,
-                           'get_service_from_name',
-                           return_value=record), \
+                           'get_service_liveness_snapshots',
+                           return_value=[record]) as snapshot, \
          mock.patch.object(
              serve_utils, '_get_to_controller_with_retry') as target_fetch, \
          mock.patch.object(serve_utils,
@@ -103,6 +97,7 @@ def test_update_status_liveness_skips_target_fetch(controller_pid,
              'set_service_status_and_active_versions_if_owner') as status_write:
         serve_utils.update_service_status(pool=False)
 
+    snapshot.assert_called_once_with(pool=False)
     target_fetch.assert_not_called()
     assert status_write.call_count == expected_status_writes
     if expected_status_writes:
@@ -113,3 +108,29 @@ def test_update_status_liveness_skips_target_fetch(controller_pid,
             '127.0.0.1',
             serve_state.ServiceStatus.CONTROLLER_FAILED,
             expected_status=serve_state.ServiceStatus.READY)
+
+
+@pytest.mark.parametrize('terminal_status',
+                         serve_state.ServiceStatus.terminal_statuses())
+def test_update_status_preserves_terminal_lifecycle_state(terminal_status):
+    record = {
+        'name': 'serve-a',
+        'status': terminal_status,
+        'controller_pid': None,
+        'controller_ip': '127.0.0.1',
+        'controller_job_id': None,
+        'hash': 'incarnation-a',
+        'resource_scope': 'scope-a',
+    }
+    with mock.patch.object(serve_state,
+                           'get_service_liveness_snapshots',
+                           return_value=[record]), \
+         mock.patch.object(serve_utils,
+                           '_controller_process_alive') as process_alive, \
+         mock.patch.object(
+             serve_state,
+             'set_service_status_and_active_versions_if_owner') as status_write:
+        serve_utils.update_service_status(pool=False)
+
+    process_alive.assert_not_called()
+    status_write.assert_not_called()

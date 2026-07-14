@@ -316,6 +316,50 @@ def test_get_services_uses_single_query_for_multiple_rows(_mock_serve_db):
     ]
 
 
+def test_get_service_liveness_snapshots_is_one_slim_version_backed_query(
+        _mock_serve_db, monkeypatch):
+    assert _add_minimal_service('serve-b',
+                                controller_ip='10.0.0.2',
+                                controller_pid=22,
+                                service_hash='hash-b',
+                                resource_scope='scope-b') is True
+    assert _add_minimal_service('serve-a',
+                                controller_ip='10.0.0.1',
+                                controller_pid=11,
+                                service_hash='hash-a',
+                                resource_scope='scope-a') is True
+    assert _add_minimal_service('pool-a', pool=True) is True
+    _insert_orphan_service_row(_mock_serve_db, 'serve-orphan')
+    serve_state.set_service_status_and_active_versions(
+        'serve-b', serve_state.ServiceStatus.FAILED_CLEANUP)
+
+    def _unexpected_spec_unpickle(_):
+        raise AssertionError('liveness snapshots must not deserialize specs')
+
+    monkeypatch.setattr(serve_state.pickle, 'loads', _unexpected_spec_unpickle)
+    with _count_sql_statements(_mock_serve_db) as counts:
+        records = serve_state.get_service_liveness_snapshots(pool=False)
+
+    assert counts['n'] == 1, counts
+    assert records == [{
+        'name': 'serve-a',
+        'status': serve_state.ServiceStatus.CONTROLLER_INIT,
+        'controller_job_id': 1,
+        'controller_pid': 11,
+        'controller_ip': '10.0.0.1',
+        'hash': 'hash-a',
+        'resource_scope': 'scope-a',
+    }, {
+        'name': 'serve-b',
+        'status': serve_state.ServiceStatus.FAILED_CLEANUP,
+        'controller_job_id': 1,
+        'controller_pid': 22,
+        'controller_ip': '10.0.0.2',
+        'hash': 'hash-b',
+        'resource_scope': 'scope-b',
+    }]
+
+
 class TestAddServiceWritesControllerIp:
     """`add_service` should persist the new controller_ip column when caller
     provides POD_IP. Older callers that don't pass it must still work
