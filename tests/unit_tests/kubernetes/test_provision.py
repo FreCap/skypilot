@@ -13,6 +13,7 @@ from sky.backends import cloud_vm_ray_backend
 from sky.provision import common as provision_common
 from sky.provision.kubernetes import config as config_lib
 from sky.provision.kubernetes import instance
+from sky.provision.kubernetes import pod_scheduling
 from sky.provision.kubernetes import utils as kubernetes_utils
 from sky.provision.kubernetes.instance import logger
 from sky.utils import subprocess_utils
@@ -1415,6 +1416,25 @@ class TestWaitForPodsToScheduleAutoscaleTimeout:
     detected, the deadline is extended from the detection moment.
     """
 
+    def test_empty_pod_set_is_a_noop(self, monkeypatch):
+        """An empty creation result must not touch config or Kubernetes."""
+        config_lookup = mock.MagicMock()
+        core_api = mock.MagicMock()
+        monkeypatch.setattr('sky.skypilot_config.get_effective_region_config',
+                            config_lookup)
+        monkeypatch.setattr('sky.adaptors.kubernetes.core_api', core_api)
+
+        instance._wait_for_pods_to_schedule(
+            namespace='ns',
+            context='test-context',
+            new_nodes=[],
+            timeout=5,
+            cluster_name='cn',
+            create_pods_start=mock.sentinel.create_pods_start)
+
+        config_lookup.assert_not_called()
+        core_api.assert_not_called()
+
     class _FakeClock:
         """Deterministic clock that advances only when sleep() is called.
 
@@ -1490,22 +1510,22 @@ class TestWaitForPodsToScheduleAutoscaleTimeout:
                             lambda *a, **kw: core_api)
 
         # 3. Autoscale detection — return caller-supplied flag.
-        monkeypatch.setattr(instance, '_cluster_had_autoscale_event',
+        monkeypatch.setattr(pod_scheduling, '_cluster_had_autoscale_event',
                             lambda *a, **kw: autoscale_detected)
-        monkeypatch.setattr(instance, '_cluster_maybe_autoscaling',
+        monkeypatch.setattr(pod_scheduling, '_cluster_maybe_autoscaling',
                             lambda *a, **kw: autoscale_detected)
 
         # 4. Replace the slow error-surfacing path with a simple marker
         #    so we can cheaply detect that the timeout path fired.
         raise_errors = mock.MagicMock(
             side_effect=config_lib.KubernetesError('simulated-timeout'))
-        monkeypatch.setattr(instance, '_raise_pod_scheduling_errors',
+        monkeypatch.setattr(pod_scheduling, '_raise_pod_scheduling_errors',
                             raise_errors)
 
         # 5. Deterministic clock — advances only via sleep().
         clock = self._FakeClock()
-        monkeypatch.setattr(instance.time, 'time', clock.time)
-        monkeypatch.setattr(instance.time, 'sleep', clock.sleep)
+        monkeypatch.setattr(pod_scheduling.time, 'time', clock.time)
+        monkeypatch.setattr(pod_scheduling.time, 'sleep', clock.sleep)
 
         # 6. No-op spinner update to avoid rich_utils side effects.
         monkeypatch.setattr('sky.utils.rich_utils.force_update_status',
@@ -1829,18 +1849,18 @@ class TestWaitForPodsToScheduleBoundPod:
         monkeypatch.setattr('sky.adaptors.kubernetes.core_api',
                             lambda *a, **kw: core_api)
 
-        monkeypatch.setattr(instance, '_cluster_had_autoscale_event',
+        monkeypatch.setattr(pod_scheduling, '_cluster_had_autoscale_event',
                             lambda *a, **kw: False)
-        monkeypatch.setattr(instance, '_cluster_maybe_autoscaling',
+        monkeypatch.setattr(pod_scheduling, '_cluster_maybe_autoscaling',
                             lambda *a, **kw: False)
 
         raise_errors = mock.MagicMock(
             side_effect=config_lib.KubernetesError('simulated-timeout'))
-        monkeypatch.setattr(instance, '_raise_pod_scheduling_errors',
+        monkeypatch.setattr(pod_scheduling, '_raise_pod_scheduling_errors',
                             raise_errors)
         monkeypatch.setattr('sky.utils.rich_utils.force_update_status',
                             lambda *a, **kw: None)
-        return raise_errors
+        return raise_errors, core_api
 
     @pytest.mark.parametrize('node_name, pod_scheduled_condition', [
         ('node-1', False),
@@ -1859,7 +1879,7 @@ class TestWaitForPodsToScheduleBoundPod:
             cluster_name_on_cloud,
             node_name=node_name,
             pod_scheduled_condition=pod_scheduled_condition)
-        raise_errors = self._wire_common_mocks(monkeypatch, pod)
+        raise_errors, core_api = self._wire_common_mocks(monkeypatch, pod)
 
         node = self._make_node('pod-0', cluster_name_on_cloud)
         import datetime  # pylint: disable=import-outside-toplevel
@@ -1878,6 +1898,7 @@ class TestWaitForPodsToScheduleBoundPod:
             'A bound pod (scheduler placed it) must not trigger the '
             'out-of-resources error path even though the kubelet has not '
             'populated container_statuses yet.')
+        core_api.list_namespaced_pod.assert_called_once()
 
     def test_unbound_pending_pod_times_out_and_raises(self, monkeypatch):
         """A genuinely unschedulable pod (no node_name, no PodScheduled=True)
@@ -1887,9 +1908,9 @@ class TestWaitForPodsToScheduleBoundPod:
         pod = self._make_unbound_pending_pod('pod-0', cluster_name_on_cloud)
         # No autoscaler configured, so the timeout is not bumped to the
         # autoscaler minimum and stays at the tiny value below.
-        raise_errors = self._wire_common_mocks(monkeypatch,
-                                               pod,
-                                               autoscaler_type=None)
+        raise_errors, _ = self._wire_common_mocks(monkeypatch,
+                                                  pod,
+                                                  autoscaler_type=None)
 
         node = self._make_node('pod-0', cluster_name_on_cloud)
         import datetime  # pylint: disable=import-outside-toplevel
