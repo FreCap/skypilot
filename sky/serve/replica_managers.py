@@ -1434,7 +1434,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         self._down_thread_pool: thread_utils.ThreadSafeDict[
             int, thread_utils.SafeThread] = thread_utils.ThreadSafeDict()
         self._wait_for_idle_trackers: dict[int,
-                                           _ReplicaDrainTracker | None] = {}
+                                           tuple[_ReplicaDrainTracker | None,
+                                                 float]] = {}
 
         # Tick-scoped memo of per-version specs, reset at the start of every
         # probe round (see _probe_all_replicas). Within a single readiness probe
@@ -1818,18 +1819,24 @@ class SkyPilotReplicaManager(ReplicaManager):
             if self._spot_placer is None:
                 logger.warning('Skipping cost-rebalance launch: no spot '
                                'placer is available.')
+                self._clean_up_skipped_cost_rebalance_redrive(
+                    replica_id, prior_cost_rebalance_for_replica_id)
                 return False
             pinned_location = spot_placer.Location.from_resources_override(
                 resources_override)
             if pinned_location is None:
                 logger.warning('Skipping cost-rebalance launch: candidate '
                                'location could not be reconstructed.')
+                self._clean_up_skipped_cost_rebalance_redrive(
+                    replica_id, prior_cost_rebalance_for_replica_id)
                 return False
             location = self._spot_placer.resolve_location(pinned_location)
             if (location is None or
                     not self._spot_placer.is_active_location(location)):
                 logger.info('Skipping cost-rebalance launch: candidate '
                             f'{pinned_location} is no longer active.')
+                self._clean_up_skipped_cost_rebalance_redrive(
+                    replica_id, prior_cost_rebalance_for_replica_id)
                 return False
             resources_override = location.to_dict()
             use_spot = location.use_spot
@@ -2657,10 +2664,36 @@ class SkyPilotReplicaManager(ReplicaManager):
                 f'{common_utils.format_exception(e)}')
         return _DEFAULT_DRAIN_SECONDS
 
-    def _register_wait_for_idle(self, info: ReplicaInfo) -> None:
+    def _clean_up_skipped_cost_rebalance_redrive(
+            self, replica_id: int,
+            prior_cost_rebalance_for_replica_id: int | None) -> None:
+        """Retire a persisted replacement that recovery cannot re-launch."""
+        if prior_cost_rebalance_for_replica_id is None:
+            # Fresh cost-rebalance emissions have not persisted a row yet.
+            return
+        logger.warning(
+            f'Retiring cost-rebalance replacement {replica_id} after its '
+            'recovery re-drive could not be enqueued.')
+        self._terminate_replica(replica_id,
+                                sync_down_logs=False,
+                                replica_drain_delay_seconds=0,
+                                is_scale_down=True,
+                                in_flight_drain_cap_seconds=0)
+
+    def _register_wait_for_idle(self,
+                                info: ReplicaInfo,
+                                deadline: float | None = None) -> None:
         """Register or conservatively retry a strict economic drain."""
         if info.replica_id in self._wait_for_idle_trackers:
             return
+        drain_cap = getattr(info.status_property, 'drain_cap_seconds', None)
+        if drain_cap is None:
+            drain_cap = self._resolve_drain_cap_seconds(info.replica_id)
+            info.status_property.drain_cap_seconds = drain_cap
+            self._persist_replica(info.replica_id, info)
+        drain_started = time.monotonic()
+        if deadline is None:
+            deadline = drain_started + drain_cap
         tracker = None
         try:
             replica_url = info.url
@@ -2670,8 +2703,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                            f'{common_utils.format_exception(e)}')
             replica_url = None
         if replica_url is not None and not self._is_pool:
-            tracker = _ReplicaDrainTracker(self, replica_url, time.monotonic())
-        self._wait_for_idle_trackers[info.replica_id] = tracker
+            tracker = _ReplicaDrainTracker(self, replica_url, drain_started)
+        self._wait_for_idle_trackers[info.replica_id] = (tracker, deadline)
 
     def _defer_scale_down_until_idle(self, replica_id: int) -> None:
         """Persist off-route state without admitting termination yet."""
@@ -2694,7 +2727,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         info.status_property.purged = False
         info.status_property.sky_down_status = (
             common_utils.ProcessStatus.SCHEDULED)
-        info.status_property.drain_cap_seconds = None
+        info.status_property.drain_cap_seconds = (
+            self._resolve_drain_cap_seconds(replica_id))
         info.status_property.wait_for_idle_before_termination = True
         self._persist_replica(replica_id, info)
         self._register_wait_for_idle(info)
@@ -2705,7 +2739,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         # instantiate the manager without running the current constructor.
         if not hasattr(self, '_wait_for_idle_trackers'):
             self._wait_for_idle_trackers = {}
-        for replica_id, tracker in list(self._wait_for_idle_trackers.items()):
+        for replica_id, tracked in list(self._wait_for_idle_trackers.items()):
+            tracker, deadline = tracked
             info = serve_state.get_replica_info_from_id(self._service_name,
                                                         replica_id)
             if info is None:
@@ -2722,11 +2757,23 @@ class SkyPilotReplicaManager(ReplicaManager):
                 if tracker is None:
                     # Endpoint discovery can fail transiently during recovery.
                     self._wait_for_idle_trackers.pop(replica_id, None)
-                    self._register_wait_for_idle(info)
-                    tracker = self._wait_for_idle_trackers.get(replica_id)
+                    self._register_wait_for_idle(info, deadline=deadline)
+                    retried = self._wait_for_idle_trackers.get(replica_id)
+                    tracker = retried[0] if retried is not None else None
                 drained = tracker is not None and tracker()
-            if not drained:
+            deadline_expired = time.monotonic() >= deadline
+            if not drained and not deadline_expired:
                 continue
+            drain_cap: int | None = 0
+            if not drained:
+                drain_cap = getattr(info.status_property, 'drain_cap_seconds',
+                                    None)
+                if drain_cap is None:
+                    drain_cap = self._resolve_drain_cap_seconds(replica_id)
+                logger.warning(
+                    f'Strict idle wait for replica {replica_id} reached its '
+                    f'{drain_cap}s deadline without fresh zero-occupancy '
+                    'proof; falling back to a bounded graceful drain.')
             info.status_property.wait_for_idle_before_termination = False
             self._persist_replica(replica_id, info)
             self._wait_for_idle_trackers.pop(replica_id, None)
@@ -2734,7 +2781,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                     sync_down_logs=False,
                                     replica_drain_delay_seconds=0,
                                     is_scale_down=True,
-                                    in_flight_drain_cap_seconds=0)
+                                    in_flight_drain_cap_seconds=drain_cap)
 
     @with_lock
     def scale_down(self,
