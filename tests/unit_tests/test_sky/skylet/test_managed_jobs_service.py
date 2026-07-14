@@ -340,7 +340,7 @@ class TestGetJobTable:
         assert target_job.recovery_count == 0
         assert target_job.metadata == {}
         assert target_job.workspace == 'ws1'
-        assert not target_job.HasField('details')
+        assert target_job.details == 'Job submitted to queue'
         assert not target_job.HasField('failure_reason')
         assert not target_job.HasField('user_name')
         assert target_job.user_hash == 'abcd1234'
@@ -404,7 +404,7 @@ class TestGetJobTable:
         assert target_job.recovery_count == 0
         assert target_job.metadata == {}
         assert target_job.workspace == 'ws1'
-        assert not target_job.HasField('details')
+        assert target_job.details == 'Job submitted to queue'
         assert not target_job.HasField('failure_reason')
         assert not target_job.HasField('user_name')
         assert target_job.user_hash == 'abcd1234'
