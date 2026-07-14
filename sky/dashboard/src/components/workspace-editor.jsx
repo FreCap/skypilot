@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useRouter } from 'next/router';
 import {
   getWorkspaces,
@@ -325,6 +325,8 @@ const DetailedAllowedUsers = ({ workspaceConfig, allUsers }) => {
 
 export function WorkspaceEditor({ workspaceName, isNewWorkspace = false }) {
   const router = useRouter();
+  const isMountedRef = useRef(false);
+  const navigationTimeoutRef = useRef(null);
   const [workspaceConfig, setWorkspaceConfig] = useState({});
   const [originalConfig, setOriginalConfig] = useState({});
   const [yamlValue, setYamlValue] = useState('');
@@ -351,6 +353,16 @@ export function WorkspaceEditor({ workspaceName, isNewWorkspace = false }) {
     clouds: [],
   });
   const [statsLoading, setStatsLoading] = useState(false);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+      if (navigationTimeoutRef.current !== null) {
+        clearTimeout(navigationTimeoutRef.current);
+      }
+    };
+  }, []);
 
   const fetchWorkspaceConfig = useCallback(
     async (showLoading = true) => {
@@ -513,13 +525,15 @@ export function WorkspaceEditor({ workspaceName, isNewWorkspace = false }) {
 
       if (isNewWorkspace) {
         await createWorkspace(workspaceName, workspaceConfig);
+        if (!isMountedRef.current) return;
         setSuccess('Workspace created successfully!');
         // Navigate to the created workspace
-        setTimeout(() => {
+        navigationTimeoutRef.current = setTimeout(() => {
           router.push(`/workspaces/${workspaceName}`);
         }, 1500);
       } else {
         await updateWorkspace(workspaceName, workspaceConfig);
+        if (!isMountedRef.current) return;
         setSuccess('Workspace updated successfully!');
         setOriginalConfig(workspaceConfig);
         // Refresh stats after successful save
@@ -527,9 +541,13 @@ export function WorkspaceEditor({ workspaceName, isNewWorkspace = false }) {
       }
     } catch (err) {
       console.error('Error saving workspace:', err);
-      setError(err);
+      if (isMountedRef.current) {
+        setError(err);
+      }
     } finally {
-      setSaving(false);
+      if (isMountedRef.current) {
+        setSaving(false);
+      }
     }
   };
 
@@ -546,17 +564,20 @@ export function WorkspaceEditor({ workspaceName, isNewWorkspace = false }) {
 
     try {
       await deleteWorkspace(workspaceName);
+      if (!isMountedRef.current) return;
       setSuccess('Workspace deleted successfully!');
-      setTimeout(() => {
+      navigationTimeoutRef.current = setTimeout(() => {
         router.push('/workspaces');
       }, 1500);
     } catch (err) {
       console.error('Error deleting workspace:', err);
-      setDeleteState((prev) => ({
-        ...prev,
-        deleting: false,
-        error: err,
-      }));
+      if (isMountedRef.current) {
+        setDeleteState((prev) => ({
+          ...prev,
+          deleting: false,
+          error: err,
+        }));
+      }
     }
   };
 
