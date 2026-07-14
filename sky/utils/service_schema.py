@@ -266,6 +266,28 @@ def get_service_schema():
                             },
                         ],
                     },
+                    # Opt-in economic replacement of serving replicas.  The
+                    # replacement is launched and proven ready before the
+                    # incumbent is removed from routing and drained.
+                    'cost_rebalance': {
+                        'type': 'object',
+                        'additionalProperties': False,
+                        'properties': {
+                            'min_savings_fraction': {
+                                'type': 'number',
+                                'exclusiveMinimum': 0,
+                                'maximum': 1,
+                            },
+                            'max_parallel_replacements': {
+                                'type': 'integer',
+                                'minimum': 1,
+                            },
+                            'stabilization_seconds': {
+                                'type': 'number',
+                                'minimum': 0,
+                            },
+                        },
+                    },
                     'dynamic_ondemand_fallback': {
                         'type': 'boolean',
                     },

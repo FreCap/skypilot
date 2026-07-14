@@ -551,6 +551,19 @@ class SpotPlacer:
     def active_locations(self) -> list[Location]:
         return self._location_with_status(LocationStatus.ACTIVE)
 
+    def is_active_location(self, location: Location) -> bool:
+        """Whether a known location is currently selectable."""
+        resolved = self.resolve_location(location)
+        return (resolved is not None and
+                self._effective_status(resolved) == LocationStatus.ACTIVE)
+
+    def cost_per_hour(self, location: Location) -> float:
+        """Return the current cached catalog cost for a known location."""
+        resolved = self.resolve_location(location)
+        if resolved is None:
+            return float('inf')
+        return self._get_cost_per_hour_cached(resolved)
+
     def preemptive_locations(self) -> list[Location]:
         return self._location_with_status(LocationStatus.PREEMPTED)
 

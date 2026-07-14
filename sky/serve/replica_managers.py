@@ -628,6 +628,10 @@ class ReplicaStatusProperty:
     # and failure teardowns, and on rows written before this field
     # existed (read via getattr for unpickle back-compat).
     drain_cap_seconds: int | None = None
+    # Economic replacement is fail-closed: persist the off-route retirement
+    # intent, but do not admit sky.down until a fresh LB report proves zero
+    # occupancy.  getattr is used for rows predating this field.
+    wait_for_idle_before_termination: bool = False
 
     def unrecoverable_failure(self) -> bool:
         """Whether the replica fails and cannot be recovered.
@@ -802,6 +806,9 @@ class ReplicaInfo:
         # (prior_reserved_fill) -- otherwise the replacement row would
         # read as demand-placed and stay ceiling-exempt for its lifetime.
         self.reserved_fill: bool = False
+        # Incumbent id this replica was launched to replace economically.
+        # None for ordinary demand/fill launches.
+        self.cost_rebalance_for_replica_id: int | None = None
 
     def get_spot_location(self) -> spot_placer.Location | None:
         return spot_placer.Location.from_pickleable(self.location)
@@ -1110,6 +1117,8 @@ class ReplicaInfo:
             # direction for a live fleet crossing the upgrade.
             self.reserved_fill = False
 
+        state.setdefault('cost_rebalance_for_replica_id', None)
+
         self.__dict__.update(state)
         self._version = version if version >= 0 else 0
 
@@ -1228,7 +1237,10 @@ class ReplicaManager:
     def clear_pending_version(self, version: int) -> None:
         """Clear a previously announced pending version."""
 
-    def scale_down(self, replica_id: int, purge: bool = False) -> None:
+    def scale_down(self,
+                   replica_id: int,
+                   purge: bool = False,
+                   wait_for_idle: bool = False) -> None:
         """Scale down replica with replica_id."""
         raise NotImplementedError
 
@@ -1421,6 +1433,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         self._ownership_lost = threading.Event()
         self._down_thread_pool: thread_utils.ThreadSafeDict[
             int, thread_utils.SafeThread] = thread_utils.ThreadSafeDict()
+        self._wait_for_idle_trackers: dict[int,
+                                           _ReplicaDrainTracker | None] = {}
 
         # Tick-scoped memo of per-version specs, reset at the start of every
         # probe round (see _probe_all_replicas). Within a single readiness probe
@@ -1582,12 +1596,23 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # sentinel was consumed at original emission, so without it
                 # the replacement row would flip a fill replica to
                 # demand-placed (permanently ceiling-exempt).
-                self._launch_replica(
-                    replica_info.replica_id,
-                    resources_override=replica_info.resources_override,
-                    existing_replica_infos=all_replica_infos,
-                    prior_reserved_fill=bool(
-                        getattr(replica_info, 'reserved_fill', False)))
+                launch_kwargs: dict[str, Any] = {
+                    'resources_override': replica_info.resources_override,
+                    'existing_replica_infos': all_replica_infos,
+                    'prior_reserved_fill': bool(
+                        getattr(replica_info, 'reserved_fill', False)),
+                }
+                prior_rebalance_id = getattr(replica_info,
+                                             'cost_rebalance_for_replica_id',
+                                             None)
+                # Older persisted rows, as well as lightweight test doubles,
+                # may not carry the pairing field. Only forward a real ID so
+                # existing launch wrappers retain their compatible signature.
+                if (isinstance(prior_rebalance_id, int) and
+                        not isinstance(prior_rebalance_id, bool)):
+                    launch_kwargs['prior_cost_rebalance_for_replica_id'] = (
+                        prior_rebalance_id)
+                self._launch_replica(replica_info.replica_id, **launch_kwargs)
             except Exception as e:  # pylint: disable=broad-except
                 logger.error('Failed to re-drive launch of replica '
                              f'{replica_info.replica_id}: '
@@ -1638,6 +1663,10 @@ class SkyPilotReplicaManager(ReplicaManager):
         ]
         for replica_info in to_down_replicas:
             try:
+                if (getattr(replica_info.status_property,
+                            'wait_for_idle_before_termination', False) is True):
+                    self._register_wait_for_idle(replica_info)
+                    continue
                 # A scale-down retirement interrupted by a controller
                 # restart re-enters a FULL bounded drain: its pre-crash
                 # drain progress is unknowable without persisted drain
@@ -1713,6 +1742,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         resources_override: dict[str, Any] | None = None,
         existing_replica_infos: list['ReplicaInfo'] | None = None,
         prior_reserved_fill: bool = False,
+        prior_cost_rebalance_for_replica_id: int | None = None,
         zero_cost_demand_budget: _ZeroCostDemandBudget | None = None,
     ) -> bool:
         """Enqueue one replica launch.
@@ -1744,6 +1774,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         zero_cost_only = False
         fill_grant_epoch: int | None = None
         fill_pool_key: str | None = None
+        cost_rebalance_for_replica_id = (prior_cost_rebalance_for_replica_id)
         if (resources_override is not None and
                 serve_constants.RESERVED_CAPACITY_FILL_OVERRIDE_KEY
                 in resources_override):
@@ -1755,6 +1786,13 @@ class SkyPilotReplicaManager(ReplicaManager):
             fill_pool_key = resources_override.pop(
                 serve_constants.RESERVED_FILL_POOL_KEY_OVERRIDE_KEY, None)
             zero_cost_only = True
+        if (resources_override is not None and
+                serve_constants.COST_REBALANCE_FOR_REPLICA_OVERRIDE_KEY
+                in resources_override):
+            resources_override = dict(resources_override)
+            cost_rebalance_for_replica_id = int(
+                resources_override.pop(
+                    serve_constants.COST_REBALANCE_FOR_REPLICA_OVERRIDE_KEY))
         logger.info(f'Launching replica {replica_id}...')
         cluster_name = serve_utils.generate_replica_cluster_name(
             self._service_name, replica_id,
@@ -1776,7 +1814,27 @@ class SkyPilotReplicaManager(ReplicaManager):
         # A fill launch must reach the placer even though zero-cost k8s
         # entries are use_spot=False (the _should_use_spot gate above keys
         # on the task/override spot-ness, which says nothing about fill).
-        if self._spot_placer is not None and (use_spot or zero_cost_only):
+        if cost_rebalance_for_replica_id is not None:
+            if self._spot_placer is None:
+                logger.warning('Skipping cost-rebalance launch: no spot '
+                               'placer is available.')
+                return False
+            pinned_location = spot_placer.Location.from_resources_override(
+                resources_override)
+            if pinned_location is None:
+                logger.warning('Skipping cost-rebalance launch: candidate '
+                               'location could not be reconstructed.')
+                return False
+            location = self._spot_placer.resolve_location(pinned_location)
+            if (location is None or
+                    not self._spot_placer.is_active_location(location)):
+                logger.info('Skipping cost-rebalance launch: candidate '
+                            f'{pinned_location} is no longer active.')
+                return False
+            resources_override = location.to_dict()
+            use_spot = location.use_spot
+            retry_until_up = False
+        elif self._spot_placer is not None and (use_spot or zero_cost_only):
             # For spot placer, we don't retry until up so any launch failed
             # due to availability issue will be handled by the placer.
             retry_until_up = False
@@ -1926,6 +1984,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         # replaced row's attribution on recovery re-drives (the sentinel
         # only exists at original emission).
         info.reserved_fill = bool(zero_cost_only or prior_reserved_fill)
+        info.cost_rebalance_for_replica_id = (cost_rebalance_for_replica_id)
         if (zero_cost_only and fill_grant_epoch is not None and
                 fill_pool_key is not None):
             # Broker epoch fence, authoritative leg: the pre-check above
@@ -2312,6 +2371,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                     serve_constants.RESERVED_CAPACITY_FILL_OVERRIDE_KEY
                     in resources_override):
                 return True
+            if (resources_override is not None and
+                    serve_constants.COST_REBALANCE_FOR_REPLICA_OVERRIDE_KEY
+                    in resources_override):
+                return True
             use_spot_override = (resources_override or {}).get('use_spot')
             if use_spot_override is None:
                 uses_task_default = True
@@ -2401,6 +2464,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             # must leave recovery the resolved cap, not the resolver.
             info.status_property.drain_cap_seconds = (
                 in_flight_drain_cap_seconds)
+            info.status_property.wait_for_idle_before_termination = False
             self._persist_replica(replica_id, info)
             launch_thread = self._launch_thread_pool[replica_id]
             if launch_thread.is_alive():
@@ -2515,6 +2579,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                     f'replica_id: {replica_id}')
         info.status_property.is_scale_down = is_scale_down
         info.status_property.purged = purge
+        info.status_property.wait_for_idle_before_termination = False
 
         # If the cluster does not exist, it means either the cluster never
         # exists (e.g., the cluster is scaled down before it gets a chance to
@@ -2592,13 +2657,98 @@ class SkyPilotReplicaManager(ReplicaManager):
                 f'{common_utils.format_exception(e)}')
         return _DEFAULT_DRAIN_SECONDS
 
+    def _register_wait_for_idle(self, info: ReplicaInfo) -> None:
+        """Register or conservatively retry a strict economic drain."""
+        if info.replica_id in self._wait_for_idle_trackers:
+            return
+        tracker = None
+        try:
+            replica_url = info.url
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning('Unable to resolve replica '
+                           f'{info.replica_id} url for strict drain: '
+                           f'{common_utils.format_exception(e)}')
+            replica_url = None
+        if replica_url is not None and not self._is_pool:
+            tracker = _ReplicaDrainTracker(self, replica_url, time.monotonic())
+        self._wait_for_idle_trackers[info.replica_id] = tracker
+
+    def _defer_scale_down_until_idle(self, replica_id: int) -> None:
+        """Persist off-route state without admitting termination yet."""
+        info = serve_state.get_replica_info_from_id(self._service_name,
+                                                    replica_id)
+        if info is None:
+            return
+        if (getattr(info.status_property, 'wait_for_idle_before_termination',
+                    False) is True):
+            self._register_wait_for_idle(info)
+            return
+        if not global_user_state.cluster_with_name_exists(info.cluster_name):
+            self._terminate_replica(replica_id,
+                                    sync_down_logs=False,
+                                    replica_drain_delay_seconds=0,
+                                    is_scale_down=True,
+                                    in_flight_drain_cap_seconds=0)
+            return
+        info.status_property.is_scale_down = True
+        info.status_property.purged = False
+        info.status_property.sky_down_status = (
+            common_utils.ProcessStatus.SCHEDULED)
+        info.status_property.drain_cap_seconds = None
+        info.status_property.wait_for_idle_before_termination = True
+        self._persist_replica(replica_id, info)
+        self._register_wait_for_idle(info)
+
+    def _refresh_wait_for_idle(self) -> None:
+        """Admit strict drains only after fresh LB zero-occupancy proof."""
+        # Some recovery/unit-test construction paths predate this field and
+        # instantiate the manager without running the current constructor.
+        if not hasattr(self, '_wait_for_idle_trackers'):
+            self._wait_for_idle_trackers = {}
+        for replica_id, tracker in list(self._wait_for_idle_trackers.items()):
+            info = serve_state.get_replica_info_from_id(self._service_name,
+                                                        replica_id)
+            if info is None:
+                self._wait_for_idle_trackers.pop(replica_id, None)
+                continue
+            if (getattr(info.status_property,
+                        'wait_for_idle_before_termination', False) is not True):
+                self._wait_for_idle_trackers.pop(replica_id, None)
+                continue
+            if not global_user_state.cluster_with_name_exists(
+                    info.cluster_name):
+                drained = True
+            else:
+                if tracker is None:
+                    # Endpoint discovery can fail transiently during recovery.
+                    self._wait_for_idle_trackers.pop(replica_id, None)
+                    self._register_wait_for_idle(info)
+                    tracker = self._wait_for_idle_trackers.get(replica_id)
+                drained = tracker is not None and tracker()
+            if not drained:
+                continue
+            info.status_property.wait_for_idle_before_termination = False
+            self._persist_replica(replica_id, info)
+            self._wait_for_idle_trackers.pop(replica_id, None)
+            self._terminate_replica(replica_id,
+                                    sync_down_logs=False,
+                                    replica_drain_delay_seconds=0,
+                                    is_scale_down=True,
+                                    in_flight_drain_cap_seconds=0)
+
     @with_lock
-    def scale_down(self, replica_id: int, purge: bool = False) -> None:
+    def scale_down(self,
+                   replica_id: int,
+                   purge: bool = False,
+                   wait_for_idle: bool = False) -> None:
         # Retirement drain: bounded by the replica's version spec,
         # completing early once the LB provably stopped routing to the
         # replica and reports zero in-flight for it. A purge is a forceful
         # cleanup of an already-failed replica: nothing routable is being
         # retired, so it must not wait out a graceful-drain cap.
+        if wait_for_idle and not purge:
+            self._defer_scale_down_until_idle(replica_id)
+            return
         drain_cap = (None
                      if purge else self._resolve_drain_cap_seconds(replica_id))
         self._terminate_replica(replica_id,
@@ -2715,6 +2865,10 @@ class SkyPilotReplicaManager(ReplicaManager):
         the fly. If any of them finished, it will update the status of the
         corresponding replica.
         """
+        # Economic retirements are persisted off-route first and enter the
+        # normal termination pool only after the LB proves they are idle.
+        self._refresh_wait_for_idle()
+
         # To avoid `dictionary changed size during iteration` error.
         launch_thread_pool_snapshot = list(self._launch_thread_pool.items())
         # Process finished launch threads BEFORE taking the cross-process

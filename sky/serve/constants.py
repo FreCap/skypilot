@@ -318,6 +318,11 @@ RESERVED_FILL_GRANT_EPOCH_OVERRIDE_KEY = '_reserved_fill_grant_epoch'
 # pool B's unrelated fill launches.
 RESERVED_FILL_POOL_KEY_OVERRIDE_KEY = '_reserved_fill_pool_key'
 
+# Internal resources_override marker for a cost-rebalance launch.  The value is
+# the incumbent replica id.  ReplicaManager consumes it before sky.launch and
+# persists the pairing on ReplicaInfo; it must never reach Resources.copy().
+COST_REBALANCE_FOR_REPLICA_OVERRIDE_KEY = '_cost_rebalance_for_replica_id'
+
 # [boltz fork] Reserved-fill broker: multi-service arbitration of the
 # zero-cost pools (see sky/serve/reserved_capacity_broker.py). Cross-process
 # lock serializing broker rounds. On a Postgres backend get_lock() resolves
