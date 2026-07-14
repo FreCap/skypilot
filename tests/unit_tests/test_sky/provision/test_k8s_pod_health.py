@@ -1,11 +1,31 @@
 """Tests for Kubernetes pod health issue detection."""
 import datetime
+import inspect
+import pickle
 from typing import Optional
 from unittest import mock
 
 from sky.provision.kubernetes import instance as k8s_instance
+from sky.provision.kubernetes import pod_diagnostics
 from sky.provision.kubernetes.instance import _check_nodes_health
 from sky.provision.kubernetes.instance import _get_pod_health_issues
+
+
+def test_pod_status_diagnostics_instance_surface_is_stable():
+    expected_signatures = {
+        'NodeHealthInfo': '(issue: str, pods: list[str])',
+        '_get_pod_health_issues': '(pod: Any) -> str | None',
+        '_reason_lacks_specific_cause': '(reason: str | None) -> bool',
+        '_unmask_crashloopbackoff_reason': '(cs: Any) -> str | None',
+        '_get_pod_pending_reason_from_container_status': '(pod: Any) -> str | None',
+    }
+
+    for name, expected_signature in expected_signatures.items():
+        symbol = getattr(k8s_instance, name)
+        assert str(inspect.signature(symbol)) == expected_signature
+        assert symbol.__module__ == k8s_instance.__name__
+        assert pickle.loads(pickle.dumps(symbol)) is symbol
+        assert symbol is getattr(pod_diagnostics, name)
 
 
 def _make_condition(type_: str,
