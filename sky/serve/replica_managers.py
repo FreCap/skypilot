@@ -2192,10 +2192,17 @@ class SkyPilotReplicaManager(ReplicaManager):
     def _scale_up_one_locked(
             self,
             resources_override: dict[str, Any] | None,
+            used_replica_ids: set[int],
             existing_replica_infos: list['ReplicaInfo'] | None = None,
             zero_cost_demand_budget: _ZeroCostDemandBudget | None = None
     ) -> None:
-        """Allocate an id and enqueue one replica launch. Lock must be held."""
+        """Allocate an id and enqueue one replica launch. Lock must be held.
+
+        `used_replica_ids` is the set of ids with a durable replica row,
+        snapshotted once per lock acquisition. Ids are handed out
+        monotonically while the lock is held, so the snapshot stays valid
+        for the whole batch without a per-replica DB read.
+        """
         # Defensive: never hand `_launch_replica` an id that still has a
         # durable replica row. `add_or_update_replica` is an upsert keyed on
         # (service_name, replica_id), so reusing a live id would overwrite a
@@ -2203,8 +2210,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         # the allocator seeded from durable state in
         # `_recover_replica_operations` this should never fire, but guard
         # against any drift so id allocation can never clobber a live replica.
-        while serve_state.get_replica_info_from_id(
-                self._service_name, self._next_replica_id) is not None:
+        while self._next_replica_id in used_replica_ids:
             logger.warning(f'Replica id {self._next_replica_id} still has a '
                            'durable replica row; skipping it to avoid '
                            'clobbering a live replica.')
@@ -2230,7 +2236,8 @@ class SkyPilotReplicaManager(ReplicaManager):
     @with_lock
     def scale_up(self,
                  resources_override: dict[str, Any] | None = None) -> None:
-        self._scale_up_one_locked(resources_override)
+        self._scale_up_one_locked(
+            resources_override, serve_state.get_replica_ids(self._service_name))
 
     @with_lock
     def scale_up_batch(
@@ -2259,6 +2266,16 @@ class SkyPilotReplicaManager(ReplicaManager):
         if self._batch_needs_placement_snapshot(resources_overrides):
             existing_replica_infos = serve_state.get_replica_infos(
                 self._service_name)
+        # One id-only snapshot for the whole batch: the collision guard in
+        # `_scale_up_one_locked` used to point-read (and unpickle) one row
+        # per replica launched, K reads per wave that never fire in
+        # steady-state.
+        if existing_replica_infos is not None:
+            used_replica_ids = {
+                info.replica_id for info in existing_replica_infos
+            }
+        else:
+            used_replica_ids = serve_state.get_replica_ids(self._service_name)
         zero_cost_demand_budget = None
         if existing_replica_infos is not None:
             zero_cost_demand_budget = self._build_zero_cost_demand_budget(
@@ -2271,7 +2288,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                             f'{batch_version} scale-up batch because version '
                             f'{pending_version} is waiting to be applied.')
                 break
-            self._scale_up_one_locked(resources_override,
+            self._scale_up_one_locked(resources_override, used_replica_ids,
                                       existing_replica_infos,
                                       zero_cost_demand_budget)
 

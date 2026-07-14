@@ -214,8 +214,8 @@ class TestScaleUpDoesNotClobberLiveReplica:
         launched = []
         with mock.patch(
                 'sky.serve.replica_managers.serve_state.'
-                'get_replica_info_from_id',
-                return_value=None), \
+                'get_replica_ids',
+                return_value=set()), \
              mock.patch.object(mgr, '_launch_replica',
                                side_effect=_record_launch(launched)):
             mgr.scale_up()
@@ -227,15 +227,11 @@ class TestScaleUpDoesNotClobberLiveReplica:
         # 8 is free. scale_up must skip 6 and 7 and launch 8.
         mgr = _make_manager(next_replica_id=6)
         launched = []
-        existing = {6, 7}
-
-        def _get(_service_name, replica_id):
-            return mock.Mock() if replica_id in existing else None
 
         with mock.patch(
                 'sky.serve.replica_managers.serve_state.'
-                'get_replica_info_from_id',
-                side_effect=_get), \
+                'get_replica_ids',
+                return_value={6, 7}), \
              mock.patch.object(mgr, '_launch_replica',
                                side_effect=_record_launch(launched)):
             mgr.scale_up()
@@ -1169,14 +1165,17 @@ class TestScaleUpBatch:
         launched = []
         with mock.patch(
                 'sky.serve.replica_managers.serve_state.'
-                'get_replica_info_from_id',
-                return_value=None), \
+                'get_replica_ids',
+                return_value=set()) as id_scan, \
              mock.patch.object(mgr, '_launch_replica',
                                side_effect=_record_launch(launched)):
             mgr.scale_up_batch([None, {'use_spot': True}, None])
         assert launched == [1, 2, 3]
         assert mgr._next_replica_id == 4
         assert lock.acquisitions == 1
+        # The collision guard reads the id set ONCE per batch, not once per
+        # replica launched.
+        assert id_scan.call_count == 1
 
     def test_single_scale_up_unchanged(self):
         mgr = _make_manager(next_replica_id=7)
@@ -1185,8 +1184,8 @@ class TestScaleUpBatch:
         launched = []
         with mock.patch(
                 'sky.serve.replica_managers.serve_state.'
-                'get_replica_info_from_id',
-                return_value=None), \
+                'get_replica_ids',
+                return_value=set()), \
              mock.patch.object(mgr, '_launch_replica',
                                side_effect=_record_launch(launched)):
             mgr.scale_up()
@@ -1197,15 +1196,11 @@ class TestScaleUpBatch:
         mgr = _make_manager(next_replica_id=1)
         mgr.lock = self._CountingLock()
         launched = []
-        existing = {2}
-
-        def _get(_service_name, replica_id):
-            return mock.Mock() if replica_id in existing else None
 
         with mock.patch(
                 'sky.serve.replica_managers.serve_state.'
-                'get_replica_info_from_id',
-                side_effect=_get), \
+                'get_replica_ids',
+                return_value={2}), \
              mock.patch.object(mgr, '_launch_replica',
                                side_effect=_record_launch(launched)):
             mgr.scale_up_batch([None, None])
@@ -1236,7 +1231,7 @@ class TestScaleUpBatch:
 
         with mock.patch(
                 'sky.serve.replica_managers.serve_state.'
-                'get_replica_info_from_id', return_value=None), \
+                'get_replica_ids') as id_scan, \
              mock.patch(
                  'sky.serve.replica_managers.serve_state.get_replica_infos',
                  return_value=list(initial)) as scan, \
@@ -1244,6 +1239,8 @@ class TestScaleUpBatch:
             mgr.scale_up_batch([{'use_spot': True}] * 3)
 
         scan.assert_called_once_with('svc')
+        # The id set is derived from the placement snapshot; no second query.
+        id_scan.assert_not_called()
         assert [size for _, size in snapshots] == [2, 3, 4]
         assert all(snapshot is snapshots[0][0] for snapshot, _ in snapshots)
 
@@ -1256,7 +1253,7 @@ class TestScaleUpBatch:
         launched = []
         with mock.patch(
                 'sky.serve.replica_managers.serve_state.'
-                'get_replica_info_from_id', return_value=None), \
+                'get_replica_ids', return_value=set()), \
              mock.patch(
                  'sky.serve.replica_managers.serve_state.get_replica_infos'
              ) as scan, \
@@ -1285,7 +1282,7 @@ class TestScaleUpBatch:
 
         with mock.patch(
                 'sky.serve.replica_managers.serve_state.'
-                'get_replica_info_from_id', return_value=None), \
+                'get_replica_ids', return_value=set()), \
              mock.patch.object(mgr, '_launch_replica', side_effect=_launch):
             mgr.scale_up_batch([None] * 500)
 

@@ -955,11 +955,8 @@ class TestFillLaunchPath(unittest.TestCase):
                                'get_replica_infos',
                                return_value=[]), \
              mock.patch.object(replica_managers.serve_state,
-                               'get_replica_info_from_id',
-                               return_value=None), \
-             mock.patch.object(replica_managers.serve_state,
                                'add_or_update_replica') as add_mock:
-            manager._scale_up_one_locked(override)
+            manager._scale_up_one_locked(override, set())
         add_mock.assert_not_called()
         self.assertEqual(manager._next_replica_id, 7)
         self.assertEqual(manager._launch_thread_pool, {})
@@ -982,11 +979,8 @@ class TestFillLaunchPath(unittest.TestCase):
                                'get_replica_infos',
                                return_value=[]), \
              mock.patch.object(replica_managers.serve_state,
-                               'get_replica_info_from_id',
-                               return_value=None), \
-             mock.patch.object(replica_managers.serve_state,
                                'add_or_update_replica') as add_mock:
-            manager._scale_up_one_locked({_FILL_KEY: True})
+            manager._scale_up_one_locked({_FILL_KEY: True}, set())
         add_mock.assert_called_once()
         info = add_mock.call_args[0][2]
         self.assertNotIn(_FILL_KEY, info.resources_override)
