@@ -894,14 +894,16 @@ class Autoscaler:
         if cached is not None:
             return cached
         cost = 0.0
+        resolved = False
         try:
             handle = replica_info.handle()
             if handle is not None:
                 cost = float(handle.launched_resources.get_cost(seconds=3600))
+                resolved = True
         except Exception:  # pylint: disable=broad-except
             cost = 0.0
-        if (replica_info.status_property.sky_launch_status ==
-                common_utils.ProcessStatus.SUCCEEDED):
+        if (resolved and replica_info.status_property.sky_launch_status
+                == common_utils.ProcessStatus.SUCCEEDED):
             self._cost_rebalance_replica_cost_cache[
                 replica_info.replica_id] = cost
         return cost
@@ -1038,17 +1040,22 @@ class Autoscaler:
         for victim_id, replacement in sorted(pairs.items()):
             victim = by_id[victim_id]
             if self.cost_rebalance:
-                if replacement.is_ready:
+                if (replacement.is_ready and
+                        getattr(victim.status_property, 'sky_down_status',
+                                None) is None):
                     decisions.extend(
                         _generate_scale_down_decisions(
                             [victim.replica_id],
                             reason=AutoscalerDecisionReason.COST_REBALANCE))
-            elif replacement.is_ready:
+            elif (replacement.is_ready and
+                  getattr(replacement.status_property, 'sky_down_status',
+                          None) is None):
                 decisions.extend(
                     _generate_scale_down_decisions(
                         [replacement.replica_id],
                         reason=AutoscalerDecisionReason.COST_REBALANCE))
-            else:
+            elif getattr(replacement.status_property, 'sky_down_status',
+                         None) is None:
                 decisions.extend(
                     _generate_scale_down_decisions([replacement.replica_id]))
 
@@ -1065,8 +1072,6 @@ class Autoscaler:
             return decisions
 
         slots = self.cost_rebalance_max_parallel_replacements - len(pairs)
-        if slots <= 0:
-            return decisions
         paired_ids = set(pairs)
         candidates = [
             info for info in replica_infos
@@ -1084,8 +1089,6 @@ class Autoscaler:
         now = time.monotonic()
         current_candidate_keys: set[tuple[int, spot_placer.Location]] = set()
         for incumbent in candidates:
-            if slots <= 0:
-                break
             location = self._best_cost_rebalance_candidate(
                 incumbent, planned_locations)
             if location is None:
@@ -1095,6 +1098,10 @@ class Autoscaler:
             first_seen = self._cost_rebalance_candidate_since.setdefault(
                 key, now)
             if (now - first_seen < self.cost_rebalance_stabilization_seconds):
+                continue
+            if slots <= 0:
+                # Keep validating continuous eligibility while another pair
+                # occupies the replacement slot, but do not launch overlap.
                 continue
             override = location.to_dict()
             override[constants.COST_REBALANCE_FOR_REPLICA_OVERRIDE_KEY] = (
@@ -1495,17 +1502,19 @@ class _GpuShapeResolverMixin:
         if cached is not None:
             return cached
         cost = 0.0
+        resolved = False
         try:
             handle = replica_info.handle()
             if handle is not None:
                 # Coerce: anything non-numeric degrades to 0.0 (shed last).
                 cost = float(handle.launched_resources.get_cost(seconds=3600))
+                resolved = True
         except Exception:  # pylint: disable=broad-except
             cost = 0.0
         # Same post-launch-only cache rule as the shape memo: while the
         # replica is provisioning the record may be rewritten by failover.
-        if (replica_info.status_property.sky_launch_status ==
-                common_utils.ProcessStatus.SUCCEEDED):
+        if (resolved and replica_info.status_property.sky_launch_status
+                == common_utils.ProcessStatus.SUCCEEDED):
             self._replica_cost_cache[replica_info.replica_id] = cost
         return cost
 
