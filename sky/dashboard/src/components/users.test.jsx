@@ -12,7 +12,7 @@ import {
   aggregateUserUsage,
   getJobGpuCount as extractedGetJobGpuCount,
 } from '@/components/user-usage';
-import { getJobGpuCount } from '@/components/users';
+import { buildUsersWithUsage, getJobGpuCount } from '@/components/users';
 
 jest.mock('@/lib/cache', () => ({
   __esModule: true,
@@ -193,6 +193,94 @@ describe('aggregateUserUsage', () => {
       gpuCount: 14,
     });
     expect(usage.has('missing-id')).toBe(false);
+    expect(clusterVisits).toBe(2);
+    expect(jobVisits).toBe(2);
+  });
+});
+
+describe('buildUsersWithUsage', () => {
+  it('preserves an empty users response', () => {
+    expect(buildUsersWithUsage(null)).toEqual([]);
+  });
+
+  it('indexes resource snapshots once and defaults users without usage', () => {
+    let clusterVisits = 0;
+    let jobVisits = 0;
+    const trackVisits = (items, increment) => ({
+      *[Symbol.iterator]() {
+        for (const item of items) {
+          increment();
+          yield item;
+        }
+      },
+    });
+    const users = [
+      { userId: 'alice-id', username: 'alice@example.com' },
+      { userId: 'bob-id', username: 'bob' },
+    ];
+    const clusters = trackVisits(
+      [
+        {
+          user_hash: 'alice-id',
+          status: 'UP',
+          gpus: { H100: 2 },
+          num_nodes: 3,
+          cluster: 'active',
+        },
+        {
+          user_hash: 'alice-id',
+          status: 'STOPPED',
+          gpus: { H100: 8 },
+          num_nodes: 4,
+          cluster: 'stopped',
+        },
+      ],
+      () => {
+        clusterVisits += 1;
+      }
+    );
+    const jobs = trackVisits(
+      [
+        {
+          user_hash: 'alice-id',
+          status: 'RUNNING',
+          accelerators: { H100: 4 },
+          resources_str_full: '2x(H100:4)',
+          job_id: 1,
+        },
+        {
+          user_hash: 'alice-id',
+          status: 'SUCCEEDED',
+          accelerators: { H100: 8 },
+          resources_str_full: '1x(H100:8)',
+          job_id: 2,
+        },
+      ],
+      () => {
+        jobVisits += 1;
+      }
+    );
+
+    expect(buildUsersWithUsage(users, clusters, jobs)).toEqual([
+      {
+        userId: 'alice-id',
+        username: 'alice@example.com',
+        usernameDisplay: 'alice',
+        fullEmailID: 'alice@example.com',
+        clusterCount: 2,
+        jobCount: 1,
+        gpuCount: 14,
+      },
+      {
+        userId: 'bob-id',
+        username: 'bob',
+        usernameDisplay: 'bob',
+        fullEmailID: 'bob-id',
+        clusterCount: 0,
+        jobCount: 0,
+        gpuCount: 0,
+      },
+    ]);
     expect(clusterVisits).toBe(2);
     expect(jobVisits).toBe(2);
   });
