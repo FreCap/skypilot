@@ -14,6 +14,8 @@ import time
 import unittest
 from unittest import mock
 
+from aiohttp import web
+
 from sky.serve import load_balancer as lb_module
 from sky.serve import load_balancing_policies as lb_policies
 
@@ -215,6 +217,70 @@ class TestProbeRound(unittest.TestCase):
         self._run_round(balancer, {A: (0, 1), B: (1, 0)})
         self.assertEqual(balancer._replica_occupancy, {A: 0, B: 1})
         self.assertEqual(policy._select_replica(mock.MagicMock(), [A, B]), A)
+
+    def test_probe_round_reaches_fleet_beyond_default_connector_limit(self):
+        """Every replica probe must start within the same timeout window."""
+
+        async def _run():
+            replica_count = 101
+            entered = 0
+            all_entered = asyncio.Event()
+            release_responses = asyncio.Event()
+
+            async def _capacity(request):
+                nonlocal entered
+                del request
+                entered += 1
+                if entered == replica_count:
+                    all_entered.set()
+                await release_responses.wait()
+                return web.json_response({
+                    'running_count': 0,
+                    'predict_concurrency': 1,
+                })
+
+            app = web.Application()
+            app.router.add_post('/{path:.*}', _capacity)
+            runner = web.AppRunner(app, access_log=None)
+            await runner.setup()
+            site = web.TCPSite(runner, '127.0.0.1', 0)
+            await site.start()
+            assert site._server is not None
+            port = site._server.sockets[0].getsockname()[1]
+            urls = [
+                f'http://127.0.0.1:{port}/replica-{i}'
+                for i in range(replica_count)
+            ]
+            policy = lb_policies.LeastLoadPolicy()
+            policy.set_ready_replicas(urls)
+            balancer = _make_balancer(policy)
+            reached_whole_fleet = False
+            entered_before_release = 0
+            try:
+                with mock.patch.object(lb_module.constants,
+                                       'LB_OCCUPANCY_PROBE_TIMEOUT_SECONDS',
+                                       10):
+                    probe = asyncio.create_task(
+                        balancer._probe_replica_occupancy_once())
+                    try:
+                        await asyncio.wait_for(all_entered.wait(), timeout=5)
+                        reached_whole_fleet = True
+                    except asyncio.TimeoutError:
+                        entered_before_release = entered
+                    finally:
+                        release_responses.set()
+                    await probe
+            finally:
+                release_responses.set()
+                await runner.cleanup()
+
+            self.assertTrue(
+                reached_whole_fleet,
+                f'only {entered_before_release}/{replica_count} replica '
+                'probes started; '
+                'later probes were queued behind the connector limit')
+
+        asyncio.run(_run())
 
 
 if __name__ == '__main__':

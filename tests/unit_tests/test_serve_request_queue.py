@@ -352,6 +352,68 @@ def test_slow_proxy_does_not_hold_reservation_locks():
     asyncio.run(_run())
 
 
+def test_policy_swap_during_attempt_preserves_pending_capacity():
+
+    async def _run():
+        url = 'http://two-slots:8000'
+        lb = _make_lb(min_size=0,
+                      size_per_replica=0,
+                      max_concurrency_per_replica=2,
+                      max_concurrency=2,
+                      use_async_occupancy=True)
+        lb._load_balancing_policy.set_ready_replicas([url])
+        lb._occupancy_declared_urls = {url}
+        lb._replica_occupancy = {url: 0}
+        lb._replica_free_slots = {url: 2}
+        lb._occupancy_dispatch_generation = {url: 0}
+        lb._occupancy_sample_generation = {url: 0}
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        calls = 0
+
+        async def _proxy(replica_url, request):
+            nonlocal calls
+            del replica_url, request
+            calls += 1
+            if calls == 1:
+                first_started.set()
+                await release_first.wait()
+            return fastapi.responses.Response(status_code=202)
+
+        lb._proxy_request_to = _proxy
+        first = asyncio.create_task(lb._proxy_with_retries(_request()))
+        await first_started.wait()
+        with lb._client_pool_lock:
+            lb._apply_routing_spec({
+                'load_balancing_policy_name': 'instance_aware_least_load',
+                'target_concurrency_per_replica': 1,
+                'request_queue': _queue_config(min_size=0,
+                                               size_per_replica=0,
+                                               max_concurrency_per_replica=2,
+                                               max_concurrency=2,
+                                               use_async_occupancy=True),
+            })
+            policy = lb._load_balancing_policy
+            assert isinstance(
+                policy, load_balancing_policies.InstanceAwareLeastLoadPolicy)
+            policy.set_ready_replicas([url])
+            policy.set_replica_info({url: {'gpu_type': 'L4', 'gpu_count': '2'}})
+            policy.set_occupancy(lb._effective_occupancy_locked())
+        assert policy.occupancy_map == {url: 1}
+
+        second = await lb._proxy_with_retries(_request())
+        assert second.status_code == 202
+        assert policy.occupancy_map == {url: 2}
+        release_first.set()
+        assert (await first).status_code == 202
+        assert lb._occupancy_pending_reservations == {url: 2}
+        assert lb._occupancy_active_attempts == {}
+        assert lb._active_request_count == 0
+        assert lb._queue_depth == 0
+
+    asyncio.run(_run())
+
+
 def test_retriable_rejection_keeps_admitted_slot_until_next_selection():
 
     async def _run():
@@ -465,6 +527,69 @@ def test_enabling_occupancy_queue_mid_request_does_not_leak_admission():
     asyncio.run(_run())
 
 
+@pytest.mark.parametrize(('initial_occupancy', 'updated_occupancy'),
+                         [(False, True), (True, False)])
+def test_live_queue_mode_toggle_preserves_retry_ownership(
+        initial_occupancy, updated_occupancy):
+
+    async def _run():
+        first_url = 'http://first:8000'
+        second_url = 'http://second:8000'
+        lb = _make_lb(min_size=0,
+                      size_per_replica=0,
+                      max_concurrency_per_replica=1,
+                      max_concurrency=2,
+                      use_async_occupancy=initial_occupancy)
+        lb._load_balancing_policy.set_ready_replicas([first_url, second_url])
+        lb._occupancy_declared_urls = {first_url, second_url}
+        lb._replica_occupancy = {first_url: 0, second_url: 0}
+        lb._replica_free_slots = {first_url: 1, second_url: 1}
+        lb._occupancy_dispatch_generation = {first_url: 0, second_url: 0}
+        lb._occupancy_sample_generation = {first_url: 0, second_url: 0}
+        request = _request()
+        request.is_disconnected = mock.AsyncMock(return_value=False)
+        attempts = []
+
+        async def _proxy(url, forwarded_request):
+            del forwarded_request
+            attempts.append(url)
+            if url == first_url:
+                return load_balancer._RetriableStatusError(429, url)
+            return fastapi.responses.Response(status_code=400)
+
+        async def _toggle_queue_mode(delay):
+            del delay
+            with lb._client_pool_lock:
+                lb._apply_routing_spec({
+                    'request_queue': _queue_config(
+                        min_size=0,
+                        size_per_replica=0,
+                        max_concurrency_per_replica=1,
+                        max_concurrency=2,
+                        use_async_occupancy=updated_occupancy),
+                })
+
+        lb._proxy_request_to = _proxy
+        with mock.patch.object(
+                load_balancing_policies.random,
+                'choice',
+                side_effect=lambda values: values[0]), mock.patch(
+                    'sky.serve.load_balancer.asyncio.sleep',
+                    side_effect=_toggle_queue_mode):
+            response = await lb._proxy_with_retries(request)
+
+        assert response.status_code == 400
+        assert attempts == [first_url, second_url]
+        assert lb._active_request_count == 0
+        assert lb._queue_depth == 0
+        assert lb._occupancy_unassigned_reservations == 0
+        assert not lb._has_unassigned_occupancy_admission(request)
+        assert lb._occupancy_active_attempts == {}
+        assert lb._occupancy_pending_reservations == {}
+
+    asyncio.run(_run())
+
+
 def test_legacy_queue_config_defaults_to_envelope_admission():
     lb = load_balancer.SkyServeLoadBalancer('http://controller:8001', 8890)
     config = _queue_config()
@@ -567,6 +692,112 @@ def test_timeout_and_cancellation_remove_waiters():
         with pytest.raises(asyncio.CancelledError):
             await waiter
         assert lb._waiting_request_count == 0
+
+    asyncio.run(_run())
+
+
+def test_repeated_cancellation_cannot_leak_admission_count():
+
+    async def _run():
+        lb = _make_lb(min_size=0,
+                      size_per_replica=0,
+                      max_concurrency_per_replica=1,
+                      max_concurrency=1,
+                      use_async_occupancy=True)
+        url = 'http://worker:8000'
+        lb._load_balancing_policy.set_ready_replicas([url])
+        lb._occupancy_declared_urls = {url}
+        lb._replica_occupancy = {url: 0}
+        lb._replica_free_slots = {url: 1}
+        lb._occupancy_dispatch_generation = {url: 0}
+        lb._occupancy_sample_generation = {url: 0}
+        started = asyncio.Event()
+        never = asyncio.Event()
+
+        async def _proxy(replica_url, request):
+            del replica_url, request
+            started.set()
+            await never.wait()
+            raise AssertionError('unreachable')
+
+        lb._proxy_request_to = _proxy
+        task = asyncio.create_task(lb._proxy_with_retries(_request()))
+        await started.wait()
+        condition = lb._request_queue_condition
+        assert condition is not None
+        async with condition:
+            # The first cancellation leaves the accepted async reservation
+            # conservative, then enters the outer admission cleanup. Hold its
+            # condition lock and cancel again to model disconnect plus server
+            # shutdown arriving together.
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+            await asyncio.sleep(0)
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert lb._active_request_count == 0
+        assert lb._queue_depth == 0
+        assert lb._occupancy_unassigned_reservations == 0
+        assert lb._occupancy_active_attempts == {}
+        assert lb._occupancy_pending_reservations == {url: 1}
+
+    asyncio.run(_run())
+
+
+def test_repeated_cancellation_still_wakes_envelope_waiter():
+
+    async def _run():
+        lb = _make_lb(min_size=1,
+                      size_per_replica=0,
+                      max_size=1,
+                      max_concurrency_per_replica=1,
+                      max_concurrency=1,
+                      timeout_seconds=5)
+        url = 'http://worker:8000'
+        lb._load_balancing_policy.set_ready_replicas([url])
+        started = asyncio.Event()
+        never = asyncio.Event()
+        calls = 0
+
+        async def _proxy(replica_url, request):
+            nonlocal calls
+            del replica_url, request
+            calls += 1
+            if calls == 1:
+                started.set()
+                await never.wait()
+            return fastapi.responses.Response(status_code=200)
+
+        lb._proxy_request_to = _proxy
+        active = asyncio.create_task(lb._proxy_with_retries(_request()))
+        await started.wait()
+        waiter = asyncio.create_task(lb._proxy_with_retries(_request()))
+        while lb._waiting_request_count != 1:
+            await asyncio.sleep(0)
+        condition = lb._request_queue_condition
+        assert condition is not None
+        async with condition:
+            # Release state on the first cancellation, then interrupt the
+            # condition notification. The already-registered envelope waiter
+            # must still be woken after this lock is released.
+            active.cancel()
+            await asyncio.sleep(0)
+            assert lb._active_request_count == 0
+            active.cancel()
+            await asyncio.sleep(0)
+        with pytest.raises(asyncio.CancelledError):
+            await active
+
+        response = await asyncio.wait_for(waiter, timeout=1)
+        assert response.status_code == 200
+        await asyncio.sleep(0)
+        assert calls == 2
+        assert lb._active_request_count == 0
+        assert lb._waiting_request_count == 0
+        assert lb._queue_depth == 0
+        assert not lb._background_tasks
 
     asyncio.run(_run())
 
