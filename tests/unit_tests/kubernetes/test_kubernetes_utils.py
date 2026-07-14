@@ -22,6 +22,7 @@ import yaml
 from sky import exceptions
 from sky import models
 from sky.catalog import kubernetes_catalog
+from sky.provision.kubernetes import pod_config as pod_config_lib
 from sky.provision.kubernetes import utils
 
 
@@ -1522,6 +1523,87 @@ def test_combine_pod_config_fields_kubernetes_cloud():
             'node_config']
         assert 'nodeSelector' in node_config['spec']
         assert node_config['spec']['nodeSelector']['gpu'] == 'true'
+
+
+def test_pod_config_composition_characterization():
+    """Characterize merge ordering, copying, and validation at the facade."""
+    cluster_yaml_obj = {
+        'available_node_types': {
+            'ray_head_default': {
+                'node_config': {
+                    'metadata': {
+                        'name': 'test-pod',
+                        'labels': {
+                            'template': 'kept'
+                        }
+                    },
+                    'spec': {
+                        'containers': [{
+                            'name': 'ray',
+                            'image': 'rayproject/ray:nightly'
+                        }]
+                    }
+                }
+            }
+        }
+    }
+    original_cluster_yaml = copy.deepcopy(cluster_yaml_obj)
+    global_pod_config = {
+        'metadata': {
+            'labels': {
+                'global': 'kept',
+                'precedence': 'global'
+            }
+        }
+    }
+    cluster_config_overrides = {
+        'kubernetes': {
+            'pod_config': {
+                'metadata': {
+                    'labels': {
+                        'override': 'kept',
+                        'precedence': 'override'
+                    }
+                }
+            }
+        }
+    }
+
+    with patch('sky.skypilot_config.get_effective_region_config',
+               return_value=global_pod_config):
+        result = utils.combine_pod_config_fields(cluster_yaml_obj,
+                                                 cluster_config_overrides,
+                                                 context='test-context')
+
+    assert cluster_yaml_obj == original_cluster_yaml
+    node_config = result['available_node_types']['ray_head_default'][
+        'node_config']
+    assert node_config['metadata']['labels'] == {
+        'template': 'kept',
+        'global': 'kept',
+        'override': 'kept',
+        'precedence': 'override',
+    }
+    assert utils.check_pod_config(node_config) == (True, None)
+
+
+def test_pod_config_facade_preserves_symbol_identity():
+    """Keep historical imports and pickle identities after extraction."""
+    symbols = (
+        'PodValidator',
+        'check_pod_config',
+        'resolve_effective_pod_config',
+        'combine_pod_config_fields',
+        'combine_metadata_fields',
+        'combine_pod_config_fields_and_metadata',
+        'merge_custom_metadata',
+        'get_cleaned_context_and_cloud_str',
+    )
+    for symbol_name in symbols:
+        facade_symbol = getattr(utils, symbol_name)
+        assert facade_symbol is getattr(pod_config_lib, symbol_name)
+        assert facade_symbol.__module__ == utils.__name__
+        assert pickle.loads(pickle.dumps(facade_symbol)) is facade_symbol
 
 
 def test_ssh_cloud_uses_ssh_config_for_provision_timeout():

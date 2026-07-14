@@ -3,7 +3,6 @@ import collections
 from collections.abc import Callable
 import copy
 import dataclasses
-import datetime
 import enum
 import functools
 import hashlib
@@ -32,11 +31,11 @@ from sky.provision import constants as provision_constants
 from sky.provision.kubernetes import constants as kubernetes_constants
 from sky.provision.kubernetes import context_utils
 from sky.provision.kubernetes import network_utils
+from sky.provision.kubernetes import pod_config as pod_config_lib
 from sky.provision.kubernetes import pod_diagnostics
 from sky.skylet import constants
 from sky.utils import annotations
 from sky.utils import common_utils
-from sky.utils import config_utils
 from sky.utils import env_options
 from sky.utils import gpu_names
 from sky.utils import kubernetes_enums
@@ -47,9 +46,7 @@ from sky.utils import ux_utils
 from sky.utils import yaml_utils
 
 if typing.TYPE_CHECKING:
-    from dateutil import parser as dateutil_parser
     import jinja2
-    from kubernetes.client import models as kubernetes_models
     import yaml
 
     from sky import backends
@@ -57,8 +54,6 @@ if typing.TYPE_CHECKING:
 else:
     jinja2 = adaptors_common.LazyImport('jinja2')
     yaml = adaptors_common.LazyImport('yaml')
-    dateutil_parser = adaptors_common.LazyImport('dateutil.parser')
-    kubernetes_models = adaptors_common.LazyImport('kubernetes.client.models')
 
 # Please be careful when changing this.
 # When mounting, Kubernetes changes the ownership of the parent directory
@@ -1955,6 +1950,32 @@ for _pod_diagnostics_symbol in (
     _pod_diagnostics_symbol.__module__ = __name__
 # pylint: enable=protected-access
 
+# These aliases preserve the historical Kubernetes utility import surface while
+# user pod configuration validation and composition live in a focused module.
+PodValidator = pod_config_lib.PodValidator
+check_pod_config = pod_config_lib.check_pod_config
+resolve_effective_pod_config = pod_config_lib.resolve_effective_pod_config
+combine_pod_config_fields = pod_config_lib.combine_pod_config_fields
+combine_metadata_fields = pod_config_lib.combine_metadata_fields
+combine_pod_config_fields_and_metadata = (
+    pod_config_lib.combine_pod_config_fields_and_metadata)
+merge_custom_metadata = pod_config_lib.merge_custom_metadata
+get_cleaned_context_and_cloud_str = (
+    pod_config_lib.get_cleaned_context_and_cloud_str)
+
+# Preserve module and pickle identities for historical imports.
+for _pod_config_symbol in (
+        PodValidator,
+        check_pod_config,
+        resolve_effective_pod_config,
+        combine_pod_config_fields,
+        combine_metadata_fields,
+        combine_pod_config_fields_and_metadata,
+        merge_custom_metadata,
+        get_cleaned_context_and_cloud_str,
+):
+    _pod_config_symbol.__module__ = __name__
+
 
 @dataclasses.dataclass
 class V1PodStatus:
@@ -2694,199 +2715,6 @@ def check_credentials(context: str | None,
         return True, None
 
 
-class PodValidator:
-    """Validates Kubernetes pod configs against the OpenAPI spec.
-
-    Adapted from kubernetes.client.ApiClient:
-    https://github.com/kubernetes-client/python/blob/0c56ef1c8c4b50087bc7b803f6af896fb973309e/kubernetes/client/api_client.py#L33
-
-    We needed to adapt it because the original implementation ignores
-    unknown fields, whereas we want to raise an error so that users
-    are aware of the issue.
-    """
-    PRIMITIVE_TYPES = (int, float, bool, str)
-    NATIVE_TYPES_MAPPING = {
-        'int': int,
-        'float': float,
-        'str': str,
-        'bool': bool,
-        'date': datetime.date,
-        'datetime': datetime.datetime,
-        'object': object,
-    }
-
-    @classmethod
-    def validate(cls, data):
-        return cls.__validate(data, kubernetes_models.V1Pod)
-
-    @classmethod
-    def __validate(cls, data, klass):
-        """Deserializes dict, list, str into an object.
-
-        :param data: dict, list or str.
-        :param klass: class literal, or string of class name.
-
-        :return: object.
-        """
-        if data is None:
-            return None
-
-        if isinstance(klass, str):
-            if klass.startswith('list['):
-                match = re.match(r'list\[(.*)\]', klass)
-                if match is None:
-                    raise ValueError(f'Invalid list type format: {klass}')
-                sub_kls = match.group(1)
-                return [cls.__validate(sub_data, sub_kls) for sub_data in data]
-
-            if klass.startswith('dict('):
-                match = re.match(r'dict\(([^,]*), (.*)\)', klass)
-                if match is None:
-                    raise ValueError(f'Invalid dict type format: {klass}')
-                sub_kls = match.group(2)
-                return {k: cls.__validate(v, sub_kls) for k, v in data.items()}
-
-            # convert str to class
-            if klass in cls.NATIVE_TYPES_MAPPING:
-                klass = cls.NATIVE_TYPES_MAPPING[klass]
-            else:
-                klass = getattr(kubernetes_models, klass)
-
-        if klass in cls.PRIMITIVE_TYPES:
-            return cls.__validate_primitive(data, klass)
-        elif klass == object:
-            return cls.__validate_object(data)
-        elif klass == datetime.date:
-            return cls.__validate_date(data)
-        elif klass == datetime.datetime:
-            return cls.__validate_datetime(data)
-        else:
-            return cls.__validate_model(data, klass)
-
-    @classmethod
-    def __validate_primitive(cls, data, klass):
-        """Deserializes string to primitive type.
-
-        :param data: str.
-        :param klass: class literal.
-
-        :return: int, long, float, str, bool.
-        """
-        try:
-            return klass(data)
-        except UnicodeEncodeError:
-            return str(data)
-        except TypeError:
-            return data
-
-    @classmethod
-    def __validate_object(cls, value):
-        """Return an original value.
-
-        :return: object.
-        """
-        return value
-
-    @classmethod
-    def __validate_date(cls, string):
-        """Deserializes string to date.
-
-        :param string: str.
-        :return: date.
-        """
-        try:
-            return dateutil_parser.parse(string).date()
-        except ValueError as exc:
-            raise ValueError(
-                f'Failed to parse `{string}` as date object') from exc
-
-    @classmethod
-    def __validate_datetime(cls, string):
-        """Deserializes string to datetime.
-
-        The string should be in iso8601 datetime format.
-
-        :param string: str.
-        :return: datetime.
-        """
-        try:
-            return dateutil_parser.parse(string)
-        except ValueError as exc:
-            raise ValueError(
-                f'Failed to parse `{string}` as datetime object') from exc
-
-    @classmethod
-    def __validate_model(cls, data, klass):
-        """Deserializes list or dict to model.
-
-        :param data: dict, list.
-        :param klass: class literal.
-        :return: model object.
-        """
-
-        if not klass.openapi_types and not hasattr(klass,
-                                                   'get_real_child_model'):
-            return data
-
-        kwargs = {}
-        try:
-            if (data is not None and klass.openapi_types is not None and
-                    isinstance(data, (list, dict))):
-                # attribute_map is a dict that maps field names in snake_case
-                # to camelCase.
-                reverse_attribute_map = {
-                    v: k for k, v in klass.attribute_map.items()
-                }
-                for k, v in data.items():
-                    field_name = reverse_attribute_map.get(k, None)
-                    if field_name is None:
-                        raise ValueError(
-                            f'Unknown field `{k}`. Please ensure '
-                            'pod_config follows the Kubernetes '
-                            'Pod schema: '
-                            'https://github.com/kubernetes/kubernetes/blob/master/api/openapi-spec/v3/api__v1_openapi.json'
-                        )
-                    kwargs[field_name] = cls.__validate(
-                        v, klass.openapi_types[field_name])
-        except exceptions.KubernetesValidationError as e:
-            raise exceptions.KubernetesValidationError([k] + e.path,
-                                                       str(e)) from e
-        except Exception as e:
-            raise exceptions.KubernetesValidationError([k], str(e)) from e
-
-        instance = klass(**kwargs)
-
-        if hasattr(instance, 'get_real_child_model'):
-            klass_name = instance.get_real_child_model(data)
-            if klass_name:
-                instance = cls.__validate(data, klass_name)
-        return instance
-
-def check_pod_config(pod_config: dict) \
-    -> tuple[bool, str | None]:
-    """Check if the pod_config is a valid pod config.
-
-    Uses the deserialize API from the kubernetes client library.
-
-    This is a client-side validation, meant to catch common errors like
-    unknown/misspelled fields, and missing required fields.
-
-    The full validation however is done later on by the Kubernetes API server
-    when the pod creation request is sent.
-
-    Returns:
-        bool: True if pod_config is valid.
-        str: Error message about why the pod_config is invalid, None otherwise.
-    """
-    try:
-        PodValidator.validate(pod_config)
-    except exceptions.KubernetesValidationError as e:
-        return False, f'Validation error in {".".join(e.path)}: {str(e)}'
-    except Exception as e:  # pylint: disable=broad-except
-        return False, f'Unexpected error: {str(e)}'
-    return True, None
-
-
 def is_kubeconfig_exec_auth(
         context: str | None = None) -> tuple[bool, str | None]:
     """Checks if the kubeconfig file uses exec-based authentication."""
@@ -3493,197 +3321,6 @@ def inject_docker_cache_volume(
                     'name': cache_vol_name,
                     'mountPath': cache_mount,
                 })
-
-
-def resolve_effective_pod_config(
-    cluster_config_overrides: dict[str, Any],
-    cloud: clouds.Cloud | None = None,
-    context: str | None = None,
-) -> dict[str, Any]:
-    """Resolves the effective ``kubernetes.pod_config`` (global + overrides).
-
-    This is the same pod_config that combine_pod_config_fields() folds into
-    the rendered cluster YAML. make_deploy_resources_variables() needs it
-    before the template is rendered (to detect ``hostNetwork``), so both
-    resolve it here to stay in agreement on the SSH cloud/context handling.
-    """
-    # We don't use override_configs in `get_effective_region_config`, as
-    # merging the pod config requires special handling.
-    cloud_str = 'ssh' if isinstance(cloud, clouds.SSH) else 'kubernetes'
-    context_str = context
-    if isinstance(cloud, clouds.SSH) and context is not None:
-        assert context.startswith('ssh-'), 'SSH context must start with "ssh-"'
-        context_str = context[len('ssh-'):]
-    kubernetes_config = skypilot_config.get_effective_region_config(
-        cloud=cloud_str,
-        region=context_str,
-        keys=('pod_config',),
-        default_value={})
-    override_pod_config = config_utils.get_cloud_config_value_from_dict(
-        dict_config=cluster_config_overrides,
-        cloud=cloud_str,
-        region=context_str,
-        keys=('pod_config',),
-        default_value={})
-    config_utils.merge_k8s_configs(kubernetes_config, override_pod_config)
-    return kubernetes_config
-
-
-def combine_pod_config_fields(
-    cluster_yaml_obj: dict[str, Any],
-    cluster_config_overrides: dict[str, Any],
-    cloud: clouds.Cloud | None = None,
-    context: str | None = None,
-) -> dict[str, Any]:
-    """Adds or updates fields in the YAML with fields from the
-    ~/.sky/config.yaml's kubernetes.pod_spec dict.
-    This can be used to add fields to the YAML that are not supported by
-    SkyPilot yet, or require simple configuration (e.g., adding an
-    imagePullSecrets field).
-    Note that new fields are added and existing ones are updated. Nested fields
-    are not completely replaced, instead their objects are merged. Similarly,
-    if a list is encountered in the config, it will be appended to the
-    destination list.
-    For example, if the YAML has the following:
-        ```
-        ...
-        node_config:
-            spec:
-                containers:
-                    - name: ray
-                    image: rayproject/ray:nightly
-        ```
-    and the config has the following:
-        ```
-        kubernetes:
-            pod_config:
-                spec:
-                    imagePullSecrets:
-                        - name: my-secret
-        ```
-    then the resulting YAML will be:
-        ```
-        ...
-        node_config:
-            spec:
-                containers:
-                    - name: ray
-                    image: rayproject/ray:nightly
-                imagePullSecrets:
-                    - name: my-secret
-        ```
-    """
-    merged_cluster_yaml_obj = copy.deepcopy(cluster_yaml_obj)
-    kubernetes_config = resolve_effective_pod_config(cluster_config_overrides,
-                                                     cloud, context)
-
-    # Merge the kubernetes config into the YAML for both head and worker nodes.
-    config_utils.merge_k8s_configs(
-        merged_cluster_yaml_obj['available_node_types']['ray_head_default']
-        ['node_config'], kubernetes_config)
-    return merged_cluster_yaml_obj
-
-
-def combine_metadata_fields(cluster_yaml_obj: dict[str, Any],
-                            cluster_config_overrides: dict[str, Any],
-                            context: str | None = None) -> dict[str, Any]:
-    """Updates the metadata for all Kubernetes objects created by SkyPilot with
-    fields from the ~/.sky/config.yaml's kubernetes.custom_metadata dict.
-
-    Obeys the same add or update semantics as combine_pod_config_fields().
-    """
-    merged_cluster_yaml_obj = copy.deepcopy(cluster_yaml_obj)
-    context, cloud_str = get_cleaned_context_and_cloud_str(context)
-
-    # Get custom_metadata from global config
-    custom_metadata = skypilot_config.get_effective_region_config(
-        cloud=cloud_str,
-        region=context,
-        keys=('custom_metadata',),
-        default_value={})
-
-    # Get custom_metadata from task-level config overrides
-    override_custom_metadata = config_utils.get_cloud_config_value_from_dict(
-        dict_config=cluster_config_overrides,
-        cloud=cloud_str,
-        region=context,
-        keys=('custom_metadata',),
-        default_value={})
-
-    # Merge task-level overrides with global config
-    config_utils.merge_k8s_configs(custom_metadata, override_custom_metadata)
-
-    # List of objects in the cluster YAML to be updated
-    combination_destinations = [
-        # Service accounts
-        merged_cluster_yaml_obj['provider']['autoscaler_service_account']
-        ['metadata'],
-        merged_cluster_yaml_obj['provider']['autoscaler_role']['metadata'],
-        merged_cluster_yaml_obj['provider']['autoscaler_role_binding']
-        ['metadata'],
-        merged_cluster_yaml_obj['provider']['autoscaler_service_account']
-        ['metadata'],
-        # Pod spec
-        merged_cluster_yaml_obj['available_node_types']['ray_head_default']
-        ['node_config']['metadata'],
-        # Services for pods
-        *[
-            svc['metadata']
-            for svc in merged_cluster_yaml_obj['provider']['services']
-        ]
-    ]
-
-    for destination in combination_destinations:
-        config_utils.merge_k8s_configs(destination, custom_metadata)
-
-    return merged_cluster_yaml_obj
-
-
-def combine_pod_config_fields_and_metadata(
-        cluster_yaml_obj: dict[str, Any],
-        cluster_config_overrides: dict[str, Any],
-        cloud: clouds.Cloud | None = None,
-        context: str | None = None) -> dict[str, Any]:
-    """Combines pod config fields and metadata fields"""
-    combined_yaml_obj = combine_pod_config_fields(cluster_yaml_obj,
-                                                  cluster_config_overrides,
-                                                  cloud, context)
-    combined_yaml_obj = combine_metadata_fields(combined_yaml_obj,
-                                                cluster_config_overrides,
-                                                context)
-    return combined_yaml_obj
-
-
-def merge_custom_metadata(
-        original_metadata: dict[str, Any],
-        context: str | None = None,
-        cluster_config_overrides: dict[str, Any] | None = None) -> None:
-    """Merges original metadata with custom_metadata from config
-
-    Merge is done in-place, so return is not required
-    """
-    context, cloud_str = get_cleaned_context_and_cloud_str(context)
-
-    # Get custom_metadata from global config
-    custom_metadata = skypilot_config.get_effective_region_config(
-        cloud=cloud_str,
-        region=context,
-        keys=('custom_metadata',),
-        default_value={})
-
-    # Get custom_metadata from task-level config overrides if available
-    if cluster_config_overrides is not None:
-        override_custom_metadata = config_utils.get_cloud_config_value_from_dict(
-            dict_config=cluster_config_overrides,
-            cloud=cloud_str,
-            region=context,
-            keys=('custom_metadata',),
-            default_value={})
-        # Merge task-level overrides with global config
-        config_utils.merge_k8s_configs(custom_metadata,
-                                       override_custom_metadata)
-
-    config_utils.merge_k8s_configs(original_metadata, custom_metadata)
 
 
 @_retry_on_error(resource_type='runtimeclass')
@@ -4815,16 +4452,6 @@ def should_exclude_pod_from_gpu_allocation(pod) -> bool:
         return True
 
     return False
-
-
-def get_cleaned_context_and_cloud_str(
-        context: str | None) -> tuple[str | None, str]:
-    """Return the cleaned context and relevant cloud string from a context."""
-    cloud_str = 'kubernetes'
-    if context is not None and context.startswith('ssh-'):
-        cloud_str = 'ssh'
-        context = context[len('ssh-'):]
-    return context, cloud_str
 
 
 def get_pvc_events(context: str | None,
