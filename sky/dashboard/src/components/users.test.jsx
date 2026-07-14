@@ -1,6 +1,7 @@
-import { render, screen, waitFor, within } from '@testing-library/react';
+import { act, render, screen, waitFor, within } from '@testing-library/react';
 import dashboardCache from '@/lib/cache';
 import {
+  getUsers,
   getServiceAccountTokens,
   getServiceAccountTokensPaginated,
   isServiceAccountTokensPaginationAvailable,
@@ -12,7 +13,11 @@ import {
   aggregateUserUsage,
   getJobGpuCount as extractedGetJobGpuCount,
 } from '@/components/user-usage';
-import { buildUsersWithUsage, getJobGpuCount } from '@/components/users';
+import {
+  buildUsersWithUsage,
+  getJobGpuCount,
+  UsersTable,
+} from '@/components/users';
 
 jest.mock('@/lib/cache', () => ({
   __esModule: true,
@@ -20,6 +25,13 @@ jest.mock('@/lib/cache', () => ({
     get: jest.fn(),
     invalidate: jest.fn(),
     setPreloader: jest.fn(),
+  },
+}));
+
+jest.mock('@/lib/cache-preloader', () => ({
+  __esModule: true,
+  default: {
+    preloadForPage: jest.fn(() => Promise.resolve()),
   },
 }));
 
@@ -44,6 +56,196 @@ jest.mock('@/data/connectors/client', () => ({
     post: jest.fn(),
   },
 }));
+
+const deferred = () => {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+};
+
+describe('UsersTable refresh lifecycle', () => {
+  const user = {
+    userId: 'alice-id',
+    username: 'alice@example.com',
+    role: 'user',
+    userType: 'sso',
+  };
+  const cluster = {
+    cluster: 'alice-cluster',
+    user_hash: 'alice-id',
+    status: 'RUNNING',
+    gpus: { H100: 1 },
+    num_nodes: 1,
+    infra: 'aws/us-east-1',
+  };
+  const job = {
+    job_id: 1,
+    user_hash: 'alice-id',
+    status: 'RUNNING',
+    accelerators: { H100: 2 },
+    resources_str_full: '1x(H100:2)',
+    infra: 'aws/us-east-1',
+  };
+
+  const renderTable = (overrides = {}) => {
+    const props = {
+      refreshInterval: 60 * 60 * 1000,
+      setLoading: jest.fn(),
+      refreshDataRef: { current: null },
+      checkPermissionAndAct: jest.fn(async (_message, action) => action()),
+      roleLoading: false,
+      onResetPassword: jest.fn(),
+      onDeleteUser: jest.fn(),
+      basicAuthEnabled: false,
+      ingressBasicAuthEnabled: false,
+      externalProxyAuthEnabled: false,
+      currentUserRole: 'admin',
+      currentUserId: 'admin-id',
+      filters: [],
+      setValueList: jest.fn(),
+      deduplicateUsers: false,
+      setLastFetchedTime: jest.fn(),
+      setCreateError: jest.fn(),
+      ...overrides,
+    };
+    return { ...render(<UsersTable {...props} />), props };
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  it('coalesces background polls while manual refresh takes ownership', async () => {
+    jest.useFakeTimers();
+    const backgroundUsers = deferred();
+    const manualUsers = deferred();
+    const setLoading = jest.fn();
+    let userCalls = 0;
+    let clusterCalls = 0;
+    let jobCalls = 0;
+    const currentUser = {
+      ...user,
+      userId: 'bob-id',
+      username: 'bob@example.com',
+    };
+    dashboardCache.get.mockImplementation((fetcher) => {
+      if (fetcher === getUsers) {
+        userCalls += 1;
+        if (userCalls === 1) return Promise.resolve([user]);
+        if (userCalls === 2) return backgroundUsers.promise;
+        if (userCalls === 3) return manualUsers.promise;
+        return Promise.resolve([currentUser]);
+      }
+      if (fetcher === getClusters) {
+        clusterCalls += 1;
+        return Promise.resolve(
+          clusterCalls === 1
+            ? []
+            : [{ ...cluster, user_hash: currentUser.userId }]
+        );
+      }
+      if (fetcher === getManagedJobs) {
+        jobCalls += 1;
+        return Promise.resolve({
+          jobs:
+            jobCalls === 1 ? [] : [{ ...job, user_hash: currentUser.userId }],
+        });
+      }
+      throw new Error('Unexpected cache fetcher');
+    });
+
+    const { props, unmount } = renderTable({
+      refreshInterval: 1000,
+      setLoading,
+    });
+    await act(async () => {
+      for (let i = 0; i < 5; i++) await Promise.resolve();
+    });
+    expect(screen.getByText('alice')).toBeInTheDocument();
+    setLoading.mockClear();
+
+    act(() => {
+      jest.advanceTimersByTime(2000);
+    });
+    expect(userCalls).toBe(2);
+    expect(setLoading).not.toHaveBeenCalled();
+
+    act(() => {
+      props.refreshDataRef.current();
+    });
+    expect(userCalls).toBe(3);
+    expect(setLoading).toHaveBeenCalledWith(true);
+
+    await act(async () => {
+      manualUsers.resolve([currentUser]);
+      for (let i = 0; i < 5; i++) await Promise.resolve();
+    });
+    expect(screen.getByText('bob')).toBeInTheDocument();
+    expect(screen.queryByText('alice')).not.toBeInTheDocument();
+    expect(screen.getByTitle('Total GPUs: 3')).toHaveTextContent('3');
+    expect(screen.getByTitle('View 1 cluster for bob')).toHaveTextContent('1');
+    expect(screen.getByTitle('View 1 active job for bob')).toHaveTextContent(
+      '1'
+    );
+    expect(clusterCalls).toBe(2);
+    expect(jobCalls).toBe(2);
+
+    await act(async () => {
+      backgroundUsers.resolve([user]);
+      await backgroundUsers.promise;
+    });
+    expect(screen.getByText('bob')).toBeInTheDocument();
+    expect(screen.queryByText('alice')).not.toBeInTheDocument();
+    expect(userCalls).toBe(3);
+
+    await act(async () => {
+      jest.advanceTimersByTime(1000);
+      for (let i = 0; i < 5; i++) await Promise.resolve();
+    });
+    expect(userCalls).toBe(4);
+
+    unmount();
+  });
+
+  it('revokes state ownership and the refresh callback on unmount', async () => {
+    const usersRequest = deferred();
+    const setLoading = jest.fn();
+    const setLastFetchedTime = jest.fn();
+    dashboardCache.get.mockImplementation((fetcher) => {
+      if (fetcher === getUsers) return usersRequest.promise;
+      throw new Error('A revoked refresh must not fetch resource snapshots');
+    });
+
+    const { props, unmount } = renderTable({
+      setLoading,
+      setLastFetchedTime,
+    });
+    await waitFor(() => {
+      expect(dashboardCache.get).toHaveBeenCalledWith(getUsers);
+      expect(props.refreshDataRef.current).toEqual(expect.any(Function));
+    });
+    setLoading.mockClear();
+
+    unmount();
+    await act(async () => {
+      usersRequest.resolve([user]);
+      await usersRequest.promise;
+    });
+
+    expect(props.refreshDataRef.current).toBeNull();
+    expect(setLoading).not.toHaveBeenCalled();
+    expect(setLastFetchedTime).not.toHaveBeenCalled();
+    expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+  });
+});
 
 // getJobGpuCount decides how many GPUs a managed job contributes to a user's
 // GPU total on the Users page. The critical regression it guards against:

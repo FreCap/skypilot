@@ -361,6 +361,230 @@ class TestPinnedReplacementLaunch:
         assert info.is_spot is False
 
 
+def _recovery_manager():
+    """Bare manager wired with just the state the recovery pass reads."""
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    manager._service_name = 'svc'
+    manager._is_pool = False
+    manager._lb_in_flight_report = None
+    manager._spot_placer = None
+    manager._launch_thread_pool = {}
+    manager._down_thread_pool = {}
+    manager._wait_for_idle_trackers = {}
+    manager._terminate_replica = mock.Mock()
+    manager._persist_replica = mock.Mock()
+    manager._launch_replica = mock.Mock()
+    return manager
+
+
+def _pending_row(replica_id, replacement_for):
+    status_property = replica_managers.ReplicaStatusProperty()
+    row = types.SimpleNamespace(
+        replica_id=replica_id,
+        cluster_name=f'cluster-{replica_id}',
+        version=1,
+        is_spot=False,
+        status=serve_state.ReplicaStatus.PENDING,
+        status_property=status_property,
+        resources_override={'region': 'research'},
+        reserved_fill=False,
+    )
+    if replacement_for is not _ABSENT:
+        row.cost_rebalance_for_replica_id = replacement_for
+    return row
+
+
+_ABSENT = object()
+
+
+class TestRecoveryRedrive:
+    """Recovery re-drives keep (or safely drop) the persisted pairing."""
+
+    def _recover(self, row):
+        manager = _recovery_manager()
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[row]), \
+             mock.patch.object(replica_managers.global_user_state,
+                               'get_cluster_status_fields',
+                               return_value={}):
+            manager._recover_replica_operations()
+        return manager
+
+    def test_pairing_is_forwarded_to_the_redriven_launch(self):
+        row = _pending_row(3, replacement_for=7)
+        manager = self._recover(row)
+        kwargs = manager._launch_replica.call_args.kwargs
+        assert kwargs['prior_cost_rebalance_for_replica_id'] == 7
+        assert kwargs['resources_override'] == {'region': 'research'}
+
+    def test_pre_field_row_redrives_without_pairing_kwarg(self):
+        row = _pending_row(3, replacement_for=_ABSENT)
+        manager = self._recover(row)
+        kwargs = manager._launch_replica.call_args.kwargs
+        assert 'prior_cost_rebalance_for_replica_id' not in kwargs
+
+    def test_ordinary_row_redrives_without_pairing_kwarg(self):
+        row = _pending_row(3, replacement_for=None)
+        manager = self._recover(row)
+        kwargs = manager._launch_replica.call_args.kwargs
+        assert 'prior_cost_rebalance_for_replica_id' not in kwargs
+
+
+class TestPinnedLaunchFailClosed:
+    """A pinned replacement launch is skipped when its location is gone."""
+
+    def _manager(self, placer):
+        manager = replica_managers.SkyPilotReplicaManager.__new__(
+            replica_managers.SkyPilotReplicaManager)
+        manager._service_name = 'svc'
+        manager._resource_scope = None
+        manager._spot_placer = placer
+        manager.yaml_content = 'resources: {}'
+        manager.latest_version = 1
+        manager._launch_thread_pool = {}
+        manager._replica_to_request_id = {}
+        manager._replica_to_launch_cancelled = {}
+        manager._persist_replica = mock.Mock()
+        return manager
+
+    def _launch(self, manager, location):
+        override = location.to_dict()
+        override[constants.COST_REBALANCE_FOR_REPLICA_OVERRIDE_KEY] = 7
+        with mock.patch.object(replica_managers, '_should_use_spot'), \
+             mock.patch.object(replica_managers,
+                               '_get_resources_ports',
+                               return_value='8080'), \
+             mock.patch.object(replica_managers.spot_placer.Location,
+                               'from_resources_override',
+                               return_value=location), \
+             mock.patch.object(replica_managers.thread_utils, 'SafeThread'):
+            return manager._launch_replica(8, override)
+
+    def test_benched_location_skips_launch_without_a_replica_row(self):
+        cheap = make_location('research',
+                              accelerators={'A100': 1},
+                              use_spot=False)
+        placer = make_placer({cheap: 0.0})
+        # Bench without a timestamp so TTL decay (env-overridable) cannot
+        # flip the location back to ACTIVE mid-test.
+        placer.location2status[cheap] = (
+            replica_managers.spot_placer.LocationStatus.PREEMPTED)
+        manager = self._manager(placer)
+        assert self._launch(manager, cheap) is False
+        manager._persist_replica.assert_not_called()
+        assert not manager._launch_thread_pool
+
+    def test_unknown_location_skips_launch_without_a_replica_row(self):
+        cheap = make_location('research',
+                              accelerators={'A100': 1},
+                              use_spot=False)
+        other = make_location('elsewhere',
+                              accelerators={'A100': 1},
+                              use_spot=False)
+        manager = self._manager(make_placer({other: 0.0}))
+        assert self._launch(manager, cheap) is False
+        manager._persist_replica.assert_not_called()
+        assert not manager._launch_thread_pool
+
+
+class TestWaitForIdleRecovery:
+    """A strict economic drain survives a controller restart intact."""
+
+    def test_restart_reregisters_tracker_and_still_requires_idle_proof(self):
+        manager = _recovery_manager()
+        status_property = replica_managers.ReplicaStatusProperty(
+            sky_launch_status=common_utils.ProcessStatus.SUCCEEDED,
+            sky_down_status=common_utils.ProcessStatus.SCHEDULED,
+            is_scale_down=True)
+        status_property.wait_for_idle_before_termination = True
+        info = types.SimpleNamespace(
+            replica_id=1,
+            cluster_name='cluster-1',
+            url='http://replica',
+            is_spot=False,
+            status=serve_state.ReplicaStatus.SHUTTING_DOWN,
+            status_property=status_property)
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[info]), \
+             mock.patch.object(replica_managers.global_user_state,
+                               'get_cluster_status_fields',
+                               return_value={}):
+            manager._recover_replica_operations()
+
+        # Not re-driven into a bounded drain: recovery only re-registers
+        # the zero-occupancy wait.
+        manager._terminate_replica.assert_not_called()
+        assert manager._wait_for_idle_trackers[1] is not None
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_info_from_id',
+                               return_value=info), \
+             mock.patch.object(replica_managers.global_user_state,
+                               'cluster_with_name_exists',
+                               return_value=True):
+            # No LB report yet: termination stays inadmissible.
+            manager._refresh_wait_for_idle()
+            manager._terminate_replica.assert_not_called()
+
+            # Occupied report: still inadmissible.
+            manager._lb_in_flight_report = (replica_managers.time.monotonic(), {
+                'http://replica': 1
+            }, {'http://replica'}, set(), set(), 'lb-1')
+            manager._refresh_wait_for_idle()
+            manager._terminate_replica.assert_not_called()
+
+            # Fresh explicit-idle report: the drain is finally admitted.
+            manager._lb_in_flight_report = (replica_managers.time.monotonic(), {
+                'http://replica': 0
+            }, set(), set(), set(), 'lb-1')
+            manager._refresh_wait_for_idle()
+
+        assert not status_property.wait_for_idle_before_termination
+        manager._terminate_replica.assert_called_once_with(
+            1,
+            sync_down_logs=False,
+            replica_drain_delay_seconds=0,
+            is_scale_down=True,
+            in_flight_drain_cap_seconds=0)
+
+
+class TestPolicyDisabledPairCompletion:
+    """Disabling the policy keeps the incumbent and drains the replacement."""
+
+    def _pair(self):
+        paid = make_location('paid', accelerators={'L4': 1}, use_spot=True)
+        cheap = make_location('research',
+                              accelerators={'A100': 1},
+                              use_spot=False)
+        incumbents = [_Replica(1, paid, 1.0), _Replica(2, paid, 1.0)]
+        replacement = _Replica(3, cheap, 0.0, replacement_for=1)
+        return incumbents, replacement
+
+    def test_ready_replacement_is_strictly_drained_not_the_incumbent(self):
+        scaler = _autoscaler(_spec(cost_rebalance=False))
+        incumbents, replacement = self._pair()
+        decisions = scaler._generate_cost_rebalance_decisions(
+            incumbents + [replacement], [])
+        assert [(d.operator, d.target, d.reason) for d in decisions
+               ] == [(autoscalers.AutoscalerDecisionOperator.SCALE_DOWN, 3,
+                      autoscalers.AutoscalerDecisionReason.COST_REBALANCE)]
+
+    def test_unready_replacement_is_scaled_down_with_ordinary_drain(self):
+        scaler = _autoscaler(_spec(cost_rebalance=False))
+        incumbents, replacement = self._pair()
+        replacement.status = serve_state.ReplicaStatus.STARTING
+        replacement.is_ready = False
+        decisions = scaler._generate_cost_rebalance_decisions(
+            incumbents + [replacement], [])
+        assert [(d.operator, d.target, d.reason) for d in decisions] == [
+            (autoscalers.AutoscalerDecisionOperator.SCALE_DOWN, 3, None)
+        ]
+
+
 class TestStrictDrain:
     """Economic retirement cannot terminate work with unknown occupancy."""
 
