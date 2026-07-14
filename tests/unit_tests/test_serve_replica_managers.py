@@ -136,6 +136,7 @@ def _make_manager(service_name='svc', next_replica_id=1):
     mgr._down_thread_pool = {}
     mgr._tick_version_spec_cache = {}
     mgr._spot_placer = None
+    mgr._pending_version = None
     return mgr
 
 
@@ -419,6 +420,8 @@ class TestLaunchReplicaAvailabilityMaxRetry:
         placer = None
         if with_placer:
             placer = mock.Mock()
+            placer.active_locations.return_value = []
+            placer.zero_cost_locations.return_value = []
             location = mock.Mock()
             location.to_dict.return_value = {'zone': 'z'}
             placer.select_next_location.return_value = location
@@ -1320,6 +1323,8 @@ class TestLaunchReplicaSnapshotAccumulation:
         manager._launch_thread_pool = thread_utils.ThreadSafeDict()
         manager._replica_to_request_id = thread_utils.ThreadSafeDict()
         manager._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
+        placer.active_locations.return_value = []
+        placer.zero_cost_locations.return_value = []
         manager._spot_placer = placer
         return manager
 
@@ -1398,6 +1403,68 @@ class TestLaunchReplicaSnapshotAccumulation:
         assert mock_scan.call_count == 1
 
 
+class TestZeroCostDemandProbeBudget:
+
+    @staticmethod
+    def _manager(zero_cost, active):
+        manager = replica_managers.SkyPilotReplicaManager.__new__(
+            replica_managers.SkyPilotReplicaManager)
+        placer = mock.Mock()
+        placer.zero_cost_locations.return_value = zero_cost
+        placer.active_locations.return_value = active
+        manager._spot_placer = placer
+        return manager
+
+    @staticmethod
+    def _info(location, *, ready=False, terminal=False):
+        info = mock.Mock()
+        info.is_ready = ready
+        info.is_terminal = terminal
+        info.get_spot_location.return_value = location
+        return info
+
+    def test_spills_after_each_active_shape_fills_probe_budget(self):
+        zero_a = object()
+        zero_b = object()
+        paid = object()
+        manager = self._manager([zero_a, zero_b], [zero_a, zero_b, paid])
+        per_location = (
+            replica_managers._ZERO_COST_SPECULATIVE_LAUNCHES_PER_LOCATION)
+        infos = ([self._info(zero_a) for _ in range(per_location)] +
+                 [self._info(zero_b) for _ in range(per_location)])
+
+        with mock.patch(
+                'sky.serve.replica_managers.spot_placer.'
+                'locations_match_placement',
+                side_effect=lambda a, b: a is b):
+            assert manager._demand_should_skip_saturated_zero_cost(infos)
+            assert not manager._demand_should_skip_saturated_zero_cost(
+                infos[:-1])
+
+    def test_ready_terminal_and_benched_rows_do_not_consume_budget(self):
+        active_zero = object()
+        benched_zero = object()
+        paid = object()
+        manager = self._manager([active_zero, benched_zero],
+                                [active_zero, paid])
+        per_location = (
+            replica_managers._ZERO_COST_SPECULATIVE_LAUNCHES_PER_LOCATION)
+        infos = [
+            self._info(active_zero, ready=True),
+            self._info(active_zero, terminal=True),
+            *[self._info(benched_zero) for _ in range(per_location)],
+            *[self._info(active_zero) for _ in range(per_location - 1)],
+        ]
+
+        with mock.patch(
+                'sky.serve.replica_managers.spot_placer.'
+                'locations_match_placement',
+                side_effect=lambda a, b: a is b):
+            assert not manager._demand_should_skip_saturated_zero_cost(infos)
+            infos.append(self._info(active_zero))
+            assert manager._demand_should_skip_saturated_zero_cost(infos)
+
+
 class TestRecoveryRetryAndIsolation:
     """A failed recovery pass must retry (previously a recovery exception
     failed the boot and the HA daemon retried via respawn; the recovery
@@ -1471,6 +1538,31 @@ class TestRecoveryRetryAndIsolation:
             mgr._recover_replica_operations()
         # Replica 2 failed; 1 and 3 still re-driven.
         assert launched == [1, 3]
+
+    def test_newer_pending_version_stops_stale_recovery_wave(self):
+        mgr = _make_manager(next_replica_id=1)
+        launched = []
+        infos = [
+            _fake_replica_info(
+                i,
+                status=replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+            for i in (1, 2, 3)
+        ]
+        for info in infos:
+            info.version = 1
+            info.resources_override = None
+
+        def _launch(replica_id, **_kwargs):
+            launched.append(replica_id)
+            mgr.notify_version_pending(2)
+
+        with mock.patch(
+                'sky.serve.replica_managers.serve_state.get_replica_infos',
+                return_value=infos), \
+             mock.patch.object(mgr, '_launch_replica', side_effect=_launch):
+            mgr._recover_replica_operations()
+
+        assert launched == [1]
 
     def test_redrive_preserves_reserved_fill_attribution(self):
         # A fill replica surviving a controller respawn is re-driven with
