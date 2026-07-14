@@ -5,6 +5,10 @@ import unittest.mock as mock
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy import event
+from sqlalchemy import orm
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.sql import elements
+from sqlalchemy.sql import operators
 
 import sky
 from sky import backends
@@ -67,6 +71,44 @@ def test_get_glob_cluster_names_issues_one_query(_mock_db_conn):
 
     assert sorted(names) == ['serve-a', 'train-a', 'train-b']
     assert len(select_statements) == 1
+
+
+def test_get_glob_cluster_names_postgres_branch_or_combines_similar_to(
+        _mock_db_conn, monkeypatch):
+    engine = _mock_db_conn
+    monkeypatch.setattr(engine.dialect, 'name', 'postgresql')
+
+    captured_queries = []
+
+    def _capture_all(query_self):
+        captured_queries.append(query_self)
+        return []
+
+    monkeypatch.setattr(orm.Query, 'all', _capture_all)
+
+    patterns = ['train-*', '*-a', 'serve-?']
+    assert global_user_state.get_glob_cluster_names(patterns) == []
+
+    # A single query is built for all patterns.
+    assert len(captured_queries) == 1
+    whereclause = captured_queries[0].statement.whereclause
+
+    # The predicates are OR-combined, one SIMILAR TO per pattern.
+    assert isinstance(whereclause, elements.BooleanClauseList)
+    assert whereclause.operator is operators.or_
+    clauses = list(whereclause.clauses)
+    assert len(clauses) == len(patterns)
+    for clause, pattern in zip(clauses, patterns):
+        if isinstance(clause, elements.Grouping):
+            clause = clause.element
+        assert isinstance(clause, elements.BinaryExpression)
+        assert clause.left is global_user_state.cluster_table.c.name
+        assert clause.right.value == global_user_state._glob_to_similar(pattern)
+
+    # The compiled PostgreSQL statement uses one SIMILAR TO per pattern.
+    compiled = str(
+        captured_queries[0].statement.compile(dialect=postgresql.dialect()))
+    assert compiled.count('SIMILAR TO') == len(patterns)
 
 
 @pytest.mark.skipif(sys.platform != 'linux', reason='Only test in CI.')
