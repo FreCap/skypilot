@@ -56,6 +56,7 @@ from sky.server.requests import preconditions
 from sky.server.requests import process
 from sky.server.requests import request_names
 from sky.server.requests import requests as api_requests
+from sky.server.requests import role_filter
 from sky.server.requests import threads
 from sky.server.requests.queues import base as queue_base
 from sky.skylet import constants
@@ -1069,6 +1070,7 @@ async def prepare_request_async(
     re-enqueued with the same dispatch semantics
     (see reenqueue_recovered_requests).
     """
+    role_filter.reject_non_admin_pod_config(auth_user, request_body)
     if auth_user is not None:
         assert auth_user.name is not None
         # Use the authenticated user identity as the single source of truth

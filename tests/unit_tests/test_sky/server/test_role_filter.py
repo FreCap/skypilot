@@ -1,10 +1,11 @@
-"""Unit tests for the role_filter body shim used to gate ambiguous endpoints
-for the viewer role."""
+"""Unit tests for role-aware API request body filters."""
 
 from unittest import mock
 
 import fastapi
+import pytest
 
+from sky import models
 from sky.server.requests import payloads
 from sky.server.requests import role_filter
 from sky.users import rbac
@@ -31,6 +32,112 @@ def _anonymous_request():
     request = mock.Mock(spec=fastapi.Request)
     request.state.auth_user = None
     return request
+
+
+def _auth_user(user_id: str = 'user-alice') -> models.User:
+    return models.User(id=user_id, name=user_id)
+
+
+def _launch_body(task: str,
+                 override_config: dict | None = None) -> payloads.LaunchBody:
+    return payloads.LaunchBody(
+        task=task,
+        cluster_name='test-cluster',
+        override_skypilot_config=override_config or {},
+    )
+
+
+@pytest.mark.parametrize(
+    'task',
+    [
+        # User-authored task YAML.
+        'config:\n  kubernetes:\n    pod_config:\n      spec: {}\n',
+        # SDK-serialized task YAML.
+        'resources:\n  _cluster_config_overrides:\n    kubernetes:\n'
+        '      pod_config:\n        spec: {}\n',
+        # Per-context SSH configuration uses the same arbitrary pod-spec
+        # surface.
+        'resources:\n  any_of:\n    - _cluster_config_overrides:\n'
+        '        ssh:\n          context_configs:\n            cluster-a:\n'
+        '              pod_config: {}\n',
+    ],
+)
+@mock.patch.object(role_filter.permission, 'permission_service')
+def test_reject_non_admin_task_pod_config(mock_svc, task):
+    mock_svc.get_user_roles.return_value = [rbac.RoleName.USER.value]
+
+    with pytest.raises(fastapi.HTTPException) as exc_info:
+        role_filter.reject_non_admin_pod_config(_auth_user(),
+                                                _launch_body(task))
+
+    assert exc_info.value.status_code == 403
+
+
+@mock.patch.object(role_filter.permission, 'permission_service')
+def test_reject_non_admin_client_pod_config(mock_svc):
+    mock_svc.get_user_roles.return_value = [rbac.RoleName.USER.value]
+    body = _launch_body(
+        'run: echo safe', {
+            'workspaces': {
+                'research': {
+                    'kubernetes': {
+                        'context_configs': {
+                            'research': {
+                                'pod_config': {
+                                    'spec': {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        })
+
+    with pytest.raises(fastapi.HTTPException) as exc_info:
+        role_filter.reject_non_admin_pod_config(_auth_user(), body)
+
+    assert exc_info.value.status_code == 403
+
+
+@mock.patch.object(role_filter.permission, 'permission_service')
+def test_allow_admin_task_pod_config(mock_svc):
+    mock_svc.get_user_roles.return_value = [rbac.RoleName.ADMIN.value]
+    body = _launch_body(
+        'config:\n  kubernetes:\n    pod_config:\n      spec: {}\n')
+
+    role_filter.reject_non_admin_pod_config(_auth_user('admin'), body)
+
+
+def test_allow_internal_task_pod_config():
+    body = _launch_body(
+        'config:\n  kubernetes:\n    pod_config:\n      spec: {}\n')
+
+    role_filter.reject_non_admin_pod_config(None, body)
+
+
+@mock.patch.object(role_filter.permission, 'permission_service')
+def test_allow_non_admin_task_without_pod_config(mock_svc):
+    body = _launch_body(
+        'envs:\n  pod_config: harmless\nconfig:\n  kubernetes:\n'
+        '    provision_timeout: 15\n')
+
+    role_filter.reject_non_admin_pod_config(_auth_user(), body)
+
+    mock_svc.get_user_roles.assert_not_called()
+
+
+@mock.patch.object(role_filter.permission, 'permission_service')
+def test_reject_client_pod_config_for_non_task_request(mock_svc):
+    mock_svc.get_user_roles.return_value = [rbac.RoleName.USER.value]
+    body = payloads.StatusBody(
+        override_skypilot_config={'kubernetes': {
+            'pod_config': {}
+        }})
+
+    with pytest.raises(fastapi.HTTPException) as exc_info:
+        role_filter.reject_non_admin_pod_config(_auth_user(), body)
+
+    assert exc_info.value.status_code == 403
 
 
 @mock.patch.object(role_filter.permission, 'permission_service')
