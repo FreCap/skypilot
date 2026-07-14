@@ -220,7 +220,6 @@ def query_ports(
     provider_config: dict[str, Any] | None = None,
 ) -> dict[int, list[common.Endpoint]]:
     """See sky/provision/__init__.py"""
-    del head_ip  # unused
     assert provider_config is not None, 'provider_config is required'
     context = kubernetes_utils.get_context_from_config(provider_config)
     port_mode = network_utils.get_port_mode(
@@ -245,6 +244,7 @@ def query_ports(
                 cluster_name_on_cloud=cluster_name_on_cloud,
                 ports=ports,
                 provider_config=provider_config,
+                head_ip=head_ip,
             )
         else:
             return {}
@@ -326,14 +326,17 @@ def _query_ports_for_podip(
     cluster_name_on_cloud: str,
     ports: list[int],
     provider_config: dict[str, Any],
+    head_ip: str | None = None,
 ) -> dict[int, list[common.Endpoint]]:
-    context = provider_config.get(
-        'context', kubernetes_utils.get_current_kube_config_context_name())
-    namespace = provider_config.get(
-        'namespace',
-        kubernetes_utils.get_kube_config_context_namespace(context))
-    pod_name = kubernetes_utils.get_head_pod_name(cluster_name_on_cloud)
-    pod_ip = network_utils.get_pod_ip(context, namespace, pod_name)
+    pod_ip = head_ip
+    if pod_ip is None:
+        context = provider_config.get(
+            'context', kubernetes_utils.get_current_kube_config_context_name())
+        namespace = provider_config.get(
+            'namespace',
+            kubernetes_utils.get_kube_config_context_namespace(context))
+        pod_name = kubernetes_utils.get_head_pod_name(cluster_name_on_cloud)
+        pod_ip = network_utils.get_pod_ip(context, namespace, pod_name)
 
     result: dict[int, list[common.Endpoint]] = {}
     if pod_ip is None:

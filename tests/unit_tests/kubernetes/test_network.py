@@ -26,8 +26,8 @@ class TestOpenPortsUsingIngress:
            '.get_context_from_config')
     def test_url_path_uses_provider_namespace_not_kubeconfig_default(
             self, mock_get_context, mock_get_ns_from_config, mock_kubeconfig_ns,
-            mock_ingress_exists, mock_fill_template, mock_create_service,
-            mock_create_ingress, mock_merge_metadata):
+            mock_ingress_exists, mock_fill_template, _mock_create_service,
+            _mock_create_ingress, _mock_merge_metadata):
         """The Ingress URL path must reference the same namespace as the Service.
 
         Regression: when a workspace/per-context override sets
@@ -91,8 +91,8 @@ class TestOpenPortsUsingIngress:
            '.get_context_from_config')
     def test_url_path_namespace_matches_service_namespace_for_all_ports(
             self, mock_get_context, mock_get_ns_from_config, mock_kubeconfig_ns,
-            mock_ingress_exists, mock_fill_template, mock_create_service,
-            mock_create_ingress, mock_merge_metadata):
+            mock_ingress_exists, mock_fill_template, _mock_create_service,
+            _mock_create_ingress, _mock_merge_metadata):
         """Multiple ports all share the same namespace in their URL paths."""
         provider_config = {
             'context': 'shared-ctx',
@@ -120,3 +120,45 @@ class TestOpenPortsUsingIngress:
             assert 'team-b' in url_path, (
                 f'Every port URL path must use the resolved namespace, '
                 f'got: {url_path!r}')
+
+
+class TestQueryPortsUsingPodIP:
+    """PodIP endpoint lookup reuses the recorded cluster head IP."""
+
+    @patch('sky.provision.kubernetes.network.network_utils.get_pod_ip')
+    @patch('sky.provision.kubernetes.network.network_utils.get_port_mode')
+    def test_reuses_head_ip_without_kubernetes_api(self, mock_get_port_mode,
+                                                   mock_get_pod_ip):
+        mock_get_port_mode.return_value = (
+            network.kubernetes_enums.KubernetesPortMode.PODIP)
+
+        endpoints = network.query_ports(
+            cluster_name_on_cloud='cluster0',
+            ports=['8080'],
+            head_ip='10.0.0.42',
+            provider_config={'context': 'research'},
+        )
+
+        assert endpoints[8080][0].url() == '10.0.0.42:8080'
+        mock_get_pod_ip.assert_not_called()
+
+    @patch('sky.provision.kubernetes.network.network_utils.get_pod_ip',
+           return_value='10.0.0.43')
+    @patch('sky.provision.kubernetes.network.network_utils.get_port_mode')
+    def test_falls_back_to_pod_lookup_without_head_ip(self, mock_get_port_mode,
+                                                      mock_get_pod_ip):
+        mock_get_port_mode.return_value = (
+            network.kubernetes_enums.KubernetesPortMode.PODIP)
+
+        endpoints = network.query_ports(
+            cluster_name_on_cloud='cluster0',
+            ports=['8080'],
+            provider_config={
+                'context': 'research',
+                'namespace': 'default',
+            },
+        )
+
+        assert endpoints[8080][0].url() == '10.0.0.43:8080'
+        mock_get_pod_ip.assert_called_once_with('research', 'default',
+                                                'cluster0-head')
