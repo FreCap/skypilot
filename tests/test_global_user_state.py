@@ -4,6 +4,7 @@ import unittest.mock as mock
 
 import pytest
 from sqlalchemy import create_engine
+from sqlalchemy import event
 
 import sky
 from sky import backends
@@ -22,6 +23,50 @@ def _mock_db_conn(tmp_path, monkeypatch):
                         sqlalchemy_engine)
 
     global_user_state.create_table(sqlalchemy_engine)
+    yield sqlalchemy_engine
+
+
+def _insert_cluster_names(engine, names_and_workspaces):
+    with engine.begin() as connection:
+        connection.execute(global_user_state.cluster_table.insert(), [{
+            'name': name,
+            'workspace': workspace,
+        } for name, workspace in names_and_workspaces])
+
+
+def test_get_glob_cluster_names_batches_patterns(_mock_db_conn):
+    engine = _mock_db_conn
+    _insert_cluster_names(engine, [('train-a', 'alpha'), ('train-b', 'alpha'),
+                                   ('serve-a', 'beta')])
+
+    assert sorted(global_user_state.get_glob_cluster_names(
+        ['train-*', '*-a'])) == ['serve-a', 'train-a', 'train-b']
+    assert global_user_state.get_glob_cluster_names(
+        ['*-a'], workspaces_filter={'alpha'}) == ['train-a']
+    assert global_user_state.get_glob_cluster_names([]) == []
+
+
+def test_get_glob_cluster_names_issues_one_query(_mock_db_conn):
+    engine = _mock_db_conn
+    _insert_cluster_names(engine, [('train-a', 'alpha'), ('train-b', 'alpha'),
+                                   ('serve-a', 'beta')])
+    select_statements = []
+
+    @event.listens_for(engine, 'before_cursor_execute')
+    def _count_selects(_conn, _cursor, statement, *_args):
+        if statement.lstrip().upper().startswith('SELECT'):
+            select_statements.append(statement)
+
+    try:
+        assert global_user_state.get_glob_cluster_names([]) == []
+        assert not select_statements
+        names = global_user_state.get_glob_cluster_names(
+            ['train-*', '*-a', 'serve-*'])
+    finally:
+        event.remove(engine, 'before_cursor_execute', _count_selects)
+
+    assert sorted(names) == ['serve-a', 'train-a', 'train-b']
+    assert len(select_statements) == 1
 
 
 @pytest.mark.skipif(sys.platform != 'linux', reason='Only test in CI.')

@@ -1718,21 +1718,28 @@ def get_status_from_cluster_name(
 
 @metrics_lib.time_me
 def get_glob_cluster_names(
-        cluster_name: str,
+        cluster_names: list[str],
         workspaces_filter: set[str] | None = None) -> list[str]:
     engine = _db_manager.get_engine()
-    assert cluster_name is not None, 'cluster_name cannot be None'
+    if not cluster_names:
+        return []
     with orm.Session(engine) as session:
         if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
-            query = session.query(cluster_table.c.name).filter(
-                cluster_table.c.name.op('GLOB')(cluster_name))
+            match_filters = [
+                cluster_table.c.name.op('GLOB')(cluster_name)
+                for cluster_name in cluster_names
+            ]
         elif (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value
              ):
-            query = session.query(cluster_table.c.name).filter(
+            match_filters = [
                 cluster_table.c.name.op('SIMILAR TO')(
-                    _glob_to_similar(cluster_name)))
+                    _glob_to_similar(cluster_name))
+                for cluster_name in cluster_names
+            ]
         else:
             raise ValueError('Unsupported database dialect')
+        query = session.query(cluster_table.c.name).filter(
+            sqlalchemy.or_(*match_filters))
         if workspaces_filter is not None:
             query = query.filter(
                 cluster_table.c.workspace.in_(workspaces_filter))

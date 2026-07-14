@@ -3895,17 +3895,10 @@ class CloudFilter(enum.Enum):
 
 
 def _get_glob_clusters(clusters: list[str],
-                       silent: bool = False,
                        workspaces_filter: set[str] | None = None) -> list[str]:
     """Returns a list of clusters that match the glob pattern."""
-    glob_clusters = []
-    for cluster in clusters:
-        glob_cluster = global_user_state.get_glob_cluster_names(
-            cluster, workspaces_filter=workspaces_filter)
-        if len(glob_cluster) == 0 and not silent:
-            logger.info(f'Cluster {cluster} not found.')
-        glob_clusters.extend(glob_cluster)
-    return list(set(glob_clusters))
+    return global_user_state.get_glob_cluster_names(
+        clusters, workspaces_filter=workspaces_filter)
 
 
 _MAX_NAMES_IN_SUMMARY = 3
@@ -4223,9 +4216,7 @@ def get_clusters(
         cluster_names = non_glob_cluster_names
         if glob_cluster_names:
             cluster_names += _get_glob_clusters(
-                glob_cluster_names,
-                silent=True,
-                workspaces_filter=accessible_workspaces)
+                glob_cluster_names, workspaces_filter=accessible_workspaces)
 
     exclude_managed_clusters = False
     if not (_include_is_managed or env_options.Options.SHOW_DEBUG_INFO.get()):

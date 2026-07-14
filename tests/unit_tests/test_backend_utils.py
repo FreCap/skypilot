@@ -338,6 +338,22 @@ def test_get_clusters_honors_include_handle_for_incomplete_record(
         get_request_tasks.assert_not_called()
 
 
+def test_get_glob_clusters_batches_patterns(monkeypatch):
+    get_glob_cluster_names = mock.Mock(
+        return_value=['train-a', 'train-b', 'serve-a'])
+    monkeypatch.setattr('sky.global_user_state.get_glob_cluster_names',
+                        get_glob_cluster_names)
+
+    patterns = ['train-*', '*-a', 'serve-*']
+    workspaces = {'alpha', 'beta'}
+    assert backend_utils._get_glob_clusters(patterns,
+                                            workspaces_filter=workspaces) == [
+                                                'train-a', 'train-b', 'serve-a'
+                                            ]
+    get_glob_cluster_names.assert_called_once_with(patterns,
+                                                   workspaces_filter=workspaces)
+
+
 def test_get_clusters_refresh_enriches_only_final_records(monkeypatch):
     """Refreshed clusters should be enriched from their final records once."""
 
