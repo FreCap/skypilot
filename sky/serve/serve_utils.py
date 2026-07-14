@@ -774,13 +774,11 @@ def ha_recovery_for_consolidation_mode(pool: bool,
               encoding='utf-8') as f:
         start = time.time()
         f.write(f'Starting HA recovery at {datetime.datetime.now()}\n')
-        # Snapshot every service name known to the DB. In external-LB mode this
-        # is the set of live services used below to reap orphaned LB objects
-        # (LBs whose owning service row is gone). It is a superset (also
-        # includes pools), which is safe: reconcile only deletes LBs NOT in the
-        # set, and pools own no LB.
-        all_service_names = serve_state.get_glob_service_names(None)
-        for service_name in all_service_names:
+        # Snapshot only the mode this sweep can recover. Pools never own
+        # external LBs, so the service-mode snapshot is also the complete set
+        # of live LB owners used by reconciliation below.
+        service_names = serve_state.get_glob_service_names(None, pool=pool)
+        for service_name in service_names:
             svc = _get_service_status(service_name,
                                       pool=pool,
                                       with_replica_info=False,
@@ -794,37 +792,28 @@ def ha_recovery_for_consolidation_mode(pool: bool,
             needs_committed_version_check = (svc is None or
                                              ('yaml_content' in svc and
                                               svc['yaml_content'] is None))
-            if (needs_committed_version_check and
-                    serve_state.get_latest_committed_version(service_name)
-                    is None):
-                raw_identity = serve_state.get_service_mode_and_hash(
-                    service_name)
-                if (raw_identity is not None and raw_identity[0] == pool and
-                        isinstance(raw_identity[1], str) and raw_identity[1]):
-                    retired = (
-                        serve_state.mark_unrecoverable_service_for_cleanup(
-                            service_name, raw_identity[1], pool))
-                    if retired:
-                        f.write(f'{capnoun} {service_name} has no committed '
+            if needs_committed_version_check:
+                committed_version = (
+                    serve_state.get_latest_committed_version(service_name))
+                if committed_version is None:
+                    raw_identity = serve_state.get_service_mode_and_hash(
+                        service_name)
+                    if (raw_identity is not None and raw_identity[0] == pool and
+                            isinstance(raw_identity[1], str) and
+                            raw_identity[1]):
+                        retired = (
+                            serve_state.mark_unrecoverable_service_for_cleanup(
+                                service_name, raw_identity[1], pool))
+                        if retired:
+                            f.write(
+                                f'{capnoun} {service_name} has no committed '
                                 'version; retired its unusable recovery '
                                 'script and marked it for purge.\n')
-                continue
+                    continue
             if svc is None:
-                # A raw service row without committed YAML is invisible to the
-                # latest-version join and its recovery script cannot possibly
-                # boot. Retire that script atomically instead of retrying an
-                # immortal partial registration forever.
-                raw_identity = serve_state.get_service_mode_and_hash(
-                    service_name)
-                if (raw_identity is not None and raw_identity[0] == pool and
-                        isinstance(raw_identity[1], str) and raw_identity[1]):
-                    retired = (
-                        serve_state.mark_unrecoverable_service_for_cleanup(
-                            service_name, raw_identity[1], pool))
-                    if retired:
-                        f.write(f'{capnoun} {service_name} has no committed '
-                                'version; retired its unusable recovery '
-                                'script and marked it for purge.\n')
+                # The row disappeared or changed mode between the name and
+                # joined-status snapshots. It is no longer ours to recover in
+                # this sweep.
                 continue
             controller_pid = svc['controller_pid']
             controller_ip = svc.get('controller_ip')
@@ -925,7 +914,7 @@ def ha_recovery_for_consolidation_mode(pool: bool,
             from sky.serve import (  # pylint: disable=import-outside-toplevel  # noqa: E501
                 lb_k8s)
             try:
-                lb_k8s.reconcile_lb_objects(set(all_service_names))
+                lb_k8s.reconcile_lb_objects(set(service_names))
             except Exception as e:  # pylint: disable=broad-except
                 # Reconcile is best-effort cleanup; never let it abort recovery.
                 f.write(f'Failed to reconcile external LB objects: {e}\n')
