@@ -684,11 +684,29 @@ def _configure_security_group(ec2: 'mypy_boto3_ec2.ServiceResource',
         # If users specify security groups, we should not change the rules
         # of these security groups. Here we change it because it is the default
         # security group for SkyPilot.
-        security_group.authorize_ingress(IpPermissions=inbound_rules)
+        _authorize_security_group_rules(security_group, 'authorize_ingress',
+                                        inbound_rules)
     if _need_to_update_outbound_rules(security_group, outbound_rules):
-        security_group.authorize_egress(IpPermissions=outbound_rules)
+        _authorize_security_group_rules(security_group, 'authorize_egress',
+                                        outbound_rules)
 
     return sg_ids
+
+
+def _authorize_security_group_rules(security_group: Any, method_name: str,
+                                    rules: list[dict[str, Any]]) -> None:
+    """Authorize rules while tolerating a concurrent identical upsert."""
+    try:
+        getattr(security_group, method_name)(IpPermissions=rules)
+    except aws.botocore_exceptions().ClientError as exc:
+        error_code = exc.response.get('Error', {}).get('Code')
+        if error_code != 'InvalidPermission.Duplicate':
+            raise
+        # Multiple clusters can observe an empty shared security group and
+        # race to seed the same rules. AWS applies one request and rejects the
+        # others as duplicates; the desired rules already exist in that case.
+        logger.debug('Security group rules were added concurrently; '
+                     'continuing with the existing identical rules.')
 
 
 def _need_to_update_outbound_rules(

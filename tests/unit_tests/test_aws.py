@@ -376,6 +376,63 @@ def test_security_group_tagged_on_create():
     }]
 
 
+def _client_error(code: str):
+    return config.aws.botocore_exceptions().ClientError(
+        {'Error': {
+            'Code': code,
+            'Message': code,
+        }}, 'AuthorizeSecurityGroupIngress')
+
+
+def test_configure_security_group_ignores_concurrent_duplicate_ingress():
+    security_group = MagicMock(id='sg-shared')
+    security_group.ip_permissions = []
+    security_group.ip_permissions_egress = [{}]
+    security_group.authorize_ingress.side_effect = _client_error(
+        'InvalidPermission.Duplicate')
+
+    with patch.object(config,
+                      '_get_or_create_vpc_security_group',
+                      return_value=security_group):
+        result = config._configure_security_group(MagicMock(), 'vpc-123',
+                                                  'shared-sg', [], False)
+
+    assert result == ['sg-shared']
+    security_group.authorize_ingress.assert_called_once()
+
+
+def test_configure_security_group_raises_nonduplicate_ingress_error():
+    security_group = MagicMock(id='sg-shared')
+    security_group.ip_permissions = []
+    security_group.ip_permissions_egress = [{}]
+    security_group.authorize_ingress.side_effect = _client_error(
+        'UnauthorizedOperation')
+
+    with patch.object(config,
+                      '_get_or_create_vpc_security_group',
+                      return_value=security_group), pytest.raises(
+                          config.aws.botocore_exceptions().ClientError):
+        config._configure_security_group(MagicMock(), 'vpc-123', 'shared-sg',
+                                         [], False)
+
+
+def test_configure_security_group_ignores_concurrent_duplicate_egress():
+    security_group = MagicMock(id='sg-shared')
+    security_group.ip_permissions = [{}]
+    security_group.ip_permissions_egress = []
+    security_group.authorize_egress.side_effect = _client_error(
+        'InvalidPermission.Duplicate')
+
+    with patch.object(config,
+                      '_get_or_create_vpc_security_group',
+                      return_value=security_group):
+        result = config._configure_security_group(MagicMock(), 'vpc-123',
+                                                  'shared-sg', [], True)
+
+    assert result == ['sg-shared']
+    security_group.authorize_egress.assert_called_once()
+
+
 def test_ssm_default(monkeypatch):
     """Test that SSM is explicitly set to true if use_internal_ips is true
     and ssh_proxy_command is not set.
