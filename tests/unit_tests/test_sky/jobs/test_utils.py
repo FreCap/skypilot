@@ -273,6 +273,9 @@ class TestGetManagedJobQueue:
         monkeypatch.setattr(jobs_utils.managed_job_state,
                             'get_managed_jobs_highest_priority',
                             fake_get_managed_jobs_highest_priority)
+        monkeypatch.setattr(jobs_utils.managed_job_state,
+                            'get_latest_recovery_and_pending_reasons',
+                            lambda recovering_ids, pending_ids: ({}, {}))
 
     def _patch_global_user_state(self, monkeypatch: pytest.MonkeyPatch):
         """Patch global_user_state for testing."""
@@ -1106,6 +1109,7 @@ class TestFormatJobDetails:
                  failure_reason=None,
                  status='RECOVERING',
                  recovery_reason=None,
+                 pending_reason=None,
                  cloud=None):
         job = {
             'schedule_state': schedule_state,
@@ -1115,7 +1119,8 @@ class TestFormatJobDetails:
         }
         jobs_utils._format_job_details(job=job,
                                        highest_blocking_priority=0,
-                                       recovery_reason=recovery_reason)
+                                       recovery_reason=recovery_reason,
+                                       pending_reason=pending_reason)
         return job['details']
 
     def test_recovery_reason_surfaced(self):
@@ -1138,15 +1143,27 @@ class TestFormatJobDetails:
     def test_no_recovery_reason_is_none(self):
         assert self._details(recovery_reason=None) is None
 
+    def test_pending_reason_surfaced_and_multiline_collapsed(self):
+        assert self._details(
+            status='PENDING',
+            pending_reason='Capacity unavailable.\nRetrying shortly.') == (
+                'Capacity unavailable. Retrying shortly.')
+
     def test_failure_reason_takes_precedence_over_recovery(self):
         # A terminal failure_reason should win over a (stale) recovery reason.
         assert self._details(failure_reason='boom',
                              recovery_reason='ignored') == 'Failure: boom'
 
+    def test_recovery_reason_takes_precedence_over_pending(self):
+        assert self._details(
+            recovery_reason='preempted',
+            pending_reason='ignored') == ('Recovering: preempted')
+
     def test_backoff_state_takes_precedence_over_recovery(self):
         assert self._details(
             schedule_state='ALIVE_BACKOFF',
-            recovery_reason='ignored') == 'In backoff, waiting for resources'
+            recovery_reason='ignored',
+            pending_reason='ignored') == ('In backoff, waiting for resources')
 
     def test_recovery_reason_oom_appends_hint_on_kubernetes(self):
         result = self._details(cloud='Kubernetes',
