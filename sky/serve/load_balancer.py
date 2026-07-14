@@ -310,6 +310,7 @@ class SkyServeLoadBalancer:
     _request_queue_condition: asyncio.Condition | None = None
     _active_request_count: int = 0
     _waiting_request_count: int = 0
+    _draining: bool = False
     _reject_last_seen: dict[str, float] | None = None
     _reject_fallback_seq: int = 0
     _capacity_hint: dict[str, Any] | None = None
