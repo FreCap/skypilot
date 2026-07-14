@@ -18,7 +18,10 @@ import pytest
 
 from sky.jobs import state as managed_job_state
 from sky.jobs.controller import ControllerManager
+from sky.jobs.controller import JobController
+from sky.skylet import job_lib
 from sky.utils import common
+from sky.utils import status_lib
 
 
 class TestNormalJobRecovery:
@@ -1078,3 +1081,60 @@ class TestDownloadLogsForCancelledJob:
                 0, mock_handle_0, None)
             controller.download_log_and_stream.assert_any_call(
                 1, mock_handle_1, None)
+
+
+class TestUserJobStatusClassification:
+    """Tests classification of terminal jobs on the worker cluster."""
+
+    @staticmethod
+    def _make_controller() -> JobController:
+        controller = JobController.__new__(JobController)
+        controller._job_id = 1
+        controller._pool = None
+        controller._backend = MagicMock()
+        controller.download_log_and_stream = MagicMock()
+        controller._get_cluster_job_exit_codes = AsyncMock(return_value=[])
+        return controller
+
+    @pytest.mark.asyncio
+    async def test_failed_driver_is_a_user_job_failure(self):
+        controller = self._make_controller()
+        task = MagicMock(name='task')
+        task.name = 'test-task'
+        task.num_nodes = 1
+        executor = MagicMock()
+        executor.should_restart_on_failure.return_value = False
+        handle = MagicMock()
+
+        with patch('asyncio.sleep', new=AsyncMock()), patch(
+                'sky.backends.backend_utils.async_check_network_connection',
+                new=AsyncMock()), patch(
+                    'sky.jobs.utils.get_job_status',
+                    new=AsyncMock(return_value=(
+                        job_lib.JobStatus.FAILED_DRIVER, None))), patch(
+                            'sky.jobs.utils.try_to_get_job_end_time',
+                            return_value=12345.0), patch(
+                                'sky.backends.backend_utils.'
+                                'refresh_cluster_status_handle',
+                                return_value=(
+                                    status_lib.ClusterStatus.UP,
+                                    handle)), patch(
+                                        'sky.jobs.state.'
+                                        'set_failed_async',
+                                        new=AsyncMock()) as set_failed:
+            succeeded = await controller._monitor_one_task(
+                task_id=0,
+                task=task,
+                cluster_name='test-cluster',
+                executor=executor,
+                callback_func=MagicMock(),
+            )
+
+        assert succeeded is False
+        executor.should_restart_on_failure.assert_called_once_with(
+            exit_codes=[])
+        set_failed.assert_awaited_once()
+        assert (set_failed.call_args.kwargs['failure_type'] ==
+                managed_job_state.ManagedJobStatus.FAILED)
+        assert 'job driver on the remote cluster failed' in (
+            set_failed.call_args.kwargs['failure_reason'])
