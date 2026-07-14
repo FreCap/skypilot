@@ -2526,9 +2526,15 @@ def _query_cluster_status_via_cloud_api(
 
 
 def _query_cluster_info_via_cloud_api(
-    handle: 'cloud_vm_ray_backend.CloudVmRayResourceHandle'
+    handle: 'cloud_vm_ray_backend.CloudVmRayResourceHandle',
+    get_ray_config: Callable[[], dict[str, Any]] | None = None,
 ) -> provision_common.ClusterInfo:
     """Returns the cluster info.
+
+    Args:
+        get_ray_config: optional zero-arg callable returning the parsed
+          cluster YAML. Callers that already hold (or memoize) the parsed
+          YAML pass this to avoid a redundant DB read + YAML parse per call.
 
     Raises:
         exceptions.NotSupportedError: the cloud does not support the new provisioner.
@@ -2540,8 +2546,11 @@ def _query_cluster_info_via_cloud_api(
     if cloud.STATUS_VERSION >= clouds.StatusVersion.SKYPILOT:
         try:
             cloud_name = repr(cloud)
-            ray_config = global_user_state.get_cluster_yaml_dict(
-                handle.cluster_yaml)
+            if get_ray_config is not None:
+                ray_config = get_ray_config()
+            else:
+                ray_config = global_user_state.get_cluster_yaml_dict(
+                    handle.cluster_yaml)
             provider_config = ray_config['provider']
             region = provider_config.get('region') or provider_config.get(
                 'location')
@@ -3177,7 +3186,8 @@ def _update_cluster_status(
             if launched_resources.cloud.PROVISIONER_VERSION >= clouds.ProvisionerVersion.SKYPILOT:
                 # Check if the head node is alive
                 try:
-                    cluster_info = _query_cluster_info_via_cloud_api(handle)
+                    cluster_info = _query_cluster_info_via_cloud_api(
+                        handle, get_ray_config=_get_ray_config)
                     is_head_node_alive = cluster_info.get_head_instance(
                     ) is not None
                 except Exception as e:  # pylint: disable=broad-except

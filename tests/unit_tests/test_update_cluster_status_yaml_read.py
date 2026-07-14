@@ -47,10 +47,16 @@ def _make_record(handle):
     }
 
 
-def _run_update(node_status_dict, yaml_reader):
+def _run_update(node_status_dict, yaml_reader, autostop=-1):
     """Run _update_cluster_status with the real cloud-API query path."""
     handle = _make_handle()
     record = _make_record(handle)
+    record['autostop'] = autostop
+
+    cluster_info = mock.Mock()
+    cluster_info.get_head_instance.return_value = mock.Mock()
+    backend = mock.Mock(spec=backends.CloudVmRayBackend)
+    backend.is_definitely_autostopping.return_value = False
 
     external_failure = mock.Mock()
     external_failure.get.return_value = None
@@ -74,7 +80,11 @@ def _run_update(node_status_dict, yaml_reader):
                            'add_or_update_cluster'), \
          mock.patch.object(backend_utils.global_user_state,
                            'get_cluster_from_name',
-                           return_value=record):
+                           return_value=record), \
+         mock.patch.object(backend_utils.provision_lib, 'get_cluster_info',
+                           return_value=cluster_info), \
+         mock.patch.object(backend_utils, 'get_backend_from_handle',
+                           return_value=backend):
         backend_utils._update_cluster_status('test-cluster',
                                              record,
                                              retry_if_missing=False)
@@ -89,6 +99,17 @@ class TestSingleYamlReadPerRefresh:
         # need the parsed YAML; the refresh must fetch it exactly once.
         yaml_reader = mock.Mock(return_value=_YAML_DICT)
         _run_update({'pod-0': (status_lib.ClusterStatus.UP, None)}, yaml_reader)
+        assert yaml_reader.call_count == 1, yaml_reader.call_count
+
+    def test_abnormal_autostop_head_probe_reuses_query_yaml(self):
+        # With autostop enabled, the abnormal branch additionally probes the
+        # head node via _query_cluster_info_via_cloud_api. That probe needs
+        # the parsed YAML too; the refresh must still fetch it exactly once,
+        # shared with the cloud-API status query and the k8s diagnostics.
+        yaml_reader = mock.Mock(return_value=_YAML_DICT)
+        _run_update({'pod-0': (status_lib.ClusterStatus.UP, None)},
+                    yaml_reader,
+                    autostop=10)
         assert yaml_reader.call_count == 1, yaml_reader.call_count
 
     def test_failed_yaml_read_is_not_memoized(self):
