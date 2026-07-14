@@ -1,5 +1,6 @@
 """Unit tests for OCI S3-compatible storage dispatch and store behavior."""
 
+import pickle
 import subprocess
 import unittest
 from unittest import mock
@@ -7,6 +8,7 @@ from unittest import mock
 from sky import cloud_stores
 from sky import exceptions
 from sky.data import storage as storage_lib
+from sky.data import storage_oci
 
 
 def _make_storage(**attrs):
@@ -24,6 +26,24 @@ def _make_storage(**attrs):
 
 class TestOciStoreDispatch(unittest.TestCase):
     """StoreType.OCI must dispatch on oci_s3.use_s3_api()."""
+
+    def test_public_classes_round_trip_through_pickle(self):
+        for store_cls in (storage_lib.OciStore,
+                          storage_lib.OciS3CompatibleStore):
+            self.assertIs(pickle.loads(pickle.dumps(store_cls)), store_cls)
+
+        self.assertIs(storage_lib.OciStore, storage_oci.OciStore)
+        self.assertIs(storage_lib.OciS3CompatibleStore,
+                      storage_oci.OciS3CompatibleStore)
+
+    def test_native_region_suffix_is_canonicalized(self):
+        with mock.patch.object(storage_lib.AbstractStore,
+                               '__init__',
+                               return_value=None) as mock_parent_init:
+            storage_lib.OciStore(name='bucket@us-sanjose-1', source=None)
+
+        mock_parent_init.assert_called_once_with('bucket', None, 'us-sanjose-1',
+                                                 None, True, None)
 
     def test_oci_s3_store_not_in_s3_compatible_registry(self):
         # Registering under 'OCI' would take over all StoreType.OCI dispatch
