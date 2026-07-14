@@ -2854,19 +2854,32 @@ class SkyPilotReplicaManager(ReplicaManager):
         # instantiate the manager without running the current constructor.
         if not hasattr(self, '_wait_for_idle_trackers'):
             self._wait_for_idle_trackers = {}
-        for replica_id, tracked in list(self._wait_for_idle_trackers.items()):
+        tracker_items = list(self._wait_for_idle_trackers.items())
+        if not tracker_items:
+            return
+
+        replica_infos = serve_state.get_replica_infos_from_ids(
+            self._service_name, [replica_id for replica_id, _ in tracker_items])
+        tracked_infos: dict[int, ReplicaInfo] = {}
+        for replica_id, _ in tracker_items:
+            info = replica_infos.get(replica_id)
+            if (info is None or getattr(info.status_property,
+                                        'wait_for_idle_before_termination',
+                                        False) is not True):
+                self._wait_for_idle_trackers.pop(replica_id, None)
+                continue
+            tracked_infos[replica_id] = info
+
+        cluster_names = list(
+            dict.fromkeys(info.cluster_name for info in tracked_infos.values()))
+        cluster_status_fields = global_user_state.get_cluster_status_fields(
+            cluster_names)
+        for replica_id, tracked in tracker_items:
             tracker, deadline = tracked
-            info = serve_state.get_replica_info_from_id(self._service_name,
-                                                        replica_id)
+            info = tracked_infos.get(replica_id)
             if info is None:
-                self._wait_for_idle_trackers.pop(replica_id, None)
                 continue
-            if (getattr(info.status_property,
-                        'wait_for_idle_before_termination', False) is not True):
-                self._wait_for_idle_trackers.pop(replica_id, None)
-                continue
-            if not global_user_state.cluster_with_name_exists(
-                    info.cluster_name):
+            if info.cluster_name not in cluster_status_fields:
                 drained = True
             else:
                 if tracker is None:
