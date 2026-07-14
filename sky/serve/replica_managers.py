@@ -1030,13 +1030,16 @@ class ReplicaInfo:
         post_data: dict[str, Any] | None,
         timeout: int,
         headers: dict[str, str] | None,
+        resolved_url: Any = _NOT_PROVIDED,
     ) -> tuple['ReplicaInfo', bool, float]:
         """Probe the readiness of the replica.
 
         Returns:
             Tuple of (self, is_ready, probe_time).
         """
-        replica_identity = f'replica {self.replica_id} with url {self.url}'
+        url = self.url if resolved_url is _NOT_PROVIDED else resolved_url
+        assert url is None or isinstance(url, str), url
+        replica_identity = f'replica {self.replica_id} with url {url}'
         # TODO(tian): This requiring the clock on each replica to be aligned,
         # which may not be true when the GCP VMs have run for a long time. We
         # should have a better way to do this. See #2539 for more information.
@@ -1044,7 +1047,6 @@ class ReplicaInfo:
         try:
             msg = ''
             # TODO(tian): Support HTTPS in the future.
-            url = self.url
             if url is None:
                 logger.info(f'Error when probing {replica_identity}: '
                             'Cannot get the endpoint.')
@@ -1434,7 +1436,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         self._down_thread_pool: thread_utils.ThreadSafeDict[
             int, thread_utils.SafeThread] = thread_utils.ThreadSafeDict()
         self._wait_for_idle_trackers: dict[int,
-                                           _ReplicaDrainTracker | None] = {}
+                                           tuple[_ReplicaDrainTracker | None,
+                                                 float]] = {}
 
         # Tick-scoped memo of per-version specs, reset at the start of every
         # probe round (see _probe_all_replicas). Within a single readiness probe
@@ -1818,18 +1821,24 @@ class SkyPilotReplicaManager(ReplicaManager):
             if self._spot_placer is None:
                 logger.warning('Skipping cost-rebalance launch: no spot '
                                'placer is available.')
+                self._clean_up_skipped_cost_rebalance_redrive(
+                    replica_id, prior_cost_rebalance_for_replica_id)
                 return False
             pinned_location = spot_placer.Location.from_resources_override(
                 resources_override)
             if pinned_location is None:
                 logger.warning('Skipping cost-rebalance launch: candidate '
                                'location could not be reconstructed.')
+                self._clean_up_skipped_cost_rebalance_redrive(
+                    replica_id, prior_cost_rebalance_for_replica_id)
                 return False
             location = self._spot_placer.resolve_location(pinned_location)
             if (location is None or
                     not self._spot_placer.is_active_location(location)):
                 logger.info('Skipping cost-rebalance launch: candidate '
                             f'{pinned_location} is no longer active.')
+                self._clean_up_skipped_cost_rebalance_redrive(
+                    replica_id, prior_cost_rebalance_for_replica_id)
                 return False
             resources_override = location.to_dict()
             use_spot = location.use_spot
@@ -2657,10 +2666,36 @@ class SkyPilotReplicaManager(ReplicaManager):
                 f'{common_utils.format_exception(e)}')
         return _DEFAULT_DRAIN_SECONDS
 
-    def _register_wait_for_idle(self, info: ReplicaInfo) -> None:
+    def _clean_up_skipped_cost_rebalance_redrive(
+            self, replica_id: int,
+            prior_cost_rebalance_for_replica_id: int | None) -> None:
+        """Retire a persisted replacement that recovery cannot re-launch."""
+        if prior_cost_rebalance_for_replica_id is None:
+            # Fresh cost-rebalance emissions have not persisted a row yet.
+            return
+        logger.warning(
+            f'Retiring cost-rebalance replacement {replica_id} after its '
+            'recovery re-drive could not be enqueued.')
+        self._terminate_replica(replica_id,
+                                sync_down_logs=False,
+                                replica_drain_delay_seconds=0,
+                                is_scale_down=True,
+                                in_flight_drain_cap_seconds=0)
+
+    def _register_wait_for_idle(self,
+                                info: ReplicaInfo,
+                                deadline: float | None = None) -> None:
         """Register or conservatively retry a strict economic drain."""
         if info.replica_id in self._wait_for_idle_trackers:
             return
+        drain_cap = getattr(info.status_property, 'drain_cap_seconds', None)
+        if drain_cap is None:
+            drain_cap = self._resolve_drain_cap_seconds(info.replica_id)
+            info.status_property.drain_cap_seconds = drain_cap
+            self._persist_replica(info.replica_id, info)
+        drain_started = time.monotonic()
+        if deadline is None:
+            deadline = drain_started + drain_cap
         tracker = None
         try:
             replica_url = info.url
@@ -2670,8 +2705,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                            f'{common_utils.format_exception(e)}')
             replica_url = None
         if replica_url is not None and not self._is_pool:
-            tracker = _ReplicaDrainTracker(self, replica_url, time.monotonic())
-        self._wait_for_idle_trackers[info.replica_id] = tracker
+            tracker = _ReplicaDrainTracker(self, replica_url, drain_started)
+        self._wait_for_idle_trackers[info.replica_id] = (tracker, deadline)
 
     def _defer_scale_down_until_idle(self, replica_id: int) -> None:
         """Persist off-route state without admitting termination yet."""
@@ -2694,7 +2729,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         info.status_property.purged = False
         info.status_property.sky_down_status = (
             common_utils.ProcessStatus.SCHEDULED)
-        info.status_property.drain_cap_seconds = None
+        info.status_property.drain_cap_seconds = (
+            self._resolve_drain_cap_seconds(replica_id))
         info.status_property.wait_for_idle_before_termination = True
         self._persist_replica(replica_id, info)
         self._register_wait_for_idle(info)
@@ -2705,7 +2741,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         # instantiate the manager without running the current constructor.
         if not hasattr(self, '_wait_for_idle_trackers'):
             self._wait_for_idle_trackers = {}
-        for replica_id, tracker in list(self._wait_for_idle_trackers.items()):
+        for replica_id, tracked in list(self._wait_for_idle_trackers.items()):
+            tracker, deadline = tracked
             info = serve_state.get_replica_info_from_id(self._service_name,
                                                         replica_id)
             if info is None:
@@ -2722,11 +2759,23 @@ class SkyPilotReplicaManager(ReplicaManager):
                 if tracker is None:
                     # Endpoint discovery can fail transiently during recovery.
                     self._wait_for_idle_trackers.pop(replica_id, None)
-                    self._register_wait_for_idle(info)
-                    tracker = self._wait_for_idle_trackers.get(replica_id)
+                    self._register_wait_for_idle(info, deadline=deadline)
+                    retried = self._wait_for_idle_trackers.get(replica_id)
+                    tracker = retried[0] if retried is not None else None
                 drained = tracker is not None and tracker()
-            if not drained:
+            deadline_expired = time.monotonic() >= deadline
+            if not drained and not deadline_expired:
                 continue
+            drain_cap: int | None = 0
+            if not drained:
+                drain_cap = getattr(info.status_property, 'drain_cap_seconds',
+                                    None)
+                if drain_cap is None:
+                    drain_cap = self._resolve_drain_cap_seconds(replica_id)
+                logger.warning(
+                    f'Strict idle wait for replica {replica_id} reached its '
+                    f'{drain_cap}s deadline without fresh zero-occupancy '
+                    'proof; falling back to a bounded graceful drain.')
             info.status_property.wait_for_idle_before_termination = False
             self._persist_replica(replica_id, info)
             self._wait_for_idle_trackers.pop(replica_id, None)
@@ -2734,7 +2783,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                     sync_down_logs=False,
                                     replica_drain_delay_seconds=0,
                                     is_scale_down=True,
-                                    in_flight_drain_cap_seconds=0)
+                                    in_flight_drain_cap_seconds=drain_cap)
 
     @with_lock
     def scale_down(self,
@@ -3184,6 +3233,62 @@ class SkyPilotReplicaManager(ReplicaManager):
                     logger.error(f'  Traceback: {traceback.format_exc()}')
             time.sleep(_JOB_STATUS_FETCH_INTERVAL)
 
+    def _resolve_probe_urls(self,
+                            infos: list[ReplicaInfo]) -> dict[int, str | None]:
+        """Resolve one endpoint per replica from batched cluster state.
+
+        Endpoint resolution normally loads permissions and one cluster record
+        per call.  Kubernetes PodIP mode also reads the Pod unless the handle's
+        already-recorded head IP is reused.  A probe round historically called
+        ``ReplicaInfo.url`` once for logging and twice inside ``probe``, turning
+        an N-replica fleet into 3N permission, database, and Kubernetes API
+        reads while the replica-manager lock was held.
+
+        Snapshot the cluster records and provider configs once.  The returned
+        URL is passed through to ``probe`` so each replica has one consistent
+        endpoint for the whole round.
+        """
+        cluster_records = global_user_state.get_clusters_from_names(
+            [info.cluster_name for info in infos])
+        handles: dict[int, backends.CloudVmRayResourceHandle] = {}
+        yaml_replica_ids: list[int] = []
+        yaml_paths: list[str] = []
+        for info in infos:
+            cluster_record = cluster_records.get(info.cluster_name)
+            if cluster_record is None:
+                continue
+            handle = info.handle(cluster_record)
+            if handle is None:
+                continue
+            handles[info.replica_id] = handle
+            cluster_yaml = getattr(handle, 'cluster_yaml', None)
+            if cluster_yaml is not None:
+                yaml_replica_ids.append(info.replica_id)
+                yaml_paths.append(cluster_yaml)
+
+        provider_configs: dict[int, dict[str, Any]] = {}
+        if yaml_paths:
+            yaml_configs = global_user_state.get_cluster_yaml_dict_multiple(
+                yaml_paths)
+            provider_configs = {
+                replica_id: config['provider']
+                for replica_id, config in zip(yaml_replica_ids, yaml_configs)
+            }
+
+        urls: dict[int, str | None] = {}
+        for info in infos:
+            cluster_record = cluster_records.get(info.cluster_name)
+            handle = handles.get(info.replica_id)
+            if cluster_record is None or handle is None:
+                urls[info.replica_id] = None
+                continue
+            urls[info.replica_id] = info._resolve_url(  # pylint: disable=protected-access
+                cluster_record=cluster_record,
+                handle=handle,
+                provider_config=provider_configs.get(info.replica_id),
+            )
+        return urls
+
     @with_lock
     def _probe_all_replicas(self) -> None:
         """Readiness probe replicas.
@@ -3223,6 +3328,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                 raise ValueError(
                     f'{version_label} {missing_versions_str} not found.')
             self._tick_version_spec_cache.update(specs)
+            probe_urls = self._resolve_probe_urls(infos_to_probe)
+        else:
+            probe_urls = {}
         # Probes are pure I/O (HTTP GET/POST with a several-second timeout):
         # the default ThreadPool size (cpu_count) turns a large fleet into
         # dozens of sequential probe waves and the round overruns its 10s
@@ -3236,8 +3344,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                                             f'_name={info.cluster_name})')
                     probe_futures.append(pool.apply_async(info.probe_pool))
                 else:
+                    resolved_url = probe_urls[info.replica_id]
                     replica_to_probe.append(
-                        f'replica_{info.replica_id}(url={info.url})')
+                        f'replica_{info.replica_id}(url={resolved_url})')
                     probe_futures.append(
                         pool.apply_async(
                             info.probe,
@@ -3247,6 +3356,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 self._get_readiness_timeout_seconds(
                                     info.version),
                                 self._get_readiness_headers(info.version),
+                                resolved_url,
                             ),
                         ),)
             logger.info(f'Replicas to probe: {", ".join(replica_to_probe)}')

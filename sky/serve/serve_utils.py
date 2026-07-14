@@ -1456,9 +1456,10 @@ def update_service_encoded(service_name: str,
     noun = 'pool' if pool else 'service'
     capnoun = noun.capitalize()
     # Only existence and the incarnation hash are consumed here; skip the
-    # YAML render.
+    # YAML render and the fleet-sized replica serialization.
     service_status = _get_service_status(service_name,
                                          pool=pool,
+                                         with_replica_info=False,
                                          with_yaml=False)
     if service_status is None:
         with ux_utils.print_exception_no_traceback():

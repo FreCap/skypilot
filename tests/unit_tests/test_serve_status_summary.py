@@ -242,6 +242,31 @@ class TestGetServiceStatusSummary:
         assert 'replica_status_counts' not in record
 
 
+class TestUpdateServiceStatusLookup:
+    """The update fence must not serialize the full replica fleet."""
+
+    def test_update_uses_service_row_only(self, monkeypatch):
+        get_status = mock.Mock(return_value={'hash': 'incarnation-a'})
+        response = mock.Mock(status_code=200)
+        response.json.return_value = {'message': 'update accepted'}
+        post = mock.Mock(return_value=response)
+        monkeypatch.setattr(serve_utils, '_get_service_status', get_status)
+        monkeypatch.setattr(serve_utils, '_post_to_controller_with_retry', post)
+
+        serve_utils.update_service_encoded(
+            'svc',
+            version=2,
+            mode='rolling',
+            pool=False,
+            expected_service_hash='incarnation-a')
+
+        get_status.assert_called_once_with('svc',
+                                           pool=False,
+                                           with_replica_info=False,
+                                           with_yaml=False)
+        post.assert_called_once()
+
+
 class TestGetServiceStatusPickledSummary:
     """summary_only propagation through the pickled path."""
 

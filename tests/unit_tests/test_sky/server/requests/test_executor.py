@@ -9,9 +9,11 @@ import time
 from typing import List
 from unittest import mock
 
+import fastapi
 import pytest
 
 from sky import exceptions
+from sky import models
 from sky import skypilot_config
 from sky.serve import constants as serve_constants
 from sky.server import config as server_config
@@ -21,7 +23,9 @@ from sky.server.requests import continue_condition as continue_condition_lib
 from sky.server.requests import executor
 from sky.server.requests import payloads
 from sky.server.requests import process
+from sky.server.requests import request_names
 from sky.server.requests import requests as requests_lib
+from sky.server.requests import role_filter
 from sky.skylet import constants
 from sky.utils import context_utils
 
@@ -40,6 +44,28 @@ def isolated_database(tmp_path):
             requests_lib._DB = None
             yield
             requests_lib._DB = None
+
+
+@pytest.mark.asyncio
+@mock.patch.object(role_filter.permission, 'permission_service')
+async def test_prepare_request_rejects_non_admin_pod_config(mock_svc):
+    mock_svc.get_user_roles.return_value = ['user']
+    body = payloads.LaunchBody(
+        task='config:\n  kubernetes:\n    pod_config: {}\n',
+        cluster_name='test-cluster',
+        override_skypilot_config={},
+    )
+
+    with pytest.raises(fastapi.HTTPException) as exc_info:
+        await executor.prepare_request_async(
+            request_id='test-request',
+            request_name=request_names.RequestName.CLUSTER_LAUNCH,
+            request_body=body,
+            func=lambda: None,
+            auth_user=models.User(id='user-alice', name='user-alice'),
+        )
+
+    assert exc_info.value.status_code == 403
 
 
 @pytest.fixture()

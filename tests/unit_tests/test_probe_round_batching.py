@@ -18,6 +18,7 @@ from sky.serve import serve_state
 def _replica_info(replica_id, probe_result):
     info = mock.Mock()
     info.replica_id = replica_id
+    info.cluster_name = f'svc-replica-{replica_id}'
     info.version = 1
     info.url = f'http://10.0.0.{replica_id}:8080'
     info.is_spot = False
@@ -50,7 +51,83 @@ class TestProbeRoundBatching(unittest.TestCase):
         manager._handle_preemption = mock.Mock(return_value=False)
         manager._cloud_instance_looks_alive = mock.Mock(return_value=True)
         manager._terminate_replica = mock.Mock()
+        manager._resolve_probe_urls = mock.Mock(
+            side_effect=lambda infos:
+            {info.replica_id: info.url for info in infos})
         return manager
+
+    def test_probe_round_passes_pre_resolved_url(self):
+        manager = self._make_manager()
+        info = _replica_info(1, True)
+
+        with mock.patch.object(serve_state, 'get_replica_infos',
+                               return_value=[info]), \
+             mock.patch.object(serve_state, 'get_specs',
+                               return_value={1: mock.Mock()}), \
+             mock.patch.object(serve_state, 'add_or_update_replicas'), \
+             mock.patch.object(serve_state, 'set_service_uptime'):
+            manager._probe_all_replicas()
+
+        info.probe.assert_called_once_with('/', None, 15, None,
+                                           'http://10.0.0.1:8080')
+
+    def test_probe_url_resolution_batches_cluster_state(self):
+        manager = self._make_manager()
+        del manager._resolve_probe_urls
+        infos = [_replica_info(1, True), _replica_info(2, True)]
+        handles = []
+        cluster_records = {}
+        for info in infos:
+            handle = mock.Mock()
+            handle.cluster_yaml = f'/tmp/{info.cluster_name}.yaml'
+            handles.append(handle)
+            cluster_records[info.cluster_name] = {'handle': handle}
+            info.handle.return_value = handle
+            info._resolve_url.return_value = info.url
+
+        yaml_configs = [{
+            'provider': {
+                'context': f'context-{info.replica_id}'
+            }
+        } for info in infos]
+        with mock.patch.object(
+                replica_managers.global_user_state,
+                'get_clusters_from_names',
+                return_value=cluster_records) as get_clusters, \
+             mock.patch.object(
+                 replica_managers.global_user_state,
+                 'get_cluster_yaml_dict_multiple',
+                 return_value=yaml_configs) as get_yamls:
+            urls = manager._resolve_probe_urls(infos)
+
+        self.assertEqual(urls, {
+            1: 'http://10.0.0.1:8080',
+            2: 'http://10.0.0.2:8080',
+        })
+        get_clusters.assert_called_once_with(['svc-replica-1', 'svc-replica-2'])
+        get_yamls.assert_called_once_with(
+            ['/tmp/svc-replica-1.yaml', '/tmp/svc-replica-2.yaml'])
+        for info, handle, provider_config in zip(infos, handles, yaml_configs):
+            info._resolve_url.assert_called_once_with(
+                cluster_record=cluster_records[info.cluster_name],
+                handle=handle,
+                provider_config=provider_config['provider'])
+
+    def test_probe_reuses_supplied_url_without_resolving_again(self):
+        info = object.__new__(replica_managers.ReplicaInfo)
+        info.replica_id = 7
+        response = mock.Mock(status_code=200)
+        with mock.patch.object(replica_managers.requests,
+                               'get',
+                               return_value=response) as request:
+            probed_info, ready, _ = info.probe('/health', None, 15, None,
+                                               'http://10.0.0.7:8080')
+
+        self.assertIs(probed_info, info)
+        self.assertTrue(ready)
+        request.assert_called_once_with('http://10.0.0.7:8080/health',
+                                        headers=None,
+                                        timeout=15)
 
     def test_single_batch_write_flushed_before_teardown(self):
         manager = self._make_manager()

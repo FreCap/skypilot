@@ -1771,6 +1771,14 @@ Pod configuration settings (optional).
 
 Additional pod configuration settings to apply to all pods.
 
+.. note::
+
+  On a remote multi-user API server, only admins can supply ``pod_config``
+  through client or task configuration. A ``pod_config`` set by the API server
+  administrator still applies to other users' workloads. This restriction is
+  required because a raw pod spec can select service accounts, mount host
+  paths, or request privileged pod settings.
+
 Example:
 
 .. code-block:: yaml
