@@ -2438,6 +2438,12 @@ class ControllerManager:
                 if job_id in self.job_tasks:
                     del self.job_tasks[job_id]
 
+            # A cancellation that lands after the job task already finished
+            # stores cancel info that no CancelledError handler will ever
+            # consume; drop it so the dict cannot grow across jobs.
+            async with self._cancel_info_lock:
+                self._cancel_info.pop(job_id, None)
+
     async def start_job(
         self,
         job_id: int,
@@ -2464,48 +2470,80 @@ class ControllerManager:
     async def cancel_job(self):
         """Cancel an existing job."""
         while True:
-            cancels = os.listdir(jobs_constants.CONSOLIDATED_SIGNAL_PATH)
-            for cancel in cancels:
-                if not cancel.isdigit():
-                    # There maybe unexpected files that are written to the
-                    # signal directory. We for sure write filelocks to the
-                    # directory, so we need to skip.
-                    if not cancel.endswith('.lock'):
-                        logger.debug('Detected unexpected file in signal '
-                                     f'directory: {cancel}. Skipping...')
-                    continue
-                async with self._job_tasks_lock:
-                    job_id = int(cancel)
-                    if job_id in self.job_tasks:
-                        logger.info(f'Cancelling job {job_id}')
-
-                        task = self.job_tasks[job_id]
-
-                        signal_path = os.path.join(
-                            jobs_constants.CONSOLIDATED_SIGNAL_PATH, cancel)
-                        with filelock.FileLock(signal_path + '.lock'):
-                            try:
-                                content = pathlib.Path(signal_path).read_text(
-                                    encoding='utf-8').strip()
-                            except Exception as e:  # pylint: disable=broad-except
-                                content = ''
-                                logger.debug(
-                                    'Problem occurred when reading '
-                                    f'{signal_path}: '
-                                    f'{common_utils.format_exception(e)}')
-                            finally:
-                                os.remove(signal_path)
-
-                        # Parse and store graceful cancel info before
-                        # cancelling the task.
-                        graceful, graceful_timeout = managed_job_utils.parse_job_cancel_file(  # pylint: disable=line-too-long
-                            content)
-                        async with self._cancel_info_lock:
-                            self._cancel_info[job_id] = (graceful,
-                                                         graceful_timeout)
-                        task.cancel()
-                        logger.info(f'Job {job_id} cancelled successfully')
+            await self._process_cancel_signals()
             await asyncio.sleep(15)
+
+    async def _process_cancel_signals(self):
+        """Run one scan of the cancel signal directory."""
+        cancels = os.listdir(jobs_constants.CONSOLIDATED_SIGNAL_PATH)
+        for cancel in cancels:
+            if not cancel.isdigit():
+                # There maybe unexpected files that are written to the
+                # signal directory. We for sure write filelocks to the
+                # directory, so we need to skip.
+                if not cancel.endswith('.lock'):
+                    logger.debug('Detected unexpected file in signal '
+                                 f'directory: {cancel}. Skipping...')
+                continue
+            job_id = int(cancel)
+            async with self._job_tasks_lock:
+                task = self.job_tasks.get(job_id)
+            if task is None:
+                await self._reap_orphan_cancel_signal(job_id)
+                continue
+            logger.info(f'Cancelling job {job_id}')
+
+            signal_path = os.path.join(jobs_constants.CONSOLIDATED_SIGNAL_PATH,
+                                       cancel)
+            with filelock.FileLock(signal_path + '.lock'):
+                try:
+                    content = pathlib.Path(signal_path).read_text(
+                        encoding='utf-8').strip()
+                except Exception as e:  # pylint: disable=broad-except
+                    content = ''
+                    logger.debug('Problem occurred when reading '
+                                 f'{signal_path}: '
+                                 f'{common_utils.format_exception(e)}')
+                finally:
+                    os.remove(signal_path)
+
+            # Parse and store graceful cancel info before
+            # cancelling the task.
+            graceful, graceful_timeout = (
+                managed_job_utils.parse_job_cancel_file(content))
+            async with self._cancel_info_lock:
+                self._cancel_info[job_id] = (graceful, graceful_timeout)
+            task.cancel()
+            logger.info(f'Job {job_id} cancelled successfully')
+
+    async def _reap_orphan_cancel_signal(self, job_id: int) -> None:
+        """Remove a cancel signal that no consumer will ever pick up.
+
+        A signal file is normally consumed either by the owning job task
+        in this process, or at claim time while the job is still PENDING.
+        If the job reaches a terminal state in between (e.g. it finished
+        right as the cancellation landed), neither consumer ever runs
+        again for it, and the file would be re-listed by every scan of
+        every controller process forever. Only reap when the DB says the
+        job is terminal (or gone): a non-terminal job is either owned by
+        another controller process or will be handled at claim time.
+        """
+        status = await managed_job_state.get_status_async(job_id)
+        if status is not None and not status.is_terminal():
+            return
+        signal_path = os.path.join(jobs_constants.CONSOLIDATED_SIGNAL_PATH,
+                                   str(job_id))
+        try:
+            with filelock.FileLock(signal_path + '.lock'):
+                if os.path.exists(signal_path):
+                    os.remove(signal_path)
+        except OSError as e:
+            logger.debug(f'Failed to reap cancel signal for job {job_id}: '
+                         f'{common_utils.format_exception(e)}')
+            return
+        async with self._cancel_info_lock:
+            self._cancel_info.pop(job_id, None)
+        logger.info(f'Reaped cancel signal for terminated job {job_id}.')
 
     async def monitor_loop(self):
         """Monitor the job loop."""
