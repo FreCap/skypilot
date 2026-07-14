@@ -4302,6 +4302,8 @@ def get_clusters(
         """Add the resources to the record."""
         for record in _get_records_with_handle(records):
             handle = record['handle']
+            if not include_handle:
+                record.pop('handle')
             record['nodes'] = handle.launched_nodes
             if handle.launched_resources is None:
                 # Set default values when launched_resources is None
@@ -4320,8 +4322,6 @@ def get_clusters(
                 if handle.launched_resources.accelerators else None)
             record['labels'] = (handle.launched_resources.labels
                                 if handle.launched_resources.labels else {})
-            if not include_handle:
-                record.pop('handle', None)
 
     if refresh == common.StatusRefreshMode.NONE:
         _update_records_with_handle_info(_get_records_with_handle(records),

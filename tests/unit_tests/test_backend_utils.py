@@ -295,6 +295,49 @@ def test_get_clusters_launch_refresh(monkeypatch):
         backend_utils.get_clusters(refresh=common.StatusRefreshMode.FORCE)) == 2
 
 
+@pytest.mark.parametrize(
+    'refresh', [common.StatusRefreshMode.NONE, common.StatusRefreshMode.FORCE])
+@pytest.mark.parametrize('include_handle', [False, True])
+def test_get_clusters_honors_include_handle_for_incomplete_record(
+        monkeypatch, refresh, include_handle):
+    """An incomplete launch record must still honor the handle contract."""
+    handle = mock.MagicMock()
+    handle.cluster_name_on_cloud = 'launch-cluster-cloud'
+    handle.launched_nodes = 1
+    handle.launched_resources = None
+    record = {
+        'name': 'launch-cluster',
+        'handle': handle,
+        'status': status_lib.ClusterStatus.INIT,
+    }
+    get_clusters = mock.Mock(return_value=[record])
+    get_resources_repr = mock.Mock(return_value=('', ''))
+
+    monkeypatch.setattr('sky.global_user_state.get_clusters', get_clusters)
+    monkeypatch.setattr('sky.utils.resources_utils.get_readable_resources_repr',
+                        get_resources_repr)
+
+    launch_request = mock.MagicMock()
+    launch_request.cluster_name = 'launch-cluster'
+    get_request_tasks = mock.Mock(return_value=[launch_request])
+    monkeypatch.setattr('sky.server.requests.requests.get_request_tasks',
+                        get_request_tasks)
+
+    [result] = backend_utils.get_clusters(refresh=refresh,
+                                          include_handle=include_handle)
+
+    if include_handle:
+        assert result['handle'] is handle
+    else:
+        assert 'handle' not in result
+    get_clusters.assert_called_once()
+    get_resources_repr.assert_called_once_with(handle, simplified_only=False)
+    if refresh == common.StatusRefreshMode.FORCE:
+        get_request_tasks.assert_called_once()
+    else:
+        get_request_tasks.assert_not_called()
+
+
 def test_get_clusters_refresh_enriches_only_final_records(monkeypatch):
     """Refreshed clusters should be enriched from their final records once."""
 
