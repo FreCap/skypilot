@@ -1702,9 +1702,16 @@ def wait(name: str | None,
         job_id = matching[0].job_id
 
     assert job_id is not None
-    start_time = time.time()
+    deadline = (None if timeout is None else time.monotonic() + timeout)
+    statuses: list[managed_job_state.ManagedJobStatus | None] | None = None
 
     while True:
+        # The first poll is always immediate, so timeout=0 can still observe an
+        # already-terminal job. Later polls must start before the deadline.
+        if (statuses is not None and deadline is not None and
+                time.monotonic() >= deadline):
+            break
+
         records, _, _, _ = queue_v2_api(refresh=False, job_ids=[job_id])
         if not records:
             with ux_utils.print_exception_no_traceback():
@@ -1733,21 +1740,25 @@ def wait(name: str | None,
                     worst = code
             return worst
 
-        if timeout is not None:
-            elapsed = time.time() - start_time
-            if elapsed >= timeout:
-                non_terminal = [
-                    s for s in statuses if s is None or not s.is_terminal()
-                ]
-                status_str = ', '.join(
-                    s.value if s else 'unknown' for s in non_terminal)
-                with ux_utils.print_exception_no_traceback():
-                    raise TimeoutError(
-                        f'Timed out waiting for managed job {job_id} after '
-                        f'{timeout} seconds. Non-terminal status(es): '
-                        f'{status_str}.')
+        sleep_seconds = float(poll_interval)
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            sleep_seconds = min(sleep_seconds, remaining)
+        time.sleep(sleep_seconds)
 
-        time.sleep(poll_interval)
+    assert statuses is not None
+    non_terminal = [
+        status for status in statuses
+        if status is None or not status.is_terminal()
+    ]
+    status_str = ', '.join(
+        status.value if status else 'unknown' for status in non_terminal)
+    with ux_utils.print_exception_no_traceback():
+        raise TimeoutError(f'Timed out waiting for managed job {job_id} after '
+                           f'{timeout} seconds. Non-terminal status(es): '
+                           f'{status_str}.')
 
 
 @usage_lib.entrypoint

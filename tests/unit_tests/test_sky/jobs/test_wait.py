@@ -1,4 +1,5 @@
 """Unit tests for sky.jobs.server.core.wait()."""
+# pylint: disable=missing-class-docstring,unused-argument
 import time
 from typing import Dict, List, Optional, Tuple
 from unittest import mock
@@ -174,12 +175,35 @@ class TestWaitSingleTask:
 class TestWaitTimeout:
 
     @mock.patch.object(jobs_core, 'queue_v2_api')
+    def test_timeout_uses_monotonic_deadline_and_bounds_sleep(
+            self, mock_queue, monkeypatch):
+        now = [0.0]
+        sleeps = []
+
+        def _sleep(seconds):
+            sleeps.append(seconds)
+            now[0] += seconds
+
+        monkeypatch.setattr(
+            time, 'time',
+            mock.Mock(side_effect=AssertionError(
+                'wait timeout used wall-clock time')))
+        monkeypatch.setattr(time, 'monotonic', lambda: now[0])
+        monkeypatch.setattr(time, 'sleep', _sleep)
+        mock_queue.return_value = ([_make_record(1, ManagedJobStatus.RUNNING)],
+                                   1, {}, 1)
+
+        with pytest.raises(TimeoutError, match='Timed out.*2 seconds'):
+            jobs_core.wait(name=None, job_id=1, timeout=2, poll_interval=5)
+
+        assert sleeps == [2]
+        mock_queue.assert_called_once_with(refresh=False, job_ids=[1])
+
+    @mock.patch.object(jobs_core, 'queue_v2_api')
     @mock.patch('time.sleep')
-    @mock.patch.object(time, 'time')
-    def test_timeout_raises(self, mock_time, mock_sleep, mock_queue):
-        # First call to time.time() is start_time, subsequent calls simulate
-        # elapsed time.
-        mock_time.side_effect = [0.0, 0.0, 31.0]
+    @mock.patch.object(time, 'monotonic')
+    def test_timeout_raises(self, mock_monotonic, mock_sleep, mock_queue):
+        mock_monotonic.side_effect = [0.0, 0.0, 31.0]
         mock_queue.side_effect = [
             ([_make_record(1, ManagedJobStatus.RUNNING)], 1, {}, 1),
             ([_make_record(1, ManagedJobStatus.RUNNING)], 1, {}, 1),
@@ -211,10 +235,10 @@ class TestWaitTimeout:
 
     @mock.patch.object(jobs_core, 'queue_v2_api')
     @mock.patch('time.sleep')
-    @mock.patch.object(time, 'time')
-    def test_timeout_message_includes_status(self, mock_time, mock_sleep,
+    @mock.patch.object(time, 'monotonic')
+    def test_timeout_message_includes_status(self, mock_monotonic, mock_sleep,
                                              mock_queue):
-        mock_time.side_effect = [0.0, 0.0, 100.0]
+        mock_monotonic.side_effect = [0.0, 0.0, 100.0]
         mock_queue.side_effect = [
             ([_make_record(1, ManagedJobStatus.RECOVERING)], 1, {}, 1),
             ([_make_record(1, ManagedJobStatus.RECOVERING)], 1, {}, 1),
@@ -222,6 +246,20 @@ class TestWaitTimeout:
 
         with pytest.raises(TimeoutError, match='RECOVERING'):
             jobs_core.wait(name=None, job_id=1, timeout=60, poll_interval=5)
+
+    @mock.patch.object(jobs_core, 'queue_v2_api')
+    @mock.patch('time.sleep')
+    def test_zero_timeout_returns_already_terminal_job(self, mock_sleep,
+                                                       mock_queue):
+        mock_queue.return_value = ([
+            _make_record(1, ManagedJobStatus.SUCCEEDED)
+        ], 1, {}, 1)
+
+        result = jobs_core.wait(name=None, job_id=1, timeout=0, poll_interval=5)
+
+        assert result == exceptions.JobExitCode.SUCCEEDED
+        mock_sleep.assert_not_called()
+        mock_queue.assert_called_once_with(refresh=False, job_ids=[1])
 
 
 # ──────────────────────────────────────────────────────────────────────
