@@ -51,6 +51,8 @@ _DB_RETRY_TIMES = 30
 DEFAULT_JOB_EVENT_RETENTION_HOURS = 30 * 24.0
 # Run the job event retention daemon every hour
 JOB_EVENT_DAEMON_INTERVAL_SECONDS = 3600
+# Bound parameters per token upsert while keeping all chunks in one transaction.
+_API_ACCESS_TOKEN_UPSERT_BATCH_SIZE = 1000
 
 Base = declarative.declarative_base()
 
@@ -2719,8 +2721,12 @@ async def get_pool_submit_info_async(
         return info[0], info[1]
 
 
-def set_api_access_token_id(job_id: int, token_id: str) -> None:
-    """Store the API access token ID for a managed job."""
+def set_api_access_token_ids(job_ids: list[int], token_id: str) -> None:
+    """Store one API access token ID for a batch of managed jobs."""
+    unique_job_ids = list(dict.fromkeys(job_ids))
+    if not unique_job_ids:
+        return
+
     engine = _db_manager.get_engine()
     dialect_map = {
         db_utils.SQLAlchemyDialect.SQLITE.value: sqlite.insert,
@@ -2730,14 +2736,21 @@ def set_api_access_token_id(job_id: int, token_id: str) -> None:
     if insert_func is None:
         raise ValueError(f'Unsupported database dialect: {engine.dialect.name}')
     with orm.Session(engine) as session:
-        insert_stmt = insert_func(api_access_token_table).values(
-            job_id=job_id, token_id=token_id)
-        upsert_stmt = insert_stmt.on_conflict_do_update(
-            index_elements=[api_access_token_table.c.job_id],
-            set_={
-                api_access_token_table.c.token_id: insert_stmt.excluded.token_id
-            })
-        session.execute(upsert_stmt)
+        for offset in range(0, len(unique_job_ids),
+                            _API_ACCESS_TOKEN_UPSERT_BATCH_SIZE):
+            job_id_batch = unique_job_ids[offset:offset +
+                                          _API_ACCESS_TOKEN_UPSERT_BATCH_SIZE]
+            insert_stmt = insert_func(api_access_token_table).values([{
+                'job_id': job_id,
+                'token_id': token_id,
+            } for job_id in job_id_batch])
+            upsert_stmt = insert_stmt.on_conflict_do_update(
+                index_elements=[api_access_token_table.c.job_id],
+                set_={
+                    api_access_token_table.c.token_id:
+                        insert_stmt.excluded.token_id
+                })
+            session.execute(upsert_stmt)
         session.commit()
 
 
