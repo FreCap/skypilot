@@ -12,6 +12,8 @@ Focused on the helpers added for HA leader-aware routing:
   the `services` row invisible to JOIN-based queries and breaks
   status / down --purge.
 """
+# pylint: disable=import-outside-toplevel,missing-class-docstring
+# pylint: disable=protected-access,unreachable
 import socket
 import threading
 import time
@@ -103,6 +105,51 @@ class TestWaitForControllerReady:
         finally:
             stop.set()
             thread.join(timeout=2)
+
+
+class TestLatestCommittedLbTerminationGraceSeconds:
+
+    def test_returns_none_without_committed_snapshot(self):
+        with mock.patch('sky.serve.service.serve_state.'
+                        'get_latest_committed_version_spec',
+                        return_value=None), \
+             mock.patch('sky.serve.service.serve_state.'
+                        'get_latest_committed_version',
+                        side_effect=AssertionError(
+                            'must not split latest-version reads')), \
+             mock.patch('sky.serve.service.serve_state.get_spec',
+                        side_effect=AssertionError(
+                            'must not split spec reads')), \
+             mock.patch('sky.serve.service.lb_k8s.'
+                        'lb_termination_grace_period_seconds') as grace:
+            assert (service._get_latest_committed_lb_termination_grace_seconds(
+                'svc') is None)
+        grace.assert_not_called()
+
+    def test_uses_committed_spec_snapshot(self):
+        spec = mock.Mock()
+        spec.lb_stream_timeout_seconds = 17
+        spec.graceful_drain_seconds = 23
+
+        with mock.patch('sky.serve.service.serve_state.'
+                        'get_latest_committed_version_spec',
+                        return_value=(7, spec)) as snapshot, \
+             mock.patch('sky.serve.service.serve_state.'
+                        'get_latest_committed_version',
+                        side_effect=AssertionError(
+                            'must not split latest-version reads')), \
+             mock.patch('sky.serve.service.serve_state.get_spec',
+                        side_effect=AssertionError(
+                            'must not split spec reads')), \
+             mock.patch('sky.serve.service.lb_k8s.'
+                        'lb_termination_grace_period_seconds',
+                        return_value=123) as grace:
+            result = (service.
+                      _get_latest_committed_lb_termination_grace_seconds('svc'))
+
+        assert result == 123
+        snapshot.assert_called_once_with('svc')
+        grace.assert_called_once_with(17, 23)
 
 
 class TestOrphanExit:
