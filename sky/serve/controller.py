@@ -666,9 +666,6 @@ class SkyServeController:
                 # membership in this service. Do not reveal replica URLs,
                 # capacity, or routing policy to another service's Pod.
                 return fastapi.Response(status_code=503)
-            if not await loop.run_in_executor(None, self._owns_current_service):
-                return fastapi.Response(status_code=503)
-
             (replica_infos,
              async_occupancy_by_version) = (await loop.run_in_executor(
                  None, self._snapshot_replica_occupancy))
@@ -678,14 +675,18 @@ class SkyServeController:
             lb_replica_info, num_ready = await loop.run_in_executor(
                 None, self._get_lb_replica_info, replica_infos,
                 async_occupancy_by_version)
+            # Single ownership fence before the handler's only side effects:
+            # everything above is a read, and with `authority` provided the
+            # report ingestion below never awaits, so no other coroutine can
+            # interleave between this fence, the state mutation, and the
+            # routing disclosure. Extra fences after each read would just be
+            # redundant DB round-trips on the LB sync hot path.
             if not await loop.run_in_executor(None, self._owns_current_service):
                 return fastapi.Response(status_code=503)
             await self._ingest_load_balancer_report(request_data,
                                                     replica_infos,
                                                     async_occupancy_by_version,
                                                     authority=authority)
-            if not await loop.run_in_executor(None, self._owns_current_service):
-                return fastapi.Response(status_code=503)
             return responses.JSONResponse(content={
                 'replica_info': lb_replica_info,
                 'num_ready_replicas': num_ready,
