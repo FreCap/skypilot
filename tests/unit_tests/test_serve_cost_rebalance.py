@@ -247,6 +247,60 @@ class TestEconomicDecisions:
             if d.operator == autoscalers.AutoscalerDecisionOperator.SCALE_UP
         ]) == 1
 
+    def test_full_slot_still_resets_discontinuous_eligibility(
+            self, monkeypatch):
+        now = [100.0]
+        monkeypatch.setattr(autoscalers.time, 'monotonic', lambda: now[0])
+        scaler = _autoscaler(_spec(cost_rebalance_stabilization_seconds=300.0))
+        placer, _, cheap, replicas = self._fleet()
+        scaler.set_spot_placer(placer)
+        _report(scaler, replicas)
+        assert not _decisions(scaler, replicas)
+
+        replacement = _Replica(3,
+                               cheap,
+                               0.0,
+                               status=serve_state.ReplicaStatus.STARTING,
+                               replacement_for=1)
+        all_replicas = replicas + [replacement]
+        now[0] = 150.0
+        assert not _decisions(scaler, all_replicas)
+
+        # The only cheap location becomes unavailable while the existing
+        # pair occupies the sole replacement slot. This must break the
+        # continuity window even though no new launch can be emitted.
+        now[0] = 200.0
+        placer.set_preemptive(cheap)
+        assert not _decisions(scaler, all_replicas)
+
+        now[0] = 250.0
+        placer.set_active(cheap)
+        replacement.status = serve_state.ReplicaStatus.FAILED_PROVISION
+        replacement.is_terminal = True
+        assert not _decisions(scaler, all_replicas)
+
+        now[0] = 400.0
+        assert not [
+            d for d in _decisions(scaler, all_replicas)
+            if d.operator == autoscalers.AutoscalerDecisionOperator.SCALE_UP
+        ]
+        now[0] = 550.0
+        assert len([
+            d for d in _decisions(scaler, all_replicas)
+            if d.operator == autoscalers.AutoscalerDecisionOperator.SCALE_UP
+        ]) == 1
+
+    def test_transient_cost_lookup_failure_is_not_cached(self):
+        scaler = _autoscaler()
+        _, _, _, replicas = self._fleet()
+        replica = replicas[0]
+        replica.handle = mock.Mock(
+            side_effect=[RuntimeError('transient'), replica._handle])
+
+        assert scaler._get_hourly_cost_from_replica_info(replica) == 0.0
+        assert scaler._get_hourly_cost_from_replica_info(replica) == 1.0
+        assert replica.handle.call_count == 2
+
     def test_incumbent_drains_only_after_replacement_ready(self):
         scaler = _autoscaler()
         placer, _, cheap, replicas = self._fleet()
@@ -320,6 +374,32 @@ class TestEconomicDecisions:
         ]
         assert len(launches) == 2
 
+    def test_disabled_policy_does_not_downgrade_pending_strict_drain(self):
+        scaler = _autoscaler()
+        placer, _, cheap, replicas = self._fleet()
+        scaler.set_spot_placer(placer)
+        scaler.cost_rebalance = False
+        replacement = _Replica(3, cheap, 0.0, replacement_for=1)
+        all_replicas = replicas + [replacement]
+        _report(scaler, all_replicas)
+
+        first = [
+            d for d in _decisions(scaler, all_replicas)
+            if d.operator == autoscalers.AutoscalerDecisionOperator.SCALE_DOWN
+        ]
+        assert [(d.target, d.reason) for d in first
+               ] == [(3, autoscalers.AutoscalerDecisionReason.COST_REBALANCE)]
+
+        replacement.status = serve_state.ReplicaStatus.SHUTTING_DOWN
+        replacement.is_ready = False
+        replacement.status_property.sky_down_status = (
+            common_utils.ProcessStatus.SCHEDULED)
+        assert not [
+            d for d in _decisions(scaler, all_replicas)
+            if (d.operator == autoscalers.AutoscalerDecisionOperator.SCALE_DOWN
+                and d.target == 3)
+        ]
+
 
 class TestPinnedReplacementLaunch:
     """Actuation pins the selected location and durably records the pair."""
@@ -359,6 +439,30 @@ class TestPinnedReplacementLaunch:
         assert constants.COST_REBALANCE_FOR_REPLICA_OVERRIDE_KEY not in info.resources_override
         assert info.resources_override['region'] == 'research'
         assert info.is_spot is False
+
+    def test_invalid_recovery_pin_retires_persisted_replacement(self):
+        manager = replica_managers.SkyPilotReplicaManager.__new__(
+            replica_managers.SkyPilotReplicaManager)
+        manager._service_name = 'svc'
+        manager._resource_scope = None
+        manager._spot_placer = None
+        manager.yaml_content = 'resources: {}'
+        manager._launch_thread_pool = {}
+        manager._terminate_replica = mock.Mock()
+
+        with mock.patch.object(replica_managers,
+                               '_should_use_spot',
+                               return_value=True):
+            assert not manager._launch_replica(
+                8, {'region': 'research'},
+                prior_cost_rebalance_for_replica_id=7)
+
+        manager._terminate_replica.assert_called_once_with(
+            8,
+            sync_down_logs=False,
+            replica_drain_delay_seconds=0,
+            is_scale_down=True,
+            in_flight_drain_cap_seconds=0)
 
 
 class TestStrictDrain:
@@ -416,3 +520,52 @@ class TestStrictDrain:
             replica_drain_delay_seconds=0,
             is_scale_down=True,
             in_flight_drain_cap_seconds=0)
+
+    def test_lb_restart_falls_back_to_bounded_drain_at_deadline(
+            self, monkeypatch):
+        now = [100.0]
+        monkeypatch.setattr(replica_managers.time, 'monotonic', lambda: now[0])
+        manager = replica_managers.SkyPilotReplicaManager.__new__(
+            replica_managers.SkyPilotReplicaManager)
+        manager._service_name = 'svc'
+        manager._is_pool = False
+        manager._wait_for_idle_trackers = {}
+        manager._lb_in_flight_report = None
+        manager._persist_replica = mock.Mock()
+        manager._terminate_replica = mock.Mock()
+        manager._resolve_drain_cap_seconds = mock.Mock(return_value=600)
+        info = types.SimpleNamespace(
+            replica_id=1,
+            cluster_name='cluster-1',
+            url='http://replica',
+            status_property=replica_managers.ReplicaStatusProperty(
+                sky_launch_status=common_utils.ProcessStatus.SUCCEEDED))
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_info_from_id',
+                               return_value=info), \
+             mock.patch.object(replica_managers.global_user_state,
+                               'cluster_with_name_exists',
+                               return_value=True):
+            manager._defer_scale_down_until_idle(1)
+            now[0] = 110.0
+            manager._lb_in_flight_report = (110.0, {
+                'http://replica': 1
+            }, {'http://replica'}, set(), set(), 'lb-old')
+            manager._refresh_wait_for_idle()
+            now[0] = 120.0
+            manager._lb_in_flight_report = (120.0, {}, set(), set(), set(),
+                                            'lb-new')
+            manager._refresh_wait_for_idle()
+            manager._terminate_replica.assert_not_called()
+
+            now[0] = 700.0
+            manager._refresh_wait_for_idle()
+
+        assert not info.status_property.wait_for_idle_before_termination
+        manager._terminate_replica.assert_called_once_with(
+            1,
+            sync_down_logs=False,
+            replica_drain_delay_seconds=0,
+            is_scale_down=True,
+            in_flight_drain_cap_seconds=600)
