@@ -1462,6 +1462,41 @@ def get_service_from_name(service_name: str) -> dict[str, Any] | None:
     return None
 
 
+def get_service_liveness_snapshots(pool: bool) -> list[dict[str, Any]]:
+    """Read the slim, version-backed rows used by the liveness sweep.
+
+    Materializing all rows in one statement keeps a sweep on one database
+    snapshot and avoids repeatedly joining and deserializing latest-version
+    specs.  Requiring a version row preserves ``get_service_from_name()``'s
+    behavior for orphan service rows left by interrupted legacy registration.
+    """
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        rows = session.execute(
+            sqlalchemy.select(
+                services_table.c.name,
+                services_table.c.status,
+                services_table.c.controller_job_id,
+                services_table.c.controller_pid,
+                services_table.c.controller_ip,
+                services_table.c.hash,
+                services_table.c.resource_scope,
+            ).where(
+                services_table.c.pool == int(pool),
+                sqlalchemy.exists().where(version_specs_table.c.service_name ==
+                                          services_table.c.name),
+            ).order_by(services_table.c.name)).fetchall()
+    return [{
+        'name': row.name,
+        'status': ServiceStatus[row.status],
+        'controller_job_id': row.controller_job_id,
+        'controller_pid': row.controller_pid,
+        'controller_ip': row.controller_ip,
+        'hash': row.hash,
+        'resource_scope': row.resource_scope,
+    } for row in rows]
+
+
 def get_service_runtime_snapshot(
         service_name: str,
         require_version: bool = False) -> dict[str, Any] | None:

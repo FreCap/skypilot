@@ -1405,18 +1405,14 @@ def set_service_status_and_active_versions_from_replica(
 def update_service_status(pool: bool) -> None:
     noun = 'pool' if pool else 'serve'
     capnoun = noun.capitalize()
-    service_names = serve_state.get_glob_service_names(None, pool=pool)
-    for service_name in service_names:
-        record = _get_service_status(service_name,
-                                     pool=pool,
-                                     with_replica_info=False,
-                                     with_yaml=False,
-                                     with_target_num_replicas=False)
-        if record is None:
-            continue
+    records = serve_state.get_service_liveness_snapshots(pool=pool)
+    terminal_statuses = set(serve_state.ServiceStatus.terminal_statuses())
+    for record in records:
+        service_name = record['name']
         service_status = record['status']
-        if service_status == serve_state.ServiceStatus.SHUTTING_DOWN:
-            # Skip services that is shutting down.
+        if service_status in terminal_statuses:
+            # Finalization and recovery own terminal states.  In particular,
+            # never erase FAILED_CLEANUP by rewriting it CONTROLLER_FAILED.
             continue
 
         logger.info(f'Update {noun} status for {service_name!r} '
