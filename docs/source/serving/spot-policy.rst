@@ -68,6 +68,35 @@ When spot replicas are available, SkyServe will automatically switch back to usi
 
     SkyServe supports specifying both :code:`base_ondemand_fallback_replicas` and :code:`dynamic_ondemand_fallback`. Specifying both will set a base number of on-demand replicas and dynamically fallback to on-demand replicas when spot replicas are not available.
 
+Cost-aware replacement
+----------------------
+
+With a multi-location ``dynamic_fallback`` policy, ``cost_rebalance`` can
+replace an existing replica when a capacity-equivalent location remains at
+least the configured fraction cheaper. SkyServe launches and health-checks the
+replacement first. It then removes the incumbent from load-balancer routing and
+terminates it only after the load balancer proves that no request is still in
+flight. Normal demand autoscaling remains bounded by ``max_replicas``;
+``max_parallel_replacements`` permits only temporary paired overlap.
+
+.. code-block:: yaml
+
+    service:
+      replica_policy:
+        min_replicas: 1
+        max_replicas: 500
+        target_concurrency_per_replica: 1
+        spot_placer: dynamic_fallback
+        cost_rebalance:
+          min_savings_fraction: 0.3
+          max_parallel_replacements: 8
+          stabilization_seconds: 300
+
+The savings comparison uses hourly cost per configured serving-capacity unit,
+not raw per-GPU price. ``stabilization_seconds`` requires the candidate to stay
+eligible continuously before a replacement starts. This policy cannot be
+combined with ``reserved_capacity_fill``.
+
 Example
 -------
 

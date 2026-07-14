@@ -40,6 +40,7 @@ class SkyServiceSpec:
         target_qps_per_replica: float | dict[str, float] | None = None,
         target_concurrency_per_replica: float | None = None,
         reserved_capacity_fill: bool | dict[str, Any] | None = None,
+        cost_rebalance: dict[str, Any] | None = None,
         post_data: dict[str, Any] | None = None,
         tls_credential: serve_utils.TLSCredential | None = None,
         readiness_headers: dict[str, str] | None = None,
@@ -185,6 +186,46 @@ class SkyServiceSpec:
                         'reserved_capacity_fill is not supported with '
                         'on-demand fallback (dynamic_ondemand_fallback / '
                         'base_ondemand_fallback_replicas).')
+
+        if cost_rebalance is not None:
+            if not isinstance(cost_rebalance, dict):
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError('cost_rebalance must be an object. Got: '
+                                     f'{cost_rebalance!r}')
+            min_savings = cost_rebalance.get('min_savings_fraction', 0.3)
+            if (not isinstance(min_savings,
+                               (int, float)) or isinstance(min_savings, bool) or
+                    not math.isfinite(min_savings) or min_savings <= 0 or
+                    min_savings > 1):
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        'cost_rebalance.min_savings_fraction must be a finite '
+                        f'number in (0, 1]. Got: {min_savings!r}')
+            max_parallel = cost_rebalance.get('max_parallel_replacements', 1)
+            if (not isinstance(max_parallel, int) or
+                    isinstance(max_parallel, bool) or max_parallel < 1):
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        'cost_rebalance.max_parallel_replacements must be an '
+                        f'integer >= 1. Got: {max_parallel!r}')
+            stabilization = cost_rebalance.get('stabilization_seconds', 300)
+            if (not isinstance(stabilization, (int, float)) or
+                    isinstance(stabilization, bool) or
+                    not math.isfinite(stabilization) or stabilization < 0):
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        'cost_rebalance.stabilization_seconds must be a finite '
+                        f'number >= 0. Got: {stabilization!r}')
+            if spot_placer is None:
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError('cost_rebalance requires spot_placer so '
+                                     'candidate locations can be selected.')
+            if reserved_fill_enabled:
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        'cost_rebalance and reserved_capacity_fill cannot be '
+                        'enabled together. Cost rebalance already replaces '
+                        'paid capacity with cheaper available locations.')
 
         if target_concurrency_per_replica is not None:
             # Zero (or negative) per-GPU capacity would make every replica
@@ -371,6 +412,7 @@ class SkyServiceSpec:
         # ({floor_replicas, weight}); object form implies enabled.
         self._reserved_capacity_fill: bool | dict[
             str, Any] | None = reserved_capacity_fill
+        self._cost_rebalance: dict[str, Any] | None = cost_rebalance
         self._post_data: dict[str, Any] | None = post_data
         self._tls_credential: serve_utils.TLSCredential | None = (
             tls_credential)
@@ -409,6 +451,7 @@ class SkyServiceSpec:
         state.setdefault('_target_concurrency_per_replica', None)
         # Added with reserved-capacity fill; old DB rows predate it.
         state.setdefault('_reserved_capacity_fill', None)
+        state.setdefault('_cost_rebalance', None)
         # Added with the in-flight-aware graceful drain; old DB rows
         # predate it (None -> default drain semantics).
         state.setdefault('_graceful_drain_seconds', None)
@@ -603,6 +646,7 @@ class SkyServiceSpec:
             service_config['target_qps_per_replica'] = None
             service_config['target_concurrency_per_replica'] = None
             service_config['reserved_capacity_fill'] = None
+            service_config['cost_rebalance'] = None
         else:
             service_config['min_replicas'] = policy_section['min_replicas']
             service_config['max_replicas'] = policy_section.get(
@@ -615,6 +659,8 @@ class SkyServiceSpec:
                 policy_section.get('target_concurrency_per_replica', None))
             service_config['reserved_capacity_fill'] = policy_section.get(
                 'reserved_capacity_fill', None)
+            service_config['cost_rebalance'] = policy_section.get(
+                'cost_rebalance', None)
             service_config['upscale_delay_seconds'] = policy_section.get(
                 'upscale_delay_seconds', None)
             service_config['downscale_delay_seconds'] = policy_section.get(
@@ -810,6 +856,8 @@ class SkyServiceSpec:
                         'reserved_capacity_fill',
                         reserved_fill_config,
                         no_empty=True)
+        add_if_not_none('replica_policy', 'cost_rebalance',
+                        self._cost_rebalance)
         add_if_not_none('replica_policy', 'dynamic_ondemand_fallback',
                         self.dynamic_ondemand_fallback)
         add_if_not_none('replica_policy', 'base_ondemand_fallback_replicas',
@@ -1021,6 +1069,28 @@ class SkyServiceSpec:
         return 1.0
 
     @property
+    def cost_rebalance(self) -> bool:
+        return self._cost_rebalance is not None
+
+    @property
+    def cost_rebalance_min_savings_fraction(self) -> float:
+        if self._cost_rebalance is None:
+            return 0.3
+        return float(self._cost_rebalance.get('min_savings_fraction', 0.3))
+
+    @property
+    def cost_rebalance_max_parallel_replacements(self) -> int:
+        if self._cost_rebalance is None:
+            return 1
+        return int(self._cost_rebalance.get('max_parallel_replacements', 1))
+
+    @property
+    def cost_rebalance_stabilization_seconds(self) -> float:
+        if self._cost_rebalance is None:
+            return 300.0
+        return float(self._cost_rebalance.get('stabilization_seconds', 300))
+
+    @property
     def post_data(self) -> dict[str, Any] | None:
         return self._post_data
 
@@ -1117,6 +1187,7 @@ class SkyServiceSpec:
                 self._target_concurrency_per_replica),
             reserved_capacity_fill=override.pop('reserved_capacity_fill',
                                                 self._reserved_capacity_fill),
+            cost_rebalance=override.pop('cost_rebalance', self._cost_rebalance),
             post_data=override.pop('post_data', self._post_data),
             tls_credential=override.pop('tls_credential', self._tls_credential),
             readiness_headers=override.pop('readiness_headers',

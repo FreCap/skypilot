@@ -1078,6 +1078,9 @@ class SkyServeController:
                 active_versions = runtime_snapshot['active_versions']
                 logger.info(f'All replica info for autoscaler: {replica_infos}')
 
+                self._autoscaler.set_spot_placer(
+                    self._replica_manager.spot_placer)
+
                 # Autoscaler now extracts GPU type info directly from
                 # replica_infos in generate_scaling_decisions method
                 # for better decoupling.
@@ -1116,7 +1119,11 @@ class SkyServeController:
                         assert isinstance(scaling_option.target,
                                           int), scaling_option
                         _flush_scale_up()
-                        self._replica_manager.scale_down(scaling_option.target)
+                        self._replica_manager.scale_down(
+                            scaling_option.target,
+                            wait_for_idle=(
+                                scaling_option.reason == autoscalers.
+                                AutoscalerDecisionReason.COST_REBALANCE))
                 _flush_scale_up()
             except Exception as e:  # pylint: disable=broad-except
                 # No matter what error happens, we should keep the

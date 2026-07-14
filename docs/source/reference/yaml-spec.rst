@@ -1661,6 +1661,27 @@ SkyServe will scale your service so that, ultimately, each replica manages appro
       target_qps_per_replica: 5
 
 
+``service.replica_policy.cost_rebalance``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Optional cost-aware replacement policy. Requires ``spot_placer``.
+
+When a capacity-equivalent active location stays at least
+``min_savings_fraction`` cheaper for ``stabilization_seconds``, SkyServe
+launches a replacement before gracefully draining the expensive incumbent.
+``max_parallel_replacements`` bounds temporary replacement overlap and does not
+change the demand autoscaler's ``max_replicas`` limit.
+
+.. code-block:: yaml
+
+  service:
+    replica_policy:
+      cost_rebalance:
+        min_savings_fraction: 0.3
+        max_parallel_replacements: 8
+        stabilization_seconds: 300
+
+
 .. _yaml-spec-service-replica-policy-upscale-delay-seconds:
 
 ``service.replica_policy.upscale_delay_seconds``
