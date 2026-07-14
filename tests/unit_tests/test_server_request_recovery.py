@@ -312,12 +312,21 @@ def _make_launch_request(request_id: str,
 
 
 def _patch_cluster_statuses(monkeypatch, statuses):
+    # Mirrors global_user_state.get_cluster_status_fields: returns the raw
+    # (status, status_updated_at) columns and omits unknown cluster names.
+    calls = []
 
-    def _get_status(cluster_name):
-        return statuses[cluster_name]
+    def _get_status_fields(cluster_names):
+        calls.append(list(cluster_names))
+        return {
+            name: (statuses[name].value, None)
+            for name in cluster_names
+            if statuses.get(name) is not None
+        }
 
     monkeypatch.setattr(requests_lib.global_user_state,
-                        'get_status_from_cluster_name', _get_status)
+                        'get_cluster_status_fields', _get_status_fields)
+    return calls
 
 
 @pytest.mark.asyncio
@@ -349,7 +358,7 @@ async def test_recovery_requeues_interrupted_launches(isolated_database,
     ]
     for request in seed:
         assert await requests_lib.create_if_not_exists_async(request)
-    _patch_cluster_statuses(
+    calls = _patch_cluster_statuses(
         monkeypatch, {
             'cluster-init': status_lib.ClusterStatus.INIT,
             'cluster-missing': None,
@@ -357,6 +366,11 @@ async def test_recovery_requeues_interrupted_launches(isolated_database,
         })
 
     assert requests_lib.recover_db_and_logs() is True
+
+    # All statuses are resolved in a single batched lookup, regardless of
+    # how many launch rows or distinct clusters are being recovered.
+    assert len(calls) == 1
+    assert set(calls[0]) == {'cluster-init', 'cluster-missing', 'cluster-up'}
 
     for request_id in ('req-launch-init', 'req-launch-waiting'):
         record = requests_lib.get_request(request_id)
@@ -430,11 +444,11 @@ async def test_cluster_status_lookup_failure_disqualifies_only_that_row(
     for request in seed:
         assert await requests_lib.create_if_not_exists_async(request)
 
-    def _boom(cluster_name):
+    def _boom(cluster_names):
         raise RuntimeError('cluster-state DB unavailable')
 
     monkeypatch.setattr(requests_lib.global_user_state,
-                        'get_status_from_cluster_name', _boom)
+                        'get_cluster_status_fields', _boom)
 
     assert requests_lib.recover_db_and_logs() is True
 

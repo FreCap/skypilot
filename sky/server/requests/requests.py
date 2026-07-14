@@ -834,11 +834,11 @@ def _find_interrupted_launches_to_requeue() -> list[str]:
     submission) that must not be silently repeated, and a launch with no
     cluster record yet may have pre-provision side effects (e.g. storage
     creation) whose re-run semantics are not established. A failed cluster
-    status lookup likewise disqualifies just that row -- it must not abort
-    recovery of everything else.
+    status lookup likewise only disqualifies rows from replay -- it must not
+    abort recovery of everything else.
 
-    Runs outside the recovery transaction: the per-cluster status lookups hit
-    the (possibly remote) cluster-state database and must not extend the
+    Runs outside the recovery transaction: the batched cluster-status lookup
+    hits the (possibly remote) cluster-state database and must not extend the
     request-DB transaction. Safe because startup is single-threaded -- no
     executor is running yet to change the rows in between.
     """
@@ -854,23 +854,24 @@ def _find_interrupted_launches_to_requeue() -> list[str]:
         (*REPLAYABLE_REQUEST_NAMES, RequestStatus.RUNNING.value,
          RequestStatus.WAITING.value))
     rows = cursor.fetchall()
+    cluster_names = list({name for _, name in rows if name is not None})
+    try:
+        status_fields = global_user_state.get_cluster_status_fields(
+            cluster_names)
+    except Exception as e:  # pylint: disable=broad-except
+        # A failed lookup disqualifies rows from replay, not from recovery:
+        # every launch falls back to the client-retry path (CANCELLED +
+        # should_retry), same as an individually unresolvable cluster.
+        logger.warning(
+            'Could not check cluster statuses while recovering launch '
+            f'requests; leaving them to the client-retry path: {e}')
+        status_fields = {}
     requeue_ids = []
-    cluster_status_cache: dict[str, status_lib.ClusterStatus | None] = {}
     for request_id, cluster_name in rows:
         if cluster_name is None:
             continue
-        if cluster_name not in cluster_status_cache:
-            try:
-                cluster_status_cache[cluster_name] = (
-                    global_user_state.get_status_from_cluster_name(cluster_name)
-                )
-            except Exception as e:  # pylint: disable=broad-except
-                logger.warning(
-                    f'Could not check status of cluster {cluster_name!r} '
-                    f'while recovering launch request {request_id}; leaving '
-                    f'the request to the client-retry path: {e}')
-                cluster_status_cache[cluster_name] = None
-        if cluster_status_cache[cluster_name] == status_lib.ClusterStatus.INIT:
+        status_str, _ = status_fields.get(cluster_name, (None, None))
+        if status_str == status_lib.ClusterStatus.INIT.value:
             requeue_ids.append(request_id)
     return requeue_ids
 
