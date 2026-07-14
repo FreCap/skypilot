@@ -844,6 +844,26 @@ async def api_server_logs(follow: bool = True, tail: int | None = None) -> None:
 @usage_lib.entrypoint
 @annotations.client_api
 async def api_login(endpoint: str | None = None,
-                    get_token: bool = False) -> None:
-    """Async version of api_login() that logs into a SkyPilot API server."""
-    return await asyncio.to_thread(sdk.api_login, endpoint, get_token)
+                    relogin: bool = False,
+                    service_account_token: str | None = None,
+                    no_browser: bool = False,
+                    *,
+                    get_token: bool | None = None) -> None:
+    """Async version of api_login() that logs into a SkyPilot API server.
+
+    Args:
+        endpoint: The endpoint of the SkyPilot API server.
+        relogin: Whether to force relogin with OAuth2 when enabled.
+        service_account_token: Service account token for authentication.
+        no_browser: Whether to avoid opening a local browser.
+        get_token: Deprecated alias for ``relogin``.
+    """
+    if get_token is not None:
+        if relogin:
+            raise ValueError('Cannot specify both relogin and get_token.')
+        relogin = get_token
+    return await asyncio.to_thread(sdk.api_login,
+                                   endpoint,
+                                   relogin=relogin,
+                                   service_account_token=service_account_token,
+                                   no_browser=no_browser)
