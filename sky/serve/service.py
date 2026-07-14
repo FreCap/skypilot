@@ -694,7 +694,12 @@ def _kill_process(process: multiprocessing.Process | None) -> None:
 _CHILD_FAILURES_BEFORE_FLAG = 3
 _CHILD_RESPAWN_BACKOFF_BASE_SECONDS = 5
 _CHILD_RESPAWN_BACKOFF_CAP_SECONDS = 300
-_CHILD_UNRESPONSIVE_CHECKS_BEFORE_RESPAWN = 3
+# A live controller can briefly starve its lightweight health endpoint while a
+# large-fleet autoscaler/prober operation holds the GIL.  Use elapsed time,
+# rather than a count coupled to the probe timeout and loop cadence, before
+# declaring that live process hung.  A process that has actually exited is
+# still respawned immediately via multiprocessing.Process.is_alive().
+_CHILD_UNRESPONSIVE_GRACE_SECONDS = 60
 
 
 def _child_respawn_backoff_seconds(consecutive_failures: int) -> float:
@@ -703,6 +708,13 @@ def _child_respawn_backoff_seconds(consecutive_failures: int) -> float:
         _CHILD_RESPAWN_BACKOFF_BASE_SECONDS *
         (2**max(consecutive_failures - 1, 0)),
         _CHILD_RESPAWN_BACKOFF_CAP_SECONDS)
+
+
+def _live_child_unresponsive_too_long(unresponsive_since: float | None,
+                                      now: float) -> bool:
+    """Whether a still-alive child has exceeded its health grace period."""
+    return (unresponsive_since is not None and
+            now - unresponsive_since >= _CHILD_UNRESPONSIVE_GRACE_SECONDS)
 
 
 def _controller_child_responding(service_name: str, service_hash: str,
@@ -1561,7 +1573,7 @@ def _start(service_name: str,
         # next respawn may run.
         child_failures = 0
         child_retry_at = 0.0
-        controller_unresponsive_checks = 0
+        controller_unresponsive_since: float | None = None
         # Whether the DB status may need healing on the next confirmed-healthy
         # check. Starts True: an HA-recovered service may carry
         # CONTROLLER_FAILED from the status refresh daemon (set while the old
@@ -1652,12 +1664,13 @@ def _start(service_name: str,
                         service_name, service_incarnation, pod_ip,
                         controller_port)
                     if controller_responding:
-                        controller_unresponsive_checks = 0
+                        controller_unresponsive_since = None
                     else:
-                        controller_unresponsive_checks += 1
+                        if controller_unresponsive_since is None:
+                            controller_unresponsive_since = now
                         controller_needs_respawn = (
-                            controller_unresponsive_checks
-                            >= _CHILD_UNRESPONSIVE_CHECKS_BEFORE_RESPAWN)
+                            _live_child_unresponsive_too_long(
+                                controller_unresponsive_since, now))
                 if controller_needs_respawn:
                     if now >= child_retry_at:
                         result = _respawn_controller(
@@ -1670,7 +1683,7 @@ def _start(service_name: str,
                             enforce_launch_fence=enforce_launch_fence)
                         if result is not None:
                             controller_process, controller_port = result
-                            controller_unresponsive_checks = 0
+                            controller_unresponsive_since = None
                             controller_responding = True
                             healthy = external_lb_healthy
                         else:

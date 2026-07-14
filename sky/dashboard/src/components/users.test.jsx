@@ -1,5 +1,6 @@
 import { act, render, screen, waitFor, within } from '@testing-library/react';
 import dashboardCache from '@/lib/cache';
+import cachePreloader from '@/lib/cache-preloader';
 import {
   getUsers,
   getServiceAccountTokens,
@@ -117,6 +118,7 @@ describe('UsersTable refresh lifecycle', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    cachePreloader.preloadForPage.mockResolvedValue();
   });
 
   afterEach(() => {
@@ -244,6 +246,28 @@ describe('UsersTable refresh lifecycle', () => {
     expect(setLoading).not.toHaveBeenCalled();
     expect(setLastFetchedTime).not.toHaveBeenCalled();
     expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not start a refresh after unmount during preload', async () => {
+    const preload = deferred();
+    const lateUsersRequest = deferred();
+    cachePreloader.preloadForPage.mockReturnValueOnce(preload.promise);
+    dashboardCache.get.mockReturnValue(lateUsersRequest.promise);
+
+    const { props, unmount } = renderTable();
+    await waitFor(() => {
+      expect(cachePreloader.preloadForPage).toHaveBeenCalledWith('users');
+      expect(props.refreshDataRef.current).toEqual(expect.any(Function));
+    });
+
+    unmount();
+    await act(async () => {
+      preload.resolve();
+      await preload.promise;
+    });
+
+    expect(props.refreshDataRef.current).toBeNull();
+    expect(dashboardCache.get).not.toHaveBeenCalled();
   });
 });
 

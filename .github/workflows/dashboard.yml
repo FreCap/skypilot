@@ -30,6 +30,7 @@ jobs:
           src/components/infra.test.jsx \
           src/components/jobs.test.jsx \
           src/components/users.test.jsx \
+          src/components/workspace-editor.test.jsx \
           src/components/elements/deployment-version.test.jsx \
           src/components/elements/request-activity-indicator.test.jsx \
           src/data/connectors/client.test.js \

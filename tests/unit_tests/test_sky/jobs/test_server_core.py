@@ -47,3 +47,53 @@ def test_tail_logs_normalizes_non_positive_tail(given, expected):
     tail > 0). Otherwise the dashboard download (tail=0) raises
     AssertionError and produces an empty log."""
     assert _forwarded_tail(given) == expected
+
+
+def test_associate_job_api_access_token_batches_ids(monkeypatch):
+    persist = mock.Mock()
+    revoke = mock.Mock()
+    monkeypatch.setattr(jobs_core.managed_job_state, 'set_api_access_token_ids',
+                        persist)
+    monkeypatch.setattr(jobs_core.global_user_state,
+                        'delete_service_account_token', revoke)
+
+    jobs_core._associate_job_api_access_token(  # pylint: disable=protected-access
+        [7, 8, 9], 'token-id')
+
+    persist.assert_called_once_with([7, 8, 9], 'token-id')
+    revoke.assert_not_called()
+
+
+def test_associate_job_api_access_token_revokes_on_persist_failure(monkeypatch):
+    persist_error = RuntimeError('managed jobs database unavailable')
+    persist = mock.Mock(side_effect=persist_error)
+    revoke = mock.Mock()
+    monkeypatch.setattr(jobs_core.managed_job_state, 'set_api_access_token_ids',
+                        persist)
+    monkeypatch.setattr(jobs_core.global_user_state,
+                        'delete_service_account_token', revoke)
+
+    with pytest.raises(RuntimeError) as raised:
+        jobs_core._associate_job_api_access_token(  # pylint: disable=protected-access
+            [7, 8], 'token-id')
+
+    assert raised.value is persist_error
+    revoke.assert_called_once_with('token-id')
+
+
+def test_associate_job_api_access_token_preserves_persist_failure_when_revoke_fails(
+        monkeypatch, caplog):
+    persist_error = RuntimeError('managed jobs database unavailable')
+    persist = mock.Mock(side_effect=persist_error)
+    revoke = mock.Mock(side_effect=RuntimeError('token database unavailable'))
+    monkeypatch.setattr(jobs_core.managed_job_state, 'set_api_access_token_ids',
+                        persist)
+    monkeypatch.setattr(jobs_core.global_user_state,
+                        'delete_service_account_token', revoke)
+
+    with pytest.raises(RuntimeError) as raised:
+        jobs_core._associate_job_api_access_token(  # pylint: disable=protected-access
+            [7, 8], 'token-id')
+
+    assert raised.value is persist_error
+    assert 'Failed to revoke unassociated API access token token-id' in caplog.text

@@ -70,6 +70,11 @@ _LAUNCH_OWNER_WATCH_INTERVAL_SECONDS = 0.5
 # Rate limit for the "fill launch skipped" log (see _log_fill_skip).
 _FILL_SKIP_LOG_INTERVAL_SECONDS = 60
 _WAIT_LAUNCH_THREAD_TIMEOUT_SECONDS = 15
+# Cleanup is a durable invariant, not a finite-attempt operation.  Failed
+# teardown rows remain in the replica table and are retried forever; these
+# bounds only rate-limit provider calls while an outage persists.
+_FAILED_CLEANUP_RETRY_BASE_SECONDS = 60
+_FAILED_CLEANUP_RETRY_MAX_SECONDS = 15 * 60
 # A large autoscaler tick is placed synchronously before any sky.launch result
 # can bench an unavailable location.  Without a bound, a zero-cost-first
 # placer can pin the entire wave (hundreds of replicas) to one full Kubernetes
@@ -770,7 +775,9 @@ class ReplicaInfo:
     # Version 6 is also a worker-runtime compatibility marker for immutable
     # Sky Batch attempt outputs. New Batch clients reject older pool replicas
     # so an incompatible worker fails before dispatch rather than mid-run.
-    _VERSION = 6
+    # Version 7 replaces the consecutive_failure_times list with the single
+    # first_consecutive_failure_time timestamp.
+    _VERSION = 7
 
     def __init__(self, replica_id: int, cluster_name: str, replica_port: str,
                  is_spot: bool, location: spot_placer.Location | None,
@@ -790,7 +797,11 @@ class ReplicaInfo:
         # Autoscaler._fill_row_occupies_free_slot).
         self.created_at: float | None = time.time()
         self.first_not_ready_time: float | None = None
-        self.consecutive_failure_times: list[float] = []
+        # Start of the current run of consecutive failed readiness probes
+        # after the replica was once READY; None while the replica is
+        # passing probes. The failure window is measured against the
+        # current probe time, so only the first failure needs to be kept.
+        self.first_consecutive_failure_time: float | None = None
         self.status_property: ReplicaStatusProperty = ReplicaStatusProperty()
         self.is_spot: bool = is_spot
         self.location: dict[str, str | None] | None = (
@@ -1121,6 +1132,15 @@ class ReplicaInfo:
 
         state.setdefault('cost_rebalance_for_replica_id', None)
 
+        if version < 7:
+            # Rows written before version 7 carry the full list of failed
+            # probe timestamps; only its first entry was ever read (the
+            # window is first-failure -> current probe time), so migrate
+            # to the single timestamp.
+            failure_times = state.pop('consecutive_failure_times', [])
+            self.first_consecutive_failure_time = (failure_times[0]
+                                                   if failure_times else None)
+
         self.__dict__.update(state)
         self._version = version if version >= 0 else 0
 
@@ -1384,6 +1404,24 @@ class SkyPilotReplicaManager(ReplicaManager):
                 f'Service {self._service_name!r} incarnation changed while '
                 f'removing replica {replica_id}.')
 
+    def _clear_failed_cleanup_retry(self, replica_id: int) -> None:
+        """Forget in-memory cleanup rate limiting after confirmed success."""
+        self._failed_cleanup_retry_attempts.pop(replica_id, None)
+        self._failed_cleanup_retry_at.pop(replica_id, None)
+
+    def _schedule_failed_cleanup_retry(self, replica_id: int) -> None:
+        """Rate-limit, but never give up on, a durable cleanup failure."""
+        attempt = self._failed_cleanup_retry_attempts.get(replica_id, 0) + 1
+        self._failed_cleanup_retry_attempts[replica_id] = attempt
+        exponential_step = min(attempt - 1, 30)
+        delay_seconds = min(
+            _FAILED_CLEANUP_RETRY_BASE_SECONDS * 2**exponential_step,
+            _FAILED_CLEANUP_RETRY_MAX_SECONDS)
+        self._failed_cleanup_retry_at[replica_id] = (time.monotonic() +
+                                                     delay_seconds)
+        logger.warning(f'Replica {replica_id} cleanup will retry in '
+                       f'{delay_seconds}s (attempt {attempt}).')
+
     def __init__(self,
                  service_name: str,
                  spec: 'service_spec.SkyServiceSpec',
@@ -1435,6 +1473,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         self._ownership_lost = threading.Event()
         self._down_thread_pool: thread_utils.ThreadSafeDict[
             int, thread_utils.SafeThread] = thread_utils.ThreadSafeDict()
+        self._failed_cleanup_retry_attempts: dict[int, int] = {}
+        self._failed_cleanup_retry_at: dict[int, float] = {}
         self._wait_for_idle_trackers: dict[int,
                                            tuple[_ReplicaDrainTracker | None,
                                                  float]] = {}
@@ -1602,6 +1642,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 launch_kwargs: dict[str, Any] = {
                     'resources_override': replica_info.resources_override,
                     'existing_replica_infos': all_replica_infos,
+                    'recovering_existing_replica': True,
                     'prior_reserved_fill': bool(
                         getattr(replica_info, 'reserved_fill', False)),
                 }
@@ -1747,6 +1788,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         prior_reserved_fill: bool = False,
         prior_cost_rebalance_for_replica_id: int | None = None,
         zero_cost_demand_budget: _ZeroCostDemandBudget | None = None,
+        recovering_existing_replica: bool = False,
     ) -> bool:
         """Enqueue one replica launch.
 
@@ -1760,6 +1802,10 @@ class SkyPilotReplicaManager(ReplicaManager):
         from the persisted override; OR-ing the prior flag in keeps a
         recovered fill replica counted as arbitrated (ceiling-governed)
         capacity instead of silently converting it to demand.
+
+        recovering_existing_replica: the replica already has a durable row
+        and cluster identity. Reuse an exact persisted placement instead of
+        asking the spot placer to select a new location.
         """
         if replica_id in self._launch_thread_pool:
             logger.warning(f'Launch thread for replica {replica_id} '
@@ -1806,6 +1852,15 @@ class SkyPilotReplicaManager(ReplicaManager):
         use_spot = _should_use_spot(self.yaml_content, resources_override)
         retry_until_up = True
         location = None
+        recovered_location = None
+        if recovering_existing_replica and self._spot_placer is not None:
+            # A persisted row already owns a cluster name and may own live
+            # infrastructure.  Its exact location is immutable during a
+            # controller re-drive: choosing a new spot location would run the
+            # same cluster name against different resources and overwrite the
+            # only durable identity needed for cleanup.
+            recovered_location = spot_placer.Location.from_resources_override(
+                resources_override)
         if zero_cost_only and self._spot_placer is None:
             # Defensive: fill decisions are only emitted while the capacity
             # poller runs, which requires a placer. Without one there is no
@@ -1843,7 +1898,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             resources_override = location.to_dict()
             use_spot = location.use_spot
             retry_until_up = False
-        elif self._spot_placer is not None and (use_spot or zero_cost_only):
+        elif (self._spot_placer is not None and (use_spot or zero_cost_only) and
+              recovered_location is None):
             # For spot placer, we don't retry until up so any launch failed
             # due to availability issue will be handled by the placer.
             retry_until_up = False
@@ -1939,17 +1995,19 @@ class SkyPilotReplicaManager(ReplicaManager):
             # task as a whole is spot-managed).
             use_spot = location.use_spot
         elif self._spot_placer is not None:
-            # Re-driven pinned launch (controller crash mid-PENDING): the
-            # persisted override already carries the placer's inlined
-            # location fields, but skipped the selection path above (a
-            # non-spot pin fails the use_spot gate and the fill sentinel
-            # was consumed at original emission). Recover the location
-            # from the override so the upserted replica row keeps it --
-            # location=None would permanently drop the replica from the
-            # placer's load counting and from zero-cost fill accounting
-            # (no scale-down shelter, undercounted fill baseline).
-            location = spot_placer.Location.from_resources_override(
-                resources_override)
+            # Pinned launch: the persisted override already carries the
+            # placer's inlined location fields. A recovered spot pin skips
+            # fresh selection explicitly; a non-spot pin skips it via the
+            # use_spot gate after its fill sentinel was consumed at original
+            # emission. Recover the location from the override so the
+            # upserted replica row keeps it -- location=None would permanently
+            # drop the replica from the placer's load counting and from
+            # zero-cost fill accounting (no scale-down shelter, undercounted
+            # fill baseline).
+            location = recovered_location
+            if location is None:
+                location = spot_placer.Location.from_resources_override(
+                    resources_override)
             if location is not None:
                 use_spot = location.use_spot
                 # Same fail-fast contract as the selection path above: a
@@ -2399,9 +2457,16 @@ class SkyPilotReplicaManager(ReplicaManager):
                          f'exited abnormally with exception {format_exc}.')
             info.status_property.sky_down_status = (
                 common_utils.ProcessStatus.FAILED)
+            # A failed provider cleanup is never evidence that the resource
+            # is gone.  Keep the durable row regardless of scale-down, purge,
+            # preemption, or version state, then retry with capped backoff.
+            self._persist_replica(info.replica_id, info)
+            self._schedule_failed_cleanup_retry(info.replica_id)
+            return
         else:
             info.status_property.sky_down_status = (
                 common_utils.ProcessStatus.SUCCEEDED)
+            self._clear_failed_cleanup_retry(info.replica_id)
         # Failed replica still count as a replica. In our current design, we
         # want to fail early if user code have any error. This will prevent
         # infinite loop of teardown and re-provision. However, there is a
@@ -2582,7 +2647,15 @@ class SkyPilotReplicaManager(ReplicaManager):
         assert info is not None
 
         if sync_down_logs:
-            _download_and_stream_logs(info)
+            try:
+                _download_and_stream_logs(info)
+            except Exception as e:  # pylint: disable=broad-except
+                # Logs aid diagnosis, but cannot be a prerequisite for
+                # stopping potentially billable infrastructure.
+                logger.warning(
+                    f'Failed to sync down logs for replica {replica_id}; '
+                    'continuing with cleanup: '
+                    f'{common_utils.format_exception(e)}')
 
         logger.info(f'preempted: {info.status_property.preempted}, '
                     f'replica_id: {replica_id}')
@@ -2642,6 +2715,46 @@ class SkyPilotReplicaManager(ReplicaManager):
             },
         )
         self._down_thread_pool[replica_id] = t
+
+    def _reconcile_failed_cleanup(self,
+                                  replica_infos: list[ReplicaInfo]) -> None:
+        """Re-drive every durable cleanup failure until absence is proven."""
+        now = time.monotonic()
+        for info in replica_infos:
+            down_failed = (info.status_property.sky_down_status ==
+                           common_utils.ProcessStatus.FAILED)
+            if (info.status != serve_state.ReplicaStatus.FAILED_CLEANUP and
+                    not down_failed):
+                continue
+            replica_id = info.replica_id
+            if (replica_id in self._down_thread_pool or
+                    replica_id in self._launch_thread_pool):
+                continue
+            retry_at = self._failed_cleanup_retry_at.get(replica_id, 0)
+            if now < retry_at:
+                continue
+
+            status_property = info.status_property
+            is_scale_down = (status_property.is_scale_down or
+                             status_property.preempted)
+            purge = status_property.purged
+            # Once an attempt is admitted, its durable SCHEDULED/RUNNING state
+            # prevents duplicate reconciliation.  Remove the old deadline;
+            # a failure records the next one in _handle_sky_down_finish.
+            self._failed_cleanup_retry_at.pop(replica_id, None)
+            try:
+                self._terminate_replica(
+                    replica_id,
+                    sync_down_logs=not (is_scale_down or purge),
+                    replica_drain_delay_seconds=0,
+                    is_scale_down=is_scale_down,
+                    purge=purge,
+                    in_flight_drain_cap_seconds=0)
+            except Exception as e:  # pylint: disable=broad-except
+                logger.error(
+                    f'Failed to reconcile cleanup for replica {replica_id}: '
+                    f'{common_utils.format_exception(e)}')
+                self._schedule_failed_cleanup_retry(replica_id)
 
     def _resolve_drain_cap_seconds(self, replica_id: int) -> int:
         """Drain cap for retiring this replica, per its own version spec.
@@ -2741,19 +2854,32 @@ class SkyPilotReplicaManager(ReplicaManager):
         # instantiate the manager without running the current constructor.
         if not hasattr(self, '_wait_for_idle_trackers'):
             self._wait_for_idle_trackers = {}
-        for replica_id, tracked in list(self._wait_for_idle_trackers.items()):
+        tracker_items = list(self._wait_for_idle_trackers.items())
+        if not tracker_items:
+            return
+
+        replica_infos = serve_state.get_replica_infos_from_ids(
+            self._service_name, [replica_id for replica_id, _ in tracker_items])
+        tracked_infos: dict[int, ReplicaInfo] = {}
+        for replica_id, _ in tracker_items:
+            info = replica_infos.get(replica_id)
+            if (info is None or getattr(info.status_property,
+                                        'wait_for_idle_before_termination',
+                                        False) is not True):
+                self._wait_for_idle_trackers.pop(replica_id, None)
+                continue
+            tracked_infos[replica_id] = info
+
+        cluster_names = list(
+            dict.fromkeys(info.cluster_name for info in tracked_infos.values()))
+        cluster_status_fields = global_user_state.get_cluster_status_fields(
+            cluster_names)
+        for replica_id, tracked in tracker_items:
             tracker, deadline = tracked
-            info = serve_state.get_replica_info_from_id(self._service_name,
-                                                        replica_id)
+            info = tracked_infos.get(replica_id)
             if info is None:
-                self._wait_for_idle_trackers.pop(replica_id, None)
                 continue
-            if (getattr(info.status_property,
-                        'wait_for_idle_before_termination', False) is not True):
-                self._wait_for_idle_trackers.pop(replica_id, None)
-                continue
-            if not global_user_state.cluster_with_name_exists(
-                    info.cluster_name):
+            if info.cluster_name not in cluster_status_fields:
                 drained = True
             else:
                 if tracker is None:
@@ -3039,8 +3165,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                 down_to_admit.append((replica_id, t, info))
                 continue
             logger.info(f'Terminate thread for replica {replica_id} finished.')
-            self._down_thread_pool.pop(replica_id)
             self._handle_sky_down_finish(info, format_exc=t.format_exc)
+            # Pop only after the durable completion update succeeds.  If a DB
+            # write fails, retaining the finished worker makes the next tick
+            # retry the handler instead of stranding a RUNNING down status.
+            self._down_thread_pool.pop(replica_id)
 
         # Admission pass: read the launch budget ONCE per tick, under the
         # cross-process resources lock held across ALL admission decisions
@@ -3081,6 +3210,7 @@ class SkyPilotReplicaManager(ReplicaManager):
 
         # Clean old version
         replica_infos = serve_state.get_replica_infos(self._service_name)
+        self._reconcile_failed_cleanup(replica_infos)
         current_least_recent_version = min([
             info.version for info in replica_infos
         ]) if replica_infos else self.least_recent_version
@@ -3296,7 +3426,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         This function will probe all replicas to make sure the service is
         ready. It will keep track of:
             (1) the initial delay for each replica;
-            (2) the consecutive failure times.
+            (2) the start of the current consecutive-failure window.
         The replica will be terminated if any of the thresholds exceeded.
         """
         # Reset the per-tick spec memo so this probe round reads each version's
@@ -3417,7 +3547,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                             raise RuntimeError(
                                 f'Service {self._service_name!r} incarnation '
                                 'changed while publishing uptime.')
-                    info.consecutive_failure_times.clear()
+                    info.first_consecutive_failure_time = None
                     if info.status_property.first_ready_time is None:
                         info.status_property.first_ready_time = probe_time
                 else:
@@ -3434,10 +3564,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                     if info.first_not_ready_time is None:
                         info.first_not_ready_time = probe_time
                     if info.status_property.first_ready_time is not None:
-                        info.consecutive_failure_times.append(probe_time)
+                        if info.first_consecutive_failure_time is None:
+                            info.first_consecutive_failure_time = probe_time
                         consecutive_failure_time = (
-                            info.consecutive_failure_times[-1] -
-                            info.consecutive_failure_times[0])
+                            probe_time - info.first_consecutive_failure_time)
                         failure_threshold = (
                             self._consecutive_failure_threshold_timeout())
                         if consecutive_failure_time >= failure_threshold:

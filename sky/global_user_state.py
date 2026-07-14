@@ -1585,11 +1585,17 @@ def update_last_use(cluster_name: str):
 def remove_cluster(cluster_name: str, terminate: bool) -> None:
     """Removes cluster_name mapping."""
     engine = _db_manager.get_engine()
-    cluster_hash = _get_hash_for_existing_cluster(cluster_name)
-    usage_intervals = _get_cluster_usage_intervals(cluster_hash)
-    provision_log_path = get_cluster_provision_log_path(cluster_name)
-
     with orm.Session(engine) as session:
+        # Read every clusters-table field this function needs in one snapshot;
+        # the stop path below writes the handle back in the same session.
+        row = session.query(
+            cluster_table.c.cluster_hash, cluster_table.c.provision_log_path,
+            cluster_table.c.handle).filter_by(name=cluster_name).first()
+        cluster_hash = row.cluster_hash if row is not None else None
+        provision_log_path = (row.provision_log_path
+                              if row is not None else None)
+        usage_intervals = _get_cluster_usage_intervals(cluster_hash)
+
         # usage_intervals is not None and not empty
         if usage_intervals:
             assert cluster_hash is not None, cluster_name
@@ -1611,9 +1617,9 @@ def remove_cluster(cluster_name: str, terminate: bool) -> None:
         if terminate:
             session.query(cluster_table).filter_by(name=cluster_name).delete()
         else:
-            handle = get_handle_from_cluster_name(cluster_name)
-            if handle is None:
+            if row is None or row.handle is None:
                 return
+            handle = pickle.loads(row.handle)
             # Must invalidate IP list to avoid directly trying to ssh into a
             # stopped VM, which leads to timeout.
             if hasattr(handle, 'stable_internal_external_ips'):
@@ -1816,10 +1822,11 @@ def get_cluster_provision_log_path(cluster_name: str) -> str | None:
     """Returns provision_log_path from clusters table, if recorded."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
-        row = session.query(cluster_table).filter_by(name=cluster_name).first()
+        row = session.query(cluster_table.c.provision_log_path).filter_by(
+            name=cluster_name).first()
     if row is None:
         return None
-    return getattr(row, 'provision_log_path', None)
+    return row.provision_log_path
 
 
 @metrics_lib.time_me

@@ -24,7 +24,7 @@ def _replica_info(replica_id, probe_result):
     info.is_spot = False
     info.status_property.should_track_service_status.return_value = True
     info.status_property.first_ready_time = 1.0
-    info.consecutive_failure_times = []
+    info.first_consecutive_failure_time = None
     info.first_not_ready_time = None
     info.probe = mock.Mock(return_value=(info, probe_result, 2.0))
     info.probe_pool = mock.Mock(return_value=(info, probe_result, 2.0))
