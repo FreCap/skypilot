@@ -1535,8 +1535,11 @@ class TestLbSyncBlockingReadsOffLoop:
     def test_db_reads_run_off_the_event_loop(self):
         response, read_threads, loop_thread = self._run_sync()
         assert response.status_code == 200
-        # 4 ownership-fence reads + replica rows + specs all happened...
-        assert len(read_threads) == 6
+        # 2 ownership-fence reads (entry + pre-side-effect) + replica rows +
+        # specs all happened -- and nothing more: the fences are the sync
+        # handler's per-request DB cost, so extra redundant reads here are a
+        # hot-path regression.
+        assert len(read_threads) == 4
         # ...and none of them on the event-loop thread.
         assert all(tid != loop_thread for tid in read_threads)
 
@@ -1548,3 +1551,93 @@ class TestLbSyncBlockingReadsOffLoop:
             'replica_info', 'num_ready_replicas', 'routing_spec',
             'capacity_hint'
         }
+
+
+class TestLbSyncOwnershipFences:
+    """The two remaining fences gate entry and the first side effect.
+
+    Consolidating the per-await fences into these two must not weaken the
+    incarnation fencing: a controller that lost its DB row may neither
+    mutate autoscaler/replica-manager state nor disclose routing.
+    """
+
+    def _make_fenced_controller(self):
+        ctrl = _make_controller()
+        ctrl._service_hash = 'incarnation-a'  # pylint: disable=protected-access
+        ctrl._controller_owner = (101, '10.0.0.1')  # pylint: disable=protected-access
+        return ctrl
+
+    def _sync(self, ctrl, owner_rows):
+        """Drive one sync; each fence read pops the next owner row."""
+        ingest_calls = []
+
+        async def _ingest(*args, **kwargs):
+            ingest_calls.append((args, kwargs))
+            return True
+
+        with mock.patch.object(controller.serve_state,
+                               'get_service_controller_owner',
+                               side_effect=owner_rows), \
+             mock.patch.object(controller.serve_state, 'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(controller.serve_state, 'get_specs',
+                               return_value={}), \
+             mock.patch.object(ctrl, '_lb_report_authority',
+                               return_value=(True, True, True)), \
+             mock.patch.object(ctrl, '_get_lb_replica_info',
+                               return_value=([], 0)), \
+             mock.patch.object(ctrl, '_ingest_load_balancer_report',
+                               side_effect=_ingest), \
+             mock.patch.object(ctrl, '_get_capacity_hint',
+                               return_value={}):
+            response = asyncio.run(
+                ctrl._handle_load_balancer_sync(  # pylint: disable=protected-access
+                    {'lb_session_id': 'lb-a'}))
+        return response, ingest_calls
+
+    def test_non_owner_rejected_at_entry(self):
+        ctrl = self._make_fenced_controller()
+        stolen = {
+            'hash': 'incarnation-b',
+            'controller_pid': 202,
+            'controller_ip': '10.0.0.2',
+        }
+        response, ingest_calls = self._sync(ctrl, owner_rows=[stolen])
+        assert response.status_code == 503
+        assert not ingest_calls
+
+    def test_ownership_lost_mid_sync_blocks_mutation_and_disclosure(self):
+        # Owner at entry, row stolen while the replica snapshot was read:
+        # the pre-side-effect fence must reject before the report is
+        # ingested or any routing info is returned.
+        ctrl = self._make_fenced_controller()
+        owned = {
+            'hash': 'incarnation-a',
+            'controller_pid': 101,
+            'controller_ip': '10.0.0.1',
+        }
+        stolen = {
+            'hash': 'incarnation-b',
+            'controller_pid': 202,
+            'controller_ip': '10.0.0.2',
+        }
+        response, ingest_calls = self._sync(ctrl, owner_rows=[owned, stolen])
+        assert response.status_code == 503
+        assert not ingest_calls
+
+    def test_ingest_never_awaits_with_authority_provided(self):
+        # The fence consolidation relies on this: with `authority` passed,
+        # _ingest_load_balancer_report must run to completion without
+        # yielding, so nothing can interleave between the fence, the
+        # mutation, and the disclosure.
+        ctrl = _make_controller()
+        ctrl._replica_manager = mock.Mock()
+        ctrl._autoscaler = mock.Mock()
+        coro = ctrl._ingest_load_balancer_report(  # pylint: disable=protected-access
+            {'lb_session_id': 'lb-a'}, [], {},
+            authority=(True, True, True))
+        # Driving the coroutine by hand: a bare send(None) must finish it
+        # in one step (StopIteration) -- any await would suspend instead.
+        with pytest.raises(StopIteration) as stop:
+            coro.send(None)
+        assert stop.value.value is True
