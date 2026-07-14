@@ -299,22 +299,38 @@ def _get_service_record(
         service_name: str, pool: bool,
         handle: backends.CloudVmRayResourceHandle,
         backend: backends.CloudVmRayBackend) -> dict[str, Any] | None:
-    """Get the service record."""
+    """Get service metadata without materializing the replica inventory."""
     noun = 'pool' if pool else 'service'
 
     assert isinstance(handle, backends.CloudVmRayResourceHandle)
+    if serve_utils.is_consolidation_mode(pool):
+        # The API server and consolidated controller share the Serve DB.
+        # Update fencing only needs service-row metadata; routing this through
+        # full status serializes every historical replica and can make a
+        # large-fleet update unable to start.
+        service_record = serve_state.get_service_from_name(service_name)
+        if service_record is None or service_record['pool'] != pool:
+            return None
+        return service_record
+
     use_legacy = not handle.is_grpc_enabled_with_flag
 
     if not use_legacy:
         try:
             service_statuses = serve_rpc_utils.RpcRunner.get_service_status(
-                handle, [service_name], pool)
+                handle, [service_name],
+                pool,
+                summary_only=True,
+                include_target_num_replicas=False)
         except exceptions.SkyletMethodNotImplementedError:
             use_legacy = True
 
     if use_legacy:
-        code = serve_utils.ServeCodeGen.get_service_status([service_name],
-                                                           pool=pool)
+        code = serve_utils.ServeCodeGen.get_service_status(
+            [service_name],
+            pool=pool,
+            summary_only=True,
+            include_target_num_replicas=False)
         returncode, serve_status_payload, stderr = backend.run_on_head(
             handle,
             code,
