@@ -30,6 +30,7 @@ class TestOciStoreDispatch(unittest.TestCase):
     def test_public_classes_round_trip_through_pickle(self):
         for store_cls in (storage_lib.OciStore,
                           storage_lib.OciS3CompatibleStore):
+            self.assertEqual(store_cls.__module__, storage_lib.__name__)
             self.assertIs(pickle.loads(pickle.dumps(store_cls)), store_cls)
 
         self.assertIs(storage_lib.OciStore, storage_oci.OciStore)
