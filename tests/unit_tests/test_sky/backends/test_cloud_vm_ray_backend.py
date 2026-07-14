@@ -613,6 +613,44 @@ class TestCloudVmRayBackendTeardownNoLock:
         mock_get_yaml.assert_called_once_with(refreshed_handle.cluster_yaml)
 
 
+class TestPostTeardownCleanupYamlFetch:
+    """The teardown double-check loop must not re-read the cluster YAML."""
+
+    def test_yaml_fetched_once_across_status_retries(self):
+        backend = cloud_vm_ray_backend.CloudVmRayBackend()
+        # pylint: disable-next=protected-access
+        handle = TestCloudVmRayBackendTeardownNoLock._make_handle(
+            'test-cluster', '/tmp/cluster.yaml', has_ray=False)
+
+        # Instances still show as UP for two attempts, then are gone.
+        query_results = [
+            {
+                'node-0': (status_lib.ClusterStatus.UP, None)
+            },
+            {
+                'node-0': (status_lib.ClusterStatus.UP, None)
+            },
+            {},
+        ]
+
+        with patch(
+                'sky.backends.cloud_vm_ray_backend.cluster_utils.'
+                'SSHConfigHelper.remove_cluster'), patch(
+                    'sky.backends.cloud_vm_ray_backend.global_user_state.'
+                    'get_cluster_yaml_dict',
+                    return_value={'provider': {}}) as mock_get_yaml, patch(
+                        'sky.backends.cloud_vm_ray_backend.provision_lib.'
+                        'query_instances',
+                        side_effect=query_results) as mock_query, patch(
+                            'sky.backends.cloud_vm_ray_backend.'
+                            'global_user_state.remove_cluster'), patch(
+                                'sky.backends.cloud_vm_ray_backend.time.sleep'):
+            backend.post_teardown_cleanup(handle, terminate=False)
+
+        assert mock_query.call_count == 3
+        mock_get_yaml.assert_called_once_with(handle.cluster_yaml)
+
+
 class TestNewHandleRuntimeMetadata:
     """Runtime metadata a freshly constructed handle starts with."""
 
