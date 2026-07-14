@@ -848,15 +848,44 @@ class SkyServeLoadBalancer:
     async def _release_request_slot(self,
                                     request: fastapi.Request | None = None
                                    ) -> None:
+        # Release state before the first await. A request can be cancelled once
+        # for a downstream disconnect and again during server shutdown; if the
+        # second cancellation lands while waiting for the condition lock, the
+        # admission count must already be returned. These mutations are atomic
+        # with acquire's predicate/update on the single event-loop thread
+        # because there is no await between their reads and writes.
+        if request is not None:
+            with self._client_pool_lock:
+                self._release_unassigned_occupancy_admission_locked(request)
+        self._active_request_count = max(0, self._active_request_count - 1)
         condition = self._request_queue_condition
-        if condition is None:
-            return
-        async with condition:
-            if request is not None:
-                with self._client_pool_lock:
-                    self._release_unassigned_occupancy_admission_locked(request)
-            self._active_request_count = max(0, self._active_request_count - 1)
-            condition.notify_all()
+        if condition is not None:
+            # Keep notification alive independently of this request task. A
+            # second cancellation can arrive while it waits for the condition
+            # lock; the released state is safe already, but an envelope-mode
+            # waiter still needs the wakeup because it has no occupancy probe
+            # to provide a later one.
+            async def _notify() -> None:
+                async with condition:
+                    condition.notify_all()
+
+            try:
+                await _notify()
+            except asyncio.CancelledError:
+                notification = asyncio.create_task(_notify())
+                # The event loop only keeps weak task references. Retain this
+                # rare cancellation fallback until its condition notification
+                # finishes, then consume any shutdown-time exception.
+                self._background_tasks.append(notification)
+
+                def _forget_notification(done: asyncio.Task) -> None:
+                    with contextlib.suppress(ValueError):
+                        self._background_tasks.remove(done)
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        done.result()
+
+                notification.add_done_callback(_forget_notification)
+                raise
 
     async def _request_body(self, request: fastapi.Request) -> bytes:
         """Read a request body with the configured hard memory bound."""
@@ -1470,7 +1499,14 @@ class SkyServeLoadBalancer:
                 self._load_balancing_policy.set_occupancy({})
             await self._notify_request_queue()
             return
-        async with aiohttp.ClientSession() as session:
+        # aiohttp's default connector allows only 100 concurrent sockets. A
+        # probe timeout covers the entire request, including time spent queued
+        # for a connector slot, so replicas after the first 100 can time out
+        # without ever being contacted on a large fleet. Match the connector
+        # limit to this round's bounded controller-supplied fleet so every
+        # replica gets the same timeout window.
+        connector = aiohttp.TCPConnector(limit=len(probe_urls))
+        async with aiohttp.ClientSession(connector=connector) as session:
             results = await asyncio.gather(
                 *(self._fetch_replica_occupancy(session, url)
                   for url in probe_urls))
@@ -2201,21 +2237,26 @@ class SkyServeLoadBalancer:
                 acquired_slot = False
             return response
         finally:
-            if acquired_slot:
-                await self._release_request_slot(request)
-            elif not had_admission_slot:
-                # A live config update can enable occupancy-aware queueing
-                # after this request entered without an admission slot. A
-                # later rejected retry then transfers its per-URL reservation
-                # to the request-level marker. It has no streaming handoff or
-                # outer slot release to clear that marker, so clean it here.
-                with self._client_pool_lock:
-                    released_admission = (
-                        self._release_unassigned_occupancy_admission_locked(
-                            request))
-                if released_admission:
-                    await self._notify_request_queue()
-            self._queue_depth -= 1
+            try:
+                if acquired_slot:
+                    await self._release_request_slot(request)
+                elif not had_admission_slot:
+                    # A live config update can enable occupancy-aware queueing
+                    # after this request entered without an admission slot. A
+                    # later rejected retry then transfers its per-URL
+                    # reservation to the request-level marker. It has no
+                    # streaming handoff or outer slot release to clear that
+                    # marker, so clean it here.
+                    with self._client_pool_lock:
+                        released_admission = (
+                            self._release_unassigned_occupancy_admission_locked(
+                                request))
+                    if released_admission:
+                        await self._notify_request_queue()
+            finally:
+                # Admission notification is itself cancellable. The demand
+                # gauge must still balance on every exit.
+                self._queue_depth -= 1
 
     async def _proxy_with_retries_inner(
             self, request: fastapi.Request) -> fastapi.responses.Response:
