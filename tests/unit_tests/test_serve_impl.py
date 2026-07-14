@@ -25,6 +25,94 @@ def _backend_mock():
     return mock.MagicMock(spec=backends.CloudVmRayBackend)
 
 
+class TestGetServiceRecord:
+    """Update fences must not materialize a large replica inventory."""
+
+    def test_consolidation_reads_shared_db_without_status_rpc(self):
+        handle = mock.MagicMock(spec=backends.CloudVmRayResourceHandle)
+        backend = _backend_mock()
+        record = {
+            'name': 'svc',
+            'pool': False,
+            'status': serve_state.ServiceStatus.READY,
+        }
+        with mock.patch.object(impl.serve_utils,
+                               'is_consolidation_mode',
+                               return_value=True), \
+             mock.patch.object(impl.serve_state,
+                               'get_service_from_name',
+                               return_value=record) as get_service, \
+             mock.patch.object(
+                 impl.serve_rpc_utils.RpcRunner,
+                 'get_service_status') as get_status, \
+             mock.patch.object(impl.serve_utils.ServeCodeGen,
+                               'get_service_status') as codegen:
+            result = impl._get_service_record('svc', False, handle, backend)
+
+        assert result is record
+        get_service.assert_called_once_with('svc')
+        get_status.assert_not_called()
+        codegen.assert_not_called()
+        backend.run_on_head.assert_not_called()
+
+    def test_legacy_status_fallback_is_summary_only(self):
+        handle = mock.MagicMock(spec=backends.CloudVmRayResourceHandle)
+        handle.is_grpc_enabled_with_flag = False
+        backend = _backend_mock()
+        backend.run_on_head.return_value = (0, b'payload', '')
+        record = {
+            'name': 'svc',
+            'pool': False,
+            'status': serve_state.ServiceStatus.READY,
+        }
+        with mock.patch.object(impl.serve_utils,
+                               'is_consolidation_mode',
+                               return_value=False), \
+             mock.patch.object(impl.serve_utils.ServeCodeGen,
+                               'get_service_status',
+                               return_value='code') as codegen, \
+             mock.patch.object(impl.serve_utils,
+                               'load_service_status',
+                               return_value=[record]):
+            result = impl._get_service_record('svc', False, handle, backend)
+
+        assert result is record
+        codegen.assert_called_once_with(
+            ['svc'],
+            pool=False,
+            summary_only=True,
+            include_target_num_replicas=False,
+        )
+
+    def test_rpc_status_fallback_is_summary_only(self):
+        handle = mock.MagicMock(spec=backends.CloudVmRayResourceHandle)
+        handle.is_grpc_enabled_with_flag = True
+        backend = _backend_mock()
+        record = {
+            'name': 'svc',
+            'pool': False,
+            'status': serve_state.ServiceStatus.READY,
+        }
+        with mock.patch.object(impl.serve_utils,
+                               'is_consolidation_mode',
+                               return_value=False), \
+             mock.patch.object(
+                 impl.serve_rpc_utils.RpcRunner,
+                 'get_service_status',
+                 return_value=[record]) as get_status:
+            result = impl._get_service_record('svc', False, handle, backend)
+
+        assert result is record
+        get_status.assert_called_once_with(
+            handle,
+            ['svc'],
+            False,
+            summary_only=True,
+            include_target_num_replicas=False,
+        )
+        backend.run_on_head.assert_not_called()
+
+
 def test_service_request_example_is_plain_when_data_auth_disabled():
     with mock.patch.object(impl.serve_utils,
                            'is_lb_data_plane_auth_enabled',
