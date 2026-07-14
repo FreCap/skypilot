@@ -30,6 +30,10 @@ class AutoscalerDecisionOperator(enum.Enum):
     SCALE_DOWN = 'scale_down'
 
 
+class AutoscalerDecisionReason(enum.Enum):
+    COST_REBALANCE = 'cost_rebalance'
+
+
 @dataclasses.dataclass
 class AutoscalerDecision:
     """Autoscaling decisions.
@@ -44,19 +48,24 @@ class AutoscalerDecision:
     """
     operator: AutoscalerDecisionOperator
     target: dict[str, Any] | None | int
+    reason: AutoscalerDecisionReason | None
 
     # TODO(MaoZiming): Add a doc to elaborate on autoscaling policies.
-    def __init__(self, operator: AutoscalerDecisionOperator,
-                 target: dict[str, Any] | None | int):
+    def __init__(self,
+                 operator: AutoscalerDecisionOperator,
+                 target: dict[str, Any] | None | int,
+                 reason: AutoscalerDecisionReason | None = None):
         if operator == AutoscalerDecisionOperator.SCALE_UP:
             assert (target is None or isinstance(target, dict))
         else:
             assert isinstance(target, int)
         self.operator = operator
         self.target = target
+        self.reason = reason
 
     def __repr__(self) -> str:
-        return f'AutoscalerDecision({self.operator}, {self.target})'
+        return (f'AutoscalerDecision({self.operator}, {self.target}, '
+                f'reason={self.reason})')
 
 
 def _generate_scale_up_decisions(
@@ -68,10 +77,13 @@ def _generate_scale_up_decisions(
 
 
 def _generate_scale_down_decisions(
-        replica_ids: list[int]) -> list[AutoscalerDecision]:
+    replica_ids: list[int],
+    reason: AutoscalerDecisionReason | None = None,
+) -> list[AutoscalerDecision]:
     return [
-        AutoscalerDecision(AutoscalerDecisionOperator.SCALE_DOWN, replica_id)
-        for replica_id in replica_ids
+        AutoscalerDecision(AutoscalerDecisionOperator.SCALE_DOWN,
+                           replica_id,
+                           reason=reason) for replica_id in replica_ids
     ]
 
 
@@ -221,6 +233,20 @@ class Autoscaler:
         self._fill_grant: int | None = None
         self._fill_grant_epoch: int | None = None
         self._fill_grant_pool_key: str | None = None
+        # Opt-in economic replacement.  The placer reference is injected by
+        # the controller each tick because ReplicaManager owns placement state.
+        self.cost_rebalance: bool = bool(getattr(spec, 'cost_rebalance', False))
+        self.cost_rebalance_min_savings_fraction: float = float(
+            getattr(spec, 'cost_rebalance_min_savings_fraction', 0.3))
+        self.cost_rebalance_max_parallel_replacements: int = int(
+            getattr(spec, 'cost_rebalance_max_parallel_replacements', 1))
+        self.cost_rebalance_stabilization_seconds: float = float(
+            getattr(spec, 'cost_rebalance_stabilization_seconds', 300.0))
+        self._cost_rebalance_spot_placer: spot_placer.SpotPlacer | None = None
+        self._cost_rebalance_candidate_since: dict[tuple[int,
+                                                         spot_placer.Location],
+                                                   float] = {}
+        self._cost_rebalance_replica_cost_cache: dict[int, float] = {}
 
     def get_final_target_num_replicas(self) -> int:
         """Get the final target number of replicas."""
@@ -259,6 +285,18 @@ class Autoscaler:
             getattr(spec, 'reserved_fill_floor_replicas', 0) or 0)
         self.reserved_fill_weight = float(
             getattr(spec, 'reserved_fill_weight', 1.0) or 1.0)
+        self.cost_rebalance = bool(getattr(spec, 'cost_rebalance', False))
+        self.cost_rebalance_min_savings_fraction = float(
+            getattr(spec, 'cost_rebalance_min_savings_fraction', 0.3))
+        self.cost_rebalance_max_parallel_replacements = int(
+            getattr(spec, 'cost_rebalance_max_parallel_replacements', 1))
+        self.cost_rebalance_stabilization_seconds = float(
+            getattr(spec, 'cost_rebalance_stabilization_seconds', 300.0))
+        self._cost_rebalance_candidate_since.clear()
+
+    def set_spot_placer(self, placer: spot_placer.SpotPlacer | None) -> None:
+        """Publish ReplicaManager's live placement/bench state for this tick."""
+        self._cost_rebalance_spot_placer = placer
 
     def collect_request_information(
             self, request_aggregator_info: dict[str, Any]) -> None:
@@ -836,6 +874,244 @@ class Autoscaler:
             if info.version < latest_version_with_min_replicas
         ]
 
+    def _cost_rebalance_replica_capacity(
+            self, info: 'replica_managers.ReplicaInfo') -> float:
+        """Serving-capacity units represented by an existing replica."""
+        del info
+        return 1.0
+
+    def _cost_rebalance_location_capacity(
+            self, location: spot_placer.Location) -> float:
+        """Serving-capacity units represented by a candidate location."""
+        del location
+        return 1.0
+
+    def _get_hourly_cost_from_replica_info(
+            self, replica_info: 'replica_managers.ReplicaInfo') -> float:
+        """Resolve whole-replica hourly cost conservatively."""
+        cached = self._cost_rebalance_replica_cost_cache.get(
+            replica_info.replica_id)
+        if cached is not None:
+            return cached
+        cost = 0.0
+        try:
+            handle = replica_info.handle()
+            if handle is not None:
+                cost = float(handle.launched_resources.get_cost(seconds=3600))
+        except Exception:  # pylint: disable=broad-except
+            cost = 0.0
+        if (replica_info.status_property.sky_launch_status ==
+                common_utils.ProcessStatus.SUCCEEDED):
+            self._cost_rebalance_replica_cost_cache[
+                replica_info.replica_id] = cost
+        return cost
+
+    def _cost_rebalance_pairs(
+        self, replica_infos: list['replica_managers.ReplicaInfo']
+    ) -> dict[int, 'replica_managers.ReplicaInfo']:
+        """Return one live replacement row per live incumbent."""
+        by_id = {info.replica_id: info for info in replica_infos}
+        pairs: dict[int, replica_managers.ReplicaInfo] = {}
+        for replacement in replica_infos:
+            victim_id = getattr(replacement, 'cost_rebalance_for_replica_id',
+                                None)
+            if victim_id is None or replacement.is_terminal:
+                continue
+            victim = by_id.get(victim_id)
+            if victim is None or victim.is_terminal:
+                continue
+            prior = pairs.get(victim_id)
+            if prior is None or replacement.replica_id < prior.replica_id:
+                pairs[victim_id] = replacement
+        return pairs
+
+    def _protect_cost_rebalance_overlap(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+        decisions: list[AutoscalerDecision],
+    ) -> list[AutoscalerDecision]:
+        """Keep ordinary autoscaling from consuming replacement overlap."""
+        pairs = self._cost_rebalance_pairs(replica_infos)
+        if not pairs:
+            return decisions
+        protected_ids = set(pairs)
+        protected_ids.update(
+            replacement.replica_id for replacement in pairs.values())
+        overlap_to_ignore = len(pairs)
+        kept: list[AutoscalerDecision] = []
+        for decision in decisions:
+            if decision.operator != AutoscalerDecisionOperator.SCALE_DOWN:
+                kept.append(decision)
+                continue
+            assert isinstance(decision.target, int)
+            if decision.target in protected_ids:
+                logger.info('Suppressing ordinary scale-down of cost-rebalance '
+                            f'pair member {decision.target}.')
+                if overlap_to_ignore > 0:
+                    overlap_to_ignore -= 1
+                continue
+            if overlap_to_ignore > 0:
+                logger.info('Suppressing one ordinary scale-down for temporary '
+                            'cost-rebalance replacement headroom.')
+                overlap_to_ignore -= 1
+                continue
+            kept.append(decision)
+        return kept
+
+    @staticmethod
+    def _location_gpu_shape(location: spot_placer.Location) -> tuple[str, int]:
+        accelerators = location.accelerators or {}
+        if not accelerators:
+            return 'unknown', 1
+        gpu_type, gpu_count = next(iter(accelerators.items()))
+        return gpu_type, max(1, int(gpu_count))
+
+    def _best_cost_rebalance_candidate(
+        self,
+        incumbent: 'replica_managers.ReplicaInfo',
+        planned_locations: list[spot_placer.Location],
+    ) -> spot_placer.Location | None:
+        placer = self._cost_rebalance_spot_placer
+        if placer is None:
+            return None
+        incumbent_location = incumbent.get_spot_location()
+        if incumbent_location is None:
+            return None
+        incumbent_capacity = self._cost_rebalance_replica_capacity(incumbent)
+        incumbent_cost = self._get_hourly_cost_from_replica_info(incumbent)
+        if incumbent_capacity <= 0 or incumbent_cost <= 0:
+            # Unknown cost is deliberately conservative in the existing cost
+            # resolver.  Never replace an unknown/zero-cost incumbent.
+            return None
+        incumbent_unit_cost = incumbent_cost / incumbent_capacity
+        maximum_unit_cost = incumbent_unit_cost * (
+            1.0 - self.cost_rebalance_min_savings_fraction)
+
+        location_load: dict[spot_placer.Location, int] = {}
+        for location in placer.active_locations():
+            location_load[location] = sum(
+                spot_placer.locations_match_placement(current, location)
+                for current in planned_locations)
+
+        eligible: list[tuple[float, int, str, spot_placer.Location]] = []
+        for location in placer.active_locations():
+            if spot_placer.locations_match_placement(incumbent_location,
+                                                     location):
+                continue
+            candidate_capacity = self._cost_rebalance_location_capacity(
+                location)
+            if candidate_capacity + 1e-9 < incumbent_capacity:
+                continue
+            candidate_cost = placer.cost_per_hour(location)
+            if not math.isfinite(candidate_cost) or candidate_cost < 0:
+                continue
+            candidate_unit_cost = candidate_cost / candidate_capacity
+            if candidate_unit_cost > maximum_unit_cost + 1e-12:
+                continue
+            eligible.append((candidate_unit_cost, location_load[location],
+                             repr(location.to_pickleable()), location))
+        if not eligible:
+            return None
+        return min(eligible, key=lambda item: item[:3])[-1]
+
+    def _generate_cost_rebalance_decisions(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+        ordinary_decisions: list[AutoscalerDecision],
+    ) -> list[AutoscalerDecision]:
+        """Progress durable pairs and, when stable, start cheaper replacements."""
+        live_replica_ids = {
+            info.replica_id for info in replica_infos if not info.is_terminal
+        }
+        for replica_id in list(self._cost_rebalance_replica_cost_cache):
+            if replica_id not in live_replica_ids:
+                del self._cost_rebalance_replica_cost_cache[replica_id]
+        pairs = self._cost_rebalance_pairs(replica_infos)
+        by_id = {info.replica_id: info for info in replica_infos}
+        decisions: list[AutoscalerDecision] = []
+
+        # Existing pairs are completed even when a later update disables the
+        # policy.  In that case keep the incumbent and drain the replacement;
+        # otherwise wait for replacement readiness, then strictly drain the
+        # incumbent.  COST_REBALANCE means off-route now, terminate only after
+        # the LB proves zero occupancy.
+        for victim_id, replacement in sorted(pairs.items()):
+            victim = by_id[victim_id]
+            if self.cost_rebalance:
+                if replacement.is_ready:
+                    decisions.extend(
+                        _generate_scale_down_decisions(
+                            [victim.replica_id],
+                            reason=AutoscalerDecisionReason.COST_REBALANCE))
+            elif replacement.is_ready:
+                decisions.extend(
+                    _generate_scale_down_decisions(
+                        [replacement.replica_id],
+                        reason=AutoscalerDecisionReason.COST_REBALANCE))
+            else:
+                decisions.extend(
+                    _generate_scale_down_decisions([replacement.replica_id]))
+
+        if (not self.cost_rebalance or
+                self._cost_rebalance_spot_placer is None):
+            self._cost_rebalance_candidate_since.clear()
+            return decisions
+        if ordinary_decisions:
+            self._cost_rebalance_candidate_since.clear()
+            return decisions
+        if any(not info.is_terminal and info.version != self.latest_version
+               for info in replica_infos):
+            self._cost_rebalance_candidate_since.clear()
+            return decisions
+
+        slots = self.cost_rebalance_max_parallel_replacements - len(pairs)
+        if slots <= 0:
+            return decisions
+        paired_ids = set(pairs)
+        candidates = [
+            info for info in replica_infos
+            if (info.version == self.latest_version and info.is_ready and
+                info.replica_id not in paired_ids)
+        ]
+        candidates.sort(
+            key=lambda info: -self._get_hourly_cost_from_replica_info(info))
+        planned_locations = [
+            location for location in (info.get_spot_location()
+                                      for info in replica_infos
+                                      if not info.is_terminal)
+            if location is not None
+        ]
+        now = time.monotonic()
+        current_candidate_keys: set[tuple[int, spot_placer.Location]] = set()
+        for incumbent in candidates:
+            if slots <= 0:
+                break
+            location = self._best_cost_rebalance_candidate(
+                incumbent, planned_locations)
+            if location is None:
+                continue
+            key = (incumbent.replica_id, location)
+            current_candidate_keys.add(key)
+            first_seen = self._cost_rebalance_candidate_since.setdefault(
+                key, now)
+            if (now - first_seen < self.cost_rebalance_stabilization_seconds):
+                continue
+            override = location.to_dict()
+            override[constants.COST_REBALANCE_FOR_REPLICA_OVERRIDE_KEY] = (
+                incumbent.replica_id)
+            decisions.append(
+                AutoscalerDecision(
+                    AutoscalerDecisionOperator.SCALE_UP,
+                    override,
+                    reason=AutoscalerDecisionReason.COST_REBALANCE))
+            planned_locations.append(location)
+            slots -= 1
+
+        for key in list(self._cost_rebalance_candidate_since):
+            if key not in current_candidate_keys:
+                del self._cost_rebalance_candidate_since[key]
+        return decisions
+
     def generate_scaling_decisions(
         self,
         replica_infos: list['replica_managers.ReplicaInfo'],
@@ -888,9 +1164,14 @@ class Autoscaler:
         # reserved-capacity fill overlay wraps only the subclass's demand
         # decisions -- the outdated-replica drain above is version
         # control, not demand, and must never be suppressed by fill.
+        ordinary_decisions = self._apply_reserved_capacity_fill(
+            replica_infos, self._generate_scaling_decisions(replica_infos))
+        ordinary_decisions = self._protect_cost_rebalance_overlap(
+            replica_infos, ordinary_decisions)
+        scaling_decisions.extend(ordinary_decisions)
         scaling_decisions.extend(
-            self._apply_reserved_capacity_fill(
-                replica_infos, self._generate_scaling_decisions(replica_infos)))
+            self._generate_cost_rebalance_decisions(replica_infos,
+                                                    ordinary_decisions))
 
         if not scaling_decisions:
             logger.info('No scaling needed.')
@@ -1665,6 +1946,16 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
                        f'Using minimum QPS as fallback.')
         return min(target_qps_dict.values())
 
+    def _cost_rebalance_replica_capacity(
+            self, info: 'replica_managers.ReplicaInfo') -> float:
+        return self._get_target_qps_for_gpu_shape(
+            *self._get_gpu_shape_from_replica_info(info), version=info.version)
+
+    def _cost_rebalance_location_capacity(
+            self, location: spot_placer.Location) -> float:
+        return self._get_target_qps_for_gpu_shape(
+            *self._location_gpu_shape(location), version=self.latest_version)
+
     def _select_replicas_to_scale_down_by_qps(
             self, num_replicas_to_scale_down: int,
             replica_infos: list['replica_managers.ReplicaInfo']) -> list[int]:
@@ -2050,6 +2341,15 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         """
         _, gpu_count = self._get_gpu_shape_from_replica_info(info)
         return self._get_knob_for_version(info.version) * gpu_count
+
+    def _cost_rebalance_replica_capacity(
+            self, info: 'replica_managers.ReplicaInfo') -> float:
+        return self._replica_capacity(info)
+
+    def _cost_rebalance_location_capacity(
+            self, location: spot_placer.Location) -> float:
+        _, gpu_count = self._location_gpu_shape(location)
+        return self.target_concurrency_per_replica * gpu_count
 
     def _latest_capacities(
             self,
