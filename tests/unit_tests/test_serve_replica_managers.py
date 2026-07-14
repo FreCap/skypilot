@@ -131,6 +131,7 @@ def _make_manager(service_name='svc', next_replica_id=1):
     mgr.lock = threading.RLock()
     mgr._service_name = service_name
     mgr._next_replica_id = next_replica_id
+    mgr.latest_version = 1
     mgr._launch_thread_pool = {}
     mgr._down_thread_pool = {}
     mgr._tick_version_spec_cache = {}
@@ -1261,6 +1262,43 @@ class TestScaleUpBatch:
             mgr.scale_up_batch([{'use_spot': False}] * 3)
         assert launched == [1, 2, 3]
         scan.assert_not_called()
+
+    def test_batch_yields_to_newer_pending_version(self):
+        """A committed update must not wait behind the rest of a huge wave."""
+        mgr = _make_manager(next_replica_id=1)
+        mgr.lock = self._CountingLock()
+        mgr.latest_version = 4
+        mgr._pending_version = None
+        launched = []
+
+        def _launch(replica_id,
+                    resources_override,
+                    existing_replica_infos=None):
+            del resources_override, existing_replica_infos
+            launched.append(replica_id)
+            if replica_id == 2:
+                mgr.notify_version_pending(6)
+            return True
+
+        with mock.patch(
+                'sky.serve.replica_managers.serve_state.'
+                'get_replica_info_from_id', return_value=None), \
+             mock.patch.object(mgr, '_launch_replica', side_effect=_launch):
+            mgr.scale_up_batch([None] * 500)
+
+        assert launched == [1, 2]
+        assert mgr._next_replica_id == 3
+        assert mgr._pending_version == 6
+
+    def test_pending_version_signal_clears_only_matching_update(self):
+        mgr = _make_manager()
+        mgr._pending_version = None
+        mgr.notify_version_pending(6)
+        mgr.notify_version_pending(7)
+        mgr.clear_pending_version(6)
+        assert mgr._pending_version == 7
+        mgr.clear_pending_version(7)
+        assert mgr._pending_version is None
 
 
 class TestLaunchReplicaSnapshotAccumulation:

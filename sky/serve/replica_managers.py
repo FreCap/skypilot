@@ -1205,6 +1205,12 @@ class ReplicaManager:
         for resources_override in resources_overrides:
             self.scale_up(resources_override)
 
+    def notify_version_pending(self, version: int) -> None:
+        """Notify long manager operations that a newer version is waiting."""
+
+    def clear_pending_version(self, version: int) -> None:
+        """Clear a previously announced pending version."""
+
     def scale_down(self, replica_id: int, purge: bool = False) -> None:
         """Scale down replica with replica_id."""
         raise NotImplementedError
@@ -1383,6 +1389,15 @@ class SkyPilotReplicaManager(ReplicaManager):
             int, str] = thread_utils.ThreadSafeDict()
         self._replica_to_launch_cancelled: thread_utils.ThreadSafeDict[
             int, bool] = thread_utils.ThreadSafeDict()
+        # update_service persists a version before waiting for the manager
+        # lock.  A large placer-backed scale-up batch can hold that lock for
+        # minutes while it assigns hundreds of replicas.  Publish the waiting
+        # version outside the manager lock so that the stale batch can stop
+        # enqueueing work and let the update take over.  Controller updates
+        # are serialized, and integer assignment is atomic in CPython, so a
+        # separate lock would only recreate the lock inversion this signal is
+        # designed to break.
+        self._pending_version: int | None = None
         # One DB-backed owner watcher per manager fans out through this event;
         # individual launch watchdogs poll the event rather than multiplying
         # ownership queries by the number of in-flight replicas.
@@ -2040,13 +2055,30 @@ class SkyPilotReplicaManager(ReplicaManager):
         snapshot, so later decisions preserve the existing in-wave spreading
         and reserved-capacity accounting semantics.
         """
+        batch_version = self.latest_version
         existing_replica_infos = None
         if self._batch_needs_placement_snapshot(resources_overrides):
             existing_replica_infos = serve_state.get_replica_infos(
                 self._service_name)
         for resources_override in resources_overrides:
+            pending_version = getattr(self, '_pending_version', None)
+            if (pending_version is not None and
+                    pending_version > batch_version):
+                logger.info('Stopping version '
+                            f'{batch_version} scale-up batch because version '
+                            f'{pending_version} is waiting to be applied.')
+                break
             self._scale_up_one_locked(resources_override,
                                       existing_replica_infos)
+
+    def notify_version_pending(self, version: int) -> None:
+        pending_version = getattr(self, '_pending_version', None)
+        if pending_version is None or version > pending_version:
+            self._pending_version = version
+
+    def clear_pending_version(self, version: int) -> None:
+        if getattr(self, '_pending_version', None) == version:
+            self._pending_version = None
 
     def _batch_needs_placement_snapshot(
             self, resources_overrides: list[dict[str, Any] | None]) -> bool:

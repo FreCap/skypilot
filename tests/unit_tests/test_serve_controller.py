@@ -214,6 +214,9 @@ class TestGetRoutingSpec:
                                        args=(2, new_spec, mock.sentinel.mode))
             updater.start()
             assert entered_runtime_transition.wait(timeout=5)
+            ctrl._replica_manager.notify_version_pending.assert_called_once_with(  # pylint: disable=line-too-long
+                2)
+            ctrl._replica_manager.clear_pending_version.assert_not_called()
             # The DB already points at the new version, but the controller has
             # not finished applying it locally yet. Syncs must keep serving the
             # old routing spec until the runtime transition completes.
@@ -231,6 +234,8 @@ class TestGetRoutingSpec:
             updater.join(timeout=5)
 
         assert not updater.is_alive()
+        ctrl._replica_manager.clear_pending_version.assert_called_once_with(  # pylint: disable=line-too-long
+            2)
         assert ctrl._get_routing_spec() == {  # pylint: disable=protected-access
             'load_balancing_policy_name': 'instance_aware_least_load',
             'target_qps_per_replica': {
