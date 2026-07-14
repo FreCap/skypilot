@@ -21,6 +21,7 @@ import uvicorn
 from sky import models
 from sky.server import common as server_common
 from sky.server import constants as server_constants
+from sky.server import dashboard as dashboard_app
 from sky.server import file_mount_uploads
 from sky.server import server
 from sky.server.requests import executor
@@ -806,9 +807,9 @@ class TestResolveDynamicRoute:
     @pytest.fixture(autouse=True)
     def _clear_routes_cache(self):
         """Reset the cached dynamic routes between tests."""
-        server._DYNAMIC_ROUTES = None
+        dashboard_app._DYNAMIC_ROUTES = None
         yield
-        server._DYNAMIC_ROUTES = None
+        dashboard_app._DYNAMIC_ROUTES = None
 
     def test_single_dynamic_segment(self, tmp_path):
         d = _build_dashboard_tree(tmp_path)
@@ -932,7 +933,7 @@ async def test_serve_dashboard_client_route_falls_back_to_index(tmp_path):
     request = mock.MagicMock(spec=fastapi.Request)
 
     with mock.patch.object(server_constants, 'DASHBOARD_DIR', str(d)), \
-         mock.patch('sky.server.server._serve_html_with_nonce',
+         mock.patch('sky.server.dashboard._serve_html_with_nonce',
                     return_value=fastapi.responses.HTMLResponse(
                         content='<html/>', status_code=200)):
         response = await server.serve_dashboard(request, full_path='clusters')
