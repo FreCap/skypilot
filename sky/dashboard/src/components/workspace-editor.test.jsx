@@ -1,7 +1,17 @@
-import { act, render, screen, waitFor } from '@testing-library/react';
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from '@testing-library/react';
 
 import WorkspacePage from '@/pages/workspaces/[name]';
-import { getEnabledClouds, getWorkspaces } from '@/data/connectors/workspaces';
+import {
+  deleteWorkspace,
+  getEnabledClouds,
+  getWorkspaces,
+} from '@/data/connectors/workspaces';
 import { getUsers } from '@/data/connectors/users';
 import { getClusters } from '@/data/connectors/clusters';
 import { getManagedJobs } from '@/data/connectors/jobs';
@@ -184,6 +194,82 @@ describe('WorkspacePage request lifecycle', () => {
     expect(screen.queryByText('Error')).not.toBeInTheDocument();
     expect(screen.getByTestId('yaml-editor')).toHaveTextContent('beta:');
     consoleError.mockRestore();
+  });
+
+  it('cancels delayed navigation after leaving a deleted workspace', async () => {
+    const push = jest.fn();
+    mockRouter = { ...mockRouter, push };
+    getWorkspaces.mockResolvedValue({ alpha: {}, beta: {} });
+    dashboardCache.get.mockImplementation((fetcher) => {
+      if (fetcher === getClusters) return Promise.resolve([]);
+      if (fetcher === getManagedJobs) return Promise.resolve({ jobs: [] });
+      if (fetcher === getEnabledClouds) return Promise.resolve([]);
+      throw new Error('Unexpected dashboard cache fetcher');
+    });
+    deleteWorkspace.mockResolvedValue(undefined);
+
+    const { unmount } = render(<WorkspacePage />);
+    await waitFor(() =>
+      expect(screen.getByTestId('yaml-editor')).toHaveTextContent('alpha:')
+    );
+
+    jest.useFakeTimers();
+    try {
+      fireEvent.click(screen.getAllByRole('button', { name: 'Delete' })[0]);
+      fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(deleteWorkspace).toHaveBeenCalledWith('alpha');
+
+      unmount();
+      act(() => {
+        jest.advanceTimersByTime(1500);
+      });
+
+      expect(push).not.toHaveBeenCalled();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('does not schedule navigation when deletion finishes after leaving', async () => {
+    const deletion = deferred();
+    const push = jest.fn();
+    mockRouter = { ...mockRouter, push };
+    getWorkspaces.mockResolvedValue({ alpha: {} });
+    dashboardCache.get.mockImplementation((fetcher) => {
+      if (fetcher === getClusters) return Promise.resolve([]);
+      if (fetcher === getManagedJobs) return Promise.resolve({ jobs: [] });
+      if (fetcher === getEnabledClouds) return Promise.resolve([]);
+      throw new Error('Unexpected dashboard cache fetcher');
+    });
+    deleteWorkspace.mockReturnValue(deletion.promise);
+
+    const { unmount } = render(<WorkspacePage />);
+    await waitFor(() =>
+      expect(screen.getByTestId('yaml-editor')).toHaveTextContent('alpha:')
+    );
+
+    jest.useFakeTimers();
+    try {
+      fireEvent.click(screen.getAllByRole('button', { name: 'Delete' })[0]);
+      fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
+      expect(deleteWorkspace).toHaveBeenCalledWith('alpha');
+
+      unmount();
+      await act(async () => {
+        deletion.resolve();
+        await deletion.promise;
+      });
+      act(() => {
+        jest.advanceTimersByTime(1500);
+      });
+
+      expect(push).not.toHaveBeenCalled();
+    } finally {
+      jest.useRealTimers();
+    }
   });
 });
 
