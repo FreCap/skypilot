@@ -26,6 +26,7 @@ jobs:
         npm --prefix sky/dashboard test -- --runInBand \
           src/components/services.test.jsx \
           src/components/estimated-spend.test.jsx \
+          src/components/users.test.jsx \
           src/components/elements/deployment-version.test.jsx \
           src/components/elements/request-activity-indicator.test.jsx \
           src/data/connectors/client.test.js \
