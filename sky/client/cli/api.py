@@ -48,6 +48,11 @@ def _complete_api_request(ctx: click.Context, param: click.Parameter,
     return response.json()
 
 
+# Public alias used by the command facade while the historical private name
+# remains available for compatibility.
+complete_api_request = _complete_api_request
+
+
 @click.group(cls=click_utils.NaturalOrderGroup)
 def api():
     """SkyPilot API server commands."""

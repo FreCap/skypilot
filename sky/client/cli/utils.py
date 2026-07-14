@@ -2,13 +2,44 @@
 import enum
 import typing
 
+import click
+
 from sky import exceptions
 from sky import jobs as managed_jobs
 from sky import sky_logging
 from sky.schemas.api import responses
 from sky.server import common as server_common
+from sky.utils import infra_utils
+from sky.utils import ux_utils
 
 logger = sky_logging.init_logger(__name__)
+
+
+def handle_infra_cloud_region_zone_options(infra: str | None, cloud: str | None,
+                                           region: str | None,
+                                           zone: str | None):
+    """Handle the backward compatibility for --infra and --cloud/region/zone.
+
+    Returns:
+        cloud, region, zone
+    """
+    if cloud is not None or region is not None or zone is not None:
+        click.secho(
+            'The --cloud, --region, and --zone options are deprecated. '
+            'Use --infra instead.',
+            fg='yellow')
+        if infra is not None:
+            with ux_utils.print_exception_no_traceback():
+                raise ValueError('Cannot specify both --infra and '
+                                 '--cloud, --region, or --zone.')
+
+    if infra is not None:
+        infra_info = infra_utils.InfraInfo.from_str(infra)
+        # Convert None to '*' to ensure proper override behavior.
+        cloud = infra_info.cloud if infra_info.cloud is not None else '*'
+        region = infra_info.region if infra_info.region is not None else '*'
+        zone = infra_info.zone if infra_info.zone is not None else '*'
+    return cloud, region, zone
 
 
 class QueueResultVersion(enum.Enum):
