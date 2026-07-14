@@ -2239,6 +2239,20 @@ def get_replica_launch_budget_counts() -> tuple[int, int]:
 
 
 # === Version functions ===
+class VersionCommitResult(enum.Enum):
+    """Outcome of committing the immutable contents of a service version."""
+
+    COMMITTED = 'committed'
+    REJECTED = 'rejected'
+    CONTENT_CONFLICT = 'content_conflict'
+
+    def __bool__(self) -> bool:
+        # Preserve the historical bool contract for internal callers while
+        # allowing the controller to distinguish a content conflict from an
+        # ownership/terminal rejection.
+        return self is VersionCommitResult.COMMITTED
+
+
 def _lock_service_for_version_mutation(session: orm.Session,
                                        service_name: str) -> bool:
     """Lock the parent row and return whether version writes are allowed.
@@ -2321,7 +2335,13 @@ def add_or_update_version(
     expected_service_hash: str | None = None,
     expected_lifecycle_epoch: int | None = None,
     expected_controller_owner: tuple[int | None, str | None] | None = None
-) -> bool:
+) -> VersionCommitResult:
+    """Commit a version placeholder once, or accept an identical retry.
+
+    A non-NULL YAML row is immutable: replica rows and controller recovery use
+    the version number as its identity. Overwriting its content could leave a
+    live controller running one spec while a respawn boots another.
+    """
     engine = _db_manager.get_engine()
     storage_generation = _ephemeral_storage_generation_from_yaml(yaml_content)
     resource_scope: str | None = None
@@ -2329,11 +2349,11 @@ def add_or_update_version(
         _begin_immediate_if_sqlite(session, engine)
         if not _lock_service_for_version_mutation(session, service_name):
             session.rollback()
-            return False
+            return VersionCommitResult.REJECTED
         if not _lifecycle_epoch_matches_in_session(session, service_name,
                                                    expected_lifecycle_epoch):
             session.rollback()
-            return False
+            return VersionCommitResult.REJECTED
         if (expected_service_hash is not None or
                 expected_lifecycle_epoch is not None or
                 expected_controller_owner is not None):
@@ -2352,33 +2372,40 @@ def add_or_update_version(
                 (expected_controller_owner is not None and
                  (owner[2], owner[3]) != expected_controller_owner)):
                 session.rollback()
-                return False
+                return VersionCommitResult.REJECTED
             if ServiceStatus[owner[4]] in ServiceStatus.terminal_statuses():
                 session.rollback()
-                return False
+                return VersionCommitResult.REJECTED
             resource_scope = owner[5]
-        if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
-            insert_func = sqlite.insert
-        elif (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value
-             ):
-            insert_func = postgresql.insert
-        else:
+        if engine.dialect.name not in (
+                db_utils.SQLAlchemyDialect.SQLITE.value,
+                db_utils.SQLAlchemyDialect.POSTGRESQL.value):
             raise ValueError('Unsupported database dialect')
 
-        insert_stmt = insert_func(version_specs_table).values(
-            service_name=service_name,
-            version=version,
-            spec=pickle.dumps(spec),
-            yaml_content=yaml_content)
-
-        insert_stmt = insert_stmt.on_conflict_do_update(
-            index_elements=['service_name', 'version'],
-            set_={
-                'spec': insert_stmt.excluded.spec,
-                'yaml_content': insert_stmt.excluded.yaml_content
-            })
-
-        session.execute(insert_stmt)
+        existing = session.execute(
+            sqlalchemy.select(version_specs_table.c.yaml_content).where(
+                version_specs_table.c.service_name == service_name,
+                version_specs_table.c.version == version)).fetchone()
+        if existing is None:
+            session.execute(version_specs_table.insert().values(
+                service_name=service_name,
+                version=version,
+                spec=pickle.dumps(spec),
+                yaml_content=yaml_content))
+        elif existing[0] is None:
+            # `add_version` reserves a NULL-YAML placeholder. The service-row
+            # lock above serializes the one transition that fills it.
+            session.execute(
+                sqlalchemy.update(version_specs_table).where(
+                    version_specs_table.c.service_name == service_name,
+                    version_specs_table.c.version == version,
+                    version_specs_table.c.yaml_content.is_(None)).values(
+                        spec=pickle.dumps(spec), yaml_content=yaml_content))
+        elif existing[0] != yaml_content:
+            session.rollback()
+            return VersionCommitResult.CONTENT_CONFLICT
+        # An identical committed YAML is an idempotent retry. Keep both the
+        # original YAML and pickled spec bytes untouched.
         if resource_scope is not None and storage_generation is not None:
             session.query(ephemeral_storage_cleanup_intents_table).filter(
                 ephemeral_storage_cleanup_intents_table.c.service_name ==
@@ -2393,7 +2420,7 @@ def add_or_update_version(
                 ] if expected_lifecycle_epoch is not None else []),
             ).update({ephemeral_storage_cleanup_intents_table.c.provisional: 0})
         session.commit()
-    return True
+    return VersionCommitResult.COMMITTED
 
 
 def get_spec(service_name: str,

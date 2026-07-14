@@ -124,18 +124,11 @@ LB_LIVENESS_ENDPOINT_PATH = '/_lb/liveness'
 # supported RPS range across several sync intervals.
 LB_REQUEST_TIMESTAMP_CAP = 100_000
 
-# [boltz fork] Time budget in seconds for a service update to be accepted by
-# the controller. The /controller/update_service handler serializes on the
-# replica-manager lock, which a readiness-probe round can hold for tens of
-# seconds when replicas are unreachable (probe timeouts are user-configurable
-# with no hard cap, plus the inline preemption status refresh), so the
-# default 10s HTTP/gRPC timeouts would spuriously fail updates against a
-# busy-but-healthy controller. Used as the HTTP read timeout on the
-# controller POST and (plus margin) as the skylet gRPC deadline in VM mode.
-# 600: at fleet scale the lock wait is minutes, not tens of seconds
-# (measured live 2026-07-06: >120s at ~900 replicas made the CLI report a
-# false failure while the update actually landed). The wait is genuine
-# work, not a hang; budget generously.
+# [boltz fork] Compatibility time budget for controllers predating the
+# commit-then-reconcile update protocol. Their handler can wait on the
+# replica-manager lock behind a fleet-wide probe round for minutes. New
+# controllers acknowledge the durable commit before taking that lock, but
+# clients keep this budget during mixed-version rollouts.
 UPDATE_SERVICE_TIMEOUT_SECONDS = 600
 
 # The time interval in seconds for load balancer to sync with controller. Every

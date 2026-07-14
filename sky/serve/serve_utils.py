@@ -1492,10 +1492,9 @@ def update_service_encoded(service_name: str,
         service_hash,
         '/controller/update_service',
         json=request_body,
-        # See UPDATE_SERVICE_TIMEOUT_SECONDS: the handler may wait on the
-        # replica-manager lock behind a slow probe round, so the default 10s
-        # read timeout would spuriously fail the update. If even this
-        # expires, the update still applies server-side once the lock frees.
+        # Keep the compatibility timeout for controllers predating the
+        # commit-then-reconcile protocol, whose handler may still wait behind
+        # a slow replica-manager probe round.
         timeout=(_CONTROLLER_HTTP_TIMEOUT_SECONDS[0],
                  constants.UPDATE_SERVICE_TIMEOUT_SECONDS))
     if resp.status_code == 404:
@@ -1686,6 +1685,12 @@ def _get_service_status(
                 'request_queue_depth': 'queue_depth',
                 'rejected_requests': 'rejected_in_window',
                 'request_stats_age_seconds': 'report_age_seconds',
+                'committed_version': 'committed_version',
+                'applied_version': 'applied_version',
+                'update_apply_pending': 'update_apply_pending',
+                'update_apply_lag_seconds': 'update_apply_lag_seconds',
+                'update_apply_error': 'update_apply_error',
+                'update_apply_failures': 'update_apply_failures',
             }
             for record_field, autoscaler_field in request_field_map.items():
                 if autoscaler_field in autoscaler_info:
