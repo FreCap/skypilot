@@ -452,7 +452,7 @@ export function Volumes() {
   );
 }
 
-function VolumesTable({
+export function VolumesTable({
   refreshInterval,
   setLoading,
   refreshDataRef,
@@ -469,26 +469,39 @@ function VolumesTable({
   const [isInitialLoad, setIsInitialLoad] = useState(true);
   const [currentPage, setCurrentPage] = useState(1);
   const [pageSize, setPageSize] = useState(10);
+  const requestVersionRef = useRef(0);
 
   const fetchData = useCallback(async () => {
+    const requestVersion = requestVersionRef.current + 1;
+    requestVersionRef.current = requestVersion;
+    const isCurrentRequest = () => requestVersionRef.current === requestVersion;
+
     setLoading(true);
     setLocalLoading(true);
     try {
       const volumesData = await dashboardCache.get(getVolumes);
+      if (!isCurrentRequest()) {
+        return;
+      }
       setData(volumesData);
       if (onDataChange) {
         onDataChange(volumesData);
       }
     } catch (error) {
+      if (!isCurrentRequest()) {
+        return;
+      }
       console.error('Failed to fetch volumes:', error);
       setData([]);
       if (onDataChange) {
         onDataChange([]);
       }
     } finally {
-      setLoading(false);
-      setLocalLoading(false);
-      setIsInitialLoad(false);
+      if (isCurrentRequest()) {
+        setLoading(false);
+        setLocalLoading(false);
+        setIsInitialLoad(false);
+      }
     }
   }, [setLoading, onDataChange]);
 
@@ -502,6 +515,11 @@ function VolumesTable({
     if (refreshDataRef) {
       refreshDataRef.current = fetchData;
     }
+    return () => {
+      if (refreshDataRef?.current === fetchData) {
+        refreshDataRef.current = null;
+      }
+    };
   }, [refreshDataRef, fetchData]);
 
   useEffect(() => {
@@ -520,12 +538,14 @@ function VolumesTable({
 
       return () => {
         isCurrent = false;
+        requestVersionRef.current += 1;
         clearInterval(interval);
       };
     }
 
     return () => {
       isCurrent = false;
+      requestVersionRef.current += 1;
     };
   }, [refreshInterval, fetchData, preloadingComplete]);
 
