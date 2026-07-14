@@ -11,5 +11,5 @@ export default function WorkspacePage() {
     return <div>Loading...</div>;
   }
 
-  return <WorkspaceEditor workspaceName={name} />;
+  return <WorkspaceEditor key={name} workspaceName={name} />;
 }
