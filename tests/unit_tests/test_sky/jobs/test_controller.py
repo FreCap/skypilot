@@ -465,6 +465,75 @@ class TestJobGroupRecovery:
         return job_controller
 
     @pytest.mark.asyncio
+    async def test_cleanup_job_group_clusters_runs_concurrently_and_isolates_failures(
+            self, mock_dag, caplog):
+        job_controller = self._make_controller(mock_dag)
+        release_cleanup = asyncio.Event()
+        started = []
+        completed = []
+
+        async def cleanup_cluster(cluster_name):
+            started.append(cluster_name)
+            await release_cleanup.wait()
+            if cluster_name == 'bad-cluster':
+                raise RuntimeError('cleanup failed')
+            completed.append(cluster_name)
+
+        job_controller._cleanup_cluster = cleanup_cluster
+        cleanup_task = asyncio.create_task(
+            job_controller._cleanup_job_group_clusters(
+                ['first-cluster', None, 'bad-cluster', 'last-cluster']))
+
+        # Let the helper schedule every independent cleanup. A serial loop can
+        # only start first-cluster before the release gate opens.
+        for _ in range(10):
+            await asyncio.sleep(0)
+            if len(started) == 3:
+                break
+        started_before_release = set(started)
+        release_cleanup.set()
+        await cleanup_task
+
+        assert started_before_release == {
+            'first-cluster', 'bad-cluster', 'last-cluster'
+        }
+        assert sorted(started) == [
+            'bad-cluster', 'first-cluster', 'last-cluster'
+        ]
+        assert set(completed) == {'first-cluster', 'last-cluster'}
+        assert 'Failed to cleanup bad-cluster: cleanup failed' in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_cleanup_job_group_clusters_propagates_cancellation(
+            self, mock_dag):
+        job_controller = self._make_controller(mock_dag)
+        all_started = asyncio.Event()
+        started = set()
+        cancelled = set()
+
+        async def cleanup_cluster(cluster_name):
+            started.add(cluster_name)
+            if len(started) == 2:
+                all_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.add(cluster_name)
+                raise
+
+        job_controller._cleanup_cluster = cleanup_cluster
+        cleanup_task = asyncio.create_task(
+            job_controller._cleanup_job_group_clusters(['first', 'second']))
+        await all_started.wait()
+
+        cleanup_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cleanup_task
+
+        assert started == {'first', 'second'}
+        assert cancelled == {'first', 'second'}
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(('statuses', 'expected'), [
         ([managed_job_state.ManagedJobStatus.SUCCEEDED] * 3, True),
         ([
