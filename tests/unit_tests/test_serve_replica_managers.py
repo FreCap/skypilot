@@ -1543,6 +1543,41 @@ class TestZeroCostDemandProbeBudget:
         assert budget is not None
         assert budget.remaining_by_context == {'research-ctx': 2}
 
+    def test_mixed_measured_and_blackout_contexts_budget_independently(self):
+        # One context measures successfully (measured slots minus PENDING
+        # debits); the other fails (None) and falls back to the bounded
+        # per-location probe allowance minus unresolved rows. The two
+        # budgets are computed independently in the same snapshot.
+        zero_a = self._location('Kubernetes', 'ctx-a', 'A100', use_spot=False)
+        zero_b = self._location('Kubernetes', 'ctx-b', 'A100', use_spot=False)
+        paid = self._location('AWS', 'us-east-1', 'L4', use_spot=True)
+        manager = self._manager([zero_a, zero_b], [zero_a, zero_b, paid])
+        pending_a = [self._info(zero_a) for _ in range(2)]
+        for info in pending_a:
+            info.status = replica_managers.serve_state.ReplicaStatus.PENDING
+        unresolved_b = [self._info(zero_b)]
+        for info in unresolved_b:
+            info.status = (
+                replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+
+        with mock.patch.object(replica_managers.reserved_capacity,
+                               'query_free_slots_by_context',
+                               return_value={
+                                   'ctx-a': 7,
+                                   'ctx-b': None
+                               }):
+            budget = manager._build_zero_cost_demand_budget(
+                pending_a + unresolved_b, [None] * 500)
+
+        assert budget is not None
+        per_location = (
+            replica_managers._ZERO_COST_SPECULATIVE_LAUNCHES_PER_LOCATION)
+        assert budget.remaining_by_context == {
+            'ctx-a': 5,
+            'ctx-b': per_location - 1,
+        }
+        assert budget.measured_by_context == {'ctx-a': 7, 'ctx-b': None}
+
     def test_successful_zero_snapshot_does_not_speculate(self):
         zero = self._location('Kubernetes',
                               'research-ctx',
