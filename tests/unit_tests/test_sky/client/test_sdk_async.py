@@ -325,9 +325,32 @@ async def test_api_login_signature_mirrors_sync():
     """The async wrapper must expose the sync api_login parameters."""
     async_params = inspect.signature(sdk_async.api_login).parameters
     sync_params = inspect.signature(sdk.api_login).parameters
-    assert list(async_params) == list(sync_params)
+    assert list(async_params) == [*sync_params, 'get_token']
     for name, param in sync_params.items():
         assert async_params[name].default == param.default
+        assert async_params[name].kind == param.kind
+    assert async_params['get_token'].default is None
+    assert async_params['get_token'].kind is inspect.Parameter.KEYWORD_ONLY
+
+
+@pytest.mark.asyncio
+async def test_api_login_preserves_legacy_get_token_keyword(
+        mock_to_thread, mock_sdk_functions):
+    """The historical get_token keyword keeps its relogin behavior."""
+    await sdk_async.api_login('http://test-endpoint', get_token=True)
+    mock_sdk_functions['api_login'].assert_called_once_with(
+        'http://test-endpoint',
+        relogin=True,
+        service_account_token=None,
+        no_browser=False)
+
+
+@pytest.mark.asyncio
+async def test_api_login_rejects_both_relogin_names(mock_to_thread,
+                                                    mock_sdk_functions):
+    with pytest.raises(ValueError, match='both relogin and get_token'):
+        await sdk_async.api_login(relogin=True, get_token=True)
+    mock_sdk_functions['api_login'].assert_not_called()
 
 
 def _request_payload_dict(status):
