@@ -1787,6 +1787,10 @@ class SkyPilotReplicaManager(ReplicaManager):
         from the persisted override; OR-ing the prior flag in keeps a
         recovered fill replica counted as arbitrated (ceiling-governed)
         capacity instead of silently converting it to demand.
+
+        recovering_existing_replica: the replica already has a durable row
+        and cluster identity. Reuse an exact persisted placement instead of
+        asking the spot placer to select a new location.
         """
         if replica_id in self._launch_thread_pool:
             logger.warning(f'Launch thread for replica {replica_id} '
@@ -1976,15 +1980,15 @@ class SkyPilotReplicaManager(ReplicaManager):
             # task as a whole is spot-managed).
             use_spot = location.use_spot
         elif self._spot_placer is not None:
-            # Re-driven pinned launch (controller crash mid-PENDING): the
-            # persisted override already carries the placer's inlined
-            # location fields, but skipped the selection path above (a
-            # non-spot pin fails the use_spot gate and the fill sentinel
-            # was consumed at original emission). Recover the location
-            # from the override so the upserted replica row keeps it --
-            # location=None would permanently drop the replica from the
-            # placer's load counting and from zero-cost fill accounting
-            # (no scale-down shelter, undercounted fill baseline).
+            # Pinned launch: the persisted override already carries the
+            # placer's inlined location fields. A recovered spot pin skips
+            # fresh selection explicitly; a non-spot pin skips it via the
+            # use_spot gate after its fill sentinel was consumed at original
+            # emission. Recover the location from the override so the
+            # upserted replica row keeps it -- location=None would permanently
+            # drop the replica from the placer's load counting and from
+            # zero-cost fill accounting (no scale-down shelter, undercounted
+            # fill baseline).
             location = recovered_location
             if location is None:
                 location = spot_placer.Location.from_resources_override(

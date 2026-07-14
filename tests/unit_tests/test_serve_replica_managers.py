@@ -1567,6 +1567,34 @@ class TestFailedCleanupReconciliation:
         assert manager._failed_cleanup_retry_attempts == {1: 1}
         assert manager._failed_cleanup_retry_at == {1: 160}
 
+    def test_finished_down_worker_survives_completion_persist_error(self):
+        manager = _make_manager()
+        manager._is_pool = False
+        manager.least_recent_version = 1
+        manager._replica_to_request_id = thread_utils.ThreadSafeDict()
+        manager._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
+        manager._launch_thread_pool = thread_utils.ThreadSafeDict()
+        manager._down_thread_pool = thread_utils.ThreadSafeDict()
+        down_thread = mock.Mock()
+        down_thread.is_alive.return_value = False
+        down_thread.format_exc = 'provider error'
+        manager._down_thread_pool[1] = down_thread
+        info = self._info()
+        info.status_property.sky_down_status = common_utils.ProcessStatus.RUNNING
+
+        with mock.patch.object(manager, '_refresh_wait_for_idle'), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos_from_ids',
+                               side_effect=lambda _service, ids:
+                               ({1: info} if ids else {})), \
+             mock.patch.object(manager,
+                               '_persist_replica',
+                               side_effect=RuntimeError('database error')), \
+             pytest.raises(RuntimeError, match='database error'):
+            manager._refresh_thread_pool()
+
+        assert manager._down_thread_pool[1] is down_thread
+
     def test_log_sync_failure_does_not_block_cleanup(self):
         manager = _make_manager()
         manager._is_pool = False
