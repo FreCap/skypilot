@@ -5913,11 +5913,12 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             # function but do not first call teardown_cluster or
             # terminate_instances. See
             # https://github.com/skypilot-org/skypilot/pull/4443#discussion_r1872798032
+            # The cluster YAML is immutable during teardown; fetch it once
+            # instead of re-reading it from the database on every retry.
+            config = global_user_state.get_cluster_yaml_dict(
+                handle.cluster_yaml)
             attempts = 0
             while True:
-                config = global_user_state.get_cluster_yaml_dict(
-                    handle.cluster_yaml)
-
                 logger.debug(f'instance statuses attempt {attempts + 1}')
                 node_status_dict = provision_lib.query_instances(
                     repr(cloud),
