@@ -658,6 +658,19 @@ def _create_job_api_token(creator_user_id: str, job_name: str | None,
     return token_data['token'], token_data['token_id']
 
 
+def _associate_job_api_access_token(job_ids: list[int], token_id: str) -> None:
+    """Persist token cleanup ownership, revoking it if persistence fails."""
+    try:
+        managed_job_state.set_api_access_token_ids(job_ids, token_id)
+    except Exception:  # pylint: disable=broad-except
+        try:
+            global_user_state.delete_service_account_token(token_id)
+        except Exception as cleanup_error:  # pylint: disable=broad-except
+            logger.warning('Failed to revoke unassociated API access token '
+                           f'{token_id}: {cleanup_error}')
+        raise
+
+
 @timeline.event
 @usage_lib.entrypoint
 def launch(
@@ -962,10 +975,8 @@ def launch(
                         skylet_constants.
                         SERVICE_ACCOUNT_TOKEN_ENV_VAR] = _SecretStr(token)
 
-            # Store the token ID so it can be cleaned up when the
-            # job completes.
-            for job_id in job_ids:
-                managed_job_state.set_api_access_token_id(job_id, token_id)
+            # Store the token ID so it can be cleaned up when the job completes.
+            _associate_job_api_access_token(job_ids, token_id)
 
         dag_utils.dump_dag_to_yaml(dag, f.name)
 
