@@ -1148,6 +1148,45 @@ class TestQueryFreeSlots(unittest.TestCase):
         self.assertEqual(total, 3)
         query.assert_called_once()
 
+    def test_demand_snapshot_queries_two_shapes_in_context_once(self):
+        locations = [
+            self._k8s_location(gpu='A100'),
+            self._k8s_location(gpu='A100-80GB'),
+        ]
+        with mock.patch.object(reserved_capacity.kubernetes_catalog,
+                               'list_accelerators_realtime',
+                               return_value=({}, {}, {
+                                   'A100': 220,
+                                   'A100-80GB': 3,
+                                   'L4': 99,
+                               })) as query:
+            free = reserved_capacity.query_free_slots_by_context(locations)
+
+        self.assertEqual(free, {'research-ctx': 223})
+        query.assert_called_once_with(gpus_only=True,
+                                      name_filter=None,
+                                      region_filter='research-ctx',
+                                      quantity_filter=None,
+                                      case_sensitive=False,
+                                      require_price=False)
+
+    def test_demand_snapshot_distinguishes_unknown_from_zero(self):
+        locations = [self._k8s_location(gpu='A100')]
+        with mock.patch.object(reserved_capacity.kubernetes_catalog,
+                               'list_accelerators_realtime',
+                               return_value=({}, {}, {
+                                   'A100': -1
+                               })):
+            self.assertEqual(
+                reserved_capacity.query_free_slots_by_context(locations),
+                {'research-ctx': None})
+        with mock.patch.object(reserved_capacity.kubernetes_catalog,
+                               'list_accelerators_realtime',
+                               return_value=({}, {}, {})):
+            self.assertEqual(
+                reserved_capacity.query_free_slots_by_context(locations),
+                {'research-ctx': 0})
+
 
 class TestCostFeasibilityDegradation(unittest.TestCase):
     """Empty feasible list degrades to inf cost, never a boot crash."""
