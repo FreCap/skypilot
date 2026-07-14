@@ -146,6 +146,7 @@ export function Services() {
           outside the 30s interval/visibility gate. */}
       <ServicesTable
         refreshInterval={REFRESH_INTERVAL}
+        loading={loading}
         setLoading={setLoading}
         refreshDataRef={refreshDataRef}
         onFetched={setLastFetchedTime}
@@ -154,8 +155,9 @@ export function Services() {
   );
 }
 
-function ServicesTable({
+export function ServicesTable({
   refreshInterval,
+  loading,
   setLoading,
   refreshDataRef,
   onFetched,
@@ -166,14 +168,17 @@ function ServicesTable({
     key: null,
     direction: 'ascending',
   });
-  const [loading, setLocalLoading] = useState(false);
   const [isInitialLoad, setIsInitialLoad] = useState(true);
   const [currentPage, setCurrentPage] = useState(1);
   const [pageSize, setPageSize] = useState(10);
+  const requestVersionRef = useRef(0);
 
   const fetchData = useCallback(async () => {
+    const requestVersion = requestVersionRef.current + 1;
+    requestVersionRef.current = requestVersion;
+    const isCurrentRequest = () => requestVersionRef.current === requestVersion;
+
     setLoading(true);
-    setLocalLoading(true);
     try {
       // The list view only needs per-service aggregates: use the cheap
       // summary query (the full one serializes every replica and takes
@@ -181,18 +186,25 @@ function ServicesTable({
       const servicesResponse = await dashboardCache.get(getServices, [
         { summaryOnly: true },
       ]);
+      if (!isCurrentRequest()) {
+        return;
+      }
       setData(servicesResponse.services || []);
       setControllerStopped(servicesResponse.controllerStopped || false);
       if (onFetched) {
         onFetched(new Date());
       }
     } catch (error) {
+      if (!isCurrentRequest()) {
+        return;
+      }
       console.error('Failed to fetch services:', error);
       setData([]);
     } finally {
-      setLoading(false);
-      setLocalLoading(false);
-      setIsInitialLoad(false);
+      if (isCurrentRequest()) {
+        setLoading(false);
+        setIsInitialLoad(false);
+      }
     }
   }, [setLoading, onFetched]);
 
@@ -205,6 +217,11 @@ function ServicesTable({
     if (refreshDataRef) {
       refreshDataRef.current = fetchData;
     }
+    return () => {
+      if (refreshDataRef?.current === fetchData) {
+        refreshDataRef.current = null;
+      }
+    };
   }, [refreshDataRef, fetchData]);
 
   useEffect(() => {
@@ -220,6 +237,7 @@ function ServicesTable({
 
     return () => {
       isCurrent = false;
+      requestVersionRef.current += 1;
       clearInterval(interval);
     };
   }, [refreshInterval, fetchData]);
@@ -446,6 +464,7 @@ function ServicesTable({
 
 ServicesTable.propTypes = {
   refreshInterval: PropTypes.number.isRequired,
+  loading: PropTypes.bool.isRequired,
   setLoading: PropTypes.func.isRequired,
   refreshDataRef: PropTypes.shape({
     current: PropTypes.func,
