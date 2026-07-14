@@ -782,8 +782,17 @@ class SkyServeLoadBalancer:
         async with condition:
             condition.notify_all()
 
+    @staticmethod
+    def _draining_request_error() -> fastapi.HTTPException:
+        return fastapi.HTTPException(
+            status_code=503,
+            detail='Load balancer is draining; retry another endpoint.',
+            headers={'Retry-After': str(constants.LB_503_RETRY_AFTER_SECONDS)})
+
     async def _acquire_request_slot(self, request: fastapi.Request) -> bool:
         """Wait for bounded dispatch capacity. Returns False when disabled."""
+        if self._draining:
+            raise self._draining_request_error()
         config = self._request_queue_config
         if config is None:
             return False
@@ -793,6 +802,8 @@ class SkyServeLoadBalancer:
             self._request_queue_condition = condition
         deadline = time.monotonic() + config['timeout_seconds']
         async with condition:
+            if self._draining:
+                raise self._draining_request_error()
             # A controller sync may disable the queue while this coroutine
             # was waiting for the condition lock. Fall back to unqueued
             # dispatch instead of tripping the assert in
@@ -817,6 +828,8 @@ class SkyServeLoadBalancer:
             self._waiting_request_count += 1
             try:
                 while True:
+                    if self._draining:
+                        raise self._draining_request_error()
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         self._record_rejection(request)
@@ -834,6 +847,8 @@ class SkyServeLoadBalancer:
                             min(remaining,
                                 _REQUEST_QUEUE_DISCONNECT_POLL_SECONDS))
                     except asyncio.TimeoutError:
+                        if self._draining:
+                            raise self._draining_request_error() from None
                         if await request.is_disconnected():
                             raise fastapi.HTTPException(
                                 status_code=499,
@@ -850,6 +865,8 @@ class SkyServeLoadBalancer:
                                         constants.LB_503_RETRY_AFTER_SECONDS)
                                 }) from None
                         continue
+                    if self._draining:
+                        raise self._draining_request_error()
                     # A slot notification can race with the downstream
                     # disconnect. Check before transferring the newly free
                     # capacity to this waiter, rather than waiting for the
@@ -859,6 +876,11 @@ class SkyServeLoadBalancer:
                             status_code=499,
                             detail='Client disconnected while waiting in the '
                             'load balancer request queue.')
+                    # is_disconnected() yields to the event loop. SIGTERM can
+                    # begin draining during that await, so fence admission
+                    # again immediately before the non-yielding slot transfer.
+                    if self._draining:
+                        raise self._draining_request_error()
                     if self._request_queue_config is None:
                         return False
                     dispatch_limit, _ = self._request_queue_limits()
@@ -2225,12 +2247,7 @@ class SkyServeLoadBalancer:
             # The readiness change needs time to propagate through the
             # Kubernetes Service/ingress. Reject requests that arrive in that
             # window instead of starting new work while this Pod terminates.
-            raise fastapi.HTTPException(
-                status_code=503,
-                detail='Load balancer is draining; retry another endpoint.',
-                headers={
-                    'Retry-After': str(constants.LB_503_RETRY_AFTER_SECONDS)
-                })
+            raise self._draining_request_error()
         # Queue-depth gauge: requests currently inside the retry handler
         # but NOT dispatched to a replica (selecting, in retry backoff).
         # The dispatched phase is deliberately excluded: the dispatch
