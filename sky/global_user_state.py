@@ -2299,6 +2299,28 @@ def get_cluster_status_fields(
 
 
 @metrics_lib.time_me
+def get_cluster_refresh_fields(
+        cluster_name: str) -> tuple[str | None, int | None, int, bool] | None:
+    """Returns plain columns that can change status-refresh behavior.
+
+    This avoids deserializing the handle or fetching presentation fields while
+    still fencing concurrent autostop updates, which do not bump
+    ``status_updated_at``.
+    """
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        row = session.query(
+            cluster_table.c.status,
+            cluster_table.c.status_updated_at,
+            cluster_table.c.autostop,
+            cluster_table.c.to_down,
+        ).filter_by(name=cluster_name).first()
+    if row is None:
+        return None
+    return (row.status, row.status_updated_at, row.autostop, bool(row.to_down))
+
+
+@metrics_lib.time_me
 @context_utils.cancellation_guard
 def cluster_with_name_exists(cluster_name: str) -> bool:
     engine = _db_manager.get_engine()

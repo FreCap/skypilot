@@ -69,6 +69,27 @@ def test_set_cluster_status_missing_cluster_raises(tmp_path, monkeypatch):
             'nonexistent', status_lib.ClusterStatus.AUTOSTOPPING)
 
 
+def test_cluster_refresh_fields_track_autostop_without_status_bump(
+        tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    global_user_state.add_or_update_cluster(
+        cluster_name='c1',
+        cluster_handle=_MinimalHandle(),
+        requested_resources=set(),
+        ready=True,
+    )
+
+    before = global_user_state.get_cluster_refresh_fields('c1')
+    global_user_state.set_cluster_autostop_value('c1', 10, to_down=True)
+    after = global_user_state.get_cluster_refresh_fields('c1')
+
+    assert before is not None
+    assert after is not None
+    assert before[:2] == after[:2]
+    assert before[2:] == (-1, False)
+    assert after[2:] == (10, True)
+
+
 def _make_handle():
     handle = mock.Mock(spec=backends.CloudVmRayResourceHandle)
     handle.cluster_name = 'test-cluster'
@@ -161,20 +182,19 @@ def _make_refreshable_record(handle):
 
 def test_reload_skips_full_read_when_status_unchanged():
     record = _make_refreshable_record(_make_handle())
-    status_fields = {
-        'test-cluster': ('UP', record['status_updated_at']),
-    }
+    refresh_fields = ('UP', record['status_updated_at'], record['autostop'],
+                      record['to_down'])
     with mock.patch.object(backend_utils.global_user_state,
-                           'get_cluster_status_fields',
-                           return_value=status_fields) as cheap_read, \
+                           'get_cluster_refresh_fields',
+                           return_value=refresh_fields) as cheap_read, \
          mock.patch.object(
              backend_utils.global_user_state, 'get_cluster_from_name',
              side_effect=AssertionError(
                  'must not re-read the full record when status is unchanged')):
-        result = backend_utils._reload_record_if_status_changed(
+        result = backend_utils._reload_record_if_refresh_fields_changed(
             'test-cluster', record, True, False)
     assert result is record
-    cheap_read.assert_called_once_with(['test-cluster'])
+    cheap_read.assert_called_once_with('test-cluster')
 
 
 def test_reload_fetches_full_record_when_status_changed():
@@ -182,16 +202,15 @@ def test_reload_fetches_full_record_when_status_changed():
     fresh_record = dict(record,
                         status=status_lib.ClusterStatus.STOPPED,
                         status_updated_at=int(time.time()))
-    status_fields = {
-        'test-cluster': ('STOPPED', fresh_record['status_updated_at']),
-    }
+    refresh_fields = ('STOPPED', fresh_record['status_updated_at'],
+                      fresh_record['autostop'], fresh_record['to_down'])
     with mock.patch.object(backend_utils.global_user_state,
-                           'get_cluster_status_fields',
-                           return_value=status_fields), \
+                           'get_cluster_refresh_fields',
+                           return_value=refresh_fields), \
          mock.patch.object(backend_utils.global_user_state,
                            'get_cluster_from_name',
                            return_value=fresh_record) as full_read:
-        result = backend_utils._reload_record_if_status_changed(
+        result = backend_utils._reload_record_if_refresh_fields_changed(
             'test-cluster', record, True, False)
     assert result is fresh_record
     full_read.assert_called_once_with('test-cluster',
@@ -202,13 +221,13 @@ def test_reload_fetches_full_record_when_status_changed():
 def test_reload_returns_none_when_cluster_deleted():
     record = _make_refreshable_record(_make_handle())
     with mock.patch.object(backend_utils.global_user_state,
-                           'get_cluster_status_fields',
-                           return_value={}), \
+                           'get_cluster_refresh_fields',
+                           return_value=None), \
          mock.patch.object(
              backend_utils.global_user_state, 'get_cluster_from_name',
              side_effect=AssertionError(
                  'must not re-read the full record for a deleted cluster')):
-        result = backend_utils._reload_record_if_status_changed(
+        result = backend_utils._reload_record_if_refresh_fields_changed(
             'test-cluster', record, True, False)
     assert result is None
 
@@ -220,9 +239,8 @@ def test_refresh_lock_path_reads_full_record_once():
     record = _make_refreshable_record(handle)
     # Spot cluster with stale status_updated_at -> must refresh.
     handle.launched_resources.use_spot = True
-    status_fields = {
-        'test-cluster': ('UP', record['status_updated_at']),
-    }
+    refresh_fields = ('UP', record['status_updated_at'], record['autostop'],
+                      record['to_down'])
 
     lock = mock.MagicMock()
     lock.acquire.return_value.__enter__.return_value = None
@@ -232,8 +250,8 @@ def test_refresh_lock_path_reads_full_record_once():
                            'get_cluster_from_name',
                            return_value=record) as full_read, \
          mock.patch.object(backend_utils.global_user_state,
-                           'get_cluster_status_fields',
-                           return_value=status_fields) as cheap_read, \
+                           'get_cluster_refresh_fields',
+                           return_value=refresh_fields) as cheap_read, \
          mock.patch.object(backend_utils,
                            '_check_owner_identity_with_record'), \
          mock.patch.object(backend_utils.locks, 'get_lock',
@@ -244,8 +262,56 @@ def test_refresh_lock_path_reads_full_record_once():
 
     assert result is updated
     full_read.assert_called_once()
-    cheap_read.assert_called_once_with(['test-cluster'])
+    cheap_read.assert_called_once_with('test-cluster')
     update.assert_called_once_with('test-cluster', record, True, True, False)
+
+
+def test_refresh_reloads_record_when_autostop_changes_before_lock():
+    """Autostop fields used by refresh must not remain stale under the lock."""
+    handle = _make_handle()
+    handle.launched_resources.use_spot = True
+    record = _make_refreshable_record(handle)
+    record['autostop'] = -1
+    fresh_record = dict(record, autostop=10, to_down=True)
+
+    blocked = mock.MagicMock()
+    blocked.__enter__.side_effect = backend_utils.locks.LockTimeout
+    acquired = mock.MagicMock()
+    acquired.__enter__.return_value = None
+    lock = mock.MagicMock()
+    lock.acquire.side_effect = [blocked, acquired]
+    status_fields = {
+        'test-cluster': ('UP', record['status_updated_at']),
+    }
+    refresh_fields = ('UP', record['status_updated_at'], 10, True)
+
+    with mock.patch.object(backend_utils.global_user_state,
+                           'get_cluster_from_name',
+                           side_effect=[record, fresh_record]) as full_read, \
+         mock.patch.object(backend_utils.global_user_state,
+                           'get_cluster_status_fields',
+                           return_value=status_fields) as legacy_read, \
+         mock.patch.object(backend_utils.global_user_state,
+                           'get_cluster_refresh_fields',
+                           return_value=refresh_fields) as refresh_read, \
+         mock.patch.object(backend_utils,
+                           '_check_owner_identity_with_record'), \
+         mock.patch.object(backend_utils.locks, 'get_lock',
+                           return_value=lock), \
+         mock.patch.object(backend_utils.time, 'sleep') as sleep, \
+         mock.patch.object(backend_utils, '_update_cluster_status',
+                           return_value=fresh_record) as update:
+        result = backend_utils.refresh_cluster_record(
+            'test-cluster', cluster_status_lock_timeout=-1)
+
+    assert result is fresh_record
+    assert full_read.call_count == 2
+    legacy_read.assert_not_called()
+    assert refresh_read.call_count == 2
+    assert lock.acquire.call_count == 2
+    sleep.assert_called_once_with(lock.poll_interval)
+    update.assert_called_once_with('test-cluster', fresh_record, True, True,
+                                   False)
 
 
 def test_external_failures_return_record_without_reread():
