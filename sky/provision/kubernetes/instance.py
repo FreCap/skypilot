@@ -20,6 +20,7 @@ from sky.provision import docker_utils
 from sky.provision.kubernetes import config as config_lib
 from sky.provision.kubernetes import constants as k8s_constants
 from sky.provision.kubernetes import host_network_probe
+from sky.provision.kubernetes import pod_diagnostics
 from sky.provision.kubernetes import utils as kubernetes_utils
 from sky.provision.kubernetes import volume
 from sky.utils import command_runner
@@ -77,6 +78,28 @@ _PENDING_REASON_NORMAL_EVENT_ALLOWLIST = {
 _SSH_USER_PATTERN = re.compile(r'SKYPILOT_SSH_USER: ([^\s\n]+)')
 
 logger = sky_logging.init_logger(__name__)
+
+# These aliases preserve the historical instance import surface while pod
+# status interpretation lives with the existing Kubernetes diagnostics.
+# pylint: disable=protected-access
+NodeHealthInfo = pod_diagnostics.NodeHealthInfo
+_get_pod_health_issues = pod_diagnostics._get_pod_health_issues
+_reason_lacks_specific_cause = (pod_diagnostics._reason_lacks_specific_cause)
+_unmask_crashloopbackoff_reason = (
+    pod_diagnostics._unmask_crashloopbackoff_reason)
+_get_pod_pending_reason_from_container_status = (
+    pod_diagnostics._get_pod_pending_reason_from_container_status)
+
+# Preserve module and pickle identities for historical imports.
+for _pod_diagnostics_symbol in (
+        NodeHealthInfo,
+        _get_pod_health_issues,
+        _reason_lacks_specific_cause,
+        _unmask_crashloopbackoff_reason,
+        _get_pod_pending_reason_from_container_status,
+):
+    _pod_diagnostics_symbol.__module__ = __name__
+# pylint: enable=protected-access
 
 
 def ray_tag_filter(cluster_name: str) -> dict[str, str]:
@@ -2169,77 +2192,6 @@ def get_cluster_info(
         provider_config=provider_config)
 
 
-class NodeHealthInfo:
-    """Health info for a single Kubernetes node."""
-
-    def __init__(self, issue: str, pods: list[str]):
-        self.issue = issue
-        self.pods = pods
-
-
-def _get_pod_health_issues(pod: Any) -> str | None:
-    """Check a Running pod for health issues.
-
-    Examines pod conditions and container statuses to detect problems
-    that would explain why the pod is Running but not functioning
-    (e.g., Ready=False, CrashLoopBackOff).
-
-    Returns None if the pod appears healthy, or a descriptive reason string.
-    """
-    pod_status = getattr(pod, 'status', None)
-    conditions = getattr(pod_status, 'conditions', None)
-    if not conditions:
-        return None
-
-    ready_condition = None
-    for condition in conditions:
-        if condition.type == 'Ready':
-            ready_condition = condition
-            break
-
-    if ready_condition is None or ready_condition.status == 'True':
-        return None
-
-    # Pod is not ready — build a reason string
-    ready_reason = ready_condition.reason or 'Unknown'
-    parts = [f'pod not ready ({ready_reason})']
-
-    # Check container statuses for more specific info
-    container_statuses = getattr(pod_status, 'container_statuses', None) or []
-    container_issues = []
-    for cs in container_statuses:
-        if cs.ready:
-            continue
-        waiting = getattr(cs.state, 'waiting', None)
-        terminated = getattr(cs.state, 'terminated', None)
-        # A container that was OOMKilled (or otherwise died) and is now
-        # restarting records the failure in last_state, not the current state
-        # (which may be a generic 'waiting' or already running-again). Surface
-        # it so an OOM that briefly blips the cluster into recovery is not
-        # masked as a generic 'ray cluster is unhealthy' message.
-        last_terminated = cs.last_state.terminated if cs.last_state else None
-        prior = None
-        if (last_terminated is not None and last_terminated.exit_code != 0 and
-                last_terminated.reason):
-            prior = (f'{last_terminated.reason} '
-                     f'(exit code {last_terminated.exit_code})')
-        if waiting and waiting.reason:
-            issue = waiting.reason
-            if prior is not None:
-                issue += f'; previously {prior}'
-            container_issues.append(issue)
-        elif terminated and terminated.exit_code != 0:
-            container_issues.append(f'{terminated.reason or "terminated"}'
-                                    f' (exit code {terminated.exit_code})')
-        elif prior is not None:
-            container_issues.append(prior)
-
-    if container_issues:
-        parts.append('; '.join(container_issues))
-
-    return '; '.join(parts)
-
-
 def _check_nodes_health(
     context: str | None,
     node_names: set[str],
@@ -2485,21 +2437,6 @@ def _get_pod_events(context: str | None, namespace: str,
 # while pod.status.phase is still 'Running' and status.reason/message lag.
 _FAILURE_EVENT_REASONS = ('Evicted',)
 
-# Substrings that already name a specific failure cause; when a status-derived
-# reason contains one, consulting events would add nothing. Every reason we
-# carry a remediation hint for is specific by definition, so derive those from
-# the canonical hint table; add the few specific reasons that have no hint
-# (CrashLoopBackOff and the Kueue/disruption conditions).
-_SPECIFIC_FAILURE_REASON_SUBSTRINGS = tuple(
-    kubernetes_utils.get_failure_hint_reasons()) + ('CrashLoopBackOff',
-                                                    'Preempted', 'Disrupted')
-
-
-def _reason_lacks_specific_cause(reason: str | None) -> bool:
-    """Whether `reason` does not already name a specific failure cause."""
-    return not reason or not any(s in reason
-                                 for s in _SPECIFIC_FAILURE_REASON_SUBSTRINGS)
-
 
 def _get_pod_failure_reason_from_events(context: str | None, namespace: str,
                                         pod_name: str) -> str | None:
@@ -2707,70 +2644,6 @@ def get_cluster_autostop_event(
         'message': latest.message,
         'transitioned_at': event_time,
     }
-
-
-def _unmask_crashloopbackoff_reason(cs: Any) -> str | None:
-    """Return `last_state.terminated.reason` iff cs is in CrashLoopBackOff
-    and a previous terminated reason is available; else None.
-
-    Used to surface OOMKilled / Error / etc. instead of bare CrashLoopBackOff.
-    """
-    waiting = cs.state.waiting if cs.state else None
-    if waiting is None or waiting.reason != 'CrashLoopBackOff':
-        return None
-    last_term = cs.last_state.terminated if cs.last_state else None
-    if last_term is None or not last_term.reason:
-        return None
-    return last_term.reason
-
-
-def _get_pod_pending_reason_from_container_status(pod: Any) -> str | None:
-    """Tier-1 sweep: derive a pending reason from pod.status.container_statuses.
-
-    For each container in turn:
-      1. state.waiting: on ContainerCreating/PodInitializing, fall through to
-         checks 2 and 3 on the *same* container (a transient-waiting current
-         state can coexist with a prior bad termination — surface the prior
-         fault); on CrashLoopBackOff, unmask via last_state.terminated; else
-         return the waiting reason.
-      2. state.terminated: if exit_code != 0, return terminated.reason.
-      3. last_state.terminated: if exit_code != 0 and reason present, return
-         it (race-window: container restarted between iterations).
-    If a container matches none of (1)-(3), advance to the next container.
-    Returns None only after exhausting all containers.
-
-    Returns a bare reason string (e.g. "OOMKilled", not
-    "OOMKilled (exit 137)") -- the exit-code suffix is intentionally omitted
-    because it adds cardinality that defeats nop_if_duplicate dedup on the
-    LAUNCH_PROGRESS event.
-    """
-    container_statuses = getattr(getattr(pod, 'status', None),
-                                 'container_statuses', None) or []
-    for cs in container_statuses:
-        # 1. state.waiting
-        waiting = cs.state.waiting if cs.state else None
-        if waiting is not None:
-            if waiting.reason in ('ContainerCreating', 'PodInitializing'):
-                # Transient; fall through to checks 2/3 on this container.
-                pass
-            elif waiting.reason == 'CrashLoopBackOff':
-                unmasked = _unmask_crashloopbackoff_reason(cs)
-                return unmasked or 'CrashLoopBackOff'
-            else:
-                return waiting.reason
-
-        # 2. state.terminated (currently terminated, between restarts)
-        terminated = cs.state.terminated if cs.state else None
-        if terminated is not None and terminated.exit_code != 0:
-            return terminated.reason or 'Terminated'
-
-        # 3. last_state.terminated (previous run terminated badly)
-        last_term = cs.last_state.terminated if cs.last_state else None
-        if (last_term is not None and last_term.exit_code is not None and
-                last_term.exit_code != 0 and last_term.reason):
-            return last_term.reason
-
-    return None
 
 
 def _get_pod_pending_reason(context: str | None, namespace: str,
