@@ -71,6 +71,7 @@ import { trackUserAction, trackFilterUsed } from '@/lib/analytics';
 import { ServiceAccountTokensView } from '@/components/service-account-tokens';
 import {
   ACTIVE_JOB_STATUSES,
+  aggregateUserUsage,
   fetchClustersAndJobs,
   getGPUCount,
   getJobGpuCount,
@@ -116,6 +117,21 @@ const getFullEmailID = (username, userId) => {
     return username;
   }
   return userId || '-';
+};
+
+export const buildUsersWithUsage = (users = [], clusters = [], jobs = []) => {
+  const usageByUser = aggregateUserUsage(clusters, jobs);
+
+  return (users || []).map((user) => ({
+    ...user,
+    usernameDisplay: parseUsername(user.username, user.userId),
+    fullEmailID: getFullEmailID(user.username, user.userId),
+    ...(usageByUser.get(user.userId) || {
+      clusterCount: 0,
+      jobCount: 0,
+      gpuCount: 0,
+    }),
+  }));
 };
 
 const REFRESH_INTERVAL = REFRESH_INTERVALS.REFRESH_INTERVAL;
@@ -1534,52 +1550,11 @@ function UsersTable({
         setLookupsReady(true); // Mark lookups as ready
 
         // Update users with actual counts (without filter applied)
-        const finalProcessedUsers = (usersData || []).map((user) => {
-          let clusterCount = 0;
-          let clusterGPUCount = 0;
-          let jobCount = 0;
-          let jobGPUCount = 0;
-
-          // Count clusters and sum GPUs in one pass (exclude STOPPED and TERMINATED clusters from GPU count)
-          for (const cluster of clustersData || []) {
-            if (cluster.user_hash === user.userId) {
-              clusterCount++;
-              // Only count GPUs from active clusters (exclude STOPPED and TERMINATED)
-              if (
-                cluster.status !== 'STOPPED' &&
-                cluster.status !== 'TERMINATED'
-              ) {
-                const gpuCountPerNode = getGPUCount(
-                  cluster.gpus,
-                  `Cluster ${cluster.cluster}`
-                );
-                // Multiply by number of nodes to get total GPU count
-                const numNodes = cluster.num_nodes || 1;
-                clusterGPUCount += gpuCountPerNode * numNodes;
-              }
-            }
-          }
-
-          // Count active jobs and sum GPUs in one pass
-          for (const job of jobsData || []) {
-            if (
-              job.user_hash === user.userId &&
-              ACTIVE_JOB_STATUSES.has(job.status)
-            ) {
-              jobCount++;
-              jobGPUCount += getJobGpuCount(job);
-            }
-          }
-
-          return {
-            ...user,
-            usernameDisplay: parseUsername(user.username, user.userId),
-            fullEmailID: getFullEmailID(user.username, user.userId),
-            clusterCount,
-            jobCount,
-            gpuCount: clusterGPUCount + jobGPUCount,
-          };
-        });
+        const finalProcessedUsers = buildUsersWithUsage(
+          usersData,
+          clustersData,
+          jobsData
+        );
 
         // Collect unique GPU types and infra values for filter dropdowns
         const infras = new Set();
