@@ -564,11 +564,16 @@ def _start(
     force: bool = False,
 ) -> backends.CloudVmRayResourceHandle:
 
-    cluster_status, handle = backend_utils.refresh_cluster_status_handle(
-        cluster_name)
-    if handle is None:
+    # Single refreshed snapshot: status/handle and the stored autostop
+    # settings (read further below) must come from the same record, so a
+    # concurrent `sky autostop` cannot slip between two separate DB reads.
+    cluster_record = backend_utils.refresh_cluster_record(
+        cluster_name, include_user_info=False, summary_response=True)
+    if cluster_record is None or cluster_record['handle'] is None:
         raise exceptions.ClusterDoesNotExist(
             f'Cluster {cluster_name!r} does not exist.')
+    cluster_status = cluster_record['status']
+    handle = cluster_record['handle']
     if not force and cluster_status == status_lib.ClusterStatus.UP:
         sky_logging.print(f'Cluster {cluster_name!r} is already up.')
         return handle
@@ -659,28 +664,24 @@ def _start(
         # For non-controller clusters, restore autostop configuration from
         # database if not explicitly provided.
         if idle_minutes_to_autostop is None:
-            cluster_record = global_user_state.get_cluster_from_name(
-                cluster_name, include_user_info=False, summary_response=True)
-            if cluster_record is not None:
-                stored_autostop = cluster_record.get('autostop', -1)
-                stored_to_down = cluster_record.get('to_down', False)
-                # Restore autostop if it was previously set (autostop > 0)
-                if stored_autostop > 0:
-                    logger.warning(f'Restoring cluster {cluster_name!r} with '
-                                   f'autostop set to {stored_autostop} minutes'
-                                   f'. To turn off autostop, run: '
-                                   f'`sky autostop {cluster_name} --cancel`')
-                    idle_minutes_to_autostop = stored_autostop
-                    # Only restore 'down' if it was explicitly set and we're
-                    # restoring autostop
-                    if stored_to_down:
-                        down = stored_to_down
-                elif stored_autostop == 0:
-                    logger.warning(
-                        f'Autostop was previously set to 0 minutes '
-                        f'for cluster {cluster_name!r} so it will '
-                        'not be restored. To turn on autostop, run: '
-                        f'`sky autostop {cluster_name} -i <minutes>`')
+            stored_autostop = cluster_record.get('autostop', -1)
+            stored_to_down = cluster_record.get('to_down', False)
+            # Restore autostop if it was previously set (autostop > 0)
+            if stored_autostop > 0:
+                logger.warning(f'Restoring cluster {cluster_name!r} with '
+                               f'autostop set to {stored_autostop} minutes'
+                               f'. To turn off autostop, run: '
+                               f'`sky autostop {cluster_name} --cancel`')
+                idle_minutes_to_autostop = stored_autostop
+                # Only restore 'down' if it was explicitly set and we're
+                # restoring autostop
+                if stored_to_down:
+                    down = stored_to_down
+            elif stored_autostop == 0:
+                logger.warning(f'Autostop was previously set to 0 minutes '
+                               f'for cluster {cluster_name!r} so it will '
+                               'not be restored. To turn on autostop, run: '
+                               f'`sky autostop {cluster_name} -i <minutes>`')
 
     usage_lib.record_cluster_name_for_current_operation(cluster_name)
 

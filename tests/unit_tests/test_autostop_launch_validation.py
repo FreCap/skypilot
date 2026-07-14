@@ -223,10 +223,16 @@ def test_start_rejects_non_down_autostop_on_unstoppable_resources():
     # assert_-prefixed method name).
     handle.launched_resources = mock.Mock(unsafe=True)
     handle.launched_resources.assert_launchable.return_value = spot
+    record = {
+        'status': status_lib.ClusterStatus.UP,
+        'handle': handle,
+        'autostop': -1,
+        'to_down': False,
+    }
     with mock.patch.object(
             core.backend_utils,
-            'refresh_cluster_status_handle',
-            return_value=(status_lib.ClusterStatus.UP, handle)), \
+            'refresh_cluster_record',
+            return_value=record), \
          mock.patch.object(core.backend_utils,
                            'get_backend_from_handle',
                            return_value=mock.Mock(
@@ -290,18 +296,26 @@ def _start_with_stored_autostop(spot_resources, stored_autostop,
     handle.launched_nodes = 1
     backend = mock.Mock(spec=backend_lib.CloudVmRayBackend)
     backend.provision.return_value = (handle, None)
-    record = {'autostop': stored_autostop, 'to_down': stored_to_down}
+    record = {
+        'status': status_lib.ClusterStatus.STOPPED,
+        'handle': handle,
+        'autostop': stored_autostop,
+        'to_down': stored_to_down,
+    }
     with mock.patch.object(
             core.backend_utils,
-            'refresh_cluster_status_handle',
-            return_value=(status_lib.ClusterStatus.STOPPED, handle)), \
+            'refresh_cluster_record',
+            return_value=record), \
          mock.patch.object(core.backend_utils,
                            'get_backend_from_handle',
                            return_value=backend), \
          mock.patch.object(core.global_user_state,
-                           'get_cluster_from_name',
-                           return_value=record):
+                           'get_cluster_from_name') as second_read:
         core._start('t-cluster', idle_minutes_to_autostop=None, down=False)
+    # Single-snapshot invariant: the stored autostop must come from the
+    # already-refreshed record, with no second cluster-table read that a
+    # concurrent `sky autostop` could race against.
+    second_read.assert_not_called()
     return backend
 
 
