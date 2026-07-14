@@ -8,7 +8,10 @@ import {
 import { getClusters } from '@/data/connectors/clusters';
 import { getManagedJobs } from '@/data/connectors/jobs';
 import { ServiceAccountTokensView } from '@/components/service-account-tokens';
-import { getJobGpuCount as extractedGetJobGpuCount } from '@/components/user-usage';
+import {
+  aggregateUserUsage,
+  getJobGpuCount as extractedGetJobGpuCount,
+} from '@/components/user-usage';
 import { getJobGpuCount } from '@/components/users';
 
 jest.mock('@/lib/cache', () => ({
@@ -127,6 +130,74 @@ describe('getJobGpuCount', () => {
   });
 });
 
+describe('aggregateUserUsage', () => {
+  it('visits each snapshot once and preserves lifecycle boundaries', () => {
+    let clusterVisits = 0;
+    let jobVisits = 0;
+    const trackVisits = (items, increment) => ({
+      *[Symbol.iterator]() {
+        for (const item of items) {
+          increment();
+          yield item;
+        }
+      },
+    });
+    const clusters = trackVisits(
+      [
+        {
+          user_hash: 'service-id',
+          status: 'UP',
+          gpus: { H100: 2 },
+          num_nodes: 3,
+          cluster: 'active',
+        },
+        {
+          user_hash: 'service-id',
+          status: 'TERMINATED',
+          gpus: { H100: 8 },
+          num_nodes: 4,
+          cluster: 'terminal',
+        },
+      ],
+      () => {
+        clusterVisits += 1;
+      }
+    );
+    const jobs = trackVisits(
+      [
+        {
+          user_hash: 'service-id',
+          status: 'RUNNING',
+          accelerators: { H100: 4 },
+          resources_str_full: '2x(H100:4)',
+          job_id: 1,
+        },
+        {
+          user_hash: 'service-id',
+          status: 'SUCCEEDED',
+          accelerators: { H100: 8 },
+          resources_str_full: '1x(H100:8)',
+          job_id: 2,
+        },
+      ],
+      () => {
+        jobVisits += 1;
+      }
+    );
+
+    const usage = aggregateUserUsage(clusters, jobs);
+
+    expect(usage.get('service-id')).toEqual({
+      clusterCount: 2,
+      jobCount: 1,
+      gpuCount: 14,
+    });
+    expect(usage.has('missing-id')).toBe(false);
+    expect(clusterVisits).toBe(2);
+    expect(jobVisits).toBe(2);
+  });
+});
+
 describe('ServiceAccountTokensView', () => {
   const baseToken = {
     token_id: 'token-1',
@@ -176,7 +247,15 @@ describe('ServiceAccountTokensView', () => {
             user_hash: 'service-id',
             status: 'UP',
             gpus: { H100: 2 },
+            num_nodes: 3,
             cluster: 'cluster-1',
+          },
+          {
+            user_hash: 'service-id',
+            status: 'STOPPED',
+            gpus: { H100: 8 },
+            num_nodes: 4,
+            cluster: 'cluster-2',
           },
         ];
       }
@@ -190,6 +269,13 @@ describe('ServiceAccountTokensView', () => {
               resources_str_full: '1x(H100:4)',
               job_id: 1,
             },
+            {
+              user_hash: 'service-id',
+              status: 'PENDING',
+              accelerators: { H100: 8 },
+              resources_str_full: '1x(H100:8)',
+              job_id: 2,
+            },
           ],
         };
       }
@@ -201,12 +287,12 @@ describe('ServiceAccountTokensView', () => {
     const row = (await screen.findByText('ci-bot')).closest('tr');
     expect(row).not.toBeNull();
     expect(
-      within(row).getByTitle('View 1 cluster for ci-bot')
-    ).toHaveTextContent('1');
+      within(row).getByTitle('View 2 clusters for ci-bot')
+    ).toHaveTextContent('2');
     expect(
-      within(row).getByTitle('View 1 active job for ci-bot')
-    ).toHaveTextContent('1');
-    expect(within(row).getByText('6')).toBeInTheDocument();
+      within(row).getByTitle('View 2 active jobs for ci-bot')
+    ).toHaveTextContent('2');
+    expect(within(row).getByText('10')).toBeInTheDocument();
 
     const requestedFetchers = dashboardCache.get.mock.calls.map(
       ([fetcher]) => fetcher

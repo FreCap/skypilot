@@ -42,10 +42,8 @@ import {
   DialogFooter,
 } from '@/components/ui/dialog';
 import {
-  ACTIVE_JOB_STATUSES,
+  aggregateUserUsage,
   fetchClustersAndJobs,
-  getGPUCount,
-  getJobGpuCount,
 } from '@/components/user-usage';
 
 // Service Account Tokens Management Component
@@ -178,48 +176,19 @@ export function ServiceAccountTokensView({
         // Step 2: Fetch clusters and jobs data in parallel
         const { clustersData, jobsResponse } = await fetchClustersAndJobs();
         const jobsData = jobsResponse?.jobs || [];
+        const usageByUser = aggregateUserUsage(clustersData, jobsData);
 
         // Step 3: Calculate counts for each service account
         const enhancedTokens = (tokensData || []).map((token) => {
-          const serviceAccountId = token.service_account_user_id;
-          let clusterCount = 0;
-          let clusterGPUCount = 0;
-          let jobCount = 0;
-          let jobGPUCount = 0;
-
-          // Count clusters and sum GPUs in one pass (exclude STOPPED and TERMINATED clusters from GPU count)
-          for (const cluster of clustersData) {
-            if (cluster.user_hash === serviceAccountId) {
-              clusterCount++;
-              // Only count GPUs from active clusters (exclude STOPPED and TERMINATED)
-              if (
-                cluster.status !== 'STOPPED' &&
-                cluster.status !== 'TERMINATED'
-              ) {
-                clusterGPUCount += getGPUCount(
-                  cluster.gpus,
-                  `Cluster ${cluster.cluster}`
-                );
-              }
-            }
-          }
-
-          // Count active jobs and sum GPUs in one pass
-          for (const job of jobsData) {
-            if (
-              job.user_hash === serviceAccountId &&
-              ACTIVE_JOB_STATUSES.has(job.status)
-            ) {
-              jobCount++;
-              jobGPUCount += getJobGpuCount(job);
-            }
-          }
+          const usage = usageByUser.get(token.service_account_user_id) || {
+            clusterCount: 0,
+            jobCount: 0,
+            gpuCount: 0,
+          };
 
           return {
             ...token,
-            clusterCount,
-            jobCount,
-            gpuCount: clusterGPUCount + jobGPUCount,
+            ...usage,
             // Extract primary role
             primaryRole:
               token.service_account_roles &&

@@ -87,6 +87,47 @@ export const getJobGpuCount = (job) => {
   return gpuCountPerNode * numNodes;
 };
 
+// Build the unfiltered resource totals shared by user-facing tables. Each
+// resource snapshot is visited once, so adding users does not multiply the
+// cost of processing large cluster and managed-job fleets.
+export const aggregateUserUsage = (clusters = [], jobs = []) => {
+  const usageByUser = new Map();
+
+  const getUsage = (userId) => {
+    let usage = usageByUser.get(userId);
+    if (!usage) {
+      usage = { clusterCount: 0, jobCount: 0, gpuCount: 0 };
+      usageByUser.set(userId, usage);
+    }
+    return usage;
+  };
+
+  for (const cluster of clusters) {
+    const userId = cluster.user_hash;
+    if (!userId) continue;
+
+    const usage = getUsage(userId);
+    usage.clusterCount += 1;
+    if (cluster.status !== 'STOPPED' && cluster.status !== 'TERMINATED') {
+      const gpuCountPerNode = getGPUCount(
+        cluster.gpus,
+        `Cluster ${cluster.cluster}`
+      );
+      usage.gpuCount += gpuCountPerNode * (cluster.num_nodes || 1);
+    }
+  }
+
+  for (const job of jobs) {
+    if (!job.user_hash || !ACTIVE_JOB_STATUSES.has(job.status)) continue;
+
+    const usage = getUsage(job.user_hash);
+    usage.jobCount += 1;
+    usage.gpuCount += getJobGpuCount(job);
+  }
+
+  return usageByUser;
+};
+
 // Helper function to fetch clusters and managed jobs data with independent error handling
 // Uses Promise.allSettled so one failure doesn't affect the other
 export const fetchClustersAndJobs = async () => {
