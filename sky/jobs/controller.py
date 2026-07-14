@@ -1055,12 +1055,11 @@ class JobController:
                         managed_job_status = (
                             managed_job_state.ManagedJobStatus.FAILED_SETUP)
                     elif job_status == job_lib.JobStatus.FAILED_DRIVER:
-                        # FAILED_DRIVER is kind of an internal error, so we mark
-                        # this as FAILED_CONTROLLER, even though the failure is
-                        # not strictly within the controller.
+                        # The remote user-job driver failed, not this jobs
+                        # controller. Classify it as a workload failure so it
+                        # does not trigger controller-failure alerting.
                         managed_job_status = (
-                            managed_job_state.ManagedJobStatus.FAILED_CONTROLLER
-                        )
+                            managed_job_state.ManagedJobStatus.FAILED)
                         failure_reason = (
                             'The job driver on the remote cluster failed. This '
                             'can be caused by the job taking too much memory '
