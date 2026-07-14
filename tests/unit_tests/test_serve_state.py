@@ -267,6 +267,9 @@ def test_get_version_yaml_contents_fetches_all_versions_in_one_query(
         types.SimpleNamespace(graceful_drain_async_occupancy=False),
         'yaml: v1',
     )
+    # Interrupted updates leave a NULL-yaml placeholder.  The batched cleanup
+    # snapshot must preserve the old per-version reader's skip semantics.
+    assert serve_state.add_version('svc-all-yamls') == 3
 
     with _count_sql_statements(_mock_serve_db) as counts:
         yamls = serve_state.get_version_yaml_contents('svc-all-yamls')
