@@ -1336,7 +1336,7 @@ export function Users() {
   );
 }
 
-function UsersTable({
+export function UsersTable({
   refreshInterval,
   setLoading,
   refreshDataRef,
@@ -1375,15 +1375,20 @@ function UsersTable({
   // Structure: infra -> gpuType -> userId -> { clusterCount, jobCount, gpuCount }
   const [combinedLookup, setCombinedLookup] = useState({});
   const [lookupsReady, setLookupsReady] = useState(false);
+  const refreshState = useRef({ generation: 0, active: null });
 
-  const fetchDataAndProcess = useCallback(
-    async (showLoading = false) => {
+  const runRefresh = useCallback(
+    async (showLoading, owner) => {
+      const ownsRefresh = () =>
+        refreshState.current.active === owner &&
+        refreshState.current.generation === owner.generation;
       if (setLoading && showLoading) setLoading(true);
       if (showLoading) setIsLoading(true);
       setLookupsReady(false); // Reset lookups state when starting to fetch
       try {
         // Step 1: Load users first and show them immediately
         const usersData = await dashboardCache.get(getUsers);
+        if (!ownsRefresh()) return;
 
         // Show users immediately with placeholder counts
         const initialProcessedUsers = (usersData || []).map((user) => ({
@@ -1404,6 +1409,7 @@ function UsersTable({
 
         // Step 2: Load clusters and jobs in background and update counts
         const { clustersData, jobsResponse } = await fetchClustersAndJobs();
+        if (!ownsRefresh()) return;
 
         const jobsData = jobsResponse.jobs || [];
 
@@ -1596,23 +1602,55 @@ function UsersTable({
 
         setUsersWithCounts(finalProcessedUsers);
       } catch (error) {
+        if (!ownsRefresh()) return;
         console.error('Failed to fetch or process user data:', error);
         setUsersWithCounts([]);
         setHasInitiallyLoaded(true);
         if (setLoading && showLoading) setLoading(false);
         if (showLoading) setIsLoading(false);
       } finally {
-        if (setLastFetchedTime) setLastFetchedTime(new Date());
+        if (ownsRefresh() && setLastFetchedTime) {
+          setLastFetchedTime(new Date());
+        }
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [setLoading, setLastFetchedTime]
   );
 
+  const fetchDataAndProcess = useCallback(
+    (showLoading = false) => {
+      const state = refreshState.current;
+      // Polling ticks share in-flight work. Manual refreshes use loading UI
+      // and must supersede it because user mutations may have invalidated the
+      // cache since that background snapshot started.
+      if (state.active !== null && !showLoading) {
+        return state.active.promise;
+      }
+
+      const owner = { generation: ++state.generation, promise: null };
+      state.active = owner;
+      owner.promise = runRefresh(showLoading, owner).finally(() => {
+        if (state.active === owner && state.generation === owner.generation) {
+          state.active = null;
+        }
+      });
+      return owner.promise;
+    },
+    [runRefresh]
+  );
+
   useEffect(() => {
     if (refreshDataRef) {
-      refreshDataRef.current = () => fetchDataAndProcess(true); // Show loading on manual refresh
+      const refresh = () => fetchDataAndProcess(true);
+      refreshDataRef.current = refresh;
+      return () => {
+        if (refreshDataRef.current === refresh) {
+          refreshDataRef.current = null;
+        }
+      };
     }
+    return undefined;
   }, [refreshDataRef, fetchDataAndProcess]);
 
   useEffect(() => {
@@ -1634,7 +1672,12 @@ function UsersTable({
         fetchDataAndProcess(false); // Don't show loading on background refresh
       }
     }, refreshInterval);
-    return () => clearInterval(interval);
+    const state = refreshState.current;
+    return () => {
+      clearInterval(interval);
+      state.generation += 1;
+      state.active = null;
+    };
   }, [fetchDataAndProcess, refreshInterval]);
 
   const filteredAndSortedUsers = useMemo(() => {
