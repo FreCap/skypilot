@@ -4,7 +4,9 @@
 
 import collections
 import copy
+import inspect
 import os
+import pickle
 import re
 import tempfile
 from typing import Optional
@@ -4990,6 +4992,23 @@ def test_v1node_get_taints_mixed_tolerated_and_untolerated():
 # (get_condensed_pod_reason, pod_terminated_abnormally,
 #  diagnose_terminated_pod)
 # ---------------------------------------------------------------------------
+
+
+def test_pod_diagnostics_public_surface_is_stable():
+    expected_signatures = {
+        'get_condensed_pod_reason': '(pod: \'kubernetes_models.V1Pod\') -> str',
+        'pod_terminated_abnormally': '(pod: \'kubernetes_models.V1Pod\') -> bool',
+        'match_kubernetes_failure_hint': '(reason: str) -> str | None',
+        'match_kubernetes_failure_hint_text': '(reason: str) -> str | None',
+        'get_failure_hint_reasons': '() -> list[str]',
+        'diagnose_terminated_pod': '(context: str | None, namespace: str, pod_name: str) -> str | None',
+    }
+
+    for name, expected_signature in expected_signatures.items():
+        symbol = getattr(utils, name)
+        assert str(inspect.signature(symbol)) == expected_signature
+        assert symbol.__module__ == utils.__name__
+        assert pickle.loads(pickle.dumps(symbol)) is symbol
 
 
 def _make_container_status(*,
