@@ -188,6 +188,18 @@ def status(
             'request_queue_depth': (Optional[int]) requests waiting for a
               replica,
             'rejected_requests': (Optional[int]) recent capacity rejections,
+            'committed_version': (Optional[int]) latest durably accepted
+              service version,
+            'applied_version': (Optional[int]) latest version applied to the
+              live controller runtime,
+            'update_apply_pending': (Optional[bool]) whether the controller is
+              still applying a committed version,
+            'update_apply_lag_seconds': (Optional[int]) seconds since the
+              pending version committed,
+            'update_apply_error': (Optional[str]) most recent runtime apply
+              error for the pending version,
+            'update_apply_failures': (Optional[int]) consecutive apply
+              failures for the pending version,
             'replica_info': (List[Dict[str, Any]]) replica information,
         }
 

@@ -18,6 +18,7 @@ import pytest
 
 from sky.serve import controller
 from sky.serve import serve_state
+from sky.serve import serve_utils
 
 
 def test_run_controller_preserves_authoritative_launch_fence_bit(monkeypatch):
@@ -103,6 +104,7 @@ def _make_controller() -> controller.SkyServeController:
     # Bypass __init__: it builds a real replica manager and autoscaler.
     ctrl = controller.SkyServeController.__new__(controller.SkyServeController)
     ctrl._service_name = 'svc'  # pylint: disable=protected-access
+    ctrl._resource_scope = None  # pylint: disable=protected-access
     ctrl._lb_replica_cache = {}  # pylint: disable=protected-access
     ctrl._lb_translation_cache = {}  # pylint: disable=protected-access
     ctrl._lb_sync_lock = None  # pylint: disable=protected-access
@@ -248,6 +250,183 @@ class TestGetRoutingSpec:
             'retry_initial_backoff_seconds': None,
             'request_queue': None,
         }
+
+
+def _make_update_controller() -> controller.SkyServeController:
+    ctrl = _make_controller()
+    ctrl._service_hash = 'incarnation-a'  # pylint: disable=protected-access
+    ctrl._controller_owner = (123, '10.0.0.1')  # pylint: disable=protected-access
+    ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+    ctrl._update_condition = threading.Condition()  # pylint: disable=protected-access
+    ctrl._pending_update = None  # pylint: disable=protected-access
+    ctrl._committed_version = 1  # pylint: disable=protected-access
+    ctrl._applied_version = 1  # pylint: disable=protected-access
+    ctrl._update_apply_error = None  # pylint: disable=protected-access
+    ctrl._update_apply_failures = 0  # pylint: disable=protected-access
+    ctrl._update_still_authorized = mock.Mock(  # pylint: disable=protected-access
+        return_value=True)
+    return ctrl
+
+
+class TestServiceUpdateReconciler:
+
+    def test_content_conflict_returns_409_without_scheduling(self):
+        ctrl = _make_update_controller()
+        ctrl._record_committed_update = mock.Mock()  # pylint: disable=protected-access
+        with mock.patch.object(controller.serve_state,
+                               'add_or_update_version',
+                               return_value=serve_state.VersionCommitResult.
+                               CONTENT_CONFLICT) as commit:
+            response = ctrl._commit_service_update(  # pylint: disable=protected-access
+                2, mock.sentinel.spec, 'service: changed',
+                serve_utils.UpdateMode.ROLLING, 'incarnation-a', 7)
+
+        assert response.status_code == 409
+        assert 'already committed with different content' in json.loads(
+            response.body)['message']
+        ctrl._record_committed_update.assert_not_called()  # pylint: disable=protected-access
+        commit.assert_called_once_with('svc',
+                                       2,
+                                       mock.sentinel.spec,
+                                       'service: changed',
+                                       expected_service_hash='incarnation-a',
+                                       expected_lifecycle_epoch=7,
+                                       expected_controller_owner=(123,
+                                                                  '10.0.0.1'))
+
+    def test_second_commit_does_not_wait_for_first_apply(self):
+        ctrl = _make_update_controller()
+        first_apply_started = threading.Event()
+        release_first_apply = threading.Event()
+        applied_versions = []
+
+        def _apply(version, *_args):
+            applied_versions.append(version)
+            if version == 2:
+                first_apply_started.set()
+                assert release_first_apply.wait(timeout=5)
+
+        ctrl._apply_service_update = mock.Mock(  # pylint: disable=protected-access
+            side_effect=_apply)
+        ctrl._record_committed_update(  # pylint: disable=protected-access
+            2, mock.sentinel.spec_v2, serve_utils.UpdateMode.ROLLING)
+        worker = threading.Thread(target=ctrl._reconcile_pending_update_once)  # pylint: disable=protected-access
+        worker.start()
+        assert first_apply_started.wait(timeout=5)
+
+        # Regression: the old handler held _update_lock through the blocked
+        # apply, so this second durable commit could not be recorded.
+        ctrl._record_committed_update(  # pylint: disable=protected-access
+            3, mock.sentinel.spec_v3, serve_utils.UpdateMode.ROLLING)
+        status = ctrl._get_update_status()  # pylint: disable=protected-access
+        assert status['committed_version'] == 3
+        assert status['applied_version'] == 1
+        assert status['update_apply_pending']
+
+        release_first_apply.set()
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+        assert ctrl._reconcile_pending_update_once()  # pylint: disable=protected-access
+        assert applied_versions == [2, 3]
+        status = ctrl._get_update_status()  # pylint: disable=protected-access
+        assert status['committed_version'] == 3
+        assert status['applied_version'] == 3
+        assert not status['update_apply_pending']
+
+    def test_commits_coalesce_before_apply(self):
+        ctrl = _make_update_controller()
+        ctrl._apply_service_update = mock.Mock()  # pylint: disable=protected-access
+        ctrl._record_committed_update(  # pylint: disable=protected-access
+            2, mock.sentinel.spec_v2, serve_utils.UpdateMode.ROLLING)
+        ctrl._record_committed_update(  # pylint: disable=protected-access
+            3, mock.sentinel.spec_v3, serve_utils.UpdateMode.ROLLING)
+
+        assert ctrl._reconcile_pending_update_once()  # pylint: disable=protected-access
+        ctrl._apply_service_update.assert_called_once_with(  # pylint: disable=line-too-long,protected-access
+            3, mock.sentinel.spec_v3, serve_utils.UpdateMode.ROLLING)
+        assert ctrl._get_update_status()['applied_version'] == 3  # pylint: disable=protected-access
+
+    def test_duplicate_commit_does_not_replace_in_flight_update(self):
+        ctrl = _make_update_controller()
+        ctrl._apply_service_update = mock.Mock()  # pylint: disable=protected-access
+        ctrl._record_committed_update(  # pylint: disable=protected-access
+            2, mock.sentinel.original_spec, serve_utils.UpdateMode.ROLLING)
+        ctrl._record_committed_update(  # pylint: disable=protected-access
+            2, mock.sentinel.retry_spec, serve_utils.UpdateMode.ROLLING)
+
+        assert ctrl._reconcile_pending_update_once()  # pylint: disable=protected-access
+        ctrl._apply_service_update.assert_called_once_with(  # pylint: disable=line-too-long,protected-access
+            2, mock.sentinel.original_spec, serve_utils.UpdateMode.ROLLING)
+        status = ctrl._get_update_status()  # pylint: disable=protected-access
+        assert status['applied_version'] == 2
+        assert not status['update_apply_pending']
+
+    def test_failed_apply_retries_same_committed_version(self):
+        ctrl = _make_update_controller()
+        ctrl._apply_service_update = mock.Mock(  # pylint: disable=protected-access
+            side_effect=[RuntimeError('transient failure'), None])
+        ctrl._record_committed_update(  # pylint: disable=protected-access
+            2, mock.sentinel.spec_v2, serve_utils.UpdateMode.ROLLING)
+
+        assert not ctrl._reconcile_pending_update_once()  # pylint: disable=protected-access
+        failed_status = ctrl._get_update_status()  # pylint: disable=protected-access
+        assert failed_status['applied_version'] == 1
+        assert failed_status['update_apply_pending']
+        assert failed_status['update_apply_failures'] == 1
+        assert 'transient failure' in failed_status['update_apply_error']
+
+        assert ctrl._reconcile_pending_update_once()  # pylint: disable=protected-access
+        recovered_status = ctrl._get_update_status()  # pylint: disable=protected-access
+        assert recovered_status['applied_version'] == 2
+        assert not recovered_status['update_apply_pending']
+        assert recovered_status['update_apply_error'] is None
+
+    def test_newer_commit_resets_previous_apply_failure(self):
+        ctrl = _make_update_controller()
+        ctrl._apply_service_update = mock.Mock(  # pylint: disable=protected-access
+            side_effect=RuntimeError('transient failure'))
+        ctrl._record_committed_update(  # pylint: disable=protected-access
+            2, mock.sentinel.spec_v2, serve_utils.UpdateMode.ROLLING)
+        assert not ctrl._reconcile_pending_update_once()  # pylint: disable=protected-access
+
+        ctrl._record_committed_update(  # pylint: disable=protected-access
+            3, mock.sentinel.spec_v3, serve_utils.UpdateMode.ROLLING)
+        status = ctrl._get_update_status()  # pylint: disable=protected-access
+        assert status['committed_version'] == 3
+        assert status['update_apply_error'] is None
+        assert status['update_apply_failures'] == 0
+
+    def test_superseded_apply_failure_does_not_taint_newer_version(self):
+        ctrl = _make_update_controller()
+
+        def _fail_after_newer_commit(*_args):
+            ctrl._record_committed_update(  # pylint: disable=protected-access
+                3, mock.sentinel.spec_v3, serve_utils.UpdateMode.ROLLING)
+            raise RuntimeError('superseded failure')
+
+        ctrl._apply_service_update = mock.Mock(  # pylint: disable=protected-access
+            side_effect=_fail_after_newer_commit)
+        ctrl._record_committed_update(  # pylint: disable=protected-access
+            2, mock.sentinel.spec_v2, serve_utils.UpdateMode.ROLLING)
+
+        assert not ctrl._reconcile_pending_update_once()  # pylint: disable=protected-access
+        status = ctrl._get_update_status()  # pylint: disable=protected-access
+        assert status['committed_version'] == 3
+        assert status['applied_version'] == 1
+        assert status['update_apply_pending']
+        assert status['update_apply_error'] is None
+        assert status['update_apply_failures'] == 0
+
+    def test_terminal_service_drops_pending_apply(self):
+        ctrl = _make_update_controller()
+        ctrl._update_still_authorized.return_value = False  # pylint: disable=protected-access
+        ctrl._apply_service_update = mock.Mock()  # pylint: disable=protected-access
+        ctrl._record_committed_update(  # pylint: disable=protected-access
+            2, mock.sentinel.spec_v2, serve_utils.UpdateMode.ROLLING)
+
+        assert ctrl._reconcile_pending_update_once()  # pylint: disable=protected-access
+        ctrl._apply_service_update.assert_not_called()  # pylint: disable=protected-access
+        assert not ctrl._get_update_status()['update_apply_pending']  # pylint: disable=protected-access
 
 
 def _sync_full(ctrl: controller.SkyServeController,

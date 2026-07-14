@@ -159,6 +159,12 @@ class TestGetServiceStatusSummary:
             'queue_depth': 1,
             'rejected_in_window': 3,
             'report_age_seconds': 4.0,
+            'committed_version': 7,
+            'applied_version': 6,
+            'update_apply_pending': True,
+            'update_apply_lag_seconds': 12,
+            'update_apply_error': 'manager lock unavailable',
+            'update_apply_failures': 2,
         }
         autoscaler = mock.Mock(return_value=autoscaler_resp)
         monkeypatch.setattr(serve_utils, '_get_to_controller_with_retry',
@@ -179,6 +185,12 @@ class TestGetServiceStatusSummary:
         assert record['request_queue_depth'] == 1
         assert record['rejected_requests'] == 3
         assert record['request_stats_age_seconds'] == 4.0
+        assert record['committed_version'] == 7
+        assert record['applied_version'] == 6
+        assert record['update_apply_pending'] is True
+        assert record['update_apply_lag_seconds'] == 12
+        assert record['update_apply_error'] == 'manager lock unavailable'
+        assert record['update_apply_failures'] == 2
 
     def test_default_call_has_no_counts(self, patched_state, monkeypatch):
         # Internal callers that only want the service row

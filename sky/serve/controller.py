@@ -12,7 +12,7 @@ import os
 import threading
 import time
 import traceback
-from typing import Any
+from typing import Any, NamedTuple
 
 import colorama
 import fastapi
@@ -100,6 +100,13 @@ class AutoscalerInfoFilter(logging.Filter):
                     '/autoscaler/info' in message)
 
 
+class _PendingServiceUpdate(NamedTuple):
+    version: int
+    service: Any
+    update_mode: serve_utils.UpdateMode
+    committed_at: float
+
+
 class SkyServeController:
     """SkyServeController: control everything about replica.
 
@@ -127,11 +134,19 @@ class SkyServeController:
                                    controller_ip) if service_hash is not None or
                                   controller_pid is not None or
                                   controller_ip is not None else None)
-        # Serialize the DB commit and in-memory manager/autoscaler transition.
-        # The lifecycle epoch rejects an older request that arrives after a
-        # newer one; this lock prevents two accepted handlers from interleaving
-        # between their durable commit and runtime application.
+        # Serialize durable update commits. The live manager/autoscaler
+        # transition happens on the reconciler below: a fleet-wide probe can
+        # hold the replica-manager lock for minutes, but a second update must
+        # still be able to commit while the first transition waits for it.
         self._update_lock = threading.Lock()
+        self._update_condition = threading.Condition()
+        self._pending_update: _PendingServiceUpdate | None = None
+        # A controller child always boots from the latest committed version,
+        # so its initial runtime and durable state agree.
+        self._committed_version = version
+        self._applied_version = version
+        self._update_apply_error: str | None = None
+        self._update_apply_failures = 0
         # Serialize LB snapshots while resolving a cold replica cache in the
         # threadpool. Concurrent LB Pods can overlap during a rollout; without
         # this lock they would duplicate the fleet-wide endpoint work and race
@@ -800,6 +815,155 @@ class SkyServeController:
         """
         return getattr(self, '_routing_spec', None)
 
+    def _commit_service_update(self, version: int, service: Any,
+                               yaml_content: str,
+                               update_mode: serve_utils.UpdateMode,
+                               requested_service_hash: str | None,
+                               lifecycle_epoch: int | None) -> fastapi.Response:
+        """Durably accept one immutable version and schedule its apply."""
+        result = serve_state.add_or_update_version(
+            self._service_name,
+            version,
+            service,
+            yaml_content,
+            expected_service_hash=(requested_service_hash or
+                                   self._service_hash),
+            expected_lifecycle_epoch=lifecycle_epoch,
+            expected_controller_owner=self._controller_owner)
+        if result is serve_state.VersionCommitResult.REJECTED:
+            return responses.JSONResponse(content={
+                'message': 'Service lifecycle ownership changed or entered '
+                           'terminal status before the update was committed.'
+            },
+                                          status_code=409)
+        if result is serve_state.VersionCommitResult.CONTENT_CONFLICT:
+            return responses.JSONResponse(content={
+                'message': f'Service version {version} was already committed '
+                           'with different content. Re-run the update to '
+                           'allocate a new version.'
+            },
+                                          status_code=409)
+
+        logger.info(f'Committed update to version {version}: {service}')
+        self._record_committed_update(version, service, update_mode)
+        content = {'message': 'Success'}
+        content.update(self._get_update_status())
+        return responses.JSONResponse(content=content, status_code=200)
+
+    def _record_committed_update(self, version: int, service: Any,
+                                 update_mode: serve_utils.UpdateMode) -> None:
+        """Wake the reconciler after the update's durable commit."""
+        update = _PendingServiceUpdate(version, service, update_mode,
+                                       time.time())
+        scheduled = False
+        with self._update_condition:
+            self._committed_version = max(self._committed_version, version)
+            if version > self._applied_version:
+                pending = self._pending_update
+                if pending is None or version > pending.version:
+                    # Coalesce versions that commit before the worker starts.
+                    # This matches controller recovery, which also boots only
+                    # the newest committed version.
+                    self._pending_update = update
+                    scheduled = True
+                    self._update_apply_error = None
+                    self._update_apply_failures = 0
+            self._update_condition.notify()
+        if scheduled:
+            # Publish this before the reconciler waits on the manager lock.
+            # Large stale scale-up batches use the signal to yield to the newer
+            # version.
+            self._replica_manager.notify_version_pending(version)
+
+    def _get_update_status(self) -> dict[str, Any]:
+        """Return committed-versus-applied update visibility."""
+        with self._update_condition:
+            pending = self._pending_update
+            apply_lag = (None if pending is None else max(
+                0, int(time.time() - pending.committed_at)))
+            return {
+                'committed_version': self._committed_version,
+                'applied_version': self._applied_version,
+                'update_apply_pending': pending is not None,
+                'update_apply_lag_seconds': apply_lag,
+                'update_apply_error': self._update_apply_error,
+                'update_apply_failures': self._update_apply_failures,
+            }
+
+    def _update_still_authorized(self) -> bool:
+        """Whether this controller still owns a nonterminal service."""
+        owner = serve_state.get_service_controller_owner(self._service_name)
+        if owner is None or owner['status'] in (
+                serve_state.ServiceStatus.terminal_statuses()):
+            return False
+        if (self._service_hash is not None and
+                owner['hash'] != self._service_hash):
+            return False
+        if self._controller_owner is not None:
+            current_owner = (owner['controller_pid'], owner['controller_ip'])
+            if current_owner != self._controller_owner:
+                return False
+        return True
+
+    def _drop_pending_update(self, update: _PendingServiceUpdate) -> None:
+        with self._update_condition:
+            if self._pending_update is update:
+                self._pending_update = None
+        self._replica_manager.clear_pending_version(update.version)
+
+    def _reconcile_pending_update_once(self, wait: bool = False) -> bool:
+        """Apply one pending update; return whether it converged or vanished."""
+        with self._update_condition:
+            while (self._pending_update is None or
+                   self._pending_update.version <= self._applied_version):
+                if not wait:
+                    return True
+                self._update_condition.wait()
+            update = self._pending_update
+
+        try:
+            if not self._update_still_authorized():
+                logger.info(
+                    f'Dropping committed service version {update.version}: '
+                    'the controller no longer owns a live service.')
+                self._drop_pending_update(update)
+                return True
+            self._apply_service_update(update.version, update.service,
+                                       update.update_mode)
+        except Exception as e:  # pylint: disable=broad-except
+            exception_str = common_utils.format_exception(e)
+            with self._update_condition:
+                if self._pending_update is update:
+                    self._update_apply_error = exception_str
+                    self._update_apply_failures += 1
+            # _apply_service_update clears the pending-version signal in a
+            # finally block. Re-publish it while this durable version waits for
+            # a retry, unless a newer commit has already replaced the signal.
+            self._replica_manager.notify_version_pending(update.version)
+            logger.error(f'Failed to apply committed service version '
+                         f'{update.version}; will retry: {exception_str}')
+            with ux_utils.enable_traceback():
+                logger.error(f'  Traceback: {traceback.format_exc()}')
+            return False
+
+        with self._update_condition:
+            self._applied_version = max(self._applied_version, update.version)
+            if self._pending_update is update:
+                self._pending_update = None
+            self._update_apply_error = None
+            self._update_apply_failures = 0
+        logger.info(f'Applied committed service version {update.version} '
+                    f'after {time.time() - update.committed_at:.1f}s.')
+        return True
+
+    def _run_update_reconciler(self) -> None:
+        """Continuously converge runtime state to the newest committed spec."""
+        retry_backoff_seconds = 5
+        while True:
+            converged = self._reconcile_pending_update_once(wait=True)
+            if not converged:
+                time.sleep(retry_backoff_seconds)
+
     def _apply_service_update(self, version: int, service: Any,
                               update_mode: serve_utils.UpdateMode) -> None:
         """Apply a persisted update to the live controller state."""
@@ -994,8 +1158,9 @@ class SkyServeController:
             '/autoscaler/info',
             dependencies=[admin_auth_dependency, controller_owner_dependency])
         async def get_autoscaler_info() -> fastapi.Response:
-            return responses.JSONResponse(content=self._autoscaler.info(),
-                                          status_code=200)
+            info = self._autoscaler.info()
+            info.update(self._get_update_status())
+            return responses.JSONResponse(content=info, status_code=200)
 
         @self._app.post(
             '/controller/load_balancer_sync',
@@ -1005,11 +1170,9 @@ class SkyServeController:
             request_data = await request.json()
             return await self._handle_load_balancer_sync(request_data)
 
-        # Deliberately a sync handler: FastAPI runs it in the threadpool, so
-        # waiting on the replica-manager lock inside `update_version` (a probe
-        # round can hold it for tens of seconds when replicas are unreachable)
-        # never stalls the event loop — /controller/load_balancer_sync must
-        # keep serving while an update waits its turn.
+        # Deliberately a sync handler: parsing and committing the task YAML can
+        # perform blocking file/DB I/O. Runtime application happens on the
+        # reconciler, so this lock covers only the short durable commit.
         def _serialize_update(
             handler: Callable[..., fastapi.Response]
         ) -> Callable[..., fastapi.Response]:
@@ -1053,30 +1216,13 @@ class SkyServeController:
                         requested_service_hash != self._service_hash):
                     return responses.JSONResponse(content={
                         'message': 'Service incarnation changed before '
-                                   'the update was applied.'
+                                   'the update was committed.'
                     },
                                                   status_code=409)
-                persisted = serve_state.add_or_update_version(
-                    self._service_name,
-                    version,
-                    service,
-                    yaml_content,
-                    expected_service_hash=(requested_service_hash or
-                                           self._service_hash),
-                    expected_lifecycle_epoch=lifecycle_epoch,
-                    expected_controller_owner=self._controller_owner)
-                if persisted is False:
-                    return responses.JSONResponse(content={
-                        'message': 'Service lifecycle ownership changed or '
-                                   'entered terminal status before the update '
-                                   'was applied.'
-                    },
-                                                  status_code=409)
-                logger.info(
-                    f'Update to new version version {version}: {service}')
-                self._apply_service_update(version, service, update_mode)
-                return responses.JSONResponse(content={'message': 'Success'},
-                                              status_code=200)
+                return self._commit_service_update(version, service,
+                                                   yaml_content, update_mode,
+                                                   requested_service_hash,
+                                                   lifecycle_epoch)
             except Exception as e:  # pylint: disable=broad-except
                 exception_str = common_utils.format_exception(e)
                 logger.error(f'Error in update_service: {exception_str}')
@@ -1157,6 +1303,12 @@ class SkyServeController:
                          f' Exception message is {exc!r}.')
                 },
             )
+
+        # A committed update is the API success boundary. Apply it on a
+        # controller-owned worker so fleet-wide replica locks cannot make the
+        # request time out or prevent a later update from committing.
+        thread_utils.start_supervised_thread(self._run_update_reconciler,
+                                             'service-update-reconciler')
 
         # Supervised so a BaseException escaping the autoscaler loop (or the
         # loop returning) does not silently stop all scaling decisions while

@@ -42,6 +42,16 @@ def _read_row(engine, name):
     return None if result is None else dict(result._mapping)  # pylint: disable=protected-access
 
 
+def _read_version_row(engine, name, version):
+    with orm.Session(engine) as session:
+        result = session.execute(
+            sqlalchemy.select(serve_state.version_specs_table).where(
+                serve_state.version_specs_table.c.service_name == name,
+                serve_state.version_specs_table.c.version ==
+                version)).fetchone()
+    return None if result is None else dict(result._mapping)  # pylint: disable=protected-access
+
+
 @contextlib.contextmanager
 def _count_sql_statements(engine):
     counts = {'n': 0}
@@ -168,7 +178,8 @@ def test_launch_budget_counts_share_one_replica_scan(_mock_serve_db,
 
 
 def test_get_specs_batches_requested_versions_in_one_query(_mock_serve_db):
-    assert _add_minimal_service('svc-specs') is True
+    initial_spec = types.SimpleNamespace(graceful_drain_async_occupancy=False)
+    assert _add_minimal_service('svc-specs', spec=initial_spec) is True
     serve_state.add_or_update_version(
         'svc-specs',
         1,
@@ -189,6 +200,30 @@ def test_get_specs_batches_requested_versions_in_one_query(_mock_serve_db):
     assert set(specs) == {1, 2}
     assert specs[1].graceful_drain_async_occupancy is False
     assert specs[2].graceful_drain_async_occupancy is True
+
+
+def test_committed_version_content_is_immutable_and_retryable(_mock_serve_db):
+    assert _add_minimal_service('svc-immutable') is True
+    assert serve_state.add_version('svc-immutable') == 2
+    original_spec = types.SimpleNamespace(value='original')
+    result = serve_state.add_or_update_version('svc-immutable', 2,
+                                               original_spec, 'value: original')
+    assert result is serve_state.VersionCommitResult.COMMITTED
+    original_row = _read_version_row(_mock_serve_db, 'svc-immutable', 2)
+
+    # A lost-response retry is idempotent and does not rewrite either stored
+    # payload, even if the caller reconstructed a fresh spec object.
+    retry_result = serve_state.add_or_update_version(
+        'svc-immutable', 2, types.SimpleNamespace(value='original'),
+        'value: original')
+    assert retry_result is serve_state.VersionCommitResult.COMMITTED
+    assert _read_version_row(_mock_serve_db, 'svc-immutable', 2) == original_row
+
+    conflict_result = serve_state.add_or_update_version(
+        'svc-immutable', 2, types.SimpleNamespace(value='different'),
+        'value: different')
+    assert conflict_result is serve_state.VersionCommitResult.CONTENT_CONFLICT
+    assert _read_version_row(_mock_serve_db, 'svc-immutable', 2) == original_row
 
 
 def test_get_replica_infos_from_ids_batches_in_one_query(_mock_serve_db):
