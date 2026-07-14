@@ -127,6 +127,43 @@ test('keeps the newest range when an older request finishes last', async () => {
   expect(getEstimatedSpend).toHaveBeenCalledTimes(2);
 });
 
+test('coalesces interval refreshes while the same request is pending', async () => {
+  jest.useFakeTimers();
+  const pendingEstimate = deferred();
+  getCurrentUserRole.mockClear();
+  getEstimatedSpend.mockClear();
+  getCurrentUserRole.mockResolvedValue({ role: 'admin' });
+  getEstimatedSpend.mockReturnValue(pendingEstimate.promise);
+
+  const { unmount } = render(<EstimatedSpend />);
+  await act(async () => {});
+  expect(getCurrentUserRole).toHaveBeenCalledTimes(1);
+  expect(getEstimatedSpend).toHaveBeenCalledTimes(1);
+
+  await act(async () => {
+    jest.advanceTimersByTime(90_000);
+  });
+  expect(getCurrentUserRole).toHaveBeenCalledTimes(1);
+  expect(getEstimatedSpend).toHaveBeenCalledTimes(1);
+
+  await act(async () => {
+    pendingEstimate.resolve(response(30, 30));
+  });
+  await act(async () => {
+    jest.advanceTimersByTime(30_000);
+  });
+  expect(getCurrentUserRole).toHaveBeenCalledTimes(2);
+  expect(getEstimatedSpend).toHaveBeenCalledTimes(2);
+
+  unmount();
+  await act(async () => {
+    jest.advanceTimersByTime(90_000);
+  });
+  expect(getCurrentUserRole).toHaveBeenCalledTimes(2);
+  expect(getEstimatedSpend).toHaveBeenCalledTimes(2);
+  jest.useRealTimers();
+});
+
 test('groups the chart and table by user with purchase-option costs', async () => {
   getCurrentUserRole.mockResolvedValue({ role: 'admin' });
   getEstimatedSpend.mockImplementation(async (days, groupBy) => {

@@ -260,15 +260,24 @@ export function EstimatedSpend() {
   const [error, setError] = useState(null);
   const [forbidden, setForbidden] = useState(false);
   const [lastFetchedAt, setLastFetchedAt] = useState(null);
-  const requestGeneration = useRef(0);
+  const requestState = useRef({ generation: 0, active: null });
 
   const fetchData = useCallback(async () => {
-    const generation = ++requestGeneration.current;
+    const requestKey = JSON.stringify([
+      dateRange.startDate,
+      dateRange.endDate,
+      dateRange.days,
+      groupBy,
+    ]);
+    if (requestState.current.active?.key === requestKey) return;
+
+    const generation = ++requestState.current.generation;
+    requestState.current.active = { key: requestKey, generation };
     setLoading(true);
     setError(null);
     try {
       const role = await getCurrentUserRole();
-      if (generation !== requestGeneration.current) return;
+      if (generation !== requestState.current.generation) return;
       if (role.roleFetchFailed) {
         // A failed role lookup is an error, not a permission denial: keep
         // the error UI so the next refresh cycle retries.
@@ -284,25 +293,28 @@ export function EstimatedSpend() {
         startDate: dateRange.startDate,
         endDate: dateRange.endDate,
       });
-      if (generation !== requestGeneration.current) return;
+      if (generation !== requestState.current.generation) return;
       if (!estimate.group_by && groupBy !== 'job') {
         setGroupBy('job');
       }
       setData(estimate);
       setLastFetchedAt(new Date());
     } catch (fetchError) {
-      if (generation !== requestGeneration.current) return;
+      if (generation !== requestState.current.generation) return;
       if (fetchError.status === 403) {
         setForbidden(true);
       } else {
         setError(fetchError);
       }
     } finally {
-      if (generation === requestGeneration.current) {
+      if (generation === requestState.current.generation) {
         setLoading(false);
       }
+      if (requestState.current.active?.generation === generation) {
+        requestState.current.active = null;
+      }
     }
-  }, [dateRange, groupBy]);
+  }, [dateRange.days, dateRange.endDate, dateRange.startDate, groupBy]);
 
   const selectPreset = useCallback((option) => {
     const nextRange = rangeForPreset(option);
@@ -334,9 +346,11 @@ export function EstimatedSpend() {
   useEffect(() => {
     fetchData();
     const timer = setInterval(fetchData, AUTO_REFRESH_MS);
+    const state = requestState.current;
     return () => {
       clearInterval(timer);
-      requestGeneration.current += 1;
+      state.generation += 1;
+      state.active = null;
     };
   }, [fetchData]);
 
