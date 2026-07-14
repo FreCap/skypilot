@@ -456,6 +456,89 @@ class TestJobGroupRecovery:
         dag.tasks = tasks
         return dag
 
+    @staticmethod
+    def _make_controller(mock_dag):
+        job_controller = JobController.__new__(JobController)
+        job_controller._job_id = 42
+        job_controller._pool = None
+        job_controller._dag = mock_dag
+        return job_controller
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('statuses', 'expected'), [
+        ([managed_job_state.ManagedJobStatus.SUCCEEDED] * 3, True),
+        ([
+            managed_job_state.ManagedJobStatus.SUCCEEDED,
+            managed_job_state.ManagedJobStatus.FAILED,
+            managed_job_state.ManagedJobStatus.SUCCEEDED
+        ], False),
+    ])
+    async def test_recovery_reads_one_terminal_status_snapshot(
+            self, mock_dag, statuses, expected):
+        job_controller = self._make_controller(mock_dag)
+        status_snapshot = AsyncMock(return_value=list(enumerate(statuses)))
+        per_task_status = AsyncMock(
+            side_effect=AssertionError('per-task status read'))
+
+        with patch('sky.jobs.controller.managed_job_runtime.is_registered',
+                   return_value=False), patch(
+                       'sky.jobs.state.get_all_task_ids_statuses_async',
+                       status_snapshot), patch(
+                           'sky.jobs.state.get_job_status_with_task_id_async',
+                           per_task_status):
+            result = await job_controller._run_job_group()
+
+        assert result is expected
+        status_snapshot.assert_awaited_once_with(42)
+        per_task_status.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_recovery_missing_status_launches_and_ignores_extra_row(
+            self, mock_dag):
+        job_controller = self._make_controller(mock_dag)
+        stop_before_launch = RuntimeError('stop before launch')
+        prepare = AsyncMock(side_effect=stop_before_launch)
+        cleanup = AsyncMock()
+        job_controller._prepare_job_group_task_for_launch = prepare
+        job_controller._cleanup_job_group_clusters = cleanup
+        status_snapshot = AsyncMock(return_value=[
+            (0, managed_job_state.ManagedJobStatus.SUCCEEDED),
+            (2, managed_job_state.ManagedJobStatus.SUCCEEDED),
+            (99, managed_job_state.ManagedJobStatus.CANCELLING),
+        ])
+
+        with patch('sky.jobs.controller.managed_job_runtime.is_registered',
+                   return_value=False), patch(
+                       'sky.jobs.state.get_all_task_ids_statuses_async',
+                       status_snapshot), pytest.raises(
+                           RuntimeError, match='stop before launch'):
+            await job_controller._run_job_group()
+
+        prepare.assert_awaited_once()
+        assert prepare.await_args.args[1] == 1
+        cleanup.assert_awaited_once_with([None])
+
+    @pytest.mark.asyncio
+    async def test_recovery_cancelling_snapshot_raises_before_launch(
+            self, mock_dag):
+        job_controller = self._make_controller(mock_dag)
+        prepare = AsyncMock()
+        job_controller._prepare_job_group_task_for_launch = prepare
+        status_snapshot = AsyncMock(return_value=[
+            (0, managed_job_state.ManagedJobStatus.RUNNING),
+            (1, managed_job_state.ManagedJobStatus.CANCELLING),
+            (2, managed_job_state.ManagedJobStatus.PENDING),
+        ])
+
+        with patch('sky.jobs.controller.managed_job_runtime.is_registered',
+                   return_value=False), patch(
+                       'sky.jobs.state.get_all_task_ids_statuses_async',
+                       status_snapshot), pytest.raises(asyncio.CancelledError):
+            await job_controller._run_job_group()
+
+        status_snapshot.assert_awaited_once_with(42)
+        prepare.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_resume_with_mixed_task_states(self, mock_dag):
         """Test resume when tasks are in different states.

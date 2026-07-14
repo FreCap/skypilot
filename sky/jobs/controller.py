@@ -1423,10 +1423,11 @@ class JobController:
                                tuple[managed_job_state.ManagedJobStatus | None,
                                      bool]] = {}
 
+        task_statuses = dict(await
+                             managed_job_state.get_all_task_ids_statuses_async(
+                                 self._job_id))
         for task_id, task in enumerate(tasks):
-            task_status = await (
-                managed_job_state.get_job_status_with_task_id_async(
-                    job_id=self._job_id, task_id=task_id))
+            task_status = task_statuses.get(task_id)
 
             if task_status is None or task_status == (
                     managed_job_state.ManagedJobStatus.PENDING):
