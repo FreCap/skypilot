@@ -39,6 +39,7 @@ def _request() -> mock.MagicMock:
     request = mock.MagicMock()
     request.method = 'POST'
     request.headers = {}
+    request.is_disconnected = mock.AsyncMock(return_value=False)
     return request
 
 
@@ -629,8 +630,7 @@ def test_waiter_wakes_when_dispatch_slot_released():
         lb = _make_lb()
         lb._load_balancing_policy.set_ready_replicas(['http://worker:8000'])
         lb._active_request_count = 1
-        request = mock.MagicMock()
-        request.headers = {}
+        request = _request()
         waiter = asyncio.create_task(lb._acquire_request_slot(request))
         while lb._waiting_request_count != 1:
             await asyncio.sleep(0)
@@ -648,8 +648,7 @@ def test_occupancy_probe_wakes_waiter():
         lb = _make_lb(min_size=0, use_async_occupancy=True, timeout_seconds=1)
         url = 'http://worker:8000'
         lb._load_balancing_policy.set_ready_replicas([url])
-        request = mock.MagicMock()
-        request.headers = {}
+        request = _request()
         waiter = asyncio.create_task(lb._acquire_request_slot(request))
         while lb._waiting_request_count != 1:
             await asyncio.sleep(0)
@@ -679,6 +678,7 @@ def test_timeout_and_cancellation_remove_waiters():
         lb._load_balancing_policy.set_ready_replicas(['http://worker:8000'])
         request = mock.MagicMock()
         request.headers = {}
+        request.is_disconnected = mock.AsyncMock(return_value=False)
         with pytest.raises(fastapi.HTTPException) as exc:
             await lb._acquire_request_slot(request)
         assert exc.value.status_code == 503
@@ -692,6 +692,65 @@ def test_timeout_and_cancellation_remove_waiters():
         with pytest.raises(asyncio.CancelledError):
             await waiter
         assert lb._waiting_request_count == 0
+
+    asyncio.run(_run())
+
+
+def test_disconnected_waiter_is_removed_without_dispatch():
+
+    async def _run():
+        lb = _make_lb(min_size=1,
+                      size_per_replica=0,
+                      max_size=1,
+                      use_async_occupancy=True,
+                      timeout_seconds=10)
+        request = mock.MagicMock()
+        request.headers = {}
+        request.is_disconnected = mock.AsyncMock(return_value=True)
+        lb._request_body = mock.AsyncMock(return_value=b'payload')
+        lb._proxy_with_retries_inner = mock.AsyncMock()
+
+        with mock.patch.object(load_balancer,
+                               '_REQUEST_QUEUE_DISCONNECT_POLL_SECONDS', 0.001):
+            with pytest.raises(fastapi.HTTPException) as exc:
+                await lb._proxy_with_retries(request)
+
+        assert exc.value.status_code == 499
+        lb._request_body.assert_awaited_once_with(request)
+        lb._proxy_with_retries_inner.assert_not_awaited()
+        assert lb._waiting_request_count == 0
+        assert lb._active_request_count == 0
+        assert lb._queue_depth == 0
+        assert lb._rejected_in_window() == 0
+
+    asyncio.run(_run())
+
+
+def test_disconnect_racing_slot_notification_does_not_dispatch():
+
+    async def _run():
+        lb = _make_lb(timeout_seconds=10)
+        lb._load_balancing_policy.set_ready_replicas(['http://worker:8000'])
+        lb._active_request_count = 1
+        request = mock.MagicMock()
+        request.headers = {}
+        request.is_disconnected = mock.AsyncMock(return_value=False)
+        lb._request_body = mock.AsyncMock(return_value=b'payload')
+        lb._proxy_with_retries_inner = mock.AsyncMock()
+
+        waiter = asyncio.create_task(lb._proxy_with_retries(request))
+        while lb._waiting_request_count != 1:
+            await asyncio.sleep(0)
+        request.is_disconnected.return_value = True
+        await lb._release_request_slot()
+
+        with pytest.raises(fastapi.HTTPException) as exc:
+            await waiter
+        assert exc.value.status_code == 499
+        lb._proxy_with_retries_inner.assert_not_awaited()
+        assert lb._waiting_request_count == 0
+        assert lb._active_request_count == 0
+        assert lb._queue_depth == 0
 
     asyncio.run(_run())
 
@@ -842,9 +901,9 @@ def test_proxy_handler_queues_until_first_request_completes():
             return fastapi.responses.Response(status_code=200)
 
         lb._proxy_with_retries_inner = _proxy
-        first = asyncio.create_task(lb._proxy_with_retries(mock.MagicMock()))
+        first = asyncio.create_task(lb._proxy_with_retries(_request()))
         await first_started.wait()
-        second = asyncio.create_task(lb._proxy_with_retries(mock.MagicMock()))
+        second = asyncio.create_task(lb._proxy_with_retries(_request()))
         while lb._waiting_request_count != 1:
             await asyncio.sleep(0)
         assert call_count == 1
@@ -862,8 +921,7 @@ def test_disabling_queue_releases_existing_waiters():
 
     async def _run():
         lb = _make_lb()
-        request = mock.MagicMock()
-        request.headers = {}
+        request = _request()
         waiter = asyncio.create_task(lb._acquire_request_slot(request))
         while lb._waiting_request_count != 1:
             await asyncio.sleep(0)

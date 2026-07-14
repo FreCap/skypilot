@@ -42,6 +42,12 @@ _OCCUPANCY_ADMISSION_ATTR = '_sky_occupancy_admission_unassigned'
 _IDEMPOTENT_METHODS = frozenset(
     {'GET', 'HEAD', 'PUT', 'DELETE', 'OPTIONS', 'TRACE'})
 
+# A queued ASGI request does not receive a task cancellation when its client
+# disconnects. Poll the receive channel while waiting so an abandoned request
+# cannot later consume a replica slot. Request bodies are bounded and cached
+# before admission, so this poll cannot consume an unread body message.
+_REQUEST_QUEUE_DISCONNECT_POLL_SECONDS = 1.0
+
 
 class _RetriableStatusError(Exception):
     """A replica answered with a status the service marked retriable.
@@ -823,17 +829,36 @@ class SkyServeLoadBalancer:
                                     constants.LB_503_RETRY_AFTER_SECONDS)
                             })
                     try:
-                        await asyncio.wait_for(condition.wait(), remaining)
+                        await asyncio.wait_for(
+                            condition.wait(),
+                            min(remaining,
+                                _REQUEST_QUEUE_DISCONNECT_POLL_SECONDS))
                     except asyncio.TimeoutError:
-                        self._record_rejection(request)
+                        if await request.is_disconnected():
+                            raise fastapi.HTTPException(
+                                status_code=499,
+                                detail='Client disconnected while waiting in '
+                                'the load balancer request queue.') from None
+                        if time.monotonic() >= deadline:
+                            self._record_rejection(request)
+                            raise fastapi.HTTPException(
+                                status_code=503,
+                                detail='Timed out waiting in the load '
+                                'balancer request queue.',
+                                headers={
+                                    'Retry-After': str(
+                                        constants.LB_503_RETRY_AFTER_SECONDS)
+                                }) from None
+                        continue
+                    # A slot notification can race with the downstream
+                    # disconnect. Check before transferring the newly free
+                    # capacity to this waiter, rather than waiting for the
+                    # next polling interval after it has already dispatched.
+                    if await request.is_disconnected():
                         raise fastapi.HTTPException(
-                            status_code=503,
-                            detail='Timed out waiting in the load balancer '
-                            'request queue.',
-                            headers={
-                                'Retry-After': str(
-                                    constants.LB_503_RETRY_AFTER_SECONDS)
-                            }) from None
+                            status_code=499,
+                            detail='Client disconnected while waiting in the '
+                            'load balancer request queue.')
                     if self._request_queue_config is None:
                         return False
                     dispatch_limit, _ = self._request_queue_limits()
@@ -2227,6 +2252,11 @@ class SkyServeLoadBalancer:
         acquired_slot = False
         had_admission_slot = False
         try:
+            # Cache the bounded body before the queue starts polling the ASGI
+            # receive channel for disconnects. This also rejects oversized
+            # work without occupying a queue slot.
+            if self._request_queue_config is not None:
+                await self._request_body(request)
             acquired_slot = await self._acquire_request_slot(request)
             had_admission_slot = acquired_slot
             response = await self._proxy_with_retries_inner(request)
