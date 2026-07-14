@@ -1443,6 +1443,9 @@ class TestDemandPlacementGate(unittest.TestCase):
         zero_cost_location = spot_placer.Location.from_pickleable(_K8S_KEY)
         placer = mock.Mock()
         placer.zero_cost_locations.return_value = [zero_cost_location]
+        # This fixture isolates the broker grant gate.  Keep the independent
+        # speculative-placement gate inert by reporting no active locations.
+        placer.active_locations.return_value = []
         selected = _make_location('us-east-1', 'paid', use_spot=True)
         placer.select_next_location.return_value = selected
         manager = _make_manager(placer)

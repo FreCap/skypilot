@@ -70,6 +70,16 @@ _LAUNCH_OWNER_WATCH_INTERVAL_SECONDS = 0.5
 # Rate limit for the "fill launch skipped" log (see _log_fill_skip).
 _FILL_SKIP_LOG_INTERVAL_SECONDS = 60
 _WAIT_LAUNCH_THREAD_TIMEOUT_SECONDS = 15
+# A large autoscaler tick is placed synchronously before any sky.launch result
+# can bench an unavailable location.  Without a bound, a zero-cost-first
+# placer can pin the entire wave (hundreds of replicas) to one full Kubernetes
+# pool, so every launch fails before the next tick can spill to paid spot.
+# Keep a few probes in flight per ACTIVE zero-cost shape; additional demand
+# uses the placer's paid candidates until a probe materializes or fails.  Four
+# matches SkyServe's historical per-service launch parallelism and is enough to
+# fill genuinely free capacity in parallel without multiplying a stale
+# availability assumption across the fleet.
+_ZERO_COST_SPECULATIVE_LAUNCHES_PER_LOCATION = 4
 
 # Sentinel for to_info_dict's pre-fetched cluster_record
 # parameters. We can't use None because None is a legitimate value (it means
@@ -1545,6 +1555,13 @@ class SkyPilotReplicaManager(ReplicaManager):
             if info.status == serve_state.ReplicaStatus.PENDING)
 
         for replica_info in to_up_replicas:
+            pending_version = getattr(self, '_pending_version', None)
+            if (pending_version is not None and
+                    pending_version > replica_info.version):
+                logger.info('Stopping recovery re-drive for version '
+                            f'{replica_info.version} because version '
+                            f'{pending_version} is waiting to be applied.')
+                break
             # It should be robust enough for `execution.launch` to handle cases
             # where the provisioning is partially done.
             # So we mock the original request based on all call sites,
@@ -1821,12 +1838,13 @@ class SkyPilotReplicaManager(ReplicaManager):
                         'no ACTIVE zero-cost location available')
                     return False
                 location = zero_cost_location
-            elif self._demand_should_skip_zero_cost(existing_replica_infos):
-                # Broker demand-placement gate engaged: this service
-                # already holds its zero-cost grant, so new DEMAND
-                # placements compete normally instead of squatting on a
-                # peer's entitlement. Passed only when engaged so the
-                # ungated call shape stays byte-identical.
+            elif (self._demand_should_skip_zero_cost(existing_replica_infos) or
+                  self._demand_should_skip_saturated_zero_cost(
+                      existing_replica_infos)):
+                # The broker grant or speculative-probe budget says this
+                # demand launch should compete on paid capacity instead of
+                # preferring the zero-cost tier.  The placer falls back to
+                # zero-cost when no paid candidate exists.
                 location = self._spot_placer.select_next_location(
                     current_spot_locations, skip_zero_cost_preference=True)
             else:
@@ -1979,6 +1997,54 @@ class SkyPilotReplicaManager(ReplicaManager):
                     for zc in zero_cost):
                 holdings += 1
         return holdings >= grant
+
+    def _demand_should_skip_saturated_zero_cost(
+            self, existing_replica_infos: list['ReplicaInfo'] | None) -> bool:
+        """Bound speculative demand launches into zero-cost locations.
+
+        Placement for one autoscaler tick happens before any launch outcome is
+        available.  Count nonterminal, not-yet-READY rows already pinned to
+        ACTIVE zero-cost locations and stop preferring the free tier once the
+        per-location probe budget is full.  ``select_next_location(...,
+        skip_zero_cost_preference=True)`` still falls back to zero-cost when no
+        paid candidate exists, so this pacing never makes a zero-cost-only
+        service unavailable.
+
+        READY rows deliberately do not consume the probe budget: they prove
+        capacity exists.  Rows on a benched location also do not consume the
+        budget for a different active shape; the placer's normal bench logic
+        already excludes the failed location.
+        """
+        if self._spot_placer is None:
+            return False
+        active_locations = self._spot_placer.active_locations()
+        active_zero_cost = [
+            location for location in self._spot_placer.zero_cost_locations()
+            if location in active_locations
+        ]
+        if not active_zero_cost:
+            return False
+        speculative = 0
+        for info in existing_replica_infos or []:
+            if info.is_terminal or info.is_ready:
+                continue
+            replica_location = info.get_spot_location()
+            if replica_location is None:
+                continue
+            if any(
+                    spot_placer.locations_match_placement(
+                        replica_location, zero_cost)
+                    for zero_cost in active_zero_cost):
+                speculative += 1
+        limit = (_ZERO_COST_SPECULATIVE_LAUNCHES_PER_LOCATION *
+                 len(active_zero_cost))
+        if speculative < limit:
+            return False
+        logger.debug('Zero-cost demand probe budget is full '
+                     f'({speculative}/{limit} across '
+                     f'{len(active_zero_cost)} active location(s)); '
+                     'placing additional demand on paid candidates.')
+        return True
 
     def _log_fill_skip(self, reason: str) -> None:
         """Rate-limited skip log for aborted reserved-capacity fill launches.
