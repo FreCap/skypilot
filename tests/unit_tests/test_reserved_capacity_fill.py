@@ -1170,6 +1170,27 @@ class TestQueryFreeSlots(unittest.TestCase):
                                       case_sensitive=False,
                                       require_price=False)
 
+    def test_demand_snapshot_pools_per_shape_and_dedupes_to_largest(self):
+        # Heterogeneous shapes in one context pool per shape: each shape
+        # contributes available // per_replica and the context budget is
+        # the sum. Duplicate (context, gpu) entries dedupe to the LARGEST
+        # per-replica count (conservative), so A100 x2 and A100 x8 read
+        # as a single 8-GPU shape: 220 // 8 + 3 // 1 = 30.
+        locations = [
+            self._k8s_location(gpu='A100', count=2),
+            self._k8s_location(gpu='A100', count=8),
+            self._k8s_location(gpu='A100-80GB', count=1),
+        ]
+        with mock.patch.object(reserved_capacity.kubernetes_catalog,
+                               'list_accelerators_realtime',
+                               return_value=({}, {}, {
+                                   'A100': 220,
+                                   'A100-80GB': 3,
+                               })) as query:
+            free = reserved_capacity.query_free_slots_by_context(locations)
+        self.assertEqual(free, {'research-ctx': 30})
+        query.assert_called_once()
+
     def test_demand_snapshot_distinguishes_unknown_from_zero(self):
         locations = [self._k8s_location(gpu='A100')]
         with mock.patch.object(reserved_capacity.kubernetes_catalog,
