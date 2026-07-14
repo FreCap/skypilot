@@ -3389,25 +3389,25 @@ def _must_refresh_cluster_status(
     return force_refresh_for_cluster or is_stale
 
 
-def _reload_record_if_status_changed(
+def _reload_record_if_refresh_fields_changed(
         cluster_name: str, record: dict[str, Any], include_user_info: bool,
         summary_response: bool) -> dict[str, Any] | None:
-    """Reload the full cluster record only if its status fields changed.
+    """Reload the full record only if fields used by refresh changed.
 
-    Writers that affect the refresh decision bump status/status_updated_at
-    (see global_user_state.set_cluster_status), so when those columns still
-    match the in-memory record there is no need to fetch the full row again
-    (which unpickles the handle and queries the event table).
+    Status writers bump status/status_updated_at, while autostop writers update
+    autostop/to_down without touching the status timestamp. Comparing all four
+    plain columns preserves the pre-lock refresh snapshot without fetching the
+    full row (which unpickles the handle and queries the event table).
 
     Returns None if the cluster no longer exists.
     """
-    status_fields = global_user_state.get_cluster_status_fields(
-        [cluster_name]).get(cluster_name)
-    if status_fields is None:
+    refresh_fields = global_user_state.get_cluster_refresh_fields(cluster_name)
+    if refresh_fields is None:
         return None
-    status, status_updated_at = status_fields
+    status, status_updated_at, autostop, to_down = refresh_fields
     if (record['status'].name == status and
-            record['status_updated_at'] == status_updated_at):
+            record['status_updated_at'] == status_updated_at and
+            record['autostop'] == autostop and record['to_down'] == to_down):
         return record
     return global_user_state.get_cluster_from_name(
         cluster_name,
@@ -3509,7 +3509,7 @@ def refresh_cluster_record(
                 with lock.acquire(blocking=False):
                     # Check the cluster status again, since it could have been
                     # updated between our last check and acquiring the lock.
-                    record = _reload_record_if_status_changed(
+                    record = _reload_record_if_refresh_fields_changed(
                         cluster_name, record, include_user_info,
                         summary_response)
                     if record is None or not _must_refresh_cluster_status(
@@ -3540,9 +3540,8 @@ def refresh_cluster_record(
             time.sleep(lock.poll_interval)
 
             # Refresh for next loop iteration.
-            record = _reload_record_if_status_changed(cluster_name, record,
-                                                      include_user_info,
-                                                      summary_response)
+            record = _reload_record_if_refresh_fields_changed(
+                cluster_name, record, include_user_info, summary_response)
             if record is None:
                 return None
 
