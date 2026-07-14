@@ -1,10 +1,12 @@
 """Unit tests for sky/client/sdk_async.py."""
 import asyncio
+import inspect
 from unittest import mock
 
 import pytest
 
 from sky import exceptions
+from sky.client import sdk
 from sky.client import sdk_async
 from sky.schemas.api import responses
 from sky.utils import common as common_utils
@@ -306,10 +308,26 @@ async def test_api_login(mock_to_thread, mock_sdk_functions):
     """Test api_login() function."""
     mock_sdk_functions['api_login'].return_value = None
 
-    result = await sdk_async.api_login('http://test-endpoint', get_token=True)
+    result = await sdk_async.api_login('http://test-endpoint',
+                                       relogin=True,
+                                       service_account_token='sa-token',
+                                       no_browser=True)
     assert result is None
     mock_sdk_functions['api_login'].assert_called_once_with(
-        'http://test-endpoint', True)
+        'http://test-endpoint',
+        relogin=True,
+        service_account_token='sa-token',
+        no_browser=True)
+
+
+@pytest.mark.asyncio
+async def test_api_login_signature_mirrors_sync():
+    """The async wrapper must expose the sync api_login parameters."""
+    async_params = inspect.signature(sdk_async.api_login).parameters
+    sync_params = inspect.signature(sdk.api_login).parameters
+    assert list(async_params) == list(sync_params)
+    for name, param in sync_params.items():
+        assert async_params[name].default == param.default
 
 
 def _request_payload_dict(status):

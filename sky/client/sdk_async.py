@@ -844,6 +844,12 @@ async def api_server_logs(follow: bool = True, tail: int | None = None) -> None:
 @usage_lib.entrypoint
 @annotations.client_api
 async def api_login(endpoint: str | None = None,
-                    get_token: bool = False) -> None:
+                    relogin: bool = False,
+                    service_account_token: str | None = None,
+                    no_browser: bool = False) -> None:
     """Async version of api_login() that logs into a SkyPilot API server."""
-    return await asyncio.to_thread(sdk.api_login, endpoint, get_token)
+    return await asyncio.to_thread(sdk.api_login,
+                                   endpoint,
+                                   relogin=relogin,
+                                   service_account_token=service_account_token,
+                                   no_browser=no_browser)
