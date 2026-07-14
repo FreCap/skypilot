@@ -770,7 +770,9 @@ class ReplicaInfo:
     # Version 6 is also a worker-runtime compatibility marker for immutable
     # Sky Batch attempt outputs. New Batch clients reject older pool replicas
     # so an incompatible worker fails before dispatch rather than mid-run.
-    _VERSION = 6
+    # Version 7 replaces the consecutive_failure_times list with the single
+    # first_consecutive_failure_time timestamp.
+    _VERSION = 7
 
     def __init__(self, replica_id: int, cluster_name: str, replica_port: str,
                  is_spot: bool, location: spot_placer.Location | None,
@@ -790,7 +792,11 @@ class ReplicaInfo:
         # Autoscaler._fill_row_occupies_free_slot).
         self.created_at: float | None = time.time()
         self.first_not_ready_time: float | None = None
-        self.consecutive_failure_times: list[float] = []
+        # Start of the current run of consecutive failed readiness probes
+        # after the replica was once READY; None while the replica is
+        # passing probes. The failure window is measured against the
+        # current probe time, so only the first failure needs to be kept.
+        self.first_consecutive_failure_time: float | None = None
         self.status_property: ReplicaStatusProperty = ReplicaStatusProperty()
         self.is_spot: bool = is_spot
         self.location: dict[str, str | None] | None = (
@@ -1120,6 +1126,15 @@ class ReplicaInfo:
             self.reserved_fill = False
 
         state.setdefault('cost_rebalance_for_replica_id', None)
+
+        if version < 7:
+            # Rows written before version 7 carry the full list of failed
+            # probe timestamps; only its first entry was ever read (the
+            # window is first-failure -> current probe time), so migrate
+            # to the single timestamp.
+            failure_times = state.pop('consecutive_failure_times', [])
+            self.first_consecutive_failure_time = (failure_times[0]
+                                                   if failure_times else None)
 
         self.__dict__.update(state)
         self._version = version if version >= 0 else 0
@@ -3296,7 +3311,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         This function will probe all replicas to make sure the service is
         ready. It will keep track of:
             (1) the initial delay for each replica;
-            (2) the consecutive failure times.
+            (2) the start of the current consecutive-failure window.
         The replica will be terminated if any of the thresholds exceeded.
         """
         # Reset the per-tick spec memo so this probe round reads each version's
@@ -3417,7 +3432,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                             raise RuntimeError(
                                 f'Service {self._service_name!r} incarnation '
                                 'changed while publishing uptime.')
-                    info.consecutive_failure_times.clear()
+                    info.first_consecutive_failure_time = None
                     if info.status_property.first_ready_time is None:
                         info.status_property.first_ready_time = probe_time
                 else:
@@ -3434,10 +3449,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                     if info.first_not_ready_time is None:
                         info.first_not_ready_time = probe_time
                     if info.status_property.first_ready_time is not None:
-                        info.consecutive_failure_times.append(probe_time)
+                        if info.first_consecutive_failure_time is None:
+                            info.first_consecutive_failure_time = probe_time
                         consecutive_failure_time = (
-                            info.consecutive_failure_times[-1] -
-                            info.consecutive_failure_times[0])
+                            probe_time - info.first_consecutive_failure_time)
                         failure_threshold = (
                             self._consecutive_failure_threshold_timeout())
                         if consecutive_failure_time >= failure_threshold:
