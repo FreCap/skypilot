@@ -407,6 +407,64 @@ def test_retriable_rejection_keeps_admitted_slot_until_next_selection():
     asyncio.run(_run())
 
 
+def test_enabling_occupancy_queue_mid_request_does_not_leak_admission():
+
+    async def _run():
+        first_url = 'http://first:8000'
+        second_url = 'http://second:8000'
+        lb = load_balancer.SkyServeLoadBalancer('http://controller:8001', 8890)
+        lb._load_balancing_policy.set_ready_replicas([first_url, second_url])
+        lb._occupancy_declared_urls = {first_url, second_url}
+        lb._replica_occupancy = {first_url: 0, second_url: 0}
+        lb._replica_free_slots = {first_url: 1, second_url: 1}
+        lb._occupancy_dispatch_generation = {first_url: 0, second_url: 0}
+        lb._occupancy_sample_generation = {first_url: 0, second_url: 0}
+        lb._load_balancing_policy.set_occupancy({first_url: 0, second_url: 0})
+        request = _request()
+        request.is_disconnected = mock.AsyncMock(return_value=False)
+        attempts = []
+
+        async def _proxy(url, forwarded_request):
+            del forwarded_request
+            attempts.append(url)
+            if url == first_url:
+                return load_balancer._RetriableStatusError(429, url)
+            return fastapi.responses.Response(status_code=400)
+
+        async def _enable_queue(delay):
+            del delay
+            # This request entered while the queue was disabled, so it does not
+            # own an outer admission slot. Enable occupancy-aware queueing in
+            # its retry gap to reproduce a live service update.
+            assert lb._occupancy_unassigned_reservations == 0
+            lb._apply_routing_spec({
+                'request_queue': _queue_config(min_size=0,
+                                               size_per_replica=0,
+                                               max_concurrency_per_replica=1,
+                                               max_concurrency=2,
+                                               use_async_occupancy=True),
+            })
+
+        lb._proxy_request_to = _proxy
+        lb._notify_request_queue = mock.AsyncMock()
+        with mock.patch.object(
+                load_balancing_policies.random,
+                'choice',
+                side_effect=lambda values: values[0]), mock.patch(
+                    'sky.serve.load_balancer.asyncio.sleep',
+                    side_effect=_enable_queue):
+            response = await lb._proxy_with_retries(request)
+
+        assert response.status_code == 400
+        assert attempts == [first_url, second_url]
+        assert lb._occupancy_unassigned_reservations == 0
+        assert not lb._has_unassigned_occupancy_admission(request)
+        assert lb._active_request_count == 0
+        lb._notify_request_queue.assert_awaited_once()
+
+    asyncio.run(_run())
+
+
 def test_legacy_queue_config_defaults_to_envelope_admission():
     lb = load_balancer.SkyServeLoadBalancer('http://controller:8001', 8890)
     config = _queue_config()

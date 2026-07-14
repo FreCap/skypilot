@@ -721,13 +721,14 @@ class SkyServeLoadBalancer:
         self._occupancy_unassigned_reservations += 1
 
     def _release_unassigned_occupancy_admission_locked(
-            self, request: fastapi.Request) -> None:
+            self, request: fastapi.Request) -> bool:
         """Release a fleet reservation that never reached replica selection."""
         if not self._has_unassigned_occupancy_admission(request):
-            return
+            return False
         setattr(request, _OCCUPANCY_ADMISSION_ATTR, False)
         self._occupancy_unassigned_reservations = max(
             0, self._occupancy_unassigned_reservations - 1)
+        return True
 
     def _request_queue_limits(self) -> tuple[int, int]:
         """Return (dispatch concurrency, queue size) for the ready fleet."""
@@ -1206,7 +1207,8 @@ class SkyServeLoadBalancer:
                     # whether to select another URL. Transfer, rather than
                     # release, its reservation so a newly admitted request
                     # cannot consume the same fleet slot in that gap. A
-                    # terminal result releases it in `_release_request_slot`.
+                    # terminal result releases it in the request owner's outer
+                    # cleanup.
                     self._record_unassigned_occupancy_admission_locked(request)
                 if invalidate_capacity:
                     replica_free_slots = getattr(self, '_replica_free_slots',
@@ -2187,8 +2189,10 @@ class SkyServeLoadBalancer:
         # between each read and its paired write.
         self._queue_depth += 1
         acquired_slot = False
+        had_admission_slot = False
         try:
             acquired_slot = await self._acquire_request_slot(request)
+            had_admission_slot = acquired_slot
             response = await self._proxy_with_retries_inner(request)
             if (acquired_slot and
                     isinstance(response, _ReleasingStreamingResponse)):
@@ -2199,6 +2203,18 @@ class SkyServeLoadBalancer:
         finally:
             if acquired_slot:
                 await self._release_request_slot(request)
+            elif not had_admission_slot:
+                # A live config update can enable occupancy-aware queueing
+                # after this request entered without an admission slot. A
+                # later rejected retry then transfers its per-URL reservation
+                # to the request-level marker. It has no streaming handoff or
+                # outer slot release to clear that marker, so clean it here.
+                with self._client_pool_lock:
+                    released_admission = (
+                        self._release_unassigned_occupancy_admission_locked(
+                            request))
+                if released_admission:
+                    await self._notify_request_queue()
             self._queue_depth -= 1
 
     async def _proxy_with_retries_inner(
