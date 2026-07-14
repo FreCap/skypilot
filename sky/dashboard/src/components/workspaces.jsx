@@ -43,7 +43,7 @@ import { ErrorDisplay } from '@/components/elements/ErrorDisplay';
 import { RotateCwIcon, PlusIcon, Trash2Icon, EditIcon } from 'lucide-react';
 import { LastUpdatedTimestamp } from '@/components/utils';
 import { useMobile } from '@/hooks/useMobile';
-import { statusGroups } from './jobs';
+import { statusGroups } from './job-domain';
 import dashboardCache from '@/lib/cache';
 import { REFRESH_INTERVALS } from '@/lib/config';
 import cachePreloader from '@/lib/cache-preloader';

@@ -1,6 +1,6 @@
 'use client';
 
-import { statusGroups } from '@/components/jobs';
+import { statusGroups } from '@/components/job-domain';
 import { getClusters } from '@/data/connectors/clusters';
 import { getManagedJobs } from '@/data/connectors/jobs';
 import dashboardCache from '@/lib/cache';

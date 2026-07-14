@@ -41,7 +41,7 @@ import {
   StarIcon,
 } from '@/components/elements/icons';
 import { ErrorDisplay } from '@/components/elements/ErrorDisplay';
-import { statusGroups } from './jobs'; // Import statusGroups
+import { statusGroups } from './job-domain';
 import yaml from 'js-yaml';
 import { CLOUD_CANONICALIZATIONS } from '@/data/connectors/constants';
 import { getUsers } from '@/data/connectors/users';
