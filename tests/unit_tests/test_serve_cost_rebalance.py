@@ -374,6 +374,48 @@ class TestEconomicDecisions:
         ]
         assert len(launches) == 2
 
+    def test_location_load_is_computed_once_per_tick(self):
+        replica_count = 50
+        paid = make_location('paid', accelerators={'L4': 1}, use_spot=True)
+        cheap_locations = [
+            make_location(f'research-{i}',
+                          accelerators={'A100': 1},
+                          use_spot=False) for i in range(9)
+        ]
+        locations = [paid, *cheap_locations]
+        scaler = _autoscaler(
+            _spec(min_replicas=replica_count,
+                  max_replicas=replica_count,
+                  cost_rebalance_max_parallel_replacements=1))
+        scaler.set_spot_placer(
+            make_placer({
+                paid: 1.0,
+                **{
+                    location: 0.0 for location in cheap_locations
+                },
+            }))
+        replicas = [
+            _Replica(replica_id, paid, 1.0)
+            for replica_id in range(replica_count)
+        ]
+        _report(scaler, replicas)
+
+        matcher = autoscalers.spot_placer.locations_match_placement
+        with mock.patch.object(autoscalers.spot_placer,
+                               'locations_match_placement',
+                               wraps=matcher) as matches:
+            launches = [
+                decision for decision in _decisions(scaler, replicas)
+                if decision.operator ==
+                autoscalers.AutoscalerDecisionOperator.SCALE_UP
+            ]
+
+        assert len(launches) == 1
+        # One fleet-load pass, one candidate pass per replica, and one update
+        # for the launched location.  The previous implementation rebuilt the
+        # fleet load for every incumbent and exceeded 25,000 comparisons here.
+        assert matches.call_count <= len(locations) * (2 * replica_count + 1)
+
     def test_disabled_policy_does_not_downgrade_pending_strict_drain(self):
         scaler = _autoscaler()
         placer, _, cheap, replicas = self._fleet()
