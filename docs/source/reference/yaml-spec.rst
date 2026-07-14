@@ -1574,10 +1574,12 @@ reported predict concurrency to use every slot.
 
 The queue accepts at most 3,000 waiting requests, 128 concurrent requests,
 and 16 MiB per request body. The product of ``max_concurrency`` and
-``max_request_body_bytes`` must stay within a 128 MiB aggregate buffering
-budget, leaving headroom under the external load balancer's default 512 MiB
-limit. Waiting requests have not had their bodies read, so the 3,000-waiter
-ceiling bounds request envelopes rather than buffered payloads.
+``max_request_body_bytes`` must stay within a 128 MiB active-request buffering
+budget. Bodies cached before admission share a separate 128 MiB runtime budget
+based on their actual sizes. Requests that would exceed that waiting-body
+budget receive HTTP 503 with ``Retry-After``. Together, the two budgets leave
+headroom under the external load balancer's default 512 MiB limit while still
+allowing large queues of small payloads.
 
 .. code-block:: yaml
 
