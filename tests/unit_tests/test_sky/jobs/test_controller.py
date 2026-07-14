@@ -1290,3 +1290,132 @@ class TestUserJobStatusClassification:
                 managed_job_state.ManagedJobStatus.FAILED)
         assert 'job driver on the remote cluster failed' in (
             set_failed.call_args.kwargs['failure_reason'])
+
+
+class TestCancelSignalScan:
+    """Tests for ControllerManager cancel-signal handling.
+
+    Every signal file written to the consolidated signal directory must
+    eventually be consumed and removed. Signals for jobs owned by this
+    process cancel the job task; signals whose job already reached a
+    terminal state (or no longer exists) are reaped so they are not
+    re-listed by every scan forever.
+    """
+
+    @pytest.fixture
+    def signal_dir(self, tmp_path):
+        with patch('sky.jobs.constants.CONSOLIDATED_SIGNAL_PATH',
+                   str(tmp_path)):
+            yield tmp_path
+
+    def _make_manager(self):
+        return ControllerManager('test-uuid')
+
+    @pytest.mark.asyncio
+    async def test_owned_job_cancelled_without_status_query(self, signal_dir):
+        """Signal for an owned job cancels the task; no DB status query."""
+        manager = self._make_manager()
+        task = MagicMock()
+        manager.job_tasks[7] = task
+        (signal_dir / '7').touch()
+
+        with patch('sky.jobs.controller.managed_job_state.get_status_async',
+                   new_callable=AsyncMock) as status_mock:
+            await manager._process_cancel_signals()
+
+        task.cancel.assert_called_once()
+        status_mock.assert_not_awaited()
+        assert not (signal_dir / '7').exists()
+        assert manager._cancel_info[7] == (False, None)
+
+    @pytest.mark.asyncio
+    async def test_orphan_signal_for_terminal_job_reaped(self, signal_dir):
+        manager = self._make_manager()
+        manager._cancel_info[5] = (False, None)
+        (signal_dir / '5').touch()
+
+        with patch('sky.jobs.controller.managed_job_state.get_status_async',
+                   new_callable=AsyncMock,
+                   return_value=managed_job_state.ManagedJobStatus.SUCCEEDED):
+            await manager._process_cancel_signals()
+
+        assert not (signal_dir / '5').exists()
+        assert 5 not in manager._cancel_info
+
+    @pytest.mark.asyncio
+    async def test_orphan_signal_for_missing_job_reaped(self, signal_dir):
+        manager = self._make_manager()
+        (signal_dir / '6').touch()
+
+        with patch('sky.jobs.controller.managed_job_state.get_status_async',
+                   new_callable=AsyncMock,
+                   return_value=None):
+            await manager._process_cancel_signals()
+
+        assert not (signal_dir / '6').exists()
+
+    @pytest.mark.asyncio
+    async def test_orphan_signal_for_live_job_kept(self, signal_dir):
+        """A non-terminal job owned elsewhere keeps its signal file."""
+        manager = self._make_manager()
+        manager._cancel_info[8] = (True, 30)
+        (signal_dir / '8').touch()
+
+        with patch('sky.jobs.controller.managed_job_state.get_status_async',
+                   new_callable=AsyncMock,
+                   return_value=managed_job_state.ManagedJobStatus.RUNNING):
+            await manager._process_cancel_signals()
+
+        assert (signal_dir / '8').exists()
+        assert manager._cancel_info[8] == (True, 30)
+
+    @pytest.mark.asyncio
+    async def test_non_digit_and_lock_files_skipped(self, signal_dir):
+        manager = self._make_manager()
+        (signal_dir / 'unexpected').touch()
+        (signal_dir / '9.lock').touch()
+
+        with patch('sky.jobs.controller.managed_job_state.get_status_async',
+                   new_callable=AsyncMock) as status_mock:
+            await manager._process_cancel_signals()
+
+        status_mock.assert_not_awaited()
+        assert (signal_dir / 'unexpected').exists()
+        assert (signal_dir / '9.lock').exists()
+
+
+class TestRunJobLoopCancelInfoCleanup:
+    """run_job_loop must drop stale cancel info even on the success path.
+
+    If a cancellation lands after the job task already finished,
+    task.cancel() is a no-op and no CancelledError handler consumes the
+    stored cancel info; the finally block must remove it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_success_path_pops_stale_cancel_info(self):
+        manager = ControllerManager('test-uuid')
+        manager._cancel_info[3] = (False, None)
+        manager._cleanup = AsyncMock()
+
+        ctx = MagicMock()
+        controller = MagicMock()
+        controller.run = AsyncMock(return_value=True)
+
+        with patch('sky.jobs.controller.context.get', return_value=ctx), \
+                patch('sky.jobs.controller.file_content_utils.'
+                      'get_job_env_content', return_value=''), \
+                patch('sky.jobs.controller.usage_lib.'
+                      'install_fresh_messages_for_current_context'), \
+                patch('sky.jobs.controller.JobController',
+                      return_value=controller), \
+                patch('sky.jobs.controller.managed_job_state.get_status_async',
+                      new_callable=AsyncMock,
+                      return_value=(
+                          managed_job_state.ManagedJobStatus.SUCCEEDED)), \
+                patch('sky.jobs.controller.scheduler.job_done_async',
+                      new_callable=AsyncMock):
+            await manager.run_job_loop(3, '/dev/null')
+
+        assert 3 not in manager._cancel_info
+        assert 3 not in manager.job_tasks

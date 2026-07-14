@@ -756,6 +756,74 @@ def test_disconnect_racing_slot_notification_does_not_dispatch():
     asyncio.run(_run())
 
 
+def test_draining_waiter_is_rejected_without_dispatch():
+
+    async def _run():
+        lb = _make_lb(timeout_seconds=10)
+        lb._load_balancing_policy.set_ready_replicas(['http://worker:8000'])
+        lb._active_request_count = 1
+        request = _request()
+        lb._request_body = mock.AsyncMock(return_value=b'payload')
+        lb._proxy_with_retries_inner = mock.AsyncMock()
+
+        with mock.patch.object(load_balancer,
+                               '_REQUEST_QUEUE_DISCONNECT_POLL_SECONDS', 0.001):
+            waiter = asyncio.create_task(lb._proxy_with_retries(request))
+            while lb._waiting_request_count != 1:
+                await asyncio.sleep(0)
+            lb._begin_draining()
+            with pytest.raises(fastapi.HTTPException) as exc:
+                await waiter
+
+        assert exc.value.status_code == 503
+        assert exc.value.headers['Retry-After']
+        lb._proxy_with_retries_inner.assert_not_awaited()
+        assert lb._waiting_request_count == 0
+        assert lb._active_request_count == 1
+        assert lb._queue_depth == 0
+        await lb._release_request_slot()
+
+    asyncio.run(_run())
+
+
+def test_drain_racing_slot_notification_does_not_dispatch():
+
+    async def _run():
+        lb = _make_lb(timeout_seconds=10)
+        lb._load_balancing_policy.set_ready_replicas(['http://worker:8000'])
+        lb._active_request_count = 1
+        request = _request()
+        disconnect_check_started = asyncio.Event()
+        finish_disconnect_check = asyncio.Event()
+
+        async def _is_disconnected():
+            disconnect_check_started.set()
+            await finish_disconnect_check.wait()
+            return False
+
+        request.is_disconnected.side_effect = _is_disconnected
+        lb._request_body = mock.AsyncMock(return_value=b'payload')
+        lb._proxy_with_retries_inner = mock.AsyncMock()
+
+        waiter = asyncio.create_task(lb._proxy_with_retries(request))
+        while lb._waiting_request_count != 1:
+            await asyncio.sleep(0)
+        await lb._release_request_slot()
+        await disconnect_check_started.wait()
+        lb._begin_draining()
+        finish_disconnect_check.set()
+
+        with pytest.raises(fastapi.HTTPException) as exc:
+            await waiter
+        assert exc.value.status_code == 503
+        lb._proxy_with_retries_inner.assert_not_awaited()
+        assert lb._waiting_request_count == 0
+        assert lb._active_request_count == 0
+        assert lb._queue_depth == 0
+
+    asyncio.run(_run())
+
+
 def test_repeated_cancellation_cannot_leak_admission_count():
 
     async def _run():

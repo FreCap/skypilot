@@ -505,7 +505,24 @@ class SpotPlacer:
         # satisfying the resource request. In such case we choose the
         # cheapest one, as the optimizer does. Reference:
         # sky/optimizer.py::Optimizer::_print_candidates
-        cost = min(res.get_cost(seconds=3600) for res in rs)
+        costs: list[float] = []
+        for resource in rs:
+            try:
+                costs.append(resource.get_cost(seconds=3600))
+            except ValueError as e:
+                # A catalog can list a feasible instance type without a price
+                # for the requested purchase model (for example, an AWS type
+                # with no SpotPrice).  One incomplete paid candidate must not
+                # abort zero-cost classification or the autoscaler's launch
+                # tick.  Ignore it if another feasible resource is priced;
+                # otherwise treat this location as maximally expensive.
+                logger.warning('No usable price for feasible resource '
+                               f'{resource} at {location}: {e}')
+        if not costs:
+            cost = float('inf')
+            self.location2cost[location] = cost
+            return cost
+        cost = min(costs)
         self.location2cost[location] = cost
         return cost
 

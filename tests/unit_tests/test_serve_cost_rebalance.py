@@ -625,11 +625,11 @@ class TestWaitForIdleRecovery:
         assert manager._wait_for_idle_trackers[1] is not None
 
         with mock.patch.object(replica_managers.serve_state,
-                               'get_replica_info_from_id',
-                               return_value=info), \
+                               'get_replica_infos_from_ids',
+                               return_value={1: info}), \
              mock.patch.object(replica_managers.global_user_state,
-                               'cluster_with_name_exists',
-                               return_value=True):
+                               'get_cluster_status_fields',
+                               return_value={'cluster-1': ('UP', 1)}):
             # No LB report yet: termination stays inadmissible.
             manager._refresh_wait_for_idle()
             manager._terminate_replica.assert_not_called()
@@ -692,6 +692,103 @@ class TestPolicyDisabledPairCompletion:
 class TestStrictDrain:
     """Economic retirement cannot terminate work with unknown occupancy."""
 
+    def test_refresh_snapshots_rows_and_cluster_liveness_once(self):
+        manager = replica_managers.SkyPilotReplicaManager.__new__(
+            replica_managers.SkyPilotReplicaManager)
+        manager._service_name = 'svc'
+        manager._wait_for_idle_trackers = {
+            replica_id: (mock.Mock(return_value=False), float('inf'))
+            for replica_id in range(52)
+        }
+        manager._persist_replica = mock.Mock()
+        manager._terminate_replica = mock.Mock()
+        infos = {
+            replica_id: types.SimpleNamespace(
+                replica_id=replica_id,
+                cluster_name=f'cluster-{replica_id}',
+                status_property=replica_managers.ReplicaStatusProperty(
+                    wait_for_idle_before_termination=True))
+            for replica_id in range(51)
+        }
+        # Row 50 disappeared. Row 51 still exists but its durable drain intent
+        # was cancelled. Neither should remain tracked or be terminated.
+        infos.pop(50)
+        infos[51] = types.SimpleNamespace(
+            replica_id=51,
+            cluster_name='cluster-51',
+            status_property=replica_managers.ReplicaStatusProperty(
+                wait_for_idle_before_termination=False))
+        live_clusters = {
+            f'cluster-{replica_id}': ('UP', 1)
+            for replica_id in range(50)
+            if replica_id != 1
+        }
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos_from_ids',
+                return_value=infos) as replica_snapshot, \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_replica_info_from_id',
+                 side_effect=AssertionError('per-replica row read')), \
+             mock.patch.object(
+                 replica_managers.global_user_state,
+                 'get_cluster_status_fields',
+                 return_value=live_clusters) as cluster_snapshot, \
+             mock.patch.object(
+                 replica_managers.global_user_state,
+                 'cluster_with_name_exists',
+                 side_effect=AssertionError('per-cluster existence read')):
+            manager._refresh_wait_for_idle()
+
+        replica_snapshot.assert_called_once_with('svc', list(range(52)))
+        cluster_snapshot.assert_called_once_with(
+            [f'cluster-{replica_id}' for replica_id in range(50)])
+        assert set(manager._wait_for_idle_trackers) == (set(range(50)) - {1})
+        manager._persist_replica.assert_called_once_with(1, infos[1])
+        manager._terminate_replica.assert_called_once_with(
+            1,
+            sync_down_logs=False,
+            replica_drain_delay_seconds=0,
+            is_scale_down=True,
+            in_flight_drain_cap_seconds=0)
+
+    def test_refresh_snapshot_failure_preserves_tracker_for_retry(self):
+        manager = replica_managers.SkyPilotReplicaManager.__new__(
+            replica_managers.SkyPilotReplicaManager)
+        manager._service_name = 'svc'
+        tracked = (mock.Mock(return_value=False), float('inf'))
+        manager._wait_for_idle_trackers = {1: tracked}
+        manager._persist_replica = mock.Mock()
+        manager._terminate_replica = mock.Mock()
+        info = types.SimpleNamespace(
+            replica_id=1,
+            cluster_name='cluster-1',
+            status_property=replica_managers.ReplicaStatusProperty(
+                wait_for_idle_before_termination=True))
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos_from_ids',
+                side_effect=RuntimeError('replica snapshot failed')):
+            with pytest.raises(RuntimeError, match='replica snapshot failed'):
+                manager._refresh_wait_for_idle()
+        assert manager._wait_for_idle_trackers == {1: tracked}
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos_from_ids',
+                               return_value={1: info}), \
+             mock.patch.object(
+                 replica_managers.global_user_state,
+                 'get_cluster_status_fields',
+                 side_effect=RuntimeError('cluster snapshot failed')):
+            with pytest.raises(RuntimeError, match='cluster snapshot failed'):
+                manager._refresh_wait_for_idle()
+        assert manager._wait_for_idle_trackers == {1: tracked}
+        manager._persist_replica.assert_not_called()
+        manager._terminate_replica.assert_not_called()
+
     def test_off_route_intent_precedes_zero_occupancy_termination(self):
         manager = replica_managers.SkyPilotReplicaManager.__new__(
             replica_managers.SkyPilotReplicaManager)
@@ -711,9 +808,15 @@ class TestStrictDrain:
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_info_from_id',
                                return_value=info), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos_from_ids',
+                               return_value={1: info}), \
              mock.patch.object(replica_managers.global_user_state,
                                'cluster_with_name_exists',
-                               return_value=True):
+                               return_value=True), \
+             mock.patch.object(replica_managers.global_user_state,
+                               'get_cluster_status_fields',
+                               return_value={'cluster-1': ('UP', 1)}):
             manager._defer_scale_down_until_idle(1)
             assert info.status_property.wait_for_idle_before_termination
             assert info.status_property.sky_down_status == common_utils.ProcessStatus.SCHEDULED
@@ -768,9 +871,15 @@ class TestStrictDrain:
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_info_from_id',
                                return_value=info), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos_from_ids',
+                               return_value={1: info}), \
              mock.patch.object(replica_managers.global_user_state,
                                'cluster_with_name_exists',
-                               return_value=True):
+                               return_value=True), \
+             mock.patch.object(replica_managers.global_user_state,
+                               'get_cluster_status_fields',
+                               return_value={'cluster-1': ('UP', 1)}):
             manager._defer_scale_down_until_idle(1)
             now[0] = 110.0
             manager._lb_in_flight_report = (110.0, {

@@ -1,4 +1,6 @@
 """Unit tests for sky.jobs.state."""
+# pylint: disable=protected-access
+
 import contextlib
 import time
 from typing import Optional
@@ -114,6 +116,65 @@ def _set_controller_process(engine, job_id, pid, started_at):
                     controller_pid_started_at=started_at,
                 ))
         session.commit()
+
+
+def _get_api_access_token_rows(engine):
+    with orm.Session(engine) as session:
+        rows = session.execute(
+            sqlalchemy.select(state.api_access_token_table).order_by(
+                state.api_access_token_table.c.job_id)).fetchall()
+    return [(row.job_id, row.token_id) for row in rows]
+
+
+def test_set_api_access_token_ids_batches_upserts(_mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+
+    with _count_sql_statements(engine) as counts:
+        state.set_api_access_token_ids([3, 1, 2, 2], 'shared-token')
+
+    assert counts['n'] == 1, counts
+    assert _get_api_access_token_rows(engine) == [
+        (1, 'shared-token'),
+        (2, 'shared-token'),
+        (3, 'shared-token'),
+    ]
+
+    with _count_sql_statements(engine) as counts:
+        state.set_api_access_token_ids([1, 3], 'replacement-token')
+
+    assert counts['n'] == 1, counts
+    assert _get_api_access_token_rows(engine) == [
+        (1, 'replacement-token'),
+        (2, 'shared-token'),
+        (3, 'replacement-token'),
+    ]
+
+
+def test_set_api_access_token_ids_empty_input_uses_no_query(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+
+    with _count_sql_statements(engine) as counts:
+        state.set_api_access_token_ids([], 'unused-token')
+
+    assert counts['n'] == 0, counts
+    assert _get_api_access_token_rows(engine) == []
+
+
+def test_set_api_access_token_ids_rolls_back_entire_batch(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            'CREATE TRIGGER reject_later_token_chunk '
+            'BEFORE INSERT ON api_access_tokens '
+            'WHEN NEW.job_id = 1001 '
+            "BEGIN SELECT RAISE(ABORT, 'rejected token'); END")
+
+    with pytest.raises(sqlalchemy.exc.DBAPIError, match='rejected token'):
+        state.set_api_access_token_ids(list(range(1, 1002)), 'shared-token')
+
+    assert _get_api_access_token_rows(engine) == []
 
 
 def test_get_job_controller_processes_batches_and_normalizes(

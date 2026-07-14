@@ -134,6 +134,8 @@ def _make_manager(service_name='svc', next_replica_id=1):
     mgr.latest_version = 1
     mgr._launch_thread_pool = {}
     mgr._down_thread_pool = {}
+    mgr._failed_cleanup_retry_attempts = {}
+    mgr._failed_cleanup_retry_at = {}
     mgr._tick_version_spec_cache = {}
     mgr._spot_placer = None
     mgr._pending_version = None
@@ -1399,6 +1401,235 @@ class TestLaunchReplicaSnapshotAccumulation:
         # Without a caller-provided snapshot each launch scans fresh state.
         assert mock_scan.call_count == 1
 
+    def test_recovery_preserves_exact_spot_location(self):
+        # A recovered spot row already owns its cluster name. Selecting a new
+        # location would create a resource mismatch and overwrite the only
+        # durable identity available to cleanup.
+        placer = mock.Mock()
+        manager = self._make_manager(placer)
+        resources_override = {
+            'cloud': 'AWS',
+            'region': 'ap-northeast-1',
+            'zone': 'ap-northeast-1a',
+            'accelerators': {
+                'L4': 1
+            },
+            'use_spot': True,
+        }
+        persisted = []
+
+        with mock.patch('sky.serve.replica_managers._should_use_spot',
+                        return_value=True), \
+             mock.patch.object(manager,
+                               '_persist_replica',
+                               side_effect=lambda _rid, info: persisted.append(
+                                   info)), \
+             mock.patch(
+                 'sky.serve.replica_managers.serve_utils'
+                 '.generate_replica_launch_log_file_name',
+                 return_value='/tmp/launch.log'), \
+             mock.patch('sky.serve.replica_managers._get_resources_ports',
+                        return_value='8080'), \
+             mock.patch('sky.serve.replica_managers.thread_utils.SafeThread'):
+            manager._launch_replica(replica_id=1463,
+                                    resources_override=resources_override,
+                                    existing_replica_infos=[],
+                                    recovering_existing_replica=True)
+
+        placer.select_next_location.assert_not_called()
+        placer.select_next_zero_cost_location.assert_not_called()
+        assert len(persisted) == 1
+        assert persisted[0].resources_override == resources_override
+        assert persisted[0].get_spot_location() == (
+            replica_managers.spot_placer.Location.from_resources_override(
+                resources_override))
+
+
+class TestFailedCleanupReconciliation:
+
+    @staticmethod
+    def _info(replica_id=1, version=1):
+        info = replica_managers.ReplicaInfo(replica_id, f'svc-{replica_id}',
+                                            '8080', False, None, version, None)
+        info.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.SUCCEEDED)
+        return info
+
+    @pytest.mark.parametrize('terminal_kind', [
+        'scale_down',
+        'purge',
+        'preempted',
+        'outdated',
+        'spot_availability',
+    ])
+    def test_failed_down_never_removes_durable_row(self, terminal_kind):
+        manager = _make_manager()
+        info = self._info(version=0 if terminal_kind == 'outdated' else 1)
+        if terminal_kind == 'scale_down':
+            info.status_property.is_scale_down = True
+        elif terminal_kind == 'purge':
+            info.status_property.purged = True
+        elif terminal_kind == 'preempted':
+            info.status_property.preempted = True
+        elif terminal_kind == 'spot_availability':
+            info.status_property.failed_spot_availability = True
+
+        with mock.patch.object(manager, '_persist_replica') as persist, \
+             mock.patch.object(manager, '_remove_replica') as remove, \
+             mock.patch('sky.serve.replica_managers.time.monotonic',
+                        return_value=100):
+            manager._handle_sky_down_finish(info, 'provider error')
+
+        persist.assert_called_once_with(1, info)
+        remove.assert_not_called()
+        assert (info.status_property.sky_down_status ==
+                common_utils.ProcessStatus.FAILED)
+        assert manager._failed_cleanup_retry_attempts == {1: 1}
+        assert manager._failed_cleanup_retry_at == {1: 160}
+
+    def test_raw_preempted_down_failure_is_reconciled(self):
+        # PREEMPTED intentionally wins derived status, so retry eligibility
+        # must also inspect the raw failed-down field.
+        manager = _make_manager()
+        info = self._info()
+        info.status_property.preempted = True
+        info.status_property.sky_down_status = common_utils.ProcessStatus.FAILED
+        assert info.status == replica_managers.serve_state.ReplicaStatus.PREEMPTED
+
+        with mock.patch.object(manager, '_terminate_replica') as terminate, \
+             mock.patch('sky.serve.replica_managers.time.monotonic',
+                        return_value=100):
+            manager._reconcile_failed_cleanup([info])
+
+        terminate.assert_called_once_with(1,
+                                          sync_down_logs=False,
+                                          replica_drain_delay_seconds=0,
+                                          is_scale_down=True,
+                                          purge=False,
+                                          in_flight_drain_cap_seconds=0)
+
+    def test_cleanup_retry_respects_capped_backoff_deadline(self):
+        manager = _make_manager()
+        info = self._info()
+        info.status_property.sky_down_status = common_utils.ProcessStatus.FAILED
+        manager._failed_cleanup_retry_at[1] = 200
+
+        with mock.patch.object(manager, '_terminate_replica') as terminate, \
+             mock.patch('sky.serve.replica_managers.time.monotonic',
+                        side_effect=[199, 200]):
+            manager._reconcile_failed_cleanup([info])
+            terminate.assert_not_called()
+            manager._reconcile_failed_cleanup([info])
+
+        terminate.assert_called_once()
+
+    def test_cleanup_retry_delay_is_capped(self):
+        manager = _make_manager()
+        manager._failed_cleanup_retry_attempts[1] = 100
+
+        with mock.patch('sky.serve.replica_managers.time.monotonic',
+                        return_value=100):
+            manager._schedule_failed_cleanup_retry(1)
+
+        assert manager._failed_cleanup_retry_attempts == {1: 101}
+        assert manager._failed_cleanup_retry_at == {
+            1: 100 + replica_managers._FAILED_CLEANUP_RETRY_MAX_SECONDS
+        }
+
+    def test_successful_absent_cleanup_clears_retry_and_removes_old_row(self):
+        manager = _make_manager()
+        info = self._info(version=0)
+        info.status_property.sky_down_status = common_utils.ProcessStatus.FAILED
+        manager._failed_cleanup_retry_attempts[1] = 3
+        manager._failed_cleanup_retry_at[1] = 500
+
+        with mock.patch.object(manager, '_persist_replica') as persist, \
+             mock.patch.object(manager, '_remove_replica') as remove:
+            manager._handle_sky_down_finish(info, format_exc=None)
+
+        remove.assert_called_once_with(1)
+        persist.assert_not_called()
+        assert not manager._failed_cleanup_retry_attempts
+        assert not manager._failed_cleanup_retry_at
+
+    def test_synchronous_reconcile_error_is_backed_off(self):
+        manager = _make_manager()
+        info = self._info()
+        info.status_property.sky_down_status = common_utils.ProcessStatus.FAILED
+
+        with mock.patch.object(manager,
+                               '_terminate_replica',
+                               side_effect=RuntimeError('database error')), \
+             mock.patch('sky.serve.replica_managers.time.monotonic',
+                        side_effect=[100, 100]):
+            manager._reconcile_failed_cleanup([info])
+
+        assert manager._failed_cleanup_retry_attempts == {1: 1}
+        assert manager._failed_cleanup_retry_at == {1: 160}
+
+    def test_finished_down_worker_survives_completion_persist_error(self):
+        manager = _make_manager()
+        manager._is_pool = False
+        manager.least_recent_version = 1
+        manager._replica_to_request_id = thread_utils.ThreadSafeDict()
+        manager._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
+        manager._launch_thread_pool = thread_utils.ThreadSafeDict()
+        manager._down_thread_pool = thread_utils.ThreadSafeDict()
+        down_thread = mock.Mock()
+        down_thread.is_alive.return_value = False
+        down_thread.format_exc = 'provider error'
+        manager._down_thread_pool[1] = down_thread
+        info = self._info()
+        info.status_property.sky_down_status = common_utils.ProcessStatus.RUNNING
+
+        with mock.patch.object(manager, '_refresh_wait_for_idle'), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos_from_ids',
+                               side_effect=lambda _service, ids:
+                               ({1: info} if ids else {})), \
+             mock.patch.object(manager,
+                               '_persist_replica',
+                               side_effect=RuntimeError('database error')), \
+             pytest.raises(RuntimeError, match='database error'):
+            manager._refresh_thread_pool()
+
+        assert manager._down_thread_pool[1] is down_thread
+
+    def test_log_sync_failure_does_not_block_cleanup(self):
+        manager = _make_manager()
+        manager._is_pool = False
+        manager._resource_scope = None
+        manager._down_thread_pool = thread_utils.ThreadSafeDict()
+        info = self._info()
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_info_from_id',
+                               return_value=info), \
+             mock.patch.object(replica_managers.serve_utils,
+                               'generate_replica_log_file_name',
+                               return_value='/tmp/replica.log'), \
+             mock.patch.object(replica_managers.serve_utils,
+                               'generate_replica_launch_log_file_name',
+                               return_value='/tmp/launch.log'), \
+             mock.patch('sky.serve.replica_managers.os.path.exists',
+                        return_value=True), \
+             mock.patch('builtins.open', side_effect=OSError('disk error')), \
+             mock.patch.object(replica_managers.global_user_state,
+                               'cluster_with_name_exists',
+                               return_value=True), \
+             mock.patch.object(manager, '_persist_replica') as persist, \
+             mock.patch('sky.serve.replica_managers.thread_utils.SafeThread',
+                        return_value=mock.Mock()) as safe_thread:
+            manager._terminate_replica(1,
+                                       sync_down_logs=True,
+                                       replica_drain_delay_seconds=0)
+
+        persist.assert_called_once_with(1, info)
+        safe_thread.assert_called_once()
+        assert 1 in manager._down_thread_pool
+        assert (info.status_property.sky_down_status ==
+                common_utils.ProcessStatus.SCHEDULED)
+
 
 class TestZeroCostDemandProbeBudget:
 
@@ -1644,9 +1875,11 @@ class TestRecoveryRetryAndIsolation:
         def _launch(replica_id,
                     resources_override=None,
                     existing_replica_infos=None,
-                    prior_reserved_fill=False):
+                    prior_reserved_fill=False,
+                    recovering_existing_replica=False):
             del resources_override, existing_replica_infos
             del prior_reserved_fill
+            assert recovering_existing_replica
             if replica_id == 2:
                 raise RuntimeError('boom')
             launched.append(replica_id)
@@ -1809,13 +2042,20 @@ class TestRecoverySingleSnapshot:
             replica_managers.serve_state.ReplicaStatus.PROVISIONING)
         infos[0].resources_override = None
         seen_snapshots = []
+        seen_recovery_modes = []
+
+        def _launch(_replica_id,
+                    existing_replica_infos=None,
+                    recovering_existing_replica=False,
+                    **_kwargs):
+            seen_snapshots.append(existing_replica_infos)
+            seen_recovery_modes.append(recovering_existing_replica)
+
         with mock.patch(
                 'sky.serve.replica_managers.serve_state.get_replica_infos',
                 return_value=infos), \
-             mock.patch.object(
-                 mgr, '_launch_replica',
-                 side_effect=lambda replica_id, existing_replica_infos=None,
-                 **_: seen_snapshots.append(existing_replica_infos)):
+             mock.patch.object(mgr, '_launch_replica', side_effect=_launch):
             mgr._recover_replica_operations()
         assert seen_snapshots == [infos]
         assert seen_snapshots[0] is infos
+        assert seen_recovery_modes == [True]

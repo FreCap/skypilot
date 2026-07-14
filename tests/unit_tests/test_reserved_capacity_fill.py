@@ -1223,6 +1223,50 @@ class TestCostFeasibilityDegradation(unittest.TestCase):
         # Not memoized: a transient K8s API blip heals on the next call.
         self.assertEqual(placer.location2cost, {})
 
+    def test_missing_spot_price_does_not_block_zero_cost_enumeration(self):
+        placer = spot_placer.DynamicFallbackSpotPlacer.__new__(
+            spot_placer.DynamicFallbackSpotPlacer)
+        free = _make_location('research-ctx', 'free')
+        missing_price = _make_location('paid-region', 'missing-price')
+        placer.location2status = {
+            free: spot_placer.LocationStatus.ACTIVE,
+            missing_price: spot_placer.LocationStatus.ACTIVE,
+        }
+        placer.location2cost = {free: 0.0}
+        placer.num_nodes = 1
+        placer.resources = mock.Mock()
+        feasible = mock.Mock()
+        resource = mock.Mock()
+        resource.get_cost.side_effect = ValueError(
+            "No SpotPrice found for instance type 'gr6.8xlarge'.")
+        feasible.resources_list = [resource]
+        copied = mock.Mock()
+        copied.cloud.get_feasible_launchable_resources.return_value = feasible
+        placer.resources.copy.return_value = copied
+
+        self.assertEqual(placer.zero_cost_locations(), [free])
+        self.assertEqual(placer.location2cost[missing_price], float('inf'))
+
+    def test_missing_price_candidate_does_not_hide_priced_candidate(self):
+        placer = spot_placer.DynamicFallbackSpotPlacer.__new__(
+            spot_placer.DynamicFallbackSpotPlacer)
+        placer.location2cost = {}
+        placer.num_nodes = 1
+        placer.resources = mock.Mock()
+        missing = mock.Mock()
+        missing.get_cost.side_effect = ValueError('No SpotPrice found.')
+        priced = mock.Mock()
+        priced.get_cost.return_value = 0.42
+        feasible = mock.Mock()
+        feasible.resources_list = [missing, priced]
+        copied = mock.Mock()
+        copied.cloud.get_feasible_launchable_resources.return_value = feasible
+        placer.resources.copy.return_value = copied
+        location = _make_location('paid-region', 'mixed-prices')
+
+        self.assertEqual(placer._get_cost_per_hour_cached(location), 0.42)
+        self.assertEqual(placer.location2cost[location], 0.42)
+
 
 def _feed_broker(autoscaler,
                  free_slots,

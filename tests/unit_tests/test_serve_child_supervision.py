@@ -21,6 +21,21 @@ class TestBackoff:
         assert huge == service._CHILD_RESPAWN_BACKOFF_CAP_SECONDS
 
 
+class TestControllerUnresponsiveGrace:
+
+    def test_live_child_is_not_replaced_before_grace(self):
+        grace = service._CHILD_UNRESPONSIVE_GRACE_SECONDS
+        assert not service._live_child_unresponsive_too_long(
+            100.0, 100.0 + grace - 0.001)
+
+    def test_live_child_is_replaced_at_grace(self):
+        grace = service._CHILD_UNRESPONSIVE_GRACE_SECONDS
+        assert service._live_child_unresponsive_too_long(100.0, 100.0 + grace)
+
+    def test_healthy_child_has_no_unresponsive_deadline(self):
+        assert not service._live_child_unresponsive_too_long(None, 10_000.0)
+
+
 class TestControllerHealth:
 
     def test_bounded_health_check(self):
