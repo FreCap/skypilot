@@ -74,11 +74,10 @@ _WAIT_LAUNCH_THREAD_TIMEOUT_SECONDS = 15
 # can bench an unavailable location.  Without a bound, a zero-cost-first
 # placer can pin the entire wave (hundreds of replicas) to one full Kubernetes
 # pool, so every launch fails before the next tick can spill to paid spot.
-# Keep a few probes in flight per ACTIVE zero-cost shape; additional demand
-# uses the placer's paid candidates until a probe materializes or fails.  Four
-# matches SkyServe's historical per-service launch parallelism and is enough to
-# fill genuinely free capacity in parallel without multiplying a stale
-# availability assumption across the fleet.
+# Large waves replace this fixed assumption with one measured free-capacity
+# snapshot.  Keep a few probes per ACTIVE zero-cost shape only for small waves
+# (where a cluster-wide query costs more than it saves) or a measurement
+# blackout. Four matches SkyServe's historical per-service launch parallelism.
 _ZERO_COST_SPECULATIVE_LAUNCHES_PER_LOCATION = 4
 
 # Sentinel for to_info_dict's pre-fetched cluster_record
@@ -87,6 +86,14 @@ _ZERO_COST_SPECULATIVE_LAUNCHES_PER_LOCATION = 4
 # batched fetch path while preserving the existing self-fetch behavior for
 # back-compat callers like ReplicaInfo.__repr__.
 _NOT_PROVIDED: Any = object()
+
+
+@dataclasses.dataclass
+class _ZeroCostDemandBudget:
+    """One scale-up batch's measured placement budget by K8s context."""
+
+    remaining_by_context: dict[str, int]
+    measured_by_context: dict[str, int | None]
 
 
 def _remove_nonmaterial_empty_storage_scope_metadata(
@@ -1706,6 +1713,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         resources_override: dict[str, Any] | None = None,
         existing_replica_infos: list['ReplicaInfo'] | None = None,
         prior_reserved_fill: bool = False,
+        zero_cost_demand_budget: _ZeroCostDemandBudget | None = None,
     ) -> bool:
         """Enqueue one replica launch.
 
@@ -1838,13 +1846,21 @@ class SkyPilotReplicaManager(ReplicaManager):
                         'no ACTIVE zero-cost location available')
                     return False
                 location = zero_cost_location
-            elif (self._demand_should_skip_zero_cost(existing_replica_infos) or
-                  self._demand_should_skip_saturated_zero_cost(
-                      existing_replica_infos)):
+            elif self._demand_should_skip_zero_cost(existing_replica_infos):
                 # The broker grant or speculative-probe budget says this
                 # demand launch should compete on paid capacity instead of
                 # preferring the zero-cost tier.  The placer falls back to
                 # zero-cost when no paid candidate exists.
+                location = self._spot_placer.select_next_location(
+                    current_spot_locations, skip_zero_cost_preference=True)
+            elif zero_cost_demand_budget is not None:
+                location = self._select_budgeted_zero_cost_location(
+                    current_spot_locations, zero_cost_demand_budget)
+                if location is None:
+                    location = self._spot_placer.select_next_location(
+                        current_spot_locations, skip_zero_cost_preference=True)
+            elif self._demand_should_skip_saturated_zero_cost(
+                    existing_replica_infos):
                 location = self._spot_placer.select_next_location(
                     current_spot_locations, skip_zero_cost_preference=True)
             else:
@@ -1998,6 +2014,117 @@ class SkyPilotReplicaManager(ReplicaManager):
                 holdings += 1
         return holdings >= grant
 
+    def _select_budgeted_zero_cost_location(
+            self, current_locations: list[spot_placer.Location],
+            budget: _ZeroCostDemandBudget) -> spot_placer.Location | None:
+        """Reserve and select one location from a measured batch budget."""
+        if self._spot_placer is None:
+            return None
+        allowed = {
+            location for location in self._spot_placer.zero_cost_locations()
+            if budget.remaining_by_context.get(location.region, 0) > 0
+        }
+        if not allowed:
+            return None
+        location = self._spot_placer.select_next_zero_cost_location(
+            current_locations, allowed_locations=allowed)
+        if location is None:
+            return None
+        remaining = budget.remaining_by_context[location.region]
+        assert remaining > 0, (location, budget)
+        budget.remaining_by_context[location.region] = remaining - 1
+        return location
+
+    def _build_zero_cost_demand_budget(
+        self, existing_replica_infos: list['ReplicaInfo'],
+        resources_overrides: list[dict[str, Any] | None]
+    ) -> _ZeroCostDemandBudget | None:
+        """Snapshot free GPUs once for a large zero-cost-first demand wave.
+
+        Small waves retain the bounded speculative path: issuing an expensive
+        cluster-wide pod listing to place at most the existing probe allowance
+        would add API load without reducing it.  Large waves measure every
+        active Kubernetes context once and reserve no more than the observed
+        free slots.  PENDING rows are subtracted because they have not entered
+        ``sky.launch`` yet and therefore cannot appear in the Kubernetes pod
+        snapshot.
+
+        A failed measurement falls back to the fixed per-location probe
+        allowance.  A successful zero is authoritative for this batch and
+        sends demand directly to paid fallback.
+        """
+        if self._spot_placer is None:
+            return None
+        demand_count = sum(
+            resources_override is None or serve_constants.
+            RESERVED_CAPACITY_FILL_OVERRIDE_KEY not in resources_override
+            for resources_override in resources_overrides)
+        if demand_count <= _ZERO_COST_SPECULATIVE_LAUNCHES_PER_LOCATION:
+            return None
+        active = set(self._spot_placer.active_locations())
+        all_zero_cost = self._spot_placer.zero_cost_locations()
+        zero_cost = [
+            location for location in all_zero_cost if location in active and
+            str(location.cloud).lower() == 'kubernetes'
+        ]
+        paid = [
+            location for location in active if location not in all_zero_cost
+        ]
+        if not zero_cost or not paid:
+            return None
+        fallback_limit = (_ZERO_COST_SPECULATIVE_LAUNCHES_PER_LOCATION *
+                          len(zero_cost))
+        if demand_count <= fallback_limit:
+            return None
+
+        measured = reserved_capacity.query_free_slots_by_context(zero_cost)
+        active_count_by_context: dict[str, int] = {}
+        for location in zero_cost:
+            active_count_by_context[location.region] = (
+                active_count_by_context.get(location.region, 0) + 1)
+
+        pending_by_context: dict[str, int] = {}
+        for info in existing_replica_infos:
+            if info.status != serve_state.ReplicaStatus.PENDING:
+                continue
+            replica_location = info.get_spot_location()
+            if replica_location is None:
+                continue
+            if any(
+                    spot_placer.locations_match_placement(
+                        replica_location, candidate)
+                    for candidate in zero_cost):
+                pending_by_context[replica_location.region] = (
+                    pending_by_context.get(replica_location.region, 0) + 1)
+
+        remaining: dict[str, int] = {}
+        for context_name, location_count in active_count_by_context.items():
+            free_slots = measured.get(context_name)
+            if free_slots is None:
+                allowance = (_ZERO_COST_SPECULATIVE_LAUNCHES_PER_LOCATION *
+                             location_count)
+                unresolved = 0
+                for info in existing_replica_infos:
+                    if info.is_terminal or info.is_ready:
+                        continue
+                    replica_location = info.get_spot_location()
+                    if (replica_location is None or
+                            replica_location.region != context_name):
+                        continue
+                    if any(
+                            spot_placer.locations_match_placement(
+                                replica_location, candidate)
+                            for candidate in zero_cost):
+                        unresolved += 1
+                remaining[context_name] = max(0, allowance - unresolved)
+            else:
+                remaining[context_name] = max(
+                    0, free_slots - pending_by_context.get(context_name, 0))
+        logger.info('Zero-cost demand capacity snapshot: measured='
+                    f'{measured}, pending={pending_by_context}, '
+                    f'batch_budget={remaining}, demand={demand_count}.')
+        return _ZeroCostDemandBudget(remaining, measured)
+
     def _demand_should_skip_saturated_zero_cost(
             self, existing_replica_infos: list['ReplicaInfo'] | None) -> bool:
         """Bound speculative demand launches into zero-cost locations.
@@ -2065,7 +2192,9 @@ class SkyPilotReplicaManager(ReplicaManager):
     def _scale_up_one_locked(
             self,
             resources_override: dict[str, Any] | None,
-            existing_replica_infos: list['ReplicaInfo'] | None = None) -> None:
+            existing_replica_infos: list['ReplicaInfo'] | None = None,
+            zero_cost_demand_budget: _ZeroCostDemandBudget | None = None
+    ) -> None:
         """Allocate an id and enqueue one replica launch. Lock must be held."""
         # Defensive: never hand `_launch_replica` an id that still has a
         # durable replica row. `add_or_update_replica` is an upsert keyed on
@@ -2087,10 +2216,14 @@ class SkyPilotReplicaManager(ReplicaManager):
             launched = self._launch_replica(self._next_replica_id,
                                             resources_override)
         else:
-            launched = self._launch_replica(
-                self._next_replica_id,
-                resources_override,
-                existing_replica_infos=existing_replica_infos)
+            launch_kwargs: dict[str, Any] = {
+                'existing_replica_infos': existing_replica_infos
+            }
+            if zero_cost_demand_budget is not None:
+                launch_kwargs['zero_cost_demand_budget'] = (
+                    zero_cost_demand_budget)
+            launched = self._launch_replica(self._next_replica_id,
+                                            resources_override, **launch_kwargs)
         if launched:
             self._next_replica_id += 1
 
@@ -2126,6 +2259,10 @@ class SkyPilotReplicaManager(ReplicaManager):
         if self._batch_needs_placement_snapshot(resources_overrides):
             existing_replica_infos = serve_state.get_replica_infos(
                 self._service_name)
+        zero_cost_demand_budget = None
+        if existing_replica_infos is not None:
+            zero_cost_demand_budget = self._build_zero_cost_demand_budget(
+                existing_replica_infos, resources_overrides)
         for resources_override in resources_overrides:
             pending_version = getattr(self, '_pending_version', None)
             if (pending_version is not None and
@@ -2135,7 +2272,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                             f'{pending_version} is waiting to be applied.')
                 break
             self._scale_up_one_locked(resources_override,
-                                      existing_replica_infos)
+                                      existing_replica_infos,
+                                      zero_cost_demand_budget)
 
     def notify_version_pending(self, version: int) -> None:
         pending_version = getattr(self, '_pending_version', None)

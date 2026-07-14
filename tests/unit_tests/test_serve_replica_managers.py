@@ -1464,6 +1464,102 @@ class TestZeroCostDemandProbeBudget:
             infos.append(self._info(active_zero))
             assert manager._demand_should_skip_saturated_zero_cost(infos)
 
+    @staticmethod
+    def _location(cloud, region, gpu, *, use_spot):
+        return replica_managers.spot_placer.Location.from_pickleable({
+            'cloud': cloud,
+            'region': region,
+            'zone': None,
+            'accelerators': {
+                gpu: 1
+            },
+            'use_spot': use_spot,
+        })
+
+    def test_large_batch_uses_all_223_measured_slots_then_spills(self):
+        zero_a = self._location('Kubernetes',
+                                'research-ctx',
+                                'A100',
+                                use_spot=False)
+        zero_b = self._location('Kubernetes',
+                                'research-ctx',
+                                'A100-80GB',
+                                use_spot=False)
+        paid = self._location('AWS', 'us-east-1', 'L4', use_spot=True)
+        manager = self._manager([zero_a, zero_b], [zero_a, zero_b, paid])
+        manager._spot_placer.select_next_zero_cost_location.side_effect = (
+            lambda _current, allowed_locations: next(iter(allowed_locations)))
+
+        with mock.patch.object(replica_managers.reserved_capacity,
+                               'query_free_slots_by_context',
+                               return_value={'research-ctx': 223}) as query:
+            budget = manager._build_zero_cost_demand_budget([], [None] * 500)
+
+        assert budget is not None
+        assert budget.remaining_by_context == {'research-ctx': 223}
+        for _ in range(223):
+            assert manager._select_budgeted_zero_cost_location(
+                [], budget) in (zero_a, zero_b)
+        assert manager._select_budgeted_zero_cost_location([], budget) is None
+        query.assert_called_once_with([zero_a, zero_b])
+
+    def test_pending_rows_are_debited_from_measured_free_slots(self):
+        zero = self._location('Kubernetes',
+                              'research-ctx',
+                              'A100',
+                              use_spot=False)
+        paid = self._location('AWS', 'us-east-1', 'L4', use_spot=True)
+        manager = self._manager([zero], [zero, paid])
+        pending = [self._info(zero) for _ in range(3)]
+        for info in pending:
+            info.status = replica_managers.serve_state.ReplicaStatus.PENDING
+
+        with mock.patch.object(replica_managers.reserved_capacity,
+                               'query_free_slots_by_context',
+                               return_value={'research-ctx': 223}):
+            budget = manager._build_zero_cost_demand_budget(
+                pending, [None] * 500)
+
+        assert budget is not None
+        assert budget.remaining_by_context == {'research-ctx': 220}
+
+    def test_measurement_blackout_falls_back_to_probe_budget(self):
+        zero = self._location('Kubernetes',
+                              'research-ctx',
+                              'A100',
+                              use_spot=False)
+        paid = self._location('AWS', 'us-east-1', 'L4', use_spot=True)
+        manager = self._manager([zero], [zero, paid])
+        unresolved = [self._info(zero) for _ in range(2)]
+        for info in unresolved:
+            info.status = replica_managers.serve_state.ReplicaStatus.PROVISIONING
+
+        with mock.patch.object(replica_managers.reserved_capacity,
+                               'query_free_slots_by_context',
+                               return_value={'research-ctx': None}):
+            budget = manager._build_zero_cost_demand_budget(
+                unresolved, [None] * 500)
+
+        assert budget is not None
+        assert budget.remaining_by_context == {'research-ctx': 2}
+
+    def test_successful_zero_snapshot_does_not_speculate(self):
+        zero = self._location('Kubernetes',
+                              'research-ctx',
+                              'A100',
+                              use_spot=False)
+        paid = self._location('AWS', 'us-east-1', 'L4', use_spot=True)
+        manager = self._manager([zero], [zero, paid])
+
+        with mock.patch.object(replica_managers.reserved_capacity,
+                               'query_free_slots_by_context',
+                               return_value={'research-ctx': 0}):
+            budget = manager._build_zero_cost_demand_budget([], [None] * 500)
+
+        assert budget is not None
+        assert budget.remaining_by_context == {'research-ctx': 0}
+        assert manager._select_budgeted_zero_cost_location([], budget) is None
+
 
 class TestRecoveryRetryAndIsolation:
     """A failed recovery pass must retry (previously a recovery exception

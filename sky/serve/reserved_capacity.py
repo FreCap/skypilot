@@ -152,6 +152,61 @@ def query_free_slots(
     return total
 
 
+def query_free_slots_by_context(
+    zero_cost_locations: list['spot_placer_lib.Location']
+) -> dict[str, int | None]:
+    """Measure free replica slots with one cluster query per context.
+
+    Demand placement can contain several Kubernetes accelerator shapes in the
+    same context.  Calling :func:`query_pool_observation` once per shape would
+    repeat the expensive cluster-wide pod listing for every shape.  Fetch all
+    accelerator availability in a context once, then project that snapshot
+    onto the shapes the placer can actually use.
+
+    ``None`` means the context could not be measured.  A missing accelerator
+    key is a successful zero-capacity observation, while a negative value is
+    the catalog's explicit unknown-availability sentinel.
+    """
+    shapes_by_context: dict[str, dict[str, int]] = {}
+    for (context, gpu_name
+        ), per_replica in zero_cost_pool_shapes(zero_cost_locations).items():
+        shapes_by_context.setdefault(context, {})[gpu_name] = per_replica
+
+    result: dict[str, int | None] = {}
+    for context, shapes in shapes_by_context.items():
+        try:
+            _, _, available = kubernetes_catalog.list_accelerators_realtime(
+                gpus_only=True,
+                name_filter=None,
+                region_filter=context,
+                quantity_filter=None,
+                case_sensitive=False,
+                require_price=False)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning('Zero-cost demand capacity query failed for '
+                           f'context {context!r}: '
+                           f'{common_utils.format_exception(e)}')
+            result[context] = None
+            continue
+
+        available_lower = {
+            str(gpu_name).lower(): count
+            for gpu_name, count in available.items()
+        }
+        requested_counts = [
+            available_lower.get(gpu_name, 0) for gpu_name in shapes
+        ]
+        if any(count < 0 for count in requested_counts):
+            logger.warning('Zero-cost demand capacity is unknown for '
+                           f'context {context!r} ({available}).')
+            result[context] = None
+            continue
+        result[context] = sum(
+            max(0, available_lower.get(gpu_name, 0)) // per_replica
+            for gpu_name, per_replica in shapes.items())
+    return result
+
+
 def _standalone_cycle(autoscaler: 'autoscalers.Autoscaler',
                       zero_cost: list['spot_placer_lib.Location'],
                       keys: list[dict[str, Any]]) -> None:

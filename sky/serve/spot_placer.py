@@ -598,19 +598,24 @@ class SpotPlacer:
         ]
 
     def select_next_zero_cost_location(
-            self, current_locations: list[Location]) -> Location | None:
+            self,
+            current_locations: list[Location],
+            allowed_locations: set[Location] | None = None) -> Location | None:
         """Select among zero-cost ACTIVE locations only; None when none is.
 
         The no-spill guarantee of reserved-capacity fill: a fill launch
         either lands on a zero-cost location or does not happen at all, so
         this deliberately does NOT fall back to paid locations (unlike
-        select_next_location). Uses effective status, so a benched
+        select_next_location). ``allowed_locations`` can further restrict a
+        measured batch to contexts whose free-slot budget remains. Uses
+        effective status, so a benched
         zero-cost location whose TTL expired is selectable again -- and
         its retry budget is consumed on selection like any other probe.
         """
         candidates = [
             location for location in self.zero_cost_locations()
-            if self._effective_status(location) == LocationStatus.ACTIVE
+            if self._effective_status(location) == LocationStatus.ACTIVE and
+            (allowed_locations is None or location in allowed_locations)
         ]
         if not candidates:
             return None
