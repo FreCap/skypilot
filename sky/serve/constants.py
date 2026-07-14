@@ -223,15 +223,17 @@ LB_REQUEST_QUEUE_MAX_CONCURRENCY = 32
 LB_REQUEST_QUEUE_TIMEOUT_SECONDS = 120
 LB_REQUEST_QUEUE_MAX_BODY_BYTES = 1 * 1024 * 1024
 # Hard configuration ceilings, calibrated below the external LB's default
-# 512Mi memory limit. The aggregate body budget leaves room for transient
-# bytearray->bytes copies, queued ASGI receive buffers, clients, and Python.
-# One waiter retains only the ASGI request envelope: request bodies are read
-# after dispatch admission. 3,000 supports a three-deep waiting room at the
-# 1,000-replica service ceiling while remaining a finite operator-set bound.
+# 512Mi memory limit. Admitted requests are bounded by max_concurrency times
+# max_request_body_bytes. Bodies read before admission share a separate runtime
+# budget based on their actual sizes, preserving large queues of small requests
+# without allowing worst-case payloads to exhaust the process.
+# 3,000 supports a three-deep waiting room at the 1,000-replica service ceiling
+# while remaining a finite operator-set bound.
 LB_REQUEST_QUEUE_MAX_SIZE_LIMIT = 3000
 LB_REQUEST_QUEUE_MAX_CONCURRENCY_LIMIT = 128
 LB_REQUEST_QUEUE_MAX_BODY_BYTES_LIMIT = 16 * 1024 * 1024
 LB_REQUEST_QUEUE_BODY_MEMORY_BUDGET_BYTES = 128 * 1024 * 1024
+LB_REQUEST_QUEUE_WAITING_BODY_MEMORY_BUDGET_BYTES = 128 * 1024 * 1024
 
 # The timeout in seconds for load balancer to wait for a response from replica.
 # Large LLMs like Llama2-70b is able to process the request within ~30 seconds.

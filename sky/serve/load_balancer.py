@@ -34,6 +34,11 @@ _INFLIGHT_ATTR = '_sky_inflight_requests'
 # been assigned to a concrete replica. It closes the short scheduling gap
 # between the fleet-wide admission decision and per-replica slot reservation.
 _OCCUPANCY_ADMISSION_ATTR = '_sky_occupancy_admission_unassigned'
+# Request-local ownership for bodies cached before queue admission. The byte
+# reservation is transferred out of the waiting budget once dispatch admission
+# succeeds; the active-concurrency budget covers it from that point onward.
+_BOUNDED_REQUEST_BODY_ATTR = '_skyserve_bounded_body'
+_WAITING_REQUEST_BODY_BYTES_ATTR = '_skyserve_waiting_body_bytes'
 
 # HTTP semantics define these methods as idempotent: replay after an ambiguous
 # transport failure cannot create a second logical operation. POST/PATCH are
@@ -89,8 +94,8 @@ class _ReleasingStreamingResponse(fastapi.responses.StreamingResponse):
         finally:
             await self._release()
 
-    def hold_admission_slot_until_complete(self, release: Any) -> None:
-        """Chain an idempotent admission release onto the ASGI lifetime."""
+    def hold_cleanup_until_complete(self, release: Any) -> None:
+        """Chain an idempotent owner cleanup onto the ASGI lifetime."""
         upstream_release = self._release
         released = False
 
@@ -99,9 +104,8 @@ class _ReleasingStreamingResponse(fastapi.responses.StreamingResponse):
             try:
                 await upstream_release()
             finally:
-                # The admission slot must be returned even when the upstream
-                # stream release raises, or dispatch capacity leaks for the
-                # lifetime of the load balancer.
+                # The chained owner must release even when upstream cleanup
+                # raises, or its resource leaks for the LB process lifetime.
                 if not released:
                     released = True
                     await release()
@@ -310,6 +314,7 @@ class SkyServeLoadBalancer:
     _request_queue_condition: asyncio.Condition | None = None
     _active_request_count: int = 0
     _waiting_request_count: int = 0
+    _waiting_request_body_bytes: int = 0
     _reject_last_seen: dict[str, float] | None = None
     _reject_fallback_seq: int = 0
     _capacity_hint: dict[str, Any] | None = None
@@ -419,6 +424,7 @@ class SkyServeLoadBalancer:
         self._request_queue_condition = asyncio.Condition()
         self._active_request_count = 0
         self._waiting_request_count = 0
+        self._waiting_request_body_bytes = 0
         # TODO(tian): httpx.Client has a resource limit of 100 max connections
         # for each client. We should wait for feedback on the best max
         # connections.
@@ -912,12 +918,26 @@ class SkyServeLoadBalancer:
                 notification.add_done_callback(_forget_notification)
                 raise
 
+    def _release_waiting_body_budget(self,
+                                     request: fastapi.Request,
+                                     *,
+                                     drop_body: bool = False) -> None:
+        """Release one request's pre-admission body-byte reservation."""
+        request_state = vars(request)
+        reserved = request_state.pop(_WAITING_REQUEST_BODY_BYTES_ATTR, 0)
+        if reserved:
+            self._waiting_request_body_bytes = max(
+                0, self._waiting_request_body_bytes - reserved)
+        if drop_body:
+            request_state.pop(_BOUNDED_REQUEST_BODY_ATTR, None)
+
     async def _request_body(self, request: fastapi.Request) -> bytes:
         """Read a request body with the configured hard memory bound."""
         config = self._request_queue_config
         if config is None:
             return await request.body()
-        cached = getattr(request, '_skyserve_bounded_body', None)
+        request_state = vars(request)
+        cached = request_state.get(_BOUNDED_REQUEST_BODY_ATTR)
         if cached is not None:
             return cached
         limit = config['max_request_body_bytes']
@@ -932,16 +952,40 @@ class SkyServeLoadBalancer:
             except ValueError:
                 pass
         body = bytearray()
-        async for chunk in request.stream():
-            if len(body) + len(chunk) > limit:
-                raise fastapi.HTTPException(
-                    status_code=413,
-                    detail=f'Request body exceeds the {limit}-byte load '
-                    'balancer limit.')
-            body.extend(chunk)
-        result = bytes(body)
-        setattr(request, '_skyserve_bounded_body', result)
-        return result
+        reserved = 0
+        completed = False
+        try:
+            async for chunk in request.stream():
+                if len(body) + len(chunk) > limit:
+                    raise fastapi.HTTPException(
+                        status_code=413,
+                        detail=f'Request body exceeds the {limit}-byte load '
+                        'balancer limit.')
+                next_total = self._waiting_request_body_bytes + len(chunk)
+                waiting_budget = (
+                    constants.LB_REQUEST_QUEUE_WAITING_BODY_MEMORY_BUDGET_BYTES)
+                if next_total > waiting_budget:
+                    self._record_rejection(request)
+                    raise fastapi.HTTPException(
+                        status_code=503,
+                        detail=('Load balancer request-body buffer is full '
+                                f'({waiting_budget} bytes).'),
+                        headers={
+                            'Retry-After': str(
+                                constants.LB_503_RETRY_AFTER_SECONDS)
+                        })
+                self._waiting_request_body_bytes = next_total
+                reserved += len(chunk)
+                body.extend(chunk)
+            result = bytes(body)
+            request_state[_BOUNDED_REQUEST_BODY_ATTR] = result
+            request_state[_WAITING_REQUEST_BODY_BYTES_ATTR] = reserved
+            completed = True
+            return result
+        finally:
+            if not completed and reserved:
+                self._waiting_request_body_bytes = max(
+                    0, self._waiting_request_body_bytes - reserved)
 
     def _is_ready_to_serve(self) -> bool:
         """Readiness: true only once synced at least once and not draining."""
@@ -2251,6 +2295,7 @@ class SkyServeLoadBalancer:
         self._queue_depth += 1
         acquired_slot = False
         had_admission_slot = False
+        body_cleanup_transferred = False
         try:
             # Cache the bounded body before the queue starts polling the ASGI
             # receive channel for disconnects. This also rejects oversized
@@ -2259,12 +2304,26 @@ class SkyServeLoadBalancer:
                 await self._request_body(request)
             acquired_slot = await self._acquire_request_slot(request)
             had_admission_slot = acquired_slot
+            if acquired_slot:
+                # The configured active-concurrency budget owns the body now.
+                self._release_waiting_body_budget(request)
             response = await self._proxy_with_retries_inner(request)
             if (acquired_slot and
                     isinstance(response, _ReleasingStreamingResponse)):
-                response.hold_admission_slot_until_complete(
+                response.hold_cleanup_until_complete(
                     lambda: self._release_request_slot(request))
                 acquired_slot = False
+            if (vars(request).get(_WAITING_REQUEST_BODY_BYTES_ATTR, 0) and
+                    isinstance(response, _ReleasingStreamingResponse)):
+
+                async def _release_body() -> None:
+                    self._release_waiting_body_budget(request, drop_body=True)
+
+                # A live update may disable queueing between body buffering and
+                # admission. Keep that body's bytes charged until its streaming
+                # response releases the underlying httpx request owner.
+                response.hold_cleanup_until_complete(_release_body)
+                body_cleanup_transferred = True
             return response
         finally:
             try:
@@ -2284,9 +2343,14 @@ class SkyServeLoadBalancer:
                     if released_admission:
                         await self._notify_request_queue()
             finally:
-                # Admission notification is itself cancellable. The demand
-                # gauge must still balance on every exit.
-                self._queue_depth -= 1
+                try:
+                    if not body_cleanup_transferred:
+                        self._release_waiting_body_budget(request,
+                                                          drop_body=True)
+                finally:
+                    # Admission notification is itself cancellable. The demand
+                    # gauge must still balance on every exit.
+                    self._queue_depth -= 1
 
     async def _proxy_with_retries_inner(
             self, request: fastapi.Request) -> fastapi.responses.Response:

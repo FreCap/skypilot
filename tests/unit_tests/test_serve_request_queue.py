@@ -9,6 +9,7 @@ from unittest import mock
 import fastapi
 import pytest
 
+from sky.serve import constants
 from sky.serve import load_balancer
 from sky.serve import load_balancing_policies
 from sky.serve import service_spec as service_spec_lib
@@ -944,7 +945,7 @@ def test_streaming_response_holds_admission_until_asgi_release():
 
         response = load_balancer._ReleasingStreamingResponse(
             content=iter(()), release=_upstream_release)
-        response.hold_admission_slot_until_complete(lb._release_request_slot)
+        response.hold_cleanup_until_complete(lb._release_request_slot)
         assert lb._active_request_count == 1
         await response._release()
         assert lb._active_request_count == 0
@@ -973,6 +974,139 @@ def test_request_body_bound_handles_chunked_uploads():
         with pytest.raises(fastapi.HTTPException) as exc:
             await lb._request_body(request)  # type: ignore[arg-type]
         assert exc.value.status_code == 413
+        assert lb._waiting_request_body_bytes == 0
+
+    asyncio.run(_run())
+
+
+def test_waiting_body_budget_rejects_and_releases_partial_body():
+
+    async def _run():
+        lb = _make_lb(max_request_body_bytes=10)
+        held = _StreamingRequest([b'123'])
+        overflow = _StreamingRequest([b'4', b'5'])
+
+        with mock.patch.object(
+                constants, 'LB_REQUEST_QUEUE_WAITING_BODY_MEMORY_BUDGET_BYTES',
+                4):
+            body = await lb._request_body(held)  # type: ignore[arg-type]
+            assert body == b'123'
+            assert lb._waiting_request_body_bytes == 3
+            with pytest.raises(fastapi.HTTPException) as exc:
+                await lb._request_body(  # type: ignore[arg-type]
+                    overflow)
+
+        assert exc.value.status_code == 503
+        assert exc.value.headers['Retry-After']
+        # The overflow request temporarily reserved one byte before its second
+        # chunk crossed the budget; that partial ownership must be returned.
+        assert lb._waiting_request_body_bytes == 3
+        lb._release_waiting_body_budget(
+            held, drop_body=True)  # type: ignore[arg-type]
+        assert lb._waiting_request_body_bytes == 0
+        assert '_skyserve_bounded_body' not in vars(held)
+
+    asyncio.run(_run())
+
+
+def test_body_buffer_cancellation_releases_partial_reservation():
+
+    async def _run():
+        lb = _make_lb(max_request_body_bytes=10)
+        started = asyncio.Event()
+        never = asyncio.Event()
+
+        class _BlockingRequest(_StreamingRequest):
+
+            async def stream(self) -> AsyncIterator[bytes]:
+                yield b'12'
+                started.set()
+                await never.wait()
+
+        request = _BlockingRequest([])
+        task = asyncio.create_task(
+            lb._request_body(request))  # type: ignore[arg-type]
+        await started.wait()
+        assert lb._waiting_request_body_bytes == 2
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert lb._waiting_request_body_bytes == 0
+
+    asyncio.run(_run())
+
+
+def test_waiting_body_budget_transfers_on_admission():
+
+    async def _run():
+        lb = _make_lb(max_request_body_bytes=10)
+        lb._load_balancing_policy.set_ready_replicas(['http://worker:8000'])
+        request = _StreamingRequest([b'payload'])
+
+        async def _proxy(req):
+            assert vars(req)['_skyserve_bounded_body'] == b'payload'
+            assert lb._waiting_request_body_bytes == 0
+            return fastapi.responses.Response(status_code=200)
+
+        lb._proxy_with_retries_inner = _proxy
+        response = await lb._proxy_with_retries(  # type: ignore[arg-type]
+            request)
+        assert response.status_code == 200
+        assert lb._waiting_request_body_bytes == 0
+        assert '_skyserve_bounded_body' not in vars(request)
+        assert lb._active_request_count == 0
+
+    asyncio.run(_run())
+
+
+def test_queue_rejection_releases_buffered_body():
+
+    async def _run():
+        lb = _make_lb(min_size=0, size_per_replica=0, max_request_body_bytes=10)
+        request = _StreamingRequest([b'payload'])
+        lb._proxy_with_retries_inner = mock.AsyncMock()
+
+        with pytest.raises(fastapi.HTTPException) as exc:
+            await lb._proxy_with_retries(  # type: ignore[arg-type]
+                request)
+        assert exc.value.status_code == 503
+        lb._proxy_with_retries_inner.assert_not_awaited()
+        assert lb._waiting_request_body_bytes == 0
+        assert '_skyserve_bounded_body' not in vars(request)
+
+    asyncio.run(_run())
+
+
+def test_queue_disable_holds_body_budget_until_stream_release():
+
+    async def _run():
+        lb = _make_lb(max_request_body_bytes=10)
+        lb._load_balancing_policy.set_ready_replicas(['http://worker:8000'])
+        request = _StreamingRequest([b'payload'])
+
+        class _DisablingCondition(asyncio.Condition):
+
+            async def __aenter__(self):
+                lb._request_queue_config = None
+                return await super().__aenter__()
+
+        async def _noop_release():
+            return None
+
+        async def _proxy(_):
+            return load_balancer._ReleasingStreamingResponse(
+                content=iter(()), release=_noop_release)
+
+        lb._request_queue_condition = _DisablingCondition()
+        lb._proxy_with_retries_inner = _proxy
+        response = await lb._proxy_with_retries(  # type: ignore[arg-type]
+            request)
+        assert lb._waiting_request_body_bytes == len(b'payload')
+        assert vars(request)['_skyserve_bounded_body'] == b'payload'
+
+        await response._release()
+        assert lb._waiting_request_body_bytes == 0
+        assert '_skyserve_bounded_body' not in vars(request)
 
     asyncio.run(_run())
 
@@ -1013,7 +1147,7 @@ def test_admission_slot_released_when_upstream_release_raises():
 
         response = load_balancer._ReleasingStreamingResponse(
             content=iter(()), release=_upstream_release)
-        response.hold_admission_slot_until_complete(lb._release_request_slot)
+        response.hold_cleanup_until_complete(lb._release_request_slot)
         with pytest.raises(RuntimeError):
             await response._release()
         assert lb._active_request_count == 0
