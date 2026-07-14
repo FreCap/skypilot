@@ -38,6 +38,7 @@ jobs:
           src/tests/cluster-history-details.test.jsx \
           src/tests/volume-details.test.jsx \
           src/tests/pool-details.test.jsx \
+          src/lib/cache.test.js \
           src/lib/jobs-cache-manager.test.js \
           src/lib/request-activity.test.js \
           src/lib/request-activity.persistence.test.js

@@ -16,6 +16,14 @@ function simpleHash(str) {
   return hash >>> 0;
 }
 
+function invokeAsPromise(fetchFunction, args) {
+  try {
+    return Promise.resolve(fetchFunction(...args));
+  } catch (error) {
+    return Promise.reject(error);
+  }
+}
+
 class DashboardCache {
   constructor() {
     this.cache = new Map();
@@ -93,22 +101,9 @@ class DashboardCache {
       return this.pendingRequests.get(key);
     }
 
-    // If data is stale or doesn't exist, fetch fresh data.
-    // Start the fetch eagerly, but normalize a synchronous throw into
-    // a rejected promise. The rejection is then handled inside the
-    // async IIFE, which only resumes after `requestPromise` is
-    // assigned and stored in pendingRequests below. If catch/finally
-    // could run during the IIFE call itself (as with a bare
-    // `await fetchFunction(...)` and a sync throw), the cleanup would
-    // no-op and pendingRequests would then permanently hold an
-    // already-settled promise, poisoning the key for every later call
-    // until an invalidate.
-    let fetchResultPromise;
-    try {
-      fetchResultPromise = Promise.resolve(fetchFunction(...args));
-    } catch (error) {
-      fetchResultPromise = Promise.reject(error);
-    }
+    // Keep connector invocation eager while normalizing a synchronous throw
+    // into the same rejected-promise path as an asynchronous failure.
+    const fetchResultPromise = invokeAsPromise(fetchFunction, args);
     const requestPromise = (async () => {
       try {
         const freshData = await fetchResultPromise;
@@ -154,8 +149,8 @@ class DashboardCache {
       } finally {
         // Remove the pending request marker — only our own. After an
         // invalidate, a newer request may occupy this key; deleting it
-        // would break that request's deduplication. (The deferred
-        // fetch above guarantees this never runs before the marker is
+        // would break that request's deduplication. (The normalized
+        // promise above guarantees this never runs before the marker is
         // set, so no TDZ/undefined handling is needed.)
         if (this.pendingRequests.get(key) === requestPromise) {
           this.pendingRequests.delete(key);
@@ -308,8 +303,9 @@ class DashboardCache {
     const jobToken = {};
     this.backgroundJobs.set(key, jobToken);
 
-    // Execute the refresh asynchronously
-    fetchFunction(...args)
+    // Normalization keeps a synchronous connector failure inside this
+    // best-effort refresh path so the valid cache hit still succeeds.
+    invokeAsPromise(fetchFunction, args)
       .then((freshData) => {
         if (this.backgroundJobs.get(key) !== jobToken) {
           return; // invalidated while in flight
