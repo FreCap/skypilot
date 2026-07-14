@@ -4,6 +4,8 @@ These helpers exist so pool dashboard (and any future caller iterating many
 replicas) can avoid the per-name DB round-trip that would otherwise show up
 as a double N+1 inside ReplicaInfo.to_info_dict.
 """
+from sqlalchemy import event
+
 from sky import global_user_state
 from sky.skylet import constants
 from sky.utils.db import db_utils
@@ -124,6 +126,36 @@ def test_get_clusters_from_names_chunks_large_input(tmp_path, monkeypatch):
         assert result[name] is not None, name
         assert result[name]['name'] == name
     assert result['missing'] is None
+
+
+def test_get_cluster_status_fields_has_chunk_bounded_query_count(
+        tmp_path, monkeypatch):
+    """Status snapshots use one SELECT per chunk, never one per name."""
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(global_user_state, '_CLUSTER_IN_QUERY_CHUNK_SIZE', 2)
+    names = [f'c-{i}' for i in range(5)]
+    for name in names:
+        _add_cluster(name)
+
+    engine = global_user_state._db_manager.get_engine()
+    select_statements = []
+
+    @event.listens_for(engine, 'before_cursor_execute')
+    def _count_selects(_conn, _cursor, statement, *_args):
+        if statement.lstrip().upper().startswith('SELECT'):
+            select_statements.append(statement)
+
+    try:
+        assert global_user_state.get_cluster_status_fields([]) == {}
+        assert not select_statements
+        result = global_user_state.get_cluster_status_fields(names +
+                                                             ['missing'])
+    finally:
+        event.remove(engine, 'before_cursor_execute', _count_selects)
+
+    assert set(result) == set(names)
+    assert all(status == 'INIT' for status, _ in result.values())
+    assert len(select_statements) == 3
 
 
 def test_get_clusters_from_names_matches_single_helper(tmp_path, monkeypatch):
