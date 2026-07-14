@@ -1831,12 +1831,16 @@ class JobController:
     async def _cleanup_job_group_clusters(
             self, cluster_names: list[str | None]) -> None:
         """Clean up all clusters in a JobGroup."""
-        for cluster_name in cluster_names:
-            if cluster_name is not None:
-                try:
-                    await self._cleanup_cluster(cluster_name)
-                except Exception as e:  # pylint: disable=broad-except
-                    logger.warning(f'Failed to cleanup {cluster_name}: {e}')
+
+        async def cleanup_cluster(cluster_name: str) -> None:
+            try:
+                await self._cleanup_cluster(cluster_name)
+            except Exception as e:  # pylint: disable=broad-except
+                logger.warning(f'Failed to cleanup {cluster_name}: {e}')
+
+        await asyncio.gather(*(cleanup_cluster(cluster_name)
+                               for cluster_name in cluster_names
+                               if cluster_name is not None))
 
     async def run(self):
         """Run controller logic and handle exceptions."""
