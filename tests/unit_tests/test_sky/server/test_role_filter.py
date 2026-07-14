@@ -60,6 +60,9 @@ def _launch_body(task: str,
         'resources:\n  any_of:\n    - _cluster_config_overrides:\n'
         '        ssh:\n          context_configs:\n            cluster-a:\n'
         '              pod_config: {}\n',
+        # YAML escape sequences are decoded before key lookup, so the guard
+        # must inspect the parsed mapping instead of searching the raw string.
+        'config:\n  kubernetes:\n    "pod_confi\\x67": {}\n',
     ],
 )
 @mock.patch.object(role_filter.permission, 'permission_service')

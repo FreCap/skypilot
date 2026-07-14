@@ -45,8 +45,6 @@ def _config_has_pod_config(config: Any) -> bool:
 
 
 def _task_yaml_has_pod_config(task_yaml: str) -> bool:
-    if 'pod_config' not in task_yaml:
-        return False
     try:
         documents = yaml_utils.read_yaml_all_str(task_yaml)
     except Exception:  # pylint: disable=broad-except
