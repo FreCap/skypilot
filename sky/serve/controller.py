@@ -803,9 +803,19 @@ class SkyServeController:
     def _apply_service_update(self, version: int, service: Any,
                               update_mode: serve_utils.UpdateMode) -> None:
         """Apply a persisted update to the live controller state."""
-        self._replica_manager.update_version(version,
-                                             service,
-                                             update_mode=update_mode)
+        # add_or_update_version commits before this method runs.  Announce the
+        # new version without acquiring the replica-manager lock: a large
+        # placer-backed scale-up batch may currently hold that lock while
+        # enqueueing hundreds of replicas from the superseded version.  The
+        # signal lets that batch yield promptly so update_version can acquire
+        # the lock and make the durable version live.
+        self._replica_manager.notify_version_pending(version)
+        try:
+            self._replica_manager.update_version(version,
+                                                 service,
+                                                 update_mode=update_mode)
+        finally:
+            self._replica_manager.clear_pending_version(version)
         new_autoscaler = autoscalers.Autoscaler.from_spec(
             self._service_name, service)
         if not isinstance(self._autoscaler, type(new_autoscaler)):
