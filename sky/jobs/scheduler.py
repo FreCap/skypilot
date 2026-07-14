@@ -406,22 +406,25 @@ async def scheduled_launch(
     assert starting_lock == starting_signal._lock, (  # type: ignore #pylint: disable=protected-access
         'starting_lock and starting_signal must use the same lock')
 
+    # The capacity check and the slot claim must happen under a single lock
+    # acquisition: with them split, every coroutine woken between another
+    # waiter's check and its add also sees a free slot, and the launch cap is
+    # exceeded.
     while True:
         async with starting_lock:
-            starting_count = len(starting)
-            if starting_count < controller_utils.LAUNCHES_PER_WORKER:
+            if len(starting) < controller_utils.LAUNCHES_PER_WORKER:
+                starting.add(job_id)
                 break
             logger.info('Too many jobs starting, waiting for a slot')
             await starting_signal.wait()
 
     logger.info(f'Starting job {job_id}')
 
-    async with starting_lock:
-        starting.add(job_id)
-
-    await state.scheduler_set_launching_async(job_id)
-
     try:
+        # Inside the try so a failure here (e.g. a transient DB error) still
+        # releases the slot below instead of leaking it for the lifetime of
+        # the controller process.
+        await state.scheduler_set_launching_async(job_id)
         yield
     except exceptions.NoClusterLaunchedError:
         await state.scheduler_set_backoff_async(job_id)
