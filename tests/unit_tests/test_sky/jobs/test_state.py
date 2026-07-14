@@ -1,4 +1,6 @@
 """Unit tests for sky.jobs.state."""
+# pylint: disable=protected-access
+
 import contextlib
 import time
 from typing import Optional
