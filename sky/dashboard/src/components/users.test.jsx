@@ -9,6 +9,7 @@ import {
 } from '@/data/connectors/users';
 import { getClusters } from '@/data/connectors/clusters';
 import { getManagedJobs } from '@/data/connectors/jobs';
+import { apiClient } from '@/data/connectors/client';
 import { ServiceAccountTokensView } from '@/components/service-account-tokens';
 import {
   aggregateUserUsage,
@@ -678,6 +679,118 @@ describe('ServiceAccountTokensView', () => {
       expect(screen.getByText('paged-bot')).toBeInTheDocument();
       expect(screen.queryByText('stale-bot')).not.toBeInTheDocument();
     });
+  });
+
+  it('keeps the current page when an older mutation finishes later', async () => {
+    isServiceAccountTokensPaginationAvailable.mockReturnValue(true);
+    const mutation = deferred();
+    const pageOneToken = { ...baseToken, token_name: 'page-one-bot' };
+    const stalePageOneToken = {
+      ...baseToken,
+      token_name: 'stale-page-one-bot',
+    };
+    const pageTwoToken = { ...baseToken, token_name: 'page-two-bot' };
+    let pageOneCalls = 0;
+    let pageTwoCalls = 0;
+    dashboardCache.get.mockImplementation((fetcher, args) => {
+      if (fetcher === getServiceAccountTokens) return Promise.resolve([]);
+      if (fetcher === getClusters) return Promise.resolve([]);
+      if (fetcher === getManagedJobs) return Promise.resolve({ jobs: [] });
+      if (fetcher === getServiceAccountTokensPaginated) {
+        const requestedPage = args[0].page;
+        if (requestedPage === 2) {
+          pageTwoCalls += 1;
+          return Promise.resolve({
+            items: [pageTwoToken],
+            total: 2,
+            total_pages: 2,
+            has_next: false,
+            has_prev: true,
+          });
+        }
+        pageOneCalls += 1;
+        return Promise.resolve({
+          items: [pageOneCalls === 1 ? pageOneToken : stalePageOneToken],
+          total: 2,
+          total_pages: 2,
+          has_next: true,
+          has_prev: false,
+        });
+      }
+      throw new Error('Unexpected cache fetcher');
+    });
+    apiClient.post.mockReturnValue(mutation.promise);
+
+    renderView({
+      showRotateDialog: true,
+      tokenToRotate: pageOneToken,
+    });
+    expect(await screen.findByText('page-one-bot')).toBeInTheDocument();
+
+    await act(async () => {
+      screen.getByRole('button', { name: 'Rotate Token' }).click();
+      await Promise.resolve();
+    });
+    expect(apiClient.post).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      screen.getByRole('button', { name: 'Next', hidden: true }).click();
+    });
+    expect(await screen.findByText('page-two-bot')).toBeInTheDocument();
+
+    await act(async () => {
+      mutation.resolve({
+        ok: true,
+        json: jest.fn().mockResolvedValue({ token: 'rotated-token' }),
+      });
+      await mutation.promise;
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText('page-two-bot')).toBeInTheDocument();
+      expect(screen.queryByText('stale-page-one-bot')).not.toBeInTheDocument();
+      expect(screen.getByText('Page 2 of 2')).toBeInTheDocument();
+    });
+    expect(pageOneCalls).toBe(1);
+    expect(pageTwoCalls).toBe(2);
+  });
+
+  it('does not refresh after a mutation finishes after unmount', async () => {
+    const mutation = deferred();
+    dashboardCache.get.mockImplementation((fetcher) => {
+      if (fetcher === getServiceAccountTokens)
+        return Promise.resolve([baseToken]);
+      if (fetcher === getClusters) return Promise.resolve([]);
+      if (fetcher === getManagedJobs) return Promise.resolve({ jobs: [] });
+      throw new Error('Unexpected cache fetcher');
+    });
+    apiClient.post.mockReturnValue(mutation.promise);
+
+    const { unmount } = renderView({
+      showRotateDialog: true,
+      tokenToRotate: baseToken,
+    });
+    expect(await screen.findByText('ci-bot')).toBeInTheDocument();
+
+    await act(async () => {
+      screen.getByRole('button', { name: 'Rotate Token' }).click();
+      await Promise.resolve();
+    });
+    expect(apiClient.post).toHaveBeenCalledTimes(1);
+    dashboardCache.get.mockClear();
+    dashboardCache.invalidate.mockClear();
+    unmount();
+
+    await act(async () => {
+      mutation.resolve({
+        ok: true,
+        json: jest.fn().mockResolvedValue({ token: 'rotated-token' }),
+      });
+      await mutation.promise;
+    });
+
+    expect(dashboardCache.invalidate).not.toHaveBeenCalled();
+    expect(dashboardCache.get).not.toHaveBeenCalled();
   });
 
   it('switches to the server-paginated token projection without changing call counts', async () => {
