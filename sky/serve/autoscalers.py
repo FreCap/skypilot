@@ -971,7 +971,8 @@ class Autoscaler:
     def _best_cost_rebalance_candidate(
         self,
         incumbent: 'replica_managers.ReplicaInfo',
-        planned_locations: list[spot_placer.Location],
+        active_locations: list[spot_placer.Location],
+        location_load: dict[spot_placer.Location, int],
     ) -> spot_placer.Location | None:
         placer = self._cost_rebalance_spot_placer
         if placer is None:
@@ -989,14 +990,8 @@ class Autoscaler:
         maximum_unit_cost = incumbent_unit_cost * (
             1.0 - self.cost_rebalance_min_savings_fraction)
 
-        location_load: dict[spot_placer.Location, int] = {}
-        for location in placer.active_locations():
-            location_load[location] = sum(
-                spot_placer.locations_match_placement(current, location)
-                for current in planned_locations)
-
         eligible: list[tuple[float, int, str, spot_placer.Location]] = []
-        for location in placer.active_locations():
+        for location in active_locations:
             if spot_placer.locations_match_placement(incumbent_location,
                                                      location):
                 continue
@@ -1086,11 +1081,21 @@ class Autoscaler:
                                       if not info.is_terminal)
             if location is not None
         ]
+        active_locations = self._cost_rebalance_spot_placer.active_locations()
+        # This load is shared by every incumbent evaluated in the tick.  On a
+        # large fleet, rebuilding it inside `_best_cost_rebalance_candidate`
+        # turns one placement scan into a redundant scan per replica.
+        location_load = {
+            location: sum(
+                spot_placer.locations_match_placement(current, location)
+                for current in planned_locations
+            ) for location in active_locations
+        }
         now = time.monotonic()
         current_candidate_keys: set[tuple[int, spot_placer.Location]] = set()
         for incumbent in candidates:
             location = self._best_cost_rebalance_candidate(
-                incumbent, planned_locations)
+                incumbent, active_locations, location_load)
             if location is None:
                 continue
             key = (incumbent.replica_id, location)
@@ -1112,6 +1117,10 @@ class Autoscaler:
                     override,
                     reason=AutoscalerDecisionReason.COST_REBALANCE))
             planned_locations.append(location)
+            for active_location in active_locations:
+                if spot_placer.locations_match_placement(
+                        location, active_location):
+                    location_load[active_location] += 1
             slots -= 1
 
         for key in list(self._cost_rebalance_candidate_since):
