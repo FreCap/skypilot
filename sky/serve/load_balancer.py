@@ -1469,6 +1469,22 @@ class SkyServeLoadBalancer:
         # one: an admission reader must see "unknown" (and fall back to
         # its conservative floor) rather than zeros it would act on.
         hint = self._capacity_hint or {}
+        max_replicas = hint.get('max_replicas')
+        occupancy_is_usable = (probed_replicas == ready_replicas and
+                               occupancy_probe_age is not None and
+                               occupancy_probe_age
+                               <= constants.LB_OCCUPANCY_PROBE_MAX_AGE_SECONDS)
+        # Machine-agnostic admission contract. Consumers should not need to
+        # know whether capacity comes from one worker per replica or several
+        # local workers sharing a multi-GPU machine. Until every ready replica
+        # has a fresh occupancy sample, preserve the legacy one-unit-per-
+        # replica view instead of exposing a partial slot total.
+        current_capacity = (total_slots
+                            if occupancy_is_usable else ready_replicas)
+        in_flight_capacity = (running_slots
+                              if occupancy_is_usable else in_flight)
+        max_capacity = (max(max_replicas, current_capacity)
+                        if max_replicas is not None else None)
         return fastapi.responses.JSONResponse({
             'ready_replicas': ready_replicas,
             'in_flight': in_flight,
@@ -1483,7 +1499,10 @@ class SkyServeLoadBalancer:
             'rejected_in_window': self._rejected_in_window(),
             'provisioning_replicas': hint.get('provisioning_replicas'),
             'target_replicas': hint.get('target_num_replicas'),
-            'max_replicas': hint.get('max_replicas'),
+            'max_replicas': max_replicas,
+            'current_capacity': current_capacity,
+            'max_capacity': max_capacity,
+            'in_flight_capacity': in_flight_capacity,
             # [boltz fork] Async-occupancy aggregates (see the probe loop).
             # For fast-ack async fleets envelope-only in_flight reads ~0
             # while replicas crunch, so admission should size on

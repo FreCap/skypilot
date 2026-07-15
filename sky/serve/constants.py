@@ -167,6 +167,10 @@ CONTROLLER_HEALTH_READ_TIMEOUT_SECONDS = 5
 # /_lb/capacity. Overridable via SKYPILOT_LB_OCCUPANCY_PROBE_INTERVAL_SECONDS
 # (<= 0 disables the probe entirely — accounting falls back to envelope-only).
 LB_OCCUPANCY_PROBE_INTERVAL_SECONDS = 10
+# A capacity consumer must not interpret an old occupancy snapshot as current
+# async work. Keep this longer than one ordinary probe round so a single slow
+# replica does not make the aggregate flap back to the replica-level fallback.
+LB_OCCUPANCY_PROBE_MAX_AGE_SECONDS = 30
 # How long an occupancy-capable url that left the ready set is retained
 # (and kept probed / reported as occupancy-unknown) without a successful
 # occupancy answer. Off-ready probe misses are ambiguous -- torn down vs
