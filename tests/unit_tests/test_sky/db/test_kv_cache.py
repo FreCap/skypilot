@@ -1,4 +1,7 @@
+"""Tests for the shared persistent KV cache."""
+# pylint: disable=protected-access,redefined-outer-name,unused-argument
 import time
+from unittest import mock
 
 import pytest
 import sqlalchemy
@@ -16,8 +19,35 @@ def isolated_database(tmp_path):
     kv_cache._db_manager._engine = sqlalchemy.create_engine(
         f'sqlite:///{temp_db_path}')
     kv_cache.create_table(kv_cache._db_manager.get_engine())
+    kv_cache._legacy_sqlite_marker_emitted = False
     yield
     kv_cache._db_manager._engine = None
+    kv_cache._legacy_sqlite_marker_emitted = False
+
+
+def test_sqlite_use_emits_one_structured_marker_and_counts_operations(
+        isolated_database, monkeypatch):
+    warning = mock.Mock()
+    record = mock.Mock()
+    monkeypatch.setattr(kv_cache.logger, 'warning', warning)
+    monkeypatch.setattr(kv_cache.metrics_lib, 'METRICS_ENABLED', True)
+    monkeypatch.setattr(kv_cache.metrics_lib, 'record_persistence_operation',
+                        record)
+
+    assert kv_cache.get_cache_entry('non-sensitive-test-key') is None
+    assert kv_cache.get_cache_entry('another-key') is None
+
+    assert record.call_args_list == [
+        mock.call('kv_cache', 'get', 'read', 'sqlite'),
+        mock.call('kv_cache', 'get', 'read', 'sqlite'),
+    ]
+    warning.assert_called_once()
+    marker_format, *marker_args = warning.call_args.args
+    assert marker_format.startswith('event_name=%s component=%s')
+    assert marker_args[:5] == [
+        kv_cache._LEGACY_BACKEND_EVENT, 'kv_cache', 'get', 'read', 'sqlite'
+    ]
+    assert 'non-sensitive-test-key' not in warning.call_args.args
 
 
 def test_cache_entry_basic(isolated_database):

@@ -20,7 +20,6 @@ only sqlite. This module:
 import shutil
 import threading
 import time
-import types
 from unittest import mock
 import uuid
 
@@ -36,6 +35,7 @@ from test_reserved_fill_broker import clock  # noqa: F401
 # `broker_engine` defined here instead of the sqlite one).
 import test_reserved_fill_broker as sqlite_suite
 
+from sky.serve import replica_managers
 from sky.serve import reserved_capacity_broker as broker
 from sky.serve import serve_state
 from sky.utils import locks
@@ -183,8 +183,13 @@ class TestGroupedReplicaSnapshotPG:
             serve_state.add_or_update_replicas(
                 service_name,
                 [(replica_id,
-                  types.SimpleNamespace(replica_id=replica_id,
-                                        service_name=service_name))
+                  replica_managers.ReplicaInfo(replica_id=replica_id,
+                                               cluster_name=service_name,
+                                               replica_port='8080',
+                                               is_spot=False,
+                                               location=None,
+                                               version=1,
+                                               resources_override=None))
                  for replica_id in range(2)])
 
         grouped = serve_state.get_replica_infos_grouped()
