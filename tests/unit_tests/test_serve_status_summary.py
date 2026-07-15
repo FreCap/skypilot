@@ -43,6 +43,12 @@ def patched_state(monkeypatch):
     ]
     monkeypatch.setattr(serve_state, 'get_replica_infos',
                         lambda name: list(replicas))
+    monkeypatch.setattr(
+        serve_state, 'get_replica_status_counts', lambda name: {
+            'READY': 2,
+            'PROVISIONING': 1,
+            'FAILED_PROBING': 1,
+        })
     autoscaler_resp = mock.MagicMock()
     autoscaler_resp.json.return_value = {'target_num_replicas': 4}
     monkeypatch.setattr(serve_utils, '_get_to_controller_with_retry',
@@ -198,12 +204,12 @@ class TestGetServiceStatusSummary:
         # for a replica scan at all.
         called = []
 
-        def _tracking_get_replica_infos(name):
+        def _tracking_get_replica_status_counts(name):
             called.append(name)
-            return []
+            return {}
 
-        monkeypatch.setattr(serve_state, 'get_replica_infos',
-                            _tracking_get_replica_infos)
+        monkeypatch.setattr(serve_state, 'get_replica_status_counts',
+                            _tracking_get_replica_status_counts)
         record = serve_utils._get_service_status(  # pylint: disable=protected-access
             'svc',
             pool=False,
