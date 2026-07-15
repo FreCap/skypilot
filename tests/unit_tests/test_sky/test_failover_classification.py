@@ -119,13 +119,30 @@ def test_classify_is_structured_and_aws_only():
         clouds.GCP(), _FakeClientError('VcpuLimitExceeded')) is None
 
 
+@pytest.mark.parametrize('code', [
+    'VcpuLimitExceeded',
+    'quotaExceeded',
+    'QUOTA_EXCEEDED',
+    'type.googleapis.com/google.rpc.QuotaFailure',
+])
+def test_operator_quota_detection_uses_structured_codes(code):
+    assert backend._is_quota_error(_aggregate_error(code))
+
+
+def test_operator_quota_detection_ignores_capacity_and_text_only_errors():
+    assert not backend._is_quota_error(
+        _aggregate_error('InsufficientInstanceCapacity'))
+    assert not backend._is_quota_error(RuntimeError('quotaExceeded'))
+
+
 def test_classify_ignores_implicit_context():
     capacity = _FakeClientError('InsufficientInstanceCapacity')
     try:
         try:
             raise capacity
         except Exception:  # pylint: disable=broad-except
-            raise ValueError('unrelated failure')
+            raise ValueError(  # pylint: disable=raise-missing-from
+                'unrelated failure')
     except ValueError as unrelated:
         assert unrelated.__context__ is capacity
         assert unrelated.__cause__ is None
@@ -280,10 +297,13 @@ def test_retry_zones_quota_cooldown_does_not_apply_to_on_demand(
     check_quota = mock.Mock(return_value=False)
     yield_zones = mock.Mock(
         side_effect=AssertionError('zero quota must skip zone iteration'))
+    notify = mock.Mock(return_value=False)
     monkeypatch.setattr(capacity_cache, 'is_quota_cooldown_active',
                         cooldown_active)
     monkeypatch.setattr(clouds.AWS, 'check_quota_available', check_quota)
     monkeypatch.setattr(provisioner, '_yield_zones', yield_zones)
+    monkeypatch.setattr(backend, '_record_insufficient_quota_notification',
+                        notify)
 
     with pytest.raises(exceptions.ResourcesUnavailableError,
                        match='Found no quota'):
@@ -292,7 +312,34 @@ def test_retry_zones_quota_cooldown_does_not_apply_to_on_demand(
     cooldown_active.assert_not_called()
     check_quota.assert_called_once()
     yield_zones.assert_not_called()
+    notify.assert_called_once_with(to_provision)
     assert not provisioner._blocked_resources
+
+
+def test_quota_notification_has_generic_actionable_context(monkeypatch):
+    record = mock.Mock(return_value=True)
+    monkeypatch.setattr(backend.operator_notifications, 'record_notification',
+                        record)
+
+    assert backend._record_insufficient_quota_notification(_to_provision())
+    category, message = record.call_args.args
+    assert category == (backend.operator_notifications.
+                        OperatorNotificationCategory.INSUFFICIENT_QUOTA)
+    assert 'AWS' in message
+    assert 'us-east-1' in message
+    assert 'g6.4xlarge' in message
+    assert 'service' not in message.lower()
+    assert record.call_args.kwargs['dedupe_window_seconds'] == 3600
+
+
+def test_quota_notification_is_fail_open(monkeypatch):
+    monkeypatch.setattr(
+        backend.operator_notifications,
+        'record_notification',
+        mock.Mock(side_effect=RuntimeError('notification unavailable')),
+    )
+
+    assert not backend._record_insufficient_quota_notification(_to_provision())
 
 
 def test_capacity_metric_failure_is_fail_open(monkeypatch):

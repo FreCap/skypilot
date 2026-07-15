@@ -35,12 +35,15 @@ jobs:
           src/components/workspace-editor.test.jsx \
           src/components/workspaces.test.jsx \
           src/components/elements/deployment-version.test.jsx \
+          src/components/elements/operator-notification-bell.test.jsx \
           src/components/elements/request-activity-indicator.test.jsx \
+          src/components/operator-notifications.test.jsx \
           src/data/connectors/client.test.js \
           src/data/connectors/clusters.test.jsx \
           src/data/connectors/services.test.jsx \
           src/data/connectors/jobs.test.jsx \
           src/data/connectors/jobs-download-logs.test.jsx \
+          src/data/connectors/operator-notifications.test.js \
           src/data/connectors/stream-decoders.test.jsx \
           src/tests/service-details.test.jsx \
           src/tests/cluster-history-details.test.jsx \
