@@ -424,12 +424,14 @@ describe('SSHNodePoolDetails', () => {
 
   it('tears down the pool before deleting its configuration', async () => {
     const handleDeleteSSHPool = jest.fn().mockResolvedValue(undefined);
+    const teardownStream = deferred();
     sshDownNodePool.mockResolvedValue({ request_id: 'down-123' });
     streamSSHOperationLogs.mockImplementation(
       async ({ requestId, operationType, onNewLog }) => {
         expect(requestId).toBe('down-123');
         expect(operationType).toBe('down');
         onNewLog('Stopped workers\n');
+        await teardownStream.promise;
       }
     );
 
@@ -441,6 +443,16 @@ describe('SSHNodePoolDetails', () => {
     fireEvent.click(
       within(confirmDialog).getByRole('button', { name: 'Delete' })
     );
+
+    await waitFor(() =>
+      expect(streamSSHOperationLogs).toHaveBeenCalledTimes(1)
+    );
+    expect(handleDeleteSSHPool).not.toHaveBeenCalled();
+
+    await act(async () => {
+      teardownStream.resolve();
+      await teardownStream.promise;
+    });
 
     expect(
       await screen.findByText('Deployment completed successfully!')
