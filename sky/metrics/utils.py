@@ -174,6 +174,14 @@ SKY_PROVISION_CAPACITY_EVENTS_TOTAL = prom.Counter(
     ['reason', 'action'],
 )
 
+# Persistence migration signals. Labels are deliberately bounded enums: never
+# put database URLs, keys, user IDs, or other payload data in this metric.
+SKY_PERSISTENCE_OPERATIONS_TOTAL = prom.Counter(
+    'sky_persistence_operations_total',
+    'Persistence operations by component, operation, phase, and backend',
+    ['component', 'operation', 'phase', 'backend'],
+)
+
 # Time a request spends waiting in the task queue (from creation to dequeue).
 SKY_APISERVER_QUEUE_WAIT_SECONDS = prom.Histogram(
     'sky_apiserver_queue_wait_seconds',
@@ -258,6 +266,16 @@ SKY_APISERVER_FEDERATION_TOTAL = prom.Counter(
     'Count of metrics federation attempts per remote context and outcome',
     ['context', 'route', 'outcome'],
 )
+
+
+def record_persistence_operation(component: str, operation: str, phase: str,
+                                 backend: str) -> None:
+    """Records one low-cardinality persistence operation."""
+    if METRICS_ENABLED:
+        SKY_PERSISTENCE_OPERATIONS_TOTAL.labels(component=component,
+                                                operation=operation,
+                                                phase=phase,
+                                                backend=backend).inc()
 
 
 def record_federation_phase(context: str, route: str, phase: str,

@@ -1,4 +1,5 @@
 """Persistent KV cache, backed by a sqlite or postgres database."""
+import threading
 import time
 
 import sqlalchemy
@@ -8,6 +9,8 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects import sqlite
 from sqlalchemy.ext import declarative
 
+from sky import __commit__ as sky_commit
+from sky import __version__ as sky_version
 from sky import sky_logging
 from sky.metrics import utils as metrics_lib
 from sky.utils import common_utils
@@ -15,6 +18,11 @@ from sky.utils.db import db_utils
 from sky.utils.db import migration_utils
 
 logger = sky_logging.init_logger(__name__)
+
+_COMPONENT = 'kv_cache'
+_LEGACY_BACKEND_EVENT = 'skypilot.persistence.legacy_backend_used'
+_legacy_sqlite_marker_lock = threading.Lock()
+_legacy_sqlite_marker_emitted = False
 
 Base = declarative.declarative_base()
 
@@ -53,6 +61,34 @@ def create_table(engine: sqlalchemy.engine.Engine):
 _db_manager = db_utils.DatabaseManager('kv_cache', create_table)
 
 
+def _get_engine(operation: str, phase: str) -> sqlalchemy.engine.Engine:
+    """Returns the cache engine and records migration observability."""
+    engine = _db_manager.get_engine()
+    backend = engine.dialect.name
+    if metrics_lib.METRICS_ENABLED:
+        metrics_lib.record_persistence_operation(_COMPONENT, operation, phase,
+                                                 backend)
+    if backend == db_utils.SQLAlchemyDialect.SQLITE.value:
+        _emit_legacy_sqlite_marker(operation, phase)
+    return engine
+
+
+def _emit_legacy_sqlite_marker(operation: str, phase: str) -> None:
+    """Emits one non-sensitive SQLite-use marker in each process."""
+    global _legacy_sqlite_marker_emitted
+    if _legacy_sqlite_marker_emitted:
+        return
+    with _legacy_sqlite_marker_lock:
+        if _legacy_sqlite_marker_emitted:
+            return
+        logger.warning(
+            'event_name=%s component=%s operation=%s phase=%s backend=%s '
+            'server_version=%s server_commit=%s', _LEGACY_BACKEND_EVENT,
+            _COMPONENT, operation, phase,
+            db_utils.SQLAlchemyDialect.SQLITE.value, sky_version, sky_commit)
+        _legacy_sqlite_marker_emitted = True
+
+
 @metrics_lib.time_me
 def add_or_update_cache_entry(
     key: str,
@@ -66,7 +102,7 @@ def add_or_update_cache_entry(
         value: The value of the cache entry.
         expires_at: The timestamp when the cache entry expires.
     """
-    engine = _db_manager.get_engine()
+    engine = _get_engine('add_or_update', 'write')
     if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
         insert_func = sqlite.insert
     elif engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value:
@@ -100,7 +136,7 @@ def add_or_extend_cache_entry(
     This is useful for negative-cache hints written concurrently by multiple
     worker processes: a delayed older writer must not shorten a newer hint.
     """
-    engine = _db_manager.get_engine()
+    engine = _get_engine('add_or_extend', 'write')
     if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
         insert_func = sqlite.insert
         greatest = sqlalchemy.func.max
@@ -139,7 +175,7 @@ def get_cache_entry(key: str) -> str | None:
     Args:
         key: The key of the cache entry.
     """
-    engine = _db_manager.get_engine()
+    engine = _get_engine('get', 'read')
     with orm.Session(engine) as session:
         result = session.execute(
             sqlalchemy.select(kv_cache_table.c.value).where(
@@ -151,7 +187,7 @@ def get_cache_entry(key: str) -> str | None:
 @metrics_lib.time_me
 def delete_cache_entry(key: str) -> None:
     """Delete exactly one cache entry."""
-    engine = _db_manager.get_engine()
+    engine = _get_engine('delete', 'write')
     with orm.Session(engine) as session:
         session.execute(
             sqlalchemy.delete(kv_cache_table).where(
@@ -179,7 +215,7 @@ def delete_cache_entries_by_prefix(prefix: str) -> None:
         prefix: The literal prefix to match against cache keys.
     """
     escaped = _escape_like(prefix)
-    engine = _db_manager.get_engine()
+    engine = _get_engine('delete_prefix', 'write')
     with orm.Session(engine) as session:
         session.execute(
             sqlalchemy.delete(kv_cache_table).where(
@@ -203,7 +239,7 @@ def delete_cache_entries_by_prefix_suffix(prefix: str, suffix: str) -> None:
     escaped_prefix = _escape_like(prefix)
     escaped_suffix = _escape_like(suffix)
     pattern = f'{escaped_prefix}%{escaped_suffix}'
-    engine = _db_manager.get_engine()
+    engine = _get_engine('delete_prefix_suffix', 'write')
     with orm.Session(engine) as session:
         session.execute(
             sqlalchemy.delete(kv_cache_table).where(
