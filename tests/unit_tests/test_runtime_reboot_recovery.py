@@ -8,7 +8,9 @@ shipping of the installer, and the gating logic.
 """
 # pylint: disable=protected-access,missing-class-docstring
 import base64
+import hashlib
 import os
+import pickle
 import re
 from unittest import mock
 
@@ -16,9 +18,28 @@ import pytest
 
 from sky.provision import common
 from sky.provision import instance_setup
+from sky.provision import runtime_recovery
 
 _INSTALL_CMD_RE = re.compile(r'^echo ([A-Za-z0-9+/=]+) \| base64 -d \| bash$')
 _SCRIPT_SHIP_RE = re.compile(r'echo ([A-Za-z0-9+/=]+) \| base64 -d > ')
+
+
+@pytest.mark.parametrize('name', [
+    '_runtime_recovery_head_script',
+    '_runtime_recovery_worker_script',
+    '_runtime_recovery_install_cmd',
+    '_should_install_reboot_recovery',
+    '_skylet_watchdog_script',
+    '_skylet_watchdog_install_cmd',
+    '_should_install_skylet_watchdog',
+    '_install_skylet_watchdog',
+    '_install_runtime_reboot_recovery',
+])
+def test_instance_setup_facade_preserves_callable_identity(name):
+    facade_callable = getattr(instance_setup, name)
+    assert facade_callable is getattr(runtime_recovery, name)
+    assert facade_callable.__module__ == 'sky.provision.instance_setup'
+    assert pickle.loads(pickle.dumps(facade_callable)) is facade_callable
 
 
 def _make_cluster_info(provider_name: str,
@@ -62,6 +83,24 @@ def _decode_recovery_script(installer: str) -> str:
 
 
 class TestRecoveryScriptContent:
+
+    def test_generated_commands_are_byte_for_byte_stable(self):
+        samples = {
+            'head': instance_setup._runtime_recovery_head_script(
+                "ray start --head --port=6380 && echo '$HOME'"),
+            'worker': instance_setup._runtime_recovery_worker_script(
+                'ray start --address=10.0.0.1:6380'),
+            'installer': instance_setup._runtime_recovery_install_cmd(
+                'true\necho recovered\n'),
+        }
+        assert {
+            name: hashlib.sha256(value.encode()).hexdigest()
+            for name, value in samples.items()
+        } == {
+            'head': '5c04624961094adebe1a0953ec50bf5e24e959d2c7bf24bb7a5d9f6a1e7e85ee',
+            'worker': '9197b259d0a1335c9653a861567440839ed18b733171debe02202fb6a96db246',
+            'installer': '4b826eca3e2de4aa150c910a5267e520aa9e3ca009701deb39c457fc23b51309',
+        }
 
     def test_head_script_contains_ray_and_skylet_commands(self):
         ray_head_cmd = instance_setup.ray_head_start_command(

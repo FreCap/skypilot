@@ -12,6 +12,7 @@ in a Linux container (see the PR test plan).
 """
 # pylint: disable=protected-access,missing-class-docstring
 import base64
+import hashlib
 import re
 from unittest import mock
 
@@ -42,6 +43,15 @@ def _make_cluster_info(provider_name: str,
 
 
 class TestWatchdogScriptGeneration:
+
+    def test_generated_commands_are_byte_for_byte_stable(self):
+        script = instance_setup._skylet_watchdog_script(
+            "export CLUSTER='demo'; python -m sky.skylet.attempt_skylet;")
+        installer = instance_setup._skylet_watchdog_install_cmd(script)
+        assert hashlib.sha256(script.encode()).hexdigest() == (
+            '1a7e01efc993313a84f0d933de61b25438e9e28c8d66197a1581035e4e475391')
+        assert hashlib.sha256(installer.encode()).hexdigest() == (
+            'cea81ae762ddf5d968cd14003dde956a26c6050b3a9fedd9c6fdf792a73ffbe4')
 
     def test_start_command_is_substituted_verbatim(self):
         cmd = ('export SKYPILOT_HEARTBEAT_GPU_TYPE=\'H100\'; '
