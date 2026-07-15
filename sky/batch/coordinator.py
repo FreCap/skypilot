@@ -183,14 +183,34 @@ class BatchCoordinator:
         Sets the ``_cancelled`` flag so the dispatch loop breaks early,
         then shuts down any active worker services.
         """
-        self._cancelled = True
-        with self._active_workers_lock:
-            workers_snapshot = list(self._active_workers.items())
+        workers_snapshot = self._begin_cleanup()
         for cluster_name, worker_job_id in workers_snapshot:
             try:
                 self._shutdown_worker(cluster_name, worker_job_id)
             except Exception:  # pylint: disable=broad-except
                 logger.warning(f'Failed to shutdown worker on {cluster_name}')
+
+    def _begin_cleanup(self, superseded: bool = False) -> list[tuple[str, int]]:
+        """Atomically assign cleanup ownership for tracked workers."""
+        with self._active_workers_lock:
+            workers_snapshot = list(self._active_workers.items())
+            self._cancelled = True
+            if superseded:
+                self._superseded_cleanup_started = True
+            else:
+                # Normal cancellation owns these workers synchronously.  A
+                # worker finalizer can only clean a later registration.
+                self._active_workers.clear()
+        return workers_snapshot
+
+    def _claim_worker_cleanup(self, cluster_name: str,
+                              worker_job_id: int) -> bool:
+        """Claim one worker and return whether local shutdown is allowed."""
+        with self._active_workers_lock:
+            if self._active_workers.get(cluster_name) != worker_job_id:
+                return False
+            self._active_workers.pop(cluster_name)
+            return not self._superseded_cleanup_started
 
     async def handle_superseded(self, timeout: float = 60) -> None:
         """Bound cleanup of only this superseded incarnation's workers.
@@ -201,8 +221,7 @@ class BatchCoordinator:
         A timed-out in-flight call can still finish in its worker thread, but
         it targets only this incarnation's token or exact durable job ID.
         """
-        self._superseded_cleanup_started = True
-        self._cancelled = True
+        workers_snapshot = self._begin_cleanup(superseded=True)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + max(0, timeout)
 
@@ -249,8 +268,6 @@ class BatchCoordinator:
                     worker_job_id=worker_job_id)
             return within_deadline
 
-        with self._active_workers_lock:
-            workers_snapshot = list(self._active_workers.items())
         for cluster_name, worker_job_id in workers_snapshot:
             shutdown_code = self._generate_shutdown_code()
             shutdown_task = sky.Task(
@@ -1311,13 +1328,10 @@ class BatchCoordinator:
                             'Ignoring terminal failure from stale batch '
                             'attempt %d/%d', batch_idx, attempt_id)
         finally:
-            # Once supersession cleanup starts, it exclusively owns bounded
-            # external shutdown.  Worker threads only release local tracking,
-            # so they cannot start another SDK call after its global deadline.
-            if not self._superseded_cleanup_started:
+            # Cleanup ownership is claimed under the same lock used by cancel
+            # and supersession.  Exactly one path may issue external shutdown.
+            if self._claim_worker_cleanup(cluster_name, worker_job_id):
                 self._shutdown_worker(cluster_name, worker_job_id=worker_job_id)
-            with self._active_workers_lock:
-                self._active_workers.pop(cluster_name, None)
 
     # ------------------------------------------------------------------
     # Dispatch orchestration
