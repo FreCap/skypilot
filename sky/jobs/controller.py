@@ -2470,7 +2470,16 @@ class ControllerManager:
     async def cancel_job(self):
         """Cancel an existing job."""
         while True:
-            await self._process_cancel_signals()
+            try:
+                await self._process_cancel_signals()
+            except Exception as e:  # pylint: disable=broad-except
+                # A failed scan (e.g. a transient filesystem error) must not
+                # unwind this loop: it is gathered with the monitor loop in
+                # main(), so an escaped exception exits the whole controller
+                # process and kills every running job task. Unconsumed
+                # signals are re-listed by the next scan.
+                logger.error('Cancel signal scan failed: '
+                             f'{common_utils.format_exception(e)}')
             await asyncio.sleep(15)
 
     async def _process_cancel_signals(self):
@@ -2499,13 +2508,19 @@ class ControllerManager:
                 try:
                     content = pathlib.Path(signal_path).read_text(
                         encoding='utf-8').strip()
+                except FileNotFoundError:
+                    # The signal was consumed between the directory listing
+                    # and acquiring the lock (e.g. the orphan reaper of a
+                    # sibling controller process, after the job turned
+                    # terminal). There is nothing left to deliver.
+                    continue
                 except Exception as e:  # pylint: disable=broad-except
                     content = ''
                     logger.debug('Problem occurred when reading '
                                  f'{signal_path}: '
                                  f'{common_utils.format_exception(e)}')
                 finally:
-                    os.remove(signal_path)
+                    pathlib.Path(signal_path).unlink(missing_ok=True)
 
             # Parse and store graceful cancel info before
             # cancelling the task.
@@ -2515,6 +2530,20 @@ class ControllerManager:
                 self._cancel_info[job_id] = (graceful, graceful_timeout)
             task.cancel()
             logger.info(f'Job {job_id} cancelled successfully')
+
+    @staticmethod
+    def _remove_signal_file(job_id: int) -> None:
+        """Consume a job's cancel signal file, tolerating a lost race.
+
+        Takes the same filelock as the signal writer and the other
+        consumers; missing_ok covers the file being consumed by another
+        scanner (e.g. a sibling controller process) between listing the
+        directory and acquiring the lock.
+        """
+        signal_path = os.path.join(jobs_constants.CONSOLIDATED_SIGNAL_PATH,
+                                   str(job_id))
+        with filelock.FileLock(signal_path + '.lock'):
+            pathlib.Path(signal_path).unlink(missing_ok=True)
 
     async def _reap_orphan_cancel_signal(self, job_id: int) -> None:
         """Remove a cancel signal that no consumer will ever pick up.
@@ -2531,12 +2560,8 @@ class ControllerManager:
         status = await managed_job_state.get_status_async(job_id)
         if status is not None and not status.is_terminal():
             return
-        signal_path = os.path.join(jobs_constants.CONSOLIDATED_SIGNAL_PATH,
-                                   str(job_id))
         try:
-            with filelock.FileLock(signal_path + '.lock'):
-                if os.path.exists(signal_path):
-                    os.remove(signal_path)
+            self._remove_signal_file(job_id)
         except OSError as e:
             logger.debug(f'Failed to reap cancel signal for job {job_id}: '
                          f'{common_utils.format_exception(e)}')
@@ -2614,8 +2639,7 @@ class ControllerManager:
                 status = await managed_job_state.get_status_async(job_id)
                 if status == managed_job_state.ManagedJobStatus.PENDING:
                     logger.info(f'Job {job_id} cancelled')
-                    os.remove(f'{jobs_constants.CONSOLIDATED_SIGNAL_PATH}/'
-                              f'{job_id}')
+                    self._remove_signal_file(job_id)
                     await managed_job_state.set_cancelling_async(
                         job_id=job_id,
                         callback_func=managed_job_utils.event_callback_func(
