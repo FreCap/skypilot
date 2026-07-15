@@ -2958,22 +2958,32 @@ function PoolsTable({ refreshInterval, setLoading, refreshDataRef }) {
   const [isInitialLoad, setIsInitialLoad] = useState(true);
   const [currentPage, setCurrentPage] = useState(1);
   const [pageSize, setPageSize] = useState(10);
+  const mountedRef = useRef(false);
+  const requestVersionRef = useRef(0);
 
   const fetchData = React.useCallback(async () => {
+    const version = requestVersionRef.current + 1;
+    requestVersionRef.current = version;
+    const ownsState = () =>
+      mountedRef.current && version === requestVersionRef.current;
     setLocalLoading(true);
     setLoading(true);
     try {
       const poolsResponse = await dashboardCache.get(getPoolStatus, [{}]);
+      if (!ownsState()) return;
       const { pools = [] } = poolsResponse || {};
       setData(pools);
       setIsInitialLoad(false);
     } catch (err) {
+      if (!ownsState()) return;
       console.error('Error fetching pools data:', err);
       setData([]);
       setIsInitialLoad(false);
     } finally {
-      setLocalLoading(false);
-      setLoading(false);
+      if (ownsState()) {
+        setLocalLoading(false);
+        setLoading(false);
+      }
     }
   }, [setLoading]);
 
@@ -2985,6 +2995,7 @@ function PoolsTable({ refreshInterval, setLoading, refreshDataRef }) {
   }, [refreshDataRef, fetchData]);
 
   useEffect(() => {
+    mountedRef.current = true;
     setData([]);
     let isCurrent = true;
 
@@ -2998,6 +3009,8 @@ function PoolsTable({ refreshInterval, setLoading, refreshDataRef }) {
 
     return () => {
       isCurrent = false;
+      mountedRef.current = false;
+      requestVersionRef.current += 1;
       clearInterval(interval);
     };
   }, [refreshInterval, fetchData]);
