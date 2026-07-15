@@ -821,6 +821,105 @@ class ReplicaInfo:
         # None for ordinary demand/fill launches.
         self.cost_rebalance_for_replica_id: int | None = None
 
+    def to_storage_dict(self) -> dict[str, Any]:
+        """Serialize control-plane state into the versioned JSON contract."""
+        status_property = self.status_property
+        resources_override = self.resources_override
+        if resources_override is not None:
+            resources_override = dict(resources_override)
+            cloud = resources_override.get('cloud')
+            if cloud is not None and not isinstance(cloud, str):
+                # Placer-pinned overrides carry a Cloud instance. The recovery
+                # path accepts its registry name and reconstructs the object.
+                resources_override['cloud'] = str(cloud)
+
+        def _process_status_value(
+            status: common_utils.ProcessStatus | None,) -> str | None:
+            return status.value if status is not None else None
+
+        return {
+            'replica_info_version': self._version,
+            'replica_id': self.replica_id,
+            'cluster_name': self.cluster_name,
+            'version': self.version,
+            'replica_port': self.replica_port,
+            'created_at': getattr(self, 'created_at', None),
+            'first_not_ready_time': getattr(self, 'first_not_ready_time', None),
+            'first_consecutive_failure_time': getattr(
+                self, 'first_consecutive_failure_time', None),
+            'is_spot': self.is_spot,
+            'location': self.location,
+            'resources_override': resources_override,
+            'reserved_fill': bool(getattr(self, 'reserved_fill', False)),
+            'cost_rebalance_for_replica_id': getattr(
+                self, 'cost_rebalance_for_replica_id', None),
+            'status_property': {
+                'sky_launch_status': _process_status_value(
+                    status_property.sky_launch_status),
+                'user_app_failed': status_property.user_app_failed,
+                'service_ready_now': status_property.service_ready_now,
+                'first_ready_time': status_property.first_ready_time,
+                'sky_down_status': _process_status_value(
+                    status_property.sky_down_status),
+                'is_scale_down': status_property.is_scale_down,
+                'preempted': status_property.preempted,
+                'purged': status_property.purged,
+                'failed_spot_availability':
+                    status_property.failed_spot_availability,
+                'drain_cap_seconds': getattr(status_property,
+                                             'drain_cap_seconds', None),
+                'wait_for_idle_before_termination': bool(
+                    getattr(status_property, 'wait_for_idle_before_termination',
+                            False)),
+            },
+        }
+
+    @classmethod
+    def from_storage_dict(cls, state: dict[str, Any]) -> 'ReplicaInfo':
+        """Reconstruct a replica from the JSON storage contract."""
+        status_state = state['status_property']
+
+        def _process_status(
+            value: str | None,) -> common_utils.ProcessStatus | None:
+            return (common_utils.ProcessStatus(value)
+                    if value is not None else None)
+
+        replica = cls.__new__(cls)
+        replica._version = int(state['replica_info_version'])
+        replica.replica_id = int(state['replica_id'])
+        replica.cluster_name = str(state['cluster_name'])
+        replica.version = int(state['version'])
+        replica.replica_port = str(state['replica_port'])
+        replica.created_at = state.get('created_at')
+        replica.first_not_ready_time = state.get('first_not_ready_time')
+        replica.first_consecutive_failure_time = state.get(
+            'first_consecutive_failure_time')
+        replica.is_spot = bool(state['is_spot'])
+        replica.location = state.get('location')
+        replica.resources_override = state.get('resources_override')
+        replica.reserved_fill = bool(state.get('reserved_fill', False))
+        replica.cost_rebalance_for_replica_id = state.get(
+            'cost_rebalance_for_replica_id')
+        replica.status_property = ReplicaStatusProperty(
+            sky_launch_status=typing.cast(
+                common_utils.ProcessStatus,
+                _process_status(status_state['sky_launch_status'])),
+            user_app_failed=bool(status_state['user_app_failed']),
+            service_ready_now=bool(status_state['service_ready_now']),
+            first_ready_time=status_state.get('first_ready_time'),
+            sky_down_status=_process_status(
+                status_state.get('sky_down_status')),
+            is_scale_down=bool(status_state['is_scale_down']),
+            preempted=bool(status_state['preempted']),
+            purged=bool(status_state['purged']),
+            failed_spot_availability=bool(
+                status_state['failed_spot_availability']),
+            drain_cap_seconds=status_state.get('drain_cap_seconds'),
+            wait_for_idle_before_termination=bool(
+                status_state.get('wait_for_idle_before_termination', False)),
+        )
+        return replica
+
     def get_spot_location(self) -> spot_placer.Location | None:
         return spot_placer.Location.from_pickleable(self.location)
 

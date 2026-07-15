@@ -1696,15 +1696,11 @@ def _get_service_status(
     if with_replica_counts and not with_replica_info:
         # Summary mode: give callers (the dashboard header, list views)
         # enough to render without the expensive per-replica
-        # `to_info_dict` serialization below — a status histogram costs
-        # one unpickle pass over the rows, no cluster-record joins, no
-        # URL resolution. At fleet scale (hundreds of replicas) this is
-        # the difference between a snappy summary and a 30s+ full query.
-        status_counts: collections.defaultdict[
-            str, int] = collections.defaultdict(int)
-        for info in serve_state.get_replica_infos(service_name):
-            status_counts[info.status.value] += 1
-        record['replica_status_counts'] = dict(status_counts)
+        # `to_info_dict` serialization below. The status histogram is one
+        # indexed GROUP BY, with no JSON decoding, cluster-record joins, or
+        # URL resolution.
+        record['replica_status_counts'] = serve_state.get_replica_status_counts(
+            service_name)
 
     if with_replica_info:
         replica_infos = serve_state.get_replica_infos(service_name)

@@ -8,17 +8,35 @@ leader-aware routing.
 # effects). Disable for the file.
 # pylint: disable=invalid-name,protected-access
 import contextlib
+import pickle
 import types
 
 import pytest
 import sqlalchemy
 from sqlalchemy import create_engine
 from sqlalchemy import orm
+from sqlalchemy.dialects import postgresql
 
+from sky import clouds
 from sky.serve import constants as serve_constants
 from sky.serve import replica_managers
 from sky.serve import serve_state
 from sky.utils import common_utils
+from sky.utils.db import migration_utils
+
+
+def _replica(replica_id: int,
+             cluster_name: str | None = None,
+             version: int = 1) -> replica_managers.ReplicaInfo:
+    return replica_managers.ReplicaInfo(
+        replica_id=replica_id,
+        cluster_name=cluster_name or f'svc-{replica_id}',
+        replica_port='8080',
+        is_spot=False,
+        location=None,
+        version=version,
+        resources_override=None,
+    )
 
 
 class _FakeSpec:
@@ -136,7 +154,7 @@ def _insert_orphan_service_row(engine, name: str, pool: bool = False):
 
 def test_launch_budget_counts_share_one_replica_scan(_mock_serve_db,
                                                      monkeypatch):
-    """Provisioning and termination occupancy are counted in one unpickle pass.
+    """Provisioning and termination occupancy are counted in one SQL query.
 
     A row can satisfy both predicates while a launched replica is being
     terminated; preserve the historical independent-count semantics.
@@ -173,8 +191,120 @@ def test_launch_budget_counts_share_one_replica_scan(_mock_serve_db,
         return original_loads(value)
 
     monkeypatch.setattr(serve_state.pickle, 'loads', _counting_loads)
-    assert serve_state.get_replica_launch_budget_counts() == (2, 1)
-    assert unpickles == 2
+    with _count_sql_statements(_mock_serve_db) as counts:
+        assert serve_state.get_replica_launch_budget_counts() == (2, 1)
+    assert counts['n'] == 1
+    assert unpickles == 0
+
+
+def test_replica_json_storage_round_trip_preserves_lifecycle_state():
+    info = _replica(7, version=3)
+    info.created_at = 123.5
+    info.first_not_ready_time = 124.5
+    info.first_consecutive_failure_time = 125.5
+    info.reserved_fill = True
+    info.cost_rebalance_for_replica_id = 4
+    info.status_property.sky_launch_status = common_utils.ProcessStatus.SUCCEEDED
+    info.status_property.service_ready_now = True
+    info.status_property.first_ready_time = 126.5
+    info.status_property.sky_down_status = common_utils.ProcessStatus.SCHEDULED
+    info.status_property.is_scale_down = True
+    info.status_property.drain_cap_seconds = 30
+    info.status_property.wait_for_idle_before_termination = True
+
+    restored = replica_managers.ReplicaInfo.from_storage_dict(
+        info.to_storage_dict())
+
+    assert restored.to_storage_dict() == info.to_storage_dict()
+    assert restored.status == info.status
+
+
+def test_replica_state_uses_jsonb_on_postgres():
+    state_type = serve_state.replicas_table.c.replica_state.type
+    assert isinstance(state_type.dialect_impl(postgresql.dialect()),
+                      postgresql.JSONB)
+
+
+def test_replica_reads_do_not_use_pickle(_mock_serve_db, monkeypatch):
+    info = _replica(1)
+    info.resources_override = {
+        'cloud': clouds.AWS(),
+        'region': 'us-east-1',
+        'use_spot': True,
+    }
+    serve_state.add_or_update_replica('svc', 1, info)
+    monkeypatch.setattr(
+        serve_state.pickle, 'loads',
+        lambda _: pytest.fail('replica read attempted pickle fallback'))
+
+    restored = serve_state.get_replica_info_from_id('svc', 1)
+
+    assert restored is not None
+    assert restored.to_storage_dict() == info.to_storage_dict()
+    assert restored.resources_override['cloud'] == 'AWS'
+
+
+def test_replica_status_counts_are_grouped_in_sql(_mock_serve_db):
+    ready = _replica(1)
+    ready.status_property.sky_launch_status = common_utils.ProcessStatus.SUCCEEDED
+    ready.status_property.service_ready_now = True
+    serve_state.add_or_update_replicas('svc', [(1, ready), (2, _replica(2))])
+
+    with _count_sql_statements(_mock_serve_db) as counts:
+        status_counts = serve_state.get_replica_status_counts('svc')
+
+    assert counts['n'] == 1
+    assert status_counts == {'PENDING': 1, 'READY': 1}
+
+
+def test_replica_json_migration_backfills_legacy_pickle(tmp_path, monkeypatch):
+    engine = create_engine(f'sqlite:///{tmp_path / "legacy-serve.db"}')
+    legacy_metadata = sqlalchemy.MetaData()
+    legacy_replicas = sqlalchemy.Table(
+        'replicas', legacy_metadata,
+        sqlalchemy.Column('service_name', sqlalchemy.Text, primary_key=True),
+        sqlalchemy.Column('replica_id', sqlalchemy.Integer, primary_key=True),
+        sqlalchemy.Column('replica_info', sqlalchemy.LargeBinary))
+    version_table = sqlalchemy.Table(
+        'alembic_version_serve_state_db', legacy_metadata,
+        sqlalchemy.Column('version_num',
+                          sqlalchemy.String(32),
+                          primary_key=True))
+    legacy_metadata.create_all(engine)
+    info = _replica(3, cluster_name='legacy-cluster', version=2)
+    info._version = 6
+    del info.first_consecutive_failure_time
+    info.consecutive_failure_times = [42.0, 43.0]
+    info.status_property.sky_launch_status = common_utils.ProcessStatus.SUCCEEDED
+    info.status_property.service_ready_now = True
+    legacy_blob = pickle.dumps(info)
+    expected_state = pickle.loads(legacy_blob).to_storage_dict()
+    with engine.begin() as connection:
+        connection.execute(legacy_replicas.insert().values(
+            service_name='svc', replica_id=3, replica_info=legacy_blob))
+        connection.execute(version_table.insert().values(version_num='009'))
+
+    migration_utils.safe_alembic_upgrade(engine, migration_utils.SERVE_DB_NAME,
+                                         '010')
+    monkeypatch.setattr(serve_state._db_manager, '_engine', engine)
+
+    restored = serve_state.get_replica_info_from_id('svc', 3)
+    assert restored is not None
+    assert restored.to_storage_dict() == expected_state
+    assert restored.first_consecutive_failure_time == 42.0
+    assert serve_state.get_replica_status_counts('svc') == {'READY': 1}
+
+
+def test_replica_json_migration_handles_fresh_database(tmp_path):
+    engine = create_engine(f'sqlite:///{tmp_path / "fresh-serve.db"}')
+
+    serve_state.create_table(engine)
+
+    columns = {
+        column['name']
+        for column in sqlalchemy.inspect(engine).get_columns('replicas')
+    }
+    assert {'replica_state_version', 'status', 'replica_state'} <= columns
 
 
 def test_get_specs_batches_requested_versions_in_one_query(_mock_serve_db):
@@ -521,8 +651,7 @@ class TestAddServiceAtomicRegistration:
 
     def test_fenced_registration_preserves_orphan_replica_inventory(
             self, _mock_serve_db):
-        orphan = types.SimpleNamespace(replica_id=9,
-                                       cluster_name='billable-cluster-9')
+        orphan = _replica(9, cluster_name='billable-cluster-9')
         serve_state.add_or_update_replica('svc-stale', 9, orphan)
         epoch = serve_state.claim_service_lifecycle_epoch('svc-stale')
 
@@ -624,7 +753,7 @@ class TestServiceLifecycleEpoch:
         assert serve_state.add_or_update_replica(
             'svc',
             1,
-            'replica-a',
+            _replica(1, cluster_name='replica-a'),
             expected_service_hash='incarnation-a',
             expected_lifecycle_epoch=epoch_a)
 
@@ -639,7 +768,7 @@ class TestServiceLifecycleEpoch:
         assert serve_state.add_or_update_replica(
             'svc',
             1,
-            'replica-b',
+            _replica(1, cluster_name='replica-b'),
             expected_service_hash='incarnation-b',
             expected_lifecycle_epoch=epoch_b)
 
@@ -648,7 +777,9 @@ class TestServiceLifecycleEpoch:
             1,
             expected_service_hash='incarnation-a',
             expected_lifecycle_epoch=epoch_delete)
-        assert serve_state.get_replica_info_from_id('svc', 1) == 'replica-b'
+        replica = serve_state.get_replica_info_from_id('svc', 1)
+        assert replica is not None
+        assert replica.cluster_name == 'replica-b'
 
     def test_exact_owner_cleanup_is_idempotent_when_children_are_absent(
             self, _mock_serve_db):
@@ -1691,21 +1822,19 @@ class TestBatchReplicaUpsert:
     """add_or_update_replicas: one statement for a probe round's writes."""
 
     def test_batch_insert_then_batch_update(self, _mock_serve_db):
-        infos = [(i, types.SimpleNamespace(replica_id=i, tag='v1'))
-                 for i in range(1, 4)]
+        infos = [(i, _replica(i, version=1)) for i in range(1, 4)]
         serve_state.add_or_update_replicas('svc', infos)
         rows = {
             i: serve_state.get_replica_info_from_id('svc', i)
             for i in range(1, 4)
         }
-        assert all(rows[i].tag == 'v1' for i in range(1, 4))
+        assert all(rows[i].version == 1 for i in range(1, 4))
 
         # Conflict path: same keys must update in place, not duplicate.
-        updated = [(i, types.SimpleNamespace(replica_id=i, tag='v2'))
-                   for i in range(1, 4)]
+        updated = [(i, _replica(i, version=2)) for i in range(1, 4)]
         serve_state.add_or_update_replicas('svc', updated)
         assert all(
-            serve_state.get_replica_info_from_id('svc', i).tag == 'v2'
+            serve_state.get_replica_info_from_id('svc', i).version == 2
             for i in range(1, 4))
         assert len(serve_state.get_replica_infos('svc')) == 3
 
@@ -1715,9 +1844,7 @@ class TestBatchReplicaUpsert:
 
     def test_batch_larger_than_chunk_size(self, _mock_serve_db):
         n = serve_state._REPLICA_UPSERT_CHUNK_SIZE * 2 + 17
-        infos = [
-            (i, types.SimpleNamespace(replica_id=i)) for i in range(1, n + 1)
-        ]
+        infos = [(i, _replica(i)) for i in range(1, n + 1)]
         serve_state.add_or_update_replicas('svc', infos)
         assert len(serve_state.get_replica_infos('svc')) == n
 
@@ -1729,8 +1856,8 @@ class TestGroupedReplicaSnapshot:
         for service_id in range(20):
             service_name = f'svc-{service_id}'
             infos = [(replica_id,
-                      types.SimpleNamespace(replica_id=replica_id,
-                                            service_name=service_name))
+                      _replica(replica_id,
+                               cluster_name=f'{service_name}-{replica_id}'))
                      for replica_id in range(3)]
             serve_state.add_or_update_replicas(service_name, infos)
 
@@ -1740,9 +1867,10 @@ class TestGroupedReplicaSnapshot:
         assert counts['n'] == 1
         assert set(grouped) == {f'svc-{i}' for i in range(20)}
         assert all(len(infos) == 3 for infos in grouped.values())
-        assert all(info.service_name == service_name
-                   for service_name, infos in grouped.items()
-                   for info in infos)
+        assert all(
+            info.cluster_name.startswith(f'{service_name}-')
+            for service_name, infos in grouped.items()
+            for info in infos)
 
     def test_empty_table_returns_empty_mapping(self, _mock_serve_db):
         assert not serve_state.get_replica_infos_grouped()

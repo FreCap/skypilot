@@ -814,6 +814,9 @@ class TestTerminateOrphanedServiceRowPurge:
                         'get_service_mode_and_hash',
                         return_value=(raw_pool, 'orphan-hash')
                         if raw_pool is not None else None), \
+             mock.patch('sky.serve.serve_utils.serve_state.'
+                        'get_orphaned_service_child_mode',
+                        return_value=None), \
              mock.patch('sky.serve.serve_utils._terminate_failed_services',
                         return_value=serve_utils._PurgeResult(True)
                        ) as mock_purge:

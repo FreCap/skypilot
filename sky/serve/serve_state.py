@@ -16,6 +16,7 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects import sqlite
 from sqlalchemy.ext import declarative
 
+from sky.adaptors import common as adaptors_common
 from sky.serve import constants
 from sky.utils import common_utils
 from sky.utils import yaml_utils
@@ -27,6 +28,8 @@ if typing.TYPE_CHECKING:
 
     from sky.serve import replica_managers
     from sky.serve import service_spec
+
+replica_managers = adaptors_common.LazyImport('sky.serve.replica_managers')
 
 Base = declarative.declarative_base()
 
@@ -91,7 +94,19 @@ replicas_table = sqlalchemy.Table(
     sqlalchemy.Column('service_name', sqlalchemy.Text, primary_key=True),
     sqlalchemy.Column('replica_id', sqlalchemy.Integer, primary_key=True),
     sqlalchemy.Column('replica_info', sqlalchemy.LargeBinary),
+    sqlalchemy.Column('replica_state_version', sqlalchemy.Integer),
+    sqlalchemy.Column('status', sqlalchemy.Text),
+    sqlalchemy.Column('sky_down_status', sqlalchemy.Text),
+    sqlalchemy.Column('version', sqlalchemy.Integer),
+    sqlalchemy.Column('cluster_name', sqlalchemy.Text),
+    sqlalchemy.Column('created_at', sqlalchemy.Float),
+    sqlalchemy.Column('is_spot', sqlalchemy.Boolean),
+    sqlalchemy.Column(
+        'replica_state',
+        sqlalchemy.JSON().with_variant(postgresql.JSONB(), 'postgresql')),
 )
+sqlalchemy.Index('replicas_service_status_idx', replicas_table.c.service_name,
+                 replicas_table.c.status)
 
 version_specs_table = sqlalchemy.Table(
     'version_specs',
@@ -674,20 +689,14 @@ def add_service(name: str,
             orphan_replica_rows = session.execute(
                 sqlalchemy.select(
                     replicas_table.c.replica_id,
-                    replicas_table.c.replica_info).where(
+                    replicas_table.c.cluster_name).where(
                         replicas_table.c.service_name == name)).fetchall()
             if orphan_replica_rows:
-                identities = []
-                for replica_id, replica_info_bytes in orphan_replica_rows:
-                    try:
-                        replica_info = pickle.loads(replica_info_bytes)
-                        cluster_name = getattr(replica_info, 'cluster_name',
-                                               None)
-                    except Exception:  # pylint: disable=broad-except
-                        cluster_name = None
-                    identities.append(
-                        str(cluster_name
-                           ) if cluster_name else f'replica-id:{replica_id}')
+                identities = [
+                    str(cluster_name)
+                    if cluster_name else f'replica-id:{replica_id}'
+                    for replica_id, cluster_name in orphan_replica_rows
+                ]
                 session.rollback()
                 raise OrphanedReplicaRecordsError(
                     f'Cannot safely reuse service name {name!r}: orphan '
@@ -1819,17 +1828,16 @@ def get_orphaned_service_child_mode(service_name: str) -> bool | None:
                     service_name)).scalars().all()
         modes.update(bool(mode) for mode in intent_modes)
         replica_rows = session.execute(
-            sqlalchemy.select(replicas_table.c.replica_info).where(
+            sqlalchemy.select(replicas_table.c.replica_state).where(
                 replicas_table.c.service_name == service_name)).scalars().all()
         version_rows = session.execute(
             sqlalchemy.select(version_specs_table.c.spec,
                               version_specs_table.c.yaml_content).where(
                                   version_specs_table.c.service_name ==
                                   service_name)).fetchall()
-    for replica_info_bytes in replica_rows:
+    for replica_state in replica_rows:
         try:
-            replica_info = pickle.loads(replica_info_bytes)
-            modes.add(getattr(replica_info, 'replica_port', None) == '-')
+            modes.add(replica_state['replica_port'] == '-')
         except Exception:  # pylint: disable=broad-except
             return None
     for spec_bytes, yaml_content in version_rows:
@@ -1941,9 +1949,45 @@ def get_service_pool_from_db(service_name: str) -> bool | None:
 
 # === Replica functions ===
 
-# 999 (the oldest SQLITE_MAX_VARIABLE_NUMBER default) // 3 params per row,
+# 999 (the oldest SQLITE_MAX_VARIABLE_NUMBER default) // 11 fields per row,
 # rounded down for headroom.
-_REPLICA_UPSERT_CHUNK_SIZE = 300
+_REPLICA_UPSERT_CHUNK_SIZE = 90
+_POSTGRESQL_REPLICA_UPSERT_CHUNK_SIZE = 300
+_REPLICA_STATE_VERSION = 1
+
+
+def _replica_row_values(
+        service_name: str, replica_id: int,
+        replica_info: 'replica_managers.ReplicaInfo') -> dict[str, Any]:
+    """Build the legacy rollback blob and the authoritative query state."""
+    replica_state = replica_info.to_storage_dict()
+    sky_down_status = replica_info.status_property.sky_down_status
+    return {
+        'service_name': service_name,
+        'replica_id': replica_id,
+        # TODO(fcapponi): After 2026-07-20, delete the pickle column and this
+        # dual-write once production validation confirms every row has a
+        # supported replica_state_version and JSON/pickle parity.
+        'replica_info': pickle.dumps(replica_info),
+        'replica_state_version': _REPLICA_STATE_VERSION,
+        'status': replica_info.status.value,
+        'sky_down_status':
+            (sky_down_status.value if sky_down_status is not None else None),
+        'version': replica_info.version,
+        'cluster_name': replica_info.cluster_name,
+        'created_at': getattr(replica_info, 'created_at', None),
+        'is_spot': replica_info.is_spot,
+        'replica_state': replica_state,
+    }
+
+
+def _replica_from_state(
+        replica_state_version: int,
+        replica_state: dict[str, Any]) -> 'replica_managers.ReplicaInfo':
+    if replica_state_version != _REPLICA_STATE_VERSION:
+        raise RuntimeError('Unsupported replica state version: '
+                           f'{replica_state_version!r}')
+    return replica_managers.ReplicaInfo.from_storage_dict(replica_state)
 
 
 def add_or_update_replica(
@@ -1989,13 +2033,15 @@ def add_or_update_replica(
             raise ValueError('Unsupported database dialect')
 
         insert_stmt = insert_func(replicas_table).values(
-            service_name=service_name,
-            replica_id=replica_id,
-            replica_info=pickle.dumps(replica_info))
+            **_replica_row_values(service_name, replica_id, replica_info))
 
         insert_stmt = insert_stmt.on_conflict_do_update(
             index_elements=['service_name', 'replica_id'],
-            set_={'replica_info': insert_stmt.excluded.replica_info})
+            set_={
+                column.name: getattr(insert_stmt.excluded, column.name)
+                for column in replicas_table.c
+                if column.name not in ('service_name', 'replica_id')
+            })
 
         session.execute(insert_stmt)
         session.commit()
@@ -2052,21 +2098,27 @@ def add_or_update_replicas(
         else:
             raise ValueError('Unsupported database dialect')
 
-        # Chunked: 3 bind params per row, and older SQLite builds cap
-        # SQLITE_MAX_VARIABLE_NUMBER at 999 — an unchunked 1k-replica round
-        # would fail exactly on the deployments this batching targets.
-        # 300 rows/chunk keeps a 1k-replica round at ~4 round-trips.
-        for start in range(0, len(replica_infos), _REPLICA_UPSERT_CHUNK_SIZE):
-            chunk = replica_infos[start:start + _REPLICA_UPSERT_CHUNK_SIZE]
-            insert_stmt = insert_func(replicas_table).values([{
-                'service_name': service_name,
-                'replica_id': replica_id,
-                'replica_info': pickle.dumps(replica_info),
-            } for replica_id, replica_info in chunk])
+        # Older SQLite builds cap SQLITE_MAX_VARIABLE_NUMBER at 999, while
+        # PostgreSQL can preserve the prior 300-row batches. Keep the SQLite
+        # chunk below 999 / 11 bind params without slowing the production
+        # PostgreSQL probe loop.
+        chunk_size = (_REPLICA_UPSERT_CHUNK_SIZE if engine.dialect.name
+                      == db_utils.SQLAlchemyDialect.SQLITE.value else
+                      _POSTGRESQL_REPLICA_UPSERT_CHUNK_SIZE)
+        for start in range(0, len(replica_infos), chunk_size):
+            chunk = replica_infos[start:start + chunk_size]
+            insert_stmt = insert_func(replicas_table).values([
+                _replica_row_values(service_name, replica_id, replica_info)
+                for replica_id, replica_info in chunk
+            ])
 
             insert_stmt = insert_stmt.on_conflict_do_update(
                 index_elements=['service_name', 'replica_id'],
-                set_={'replica_info': insert_stmt.excluded.replica_info})
+                set_={
+                    column.name: getattr(insert_stmt.excluded, column.name)
+                    for column in replicas_table.c
+                    if column.name not in ('service_name', 'replica_id')
+                })
 
             session.execute(insert_stmt)
         session.commit()
@@ -2125,11 +2177,13 @@ def get_replica_info_from_id(
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         result = session.execute(
-            sqlalchemy.select(replicas_table.c.replica_info).where(
-                sqlalchemy.and_(
-                    replicas_table.c.service_name == service_name,
-                    replicas_table.c.replica_id == replica_id))).fetchone()
-    return pickle.loads(result[0]) if result else None
+            sqlalchemy.select(
+                replicas_table.c.replica_state_version,
+                replicas_table.c.replica_state).where(
+                    sqlalchemy.and_(
+                        replicas_table.c.service_name == service_name,
+                        replicas_table.c.replica_id == replica_id))).fetchone()
+    return _replica_from_state(result[0], result[1]) if result else None
 
 
 def get_replica_infos_from_ids(
@@ -2147,12 +2201,13 @@ def get_replica_infos_from_ids(
         rows = session.execute(
             sqlalchemy.select(
                 replicas_table.c.replica_id,
-                replicas_table.c.replica_info).where(
+                replicas_table.c.replica_state_version,
+                replicas_table.c.replica_state).where(
                     sqlalchemy.and_(
                         replicas_table.c.service_name == service_name,
                         replicas_table.c.replica_id.in_(sorted(
                             set(replica_ids)))))).fetchall()
-    return {row[0]: pickle.loads(row[1]) for row in rows}
+    return {row[0]: _replica_from_state(row[1], row[2]) for row in rows}
 
 
 def get_replica_ids(service_name: str) -> set[int]:
@@ -2171,9 +2226,11 @@ def get_replica_infos(
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         rows = session.execute(
-            sqlalchemy.select(replicas_table.c.replica_info).where(
-                replicas_table.c.service_name == service_name)).fetchall()
-    return [pickle.loads(row[0]) for row in rows]
+            sqlalchemy.select(
+                replicas_table.c.replica_state_version,
+                replicas_table.c.replica_state).where(
+                    replicas_table.c.service_name == service_name)).fetchall()
+    return [_replica_from_state(row[0], row[1]) for row in rows]
 
 
 def get_replica_infos_grouped(
@@ -2185,11 +2242,13 @@ def get_replica_infos_grouped(
     with orm.Session(engine) as session:
         rows = session.execute(
             sqlalchemy.select(replicas_table.c.service_name,
-                              replicas_table.c.replica_info))
+                              replicas_table.c.replica_state_version,
+                              replicas_table.c.replica_state))
         # Iterate the cursor instead of materializing a second list of every
         # serialized blob alongside the decoded snapshot.
-        for service_name, replica_info in rows:
-            infos_by_service[service_name].append(pickle.loads(replica_info))
+        for service_name, state_version, replica_state in rows:
+            infos_by_service[service_name].append(
+                _replica_from_state(state_version, replica_state))
     return dict(infos_by_service)
 
 
@@ -2209,6 +2268,19 @@ def get_replica_service_names() -> list[str]:
     return [row[0] for row in rows]
 
 
+def get_replica_status_counts(service_name: str) -> dict[str, int]:
+    """Return persisted replica counts grouped by status in one SQL query."""
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        rows = session.execute(
+            sqlalchemy.select(
+                replicas_table.c.status,
+                sqlalchemy.func.count()  # pylint: disable=not-callable
+            ).where(replicas_table.c.service_name == service_name).group_by(
+                replicas_table.c.status)).fetchall()
+    return {status: count for status, count in rows}
+
+
 def total_number_provisioning_replicas() -> int:
     """Returns the total number of provisioning replicas."""
     provisioning_count, _ = get_replica_launch_budget_counts()
@@ -2222,30 +2294,26 @@ def total_number_terminating_replicas() -> int:
 
 
 def get_replica_launch_budget_counts() -> tuple[int, int]:
-    """Returns provisioning and terminating replica counts in one scan.
-
-    Replica state is stored as a pickled object, so neither count can be
-    computed by SQL.  The launch admission loop needs both values together;
-    reading them through the two legacy helpers above would query and unpickle
-    the entire global replica table twice per admission tick.
+    """Returns provisioning and terminating replica counts in one query.
 
     Returns:
         A ``(provisioning_count, terminating_count)`` tuple.
     """
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
-        rows = session.execute(sqlalchemy.select(
-            replicas_table.c.replica_info)).fetchall()
-    provisioning_count = 0
-    terminating_count = 0
-    for row in rows:
-        replica_info: replica_managers.ReplicaInfo = pickle.loads(row[0])
-        if replica_info.status == ReplicaStatus.PROVISIONING:
-            provisioning_count += 1
-        if (replica_info.status_property.sky_down_status ==
-                common_utils.ProcessStatus.RUNNING):
-            terminating_count += 1
-    return provisioning_count, terminating_count
+        row = session.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.sum(
+                    sqlalchemy.case((replicas_table.c.status
+                                     == ReplicaStatus.PROVISIONING.value, 1),
+                                    else_=0)),
+                sqlalchemy.func.sum(
+                    sqlalchemy.case(
+                        (replicas_table.c.sky_down_status
+                         == common_utils.ProcessStatus.RUNNING.value, 1),
+                        else_=0)),
+            )).one()
+    return int(row[0] or 0), int(row[1] or 0)
 
 
 # === Version functions ===
