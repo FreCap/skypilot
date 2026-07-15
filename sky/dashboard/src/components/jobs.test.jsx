@@ -1,4 +1,13 @@
 import {
+  act,
+  render,
+  renderHook,
+  screen,
+  waitFor,
+} from '@testing-library/react';
+import {
+  ManagedJobs,
+  useManagedJobsPageData,
   filterJobsByName,
   filterJobsByPool,
   filterJobsByUser,
@@ -8,6 +17,207 @@ import {
 } from '@/components/jobs';
 import * as jobDomain from '@/components/job-domain';
 import * as jobsFacade from '@/components/jobs';
+import dashboardCache from '@/lib/cache';
+import cachePreloader from '@/lib/cache-preloader';
+import jobsCacheManager from '@/lib/jobs-cache-manager';
+import { getPoolStatus } from '@/data/connectors/jobs';
+import { getCurrentUserInfo } from '@/data/connectors/client';
+
+jest.mock('next/router', () => {
+  const router = {
+    isReady: true,
+    query: {},
+    push: jest.fn(),
+    replace: jest.fn(),
+  };
+  return { useRouter: () => router };
+});
+
+jest.mock('@/lib/cache', () => ({
+  __esModule: true,
+  default: {
+    get: jest.fn(),
+    invalidate: jest.fn(),
+  },
+}));
+
+jest.mock('@/lib/cache-preloader', () => ({
+  __esModule: true,
+  default: {
+    preloadForPage: jest.fn(),
+  },
+}));
+
+jest.mock('@/lib/jobs-cache-manager', () => ({
+  __esModule: true,
+  default: {
+    getPaginatedJobs: jest.fn(),
+    prefetchNextPage: jest.fn(),
+    invalidateCache: jest.fn(),
+  },
+}));
+
+jest.mock('@/data/connectors/client', () => ({
+  apiClient: jest.fn(),
+  getCurrentUserInfo: jest.fn(),
+}));
+
+beforeEach(() => {
+  jest.clearAllMocks();
+  cachePreloader.preloadForPage.mockResolvedValue(undefined);
+  dashboardCache.get.mockImplementation((fetcher) => {
+    if (fetcher === getPoolStatus) {
+      return Promise.resolve({ pools: [] });
+    }
+    return Promise.resolve([]);
+  });
+  jobsCacheManager.getPaginatedJobs.mockResolvedValue({
+    jobs: [],
+    pools: [],
+    total: 0,
+    totalNoFilter: 0,
+    statusCounts: {},
+    controllerStopped: false,
+    hasNext: false,
+  });
+  getCurrentUserInfo.mockResolvedValue({ id: 'local', name: 'local' });
+});
+
+const deferred = () => {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+};
+
+describe('managed jobs page initialization', () => {
+  it('performs one preload sweep for one mount', async () => {
+    render(<ManagedJobs />);
+
+    await screen.findByText(/Updated just now/);
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(cachePreloader.preloadForPage).toHaveBeenCalledTimes(1);
+    expect(cachePreloader.preloadForPage).toHaveBeenCalledWith('jobs');
+    expect(
+      dashboardCache.get.mock.calls.filter(
+        ([fetcher]) => fetcher === getPoolStatus
+      )
+    ).toHaveLength(2); // One page snapshot plus the PoolsTable's own read.
+  });
+
+  it('does not start the pool request when preload finishes after unmount', async () => {
+    const preload = deferred();
+    cachePreloader.preloadForPage.mockReturnValue(preload.promise);
+    const { unmount } = renderHook(() => useManagedJobsPageData());
+
+    unmount();
+    await act(async () => {
+      preload.resolve();
+      await preload.promise;
+    });
+
+    expect(dashboardCache.get).not.toHaveBeenCalled();
+  });
+
+  it('continues to the pool snapshot when preload fails', async () => {
+    cachePreloader.preloadForPage.mockRejectedValue(
+      new Error('preload unavailable')
+    );
+    dashboardCache.get.mockResolvedValue({ pools: [{ name: 'pool-a' }] });
+    const consoleError = jest
+      .spyOn(console, 'error')
+      .mockImplementation(() => {});
+    const { result } = renderHook(() => useManagedJobsPageData());
+
+    await waitFor(() => {
+      expect(result.current.poolsData).toEqual([{ name: 'pool-a' }]);
+    });
+    expect(result.current.preloadingComplete).toBe(true);
+    expect(result.current.poolsLoading).toBe(false);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+    expect(consoleError).toHaveBeenCalledWith(
+      'Error preloading jobs data:',
+      expect.objectContaining({ message: 'preload unavailable' })
+    );
+    consoleError.mockRestore();
+  });
+
+  it('lets the latest refresh own the pool snapshot and child fanout', async () => {
+    const initialPools = deferred();
+    const refreshedPools = deferred();
+    dashboardCache.get
+      .mockReturnValueOnce(initialPools.promise)
+      .mockReturnValueOnce(refreshedPools.promise);
+    const { result } = renderHook(() => useManagedJobsPageData());
+
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(1));
+    const refreshJobs = jest.fn();
+    const refreshPools = jest.fn();
+    result.current.jobsRefreshRef.current = refreshJobs;
+    result.current.poolsRefreshRef.current = refreshPools;
+
+    act(() => result.current.handleRefresh());
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(2));
+    expect(refreshJobs).toHaveBeenCalledTimes(1);
+    expect(refreshPools).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      refreshedPools.resolve({ pools: [{ name: 'fresh-pool' }] });
+      await refreshedPools.promise;
+    });
+    expect(result.current.poolsData).toEqual([{ name: 'fresh-pool' }]);
+    expect(result.current.poolsLoading).toBe(false);
+
+    await act(async () => {
+      initialPools.resolve({ pools: [{ name: 'stale-pool' }] });
+      await initialPools.promise;
+    });
+    expect(result.current.poolsData).toEqual([{ name: 'fresh-pool' }]);
+    expect(cachePreloader.preloadForPage).toHaveBeenNthCalledWith(1, 'jobs');
+    expect(cachePreloader.preloadForPage).toHaveBeenNthCalledWith(2, 'jobs', {
+      force: true,
+    });
+    expect(jobsCacheManager.invalidateCache).toHaveBeenCalledTimes(1);
+    expect(dashboardCache.invalidate).toHaveBeenCalledWith(getPoolStatus, [{}]);
+  });
+
+  it('ignores a stale request failure after a refresh succeeds', async () => {
+    const initialPools = deferred();
+    const refreshedPools = deferred();
+    dashboardCache.get
+      .mockReturnValueOnce(initialPools.promise)
+      .mockReturnValueOnce(refreshedPools.promise);
+    const consoleError = jest
+      .spyOn(console, 'error')
+      .mockImplementation(() => {});
+    const { result } = renderHook(() => useManagedJobsPageData());
+
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(1));
+    act(() => result.current.handleRefresh());
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      refreshedPools.resolve({ pools: [{ name: 'fresh-pool' }] });
+      await refreshedPools.promise;
+    });
+    await act(async () => {
+      initialPools.reject(new Error('stale pool failure'));
+      await expect(initialPools.promise).rejects.toThrow('stale pool failure');
+    });
+
+    expect(result.current.poolsData).toEqual([{ name: 'fresh-pool' }]);
+    expect(consoleError).not.toHaveBeenCalledWith(
+      'Error fetching data:',
+      expect.objectContaining({ message: 'stale pool failure' })
+    );
+    consoleError.mockRestore();
+  });
+});
 
 describe('job domain helpers', () => {
   it('preserves direct identities through the historical jobs facade', () => {
