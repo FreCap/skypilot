@@ -87,6 +87,7 @@ export function ServiceAccountTokensView({
   // Enhanced tokens with cluster/job counts
   const [tokensWithCounts, setTokensWithCounts] = useState([]);
   const refreshIdRef = useRef(0);
+  const mountedRef = useRef(false);
 
   // Server-side pagination state (used only when the pagination plugin
   // exposes window.__skyServiceAccountTokensPaginationFetch). Defer the
@@ -209,10 +210,19 @@ export function ServiceAccountTokensView({
     },
     [page, limit, debouncedSearch, serverPaginated]
   );
+  const fetchTokensAndCountsRef = useRef(fetchTokensAndCounts);
+  fetchTokensAndCountsRef.current = fetchTokensAndCounts;
+
+  const refreshAfterMutation = useCallback(async () => {
+    if (!mountedRef.current) return;
+    await fetchTokensAndCountsRef.current(true);
+  }, []);
 
   useEffect(() => {
+    mountedRef.current = true;
     fetchTokensAndCounts();
     return () => {
+      mountedRef.current = false;
       refreshIdRef.current += 1;
     };
   }, [fetchTokensAndCounts]);
@@ -237,6 +247,7 @@ export function ServiceAccountTokensView({
       return;
     }
 
+    const loadingId = ++refreshIdRef.current;
     setLoading(true);
     try {
       const response = await apiClient.post(
@@ -253,13 +264,13 @@ export function ServiceAccountTokensView({
       }
 
       setCreateSuccess('Service account role updated successfully!');
-      await fetchTokensAndCounts(true); // Refresh data (force refresh after mutation)
+      await refreshAfterMutation();
       handleCancelEdit(); // Exit edit mode
     } catch (error) {
       console.error('Failed to update service account role:', error);
       setCreateError(error);
     } finally {
-      setLoading(false);
+      if (loadingId === refreshIdRef.current) setLoading(false);
     }
   };
 
@@ -298,7 +309,7 @@ export function ServiceAccountTokensView({
         const data = await response.json();
         setCreatedTokenInDialog(data.token);
         setNewToken({ token_name: '', expires_in_days: 30 });
-        await fetchTokensAndCounts(true); // Force refresh after creation
+        await refreshAfterMutation();
       } else {
         const errorData = await response.json();
         throw new Error(errorData.detail || 'Failed to create token');
@@ -331,7 +342,7 @@ export function ServiceAccountTokensView({
         setShowDeleteDialog(false);
         setTokenToDelete(null);
         setDeleteError(null);
-        await fetchTokensAndCounts(true); // Force refresh after deletion
+        await refreshAfterMutation();
       } else {
         const errorData = await response.json();
         throw new Error(errorData.detail || 'Failed to delete service account');
@@ -367,7 +378,7 @@ export function ServiceAccountTokensView({
       if (response.ok) {
         const data = await response.json();
         setRotatedTokenInDialog(data.token);
-        await fetchTokensAndCounts(true); // Force refresh after rotation
+        await refreshAfterMutation();
       } else {
         const errorData = await response.json();
         throw new Error(errorData.detail || 'Failed to rotate token');
