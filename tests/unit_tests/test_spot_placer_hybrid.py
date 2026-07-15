@@ -87,6 +87,13 @@ class TestCapacityAwareCost:
         assert make_placer(costs).select_next_location([]) == one_gpu
         assert _make_per_gpu_placer(costs).select_next_location([]) == four_gpu
 
+    def test_fractional_gpu_shape_uses_exact_configured_count(self):
+        half_gpu = make_location('half', accelerators={'L4': 0.5})
+        one_gpu = make_location('one', accelerators={'L4': 1})
+        placer = _make_per_gpu_placer({half_gpu: 0.4, one_gpu: 0.6})
+
+        assert placer.select_next_location([]) == one_gpu
+
     def test_least_loaded_spreading_precedes_per_gpu_cost(self):
         one_gpu = make_location('one', accelerators={'L4': 1})
         four_gpu = make_location('four', accelerators={'L4': 4})

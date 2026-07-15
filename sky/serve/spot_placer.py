@@ -767,8 +767,9 @@ class CapacityAwareDynamicFallbackSpotPlacer(DynamicFallbackSpotPlacer,
     """Dynamic fallback whose cost tiebreak is hourly price per GPU slot."""
 
     @staticmethod
-    def _accelerator_slots(location: Location) -> int:
-        return max(1, sum((location.accelerators or {}).values()))
+    def _accelerator_slots(location: Location) -> float:
+        slots = sum((location.accelerators or {}).values())
+        return float(slots) if slots > 0 else 1.0
 
     def _min_cost_location(self, locations: list[Location]) -> Location:
         return min(locations,
