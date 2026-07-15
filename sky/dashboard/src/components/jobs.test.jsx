@@ -1,5 +1,6 @@
 import {
   act,
+  fireEvent,
   render,
   renderHook,
   screen,
@@ -216,6 +217,53 @@ describe('managed jobs page initialization', () => {
       expect.objectContaining({ message: 'stale pool failure' })
     );
     consoleError.mockRestore();
+  });
+
+  it('keeps the visible pools table on the latest manual refresh', async () => {
+    const initialPoolRequestA = deferred();
+    const initialPoolRequestB = deferred();
+    const refreshedPools = deferred();
+    let poolRequestCount = 0;
+    dashboardCache.get.mockImplementation((fetcher) => {
+      if (fetcher !== getPoolStatus) return Promise.resolve([]);
+      poolRequestCount += 1;
+      if (poolRequestCount === 1) return initialPoolRequestA.promise;
+      if (poolRequestCount === 2) return initialPoolRequestB.promise;
+      return refreshedPools.promise;
+    });
+    render(<ManagedJobs />);
+
+    await waitFor(() => expect(poolRequestCount).toBe(2));
+    const refreshButton = screen.getByRole('button', { name: 'Refresh' });
+    await waitFor(() => expect(refreshButton).toBeEnabled());
+    fireEvent.click(refreshButton);
+    await waitFor(() => expect(poolRequestCount).toBe(4));
+
+    await act(async () => {
+      refreshedPools.resolve({
+        pools: [{ name: 'fresh-pool', replica_info: [] }],
+      });
+      await refreshedPools.promise;
+    });
+    await screen.findAllByText('fresh-pool');
+
+    await act(async () => {
+      initialPoolRequestA.resolve({
+        pools: [{ name: 'stale-pool', replica_info: [] }],
+      });
+      initialPoolRequestB.resolve({
+        pools: [{ name: 'stale-pool', replica_info: [] }],
+      });
+      await Promise.all([
+        initialPoolRequestA.promise,
+        initialPoolRequestB.promise,
+      ]);
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByText('stale-pool')).not.toBeInTheDocument();
+    });
+    expect(screen.getAllByText('fresh-pool')).not.toHaveLength(0);
   });
 });
 
