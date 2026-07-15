@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { CircularProgress } from '@mui/material';
 import { PlayIcon, TrashIcon } from 'lucide-react';
 
@@ -31,6 +31,9 @@ export function SSHNodePoolDetails({
 }) {
   const [statusData, setStatusData] = useState(null);
   const [statusLoading, setStatusLoading] = useState(true);
+  const activePoolNameRef = useRef(null);
+  const statusRequestRef = useRef(0);
+  const statusRefreshTimerRef = useRef(null);
 
   // Confirmation dialog state
   const [confirmDialog, setConfirmDialog] = useState({
@@ -49,14 +52,23 @@ export function SSHNodePoolDetails({
     requestId: null,
   });
 
-  // Fetch status when component mounts
-  useEffect(() => {
-    const fetchStatus = async () => {
-      try {
+  const fetchStatus = useCallback(
+    async (showLoading = true) => {
+      const requestId = statusRequestRef.current + 1;
+      statusRequestRef.current = requestId;
+      const isCurrentRequest = () =>
+        activePoolNameRef.current === poolName &&
+        statusRequestRef.current === requestId;
+
+      if (showLoading) {
         setStatusLoading(true);
+      }
+      try {
         const status = await getSSHNodePoolStatus(poolName);
+        if (!isCurrentRequest()) return;
         setStatusData(status);
       } catch (error) {
+        if (!isCurrentRequest()) return;
         console.error('Failed to fetch SSH Node Pool status:', error);
         setStatusData({
           pool_name: poolName,
@@ -64,12 +76,44 @@ export function SSHNodePoolDetails({
           reason: 'Failed to fetch status',
         });
       } finally {
-        setStatusLoading(false);
+        if (isCurrentRequest()) {
+          setStatusLoading(false);
+        }
       }
-    };
+    },
+    [poolName]
+  );
+
+  const scheduleStatusRefresh = useCallback(() => {
+    if (activePoolNameRef.current !== poolName) return;
+    if (statusRefreshTimerRef.current !== null) {
+      clearTimeout(statusRefreshTimerRef.current);
+    }
+    statusRefreshTimerRef.current = setTimeout(() => {
+      statusRefreshTimerRef.current = null;
+      if (activePoolNameRef.current === poolName) {
+        void fetchStatus(false);
+      }
+    }, 1000);
+  }, [fetchStatus, poolName]);
+
+  // Fetch status when the selected pool changes. Revoke both in-flight
+  // requests and delayed refreshes before another pool can take ownership.
+  useEffect(() => {
+    activePoolNameRef.current = poolName;
 
     fetchStatus();
-  }, [poolName]);
+    return () => {
+      if (activePoolNameRef.current === poolName) {
+        activePoolNameRef.current = null;
+      }
+      statusRequestRef.current += 1;
+      if (statusRefreshTimerRef.current !== null) {
+        clearTimeout(statusRefreshTimerRef.current);
+        statusRefreshTimerRef.current = null;
+      }
+    };
+  }, [fetchStatus, poolName]);
 
   const StatusBadge = ({ status, reason }) => {
     const isReady = status === 'Ready';
@@ -219,22 +263,6 @@ export function SSHNodePoolDetails({
             deploymentComplete: true,
             deploymentSuccess: true,
           }));
-
-          // Refresh status after successful deployment
-          setTimeout(async () => {
-            const fetchStatus = async () => {
-              try {
-                const status = await getSSHNodePoolStatus(poolName);
-                setStatusData(status);
-              } catch (error) {
-                console.error(
-                  'Failed to fetch SSH Node Pool status after deployment:',
-                  error
-                );
-              }
-            };
-            fetchStatus();
-          }, 1000);
         } catch (error) {
           console.error('Deployment failed:', error);
           setStreamingDialog((prev) => ({
@@ -244,6 +272,8 @@ export function SSHNodePoolDetails({
             deploymentSuccess: false,
             logs: prev.logs + `\nDeployment failed: ${error.message}`,
           }));
+        } finally {
+          scheduleStatusRefresh();
         }
       } else if (confirmDialog.action === 'delete') {
         // Hide confirmation dialog and show streaming dialog
@@ -322,21 +352,6 @@ export function SSHNodePoolDetails({
       deploymentSuccess: false,
       requestId: null,
     });
-
-    // Refresh status after deployment
-    if (streamingDialog.deploymentComplete) {
-      setTimeout(() => {
-        const fetchStatus = async () => {
-          try {
-            const status = await getSSHNodePoolStatus(poolName);
-            setStatusData(status);
-          } catch (error) {
-            console.error('Failed to refresh status:', error);
-          }
-        };
-        fetchStatus();
-      }, 1000);
-    }
   };
 
   const getDialogContent = () => {
