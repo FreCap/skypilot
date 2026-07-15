@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useRouter } from 'next/router';
 import Link from 'next/link';
 import { CircularProgress } from '@mui/material';
@@ -253,6 +253,7 @@ export function RecipeDetail() {
   const [copied, setCopied] = useState(false);
   const [commandCopied, setCommandCopied] = useState(false);
   const [yamlCopied, setYamlCopied] = useState(false);
+  const requestVersionRef = useRef(0);
 
   // Modal states
   const [isEditModalOpen, setIsEditModalOpen] = useState(false);
@@ -261,7 +262,12 @@ export function RecipeDetail() {
   const fetchTemplate = useCallback(async () => {
     // Wait for router to be ready before accessing query params
     // (required for Next.js static export where query params are populated client-side)
-    if (!router.isReady || !slug) return;
+    if (!router.isReady || !slug) {
+      setTemplate(null);
+      setError(null);
+      setLoading(true);
+      return;
+    }
 
     const templateId = parseRecipeSlug(slug);
     if (!templateId) {
@@ -270,25 +276,38 @@ export function RecipeDetail() {
       return;
     }
 
+    const requestVersion = requestVersionRef.current + 1;
+    requestVersionRef.current = requestVersion;
+    const isCurrentRequest = () => requestVersionRef.current === requestVersion;
     setLoading(true);
     setError(null);
+    setTemplate((current) => (current?.name === templateId ? current : null));
 
     try {
       const data = await getRecipe(templateId);
+      if (!isCurrentRequest()) return;
       if (!data) {
+        setTemplate(null);
         setError('Recipe not found');
       } else {
         setTemplate(data);
       }
     } catch (err) {
+      if (!isCurrentRequest()) return;
+      setTemplate(null);
       setError(err.message || 'Failed to load recipe');
     } finally {
-      setLoading(false);
+      if (isCurrentRequest()) {
+        setLoading(false);
+      }
     }
   }, [router.isReady, slug]);
 
   useEffect(() => {
     fetchTemplate();
+    return () => {
+      requestVersionRef.current += 1;
+    };
   }, [fetchTemplate]);
 
   const handleEdit = async (data) => {
