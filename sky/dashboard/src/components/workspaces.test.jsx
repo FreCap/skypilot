@@ -13,6 +13,7 @@ import {
   getEnabledCloudsBatch,
   getWorkspaces,
 } from '@/data/connectors/workspaces';
+import { apiClient } from '@/data/connectors/client';
 import cachePreloader from '@/lib/cache-preloader';
 import dashboardCache from '@/lib/cache';
 
@@ -223,5 +224,35 @@ describe('Workspaces request lifecycle', () => {
     expect(screen.getByText('gamma')).toBeInTheDocument();
     expect(screen.queryByText('beta')).not.toBeInTheDocument();
     expect(callsFor(getWorkspaces)).toHaveLength(3);
+  });
+
+  it('clears loading state when the current manual refresh fails', async () => {
+    installSuccessfulFetches();
+    const consoleError = jest
+      .spyOn(console, 'error')
+      .mockImplementation(() => undefined);
+
+    render(<Workspaces />);
+    await screen.findByText('alpha');
+
+    dashboardCache.get.mockImplementation((fetcher) => {
+      if (fetcher === getWorkspaces) {
+        return Promise.reject(new Error('workspace refresh failed'));
+      }
+      throw new Error('Failed refresh continued to the next stage');
+    });
+    apiClient.fetch.mockResolvedValueOnce({});
+
+    fireEvent.keyDown(window, { key: 'r', ctrlKey: true });
+    await waitFor(() => expect(callsFor(getWorkspaces)).toHaveLength(2));
+    await waitFor(() => {
+      expect(screen.getByText('Refresh').closest('button')).toBeEnabled();
+    });
+    expect(screen.queryAllByText('Loading...')).toHaveLength(0);
+    expect(consoleError).toHaveBeenCalledWith(
+      'Error fetching workspace data:',
+      expect.any(Error)
+    );
+    consoleError.mockRestore();
   });
 });
