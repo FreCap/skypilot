@@ -9,6 +9,7 @@ Also tests the cancelled job log download feature in ControllerManager
 and file mount cleanup in task_cleanup().
 """
 import asyncio
+import pathlib
 from typing import Dict, List, Optional, Tuple
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
@@ -1368,6 +1369,123 @@ class TestCancelSignalScan:
 
         assert (signal_dir / '8').exists()
         assert manager._cancel_info[8] == (True, 30)
+
+    @pytest.mark.asyncio
+    async def test_signal_vanished_under_lock_skips_cancel(self, signal_dir):
+        """A signal consumed by another scanner mid-scan is a no-op.
+
+        The file exists at directory-listing time but is gone by the
+        time the scan holds the filelock (e.g. a sibling controller
+        process reaped it). The scan must neither raise nor cancel the
+        task on a signal that no longer exists.
+        """
+        manager = self._make_manager()
+        task = MagicMock()
+        manager.job_tasks[7] = task
+        (signal_dir / '7').touch()
+
+        class ConsumingLock:
+            """Filelock stand-in that consumes the signal on acquire."""
+
+            def __init__(self, lock_path: str):
+                self._signal = pathlib.Path(lock_path[:-len('.lock')])
+
+            def __enter__(self):
+                self._signal.unlink(missing_ok=True)
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        with patch('sky.jobs.controller.filelock.FileLock', ConsumingLock):
+            await manager._process_cancel_signals()
+
+        task.cancel.assert_not_called()
+        assert 7 not in manager._cancel_info
+
+    @pytest.mark.asyncio
+    async def test_cancel_loop_survives_scan_failure(self):
+        """One failed scan must not unwind the cancel loop.
+
+        cancel_job is gathered with the monitor loop in main(); an
+        escaped exception exits the whole controller process.
+        """
+        manager = self._make_manager()
+        second_scan_ran = asyncio.Event()
+        calls = 0
+
+        async def fake_scan():
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError('scan failed')
+            second_scan_ran.set()
+            # Keep the second scan suspended so the loop cannot spin while
+            # the waiter observes the successful retry.
+            await asyncio.Event().wait()
+
+        with patch.object(manager, '_process_cancel_signals',
+                          side_effect=fake_scan), \
+                patch('sky.jobs.controller.asyncio.sleep',
+                      new_callable=AsyncMock) as sleep:
+            loop_task = asyncio.create_task(manager.cancel_job())
+            try:
+                await asyncio.wait_for(second_scan_ran.wait(), timeout=5)
+            finally:
+                loop_task.cancel()
+                result = await asyncio.gather(loop_task, return_exceptions=True)
+        assert calls >= 2
+        sleep.assert_awaited_once_with(15)
+        assert isinstance(result[0], asyncio.CancelledError)
+
+    def test_remove_signal_file_is_idempotent(self, signal_dir):
+        """The shared signal consumer tolerates an already-removed file."""
+        (signal_dir / '12').touch()
+        ControllerManager._remove_signal_file(12)
+        assert not (signal_dir / '12').exists()
+        # Second removal (lost race with another consumer) must not raise.
+        ControllerManager._remove_signal_file(12)
+
+    @pytest.mark.asyncio
+    async def test_pending_cancel_uses_idempotent_signal_removal(self):
+        """The PENDING claim path shares the race-safe signal consumer."""
+        manager = self._make_manager()
+        manager.start_job = AsyncMock()
+        waiting_calls = 0
+
+        async def get_waiting_job(**_kwargs):
+            nonlocal waiting_calls
+            waiting_calls += 1
+            if waiting_calls == 1:
+                return {'job_id': 12}
+            raise asyncio.CancelledError
+
+        with patch('sky.jobs.controller.controller_utils.'
+                   'get_number_of_jobs_controllers', return_value=1), \
+                patch('sky.jobs.controller.managed_job_state.'
+                      'get_waiting_job_async', side_effect=get_waiting_job), \
+                patch('sky.jobs.controller.os.listdir', return_value=['12']), \
+                patch('sky.jobs.controller.managed_job_state.'
+                      'get_status_async', new_callable=AsyncMock,
+                      return_value=managed_job_state.ManagedJobStatus.PENDING
+                     ) as get_status, \
+                patch.object(manager, '_remove_signal_file') as remove_signal, \
+                patch('sky.jobs.controller.managed_job_state.'
+                      'set_cancelling_async', new_callable=AsyncMock
+                     ) as set_cancelling, \
+                patch('sky.jobs.controller.managed_job_state.'
+                      'set_cancelled_async', new_callable=AsyncMock
+                     ) as set_cancelled, \
+                patch('sky.jobs.controller.managed_job_utils.'
+                      'event_callback_func'):
+            with pytest.raises(asyncio.CancelledError):
+                await manager.monitor_loop()
+
+        get_status.assert_awaited_once_with(12)
+        remove_signal.assert_called_once_with(12)
+        set_cancelling.assert_awaited_once()
+        set_cancelled.assert_awaited_once()
+        manager.start_job.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_non_digit_and_lock_files_skipped(self, signal_dir):
