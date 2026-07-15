@@ -52,6 +52,7 @@ import { DeploymentVersion } from '@/components/elements/version-display';
 import { useGroupedNavLinks, usePluginRoutes } from '@/plugins/PluginProvider';
 import { PluginSlot } from '@/plugins/PluginSlot';
 import { RequestActivityIndicator } from './request-activity-indicator';
+import { OperatorNotificationBell } from './operator-notification-bell';
 
 // Create a context for sidebar state management
 const SidebarContext = createContext(null);
@@ -598,6 +599,7 @@ export function TopBar() {
           {/* External links and user profile - only show on desktop, mobile uses sidebar */}
           <div className="flex items-center space-x-1 ml-auto">
             <RequestActivityIndicator compact={isMobile} />
+            <OperatorNotificationBell role={userRole} compact={isMobile} />
             {!isMobile && (
               <>
                 {/* Ungrouped plugin links - positioned on the right */}

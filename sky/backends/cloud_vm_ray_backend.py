@@ -80,6 +80,7 @@ from sky.utils import lock_events
 from sky.utils import locks
 from sky.utils import log_utils
 from sky.utils import message_utils
+from sky.utils import operator_notifications
 from sky.utils import registry
 from sky.utils import resources_utils
 from sky.utils import rich_utils
@@ -807,6 +808,11 @@ _QUOTA_ERROR_CODES = frozenset({
     'MaxSpotInstanceCountExceeded',
     'InstanceLimitExceeded',
 })
+_PROVIDER_QUOTA_ERROR_CODES = _QUOTA_ERROR_CODES | frozenset({
+    'QUOTA_EXCEEDED',
+    'quotaExceeded',
+    'type.googleapis.com/google.rpc.QuotaFailure',
+})
 
 
 def _record_capacity_metric(reason: str, action: str) -> None:
@@ -864,6 +870,54 @@ def _classify_capacity_error(cloud: 'clouds.Cloud',
             return 'quota'
         return 'capacity'
     return None
+
+
+def _is_quota_error(error: BaseException) -> bool:
+    """Whether an exception chain contains a recognized provider quota code."""
+    for exc in _iter_error_chain(error):
+        errors = getattr(exc, 'errors', None)
+        if isinstance(errors, list):
+            if any(
+                    isinstance(item, dict) and
+                    str(item.get('code')) in _PROVIDER_QUOTA_ERROR_CODES
+                    for item in errors):
+                return True
+        response = getattr(exc, 'response', None)
+        if isinstance(response, dict):
+            code = response.get('Error', {}).get('Code')
+            if code is not None and str(code) in _PROVIDER_QUOTA_ERROR_CODES:
+                return True
+    return False
+
+
+def _record_insufficient_quota_notification(
+        resources: 'resources_lib.Resources') -> bool:
+    """Record actionable quota context without including workload identity."""
+    try:
+        resource_description = resources.instance_type
+        if resource_description is None and resources.accelerators:
+            resource_description = ', '.join(
+                f'{name}:{count}'
+                for name, count in sorted(resources.accelerators.items()))
+        if resource_description is None:
+            resource_description = 'the requested resources'
+        purchase_option = 'spot' if resources.use_spot else 'on-demand'
+        region = resources.region or 'an unspecified region'
+        message = (f'Insufficient {resources.cloud} quota for '
+                   f'{resource_description} {purchase_option} capacity in '
+                   f'{region}. Request a quota increase or choose different '
+                   'resources.')
+        return operator_notifications.record_notification(
+            operator_notifications.OperatorNotificationCategory.
+            INSUFFICIENT_QUOTA,
+            message,
+            dedupe_window_seconds=operator_notifications.
+            INSUFFICIENT_QUOTA_DEDUPE_WINDOW_SECONDS)
+    except Exception as e:  # pylint: disable=broad-except
+        # Operator observability must never alter provisioning behavior.
+        logger.debug('Operator notification failed: '
+                     f'{common_utils.format_exception(e)}')
+        return False
 
 
 def _capacity_cache_key(
@@ -1285,6 +1339,7 @@ class RetryingVmProvisioner:
                 instance_descriptor = 'spot'
             else:
                 instance_descriptor = 'on-demand'
+            _record_insufficient_quota_notification(to_provision)
             raise exceptions.ResourcesUnavailableError(
                 f'{colorama.Fore.YELLOW}Found no quota for '
                 f'{to_provision.instance_type} {instance_descriptor} '
@@ -1626,6 +1681,9 @@ class RetryingVmProvisioner:
                     except Exception as e:  # pylint: disable=broad-except
                         capacity_reason = _classify_capacity_error(
                             to_provision.cloud, e)
+                        if _is_quota_error(e):
+                            _record_insufficient_quota_notification(
+                                to_provision)
                         failure_requested_full_demand = (
                             capacity_reason is not None and
                             _failure_requested_full_demand(e, num_nodes))

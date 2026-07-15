@@ -53,6 +53,12 @@ _DEFAULT_USER_BLOCKLIST = [{
 }, {
     'path': '/estimated_spend',
     'method': 'GET'
+}, {
+    'path': '/notifications',
+    'method': 'GET'
+}, {
+    'path': '/notifications/read',
+    'method': 'POST'
 }]
 
 # Default allowlist for the viewer role. Viewer is allowlist-based: any
