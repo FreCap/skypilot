@@ -13,6 +13,7 @@ import pytest
 from spot_placer_test_utils import make_location
 from spot_placer_test_utils import make_placer
 
+from sky.container_images import models as container_image_models
 from sky.serve import spot_placer
 
 
@@ -317,6 +318,31 @@ class TestHeterogeneousLocations:
         b = make_location('us-east-1', accelerators={'L4': 4})
         assert a != b
         assert len({a, b}) == 2
+
+    def test_container_image_selector_namespaces_are_distinct(self):
+        base = make_location('us-east-1', accelerators={'L4': 1})
+
+        def with_image(image):
+            return spot_placer.Location(cloud=base.cloud,
+                                        region=base.region,
+                                        zone=base.zone,
+                                        accelerators=base.accelerators,
+                                        use_spot=base.use_spot,
+                                        container_image=image)
+
+        by_ref = with_image(container_image_models.ContainerImage(ref='same'))
+        by_release = with_image(
+            container_image_models.ContainerImage(release='same'))
+        by_artifact = with_image(
+            container_image_models.ContainerImage(
+                artifact_id='11111111-1111-4111-8111-111111111111'))
+        by_ref_and_release = with_image(
+            container_image_models.ContainerImage(ref='same', release='same'))
+
+        assert len({by_ref, by_release, by_artifact, by_ref_and_release}) == 4
+        assert by_ref != by_release
+        assert by_release != by_artifact
+        assert by_ref != by_ref_and_release
 
     def test_to_dict_carries_shape_and_spotness(self):
         k8s = make_location('ctx', accelerators={'A100': 1}, use_spot=False)
@@ -664,10 +690,10 @@ run: echo hi
             serve_utils.validate_service_task(task, pool=False)
 
 
-class TestImageIdNormalizationEndToEnd:
-    """Enumerated locations must carry region-independent image dicts."""
+class TestContainerImageNormalizationEndToEnd:
+    """Enumerated locations must carry the first-class container image."""
 
-    def test_enumeration_normalizes_image_id(self):
+    def test_enumeration_normalizes_legacy_image_id(self):
         # pylint: disable=import-outside-toplevel
         import sky
         t = sky.Task.from_yaml_str("""
@@ -684,7 +710,9 @@ run: echo hi
         locs = spot_placer._get_possible_location_from_task(t)
         assert locs, 'expected at least one location'
         for loc in locs:
-            assert loc.image_id == {None: 'docker:myrepo/model:v1'}, loc
+            assert loc.image_id is None, loc
+            assert loc.container_image is not None, loc
+            assert loc.container_image.ref == 'myrepo/model:v1', loc
 
 
 class TestDiskTierPerLocation:
@@ -753,12 +781,15 @@ run: echo hi
         spot_placer._get_possible_location_from_task(t)
         by_acc = {list(r.accelerators)[0]: r for r in captured}
         assert by_acc['L4'].disk_tier is not None
-        assert by_acc['L4'].image_id is not None
+        assert by_acc['L4'].image_id is None
+        assert by_acc['L4'].container_image is not None
         # The tier-less/image-less entry must not inherit the other
-        # entry's disk_tier or image_id in the feasibility shape: clouds
-        # that reject those attributes would silently drop the location.
+        # entry's disk_tier or container_image in the feasibility shape:
+        # clouds that reject those attributes would silently drop the
+        # location.
         assert by_acc['A10G'].disk_tier is None
         assert by_acc['A10G'].image_id is None
+        assert by_acc['A10G'].container_image is None
 
     def test_pickle_roundtrip_and_backcompat(self):
         with mock.patch.object(spot_placer.registry.CLOUD_REGISTRY,
@@ -777,3 +808,18 @@ run: echo hi
                 'zone': None,
             })
             assert old.disk_tier is None
+            assert old.container_image is None
+
+            with_image = spot_placer.Location.from_pickleable({
+                'cloud': 'AWS',
+                'region': 'us-east-1',
+                'zone': None,
+                'container_image': {
+                    'ref': 'registry.example/model@sha256:' + 'a' * 64,
+                    'profile': 'managed',
+                },
+            })
+            assert with_image.container_image is not None
+            assert with_image.container_image.profile == 'managed'
+            assert (spot_placer.Location.from_pickleable(
+                with_image.to_pickleable()) == with_image)

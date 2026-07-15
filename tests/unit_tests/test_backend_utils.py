@@ -922,6 +922,157 @@ def test_replace_yaml_dicts_restores_new_nested_field_when_old_is_null():
     assert result['provider']['security_group']['GroupName'] == 'new-name'
 
 
+def test_stopped_restart_uses_rotated_managed_vm_image_and_auth():
+    """Managed restart keeps the new endpoint and removes obsolete login."""
+    digest = 'sha256:' + 'a' * 64
+    old_ref = f'old.example/skypilot/image@{digest}'
+    new_ref = f'new.example/skypilot/image@{digest}'
+    new_yaml = ('cluster_name: c\n'
+                'docker:\n'
+                f'  image: {new_ref}\n'
+                '  run_options: [--ipc=host]\n'
+                'provider: {type: external}\n'
+                'node_config: {InstanceType: t}\n')
+    old_yaml = ('cluster_name: c\n'
+                'docker:\n'
+                f'  image: {old_ref}\n'
+                '  docker_login_config:\n'
+                '    username: AWS\n'
+                '    password: old-token\n'
+                '    server: old.example\n'
+                'provider: {type: external}\n'
+                'node_config: {InstanceType: t}\n')
+
+    restored = backend_utils._replace_yaml_dicts(
+        new_yaml, old_yaml,
+        backend_utils._RAY_YAML_KEYS_TO_RESTORE_FOR_BACK_COMPATIBILITY,
+        backend_utils._RAY_YAML_KEYS_TO_RESTORE_EXCEPTIONS)
+    out = backend_utils._restore_managed_container_image_fields(
+        new_yaml, restored, new_ref)
+    result = yaml_utils.read_yaml_str(out)
+    assert result['docker']['image'] == new_ref
+    assert 'docker_login_config' not in result['docker']
+
+
+def test_stopped_restart_updates_only_managed_kubernetes_containers():
+    """Kubernetes restore overlays named workload containers, not sidecars."""
+    digest = 'sha256:' + 'b' * 64
+    old_ref = f'old.example/skypilot/image@{digest}'
+    new_ref = f'new.example/skypilot/image@{digest}'
+    new_yaml = ('cluster_name: c\n'
+                'available_node_types:\n'
+                '  ray_head_default:\n'
+                '    node_config:\n'
+                '      spec:\n'
+                '        containers:\n'
+                '        - {name: ray-node, image: ' + new_ref + '}\n'
+                '        - {name: metrics, image: metrics:new}\n'
+                '        - {name: newly-added, image: ' + new_ref + '}\n')
+    old_yaml = ('cluster_name: c\n'
+                'available_node_types:\n'
+                '  ray_head_default:\n'
+                '    node_config:\n'
+                '      spec:\n'
+                '        containers:\n'
+                '        - {name: metrics, image: metrics:old}\n'
+                '        - {name: ray-node, image: ' + old_ref + '}\n')
+
+    restored = backend_utils._replace_yaml_dicts(
+        new_yaml, old_yaml,
+        backend_utils._RAY_YAML_KEYS_TO_RESTORE_FOR_BACK_COMPATIBILITY,
+        backend_utils._RAY_YAML_KEYS_TO_RESTORE_EXCEPTIONS)
+    out = backend_utils._restore_managed_container_image_fields(
+        new_yaml, restored, new_ref)
+    containers = yaml_utils.read_yaml_str(out)['available_node_types'][
+        'ray_head_default']['node_config']['spec']['containers']
+    by_name = {container['name']: container['image'] for container in containers}
+    assert by_name == {'metrics': 'metrics:old', 'ray-node': new_ref}
+
+
+def test_managed_kubernetes_image_overrides_pod_config_image():
+    """A pod override cannot diverge runtime bytes from the catalog fence."""
+    digest = 'sha256:' + 'c' * 64
+    managed_ref = f'managed.example/skypilot/image@{digest}'
+    config = yaml_utils.read_yaml_str(
+        'available_node_types:\n'
+        '  ray_head_default:\n'
+        '    node_config:\n'
+        '      spec:\n'
+        '        containers:\n'
+        '        - {name: ray-node, image: hidden-override:latest}\n'
+        '        - {name: metrics, image: metrics:v1}\n'
+        '      deployment_spec:\n'
+        '        spec:\n'
+        '          template:\n'
+        '            spec:\n'
+        '              initContainers:\n'
+        '              - {name: init-copy-home, image: hidden-override:latest}\n'
+        '              - {name: another-init, image: helper:v1}\n')
+
+    backend_utils._enforce_managed_kubernetes_image(config, managed_ref)
+    node_config = config['available_node_types']['ray_head_default'][
+        'node_config']
+    containers = node_config['spec']['containers']
+    assert {
+        item['name']: item['image'] for item in containers
+    } == {
+        'ray-node': managed_ref,
+        'metrics': 'metrics:v1',
+    }
+    init_containers = node_config['deployment_spec']['spec']['template'][
+        'spec']['initContainers']
+    assert {
+        item['name']: item['image'] for item in init_containers
+    } == {
+        'init-copy-home': managed_ref,
+        'another-init': 'helper:v1',
+    }
+
+
+def test_managed_kubernetes_image_requires_active_head_node_container():
+    digest = 'sha256:' + 'd' * 64
+    managed_ref = f'managed.example/skypilot/image@{digest}'
+    config = {
+        'head_node_type': 'active',
+        'available_node_types': {
+            'ray_head_default': {
+                'node_config': {
+                    'spec': {
+                        'containers': [{
+                            'name': 'ray-node',
+                            'image': 'unused:latest',
+                        }],
+                    },
+                },
+            },
+            'active': {
+                'node_config': {
+                    'spec': {
+                        'containers': [{
+                            'name': 'workload',
+                            'image': 'divergent:latest',
+                        }],
+                    },
+                },
+            },
+        },
+    }
+    with pytest.raises(exceptions.InvalidCloudConfigs,
+                       match='actively provisioned head node type'):
+        backend_utils._enforce_managed_kubernetes_image(config, managed_ref)
+    assert config['available_node_types']['active']['node_config']['spec'][
+        'containers'][0]['image'] == 'divergent:latest'
+
+    config['available_node_types']['active']['node_config']['spec'][
+        'containers'] = [{
+            'name': 'ray-node',
+            'image': 'divergent:latest',
+        }]
+    backend_utils._enforce_managed_kubernetes_image(config, managed_ref)
+    assert config['available_node_types']['active']['node_config']['spec'][
+        'containers'][0]['image'] == managed_ref
+
+
 def test_make_safe_symlink_command_default_uses_sudo():
     """By default the privileged steps are prefixed with sudo."""
     cmd = backend_utils.FileMountHelper.make_safe_symlink_command(

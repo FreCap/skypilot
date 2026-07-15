@@ -59,6 +59,31 @@ except ValueError:
 _INTERRUPT_BEFORE_SHUTDOWN_DEADLINE_SECONDS = (2 *
                                                _WAIT_REQUESTS_INTERVAL_SECONDS)
 
+
+class _AccessLogQueryFilter(logging.Filter):
+    """Removes query strings before Uvicorn formats an access-log record.
+
+    Query parameters are untrusted and several public APIs legitimately carry
+    selectors or workspace names in them.  Uvicorn constructs its access-log
+    record before FastAPI validation, so endpoint-level sanitization is too
+    late.  Preserve method/path/status observability while never emitting the
+    query component.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.name != 'uvicorn.access':
+            return True
+        args = record.args
+        if (isinstance(args, tuple) and len(args) >= 3 and
+                isinstance(args[2], str)):
+            sanitized_path = args[2].split('?', 1)[0]
+            if sanitized_path != args[2]:
+                record.args = (*args[:2], sanitized_path, *args[3:])
+        return True
+
+
+_ACCESS_LOG_QUERY_FILTER = _AccessLogQueryFilter()
+
 # TODO(aylei): use decorator to register requests that need to be proactively
 # cancelled instead of hardcoding here.
 _RETRIABLE_REQUEST_NAMES = {
@@ -94,6 +119,10 @@ def add_timestamp_prefix_for_server_logs() -> None:
     for name in ['uvicorn', 'uvicorn.access']:
         uvicorn_logger = logging.getLogger(name)
         uvicorn_logger.handlers.clear()
+        if name == 'uvicorn.access' and not any(
+                current is _ACCESS_LOG_QUERY_FILTER
+                for current in uvicorn_logger.filters):
+            uvicorn_logger.addFilter(_ACCESS_LOG_QUERY_FILTER)
         uvicorn_logger.addHandler(stream_handler)
 
 

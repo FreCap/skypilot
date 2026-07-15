@@ -610,6 +610,7 @@ def test_stale_bootstrap_incarnation_is_rejected_before_file_or_lb_work():
         'controller_job_id': 1,
         'controller_pid': 123,
         'controller_ip': '10.0.0.2',
+        'workspace': 'default',
     }
     with mock.patch.object(service.auth_utils, 'get_or_generate_keys'), \
          mock.patch.object(service.serve_state,
@@ -633,6 +634,7 @@ def test_legacy_stale_bootstrap_job_is_rejected_before_file_or_lb_work():
         'controller_job_id': 2,
         'controller_pid': 123,
         'controller_ip': '10.0.0.2',
+        'workspace': 'default',
     }
     with mock.patch.object(service.auth_utils, 'get_or_generate_keys'), \
          mock.patch.object(service.serve_state,
@@ -654,6 +656,22 @@ def test_delayed_legacy_recovery_cannot_recreate_absent_service():
                            'get_service_from_name',
                            return_value=None), \
          pytest.raises(RuntimeError, match='legacy name-only'):
+        service._start('svc', '/does/not/exist', 1, 'sky serve up')
+
+
+def test_legacy_service_without_workspace_fails_recovery_closed():
+    record = {
+        'hash': 'incarnation-a',
+        'controller_job_id': 1,
+        'controller_pid': 123,
+        'controller_ip': '10.0.0.2',
+        'workspace': None,
+    }
+    with mock.patch.object(service.auth_utils, 'get_or_generate_keys'), \
+         mock.patch.object(service.serve_state,
+                           'get_service_from_name',
+                           return_value=record), \
+         pytest.raises(RuntimeError, match='durable workspace'):
         service._start('svc', '/does/not/exist', 1, 'sky serve up')
 
 
@@ -705,13 +723,13 @@ def test_recovery_spawns_controller_with_persisted_semantics(
         'controller_job_id': 1,
         'controller_pid': 123,
         'controller_ip': '10.0.0.2',
+        'workspace': 'default',
         'resource_scope': 'incarnation-a',
         'pool': True,
         'status': serve_state.ServiceStatus.READY,
         'yaml_content': yaml_content,
     }
     process = mock.MagicMock(pid=456)
-
     with mock.patch.object(service.auth_utils, 'get_or_generate_keys'), \
          mock.patch.object(service.serve_state,
                            'get_service_from_name',

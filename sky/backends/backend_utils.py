@@ -2,6 +2,7 @@
 import asyncio
 from collections.abc import Callable
 from collections.abc import Sequence
+import copy
 from datetime import datetime
 import enum
 import fnmatch
@@ -692,6 +693,129 @@ def _replace_yaml_dicts(
     return yaml_utils.dump_yaml_str(new_config)
 
 
+def _restore_managed_container_image_fields(
+        new_yaml: str,
+        restored_yaml: str,
+        image_reference: str,
+        *,
+        enforce_kubernetes: bool = False) -> str:
+    """Keeps a freshly resolved managed image after restart restoration.
+
+    Existing-cluster compatibility restores broad ``docker`` and
+    ``node_config`` blocks from the stored Ray YAML.  A managed image plan is
+    deliberately re-resolved before a stopped cluster is reprovisioned, so its
+    physical reference and runtime login instruction must instead come from
+    the newly rendered YAML.  This helper overlays only image fields whose new
+    value is the resolved reference.  Named list entries are matched by name
+    so Kubernetes sidecars can be reordered without receiving the workload
+    image accidentally.
+    """
+    new_config = yaml_utils.safe_load(new_yaml)
+    restored_config = yaml_utils.safe_load(restored_yaml)
+
+    def _matching_list_item(new_item: Any, restored_list: list[Any],
+                            index: int) -> Any | None:
+        if isinstance(new_item, dict) and isinstance(new_item.get('name'), str):
+            name = new_item['name']
+            for candidate in restored_list:
+                if isinstance(candidate,
+                              dict) and candidate.get('name') == name:
+                    return candidate
+            return None
+        if index < len(restored_list):
+            return restored_list[index]
+        return None
+
+    def _overlay_images(new_value: Any, restored_value: Any) -> None:
+        if isinstance(new_value, dict) and isinstance(restored_value, dict):
+            if new_value.get('image') == image_reference:
+                restored_value['image'] = image_reference
+            for key, child in new_value.items():
+                if key == 'image' or key not in restored_value:
+                    continue
+                _overlay_images(child, restored_value[key])
+        elif isinstance(new_value, list) and isinstance(restored_value, list):
+            for index, child in enumerate(new_value):
+                restored_child = _matching_list_item(child, restored_value,
+                                                     index)
+                if restored_child is not None:
+                    _overlay_images(child, restored_child)
+
+    _overlay_images(new_config, restored_config)
+    if enforce_kubernetes:
+        _enforce_managed_kubernetes_image(restored_config, image_reference)
+
+    # Login instructions may live under docker (new provisioners) or provider
+    # (legacy provisioners).  Absence is meaningful: an auth rotation to
+    # anonymous must delete a stale instruction restored from the old YAML.
+    for parent_key in ('docker', 'provider'):
+        new_parent = new_config.get(parent_key)
+        restored_parent = restored_config.get(parent_key)
+        if not isinstance(restored_parent, dict):
+            continue
+        if (isinstance(new_parent, dict) and
+                'docker_login_config' in new_parent):
+            restored_parent['docker_login_config'] = copy.deepcopy(
+                new_parent['docker_login_config'])
+        else:
+            restored_parent.pop('docker_login_config', None)
+
+    return yaml_utils.dump_yaml_str(restored_config)
+
+
+def _enforce_managed_kubernetes_image(config: dict[str, Any],
+                                      image_reference: str) -> None:
+    """Makes the resolved image authoritative over Kubernetes pod overrides."""
+    available_node_types = config.get('available_node_types')
+    if not isinstance(available_node_types, dict):
+        return
+
+    head_node_type = config.get('head_node_type', 'ray_head_default')
+    if (not isinstance(head_node_type, str) or
+            head_node_type not in available_node_types):
+        raise exceptions.InvalidCloudConfigs(
+            'Managed container images require a valid active Kubernetes head '
+            'node type.')
+    active_ray_node_count = 0
+
+    def _set_named_image(containers: Any, name: str) -> int:
+        if not isinstance(containers, list):
+            return 0
+        changed = 0
+        for container in containers:
+            if isinstance(container, dict) and container.get('name') == name:
+                container['image'] = image_reference
+                changed += 1
+        return changed
+
+    for node_type_name, node_type in available_node_types.items():
+        if not isinstance(node_type, dict):
+            continue
+        node_config = node_type.get('node_config')
+        if not isinstance(node_config, dict):
+            continue
+        pod_spec = node_config.get('spec')
+        if isinstance(pod_spec, dict):
+            changed = _set_named_image(pod_spec.get('containers'), 'ray-node')
+            if node_type_name == head_node_type:
+                active_ray_node_count += changed
+        deployment = node_config.get('deployment_spec')
+        if isinstance(deployment, dict):
+            deployment_spec = deployment.get('spec')
+            if isinstance(deployment_spec, dict):
+                template = deployment_spec.get('template')
+                if isinstance(template, dict):
+                    template_spec = template.get('spec')
+                    if isinstance(template_spec, dict):
+                        _set_named_image(template_spec.get('initContainers'),
+                                         'init-copy-home')
+
+    if active_ray_node_count != 1:
+        raise exceptions.InvalidCloudConfigs(
+            'Managed container images require the Kubernetes ray-node '
+            'container in the actively provisioned head node type.')
+
+
 def get_expirable_clouds(
         enabled_clouds: Sequence[clouds.Cloud]) -> list[clouds.Cloud]:
     """Returns a list of clouds that use local credentials and whose credentials can expire.
@@ -1370,11 +1494,17 @@ def write_cluster_config(
             cluster_config_overrides=cluster_config_overrides,
             cloud=cloud,
             context=region.name)
+        resolved_container_image = to_provision.resolved_container_image
+        if resolved_container_image is not None:
+            _enforce_managed_kubernetes_image(
+                combined_yaml_obj, resolved_container_image.reference)
         # Write the updated YAML back to the file
         yaml_utils.dump_yaml(tmp_yaml_path, combined_yaml_obj)
 
+        head_node_type = combined_yaml_obj.get('head_node_type',
+                                               'ray_head_default')
         pod_config: dict[str, Any] = combined_yaml_obj['available_node_types'][
-            'ray_head_default']['node_config']
+            head_node_type]['node_config']
         # Check pod spec only. For high availability controllers, we deploy pvc & deployment for the controller. Read kubernetes-ray.yml.j2 for more details.
         pod_config.pop('deployment_spec', None)
         pod_config.pop('pvc_spec', None)
@@ -1404,6 +1534,13 @@ def write_cluster_config(
             new_yaml_content, old_yaml_content,
             _RAY_YAML_KEYS_TO_RESTORE_FOR_BACK_COMPATIBILITY,
             _RAY_YAML_KEYS_TO_RESTORE_EXCEPTIONS)
+        resolved_container_image = to_provision.resolved_container_image
+        if resolved_container_image is not None:
+            restored_yaml_content = _restore_managed_container_image_fields(
+                new_yaml_content,
+                restored_yaml_content,
+                resolved_container_image.reference,
+                enforce_kubernetes=isinstance(cloud, clouds.Kubernetes))
         with open(tmp_yaml_path, 'w', encoding='utf-8') as f:
             f.write(restored_yaml_content)
 

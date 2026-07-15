@@ -24,6 +24,7 @@ from sky import task as task_lib
 from sky.adaptors import common as adaptors_common
 from sky.backends import backend_utils
 from sky.catalog import common as service_catalog_common
+from sky.container_images import state as container_image_state
 from sky.data import data_utils
 from sky.data import storage as storage_lib
 from sky.serve import constants as serve_constants
@@ -339,6 +340,21 @@ def _get_service_record(
     return service_statuses[0]
 
 
+def _require_service_update_workspace(service_record: dict[str, Any],
+                                      service_name: str, noun: str) -> str:
+    """Returns the durable workspace after fencing the request scope."""
+    stored_workspace = service_record.get('workspace')
+    if not isinstance(stored_workspace, str) or not stored_workspace:
+        raise RuntimeError(
+            f'Cannot safely update legacy {noun} {service_name!r} without a '
+            'durable workspace. Recreate it in the intended workspace.')
+    if skypilot_config.get_active_workspace() != stored_workspace:
+        raise RuntimeError(
+            f'Cannot update {noun} {service_name!r} from a different '
+            'workspace than the one that owns it.')
+    return stored_workspace
+
+
 # Config subtrees that may carry credentials in supported configurations
 # (free-form objects: arbitrary pod specs can hold plaintext env
 # credentials, create_instance_kwargs can hold registry credentials).
@@ -592,6 +608,10 @@ def _up_impl_body(task: 'task_lib.Task', service_name: str, pool: bool,
         dag, request_name=request_names.AdminPolicyRequestName.SERVE_UP)
     task = dag.tasks[0]
     assert task.service is not None
+    service_workspace = (skypilot_config.get_active_workspace() or
+                         constants.SKYPILOT_DEFAULT_WORKSPACE)
+    serve_utils.snapshot_service_container_images(task,
+                                                  workspace=service_workspace)
     _require_supported_service_topology(task, pool)
     dag.resolve_and_validate_volumes()
     dag.pre_mount_volumes()
@@ -678,7 +698,7 @@ def _up_impl_body(task: 'task_lib.Task', service_name: str, pool: bool,
             rid = common_utils.get_current_request_id()
             controller_job_id = hash(uuid.UUID(rid).int) & 0x7FFFFFFF
 
-        vars_to_fill = {
+        vars_to_fill: dict[str, Any] = {
             'remote_task_yaml_path': remote_tmp_task_yaml_path,
             'local_task_yaml_path': service_file.name,
             'service_name': service_name,
@@ -691,12 +711,18 @@ def _up_impl_body(task: 'task_lib.Task', service_name: str, pool: bool,
                 service_catalog_common.get_modified_catalog_file_mounts(),
             'consolidation_mode_job_id': controller_job_id,
             'entrypoint': shlex.quote(common_utils.get_current_command()),
+            'workspace': shlex.quote(service_workspace),
             **controller_utils.shared_controller_vars_to_fill(
                 controller=controller_utils.Controllers.SKY_SERVE_CONTROLLER,
                 remote_user_config_path=remote_config_yaml_path,
                 local_user_config=mutated_user_config,
             ),
         }
+        catalog_authority = container_image_state.get_catalog_authority_id()
+        assert catalog_authority is not None
+        vars_to_fill['controller_envs'][
+            constants.CONTAINER_IMAGE_CATALOG_AUTHORITY_ENV_VAR] = (
+                catalog_authority)
         common_utils.fill_template(serve_constants.CONTROLLER_TEMPLATE,
                                    vars_to_fill,
                                    output_path=controller_file.name)
@@ -1005,6 +1031,8 @@ def _assert_service_update_fence(service_name: str, pool: bool,
     if (current is None or current.get('hash') != expected_service_hash):
         raise RuntimeError(f'Service {service_name!r} changed incarnation '
                            f'while {phase}; retry against the current service.')
+    _require_service_update_workspace(current, service_name,
+                                      'pool' if pool else 'service')
     service_status = current['status']
     if service_status in serve_state.ServiceStatus.terminal_statuses():
         raise RuntimeError(f'Service {service_name!r} entered terminal status '
@@ -1077,6 +1105,8 @@ def _update_impl_body(
     if not isinstance(expected_service_hash, str) or not expected_service_hash:
         raise RuntimeError(f'Cannot safely update {noun} {service_name!r} '
                            'without a durable service incarnation.')
+    service_workspace = _require_service_update_workspace(
+        service_record, service_name, noun)
     if lifecycle_lock is None:
         raise RuntimeError('Service update requires lifecycle ownership.')
     lifecycle_epoch = serve_utils.get_service_lifecycle_epoch(lifecycle_lock)
@@ -1123,6 +1153,8 @@ def _update_impl_body(
     dag, _ = admin_policy_utils.apply(
         task, request_name=request_names.AdminPolicyRequestName.SERVE_UPDATE)
     task = dag.tasks[0]
+    serve_utils.snapshot_service_container_images(task,
+                                                  workspace=service_workspace)
     if pool:
         _maybe_display_run_warning(task)
         # Use dummy run script for pool.

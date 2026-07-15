@@ -11,6 +11,7 @@ from typing import Any
 
 from sky import global_user_state
 from sky import task as task_lib
+from sky.utils import common_utils
 from sky.utils import config_utils
 from sky.utils import yaml_utils
 
@@ -19,6 +20,12 @@ from sky.utils import yaml_utils
 _SENSITIVE_CONFIG_KEYS: list[tuple[str, ...]] = [
     ('api_server', 'endpoint'),
     ('api_server', 'service_account_token'),
+    # Registry configuration is designed to contain identity references, not
+    # credential values. Redact it wholesale anyway: invalid request-scoped
+    # configuration is untrusted before the model boundary and must never turn
+    # a typo or hostile value into a debug-log secret channel.
+    (
+        'container_registries',),
 ]
 
 
@@ -33,6 +40,21 @@ def redact_config(config: dict[str, Any]) -> dict[str, Any]:
         val = config_copy.get_nested(field_path, default_value=None)
         if val is not None:
             config_copy.set_nested(field_path, '<redacted>')
+    if 'workspaces' not in config_copy:
+        return dict(**config_copy)
+    workspaces = config_copy['workspaces']
+    if not isinstance(workspaces, dict):
+        config_copy['workspaces'] = '<redacted>'
+        return dict(**config_copy)
+    if any(not common_utils.is_valid_workspace_name(workspace)
+           for workspace in workspaces):
+        config_copy['workspaces'] = '<redacted>'
+        return dict(**config_copy)
+    for workspace, workspace_config in list(workspaces.items()):
+        if not isinstance(workspace_config, dict):
+            workspaces[workspace] = '<redacted>'
+        elif 'container_images' in workspace_config:
+            workspace_config['container_images'] = '<redacted>'
     return dict(**config_copy)
 
 

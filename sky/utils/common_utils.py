@@ -227,6 +227,14 @@ def check_recipe_name_is_valid(recipe_name: str | None) -> None:
                 'only contains letters, numbers, and dashes).')
 
 
+def is_valid_workspace_name(workspace_name: Any) -> bool:
+    """Returns whether a value is a bounded SkyPilot workspace name."""
+    return (isinstance(workspace_name, str) and
+            len(workspace_name) <= constants.WORKSPACE_NAME_MAX_LENGTH and
+            re.fullmatch(constants.WORKSPACE_NAME_VALID_REGEX,
+                         workspace_name) is not None)
+
+
 def check_workspace_name_is_valid(workspace_name: str | None) -> None:
     """Errors out on invalid workspace names.
 

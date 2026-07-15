@@ -15,6 +15,7 @@ from sky import clouds as sky_clouds
 from sky import sky_logging
 from sky import skypilot_config
 from sky.clouds import cloud as sky_cloud
+from sky.container_images import models as container_image_models
 from sky.utils import registry
 from sky.utils import resources_utils
 from sky.utils import ux_utils
@@ -102,6 +103,7 @@ class Location:
     # Kubernetes pool entry whose replicas run inside the model image).
     # Normalized SkyPilot form: {region_or_None: image_ref}.
     image_id: dict[str | None, str] | None = None
+    container_image: container_image_models.ContainerImage | None = None
     # Per-entry disk tier (e.g. 'high' on VM entries for docker-load
     # throughput; unset on Kubernetes entries, which reject the field).
     disk_tier: str | None = None
@@ -117,6 +119,14 @@ class Location:
         if self.image_id:
             parts.append(','.join(f'{k}={v}' for k, v in sorted(
                 self.image_id.items(), key=lambda kv: str(kv[0]))))
+        if self.container_image is not None:
+            selector = (
+                ('ref', self.container_image.ref),
+                ('release', self.container_image.release),
+                ('artifact_id', self.container_image.artifact_id),
+                ('distribution', self.container_image.distribution),
+            )
+            parts.append(f'container_image={selector!r}')
         if self.disk_tier:
             parts.append(f'disk_tier={self.disk_tier}')
         if self.ephemeral_storage is not None:
@@ -150,6 +160,7 @@ class Location:
                    accelerators=resources.accelerators,
                    use_spot=resources.use_spot,
                    image_id=image_id,
+                   container_image=resources.container_image,
                    disk_tier=disk_tier,
                    ephemeral_storage=resources.ephemeral_storage)
 
@@ -170,6 +181,7 @@ class Location:
         # is applied to every any_of entry, so each selected location must
         # strip fields that only another backend supports.
         d['image_id'] = self.image_id
+        d['container_image'] = self.container_image
         d['disk_tier'] = self.disk_tier
         d['ephemeral_storage'] = self.ephemeral_storage
         return d
@@ -194,6 +206,9 @@ class Location:
             accelerators=data.get('accelerators'),
             use_spot=data.get('use_spot', True),
             image_id=data.get('image_id'),
+            container_image=(container_image_models.ContainerImage.from_config(
+                data['container_image']) if data.get('container_image')
+                             is not None else None),
             disk_tier=data.get('disk_tier'),
             ephemeral_storage=data.get('ephemeral_storage'),
         )
@@ -206,6 +221,8 @@ class Location:
             'accelerators': self.accelerators,
             'use_spot': self.use_spot,
             'image_id': self.image_id,
+            'container_image': (self.container_image.to_yaml_config()
+                                if self.container_image is not None else None),
             'disk_tier': self.disk_tier,
             'ephemeral_storage': self.ephemeral_storage,
         }
@@ -242,6 +259,9 @@ class Location:
             accelerators=override.get('accelerators'),
             use_spot=override.get('use_spot', True),
             image_id=override.get('image_id'),
+            container_image=(container_image_models.ContainerImage.from_config(
+                override['container_image']) if override.get('container_image')
+                             is not None else None),
             disk_tier=override.get('disk_tier'),
             ephemeral_storage=override.get('ephemeral_storage'),
         )
@@ -359,7 +379,7 @@ def _get_possible_location_from_task(
         config = resources.copy(cloud=None, region=None,
                                 zone=None).to_yaml_config()
         for key in ('accelerators', 'use_spot', 'spot_recovery', 'image_id',
-                    'disk_tier', 'ephemeral_storage'):
+                    'container_image', 'disk_tier', 'ephemeral_storage'):
             config.pop(key, None)
         return config
 
@@ -374,7 +394,7 @@ def _get_possible_location_from_task(
                     'Different resource configurations are not supported '
                     'for spot placement. All resources must have the same '
                     'configuration except for cloud/region/zone/'
-                    'accelerators/use_spot/image_id/disk_tier/'
+                    'accelerators/use_spot/image_id/container_image/disk_tier/'
                     'ephemeral_storage.')
 
     # Group entries by (accelerators, use_spot) shape: locations are
@@ -456,6 +476,7 @@ def _get_possible_location_from_task(
                         loc.use_spot = candidate_shape.use_spot
                         loc.image_id = _normalize_image_id(
                             candidate_shape.image_id)
+                        loc.container_image = candidate_shape.container_image
                         loc.disk_tier = (candidate_shape.disk_tier.value
                                          if candidate_shape.disk_tier
                                          is not None else None)

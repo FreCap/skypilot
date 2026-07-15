@@ -15,7 +15,7 @@ import sqlite3
 import threading
 import time
 import traceback
-from typing import Any, NamedTuple, NoReturn
+from typing import Any, NamedTuple, NoReturn, TypeVar
 import uuid
 
 import anyio
@@ -47,6 +47,8 @@ from sky.utils import ux_utils
 from sky.utils.db import db_utils
 
 logger = sky_logging.init_logger(__name__)
+
+_ErrorT = TypeVar('_ErrorT', bound=BaseException)
 
 
 def _unresolved_entrypoint(*args: Any, **kwargs: Any) -> NoReturn:
@@ -99,6 +101,17 @@ RESET_REQUESTS_ON_STARTUP_ENV_VAR = 'SKYPILOT_RESET_REQUESTS_ON_STARTUP'
 # REQUEST_NAME_PREFIX + request_name at creation), so match that form.
 REPLAYABLE_REQUEST_NAMES = (server_constants.REQUEST_NAME_PREFIX +
                             request_names.RequestName.CLUSTER_LAUNCH.value,)
+
+_CONTAINER_IMAGE_REQUEST_NAMES = frozenset(
+    server_constants.REQUEST_NAME_PREFIX + name.value for name in (
+        request_names.RequestName.IMAGE_PUBLISH,
+        request_names.RequestName.IMAGE_REGISTER,
+        request_names.RequestName.IMAGE_PREPARE,
+        request_names.RequestName.IMAGE_STATUS,
+        request_names.RequestName.IMAGE_RETRY,
+    ))
+_CONTAINER_IMAGE_REQUEST_ERROR_MESSAGE = (
+    'Managed container image request failed validation or execution.')
 
 # TODO(zhwu): For scalability, there are several TODOs:
 # [x] Have a way to queue requests.
@@ -181,6 +194,38 @@ def _build_error_dict(error: BaseException) -> dict[str, Any]:
         'type': type(error).__name__,
         'message': str(error),
     }
+
+
+def _request_body_uses_container_image(
+        request_body: payloads.RequestBody | None) -> bool:
+    """Returns whether a persisted task or DAG uses managed images."""
+    if request_body is None:
+        return False
+    return any(
+        isinstance(value, str) and
+        payloads.serialized_task_uses_container_image(value)
+        for value in (getattr(request_body, 'task', None),
+                      getattr(request_body, 'dag', None)))
+
+
+def request_error_requires_sanitization(
+    name: str | None,
+    request_body: payloads.RequestBody | None = None,
+) -> bool:
+    """Returns whether errors for this request cross an image boundary."""
+    return (name in _CONTAINER_IMAGE_REQUEST_NAMES or
+            _request_body_uses_container_image(request_body))
+
+
+def sanitize_request_error(
+    name: str | None,
+    error: _ErrorT,
+    request_body: payloads.RequestBody | None = None,
+) -> _ErrorT | ValueError:
+    """Removes provider and caller values from image terminal errors."""
+    if request_error_requires_sanitization(name, request_body):
+        return ValueError(_CONTAINER_IMAGE_REQUEST_ERROR_MESSAGE)
+    return error
 
 
 def _encoded_return_value(name: str, request_id: str, return_value: Any) -> Any:
@@ -274,7 +319,11 @@ class Request:
 
     def set_error(self, error: BaseException) -> None:
         """Set the error."""
-        self.error = _build_error_dict(error)
+        sanitized_error = sanitize_request_error(self.name, error,
+                                                 self.request_body)
+        if request_error_requires_sanitization(self.name, self.request_body):
+            _set_value_free_exception_stacktrace(sanitized_error)
+        self.error = _build_error_dict(sanitized_error)
 
     def get_error(self) -> dict[str, Any] | None:
         """Get the error."""
@@ -351,6 +400,10 @@ class Request:
         """Serialize the SkyPilot API request."""
         assert isinstance(self.request_body,
                           payloads.RequestBody), (self.name, self.request_body)
+        # Pydantic validates normal request construction, but this final fence
+        # also covers internally constructed or restored bodies before their
+        # task text can enter the durable request row.
+        payloads.validate_task_request_body_for_persistence(self.request_body)
         try:
             # Use version-aware serializer to handle backward compatibility
             # for old clients that don't recognize new fields.
@@ -1579,9 +1632,22 @@ def set_exception_stacktrace(e: BaseException) -> None:
     setattr(e, 'stacktrace', stacktrace)
 
 
+def _set_value_free_exception_stacktrace(e: BaseException) -> None:
+    """Attaches an exception-only trace without the active raw exception."""
+    stacktrace = ''.join(traceback.format_exception_only(type(e), e))
+    setattr(e, 'stacktrace', stacktrace)
+
+
 def set_request_failed(request_id: str, e: BaseException) -> None:
     """Set a request to failed and populate the error message."""
-    set_exception_stacktrace(e)
+    request = get_request(request_id, fields=['name', 'request_body'])
+    sanitize = (request is not None and request_error_requires_sanitization(
+        request.name, request.request_body))
+    if sanitize:
+        e = sanitize_request_error(request.name, e, request.request_body)
+        _set_value_free_exception_stacktrace(e)
+    else:
+        set_exception_stacktrace(e)
     request_storage.get_request_backend().set_request_finished(
         request_id, RequestStatus.FAILED, error=e)
 
@@ -1590,7 +1656,15 @@ def set_request_failed(request_id: str, e: BaseException) -> None:
 @asyncio_utils.shield
 async def set_request_failed_async(request_id: str, e: BaseException) -> None:
     """Set a request to failed and populate the error message."""
-    set_exception_stacktrace(e)
+    request = await get_request_async(request_id,
+                                      fields=['name', 'request_body'])
+    sanitize = (request is not None and request_error_requires_sanitization(
+        request.name, request.request_body))
+    if sanitize:
+        e = sanitize_request_error(request.name, e, request.request_body)
+        _set_value_free_exception_stacktrace(e)
+    else:
+        set_exception_stacktrace(e)
     await request_storage.get_request_backend().set_request_finished_async(
         request_id, RequestStatus.FAILED, error=e)
 

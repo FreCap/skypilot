@@ -255,6 +255,20 @@ def decode_volume_list(
     ]
 
 
+@register_decoders('image.status')
+def decode_image_status(
+    return_value: list[dict[str,
+                            Any]],) -> list[responses.ContainerImageRecord]:
+    return [responses.ContainerImageRecord(**image) for image in return_value]
+
+
+@register_decoders('image.publish', 'image.register', 'image.prepare',
+                   'image.retry')
+def decode_image_record(
+        return_value: dict[str, Any]) -> responses.ContainerImageRecord:
+    return responses.ContainerImageRecord(**return_value)
+
+
 @register_decoders('job_status')
 def decode_job_status(
     return_value: dict[str, str | None]

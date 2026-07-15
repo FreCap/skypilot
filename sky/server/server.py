@@ -21,6 +21,8 @@ import uuid
 import zlib
 
 import fastapi
+from fastapi import exception_handlers as fastapi_exception_handlers
+from fastapi import exceptions as fastapi_exceptions
 from fastapi.middleware import cors
 import starlette.background
 import starlette.middleware.base
@@ -36,6 +38,7 @@ from sky import execution
 from sky import global_user_state
 from sky import sky_logging
 from sky import skypilot_config
+from sky.container_images import server as container_images_rest
 from sky.data import storage_utils
 from sky.jobs import state as managed_job_state
 from sky.jobs import utils as managed_job_utils
@@ -520,6 +523,9 @@ app.include_router(workspaces_rest.router,
                    prefix='/workspaces',
                    tags=['workspaces'])
 app.include_router(volumes_rest.router, prefix='/volumes', tags=['volumes'])
+app.include_router(container_images_rest.router,
+                   prefix='/images',
+                   tags=['images'])
 app.include_router(ssh_node_pools_rest.router,
                    prefix='/ssh_node_pools',
                    tags=['ssh_node_pools'])
@@ -528,6 +534,50 @@ app.include_router(file_mount_uploads.router)
 # increase the resource limit for the server
 soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
 resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+
+
+def _is_container_image_request_path(path: str) -> bool:
+    return (path == '/images' or path.startswith('/images/') or
+            path == '/api/v1/images' or path.startswith('/api/v1/images/'))
+
+
+def _contains_container_image_input(value: Any) -> bool:
+    """Returns whether rejected input may contain a managed-image selector."""
+    if isinstance(value, str):
+        return 'container_image' in value or 'image_id' in value
+    if isinstance(value, dict):
+        return any(key in ('container_image',
+                           'image_id') or _contains_container_image_input(item)
+                   for key, item in value.items())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_container_image_input(item) for item in value)
+    return False
+
+
+@app.exception_handler(fastapi_exceptions.RequestValidationError)
+async def handle_request_validation_error(
+    request: fastapi.Request,
+    error: fastapi_exceptions.RequestValidationError,
+) -> fastapi.responses.Response:
+    """Prevents rejected container-image input from crossing the API wire."""
+    if (not payloads.is_container_image_task_validation_error(error) and
+            not _is_container_image_request_path(request.url.path) and
+            not _contains_container_image_input(error.body)):
+        return await fastapi_exception_handlers.request_validation_exception_handler(
+            request, error)
+    # FastAPI's default 422 body repeats both Pydantic's message and raw input.
+    # Image references are an authentication boundary, so even rejected values
+    # must not be reflected. Keep the standard detail-list shape without
+    # including attacker-controlled locations, contexts, messages, or inputs.
+    return fastapi.responses.JSONResponse(
+        status_code=422,
+        content={
+            'detail': [{
+                'type': 'value_error',
+                'loc': ['request'],
+                'msg': 'Invalid container image request.',
+            }]
+        })
 
 
 @app.exception_handler(exceptions.ConcurrentWorkerExhaustedError)

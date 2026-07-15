@@ -573,6 +573,7 @@ SKIPPED_CLIENT_OVERRIDE_KEYS: list[tuple[str, ...]] = [
     ('api_server',),
     ('allowed_clouds',),
     ('workspaces',),
+    ('container_registries',),
     ('db',),
     ('daemons',),
     # TODO(kevin,tian): Override the whole controller config once our test
@@ -626,6 +627,11 @@ SKY_USER_FILE_PATH = '~/.sky/generated'
 ENV_VAR_IS_SKYPILOT_SERVER = 'IS_SKYPILOT_SERVER'
 OVERRIDE_CONSOLIDATION_MODE = 'IS_SKYPILOT_JOB_CONTROLLER'
 IS_SKYPILOT_SERVE_CONTROLLER = 'IS_SKYPILOT_SERVE_CONTROLLER'
+# Expected catalog UUID passed to dedicated controller processes. It proves
+# that a controller opened the same managed-image authority as the API server,
+# rather than merely opening some PostgreSQL database.
+CONTAINER_IMAGE_CATALOG_AUTHORITY_ENV_VAR = (
+    'SKYPILOT_CONTAINER_IMAGE_CATALOG_AUTHORITY')
 # Environment variable that is set to 'true' if rolling update strategy is
 # enabled for the API server deployment.
 SKYPILOT_ROLLING_UPDATE_ENABLED = 'SKYPILOT_ROLLING_UPDATE_ENABLED'

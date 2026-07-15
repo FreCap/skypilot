@@ -371,3 +371,36 @@ def format_volume_table(volumes: list[responses.VolumeRecord],
         return table_str
     else:
         return 'No existing volumes.'
+
+
+def format_container_image_table(
+        images: list[responses.ContainerImageRecord]) -> str:
+    """Formats logical image and per-target preparation state."""
+    table = log_utils.create_table([
+        'ARTIFACT', 'RELEASES', 'SOURCE', 'DISTRIBUTION', 'TARGET', 'STATE',
+        'ATTEMPTS', 'VERIFIED', 'ERROR'
+    ])
+    for image in images:
+        releases = ','.join(image.releases) or '-'
+        source = image.resolved_source_ref or image.source_ref or '-'
+        if not image.locations:
+            table.add_row([
+                image.id, releases, source, '-', '-', 'UNMATERIALIZED', 0, '-',
+                ''
+            ])
+        for location in image.locations:
+            verified = (log_utils.readable_time_duration(
+                location.last_verified_at)
+                        if location.last_verified_at is not None else '-')
+            table.add_row([
+                image.id,
+                releases,
+                source,
+                location.distribution,
+                location.target_id,
+                location.state,
+                location.attempt_count,
+                verified,
+                location.last_error or '',
+            ])
+    return str(table) if images else 'No managed container images.'

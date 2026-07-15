@@ -8,10 +8,13 @@ leader-aware routing.
 # effects). Disable for the file.
 # pylint: disable=invalid-name,protected-access
 import contextlib
+import importlib
 import json
 import pickle
 import types
 
+from alembic import operations
+from alembic.runtime import migration
 import pytest
 import sqlalchemy
 from sqlalchemy import create_engine
@@ -106,6 +109,7 @@ def _add_minimal_service(name: str,
                          service_hash=None,
                          lifecycle_epoch=None,
                          resource_scope=None,
+                         workspace=None,
                          yaml_content='yaml: v1',
                          pool=False,
                          spec=None):
@@ -127,6 +131,7 @@ def _add_minimal_service(name: str,
         # fields instead of calling SkyServiceSpec methods on it.
         spec=spec,
         yaml_content=yaml_content,
+        workspace=workspace,
         controller_ip=controller_ip,
         service_hash=service_hash,
         lifecycle_epoch=lifecycle_epoch,
@@ -151,6 +156,36 @@ def _insert_orphan_service_row(engine, name: str, pool: bool = False):
             hash='orphan',
             entrypoint='entry'))
         session.commit()
+
+
+def test_schema_015_preserves_legacy_workspace_as_null(tmp_path):
+    engine = create_engine(f'sqlite:///{tmp_path / "legacy-serve.db"}')
+    old_metadata = sqlalchemy.MetaData()
+    old_services = sqlalchemy.Table(
+        'services', old_metadata,
+        sqlalchemy.Column('name', sqlalchemy.Text, primary_key=True))
+    old_metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(old_services.insert().values(name='legacy-svc'))
+
+    schema_015 = importlib.import_module(
+        'sky.schemas.db.serve_state.015_service_workspace')
+    with engine.connect() as connection:
+        context = migration.MigrationContext.configure(connection)
+        with operations.Operations.context(context):
+            schema_015.upgrade()
+
+    workspace_column = next(
+        column for column in sqlalchemy.inspect(engine).get_columns('services')
+        if column['name'] == 'workspace')
+    assert workspace_column['nullable']
+    with engine.connect() as connection:
+        workspace = connection.execute(
+            sqlalchemy.text(
+                'SELECT workspace FROM services WHERE name = :name'), {
+                    'name': 'legacy-svc'
+                }).scalar_one()
+    assert workspace is None
 
 
 def test_launch_budget_counts_share_one_replica_scan(_mock_serve_db,
@@ -786,6 +821,13 @@ def test_get_service_from_name_uses_joined_spec_in_single_query(_mock_serve_db):
     assert record is not None
     assert record['policy'] == 'qps=2'
     assert record['load_balancing_policy'] == 'least_load'
+
+
+def test_service_workspace_survives_durable_round_trip(_mock_serve_db):
+    assert _add_minimal_service('svc-workspace', workspace='research') is True
+    record = serve_state.get_service_from_name('svc-workspace')
+    assert record is not None
+    assert record['workspace'] == 'research'
 
 
 def test_get_services_uses_single_query_for_multiple_rows(_mock_serve_db):

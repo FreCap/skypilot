@@ -196,6 +196,10 @@ _DEFAULT_VIEWER_ALLOWLIST = [
         'method': 'POST'
     },
     {
+        'path': '/images',
+        'method': 'GET'
+    },
+    {
         'path': '/recipes',
         'method': 'GET'
     },

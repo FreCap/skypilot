@@ -38,6 +38,9 @@ services_table = sqlalchemy.Table(
     'services',
     Base.metadata,
     sqlalchemy.Column('name', sqlalchemy.Text, primary_key=True),
+    # Durable user workspace for every replica launch and recovery. The
+    # controller itself may run in the system/default workspace.
+    sqlalchemy.Column('workspace', sqlalchemy.Text, server_default=None),
     sqlalchemy.Column('controller_job_id',
                       sqlalchemy.Integer,
                       server_default=None),
@@ -664,6 +667,7 @@ def add_service(name: str,
                 entrypoint: str,
                 spec: Optional['service_spec.SkyServiceSpec'],
                 yaml_content: str,
+                workspace: str | None = None,
                 controller_ip: str | None = None,
                 service_hash: str | None = None,
                 lifecycle_epoch: int | None = None,
@@ -771,6 +775,7 @@ def add_service(name: str,
             session.execute(
                 insert_func(services_table).values(
                     name=name,
+                    workspace=workspace,
                     controller_job_id=controller_job_id,
                     status=status.value,
                     policy=policy,
@@ -1433,6 +1438,7 @@ def _get_service_from_row(r: 'row.RowMapping') -> dict[str, Any]:
         'pool': bool(r['pool']),
         'controller_pid': r['controller_pid'],
         'controller_ip': r['controller_ip'],
+        'workspace': r['workspace'],
         'hash': r['hash'],
         'lifecycle_epoch': r['lifecycle_epoch'],
         'resource_scope': r['resource_scope'],

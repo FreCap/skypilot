@@ -72,6 +72,7 @@ run: |
   {%- endif %}
    -u -m sky.serve.service \
     --service-name {{service_name}} \
+    --workspace {{workspace}} \
     --service-incarnation {{service_incarnation}} \
     {%- if lifecycle_epoch is not none %}
     --lifecycle-epoch {{lifecycle_epoch}} \

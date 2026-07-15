@@ -454,6 +454,7 @@ class TestExternalCapabilityMutationPaths:
         service_record = {
             'status': serve_state.ServiceStatus.READY,
             'hash': 'incarnation-a',
+            'workspace': 'research',
         }
         lifecycle_lock = mock.MagicMock(epoch=1)
         with mock.patch.object(impl.controller_utils,
@@ -467,6 +468,9 @@ class TestExternalCapabilityMutationPaths:
              mock.patch.object(impl,
                                '_get_service_record',
                                return_value=service_record), \
+             mock.patch.object(impl.skypilot_config,
+                               'get_active_workspace',
+                               return_value='research'), \
              mock.patch.object(impl.serve_utils, 'validate_service_task'), \
              mock.patch.object(impl.admin_policy_utils,
                                'apply',
@@ -856,6 +860,51 @@ class TestLifecycleLocking:
             impl._assert_service_update_fence('svc', False, handle, backend,
                                               'incarnation-a', lifecycle_lock,
                                               'adding a version')
+
+    @pytest.mark.parametrize('stored_workspace', [None, ''])
+    def test_update_rejects_legacy_service_without_workspace(
+            self, stored_workspace):
+        record = {
+            'name': 'svc',
+            'hash': 'incarnation-a',
+            'status': serve_state.ServiceStatus.READY,
+            'workspace': stored_workspace,
+        }
+        with pytest.raises(RuntimeError, match='durable workspace'):
+            impl._require_service_update_workspace(record, 'svc', 'service')
+
+    def test_update_rejects_caller_from_different_workspace_before_mutation(
+            self):
+        task = mock.MagicMock()
+        handle = mock.MagicMock(spec=backends.CloudVmRayResourceHandle)
+        backend = _backend_mock()
+        record = {
+            'name': 'svc',
+            'hash': 'incarnation-a',
+            'status': serve_state.ServiceStatus.READY,
+            'workspace': 'research',
+        }
+        with mock.patch.object(impl.controller_utils,
+                               'get_controller_for_pool'), \
+             mock.patch.object(impl.backend_utils,
+                               'is_controller_accessible',
+                               return_value=handle), \
+             mock.patch.object(impl.backend_utils,
+                               'get_backend_from_handle',
+                               return_value=backend), \
+             mock.patch.object(impl,
+                               '_get_service_record',
+                               return_value=record), \
+             mock.patch.object(impl.skypilot_config,
+                               'get_active_workspace',
+                               return_value='other-workspace'), \
+             mock.patch.object(
+                 impl.serve_utils,
+                 'snapshot_service_container_images') as snapshot, \
+             pytest.raises(RuntimeError, match='different workspace'):
+            impl._update_impl_body(task, 'svc', lifecycle_lock=mock.MagicMock())
+        task.validate.assert_not_called()
+        snapshot.assert_not_called()
 
     def _run_down(self, service_names, all=False):  # pylint: disable=redefined-builtin
         locked = []

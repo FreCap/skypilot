@@ -69,6 +69,8 @@ from sky.client.cli import gpus as gpu_commands
 from sky.client.cli import table_utils
 from sky.client.cli import utils as cli_utils
 from sky.client.cli import workspace as workspace_commands
+from sky.container_images import client as container_images_sdk
+from sky.container_images import models as container_image_models
 from sky.jobs.state import ManagedJobStatus
 from sky.schemas.api import responses
 from sky.server import common as server_common
@@ -757,7 +759,8 @@ def _check_yaml_only(
     try:
         with open(entrypoint, encoding='utf-8') as f:
             try:
-                config = list(yaml_utils.safe_load_all(f))
+                config = yaml_utils.read_yaml_all_str(
+                    f.read(), reject_duplicate_keys=True)
                 if config:
                     # FIXME(zongheng): in a chain DAG YAML it only returns the
                     # first section. OK for downstream but is weird.
@@ -767,20 +770,19 @@ def _check_yaml_only(
                 if isinstance(result, str):
                     # 'sky exec cluster ./my_script.sh'
                     is_yaml = False
-            except yaml.YAMLError as e:
-                if yaml_file_provided:
-                    logger.debug(e)
-                    detailed_error = f'\nYAML Error: {e}\n'
-                    invalid_reason = ('contains an invalid configuration. '
-                                      'Please check syntax.\n'
-                                      f'{detailed_error}')
-                is_yaml = False
             except UnicodeDecodeError as e:
                 if yaml_file_provided:
                     logger.debug(e)
                     invalid_reason = (
                         'is not a valid UTF-8 text file and cannot be '
                         'parsed as YAML.')
+                is_yaml = False
+            except ValueError:
+                if yaml_file_provided:
+                    logger.debug('YAML parsing failed at the CLI boundary.')
+                    invalid_reason = ('contains an invalid configuration. '
+                                      'Please check YAML syntax and duplicate '
+                                      'mapping keys.')
                 is_yaml = False
 
     except OSError:
@@ -4065,6 +4067,140 @@ def storage_delete(names: list[str], all: bool, yes: bool, async_call: bool):  #
             logger.error(f'{colorama.Fore.RED}Error deleting storage {name}: '
                          f'{common_utils.format_exception(e, use_bracket=True)}'
                          f'{colorama.Style.RESET_ALL}')
+
+
+@cli.group(cls=_NaturalOrderGroup)
+def image():
+    """Manage digest-pinned container image distribution."""
+    pass
+
+
+@image.command('publish', cls=_DocumentedCodeCommand)
+@click.argument('image_ref', required=True, type=str, metavar='REF')
+@click.option('--release',
+              type=str,
+              help='Optional immutable release name to bind to the digest.')
+@click.option('--distribution',
+              type=str,
+              help='Registry distribution whose canonical target to prepare.')
+@click.option('--workspace',
+              '-w',
+              'workspace_name',
+              expose_value=True,
+              callback=flags.apply_workspace_option_callback,
+              help='Workspace in which to publish the image.')
+@usage_lib.entrypoint
+def image_publish(image_ref: str, release: str | None, distribution: str | None,
+                  workspace_name: str | None) -> None:
+    """Publish a digest-pinned REF and optional immutable release name.
+
+    Publication records logical content identity and queues only canonical
+    preparation. It never fans the image out to every regional target.
+    """
+    image_spec = container_image_models.ContainerImage(
+        ref=image_ref, release=release, distribution=distribution)
+    if image_spec.digest is None:
+        raise click.UsageError(
+            'sky image publish requires a digest-pinned OCI reference. '
+            'Resolve and build mutable tags outside the API request path.')
+    record = sdk.stream_and_get(
+        container_images_sdk.publish(image_spec.to_yaml_config(),
+                                     workspace=workspace_name))
+    click.echo(table_utils.format_container_image_table([record]))
+
+
+@image.command('status', cls=_DocumentedCodeCommand)
+@click.argument('image_ref', required=False, type=str, metavar='IMAGE')
+@click.option('--workspace',
+              '-w',
+              'workspace_name',
+              expose_value=True,
+              callback=flags.apply_workspace_option_callback,
+              help='Workspace whose image catalog to inspect.')
+@usage_lib.entrypoint
+def image_status(image_ref: str | None, workspace_name: str | None):
+    """Show preparation status for an unambiguous IMAGE selector.
+
+    Use ref=..., release=..., or artifact_id=... to select an identity
+    namespace explicitly.
+    """
+    records = sdk.stream_and_get(
+        container_images_sdk.status(image_ref, workspace=workspace_name))
+    click.echo(table_utils.format_container_image_table(records))
+
+
+@image.command('prepare', cls=_DocumentedCodeCommand)
+@click.argument('image_ref', required=True, type=str, metavar='IMAGE')
+@click.option('--targets',
+              required=True,
+              type=str,
+              help='Comma-separated registry profile target names.')
+@click.option('--distribution',
+              type=str,
+              help='Registry distribution to use for this image source.')
+@click.option('--release',
+              type=str,
+              help=('Immutable release label to bind to the resolved image '
+                    'digest (for example, boltz-2.1.0).'))
+@click.option('--workspace',
+              '-w',
+              'workspace_name',
+              expose_value=True,
+              callback=flags.apply_workspace_option_callback,
+              help='Workspace in which to prepare the image.')
+@usage_lib.entrypoint
+def image_prepare(image_ref: str, targets: str, distribution: str | None,
+                  release: str | None, workspace_name: str | None) -> None:
+    """Prepare verified copies for an unambiguous IMAGE selector."""
+    target_list = [
+        target.strip() for target in targets.split(',') if target.strip()
+    ]
+    image_spec: str | dict[str, str] = image_ref
+    if release is not None:
+        explicit = container_image_models.parse_explicit_image_selector(
+            image_ref)
+        if explicit is None:
+            image_spec = {'ref': image_ref}
+        else:
+            if explicit.ref is None:
+                raise click.UsageError(
+                    '--release can bind only a source reference. It cannot '
+                    'replace an explicit release= or artifact_id= selector.')
+            explicit_config = explicit.to_yaml_config()
+            image_spec = ({
+                'ref': explicit_config
+            } if isinstance(explicit_config, str) else explicit_config)
+        image_spec['release'] = release
+    record = sdk.stream_and_get(
+        container_images_sdk.prepare(image_spec,
+                                     target_list,
+                                     workspace=workspace_name,
+                                     distribution=distribution))
+    click.echo(table_utils.format_container_image_table([record]))
+
+
+@image.command('retry', cls=_DocumentedCodeCommand)
+@click.argument('image_ref', required=True, type=str, metavar='IMAGE')
+@click.option('--target', required=True, type=str, help='Target name to retry.')
+@click.option('--distribution',
+              type=str,
+              help='Registry distribution containing the target.')
+@click.option('--workspace',
+              '-w',
+              'workspace_name',
+              expose_value=True,
+              callback=flags.apply_workspace_option_callback,
+              help='Workspace containing the image.')
+@usage_lib.entrypoint
+def image_retry(image_ref: str, target: str, distribution: str | None,
+                workspace_name: str | None) -> None:
+    """Retry one target for an unambiguous IMAGE selector."""
+    record = sdk.stream_and_get(
+        container_images_sdk.retry(image_ref,
+                                   target,
+                                   workspace=workspace_name,
+                                   distribution=distribution))
+    click.echo(table_utils.format_container_image_table([record]))
 
 
 @cli.group(cls=_NaturalOrderGroup)

@@ -1,4 +1,7 @@
 """Unit tests for sky.server.requests.executor module."""
+# pylint: disable=import-outside-toplevel,missing-class-docstring
+# pylint: disable=protected-access,redefined-outer-name,reimported
+# pylint: disable=unused-argument,unused-import
 import asyncio
 import concurrent.futures
 import functools
@@ -133,6 +136,49 @@ def dummy_entrypoint(*args, **kwargs):
     return 'success'
 
 
+_MANAGED_IMAGE_LOG_SECRET = 'synthetic-provider-secret'
+
+
+class _ManagedImageFailureBody(payloads.RequestBody):
+    task: str
+
+
+def _managed_image_failure_entrypoint(**_):
+    raise RuntimeError(f'provider token={_MANAGED_IMAGE_LOG_SECRET}')
+
+
+def _managed_image_failure_request(
+        request_id: str, *, legacy_image_id: bool) -> requests_lib.Request:
+    if legacy_image_id:
+        task = 'resources:\n  image_id: docker:ubuntu\n'
+    else:
+        task = 'resources:\n  container_image: ubuntu\n'
+    return requests_lib.Request(
+        request_id=request_id,
+        name=(server_constants.REQUEST_NAME_PREFIX +
+              request_names.RequestName.CLUSTER_LAUNCH.value),
+        status=requests_lib.RequestStatus.PENDING,
+        created_at=time.time(),
+        user_id='test-user-id',
+        entrypoint=_managed_image_failure_entrypoint,
+        request_body=_ManagedImageFailureBody(task=task),
+    )
+
+
+def _assert_managed_image_failure_is_value_free(request_id: str,
+                                                error_log: mock.Mock) -> None:
+    rendered_log = str(error_log.call_args_list)
+    assert _MANAGED_IMAGE_LOG_SECRET not in rendered_log
+    assert requests_lib._CONTAINER_IMAGE_REQUEST_ERROR_MESSAGE in rendered_log
+    stored = requests_lib.get_request(request_id)
+    assert stored is not None
+    error = stored.get_error()
+    assert error is not None
+    assert _MANAGED_IMAGE_LOG_SECRET not in error['message']
+    assert _MANAGED_IMAGE_LOG_SECRET not in getattr(error['object'],
+                                                    'stacktrace', '')
+
+
 @pytest.mark.asyncio
 async def test_execute_request_coroutine_ctx_cancelled_on_cancellation(
         isolated_database):
@@ -166,10 +212,51 @@ async def test_execute_request_coroutine_ctx_cancelled_on_cancellation(
         mock_ctx.cancel.assert_called()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize('legacy_image_id', [False, True])
+async def test_managed_image_coroutine_failure_log_is_value_free(
+        isolated_database, legacy_image_id):
+    request_id = 'managed-image-coroutine-failure'
+    request = _managed_image_failure_request(request_id,
+                                             legacy_image_id=legacy_image_id)
+    assert await requests_lib.create_if_not_exists_async(request)
+    future = asyncio.get_running_loop().create_future()
+    future.set_exception(
+        RuntimeError(f'provider token={_MANAGED_IMAGE_LOG_SECRET}'))
+    mock_ctx = mock.Mock()
+    mock_ctx.redirect_log.return_value = None
+    with mock.patch('sky.utils.context.initialize'), \
+         mock.patch('sky.utils.context.get', return_value=mock_ctx), \
+         mock.patch.object(executor, 'get_request_thread_executor'), \
+         mock.patch.object(context_utils,
+                           'to_thread_with_executor',
+                           return_value=future), \
+         mock.patch.object(executor.logger, 'error') as error_log:
+        await executor._execute_request_coroutine(request)
+
+    _assert_managed_image_failure_is_value_free(request_id, error_log)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('legacy_image_id', [False, True])
+async def test_managed_image_process_failure_log_is_value_free(
+        mock_fd_operations, legacy_image_id):
+    del mock_fd_operations
+    request_id = 'managed-image-process-failure'
+    request = _managed_image_failure_request(request_id,
+                                             legacy_image_id=legacy_image_id)
+    assert await requests_lib.create_if_not_exists_async(request)
+    with mock.patch.object(executor.logger, 'error') as error_log:
+        executor._request_execution_wrapper(request_id,
+                                            ignore_return_value=False)
+
+    _assert_managed_image_failure_is_value_free(request_id, error_log)
+
+
 CALLED_FLAG = [False]
 
 
-def dummy_entrypoint(called_flag):
+def _called_flag_entrypoint(called_flag):
     CALLED_FLAG[0] = True
     return 'ok'
 
@@ -180,7 +267,7 @@ async def test_api_cancel_race_condition(isolated_database):
     CALLED_FLAG[0] = False
     req = requests_lib.Request(request_id='race-cancel-before',
                                name='test-request',
-                               entrypoint=dummy_entrypoint,
+                               entrypoint=_called_flag_entrypoint,
                                request_body=payloads.RequestBody(),
                                status=requests_lib.RequestStatus.PENDING,
                                created_at=0.0,

@@ -48,6 +48,10 @@ from sky.backends import wheel_utils
 from sky.clouds import cloud as sky_cloud
 from sky.clouds import kubernetes as k8s_cloud
 from sky.clouds.utils import gcp_utils
+from sky.container_images import config as container_images_config
+from sky.container_images import core as container_images_core
+from sky.container_images import models as container_image_models
+from sky.container_images import resolver as container_image_resolver
 from sky.dag import DEFAULT_EXECUTION
 from sky.data import storage as storage_lib
 from sky.provision import capacity_cache
@@ -141,6 +145,60 @@ SKY_REMOTE_APP_DIR = backend_utils.SKY_REMOTE_APP_DIR
 SKY_REMOTE_WORKDIR = constants.SKY_REMOTE_WORKDIR
 
 logger = sky_logging.init_logger(__name__)
+
+
+def _resolve_container_image_for_placement(
+    resources: resources_lib.Resources,
+    *,
+    ensure: bool = True,
+) -> resources_lib.Resources:
+    """Pins a managed image after optimization and before provisioning."""
+    cloud = resources.cloud
+    assert cloud is not None, resources
+    assert resources.region is not None, resources
+    # SSH node pools inherit Kubernetes because their workload runtime is a
+    # SkyPilot-managed k3s cluster.  Registry authority must therefore follow
+    # the kubelet context binding, not the host transport used to bootstrap
+    # that cluster.
+    backend = ('kubernetes' if isinstance(cloud, clouds.Kubernetes) else 'vm')
+    registry_binding = (container_images_config.get_kubernetes_registry_binding(
+        resources.region) if backend == 'kubernetes' else None)
+    placement_kwargs: dict[str, str] = {}
+    if registry_binding is not None:
+        (placement_kwargs['registry_provider'],
+         placement_kwargs['registry_region'],
+         placement_kwargs['registry_prefix'],
+         placement_kwargs['registry_auth_strategy']) = registry_binding
+    architecture = None
+    if resources.instance_type is not None:
+        try:
+            architecture = cloud.get_arch_from_instance_type(
+                resources.instance_type)
+        except NotImplementedError:
+            pass
+    runtime_platform = (
+        container_image_models.runtime_platform_from_architecture(architecture))
+    placement = container_image_models.Placement(provider=str(cloud).lower(),
+                                                 region=resources.region,
+                                                 backend=backend,
+                                                 platform=runtime_platform,
+                                                 **placement_kwargs)
+    try:
+        return container_images_core.resolve_for_placement(resources,
+                                                           placement,
+                                                           ensure=ensure)
+    except container_image_resolver.ImageRouteUnavailableError as e:
+        # Route readiness is placement-specific. Let the existing provisioning
+        # loop block exactly this candidate and optimize another region/cloud.
+        raise exceptions.ResourcesUnavailableError(str(e)) from e
+    except ValueError as e:
+        # Catalog, profile, and policy errors are not capacity failures. A
+        # different placement cannot repair them, so fail without cycling the
+        # fleet through every candidate.
+        raise exceptions.ResourcesUnavailableError(
+            f'Cannot resolve managed container image: {e}',
+            no_failover=True) from e
+
 
 # Timeout (seconds) for provision progress: if in this duration no new nodes
 # are launched, abort and failover.
@@ -1349,6 +1407,14 @@ class RetryingVmProvisioner:
                 f'To request quotas, check the instruction: '
                 f'https://docs.skypilot.co/en/latest/cloud-setup/quota.html.')
 
+        # Quota has passed and the region is now a real launch attempt. This
+        # is the first point where ensure-on-use may create materialization
+        # intents. Dry runs remain read-only.
+        to_provision = typing.cast(
+            resources_lib.LaunchableResources,
+            _resolve_container_image_for_placement(to_provision,
+                                                   ensure=not dryrun))
+
         insufficient_resources = None
         last_error_reason: str | None = None
         for zones in self._yield_zones(to_provision, num_nodes, cluster_name,
@@ -1520,17 +1586,22 @@ class RetryingVmProvisioner:
                 workload_id, workload_task_id = _get_workload_attribution(
                     task, cluster_name, self._workload_type,
                     self._extra_launch_context)
-                global_user_state.add_or_update_cluster(
-                    cluster_name,
-                    cluster_handle=handle,
-                    requested_resources=requested_resources,
-                    ready=False,
-                    is_managed=self._is_managed,
-                    provision_log_path=log_abs_path,
-                    workload_type=self._workload_type,
-                    workload_id=workload_id,
-                    workload_task_id=workload_task_id,
-                )
+                try:
+                    global_user_state.add_or_update_cluster(
+                        cluster_name,
+                        cluster_handle=handle,
+                        requested_resources=requested_resources,
+                        ready=False,
+                        is_managed=self._is_managed,
+                        provision_log_path=log_abs_path,
+                        workload_type=self._workload_type,
+                        workload_id=workload_id,
+                        workload_task_id=workload_task_id,
+                    )
+                except ValueError as e:
+                    raise exceptions.ResourcesUnavailableError(
+                        'The selected image route changed before the launch '
+                        f'was committed: {e}') from e
 
                 # Add cluster event for actual provisioning start.
                 global_user_state.add_cluster_event(
@@ -3120,7 +3191,8 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
         if resources_dict is not None:
             launched_resources = (
                 resources_lib.Resources._from_yaml_config_single(  # pylint: disable=protected-access
-                    resources_dict.copy()))
+                    resources_dict.copy(),
+                    _allow_resolved_container_image=True))
         else:
             launched_resources = None
 
@@ -4213,6 +4285,9 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             user_specified_task_config = task.to_yaml_config(
                 use_user_specified_yaml=True)
 
+        # The INIT transaction pinned the pull plan before it was rendered
+        # into the runtime. The READY transaction preserves that exact plan;
+        # a newer distribution revision applies on a later launch or restart.
         with timeline.Event('backend.provision.post_process'):
             global_user_state.add_or_update_cluster(
                 handle.cluster_name,

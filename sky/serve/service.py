@@ -6,6 +6,7 @@ controller child; it never starts an in-pod load balancer.
 """
 import argparse
 from collections.abc import Callable
+import contextlib
 import json
 import multiprocessing
 import os
@@ -23,6 +24,7 @@ import filelock
 from sky import exceptions
 from sky import global_user_state
 from sky import sky_logging
+from sky import skypilot_config
 from sky import task as task_lib
 from sky.backends import backend_utils
 from sky.backends import cloud_vm_ray_backend
@@ -1154,13 +1156,29 @@ def _start(service_name: str,
            job_id: int,
            entrypoint: str,
            requested_incarnation: str | None = None,
-           lifecycle_epoch: int | None = None):
+           lifecycle_epoch: int | None = None,
+           workspace: str | None = None):
     """Start the service controller and reconcile its external LB."""
     # Generate ssh key pair to avoid race condition when multiple sky.launch
     # are executed at the same time.
     auth_utils.get_or_generate_keys()
 
     service = serve_state.get_service_from_name(service_name)
+    stored_workspace = service.get('workspace') if service is not None else None
+    if service is not None and (not isinstance(stored_workspace, str) or
+                                not stored_workspace):
+        raise RuntimeError(
+            f'Refusing recovery for legacy service {service_name!r} without '
+            'a durable workspace. Recreate it in the intended workspace.')
+    if (stored_workspace is not None and workspace is not None and
+            stored_workspace != workspace):
+        raise RuntimeError(
+            f'Refusing service recovery for {service_name!r} in workspace '
+            f'{workspace!r}; the durable service workspace is '
+            f'{stored_workspace!r}.')
+    workspace = (stored_workspace or workspace or
+                 skypilot_config.get_active_workspace() or
+                 skylet_constants.SKYPILOT_DEFAULT_WORKSPACE)
     # This bit comes from the API-side topology that allocated the lifecycle
     # epoch. It cannot be re-derived in the controller child: run_controller
     # sets OVERRIDE_CONSOLIDATION_MODE for unrelated controller behavior.
@@ -1345,6 +1363,7 @@ def _start(service_name: str,
                     controller_ip=pod_ip,
                     spec=service_spec,
                     yaml_content=yaml_content,
+                    workspace=workspace,
                     entrypoint=entrypoint,
                     service_hash=service_incarnation,
                     lifecycle_epoch=lifecycle_epoch,
@@ -1798,6 +1817,9 @@ if __name__ == '__main__':
                         type=str,
                         help='Name of the service',
                         required=True)
+    parser.add_argument('--workspace',
+                        type=str,
+                        help='Durable workspace for replica launches')
     parser.add_argument('--service-incarnation',
                         type=str,
                         help='Preallocated service incarnation/resource scope')
@@ -1820,5 +1842,15 @@ if __name__ == '__main__':
     # We start process with 'spawn', because 'fork' could result in weird
     # behaviors; 'spawn' is also cross-platform.
     multiprocessing.set_start_method('spawn', force=True)
-    _start(args.service_name, args.task_yaml, args.job_id, args.entrypoint,
-           args.service_incarnation, args.lifecycle_epoch)
+    cli_workspace = args.workspace
+    workspace_context = (
+        skypilot_config.local_active_workspace_ctx(cli_workspace)
+        if cli_workspace is not None else contextlib.nullcontext())
+    with workspace_context:
+        _start(args.service_name,
+               args.task_yaml,
+               args.job_id,
+               args.entrypoint,
+               args.service_incarnation,
+               args.lifecycle_epoch,
+               workspace=cli_workspace)

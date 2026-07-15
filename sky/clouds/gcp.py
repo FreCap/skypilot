@@ -848,6 +848,13 @@ class GCP(clouds.Cloud):
                                                            clouds='gcp')
 
     @classmethod
+    def get_arch_from_instance_type(
+        cls,
+        instance_type: str,
+    ) -> str | None:
+        return catalog.get_arch_from_instance_type(instance_type, clouds='gcp')
+
+    @classmethod
     def get_vcpus_mem_from_instance_type(
         cls,
         instance_type: str,

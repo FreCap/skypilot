@@ -29,7 +29,7 @@ DB_INIT_LOCK_TIMEOUT_SECONDS = 10
 _alembic_thread_lock = threading.Lock()
 
 GLOBAL_USER_STATE_DB_NAME = 'state_db'
-GLOBAL_USER_STATE_VERSION = '022'  # operator notifications
+GLOBAL_USER_STATE_VERSION = '023'  # managed container image catalog
 GLOBAL_USER_STATE_LOCK_PATH = f'~/.sky/locks/.{GLOBAL_USER_STATE_DB_NAME}.lock'
 
 SPOT_JOBS_DB_NAME = 'spot_jobs_db'
@@ -37,7 +37,7 @@ SPOT_JOBS_VERSION = '023'  # add Batch coordinator ownership fence
 SPOT_JOBS_LOCK_PATH = f'~/.sky/locks/.{SPOT_JOBS_DB_NAME}.lock'
 
 SERVE_DB_NAME = 'serve_db'
-SERVE_VERSION = '014'  # Durable elected service version pointer
+SERVE_VERSION = '015'  # persist service workspace for replica recovery
 SERVE_LOCK_PATH = f'~/.sky/locks/.{SERVE_DB_NAME}.lock'
 
 SKYPILOT_CONFIG_DB_NAME = 'sky_config_db'

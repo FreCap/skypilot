@@ -154,6 +154,8 @@ from sky.client.sdk import storage_delete
 from sky.client.sdk import storage_ls
 from sky.client.sdk import stream_and_get
 from sky.client.sdk import tail_logs
+from sky.container_images import client as image
+from sky.container_images import ContainerImage
 from sky.dag import Dag
 from sky.dag import DagExecution
 from sky.data import FileMountType
@@ -245,6 +247,7 @@ __all__ = [
     'DagExecution',
     'Task',
     'Resources',
+    'ContainerImage',
     # core APIs
     'optimize',
     'launch',

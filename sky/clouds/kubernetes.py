@@ -730,16 +730,9 @@ class Kubernetes(clouds.Cloud):
             acc_count = acc_count or 0
 
         def _get_image_id(resources: 'resources_lib.Resources') -> str:
-            image_id_dict = resources.image_id
-            if image_id_dict is not None:
-                # Use custom image specified in resources
-                if None in image_id_dict:
-                    image_id = image_id_dict[None]
-                else:
-                    assert resources.region in image_id_dict, image_id_dict
-                    image_id = image_id_dict[resources.region]
-                if image_id.startswith('docker:'):
-                    image_id = image_id[len('docker:'):]
+            container_image = resources.extract_docker_image()
+            if container_image is not None:
+                image_id = container_image
             else:
                 # Select image based on whether we are using GPUs or not.
                 image_id = self.IMAGE_GPU if acc_count > 0 else self.IMAGE_CPU

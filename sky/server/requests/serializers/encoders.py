@@ -243,6 +243,20 @@ def encode_volume_list(
     return [volume_info.model_dump() for volume_info in return_value]
 
 
+@register_encoder('image.status')
+def encode_image_status(
+    return_value: list[responses.ContainerImageRecord],
+) -> list[dict[str, Any]]:
+    return [image.model_dump() for image in return_value]
+
+
+@register_encoder('image.publish', 'image.register', 'image.prepare',
+                  'image.retry')
+def encode_image_record(
+        return_value: responses.ContainerImageRecord) -> dict[str, Any]:
+    return return_value.model_dump()
+
+
 @register_encoder('job_status')
 def encode_job_status(return_value: dict[int, Any]) -> dict[str, str]:
     for job_id in return_value.keys():

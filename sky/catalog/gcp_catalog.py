@@ -330,6 +330,29 @@ def get_accelerators_from_instance_type(
         return None
 
 
+def get_arch_from_instance_type(instance_type: str) -> str | None:
+    """Returns the guest CPU architecture for one GCP machine type.
+
+    Current catalogs carry the Compute Engine ``architecture`` field.  The
+    fallback keeps catalogs generated before that field was added safe: those
+    catalogs can contain only the then-known machine families, for which T2A,
+    C4A, N4A, and A4X are Arm and the remaining families are x86-64.
+    """
+    if instance_type == 'TPU-VM':
+        return None
+    architecture = common.get_arch_from_instance_type_impl(_df, instance_type)
+    if architecture is not None:
+        normalized = str(architecture).lower()
+        if normalized in ('arm64', 'x86_64'):
+            return normalized
+        return None
+    if 'Arch' in _df.columns:
+        return None
+    arm64_prefixes = ('t2a-', 'c4a-', 'n4a-', 'a4x-')
+    return ('arm64'
+            if instance_type.lower().startswith(arm64_prefixes) else 'x86_64')
+
+
 def get_instance_type_for_accelerator(
         acc_name: str,
         acc_count: int,

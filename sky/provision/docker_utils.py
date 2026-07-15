@@ -44,25 +44,32 @@ _DOCKER_SOCKET_WAIT_TIMEOUT_SECONDS = 30
 INSTALL_AWS_CLI_CMD = (
     'which aws || ((command -v unzip >/dev/null 2>&1 || '
     '(sudo apt-get update && sudo apt-get install -y unzip)) && '
-    'curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" '
+    'AWS_CLI_MACHINE="$(uname -m)" && '
+    'case "$AWS_CLI_MACHINE" in '
+    'x86_64|amd64) AWS_CLI_ARCH=x86_64 ;; '
+    'aarch64|arm64) AWS_CLI_ARCH=aarch64 ;; '
+    '*) echo "Unsupported AWS CLI architecture" >&2; exit 1 ;; esac && '
+    'curl -fsSL "https://awscli.amazonaws.com/'
+    'awscli-exe-linux-${AWS_CLI_ARCH}.zip" '
     '-o "/tmp/awscliv2.zip" && '
     'unzip -q /tmp/awscliv2.zip -d /tmp && sudo /tmp/aws/install '
     '&& rm -rf /tmp/awscliv2.zip /tmp/aws)')
 
 # Pattern to extract SSH user from command output, handling MOTD contamination
 _DOCKER_USER_PATTERN = re.compile(r'SKYPILOT_DOCKER_USER: ([^\s\n]+)')
+_ECR_SERVER_PATTERN = re.compile(
+    r'^[0-9]{12}\.dkr\.ecr\.([a-z0-9-]+)\.amazonaws\.com(?:\.cn)?$')
 
 
 def _extract_region_from_ecr_server(server: str) -> str:
     """Extract AWS region from ECR server URL.
 
-    ECR server format: <account-id>.dkr.ecr.<region>.amazonaws.com
+    ECR server format: <account-id>.dkr.ecr.<region>.amazonaws.com[.cn]
     Returns the region part from the URL.
     """
-    # Split: ['<account-id>', 'dkr', 'ecr', '<region>', 'amazonaws', 'com']
-    parts = server.split('.')
-    if len(parts) >= 6 and parts[1] == 'dkr' and parts[2] == 'ecr':
-        return parts[3]
+    match = _ECR_SERVER_PATTERN.fullmatch(server)
+    if match is not None:
+        return match.group(1)
     raise ValueError(f'Invalid ECR server format: {server}')
 
 
@@ -312,10 +319,9 @@ class DockerInitializer:
                     f'--password {shlex.quote(docker_login_config.password)} '
                     f'{shlex.quote(docker_login_config.server)}',
                     wait_for_docker_daemon=True)
-            elif (docker_login_config.server.endswith('.amazonaws.com') and
-                  '.dkr.ecr.' in docker_login_config.server):
+            elif _ECR_SERVER_PATTERN.fullmatch(docker_login_config.server):
                 # AWS ECR: Use aws ecr get-login-password for authentication
-                # ECR format: <account-id>.dkr.ecr.<region>.amazonaws.com
+                # ECR format: <account-id>.dkr.ecr.<region>.amazonaws.com[.cn]
                 # This command uses the IAM credentials from the EC2 instance
                 # Ref: https://docs.aws.amazon.com/AmazonECR/latest/userguide/registry_auth.html # pylint: disable=line-too-long
                 region = _extract_region_from_ecr_server(

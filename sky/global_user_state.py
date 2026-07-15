@@ -55,6 +55,22 @@ DEFAULT_CLUSTER_EVENT_RETENTION_HOURS = 30 * 24.0
 DEBUG_CLUSTER_EVENT_RETENTION_HOURS = 30 * 24.0
 TERMINAL_CLUSTER_EVENT_RETENTION_HOURS = 30 * 24.0
 MIN_CLUSTER_EVENT_DAEMON_INTERVAL_SECONDS = 3600
+CONTAINER_IMAGE_MAX_AUTOMATIC_ATTEMPTS = 20
+_CONTAINER_IMAGE_QUEUE_ATTEMPT_BOUND = (
+    f'attempt_count < {CONTAINER_IMAGE_MAX_AUTOMATIC_ATTEMPTS}')
+
+
+def _bounded_container_image_queue(predicate: str) -> sqlalchemy.TextClause:
+    return sqlalchemy.text(
+        f'{predicate} AND {_CONTAINER_IMAGE_QUEUE_ATTEMPT_BOUND}')
+
+
+def _bounded_container_image_sqlite_queue(
+        predicate: str) -> sqlalchemy.TextClause:
+    """Uses the Boolean spelling emitted by SQLAlchemy's SQLite compiler."""
+    predicate = predicate.replace('IS TRUE', 'IS 1').replace('IS FALSE', 'IS 0')
+    return _bounded_container_image_queue(predicate)
+
 
 _UNIQUE_CONSTRAINT_FAILED_ERROR_MSGS = [
     # sqlite
@@ -178,6 +194,981 @@ volume_table = sqlalchemy.Table(
     sqlalchemy.Column('usedby_clusters', sqlalchemy.Text, server_default=None),
     sqlalchemy.Column('creation_yaml', sqlalchemy.Text, server_default=None),
 )
+
+# Workspace-scoped immutable OCI artifacts. These tables intentionally store
+# identity and orchestration state only. Registry credentials are minted for a
+# bounded operation and must never be persisted here.
+container_image_catalog_table = sqlalchemy.Table(
+    'container_image_catalog',
+    Base.metadata,
+    sqlalchemy.Column('id', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('authority_id', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('created_at', sqlalchemy.Integer, nullable=False),
+)
+
+# One per-workspace serialization row keeps catalog quotas exact without a
+# global publication hot lock. Artifact counts only increase because catalog
+# identity is immutable and v0 deliberately has no artifact deletion path.
+container_image_workspace_catalog_table = sqlalchemy.Table(
+    'container_image_workspace_catalogs',
+    Base.metadata,
+    sqlalchemy.Column('workspace', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('artifact_count',
+                      sqlalchemy.Integer,
+                      nullable=False,
+                      server_default='0'),
+    sqlalchemy.Column('updated_at', sqlalchemy.Integer, nullable=False),
+)
+
+container_image_profile_revision_table = sqlalchemy.Table(
+    'container_image_profile_revisions',
+    Base.metadata,
+    sqlalchemy.Column('workspace', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('profile', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('revision', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.Column('revision_fingerprint', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('created_at', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.Column('updated_at', sqlalchemy.Integer, nullable=False),
+)
+
+container_image_table = sqlalchemy.Table(
+    'container_images',
+    Base.metadata,
+    sqlalchemy.Column('id', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('workspace', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('creator_user_hash', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('source_ref', sqlalchemy.Text, server_default=None),
+    sqlalchemy.Column('resolved_source_ref',
+                      sqlalchemy.Text,
+                      server_default=None),
+    sqlalchemy.Column('source_digest', sqlalchemy.Text, nullable=False),
+    # Producer metadata makes externally imported OCI images one producer
+    # kind rather than baking that limitation into artifact identity.
+    sqlalchemy.Column('producer_kind', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('producer_spec_hash',
+                      sqlalchemy.Text,
+                      server_default=None),
+    sqlalchemy.Column('builder_version', sqlalchemy.Text, server_default=None),
+    sqlalchemy.Column('platforms_json', sqlalchemy.Text, server_default='[]'),
+    sqlalchemy.Column('compressed_size_bytes',
+                      sqlalchemy.BigInteger,
+                      server_default=None),
+    sqlalchemy.Column('created_at', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.Column('updated_at', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.UniqueConstraint('workspace',
+                                'source_digest',
+                                name='uq_container_images_scope_digest'),
+    sqlalchemy.Index('ix_container_images_scope_source_ref', 'workspace',
+                     'source_ref'),
+    sqlalchemy.Index('ix_container_images_scope_created', 'workspace',
+                     'created_at', 'id'),
+)
+
+container_image_release_table = sqlalchemy.Table(
+    'container_image_releases',
+    Base.metadata,
+    sqlalchemy.Column('workspace', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('name', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('image_id',
+                      sqlalchemy.Text,
+                      sqlalchemy.ForeignKey('container_images.id'),
+                      nullable=False),
+    sqlalchemy.Column('created_at', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.Index('ix_container_image_releases_image', 'image_id'),
+)
+
+container_image_source_table = sqlalchemy.Table(
+    'container_image_sources',
+    Base.metadata,
+    sqlalchemy.Column('id', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('workspace', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('image_id',
+                      sqlalchemy.Text,
+                      sqlalchemy.ForeignKey('container_images.id'),
+                      nullable=False),
+    sqlalchemy.Column('source_ref', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('resolved_source_ref', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('created_at', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.UniqueConstraint('workspace',
+                                'source_ref',
+                                name='uq_container_image_source_ref'),
+    sqlalchemy.Index('ix_container_image_sources_image', 'image_id'),
+    sqlalchemy.Index('ix_container_image_sources_resolved', 'workspace',
+                     'resolved_source_ref'),
+)
+
+container_image_location_table = sqlalchemy.Table(
+    'container_image_locations',
+    Base.metadata,
+    sqlalchemy.Column('id', sqlalchemy.Text, primary_key=True),
+    # Denormalize workspace onto the queue row so million-row claim paths can
+    # use one ordered index probe instead of joining through artifact identity.
+    sqlalchemy.Column('workspace', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('image_id',
+                      sqlalchemy.Text,
+                      sqlalchemy.ForeignKey('container_images.id'),
+                      nullable=False),
+    sqlalchemy.Column('profile', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('target_id', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('target_fingerprint', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('policy_fingerprint', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('profile_revision', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.Column('canonical',
+                      sqlalchemy.Boolean,
+                      nullable=False,
+                      server_default=sqlalchemy.false()),
+    sqlalchemy.Column('canonical_location_id',
+                      sqlalchemy.Text,
+                      sqlalchemy.ForeignKey('container_image_locations.id'),
+                      server_default=None),
+    # Indexed dependency snapshot for regional queues. Every canonical READY
+    # transition updates its children in the same transaction; claims still
+    # lock/recheck the exact canonical row as their final correctness fence.
+    sqlalchemy.Column('canonical_ready',
+                      sqlalchemy.Boolean,
+                      nullable=False,
+                      server_default=sqlalchemy.false()),
+    # Canonical intents bind to one immutable import source. Regional rows
+    # inherit the binding through canonical_location_id.
+    sqlalchemy.Column('source_id',
+                      sqlalchemy.Text,
+                      sqlalchemy.ForeignKey('container_image_sources.id'),
+                      server_default=None),
+    sqlalchemy.Column('target_ref', sqlalchemy.Text, server_default=None),
+    sqlalchemy.Column('expected_digest', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('state', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('attempt_count',
+                      sqlalchemy.Integer,
+                      nullable=False,
+                      server_default='0'),
+    sqlalchemy.Column('lease_owner', sqlalchemy.Text, server_default=None),
+    sqlalchemy.Column('lease_expires_at',
+                      sqlalchemy.Integer,
+                      server_default=None),
+    sqlalchemy.Column('heartbeat_at', sqlalchemy.Integer, server_default=None),
+    sqlalchemy.Column('next_retry_at', sqlalchemy.Integer, server_default=None),
+    sqlalchemy.Column('last_verified_at',
+                      sqlalchemy.Integer,
+                      server_default=None),
+    sqlalchemy.Column('verification_requested_at',
+                      sqlalchemy.Integer,
+                      server_default=None),
+    sqlalchemy.Column('last_used_at', sqlalchemy.Integer, server_default=None),
+    sqlalchemy.Column('auto_evict',
+                      sqlalchemy.Boolean,
+                      nullable=False,
+                      server_default=sqlalchemy.false()),
+    sqlalchemy.Column('last_error', sqlalchemy.Text, server_default=None),
+    sqlalchemy.Column('updated_at', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.UniqueConstraint(
+        'image_id',
+        'target_fingerprint',
+        name='uq_container_image_materialization_identity'),
+    sqlalchemy.UniqueConstraint('image_id',
+                                'target_ref',
+                                name='uq_container_image_physical_reference'),
+    sqlalchemy.CheckConstraint(
+        "(lease_owner IS NULL AND lease_expires_at IS NULL AND "
+        "heartbeat_at IS NULL) OR (lease_owner IS NOT NULL AND "
+        "lease_owner <> '' AND lease_expires_at IS NOT NULL AND "
+        "heartbeat_at IS NOT NULL)",
+        name='ck_container_image_location_complete_lease'),
+    sqlalchemy.CheckConstraint(
+        "lease_owner IS NULL OR state IN ('COPYING', 'EVICTING') OR "
+        "(state = 'READY' AND verification_requested_at IS NOT NULL)",
+        name='ck_container_image_location_lease_state'),
+    sqlalchemy.Index('ix_container_image_locations_lookup', 'image_id',
+                     'profile', 'target_id', 'target_fingerprint'),
+    sqlalchemy.Index('ix_container_image_locations_canonical_source',
+                     'canonical_location_id', 'profile_revision'),
+    sqlalchemy.Index(
+        'ix_container_image_locations_ready_canonical_dependency',
+        'workspace',
+        'profile',
+        'profile_revision',
+        'id',
+        'image_id',
+        postgresql_where=sqlalchemy.text(
+            "canonical IS TRUE AND state = 'READY' AND target_ref IS NOT NULL"),
+        sqlite_where=sqlalchemy.text(
+            "canonical IS 1 AND state = 'READY' AND target_ref IS NOT NULL")),
+    sqlalchemy.Index('ix_container_image_locations_import_source', 'source_id'),
+    sqlalchemy.Index('ix_container_image_locations_eviction_ready', 'workspace',
+                     'auto_evict', 'state', 'last_used_at', 'next_retry_at'),
+    sqlalchemy.Index('ix_container_image_locations_profile_eviction_ready',
+                     'workspace',
+                     'profile',
+                     'profile_revision',
+                     'last_used_at',
+                     'id',
+                     postgresql_where=_bounded_container_image_queue(
+                         "canonical IS FALSE AND auto_evict IS TRUE AND "
+                         "canonical_ready IS TRUE AND state = 'READY' AND "
+                         "next_retry_at IS NULL"),
+                     sqlite_where=_bounded_container_image_sqlite_queue(
+                         "canonical IS FALSE AND auto_evict IS TRUE AND "
+                         "canonical_ready IS TRUE AND state = 'READY' AND "
+                         "next_retry_at IS NULL")),
+    sqlalchemy.Index('ix_container_image_locations_profile_eviction_retry',
+                     'workspace',
+                     'profile',
+                     'profile_revision',
+                     'next_retry_at',
+                     'id',
+                     postgresql_where=_bounded_container_image_queue(
+                         "canonical IS FALSE AND auto_evict IS TRUE AND "
+                         "canonical_ready IS TRUE AND state = 'READY' AND "
+                         "next_retry_at IS NOT NULL"),
+                     sqlite_where=_bounded_container_image_sqlite_queue(
+                         "canonical IS FALSE AND auto_evict IS TRUE AND "
+                         "canonical_ready IS TRUE AND state = 'READY' AND "
+                         "next_retry_at IS NOT NULL")),
+    sqlalchemy.Index('ix_container_image_locations_eviction_lease', 'workspace',
+                     'auto_evict', 'state', 'lease_expires_at'),
+    sqlalchemy.Index('ix_container_image_locations_profile_eviction_lease',
+                     'workspace',
+                     'profile',
+                     'profile_revision',
+                     'lease_expires_at',
+                     'id',
+                     postgresql_where=_bounded_container_image_queue(
+                         "canonical IS FALSE AND auto_evict IS TRUE AND "
+                         "canonical_ready IS TRUE AND state = 'EVICTING' AND "
+                         "lease_owner IS NOT NULL AND lease_owner <> '' AND "
+                         "lease_expires_at IS NOT NULL AND "
+                         "heartbeat_at IS NOT NULL"),
+                     sqlite_where=_bounded_container_image_sqlite_queue(
+                         "canonical IS FALSE AND auto_evict IS TRUE AND "
+                         "canonical_ready IS TRUE AND state = 'EVICTING' AND "
+                         "lease_owner IS NOT NULL AND lease_owner <> '' AND "
+                         "lease_expires_at IS NOT NULL AND "
+                         "heartbeat_at IS NOT NULL")),
+    sqlalchemy.Index(
+        'ix_container_image_locations_profile_eviction_incomplete_lease',
+        'workspace',
+        'profile',
+        'profile_revision',
+        'id',
+        postgresql_where=_bounded_container_image_queue(
+            "canonical IS FALSE AND auto_evict IS TRUE AND "
+            "canonical_ready IS TRUE AND state = 'EVICTING' AND "
+            "(lease_owner IS NULL OR lease_owner = '' OR "
+            "lease_expires_at IS NULL OR heartbeat_at IS NULL)"),
+        sqlite_where=_bounded_container_image_sqlite_queue(
+            "canonical IS FALSE AND auto_evict IS TRUE AND "
+            "canonical_ready IS TRUE AND state = 'EVICTING' AND "
+            "(lease_owner IS NULL OR lease_owner = '' OR "
+            "lease_expires_at IS NULL OR heartbeat_at IS NULL)")),
+    sqlalchemy.Index('ix_container_image_locations_materialize_queue',
+                     'workspace', 'state', 'next_retry_at', 'canonical',
+                     'updated_at'),
+    sqlalchemy.Index('ix_container_image_locations_profile_pending_queue',
+                     'workspace',
+                     'profile',
+                     'profile_revision',
+                     'updated_at',
+                     'id',
+                     postgresql_where=_bounded_container_image_queue(
+                         "canonical IS TRUE AND state = 'PENDING' AND "
+                         "next_retry_at IS NULL"),
+                     sqlite_where=_bounded_container_image_sqlite_queue(
+                         "canonical IS TRUE AND state = 'PENDING' AND "
+                         "next_retry_at IS NULL")),
+    sqlalchemy.Index('ix_container_image_locations_regional_pending_queue',
+                     'workspace',
+                     'profile',
+                     'profile_revision',
+                     'updated_at',
+                     'id',
+                     postgresql_where=_bounded_container_image_queue(
+                         "canonical IS FALSE AND canonical_ready IS TRUE AND "
+                         "state = 'PENDING' AND next_retry_at IS NULL"),
+                     sqlite_where=_bounded_container_image_sqlite_queue(
+                         "canonical IS FALSE AND canonical_ready IS TRUE AND "
+                         "state = 'PENDING' AND next_retry_at IS NULL")),
+    sqlalchemy.Index('ix_container_image_locations_profile_pending_retry',
+                     'workspace',
+                     'profile',
+                     'profile_revision',
+                     'next_retry_at',
+                     'id',
+                     postgresql_where=_bounded_container_image_queue(
+                         "canonical IS TRUE AND state = 'PENDING' AND "
+                         "next_retry_at IS NOT NULL"),
+                     sqlite_where=_bounded_container_image_sqlite_queue(
+                         "canonical IS TRUE AND state = 'PENDING' AND "
+                         "next_retry_at IS NOT NULL")),
+    sqlalchemy.Index('ix_container_image_locations_regional_pending_retry',
+                     'workspace',
+                     'profile',
+                     'profile_revision',
+                     'next_retry_at',
+                     'id',
+                     postgresql_where=_bounded_container_image_queue(
+                         "canonical IS FALSE AND canonical_ready IS TRUE AND "
+                         "state = 'PENDING' AND next_retry_at IS NOT NULL"),
+                     sqlite_where=_bounded_container_image_sqlite_queue(
+                         "canonical IS FALSE AND canonical_ready IS TRUE AND "
+                         "state = 'PENDING' AND next_retry_at IS NOT NULL")),
+    sqlalchemy.Index('ix_container_image_locations_profile_copying_queue',
+                     'workspace',
+                     'profile',
+                     'profile_revision',
+                     'lease_expires_at',
+                     'id',
+                     postgresql_where=_bounded_container_image_queue(
+                         "canonical IS TRUE AND state = 'COPYING' AND "
+                         "lease_owner IS NOT NULL AND lease_owner <> '' AND "
+                         "lease_expires_at IS NOT NULL AND "
+                         "heartbeat_at IS NOT NULL"),
+                     sqlite_where=_bounded_container_image_sqlite_queue(
+                         "canonical IS TRUE AND state = 'COPYING' AND "
+                         "lease_owner IS NOT NULL AND lease_owner <> '' AND "
+                         "lease_expires_at IS NOT NULL AND "
+                         "heartbeat_at IS NOT NULL")),
+    sqlalchemy.Index('ix_container_image_locations_regional_copying_queue',
+                     'workspace',
+                     'profile',
+                     'profile_revision',
+                     'lease_expires_at',
+                     'id',
+                     postgresql_where=_bounded_container_image_queue(
+                         "canonical IS FALSE AND canonical_ready IS TRUE AND "
+                         "state = 'COPYING' AND lease_owner IS NOT NULL AND "
+                         "lease_owner <> '' AND lease_expires_at IS NOT NULL "
+                         "AND heartbeat_at IS NOT NULL"),
+                     sqlite_where=_bounded_container_image_sqlite_queue(
+                         "canonical IS FALSE AND canonical_ready IS TRUE AND "
+                         "state = 'COPYING' AND lease_owner IS NOT NULL AND "
+                         "lease_owner <> '' AND lease_expires_at IS NOT NULL "
+                         "AND heartbeat_at IS NOT NULL")),
+    sqlalchemy.Index(
+        'ix_container_image_locations_profile_copying_incomplete_lease',
+        'workspace',
+        'profile',
+        'profile_revision',
+        'id',
+        postgresql_where=_bounded_container_image_queue(
+            "canonical IS TRUE AND state = 'COPYING' AND "
+            "(lease_owner IS NULL OR lease_owner = '' OR "
+            "lease_expires_at IS NULL OR heartbeat_at IS NULL)"),
+        sqlite_where=_bounded_container_image_sqlite_queue(
+            "canonical IS TRUE AND state = 'COPYING' AND "
+            "(lease_owner IS NULL OR lease_owner = '' OR "
+            "lease_expires_at IS NULL OR heartbeat_at IS NULL)")),
+    sqlalchemy.Index(
+        'ix_container_image_locations_regional_copying_incomplete_lease',
+        'workspace',
+        'profile',
+        'profile_revision',
+        'id',
+        postgresql_where=_bounded_container_image_queue(
+            "canonical IS FALSE AND canonical_ready IS TRUE AND "
+            "state = 'COPYING' AND (lease_owner IS NULL OR "
+            "lease_owner = '' OR lease_expires_at IS NULL OR "
+            "heartbeat_at IS NULL)"),
+        sqlite_where=_bounded_container_image_sqlite_queue(
+            "canonical IS FALSE AND canonical_ready IS TRUE AND "
+            "state = 'COPYING' AND (lease_owner IS NULL OR "
+            "lease_owner = '' OR lease_expires_at IS NULL OR "
+            "heartbeat_at IS NULL)")),
+    sqlalchemy.Index(
+        'ix_container_image_locations_profile_retry_queue',
+        'workspace',
+        'profile',
+        'profile_revision',
+        'next_retry_at',
+        'id',
+        postgresql_where=_bounded_container_image_queue(
+            "canonical IS TRUE AND state IN ('FAILED', 'MISSING')"),
+        sqlite_where=_bounded_container_image_sqlite_queue(
+            "canonical IS TRUE AND state IN ('FAILED', 'MISSING')")),
+    sqlalchemy.Index('ix_container_image_locations_regional_retry_queue',
+                     'workspace',
+                     'profile',
+                     'profile_revision',
+                     'next_retry_at',
+                     'id',
+                     postgresql_where=_bounded_container_image_queue(
+                         "canonical IS FALSE AND canonical_ready IS TRUE AND "
+                         "state IN ('FAILED', 'MISSING')"),
+                     sqlite_where=_bounded_container_image_sqlite_queue(
+                         "canonical IS FALSE AND canonical_ready IS TRUE AND "
+                         "state IN ('FAILED', 'MISSING')")),
+    sqlalchemy.Index('ix_container_image_locations_verify_queue', 'workspace',
+                     'state', 'verification_requested_at', 'next_retry_at',
+                     'lease_expires_at'),
+    sqlalchemy.Index('ix_container_image_locations_profile_verification_queue',
+                     'workspace',
+                     'profile',
+                     'profile_revision',
+                     'verification_requested_at',
+                     'id',
+                     postgresql_where=_bounded_container_image_queue(
+                         "canonical IS TRUE AND state = 'READY' AND "
+                         "verification_requested_at IS NOT NULL AND "
+                         "next_retry_at IS NULL"),
+                     sqlite_where=_bounded_container_image_sqlite_queue(
+                         "canonical IS TRUE AND state = 'READY' AND "
+                         "verification_requested_at IS NOT NULL AND "
+                         "next_retry_at IS NULL")),
+    sqlalchemy.Index('ix_container_image_locations_regional_verify_queue',
+                     'workspace',
+                     'profile',
+                     'profile_revision',
+                     'verification_requested_at',
+                     'id',
+                     postgresql_where=_bounded_container_image_queue(
+                         "canonical IS FALSE AND canonical_ready IS TRUE AND "
+                         "state = 'READY' AND "
+                         "verification_requested_at IS NOT NULL AND "
+                         "next_retry_at IS NULL"),
+                     sqlite_where=_bounded_container_image_sqlite_queue(
+                         "canonical IS FALSE AND canonical_ready IS TRUE AND "
+                         "state = 'READY' AND "
+                         "verification_requested_at IS NOT NULL AND "
+                         "next_retry_at IS NULL")),
+    sqlalchemy.Index('ix_container_image_locations_profile_verification_retry',
+                     'workspace',
+                     'profile',
+                     'profile_revision',
+                     'next_retry_at',
+                     'id',
+                     postgresql_where=_bounded_container_image_queue(
+                         "canonical IS TRUE AND state = 'READY' AND "
+                         "verification_requested_at IS NOT NULL AND "
+                         "next_retry_at IS NOT NULL"),
+                     sqlite_where=_bounded_container_image_sqlite_queue(
+                         "canonical IS TRUE AND state = 'READY' AND "
+                         "verification_requested_at IS NOT NULL AND "
+                         "next_retry_at IS NOT NULL")),
+    sqlalchemy.Index(
+        'ix_container_image_locations_regional_verification_retry',
+        'workspace',
+        'profile',
+        'profile_revision',
+        'next_retry_at',
+        'id',
+        postgresql_where=_bounded_container_image_queue(
+            "canonical IS FALSE AND canonical_ready IS TRUE AND "
+            "state = 'READY' AND verification_requested_at IS NOT NULL AND "
+            "next_retry_at IS NOT NULL"),
+        sqlite_where=_bounded_container_image_sqlite_queue(
+            "canonical IS FALSE AND canonical_ready IS TRUE AND "
+            "state = 'READY' AND verification_requested_at IS NOT NULL AND "
+            "next_retry_at IS NOT NULL")),
+    sqlalchemy.Index(
+        'ix_container_image_locations_profile_copying_active_lease',
+        'workspace',
+        'profile',
+        'lease_expires_at',
+        'id',
+        postgresql_where=sqlalchemy.text(
+            "state = 'COPYING' AND lease_owner IS NOT NULL AND "
+            "lease_owner <> '' AND lease_expires_at IS NOT NULL AND "
+            "heartbeat_at IS NOT NULL"),
+        sqlite_where=sqlalchemy.text(
+            "state = 'COPYING' AND lease_owner IS NOT NULL AND "
+            "lease_owner <> '' AND lease_expires_at IS NOT NULL AND "
+            "heartbeat_at IS NOT NULL")),
+    sqlalchemy.Index(
+        'ix_container_image_locations_profile_evicting_active_lease',
+        'workspace',
+        'profile',
+        'lease_expires_at',
+        'id',
+        postgresql_where=sqlalchemy.text(
+            "state = 'EVICTING' AND lease_owner IS NOT NULL AND "
+            "lease_owner <> '' AND lease_expires_at IS NOT NULL AND "
+            "heartbeat_at IS NOT NULL"),
+        sqlite_where=sqlalchemy.text(
+            "state = 'EVICTING' AND lease_owner IS NOT NULL AND "
+            "lease_owner <> '' AND lease_expires_at IS NOT NULL AND "
+            "heartbeat_at IS NOT NULL")),
+    sqlalchemy.Index(
+        'ix_container_image_locations_profile_verification_active_lease',
+        'workspace',
+        'profile',
+        'lease_expires_at',
+        'id',
+        postgresql_where=sqlalchemy.text(
+            "state = 'READY' AND verification_requested_at IS NOT NULL AND "
+            "lease_owner IS NOT NULL AND lease_owner <> '' AND "
+            "lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL"),
+        sqlite_where=sqlalchemy.text(
+            "state = 'READY' AND verification_requested_at IS NOT NULL AND "
+            "lease_owner IS NOT NULL AND lease_owner <> '' AND "
+            "lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL")),
+)
+
+container_image_reference_table = sqlalchemy.Table(
+    'container_image_references',
+    Base.metadata,
+    sqlalchemy.Column('id', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('workspace', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('location_id',
+                      sqlalchemy.Text,
+                      sqlalchemy.ForeignKey('container_image_locations.id'),
+                      nullable=False),
+    sqlalchemy.Column('consumer_type', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('consumer_id', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('expires_at', sqlalchemy.Integer, server_default=None),
+    sqlalchemy.Column('created_at', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.Column('updated_at', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.UniqueConstraint('workspace',
+                                'consumer_type',
+                                'consumer_id',
+                                name='uq_container_image_reference_consumer'),
+    sqlalchemy.Index('ix_container_image_references_location', 'location_id',
+                     'expires_at'),
+    sqlalchemy.Index('ix_container_image_references_consumer', 'consumer_type',
+                     'consumer_id'),
+)
+
+
+def container_image_exact_canonical_ready(location: sqlalchemy.Table,
+                                          alias_name: str) -> Any:
+    """Requires a regional row's exact canonical source to remain READY."""
+    canonical = location.alias(alias_name)
+    return sqlalchemy.or_(
+        location.c.canonical.is_(True),
+        sqlalchemy.exists().where(
+            canonical.c.id == location.c.canonical_location_id,
+            canonical.c.image_id == location.c.image_id,
+            canonical.c.profile == location.c.profile,
+            canonical.c.profile_revision == location.c.profile_revision,
+            canonical.c.canonical.is_(True),
+            canonical.c.state == 'READY',
+            canonical.c.target_ref.isnot(None),
+        ),
+    )
+
+
+def lock_container_image_exact_canonical_for_work(
+    session: orm.Session,
+    location_id: str,
+) -> bool:
+    """Locks the exact READY canonical source for a regional transaction.
+
+    Callers must first take the shared profile-revision lock, then call this
+    helper before locking or updating the regional row.  PostgreSQL ``FOR
+    SHARE`` conflicts with a canonical state update, turning the canonical
+    readiness check into a serialization fence rather than a statement-
+    snapshot predicate.  Canonical locations return immediately because the
+    caller's subsequent update locks that same row.
+    """
+    location = container_image_location_table
+    row = session.execute(
+        sqlalchemy.select(
+            location.c.canonical,
+            location.c.canonical_location_id,
+            location.c.image_id,
+            location.c.profile,
+            location.c.profile_revision,
+        ).where(location.c.id == location_id)).mappings().first()
+    if row is None:
+        return False
+    if bool(row['canonical']):
+        return True
+    canonical_location_id = row['canonical_location_id']
+    if canonical_location_id is None:
+        return False
+    statement = sqlalchemy.select(location.c.id).where(
+        location.c.id == canonical_location_id,
+        location.c.image_id == row['image_id'],
+        location.c.profile == row['profile'],
+        location.c.profile_revision == row['profile_revision'],
+        location.c.canonical.is_(True),
+        location.c.state == 'READY',
+        location.c.target_ref.isnot(None),
+    )
+    bind = session.get_bind()
+    assert bind is not None
+    if bind.dialect.name == 'postgresql':
+        statement = statement.with_for_update(read=True)
+    return session.execute(statement).first() is not None
+
+
+def lock_container_image_profile_revision_for_work(
+    session: orm.Session,
+    workspace: str,
+    profile: str,
+    revision: int,
+    *,
+    revision_fingerprint: str | None = None,
+    skip_locked: bool = False,
+) -> bool:
+    """Acquires the shared profile lock used by data-plane transactions.
+
+    PostgreSQL permits concurrent ``FOR KEY SHARE`` holders but makes profile
+    activation's ``FOR UPDATE`` wait for all of them. A claim therefore
+    linearizes before activation, so activation observes its lease, or after
+    activation, so the stale revision no longer matches. Callers must acquire
+    this lock before locking or updating a location row.
+    """
+    statement = sqlalchemy.select(
+        container_image_profile_revision_table.c.revision).where(
+            container_image_profile_revision_table.c.workspace == workspace,
+            container_image_profile_revision_table.c.profile == profile,
+            container_image_profile_revision_table.c.revision == revision)
+    if revision_fingerprint is not None:
+        statement = statement.where(
+            container_image_profile_revision_table.c.revision_fingerprint ==
+            revision_fingerprint)
+    bind = session.get_bind()
+    assert bind is not None
+    if bind.dialect.name == 'postgresql':
+        statement = statement.with_for_update(read=True,
+                                              key_share=True,
+                                              skip_locked=skip_locked)
+    return session.execute(statement).first() is not None
+
+
+def _validate_container_image_runtime_policy(
+    resolved_image: Any,
+    launched_resources: Any,
+    workspace: str,
+    canonical: bool,
+    source_ref: str,
+) -> tuple[str, str]:
+    """Recomputes the complete placement policy at cluster commit time.
+
+    These imports stay local because container image state imports this module
+    to define its tables, while the provider boundary imports provisioning
+    modules that also depend on global user state.
+    """
+    # pylint: disable=import-outside-toplevel
+    from sky.container_images import config as container_image_config
+    from sky.container_images import core as container_image_core
+    from sky.container_images import models as container_image_models
+    from sky.container_images import providers as container_image_providers
+    from sky.container_images import references as container_image_references
+
+    image_spec = launched_resources.container_image
+    cloud = launched_resources.cloud
+    region = launched_resources.region
+    if image_spec is None or cloud is None or region is None:
+        raise ValueError('A managed image cluster handle requires its '
+                         'container selector and concrete placement.')
+    profile, policy = container_image_config.resolve_profile(
+        image_spec.distribution, workspace)
+    if (profile is None or profile.name != resolved_image.distribution or
+            profile.revision != resolved_image.profile_revision):
+        raise ValueError('Resolved image distribution policy no longer '
+                         'matches the cluster handle.')
+    try:
+        target = profile.target(resolved_image.target_id)
+    except ValueError as e:
+        raise ValueError('Resolved image target no longer exists in the '
+                         'current distribution policy.') from e
+    target_fingerprint = profile.physical_fingerprint(target)
+    if ((target is profile.canonical) != canonical or
+            profile.policy_fingerprint(
+                target, canonical) != resolved_image.policy_fingerprint):
+        raise ValueError('Resolved image target policy no longer matches the '
+                         'cluster handle.')
+    expected_reference = container_image_references.managed_reference(
+        profile, target, workspace, source_ref, resolved_image.digest)
+    if expected_reference != resolved_image.reference:
+        raise ValueError('Resolved image reference no longer matches its '
+                         'managed registry destination.')
+
+    backend = _container_image_backend(cloud)
+    registry_binding = (
+        container_image_config.get_kubernetes_registry_binding(region)
+        if backend == 'kubernetes' else None)
+    placement_kwargs: dict[str, str] = {}
+    if registry_binding is not None:
+        (placement_kwargs['registry_provider'],
+         placement_kwargs['registry_region'],
+         placement_kwargs['registry_prefix'],
+         placement_kwargs['registry_auth_strategy']) = registry_binding
+    runtime_platform = _container_image_runtime_platform(
+        cloud, launched_resources.instance_type)
+    placement = container_image_models.Placement(provider=str(cloud).lower(),
+                                                 region=region,
+                                                 backend=backend,
+                                                 platform=runtime_platform,
+                                                 **placement_kwargs)
+    if not container_image_core.route_satisfies_locality(
+            profile, target, placement, policy.locality):
+        raise ValueError(
+            'Resolved image target no longer satisfies the current '
+            'workspace locality policy.')
+    adapter = container_image_providers.get_adapter(target.provider)
+    expected_auth = adapter.resolve_runtime_pull_auth(target, placement)
+    if expected_auth != resolved_image.auth_strategy:
+        raise ValueError('Resolved image runtime pull authority no longer '
+                         'matches its policy and placement.')
+    assert expected_auth is not None
+    expected_login = adapter.runtime_login_config(target, expected_auth,
+                                                  placement)
+    if expected_login != launched_resources.docker_login_config:
+        raise ValueError('Resolved image runtime login instruction no longer '
+                         'matches its policy and placement.')
+    return profile.revision_fingerprint, target_fingerprint
+
+
+def _validate_container_image_selector(
+    session: orm.Session,
+    image_spec: Any,
+    workspace: str,
+    image_id: str,
+    digest: str,
+) -> None:
+    """Binds the serialized logical selector to the committed artifact."""
+    if (image_spec.artifact_id is not None and
+            image_spec.artifact_id != image_id):
+        raise ValueError('Resolved image artifact ID does not match the '
+                         'cluster container selector.')
+    if image_spec.ref is not None:
+        if image_spec.digest != digest:
+            raise ValueError('Resolved image digest does not match the '
+                             'cluster container source.')
+        source_exists = session.execute(
+            sqlalchemy.select(container_image_source_table.c.id).where(
+                container_image_source_table.c.workspace == workspace,
+                container_image_source_table.c.image_id == image_id,
+                container_image_source_table.c.source_ref ==
+                image_spec.ref)).first()
+        if source_exists is None:
+            raise ValueError('Resolved image source is not bound to the '
+                             'cluster artifact.')
+    if image_spec.release is not None:
+        release_exists = session.execute(
+            sqlalchemy.select(container_image_release_table.c.image_id).where(
+                container_image_release_table.c.workspace == workspace,
+                container_image_release_table.c.name == image_spec.release,
+                container_image_release_table.c.image_id == image_id)).first()
+        if release_exists is None:
+            raise ValueError('Resolved image release is not bound to the '
+                             'cluster artifact.')
+
+
+def _container_image_execution_state(resources: Any) -> tuple[Any, ...]:
+    """Returns every image field that may affect one runtime pull."""
+    if resources is None:
+        return (None, None, None, None, None, None, None)
+    cloud = getattr(resources, 'cloud', None)
+    cloud_name = str(cloud).lower() if cloud is not None else None
+    backend = (_container_image_backend(cloud) if cloud is not None else None)
+    return (
+        getattr(resources, 'container_image', None),
+        getattr(resources, 'resolved_container_image', None),
+        cloud_name,
+        getattr(resources, 'region', None),
+        backend,
+        getattr(resources, 'instance_type', None),
+        getattr(resources, 'docker_login_config', None),
+    )
+
+
+def _container_image_backend(cloud: Any) -> str:
+    """Classifies one cloud consistently across resolve and durable commit."""
+    # pylint: disable=import-outside-toplevel
+    from sky import clouds as clouds_lib
+
+    # SSH node pools run workload pods in the k3s cluster SkyPilot bootstraps
+    # on their hosts.  They therefore share Kubernetes kubelet pull authority
+    # even though SSH is the control-plane transport used during bootstrap.
+    return ('kubernetes' if isinstance(cloud, clouds_lib.Kubernetes) else 'vm')
+
+
+def _container_image_runtime_platform(cloud: Any,
+                                      instance_type: str | None) -> str | None:
+    """Returns a known Linux OCI platform without provider conditionals."""
+    # pylint: disable=import-outside-toplevel
+    from sky.container_images import models as container_image_models
+    architecture = None
+    if instance_type is not None:
+        try:
+            architecture = cloud.get_arch_from_instance_type(instance_type)
+        except NotImplementedError:
+            pass
+    return container_image_models.runtime_platform_from_architecture(
+        architecture)
+
+
+def _validate_container_image_runtime_platform(
+    platforms_json: str,
+    launched_resources: Any,
+    *,
+    allow_unverified: bool = False,
+) -> None:
+    """Fences durable handles against a known incompatible artifact."""
+    # pylint: disable=import-outside-toplevel
+    from sky.container_images import models as container_image_models
+    cloud = launched_resources.cloud
+    if cloud is None:
+        raise ValueError('A managed container image requires a concrete '
+                         'runtime cloud before persistence.')
+    runtime_platform = _container_image_runtime_platform(
+        cloud, launched_resources.instance_type)
+    try:
+        platforms = container_image_models.validate_oci_platforms(
+            json.loads(platforms_json), 'Container artifact platforms')
+        if allow_unverified and not platforms:
+            return
+        supported = container_image_models.platforms_support_runtime(
+            platforms, runtime_platform)
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            'Container artifact platform metadata is invalid.') from e
+    if not supported:
+        raise ValueError('Container artifact platforms do not support the '
+                         'cluster runtime architecture.')
+
+
+def _validate_container_image_source_fallback(
+    session: orm.Session,
+    resolved_image: Any,
+    launched_resources: Any,
+    workspace: str,
+    *,
+    allow_persisted_init_plan: bool = False,
+) -> None:
+    """Binds a locationless fallback to its exact source and live policy."""
+    # pylint: disable=import-outside-toplevel
+    from sky.container_images import config as container_image_config
+    from sky.container_images import models as container_image_models
+    from sky.container_images import providers as container_image_providers
+
+    image_spec = launched_resources.container_image
+    assert image_spec is not None
+    if image_spec.ref is None:
+        raise ValueError('A WARMING source fallback requires the exact source '
+                         'reference in the cluster container selector.')
+    if (resolved_image.reference != image_spec.ref or
+            resolved_image.digest != image_spec.digest):
+        raise ValueError('A WARMING source fallback does not match the exact '
+                         'source selected by the cluster.')
+    _validate_container_image_selector(session, image_spec, workspace,
+                                       resolved_image.image_id,
+                                       resolved_image.digest)
+    image_row = session.execute(
+        sqlalchemy.select(
+            container_image_table.c.id,
+            container_image_table.c.platforms_json).where(
+                container_image_table.c.id == resolved_image.image_id,
+                container_image_table.c.workspace == workspace,
+                container_image_table.c.source_digest ==
+                resolved_image.digest)).first()
+    if image_row is None:
+        raise ValueError('A WARMING source fallback is not bound to an '
+                         'immutable artifact in this workspace.')
+    cloud = launched_resources.cloud
+    region = launched_resources.region
+    if cloud is None or region is None:
+        raise ValueError('A WARMING source fallback requires an exact runtime '
+                         'placement.')
+    _validate_container_image_runtime_platform(str(image_row.platforms_json),
+                                               launched_resources,
+                                               allow_unverified=True)
+    if allow_persisted_init_plan:
+        # INIT already committed this exact secret-free source, placement,
+        # runtime auth and login plan. The INIT -> UP continuation must not be
+        # stranded by an unrelated policy rotation between those two writes.
+        return
+    profile, policy = container_image_config.resolve_profile(
+        image_spec.distribution, workspace)
+    if (profile is None or policy.mode
+            != container_image_models.WorkspaceImageMode.MANAGED_PREFERRED or
+            policy.locality != container_image_models.Locality.PREFER):
+        raise ValueError('A WARMING source fallback is no longer authorized by '
+                         'the current workspace image policy.')
+    cloud_name = str(cloud).lower()
+    backend = _container_image_backend(cloud)
+    placement_kwargs: dict[str, str] = {}
+    if backend == 'kubernetes':
+        binding = container_image_config.get_kubernetes_registry_binding(region)
+        if binding is not None:
+            (placement_kwargs['registry_provider'],
+             placement_kwargs['registry_region'],
+             placement_kwargs['registry_prefix'],
+             placement_kwargs['registry_auth_strategy']) = binding
+    placement = container_image_models.Placement(
+        provider=cloud_name,
+        region=region,
+        backend=backend,
+        platform=(_container_image_runtime_platform(
+            cloud, launched_resources.instance_type)),
+        **placement_kwargs)
+    expected_auth, expected_login = (
+        container_image_providers.resolve_source_runtime_pull_auth(
+            resolved_image.reference, placement,
+            launched_resources.docker_login_config))
+    if (resolved_image.auth_strategy != expected_auth or
+            launched_resources.docker_login_config != expected_login):
+        raise ValueError('A WARMING source fallback does not match its exact '
+                         'placement runtime pull authority.')
+
+
+def _validate_container_image_resolution(
+    session: orm.Session,
+    launched_resources: Any,
+    resolved_image: Any,
+    workspace: str,
+    *,
+    allow_persisted_init_plan: bool = False,
+) -> None:
+    """Rejects unresolved managed selectors and validates source fallbacks."""
+    # pylint: disable=import-outside-toplevel
+    from sky.container_images import config as container_image_config
+    from sky.container_images import models as container_image_models
+
+    image_spec = launched_resources.container_image
+    if image_spec is None:
+        return
+    if resolved_image is not None:
+        if resolved_image.location_id is None:
+            _validate_container_image_source_fallback(
+                session,
+                resolved_image,
+                launched_resources,
+                workspace,
+                allow_persisted_init_plan=(allow_persisted_init_plan))
+        return
+    if (launched_resources.container_image_from_legacy_image_id and
+            image_spec.distribution is None):
+        policy = container_image_config.get_workspace_policy(workspace)
+        if policy.mode == container_image_models.WorkspaceImageMode.MANAGED_REQUIRED:
+            raise ValueError('A managed-required workspace cannot persist an '
+                             'unresolved legacy container image.')
+        return
+    profile, _ = container_image_config.resolve_profile(image_spec.distribution,
+                                                        workspace)
+    if profile is not None:
+        raise ValueError('A managed container selector requires a resolved '
+                         'runtime pull plan before cluster persistence.')
+    if image_spec.ref is None:
+        raise ValueError('A release or artifact container selector requires a '
+                         'managed resolved runtime pull plan.')
+
+
+def _validate_container_image_inline_credentials(resources: Any) -> None:
+    """Fences cluster-handle persistence against restored unsafe resources."""
+    resource_validator = getattr(
+        resources, '_validate_container_image_docker_credentials', None)
+    if resource_validator is not None:
+        resource_validator()
+    image_spec = getattr(resources, 'container_image', None)
+    from_legacy = getattr(resources, 'container_image_from_legacy_image_id',
+                          False)
+    login_config = getattr(resources, 'docker_login_config', None)
+    if image_spec is None or from_legacy or login_config is None:
+        return
+    if isinstance(login_config, dict):
+        username = login_config.get('username')
+        password = login_config.get('password')
+    else:
+        username = getattr(login_config, 'username', None)
+        password = getattr(login_config, 'password', None)
+    if username or password:
+        raise ValueError(
+            'container_image does not support inline Docker username or '
+            'password credentials. Use a public source or a server-side '
+            'workload identity.')
+
 
 # Table for Cluster History
 # usage_intervals: List[Tuple[int, int]]
@@ -831,6 +1822,12 @@ def add_or_update_cluster(cluster_name: str,
     """
     engine = _db_manager.get_engine()
 
+    # Restored or internally constructed handles can bypass current Resources
+    # construction. Fence them before pickle allocates any durable bytes.
+    pre_pickle_resources = getattr(cluster_handle, 'launched_resources', None)
+    if pre_pickle_resources is not None:
+        _validate_container_image_inline_credentials(pre_pickle_resources)
+
     # FIXME: launched_at will be changed when `sky launch -c` is called.
     handle = pickle.dumps(cluster_handle)
     cluster_launched_at = int(time.time()) if is_launch else None
@@ -844,12 +1841,37 @@ def add_or_update_cluster(cluster_name: str,
     cloud = None
     region = None
     zone = None
+    image_location_id = None
+    image_target_ref = None
+    image_id = None
+    image_target_id = None
+    image_distribution = None
+    image_profile_revision = None
+    image_policy_fingerprint = None
+    image_digest = None
+    resolved_image = None
+    launched_resources = None
     if hasattr(cluster_handle, 'launched_resources'):
-        lr = cluster_handle.launched_resources
-        if lr is not None:
-            cloud = str(lr.cloud) if getattr(lr, 'cloud', None) else None
-            region = str(lr.region) if getattr(lr, 'region', None) else None
-            zone = str(lr.zone) if getattr(lr, 'zone', None) else None
+        launched_resources = cluster_handle.launched_resources
+        if launched_resources is not None:
+            cloud = (str(launched_resources.cloud) if getattr(
+                launched_resources, 'cloud', None) else None)
+            region = (str(launched_resources.region) if getattr(
+                launched_resources, 'region', None) else None)
+            zone = (str(launched_resources.zone) if getattr(
+                launched_resources, 'zone', None) else None)
+            resolved_image = getattr(launched_resources,
+                                     'resolved_container_image', None)
+            if (resolved_image is not None and
+                    resolved_image.location_id is not None):
+                image_location_id = resolved_image.location_id
+                image_target_ref = resolved_image.reference
+                image_id = resolved_image.image_id
+                image_target_id = resolved_image.target_id
+                image_distribution = resolved_image.distribution
+                image_profile_revision = resolved_image.profile_revision
+                image_policy_fingerprint = resolved_image.policy_fingerprint
+                image_digest = resolved_image.digest
 
     # Extract node_names from cached_cluster_info and merge with lineage.
     # Also opportunistically compute cloud-provider instance console URLs for
@@ -931,6 +1953,42 @@ def add_or_update_cluster(cluster_name: str,
         # is called, or until the code escapes the with block.
         cluster_row = session.query(cluster_table).filter_by(
             name=cluster_name).with_for_update().first()
+        cluster_workspace = (cluster_row.workspace
+                             if cluster_row is not None and
+                             cluster_row.workspace else active_workspace or
+                             constants.SKYPILOT_DEFAULT_WORKSPACE)
+        ready_continuation = (ready and cluster_row is not None and
+                              cluster_row.status
+                              == status_lib.ClusterStatus.INIT.value)
+        previous_image_execution_state = None
+        if cluster_row is not None and (not is_launch or ready_continuation):
+            try:
+                previous_handle = pickle.loads(cluster_row.handle)
+                previous_resources = getattr(previous_handle,
+                                             'launched_resources', None)
+                previous_image_execution_state = (
+                    _container_image_execution_state(previous_resources))
+            except Exception:  # pylint: disable=broad-except
+                # A status refresh may skip catalog work only after proving it
+                # carries the same complete image execution state as the
+                # existing durable handle. A legacy or unreadable handle falls
+                # through to full validation.
+                previous_image_execution_state = None
+        current_image_execution_state = _container_image_execution_state(
+            launched_resources)
+        persisted_warming_continuation = (ready_continuation and
+                                          resolved_image is not None and
+                                          resolved_image.location_id is None and
+                                          previous_image_execution_state
+                                          == current_image_execution_state)
+        if (launched_resources is not None and getattr(
+                launched_resources, 'container_image', None) is not None):
+            _validate_container_image_resolution(
+                session,
+                launched_resources,
+                resolved_image,
+                cluster_workspace,
+                allow_persisted_init_plan=(persisted_warming_continuation))
 
         # Merge current node names into existing lineage
         existing_node_names = (cluster_row.node_names if cluster_row else None)
@@ -1042,6 +2100,257 @@ def add_or_update_cluster(cluster_name: str,
                     cluster_table.c.node_names: node_names,
                 })
             session.execute(insert_or_update_stmt)
+
+        if image_location_id is not None:
+            # Commit the restartable cluster handle and its eviction fence in
+            # one transaction. A crash can leave neither or both, never a
+            # durable handle whose image is immediately evictable.
+            assert image_target_ref is not None
+            existing_references = session.execute(
+                sqlalchemy.select(container_image_reference_table).where(
+                    container_image_reference_table.c.consumer_type ==
+                    'cluster', container_image_reference_table.c.consumer_id ==
+                    cluster_name).with_for_update()).mappings().all()
+            if any(reference['workspace'] != cluster_workspace
+                   for reference in existing_references):
+                raise ValueError('A cluster image reference cannot move '
+                                 'between workspaces without termination.')
+            existing_reference = (existing_references[0]
+                                  if existing_references else None)
+            reference_unchanged = (
+                existing_reference is not None and
+                existing_reference['location_id'] == image_location_id and
+                (not is_launch or ready_continuation) and
+                previous_image_execution_state == current_image_execution_state)
+            if not reference_unchanged:
+                assert image_id is not None
+                assert image_target_id is not None
+                assert image_distribution is not None
+                assert image_profile_revision is not None
+                assert image_policy_fingerprint is not None
+                assert image_digest is not None
+                canonical_source_location = (
+                    container_image_location_table.alias(
+                        'cluster_image_canonical_source_location'))
+                canonical_source = container_image_source_table.alias(
+                    'cluster_image_canonical_source')
+                canonical_location_id = sqlalchemy.case(
+                    (container_image_location_table.c.canonical.is_(True),
+                     container_image_location_table.c.id),
+                    else_=container_image_location_table.c.canonical_location_id
+                )
+                profile_row = session.execute(
+                    sqlalchemy.select(
+                        container_image_table.c.workspace,
+                        container_image_table.c.platforms_json,
+                        canonical_source.c.resolved_source_ref.label(
+                            'canonical_source_ref'),
+                        container_image_location_table.c.image_id,
+                        container_image_location_table.c.profile,
+                        container_image_location_table.c.target_id,
+                        container_image_location_table.c.target_fingerprint,
+                        container_image_location_table.c.profile_revision,
+                        container_image_location_table.c.policy_fingerprint,
+                        container_image_location_table.c.expected_digest,
+                        container_image_location_table.c.canonical,
+                    ).join(
+                        container_image_table,
+                        container_image_table.c.id ==
+                        container_image_location_table.c.image_id,
+                    ).join(
+                        canonical_source_location,
+                        sqlalchemy.and_(
+                            canonical_source_location.c.id ==
+                            canonical_location_id,
+                            canonical_source_location.c.image_id ==
+                            container_image_location_table.c.image_id,
+                            canonical_source_location.c.canonical.is_(True)),
+                    ).join(
+                        canonical_source,
+                        sqlalchemy.and_(
+                            canonical_source.c.id ==
+                            canonical_source_location.c.source_id,
+                            canonical_source.c.image_id ==
+                            container_image_location_table.c.image_id,
+                            canonical_source.c.workspace ==
+                            container_image_table.c.workspace),
+                    ).where(container_image_location_table.c.id ==
+                            image_location_id)).mappings().first()
+                if (profile_row is None or
+                        profile_row['image_id'] != image_id or
+                        profile_row['profile'] != image_distribution or
+                        profile_row['target_id'] != image_target_id or
+                        profile_row['profile_revision']
+                        != image_profile_revision or
+                        profile_row['policy_fingerprint']
+                        != image_policy_fingerprint or
+                        profile_row['expected_digest'] != image_digest or
+                        profile_row['workspace'] != cluster_workspace):
+                    raise ValueError(
+                        'Image materialization policy snapshot no longer '
+                        'matches the cluster handle.')
+                assert resolved_image is not None
+                assert launched_resources is not None
+                image_spec = launched_resources.container_image
+                assert image_spec is not None
+                _validate_container_image_runtime_platform(
+                    str(profile_row['platforms_json']), launched_resources)
+                _validate_container_image_selector(
+                    session, image_spec, str(profile_row['workspace']),
+                    image_id, image_digest)
+                revision_fingerprint, target_fingerprint = (
+                    _validate_container_image_runtime_policy(
+                        resolved_image, launched_resources,
+                        str(profile_row['workspace']),
+                        bool(profile_row['canonical']),
+                        str(profile_row['canonical_source_ref'])))
+                if (str(profile_row['target_fingerprint'])
+                        != target_fingerprint):
+                    raise ValueError(
+                        'Image materialization belongs to a different physical '
+                        'registry destination than the current target policy.')
+                if (not lock_container_image_profile_revision_for_work(
+                        session,
+                        str(profile_row['workspace']),
+                        str(profile_row['profile']),
+                        int(profile_row['profile_revision']),
+                        revision_fingerprint=revision_fingerprint)):
+                    raise ValueError(
+                        'Image materialization belongs to a stale registry '
+                        'profile revision.')
+                if not lock_container_image_exact_canonical_for_work(
+                        session, image_location_id):
+                    raise ValueError(
+                        'Image materialization is no longer READY because its '
+                        'exact canonical source is unavailable.')
+                # Lock the READY row before testing it. Eviction claims update
+                # this same row, so PostgreSQL serializes the two transactions:
+                # either the reference commits first and eviction rechecks it,
+                # or eviction wins and this launch rolls back.
+                active_location_lease = sqlalchemy.and_(
+                    container_image_location_table.c.lease_owner.isnot(None),
+                    container_image_location_table.c.lease_owner != '',
+                    container_image_location_table.c.lease_expires_at.isnot(
+                        None), container_image_location_table.c.lease_expires_at
+                    > status_updated_at,
+                    container_image_location_table.c.heartbeat_at.isnot(None))
+                location_available = sqlalchemy.not_(active_location_lease)
+                image_row = session.execute(
+                    sqlalchemy.select(container_image_location_table.c.id,
+                                      container_image_table.c.workspace).
+                    join(
+                        container_image_table,
+                        container_image_table.c.id ==
+                        container_image_location_table.c.image_id,
+                    ).where(
+                        container_image_location_table.c.id ==
+                        image_location_id,
+                        container_image_location_table.c.image_id == image_id,
+                        container_image_location_table.c.target_id ==
+                        image_target_id,
+                        container_image_location_table.c.target_fingerprint ==
+                        target_fingerprint,
+                        container_image_location_table.c.profile ==
+                        image_distribution,
+                        container_image_location_table.c.profile_revision ==
+                        image_profile_revision,
+                        container_image_location_table.c.policy_fingerprint ==
+                        image_policy_fingerprint,
+                        container_image_location_table.c.expected_digest ==
+                        image_digest,
+                        container_image_location_table.c.state == 'READY',
+                        container_image_location_table.c.target_ref ==
+                        image_target_ref,
+                        location_available,
+                        container_image_exact_canonical_ready(
+                            container_image_location_table,
+                            'cluster_reference_canonical'),
+                        sqlalchemy.exists().where(
+                            container_image_table.c.id ==
+                            container_image_location_table.c.image_id,
+                            container_image_profile_revision_table.c.workspace
+                            == container_image_table.c.workspace,
+                            container_image_profile_revision_table.c.profile ==
+                            container_image_location_table.c.profile,
+                            container_image_profile_revision_table.c.revision ==
+                            container_image_location_table.c.profile_revision,
+                        ),
+                    ).with_for_update(
+                        of=container_image_location_table)).mappings().first()
+                if image_row is None:
+                    raise ValueError(
+                        'Image materialization is no longer READY, is being '
+                        'verified, or does not match the cluster handle.')
+                touch_result = session.execute(
+                    container_image_location_table.update().where(
+                        container_image_location_table.c.id ==
+                        image_location_id,
+                        container_image_location_table.c.image_id == image_id,
+                        container_image_location_table.c.target_id ==
+                        image_target_id,
+                        container_image_location_table.c.target_fingerprint ==
+                        target_fingerprint,
+                        container_image_location_table.c.profile ==
+                        image_distribution,
+                        container_image_location_table.c.profile_revision ==
+                        image_profile_revision,
+                        container_image_location_table.c.policy_fingerprint ==
+                        image_policy_fingerprint,
+                        container_image_location_table.c.expected_digest ==
+                        image_digest,
+                        container_image_location_table.c.state == 'READY',
+                        container_image_location_table.c.target_ref ==
+                        image_target_ref,
+                        location_available,
+                        container_image_exact_canonical_ready(
+                            container_image_location_table,
+                            'cluster_touch_canonical'),
+                        sqlalchemy.exists().where(
+                            container_image_table.c.id ==
+                            container_image_location_table.c.image_id,
+                            container_image_profile_revision_table.c.workspace
+                            == container_image_table.c.workspace,
+                            container_image_profile_revision_table.c.profile ==
+                            container_image_location_table.c.profile,
+                            container_image_profile_revision_table.c.revision ==
+                            container_image_location_table.c.profile_revision,
+                        ),
+                    ).values(last_used_at=status_updated_at,
+                             next_retry_at=None,
+                             updated_at=status_updated_at))
+                if touch_result.rowcount != 1:
+                    raise ValueError(
+                        'Image materialization changed while the cluster '
+                        'reference was being acquired.')
+                reference_id = str(uuid.uuid4())
+                reference_insert = insert_func(
+                    container_image_reference_table).values(
+                        id=reference_id,
+                        workspace=image_row['workspace'],
+                        location_id=image_location_id,
+                        consumer_type='cluster',
+                        consumer_id=cluster_name,
+                        expires_at=None,
+                        created_at=status_updated_at,
+                        updated_at=status_updated_at)
+                session.execute(
+                    reference_insert.on_conflict_do_update(
+                        index_elements=[
+                            container_image_reference_table.c.workspace,
+                            container_image_reference_table.c.consumer_type,
+                            container_image_reference_table.c.consumer_id,
+                        ],
+                        set_={
+                            container_image_reference_table.c.location_id: image_location_id,
+                            container_image_reference_table.c.expires_at: None,
+                            container_image_reference_table.c.updated_at: status_updated_at,
+                        }))
+        else:
+            # Updating a cluster away from a managed image must release its
+            # old eviction fence in the same transaction as the new handle.
+            session.execute(container_image_reference_table.delete().where(
+                container_image_reference_table.c.consumer_type == 'cluster',
+                container_image_reference_table.c.consumer_id == cluster_name))
 
         # Modify cluster history table
         launched_nodes = getattr(cluster_handle, 'launched_nodes', None)
@@ -1602,10 +2911,28 @@ def update_cluster_handle(cluster_name: str,
     update_dict: dict[Any, Any] = {cluster_table.c.handle: handle}
 
     with orm.Session(engine) as session:
+        cluster_row = session.query(cluster_table).filter_by(
+            name=cluster_name).with_for_update().first()
+        if cluster_row is None:
+            return
+        try:
+            stored_handle = pickle.loads(cluster_row.handle)
+        except Exception as e:  # pylint: disable=broad-except
+            raise ValueError(
+                'Cannot safely apply a metadata-only cluster handle update '
+                'because the stored handle is unreadable.') from e
+        stored_resources = getattr(stored_handle, 'launched_resources', None)
+        updated_resources = getattr(cluster_handle, 'launched_resources', None)
+        if (_container_image_execution_state(stored_resources)
+                != _container_image_execution_state(updated_resources)):
+            raise ValueError(
+                'update_cluster_handle() is metadata-only and cannot change '
+                'container image execution state. Use '
+                'add_or_update_cluster() so the durable image reference is '
+                'updated atomically.')
+
         if current_names is not None:
-            row = session.query(cluster_table.c.node_names).filter_by(
-                name=cluster_name).with_for_update().first()
-            existing_json = row.node_names if row else None
+            existing_json = cluster_row.node_names
             node_names = common_utils.merge_node_names_lineage(
                 existing_json, current_names)
             update_dict[cluster_table.c.node_names] = node_names
@@ -1661,6 +2988,11 @@ def remove_cluster(cluster_name: str, terminate: bool) -> None:
 
         if terminate:
             session.query(cluster_table).filter_by(name=cluster_name).delete()
+            # Container image references deliberately survive stop/start but
+            # are released with the retained cluster record on termination.
+            session.execute(container_image_reference_table.delete().where(
+                container_image_reference_table.c.consumer_type == 'cluster',
+                container_image_reference_table.c.consumer_id == cluster_name))
         else:
             if row is None or row.handle is None:
                 return

@@ -36,6 +36,7 @@ from sky import sky_logging
 from sky import skypilot_config
 from sky.adaptors import common as adaptors_common
 from sky.client import sdk
+from sky.container_images import task_utils as container_image_task_utils
 from sky.jobs import state as managed_job_state
 from sky.serve import auth_tokens
 from sky.serve import constants
@@ -1106,6 +1107,26 @@ def validate_external_lb_service_spec(
                 'external SkyServe load balancer. Terminate TLS at the '
                 'platform ingress/load balancer and remove tls_credential '
                 'from the service specification.')
+
+
+def snapshot_service_container_images(
+    task: 'sky.Task',
+    workspace: str | None = None,
+) -> str | None:
+    """Pins every candidate in one service version to one artifact.
+
+    Managed selectors may retain different distribution profiles for
+    placement, but their content identity must converge. Direct and legacy
+    images have no catalog identity, so every candidate must use the exact same
+    selector. The rewritten task YAML is the durable per-version snapshot.
+    """
+    try:
+        artifact_ids = container_image_task_utils.snapshot_task_container_images(
+            [task], workspace)
+    except ValueError:
+        with ux_utils.print_exception_no_traceback():
+            raise
+    return next(iter(artifact_ids), None)
 
 
 def validate_logical_replica_task(

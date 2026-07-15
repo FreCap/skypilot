@@ -197,7 +197,8 @@ def launch_cluster(
         pre_launch_guard: Callable[[], bool] | None = None,
         continue_guard: Callable[[], bool] | None = None,
         launch_fence: dict[str, Any] | None = None,
-        service_spec: 'service_spec.SkyServiceSpec | None' = None) -> None:
+        service_spec: 'service_spec.SkyServiceSpec | None' = None,
+        workspace: str | None = None) -> None:
     """Launch a sky serve replica cluster.
 
     This function will not wait for the job starts running. It will return
@@ -342,11 +343,16 @@ def launch_cluster(
             launch_kwargs: dict[str, Any] = {}
             if launch_fence is not None:
                 launch_kwargs['_extra_launch_context'] = launch_fence
-            request_id = sdk.launch(task,
-                                    cluster_name,
-                                    retry_until_up=retry_until_up,
-                                    _is_launched_by_sky_serve_controller=True,
-                                    **launch_kwargs)
+            workspace_ctx: contextlib.AbstractContextManager = (
+                skypilot_config.local_active_workspace_ctx(workspace)
+                if workspace is not None else contextlib.nullcontext())
+            with workspace_ctx:
+                request_id = sdk.launch(
+                    task,
+                    cluster_name,
+                    retry_until_up=retry_until_up,
+                    _is_launched_by_sky_serve_controller=True,
+                    **launch_kwargs)
             logger.info(f'Replica cluster {cluster_name} launch requested '
                         f'with request_id: {request_id}.')
             replica_to_request_id[replica_id] = request_id
@@ -1602,6 +1608,18 @@ class ReplicaManager:
         self.lock = threading.Lock()
         self._next_replica_id: int = 1
         self._service_name: str = service_name
+        service_record = serve_state.get_service_from_name(service_name)
+        stored_workspace = (service_record.get('workspace')
+                            if service_record is not None else None)
+        if service_record is not None and (
+                not isinstance(stored_workspace, str) or not stored_workspace):
+            raise RuntimeError(
+                f'Refusing replica recovery for legacy service '
+                f'{service_name!r} without a durable workspace. Recreate it '
+                'in the intended workspace.')
+        self._workspace = (stored_workspace or
+                           skypilot_config.get_active_workspace() or
+                           constants.SKYPILOT_DEFAULT_WORKSPACE)
         self._resource_scope = resource_scope
         self._service_hash = service_hash
         self._controller_owner = ((controller_pid,
@@ -2730,6 +2748,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                 'continue_guard': self._launch_owner_watchdog_allows_continue,
                 'launch_fence': self._replica_launch_fence_context(),
                 'service_spec': launch_spec,
+                'workspace': getattr(
+                    self, '_workspace',
+                    skypilot_config.get_active_workspace() or
+                    constants.SKYPILOT_DEFAULT_WORKSPACE),
             },
         )
         replica_port = _get_resources_ports(launch_yaml_content, launch_spec)

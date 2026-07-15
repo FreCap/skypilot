@@ -136,10 +136,20 @@ def add_all_tables_to_db_sqlalchemy(
             table.create(bind=engine, checkfirst=True)
         except (sqlalchemy_exc.OperationalError,
                 sqlalchemy_exc.ProgrammingError) as e:
-            if 'already exists' in str(e):
-                pass
-            else:
+            if 'already exists' not in str(e):
                 raise
+        # `Table.create(checkfirst=True)` skips the complete table object when
+        # a prior autocommit attempt created the table but crashed between
+        # index statements. Reconcile every index independently. In a
+        # multi-host race, one duplicate must not prevent later missing
+        # indexes from being attempted before the migration is stamped.
+        for index in table.indexes:
+            try:
+                index.create(bind=engine, checkfirst=True)
+            except (sqlalchemy_exc.OperationalError,
+                    sqlalchemy_exc.ProgrammingError) as e:
+                if 'already exists' not in str(e):
+                    raise
 
 
 def add_table_to_db_sqlalchemy(
@@ -603,6 +613,6 @@ def get_engine(
                 'sqlite+aiosqlite:///' + db_path, connect_args={'timeout': 30})
         if db_path not in _sqlite_engine_cache:
             _sqlite_engine_cache[db_path] = sqlalchemy.create_engine(
-                'sqlite:///' + db_path)
+                'sqlite:///' + db_path, connect_args={'timeout': 30})
         engine = _sqlite_engine_cache[db_path]
     return engine

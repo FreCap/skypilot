@@ -28,6 +28,8 @@ from sky.adaptors import common as adaptors_common
 from sky.backends import backend_utils
 from sky.backends import cloud_vm_ray_backend
 from sky.catalog import common as service_catalog_common
+from sky.container_images import state as container_image_state
+from sky.container_images import task_utils as container_image_task_utils
 from sky.dag import DEFAULT_EXECUTION
 from sky.data import data_utils
 from sky.data import storage as storage_lib
@@ -736,6 +738,7 @@ def launch(
             raise ValueError('JobGroups do not support pools. Please remove '
                              'the --pool argument when launching a job group.')
     dag.validate()
+    container_image_task_utils.snapshot_task_container_images(dag.tasks)
     # TODO(aylei): use consolidated job controller instead of performing
     # pre-mount operations when submitting jobs.
     dag.pre_mount_volumes()
@@ -1011,6 +1014,11 @@ def launch(
                 local_user_config=mutated_user_config,
             ),
         }
+        catalog_authority = container_image_state.get_catalog_authority_id()
+        assert catalog_authority is not None
+        vars_to_fill['controller_envs'][
+            skylet_constants.CONTAINER_IMAGE_CATALOG_AUTHORITY_ENV_VAR] = (
+                catalog_authority)
 
         yaml_path = os.path.join(
             managed_job_constants.JOBS_CONTROLLER_YAML_PREFIX,
