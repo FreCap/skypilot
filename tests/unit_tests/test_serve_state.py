@@ -8,6 +8,7 @@ leader-aware routing.
 # effects). Disable for the file.
 # pylint: disable=invalid-name,protected-access
 import contextlib
+import json
 import pickle
 import types
 
@@ -219,6 +220,60 @@ def test_replica_json_storage_round_trip_preserves_lifecycle_state():
     assert restored.status == info.status
 
 
+def test_replica_json_storage_preserves_region_independent_image_id():
+    image = 'docker:example.invalid/boltz:model'
+    resource_state = {
+        'cloud': 'Kubernetes',
+        'region': 'prod_research_cluster_eks',
+        'zone': None,
+        'accelerators': {
+            'A100-80GB': 1,
+        },
+        'use_spot': False,
+        'image_id': {
+            None: image,
+        },
+        'disk_tier': None,
+        'ephemeral_storage': 20,
+    }
+    info = _replica(9)
+    info.location = dict(resource_state)
+    info.resources_override = dict(resource_state)
+    info.resources_override['cloud'] = clouds.Kubernetes()
+
+    storage_state = info.to_storage_dict()
+    assert storage_state['location']['image_id'] == [[None, image]]
+    assert storage_state['resources_override']['image_id'] == [[None, image]]
+
+    # Exercise the same JSON object-key conversion as PostgreSQL JSONB.
+    restored = replica_managers.ReplicaInfo.from_storage_dict(
+        json.loads(json.dumps(storage_state)))
+
+    assert restored.location['image_id'] == {None: image}
+    assert restored.resources_override['image_id'] == {None: image}
+    assert restored.resources_override['cloud'] == 'Kubernetes'
+    assert restored.get_spot_location().image_id == {None: image}
+    assert restored.to_storage_dict() == storage_state
+
+
+def test_replica_json_storage_reads_legacy_null_image_id_key():
+    info = _replica(1)
+    state = info.to_storage_dict()
+    state['resources_override'] = {
+        'cloud': 'Kubernetes',
+        'region': 'prod_research_cluster_eks',
+        'image_id': {
+            'null': 'docker:example.invalid/boltz:model',
+        },
+    }
+
+    restored = replica_managers.ReplicaInfo.from_storage_dict(state)
+
+    assert restored.resources_override['image_id'] == {
+        None: 'docker:example.invalid/boltz:model'
+    }
+
+
 def test_replica_state_uses_jsonb_on_postgres():
     state_type = serve_state.replicas_table.c.replica_state.type
     assert isinstance(state_type.dialect_impl(postgresql.dialect()),
@@ -275,6 +330,21 @@ def test_replica_json_migration_backfills_legacy_pickle(tmp_path, monkeypatch):
     info._version = 6
     del info.first_consecutive_failure_time
     info.consecutive_failure_times = [42.0, 43.0]
+    info.location = {
+        'cloud': 'Kubernetes',
+        'region': 'prod_research_cluster_eks',
+        'zone': None,
+        'accelerators': {
+            'A100-80GB': 1,
+        },
+        'use_spot': False,
+        'image_id': {
+            None: 'docker:example.invalid/boltz:model',
+        },
+        'disk_tier': None,
+        'ephemeral_storage': 20,
+    }
+    info.resources_override = dict(info.location)
     info.status_property.sky_launch_status = common_utils.ProcessStatus.SUCCEEDED
     info.status_property.service_ready_now = True
     legacy_blob = pickle.dumps(info)

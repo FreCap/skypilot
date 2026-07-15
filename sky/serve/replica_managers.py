@@ -769,6 +769,52 @@ class ReplicaStatusProperty:
             return serve_state.ReplicaStatus.STARTING
 
 
+def _encode_replica_resource_state(
+        state: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Makes a location/resources override lossless in a JSON object.
+
+    ``Resources.image_id`` is keyed by a region or by ``None`` for a
+    region-independent image. JSON object keys cannot represent ``None``:
+    PostgreSQL JSONB reads it back as the string ``"null"``. Store this one
+    nested mapping as key/value pairs so its key types survive the round trip.
+    """
+    if state is None:
+        return None
+    encoded = dict(state)
+    image_id = encoded.get('image_id')
+    if isinstance(image_id, dict):
+        encoded['image_id'] = [
+            [region, image] for region, image in image_id.items()
+        ]
+    return encoded
+
+
+def _decode_replica_resource_state(
+        state: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Restores the internal location/resources override representation."""
+    if state is None:
+        return None
+    decoded = dict(state)
+    image_id = decoded.get('image_id')
+    if isinstance(image_id, list):
+        restored_image_id = {}
+        for item in image_id:
+            if not isinstance(item, list) or len(item) != 2:
+                raise ValueError('Invalid replica image_id storage state: '
+                                 f'{image_id!r}')
+            restored_image_id[item[0]] = item[1]
+        decoded['image_id'] = restored_image_id
+    elif isinstance(image_id, dict) and 'null' in image_id:
+        # Compatibility for version-1 rows written before image_id mappings
+        # used a lossless representation. The JSON encoder coerced a None key
+        # to the literal string "null".
+        decoded['image_id'] = {
+            None if region == 'null' else region: image
+            for region, image in image_id.items()
+        }
+    return decoded
+
+
 class ReplicaInfo:
     """Replica info for each replica."""
 
@@ -824,9 +870,10 @@ class ReplicaInfo:
     def to_storage_dict(self) -> dict[str, Any]:
         """Serialize control-plane state into the versioned JSON contract."""
         status_property = self.status_property
-        resources_override = self.resources_override
+        location = _encode_replica_resource_state(self.location)
+        resources_override = _encode_replica_resource_state(
+            self.resources_override)
         if resources_override is not None:
-            resources_override = dict(resources_override)
             cloud = resources_override.get('cloud')
             if cloud is not None and not isinstance(cloud, str):
                 # Placer-pinned overrides carry a Cloud instance. The recovery
@@ -848,7 +895,7 @@ class ReplicaInfo:
             'first_consecutive_failure_time': getattr(
                 self, 'first_consecutive_failure_time', None),
             'is_spot': self.is_spot,
-            'location': self.location,
+            'location': location,
             'resources_override': resources_override,
             'reserved_fill': bool(getattr(self, 'reserved_fill', False)),
             'cost_rebalance_for_replica_id': getattr(
@@ -895,8 +942,9 @@ class ReplicaInfo:
         replica.first_consecutive_failure_time = state.get(
             'first_consecutive_failure_time')
         replica.is_spot = bool(state['is_spot'])
-        replica.location = state.get('location')
-        replica.resources_override = state.get('resources_override')
+        replica.location = _decode_replica_resource_state(state.get('location'))
+        replica.resources_override = _decode_replica_resource_state(
+            state.get('resources_override'))
         replica.reserved_fill = bool(state.get('reserved_fill', False))
         replica.cost_rebalance_for_replica_id = state.get(
             'cost_rebalance_for_replica_id')
