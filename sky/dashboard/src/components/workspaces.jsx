@@ -624,7 +624,7 @@ export function Workspaces() {
     try {
       await apiClient.fetch('/check', {}, 'POST');
       if (!isCurrentRefresh()) return;
-      await fetchData({ showLoadingIndicators: false });
+      await fetchData({ showLoadingIndicators: true });
     } catch (error) {
       if (isCurrentRefresh()) {
         console.error('Error during sky check refresh:', error);
