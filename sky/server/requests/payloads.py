@@ -721,6 +721,11 @@ class RequestStatusBody(pydantic.BaseModel):
     cluster_name: str | None = None
 
 
+class OperatorNotificationReadBody(pydantic.BaseModel):
+    """The request body for advancing an operator notification cursor."""
+    through_sequence: int
+
+
 class ServeUpBody(RequestBody):
     """The request body for the serve up endpoint."""
     task: str

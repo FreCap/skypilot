@@ -393,6 +393,51 @@ system_config_table = sqlalchemy.Table(
     sqlalchemy.Column('updated_at', sqlalchemy.Integer),
 )
 
+# Low-cardinality operator notifications. One row is retained per category;
+# repeated occurrences update the same row instead of appending an event.
+operator_notification_table = sqlalchemy.Table(
+    'operator_notifications',
+    Base.metadata,
+    sqlalchemy.Column('category', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('message', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('first_seen_at', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.Column('last_seen_at',
+                      sqlalchemy.Integer,
+                      nullable=False,
+                      index=True),
+    sqlalchemy.Column('occurrence_count', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.Column('sequence',
+                      sqlalchemy.Integer,
+                      nullable=False,
+                      index=True),
+)
+
+# Each dashboard operator acknowledges a single global sequence, rather than
+# multiplying notification rows by (user, category).
+operator_notification_cursor_table = sqlalchemy.Table(
+    'operator_notification_cursors',
+    Base.metadata,
+    sqlalchemy.Column('user_id', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('last_seen_sequence',
+                      sqlalchemy.Integer,
+                      nullable=False,
+                      server_default='0'),
+    sqlalchemy.Column('updated_at', sqlalchemy.Integer, nullable=False),
+)
+
+# A singleton counter gives notification incidents a total order across
+# categories. Gaps are harmless: suppressed occurrences consume a sequence but
+# keep their category's previous incident sequence.
+operator_notification_sequence_table = sqlalchemy.Table(
+    'operator_notification_sequence',
+    Base.metadata,
+    sqlalchemy.Column('singleton_id', sqlalchemy.Integer, primary_key=True),
+    sqlalchemy.Column('value',
+                      sqlalchemy.Integer,
+                      nullable=False,
+                      server_default='0'),
+)
+
 
 def _glob_to_similar(glob_pattern):
     """Converts a glob pattern to a PostgreSQL LIKE pattern."""
@@ -3658,6 +3703,168 @@ def set_system_config(config_key: str, config_value: str) -> None:
             })
         session.execute(upsert_stmnt)
         session.commit()
+
+
+def _operator_notification_insert_func(
+    engine: sqlalchemy.engine.Engine,) -> Any:
+    if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
+        return sqlite.insert
+    if engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        return postgresql.insert
+    raise ValueError('Unsupported database dialect')
+
+
+def _next_operator_notification_sequence(session: orm.Session,
+                                         insert_func: Any) -> int:
+    ensure_counter = insert_func(operator_notification_sequence_table).values(
+        singleton_id=1, value=0
+    ).on_conflict_do_nothing(
+        index_elements=[operator_notification_sequence_table.c.singleton_id])
+    session.execute(ensure_counter)
+    # This UPDATE takes the row's write lock before computing value + 1 on
+    # both SQLite and PostgreSQL. Reading it back in the same transaction is
+    # therefore race-free without depending on SQLite RETURNING support.
+    session.execute(operator_notification_sequence_table.update().where(
+        operator_notification_sequence_table.c.singleton_id == 1).values(
+            value=operator_notification_sequence_table.c.value + 1))
+    sequence = session.execute(
+        sqlalchemy.select(operator_notification_sequence_table.c.value).where(
+            operator_notification_sequence_table.c.singleton_id ==
+            1)).scalar_one()
+    return int(sequence)
+
+
+@metrics_lib.time_me
+def record_operator_notification(category: str,
+                                 message: str,
+                                 dedupe_window_seconds: int,
+                                 emitted_at: int | None = None) -> None:
+    """Record a low-cardinality operator notification.
+
+    One row is retained per category. Occurrences inside a continuous incident
+    update its message/count/last-seen time but preserve its sequence, so an
+    operator who acknowledges it is not alerted again until the category has
+    been quiet for ``dedupe_window_seconds``.
+    """
+    if emitted_at is None:
+        emitted_at = int(time.time())
+    if dedupe_window_seconds < 0:
+        raise ValueError('dedupe_window_seconds must be non-negative')
+
+    engine = _db_manager.get_engine()
+    insert_func = _operator_notification_insert_func(engine)
+    with orm.Session(engine) as session:
+        sequence = _next_operator_notification_sequence(session, insert_func)
+        insert_stmnt = insert_func(operator_notification_table).values(
+            category=category,
+            message=message,
+            first_seen_at=emitted_at,
+            last_seen_at=emitted_at,
+            occurrence_count=1,
+            sequence=sequence,
+        )
+        current = operator_notification_table.c
+        starts_new_incident = (current.last_seen_at
+                               <= emitted_at - dedupe_window_seconds)
+        advances_last_seen = current.last_seen_at < emitted_at
+        upsert_stmnt = insert_stmnt.on_conflict_do_update(
+            index_elements=[current.category],
+            set_={
+                current.message: message,
+                current.last_seen_at: sqlalchemy.case(
+                    (advances_last_seen, emitted_at),
+                    else_=current.last_seen_at),
+                current.occurrence_count: current.occurrence_count + 1,
+                current.sequence: sqlalchemy.case(
+                    (starts_new_incident, sequence), else_=current.sequence),
+            })
+        session.execute(upsert_stmnt)
+        session.commit()
+
+
+@metrics_lib.time_me
+def get_operator_notifications(user_id: str, since: int) -> dict[str, Any]:
+    """Return recent notification categories and this user's unread state."""
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        cursor = session.execute(
+            sqlalchemy.select(
+                operator_notification_cursor_table.c.last_seen_sequence).where(
+                    operator_notification_cursor_table.c.user_id ==
+                    user_id)).scalar_one_or_none()
+        last_seen_sequence = int(cursor or 0)
+        rows = session.execute(
+            sqlalchemy.select(operator_notification_table).
+            where(operator_notification_table.c.last_seen_at >= since).order_by(
+                operator_notification_table.c.last_seen_at.desc(),
+                operator_notification_table.c.category.asc())).mappings().all()
+
+    notifications = []
+    latest_sequence = 0
+    unread_count = 0
+    for item in rows:
+        sequence = int(item['sequence'])
+        unread = sequence > last_seen_sequence
+        latest_sequence = max(latest_sequence, sequence)
+        unread_count += int(unread)
+        notifications.append({
+            'category': item['category'],
+            'message': item['message'],
+            'first_seen_at': int(item['first_seen_at']),
+            'last_seen_at': int(item['last_seen_at']),
+            'occurrence_count': int(item['occurrence_count']),
+            'sequence': sequence,
+            'unread': unread,
+        })
+    return {
+        'notifications': notifications,
+        'unread_count': unread_count,
+        'latest_sequence': latest_sequence,
+        'last_seen_sequence': last_seen_sequence,
+    }
+
+
+@db_retries.retry
+@metrics_lib.time_me
+def mark_operator_notifications_read(user_id: str,
+                                     through_sequence: int,
+                                     updated_at: int | None = None) -> int:
+    """Monotonically advance a user's cursor, clamped to issued sequences."""
+    if through_sequence < 0:
+        raise ValueError('through_sequence must be non-negative')
+    if updated_at is None:
+        updated_at = int(time.time())
+
+    engine = _db_manager.get_engine()
+    insert_func = _operator_notification_insert_func(engine)
+    with orm.Session(engine) as session:
+        issued_sequence = session.execute(
+            sqlalchemy.select(
+                operator_notification_sequence_table.c.value).where(
+                    operator_notification_sequence_table.c.singleton_id ==
+                    1)).scalar_one_or_none()
+        clamped_sequence = min(through_sequence, int(issued_sequence or 0))
+        insert_stmnt = insert_func(operator_notification_cursor_table).values(
+            user_id=user_id,
+            last_seen_sequence=clamped_sequence,
+            updated_at=updated_at)
+        current = operator_notification_cursor_table.c
+        advances_cursor = current.last_seen_sequence < clamped_sequence
+        upsert_stmnt = insert_stmnt.on_conflict_do_update(
+            index_elements=[current.user_id],
+            set_={
+                current.last_seen_sequence: sqlalchemy.case(
+                    (advances_cursor, clamped_sequence),
+                    else_=current.last_seen_sequence),
+                current.updated_at: sqlalchemy.case(
+                    (advances_cursor, updated_at), else_=current.updated_at),
+            })
+        session.execute(upsert_stmnt)
+        session.commit()
+        effective_cursor = session.execute(
+            sqlalchemy.select(current.last_seen_sequence).where(
+                current.user_id == user_id)).scalar_one()
+    return int(effective_cursor)
 
 
 def get_max_db_connections() -> int | None:

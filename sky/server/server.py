@@ -1411,6 +1411,47 @@ def estimated_spend(
         raise fastapi.HTTPException(status_code=422, detail=str(e)) from e
 
 
+def _operator_notification_user_id(request: fastapi.Request) -> str:
+    """Return the current admin identity or reject the notification API."""
+    auth_user = request.state.auth_user
+    if auth_user is None:
+        # Authentication-disabled local API servers retain their existing
+        # single-user behavior and treat the local user as the operator.
+        return common_utils.get_user_hash()
+    roles = permission.permission_service.get_user_roles(auth_user.id)
+    if rbac.RoleName.ADMIN.value not in roles:
+        raise fastapi.HTTPException(
+            status_code=403,
+            detail='Only admins can view operator notifications.')
+    return auth_user.id
+
+
+@app.get('/notifications')
+def operator_notifications(
+        request: fastapi.Request,
+        days: int = fastapi.Query(default=7, ge=1, le=30),
+) -> dict[str, Any]:
+    """Return recent coalesced notifications and the caller's unread state."""
+    user_id = _operator_notification_user_id(request)
+    since = int(time.time()) - days * 24 * 60 * 60
+    return global_user_state.get_operator_notifications(user_id, since)
+
+
+@app.post('/notifications/read')
+def mark_operator_notifications_read(
+    request: fastapi.Request,
+    body: payloads.OperatorNotificationReadBody,
+) -> dict[str, int]:
+    """Advance the caller's notification cursor monotonically."""
+    user_id = _operator_notification_user_id(request)
+    if body.through_sequence < 0:
+        raise fastapi.HTTPException(
+            status_code=422, detail='through_sequence must be non-negative')
+    cursor = global_user_state.mark_operator_notifications_read(
+        user_id, body.through_sequence)
+    return {'last_seen_sequence': cursor}
+
+
 @app.post('/cluster_events')
 async def cluster_events(
         request: fastapi.Request,
