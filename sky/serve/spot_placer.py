@@ -4,10 +4,12 @@ import collections
 import dataclasses
 import enum
 import os
+import re
 import time
 import typing
 from typing import Any, Optional
 
+from sky import catalog
 from sky import check as sky_check
 from sky import clouds as sky_clouds
 from sky import sky_logging
@@ -28,6 +30,11 @@ SPOT_PLACERS = {}
 DEFAULT_SPOT_PLACER = None
 SPOT_HEDGE_PLACER = 'dynamic_fallback'
 CAPACITY_AWARE_SPOT_PLACER = 'dynamic_fallback_per_gpu'
+
+# These backends build their accelerator catalogs by inspecting the user's
+# cluster. Per-GPU placement must not turn service-controller construction into
+# a Kubernetes/Slurm API poll; configured shapes remain exact for them.
+_LIVE_ACCELERATOR_CATALOG_CLOUDS = frozenset({'kubernetes', 'slurm', 'ssh'})
 
 # How long a location stays benched after a failed launch or a preemption
 # before it becomes eligible for a retry. Without this, a location marked
@@ -284,7 +291,60 @@ class LocationStatus(enum.Enum):
     PREEMPTED = 'PREEMPTED'
 
 
-def _get_possible_location_from_task(task: 'task_lib.Task') -> list[Location]:
+def _expand_accelerator_counts_for_cloud(
+    resources: 'resources_lib.Resources',
+    cloud: sky_clouds.Cloud,
+    counts_cache: dict[tuple[str, str], list[float]] | None = None,
+) -> list['resources_lib.Resources']:
+    """Expand one paid spot GPU shape using SkyPilot's static catalog.
+
+    ``dynamic_fallback_per_gpu`` treats every whole GPU as an equivalent
+    serving slot. The accelerator model remains user policy, while supported
+    machine widths are provider catalog data owned by SkyPilot. Cluster-backed
+    catalogs are deliberately excluded because listing them can query live
+    control planes.
+    """
+    accelerators = resources.accelerators
+    if (not resources.use_spot or accelerators is None or
+            len(accelerators) != 1 or resources.instance_type is not None):
+        return [resources]
+    cloud_name = str(cloud).lower()
+    if cloud_name in _LIVE_ACCELERATOR_CATALOG_CLOUDS:
+        return [resources]
+
+    accelerator_name, configured_count = next(iter(accelerators.items()))
+    if not float(configured_count).is_integer():
+        return [resources]
+    cache_key = (cloud_name, accelerator_name.lower())
+    if counts_cache is None or cache_key not in counts_cache:
+        counts_by_name = catalog.list_accelerator_counts(
+            name_filter=f'^{re.escape(accelerator_name)}$',
+            clouds=cloud_name,
+        )
+        catalog_counts = next(
+            (counts for name, counts in counts_by_name.items()
+             if name.lower() == accelerator_name.lower()), [])
+        if counts_cache is not None:
+            counts_cache[cache_key] = catalog_counts
+    else:
+        catalog_counts = counts_cache[cache_key]
+    whole_counts = {
+        int(count)
+        for count in catalog_counts
+        if count >= 1 and float(count).is_integer()
+    }
+    whole_counts.add(int(configured_count))
+    return [
+        resources.copy(accelerators={accelerator_name: count})
+        for count in sorted(whole_counts)
+    ]
+
+
+def _get_possible_location_from_task(
+    task: 'task_lib.Task',
+    *,
+    expand_accelerator_counts: bool = False,
+) -> list[Location]:
 
     def _shape_free_config(
             resources: 'resources_lib.Resources') -> dict[str, Any]:
@@ -320,6 +380,7 @@ def _get_possible_location_from_task(task: 'task_lib.Task') -> list[Location]:
     # enumerated per shape so each candidate location knows exactly what
     # to launch there.
     possible_locations = set()
+    accelerator_counts_cache: dict[tuple[str, str], list[float]] = {}
     for shape_entry in resources_list:
         location_requirements: dict[str, dict[str, set[str]]] = (
             collections.defaultdict(lambda: collections.defaultdict(set)))
@@ -352,45 +413,54 @@ def _get_possible_location_from_task(task: 'task_lib.Task') -> list[Location]:
         # leave them unset (e.g. a cloud entry's disk_tier poisons a
         # Kubernetes entry, whose feasibility check then rejects
         # custom_disk_tier and silently drops the context).
-        shape_resources = r.copy(cloud=None, region=None, zone=None)
         for cloud in clouds_list:
-            feasible_resources: resources_utils.FeasibleResources = (
-                cloud.get_feasible_launchable_resources(
-                    shape_resources, num_nodes=task.num_nodes))
-            for feasible in feasible_resources.resources_list:
-                # We set override_optimize_by_zone=True to force the
-                # provisioner to use zone-level provisioning. This is to get
-                # accurate location information.
-                launchables: list[resources_lib.Resources] = (
-                    resources_utils.make_launchables_for_valid_region_zones(
-                        feasible, override_optimize_by_zone=True))
-                for launchable in launchables:
-                    cloud_str = str(launchable.cloud)
-                    region = launchable.region
-                    zone = launchable.zone
-                    assert region is not None, 'Region must be specified'
-                    if (cloud_str not in location_requirements and
-                            location_requirements):
-                        continue
-                    # .get() avoids creating extra entries in
-                    # location_requirements that would then be treated as
-                    # user requirements for the following regions.
-                    cloud_reqs = location_requirements.get(cloud_str, {})
-                    if region not in cloud_reqs and cloud_reqs:
-                        continue
-                    region_reqs = cloud_reqs.get(region, set())
-                    if zone not in region_reqs and region_reqs:
-                        continue
-                    loc = Location.from_resources(launchable)
-                    # Pin the shape from the any_of entry, not the launchable
-                    # (make_launchables may resolve counts differently).
-                    loc.accelerators = r.accelerators
-                    loc.use_spot = r.use_spot
-                    loc.image_id = _normalize_image_id(r.image_id)
-                    loc.disk_tier = (r.disk_tier.value
-                                     if r.disk_tier is not None else None)
-                    loc.ephemeral_storage = r.ephemeral_storage
-                    possible_locations.add(loc)
+            shape_resources = r.copy(cloud=None, region=None, zone=None)
+            resource_shapes = [shape_resources]
+            if expand_accelerator_counts:
+                resource_shapes = _expand_accelerator_counts_for_cloud(
+                    shape_resources, cloud, accelerator_counts_cache)
+            for candidate_shape in resource_shapes:
+                feasible_resources: resources_utils.FeasibleResources = (
+                    cloud.get_feasible_launchable_resources(
+                        candidate_shape, num_nodes=task.num_nodes))
+                for feasible in feasible_resources.resources_list:
+                    # We set override_optimize_by_zone=True to force the
+                    # provisioner to use zone-level provisioning. This is to
+                    # get accurate location information.
+                    launchables: list[resources_lib.Resources] = (
+                        resources_utils.make_launchables_for_valid_region_zones(
+                            feasible, override_optimize_by_zone=True))
+                    for launchable in launchables:
+                        cloud_str = str(launchable.cloud)
+                        region = launchable.region
+                        zone = launchable.zone
+                        assert region is not None, 'Region must be specified'
+                        if (cloud_str not in location_requirements and
+                                location_requirements):
+                            continue
+                        # .get() avoids creating extra entries in
+                        # location_requirements that would then be treated as
+                        # user requirements for the following regions.
+                        cloud_reqs = location_requirements.get(cloud_str, {})
+                        if region not in cloud_reqs and cloud_reqs:
+                            continue
+                        region_reqs = cloud_reqs.get(region, set())
+                        if zone not in region_reqs and region_reqs:
+                            continue
+                        loc = Location.from_resources(launchable)
+                        # Pin the shape from the catalog-expanded entry, not
+                        # the launchable (make_launchables may resolve counts
+                        # differently).
+                        loc.accelerators = candidate_shape.accelerators
+                        loc.use_spot = candidate_shape.use_spot
+                        loc.image_id = _normalize_image_id(
+                            candidate_shape.image_id)
+                        loc.disk_tier = (candidate_shape.disk_tier.value
+                                         if candidate_shape.disk_tier
+                                         is not None else None)
+                        loc.ephemeral_storage = (
+                            candidate_shape.ephemeral_storage)
+                        possible_locations.add(loc)
 
     return list(possible_locations)
 
@@ -398,8 +468,14 @@ def _get_possible_location_from_task(task: 'task_lib.Task') -> list[Location]:
 class SpotPlacer:
     """Spot Placement specification."""
 
+    _expand_accelerator_counts = False
+
     def __init__(self, task: 'task_lib.Task') -> None:
-        possible_locations = _get_possible_location_from_task(task)
+        if self._expand_accelerator_counts:
+            possible_locations = _get_possible_location_from_task(
+                task, expand_accelerator_counts=True)
+        else:
+            possible_locations = _get_possible_location_from_task(task)
         logger.info(f'{len(possible_locations)} possible location candidates '
                     'are enabled for spot placement.')
         logger.debug(f'All possible locations: {possible_locations}')
@@ -764,14 +840,47 @@ class DynamicFallbackSpotPlacer(SpotPlacer,
 
 class CapacityAwareDynamicFallbackSpotPlacer(DynamicFallbackSpotPlacer,
                                              name=CAPACITY_AWARE_SPOT_PLACER):
-    """Dynamic fallback whose cost tiebreak is hourly price per GPU slot."""
+    """Dynamic fallback that discovers and prices whole-GPU spot shapes.
+
+    Availability spreading is by physical placement, not machine width.  A
+    1-GPU and an 8-GPU candidate in the same zone are alternative shapes at
+    one location; treating them as separate locations would deliberately
+    launch every width before reusing the cheapest one.  Within the least
+    GPU-loaded physical placements, choose the cheapest active shape per GPU.
+    """
+
+    _expand_accelerator_counts = True
 
     @staticmethod
     def _accelerator_slots(location: Location) -> float:
         slots = sum((location.accelerators or {}).values())
         return float(slots) if slots > 0 else 1.0
 
+    @staticmethod
+    def _placement_key(location: Location) -> tuple[str, str, str | None]:
+        return (str(location.cloud).lower(), location.region, location.zone)
+
     def _min_cost_location(self, locations: list[Location]) -> Location:
         return min(locations,
                    key=lambda location: self._get_cost_per_hour_cached(location)
                    / self._accelerator_slots(location))
+
+    def _select_least_loaded_min_cost(
+            self, candidate_locations: list[Location],
+            current_locations: list[Location]) -> Location:
+        """Spread GPU slots across placements, then pick their best shape."""
+        placement_load: collections.defaultdict[tuple[
+            str, str, str | None], float] = collections.defaultdict(float)
+        for location in current_locations:
+            resolved = self.resolve_location(location)
+            if resolved is not None:
+                placement_load[self._placement_key(
+                    resolved)] += self._accelerator_slots(resolved)
+        min_load = min((placement_load[self._placement_key(location)]
+                        for location in candidate_locations),
+                       default=0)
+        least_loaded = [
+            location for location in candidate_locations
+            if placement_load[self._placement_key(location)] == min_load
+        ]
+        return self._min_cost_location(least_loaded or candidate_locations)

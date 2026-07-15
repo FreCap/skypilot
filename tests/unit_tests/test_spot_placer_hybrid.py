@@ -77,11 +77,155 @@ class TestZeroCostTierFirst:
 
 
 class TestCapacityAwareCost:
-    """Opt-in placement compares paid shapes by machine price per GPU."""
+    """Opt-in placement discovers and prices paid shapes per GPU."""
+
+    def test_catalog_counts_expand_and_region_feasibility_filters(
+            self, monkeypatch):
+        # pylint: disable=import-outside-toplevel
+        import sky
+        from sky.clouds import aws as aws_cloud
+        from sky.utils import resources_utils
+
+        task = sky.Task.from_yaml_str("""
+resources:
+  infra: aws/us-east-1
+  accelerators: L4:1
+  use_spot: true
+run: echo hi
+""")
+        monkeypatch.setattr(spot_placer.catalog, 'list_accelerator_counts',
+                            lambda **_: {'L4': [1.0, 4.0, 8.0, 0.5]})
+
+        def _feasible(self, resources, num_nodes=1):
+            del self, num_nodes
+            count = next(iter(resources.accelerators.values()))
+            launchable = resources.copy(cloud=aws_cloud.AWS(),
+                                        instance_type=f'fake-l4-{count}')
+            return resources_utils.FeasibleResources([launchable], [], None)
+
+        def _launchables(resources, override_optimize_by_zone=False):
+            del override_optimize_by_zone
+            count = next(iter(resources.accelerators.values()))
+            # Simulate the 8-GPU shape being catalog-supported globally but
+            # unavailable in the one region allowed by this task.
+            region = 'us-west-2' if count == 8 else 'us-east-1'
+            return [resources.copy(region=region, zone=None)]
+
+        monkeypatch.setattr(aws_cloud.AWS, 'get_feasible_launchable_resources',
+                            _feasible)
+        monkeypatch.setattr(spot_placer.resources_utils,
+                            'make_launchables_for_valid_region_zones',
+                            _launchables)
+
+        locations = spot_placer._get_possible_location_from_task(
+            task, expand_accelerator_counts=True)
+
+        assert {next(iter(loc.accelerators.values())) for loc in locations
+               } == {1, 4}
+        assert {loc.region for loc in locations} == {'us-east-1'}
+
+    def test_live_cluster_catalog_is_never_queried(self, monkeypatch):
+        # pylint: disable=import-outside-toplevel
+        import sky
+        from sky.clouds import kubernetes as kubernetes_cloud
+        from sky.utils import resources_utils
+
+        task = sky.Task.from_yaml_str("""
+resources:
+  infra: k8s/research-ctx
+  accelerators: A100:1
+  use_spot: true
+run: echo hi
+""")
+        catalog_call = mock.MagicMock(
+            side_effect=AssertionError('must not query Kubernetes catalog'))
+        monkeypatch.setattr(spot_placer.catalog, 'list_accelerator_counts',
+                            catalog_call)
+        monkeypatch.setattr(kubernetes_cloud.Kubernetes,
+                            'get_feasible_launchable_resources',
+                            lambda self, resources, num_nodes=1: resources_utils
+                            .FeasibleResources([], [], None))
+
+        spot_placer._get_possible_location_from_task(
+            task, expand_accelerator_counts=True)
+
+        catalog_call.assert_not_called()
+
+    def test_each_any_of_accelerator_model_expands_independently(
+            self, monkeypatch):
+        # pylint: disable=import-outside-toplevel
+        import sky
+        from sky.clouds import aws as aws_cloud
+        from sky.utils import resources_utils
+
+        task = sky.Task.from_yaml_str("""
+resources:
+  any_of:
+    - infra: aws/us-east-1
+      accelerators: L4:1
+      use_spot: true
+    - infra: aws/us-east-1
+      accelerators: A10G:1
+      use_spot: true
+run: echo hi
+""")
+
+        def _counts(*, name_filter, **_kwargs):
+            if 'L4' in name_filter:
+                return {'L4': [1.0, 4.0]}
+            return {'A10G': [1.0, 2.0]}
+
+        catalog_call = mock.MagicMock(side_effect=_counts)
+        monkeypatch.setattr(spot_placer.catalog, 'list_accelerator_counts',
+                            catalog_call)
+
+        def _feasible(self, resources, num_nodes=1):
+            del self, num_nodes
+            accelerator, count = next(iter(resources.accelerators.items()))
+            launchable = resources.copy(cloud=aws_cloud.AWS(),
+                                        instance_type=f'fake-{accelerator}-'
+                                        f'{count}')
+            return resources_utils.FeasibleResources([launchable], [], None)
+
+        monkeypatch.setattr(aws_cloud.AWS, 'get_feasible_launchable_resources',
+                            _feasible)
+        monkeypatch.setattr(
+            spot_placer.resources_utils,
+            'make_launchables_for_valid_region_zones', lambda resources, **_:
+            [resources.copy(region='us-east-1', zone=None)])
+
+        locations = spot_placer._get_possible_location_from_task(
+            task, expand_accelerator_counts=True)
+
+        assert {(accelerator, count)
+                for location in locations
+                for accelerator, count in (location.accelerators or {}).items()
+               } == {('L4', 1), ('L4', 4), ('A10G', 1), ('A10G', 2)}
+        assert catalog_call.call_count == 2
+
+    def test_explicit_instance_type_remains_exact(self, monkeypatch):
+        # pylint: disable=import-outside-toplevel
+        import sky
+
+        resources = sky.Resources(cloud=sky.clouds.AWS(),
+                                  instance_type='g6.12xlarge',
+                                  accelerators={'L4': 4},
+                                  use_spot=True)
+        catalog_call = mock.MagicMock()
+        monkeypatch.setattr(spot_placer.catalog, 'list_accelerator_counts',
+                            catalog_call)
+
+        assert spot_placer._expand_accelerator_counts_for_cloud(
+            resources, sky.clouds.AWS()) == [resources]
+        catalog_call.assert_not_called()
 
     def test_multi_gpu_shape_wins_when_it_is_cheaper_per_gpu(self):
-        one_gpu = make_location('one', accelerators={'L4': 1})
-        four_gpu = make_location('four', accelerators={'L4': 4})
+        one_gpu = make_location('same-zone',
+                                accelerators={'L4': 1},
+                                cloud_name='AWS')
+        four_gpu = make_location('same-zone',
+                                 accelerators={'L4': 4},
+                                 cloud_name='AWS')
         costs = {one_gpu: 0.2, four_gpu: 0.6}
 
         assert make_placer(costs).select_next_location([]) == one_gpu
@@ -94,12 +238,44 @@ class TestCapacityAwareCost:
 
         assert placer.select_next_location([]) == one_gpu
 
-    def test_least_loaded_spreading_precedes_per_gpu_cost(self):
-        one_gpu = make_location('one', accelerators={'L4': 1})
-        four_gpu = make_location('four', accelerators={'L4': 4})
+    def test_gpu_load_spreads_across_physical_locations(self):
+        one_gpu = make_location('one', accelerators={'L4': 1}, cloud_name='AWS')
+        four_gpu = make_location('four',
+                                 accelerators={'L4': 4},
+                                 cloud_name='AWS')
         placer = _make_per_gpu_placer({one_gpu: 0.2, four_gpu: 0.6})
 
         assert placer.select_next_location([four_gpu]) == one_gpu
+
+    def test_shapes_do_not_create_fake_diversity_locations(self):
+        one_gpu = make_location('east',
+                                accelerators={'L4': 1},
+                                cloud_name='AWS')
+        four_gpu = make_location('east',
+                                 accelerators={'L4': 4},
+                                 cloud_name='AWS')
+        other_region = make_location('west',
+                                     accelerators={'L4': 1},
+                                     cloud_name='AWS')
+        placer = _make_per_gpu_placer({
+            one_gpu: 0.2,
+            four_gpu: 0.6,
+            other_region: 0.25,
+        })
+
+        assert placer.select_next_location([]) == four_gpu
+        assert placer.select_next_location([four_gpu]) == other_region
+
+    def test_multiple_accelerator_models_share_per_gpu_optimization(self):
+        l4 = make_location('same-zone',
+                           accelerators={'L4': 4},
+                           cloud_name='AWS')
+        a10g = make_location('same-zone',
+                             accelerators={'A10G': 1},
+                             cloud_name='AWS')
+        placer = _make_per_gpu_placer({l4: 0.8, a10g: 0.25})
+
+        assert placer.select_next_location([]) == l4
 
     def test_zero_cost_tier_still_wins(self):
         reserved = make_location('reserved', accelerators={'A100': 1})

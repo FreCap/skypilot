@@ -73,6 +73,25 @@ def test_queue_config_round_trip_and_defaults():
     assert spec.copy().lb_request_queue == queue
 
 
+def test_async_occupancy_defaults_per_replica_cap_to_global_cap():
+    spec = _make_spec(lb_request_queue={
+        'use_async_occupancy': True,
+        'max_concurrency': 17,
+    })
+    queue = spec.lb_request_queue
+    assert queue is not None
+    assert queue['max_concurrency_per_replica'] == 17
+
+    capped = _make_spec(
+        lb_request_queue={
+            'use_async_occupancy': True,
+            'max_concurrency': 17,
+            'max_concurrency_per_replica': 4,
+        })
+    assert capped.lb_request_queue is not None
+    assert capped.lb_request_queue['max_concurrency_per_replica'] == 4
+
+
 @pytest.mark.parametrize('queue', [
     {
         'min_size': 11,

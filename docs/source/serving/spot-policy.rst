@@ -72,11 +72,14 @@ Cost-aware multi-GPU placement
 ------------------------------
 
 For a heterogeneous ``resources.any_of`` fleet, set ``spot_placer`` to
-``dynamic_fallback_per_gpu`` to compare equally loaded paid locations by hourly
-machine price divided by their configured accelerator count. This lets a
-four-GPU machine win over a cheaper one-GPU machine when its cost per serving
-slot is lower. Least-loaded spreading, failed-location benching, and the strict
-preference for zero-cost reserved capacity remain unchanged.
+``dynamic_fallback_per_gpu`` to spread capacity across physical locations and
+compare their active machine shapes by hourly price divided by accelerator
+count. SkyPilot expands each paid spot entry across the whole-GPU machine
+widths supported by its provider catalog, so the service does not need to
+duplicate instance-shape lists. A 1-GPU and a 4-GPU machine in the same zone
+are alternatives, not separate diversity locations; the 4-GPU machine wins
+when its cost per serving slot is lower. Configured cloud and region
+constraints still apply.
 
 .. code-block:: yaml
 
@@ -90,15 +93,19 @@ preference for zero-cost reserved capacity remain unchanged.
     resources:
       any_of:
         - infra: aws/us-east-1
-          accelerators: L4:1
+          accelerators: L4
           use_spot: true
         - infra: gcp/us-central1
-          accelerators: L4:4
+          accelerators: L4
           use_spot: true
 
 ``dynamic_fallback`` continues to compare raw hourly machine prices. Use the
 per-GPU policy only when each configured GPU contributes one equivalent serving
-slot.
+slot. Multiple accelerator models can be supplied as separate ``any_of``
+entries; supported widths are discovered independently for each model.
+Non-spot entries and cluster-backed clouds such as Kubernetes remain at their
+explicitly configured count. SkyPilot does not inspect those live cluster APIs
+to discover additional shapes.
 
 .. note::
 

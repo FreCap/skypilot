@@ -1575,6 +1575,10 @@ replica backed by a multi-GPU instance to accept work for each free model worker
 even when requests return an asynchronous acknowledgement.
 ``max_concurrency_per_replica`` remains a safety ceiling; set it at least as
 high as the largest replica's reported predict concurrency to use every slot.
+When ``use_async_occupancy`` is true and this field is omitted, it defaults to
+``max_concurrency`` so probed multi-worker replicas work without a duplicated
+machine-width setting. Set it explicitly only to impose a stricter per-replica
+ceiling.
 If ``min_size`` is 0, arrivals fail immediately while every occupancy probe is
 unknown, including the interval before the first successful probe after a load
 balancer restart. Set a positive ``min_size`` to let arrivals wait through that

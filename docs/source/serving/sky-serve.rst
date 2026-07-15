@@ -647,5 +647,6 @@ If you encounter the "Max number of services reached" error, you can increase th
    update
    auth
    spot-policy
+   local-async-router
    https
    serve-high-availability

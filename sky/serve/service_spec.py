@@ -317,6 +317,14 @@ class SkyServiceSpec:
                 'use_async_occupancy': False,
             }
             queue_defaults.update(lb_request_queue)
+            if (queue_defaults['use_async_occupancy'] and
+                    'max_concurrency_per_replica' not in lb_request_queue):
+                # Async occupancy contributes each replica's probed slots, so
+                # an implicit value of one would silently disable multi-worker
+                # replicas. The fleet-wide cap remains the safety ceiling;
+                # callers can still opt into a stricter per-replica cap.
+                queue_defaults['max_concurrency_per_replica'] = (
+                    queue_defaults['max_concurrency'])
             for field in ('min_size', 'size_per_replica', 'max_size',
                           'max_concurrency_per_replica', 'max_concurrency',
                           'max_request_body_bytes'):
