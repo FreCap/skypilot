@@ -33,6 +33,12 @@ runs:
         # tests to access them.
         uv pip install -e ".[all]"
         uv pip install pytest pytest-xdist pytest-env>=0.6 pytest-asyncio memory-profiler==0.61.0 buildkite-test-collector
+        # Real-PostgreSQL unit suites use the repository-pinned container
+        # dependency. Keep it out of production extras while making the
+        # unfiltered Unit Tests job a mandatory PostgreSQL gate.
+        if [[ "${{ inputs.test-name }}" == "Unit Tests" ]]; then
+          uv pip install "testcontainers[postgres]==4.14.2"
+        fi
     - name: Set branch name and commit message
       id: set_env
       shell: bash

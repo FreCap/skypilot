@@ -18,6 +18,27 @@ from sky.server import metrics
 from sky.server.server import BasicAuthMiddleware
 
 
+def test_record_persistence_operation_is_gated_and_low_cardinality():
+    metric = MagicMock()
+    with patch.object(metrics_utils, 'SKY_PERSISTENCE_OPERATIONS_TOTAL',
+                      metric), \
+         patch.object(metrics_utils, 'METRICS_ENABLED', False):
+        metrics_utils.record_persistence_operation('kv_cache', 'get', 'read',
+                                                   'postgresql')
+    metric.labels.assert_not_called()
+
+    with patch.object(metrics_utils, 'SKY_PERSISTENCE_OPERATIONS_TOTAL',
+                      metric), \
+         patch.object(metrics_utils, 'METRICS_ENABLED', True):
+        metrics_utils.record_persistence_operation('kv_cache', 'get', 'read',
+                                                   'postgresql')
+    metric.labels.assert_called_once_with(component='kv_cache',
+                                          operation='get',
+                                          phase='read',
+                                          backend='postgresql')
+    metric.labels.return_value.inc.assert_called_once_with()
+
+
 def test_get_status_code_group():
     """Test status code grouping"""
     assert metrics._get_status_code_group(200) == "2xx"
