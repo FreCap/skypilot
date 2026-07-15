@@ -618,6 +618,68 @@ describe('ServiceAccountTokensView', () => {
     ]);
   });
 
+  it('starts independent client-side snapshots together', async () => {
+    const tokensRequest = deferred();
+    dashboardCache.get.mockImplementation((fetcher) => {
+      if (fetcher === getServiceAccountTokens) return tokensRequest.promise;
+      if (fetcher === getClusters) return Promise.resolve([]);
+      if (fetcher === getManagedJobs) return Promise.resolve({ jobs: [] });
+      throw new Error('Unexpected cache fetcher');
+    });
+
+    renderView();
+
+    await waitFor(() => {
+      expect(dashboardCache.get).toHaveBeenCalledWith(getServiceAccountTokens);
+    });
+    expect(dashboardCache.get).toHaveBeenCalledWith(getClusters);
+    expect(dashboardCache.get).toHaveBeenCalledWith(getManagedJobs, [
+      { allUsers: true, skipFinished: true },
+    ]);
+
+    await act(async () => {
+      tokensRequest.resolve([baseToken]);
+      await tokensRequest.promise;
+    });
+    expect(await screen.findByText('ci-bot')).toBeInTheDocument();
+    expect(dashboardCache.get).toHaveBeenCalledTimes(3);
+  });
+
+  it('keeps the paginated refresh when the initial refresh finishes later', async () => {
+    isServiceAccountTokensPaginationAvailable.mockReturnValue(true);
+    const initialTokens = deferred();
+    const staleToken = { ...baseToken, token_name: 'stale-bot' };
+    const pagedToken = { ...baseToken, token_name: 'paged-bot' };
+    dashboardCache.get.mockImplementation((fetcher) => {
+      if (fetcher === getServiceAccountTokens) return initialTokens.promise;
+      if (fetcher === getClusters) return Promise.resolve([]);
+      if (fetcher === getManagedJobs) return Promise.resolve({ jobs: [] });
+      if (fetcher === getServiceAccountTokensPaginated) {
+        return Promise.resolve({
+          items: [pagedToken],
+          total: 1,
+          total_pages: 1,
+          has_next: false,
+          has_prev: false,
+        });
+      }
+      throw new Error('Unexpected cache fetcher');
+    });
+
+    renderView();
+    expect(await screen.findByText('paged-bot')).toBeInTheDocument();
+
+    await act(async () => {
+      initialTokens.resolve([staleToken]);
+      await initialTokens.promise;
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText('paged-bot')).toBeInTheDocument();
+      expect(screen.queryByText('stale-bot')).not.toBeInTheDocument();
+    });
+  });
+
   it('switches to the server-paginated token projection without changing call counts', async () => {
     isServiceAccountTokensPaginationAvailable.mockReturnValue(true);
     const pagedToken = { ...baseToken, token_name: 'paged-bot' };
