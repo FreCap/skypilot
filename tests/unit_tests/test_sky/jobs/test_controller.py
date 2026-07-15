@@ -20,9 +20,127 @@ import pytest
 from sky.jobs import state as managed_job_state
 from sky.jobs.controller import ControllerManager
 from sky.jobs.controller import JobController
+from sky.skylet import constants
 from sky.skylet import job_lib
 from sky.utils import common
 from sky.utils import status_lib
+
+
+class TestFileMountsBlobIdSnapshot:
+    """The immutable per-job blob id is resolved once without loop stalls."""
+
+    @staticmethod
+    def _make_controller() -> JobController:
+        controller = JobController.__new__(JobController)
+        controller._job_id = 42
+        controller._pool = None
+        controller._backend = MagicMock()
+        controller._backend.run_timestamp = '2026-07-15-00-00-00-000000'
+        controller.starting = set()
+        controller.starting_lock = asyncio.Lock()
+        controller.starting_signal = asyncio.Condition(controller.starting_lock)
+        return controller
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('blob_id', ['blob-42', None])
+    async def test_snapshot_caches_present_and_null_values(self, blob_id):
+        controller = self._make_controller()
+        get_blob_id = AsyncMock(return_value=blob_id)
+
+        with patch('sky.jobs.state.get_file_mounts_blob_id_async',
+                   new=get_blob_id):
+            results = [
+                await controller._get_file_mounts_blob_id() for _ in range(1000)
+            ]
+
+        assert results == [blob_id] * 1000
+        get_blob_id.assert_awaited_once_with(42)
+
+    @pytest.mark.asyncio
+    async def test_cancelled_snapshot_lookup_is_retried(self):
+        controller = self._make_controller()
+        attempts = 0
+
+        async def get_blob_id(_job_id):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise asyncio.CancelledError()
+            return 'blob-after-retry'
+
+        with patch('sky.jobs.state.get_file_mounts_blob_id_async',
+                   side_effect=get_blob_id) as lookup:
+            with pytest.raises(asyncio.CancelledError):
+                await controller._get_file_mounts_blob_id()
+            assert (await
+                    controller._get_file_mounts_blob_id() == 'blob-after-retry')
+
+        assert lookup.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_chain_executor_uses_async_snapshot(self):
+        controller = self._make_controller()
+        task = MagicMock()
+        task.name = 'task'
+        task.run = 'echo hello'
+        task.metadata = {}
+        task.resources = []
+        task.envs = {constants.TASK_ID_ENV_VAR: 'managed-task-id'}
+
+        class ExpectedStop(Exception):
+            pass
+
+        get_blob_id = AsyncMock(return_value='blob-chain')
+        with patch('sky.jobs.state.get_latest_task_id_status_async',
+                   new=AsyncMock(return_value=(
+                       0, managed_job_state.ManagedJobStatus.PENDING))), \
+             patch('sky.jobs.state.get_file_mounts_blob_id_async',
+                   new=get_blob_id), \
+             patch('sky.jobs.recovery_strategy.StrategyExecutor.make',
+                   side_effect=ExpectedStop) as make, \
+             pytest.raises(ExpectedStop):
+            await controller._run_one_task(0, task)
+
+        get_blob_id.assert_awaited_once_with(42)
+        assert make.call_args.kwargs['file_mounts_blob_id'] == 'blob-chain'
+
+    @pytest.mark.asyncio
+    async def test_job_group_executors_reuse_snapshot(self):
+        controller = self._make_controller()
+        tasks = []
+        for task_id in range(20):
+            task = MagicMock()
+            task.name = f'task-{task_id}'
+            task.run = 'echo hello'
+            task.resources = []
+            task.envs = {}
+            tasks.append(task)
+        controller._dag = MagicMock(tasks=tasks)
+
+        executor = MagicMock()
+        executor.max_restarts_on_errors = 0
+        executor.recover_on_exit_codes = []
+        executor.task_specs.return_value = {}
+        get_blob_id = AsyncMock(return_value='blob-group')
+
+        with patch('sky.jobs.state.get_file_mounts_blob_id_async',
+                   new=get_blob_id), \
+             patch('sky.jobs.controller.job_group_networking.'
+                   'generate_wait_for_networking_script', return_value=''), \
+             patch('sky.jobs.controller.job_group_networking.'
+                   'generate_inline_networking_setup_script',
+                   return_value=''), \
+             patch('sky.jobs.recovery_strategy.StrategyExecutor.make',
+                   return_value=executor) as make, \
+             patch('sky.jobs.state.set_starting_async', new=AsyncMock()):
+            for task_id, task in enumerate(tasks):
+                await controller._prepare_job_group_task_for_launch(
+                    task, task_id, 'group', [])
+
+        get_blob_id.assert_awaited_once_with(42)
+        assert make.call_count == len(tasks)
+        assert all(call.kwargs['file_mounts_blob_id'] == 'blob-group'
+                   for call in make.call_args_list)
 
 
 class TestNormalJobRecovery:

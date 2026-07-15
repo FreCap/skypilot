@@ -3262,14 +3262,14 @@ def get_workspace(job_id: int) -> str:
         return job_workspace
 
 
-@db_retries.retry
-def get_file_mounts_blob_id(job_id: int) -> str | None:
+@db_retries.retry_async
+async def get_file_mounts_blob_id_async(job_id: int) -> str | None:
     """Return the file_mounts_blob_id persisted for a job, if any."""
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        row = session.execute(
+    engine = await _db_manager.get_async_engine()
+    async with sql_async.AsyncSession(engine) as session:
+        row = (await session.execute(
             sqlalchemy.select(job_info_table.c.file_mounts_blob_id).where(
-                job_info_table.c.spot_job_id == job_id)).fetchone()
+                job_info_table.c.spot_job_id == job_id))).fetchone()
         if row is None:
             return None
         return row[0]
