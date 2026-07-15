@@ -611,6 +611,31 @@ def test_get_active_file_mounts_blob_ids(_mock_managed_jobs_db_conn):
     assert blob_ids == {'blob-active', 'blob-queued', 'blob-recovering'}
 
 
+@pytest.mark.asyncio
+async def test_get_file_mounts_blob_id_async(_mock_managed_jobs_db_conn):
+    blob_job = state.set_job_info_without_job_id(
+        name='with-blob',
+        workspace='ws',
+        entrypoint='entry',
+        pool=None,
+        pool_hash=None,
+        user_hash='u',
+        file_mounts_blob_id='blob-async',
+    )
+    null_job = state.set_job_info_without_job_id(
+        name='without-blob',
+        workspace='ws',
+        entrypoint='entry',
+        pool=None,
+        pool_hash=None,
+        user_hash='u',
+    )
+
+    assert await state.get_file_mounts_blob_id_async(blob_job) == 'blob-async'
+    assert await state.get_file_mounts_blob_id_async(null_job) is None
+    assert await state.get_file_mounts_blob_id_async(999_999) is None
+
+
 def _new_pool_job(engine,
                   *,
                   pool: str,

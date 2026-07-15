@@ -78,6 +78,7 @@ _background_tasks_lock: asyncio.Lock = asyncio.Lock()
 # eliminates single-tick false positives; genuine failures where the head is
 # unreachable fetch no job status at all and still recover immediately.
 _NOT_UP_CONFIRMATIONS_BEFORE_RECOVERY = 3
+_FILE_MOUNTS_BLOB_ID_UNSET = object()
 
 
 class _ClusterNotUpDebouncer:
@@ -261,6 +262,7 @@ class JobController:
         logger.info('Initializing JobsController for job_id=%s', job_id)
 
         self._job_id = job_id
+        self._file_mounts_blob_id: object = _FILE_MOUNTS_BLOB_ID_UNSET
         self._dag = _get_dag(job_id)
         self._dag_name = self._dag.name
         logger.info(f'Loaded DAG: {self._dag}')
@@ -308,6 +310,16 @@ class JobController:
             else:
                 task_envs['SKYPILOT_JOB_RANK'] = '0'
             task.update_envs(task_envs)
+
+    async def _get_file_mounts_blob_id(self) -> str | None:
+        """Return the controller-lifetime snapshot of immutable blob metadata."""
+        blob_id = getattr(self, '_file_mounts_blob_id',
+                          _FILE_MOUNTS_BLOB_ID_UNSET)
+        if blob_id is _FILE_MOUNTS_BLOB_ID_UNSET:
+            blob_id = await managed_job_state.get_file_mounts_blob_id_async(
+                self._job_id)
+            self._file_mounts_blob_id = blob_id
+        return typing.cast(str | None, blob_id)
 
     def download_log_and_stream(
         self,
@@ -526,8 +538,7 @@ class JobController:
             self.starting,
             self.starting_lock,
             self.starting_signal,
-            file_mounts_blob_id=managed_job_state.get_file_mounts_blob_id(
-                self._job_id))
+            file_mounts_blob_id=await self._get_file_mounts_blob_id())
         if not is_resume:
             submitted_at = time.time()
             if task_id == 0:
@@ -1284,8 +1295,7 @@ class JobController:
             self.starting,
             self.starting_lock,
             self.starting_signal,
-            file_mounts_blob_id=managed_job_state.get_file_mounts_blob_id(
-                self._job_id))
+            file_mounts_blob_id=await self._get_file_mounts_blob_id())
 
         callback_func = managed_job_utils.event_callback_func(
             job_id=self._job_id, task_id=task_id, task=task)
