@@ -1,4 +1,5 @@
 import {
+  act,
   fireEvent,
   render,
   screen,
@@ -69,6 +70,45 @@ const node = {
     { key: 'accepted', effect: 'NoSchedule', tolerated: true },
   ],
 };
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+function sshNodePoolDetails({
+  poolName = 'gpu-pool',
+  handleDeploySSHPool = jest.fn(),
+  handleDeleteSSHPool = jest.fn(),
+} = {}) {
+  return (
+    <SSHNodePoolDetails
+      poolName={poolName}
+      gpusInContext={[]}
+      nodesInContext={[]}
+      handleDeploySSHPool={handleDeploySSHPool}
+      handleDeleteSSHPool={handleDeleteSSHPool}
+    />
+  );
+}
+
+async function completeSSHNodePoolDeployment() {
+  expect(await screen.findByText('Not Ready')).toBeVisible();
+  fireEvent.click(screen.getByRole('button', { name: 'Deploy' }));
+  fireEvent.click(
+    within(screen.getByRole('dialog')).getByRole('button', {
+      name: 'Deploy',
+    })
+  );
+  expect(
+    await screen.findByText('Deployment completed successfully!')
+  ).toBeVisible();
+}
 
 describe('ContextDetails', () => {
   beforeEach(() => {
@@ -193,16 +233,13 @@ describe('SSHNodePoolDetails', () => {
     });
   });
 
+  afterEach(() => {
+    jest.useRealTimers();
+    jest.restoreAllMocks();
+  });
+
   it('loads status and exposes the deploy action for a non-ready pool', async () => {
-    render(
-      <SSHNodePoolDetails
-        poolName="gpu-pool"
-        gpusInContext={[]}
-        nodesInContext={[]}
-        handleDeploySSHPool={jest.fn()}
-        handleDeleteSSHPool={jest.fn()}
-      />
-    );
+    render(sshNodePoolDetails());
 
     expect(await screen.findByText('Not Ready')).toBeVisible();
     expect(
@@ -211,6 +248,74 @@ describe('SSHNodePoolDetails', () => {
     expect(screen.getByRole('button', { name: 'Deploy' })).toBeEnabled();
     expect(getSSHNodePoolStatus).toHaveBeenCalledTimes(1);
     expect(getSSHNodePoolStatus).toHaveBeenCalledWith('gpu-pool');
+  });
+
+  it('keeps the new pool loading when an old status request resolves', async () => {
+    const oldStatus = deferred();
+    const newStatus = deferred();
+    getSSHNodePoolStatus.mockImplementation((poolName) =>
+      poolName === 'old-pool' ? oldStatus.promise : newStatus.promise
+    );
+
+    const { rerender } = render(sshNodePoolDetails({ poolName: 'old-pool' }));
+
+    await waitFor(() => expect(getSSHNodePoolStatus).toHaveBeenCalledTimes(1));
+    rerender(sshNodePoolDetails({ poolName: 'new-pool' }));
+    await waitFor(() => expect(getSSHNodePoolStatus).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      oldStatus.resolve({
+        pool_name: 'old-pool',
+        status: 'Ready',
+      });
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText('Loading...')).toBeVisible();
+    expect(screen.queryByText('Ready')).not.toBeInTheDocument();
+
+    await act(async () => {
+      newStatus.resolve({
+        pool_name: 'new-pool',
+        status: 'Not Ready',
+      });
+      await Promise.resolve();
+    });
+    expect(screen.getByText('Not Ready')).toBeVisible();
+  });
+
+  it('ignores an old pool error after the new status is visible', async () => {
+    const oldStatus = deferred();
+    const newStatus = deferred();
+    const consoleError = jest
+      .spyOn(console, 'error')
+      .mockImplementation(() => {});
+    getSSHNodePoolStatus.mockImplementation((poolName) =>
+      poolName === 'old-pool' ? oldStatus.promise : newStatus.promise
+    );
+
+    const { rerender } = render(sshNodePoolDetails({ poolName: 'old-pool' }));
+    await waitFor(() => expect(getSSHNodePoolStatus).toHaveBeenCalledTimes(1));
+    rerender(sshNodePoolDetails({ poolName: 'new-pool' }));
+    await waitFor(() => expect(getSSHNodePoolStatus).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      newStatus.resolve({
+        pool_name: 'new-pool',
+        status: 'Ready',
+      });
+      await Promise.resolve();
+    });
+    expect(screen.getByText('Ready')).toBeVisible();
+
+    await act(async () => {
+      oldStatus.reject(new Error('old pool unavailable'));
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText('Ready')).toBeVisible();
+    expect(screen.queryByText('Error')).not.toBeInTheDocument();
+    consoleError.mockRestore();
   });
 
   it('streams deployment logs and reports successful completion', async () => {
@@ -225,15 +330,7 @@ describe('SSHNodePoolDetails', () => {
       }
     );
 
-    render(
-      <SSHNodePoolDetails
-        poolName="gpu-pool"
-        gpusInContext={[]}
-        nodesInContext={[]}
-        handleDeploySSHPool={handleDeploySSHPool}
-        handleDeleteSSHPool={jest.fn()}
-      />
-    );
+    render(sshNodePoolDetails({ handleDeploySSHPool }));
 
     await screen.findByText('Not Ready');
     fireEvent.click(screen.getByRole('button', { name: 'Deploy' }));
@@ -252,6 +349,79 @@ describe('SSHNodePoolDetails', () => {
     expect(screen.queryByText(/hidden debug line/)).not.toBeInTheDocument();
   });
 
+  it('refreshes status once after a completed deployment', async () => {
+    jest.useFakeTimers();
+    const handleDeploySSHPool = jest
+      .fn()
+      .mockResolvedValue({ request_id: 'request-123' });
+    streamSSHDeploymentLogs.mockResolvedValue(undefined);
+
+    render(sshNodePoolDetails({ handleDeploySSHPool }));
+    await completeSSHNodePoolDeployment();
+    fireEvent.click(
+      within(screen.getByRole('dialog')).getAllByRole('button', {
+        name: 'Close',
+      })[0]
+    );
+
+    await act(async () => {
+      jest.advanceTimersByTime(1000);
+      await Promise.resolve();
+    });
+
+    expect(getSSHNodePoolStatus).toHaveBeenCalledTimes(2);
+    expect(getSSHNodePoolStatus).toHaveBeenLastCalledWith('gpu-pool');
+  });
+
+  it('cancels a pending deployment refresh when the pool changes', async () => {
+    jest.useFakeTimers();
+    const handleDeploySSHPool = jest
+      .fn()
+      .mockResolvedValue({ request_id: 'request-123' });
+    streamSSHDeploymentLogs.mockResolvedValue(undefined);
+
+    const { rerender } = render(sshNodePoolDetails({ handleDeploySSHPool }));
+    await completeSSHNodePoolDeployment();
+
+    rerender(
+      sshNodePoolDetails({
+        poolName: 'next-pool',
+        handleDeploySSHPool,
+      })
+    );
+    await waitFor(() => expect(getSSHNodePoolStatus).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      jest.advanceTimersByTime(1000);
+      await Promise.resolve();
+    });
+
+    expect(getSSHNodePoolStatus).toHaveBeenCalledTimes(2);
+    expect(getSSHNodePoolStatus.mock.calls).toEqual([
+      ['gpu-pool'],
+      ['next-pool'],
+    ]);
+  });
+
+  it('cancels a pending deployment refresh when the view unmounts', async () => {
+    jest.useFakeTimers();
+    const handleDeploySSHPool = jest
+      .fn()
+      .mockResolvedValue({ request_id: 'request-123' });
+    streamSSHDeploymentLogs.mockResolvedValue(undefined);
+
+    const { unmount } = render(sshNodePoolDetails({ handleDeploySSHPool }));
+    await completeSSHNodePoolDeployment();
+
+    unmount();
+    await act(async () => {
+      jest.advanceTimersByTime(1000);
+      await Promise.resolve();
+    });
+
+    expect(getSSHNodePoolStatus).toHaveBeenCalledTimes(1);
+  });
+
   it('tears down the pool before deleting its configuration', async () => {
     const handleDeleteSSHPool = jest.fn().mockResolvedValue(undefined);
     sshDownNodePool.mockResolvedValue({ request_id: 'down-123' });
@@ -263,15 +433,7 @@ describe('SSHNodePoolDetails', () => {
       }
     );
 
-    render(
-      <SSHNodePoolDetails
-        poolName="gpu-pool"
-        gpusInContext={[]}
-        nodesInContext={[]}
-        handleDeploySSHPool={jest.fn()}
-        handleDeleteSSHPool={handleDeleteSSHPool}
-      />
-    );
+    render(sshNodePoolDetails({ handleDeleteSSHPool }));
 
     await screen.findByText('Not Ready');
     fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
