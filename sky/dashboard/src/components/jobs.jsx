@@ -155,14 +155,119 @@ const formatSubmittedTime = (timestamp) => {
   return <TimestampWithTooltip date={date} />;
 };
 
+export function useManagedJobsPageData() {
+  const [, setLoading] = useState(false);
+  const [poolsLoading, setPoolsLoading] = useState(true); // Start as true for initial load
+  const initialLoadRef = useRef(true);
+  const jobsRefreshRef = useRef(null);
+  const poolsRefreshRef = useRef(null);
+  const [poolsData, setPoolsData] = useState([]);
+  const [preloadingComplete, setPreloadingComplete] = useState(false);
+  const [lastFetchedTime, setLastFetchedTime] = useState(null);
+  const mountedRef = useRef(false);
+  const requestVersionRef = useRef(0);
+
+  const loadPageData = useCallback(
+    async ({ forcePreload = false, refreshChildren = false } = {}) => {
+      const version = requestVersionRef.current + 1;
+      requestVersionRef.current = version;
+      const isInitialLoad = initialLoadRef.current;
+      const ownsState = () =>
+        mountedRef.current && version === requestVersionRef.current;
+
+      if (isInitialLoad) {
+        setPoolsLoading(true);
+      }
+
+      try {
+        try {
+          if (forcePreload) {
+            await cachePreloader.preloadForPage('jobs', { force: true });
+          } else {
+            await cachePreloader.preloadForPage('jobs');
+          }
+        } catch (error) {
+          if (ownsState()) {
+            console.error('Error preloading jobs data:', error);
+          }
+        }
+
+        if (!ownsState()) return;
+
+        setPreloadingComplete(true);
+        setLastFetchedTime(new Date());
+
+        // Child refreshes do not depend on the page-level pool snapshot. Start
+        // them before awaiting that snapshot so manual refresh keeps its
+        // existing parallel fanout.
+        if (refreshChildren) {
+          jobsRefreshRef.current?.();
+          poolsRefreshRef.current?.();
+        }
+
+        const poolsResponse = await dashboardCache.get(getPoolStatus, [{}]);
+        if (ownsState()) {
+          setPoolsData(poolsResponse?.pools || []);
+        }
+      } catch (error) {
+        if (ownsState()) {
+          console.error('Error fetching data:', error);
+        }
+      } finally {
+        if (ownsState()) {
+          if (isInitialLoad) {
+            setPoolsLoading(false);
+            initialLoadRef.current = false;
+          }
+        }
+      }
+    },
+    []
+  );
+
+  useEffect(() => {
+    mountedRef.current = true;
+    loadPageData();
+    return () => {
+      mountedRef.current = false;
+      requestVersionRef.current += 1;
+      jobsRefreshRef.current = null;
+      poolsRefreshRef.current = null;
+    };
+  }, [loadPageData]);
+
+  const handleRefresh = useCallback(() => {
+    jobsCacheManager.invalidateCache();
+    dashboardCache.invalidate(getPoolStatus, [{}]);
+    dashboardCache.invalidate(getWorkspaces);
+    setPreloadingComplete(false);
+    loadPageData({ forcePreload: true, refreshChildren: true });
+  }, [loadPageData]);
+
+  return {
+    setLoading,
+    jobsRefreshRef,
+    poolsRefreshRef,
+    poolsData,
+    poolsLoading,
+    preloadingComplete,
+    lastFetchedTime,
+    handleRefresh,
+  };
+}
+
 export function ManagedJobs() {
   const router = useRouter();
-  const [loading, setLoading] = useState(false);
-  const [poolsLoading, setPoolsLoading] = useState(true); // Start as true for initial load
-  const [isInitialLoad, setIsInitialLoad] = useState(true);
-  const jobsRefreshRef = React.useRef(null);
-  const poolsRefreshRef = React.useRef(null);
-  const [poolsData, setPoolsData] = useState([]);
+  const {
+    setLoading,
+    jobsRefreshRef,
+    poolsRefreshRef,
+    poolsData,
+    poolsLoading,
+    preloadingComplete,
+    lastFetchedTime,
+    handleRefresh,
+  } = useManagedJobsPageData();
   const [filters, setFilters] = useState([]);
   const [valueList, setValueList] = useState({
     name: [],
@@ -171,73 +276,6 @@ export function ManagedJobs() {
     pool: [],
     labels: [],
   });
-  const [preloadingComplete, setPreloadingComplete] = useState(false);
-  const [lastFetchedTime, setLastFetchedTime] = useState(null);
-
-  const fetchData = React.useCallback(
-    async (isRefreshButton = false) => {
-      setLoading(true);
-      // Only set poolsLoading on initial load, not on refresh button clicks
-      if (!isRefreshButton && isInitialLoad) {
-        setPoolsLoading(true);
-      }
-      try {
-        const [poolsResponse] = await Promise.all([
-          dashboardCache.get(getPoolStatus, [{}]),
-        ]);
-        setPoolsData(poolsResponse.pools || []);
-      } catch (error) {
-        console.error('Error fetching data:', error);
-      } finally {
-        setLoading(false);
-        if (!isRefreshButton && isInitialLoad) {
-          setPoolsLoading(false);
-          setIsInitialLoad(false);
-        }
-      }
-    },
-    [isInitialLoad]
-  );
-
-  useEffect(() => {
-    const preloadData = async () => {
-      try {
-        // Await cache preloading for jobs page
-        await cachePreloader.preloadForPage('jobs');
-      } catch (error) {
-        console.error('Error preloading jobs data:', error);
-      } finally {
-        // Signal completion even on error so the table can load
-        setPreloadingComplete(true);
-        setLastFetchedTime(new Date());
-        fetchData();
-      }
-    };
-    preloadData();
-  }, [fetchData]);
-
-  const handleRefresh = () => {
-    // Invalidate cache to ensure fresh data is fetched for both jobs and pools
-    jobsCacheManager.invalidateCache();
-    dashboardCache.invalidate(getPoolStatus, [{}]);
-    dashboardCache.invalidate(getWorkspaces);
-
-    // Reset preloading state
-    setPreloadingComplete(false);
-
-    // Trigger a new preload cycle
-    cachePreloader.preloadForPage('jobs', { force: true }).then(() => {
-      setPreloadingComplete(true);
-      setLastFetchedTime(new Date());
-      // Trigger a re-fetch in both tables via their refreshDataRef
-      if (jobsRefreshRef.current) {
-        jobsRefreshRef.current();
-      }
-      if (poolsRefreshRef.current) {
-        poolsRefreshRef.current();
-      }
-    });
-  };
 
   // Helper function to update URL query parameters
   const updateURLParams = (filters) => {
