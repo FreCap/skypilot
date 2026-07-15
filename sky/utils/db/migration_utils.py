@@ -37,7 +37,7 @@ SPOT_JOBS_VERSION = '023'  # add Batch coordinator ownership fence
 SPOT_JOBS_LOCK_PATH = f'~/.sky/locks/.{SPOT_JOBS_DB_NAME}.lock'
 
 SERVE_DB_NAME = 'serve_db'
-SERVE_VERSION = '009'  # mode-safe scoped storage cleanup intents
+SERVE_VERSION = '010'  # replica JSON query state
 SERVE_LOCK_PATH = f'~/.sky/locks/.{SERVE_DB_NAME}.lock'
 
 SKYPILOT_CONFIG_DB_NAME = 'sky_config_db'
