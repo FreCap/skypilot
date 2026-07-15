@@ -104,27 +104,6 @@ const PROPERTY_OPTIONS = [
   },
 ];
 
-// Helper function to format username for display (reuse from users.jsx)
-const formatUserDisplay = (username, userId) => {
-  if (username && username.includes('@')) {
-    const emailPrefix = username.split('@')[0];
-    // Show email prefix with userId if they're different
-    if (userId && userId !== emailPrefix) {
-      return `${emailPrefix} (${userId})`;
-    }
-    return emailPrefix;
-  }
-  // If no email, show username with userId in parentheses only if they're different
-  const usernameBase = username || userId || 'N/A';
-
-  // Skip showing userId if it's the same as username
-  if (userId && userId !== usernameBase) {
-    return `${usernameBase} (${userId})`;
-  }
-
-  return usernameBase;
-};
-
 // Helper function to format duration in a human-readable way
 const formatDuration = (durationSeconds) => {
   if (!durationSeconds || durationSeconds === 0) {
@@ -158,6 +137,60 @@ const formatDuration = (durationSeconds) => {
 
   return result.trim() || '0s';
 };
+
+export function useClustersPageData({ showHistory, refreshDataRef }) {
+  const [preloadingComplete, setPreloadingComplete] = useState(false);
+  const [lastFetchedTime, setLastFetchedTime] = useState(null);
+  const requestVersionRef = useRef(0);
+
+  const runPreload = useCallback(
+    async ({ force = false, refreshTable = false } = {}) => {
+      const requestVersion = requestVersionRef.current + 1;
+      requestVersionRef.current = requestVersion;
+      const isCurrentRequest = () =>
+        requestVersionRef.current === requestVersion;
+
+      setPreloadingComplete(false);
+      try {
+        if (force) {
+          await cachePreloader.preloadForPage('clusters', { force: true });
+        } else {
+          await cachePreloader.preloadForPage('clusters');
+        }
+      } catch (error) {
+        if (isCurrentRequest()) {
+          console.error('Error preloading clusters data:', error);
+        }
+      }
+
+      if (!isCurrentRequest()) return;
+      setPreloadingComplete(true);
+      setLastFetchedTime(new Date());
+      if (refreshTable && refreshDataRef.current) {
+        refreshDataRef.current();
+      }
+    },
+    [refreshDataRef]
+  );
+
+  useEffect(() => {
+    runPreload();
+    return () => {
+      requestVersionRef.current += 1;
+    };
+  }, [runPreload]);
+
+  const handleRefresh = useCallback(() => {
+    dashboardCache.invalidate(getClusters);
+    dashboardCache.invalidate(getWorkspaces);
+    if (showHistory) {
+      dashboardCache.invalidate(getClusterHistory);
+    }
+    return runPreload({ force: true, refreshTable: true });
+  }, [runPreload, showHistory]);
+
+  return { preloadingComplete, lastFetchedTime, handleRefresh };
+}
 
 export function Clusters() {
   const router = useRouter();
@@ -205,8 +238,8 @@ export function Clusters() {
     infra: [],
     labels: [],
   }); /// Option values for properties
-  const [preloadingComplete, setPreloadingComplete] = useState(false);
-  const [lastFetchedTime, setLastFetchedTime] = useState(null);
+  const { preloadingComplete, lastFetchedTime, handleRefresh } =
+    useClustersPageData({ showHistory, refreshDataRef });
 
   // Handle URL query parameters for workspace and user filtering and show history
   useEffect(() => {
@@ -239,76 +272,6 @@ export function Clusters() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [router.isReady, router.query.history, router.query.historyDays]);
-
-  useEffect(() => {
-    const fetchFilterData = async () => {
-      try {
-        // Trigger cache preloading for clusters page and background preload other pages
-        await cachePreloader.preloadForPage('clusters');
-
-        // Fetch configured workspaces for the filter dropdown
-        const fetchedWorkspacesConfig = await dashboardCache.get(getWorkspaces);
-        const configuredWorkspaceNames = Object.keys(fetchedWorkspacesConfig);
-
-        // Fetch all clusters to see if 'default' workspace is implicitly used
-        const allClusters = await dashboardCache.get(getClusters);
-        const uniqueClusterWorkspaces = [
-          ...new Set(
-            allClusters
-              .map((cluster) => cluster.workspace || 'default')
-              .filter((ws) => ws)
-          ),
-        ];
-
-        // Combine configured workspaces with any actively used 'default' workspace
-        const finalWorkspaces = new Set(configuredWorkspaceNames);
-        if (
-          uniqueClusterWorkspaces.includes('default') &&
-          !finalWorkspaces.has('default')
-        ) {
-          // Add 'default' if it's used by clusters but not in configured list
-          // This ensures 'default' appears if relevant, even if not explicitly in skypilot config
-        }
-        // Ensure all unique cluster workspaces are in the list, especially 'default'
-        uniqueClusterWorkspaces.forEach((wsName) =>
-          finalWorkspaces.add(wsName)
-        );
-
-        // Get unique users from cluster data for filter dropdown
-        const uniqueClusterUsers = [
-          ...new Set(
-            allClusters
-              .map((cluster) => ({
-                userId: cluster.user_hash || cluster.user,
-                username: cluster.user,
-              }))
-              .filter((user) => user.userId)
-          ).values(),
-        ];
-
-        // Process users for filtering - only use cluster users
-        const finalUsers = new Map();
-        uniqueClusterUsers.forEach((user) => {
-          finalUsers.set(user.userId, {
-            userId: user.userId,
-            username: user.username,
-            display: formatUserDisplay(user.username, user.userId),
-          });
-        });
-
-        // Signal that preloading is complete
-        setPreloadingComplete(true);
-        setLastFetchedTime(new Date());
-      } catch (error) {
-        console.error('Error fetching data for filters:', error);
-        // Still signal completion even on error so the table can load
-        setPreloadingComplete(true);
-        setLastFetchedTime(new Date());
-      }
-    };
-
-    fetchFilterData();
-  }, []);
 
   // Helper function to update URL query parameters
   const updateURLParams = (filters) => {
@@ -411,29 +374,6 @@ export function Clusters() {
     }
 
     setFilters(filters);
-  };
-
-  const handleRefresh = () => {
-    // Invalidate cache to ensure fresh data is fetched
-    dashboardCache.invalidate(getClusters);
-    dashboardCache.invalidate(getWorkspaces);
-    // Only invalidate cluster history if we're currently showing history
-    if (showHistory) {
-      dashboardCache.invalidate(getClusterHistory);
-    }
-
-    // Reset preloading state so ClusterTable can fetch fresh data immediately
-    setPreloadingComplete(false);
-
-    // Trigger a new preload cycle
-    cachePreloader.preloadForPage('clusters', { force: true }).then(() => {
-      setPreloadingComplete(true);
-      setLastFetchedTime(new Date());
-      // Call refresh after preloading is complete
-      if (refreshDataRef.current) {
-        refreshDataRef.current();
-      }
-    });
   };
 
   return (
