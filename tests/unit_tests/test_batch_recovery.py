@@ -713,6 +713,112 @@ def test_worker_shutdown_cancels_only_owned_job(monkeypatch):
                                    worker_job_id=17)
 
 
+def test_cancel_claims_worker_cleanup_once(monkeypatch):
+    batch_coordinator = _make_coordinator()
+    entered = threading.Event()
+    release = threading.Event()
+    monkeypatch.setattr(batch_coordinator, '_launch_worker_service',
+                        mock.Mock(return_value=17))
+
+    def _pop_ready_batch():
+        entered.set()
+        release.wait(timeout=5)
+        return None, None
+
+    monkeypatch.setattr(batch_coordinator, '_pop_ready_batch', _pop_ready_batch)
+    shutdown = mock.Mock()
+    monkeypatch.setattr(batch_coordinator, '_shutdown_worker', shutdown)
+    dispatch = threading.Thread(target=batch_coordinator._worker_dispatch_loop,
+                                args=('worker-a',))
+    dispatch.start()
+    assert entered.wait(timeout=5)
+
+    batch_coordinator.cancel()
+    batch_coordinator.cancel()
+    release.set()
+    dispatch.join(timeout=5)
+
+    assert not dispatch.is_alive()
+    shutdown.assert_called_once_with('worker-a', 17)
+    assert not batch_coordinator._active_workers
+
+
+def test_worker_finalization_claims_cleanup_before_late_cancel(monkeypatch):
+    batch_coordinator = _make_coordinator()
+    monkeypatch.setattr(batch_coordinator, '_launch_worker_service',
+                        mock.Mock(return_value=17))
+    monkeypatch.setattr(batch_coordinator, '_pop_ready_batch',
+                        mock.Mock(return_value=(None, None)))
+    shutdown = mock.Mock()
+    monkeypatch.setattr(batch_coordinator, '_shutdown_worker', shutdown)
+
+    batch_coordinator._worker_dispatch_loop('worker-a')
+    batch_coordinator.cancel()
+
+    shutdown.assert_called_once_with('worker-a', worker_job_id=17)
+    assert not batch_coordinator._active_workers
+
+
+def test_worker_launched_after_cancel_cleans_itself(monkeypatch):
+    batch_coordinator = _make_coordinator()
+    entered = threading.Event()
+    release = threading.Event()
+
+    def _launch_worker_service(cluster_name):
+        assert cluster_name == 'worker-a'
+        entered.set()
+        release.wait(timeout=5)
+        return 17
+
+    monkeypatch.setattr(batch_coordinator, '_launch_worker_service',
+                        _launch_worker_service)
+    shutdown = mock.Mock()
+    monkeypatch.setattr(batch_coordinator, '_shutdown_worker', shutdown)
+    dispatch = threading.Thread(target=batch_coordinator._worker_dispatch_loop,
+                                args=('worker-a',))
+    dispatch.start()
+    assert entered.wait(timeout=5)
+
+    batch_coordinator.cancel()
+    shutdown.assert_not_called()
+    release.set()
+    dispatch.join(timeout=5)
+
+    assert not dispatch.is_alive()
+    shutdown.assert_called_once_with('worker-a', worker_job_id=17)
+    assert not batch_coordinator._active_workers
+
+
+def test_superseded_cleanup_claim_blocks_worker_finalizer(monkeypatch):
+    batch_coordinator = _make_coordinator()
+    entered = threading.Event()
+    release = threading.Event()
+    monkeypatch.setattr(batch_coordinator, '_launch_worker_service',
+                        mock.Mock(return_value=17))
+
+    def _pop_ready_batch():
+        entered.set()
+        release.wait(timeout=5)
+        return None, None
+
+    monkeypatch.setattr(batch_coordinator, '_pop_ready_batch', _pop_ready_batch)
+    shutdown = mock.Mock()
+    monkeypatch.setattr(batch_coordinator, '_shutdown_worker', shutdown)
+    dispatch = threading.Thread(target=batch_coordinator._worker_dispatch_loop,
+                                args=('worker-a',))
+    dispatch.start()
+    assert entered.wait(timeout=5)
+
+    claimed = batch_coordinator._begin_cleanup(superseded=True)
+    release.set()
+    dispatch.join(timeout=5)
+
+    assert claimed == [('worker-a', 17)]
+    assert not dispatch.is_alive()
+    shutdown.assert_not_called()
+    assert not batch_coordinator._active_workers
+
+
 def test_durable_worker_id_ignores_duplicate_or_spoofed_names(
         batch_state_db, monkeypatch):
     del batch_state_db
