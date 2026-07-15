@@ -6,6 +6,7 @@ import {
   within,
   waitFor,
 } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 
 jest.mock('@/lib/cache', () => ({
   __esModule: true,
@@ -24,7 +25,9 @@ import { getServices } from '@/data/connectors/services';
 import {
   getReplicaPlacementBreakdown,
   ReplicaPlacementCard,
+  ReplicasCard,
   ServiceDetailCard,
+  sortReplicas,
   useServiceDetails,
 } from '@/pages/services/[service]';
 
@@ -312,5 +315,78 @@ describe('service replica placement breakdown', () => {
       '4',
     ]);
     expect(screen.getByText('Pending placement')).toBeTruthy();
+  });
+});
+
+describe('service replica table sorting', () => {
+  const replicas = [
+    {
+      id: 10,
+      status: 'READY',
+      version: 2,
+      resources_str: 'L4:1',
+      hourlyCost: 2.5,
+      region: 'us-west-2',
+      endpoint: 'http://10.0.0.10:8000',
+      launched_at: 30,
+    },
+    {
+      id: 2,
+      status: 'PROVISIONING',
+      version: 1,
+      resources_str: 'H100:8',
+      hourlyCost: null,
+      region: 'us-east-1',
+      endpoint: null,
+      launched_at: 10,
+    },
+    {
+      id: 1,
+      status: 'READY',
+      version: 1,
+      resources_str: 'L4:1',
+      hourlyCost: 1.25,
+      region: 'us-central1',
+      endpoint: 'http://10.0.0.1:8000',
+      launched_at: 20,
+    },
+  ];
+
+  it('sorts numerically and leaves missing values at the end', () => {
+    expect(
+      sortReplicas(replicas, {
+        key: 'id',
+        direction: 'ascending',
+      }).map((replica) => replica.id)
+    ).toEqual([1, 2, 10]);
+    expect(
+      sortReplicas(replicas, {
+        key: 'hourlyCost',
+        direction: 'descending',
+      }).map((replica) => replica.id)
+    ).toEqual([10, 1, 2]);
+  });
+
+  it('orders by ID initially and toggles a selected column', async () => {
+    const user = userEvent.setup();
+    render(<ReplicasCard replicas={replicas} loading={false} />);
+
+    const rowIds = () =>
+      screen
+        .getAllByRole('row')
+        .slice(1)
+        .map((row) => within(row).getAllByRole('cell')[0].textContent);
+
+    expect(rowIds()).toEqual(['1', '2', '10']);
+    expect(screen.getByRole('columnheader', { name: 'ID' })).toHaveAttribute(
+      'aria-sort',
+      'ascending'
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Launched' }));
+    expect(rowIds()).toEqual(['2', '1', '10']);
+
+    await user.click(screen.getByRole('button', { name: 'Launched' }));
+    expect(rowIds()).toEqual(['10', '1', '2']);
   });
 });

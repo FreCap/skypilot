@@ -1,4 +1,10 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, {
+  useState,
+  useEffect,
+  useCallback,
+  useMemo,
+  useRef,
+} from 'react';
 import { CircularProgress } from '@mui/material';
 import { useRouter } from 'next/router';
 import Link from 'next/link';
@@ -637,8 +643,89 @@ export function ReplicaPlacementCard({ replicas, loading }) {
   );
 }
 
-function ReplicasCard({ replicas, loading }) {
+const REPLICA_SORT_VALUE = {
+  id: (replica) => replica.id,
+  status: (replica) => replica.status,
+  version: (replica) => replica.version,
+  resources: (replica) => replica.resources_str_full || replica.resources_str,
+  hourlyCost: (replica) => replica.hourlyCost,
+  region: (replica) => replica.region,
+  endpoint: (replica) => replica.endpoint,
+  launched_at: (replica) => replica.launched_at,
+};
+
+const replicaSortCollator = new Intl.Collator(undefined, {
+  numeric: true,
+  sensitivity: 'base',
+});
+
+export function sortReplicas(replicas, sortConfig) {
   const replicaList = Array.isArray(replicas) ? replicas : [];
+  const getValue = REPLICA_SORT_VALUE[sortConfig.key];
+  if (!getValue) return replicaList;
+
+  return replicaList
+    .map((replica, index) => ({ replica, index }))
+    .sort((left, right) => {
+      const leftValue = getValue(left.replica);
+      const rightValue = getValue(right.replica);
+      const leftMissing = leftValue === null || leftValue === undefined;
+      const rightMissing = rightValue === null || rightValue === undefined;
+      if (leftMissing || rightMissing) {
+        if (leftMissing !== rightMissing) return leftMissing ? 1 : -1;
+        return left.index - right.index;
+      }
+
+      const comparison =
+        typeof leftValue === 'number' && typeof rightValue === 'number'
+          ? leftValue - rightValue
+          : replicaSortCollator.compare(String(leftValue), String(rightValue));
+      if (comparison === 0) return left.index - right.index;
+      return sortConfig.direction === 'ascending' ? comparison : -comparison;
+    })
+    .map(({ replica }) => replica);
+}
+
+export function ReplicasCard({ replicas, loading }) {
+  const [sortConfig, setSortConfig] = useState({
+    key: 'id',
+    direction: 'ascending',
+  });
+  const sortedReplicas = useMemo(
+    () => sortReplicas(replicas, sortConfig),
+    [replicas, sortConfig]
+  );
+
+  const requestSort = (key) => {
+    setSortConfig((current) => ({
+      key,
+      direction:
+        current.key === key && current.direction === 'ascending'
+          ? 'descending'
+          : 'ascending',
+    }));
+  };
+
+  const sortableHeader = (label, key) => {
+    const active = sortConfig.key === key;
+    const direction = active ? sortConfig.direction : null;
+    return (
+      <TableHead className="whitespace-nowrap" aria-sort={direction || 'none'}>
+        <button
+          type="button"
+          className="inline-flex w-full items-center gap-1 text-left hover:text-sky-blue"
+          onClick={() => requestSort(key)}
+        >
+          {label}
+          {active && (
+            <span aria-hidden="true">
+              {direction === 'ascending' ? '↑' : '↓'}
+            </span>
+          )}
+        </button>
+      </TableHead>
+    );
+  };
 
   return (
     <div className="mb-6">
@@ -656,19 +743,19 @@ function ReplicasCard({ replicas, loading }) {
           <Table className="min-w-full">
             <TableHeader>
               <TableRow>
-                <TableHead className="whitespace-nowrap">ID</TableHead>
-                <TableHead className="whitespace-nowrap">Status</TableHead>
-                <TableHead className="whitespace-nowrap">Version</TableHead>
-                <TableHead className="whitespace-nowrap">Resources</TableHead>
-                <TableHead className="whitespace-nowrap">Est. $/hr</TableHead>
-                <TableHead className="whitespace-nowrap">Region</TableHead>
-                <TableHead className="whitespace-nowrap">Endpoint</TableHead>
-                <TableHead className="whitespace-nowrap">Launched</TableHead>
+                {sortableHeader('ID', 'id')}
+                {sortableHeader('Status', 'status')}
+                {sortableHeader('Version', 'version')}
+                {sortableHeader('Resources', 'resources')}
+                {sortableHeader('Est. $/hr', 'hourlyCost')}
+                {sortableHeader('Region', 'region')}
+                {sortableHeader('Endpoint', 'endpoint')}
+                {sortableHeader('Launched', 'launched_at')}
               </TableRow>
             </TableHeader>
             <TableBody>
-              {replicaList.length > 0 ? (
-                replicaList.map((replica) => (
+              {sortedReplicas.length > 0 ? (
+                sortedReplicas.map((replica) => (
                   <TableRow key={replica.id}>
                     <TableCell>{replica.id}</TableCell>
                     <TableCell>
