@@ -50,6 +50,9 @@ class TestCapacityEndpoint(unittest.TestCase):
         body = json.loads(response.body)
         self.assertEqual(body['ready_replicas'], 2)
         self.assertEqual(body['in_flight'], 3)
+        self.assertEqual(body['current_capacity'], 2)
+        self.assertEqual(body['in_flight_capacity'], 3)
+        self.assertIsNone(body['max_capacity'])
         self.assertFalse(body['draining'])
         self.assertTrue(body['synced'])
         self.assertGreaterEqual(body['last_sync_age_seconds'], 3.0)
@@ -107,6 +110,8 @@ class TestCapacityEndpoint(unittest.TestCase):
         self.assertEqual(body['provisioning_replicas'], 4)
         self.assertEqual(body['target_replicas'], 12)
         self.assertEqual(body['max_replicas'], 20)
+        self.assertEqual(body['current_capacity'], 1)
+        self.assertEqual(body['max_capacity'], 20)
 
     def test_in_flight_ignores_pruned_replicas(self):
         # Load entries for replicas no longer ready must not inflate the
@@ -154,7 +159,49 @@ class TestCapacityEndpoint(unittest.TestCase):
         self.assertEqual(body['total_slots'], 2)
         self.assertEqual(body['running_slots'], 1)
         self.assertEqual(body['free_slots'], 1)
+        # c is unprobed, so the generic contract falls back to one capacity
+        # unit per ready replica instead of exposing a partial slot total.
+        self.assertEqual(body['current_capacity'], 3)
+        self.assertEqual(body['in_flight_capacity'], 1)
         self.assertGreaterEqual(body['occupancy_probe_age_seconds'], 1.0)
+
+    def test_generic_capacity_uses_complete_fresh_slot_snapshot(self):
+        policy = lb_policies.LeastLoadPolicy()
+        policy.set_ready_replicas(['http://four-gpu:8080'])
+        balancer = _make_balancer(policy)
+        balancer._capacity_hint = {'max_replicas': 2}
+        balancer._replica_occupancy = {'http://four-gpu:8080': 2}
+        balancer._replica_total_slots = {'http://four-gpu:8080': 4}
+        balancer._replica_free_slots = {'http://four-gpu:8080': 2}
+        balancer._last_occupancy_probe_time = time.monotonic() - 1.0
+        body = json.loads(
+            asyncio.run(balancer._capacity(mock.MagicMock())).body)
+        self.assertEqual(body['current_capacity'], 4)
+        self.assertEqual(body['in_flight_capacity'], 2)
+        # A configured replica ceiling must never understate already
+        # materialized multi-worker capacity.
+        self.assertEqual(body['max_capacity'], 4)
+
+    def test_generic_capacity_falls_back_when_slot_snapshot_is_stale(self):
+        policy = lb_policies.LeastLoadPolicy()
+        policy.set_ready_replicas(['http://four-gpu:8080'])
+        policy.load_map['http://four-gpu:8080'] = 1
+        balancer = _make_balancer(policy)
+        balancer._capacity_hint = {'max_replicas': 3}
+        balancer._replica_occupancy = {'http://four-gpu:8080': 2}
+        balancer._replica_total_slots = {'http://four-gpu:8080': 4}
+        balancer._replica_free_slots = {'http://four-gpu:8080': 2}
+        balancer._last_occupancy_probe_time = (
+            time.monotonic() -
+            lb_module.constants.LB_OCCUPANCY_PROBE_MAX_AGE_SECONDS - 1.0)
+        body = json.loads(
+            asyncio.run(balancer._capacity(mock.MagicMock())).body)
+        self.assertEqual(body['current_capacity'], 1)
+        # The legacy in-flight aggregate conservatively includes both the
+        # HTTP envelope and the last observed async occupancy when a probe is
+        # stale, preserving the pre-existing fallback behavior.
+        self.assertEqual(body['in_flight_capacity'], 3)
+        self.assertEqual(body['max_capacity'], 3)
 
     def test_occupancy_aggregates_debit_assigned_and_unassigned_slots(self):
         policy = lb_policies.LeastLoadPolicy()

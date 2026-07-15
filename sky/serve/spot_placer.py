@@ -304,6 +304,8 @@ def _expand_accelerator_counts_for_cloud(
     catalogs are deliberately excluded because listing them can query live
     control planes.
     """
+    # TODO(fran): Represent fractional/MIG devices and their capacity weights
+    # in the resource/catalog abstraction instead of assuming whole GPUs.
     accelerators = resources.accelerators
     if (not resources.use_spot or accelerators is None or
             len(accelerators) != 1 or resources.instance_type is not None):
@@ -861,6 +863,8 @@ class CapacityAwareDynamicFallbackSpotPlacer(DynamicFallbackSpotPlacer,
         return (str(location.cloud).lower(), location.region, location.zone)
 
     def _min_cost_location(self, locations: list[Location]) -> Location:
+        # TODO(fran): Rank heterogeneous accelerators by measured workload
+        # throughput per dollar once services can publish benchmark weights.
         return min(locations,
                    key=lambda location: self._get_cost_per_hour_cached(location)
                    / self._accelerator_slots(location))
