@@ -368,7 +368,7 @@ def test_probe_started_before_async_dispatch_cannot_revalidate_zero():
             del session, selected_url
             probe_started.set()
             await finish_probe.wait()
-            return (0, 4)
+            return (0, 4, 4)
 
         async def _fake_proxy(selected_url, forwarded_request):
             del selected_url, forwarded_request
@@ -411,7 +411,7 @@ def test_probe_during_async_dispatch_cannot_publish_idle_after_accept():
 
         async def _fetch_zero(session, selected_url):
             del session, selected_url
-            return (0, 4)
+            return (0, 4, 4)
 
         async def _held_proxy(selected_url, forwarded_request):
             del selected_url, forwarded_request
@@ -459,7 +459,7 @@ def test_probe_started_after_async_dispatch_revalidates_occupancy():
 
     async def _fetch(session, selected_url):
         del session, selected_url
-        return (1, 3)
+        return (1, 3, 4)
 
     lb._fetch_replica_occupancy = _fetch
     asyncio.run(lb._probe_replica_occupancy_once())
@@ -765,7 +765,7 @@ def test_explicit_false_waits_for_idle_before_clearing_capability():
 
     async def _fetch_idle(session, selected_url):
         del session, selected_url
-        return (0, 1)
+        return (0, 1, 1)
 
     lb._fetch_replica_occupancy = _fetch_idle
     asyncio.run(lb._probe_replica_occupancy_once())
@@ -810,7 +810,7 @@ def test_cold_explicit_false_preserves_positive_runtime_occupancy():
     _, _, unknown_urls, _ = lb._in_flight_with_draining()
     assert unknown_urls == [url]
 
-    results = [(1, 0), None, (0, 1), (0, 1)]
+    results = [(1, 0, 1), None, (0, 1, 1), (0, 1, 1)]
 
     async def _fetch(session, selected_url):
         del session, selected_url
@@ -867,7 +867,7 @@ def test_recognized_async_request_temporarily_overrides_explicit_false():
 
     async def _fetch_idle(session, selected_url):
         del session, selected_url
-        return (0, 1)
+        return (0, 1, 1)
 
     lb._fetch_replica_occupancy = _fetch_idle
     asyncio.run(lb._probe_replica_occupancy_once())
@@ -965,7 +965,7 @@ def test_probe_round_marks_and_prunes_capability():
 
     async def _fake_fetch(session, url):
         del session, url
-        return (1, 0)
+        return (1, 0, 1)
 
     lb._fetch_replica_occupancy = _fake_fetch
     asyncio.run(lb._probe_replica_occupancy_once())

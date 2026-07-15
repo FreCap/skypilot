@@ -358,6 +358,10 @@ class SkyServeLoadBalancer:
     # the trailing generation fence can invalidate it.
     _occupancy_pending_reservations: dict[str, int] | None = None
     _occupancy_active_attempts: dict[str, int] | None = None
+    # Last generation-valid predict concurrency reported per replica URL.
+    # Stored separately from free slots because a draining worker may report
+    # running work while advertising zero serving capacity.
+    _replica_total_slots: dict[str, int] | None = None
     # Fleet slot admitted by the request queue but not yet transferred to a
     # selected URL. Normally lives for one event-loop turn; tracking it makes
     # admission correct even if scheduling changes or a test deliberately
@@ -489,13 +493,14 @@ class SkyServeLoadBalancer:
         # judge its freshness via last_sync_age_seconds.
         self._capacity_hint: dict[str, Any] | None = None
         # [boltz fork] Replica-reported async occupancy, from the probe loop
-        # (see _probe_occupancy_loop): url -> running async jobs, and
-        # url -> free predict slots (max(0, predict_concurrency - running)).
+        # (see _probe_occupancy_loop): url -> running async jobs, total predict
+        # slots, and free predict slots (max(0, total - running)).
         # Rebuilt wholesale each probe round from the then-ready set, so a
         # pruned replica ages out on the next round. Absent url == probe
         # failed/never ran == occupancy unknown (never assumed busy). Guarded
         # by _client_pool_lock like the rest of the routing state.
         self._replica_occupancy: dict[str, int] = {}
+        self._replica_total_slots: dict[str, int] = {}
         self._replica_free_slots: dict[str, int] = {}
         self._occupancy_dispatch_generation = {}
         self._occupancy_sample_generation = {}
@@ -751,19 +756,30 @@ class SkyServeLoadBalancer:
             ready_urls = set(self._load_balancing_policy.ready_replicas)
             ready_replicas = len(ready_urls)
             free_slots = None
+            queue_capacity_units = ready_replicas
+            dispatch_capacity = (ready_replicas *
+                                 config['max_concurrency_per_replica'])
             if config.get('use_async_occupancy', False):
                 # Unknown occupancy is not free capacity. A selected async
                 # attempt consumes one replica reservation; admissions that
                 # have not reached selection consume the fleet-wide remainder.
                 effective = self._effective_replica_free_slots_locked()
+                total_slots = getattr(self, '_replica_total_slots', None) or {}
+                # The configured per-replica value remains a hard safety cap,
+                # but a heterogeneous replica contributes its actual probed
+                # slots instead of one replica-count unit. Unknown replicas
+                # contribute no invented capacity.
+                queue_capacity_units = sum(
+                    min(total_slots.get(url, 0),
+                        config['max_concurrency_per_replica'])
+                    for url in ready_urls)
+                dispatch_capacity = queue_capacity_units
                 free_slots = max(
                     0,
                     sum(slots for url, slots in effective.items()
                         if url in ready_urls) -
                     self._occupancy_unassigned_reservations)
-        dispatch_limit = min(
-            config['max_concurrency'],
-            ready_replicas * config['max_concurrency_per_replica'])
+        dispatch_limit = min(config['max_concurrency'], dispatch_capacity)
         if free_slots is not None:
             # `_active_request_count` already includes admitted requests whose
             # per-replica or fleet reservation was subtracted above. Add the
@@ -772,7 +788,7 @@ class SkyServeLoadBalancer:
             dispatch_limit = min(dispatch_limit,
                                  self._active_request_count + free_slots)
         queue_size = max(config['min_size'],
-                         ready_replicas * config['size_per_replica'])
+                         queue_capacity_units * config['size_per_replica'])
         return dispatch_limit, min(config['max_size'], queue_size)
 
     def _current_dispatch_load(self) -> int:
@@ -1397,6 +1413,8 @@ class SkyServeLoadBalancer:
         with self._client_pool_lock:
             ready_set = set(self._load_balancing_policy.ready_replicas)
             ready_replicas = len(ready_set)
+            total_slots_by_url = getattr(self, '_replica_total_slots',
+                                         None) or {}
             # [boltz fork] Occupancy aggregates, over probed AND ready
             # replicas only: a probe entry for a since-pruned replica must
             # not count, and an unprobed replica contributes no free slot
@@ -1407,10 +1425,20 @@ class SkyServeLoadBalancer:
                 url: slots
                 for url, slots in
                 self._effective_replica_free_slots_locked().items()
-                if url in ready_set
+                if url in ready_set and url in total_slots_by_url
             }
             probed_replicas = len(probed)
             busy_replicas = sum(1 for free in probed.values() if free <= 0)
+            total_slots = sum(total_slots_by_url[url] for url in probed)
+            observed_occupancy = getattr(self, '_replica_occupancy', {}) or {}
+            pending_reservations = self._occupancy_pending_reservations or {}
+            # Reported work is meaningful only for the probed set, while an
+            # accepted post-probe reservation remains real work even if the
+            # next probe misses and its capacity baseline fails closed.
+            running_slots = (
+                sum(observed_occupancy.get(url, 0) for url in probed) +
+                sum(pending_reservations.get(url, 0) for url in ready_set) +
+                self._occupancy_unassigned_reservations)
             free_slots = max(
                 0,
                 sum(probed.values()) - self._occupancy_unassigned_reservations)
@@ -1460,9 +1488,13 @@ class SkyServeLoadBalancer:
             # For fast-ack async fleets envelope-only in_flight reads ~0
             # while replicas crunch, so admission should size on
             # free_slots gated by occupancy_probe_age_seconds, exactly
-            # like last_sync_age gates the ready count.
+            # like last_sync_age gates the ready count. running_slots is work,
+            # not total_slots - free_slots: reservations can outlive a probe
+            # baseline, and draining replicas can run with total_slots == 0.
             'probed_replicas': probed_replicas,
             'busy_replicas': busy_replicas,
+            'total_slots': total_slots,
+            'running_slots': running_slots,
             'free_slots': free_slots,
             'occupancy_probe_age_seconds': occupancy_probe_age,
         })
@@ -1515,8 +1547,8 @@ class SkyServeLoadBalancer:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _parse_replica_occupancy(raw: Any) -> tuple[int, int] | None:
-        """(running_count, free_slots) from an async_capacity payload.
+    def _parse_replica_occupancy(raw: Any) -> tuple[int, int, int] | None:
+        """(running_count, free_slots, total_slots) from async_capacity.
 
         None on any non-conforming shape (older image without the action,
         or an error body): the caller treats it as occupancy unknown.
@@ -1533,11 +1565,11 @@ class SkyServeLoadBalancer:
             return None
         if running < 0 or concurrency < 0:
             return None
-        return running, max(0, concurrency - running)
+        return running, max(0, concurrency - running), concurrency
 
     async def _fetch_replica_occupancy(
             self, session: 'aiohttp.ClientSession',
-            replica_url: str) -> tuple[int, int] | None:
+            replica_url: str) -> tuple[int, int, int] | None:
         """One occupancy probe; None on any failure (unknown, never busy)."""
         try:
             async with session.post(
@@ -1576,6 +1608,7 @@ class SkyServeLoadBalancer:
         if not probe_urls:
             with self._client_pool_lock:
                 self._replica_occupancy = {}
+                self._replica_total_slots = {}
                 self._replica_free_slots = {}
                 self._occupancy_capable = set()
                 self._occupancy_declared_urls = set()
@@ -1603,11 +1636,12 @@ class SkyServeLoadBalancer:
                 *(self._fetch_replica_occupancy(session, url)
                   for url in probe_urls))
         occupancy: dict[str, int] = {}
+        total_slots: dict[str, int] = {}
         free_slots: dict[str, int] = {}
         for url, result in zip(probe_urls, results):
             if result is None:
                 continue
-            occupancy[url], free_slots[url] = result
+            occupancy[url], free_slots[url], total_slots[url] = result
         # Off-ready urls must not advertise free slots to admission.
         ready_set = set(ready_urls)
         free_slots = {
@@ -1628,6 +1662,7 @@ class SkyServeLoadBalancer:
             # conservative while preserving the other slots. A genuine probe
             # miss still drops the baseline and fails closed.
             merged_occupancy = dict(self._replica_occupancy)
+            merged_total_slots = dict(self._replica_total_slots or {})
             merged_free_slots = dict(self._replica_free_slots)
             merged_sample_generation = dict(self._occupancy_sample_generation or
                                             {})
@@ -1635,10 +1670,12 @@ class SkyServeLoadBalancer:
             missed_urls = set(probe_urls) - set(occupancy)
             for url in missed_urls:
                 merged_occupancy.pop(url, None)
+                merged_total_slots.pop(url, None)
                 merged_free_slots.pop(url, None)
                 merged_sample_generation.pop(url, None)
             for url in valid_sample_urls:
                 merged_occupancy[url] = occupancy[url]
+                merged_total_slots[url] = total_slots[url]
                 if url in free_slots:
                     merged_free_slots[url] = free_slots[url]
                 else:
@@ -1658,6 +1695,11 @@ class SkyServeLoadBalancer:
                 if url not in ready_set and url not in current_ready
             }
             self._replica_occupancy = merged_occupancy
+            self._replica_total_slots = {
+                url: slots
+                for url, slots in merged_total_slots.items()
+                if url in ready_set and url in current_ready
+            }
             self._replica_free_slots = {
                 url: slots
                 for url, slots in merged_free_slots.items()
@@ -1713,6 +1755,11 @@ class SkyServeLoadBalancer:
             self._replica_occupancy = {
                 url: count
                 for url, count in self._replica_occupancy.items()
+                if url in keep
+            }
+            self._replica_total_slots = {
+                url: slots
+                for url, slots in self._replica_total_slots.items()
                 if url in keep
             }
             self._replica_free_slots = {

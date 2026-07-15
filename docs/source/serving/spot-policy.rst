@@ -68,6 +68,44 @@ When spot replicas are available, SkyServe will automatically switch back to usi
 
     SkyServe supports specifying both :code:`base_ondemand_fallback_replicas` and :code:`dynamic_ondemand_fallback`. Specifying both will set a base number of on-demand replicas and dynamically fallback to on-demand replicas when spot replicas are not available.
 
+Cost-aware multi-GPU placement
+------------------------------
+
+For a heterogeneous ``resources.any_of`` fleet, set ``spot_placer`` to
+``dynamic_fallback_per_gpu`` to compare equally loaded paid locations by hourly
+machine price divided by their configured accelerator count. This lets a
+four-GPU machine win over a cheaper one-GPU machine when its cost per serving
+slot is lower. Least-loaded spreading, failed-location benching, and the strict
+preference for zero-cost reserved capacity remain unchanged.
+
+.. code-block:: yaml
+
+    service:
+      replica_policy:
+        min_replicas: 1
+        max_replicas: 100
+        target_concurrency_per_replica: 1
+        spot_placer: dynamic_fallback_per_gpu
+
+    resources:
+      any_of:
+        - infra: aws/us-east-1
+          accelerators: L4:1
+          use_spot: true
+        - infra: gcp/us-central1
+          accelerators: L4:4
+          use_spot: true
+
+``dynamic_fallback`` continues to compare raw hourly machine prices. Use the
+per-GPU policy only when each configured GPU contributes one equivalent serving
+slot.
+
+.. note::
+
+    Upgrade the SkyPilot API server and service controllers before updating an
+    existing service to ``dynamic_fallback_per_gpu``. Older controllers do not
+    recognize the new opt-in placer name.
+
 Cost-aware replacement
 ----------------------
 

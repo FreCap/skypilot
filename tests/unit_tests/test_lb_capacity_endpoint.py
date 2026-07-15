@@ -31,6 +31,7 @@ def _make_balancer(policy):
     balancer._reject_fallback_seq = 0
     balancer._capacity_hint = None
     balancer._replica_occupancy = {}
+    balancer._replica_total_slots = {}
     balancer._replica_free_slots = {}
     balancer._last_occupancy_probe_time = None
     return balancer
@@ -130,6 +131,8 @@ class TestCapacityEndpoint(unittest.TestCase):
             asyncio.run(balancer._capacity(mock.MagicMock())).body)
         self.assertEqual(body['probed_replicas'], 0)
         self.assertEqual(body['busy_replicas'], 0)
+        self.assertEqual(body['total_slots'], 0)
+        self.assertEqual(body['running_slots'], 0)
         self.assertEqual(body['free_slots'], 0)
         self.assertIsNone(body['occupancy_probe_age_seconds'])
 
@@ -141,12 +144,15 @@ class TestCapacityEndpoint(unittest.TestCase):
             ['http://a:8080', 'http://b:8080', 'http://c:8080'])
         balancer = _make_balancer(policy)
         balancer._replica_occupancy = {'http://a:8080': 1, 'http://b:8080': 0}
+        balancer._replica_total_slots = {'http://a:8080': 1, 'http://b:8080': 1}
         balancer._replica_free_slots = {'http://a:8080': 0, 'http://b:8080': 1}
         balancer._last_occupancy_probe_time = time.monotonic() - 2.0
         body = json.loads(
             asyncio.run(balancer._capacity(mock.MagicMock())).body)
         self.assertEqual(body['probed_replicas'], 2)
         self.assertEqual(body['busy_replicas'], 1)
+        self.assertEqual(body['total_slots'], 2)
+        self.assertEqual(body['running_slots'], 1)
         self.assertEqual(body['free_slots'], 1)
         self.assertGreaterEqual(body['occupancy_probe_age_seconds'], 1.0)
 
@@ -155,13 +161,42 @@ class TestCapacityEndpoint(unittest.TestCase):
         policy.set_ready_replicas(['http://four-gpu:8080'])
         balancer = _make_balancer(policy)
         balancer._replica_occupancy = {'http://four-gpu:8080': 0}
+        balancer._replica_total_slots = {'http://four-gpu:8080': 4}
         balancer._replica_free_slots = {'http://four-gpu:8080': 4}
         balancer._occupancy_pending_reservations = {'http://four-gpu:8080': 1}
         balancer._occupancy_unassigned_reservations = 1
         body = json.loads(
             asyncio.run(balancer._capacity(mock.MagicMock())).body)
         self.assertEqual(body['probed_replicas'], 1)
+        self.assertEqual(body['total_slots'], 4)
+        self.assertEqual(body['running_slots'], 2)
         self.assertEqual(body['free_slots'], 2)
+
+    def test_draining_replica_reports_running_work_without_capacity(self):
+        policy = lb_policies.LeastLoadPolicy()
+        policy.set_ready_replicas(['http://draining:8080'])
+        balancer = _make_balancer(policy)
+        balancer._replica_occupancy = {'http://draining:8080': 1}
+        balancer._replica_total_slots = {'http://draining:8080': 0}
+        balancer._replica_free_slots = {'http://draining:8080': 0}
+        body = json.loads(
+            asyncio.run(balancer._capacity(mock.MagicMock())).body)
+        self.assertEqual(body['probed_replicas'], 1)
+        self.assertEqual(body['total_slots'], 0)
+        self.assertEqual(body['running_slots'], 1)
+        self.assertEqual(body['free_slots'], 0)
+
+    def test_probe_miss_keeps_accepted_reservation_visible_as_running(self):
+        policy = lb_policies.LeastLoadPolicy()
+        policy.set_ready_replicas(['http://unknown:8080'])
+        balancer = _make_balancer(policy)
+        balancer._occupancy_pending_reservations = {'http://unknown:8080': 1}
+        body = json.loads(
+            asyncio.run(balancer._capacity(mock.MagicMock())).body)
+        self.assertEqual(body['probed_replicas'], 0)
+        self.assertEqual(body['total_slots'], 0)
+        self.assertEqual(body['running_slots'], 1)
+        self.assertEqual(body['free_slots'], 0)
 
     def test_occupancy_ignores_pruned_replicas(self):
         # A probe entry for a replica the controller since removed from the
@@ -170,9 +205,12 @@ class TestCapacityEndpoint(unittest.TestCase):
         policy.set_ready_replicas(['http://a:8080'])
         balancer = _make_balancer(policy)
         balancer._replica_occupancy = {'http://a:8080': 0, 'http://gone': 0}
+        balancer._replica_total_slots = {'http://a:8080': 1, 'http://gone': 1}
         balancer._replica_free_slots = {'http://a:8080': 1, 'http://gone': 1}
         balancer._last_occupancy_probe_time = time.monotonic()
         body = json.loads(
             asyncio.run(balancer._capacity(mock.MagicMock())).body)
         self.assertEqual(body['probed_replicas'], 1)
+        self.assertEqual(body['total_slots'], 1)
+        self.assertEqual(body['running_slots'], 0)
         self.assertEqual(body['free_slots'], 1)

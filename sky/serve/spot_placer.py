@@ -27,6 +27,7 @@ logger = sky_logging.init_logger(__name__)
 SPOT_PLACERS = {}
 DEFAULT_SPOT_PLACER = None
 SPOT_HEDGE_PLACER = 'dynamic_fallback'
+CAPACITY_AWARE_SPOT_PLACER = 'dynamic_fallback_per_gpu'
 
 # How long a location stays benched after a failed launch or a preemption
 # before it becomes eligible for a retry. Without this, a location marked
@@ -759,3 +760,17 @@ class DynamicFallbackSpotPlacer(SpotPlacer,
         # locations come back on their own.
         if not self.active_locations():
             self.clear_preemptive_locations()
+
+
+class CapacityAwareDynamicFallbackSpotPlacer(DynamicFallbackSpotPlacer,
+                                             name=CAPACITY_AWARE_SPOT_PLACER):
+    """Dynamic fallback whose cost tiebreak is hourly price per GPU slot."""
+
+    @staticmethod
+    def _accelerator_slots(location: Location) -> int:
+        return max(1, sum((location.accelerators or {}).values()))
+
+    def _min_cost_location(self, locations: list[Location]) -> Location:
+        return min(locations,
+                   key=lambda location: self._get_cost_per_hour_cached(location)
+                   / self._accelerator_slots(location))

@@ -112,7 +112,7 @@ class TestOccupancyParsing(unittest.TestCase):
                 'status': 'READY',
                 'running_count': 1,
                 'predict_concurrency': 1
-            }), (1, 0))
+            }), (1, 0, 1))
 
     def test_idle_payload(self):
         self.assertEqual(
@@ -120,7 +120,7 @@ class TestOccupancyParsing(unittest.TestCase):
                 'status': 'READY',
                 'running_count': 0,
                 'predict_concurrency': 1
-            }), (0, 1))
+            }), (0, 1, 1))
 
     def test_draining_reports_zero_free_slots(self):
         # The wrapper reports predict_concurrency 0 while draining, so free
@@ -130,7 +130,7 @@ class TestOccupancyParsing(unittest.TestCase):
                 'status': 'DRAINING',
                 'running_count': 1,
                 'predict_concurrency': 0
-            }), (1, 0))
+            }), (1, 0, 0))
 
     def test_non_conforming_shapes_are_unknown(self):
         # Older images without the action answer something else entirely —
@@ -166,6 +166,7 @@ def _make_balancer(policy):
     balancer._draining = False
     balancer._last_sync_time = time.monotonic()
     balancer._replica_occupancy = {}
+    balancer._replica_total_slots = {}
     balancer._replica_free_slots = {}
     balancer._last_occupancy_probe_time = None
     return balancer
@@ -189,8 +190,9 @@ class TestProbeRound(unittest.TestCase):
         policy.set_ready_replicas([A, B, C])
         balancer = _make_balancer(policy)
         # a busy, b idle, c unreachable (fetch -> None).
-        self._run_round(balancer, {A: (1, 0), B: (0, 1)})
+        self._run_round(balancer, {A: (1, 0, 1), B: (0, 1, 1)})
         self.assertEqual(balancer._replica_occupancy, {A: 1, B: 0})
+        self.assertEqual(balancer._replica_total_slots, {A: 1, B: 1})
         self.assertEqual(balancer._replica_free_slots, {A: 0, B: 1})
         self.assertIsNotNone(balancer._last_occupancy_probe_time)
         # The policy received the same occupancy: a deprioritized in routing.
@@ -200,11 +202,12 @@ class TestProbeRound(unittest.TestCase):
         policy = lb_policies.LeastLoadPolicy()
         policy.set_ready_replicas([A])
         balancer = _make_balancer(policy)
-        self._run_round(balancer, {A: (1, 0)})
+        self._run_round(balancer, {A: (1, 0, 1)})
         self.assertEqual(balancer._replica_occupancy, {A: 1})
         policy.set_ready_replicas([])
         self._run_round(balancer, {})
         self.assertEqual(balancer._replica_occupancy, {})
+        self.assertEqual(balancer._replica_total_slots, {})
         self.assertEqual(balancer._replica_free_slots, {})
         self.assertEqual(policy.occupancy_map, {})
 
@@ -213,8 +216,8 @@ class TestProbeRound(unittest.TestCase):
         policy = lb_policies.LeastLoadPolicy()
         policy.set_ready_replicas([A, B])
         balancer = _make_balancer(policy)
-        self._run_round(balancer, {A: (1, 0), B: (0, 1)})
-        self._run_round(balancer, {A: (0, 1), B: (1, 0)})
+        self._run_round(balancer, {A: (1, 0, 1), B: (0, 1, 1)})
+        self._run_round(balancer, {A: (0, 1, 1), B: (1, 0, 1)})
         self.assertEqual(balancer._replica_occupancy, {A: 0, B: 1})
         self.assertEqual(policy._select_replica(mock.MagicMock(), [A, B]), A)
 

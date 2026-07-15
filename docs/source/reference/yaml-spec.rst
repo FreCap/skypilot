@@ -1550,10 +1550,14 @@ to a ready replica.
 ``service.load_balancer.request_queue``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Enables a bounded request queue in the load balancer. The effective queue size
-is ``min(max_size, max(min_size, ready_replicas * size_per_replica))``. An
-empty object enables the defaults shown below. Requests beyond the effective
-queue size receive HTTP 503, requests that wait longer than
+Enables a bounded request queue in the load balancer. By default, the effective
+queue size is
+``min(max_size, max(min_size, ready_replicas * size_per_replica))``. When
+``use_async_occupancy`` is true, ``ready_replicas`` in this formula is replaced
+by the sum of fresh, probed predict-concurrency slots, with each replica capped
+by ``max_concurrency_per_replica``. An empty object enables the defaults shown
+below. Requests beyond the effective queue size receive HTTP 503, requests that
+wait longer than
 ``timeout_seconds`` receive HTTP 503, and bodies larger than
 ``max_request_body_bytes`` receive HTTP 413.
 
@@ -1563,14 +1567,18 @@ per ready replica before new arrivals wait in the queue, while
 ``max_concurrency`` is the absolute load-balancer-wide dispatch ceiling.
 When ``use_async_occupancy`` is true, dispatch concurrency is also clamped by
 the fresh free-slot total reported by occupancy-capable replicas. Unknown
-occupancy contributes no free capacity, and occupancy probe updates wake
-waiting requests. Each dispatched request reserves one reported slot until a
-new, non-racing occupancy probe reconciles it. Other reported slots on the
-same replica remain available, which allows one SkyServe replica backed by a
-multi-GPU instance to accept work for each free model worker even when requests
-return an asynchronous acknowledgement. ``max_concurrency_per_replica``
-remains a safety ceiling; set it at least as high as the largest replica's
-reported predict concurrency to use every slot.
+occupancy contributes neither queue capacity nor free capacity, and occupancy
+probe updates wake waiting requests. Each dispatched request reserves one
+reported slot until a new, non-racing occupancy probe reconciles it. Other
+reported slots on the same replica remain available, which allows one SkyServe
+replica backed by a multi-GPU instance to accept work for each free model worker
+even when requests return an asynchronous acknowledgement.
+``max_concurrency_per_replica`` remains a safety ceiling; set it at least as
+high as the largest replica's reported predict concurrency to use every slot.
+If ``min_size`` is 0, arrivals fail immediately while every occupancy probe is
+unknown, including the interval before the first successful probe after a load
+balancer restart. Set a positive ``min_size`` to let arrivals wait through that
+interval.
 
 The queue accepts at most 3,000 waiting requests, 128 concurrent requests,
 and 16 MiB per request body. The product of ``max_concurrency`` and

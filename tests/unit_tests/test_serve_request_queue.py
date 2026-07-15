@@ -126,10 +126,29 @@ def test_async_occupancy_clamps_dispatch_limit():
                   use_async_occupancy=True)
     urls = ['http://worker-0:8000', 'http://worker-1:8000']
     lb._load_balancing_policy.set_ready_replicas(urls)
+    lb._replica_total_slots = {urls[0]: 1, urls[1]: 1}
     lb._replica_free_slots = {urls[0]: 0, urls[1]: 1}
     assert lb._request_queue_limits() == (1, 6)
     lb._replica_free_slots = {}
     assert lb._request_queue_limits() == (0, 6)
+
+
+def test_async_occupancy_sizes_queue_by_probed_slots():
+    lb = _make_lb(min_size=0,
+                  size_per_replica=3,
+                  max_size=3000,
+                  max_concurrency_per_replica=8,
+                  use_async_occupancy=True)
+    one_gpu = 'http://one-gpu:8000'
+    four_gpu = 'http://four-gpu:8000'
+    unknown = 'http://unknown:8000'
+    lb._load_balancing_policy.set_ready_replicas([one_gpu, four_gpu, unknown])
+    lb._replica_total_slots = {one_gpu: 1, four_gpu: 4}
+    lb._replica_free_slots = {one_gpu: 1, four_gpu: 4}
+
+    assert lb._request_queue_limits() == (5, 15)
+    lb._request_queue_config['max_concurrency_per_replica'] = 2
+    assert lb._request_queue_limits() == (3, 9)
 
 
 def test_fast_ack_multi_slot_reservations_fill_and_resume_exactly():
@@ -152,7 +171,7 @@ def test_fast_ack_multi_slot_reservations_fill_and_resume_exactly():
         async def _capacity(session, replica_url):
             del session
             assert replica_url == url
-            return running, capacity - running
+            return running, capacity - running, capacity
 
         async def _fast_ack(replica_url, request):
             nonlocal running
@@ -236,6 +255,7 @@ def test_instance_aware_routing_fills_one_and_four_gpu_replicas():
                 },
             })
             lb._replica_occupancy = {one_gpu: 0, four_gpu: 0}
+            lb._replica_total_slots = dict(capacities)
             lb._replica_free_slots = dict(capacities)
             lb._occupancy_dispatch_generation = {one_gpu: 0, four_gpu: 0}
             lb._occupancy_sample_generation = {one_gpu: 0, four_gpu: 0}
@@ -285,6 +305,7 @@ def test_unassigned_admissions_close_selection_scheduling_gap():
                       use_async_occupancy=True)
         url = 'http://two-slots:8000'
         lb._load_balancing_policy.set_ready_replicas([url])
+        lb._replica_total_slots = {url: 2}
         lb._replica_free_slots = {url: 2}
         requests = [_request() for _ in range(3)]
 
@@ -322,6 +343,7 @@ def test_slow_proxy_does_not_hold_reservation_locks():
         lb._load_balancing_policy.set_ready_replicas([url])
         lb._occupancy_declared_urls = {url}
         lb._replica_occupancy = {url: 0}
+        lb._replica_total_slots = {url: 4}
         lb._replica_free_slots = {url: 4}
         lb._occupancy_dispatch_generation = {url: 0}
         lb._occupancy_sample_generation = {url: 0}
@@ -366,6 +388,7 @@ def test_policy_swap_during_attempt_preserves_pending_capacity():
         lb._load_balancing_policy.set_ready_replicas([url])
         lb._occupancy_declared_urls = {url}
         lb._replica_occupancy = {url: 0}
+        lb._replica_total_slots = {url: 2}
         lb._replica_free_slots = {url: 2}
         lb._occupancy_dispatch_generation = {url: 0}
         lb._occupancy_sample_generation = {url: 0}
@@ -429,6 +452,7 @@ def test_retriable_rejection_keeps_admitted_slot_until_next_selection():
         lb._load_balancing_policy.set_ready_replicas([first_url, second_url])
         lb._occupancy_declared_urls = {first_url, second_url}
         lb._replica_occupancy = {first_url: 0, second_url: 0}
+        lb._replica_total_slots = {first_url: 1, second_url: 1}
         lb._replica_free_slots = {first_url: 1, second_url: 1}
         lb._occupancy_dispatch_generation = {first_url: 0, second_url: 0}
         lb._occupancy_sample_generation = {first_url: 0, second_url: 0}
@@ -480,6 +504,7 @@ def test_enabling_occupancy_queue_mid_request_does_not_leak_admission():
         lb._load_balancing_policy.set_ready_replicas([first_url, second_url])
         lb._occupancy_declared_urls = {first_url, second_url}
         lb._replica_occupancy = {first_url: 0, second_url: 0}
+        lb._replica_total_slots = {first_url: 1, second_url: 1}
         lb._replica_free_slots = {first_url: 1, second_url: 1}
         lb._occupancy_dispatch_generation = {first_url: 0, second_url: 0}
         lb._occupancy_sample_generation = {first_url: 0, second_url: 0}
@@ -545,6 +570,7 @@ def test_live_queue_mode_toggle_preserves_retry_ownership(
         lb._load_balancing_policy.set_ready_replicas([first_url, second_url])
         lb._occupancy_declared_urls = {first_url, second_url}
         lb._replica_occupancy = {first_url: 0, second_url: 0}
+        lb._replica_total_slots = {first_url: 1, second_url: 1}
         lb._replica_free_slots = {first_url: 1, second_url: 1}
         lb._occupancy_dispatch_generation = {first_url: 0, second_url: 0}
         lb._occupancy_sample_generation = {first_url: 0, second_url: 0}
@@ -646,7 +672,7 @@ def test_waiter_wakes_when_dispatch_slot_released():
 def test_occupancy_probe_wakes_waiter():
 
     async def _run():
-        lb = _make_lb(min_size=0, use_async_occupancy=True, timeout_seconds=1)
+        lb = _make_lb(min_size=1, use_async_occupancy=True, timeout_seconds=1)
         url = 'http://worker:8000'
         lb._load_balancing_policy.set_ready_replicas([url])
         request = _request()
@@ -657,7 +683,7 @@ def test_occupancy_probe_wakes_waiter():
         async def _free_slot(session, replica_url):
             del session
             assert replica_url == url
-            return 0, 1
+            return 0, 1, 1
 
         with mock.patch.object(lb,
                                '_fetch_replica_occupancy',
@@ -673,7 +699,7 @@ def test_occupancy_probe_wakes_waiter():
 def test_timeout_and_cancellation_remove_waiters():
 
     async def _run():
-        lb = _make_lb(min_size=0,
+        lb = _make_lb(min_size=1,
                       use_async_occupancy=True,
                       timeout_seconds=0.01)
         lb._load_balancing_policy.set_ready_replicas(['http://worker:8000'])
@@ -836,6 +862,7 @@ def test_repeated_cancellation_cannot_leak_admission_count():
         lb._load_balancing_policy.set_ready_replicas([url])
         lb._occupancy_declared_urls = {url}
         lb._replica_occupancy = {url: 0}
+        lb._replica_total_slots = {url: 1}
         lb._replica_free_slots = {url: 1}
         lb._occupancy_dispatch_generation = {url: 0}
         lb._occupancy_sample_generation = {url: 0}
@@ -939,6 +966,7 @@ def test_capacity_reports_request_queue_state():
                       use_async_occupancy=True)
         url = 'http://worker:8000'
         lb._load_balancing_policy.set_ready_replicas([url])
+        lb._replica_total_slots = {url: 1}
         lb._replica_free_slots = {url: 1}
         lb._waiting_request_count = 2
         response = await lb._capacity(mock.MagicMock())

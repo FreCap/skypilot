@@ -35,6 +35,17 @@ def hybrid_placer():
     return placer, k8s, cheap_spot, pricey_spot
 
 
+def _make_per_gpu_placer(costs):
+    placer = spot_placer.CapacityAwareDynamicFallbackSpotPlacer.__new__(
+        spot_placer.CapacityAwareDynamicFallbackSpotPlacer)
+    placer.location2status = {
+        location: spot_placer.LocationStatus.ACTIVE for location in costs
+    }
+    placer.location2preempted_at = {}
+    placer.location2cost = dict(costs)
+    return placer
+
+
 class TestZeroCostTierFirst:
     """Free capacity fills completely before any paid launch."""
 
@@ -63,6 +74,32 @@ class TestZeroCostTierFirst:
         # again and immediately preferred.
         now[0] += spot_placer._PREEMPTION_RETRY_SECONDS_DEFAULT + 1
         assert placer.select_next_location([cheap_spot] * 10) == k8s
+
+
+class TestCapacityAwareCost:
+    """Opt-in placement compares paid shapes by machine price per GPU."""
+
+    def test_multi_gpu_shape_wins_when_it_is_cheaper_per_gpu(self):
+        one_gpu = make_location('one', accelerators={'L4': 1})
+        four_gpu = make_location('four', accelerators={'L4': 4})
+        costs = {one_gpu: 0.2, four_gpu: 0.6}
+
+        assert make_placer(costs).select_next_location([]) == one_gpu
+        assert _make_per_gpu_placer(costs).select_next_location([]) == four_gpu
+
+    def test_least_loaded_spreading_precedes_per_gpu_cost(self):
+        one_gpu = make_location('one', accelerators={'L4': 1})
+        four_gpu = make_location('four', accelerators={'L4': 4})
+        placer = _make_per_gpu_placer({one_gpu: 0.2, four_gpu: 0.6})
+
+        assert placer.select_next_location([four_gpu]) == one_gpu
+
+    def test_zero_cost_tier_still_wins(self):
+        reserved = make_location('reserved', accelerators={'A100': 1})
+        paid = make_location('paid', accelerators={'L4': 8})
+        placer = _make_per_gpu_placer({reserved: 0.0, paid: 0.4})
+
+        assert placer.select_next_location([reserved] * 20) == reserved
 
 
 class TestProvisionTimeoutWarning:
@@ -308,6 +345,12 @@ class TestMixedValidation:
     def test_mixed_with_placer_accepted(self):
         from sky.serve import serve_utils
         serve_utils.validate_service_task(self._task('dynamic_fallback',
+                                                     k8s_spot=False),
+                                          pool=False)
+
+    def test_mixed_with_per_gpu_placer_accepted(self):
+        from sky.serve import serve_utils
+        serve_utils.validate_service_task(self._task('dynamic_fallback_per_gpu',
                                                      k8s_spot=False),
                                           pool=False)
 
