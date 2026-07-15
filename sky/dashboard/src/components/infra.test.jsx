@@ -8,6 +8,13 @@ import {
 
 import { ContextDetails } from '@/components/infra';
 import { ContextDetails as ExtractedContextDetails } from '@/components/infra-context-details';
+import { SSHNodePoolDetails } from '@/components/ssh-node-pool-details';
+import {
+  getSSHNodePoolStatus,
+  sshDownNodePool,
+  streamSSHDeploymentLogs,
+  streamSSHOperationLogs,
+} from '@/data/connectors/ssh-node-pools';
 import { checkGrafanaAvailability, getGrafanaUrl } from '@/utils/grafana';
 import { trackInfraAction } from '@/lib/analytics';
 
@@ -20,6 +27,17 @@ jest.mock('@/utils/grafana', () => ({
 
 jest.mock('@/lib/analytics', () => ({
   trackInfraAction: jest.fn(),
+}));
+
+jest.mock('@/data/connectors/ssh-node-pools', () => ({
+  getSSHNodePools: jest.fn(),
+  updateSSHNodePools: jest.fn(),
+  deleteSSHNodePool: jest.fn(),
+  deploySSHNodePool: jest.fn(),
+  sshDownNodePool: jest.fn(),
+  getSSHNodePoolStatus: jest.fn(),
+  streamSSHDeploymentLogs: jest.fn(),
+  streamSSHOperationLogs: jest.fn(),
 }));
 
 jest.mock('@/plugins/PluginSlot', () => ({
@@ -162,5 +180,114 @@ describe('ContextDetails', () => {
       expect.stringContaining('from=now-15m')
     );
     expect(global.fetch).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('SSHNodePoolDetails', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    getSSHNodePoolStatus.mockResolvedValue({
+      pool_name: 'gpu-pool',
+      status: 'Not Ready',
+      reason: 'runtime missing',
+    });
+  });
+
+  it('loads status and exposes the deploy action for a non-ready pool', async () => {
+    render(
+      <SSHNodePoolDetails
+        poolName="gpu-pool"
+        gpusInContext={[]}
+        nodesInContext={[]}
+        handleDeploySSHPool={jest.fn()}
+        handleDeleteSSHPool={jest.fn()}
+      />
+    );
+
+    expect(await screen.findByText('Not Ready')).toBeVisible();
+    expect(
+      screen.getByText('(Click Deploy to set up this node pool)')
+    ).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Deploy' })).toBeEnabled();
+    expect(getSSHNodePoolStatus).toHaveBeenCalledTimes(1);
+    expect(getSSHNodePoolStatus).toHaveBeenCalledWith('gpu-pool');
+  });
+
+  it('streams deployment logs and reports successful completion', async () => {
+    const handleDeploySSHPool = jest
+      .fn()
+      .mockResolvedValue({ request_id: 'request-123' });
+    streamSSHDeploymentLogs.mockImplementation(
+      async ({ requestId, onNewLog }) => {
+        expect(requestId).toBe('request-123');
+        onNewLog('\u001b[32mInstalling\u001b[0m\n');
+        onNewLog('D 07-15 12:34:56 hidden debug line\n└── ready\n');
+      }
+    );
+
+    render(
+      <SSHNodePoolDetails
+        poolName="gpu-pool"
+        gpusInContext={[]}
+        nodesInContext={[]}
+        handleDeploySSHPool={handleDeploySSHPool}
+        handleDeleteSSHPool={jest.fn()}
+      />
+    );
+
+    await screen.findByText('Not Ready');
+    fireEvent.click(screen.getByRole('button', { name: 'Deploy' }));
+    const confirmDialog = screen.getByRole('dialog');
+    fireEvent.click(
+      within(confirmDialog).getByRole('button', { name: 'Deploy' })
+    );
+
+    expect(
+      await screen.findByText('Deployment completed successfully!')
+    ).toBeVisible();
+    expect(handleDeploySSHPool).toHaveBeenCalledWith('gpu-pool');
+    expect(streamSSHDeploymentLogs).toHaveBeenCalledTimes(1);
+    expect(screen.getByText(/Installing/)).toHaveTextContent('Installing');
+    expect(screen.getByText(/└─ ready/)).toBeVisible();
+    expect(screen.queryByText(/hidden debug line/)).not.toBeInTheDocument();
+  });
+
+  it('tears down the pool before deleting its configuration', async () => {
+    const handleDeleteSSHPool = jest.fn().mockResolvedValue(undefined);
+    sshDownNodePool.mockResolvedValue({ request_id: 'down-123' });
+    streamSSHOperationLogs.mockImplementation(
+      async ({ requestId, operationType, onNewLog }) => {
+        expect(requestId).toBe('down-123');
+        expect(operationType).toBe('down');
+        onNewLog('Stopped workers\n');
+      }
+    );
+
+    render(
+      <SSHNodePoolDetails
+        poolName="gpu-pool"
+        gpusInContext={[]}
+        nodesInContext={[]}
+        handleDeploySSHPool={jest.fn()}
+        handleDeleteSSHPool={handleDeleteSSHPool}
+      />
+    );
+
+    await screen.findByText('Not Ready');
+    fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
+    const confirmDialog = screen.getByRole('dialog');
+    fireEvent.click(
+      within(confirmDialog).getByRole('button', { name: 'Delete' })
+    );
+
+    expect(
+      await screen.findByText('Deployment completed successfully!')
+    ).toBeVisible();
+    expect(sshDownNodePool).toHaveBeenCalledWith('gpu-pool');
+    expect(streamSSHOperationLogs).toHaveBeenCalledTimes(1);
+    expect(handleDeleteSSHPool).toHaveBeenCalledWith('gpu-pool');
+    expect(
+      screen.getByText(/SSH Node Pool teardown completed successfully/)
+    ).toBeVisible();
   });
 });
