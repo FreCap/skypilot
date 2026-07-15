@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { CircularProgress } from '@mui/material';
 import Link from 'next/link';
 import {
@@ -63,7 +63,6 @@ export function ServiceAccountTokensView({
   searchQuery,
   setSearchQuery,
 }) {
-  const [tokens, setTokens] = useState([]);
   const [loading, setLoading] = useState(true);
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
   const [tokenToDelete, setTokenToDelete] = useState(null);
@@ -87,6 +86,7 @@ export function ServiceAccountTokensView({
 
   // Enhanced tokens with cluster/job counts
   const [tokensWithCounts, setTokensWithCounts] = useState([]);
+  const refreshIdRef = useRef(0);
 
   // Server-side pagination state (used only when the pagination plugin
   // exposes window.__skyServiceAccountTokensPaginationFetch). Defer the
@@ -118,6 +118,8 @@ export function ServiceAccountTokensView({
   // Fetch tokens and related data
   const fetchTokensAndCounts = useCallback(
     async (forceRefresh = false) => {
+      const refreshId = ++refreshIdRef.current;
+      const ownsRefresh = () => refreshId === refreshIdRef.current;
       try {
         setLoading(true);
 
@@ -143,8 +145,8 @@ export function ServiceAccountTokensView({
               },
             ]
           );
+          if (!ownsRefresh()) return;
           const items = resp.items || [];
-          setTokens(items);
           setTotal(resp.total ?? items.length);
           setTotalPages(resp.total_pages ?? resp.totalPages ?? 1);
           setHasNext(resp.has_next ?? resp.hasNext ?? false);
@@ -169,16 +171,14 @@ export function ServiceAccountTokensView({
           dashboardCache.invalidate(getServiceAccountTokens);
         }
 
-        // Step 1: Fetch service account tokens (using cache)
-        const tokensData = await dashboardCache.get(getServiceAccountTokens);
-        setTokens(tokensData || []);
-
-        // Step 2: Fetch clusters and jobs data in parallel
-        const { clustersData, jobsResponse } = await fetchClustersAndJobs();
+        const [tokensData, { clustersData, jobsResponse }] = await Promise.all([
+          dashboardCache.get(getServiceAccountTokens),
+          fetchClustersAndJobs(),
+        ]);
+        if (!ownsRefresh()) return;
         const jobsData = jobsResponse?.jobs || [];
         const usageByUser = aggregateUserUsage(clustersData, jobsData);
 
-        // Step 3: Calculate counts for each service account
         const enhancedTokens = (tokensData || []).map((token) => {
           const usage = usageByUser.get(token.service_account_user_id) || {
             clusterCount: 0,
@@ -200,11 +200,11 @@ export function ServiceAccountTokensView({
 
         setTokensWithCounts(enhancedTokens);
       } catch (error) {
+        if (!ownsRefresh()) return;
         console.error('Error fetching tokens and counts:', error);
-        setTokens([]);
         setTokensWithCounts([]);
       } finally {
-        setLoading(false);
+        if (ownsRefresh()) setLoading(false);
       }
     },
     [page, limit, debouncedSearch, serverPaginated]
@@ -212,6 +212,9 @@ export function ServiceAccountTokensView({
 
   useEffect(() => {
     fetchTokensAndCounts();
+    return () => {
+      refreshIdRef.current += 1;
+    };
   }, [fetchTokensAndCounts]);
 
   // Role editing functions
