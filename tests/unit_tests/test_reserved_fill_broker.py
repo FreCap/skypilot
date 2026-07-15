@@ -9,6 +9,7 @@ downstream identity.
 # pylint: disable=protected-access,invalid-name
 import contextlib
 import json
+import pickle
 from typing import List
 from unittest import mock
 
@@ -41,6 +42,30 @@ def _claim(floor=0,
 
 
 # =========================== Pure allocation math ===========================
+
+
+def test_allocation_math_facade_identity_and_pickle_round_trip():
+    assert broker.ClaimInput.__module__ == broker.__name__
+    claim = _claim(floor=2, effective_cap=1)
+    assert pickle.loads(pickle.dumps(claim)) == claim
+    for function in (broker.scale_floors, broker.water_fill,
+                     broker.compute_entitlements, broker.damp_grants,
+                     broker.compute_feeds):
+        assert function.__module__ == broker.__name__
+        assert pickle.loads(pickle.dumps(function)) is function
+
+
+def test_scale_floors_uses_deterministic_largest_remainder_rounding():
+    assert broker.scale_floors(2, {
+        'c': 1,
+        'b': 1,
+        'a': 1
+    }) == {
+        'a': 1,
+        'b': 1,
+        'c': 0,
+    }
+    assert broker.scale_floors(-1, {'a': 1}) == {'a': 0}
 
 
 class TestWaterFill:
@@ -144,6 +169,32 @@ class TestEntitlements:
 
 
 class TestFeeds:
+
+    def test_malformed_sticky_amount_ignored_but_valid_since_preserved(self):
+        claims = {'a': _claim(), 'b': _claim()}
+        feeds, sticky = broker.compute_feeds(2, {
+            'a': 2,
+            'b': 2
+        }, claims, {
+            'a': {
+                'amount': 'invalid',
+                'since': 0.0
+            },
+            'b': {
+                'amount': 1,
+            },
+        }, 10.0, 100.0)
+        assert feeds == {'a': 1, 'b': 1}
+        assert sticky == {
+            'a': {
+                'amount': 1,
+                'since': 0.0
+            },
+            'b': {
+                'amount': 1,
+                'since': 10.0
+            },
+        }
 
     def test_bounded_by_free_and_need(self):
         grants = {'a': 5, 'b': 5}
