@@ -12,8 +12,51 @@ from sky import resources
 from sky import task
 from sky.backends import cloud_vm_ray_backend
 from sky.backends.cloud_vm_ray_backend import CloudVmRayResourceHandle
+from sky.backends.cloud_vm_ray_backend import GangSchedulingStatus
+from sky.backends.cloud_vm_ray_backend import RetryingVmProvisioner
 from sky.backends.cloud_vm_ray_backend import SSHTunnelInfo
 from sky.utils import status_lib
+
+
+@pytest.mark.parametrize(('workers_ready', 'expected_status'),
+                         [(False, GangSchedulingStatus.GANG_FAILED),
+                          (True, GangSchedulingStatus.CLUSTER_READY)])
+def test_gang_schedule_uses_worker_readiness_result(workers_ready,
+                                                    expected_status):
+    handle = MagicMock(cluster_name='test-cluster', launched_nodes=2)
+    logging_info = {'region_name': 'us-east-1', 'zone_str': ''}
+
+    with patch.object(
+            cloud_vm_ray_backend,
+            'write_ray_up_script_with_patched_launch_hash_fn',
+            return_value='/tmp/ray-up.py'), patch.object(
+                cloud_vm_ray_backend.log_lib,
+                'run_with_log',
+                return_value=(
+                    0, 'head ready', '')) as mock_ray_up, patch.object(
+                        cloud_vm_ray_backend.backend_utils,
+                        'wait_until_ray_cluster_ready',
+                        return_value=(workers_ready,
+                                      'docker-user')) as mock_wait_ready:
+        status, stdout, stderr, head_internal_ip, head_external_ip = (
+            RetryingVmProvisioner._gang_schedule_ray_up(  # pylint: disable=protected-access
+                MagicMock(),
+                cloud_vm_ray_backend.clouds.AWS(),
+                '/tmp/cluster.yaml',
+                handle,
+                '/tmp/provision.log',
+                stream_logs=False,
+                logging_info=logging_info,
+                use_spot=False))
+
+    assert status is expected_status
+    assert (stdout, stderr, head_internal_ip, head_external_ip) == ('', '',
+                                                                    None, None)
+    mock_ray_up.assert_called_once()
+    mock_wait_ready.assert_called_once_with('/tmp/cluster.yaml',
+                                            num_nodes=2,
+                                            log_path='/tmp/provision.log',
+                                            nodes_launching_progress_timeout=90)
 
 
 class TestCloudVmRayBackendTaskRedaction:

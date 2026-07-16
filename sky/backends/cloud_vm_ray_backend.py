@@ -2046,7 +2046,7 @@ class RetryingVmProvisioner:
         # FIXME(zongheng): the below requires ray processes are up on head. To
         # repro it failing: launch a 2-node cluster, log into head and ray
         # stop, then launch again.
-        cluster_ready = backend_utils.wait_until_ray_cluster_ready(
+        cluster_ready, _ = backend_utils.wait_until_ray_cluster_ready(
             cluster_config_file,
             num_nodes=cluster_handle.launched_nodes,
             log_path=log_abs_path,
