@@ -17,18 +17,13 @@ router = fastapi.APIRouter()
 @router.get('')
 async def list_recipes(request: fastapi.Request) -> None:
     """List recipes (pinned + user's own)."""
-    auth_user = request.state.auth_user
-    auth_user_env_vars_kwargs = {
-        'env_vars': auth_user.to_env_vars()
-    } if auth_user else {}
-    request_body = payloads.RecipeListBody(**auth_user_env_vars_kwargs)
-
     await executor.schedule_request_async(
         request_id=request.state.request_id,
         request_name=request_names.RequestName.RECIPE_LIST,
-        request_body=request_body,
+        request_body=payloads.RecipeListBody(),
         func=core.list_recipes,
         schedule_type=api_requests.ScheduleType.SHORT,
+        auth_user=request.state.auth_user,
     )
 
 
@@ -44,6 +39,7 @@ async def list_recipes_with_filters(
         request_body=list_body,
         func=core.list_recipes,
         schedule_type=api_requests.ScheduleType.SHORT,
+        auth_user=request.state.auth_user,
     )
 
 
@@ -59,6 +55,7 @@ async def get_recipe(
         request_body=get_body,
         func=core.get_recipe,
         schedule_type=api_requests.ScheduleType.SHORT,
+        auth_user=request.state.auth_user,
     )
 
 
@@ -74,6 +71,7 @@ async def create_recipe(
         request_body=create_body,
         func=core.create_recipe,
         schedule_type=api_requests.ScheduleType.SHORT,
+        auth_user=request.state.auth_user,
     )
 
 
@@ -89,6 +87,7 @@ async def update_recipe(
         request_body=update_body,
         func=core.update_recipe,
         schedule_type=api_requests.ScheduleType.SHORT,
+        auth_user=request.state.auth_user,
     )
 
 
@@ -104,6 +103,7 @@ async def delete_recipe(
         request_body=delete_body,
         func=core.delete_recipe,
         schedule_type=api_requests.ScheduleType.SHORT,
+        auth_user=request.state.auth_user,
     )
 
 
@@ -121,4 +121,5 @@ async def pin_recipe(
         request_body=pin_body,
         func=core.toggle_pin,
         schedule_type=api_requests.ScheduleType.SHORT,
+        auth_user=request.state.auth_user,
     )
