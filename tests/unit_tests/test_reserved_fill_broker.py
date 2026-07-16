@@ -10,7 +10,6 @@ downstream identity.
 import contextlib
 import json
 import pickle
-from typing import List
 from unittest import mock
 
 import pytest
@@ -21,12 +20,23 @@ from sqlalchemy import orm
 from sqlalchemy.sql import dml
 
 from sky.serve import constants as serve_constants
+from sky.serve import replica_managers
 from sky.serve import reserved_capacity_broker as broker
 from sky.serve import serve_state
 from sky.utils import common_utils
 from sky.utils import locks
 
 _POOL = broker.make_pool_key('research-ctx', 'A100')
+
+
+def _replica(replica_id: int = 1) -> replica_managers.ReplicaInfo:
+    return replica_managers.ReplicaInfo(replica_id=replica_id,
+                                        cluster_name=f'svc-{replica_id}',
+                                        replica_port='8080',
+                                        is_spot=False,
+                                        location=None,
+                                        version=1,
+                                        resources_override=None)
 
 
 def _claim(floor=0,
@@ -977,7 +987,7 @@ class TestEpochFencing:
         assert b_first.epoch != broker.current_epoch(pool_b)
 
     def test_feed_only_redistribution_bumps_epoch(self, clock, monkeypatch):
-        rows: List[mock.Mock] = []
+        rows: list[mock.Mock] = []
         monkeypatch.setattr(
             serve_state, 'get_replica_infos',
             mock.Mock(side_effect=lambda name: rows if name == 'svc-a' else []))
@@ -1130,7 +1140,7 @@ class TestStaleWriterFence:
 class TestAtomicPersistFence:
     """The launch-path epoch recheck is atomic with the replica persist."""
 
-    _STUB_INFO = 'replica-info-stub'  # pickled opaquely by the persist
+    _STUB_INFO = _replica()
 
     def _replica_row_count(self):
         engine = serve_state._db_manager.get_engine()
@@ -1173,6 +1183,21 @@ class TestAtomicPersistFence:
                                                       pool_key=pool_b,
                                                       expected_epoch=99)
         assert self._replica_row_count() == 2
+
+    def test_persist_writes_readable_authoritative_state(self):
+        _upsert('svc-a')
+        _upsert('svc-b')
+        alloc = _run('svc-a', free=4)
+        assert alloc is not None
+        info = _replica(7)
+
+        assert serve_state.add_replica_if_round_epoch(
+            'svc-a', 7, info, pool_key=_POOL, expected_epoch=alloc.epoch)
+
+        stored = serve_state.get_replica_info_from_id('svc-a', 7)
+        assert stored is not None
+        assert stored.replica_id == 7
+        assert stored.cluster_name == 'svc-7'
 
     def test_persist_requires_live_same_pool_claim(self):
         # A disabled/pruned claimant's queued fill launch must fence out
@@ -1268,7 +1293,7 @@ class TestRoundPersistExclusion:
     (fenced by the bumped epoch).
     """
 
-    _STUB_INFO = 'replica-info-stub'
+    _STUB_INFO = _replica()
 
     def _replica_row_count(self):
         engine = serve_state._db_manager.get_engine()
@@ -1333,7 +1358,7 @@ class TestFencePendingFailsClosed:
     must fail closed while the marker is set.
     """
 
-    _STUB_INFO = 'replica-info-stub'
+    _STUB_INFO = _replica()
 
     def _replica_row_count(self):
         engine = serve_state._db_manager.get_engine()
@@ -1534,7 +1559,7 @@ class TestSqliteFenceBusySkip:
 
         monkeypatch.setattr(orm.Session, 'execute', busy_execute)
         assert not serve_state.add_replica_if_round_epoch(
-            'svc-a', 1, 'stub-info', pool_key=_POOL, expected_epoch=alloc.epoch)
+            'svc-a', 1, _replica(), pool_key=_POOL, expected_epoch=alloc.epoch)
         assert attempts['count'] == serve_state._SQLITE_FENCE_BUSY_RETRIES
         monkeypatch.setattr(orm.Session, 'execute', real_execute)
         engine = serve_state._db_manager.get_engine()
@@ -1743,7 +1768,7 @@ class TestFedLaunchBootSurvival:
 
     def test_grant_never_drops_below_holdings_while_booting(
             self, clock, monkeypatch):
-        rows: List[mock.Mock] = []
+        rows: list[mock.Mock] = []
         monkeypatch.setattr(
             serve_state, 'get_replica_infos',
             mock.Mock(side_effect=lambda name: rows if name == 'svc-a' else []))

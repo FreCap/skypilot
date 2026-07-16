@@ -3314,7 +3314,7 @@ def add_replica_if_round_epoch(
     launch exactly like a fenced pre-check.
     """
     engine = _db_manager.get_engine()
-    pickled_info = pickle.dumps(replica_info)
+    row_values = _replica_row_values(service_name, replica_id, replica_info)
     if engine.dialect.name != db_utils.SQLAlchemyDialect.SQLITE.value:
         with orm.Session(engine) as session:
             if expected_service_hash is not None:
@@ -3348,12 +3348,14 @@ def add_replica_if_round_epoch(
                 session.rollback()
                 return False
             insert_stmt = _upsert_insert_func(engine)(replicas_table).values(
-                service_name=service_name,
-                replica_id=replica_id,
-                replica_info=pickled_info)
+                **row_values)
             insert_stmt = insert_stmt.on_conflict_do_update(
                 index_elements=['service_name', 'replica_id'],
-                set_={'replica_info': insert_stmt.excluded.replica_info})
+                set_={
+                    column.name: getattr(insert_stmt.excluded, column.name)
+                    for column in replicas_table.c
+                    if column.name not in ('service_name', 'replica_id')
+                })
             session.execute(insert_stmt)
             session.commit()
         return True
@@ -3383,16 +3385,20 @@ def add_replica_if_round_epoch(
             ])
         current_incarnation = sqlalchemy.select(
             services_table.c.name).where(*owner_predicates).exists()
-    select_stmt = sqlalchemy.select(
-        sqlalchemy.literal(service_name),
-        sqlalchemy.literal(replica_id),
-        sqlalchemy.literal(pickled_info, sqlalchemy.LargeBinary()),
-    ).where(sqlalchemy.not_(stale_round), live_claim, current_incarnation)
+    columns = [replicas_table.c[name] for name in row_values]
+    select_stmt = sqlalchemy.select(*[
+        sqlalchemy.literal(row_values[column.name], type_=column.type)
+        for column in columns
+    ]).where(sqlalchemy.not_(stale_round), live_claim, current_incarnation)
     insert_stmt = sqlite.insert(replicas_table).from_select(
-        ['service_name', 'replica_id', 'replica_info'], select_stmt)
+        [column.name for column in columns], select_stmt)
     insert_stmt = insert_stmt.on_conflict_do_update(
         index_elements=['service_name', 'replica_id'],
-        set_={'replica_info': insert_stmt.excluded.replica_info})
+        set_={
+            column.name: getattr(insert_stmt.excluded, column.name)
+            for column in replicas_table.c
+            if column.name not in ('service_name', 'replica_id')
+        })
     for attempt in range(_SQLITE_FENCE_BUSY_RETRIES):
         try:
             with orm.Session(engine) as session:
