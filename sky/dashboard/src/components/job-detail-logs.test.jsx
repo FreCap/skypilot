@@ -1,7 +1,14 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react';
 
 import JobDetails from '@/pages/jobs/[job]';
 import {
+  downloadManagedJobLogs,
   streamManagedJobLogs,
   useSingleManagedJob,
 } from '@/data/connectors/jobs';
@@ -159,6 +166,34 @@ it('preserves expanded controller-log streaming and plugin context', async () =>
       status: 'RUNNING',
       isController: true,
       refreshTrigger: 0,
+    });
+  });
+});
+
+it('preserves controller-log expansion and download behavior', async () => {
+  downloadManagedJobLogs.mockResolvedValue(undefined);
+  render(<JobDetails />);
+
+  const section = document.querySelector('#controller-logs-section');
+  const toggle = within(section).getByRole('button', {
+    name: /Controller Logs/,
+  });
+  expect(screen.queryByText('controller output')).not.toBeInTheDocument();
+
+  fireEvent.click(toggle);
+
+  expect(window.localStorage.getItem('skypilot-controller-logs-expanded')).toBe(
+    'true'
+  );
+  expect(await screen.findByText('controller output')).toBeInTheDocument();
+
+  const [, downloadButton] = within(section).getAllByRole('button');
+  fireEvent.click(downloadButton);
+  await waitFor(() => {
+    expect(downloadManagedJobLogs).toHaveBeenCalledWith({
+      jobId: 42,
+      controller: true,
+      jobStatus: 'RUNNING',
     });
   });
 });
