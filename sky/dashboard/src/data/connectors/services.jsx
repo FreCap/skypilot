@@ -72,6 +72,7 @@ const HISTORY_COUNT_FIELDS = [
 
 export function normalizeReplicaHistory(history) {
   if (!history || typeof history !== 'object') return null;
+  const available = history.available !== false;
   const samples = Array.isArray(history.samples)
     ? history.samples
         .map((sample) => {
@@ -112,7 +113,7 @@ export function normalizeReplicaHistory(history) {
     : [];
   const requestsLastHour = Number(history.requests_last_hour);
   return {
-    available: history.available !== false,
+    available,
     bucketSeconds: Number(history.bucket_seconds) || 60,
     retentionHours: Number(history.retention_hours) || 72,
     windowStart: Number(history.window_start) || null,
@@ -124,7 +125,7 @@ export function normalizeReplicaHistory(history) {
         ? Number(history.request_window_seconds)
         : null,
     requestsLastHour:
-      Number.isInteger(requestsLastHour) && requestsLastHour >= 0
+      available && Number.isInteger(requestsLastHour) && requestsLastHour >= 0
         ? requestsLastHour
         : null,
   };

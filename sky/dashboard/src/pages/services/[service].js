@@ -410,7 +410,10 @@ export function ServiceDetailCard({
       `${serviceData.recentRequestCount.toLocaleString()} requests in ${serviceData.requestWindowSeconds}s`
     );
   }
-  if (requestHistory?.requestsLastHour != null) {
+  if (
+    requestHistory?.available !== false &&
+    requestHistory?.requestsLastHour != null
+  ) {
     requestDetails.push(
       `${requestHistory.requestsLastHour.toLocaleString()} requests in last hour`
     );

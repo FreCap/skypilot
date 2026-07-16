@@ -48,6 +48,29 @@ def test_begin_draining_is_idempotent():
     assert lb._draining is True
 
 
+def test_begin_draining_flushes_pending_request_history_once():
+
+    async def _scenario():
+        lb = _make_lb()
+        lb._request_aggregator.add(None)
+        flushed = asyncio.Event()
+
+        async def _flush():
+            flushed.set()
+
+        with mock.patch.object(lb,
+                               '_flush_request_history_on_drain',
+                               side_effect=_flush) as flush:
+            lb._begin_draining()
+            await asyncio.wait_for(flushed.wait(), timeout=1)
+            lb._begin_draining()
+            await asyncio.sleep(0)
+        flush.assert_awaited_once_with()
+        assert not lb._background_tasks
+
+    asyncio.run(_scenario())
+
+
 def test_draining_rejects_new_inference_requests():
     lb = _make_lb()
     lb._begin_draining()
@@ -55,6 +78,31 @@ def test_draining_rejects_new_inference_requests():
         asyncio.run(lb._proxy_with_retries(mock.MagicMock()))
     assert exc_info.value.status_code == 503
     assert exc_info.value.headers['Retry-After']
+
+
+def test_drain_during_admission_rejects_before_recording_request():
+
+    async def _scenario():
+        lb = _make_lb()
+        request = mock.MagicMock()
+
+        async def _admit(_request):
+            lb._begin_draining()
+            return True
+
+        with mock.patch.object(lb,
+                               '_acquire_request_slot',
+                               side_effect=_admit), \
+             mock.patch.object(
+                 lb,
+                 '_release_request_slot',
+                 new=mock.AsyncMock()):
+            with pytest.raises(fastapi.HTTPException) as exc_info:
+                await lb._proxy_with_retries(request)
+        assert exc_info.value.status_code == 503
+        assert lb._request_aggregator.request_history_snapshot() is None
+
+    asyncio.run(_scenario())
 
 
 def test_session_id_is_pod_uid(monkeypatch):

@@ -326,8 +326,10 @@ class _FakeSession:
         self._captured = captured
 
     def post(self, *args, **kwargs):
+        self._captured['url'] = args[0]
         self._captured['headers'] = kwargs.get('headers')
         self._captured['json'] = kwargs.get('json')
+        self._captured['timeout'] = kwargs.get('timeout')
         self._captured.setdefault('headers_history',
                                   []).append(kwargs.get('headers'))
         self._captured.setdefault('json_history', []).append(kwargs.get('json'))
@@ -652,6 +654,47 @@ def test_request_history_ack_does_not_erase_arrival_during_sync(monkeypatch):
         'bucket_start': 120,
         'request_count': 2,
     }]
+
+
+def test_drain_flush_uses_history_only_endpoint_and_acknowledges(monkeypatch):
+    now = [120.0]
+    monkeypatch.setattr(serve_utils.time, 'time', lambda: now[0])
+    lb = _make_lb()
+    lb._request_aggregator.add(None)
+    captured = {'response_json': {'request_history_accepted': True}}
+    monkeypatch.setattr(load_balancer.aiohttp, 'ClientSession',
+                        lambda *a, **k: _FakeSession(200, captured))
+
+    _run(lb._flush_request_history_on_drain())
+
+    assert captured['url'].endswith(
+        '/controller/load_balancer_request_history_sync')
+    assert set(captured['json']) == {
+        'request_history',
+        'request_history_session_id',
+        'lb_session_id',
+    }
+    assert captured['json']['request_history']['buckets'] == [{
+        'bucket_start': 120,
+        'request_count': 1,
+    }]
+    assert (captured['timeout'].total ==
+            constants.LB_DRAIN_HISTORY_FLUSH_TIMEOUT_SECONDS)
+    assert lb._request_aggregator.request_history_snapshot() is None
+
+
+def test_failed_drain_flush_is_bounded_and_retains_history(monkeypatch):
+    now = [120.0]
+    monkeypatch.setattr(serve_utils.time, 'time', lambda: now[0])
+    lb = _make_lb()
+    lb._request_aggregator.add(None)
+    captured = {}
+    monkeypatch.setattr(load_balancer.aiohttp, 'ClientSession',
+                        lambda *a, **k: _FakeSession(500, captured))
+
+    _run(lb._flush_request_history_on_drain())
+
+    assert lb._request_aggregator.request_history_snapshot() is not None
 
 
 def test_aggregator_keeps_arrivals_during_successful_sync(monkeypatch):

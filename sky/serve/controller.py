@@ -518,17 +518,27 @@ class SkyServeController:
             if info.version in logical_versions or info.is_terminal:
                 continue
             observed = observed_slots.get(info.replica_id)
+            if observed is None or observed < 1:
+                continue
+            current = getattr(info, 'planned_capacity', 1)
+            if (isinstance(current, bool) or not isinstance(current, int) or
+                    current < 1):
+                current = 1
+            durable_bound = (current if bool(
+                getattr(info, 'logical_bridge_capacity_verified', False)) else
+                             1)
             cached = self._lb_translation_cache.get(info.replica_id)
-            if observed is None or observed < 1 or cached is None:
+            if cached is None:
+                observed_slots[info.replica_id] = min(observed, durable_bound)
                 continue
             gpu_type, gpu_count = cached[1], cached[2]
             if (gpu_type == 'unknown' or isinstance(gpu_count, bool) or
                     not isinstance(gpu_count, int) or gpu_count < 1):
+                observed_slots[info.replica_id] = min(observed, durable_bound)
                 continue
             verified = min(observed, gpu_count)
             # Pass only state transitions to the manager. This keeps the LB
             # sync hot path free of a redundant DB read/write per heartbeat.
-            current = int(getattr(info, 'planned_capacity', 1))
             if (not bool(
                     getattr(info, 'logical_bridge_capacity_verified', False)) or
                     verified > current):
@@ -630,6 +640,37 @@ class SkyServeController:
             return None, None
         return in_flight, routing_urls
 
+    async def _confirm_logical_bridge_capacities(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+        logical_versions: set[int],
+        observed_slots: dict[int, int],
+    ) -> None:
+        """Bound and durably confirm physical-bridge logical capacities."""
+        bridge_candidates = self._logical_bridge_capacity_candidates(
+            replica_infos, logical_versions, observed_slots)
+        if not bridge_candidates:
+            return
+        confirmer = getattr(self._replica_manager,
+                            'confirm_logical_bridge_capacities', None)
+        if not callable(confirmer):
+            return
+        loop = asyncio.get_running_loop()
+        try:
+            confirmed = await loop.run_in_executor(None, confirmer,
+                                                   bridge_candidates)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning('Failed to persist verified logical bridge '
+                           'capacity; retaining conservative width one: '
+                           f'{common_utils.format_exception(e)}')
+            return
+        infos_by_id = {info.replica_id: info for info in replica_infos}
+        for replica_id, capacity in confirmed.items():
+            info = infos_by_id.get(replica_id)
+            if info is not None:
+                info.planned_capacity = capacity
+                info.logical_bridge_capacity_verified = True
+
     async def _ingest_load_balancer_report(
         self,
         request_data: dict[str, Any],
@@ -652,6 +693,30 @@ class SkyServeController:
             authority = await loop.run_in_executor(
                 None, self._lb_report_authority,
                 request_data.get('lb_session_id'))
+        observed_slots: dict[int, int] = {}
+        if authority[1]:
+            observed_slots = self._translate_observed_slots(
+                request_data.get('total_slots_by_url'))
+            if logical_versions is not None:
+                await self._confirm_logical_bridge_capacities(
+                    replica_infos, logical_versions, observed_slots)
+        return self._apply_load_balancer_report(
+            request_data,
+            replica_infos,
+            async_occupancy_by_version,
+            authority,
+            observed_slots,
+        )
+
+    def _apply_load_balancer_report(
+        self,
+        request_data: dict[str, Any],
+        replica_infos: list['replica_managers.ReplicaInfo'],
+        async_occupancy_by_version: dict[int, bool | None],
+        authority: tuple[bool, bool, bool],
+        observed_slots: dict[int, int],
+    ) -> bool:
+        """Synchronously mutate runtime state from one prepared LB report."""
         (reporter_is_live, demand_authoritative,
          drain_authoritative) = authority
         if not reporter_is_live:
@@ -681,33 +746,6 @@ class SkyServeController:
                 request_data.get('occupancy_sampled_urls', []),
                 request_data.get('unknown_in_flight_urls', []),
                 force_all_live_unknown=not drain_authoritative)
-            observed_slots = self._translate_observed_slots(
-                request_data.get('total_slots_by_url'))
-            bridge_candidates = (self._logical_bridge_capacity_candidates(
-                replica_infos, logical_versions, observed_slots)
-                                 if logical_versions is not None else {})
-            if bridge_candidates:
-                confirmer = getattr(self._replica_manager,
-                                    'confirm_logical_bridge_capacities', None)
-                if callable(confirmer):
-                    loop = asyncio.get_running_loop()
-                    try:
-                        confirmed = await loop.run_in_executor(
-                            None, confirmer, bridge_candidates)
-                    except Exception as e:  # pylint: disable=broad-except
-                        logger.warning(
-                            'Failed to persist verified logical bridge '
-                            'capacity; retaining conservative width one: '
-                            f'{common_utils.format_exception(e)}')
-                    else:
-                        infos_by_id = {
-                            info.replica_id: info for info in replica_infos
-                        }
-                        for replica_id, capacity in confirmed.items():
-                            info = infos_by_id.get(replica_id)
-                            if info is not None:
-                                info.planned_capacity = capacity
-                                info.logical_bridge_capacity_verified = True
             self._reconcile_generation = getattr(self, '_reconcile_generation',
                                                  0) + 1
             reconcile_generation = self._reconcile_generation
@@ -786,41 +824,30 @@ class SkyServeController:
             lb_replica_info, num_ready = await loop.run_in_executor(
                 None, self._get_lb_replica_info, replica_infos,
                 async_occupancy_by_version)
-            # Single ownership fence before the handler's only side effects:
-            # everything above is a read, and with `authority` provided the
-            # report ingestion below never awaits, so no other coroutine can
-            # interleave between this fence, the state mutation, and the
-            # routing disclosure. Extra fences after each read would just be
-            # redundant DB round-trips on the LB sync hot path.
+            # History is incarnation-scoped and never changes runtime state,
+            # so it may finish before the final ownership fence even if this
+            # controller loses the service mid-write.
+            observed_slots: dict[int, int] = {}
+            if authority[1]:
+                observed_slots = self._translate_observed_slots(
+                    request_data.get('total_slots_by_url'))
+                if logical_versions is not None:
+                    await self._confirm_logical_bridge_capacities(
+                        replica_infos, logical_versions, observed_slots)
+            request_history_accepted = await self._persist_request_history(
+                request_data)
             if not await loop.run_in_executor(None, self._owns_current_service):
                 return fastapi.Response(status_code=503)
-            request_history_accepted = False
-            try:
-                request_history_accepted = await loop.run_in_executor(
-                    None, self._record_request_history, request_data)
-            except ValueError as e:
-                # A malformed snapshot cannot become valid by retrying. Drop
-                # it with an acknowledgement so a mixed-version or corrupted
-                # LB cannot hammer the controller every sync forever.
-                request_history_accepted = True
-                logger.warning(
-                    'Dropping invalid load balancer request history for '
-                    f'{self._service_name!r}: '
-                    f'{common_utils.format_exception(e)}')
-            except Exception as e:  # pylint: disable=broad-except
-                # Request history is observability, not control-plane state.
-                # Keep routing and autoscaling available while asking the LB
-                # to retry only its bounded cumulative counters.
-                logger.warning(
-                    'Failed to persist load balancer request history for '
-                    f'{self._service_name!r}: '
-                    f'{common_utils.format_exception(e)}')
-            await self._ingest_load_balancer_report(
+            # All awaits, including durable bridge confirmation, are above
+            # this final ownership fence. Runtime mutation and confidential
+            # routing disclosure below are one synchronous critical section.
+            self._apply_load_balancer_report(
                 request_data,
                 replica_infos,
                 async_occupancy_by_version,
-                authority=authority,
-                logical_versions=logical_versions)
+                authority,
+                observed_slots,
+            )
             self._replica_counts_snapshot = self._get_replica_counts(
                 replica_infos)
             return responses.JSONResponse(content={
@@ -832,6 +859,46 @@ class SkyServeController:
                 'request_history_accepted': request_history_accepted,
             },
                                           status_code=200)
+
+    async def _handle_load_balancer_request_history_sync(
+            self, request_data: dict[str, Any]) -> fastapi.Response:
+        """Persist a draining LB's history without reporting demand."""
+        loop = asyncio.get_running_loop()
+        if not await loop.run_in_executor(None, self._owns_current_service):
+            return fastapi.Response(status_code=503)
+        authority = await loop.run_in_executor(
+            None, self._lb_report_authority, request_data.get('lb_session_id'))
+        if not authority[0]:
+            return fastapi.Response(status_code=503)
+        accepted = await self._persist_request_history(request_data)
+        return responses.JSONResponse(
+            content={'request_history_accepted': accepted}, status_code=200)
+
+    async def _persist_request_history(self, request_data: dict[str,
+                                                                Any]) -> bool:
+        """Persist history without allowing observability to fail sync."""
+        loop = asyncio.get_running_loop()
+        try:
+            return await loop.run_in_executor(None,
+                                              self._record_request_history,
+                                              request_data)
+        except ValueError as e:
+            # A malformed snapshot cannot become valid by retrying. Drop it
+            # with an acknowledgement so a mixed-version or corrupted LB
+            # cannot hammer the controller every sync forever.
+            logger.warning('Dropping invalid load balancer request history for '
+                           f'{self._service_name!r}: '
+                           f'{common_utils.format_exception(e)}')
+            return True
+        except Exception as e:  # pylint: disable=broad-except
+            # Request history is observability, not control-plane state.
+            # Keep routing and autoscaling available while asking the LB to
+            # retry only its bounded cumulative counters.
+            logger.warning(
+                'Failed to persist load balancer request history for '
+                f'{self._service_name!r}: '
+                f'{common_utils.format_exception(e)}')
+            return False
 
     def _record_request_history(self, request_data: dict[str, Any]) -> bool:
         """Persist one live LB process's cumulative minute counters."""
@@ -1561,6 +1628,15 @@ class SkyServeController:
                 request: fastapi.Request) -> fastapi.Response:
             request_data = await request.json()
             return await self._handle_load_balancer_sync(request_data)
+
+        @self._app.post(
+            '/controller/load_balancer_request_history_sync',
+            dependencies=[sync_auth_dependency, controller_owner_dependency])
+        async def load_balancer_request_history_sync(
+                request: fastapi.Request) -> fastapi.Response:
+            request_data = await request.json()
+            return await self._handle_load_balancer_request_history_sync(
+                request_data)
 
         # Deliberately a sync handler: parsing and committing the task YAML can
         # perform blocking file/DB I/O. Runtime application happens on the

@@ -24,9 +24,17 @@ router = fastapi.APIRouter()
 
 CONTROLLER_SYNC_ROUTE_PATH = (
     '/api/internal/serve/{service_name}/controller/load_balancer_sync')
+CONTROLLER_HISTORY_SYNC_ROUTE_PATH = (
+    '/api/internal/serve/{service_name}/controller/'
+    'load_balancer_request_history_sync')
 _CONTROLLER_SYNC_ROUTE_PREFIX = '/api/internal/serve/'
-_CONTROLLER_SYNC_ROUTE_SUFFIX = '/controller/load_balancer_sync'
+_CONTROLLER_SYNC_ROUTE_SUFFIXES = (
+    '/controller/load_balancer_sync',
+    '/controller/load_balancer_request_history_sync',
+)
 _CONTROLLER_SYNC_TARGET_PATH = '/controller/load_balancer_sync'
+_CONTROLLER_HISTORY_SYNC_TARGET_PATH = (
+    '/controller/load_balancer_request_history_sync')
 
 # (durable service incarnation, controller process, normalized IP, port).
 # Every member participates in the before/after comparison so same-name
@@ -35,13 +43,15 @@ _ControllerOwner = tuple[str, int, str, int]
 
 
 def is_controller_sync_path(path: str) -> bool:
-    """Whether ``path`` is exactly the internal controller-sync route."""
-    if not (path.startswith(_CONTROLLER_SYNC_ROUTE_PREFIX) and
-            path.endswith(_CONTROLLER_SYNC_ROUTE_SUFFIX)):
+    """Whether ``path`` is exactly an internal LB-controller sync route."""
+    if not path.startswith(_CONTROLLER_SYNC_ROUTE_PREFIX):
         return False
-    service_name = path[len(_CONTROLLER_SYNC_ROUTE_PREFIX
-                           ):-len(_CONTROLLER_SYNC_ROUTE_SUFFIX)]
-    return bool(service_name) and '/' not in service_name
+    for suffix in _CONTROLLER_SYNC_ROUTE_SUFFIXES:
+        if not path.endswith(suffix):
+            continue
+        service_name = path[len(_CONTROLLER_SYNC_ROUTE_PREFIX):-len(suffix)]
+        return bool(service_name) and '/' not in service_name
+    return False
 
 
 def _get_controller_owner(service_name: str) -> _ControllerOwner | None:
@@ -82,11 +92,11 @@ def _get_controller_owner(service_name: str) -> _ControllerOwner | None:
     return service_hash, controller_pid, normalized_ip, controller_port
 
 
-def _controller_sync_url(owner: _ControllerOwner) -> str:
+def _controller_sync_url(owner: _ControllerOwner, target_path: str) -> str:
     _, _, controller_ip, controller_port = owner
     # RFC 3986 requires brackets around an IPv6 literal in a URL authority.
     host = f'[{controller_ip}]' if ':' in controller_ip else controller_ip
-    return f'http://{host}:{controller_port}{_CONTROLLER_SYNC_TARGET_PATH}'
+    return f'http://{host}:{controller_port}{target_path}'
 
 
 def _service_unavailable(detail: str) -> fastapi.responses.JSONResponse:
@@ -100,15 +110,14 @@ async def _read_controller_owner(service_name: str) -> _ControllerOwner | None:
     return await asyncio.to_thread(_get_controller_owner, service_name)
 
 
-@router.post(CONTROLLER_SYNC_ROUTE_PATH, include_in_schema=False)
-async def proxy_load_balancer_sync(
-        service_name: str, request: fastapi.Request) -> fastapi.Response:
+async def _proxy_controller_sync(service_name: str, request: fastapi.Request,
+                                 target_path: str) -> fastapi.Response:
     """Forward one LB sync to the service's current controller owner.
 
     The request is deliberately never retried: the sync carries a drained
-    request batch, so replaying an ambiguous POST could count it twice.  The
-    owner tuple is checked again after the response; a concurrent ownership
-    transfer makes the result unusable even if the old owner replied.
+    request batch or a cumulative history snapshot. The owner tuple is checked
+    again after the response; a concurrent ownership transfer makes the result
+    unusable even if the old owner replied.
     """
     try:
         owner_before = await _read_controller_owner(service_name)
@@ -144,7 +153,7 @@ async def proxy_load_balancer_sync(
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                    _controller_sync_url(owner_before),
+                    _controller_sync_url(owner_before, target_path),
                     data=body,
                     headers=forwarded_headers,
                     timeout=aiohttp.ClientTimeout(
@@ -179,3 +188,17 @@ async def proxy_load_balancer_sync(
     return fastapi.Response(content=response_body,
                             status_code=response_status,
                             headers=response_headers)
+
+
+@router.post(CONTROLLER_SYNC_ROUTE_PATH, include_in_schema=False)
+async def proxy_load_balancer_sync(
+        service_name: str, request: fastapi.Request) -> fastapi.Response:
+    return await _proxy_controller_sync(service_name, request,
+                                        _CONTROLLER_SYNC_TARGET_PATH)
+
+
+@router.post(CONTROLLER_HISTORY_SYNC_ROUTE_PATH, include_in_schema=False)
+async def proxy_load_balancer_request_history_sync(
+        service_name: str, request: fastapi.Request) -> fastapi.Response:
+    return await _proxy_controller_sync(service_name, request,
+                                        _CONTROLLER_HISTORY_SYNC_TARGET_PATH)
