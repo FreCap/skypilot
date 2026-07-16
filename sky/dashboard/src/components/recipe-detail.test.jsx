@@ -1,4 +1,10 @@
-import { act, render, screen, waitFor } from '@testing-library/react';
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from '@testing-library/react';
 
 let mockRouter;
 
@@ -29,7 +35,12 @@ jest.mock('@/components/ui/yaml-code-block', () => ({
   YamlCodeBlock: ({ value }) => <pre>{value}</pre>,
 }));
 
-import { getRecipe } from '@/data/connectors/recipes';
+import {
+  deleteRecipe,
+  getRecipe,
+  togglePinRecipe,
+} from '@/data/connectors/recipes';
+import { showToast } from '@/data/connectors/toast';
 import { RecipeDetail } from '@/components/recipe-detail';
 
 function deferred() {
@@ -218,5 +229,101 @@ describe('RecipeDetail request ownership', () => {
 
     view.rerender(<RecipeDetail />);
     expect(getRecipe).toHaveBeenCalledTimes(1);
+  });
+
+  it('drops a stale pin result after the newest route has loaded', async () => {
+    const pinA = deferred();
+    getRecipe
+      .mockResolvedValueOnce(recipe('recipe-a'))
+      .mockResolvedValueOnce(recipe('recipe-b'));
+    togglePinRecipe.mockImplementationOnce(() => pinA.promise);
+
+    const view = render(<RecipeDetail />);
+    await screen.findAllByText('recipe-a');
+
+    fireEvent.click(screen.getByText('Pin'));
+    expect(togglePinRecipe).toHaveBeenCalledWith('recipe-a', true);
+
+    setRoute('recipe-b');
+    view.rerender(<RecipeDetail />);
+    await screen.findAllByText('recipe-b');
+
+    await act(async () => {
+      pinA.resolve({ ...recipe('recipe-a'), pinned: true });
+      await pinA.promise;
+    });
+
+    expect(screen.queryAllByText('recipe-a')).toHaveLength(0);
+    expect(screen.getAllByText('recipe-b').length).toBeGreaterThan(0);
+  });
+
+  it('drops a stale pin failure after the newest route has loaded', async () => {
+    const pinA = deferred();
+    getRecipe
+      .mockResolvedValueOnce(recipe('recipe-a'))
+      .mockResolvedValueOnce(recipe('recipe-b'));
+    togglePinRecipe.mockImplementationOnce(() => pinA.promise);
+
+    const view = render(<RecipeDetail />);
+    await screen.findAllByText('recipe-a');
+    fireEvent.click(screen.getByText('Pin'));
+
+    setRoute('recipe-b');
+    view.rerender(<RecipeDetail />);
+    await screen.findAllByText('recipe-b');
+
+    await act(async () => {
+      pinA.reject(new Error('stale pin failure'));
+      await expect(pinA.promise).rejects.toThrow('stale pin failure');
+    });
+
+    expect(screen.queryAllByText('recipe-a')).toHaveLength(0);
+    expect(screen.getAllByText('recipe-b').length).toBeGreaterThan(0);
+    expect(showToast).not.toHaveBeenCalled();
+  });
+
+  it('does not navigate after a stale delete succeeds', async () => {
+    const deleteA = deferred();
+    getRecipe
+      .mockResolvedValueOnce(recipe('recipe-a'))
+      .mockResolvedValueOnce(recipe('recipe-b'));
+    deleteRecipe.mockImplementationOnce(() => deleteA.promise);
+
+    const view = render(<RecipeDetail />);
+    await screen.findAllByText('recipe-a');
+    const recipeARouter = mockRouter;
+    fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
+    await screen.findByRole('dialog');
+    fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
+    expect(deleteRecipe).toHaveBeenCalledWith('recipe-a');
+
+    setRoute('recipe-b');
+    view.rerender(<RecipeDetail />);
+    await screen.findAllByText('recipe-b');
+    expect(screen.queryByRole('dialog')).toBeNull();
+
+    await act(async () => {
+      deleteA.resolve(true);
+      await deleteA.promise;
+    });
+
+    expect(recipeARouter.push).not.toHaveBeenCalled();
+    expect(screen.getAllByText('recipe-b').length).toBeGreaterThan(0);
+    expect(showToast).not.toHaveBeenCalled();
+  });
+
+  it('publishes a current pin result', async () => {
+    getRecipe.mockResolvedValueOnce(recipe('recipe-a'));
+    togglePinRecipe.mockResolvedValueOnce({
+      ...recipe('recipe-a'),
+      pinned: true,
+    });
+
+    render(<RecipeDetail />);
+    await screen.findAllByText('recipe-a');
+    fireEvent.click(screen.getByText('Pin'));
+
+    expect(await screen.findByText('Unpin')).toBeTruthy();
+    expect(showToast).toHaveBeenCalledWith('Recipe pinned!', 'success');
   });
 });
