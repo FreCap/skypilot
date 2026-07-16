@@ -2284,14 +2284,10 @@ class TestLogicalCapacityPlanning:
             replica_managers.LogicalReconcileSnapshot(
                 version=1,
                 generation=5,
-                observed_slots_by_replica_id={
-                    1: 0,
-                    2: 8
-                },
-                in_flight_by_replica_id={
-                    1: 0,
-                    2: 0
-                },
+                # The controller removes SHUTTING_DOWN replicas from its
+                # URL-to-ID translation before this post-retirement report.
+                observed_slots_by_replica_id={2: 8},
+                in_flight_by_replica_id={2: 0},
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
         mgr._logical_target = (1, 5, 8)

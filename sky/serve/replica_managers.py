@@ -3912,8 +3912,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         if current_target > selection_target:
             return 'abort'
         if (require_victim_idle and
-            (info.replica_id in snapshot.unknown_replica_ids or
-             snapshot.in_flight_by_replica_id.get(info.replica_id) != 0)):
+                not self._logical_retirement_victim_is_idle(info, snapshot)):
             return 'wait'
 
         ready_capacity = 0
@@ -3930,6 +3929,19 @@ class SkyPilotReplicaManager(ReplicaManager):
             ready_capacity += min(
                 int(getattr(candidate, 'planned_capacity', 1)), observed)
         return 'safe' if ready_capacity >= current_target else 'abort'
+
+    def _logical_retirement_victim_is_idle(
+            self, info: ReplicaInfo,
+            snapshot: LogicalReconcileSnapshot) -> bool:
+        """Use the raw URL proof when the ID translation is already pruned."""
+        tracked = getattr(self, '_wait_for_idle_trackers',
+                          {}).get(info.replica_id)
+        if tracked is not None:
+            tracker, _ = tracked
+            if tracker is not None and tracker():
+                return True
+        return (info.replica_id not in snapshot.unknown_replica_ids and
+                snapshot.in_flight_by_replica_id.get(info.replica_id) == 0)
 
     @staticmethod
     def _is_committed_logical_retirement(info: ReplicaInfo) -> bool:
