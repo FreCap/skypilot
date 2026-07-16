@@ -450,15 +450,20 @@ describe('getServices', () => {
 
 describe('normalizeReplicaHistory', () => {
   it('drops malformed samples and defaults invalid counts to zero', () => {
-    expect(
-      normalizeReplicaHistory({
-        available: true,
-        samples: [
-          { timestamp: '100', version: 1, ready_count: '2' },
-          { timestamp: 'bad', version: 2, ready_count: 3 },
-        ],
-      }).samples
-    ).toEqual([
+    const history = normalizeReplicaHistory({
+      available: true,
+      samples: [
+        { timestamp: '100', version: 1, ready_count: '2' },
+        { timestamp: 'bad', version: 2, ready_count: 3 },
+      ],
+      request_samples: [
+        { timestamp: '120', request_count: '7' },
+        { timestamp: 'bad', request_count: 8 },
+      ],
+      request_window_seconds: 3600,
+      requests_last_hour: 7,
+    });
+    expect(history.samples).toEqual([
       expect.objectContaining({
         timestamp: 100,
         version: 1,
@@ -467,6 +472,11 @@ describe('normalizeReplicaHistory', () => {
         totalCount: 0,
       }),
     ]);
+    expect(history.requestSamples).toEqual([
+      { timestamp: 120, requestCount: 7 },
+    ]);
+    expect(history.requestWindowSeconds).toBe(3600);
+    expect(history.requestsLastHour).toBe(7);
   });
 });
 

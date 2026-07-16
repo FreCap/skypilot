@@ -93,4 +93,65 @@ def test_missing_central_service_is_unavailable(monkeypatch):
         'bucket_seconds': 60,
         'retention_hours': 72,
         'samples': [],
+        'request_samples': [],
+        'request_window_seconds': 3600,
+        'requests_last_hour': 0,
     }
+
+
+def test_request_history_rows_validate_and_normalize_recent_buckets():
+    observed_at = datetime.datetime(2026,
+                                    7,
+                                    16,
+                                    13,
+                                    5,
+                                    20,
+                                    tzinfo=datetime.timezone.utc)
+
+    rows = serve_history._request_history_rows(
+        'svc', 'hash', 'pod:process', {
+            'bucket_seconds': 60,
+            'buckets': [{
+                'bucket_start': int(observed_at.timestamp()) // 60 * 60,
+                'request_count': 7,
+            }],
+        }, observed_at)
+
+    assert rows == [{
+        'service_name': 'svc',
+        'service_hash': 'hash',
+        'reporter_session_id': 'pod:process',
+        'bucket_start': observed_at.replace(second=0, microsecond=0),
+        'observed_at': observed_at,
+        'request_count': 7,
+    }]
+
+
+@pytest.mark.parametrize(
+    'request_history',
+    [
+        {
+            'bucket_seconds': 30,
+            'buckets': [],
+        },
+        {
+            'bucket_seconds': 60,
+            'buckets': [{
+                'bucket_start': 61,
+                'request_count': 1,
+            }],
+        },
+        {
+            'bucket_seconds': 60,
+            'buckets': [{
+                'bucket_start': 60,
+                'request_count': 0,
+            }],
+        },
+    ],
+)
+def test_request_history_rows_reject_malformed_reports(request_history):
+    observed_at = datetime.datetime.fromtimestamp(60, datetime.timezone.utc)
+    with pytest.raises(ValueError):
+        serve_history._request_history_rows('svc', 'hash', 'pod:process',
+                                            request_history, observed_at)

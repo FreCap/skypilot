@@ -333,6 +333,7 @@ function ServiceDetails() {
           <>
             <ServiceDetailCard
               serviceData={serviceData}
+              requestHistory={replicaHistory}
               pricingLoading={replicasLoading && serviceData.summaryOnly}
             />
             <ReplicaHistoryCard
@@ -374,7 +375,11 @@ function formatRequestRate(value) {
   })} req/s`;
 }
 
-export function ServiceDetailCard({ serviceData, pricingLoading = false }) {
+export function ServiceDetailCard({
+  serviceData,
+  requestHistory = null,
+  pricingLoading = false,
+}) {
   const hourlyCostDetails = [];
   if (serviceData.spotHourlyCost > 0) {
     hourlyCostDetails.push(`Spot ${formatUsd(serviceData.spotHourlyCost)}/hr`);
@@ -403,6 +408,11 @@ export function ServiceDetailCard({ serviceData, pricingLoading = false }) {
   ) {
     requestDetails.push(
       `${serviceData.recentRequestCount.toLocaleString()} requests in ${serviceData.requestWindowSeconds}s`
+    );
+  }
+  if (requestHistory?.requestsLastHour != null) {
+    requestDetails.push(
+      `${requestHistory.requestsLastHour.toLocaleString()} requests in last hour`
     );
   }
   if (serviceData.inFlightRequests != null) {

@@ -8,6 +8,7 @@ import threading
 import time
 import traceback
 from typing import Any, Union
+import uuid
 
 import aiohttp
 import fastapi
@@ -232,6 +233,11 @@ class SkyServeLoadBalancer:
                     f'{self._load_balancing_policy_name}.')
         self._request_aggregator: serve_utils.RequestsAggregator = (
             serve_utils.RequestTimestamp())
+        # A Pod UID authorizes controller syncs, but survives container
+        # restarts. Request-history counters restart with this process, so use
+        # a process incarnation too; otherwise a restarted LB in the same
+        # minute could send a lower cumulative count under the old DB key.
+        self._request_history_session_id = uuid.uuid4().hex
         self._stream_timeout_seconds = constants.DEFAULT_LB_STREAM_TIMEOUT
         # Replica responses with these statuses are re-routed like
         # transport failures (empty = never, the default). Safe only for
@@ -1817,9 +1823,13 @@ class SkyServeLoadBalancer:
             # now-empty aggregator for the next sync. A failed/cancelled send
             # restores this batch ahead of those newer arrivals in `finally`.
             request_batch = self._request_aggregator.drain()
+            request_history = (
+                self._request_aggregator.request_history_snapshot())
             request_batch_accepted = False
             sync_payload = {
                 'request_aggregator': request_batch,
+                'request_history': request_history,
+                'request_history_session_id': self._request_history_session_id,
                 'in_flight': in_flight,
                 'routing_urls': routing_urls,
                 'unknown_in_flight_urls': unknown_urls,
@@ -1871,6 +1881,10 @@ class SkyServeLoadBalancer:
                         # conservatively over-counting.
                         request_batch_accepted = True
                         response_json = await response.json()
+                        if response_json.get(
+                                'request_history_accepted') is True:
+                            self._request_aggregator.mark_request_history_accepted(
+                                request_history)
                         replica_info = response_json.get('replica_info', {})
                         # Count of READY, active replicas the controller has,
                         # which can exceed len(replica_info) when endpoints are

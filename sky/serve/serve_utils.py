@@ -450,6 +450,15 @@ class RequestsAggregator:
         """Convert the aggregator to a dict."""
         raise NotImplementedError
 
+    def request_history_snapshot(self) -> dict[str, Any] | None:
+        """Return request-history counters awaiting acknowledgement."""
+        raise NotImplementedError
+
+    def mark_request_history_accepted(self,
+                                      snapshot: dict[str, Any] | None) -> None:
+        """Mark a request-history snapshot as durably accepted."""
+        raise NotImplementedError
+
     def __repr__(self) -> str:
         raise NotImplementedError
 
@@ -467,15 +476,83 @@ class RequestTimestamp(RequestsAggregator):
         # QPS autoscaling). See constants.LB_REQUEST_TIMESTAMP_CAP.
         self.timestamps: collections.deque[float] = collections.deque(
             maxlen=constants.LB_REQUEST_TIMESTAMP_CAP)
+        # Exact arrival counters are reported independently from the lossy,
+        # bounded raw timestamp batch used by autoscaling. Counts remain in
+        # memory through the current hour so another request in an already
+        # acknowledged minute advances the same cumulative counter.
+        self._request_history: dict[int, int] = {}
+        self._acknowledged_request_history: dict[int, int] = {}
 
     def add(self, request: 'fastapi.Request') -> None:
         """Add a request to the request aggregator."""
         del request  # unused
-        self.timestamps.append(time.time())
+        timestamp = time.time()
+        self.timestamps.append(timestamp)
+        bucket_seconds = constants.LB_REQUEST_HISTORY_BUCKET_SECONDS
+        bucket_start = int(timestamp // bucket_seconds) * bucket_seconds
+        self._request_history[bucket_start] = (
+            self._request_history.get(bucket_start, 0) + 1)
+        self._prune_request_history(bucket_start)
 
     def clear(self) -> None:
         """Clear all current request aggregator."""
         self.timestamps.clear()
+        self._request_history.clear()
+        self._acknowledged_request_history.clear()
+
+    def _prune_request_history(self, newest_bucket: int) -> None:
+        oldest_bucket = (newest_bucket -
+                         (constants.LB_REQUEST_HISTORY_MAX_BUCKETS - 1) *
+                         constants.LB_REQUEST_HISTORY_BUCKET_SECONDS)
+        self._request_history = {
+            bucket: count
+            for bucket, count in self._request_history.items()
+            if bucket >= oldest_bucket
+        }
+        self._acknowledged_request_history = {
+            bucket: count
+            for bucket, count in self._acknowledged_request_history.items()
+            if bucket >= oldest_bucket
+        }
+
+    def request_history_snapshot(self) -> dict[str, Any] | None:
+        """Return counters changed since their last durable acknowledgement."""
+        bucket_seconds = constants.LB_REQUEST_HISTORY_BUCKET_SECONDS
+        newest_bucket = int(time.time() // bucket_seconds) * bucket_seconds
+        self._prune_request_history(newest_bucket)
+        buckets = [{
+            'bucket_start': bucket,
+            'request_count': count,
+        }
+                   for bucket, count in sorted(self._request_history.items())
+                   if count > self._acknowledged_request_history.get(bucket, 0)]
+        if not buckets:
+            return None
+        return {
+            'bucket_seconds': constants.LB_REQUEST_HISTORY_BUCKET_SECONDS,
+            'buckets': buckets,
+        }
+
+    def mark_request_history_accepted(self,
+                                      snapshot: dict[str, Any] | None) -> None:
+        """Acknowledge only counts present in an accepted snapshot.
+
+        Requests arriving while the snapshot is in flight increment the live
+        counter beyond the acknowledged value and are therefore sent on the
+        next sync.
+        """
+        if snapshot is None:
+            return
+        for bucket in snapshot.get('buckets', []):
+            bucket_start = bucket.get('bucket_start')
+            request_count = bucket.get('request_count')
+            current_count = self._request_history.get(bucket_start)
+            if current_count is None:
+                continue
+            accepted_count = min(current_count, request_count)
+            self._acknowledged_request_history[bucket_start] = max(
+                accepted_count,
+                self._acknowledged_request_history.get(bucket_start, 0))
 
     def drain(self) -> dict[str, Any]:
         """Take the current timestamps, leaving later arrivals untouched."""

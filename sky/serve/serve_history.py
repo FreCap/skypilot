@@ -1,4 +1,4 @@
-"""PostgreSQL-backed aggregate history for SkyServe machine statuses."""
+"""PostgreSQL-backed aggregate history for SkyServe status and requests."""
 
 import datetime
 from typing import Any
@@ -52,6 +52,30 @@ sqlalchemy.Index('serve_replica_status_history_lookup_idx',
                  serve_replica_status_history_table.c.bucket_start.desc())
 sqlalchemy.Index('serve_replica_status_history_bucket_idx',
                  serve_replica_status_history_table.c.bucket_start)
+
+serve_request_activity_history_table = sqlalchemy.Table(
+    'serve_request_activity_history',
+    metadata,
+    sqlalchemy.Column('service_name', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('service_hash', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('reporter_session_id', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('bucket_start',
+                      sqlalchemy.DateTime(timezone=True),
+                      primary_key=True),
+    sqlalchemy.Column('observed_at',
+                      sqlalchemy.DateTime(timezone=True),
+                      nullable=False),
+    sqlalchemy.Column('request_count', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.CheckConstraint(
+        'request_count >= 0',
+        name='serve_request_activity_history_nonnegative'),
+)
+sqlalchemy.Index('serve_request_activity_history_lookup_idx',
+                 serve_request_activity_history_table.c.service_name,
+                 serve_request_activity_history_table.c.service_hash,
+                 serve_request_activity_history_table.c.bucket_start.desc())
+sqlalchemy.Index('serve_request_activity_history_bucket_idx',
+                 serve_request_activity_history_table.c.bucket_start)
 
 _COUNT_COLUMNS = (
     'ready_count',
@@ -191,7 +215,118 @@ def record_status_snapshot(timestamp: float | None = None) -> int:
             connection.execute(
                 sqlalchemy.delete(serve_replica_status_history_table).where(
                     serve_replica_status_history_table.c.bucket_start < cutoff))
+            connection.execute(
+                sqlalchemy.delete(serve_request_activity_history_table).where(
+                    serve_request_activity_history_table.c.bucket_start <
+                    cutoff))
     return len(history_rows)
+
+
+def _request_history_rows(
+    service_name: str,
+    service_hash: str,
+    reporter_session_id: str,
+    request_history: dict[str, Any],
+    observed_at: datetime.datetime,
+) -> list[dict[str, Any]]:
+    """Validate one LB report and convert it to minute-bucket DB rows."""
+    if not isinstance(request_history, dict):
+        raise ValueError('request_history must be an object.')
+    if request_history.get('bucket_seconds') != BUCKET_SECONDS:
+        raise ValueError(f'request_history bucket_seconds must be '
+                         f'{BUCKET_SECONDS}.')
+    buckets = request_history.get('buckets')
+    if not isinstance(buckets, list):
+        raise ValueError('request_history buckets must be a list.')
+    max_buckets = constants.LB_REQUEST_HISTORY_MAX_BUCKETS
+    if len(buckets) > max_buckets:
+        raise ValueError(f'request_history may contain at most '
+                         f'{max_buckets} buckets.')
+
+    current_bucket = observed_at.replace(second=0, microsecond=0)
+    oldest_bucket = current_bucket - datetime.timedelta(
+        seconds=constants.LB_REQUEST_HISTORY_WINDOW_SECONDS +
+        2 * BUCKET_SECONDS)
+    newest_bucket = current_bucket + datetime.timedelta(seconds=2 *
+                                                        BUCKET_SECONDS)
+    seen_bucket_starts: set[int] = set()
+    rows = []
+    for bucket in buckets:
+        if not isinstance(bucket, dict):
+            raise ValueError('request_history bucket must be an object.')
+        bucket_start = bucket.get('bucket_start')
+        request_count = bucket.get('request_count')
+        if (not isinstance(bucket_start, int) or
+                isinstance(bucket_start, bool) or
+                bucket_start % BUCKET_SECONDS != 0):
+            raise ValueError('request_history bucket_start must be an aligned '
+                             'integer epoch timestamp.')
+        if bucket_start in seen_bucket_starts:
+            raise ValueError('request_history bucket_start must be unique.')
+        seen_bucket_starts.add(bucket_start)
+        if (not isinstance(request_count, int) or
+                isinstance(request_count, bool) or request_count <= 0):
+            raise ValueError('request_history request_count must be a positive '
+                             'integer.')
+        bucket_datetime = _utc_datetime(bucket_start)
+        if not oldest_bucket <= bucket_datetime <= newest_bucket:
+            raise ValueError('request_history bucket_start is outside the '
+                             'accepted recent window.')
+        rows.append({
+            'service_name': service_name,
+            'service_hash': service_hash,
+            'reporter_session_id': reporter_session_id,
+            'bucket_start': bucket_datetime,
+            'observed_at': observed_at,
+            'request_count': request_count,
+        })
+    return rows
+
+
+def record_request_activity(
+    service_name: str,
+    service_hash: str,
+    reporter_session_id: str,
+    request_history: dict[str, Any] | None,
+    timestamp: float | None = None,
+) -> int:
+    """Persist cumulative minute arrival counters from one LB process.
+
+    Exact counters are idempotent across retries. A higher count for the same
+    service incarnation, reporter process, and minute replaces a lower one;
+    stale or out-of-order reports can therefore never decrement history.
+    Non-PostgreSQL deployments accept and drop history by returning zero.
+    """
+    if request_history is None:
+        return 0
+    observed_at = _utc_datetime(timestamp)
+    rows = _request_history_rows(service_name, service_hash,
+                                 reporter_session_id, request_history,
+                                 observed_at)
+    engine = _postgres_engine()
+    if engine is None or not rows:
+        return 0
+    with engine.begin() as connection:
+        insert = postgresql.insert(serve_request_activity_history_table).values(
+            rows)
+        excluded = insert.excluded
+        connection.execute(
+            insert.on_conflict_do_update(
+                index_elements=[
+                    serve_request_activity_history_table.c.service_name,
+                    serve_request_activity_history_table.c.service_hash,
+                    serve_request_activity_history_table.c.reporter_session_id,
+                    serve_request_activity_history_table.c.bucket_start,
+                ],
+                set_={
+                    'observed_at': sqlalchemy.func.greatest(
+                        serve_request_activity_history_table.c.observed_at,
+                        excluded.observed_at),
+                    'request_count': sqlalchemy.func.greatest(
+                        serve_request_activity_history_table.c.request_count,
+                        excluded.request_count),
+                }))
+    return len(rows)
 
 
 def get_status_history(service_name: str,
@@ -215,6 +350,10 @@ def get_status_history(service_name: str,
             'bucket_seconds': BUCKET_SECONDS,
             'retention_hours': RETENTION_HOURS,
             'samples': [],
+            'request_samples': [],
+            'request_window_seconds':
+                constants.LB_REQUEST_HISTORY_WINDOW_SECONDS,
+            'requests_last_hour': 0,
         }
 
     observed_at = _utc_datetime(timestamp)
@@ -232,6 +371,10 @@ def get_status_history(service_name: str,
                 'bucket_seconds': BUCKET_SECONDS,
                 'retention_hours': RETENTION_HOURS,
                 'samples': [],
+                'request_samples': [],
+                'request_window_seconds':
+                    constants.LB_REQUEST_HISTORY_WINDOW_SECONDS,
+                'requests_last_hour': 0,
             }
         predicates = [
             history.c.service_name == service_name,
@@ -244,6 +387,19 @@ def get_status_history(service_name: str,
         rows = session.execute(
             sqlalchemy.select(history).where(*predicates).order_by(
                 history.c.bucket_start, history.c.version)).mappings().all()
+        request_history = serve_request_activity_history_table
+        request_rows = session.execute(
+            sqlalchemy.select(
+                request_history.c.bucket_start,
+                sqlalchemy.func.sum(  # pylint: disable=not-callable
+                    request_history.c.request_count).label('request_count'),
+            ).where(
+                request_history.c.service_name == service_name,
+                request_history.c.service_hash == service_hash,
+                request_history.c.bucket_start >= window_start,
+                request_history.c.bucket_start <= observed_at,
+            ).group_by(request_history.c.bucket_start).order_by(
+                request_history.c.bucket_start)).all()
 
     samples = []
     for row in rows:
@@ -256,6 +412,17 @@ def get_status_history(service_name: str,
             },
             'total_count': row['total_count'],
         })
+    request_samples = [{
+        'timestamp': row.bucket_start.timestamp(),
+        'request_count': int(row.request_count),
+    } for row in request_rows]
+    current_bucket = observed_at.replace(second=0, microsecond=0)
+    request_window_start = current_bucket - datetime.timedelta(
+        seconds=constants.LB_REQUEST_HISTORY_WINDOW_SECONDS - BUCKET_SECONDS)
+    requests_last_hour = sum(
+        sample['request_count']
+        for sample in request_samples
+        if sample['timestamp'] >= request_window_start.timestamp())
     return {
         'available': True,
         'service_hash': service_hash,
@@ -264,4 +431,7 @@ def get_status_history(service_name: str,
         'window_start': window_start.timestamp(),
         'window_end': observed_at.timestamp(),
         'samples': samples,
+        'request_samples': request_samples,
+        'request_window_seconds': constants.LB_REQUEST_HISTORY_WINDOW_SECONDS,
+        'requests_last_hour': requests_last_hour,
     }

@@ -94,6 +94,23 @@ export function normalizeReplicaHistory(history) {
         })
         .filter(Boolean)
     : [];
+  const requestSamples = Array.isArray(history.request_samples)
+    ? history.request_samples
+        .map((sample) => {
+          const timestamp = Number(sample.timestamp);
+          const requestCount = Number(sample.request_count);
+          if (
+            !Number.isFinite(timestamp) ||
+            !Number.isInteger(requestCount) ||
+            requestCount < 0
+          ) {
+            return null;
+          }
+          return { timestamp, requestCount };
+        })
+        .filter(Boolean)
+    : [];
+  const requestsLastHour = Number(history.requests_last_hour);
   return {
     available: history.available !== false,
     bucketSeconds: Number(history.bucket_seconds) || 60,
@@ -101,6 +118,15 @@ export function normalizeReplicaHistory(history) {
     windowStart: Number(history.window_start) || null,
     windowEnd: Number(history.window_end) || null,
     samples,
+    requestSamples,
+    requestWindowSeconds:
+      Number(history.request_window_seconds) > 0
+        ? Number(history.request_window_seconds)
+        : null,
+    requestsLastHour:
+      Number.isInteger(requestsLastHour) && requestsLastHour >= 0
+        ? requestsLastHour
+        : null,
   };
 }
 

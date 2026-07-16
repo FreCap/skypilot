@@ -1441,6 +1441,13 @@ class TestAuthoritativeLbReportIngestion:
 
     def test_wrong_service_uid_cannot_enumerate_replica_urls(self):
         ctrl, _, report = self._controller_and_report()
+        report['request_history'] = {
+            'bucket_seconds': 60,
+            'buckets': [{
+                'bucket_start': 120,
+                'request_count': 1,
+            }],
+        }
         with mock.patch.object(
                 controller.lb_k8s,
                 'get_lb_pod_authority',
@@ -1448,7 +1455,9 @@ class TestAuthoritativeLbReportIngestion:
                     {'other-service-pod'},
                     {'other-service-pod'})), mock.patch.object(
                         controller.serve_state,
-                        'get_replica_infos') as get_replica_infos:
+                        'get_replica_infos') as get_replica_infos, \
+             mock.patch.object(controller.serve_history,
+                               'record_request_activity') as record_history:
             response = asyncio.run(
                 ctrl._handle_load_balancer_sync(  # pylint: disable=protected-access
                     report))
@@ -1457,6 +1466,125 @@ class TestAuthoritativeLbReportIngestion:
         assert response.body == b''
         # Membership is checked before even reading/resolving replica records.
         get_replica_infos.assert_not_called()
+        record_history.assert_not_called()
+
+    def test_request_history_uses_process_incarnation_and_service_hash(self):
+        ctrl, _, report = self._controller_and_report()
+        ctrl._service_hash = 'service-hash'  # pylint: disable=protected-access
+        report['request_history_session_id'] = 'a' * 32
+        report['request_history'] = {
+            'bucket_seconds': 60,
+            'buckets': [{
+                'bucket_start': 120,
+                'request_count': 3,
+            }],
+        }
+
+        with mock.patch.object(controller.serve_history,
+                               'record_request_activity') as record_history:
+            accepted = ctrl._record_request_history(  # pylint: disable=protected-access
+                report)
+
+        assert accepted is True
+        record_history.assert_called_once_with(
+            'svc',
+            'service-hash',
+            f"lb-a:{'a' * 32}",
+            report['request_history'],
+        )
+
+    @pytest.mark.parametrize('session_id', [None, '', 'not-a-uuid', 'G' * 32])
+    def test_request_history_rejects_invalid_process_session(self, session_id):
+        ctrl, _, report = self._controller_and_report()
+        ctrl._service_hash = 'service-hash'  # pylint: disable=protected-access
+        report['request_history_session_id'] = session_id
+        report['request_history'] = {
+            'bucket_seconds': 60,
+            'buckets': [],
+        }
+
+        with pytest.raises(ValueError, match='reporter session'):
+            ctrl._record_request_history(  # pylint: disable=protected-access
+                report)
+
+    @pytest.mark.parametrize(
+        ('history_error', 'history_accepted'),
+        [(RuntimeError('database unavailable'), False),
+         (ValueError('malformed snapshot'), True)],
+    )
+    def test_request_history_failure_does_not_fail_routing_sync(
+            self, history_error, history_accepted):
+        ctrl, info, report = self._controller_and_report()
+        ctrl._service_hash = 'service-hash'  # pylint: disable=protected-access
+        ctrl._routing_spec = {'policy': 'round_robin'}  # pylint: disable=protected-access
+        report['request_history_session_id'] = 'a' * 32
+        report['request_history'] = {
+            'bucket_seconds': 60,
+            'buckets': [{
+                'bucket_start': 120,
+                'request_count': 3,
+            }],
+        }
+
+        with mock.patch.object(
+                ctrl, '_owns_current_service', return_value=True), \
+             mock.patch.object(
+                 controller.lb_k8s,
+                 'get_lb_pod_authority',
+                 return_value=controller.lb_k8s.LbPodAuthority(
+                     {'lb-a'}, {'lb-a'})), \
+             mock.patch.object(
+                 ctrl,
+                 '_snapshot_replica_occupancy',
+                 return_value=([info], {
+                     1: True
+                 }, set())), \
+             mock.patch.object(
+                 ctrl, '_get_lb_replica_info', return_value=({}, 1)), \
+             mock.patch.object(
+                 ctrl, '_get_capacity_hint', return_value={}), \
+             mock.patch.object(
+                 ctrl,
+                 '_record_request_history',
+                 side_effect=history_error):
+            response = asyncio.run(
+                ctrl._handle_load_balancer_sync(  # pylint: disable=protected-access
+                    report))
+
+        assert response.status_code == 200
+        assert (json.loads(response.body)['request_history_accepted']
+                is history_accepted)
+
+    def test_live_max_surge_reporter_persists_request_history(self):
+        ctrl, info, report = self._controller_and_report()
+        ctrl._routing_spec = {'policy': 'round_robin'}  # pylint: disable=protected-access
+        record_history = mock.Mock(return_value=True)
+        ctrl._record_request_history = record_history  # pylint: disable=protected-access
+
+        with mock.patch.object(
+                ctrl, '_owns_current_service', return_value=True), \
+             mock.patch.object(
+                 controller.lb_k8s,
+                 'get_lb_pod_authority',
+                 return_value=controller.lb_k8s.LbPodAuthority(
+                     {'lb-a', 'lb-b'}, {'lb-a', 'lb-b'})), \
+             mock.patch.object(
+                 ctrl,
+                 '_snapshot_replica_occupancy',
+                 return_value=([info], {
+                     1: True
+                 }, set())), \
+             mock.patch.object(
+                 ctrl, '_get_lb_replica_info', return_value=({}, 1)), \
+             mock.patch.object(
+                 ctrl, '_get_capacity_hint', return_value={}):
+            response = asyncio.run(
+                ctrl._handle_load_balancer_sync(  # pylint: disable=protected-access
+                    report))
+
+        assert response.status_code == 200
+        assert json.loads(response.body)['request_history_accepted'] is True
+        record_history.assert_called_once_with(report)
 
     def test_sole_matching_reporter_updates_all_demand_and_drain_state(self):
         ctrl, info, report = self._controller_and_report()
@@ -2049,7 +2177,7 @@ class TestLbSyncBlockingReadsOffLoop:
         body = json.loads(response.body)
         assert set(body) == {
             'replica_info', 'num_ready_replicas', 'routing_spec',
-            'capacity_hint'
+            'capacity_hint', 'request_history_accepted'
         }
 
 

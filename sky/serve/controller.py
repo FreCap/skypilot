@@ -28,6 +28,7 @@ from sky.serve import constants as serve_constants
 from sky.serve import lb_k8s
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity
+from sky.serve import serve_history
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.skylet import constants
@@ -793,6 +794,27 @@ class SkyServeController:
             # redundant DB round-trips on the LB sync hot path.
             if not await loop.run_in_executor(None, self._owns_current_service):
                 return fastapi.Response(status_code=503)
+            request_history_accepted = False
+            try:
+                request_history_accepted = await loop.run_in_executor(
+                    None, self._record_request_history, request_data)
+            except ValueError as e:
+                # A malformed snapshot cannot become valid by retrying. Drop
+                # it with an acknowledgement so a mixed-version or corrupted
+                # LB cannot hammer the controller every sync forever.
+                request_history_accepted = True
+                logger.warning(
+                    'Dropping invalid load balancer request history for '
+                    f'{self._service_name!r}: '
+                    f'{common_utils.format_exception(e)}')
+            except Exception as e:  # pylint: disable=broad-except
+                # Request history is observability, not control-plane state.
+                # Keep routing and autoscaling available while asking the LB
+                # to retry only its bounded cumulative counters.
+                logger.warning(
+                    'Failed to persist load balancer request history for '
+                    f'{self._service_name!r}: '
+                    f'{common_utils.format_exception(e)}')
             await self._ingest_load_balancer_report(
                 request_data,
                 replica_infos,
@@ -807,8 +829,37 @@ class SkyServeController:
                 'routing_spec': self._get_routing_spec(),
                 'capacity_hint': self._get_capacity_hint(
                     replica_infos, logical_versions),
+                'request_history_accepted': request_history_accepted,
             },
                                           status_code=200)
+
+    def _record_request_history(self, request_data: dict[str, Any]) -> bool:
+        """Persist one live LB process's cumulative minute counters."""
+        request_history = request_data.get('request_history')
+        if request_history is None:
+            return True
+        service_hash = getattr(self, '_service_hash', None)
+        if service_hash is None:
+            # Compatibility for direct/legacy controller construction without
+            # an incarnation fence. Do not create history that could leak into
+            # a later same-name service.
+            return True
+        lb_session_id = request_data.get('lb_session_id')
+        process_session_id = request_data.get('request_history_session_id')
+        if (not isinstance(lb_session_id, str) or not lb_session_id or
+                not isinstance(process_session_id, str) or
+                len(process_session_id) != 32 or
+                any(character not in '0123456789abcdef'
+                    for character in process_session_id)):
+            raise ValueError('Invalid request history reporter session.')
+        reporter_session_id = f'{lb_session_id}:{process_session_id}'
+        serve_history.record_request_activity(
+            self._service_name,
+            service_hash,
+            reporter_session_id,
+            request_history,
+        )
+        return True
 
     def _owns_current_service(self) -> bool:
         """Whether this controller parent still owns the exact DB row."""

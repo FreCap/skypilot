@@ -13,7 +13,8 @@ Independent tokens:
 
 Logic-only: no assertions on log or exception message text.
 """
-# pylint: disable=invalid-name,protected-access
+# pylint: disable=invalid-name,protected-access,missing-class-docstring
+# pylint: disable=unused-argument,use-implicit-booleaness-not-comparison
 import asyncio
 import inspect
 import pickle
@@ -303,7 +304,10 @@ class _FakeResp:
         return self._status
 
     async def json(self):
-        return {'replica_info': {}, 'routing_spec': None}
+        return self._captured.get('response_json', {
+            'replica_info': {},
+            'routing_spec': None,
+        })
 
     async def __aenter__(self):
         on_response_enter = self._captured.get('on_response_enter')
@@ -529,6 +533,61 @@ def test_request_aggregator_is_bounded():
         agg.to_dict()['timestamps']) == constants.LB_REQUEST_TIMESTAMP_CAP
 
 
+def test_request_history_uses_cumulative_minute_counters(monkeypatch):
+    now = [120.0]
+    monkeypatch.setattr(serve_utils.time, 'time', lambda: now[0])
+    agg = serve_utils.RequestTimestamp()
+
+    agg.add(None)
+    agg.add(None)
+    first = agg.request_history_snapshot()
+    assert first == {
+        'bucket_seconds': 60,
+        'buckets': [{
+            'bucket_start': 120,
+            'request_count': 2,
+        }],
+    }
+
+    agg.mark_request_history_accepted(first)
+    assert agg.request_history_snapshot() is None
+    agg.add(None)
+    assert agg.request_history_snapshot()['buckets'] == [{
+        'bucket_start': 120,
+        'request_count': 3,
+    }]
+
+
+def test_request_history_ack_preserves_arrivals_during_sync(monkeypatch):
+    now = [120.0]
+    monkeypatch.setattr(serve_utils.time, 'time', lambda: now[0])
+    agg = serve_utils.RequestTimestamp()
+    agg.add(None)
+    snapshot = agg.request_history_snapshot()
+
+    agg.add(None)
+    agg.mark_request_history_accepted(snapshot)
+
+    assert agg.request_history_snapshot()['buckets'] == [{
+        'bucket_start': 120,
+        'request_count': 2,
+    }]
+
+
+def test_request_history_is_bounded_to_recent_hour(monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr(serve_utils.time, 'time', lambda: now[0])
+    agg = serve_utils.RequestTimestamp()
+    for minute in range(constants.LB_REQUEST_HISTORY_MAX_BUCKETS + 5):
+        now[0] = float(minute * 60)
+        agg.add(None)
+
+    snapshot = agg.request_history_snapshot()
+
+    assert len(snapshot['buckets']) == constants.LB_REQUEST_HISTORY_MAX_BUCKETS
+    assert snapshot['buckets'][0]['bucket_start'] == 5 * 60
+
+
 def test_aggregator_drained_on_success_and_restored_on_failure(monkeypatch):
     monkeypatch.delenv(constants.CONTROLLER_AUTH_TOKEN_ENV_VAR, raising=False)
 
@@ -547,6 +606,52 @@ def test_aggregator_drained_on_success_and_restored_on_failure(monkeypatch):
     lb2._request_aggregator = agg2
     _sync_once(monkeypatch, lb2, 200, {})
     assert agg2.to_dict()['timestamps'] == []
+
+
+def test_request_history_requires_independent_controller_ack(monkeypatch):
+    now = [120.0]
+    monkeypatch.setattr(serve_utils.time, 'time', lambda: now[0])
+    lb = _make_lb()
+    lb._request_aggregator.add(None)
+    captured = {}
+
+    _sync_once(monkeypatch, lb, 200, captured)
+
+    assert captured['json']['request_history']['buckets'][0][
+        'request_count'] == 1
+    assert lb._request_aggregator.request_history_snapshot() is not None
+
+    captured = {
+        'response_json': {
+            'replica_info': {},
+            'routing_spec': None,
+            'request_history_accepted': True,
+        }
+    }
+    _sync_once(monkeypatch, lb, 200, captured)
+    assert lb._request_aggregator.request_history_snapshot() is None
+
+
+def test_request_history_ack_does_not_erase_arrival_during_sync(monkeypatch):
+    now = [120.0]
+    monkeypatch.setattr(serve_utils.time, 'time', lambda: now[0])
+    lb = _make_lb()
+    lb._request_aggregator.add(None)
+    captured = {
+        'response_json': {
+            'replica_info': {},
+            'routing_spec': None,
+            'request_history_accepted': True,
+        },
+        'on_response_enter': lambda: lb._request_aggregator.add(None),
+    }
+
+    _sync_once(monkeypatch, lb, 200, captured)
+
+    assert lb._request_aggregator.request_history_snapshot()['buckets'] == [{
+        'bucket_start': 120,
+        'request_count': 2,
+    }]
 
 
 def test_aggregator_keeps_arrivals_during_successful_sync(monkeypatch):

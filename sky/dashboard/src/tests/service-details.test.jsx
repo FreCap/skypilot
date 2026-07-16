@@ -160,6 +160,10 @@ describe('ServiceDetailCard cost and request estimates', () => {
   it('shows hourly cost, request activity, and compute cost per request', () => {
     render(
       <ServiceDetailCard
+        requestHistory={{
+          requestsLastHour: 1234,
+          requestWindowSeconds: 3600,
+        }}
         serviceData={{
           name: 'svc',
           status: 'READY',
@@ -198,7 +202,7 @@ describe('ServiceDetailCard cost and request estimates', () => {
     expect(screen.getByText('0.50 req/s')).toBeTruthy();
     expect(
       screen.getByText(
-        '30 requests in 60s · 2 in flight · 1 queued · 3 rejected · activity report 4s old'
+        '30 requests in 60s · 1,234 requests in last hour · 2 in flight · 1 queued · 3 rejected · activity report 4s old'
       )
     ).toBeTruthy();
     expect(screen.getByText('$3.0556')).toBeTruthy();

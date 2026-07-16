@@ -123,6 +123,13 @@ LB_LIVENESS_ENDPOINT_PATH = '/_lb/liveness'
 # CAP samples are kept -- ample for QPS autoscaling even at the top of the
 # supported RPS range across several sync intervals.
 LB_REQUEST_TIMESTAMP_CAP = 100_000
+# The load balancer retains exact per-minute arrival counters for the recent
+# dashboard window. One extra bucket covers the partially elapsed boundary
+# minute without allowing a controller outage to grow LB memory unbounded.
+LB_REQUEST_HISTORY_BUCKET_SECONDS = 60
+LB_REQUEST_HISTORY_WINDOW_SECONDS = 60 * 60
+LB_REQUEST_HISTORY_MAX_BUCKETS = (
+    LB_REQUEST_HISTORY_WINDOW_SECONDS // LB_REQUEST_HISTORY_BUCKET_SECONDS + 1)
 
 # [boltz fork] Compatibility time budget for controllers predating the
 # commit-then-reconcile update protocol. Their handler can wait on the

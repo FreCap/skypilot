@@ -310,6 +310,7 @@ class TestMigrationChainPG:
                     'service_lifecycle_fences',
                     'demand_capacity_observations',
                     'serve_replica_status_history',
+                    'serve_request_activity_history',
                 }.issubset(tables), tables
                 service_columns = {
                     column['name']
@@ -454,6 +455,61 @@ class TestServeStatusHistoryPG:
         assert len(current['samples']) == 1
         assert current['samples'][0]['total_count'] == 0
 
+    def test_request_history_is_idempotent_additive_and_incarnation_scoped(
+            self, history_engine):
+        timestamp = 1784207110.0
+        bucket_start = int(timestamp) // 60 * 60
+
+        def request_history(count):
+            return {
+                'bucket_seconds': 60,
+                'buckets': [{
+                    'bucket_start': bucket_start,
+                    'request_count': count,
+                }],
+            }
+
+        with history_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.insert(serve_state.services_table).values(
+                    name='svc', hash='hash-a', current_version=1, pool=0))
+
+        assert serve_history.record_request_activity('svc', 'hash-a',
+                                                     'pod-a:process-a',
+                                                     request_history(3),
+                                                     timestamp) == 1
+        # Stale/out-of-order retry cannot decrement the exact counter.
+        serve_history.record_request_activity('svc', 'hash-a',
+                                              'pod-a:process-a',
+                                              request_history(2), timestamp + 1)
+        serve_history.record_request_activity('svc', 'hash-a',
+                                              'pod-a:process-a',
+                                              request_history(5), timestamp + 2)
+        # A concurrently live maxSurge process receives distinct requests, so
+        # its cumulative counter is additive.
+        serve_history.record_request_activity('svc', 'hash-a',
+                                              'pod-b:process-b',
+                                              request_history(7), timestamp + 3)
+
+        history = serve_history.get_status_history('svc',
+                                                   timestamp=timestamp + 4)
+        assert history['request_samples'] == [{
+            'timestamp': float(bucket_start),
+            'request_count': 12,
+        }]
+        assert history['requests_last_hour'] == 12
+        assert history['request_window_seconds'] == 3600
+
+        with history_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(
+                    serve_state.services_table).values(hash='hash-b'))
+        current = serve_history.get_status_history('svc',
+                                                   timestamp=timestamp + 5)
+        assert current['service_hash'] == 'hash-b'
+        assert current['request_samples'] == []
+        assert current['requests_last_hour'] == 0
+
     def test_hourly_snapshot_prunes_rows_older_than_three_days(
             self, history_engine):
         now = 1784210400.0  # Exact UTC hour, so the bounded cleanup runs.
@@ -461,6 +517,7 @@ class TestServeStatusHistoryPG:
             now - 73 * 3600, datetime.timezone.utc).replace(second=0,
                                                             microsecond=0)
         table = serve_history.serve_replica_status_history_table
+        request_table = serve_history.serve_request_activity_history_table
         with history_engine.begin() as connection:
             connection.execute(
                 sqlalchemy.insert(serve_state.services_table).values(
@@ -478,6 +535,14 @@ class TestServeStatusHistoryPG:
                                                 preempted_count=0,
                                                 stopping_count=0,
                                                 total_count=1))
+            connection.execute(
+                sqlalchemy.insert(request_table).values(
+                    service_name='old',
+                    service_hash='old-hash',
+                    reporter_session_id='pod:process',
+                    bucket_start=old_bucket,
+                    observed_at=old_bucket,
+                    request_count=1))
 
         serve_history.record_status_snapshot(now)
 
@@ -487,6 +552,11 @@ class TestServeStatusHistoryPG:
                     sqlalchemy.func.count()  # pylint: disable=not-callable
                 ).select_from(table).where(
                     table.c.service_name == 'old')).scalar_one() == 0
+            assert connection.execute(
+                sqlalchemy.select(
+                    sqlalchemy.func.count()  # pylint: disable=not-callable
+                ).select_from(request_table).where(
+                    request_table.c.service_name == 'old')).scalar_one() == 0
 
 
 # ======================= Concurrency smoke on PG =======================
