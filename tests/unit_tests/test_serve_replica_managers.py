@@ -2420,6 +2420,7 @@ class TestLogicalCapacityPlanning:
         elif guard == 'insufficient_replacement':
             snapshot.observed_slots_by_replica_id[10] = 0
         mgr._logical_reconcile_snapshot = snapshot
+        retiring.status_property.drain_started_at = 1234.5
         mgr._lb_in_flight_report = (now[0], {}, set(), set(), set(),
                                     'lb-session')
         mgr._wait_for_idle_trackers = {
@@ -2444,6 +2445,7 @@ class TestLogicalCapacityPlanning:
             assert 9 in mgr._wait_for_idle_trackers
         else:
             assert not retiring.status_property.is_scale_down
+            assert retiring.status_property.drain_started_at is None
             assert 9 not in mgr._wait_for_idle_trackers
 
     def test_outdated_bounded_retirement_retries_scheduling_failure(
@@ -3350,6 +3352,50 @@ class TestFailedCleanupReconciliation:
                                           purge=False,
                                           in_flight_drain_cap_seconds=0)
 
+    def test_provider_failure_does_not_repeat_consumed_drain(self):
+        manager = _make_manager()
+        info = self._info()
+        info.status_property.is_scale_down = True
+        info.status_property.drain_cap_seconds = 600
+        info.status_property.drain_started_at = 10.0
+        info.status_property.sky_down_status = common_utils.ProcessStatus.FAILED
+
+        with mock.patch.object(manager, '_terminate_replica') as terminate, \
+             mock.patch('sky.serve.replica_managers.time.monotonic',
+                        return_value=100):
+            manager._reconcile_failed_cleanup([info])
+
+        terminate.assert_called_once_with(1,
+                                          sync_down_logs=False,
+                                          replica_drain_delay_seconds=0,
+                                          is_scale_down=True,
+                                          purge=False,
+                                          in_flight_drain_cap_seconds=0)
+
+    def test_legacy_failed_row_gets_one_conservative_bounded_drain(self):
+        manager = _make_manager()
+        info = self._info()
+        info.status_property.is_scale_down = True
+        info.status_property.drain_cap_seconds = 600
+        info.status_property.sky_down_status = common_utils.ProcessStatus.FAILED
+        legacy_state = info.to_storage_dict()
+        legacy_state['status_property'].pop('drain_started_at')
+        legacy_info = replica_managers.ReplicaInfo.from_storage_dict(
+            legacy_state)
+        assert legacy_info.status_property.drain_started_at is None
+
+        with mock.patch.object(manager, '_terminate_replica') as terminate, \
+             mock.patch('sky.serve.replica_managers.time.monotonic',
+                        return_value=100):
+            manager._reconcile_failed_cleanup([legacy_info])
+
+        terminate.assert_called_once_with(1,
+                                          sync_down_logs=False,
+                                          replica_drain_delay_seconds=0,
+                                          is_scale_down=True,
+                                          purge=False,
+                                          in_flight_drain_cap_seconds=600)
+
     def test_cleanup_retry_respects_capped_backoff_deadline(self):
         manager = _make_manager()
         info = self._info()
@@ -3538,6 +3584,8 @@ class TestFailedCleanupReconciliation:
         manager.least_recent_version = 9
         retiring.status_property.wait_for_idle_before_termination = False
         retiring.status_property.logical_retirement_confirmed_generation = 5
+        retiring.status_property.drain_cap_seconds = 600
+        retiring.status_property.drain_started_at = 10.0
         original_thread = mock.Mock()
         original_thread.is_alive.return_value = False
         original_thread.format_exc = None
@@ -3562,7 +3610,7 @@ class TestFailedCleanupReconciliation:
             if (failed_state_persist_raises and
                     not failed_persist_attempted[0] and
                     info.status_property.sky_down_status
-                    == common_utils.ProcessStatus.FAILED):
+                    == common_utils.ProcessStatus.SCHEDULED):
                 failed_persist_attempted[0] = True
                 raise RuntimeError('failed-state database write')
             durable[replica_id] = _clone(info)
@@ -3600,7 +3648,7 @@ class TestFailedCleanupReconciliation:
                                return_value=str(tmp_path / 'replica.log')), \
              mock.patch.object(replica_managers.thread_utils,
                                'SafeThread',
-                               return_value=fresh_thread), \
+                               return_value=fresh_thread) as safe_thread_factory, \
              mock.patch.object(controller_utils, 'get_resources_lock_path',
                                return_value=str(tmp_path / 'resources.lock')), \
              mock.patch.object(controller_utils,
@@ -3614,6 +3662,8 @@ class TestFailedCleanupReconciliation:
                                side_effect=_persist), \
              mock.patch.object(manager, '_remove_replica') as remove, \
              mock.patch('sky.serve.replica_managers.time.monotonic',
+                        side_effect=lambda: clock[0]), \
+             mock.patch('sky.serve.replica_managers.time.time',
                         side_effect=lambda: clock[0]):
             if failed_state_persist_raises:
                 with pytest.raises(RuntimeError,
@@ -3629,7 +3679,7 @@ class TestFailedCleanupReconciliation:
             assert manager._failed_cleanup_retry_at == {9: 160}
             expected_durable_status = (common_utils.ProcessStatus.RUNNING
                                        if failed_state_persist_raises else
-                                       common_utils.ProcessStatus.FAILED)
+                                       common_utils.ProcessStatus.SCHEDULED)
             assert (durable[9].status_property.sky_down_status ==
                     expected_durable_status)
             assert durable[9].status_property.logical_retirement_committed
@@ -3648,6 +3698,9 @@ class TestFailedCleanupReconciliation:
             assert (durable[9].status_property.logical_retirement_version
                     is None)
             assert not durable[9].is_ready
+            assert manager._down_thread_pool[9] is fresh_thread
+            assert (safe_thread_factory.call_args.kwargs['kwargs']
+                    ['drain_deadline'] == 610)
 
             manager._refresh_thread_pool()
 

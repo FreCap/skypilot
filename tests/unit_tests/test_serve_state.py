@@ -214,6 +214,7 @@ def test_replica_json_storage_round_trip_preserves_lifecycle_state():
     info.status_property.sky_down_status = common_utils.ProcessStatus.SCHEDULED
     info.status_property.is_scale_down = True
     info.status_property.drain_cap_seconds = 30
+    info.status_property.drain_started_at = 1234.5
     info.status_property.wait_for_idle_before_termination = True
     info.status_property.logical_retirement_version = 3
     info.status_property.logical_retirement_controller_epoch = 'epoch-a'
@@ -259,6 +260,20 @@ def test_replica_json_storage_round_trip_preserves_lifecycle_state():
     assert (
         malformed_commit_restored.status_property.logical_retirement_committed
         is None)
+
+    legacy_drain_state = info.to_storage_dict()
+    legacy_drain_state['status_property'].pop('drain_started_at')
+    legacy_drain_restored = replica_managers.ReplicaInfo.from_storage_dict(
+        legacy_drain_state)
+    assert legacy_drain_restored.status_property.drain_started_at is None
+
+    for malformed_started_at in (True, 0, -1, float('inf'), '1234.5'):
+        malformed_drain_state = info.to_storage_dict()
+        malformed_drain_state['status_property'][
+            'drain_started_at'] = malformed_started_at
+        malformed_drain_restored = (replica_managers.ReplicaInfo.
+                                    from_storage_dict(malformed_drain_state))
+        assert malformed_drain_restored.status_property.drain_started_at is None
 
 
 def test_replica_json_storage_preserves_region_independent_image_id():

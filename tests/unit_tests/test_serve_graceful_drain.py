@@ -457,8 +457,7 @@ class TestScaleDownWiring:
 
 
 class TestRecoveryRedrive:
-    """A scale-down retirement interrupted by a controller restart must
-    re-enter a full bounded drain, not re-drive with no drain."""
+    """A recovered retirement must re-enter its remaining bounded drain."""
 
     def _redrive(self,
                  is_scale_down,
@@ -669,7 +668,10 @@ class TestTerminateReplicaDrainAssembly:
                        url='http://r1:8080',
                        url_error=None,
                        cap=300,
-                       interrupted_launch=False):
+                       interrupted_launch=False,
+                       started_at=None,
+                       wall_now=1000.0,
+                       monotonic_now=2000.0):
         """Build a real manager and run the real _terminate_replica."""
         rm = replica_managers.SkyPilotReplicaManager.__new__(
             replica_managers.SkyPilotReplicaManager)
@@ -689,6 +691,7 @@ class TestTerminateReplicaDrainAssembly:
         info = mock.Mock()
         info.cluster_name = 'svc-7-abc'
         info.status_property = replica_managers.ReplicaStatusProperty()
+        info.status_property.drain_started_at = started_at
         if url_error is not None:
             type(info).url = mock.PropertyMock(side_effect=url_error)
         else:
@@ -707,7 +710,8 @@ class TestTerminateReplicaDrainAssembly:
         def _snapshot_write(_service_name, _replica_id, written_info):
             writes.append((written_info.status_property.sky_launch_status,
                            written_info.status_property.sky_down_status,
-                           written_info.status_property.drain_cap_seconds))
+                           written_info.status_property.drain_cap_seconds,
+                           written_info.status_property.drain_started_at))
 
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_info_from_id',
@@ -719,7 +723,11 @@ class TestTerminateReplicaDrainAssembly:
                                'cluster_with_name_exists',
                                return_value=True), \
              mock.patch.object(replica_managers.thread_utils, 'SafeThread',
-                               _FakeThread):
+                               _FakeThread), \
+             mock.patch.object(replica_managers.time,
+                               'time', return_value=wall_now), \
+             mock.patch.object(replica_managers.time,
+                               'monotonic', return_value=monotonic_now):
             rm._terminate_replica(7,
                                   sync_down_logs=False,
                                   replica_drain_delay_seconds=0,
@@ -736,7 +744,7 @@ class TestTerminateReplicaDrainAssembly:
             w for w in captured['writes']
             if w[1] is replica_managers.common_utils.ProcessStatus.SCHEDULED
         ]
-        assert scheduled and scheduled[0][2] == 450
+        assert scheduled and scheduled[0][2:] == (450, 1000.0)
 
     def test_interrupted_launch_write_persists_the_cap(self):
         # The INTERRUPTED row already derives SHUTTING_DOWN, so a crash
@@ -744,17 +752,52 @@ class TestTerminateReplicaDrainAssembly:
         captured = self._assemble_impl(cap=450, interrupted_launch=True)
         first = captured['writes'][0]
         assert first == (
-            replica_managers.common_utils.ProcessStatus.INTERRUPTED, None, 450)
+            replica_managers.common_utils.ProcessStatus.INTERRUPTED, None, 450,
+            1000.0)
 
     def test_deadline_and_tracker_reach_the_thread(self):
-        before = replica_managers.time.monotonic()
         captured = self._assemble()
         kwargs = captured['kwargs']
         assert isinstance(kwargs['drain_complete'],
                           replica_managers._ReplicaDrainTracker)
-        # Deadline anchored ~now (persist time) plus the cap.
-        assert before + 300 <= kwargs['drain_deadline'] <= (
-            replica_managers.time.monotonic() + 300 + 1)
+        assert kwargs['drain_deadline'] == 2300.0
+
+    def test_recovery_consumes_only_remaining_cap(self):
+        first = self._assemble_impl(cap=600,
+                                    started_at=700.0,
+                                    wall_now=1000.0,
+                                    monotonic_now=2000.0)
+        second = self._assemble_impl(cap=600,
+                                     started_at=700.0,
+                                     wall_now=1100.0,
+                                     monotonic_now=3000.0)
+
+        assert first['kwargs']['drain_deadline'] == 2300.0
+        assert second['kwargs']['drain_deadline'] == 3200.0
+        assert first['writes'][-1][3] == second['writes'][-1][3] == 700.0
+
+    def test_expired_recovery_deadline_is_immediate(self):
+        captured = self._assemble_impl(cap=300,
+                                       started_at=100.0,
+                                       wall_now=1000.0,
+                                       monotonic_now=2000.0)
+        assert captured['kwargs']['drain_deadline'] == 2000.0
+
+    def test_far_future_timestamp_gets_one_durable_full_cap(self):
+        captured = self._assemble_impl(cap=300,
+                                       started_at=2000.0,
+                                       wall_now=1000.0,
+                                       monotonic_now=3000.0)
+        assert captured['writes'][-1][3] == 1000.0
+        assert captured['kwargs']['drain_deadline'] == 3300.0
+
+    def test_small_future_clock_skew_fails_closed(self):
+        captured = self._assemble_impl(cap=300,
+                                       started_at=1100.0,
+                                       wall_now=1000.0,
+                                       monotonic_now=3000.0)
+        assert captured['writes'][-1][3] == 1100.0
+        assert captured['kwargs']['drain_deadline'] == 3300.0
 
     def test_zero_cap_skips_assembly_entirely(self):
         kwargs = self._assemble_impl(cap=0)['kwargs']
@@ -774,6 +817,99 @@ class TestTerminateReplicaDrainAssembly:
     def test_url_none_falls_back_to_bounded_sleep(self):
         kwargs = self._assemble(url=None)['kwargs']
         assert kwargs['drain_complete'] is None
+
+
+class TestRecoveredStrictDrainDeadline:
+
+    @staticmethod
+    def _manager_and_info(started_at):
+        rm = replica_managers.SkyPilotReplicaManager.__new__(
+            replica_managers.SkyPilotReplicaManager)
+        rm._service_name = 'svc'
+        rm._is_pool = False
+        rm._wait_for_idle_trackers = {}
+        rm._lb_in_flight_report = None
+        rm._persist_replica = mock.Mock()
+        info = mock.Mock(replica_id=7, cluster_name='svc-7')
+        info.status_property = replica_managers.ReplicaStatusProperty(
+            drain_cap_seconds=600, drain_started_at=started_at)
+        type(info).url = mock.PropertyMock(return_value='http://r7:8080')
+        return rm, info
+
+    def test_recovery_reuses_durable_start_and_requires_fresh_lb_report(self):
+        rm, info = self._manager_and_info(700.0)
+        with mock.patch.object(replica_managers.time,
+                               'time', return_value=1000.0), \
+             mock.patch.object(replica_managers.time,
+                               'monotonic', return_value=2000.0):
+            rm._register_wait_for_idle(info)
+
+        tracker, deadline = rm._wait_for_idle_trackers[7]
+        assert deadline == 2300.0
+        assert info.status_property.drain_started_at == 700.0
+        rm._persist_replica.assert_not_called()
+        assert tracker is not None
+
+        rm._lb_in_flight_report = (1999.0, {
+            'http://r7:8080': 0
+        }, set(), set(), set(), 'lb-a')
+        with mock.patch.object(replica_managers.time,
+                               'monotonic',
+                               return_value=2001.0):
+            assert tracker() is False
+            rm._lb_in_flight_report = (2001.0, {
+                'http://r7:8080': 0
+            }, set(), set(), set(), 'lb-a')
+            assert tracker() is True
+
+    def test_legacy_row_backfill_is_durable_before_tracker_registration(self):
+        rm, info = self._manager_and_info(None)
+        with mock.patch.object(replica_managers.time,
+                               'time', return_value=1000.0), \
+             mock.patch.object(replica_managers.time,
+                               'monotonic', return_value=2000.0):
+            rm._register_wait_for_idle(info)
+
+        assert info.status_property.drain_started_at == 1000.0
+        rm._persist_replica.assert_called_once_with(7, info)
+        assert rm._wait_for_idle_trackers[7][1] == 2600.0
+
+    def test_backfill_failure_does_not_admit_in_memory_drain(self):
+        rm, info = self._manager_and_info(None)
+        rm._persist_replica.side_effect = RuntimeError('db unavailable')
+        with mock.patch.object(replica_managers.time,
+                               'time', return_value=1000.0), \
+             mock.patch.object(replica_managers.time,
+                               'monotonic', return_value=2000.0), \
+             pytest.raises(RuntimeError, match='db unavailable'):
+            rm._register_wait_for_idle(info)
+
+        assert rm._wait_for_idle_trackers == {}
+
+    def test_deferred_off_route_write_atomically_stamps_start(self):
+        rm, info = self._manager_and_info(None)
+        rm._logical_controller_epoch = 'epoch-a'
+        rm._resolve_drain_cap_seconds = mock.Mock(return_value=600)
+        rm._register_wait_for_idle = mock.Mock()
+        order = mock.Mock()
+        rm._persist_replica = order.persist
+        rm._register_wait_for_idle = order.register
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_info_from_id',
+                               return_value=info), \
+             mock.patch.object(replica_managers.global_user_state,
+                               'cluster_with_name_exists',
+                               return_value=True), \
+             mock.patch.object(replica_managers.time,
+                               'time', return_value=1000.0):
+            rm._defer_scale_down_until_idle(7, (3, 4, 8))
+
+        assert info.status_property.drain_cap_seconds == 600
+        assert info.status_property.drain_started_at == 1000.0
+        assert order.mock_calls == [
+            mock.call.persist(7, info),
+            mock.call.register(info)
+        ]
 
 
 class TestStatusDerivationForRecovery:
