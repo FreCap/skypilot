@@ -767,7 +767,7 @@ class ServeUpdateBody(RequestBody):
 
 class ServeVersionElectionBody(BasePayload):
     """The public admin request for electing a stored service version."""
-    version: int
+    version: int = pydantic.Field(ge=1)
 
 
 class ServeElectVersionBody(RequestBody):

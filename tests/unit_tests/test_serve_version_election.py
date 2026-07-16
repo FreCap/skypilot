@@ -83,8 +83,11 @@ def test_elect_version_reuses_safe_update_path():
                            'get_service_from_name',
                            return_value=record), \
          mock.patch.object(impl.serve_state,
-                           'get_yaml_content',
-                           return_value='service: {}'), \
+                           'get_yaml_contents',
+                           return_value={
+                               1: 'service: old',
+                               3: 'service: current',
+                           }), \
          mock.patch.object(impl.task_lib.Task,
                            'from_yaml_str',
                            return_value=task), \
@@ -96,6 +99,35 @@ def test_elect_version_reuses_safe_update_path():
                                    serve_utils.UpdateMode.ROLLING,
                                    pool=False,
                                    lifecycle_lock=lifecycle_lock)
+
+
+def test_elect_version_rejects_configuration_that_is_already_elected():
+    lifecycle_lock = contextlib.nullcontext()
+    record = {
+        'hash': 'service-hash',
+        'pool': False,
+        'elected_version': 3,
+    }
+    with mock.patch.object(impl.filelock,
+                           'FileLock',
+                           return_value=contextlib.nullcontext()), \
+         mock.patch.object(impl.serve_utils,
+                           'get_service_lifecycle_lock',
+                           return_value=lifecycle_lock), \
+         mock.patch.object(impl.serve_state,
+                           'get_service_from_name',
+                           return_value=record), \
+         mock.patch.object(impl.serve_state,
+                           'get_yaml_contents',
+                           return_value={
+                               1: 'service: same',
+                               3: 'service: same',
+                           }), \
+         mock.patch.object(impl, '_update_impl') as update, \
+         pytest.raises(ValueError, match='already has the configuration'):
+        impl.elect_version('svc', 1, 'service-hash')
+
+    update.assert_not_called()
 
 
 def test_elect_version_rejects_stale_service_incarnation():

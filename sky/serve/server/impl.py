@@ -968,15 +968,27 @@ def elect_version(service_name: str, version: int,
                 raise RuntimeError(
                     f'Service {service_name!r} changed before version '
                     f'{version} could be elected. Refresh and try again.')
-            if record.get('elected_version') == version:
+            elected_version = record.get('elected_version')
+            if elected_version == version:
                 raise ValueError(
                     f'Service {service_name!r} already has version {version} '
                     'elected.')
-            yaml_content = serve_state.get_yaml_content(service_name, version)
+            versions = [version]
+            if isinstance(elected_version, int):
+                versions.append(elected_version)
+            yaml_contents = serve_state.get_yaml_contents(
+                service_name, versions)
+            yaml_content = yaml_contents.get(version)
             if yaml_content is None:
                 raise ValueError(
                     f'Committed version {version} does not exist for service '
                     f'{service_name!r}.')
+            if (isinstance(elected_version, int) and
+                    yaml_contents.get(elected_version) == yaml_content):
+                raise ValueError(
+                    f'Service {service_name!r} already has the configuration '
+                    f'from version {version} elected as version '
+                    f'{elected_version}.')
             task = task_lib.Task.from_yaml_str(yaml_content)
             _update_impl(task,
                          service_name,

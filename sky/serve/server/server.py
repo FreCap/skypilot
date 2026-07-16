@@ -1,5 +1,6 @@
 """Rest APIs for SkyServe."""
 
+import asyncio
 import pathlib
 
 import fastapi
@@ -107,7 +108,8 @@ async def elect_version(
 ) -> None:
     """Safely roll out a new generation from a stored version."""
     _require_admin(request)
-    record = serve_state.get_service_from_name(service_name)
+    record = await asyncio.to_thread(serve_state.get_service_from_name,
+                                     service_name)
     if record is None or record.get('pool'):
         raise fastapi.HTTPException(status_code=404,
                                     detail='Service not found.')
@@ -115,16 +117,11 @@ async def elect_version(
         raise fastapi.HTTPException(
             status_code=409,
             detail='Service has no durable incarnation identity.')
-    history = _service_version_history(service_name, record)
-    if election_body.version < 1:
-        raise fastapi.HTTPException(status_code=422,
-                                    detail='Version must be positive.')
-    selected = next((version for version in history['versions']
-                     if version['version'] == election_body.version), None)
-    if selected is None:
+    if await asyncio.to_thread(serve_state.get_yaml_content, service_name,
+                               election_body.version) is None:
         raise fastapi.HTTPException(status_code=404,
                                     detail='Service version not found.')
-    if selected['elected']:
+    if record.get('elected_version') == election_body.version:
         raise fastapi.HTTPException(status_code=409,
                                     detail='Version is already elected.')
     await executor.schedule_request_async(
