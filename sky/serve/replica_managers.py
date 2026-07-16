@@ -5406,6 +5406,9 @@ class SkyPilotReplicaManager(ReplicaManager):
         new_spot_placer = None
         if new_uses_logical_replicas or isinstance(new_placer_name, str):
             new_spot_placer = spot_placer.SpotPlacer.from_task(spec, new_task)
+        old_spot_placer = getattr(self, '_spot_placer', None)
+        if new_spot_placer is not None and old_spot_placer is not None:
+            new_spot_placer.inherit_preemption_state(old_spot_placer)
         if new_uses_logical_replicas:
             _validate_logical_capacity_sources(new_default_planned_capacity,
                                                new_spot_placer,
