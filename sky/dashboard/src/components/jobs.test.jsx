@@ -4,6 +4,7 @@ import {
   render,
   renderHook,
   screen,
+  within,
   waitFor,
 } from '@testing-library/react';
 import {
@@ -110,6 +111,43 @@ describe('managed jobs page initialization', () => {
         ([fetcher]) => fetcher === getPoolStatus
       )
     ).toHaveLength(2); // One page snapshot plus the PoolsTable's own read.
+  });
+
+  it('renders the pool row contract from the pool snapshot', async () => {
+    dashboardCache.get.mockImplementation((fetcher) => {
+      if (fetcher === getPoolStatus) {
+        return Promise.resolve({
+          pools: [
+            {
+              name: 'training-pool',
+              jobCounts: { RUNNING: 2 },
+              replica_info: [
+                { status: 'READY', cloud: 'AWS', region: 'us-east-1' },
+                { status: 'STOPPED', cloud: 'AWS', region: 'us-east-1' },
+              ],
+              target_num_replicas: 3,
+              requested_resources_str: '1x A100',
+            },
+          ],
+        });
+      }
+      return Promise.resolve([]);
+    });
+
+    render(<ManagedJobs />);
+
+    const poolLink = await screen.findByRole('link', {
+      name: 'training-pool',
+    });
+    const poolRow = poolLink.closest('tr');
+    expect(poolLink).toHaveAttribute('href', '/jobs/pools/training-pool');
+    expect(within(poolRow).getByText('1 (target: 3)')).toBeInTheDocument();
+    expect(within(poolRow).getByText('1x A100')).toBeInTheDocument();
+    expect(within(poolRow).getByText('RUNNING')).toBeInTheDocument();
+    expect(within(poolRow).getByText('AWS (1 region)')).toBeInTheDocument();
+    expect(
+      within(poolRow).getByRole('link', { name: 'See all jobs' })
+    ).toHaveAttribute('href', expect.stringContaining('pool'));
   });
 
   it('does not start the pool request when preload finishes after unmount', async () => {
