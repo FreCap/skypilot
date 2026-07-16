@@ -9,9 +9,11 @@ import {
 
 import {
   ContextDetails,
+  InfrastructureSection,
   loadContextGPUDataInParallel,
 } from '@/components/infra';
 import { ContextDetails as ExtractedContextDetails } from '@/components/infra-context-details';
+import { InfrastructureSection as ExtractedInfrastructureSection } from '@/components/infra-section';
 import { SSHNodePoolDetails } from '@/components/ssh-node-pool-details';
 import {
   getSSHNodePoolStatus,
@@ -83,6 +85,81 @@ function deferred() {
   });
   return { promise, resolve, reject };
 }
+
+describe('InfrastructureSection', () => {
+  it('preserves the infra facade export as a direct alias', () => {
+    expect(InfrastructureSection).toBe(ExtractedInfrastructureSection);
+  });
+
+  it('keeps empty and initial-loading states distinct', () => {
+    const { rerender } = render(
+      <InfrastructureSection
+        title="Kubernetes"
+        isLoading={false}
+        isDataLoaded={true}
+        contexts={[]}
+        gpus={[]}
+        groupedPerContextGPUs={{}}
+        groupedPerNodeGPUs={{}}
+        handleContextClick={jest.fn()}
+      />
+    );
+
+    expect(
+      screen.getByText('No Kubernetes found or Kubernetes is not configured.')
+    ).toBeVisible();
+
+    rerender(
+      <InfrastructureSection
+        title="Kubernetes"
+        isLoading={true}
+        isDataLoaded={false}
+        contexts={[]}
+        gpus={[]}
+        groupedPerContextGPUs={{}}
+        groupedPerNodeGPUs={{}}
+        handleContextClick={jest.fn()}
+      />
+    );
+
+    expect(screen.getByText('Loading Kubernetes...')).toBeVisible();
+  });
+
+  it('projects context resources and routes context selection', () => {
+    const handleContextClick = jest.fn();
+    render(
+      <InfrastructureSection
+        title="Kubernetes"
+        isLoading={false}
+        isDataLoaded={true}
+        contexts={['dev-cluster']}
+        gpus={[gpu]}
+        groupedPerContextGPUs={{ 'dev-cluster': [gpu] }}
+        groupedPerNodeGPUs={{ 'dev-cluster': [node] }}
+        handleContextClick={handleContextClick}
+        contextStats={{
+          'kubernetes/dev-cluster': { clusters: 2, jobs: 3 },
+        }}
+        jobsData={{ 'kubernetes/dev-cluster': { jobs: 3 } }}
+        isJobsDataLoading={false}
+        isClusterDataLoading={false}
+        loadedContexts={new Set(['dev-cluster'])}
+      />
+    );
+
+    const contextRow = screen.getByText('dev-cluster').closest('tr');
+    expect(contextRow).not.toBeNull();
+    expect(within(contextRow).getByText('2')).toBeVisible();
+    expect(within(contextRow).getByText('3')).toBeVisible();
+    expect(within(contextRow).getByText('8')).toBeVisible();
+    expect(within(contextRow).getByText('32 GB')).toBeVisible();
+    expect(within(contextRow).getByText('H100')).toBeVisible();
+    expect(within(contextRow).getByText('4')).toBeVisible();
+
+    fireEvent.click(screen.getByText('dev-cluster'));
+    expect(handleContextClick).toHaveBeenCalledWith('dev-cluster');
+  });
+});
 
 describe('loadContextGPUDataInParallel', () => {
   it('starts every context once and settles after successes and failures', async () => {
