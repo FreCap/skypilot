@@ -412,12 +412,15 @@ def launch_cluster(
         gap_seconds = backoff.current_backoff()
         logger.info('Retrying to launch the sky serve replica cluster '
                     f'in {gap_seconds:.1f} seconds.')
-        start_backoff = time.time()
+        backoff_deadline = time.monotonic() + gap_seconds
         # Check if it is cancelled every 0.1 seconds.
-        while time.time() - start_backoff < gap_seconds:
+        while True:
             if _check_is_cancelled():
                 return
-            time.sleep(0.1)
+            remaining = backoff_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.1, remaining))
 
 
 def _wait_for_drain(drain_deadline: float,

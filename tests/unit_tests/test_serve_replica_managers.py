@@ -396,7 +396,13 @@ class TestLaunchClusterRetry:
     (capacity) failures when `availability_max_retry` caps them; other
     (transient) errors must keep the `max_retry` in-place attempts."""
 
-    def _run_launch_cluster(self, tmp_path, stream_side_effects, **kwargs):
+    def _run_launch_cluster(self,
+                            tmp_path,
+                            stream_side_effects,
+                            *,
+                            backoff_seconds=0,
+                            replica_to_launch_cancelled=None,
+                            **kwargs):
         """Run launch_cluster with a mocked SDK.
 
         Each element of stream_side_effects is one launch attempt: an
@@ -413,10 +419,12 @@ class TestLaunchClusterRetry:
                        ) as mock_terminate, \
              mock.patch('sky.serve.replica_managers.common_utils.Backoff'
                        ) as mock_backoff:
-            # Skip the (up to 60s) backoff between attempts.
-            mock_backoff.return_value.current_backoff.return_value = 0
+            mock_backoff.return_value.current_backoff.return_value = (
+                backoff_seconds)
             mock_sdk.launch.return_value = 'request-id'
             mock_sdk.stream_and_get.side_effect = stream_side_effects
+            if replica_to_launch_cancelled is None:
+                replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
             try:
                 replica_managers.launch_cluster(
                     replica_id=1,
@@ -424,11 +432,66 @@ class TestLaunchClusterRetry:
                     cluster_name='svc-1',
                     log_file=str(tmp_path / 'launch.log'),
                     replica_to_request_id=thread_utils.ThreadSafeDict(),
-                    replica_to_launch_cancelled=thread_utils.ThreadSafeDict(),
+                    replica_to_launch_cancelled=replica_to_launch_cancelled,
                     **kwargs)
             except RuntimeError as e:
                 raised = e
         return mock_sdk, mock_terminate, raised
+
+    def test_retry_backoff_uses_monotonic_bounded_sleeps(self, tmp_path):
+        now = 0.0
+        sleeps = []
+
+        def _monotonic():
+            return now
+
+        def _sleep(seconds):
+            nonlocal now
+            sleeps.append(seconds)
+            now += seconds
+
+        fake_time = mock.Mock(wraps=replica_managers.time)
+        fake_time.time.side_effect = AssertionError('wall clock used')
+        fake_time.monotonic.side_effect = _monotonic
+        fake_time.sleep.side_effect = _sleep
+        with mock.patch('sky.serve.replica_managers.time', fake_time):
+            mock_sdk, _, raised = self._run_launch_cluster(
+                tmp_path, [RuntimeError('transient'), None],
+                backoff_seconds=0.15)
+
+        assert raised is None
+        assert mock_sdk.launch.call_count == 2
+        assert sleeps == pytest.approx([0.1, 0.05])
+        assert now == pytest.approx(0.15)
+
+    def test_retry_backoff_stops_on_cancellation(self, tmp_path):
+        now = 0.0
+        sleeps = []
+        cancelled = thread_utils.ThreadSafeDict()
+
+        def _monotonic():
+            return now
+
+        def _sleep(seconds):
+            nonlocal now
+            sleeps.append(seconds)
+            now += seconds
+            cancelled[1] = True
+
+        fake_time = mock.Mock(wraps=replica_managers.time)
+        fake_time.monotonic.side_effect = _monotonic
+        fake_time.sleep.side_effect = _sleep
+        with mock.patch('sky.serve.replica_managers.time', fake_time):
+            mock_sdk, mock_terminate, raised = self._run_launch_cluster(
+                tmp_path, [RuntimeError('transient')],
+                backoff_seconds=1,
+                replica_to_launch_cancelled=cancelled)
+
+        assert raised is None
+        assert mock_sdk.launch.call_count == 1
+        assert mock_terminate.call_count == 1
+        assert sleeps == [0.1]
+        assert 1 not in cancelled
 
     def test_capacity_failure_fails_fast_with_availability_max_retry(
             self, tmp_path):
