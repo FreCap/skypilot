@@ -20,6 +20,10 @@ import {
   getJobGpuCount,
   UsersTable,
 } from '@/components/users';
+import {
+  buildUsersWithUsage as extractedBuildUsersWithUsage,
+  UsersTable as ExtractedUsersTable,
+} from '@/components/users-table';
 
 jest.mock('@/lib/cache', () => ({
   __esModule: true,
@@ -120,6 +124,11 @@ describe('UsersTable refresh lifecycle', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     cachePreloader.preloadForPage.mockResolvedValue();
+  });
+
+  it('preserves the users module exports as direct aliases', () => {
+    expect(UsersTable).toBe(ExtractedUsersTable);
+    expect(buildUsersWithUsage).toBe(extractedBuildUsersWithUsage);
   });
 
   afterEach(() => {
