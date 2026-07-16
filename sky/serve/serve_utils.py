@@ -2319,7 +2319,7 @@ def _terminate_failed_services_locked(
             return _purge_ownership_failure(
                 service_name, 'orphan teardown claim lost ownership')
 
-    owner_ack_deadline = time.time() + 10
+    owner_ack_deadline = time.monotonic() + 10
     while True:
         owner = serve_state.get_service_controller_owner(service_name)
         if owner is None or owner.get('hash') != expected_service_hash:
@@ -2328,13 +2328,14 @@ def _terminate_failed_services_locked(
         if (owner.get('controller_port') ==
                 constants.CONTROLLER_TEARDOWN_ACK_PORT):
             break
-        if time.time() >= owner_ack_deadline:
+        remaining = owner_ack_deadline - time.monotonic()
+        if remaining <= 0:
             return (f'{colorama.Fore.YELLOW}failed service '
                     f'{service_name!r} could not be purged because its '
                     'controller has not yet acknowledged durable teardown; '
                     'cleanup remains scheduled and can be retried.'
                     f'{colorama.Style.RESET_ALL}')
-        time.sleep(0.2)
+        time.sleep(min(0.2, remaining))
 
     if not _still_owns():
         return _purge_ownership_failure(
