@@ -202,6 +202,7 @@ def test_replica_json_storage_round_trip_preserves_lifecycle_state():
     info = _replica(7, version=3)
     info.planned_capacity = 8
     info.unknown_capacity_replacement = True
+    info.logical_bridge_capacity_verified = True
     info.created_at = 123.5
     info.first_not_ready_time = 124.5
     info.first_consecutive_failure_time = 125.5
@@ -225,6 +226,7 @@ def test_replica_json_storage_round_trip_preserves_lifecycle_state():
 
     assert restored.to_storage_dict() == info.to_storage_dict()
     assert restored.unknown_capacity_replacement is True
+    assert restored.logical_bridge_capacity_verified is True
     assert restored.status == info.status
 
 

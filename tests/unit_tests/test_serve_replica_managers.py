@@ -227,6 +227,47 @@ def _record_launch(launched):
     return _side_effect
 
 
+def test_confirm_logical_bridge_capacity_is_durable_and_monotonic():
+    mgr = _make_manager()
+    mgr._uses_logical_replicas = True
+    info = replica_managers.ReplicaInfo(replica_id=1,
+                                        cluster_name='svc-1',
+                                        replica_port='8080',
+                                        is_spot=True,
+                                        location=None,
+                                        version=1,
+                                        resources_override=None)
+    persisted = []
+    with mock.patch.object(replica_managers.serve_state,
+                           'get_replica_infos',
+                           return_value=[info]), \
+         mock.patch.object(mgr,
+                           '_persist_replicas',
+                           side_effect=persisted.extend):
+        confirmed = mgr.confirm_logical_bridge_capacities({1: 8})
+
+    assert confirmed == {1: 8}
+    assert info.to_storage_dict()['replica_info_version'] == 10
+    assert info.planned_capacity == 8
+    assert info.logical_bridge_capacity_verified is True
+    assert persisted == [(1, info)]
+
+    # A later smaller runtime observation must affect ready capacity only. It
+    # cannot shrink the durable upper bound or cause another DB write.
+    persisted.clear()
+    with mock.patch.object(replica_managers.serve_state,
+                           'get_replica_infos',
+                           return_value=[info]), \
+         mock.patch.object(mgr,
+                           '_persist_replicas',
+                           side_effect=persisted.extend):
+        confirmed = mgr.confirm_logical_bridge_capacities({1: 4})
+
+    assert confirmed == {1: 8}
+    assert info.planned_capacity == 8
+    assert not persisted
+
+
 class TestReplicaIdSeededOnRecovery:
     """`_recover_replica_operations` must advance `_next_replica_id` past every
     persisted replica id.

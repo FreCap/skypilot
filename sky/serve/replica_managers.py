@@ -943,7 +943,9 @@ class ReplicaInfo:
     # Version 8 persists the immutable logical slot width selected for this
     # physical backend. Version 9 marks bounded unknown-capacity replacement
     # rows so a persistent telemetry outage cannot recursively replace them.
-    _VERSION = 9
+    # Version 10 records that a pre-activation physical bridge has published
+    # a load-balancer-verified logical width.
+    _VERSION = 10
 
     def __init__(self,
                  replica_id: int,
@@ -985,6 +987,11 @@ class ReplicaInfo:
                              f'Got: {planned_capacity!r}')
         self.planned_capacity: int = planned_capacity
         self.unknown_capacity_replacement = bool(unknown_capacity_replacement)
+        # A physical row created before implicit logical replicas starts at
+        # width one. It becomes part of the logical capacity contract only
+        # after the live LB probes the local router and the controller clamps
+        # that observation to the backend's launched GPU count.
+        self.logical_bridge_capacity_verified: bool = False
         # Launch-origin attribution: True only for sentinel (fill)
         # launches; set by _launch_replica before the row is persisted.
         # The broker's holdings split and the grant ceiling's demand
@@ -1032,6 +1039,8 @@ class ReplicaInfo:
             'planned_capacity': int(getattr(self, 'planned_capacity', 1)),
             'unknown_capacity_replacement': bool(
                 getattr(self, 'unknown_capacity_replacement', False)),
+            'logical_bridge_capacity_verified': bool(
+                getattr(self, 'logical_bridge_capacity_verified', False)),
             'reserved_fill': bool(getattr(self, 'reserved_fill', False)),
             'cost_rebalance_for_replica_id': getattr(
                 self, 'cost_rebalance_for_replica_id', None),
@@ -1101,6 +1110,8 @@ class ReplicaInfo:
         replica.planned_capacity = planned_capacity
         replica.unknown_capacity_replacement = bool(
             state.get('unknown_capacity_replacement', False))
+        replica.logical_bridge_capacity_verified = bool(
+            state.get('logical_bridge_capacity_verified', False))
         replica.reserved_fill = bool(state.get('reserved_fill', False))
         replica.cost_rebalance_for_replica_id = state.get(
             'cost_rebalance_for_replica_id')
@@ -1774,6 +1785,46 @@ class SkyPilotReplicaManager(ReplicaManager):
             raise RuntimeError(
                 f'Service {self._service_name!r} incarnation changed while '
                 'persisting replica probe results.')
+
+    @with_lock
+    def confirm_logical_bridge_capacities(
+            self, verified_capacities: dict[int, int]) -> dict[int, int]:
+        """Durably adopt fresh LB-proven widths for physical bridge rows.
+
+        The caller has already bounded each observation by the launched GPU
+        count. Re-read under the manager lock before updating so an older LB
+        sync snapshot cannot overwrite a concurrent readiness or teardown
+        transition. This path runs only for a bridge's first proof or a later
+        monotonic width increase, not on every LB heartbeat.
+        """
+        if not self._uses_logical_replicas or not verified_capacities:
+            return {}
+        fresh_infos = {
+            info.replica_id: info
+            for info in serve_state.get_replica_infos(self._service_name)
+        }
+        updates: list[tuple[int, ReplicaInfo]] = []
+        confirmed: dict[int, int] = {}
+        for replica_id, verified_capacity in verified_capacities.items():
+            info = fresh_infos.get(replica_id)
+            if (info is None or info.is_terminal or
+                    isinstance(verified_capacity, bool) or
+                    not isinstance(verified_capacity, int) or
+                    verified_capacity < 1):
+                continue
+            current_capacity = int(getattr(info, 'planned_capacity', 1))
+            adopted_capacity = max(current_capacity, verified_capacity)
+            already_verified = bool(
+                getattr(info, 'logical_bridge_capacity_verified', False))
+            if not already_verified or adopted_capacity != current_capacity:
+                info._version = ReplicaInfo._VERSION  # pylint: disable=protected-access
+                info.planned_capacity = adopted_capacity
+                info.logical_bridge_capacity_verified = True
+                updates.append((replica_id, info))
+            confirmed[replica_id] = adopted_capacity
+        if updates:
+            self._persist_replicas(updates)
+        return confirmed
 
     def _remove_replica(self, replica_id: int) -> None:
         removed = serve_state.remove_replica(self._service_name, replica_id,

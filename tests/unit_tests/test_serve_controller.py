@@ -69,6 +69,8 @@ class _FakeReplicaInfo:
         self.url_resolutions = 0
         self.handle_resolutions = 0
         self.last_provider_config = None
+        self.planned_capacity = 1
+        self.logical_bridge_capacity_verified = False
 
     @property
     def url(self) -> Optional[str]:
@@ -1350,6 +1352,7 @@ class _StatefulReplicaManager:
                        ['http://trusted:8080'], 'trusted-session')
         self.update_calls = 0
         self.logical_snapshot = None
+        self.confirmed_bridge_capacities = []
 
     def update_lb_in_flight(self, in_flight, routing_urls, unknown_urls,
                             draining_urls, lb_session_id) -> None:
@@ -1362,6 +1365,10 @@ class _StatefulReplicaManager:
 
     def update_logical_reconcile_snapshot(self, **kwargs) -> None:
         self.logical_snapshot = kwargs
+
+    def confirm_logical_bridge_capacities(self, capacities):
+        self.confirmed_bridge_capacities.append(dict(capacities))
+        return dict(capacities)
 
 
 class TestAuthoritativeLbReportIngestion:
@@ -1497,6 +1504,40 @@ class TestAuthoritativeLbReportIngestion:
             'unknown_replica_ids': set(),
         }
 
+    def test_logical_report_adopts_bridge_width_only_after_bounded_lb_proof(
+            self):
+        ctrl, info, report = self._controller_and_report()
+        ctrl._autoscaler.replica_unit = 'logical'  # pylint: disable=protected-access
+        ctrl._autoscaler.latest_version = 2  # pylint: disable=protected-access
+        ctrl._lb_translation_cache = {  # pylint: disable=protected-access
+            1: (self._URL, 'L4', 8)
+        }
+        report['total_slots_by_url'] = {self._URL: 64}
+        report['occupancy_sampled_urls'] = [self._URL]
+        report['unknown_in_flight_urls'] = []
+
+        accepted = asyncio.run(
+            ctrl._ingest_load_balancer_report(  # pylint: disable=protected-access,too-many-function-args
+                report, [info], {1: True}, (True, True, True), {2}))
+
+        assert accepted is True
+        # The local router's report is independently capped by the launched
+        # shape before it can affect durable or autoscaler state.
+        assert ctrl._replica_manager.confirmed_bridge_capacities == [{1: 8}]  # pylint: disable=protected-access
+        assert info.planned_capacity == 8
+        assert info.logical_bridge_capacity_verified is True
+        assert ctrl._autoscaler.reports[-1][  # pylint: disable=protected-access
+            'observed_slots_by_replica_id'] == {
+                1: 8
+            }
+
+        # The durable proof suppresses persistence work on later heartbeats.
+        accepted = asyncio.run(
+            ctrl._ingest_load_balancer_report(  # pylint: disable=protected-access,too-many-function-args
+                report, [info], {1: True}, (True, True, True), {2}))
+        assert accepted is True
+        assert ctrl._replica_manager.confirmed_bridge_capacities == [{1: 8}]  # pylint: disable=protected-access
+
     def test_sole_ready_reporter_keeps_demand_during_terminating_overlap(self):
         ctrl, info, report = self._controller_and_report()
         with mock.patch.object(controller.lb_k8s,
@@ -1572,9 +1613,11 @@ class TestAuthoritativeLbReportIngestion:
         async def _capture_ingest(request_data,
                                   replica_infos,
                                   async_occupancy_by_version,
-                                  authority=None):
+                                  authority=None,
+                                  logical_versions=None):
             del request_data, replica_infos, authority
             observed['ingest'] = dict(async_occupancy_by_version)
+            observed['ingest_logical_versions'] = set(logical_versions or ())
             return True
 
         ctrl._get_lb_replica_info = _capture_lb_replica_info  # pylint: disable=protected-access
@@ -1616,6 +1659,7 @@ class TestAuthoritativeLbReportIngestion:
         get_specs.assert_called_once_with('svc', [1, 2, 3])
         assert observed['sync'] == {1: False, 2: None, 3: True}
         assert observed['ingest'] == {1: False, 2: None, 3: True}
+        assert observed['ingest_logical_versions'] == {3}
         assert observed['logical_versions'] == {3}
         assert observed['sync_thread'] != event_loop_thread
 
@@ -1798,6 +1842,31 @@ class TestGetCapacityHint:
         assert hint['logical_replica_urls'] == ['http://logical']
         assert hint['ready_replicas'] == 9
         assert hint['physical_ready_replicas'] == 2
+
+    def test_logical_hint_includes_lb_verified_physical_bridge(self):
+        ctrl = _make_controller()
+        ctrl._autoscaler = _FakeAutoscaler(  # pylint: disable=protected-access
+            target=8,
+            recomputed=True,
+            latest_version=2,
+            replica_unit='logical')
+        physical = _FakeReplicaInfo(1,
+                                    serve_state.ReplicaStatus.READY,
+                                    version=1)
+        physical.planned_capacity = 8
+        physical.logical_bridge_capacity_verified = True
+        ctrl._lb_translation_cache = {  # pylint: disable=protected-access
+            1: ('http://physical', 'L4', 8),
+        }
+
+        hint = ctrl._get_capacity_hint(  # pylint: disable=protected-access
+            [physical],
+            logical_versions=set())
+
+        assert hint['planned_capacity_by_url'] == {'http://physical': 8}
+        assert hint['logical_replica_urls'] == ['http://physical']
+        assert hint['ready_replicas'] == 8
+        assert hint['physical_ready_replicas'] == 1
 
     def test_logical_counts_preserve_capacity_and_physical_failures(self):
         ctrl = _make_controller()

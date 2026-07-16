@@ -503,6 +503,40 @@ class SkyServeController:
             if url in url_to_replica_id
         }
 
+    def _logical_bridge_capacity_candidates(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+        logical_versions: set[int],
+        observed_slots: dict[int, int],
+    ) -> dict[int, int]:
+        """Return fresh physical-bridge widths bounded by launched GPUs."""
+        if getattr(self._autoscaler, 'replica_unit', None) != 'logical':
+            return {}
+        candidates: dict[int, int] = {}
+        for info in replica_infos:
+            if info.version in logical_versions or info.is_terminal:
+                continue
+            observed = observed_slots.get(info.replica_id)
+            cached = self._lb_translation_cache.get(info.replica_id)
+            if observed is None or observed < 1 or cached is None:
+                continue
+            gpu_type, gpu_count = cached[1], cached[2]
+            if (gpu_type == 'unknown' or isinstance(gpu_count, bool) or
+                    not isinstance(gpu_count, int) or gpu_count < 1):
+                continue
+            verified = min(observed, gpu_count)
+            # Pass only state transitions to the manager. This keeps the LB
+            # sync hot path free of a redundant DB read/write per heartbeat.
+            current = int(getattr(info, 'planned_capacity', 1))
+            if (not bool(
+                    getattr(info, 'logical_bridge_capacity_verified', False)) or
+                    verified > current):
+                candidates[info.replica_id] = verified
+            # Reporter-controlled values must never reach the autoscaler above
+            # the independently resolved hardware bound.
+            observed_slots[info.replica_id] = verified
+        return candidates
+
     def _unknown_async_replica_ids(
         self,
         replica_infos: list['replica_managers.ReplicaInfo'],
@@ -601,6 +635,7 @@ class SkyServeController:
         replica_infos: list['replica_managers.ReplicaInfo'],
         async_occupancy_by_version: dict[int, bool | None],
         authority: tuple[bool, bool, bool] | None = None,
+        logical_versions: set[int] | None = None,
     ) -> bool:
         """Apply the independently authorized parts of one external LB report.
 
@@ -647,6 +682,31 @@ class SkyServeController:
                 force_all_live_unknown=not drain_authoritative)
             observed_slots = self._translate_observed_slots(
                 request_data.get('total_slots_by_url'))
+            bridge_candidates = (self._logical_bridge_capacity_candidates(
+                replica_infos, logical_versions, observed_slots)
+                                 if logical_versions is not None else {})
+            if bridge_candidates:
+                confirmer = getattr(self._replica_manager,
+                                    'confirm_logical_bridge_capacities', None)
+                if callable(confirmer):
+                    loop = asyncio.get_running_loop()
+                    try:
+                        confirmed = await loop.run_in_executor(
+                            None, confirmer, bridge_candidates)
+                    except Exception as e:  # pylint: disable=broad-except
+                        logger.warning(
+                            'Failed to persist verified logical bridge '
+                            'capacity; retaining conservative width one: '
+                            f'{common_utils.format_exception(e)}')
+                    else:
+                        infos_by_id = {
+                            info.replica_id: info for info in replica_infos
+                        }
+                        for replica_id, capacity in confirmed.items():
+                            info = infos_by_id.get(replica_id)
+                            if info is not None:
+                                info.planned_capacity = capacity
+                                info.logical_bridge_capacity_verified = True
             self._reconcile_generation = getattr(self, '_reconcile_generation',
                                                  0) + 1
             reconcile_generation = self._reconcile_generation
@@ -733,10 +793,12 @@ class SkyServeController:
             # redundant DB round-trips on the LB sync hot path.
             if not await loop.run_in_executor(None, self._owns_current_service):
                 return fastapi.Response(status_code=503)
-            await self._ingest_load_balancer_report(request_data,
-                                                    replica_infos,
-                                                    async_occupancy_by_version,
-                                                    authority=authority)
+            await self._ingest_load_balancer_report(
+                request_data,
+                replica_infos,
+                async_occupancy_by_version,
+                authority=authority,
+                logical_versions=logical_versions)
             self._replica_counts_snapshot = self._get_replica_counts(
                 replica_infos)
             return responses.JSONResponse(content={
@@ -845,7 +907,9 @@ class SkyServeController:
             planned_capacity_by_url = {
                 cached[0]: int(getattr(info, 'planned_capacity', 1))
                 for info in replica_infos
-                if info.version in logical_versions and not info.is_terminal
+                if (info.version in logical_versions or bool(
+                    getattr(info, 'logical_bridge_capacity_verified', False))
+                   ) and not info.is_terminal
                 for cached in [self._lb_translation_cache.get(info.replica_id)]
                 if cached is not None
             }
