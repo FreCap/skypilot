@@ -3,6 +3,7 @@
 import concurrent.futures
 import contextlib
 import threading
+from unittest import mock
 
 import pytest
 import sqlalchemy
@@ -111,6 +112,25 @@ def test_postgres_all_operations(postgres_database):
                                  description='changed')
     with pytest.raises(ValueError, match='cannot be deleted'):
         recipes_db.delete_recipe('basic-cluster', user_id='system')
+
+
+def test_postgres_operations_are_counted_without_legacy_marker(
+        postgres_database, monkeypatch):
+    record = mock.Mock()
+    marker = mock.Mock()
+    monkeypatch.setattr(recipes_db.metrics_lib, 'METRICS_ENABLED', True)
+    monkeypatch.setattr(recipes_db.metrics_lib, 'record_persistence_operation',
+                        record)
+    monkeypatch.setattr(recipes_db, '_emit_legacy_sqlite_marker', marker)
+
+    assert recipes_db.get_recipe('basic-cluster') is not None
+    recipes_db.list_recipes(pinned_only=True)
+
+    assert record.call_args_list == [
+        mock.call('recipes', 'get', 'read', 'postgresql'),
+        mock.call('recipes', 'list', 'read', 'postgresql'),
+    ]
+    marker.assert_not_called()
 
 
 def test_postgres_duplicate_create_is_atomic(postgres_database):

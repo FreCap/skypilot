@@ -6,6 +6,7 @@ pinned globally, filtered by category/tags, and deployed as clusters, jobs,
 pools, or volumes.
 """
 import os
+import threading
 import time
 from typing import Any
 
@@ -13,8 +14,11 @@ import sqlalchemy
 from sqlalchemy import orm
 from sqlalchemy.ext import declarative
 
+from sky import __commit__ as sky_commit
+from sky import __version__ as sky_version
 from sky import exceptions
 from sky import sky_logging
+from sky.metrics import utils as metrics_lib
 from sky.recipes.utils import recipe_type_to_str
 from sky.recipes.utils import RecipeType
 from sky.utils import common_utils
@@ -22,6 +26,11 @@ from sky.utils.db import db_utils
 from sky.utils.db import migration_utils
 
 logger = sky_logging.init_logger(__name__)
+
+_COMPONENT = 'recipes'
+_LEGACY_BACKEND_EVENT = 'skypilot.persistence.legacy_backend_used'
+_legacy_sqlite_marker_lock = threading.Lock()
+_legacy_sqlite_marker_emitted = False
 
 # SQLAlchemy Base
 Base = declarative.declarative_base()
@@ -179,6 +188,35 @@ _db_manager = db_utils.DatabaseManager('recipes',
                                        _create_table,
                                        post_init_fn=_insert_default_templates)
 
+
+def _get_engine(operation: str, phase: str) -> sqlalchemy.engine.Engine:
+    """Returns the Recipes engine and records migration observability."""
+    engine = _db_manager.get_engine()
+    backend = engine.dialect.name
+    if metrics_lib.METRICS_ENABLED:
+        metrics_lib.record_persistence_operation(_COMPONENT, operation, phase,
+                                                 backend)
+    if backend == db_utils.SQLAlchemyDialect.SQLITE.value:
+        _emit_legacy_sqlite_marker(operation, phase)
+    return engine
+
+
+def _emit_legacy_sqlite_marker(operation: str, phase: str) -> None:
+    """Emits one non-sensitive SQLite-use marker in each process."""
+    global _legacy_sqlite_marker_emitted
+    if _legacy_sqlite_marker_emitted:
+        return
+    with _legacy_sqlite_marker_lock:
+        if _legacy_sqlite_marker_emitted:
+            return
+        logger.warning(
+            'event_name=%s component=%s operation=%s phase=%s backend=%s '
+            'server_version=%s server_commit=%s', _LEGACY_BACKEND_EVENT,
+            _COMPONENT, operation, phase,
+            db_utils.SQLAlchemyDialect.SQLITE.value, sky_version, sky_commit)
+        _legacy_sqlite_marker_emitted = True
+
+
 # =============================================================================
 # Data classes
 # =============================================================================
@@ -290,7 +328,7 @@ def create_recipe(
         exceptions.InvalidRecipeNameError: If the name format is invalid.
         exceptions.RecipeAlreadyExistsError: If a recipe with this name exists.
     """
-    engine = _db_manager.get_engine()
+    engine = _get_engine('create', 'write')
     # Validate name format
     common_utils.check_recipe_name_is_valid(name)
 
@@ -341,7 +379,7 @@ def get_recipe(recipe_name: str) -> Recipe | None:
     Returns:
         The Recipe if found, None otherwise.
     """
-    engine = _db_manager.get_engine()
+    engine = _get_engine('get', 'read')
     with orm.Session(engine) as session:
         result = session.execute(
             sqlalchemy.select(recipes_table).where(
@@ -372,7 +410,7 @@ def list_recipes(
     Returns:
         List of matching YamlTemplate objects.
     """
-    engine = _db_manager.get_engine()
+    engine = _get_engine('list', 'read')
     query = sqlalchemy.select(recipes_table)
 
     if pinned_only:
@@ -419,7 +457,6 @@ def update_recipe(
     Raises:
         ValueError: If the recipe is not found or not editable.
     """
-    engine = _db_manager.get_engine()
     # TODO(lloyd): We might want to change this in the future to change who is
     # allowed to update a recipe.
     updates: dict[str, Any] = {}
@@ -431,6 +468,8 @@ def update_recipe(
     if not updates:
         # No updates requested, just return current state
         return get_recipe(recipe_name)
+
+    engine = _get_engine('update', 'write')
 
     updates['updated_at'] = time.time()
     updates['updated_by_id'] = user_id
@@ -472,7 +511,7 @@ def delete_recipe(recipe_name: str, user_id: str) -> bool:
     Raises:
         ValueError: If the recipe is not editable (e.g., default recipes).
     """
-    engine = _db_manager.get_engine()
+    engine = _get_engine('delete', 'write')
 
     # Atomic delete with ownership and editability checks in WHERE clause.
     # This avoids race conditions between check and delete, and works
@@ -514,7 +553,7 @@ def toggle_pin(recipe_name: str, pinned: bool) -> Recipe | None:
     Raises:
         ValueError: If the recipe is not pinnable (e.g., default recipes).
     """
-    engine = _db_manager.get_engine()
+    engine = _get_engine('toggle_pin', 'write')
     # Atomic update with pinnable check in WHERE clause.
     # This avoids race conditions between check and update, and works
     # for both SQLite and PostgreSQL.
