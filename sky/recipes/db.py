@@ -132,6 +132,7 @@ def _insert_default_templates(engine: sqlalchemy.engine.Engine) -> None:
                 sqlalchemy.func.count()).select_from(recipes_table)).scalar()
         if count == 0:
             now = time.time()
+            default_rows = []
             for filename, metadata in DEFAULT_TEMPLATES.items():
                 try:
                     content = _load_example_content(filename)
@@ -139,20 +140,39 @@ def _insert_default_templates(engine: sqlalchemy.engine.Engine) -> None:
                     logger.warning(f'Example file not found: {filename}.yaml')
                     continue
 
-                session.execute(recipes_table.insert().values(
-                    name=metadata['name'],
-                    description=metadata['description'],
-                    content=content,
-                    recipe_type=metadata['recipe_type'],
-                    pinned=1,
-                    user_id='system',
-                    user_name='SkyPilot',
-                    created_at=now,
-                    updated_at=now,
-                    is_editable=0,
-                    is_pinnable=1,
-                ))
-            session.commit()
+                default_rows.append({
+                    'name': metadata['name'],
+                    'description': metadata['description'],
+                    'content': content,
+                    'recipe_type': metadata['recipe_type'],
+                    'pinned': 1,
+                    'user_id': 'system',
+                    'user_name': 'SkyPilot',
+                    'created_at': now,
+                    'updated_at': now,
+                    'is_editable': 0,
+                    'is_pinnable': 1,
+                })
+            try:
+                for row in default_rows:
+                    session.execute(recipes_table.insert().values(**row))
+                session.commit()
+            except sqlalchemy.exc.IntegrityError:
+                # Multiple API-server replicas can all observe an empty table
+                # before any of them commits the default templates.  The
+                # primary key safely selects one winner; losing transactions
+                # should accept that winner instead of failing startup.
+                session.rollback()
+                expected_names = {row['name'] for row in default_rows}
+                existing_names = set(
+                    session.execute(
+                        sqlalchemy.select(recipes_table.c.name).where(
+                            recipes_table.c.name.in_(expected_names),
+                            recipes_table.c.user_id == 'system',
+                            recipes_table.c.is_editable == 0)).scalars())
+                if existing_names != expected_names:
+                    raise
+                logger.debug('Default recipes were initialized concurrently.')
 
 
 _db_manager = db_utils.DatabaseManager('recipes',
