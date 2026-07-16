@@ -619,6 +619,16 @@ export async function streamManagedJobLogs({
   signal,
   onNewLog,
 }) {
+  const requestController = new AbortController();
+  const forwardCallerAbort = () => requestController.abort();
+  if (signal) {
+    if (signal.aborted) {
+      forwardCallerAbort();
+    } else {
+      signal.addEventListener('abort', forwardCallerAbort, { once: true });
+    }
+  }
+
   // Measure timeout from last received data, not from start of request.
   const inactivityTimeout = 30000; // 30 seconds of no data activity
   let lastActivity = Date.now();
@@ -662,7 +672,7 @@ export async function streamManagedJobLogs({
         '/jobs/logs',
         requestBody,
         'POST',
-        { signal }
+        { signal: requestController.signal }
       );
 
       // Stream the logs
@@ -685,9 +695,8 @@ export async function streamManagedJobLogs({
           if (chunk) onNewLog(chunk);
         }
       } finally {
-        // Only cancel the reader if the signal hasn't been aborted
-        // If signal is aborted, the reader should already be canceling
-        if (!signal || !signal.aborted) {
+        // An aborted reader is already being canceled by fetch.
+        if (!requestController.signal.aborted) {
           try {
             reader.cancel();
           } catch (cancelError) {
@@ -717,21 +726,27 @@ export async function streamManagedJobLogs({
     }
   })();
 
-  // Race the fetch against the activity-based timeout
-  const result = await Promise.race([fetchPromise, timeoutPromise]);
-
-  // Clear any remaining timeout
-  if (timeoutId) {
-    clearTimeout(timeoutId);
+  // Race the fetch against the activity-based timeout.
+  let result;
+  try {
+    result = await Promise.race([fetchPromise, timeoutPromise]);
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+    if (signal) {
+      signal.removeEventListener('abort', forwardCallerAbort);
+    }
   }
 
-  // If we timed out due to inactivity, show a more informative message
+  // If inactivity wins, stop and join the losing request before returning.
   if (result.timeout) {
+    requestController.abort();
+    await fetchPromise;
     showToast(
       `Log request for job ${jobId} timed out after ${inactivityTimeout / 1000}s of inactivity`,
       'warning'
     );
-    return;
   }
 }
 
