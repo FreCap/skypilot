@@ -36,11 +36,9 @@ def _require_admin(request: fastapi.Request) -> None:
             detail='Only admins can view or elect service versions.')
 
 
-def _service_version_history(service_name: str,
-                             record: dict | None = None) -> dict:
+def _service_version_history(service_name: str) -> dict:
     """Return redacted immutable versions and current rollout state."""
-    if record is None:
-        record = serve_state.get_service_from_name(service_name)
+    record = serve_state.get_service_from_name(service_name)
     if record is None or record.get('pool'):
         raise fastapi.HTTPException(status_code=404,
                                     detail='Service not found.')
@@ -107,7 +105,7 @@ async def elect_version(
     election_body: payloads.ServeVersionElectionBody,
 ) -> None:
     """Safely roll out a new generation from a stored version."""
-    _require_admin(request)
+    await asyncio.to_thread(_require_admin, request)
     record = await asyncio.to_thread(serve_state.get_service_from_name,
                                      service_name)
     if record is None or record.get('pool'):
