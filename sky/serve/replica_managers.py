@@ -4,6 +4,7 @@ from collections.abc import Mapping
 import contextlib
 import dataclasses
 import functools
+import math
 from multiprocessing import pool as mp_pool
 import os
 import pathlib
@@ -64,6 +65,12 @@ _DEFAULT_LAUNCH_MAX_RETRY = 3
 _DEFAULT_DRAIN_SECONDS = 120
 # Poll cadence for the in-flight-aware drain wait during replica retirement.
 _DRAIN_POLL_SECONDS = 2
+# Wall-clock persistence is the only way to carry a drain deadline across
+# process restarts. Accept ordinary NTP skew, but rewrite timestamps farther in
+# the future before admitting teardown so one corrupted row cannot postpone
+# cleanup indefinitely. A large forward clock jump remains indistinguishable
+# from real elapsed time and is part of the host clock's trust boundary.
+_DRAIN_WALL_CLOCK_FUTURE_SKEW_SECONDS = 5 * 60
 # An LB in-flight report older than this is considered stale (LB dead or
 # not reporting): the drain wait then falls back to the full cap.
 _IN_FLIGHT_REPORT_STALENESS_SECONDS = (
@@ -451,6 +458,47 @@ def _wait_for_drain(drain_deadline: float,
     logger.info('Drain deadline reached; proceeding with termination.')
 
 
+def _is_valid_drain_started_at(value: Any) -> bool:
+    return (not isinstance(value, bool) and isinstance(value, (int, float)) and
+            math.isfinite(value) and value > 0)
+
+
+def _ensure_drain_started_at(status: 'ReplicaStatusProperty',
+                             drain_cap_seconds: int | None) -> float | None:
+    """Return the durable wall-clock start for one bounded drain.
+
+    Monotonic timestamps cannot survive a controller restart. Persisting the
+    wall-clock start keeps the configured cap bounded across recovery while a
+    fresh monotonic tracker is still used for each controller incarnation's LB
+    reports. Legacy or malformed rows get one conservative full-cap window.
+    """
+    if drain_cap_seconds is None or drain_cap_seconds <= 0:
+        status.drain_started_at = None
+        return None
+    now = time.time()
+    started_at = getattr(status, 'drain_started_at', None)
+    if not _is_valid_drain_started_at(started_at):
+        started_at = now
+        status.drain_started_at = started_at
+    else:
+        assert isinstance(started_at, (int, float))
+        if started_at > now + _DRAIN_WALL_CLOCK_FUTURE_SKEW_SECONDS:
+            started_at = now
+            status.drain_started_at = started_at
+    assert isinstance(started_at, (int, float))
+    return float(started_at)
+
+
+def _remaining_drain_seconds(started_at: float,
+                             drain_cap_seconds: int) -> float:
+    """Return a restart-safe, fail-closed remainder for a bounded drain."""
+    now = time.time()
+    # A small future timestamp can result from bounded clock skew. Treat it as
+    # zero elapsed until the wall clock catches up.
+    elapsed = max(now - started_at, 0.0)
+    return max(float(drain_cap_seconds) - elapsed, 0.0)
+
+
 class _ReplicaDrainTracker:
     """Stateful drain-complete predicate for one retiring replica.
 
@@ -743,6 +791,11 @@ class ReplicaStatusProperty:
     # and failure teardowns, and on rows written before this field
     # existed (read via getattr for unpickle back-compat).
     drain_cap_seconds: int | None = None
+    # Wall-clock epoch seconds at which the bounded drain first became
+    # durable. Unlike time.monotonic(), this survives controller restarts and
+    # prevents repeated recovery from restarting the full drain cap. None for
+    # unbounded/immediate cleanup and rows written before this field existed.
+    drain_started_at: float | None = None
     # Economic replacement is fail-closed: persist the off-route retirement
     # intent, but do not admit sky.down until a fresh LB report proves zero
     # occupancy.  getattr is used for rows predating this field.
@@ -1027,6 +1080,9 @@ class ReplicaInfo:
             'logical_retirement_committed')
         if type(logical_retirement_committed) is not bool:
             logical_retirement_committed = None
+        drain_started_at = getattr(status_property, 'drain_started_at', None)
+        if not _is_valid_drain_started_at(drain_started_at):
+            drain_started_at = None
         location = _encode_replica_resource_state(self.location)
         resources_override = _encode_replica_resource_state(
             self.resources_override)
@@ -1077,6 +1133,7 @@ class ReplicaInfo:
                     status_property.failed_spot_availability,
                 'drain_cap_seconds': getattr(status_property,
                                              'drain_cap_seconds', None),
+                'drain_started_at': drain_started_at,
                 'wait_for_idle_before_termination': bool(
                     getattr(status_property, 'wait_for_idle_before_termination',
                             False)),
@@ -1153,6 +1210,10 @@ class ReplicaInfo:
             failed_spot_availability=bool(
                 status_state['failed_spot_availability']),
             drain_cap_seconds=status_state.get('drain_cap_seconds'),
+            drain_started_at=(status_state.get('drain_started_at')
+                              if _is_valid_drain_started_at(
+                                  status_state.get('drain_started_at')) else
+                              None),
             wait_for_idle_before_termination=bool(
                 status_state.get('wait_for_idle_before_termination', False)),
             logical_retirement_version=status_state.get(
@@ -2281,17 +2342,16 @@ class SkyPilotReplicaManager(ReplicaManager):
                             'wait_for_idle_before_termination', False) is True):
                     self._register_wait_for_idle(replica_info)
                     continue
-                # A scale-down retirement interrupted by a controller
-                # restart re-enters a FULL bounded drain: its pre-crash
-                # drain progress is unknowable without persisted drain
-                # state, and re-driving with no drain (as before) would
-                # kill whatever is still in flight. Worst case the total
-                # drain doubles; it never kills early. Purged and failure
-                # teardowns keep the immediate re-drive. Preempted replicas
-                # also re-drive immediately: their cloud instance is already
-                # gone (or partially gone), and the persisted preempted bit
-                # is itself sufficient to classify this as scale-down cleanup
-                # even if the crash preceded the is_scale_down write.
+                # A scale-down retirement interrupted by a controller restart
+                # re-enters the remaining bounded drain. The cap and wall-clock
+                # start are persisted with the off-route row, so recovery never
+                # kills early and repeated restarts cannot restart the cost
+                # window. Purged and failure teardowns keep the immediate
+                # re-drive. Preempted replicas also re-drive immediately: their
+                # cloud instance is already gone (or partially gone), and the
+                # persisted preempted bit is itself sufficient to classify this
+                # as scale-down cleanup even if the crash preceded the
+                # is_scale_down write.
                 drain_cap: int | None = None
                 status_property = replica_info.status_property
                 if replica_info.cluster_name in orphaned_spot_clusters:
@@ -3428,6 +3488,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             # must leave recovery the resolved cap, not the resolver.
             info.status_property.drain_cap_seconds = (
                 in_flight_drain_cap_seconds)
+            _ensure_drain_started_at(info.status_property,
+                                     in_flight_drain_cap_seconds)
             info.status_property.wait_for_idle_before_termination = False
             self._persist_replica(replica_id, info)
             launch_thread = self._launch_thread_pool[replica_id]
@@ -3585,13 +3647,17 @@ class SkyPilotReplicaManager(ReplicaManager):
         info.status_property.sky_down_status = (
             common_utils.ProcessStatus.SCHEDULED)
         info.status_property.drain_cap_seconds = in_flight_drain_cap_seconds
+        drain_started_at = _ensure_drain_started_at(
+            info.status_property, in_flight_drain_cap_seconds)
         self._persist_replica(replica_id, info)
         drain_deadline: float | None = None
         drain_complete: Callable[[], bool] | None = None
         if (in_flight_drain_cap_seconds is not None and
                 in_flight_drain_cap_seconds > 0):
+            assert drain_started_at is not None
             drain_started = time.monotonic()
-            drain_deadline = drain_started + in_flight_drain_cap_seconds
+            drain_deadline = drain_started + _remaining_drain_seconds(
+                drain_started_at, in_flight_drain_cap_seconds)
             try:
                 # Live endpoint resolution (one DB/provider lookup); a
                 # failure must never block the teardown -- it only costs
@@ -3643,6 +3709,25 @@ class SkyPilotReplicaManager(ReplicaManager):
             is_scale_down = (status_property.is_scale_down or
                              status_property.preempted)
             purge = status_property.purged
+            # A provider cleanup failure means the drain worker already ran;
+            # retry cleanup immediately. A worker-start failure never entered
+            # the drain wait and remains SCHEDULED, so it must reuse the
+            # original cap/start pair and consume only the remaining window.
+            # Pre-field FAILED rows are ambiguous because older controllers
+            # also used FAILED for Thread.start() failures; without a durable
+            # timestamp, grant one conservative bounded drain on upgrade.
+            drain_cap: int | None = 0
+            ambiguous_legacy_failure = (
+                down_failed and is_scale_down and not purge and
+                not status_property.preempted and
+                not _is_valid_drain_started_at(
+                    getattr(status_property, 'drain_started_at', None)))
+            if ((not down_failed or ambiguous_legacy_failure) and
+                    is_scale_down and not purge and
+                    not status_property.preempted):
+                drain_cap = getattr(status_property, 'drain_cap_seconds', None)
+                if drain_cap is None:
+                    drain_cap = self._resolve_drain_cap_seconds(replica_id)
             # Once an attempt is admitted, its durable SCHEDULED/RUNNING state
             # prevents duplicate reconciliation.  Remove the old deadline;
             # a failure records the next one in _handle_sky_down_finish.
@@ -3654,7 +3739,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                     replica_drain_delay_seconds=0,
                     is_scale_down=is_scale_down,
                     purge=purge,
-                    in_flight_drain_cap_seconds=0)
+                    in_flight_drain_cap_seconds=drain_cap)
             except Exception as e:  # pylint: disable=broad-except
                 logger.error(
                     f'Failed to reconcile cleanup for replica {replica_id}: '
@@ -3707,13 +3792,24 @@ class SkyPilotReplicaManager(ReplicaManager):
         if info.replica_id in self._wait_for_idle_trackers:
             return
         drain_cap = getattr(info.status_property, 'drain_cap_seconds', None)
+        needs_persist = False
         if drain_cap is None:
             drain_cap = self._resolve_drain_cap_seconds(info.replica_id)
             info.status_property.drain_cap_seconds = drain_cap
+            needs_persist = True
+        prior_started_at = getattr(info.status_property, 'drain_started_at',
+                                   None)
+        drain_started_at = _ensure_drain_started_at(info.status_property,
+                                                    drain_cap)
+        if drain_started_at != prior_started_at:
+            needs_persist = True
+        if needs_persist:
             self._persist_replica(info.replica_id, info)
         drain_started = time.monotonic()
         if deadline is None:
-            deadline = drain_started + drain_cap
+            remaining = (0.0 if drain_started_at is None else
+                         _remaining_drain_seconds(drain_started_at, drain_cap))
+            deadline = drain_started + remaining
         tracker = None
         try:
             replica_url = info.url
@@ -3752,6 +3848,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             common_utils.ProcessStatus.SCHEDULED)
         info.status_property.drain_cap_seconds = (
             self._resolve_drain_cap_seconds(replica_id))
+        _ensure_drain_started_at(info.status_property,
+                                 info.status_property.drain_cap_seconds)
         info.status_property.wait_for_idle_before_termination = True
         if logical_retirement is not None:
             version, generation, target_capacity = logical_retirement
@@ -4048,6 +4146,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         status.is_scale_down = False
         status.purged = False
         status.drain_cap_seconds = None
+        status.drain_started_at = None
         status.wait_for_idle_before_termination = False
         status.logical_retirement_version = None
         status.logical_retirement_controller_epoch = None
@@ -4789,7 +4888,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                             # commitment bit were persisted before start, so
                             # a crash here is safely recoverable. In-process,
                             # convert failed admission into the ordinary
-                            # failed-cleanup retry loop with a fresh worker.
+                            # retry loop with a fresh worker. Keep SCHEDULED:
+                            # unlike a provider cleanup failure, Thread.start()
+                            # never entered the drain wait, so the retry must
+                            # consume the remaining original deadline.
                             logger.error(
                                 f'Failed to start terminate worker for '
                                 f'replica {replica_id}: '
@@ -4797,7 +4899,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                             self._down_thread_pool.pop(replica_id)
                             self._wait_for_idle_trackers.pop(replica_id, None)
                             info.status_property.sky_down_status = (
-                                common_utils.ProcessStatus.FAILED)
+                                common_utils.ProcessStatus.SCHEDULED)
                             try:
                                 self._persist_replica(replica_id, info)
                             finally:
