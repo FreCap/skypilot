@@ -101,7 +101,11 @@ class OciClient:
                  source_authfile: str | None = None,
                  destination_authfile: str | None = None,
                  cancel_event: threading.Event | None = None) -> None:
-        """Copies a complete image index without placing secrets in argv."""
+        """Copies every runtime platform without placing secrets in argv.
+
+        OCI artifacts reachable only through the separate Referrers API, such
+        as signatures and SBOMs, are outside this runtime-image copy contract.
+        """
         source = models.validate_oci_reference(source, 'OCI copy source')
         destination = models.validate_oci_reference(destination,
                                                     'OCI copy destination')
@@ -298,8 +302,10 @@ class OciClient:
                     descriptor, 'OCI image index descriptor')
                 descriptor_media_type = descriptor.get('mediaType')
                 if descriptor_media_type not in _IMAGE_MANIFEST_MEDIA_TYPES:
-                    # Signatures, attestations, and other referrers are copied
-                    # but cannot provide runnable platform evidence.
+                    # Non-runtime descriptors embedded in the index may be
+                    # copied by --all, but cannot provide platform evidence.
+                    # External subject referrers are not index children and are
+                    # outside the runtime-image copy contract.
                     continue
                 if descriptor.get('artifactType') is not None:
                     continue

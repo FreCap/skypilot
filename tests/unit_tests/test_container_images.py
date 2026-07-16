@@ -2153,7 +2153,7 @@ def test_resolver_locality_and_auth_fail_closed():
         resolver.resolve(placement, [unsafe_canonical], models.Locality.PREFER)
 
 
-def test_runtime_platform_filters_incompatible_routes_and_accepts_multi_arch():
+def test_runtime_platform_filters_only_known_incompatible_routes():
     assert models.runtime_platform_from_architecture('x86_64') == 'linux/amd64'
     assert models.runtime_platform_from_architecture('aarch64') == 'linux/arm64'
     assert models.runtime_platform_from_architecture('unknown') is None
@@ -2184,14 +2184,17 @@ def test_runtime_platform_filters_incompatible_routes_and_accepts_multi_arch():
                                                 'linux/arm64/v8'))
     assert resolver.resolve(arm, [multi_arch],
                             models.Locality.PREFER).image_id == _ARTIFACT_ID
-    unknown = models.Placement(provider='nebius',
-                               region='eu-north1',
-                               backend='vm')
-    with pytest.raises(resolver.ImageRouteUnavailableError,
-                       match='runtime platform None'):
-        resolver.resolve(unknown, [route], models.Locality.PREFER)
-    assert resolver.resolve(unknown, [multi_arch],
-                            models.Locality.PREFER).image_id == _ARTIFACT_ID
+    unknown_placements = (
+        models.Placement(provider='nebius', region='eu-north1', backend='vm'),
+        models.Placement(provider='kubernetes',
+                         region='prod-research-cluster',
+                         backend='kubernetes'),
+    )
+    for unknown in unknown_placements:
+        assert resolver.resolve(unknown, [route],
+                                models.Locality.PREFER).image_id == _ARTIFACT_ID
+        assert resolver.resolve(unknown, [multi_arch],
+                                models.Locality.PREFER).image_id == _ARTIFACT_ID
 
 
 def test_preprovision_rejects_known_incompatible_artifact_platform(
@@ -2260,6 +2263,19 @@ def test_cluster_commit_rejects_known_incompatible_artifact_platform():
                 json.dumps(['linux/amd64']), launched)
         global_user_state._validate_container_image_runtime_platform(
             json.dumps(['linux/amd64', 'linux/arm64']), launched)
+
+    # Clouds without architecture metadata must not force an unrelated arm64
+    # build. They retain the verified single-platform image and defer the
+    # unknown compatibility decision to the runtime.
+    unknown_placements = (
+        resources_lib.Resources(cloud=clouds.Nebius(),
+                                instance_type='gpu-l4-1gpu'),
+        resources_lib.Resources(cloud=clouds.Kubernetes(),
+                                instance_type='4CPU--16GB--L4:1'),
+    )
+    for unknown in unknown_placements:
+        global_user_state._validate_container_image_runtime_platform(
+            json.dumps(['linux/amd64']), unknown)
 
 
 def test_service_version_snapshots_one_artifact_across_candidates(
@@ -7172,8 +7188,6 @@ def test_regional_cache_eviction_is_managed_fenced_and_repairable(
     monkeypatch.setattr(config, 'resolve_profile', lambda *_:
                         (profile, models.WorkspaceImagePolicy()))
     image, target_ref = _ready_regional_location()
-    location = next(location for location in state.list_locations(image.id)
-                    if location.target_id == 'aws-us-west-2')
 
     # External profiles use the same preparation state machine but can never
     # grant SkyPilot deletion authority.
@@ -8618,6 +8632,10 @@ def test_variant_platforms_fail_closed_without_exact_cpu_feature_proof():
         ('linux/amd64/v4', 'linux/arm64/v9'), None)
     assert models.platforms_support_runtime(('linux/amd64/v1',), 'linux/amd64')
     assert models.platforms_support_runtime(('linux/arm64/v8',), 'linux/arm64')
+    assert models.platforms_support_runtime(('linux/amd64',), None)
+    assert models.platforms_support_runtime(('linux/arm64/v8',), None)
+    assert not models.platforms_support_runtime(('linux/ppc64le',), None)
+    assert not models.platforms_support_runtime(('windows/amd64',), None)
     assert models.platforms_support_runtime(
         ('linux/amd64/v1', 'linux/arm64/v8'), None)
     assert models.platforms_support_runtime(('linux/amd64/v4',),

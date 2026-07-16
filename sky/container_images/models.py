@@ -52,7 +52,7 @@ _OCI_RUNTIME_ARCHITECTURES = {
     'arm64': 'arm64',
     'aarch64': 'arm64',
 }
-_PORTABLE_UNKNOWN_RUNTIME_PLATFORMS = frozenset({'linux/amd64', 'linux/arm64'})
+_KNOWN_LINUX_RUNTIME_PLATFORMS = frozenset({'linux/amd64', 'linux/arm64'})
 _REGISTRY_LOCALITY_REGION_PATTERN = re.compile(
     r'^[A-Za-z0-9][A-Za-z0-9_.:/@+-]{0,511}$')
 _AWS_REGISTRY_REGION_PATTERN = re.compile(
@@ -138,18 +138,18 @@ def _is_safe_generic_platform(platform: str) -> bool:
 
 def platforms_support_runtime(platforms: tuple[str, ...] | list[str],
                               runtime_platform: str | None) -> bool:
-    """Returns whether bounded OCI metadata supports a concrete runtime."""
+    """Returns whether OCI metadata is not known incompatible with a runtime."""
     validated = validate_oci_platforms(platforms, 'Artifact platforms')
     if runtime_platform is None:
-        # An unknown node architecture is not proof that a single-platform
-        # image can run.  It is safe only when the verified image covers every
-        # Linux architecture SkyPilot currently knows how to provision.
-        platform_families = {
-            '/'.join(platform.split('/')[:2])
-            for platform in validated
-            if _is_safe_generic_platform(platform)
-        }
-        return _PORTABLE_UNKNOWN_RUNTIME_PLATFORMS.issubset(platform_families)
+        # Unknown placement architecture is not proof of a mismatch. Requiring
+        # every architecture here would force users to publish unused variants
+        # merely because a cloud catalog or Kubernetes context cannot report
+        # the eventual node architecture. Accept one generic Linux platform;
+        # exact known architectures are still fenced below. CPU-feature-specific
+        # variants remain incompatible without exact runtime proof.
+        return any(
+            '/'.join(platform.split('/')[:2]) in _KNOWN_LINUX_RUNTIME_PLATFORMS
+            and _is_safe_generic_platform(platform) for platform in validated)
     if not validated:
         return False
     runtime = validate_oci_platform(runtime_platform, 'Runtime platform')
