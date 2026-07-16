@@ -8,8 +8,8 @@ runner might call the serve DB directly when the controller is
 in-process (consolidation mode).
 
 At most one runner is registered at a time. If nothing has registered,
-``current()`` lazily constructs ``_DefaultServiceStatusRunner`` from
-``sky.serve.server.impl`` so there's always a usable runner regardless
+``current()`` lazily constructs ``DefaultServiceStatusRunner`` from
+``sky.serve.server.status`` so there's always a usable runner regardless
 of import ordering. Plugins override the default by calling
 ``register(MyRunner())`` in their ``install()`` phase.
 
@@ -17,7 +17,7 @@ Thread-safety: ``register()`` is only expected to be called during
 server/plugin startup, before request handling begins. ``current()``'s
 default-runner lazy init is double-checked-locked because uvicorn runs
 sync request handlers in a thread pool — concurrent first calls would
-otherwise construct ``_DefaultServiceStatusRunner`` twice. The lock is
+otherwise construct ``DefaultServiceStatusRunner`` twice. The lock is
 not held on the hot path (post-init reads short-circuit before the
 ``with`` block).
 """
@@ -74,7 +74,7 @@ def current() -> ServiceStatusRunner:
     """Return the registered runner, falling back to the default.
 
     If nothing has been registered, constructs and installs
-    ``_DefaultServiceStatusRunner`` so there's always a usable runner
+    ``DefaultServiceStatusRunner`` so there's always a usable runner
     regardless of import ordering.
 
     Uvicorn dispatches sync handlers to a thread pool, so concurrent
@@ -90,8 +90,8 @@ def current() -> ServiceStatusRunner:
             if _current is None:
                 # In-function import: a top-level import would deadlock
                 # pylint: disable=import-outside-toplevel
-                from sky.serve.server.impl import _DefaultServiceStatusRunner
-                _current = _DefaultServiceStatusRunner()
+                from sky.serve.server.status import DefaultServiceStatusRunner
+                _current = DefaultServiceStatusRunner()
     return _current
 
 

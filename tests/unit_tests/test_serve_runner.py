@@ -6,6 +6,7 @@ the controller is consolidated into the API server.
 """
 # pylint: disable=invalid-name,protected-access
 import contextlib
+import pickle
 from unittest import mock
 
 import pytest
@@ -14,6 +15,7 @@ from sky import backends
 from sky import exceptions
 from sky.serve import runner as serve_runner
 from sky.serve.server import impl
+from sky.serve.server import status as serve_status
 
 
 @pytest.fixture(autouse=True)
@@ -36,6 +38,24 @@ def _backend_mock():
 
 class TestRegistry:
     """Runner registry: default construction and override."""
+
+    def test_impl_exports_keep_historical_module_identity(self):
+        assert (impl._external_service_endpoint_url
+                is serve_status.external_service_endpoint_url)
+        assert impl.status is serve_status.status
+        assert (impl._DefaultServiceStatusRunner
+                is serve_status.DefaultServiceStatusRunner)
+        assert (impl._external_service_endpoint_url.__module__ == impl.__name__)
+        assert (impl._external_service_endpoint_url.__name__ ==
+                '_external_service_endpoint_url')
+        assert impl.status.__module__ == impl.__name__
+        assert impl._DefaultServiceStatusRunner.__module__ == impl.__name__
+        assert (impl._DefaultServiceStatusRunner.__name__ ==
+                '_DefaultServiceStatusRunner')
+        for exported_symbol in (impl._external_service_endpoint_url,
+                                impl.status, impl._DefaultServiceStatusRunner):
+            assert pickle.loads(
+                pickle.dumps(exported_symbol)) is exported_symbol
 
     def test_current_returns_default_when_unregistered(self):
         runner = serve_runner.current()
@@ -67,14 +87,14 @@ class TestDefaultRunnerRpcPath:
         handle = _handle_mock(grpc_enabled=True)
         expected = [{'name': 'p1', 'status': 'READY'}]
         with mock.patch(
-                'sky.serve.server.impl.serve_rpc_utils.RpcRunner.'
+                'sky.serve.server.status.serve_rpc_utils.RpcRunner.'
                 'get_service_status',
                 return_value=expected) as rpc, \
              mock.patch(
-                'sky.serve.server.impl.serve_utils.ServeCodeGen.'
+                'sky.serve.server.status.serve_utils.ServeCodeGen.'
                 'get_service_status') as codegen, \
              mock.patch(
-                'sky.serve.server.impl.backend_utils.'
+                'sky.serve.server.status.backend_utils.'
                 'get_backend_from_handle') as get_backend:
             result = runner.get_service_status(handle=handle,
                                                service_names=['p1'],
@@ -95,19 +115,19 @@ class TestDefaultRunnerRpcPath:
         backend.run_on_head.return_value = (0, b'PAYLOAD', '')
         legacy_records = [{'name': 'p2'}]
         with mock.patch(
-                'sky.serve.server.impl.serve_rpc_utils.RpcRunner.'
+                'sky.serve.server.status.serve_rpc_utils.RpcRunner.'
                 'get_service_status',
                 side_effect=exceptions.SkyletMethodNotImplementedError(
                     'old skylet')), \
              mock.patch(
-                'sky.serve.server.impl.serve_utils.ServeCodeGen.'
+                'sky.serve.server.status.serve_utils.ServeCodeGen.'
                 'get_service_status',
                 return_value='CODE') as codegen, \
              mock.patch(
-                'sky.serve.server.impl.serve_utils.load_service_status',
+                'sky.serve.server.status.serve_utils.load_service_status',
                 return_value=legacy_records) as load, \
              mock.patch(
-                'sky.serve.server.impl.backend_utils.'
+                'sky.serve.server.status.backend_utils.'
                 'get_backend_from_handle',
                 return_value=backend):
             result = runner.get_service_status(handle=handle,
@@ -131,17 +151,17 @@ class TestDefaultRunnerLegacyPath:
         backend = _backend_mock()
         backend.run_on_head.return_value = (0, b'PAYLOAD', '')
         with mock.patch(
-                'sky.serve.server.impl.serve_rpc_utils.RpcRunner.'
+                'sky.serve.server.status.serve_rpc_utils.RpcRunner.'
                 'get_service_status') as rpc, \
              mock.patch(
-                'sky.serve.server.impl.serve_utils.ServeCodeGen.'
+                'sky.serve.server.status.serve_utils.ServeCodeGen.'
                 'get_service_status',
                 return_value='CODE'), \
              mock.patch(
-                'sky.serve.server.impl.serve_utils.load_service_status',
+                'sky.serve.server.status.serve_utils.load_service_status',
                 return_value=[{'name': 'p3'}]), \
              mock.patch(
-                'sky.serve.server.impl.backend_utils.'
+                'sky.serve.server.status.backend_utils.'
                 'get_backend_from_handle',
                 return_value=backend):
             result = runner.get_service_status(handle=handle,
@@ -157,17 +177,17 @@ class TestDefaultRunnerLegacyPath:
         backend = _backend_mock()
         backend.run_on_head.return_value = (1, b'', 'boom')
         with mock.patch(
-                'sky.serve.server.impl.serve_utils.ServeCodeGen.'
+                'sky.serve.server.status.serve_utils.ServeCodeGen.'
                 'get_service_status',
                 return_value='CODE'), \
              mock.patch(
-                'sky.serve.server.impl.subprocess_utils.handle_returncode',
+                'sky.serve.server.status.subprocess_utils.handle_returncode',
                 side_effect=exceptions.CommandError(returncode=1,
                                                     command='CODE',
                                                     error_msg='boom failed',
                                                     detailed_reason=None)), \
              mock.patch(
-                'sky.serve.server.impl.backend_utils.'
+                'sky.serve.server.status.backend_utils.'
                 'get_backend_from_handle',
                 return_value=backend):
             with pytest.raises(RuntimeError, match='boom failed'):
@@ -183,16 +203,16 @@ class TestStatusDelegatesToRunner:
         if handle is None:
             handle = _handle_mock(grpc_enabled=True)
         return [
-            mock.patch('sky.serve.server.impl.backend_utils.'
+            mock.patch('sky.serve.server.status.backend_utils.'
                        'check_network_connection'),
             mock.patch(
-                'sky.serve.server.impl.controller_utils.get_controller_for_pool'
+                'sky.serve.server.status.controller_utils.get_controller_for_pool'
             ),
             mock.patch(
-                'sky.serve.server.impl.backend_utils.is_controller_accessible',
+                'sky.serve.server.status.backend_utils.is_controller_accessible',
                 return_value=handle),
             mock.patch(
-                'sky.serve.server.impl.backend_utils.get_backend_from_handle',
+                'sky.serve.server.status.backend_utils.get_backend_from_handle',
                 return_value=get_backend_return or _backend_mock()),
         ]
 
@@ -248,18 +268,18 @@ class TestStatusDelegatesToRunner:
                 stack.enter_context(p)
             rpc = stack.enter_context(
                 mock.patch(
-                    'sky.serve.server.impl.serve_rpc_utils.RpcRunner.'
+                    'sky.serve.server.status.serve_rpc_utils.RpcRunner.'
                     'get_service_status',
                     side_effect=exceptions.SkyletMethodNotImplementedError(
                         'old skylet')))
             codegen = stack.enter_context(
                 mock.patch(
-                    'sky.serve.server.impl.serve_utils.ServeCodeGen.'
+                    'sky.serve.server.status.serve_utils.ServeCodeGen.'
                     'get_service_status',
                     return_value='CODE'))
             stack.enter_context(
                 mock.patch(
-                    'sky.serve.server.impl.serve_utils.load_service_status',
+                    'sky.serve.server.status.serve_utils.load_service_status',
                     return_value=legacy_records))
             result = impl.status(pool=False)
 
@@ -315,7 +335,7 @@ class TestStatusDelegatesToRunner:
             for p in self._common_patches():
                 stack.enter_context(p)
             external_endpoint = stack.enter_context(
-                mock.patch.object(impl.lb_k8s,
+                mock.patch.object(serve_status.lb_k8s,
                                   'lb_service_endpoint_or_none',
                                   side_effect=AssertionError(
                                       'summary-only endpoint resolution')))
@@ -351,7 +371,7 @@ class TestStatusDelegatesToRunner:
             for patcher in self._common_patches():
                 stack.enter_context(patcher)
             get_history = stack.enter_context(
-                mock.patch.object(impl.serve_history,
+                mock.patch.object(serve_status.serve_history,
                                   'get_status_history',
                                   return_value=history_payload))
             result = impl.status(service_names='svc',
@@ -379,12 +399,12 @@ class TestStatusDelegatesToRunner:
                 stack.enter_context(p)
             external_endpoint = stack.enter_context(
                 mock.patch.object(
-                    impl.lb_k8s,
+                    serve_status.lb_k8s,
                     'lb_service_endpoint_or_none',
                     return_value='skypilot-serve-lb-svc.ns.svc:30001'))
             legacy_endpoint = stack.enter_context(
                 mock.patch.object(
-                    impl.backend_utils,
+                    serve_status.backend_utils,
                     'get_endpoints',
                     side_effect=AssertionError('legacy endpoint fallback')))
             result = impl.status(pool=False)
@@ -410,12 +430,12 @@ class TestStatusDelegatesToRunner:
             for p in self._common_patches():
                 stack.enter_context(p)
             external_endpoint = stack.enter_context(
-                mock.patch.object(impl.lb_k8s,
+                mock.patch.object(serve_status.lb_k8s,
                                   'lb_service_endpoint_or_none',
                                   return_value=None))
             legacy_endpoint = stack.enter_context(
                 mock.patch.object(
-                    impl.backend_utils,
+                    serve_status.backend_utils,
                     'get_endpoints',
                     side_effect=AssertionError('legacy endpoint fallback')))
             result = impl.status(pool=False)
@@ -440,7 +460,7 @@ class TestStatusDelegatesToRunner:
                 stack.enter_context(p)
             external_endpoint = stack.enter_context(
                 mock.patch.object(
-                    impl.lb_k8s,
+                    serve_status.lb_k8s,
                     'lb_service_endpoint_or_none',
                     side_effect=AssertionError('pool endpoint construction')))
             result = impl.status(pool=True)
