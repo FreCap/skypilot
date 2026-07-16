@@ -2014,6 +2014,23 @@ def test_config_admission_rejects_reserved_canonical_target_name():
             }}, 'test')
 
 
+def test_config_admission_ignores_unrelated_workspace_settings():
+    skypilot_config._validate_container_image_config(
+        {
+            'workspaces': {
+                # Existing workspace names can predate the managed-image OCI
+                # naming contract. Do not reject them until they opt in to an
+                # image policy that needs a catalog namespace.
+                'workspaceA': {
+                    'kubernetes': {
+                        'namespace': 'research'
+                    }
+                }
+            }
+        },
+        'test')
+
+
 def test_managed_reference_is_scoped_and_digest_pinned():
     profile = _profile()
     reference = references.managed_reference(profile, profile.canonical,

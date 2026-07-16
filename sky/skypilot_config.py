@@ -747,11 +747,11 @@ def _validate_container_image_config(config: dict[str, Any],
 
         for workspace, workspace_config in (config.get('workspaces') or
                                             {}).items():
-            image_models.validate_workspace_name(
-                workspace, 'Container image policy workspace')
             image_config = workspace_config.get('container_images')
             if image_config is None:
                 continue
+            image_models.validate_workspace_name(
+                workspace, 'Container image policy workspace')
             policy = image_models.WorkspaceImagePolicy(
                 mode=image_models.WorkspaceImageMode(
                     image_config.get('mode', 'managed_preferred')),
