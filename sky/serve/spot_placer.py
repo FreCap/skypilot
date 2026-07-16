@@ -575,6 +575,23 @@ class SpotPlacer:
             self.location2status[location] = LocationStatus.ACTIVE
         self.location2preempted_at.clear()
 
+    def inherit_preemption_state(self, old_placer: 'SpotPlacer') -> None:
+        """Carry live benches for unchanged shapes into a rebuilt placer.
+
+        Exact ``Location`` equality is intentional.  A service update may
+        retain a cloud/region/zone while changing the accelerator, purchase
+        model, image, disk tier, or ephemeral storage; a capacity failure for
+        the old shape must not bench that new shape.
+        """
+        for location in self.location2status:
+            if (old_placer.location2status.get(location)
+                    != LocationStatus.PREEMPTED):
+                continue
+            self.location2status[location] = LocationStatus.PREEMPTED
+            preempted_at = old_placer.location2preempted_at.get(location)
+            if preempted_at is not None:
+                self.location2preempted_at[location] = preempted_at
+
     def _get_cost_per_hour_cached(self, location: Location) -> float:
         if location in self.location2cost:
             return self.location2cost[location]
