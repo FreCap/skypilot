@@ -35,6 +35,7 @@ import {
   formatFullTimestamp,
 } from '@/components/utils';
 import { EndpointCell, formatUptime } from '@/components/services';
+import { ReplicaHistoryCard } from '@/components/serve-replica-history';
 import { useMobile } from '@/hooks/useMobile';
 import { formatYaml } from '@/lib/yamlUtils';
 import { YamlCodeBlock } from '@/components/ui/yaml-code-block';
@@ -122,8 +123,10 @@ export function getReplicaPlacementBreakdown(replicas) {
 
 export function useServiceDetails({ serviceName }) {
   const [serviceData, setServiceData] = useState(null);
+  const [replicaHistory, setReplicaHistory] = useState(null);
   const [loading, setLoading] = useState(true);
   const [replicasLoading, setReplicasLoading] = useState(true);
+  const [historyLoading, setHistoryLoading] = useState(true);
   const requestVersionRef = useRef(0);
 
   // Two-phase load, both scoped to THIS service (the old implementation
@@ -137,6 +140,8 @@ export function useServiceDetails({ serviceName }) {
     requestVersionRef.current = requestVersion;
     setLoading(true);
     setReplicasLoading(true);
+    setHistoryLoading(true);
+    setReplicaHistory(null);
     const isCurrentRequest = () => requestVersionRef.current === requestVersion;
     // Ordering within THIS invocation only: once the full result has
     // landed, a later-resolving summary must not overwrite it — but a
@@ -149,11 +154,14 @@ export function useServiceDetails({ serviceName }) {
           serviceNames: [serviceName],
           summaryOnly: true,
           includeTargetReplicas: true,
+          historyHours: 12,
         },
       ])
       .then(({ services }) => {
-        if (!isCurrentRequest() || fullLanded) return;
+        if (!isCurrentRequest()) return;
         const found = (services || []).find((s) => s.name === serviceName);
+        setReplicaHistory(found?.replicaHistory || null);
+        if (fullLanded) return;
         setServiceData(found || null);
       })
       .catch((error) => {
@@ -162,6 +170,7 @@ export function useServiceDetails({ serviceName }) {
       .finally(() => {
         if (isCurrentRequest()) {
           setLoading(false);
+          setHistoryLoading(false);
         }
       });
     const fullPromise = dashboardCache
@@ -187,13 +196,51 @@ export function useServiceDetails({ serviceName }) {
     fetchData();
   }, [fetchData]);
 
+  useEffect(() => {
+    if (!serviceName) return undefined;
+    const historyArgs = [
+      {
+        serviceNames: [serviceName],
+        summaryOnly: true,
+        includeTargetReplicas: false,
+        historyHours: 12,
+      },
+    ];
+    const refreshHistory = async () => {
+      const requestVersion = requestVersionRef.current;
+      setHistoryLoading(true);
+      dashboardCache.invalidate(getServices, historyArgs);
+      try {
+        const { services } = await dashboardCache.get(getServices, historyArgs);
+        if (requestVersionRef.current !== requestVersion) return;
+        const found = (services || []).find((s) => s.name === serviceName);
+        setReplicaHistory(found?.replicaHistory || null);
+      } catch (error) {
+        console.error('Failed to refresh service history:', error);
+      } finally {
+        if (requestVersionRef.current === requestVersion) {
+          setHistoryLoading(false);
+        }
+      }
+    };
+    const interval = setInterval(refreshHistory, 60 * 1000);
+    return () => clearInterval(interval);
+  }, [serviceName]);
+
   const refreshData = useCallback(async () => {
     // Drop every args-keyed getServices variant (summary and full).
     dashboardCache.invalidateFunction(getServices);
     await fetchData();
   }, [fetchData]);
 
-  return { serviceData, loading, replicasLoading, refreshData };
+  return {
+    serviceData,
+    replicaHistory,
+    loading,
+    replicasLoading,
+    historyLoading,
+    refreshData,
+  };
 }
 
 function ServiceDetails() {
@@ -203,10 +250,14 @@ function ServiceDetails() {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isInitialLoad, setIsInitialLoad] = useState(true);
   const isMobile = useMobile();
-  const { serviceData, loading, replicasLoading, refreshData } =
-    useServiceDetails({
-      serviceName,
-    });
+  const {
+    serviceData,
+    replicaHistory,
+    loading,
+    replicasLoading,
+    historyLoading,
+    refreshData,
+  } = useServiceDetails({ serviceName });
 
   useEffect(() => {
     if (!loading && isInitialLoad) {
@@ -283,6 +334,10 @@ function ServiceDetails() {
             <ServiceDetailCard
               serviceData={serviceData}
               pricingLoading={replicasLoading && serviceData.summaryOnly}
+            />
+            <ReplicaHistoryCard
+              history={replicaHistory}
+              loading={historyLoading}
             />
             <ReplicaPlacementCard
               replicas={serviceData.replicas}

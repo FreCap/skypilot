@@ -222,6 +222,18 @@ SkyPilot uses a client-server model with API versioning:
 - Use `@versions.minimal_api_version(N)` decorator for new SDK methods
 - Handle version differences with `versions.get_remote_api_version()`
 
+### Central Database Policy
+
+The central/API-server database is PostgreSQL-only. SQLite support for this
+database path is deprecated.
+
+- New central/API-server tables and migrations must target PostgreSQL. Do not
+  add SQLite compatibility code or SQLite-specific tests for them.
+- Store centralized operational history, including minute-level Serve replica
+  status snapshots, in PostgreSQL when that data is already collected.
+- Keep this scope distinct from local or controller databases that still
+  officially support SQLite.
+
 ### Protobuf Regeneration
 
 When modifying `.proto` files in `sky/schemas/proto/`:

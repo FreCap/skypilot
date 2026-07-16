@@ -29,6 +29,7 @@ from sky.data import storage as storage_lib
 from sky.serve import constants as serve_constants
 from sky.serve import lb_k8s
 from sky.serve import runner as serve_runner
+from sky.serve import serve_history
 from sky.serve import serve_rpc_utils
 from sky.serve import serve_state
 from sky.serve import serve_utils
@@ -1529,6 +1530,7 @@ def status(
     pool: bool = False,
     summary_only: bool = False,
     include_target_num_replicas: bool | None = None,
+    history_hours: int | None = None,
 ) -> list[dict[str, Any]]:
     """Gets statuses of services or pools.
 
@@ -1541,6 +1543,11 @@ def status(
     if service_names is not None:
         if isinstance(service_names, str):
             service_names = [service_names]
+    if history_hours is not None:
+        if pool:
+            raise ValueError('Status history is only supported for services.')
+        if service_names is None or len(service_names) != 1:
+            raise ValueError('Status history requires exactly one service.')
 
     try:
         backend_utils.check_network_connection()
@@ -1579,6 +1586,11 @@ def status(
             # endpoint, and an unavailable external runtime stays unavailable.
             service_record['endpoint'] = _external_service_endpoint_url(
                 service_record['name'], service_record.get('resource_scope'))
+
+    if history_hours is not None and service_records:
+        service_records[0]['replica_status_history'] = (
+            serve_history.get_status_history(service_records[0]['name'],
+                                             hours=history_hours))
 
     return service_records
 

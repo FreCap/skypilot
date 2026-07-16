@@ -18,6 +18,7 @@ only sqlite. This module:
 """
 # pylint: disable=cell-var-from-loop,missing-class-docstring
 # pylint: disable=protected-access,redefined-outer-name,unused-import
+import datetime
 import shutil
 import threading
 import time
@@ -38,6 +39,7 @@ import test_reserved_fill_broker as sqlite_suite
 
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity_broker as broker
+from sky.serve import serve_history
 from sky.serve import serve_state
 from sky.utils import locks
 from sky.utils.db import migration_utils
@@ -307,6 +309,7 @@ class TestMigrationChainPG:
                     'reserved_fill_lease',
                     'service_lifecycle_fences',
                     'demand_capacity_observations',
+                    'serve_replica_status_history',
                 }.issubset(tables), tables
                 service_columns = {
                     column['name']
@@ -337,6 +340,153 @@ class TestMigrationChainPG:
                 assert 'fence_pending' in columns, columns
         finally:
             engine.dispose()
+
+
+# =================== Aggregate Serve history on PG ====================
+
+
+@pytest.fixture
+def history_engine(pg_server, monkeypatch):
+    url = _create_database(pg_server, f'history_{uuid.uuid4().hex[:8]}')
+    engine = create_engine(url)
+    serve_state.Base.metadata.create_all(engine)
+    serve_history.metadata.create_all(engine)
+    monkeypatch.setattr(serve_state._db_manager, '_engine', engine)
+    yield engine
+    engine.dispose()
+
+
+class TestServeStatusHistoryPG:
+
+    def test_snapshot_groups_physical_rows_and_zero_capacity(
+            self, history_engine):
+        services = serve_state.services_table
+        replicas = serve_state.replicas_table
+        with history_engine.begin() as connection:
+            connection.execute(sqlalchemy.insert(services), [{
+                'name': 'svc',
+                'hash': 'hash-a',
+                'current_version': 2,
+                'pool': 0,
+            }, {
+                'name': 'empty',
+                'hash': 'hash-empty',
+                'current_version': 7,
+                'pool': 0,
+            }, {
+                'name': 'pool',
+                'hash': 'hash-pool',
+                'current_version': 1,
+                'pool': 1,
+            }])
+            connection.execute(sqlalchemy.insert(replicas), [{
+                'service_name': 'svc',
+                'replica_id': 1,
+                'status': 'READY',
+                'version': 1,
+            }, {
+                'service_name': 'svc',
+                'replica_id': 2,
+                'status': 'FAILED_PROBING',
+                'version': 1,
+            }, {
+                'service_name': 'svc',
+                'replica_id': 3,
+                'status': 'PROVISIONING',
+                'version': 2,
+            }, {
+                'service_name': 'pool',
+                'replica_id': 1,
+                'status': 'READY',
+                'version': 1,
+            }])
+
+        timestamp = 1784207110.0
+        assert serve_history.record_status_snapshot(timestamp) == 3
+        history = serve_history.get_status_history('svc',
+                                                   timestamp=timestamp + 1)
+        assert [(row['version'], row['ready_count'], row['provisioning_count'],
+                 row['errored_count'], row['total_count'])
+                for row in history['samples']] == [
+                    (1, 1, 0, 1, 2),
+                    (2, 0, 1, 0, 1),
+                ]
+        empty = serve_history.get_status_history('empty',
+                                                 timestamp=timestamp + 1)
+        assert len(empty['samples']) == 1
+        assert empty['samples'][0]['version'] == 7
+        assert empty['samples'][0]['total_count'] == 0
+
+    def test_same_minute_upsert_and_incarnation_filter(self, history_engine):
+        services = serve_state.services_table
+        replicas = serve_state.replicas_table
+        with history_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.insert(services).values(name='svc',
+                                                   hash='old-hash',
+                                                   current_version=1,
+                                                   pool=0))
+            connection.execute(
+                sqlalchemy.insert(replicas).values(service_name='svc',
+                                                   replica_id=1,
+                                                   status='READY',
+                                                   version=1))
+        timestamp = 1784207110.0
+        serve_history.record_status_snapshot(timestamp)
+        with history_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(replicas).values(status='SHUTTING_DOWN'))
+        serve_history.record_status_snapshot(timestamp + 30)
+        old_history = serve_history.get_status_history('svc',
+                                                       timestamp=timestamp + 31)
+        assert len(old_history['samples']) == 1
+        assert old_history['samples'][0]['ready_count'] == 0
+        assert old_history['samples'][0]['stopping_count'] == 1
+
+        with history_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(services).values(hash='new-hash'))
+            connection.execute(sqlalchemy.delete(replicas))
+        serve_history.record_status_snapshot(timestamp + 70)
+        current = serve_history.get_status_history('svc',
+                                                   timestamp=timestamp + 71)
+        assert current['service_hash'] == 'new-hash'
+        assert len(current['samples']) == 1
+        assert current['samples'][0]['total_count'] == 0
+
+    def test_hourly_snapshot_prunes_rows_older_than_three_days(
+            self, history_engine):
+        now = 1784210400.0  # Exact UTC hour, so the bounded cleanup runs.
+        old_bucket = datetime.datetime.fromtimestamp(
+            now - 73 * 3600, datetime.timezone.utc).replace(second=0,
+                                                            microsecond=0)
+        table = serve_history.serve_replica_status_history_table
+        with history_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.insert(serve_state.services_table).values(
+                    name='svc', hash='hash', current_version=1, pool=0))
+            connection.execute(
+                sqlalchemy.insert(table).values(service_name='old',
+                                                service_hash='old-hash',
+                                                version=1,
+                                                bucket_start=old_bucket,
+                                                observed_at=old_bucket,
+                                                ready_count=1,
+                                                provisioning_count=0,
+                                                not_ready_count=0,
+                                                errored_count=0,
+                                                preempted_count=0,
+                                                stopping_count=0,
+                                                total_count=1))
+
+        serve_history.record_status_snapshot(now)
+
+        with history_engine.connect() as connection:
+            assert connection.execute(
+                sqlalchemy.select(
+                    sqlalchemy.func.count()  # pylint: disable=not-callable
+                ).select_from(table).where(
+                    table.c.service_name == 'old')).scalar_one() == 0
 
 
 # ======================= Concurrency smoke on PG =======================

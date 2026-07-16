@@ -60,6 +60,50 @@ const FAILED_REPLICA_STATUSES = new Set([
   'UNKNOWN',
 ]);
 
+const HISTORY_COUNT_FIELDS = [
+  ['ready_count', 'readyCount'],
+  ['provisioning_count', 'provisioningCount'],
+  ['not_ready_count', 'notReadyCount'],
+  ['errored_count', 'erroredCount'],
+  ['preempted_count', 'preemptedCount'],
+  ['stopping_count', 'stoppingCount'],
+  ['total_count', 'totalCount'],
+];
+
+export function normalizeReplicaHistory(history) {
+  if (!history || typeof history !== 'object') return null;
+  const samples = Array.isArray(history.samples)
+    ? history.samples
+        .map((sample) => {
+          const timestamp = Number(sample.timestamp);
+          const version = Number(sample.version);
+          if (!Number.isFinite(timestamp) || !Number.isInteger(version)) {
+            return null;
+          }
+          const normalized = {
+            timestamp,
+            observedAt: Number(sample.observed_at) || timestamp,
+            version,
+          };
+          HISTORY_COUNT_FIELDS.forEach(([source, target]) => {
+            const value = Number(sample[source]);
+            normalized[target] =
+              Number.isInteger(value) && value >= 0 ? value : 0;
+          });
+          return normalized;
+        })
+        .filter(Boolean)
+    : [];
+  return {
+    available: history.available !== false,
+    bucketSeconds: Number(history.bucket_seconds) || 60,
+    retentionHours: Number(history.retention_hours) || 72,
+    windowStart: Number(history.window_start) || null,
+    windowEnd: Number(history.window_end) || null,
+    samples,
+  };
+}
+
 // Normalize a raw service record from the /serve/status response into the
 // shape consumed by the services pages. Statuses arrive as plain strings
 // (sky/serve/serve_state.py ServiceStatus values).
@@ -217,6 +261,7 @@ export function normalizeService(record) {
     rejectedRequests: record.rejected_requests ?? null,
     requestStatsAgeSeconds: record.request_stats_age_seconds ?? null,
     costPerThousandRequests,
+    replicaHistory: normalizeReplicaHistory(record.replica_status_history),
     replicas,
   };
 }
@@ -231,6 +276,7 @@ export async function getServices(options = {}) {
     serviceNames = null,
     summaryOnly = false,
     includeTargetReplicas,
+    historyHours,
   } = options;
   try {
     const requestBody = {
@@ -239,6 +285,9 @@ export async function getServices(options = {}) {
     };
     if (includeTargetReplicas !== undefined) {
       requestBody.include_target_num_replicas = includeTargetReplicas;
+    }
+    if (historyHours !== undefined) {
+      requestBody.history_hours = historyHours;
     }
     const response = await apiClient.post(`/serve/status`, requestBody);
     if (!response.ok) {

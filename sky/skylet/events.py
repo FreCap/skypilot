@@ -15,6 +15,7 @@ from sky.jobs import constants as managed_job_constants
 from sky.jobs import scheduler
 from sky.jobs import state as managed_job_state
 from sky.jobs import utils as managed_job_utils
+from sky.serve import serve_history
 from sky.serve import serve_utils
 from sky.skylet import autostop_lib
 from sky.skylet import constants
@@ -149,6 +150,15 @@ class ServiceUpdateEvent(SkyletEvent):
 
     def _run(self):
         serve_utils.update_service_status(self._pool)
+
+
+class ServiceStatusHistoryEvent(SkyletEvent):
+    """Persist one aggregate physical-machine snapshot per minute."""
+    EVENT_INTERVAL_SECONDS = 60
+
+    def _run(self):
+        written = serve_history.record_status_snapshot()
+        logger.debug(f'Persisted {written} Serve status history rows.')
 
 
 class UsageHeartbeatReportEvent(SkyletEvent):

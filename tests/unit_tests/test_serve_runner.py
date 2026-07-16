@@ -324,6 +324,44 @@ class TestStatusDelegatesToRunner:
         assert [record['endpoint'] for record in result] == [None, None]
         external_endpoint.assert_not_called()
 
+    def test_status_history_requires_exactly_one_service(self):
+        with pytest.raises(ValueError, match='requires exactly one service'):
+            impl.status(pool=False, history_hours=12)
+        with pytest.raises(ValueError, match='requires exactly one service'):
+            impl.status(service_names=['svc-a', 'svc-b'],
+                        pool=False,
+                        history_hours=12)
+
+    def test_status_attaches_postgres_history_to_named_service(self):
+        records = [{
+            'name': 'svc',
+            'load_balancer_port': None,
+            'tls_encrypted': False,
+        }]
+        runner = mock.Mock()
+        runner.get_service_status.return_value = records
+        serve_runner.register(runner)
+        history_payload = {
+            'available': True,
+            'bucket_seconds': 60,
+            'samples': [],
+        }
+
+        with contextlib.ExitStack() as stack:
+            for patcher in self._common_patches():
+                stack.enter_context(patcher)
+            get_history = stack.enter_context(
+                mock.patch.object(impl.serve_history,
+                                  'get_status_history',
+                                  return_value=history_payload))
+            result = impl.status(service_names='svc',
+                                 pool=False,
+                                 summary_only=True,
+                                 history_hours=12)
+
+        get_history.assert_called_once_with('svc', hours=12)
+        assert result[0]['replica_status_history'] == history_payload
+
     @pytest.mark.parametrize('tls_encrypted', [False, True])
     def test_status_uses_only_external_service_endpoint(self, tls_encrypted):
         records = [{

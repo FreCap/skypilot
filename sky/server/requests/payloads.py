@@ -801,6 +801,9 @@ class ServeStatusBody(RequestBody):
     # full status behavior (include targets) but leaves summary-only requests
     # on the cheap DB-only path.
     include_target_num_replicas: bool | None = None
+    # Include aggregate physical-machine history for one named service.
+    # Central history is PostgreSQL-only and retained for up to 72 hours.
+    history_hours: int | None = None
 
 
 class RealtimeGpuAvailabilityRequestBody(RequestBody):

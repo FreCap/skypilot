@@ -430,6 +430,11 @@ def ensure_tables_initialized() -> None:
     _db_manager.get_engine()
 
 
+def get_database_engine() -> sqlalchemy.engine.Engine:
+    """Return the initialized database engine for Serve state."""
+    return _db_manager.get_engine()
+
+
 _UNIQUE_CONSTRAINT_FAILED_ERROR_MSGS = [
     # sqlite
     'UNIQUE constraint failed: services.name',
