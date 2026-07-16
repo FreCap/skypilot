@@ -70,18 +70,39 @@ def claim_ttl_seconds() -> float:
     return float(constants.RESERVED_FILL_CLAIM_TTL_SECONDS)
 
 
-def make_pool_key(context: str, gpu_name: str) -> str:
-    """Canonical pool identity: (kubernetes context, lowercased GPU name).
+def make_pool_key(context: str,
+                  gpu_names: str | list[str] | tuple[str, ...]) -> str:
+    """Canonical pool identity: (Kubernetes context, accelerator set).
 
     JSON list, not a joined string: context names are user-controlled and a
-    separator collision must not merge two pools.
+    separator collision must not merge two pools. Single-accelerator keys keep
+    their original encoding so existing broker rows remain valid.
     """
-    return json.dumps([context, gpu_name.lower()])
+    if isinstance(gpu_names, str):
+        names: tuple[str, ...] = (gpu_names.lower(),)
+    else:
+        names = tuple(sorted({name.lower() for name in gpu_names}))
+    if not names:
+        raise ValueError('A reserved-capacity pool needs an accelerator.')
+    encoded_names: str | list[str] = names[0] if len(names) == 1 else list(
+        names)
+    return json.dumps([context, encoded_names])
 
 
-def parse_pool_key(pool_key: str) -> tuple[str, str]:
-    context, gpu_name = json.loads(pool_key)
-    return context, gpu_name
+def parse_pool_key(pool_key: str) -> tuple[str, tuple[str, ...]]:
+    context, encoded_names = json.loads(pool_key)
+    if isinstance(encoded_names, str):
+        names: tuple[str, ...] = (encoded_names.lower(),)
+    else:
+        names = tuple(sorted({str(name).lower() for name in encoded_names}))
+    return context, names
+
+
+def _pool_keys_overlap(left: str, right: str) -> bool:
+    left_context, left_names = parse_pool_key(left)
+    right_context, right_names = parse_pool_key(right)
+    return (left_context == right_context and
+            bool(set(left_names).intersection(right_names)))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -242,19 +263,42 @@ def upsert_claim(
     expected_service_hash: str | None = None,
     expected_controller_owner: tuple[int | None, str | None] | None = None
 ) -> bool:
-    """Upserts this service's claim (the per-poll heartbeat)."""
-    return serve_state.upsert_reserved_fill_claim(
-        service_name,
-        pool_key=pool_key,
-        weight=weight,
-        floor_replicas=floor_replicas,
-        gpus_per_replica=gpus_per_replica,
-        holdings_fill=holdings_fill,
-        effective_cap=effective_cap,
-        launchable=launchable,
-        heartbeat_ts=time.time(),
-        expected_service_hash=expected_service_hash,
-        expected_controller_owner=expected_controller_owner)
+    """Upsert one heartbeat without allowing overlapping pool groups."""
+    lock = locks.get_lock(constants.RESERVED_FILL_BROKER_LOCK_ID)
+    with lock.acquire(blocking=True):
+        now = time.time()
+        for row in serve_state.get_reserved_fill_claims():
+            if row['service_name'] == service_name:
+                continue
+            if now - float(row['heartbeat_ts'] or 0) > claim_ttl_seconds():
+                continue
+            other_pool_key = row['pool_key']
+            if (other_pool_key != pool_key and
+                    _pool_keys_overlap(pool_key, other_pool_key)):
+                logger.error(
+                    'Reserved-fill broker: rejecting claim of '
+                    f'{service_name!r} for overlapping pool group '
+                    f'{pool_key}; {row["service_name"]!r} already claims '
+                    f'{other_pool_key}. Use the same accelerator group for '
+                    'shared arbitration.')
+                serve_state.remove_reserved_fill_claim(
+                    service_name,
+                    expected_service_hash=expected_service_hash,
+                    expected_controller_owner=expected_controller_owner)
+                _GRANT_CACHE.pop(service_name, None)
+                return False
+        return serve_state.upsert_reserved_fill_claim(
+            service_name,
+            pool_key=pool_key,
+            weight=weight,
+            floor_replicas=floor_replicas,
+            gpus_per_replica=gpus_per_replica,
+            holdings_fill=holdings_fill,
+            effective_cap=effective_cap,
+            launchable=launchable,
+            heartbeat_ts=now,
+            expected_service_hash=expected_service_hash,
+            expected_controller_owner=expected_controller_owner)
 
 
 def remove_claim(
@@ -336,7 +380,8 @@ def _reject_mixed_gpus_per_replica(
     return rows
 
 
-def _replica_row_on_pool(info: Any, context: str, gpu_name: str) -> bool:
+def _replica_row_on_pool(info: Any, context: str,
+                         gpu_names: tuple[str, ...]) -> bool:
     """Whether a replica row's persisted location sits on the pool.
 
     Relaxed placement identity (mirrors the #108 fill matcher's spirit):
@@ -354,7 +399,7 @@ def _replica_row_on_pool(info: Any, context: str, gpu_name: str) -> bool:
     accelerators = location.get('accelerators') or {}
     if not accelerators:
         return True
-    return any(name.lower() == gpu_name for name in accelerators)
+    return any(name.lower() in gpu_names for name in accelerators)
 
 
 def _row_was_launched(info: Any) -> bool:
@@ -458,7 +503,7 @@ def _occupying_debit(
       indefinitely, and counting them forever would over-count the pool
       once the pod eventually dies (accepted: rare and launch-gated).
     """
-    context, gpu_name = parse_pool_key(pool_key)
+    context, gpu_names = parse_pool_key(pool_key)
     feed_debit = 0
     entitlement_debit = 0
     live_fill: dict[str, int] = {}
@@ -516,11 +561,11 @@ def _occupying_debit(
                 if (getattr(info, 'status',
                             None) == serve_state.ReplicaStatus.SHUTTING_DOWN and
                         bool(getattr(info, 'reserved_fill', False)) and
-                        _replica_row_on_pool(info, context, gpu_name) and
+                        _replica_row_on_pool(info, context, gpu_names) and
                         _row_was_launched(info)):
                     unclaimed_fill += 1
                 continue
-            if not _replica_row_on_pool(info, context, gpu_name):
+            if not _replica_row_on_pool(info, context, gpu_names):
                 continue
             is_fill = bool(getattr(info, 'reserved_fill', False))
             if not is_claimant and not is_fill:

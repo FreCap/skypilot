@@ -572,14 +572,12 @@ class TestMixedValidation:
                                               pool=False)
 
 
-class TestReservedFillSinglePoolValidation:
-    """validate_service_task rejects fill specs spanning >1 k8s pool.
+class TestReservedFillPoolValidation:
+    """validate_service_task groups accelerators in one k8s context.
 
-    The broker's v1 arbitration supports exactly one (context, GPU) pool
-    per service; the runtime cycle rejects violations too, but only via
-    controller error logs, so misconfigurations must also fail at submit
-    time. All Kubernetes entries are treated as candidate pool shapes
-    (zero-cost-ness is not knowable client-side).
+    Multiple contexts remain ambiguous broker pools and fail at submit time.
+    All Kubernetes entries are treated as candidate pool shapes because
+    zero-cost-ness is not knowable client-side.
     """
 
     def _task(self, k8s_entries):
@@ -605,21 +603,20 @@ run: echo hi
 """
         return sky.Task.from_yaml_str(yaml_str)
 
-    def test_two_distinct_pools_rejected(self):
+    def test_multiple_contexts_rejected(self):
         # pylint: disable=import-outside-toplevel
         from sky.serve import serve_utils
-        for entries in (
-            [('ctx-a', 'A100'), ('ctx-a', 'H100')],  # same ctx, two GPUs
-            [('ctx-a', 'A100'), ('ctx-b', 'A100')],  # two contexts, one GPU
-        ):
-            with pytest.raises(ValueError, match='exactly one Kubernetes'):
-                serve_utils.validate_service_task(self._task(entries),
-                                                  pool=False)
+        entries = [('ctx-a', 'A100'), ('ctx-b', 'A100')]
+        with pytest.raises(ValueError, match='one Kubernetes context'):
+            serve_utils.validate_service_task(self._task(entries), pool=False)
 
     def test_single_pool_accepted(self):
         # pylint: disable=import-outside-toplevel
         from sky.serve import serve_utils
         serve_utils.validate_service_task(self._task([('ctx-a', 'A100')]),
+                                          pool=False)
+        serve_utils.validate_service_task(self._task([('ctx-a', 'A100'),
+                                                      ('ctx-a', 'H100')]),
                                           pool=False)
         # Same pool enumerated case-insensitively still counts once.
         serve_utils.validate_service_task(self._task([('ctx-a', 'A100'),

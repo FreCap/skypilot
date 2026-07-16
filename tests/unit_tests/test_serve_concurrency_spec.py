@@ -245,11 +245,6 @@ def test_other_placer_keeps_legacy_physical_semantics():
     ({
         'target_concurrency_per_replica': 1,
     }, 'graceful_drain_async_occupancy: true'),
-    ({
-        'target_concurrency_per_replica': 1,
-        'graceful_drain_async_occupancy': True,
-        'reserved_capacity_fill': True,
-    }, 'does not yet support reserved_capacity_fill'),
 ])
 def test_per_gpu_placer_rejects_ambiguous_capacity_contract(kwargs, match):
     with pytest.raises(ValueError, match=match):
@@ -257,6 +252,17 @@ def test_per_gpu_placer_rejects_ambiguous_capacity_contract(kwargs, match):
                    max_replicas=5,
                    spot_placer=spot_placer.CAPACITY_AWARE_SPOT_PLACER,
                    **kwargs)
+
+
+def test_per_gpu_placer_accepts_reserved_fill_at_spec_level():
+    spec = _make_spec(min_replicas=1,
+                      max_replicas=5,
+                      target_concurrency_per_replica=1,
+                      graceful_drain_async_occupancy=True,
+                      spot_placer=spot_placer.CAPACITY_AWARE_SPOT_PLACER,
+                      reserved_capacity_fill=True)
+    assert spec.uses_logical_replicas
+    assert spec.reserved_capacity_fill
 
 
 def test_replica_unit_is_not_a_user_facing_yaml_field():

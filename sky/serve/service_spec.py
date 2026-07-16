@@ -256,12 +256,10 @@ class SkyServiceSpec:
                         'dynamic_fallback_per_gpu requires '
                         'graceful_drain_async_occupancy: true so scale-down '
                         'can prove that no asynchronous work is running.')
-            if reserved_fill_enabled:
-                with ux_utils.print_exception_no_traceback():
-                    raise ValueError(
-                        'dynamic_fallback_per_gpu does not yet support '
-                        'reserved_capacity_fill. The reserved allocator '
-                        'must migrate from backend counts to GPU slots first.')
+            # Reserved fill is safe for logical fleets when every Kubernetes
+            # fill shape is one GPU, so one broker slot is one logical slot.
+            # The task-level validator enforces that resource invariant (the
+            # service spec alone does not carry the task's resource shapes).
 
         if target_qps_per_replica is not None:
             if max_replicas is None:

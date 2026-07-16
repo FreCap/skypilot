@@ -1109,35 +1109,37 @@ def validate_service_task(task: 'sky.Task', pool: bool) -> None:
     # is valid for spot placer.
     spot_placer.SpotPlacer.from_task(task.service, task)
 
-    # [boltz fork] Reserved-capacity fill v1 arbitrates exactly ONE
-    # Kubernetes (context, GPU) pool per service; the broker cycle rejects
-    # multi-pool claims at runtime, but that surfaces only as a controller
-    # error log -- reject at submit time too. Zero-cost-ness is not fully
-    # knowable client-side (it needs per-location pricing on the
-    # controller), so ALL Kubernetes entries are treated as candidate pool
-    # shapes: the conservative superset (a Kubernetes entry is the
-    # zero-cost tier in every supported fill topology). The runtime guard
-    # stays as the backstop for specs that slip past (e.g. older clients).
+    # Reserved fill supports one Kubernetes context per service. Multiple
+    # accelerator names in that context form one brokered capacity group,
+    # provided they use the same GPU count per backend. Zero-cost-ness is not
+    # fully knowable client-side, so all Kubernetes entries are the safe
+    # conservative candidate set.
     if task.service.reserved_capacity_fill:
-        pool_shapes = set()
+        pool_shapes: dict[tuple[str | None, str], int] = {}
         for requested_resources in task.resources:
             if str(requested_resources.cloud).lower() != 'kubernetes':
                 continue
             accelerators = requested_resources.accelerators or {}
             if not accelerators:
                 continue
-            gpu_name = next(iter(accelerators))
-            pool_shapes.add((requested_resources.region, gpu_name.lower()))
-        if len(pool_shapes) > 1:
-            # key=repr: a shape's context may be None (no context pinned),
-            # which does not order against strings.
-            shapes = sorted(pool_shapes, key=repr)
+            gpu_name, gpu_count = next(iter(accelerators.items()))
+            key = (requested_resources.region, gpu_name.lower())
+            pool_shapes[key] = max(pool_shapes.get(key, 1), int(gpu_count))
+        contexts = {context for context, _ in pool_shapes}
+        gpu_counts = set(pool_shapes.values())
+        if len(contexts) > 1 or len(gpu_counts) > 1:
+            shapes = sorted(pool_shapes.items(), key=repr)
             with ux_utils.print_exception_no_traceback():
                 raise ValueError(
-                    'reserved_capacity_fill supports exactly one Kubernetes '
-                    '(context, GPU) pool per service; the resources span '
-                    f'{shapes}. Keep a single Kubernetes '
-                    'shape, or disable reserved_capacity_fill.')
+                    'reserved_capacity_fill requires one Kubernetes context '
+                    'and one GPU count per backend; the resources span '
+                    f'{shapes}.')
+        if task.service.uses_logical_replicas and gpu_counts != {1}:
+            with ux_utils.print_exception_no_traceback():
+                raise ValueError(
+                    'dynamic_fallback_per_gpu with reserved_capacity_fill '
+                    'requires one-GPU Kubernetes fill shapes so broker slots '
+                    'equal logical slots.')
 
     replica_ingress_port: int | None = int(
         task.service.ports) if (task.service.ports is not None) else None
