@@ -5,11 +5,25 @@ which surfaces provisioning milestones (e.g. image pulling) from the job's
 underlying cluster in the managed-job timeline.
 """
 import datetime
+import inspect
 
 from sky import global_user_state
 from sky.jobs import state as managed_job_state
 from sky.jobs import utils as managed_job_utils
 from sky.jobs.server import core
+
+
+def test_public_entrypoint_contract():
+    assert core.get_job_events.__module__ == 'sky.jobs.server.core'
+    assert core.get_job_events.__name__ == 'get_job_events'
+    signature = inspect.signature(core.get_job_events)
+    assert list(signature.parameters) == [
+        'job_id', 'task_id', 'limit', 'include_cluster_events'
+    ]
+    assert signature.parameters['job_id'].default is inspect.Parameter.empty
+    assert signature.parameters['task_id'].default is None
+    assert signature.parameters['limit'].default == 10
+    assert signature.parameters['include_cluster_events'].default is False
 
 
 def _job_event(reason, status, ts):
@@ -42,8 +56,13 @@ def test_no_merge_when_flag_disabled(monkeypatch):
         _job_event('Job is starting',
                    managed_job_state.ManagedJobStatus.STARTING, 100)
     ]
-    monkeypatch.setattr(managed_job_state, 'get_job_events',
-                        lambda **kwargs: list(job_events))
+    captured = {}
+
+    def _get_job_events(**kwargs):
+        captured.update(kwargs)
+        return list(job_events)
+
+    monkeypatch.setattr(managed_job_state, 'get_job_events', _get_job_events)
 
     def _should_not_be_called(*args, **kwargs):
         raise AssertionError('cluster events should not be read')
@@ -53,8 +72,12 @@ def test_no_merge_when_flag_disabled(monkeypatch):
     monkeypatch.setattr(global_user_state, 'get_cluster_events_by_name',
                         _should_not_be_called)
 
-    result = core.get_job_events(job_id=1, include_cluster_events=False)
+    result = core.get_job_events(job_id=1,
+                                 task_id=2,
+                                 limit=7,
+                                 include_cluster_events=False)
     assert result == job_events
+    assert captured == {'job_id': 1, 'task_id': 2, 'limit': 7}
 
 
 def test_merge_orders_newest_first_and_truncates(monkeypatch):
@@ -230,6 +253,7 @@ def test_pipeline_uses_per_task_cluster_name(monkeypatch):
     queried_names = []
 
     def _fake_cluster_events(name, event_types, limit=None):
+        del event_types, limit
         queried_names.append(name)
         return [{'reason': f'Provisioning {name}', 'transitioned_at': 100}]
 
