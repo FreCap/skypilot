@@ -1863,21 +1863,44 @@ class SkyPilotReplicaManager(ReplicaManager):
                 f'Service {self._service_name!r} incarnation changed while '
                 f'removing replica {replica_id}.')
 
+    def _failed_cleanup_retry_state(
+            self) -> tuple[dict[int, int], dict[int, float]]:
+        """Return retry maps, tolerating managers built before these fields.
+
+        Normal construction initializes both maps in ``__init__``.  Keeping
+        this accessor backward-compatible also protects lightweight embedders,
+        tests, and upgrade/recovery paths that reconstruct a manager without
+        replaying the newest initializer in full.
+        """
+        attempts: dict[int, int] | None = getattr(
+            self, '_failed_cleanup_retry_attempts', None)
+        retry_at: dict[int, float] | None = getattr(self,
+                                                    '_failed_cleanup_retry_at',
+                                                    None)
+        if attempts is None:
+            attempts = {}
+            self._failed_cleanup_retry_attempts = attempts
+        if retry_at is None:
+            retry_at = {}
+            self._failed_cleanup_retry_at = retry_at
+        return attempts, retry_at
+
     def _clear_failed_cleanup_retry(self, replica_id: int) -> None:
         """Forget in-memory cleanup rate limiting after confirmed success."""
-        self._failed_cleanup_retry_attempts.pop(replica_id, None)
-        self._failed_cleanup_retry_at.pop(replica_id, None)
+        attempts, retry_at = self._failed_cleanup_retry_state()
+        attempts.pop(replica_id, None)
+        retry_at.pop(replica_id, None)
 
     def _schedule_failed_cleanup_retry(self, replica_id: int) -> None:
         """Rate-limit, but never give up on, a durable cleanup failure."""
-        attempt = self._failed_cleanup_retry_attempts.get(replica_id, 0) + 1
-        self._failed_cleanup_retry_attempts[replica_id] = attempt
+        attempts, retry_at = self._failed_cleanup_retry_state()
+        attempt = attempts.get(replica_id, 0) + 1
+        attempts[replica_id] = attempt
         exponential_step = min(attempt - 1, 30)
         delay_seconds = min(
             _FAILED_CLEANUP_RETRY_BASE_SECONDS * 2**exponential_step,
             _FAILED_CLEANUP_RETRY_MAX_SECONDS)
-        self._failed_cleanup_retry_at[replica_id] = (time.monotonic() +
-                                                     delay_seconds)
+        retry_at[replica_id] = time.monotonic() + delay_seconds
         logger.warning(f'Replica {replica_id} cleanup will retry in '
                        f'{delay_seconds}s (attempt {attempt}).')
 
@@ -1943,8 +1966,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         self._ownership_lost = threading.Event()
         self._down_thread_pool: thread_utils.ThreadSafeDict[
             int, thread_utils.SafeThread] = thread_utils.ThreadSafeDict()
-        self._failed_cleanup_retry_attempts: dict[int, int] = {}
-        self._failed_cleanup_retry_at: dict[int, float] = {}
+        self._failed_cleanup_retry_attempts = {}
+        self._failed_cleanup_retry_at = {}
         self._wait_for_idle_trackers: dict[int,
                                            tuple[_ReplicaDrainTracker | None,
                                                  float]] = {}
@@ -3585,10 +3608,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                                   replica_infos: list[ReplicaInfo]) -> None:
         """Re-drive every durable cleanup failure until absence is proven."""
         now = time.monotonic()
+        _, retry_at_by_replica = self._failed_cleanup_retry_state()
         for info in replica_infos:
             down_failed = (info.status_property.sky_down_status ==
                            common_utils.ProcessStatus.FAILED)
-            retry_pending = info.replica_id in self._failed_cleanup_retry_at
+            retry_pending = info.replica_id in retry_at_by_replica
             if (info.status != serve_state.ReplicaStatus.FAILED_CLEANUP and
                     not down_failed and not retry_pending):
                 continue
@@ -3596,7 +3620,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             if (replica_id in self._down_thread_pool or
                     replica_id in self._launch_thread_pool):
                 continue
-            retry_at = self._failed_cleanup_retry_at.get(replica_id, 0)
+            retry_at = retry_at_by_replica.get(replica_id, 0)
             if now < retry_at:
                 continue
 
@@ -3607,7 +3631,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             # Once an attempt is admitted, its durable SCHEDULED/RUNNING state
             # prevents duplicate reconciliation.  Remove the old deadline;
             # a failure records the next one in _handle_sky_down_finish.
-            self._failed_cleanup_retry_at.pop(replica_id, None)
+            retry_at_by_replica.pop(replica_id, None)
             try:
                 self._terminate_replica(
                     replica_id,
