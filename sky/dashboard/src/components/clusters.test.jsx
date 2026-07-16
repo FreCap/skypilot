@@ -6,7 +6,17 @@ import {
   waitFor,
 } from '@testing-library/react';
 
-import { Clusters } from '@/components/clusters';
+import {
+  Clusters,
+  Status2Actions,
+  enabledActions,
+  handleVSCodeConnection,
+} from '@/components/clusters';
+import {
+  Status2Actions as ExtractedStatus2Actions,
+  enabledActions as extractedEnabledActions,
+  handleVSCodeConnection as extractedHandleVSCodeConnection,
+} from '@/components/cluster-actions';
 import {
   getClusters,
   getClusterHistory,
@@ -15,6 +25,7 @@ import {
 import { getWorkspaces } from '@/data/connectors/workspaces';
 import dashboardCache from '@/lib/cache';
 import cachePreloader from '@/lib/cache-preloader';
+import { trackClusterAction } from '@/lib/analytics';
 
 const router = {
   isReady: true,
@@ -196,5 +207,76 @@ describe('Clusters preload lifecycle', () => {
     });
 
     expect(dashboardCache.invalidate).toHaveBeenCalledWith(getClusterHistory);
+  });
+});
+
+describe('Cluster actions', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('enables connection actions only for running clusters', () => {
+    expect(enabledActions('RUNNING')).toEqual(['connect', 'VSCode']);
+    expect(enabledActions('STOPPED')).toEqual([]);
+  });
+
+  it('preserves the clusters module exports as direct aliases', () => {
+    expect(Status2Actions).toBe(ExtractedStatus2Actions);
+    expect(enabledActions).toBe(extractedEnabledActions);
+    expect(handleVSCodeConnection).toBe(extractedHandleVSCodeConnection);
+  });
+
+  it('dispatches running-cluster actions with analytics', () => {
+    const onOpenSSHModal = jest.fn();
+    const onOpenVSCodeModal = jest.fn();
+
+    render(
+      <Status2Actions
+        withLabel
+        cluster="cluster-a"
+        status="RUNNING"
+        onOpenSSHModal={onOpenSSHModal}
+        onOpenVSCodeModal={onOpenVSCodeModal}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Connect' }));
+    fireEvent.click(screen.getByRole('button', { name: 'VSCode' }));
+
+    expect(onOpenSSHModal).toHaveBeenCalledWith('cluster-a');
+    expect(onOpenVSCodeModal).toHaveBeenCalledWith('cluster-a');
+    expect(trackClusterAction).toHaveBeenNthCalledWith(1, 'connect', {
+      status: 'RUNNING',
+    });
+    expect(trackClusterAction).toHaveBeenNthCalledWith(2, 'VSCode', {
+      status: 'RUNNING',
+    });
+  });
+
+  it('renders disabled actions without clickable controls', () => {
+    render(<Status2Actions withLabel cluster="cluster-a" status="STOPPED" />);
+
+    expect(screen.queryAllByRole('button')).toHaveLength(0);
+    expect(screen.getByTitle('connect')).toHaveTextContent('Connect');
+    expect(screen.getByTitle('VSCode')).toHaveTextContent('VSCode');
+  });
+
+  it('falls back to the SSH URI when no modal callback is provided', () => {
+    const open = jest.spyOn(window, 'open').mockImplementation(() => null);
+
+    render(<Status2Actions withLabel cluster="cluster-a" status="RUNNING" />);
+    fireEvent.click(screen.getByRole('button', { name: 'Connect' }));
+
+    expect(open).toHaveBeenCalledWith('ssh://cluster-a');
+    open.mockRestore();
+  });
+
+  it('keeps direct VS Code dispatch as a no-op without a callback', () => {
+    const onOpenVSCodeModal = jest.fn();
+
+    handleVSCodeConnection('cluster-a', onOpenVSCodeModal);
+    handleVSCodeConnection('cluster-b');
+
+    expect(onOpenVSCodeModal).toHaveBeenCalledWith('cluster-a');
   });
 });
