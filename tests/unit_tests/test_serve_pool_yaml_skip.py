@@ -67,6 +67,36 @@ def test_update_pool_status_liveness_skips_pool_yaml():
     full_status.assert_not_called()
 
 
+@pytest.mark.parametrize(('pool', 'noun'), [(False, 'service'), (True, 'pool')])
+def test_terminate_services_skips_display_yaml(pool, noun):
+    record = {
+        'name': 'target-a',
+        'pool': pool,
+        'version': 1,
+        'yaml_content': None,
+        'status': serve_state.ServiceStatus.SHUTTING_DOWN,
+        'hash': 'incarnation-a',
+        'resource_scope': 'scope-a',
+    }
+    with mock.patch.object(serve_state,
+                           'get_glob_service_names',
+                           return_value=['target-a']), \
+         mock.patch.object(serve_state,
+                           'get_service_from_name',
+                           return_value=record), \
+         mock.patch.object(serve_utils,
+                           'get_yaml_content',
+                           side_effect=AssertionError(
+                               'termination must not load display YAML')) \
+                 as get_yaml:
+        message = serve_utils.terminate_services(['target-a'],
+                                                 purge=False,
+                                                 pool=pool)
+
+    get_yaml.assert_not_called()
+    assert message == f'No {noun} to terminate.'
+
+
 @pytest.mark.parametrize(
     ('controller_pid', 'controller_alive', 'expected_status_writes'),
     [(123, True, 0), (None, False, 1)],
