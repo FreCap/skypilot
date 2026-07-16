@@ -16,6 +16,14 @@ export function normalizeReplica(replica) {
     Number.isInteger(rawPlannedCapacity) && rawPlannedCapacity > 0
       ? rawPlannedCapacity
       : 1;
+  const rawReadyAt = replica.ready_at;
+  const readyAt =
+    rawReadyAt === null || rawReadyAt === undefined ? null : Number(rawReadyAt);
+  const rawTimeToReadySeconds = replica.time_to_ready_seconds;
+  const timeToReadySeconds =
+    rawTimeToReadySeconds === null || rawTimeToReadySeconds === undefined
+      ? null
+      : Number(rawTimeToReadySeconds);
   return {
     id: replica.replica_id,
     status: replica.status,
@@ -23,6 +31,10 @@ export function normalizeReplica(replica) {
     endpoint: replica.endpoint || null,
     is_spot: replica.is_spot,
     launched_at: replica.launched_at || null,
+    ready_at: Number.isFinite(readyAt) ? readyAt : null,
+    timeToReadySeconds: Number.isFinite(timeToReadySeconds)
+      ? timeToReadySeconds
+      : null,
     cloud: replica.cloud || null,
     region: replica.region || null,
     infra: replica.infra || null,

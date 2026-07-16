@@ -369,6 +369,8 @@ describe('service replica table sorting', () => {
       hourlyCost: 2.5,
       region: 'us-west-2',
       endpoint: 'http://10.0.0.10:8000',
+      ready_at: 110,
+      timeToReadySeconds: 80,
       launched_at: 30,
     },
     {
@@ -379,6 +381,8 @@ describe('service replica table sorting', () => {
       hourlyCost: null,
       region: 'us-east-1',
       endpoint: null,
+      ready_at: null,
+      timeToReadySeconds: null,
       launched_at: 10,
     },
     {
@@ -389,6 +393,8 @@ describe('service replica table sorting', () => {
       hourlyCost: 1.25,
       region: 'us-central1',
       endpoint: 'http://10.0.0.1:8000',
+      ready_at: 40,
+      timeToReadySeconds: 20,
       launched_at: 20,
     },
   ];
@@ -428,6 +434,12 @@ describe('service replica table sorting', () => {
     expect(rowIds()).toEqual(['2', '1', '10']);
 
     await user.click(screen.getByRole('button', { name: 'Launched' }));
+    expect(rowIds()).toEqual(['10', '1', '2']);
+
+    await user.click(screen.getByRole('button', { name: 'Ready in' }));
+    expect(rowIds()).toEqual(['1', '10', '2']);
+
+    await user.click(screen.getByRole('button', { name: 'Ready in' }));
     expect(rowIds()).toEqual(['10', '1', '2']);
   });
 });

@@ -63,6 +63,8 @@ function rawServiceRecord(overrides = {}) {
         endpoint: 'http://10.0.0.2:8000',
         is_spot: false,
         launched_at: 1751590000,
+        ready_at: 1751590125,
+        time_to_ready_seconds: 180,
         cloud: 'AWS',
         region: 'us-east-1',
         infra: 'AWS (us-east-1)',
@@ -126,6 +128,8 @@ describe('getServices', () => {
       version: 2,
       endpoint: 'http://10.0.0.2:8000',
       launched_at: 1751590000,
+      ready_at: 1751590125,
+      timeToReadySeconds: 180,
       region: 'us-east-1',
       resources_str: '1x(gpus=L4:1)',
       resources_str_full: '1x(gpus=L4:1, cpus=4, mem=16)',
@@ -451,5 +455,7 @@ describe('normalizeService / normalizeReplica', () => {
     expect(replica.resources_str_full).toBe('1x(gpus=L4:1)');
     expect(replica.endpoint).toBeNull();
     expect(replica.launched_at).toBeNull();
+    expect(replica.ready_at).toBeNull();
+    expect(replica.timeToReadySeconds).toBeNull();
   });
 });

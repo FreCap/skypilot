@@ -1296,6 +1296,19 @@ class ReplicaInfo:
             handle = None
         else:
             handle = self.handle(cluster_record)
+        created_at = getattr(self, 'created_at', None)
+        ready_at = self.status_property.first_ready_time
+        # ``-1`` is the persisted sentinel for an exhausted initial-delay
+        # window, not a successful readiness probe.
+        if ready_at is not None and ready_at < 0:
+            ready_at = None
+        time_to_ready_seconds = None
+        if (created_at is not None and ready_at is not None and
+                ready_at >= created_at):
+            # End-to-end launch latency: replica row creation -> first
+            # successful readiness probe. This includes placement queueing,
+            # cloud provisioning, setup, and application startup.
+            time_to_ready_seconds = ready_at - created_at
         info_dict = {
             'replica_id': self.replica_id,
             'name': self.cluster_name,
@@ -1311,6 +1324,8 @@ class ReplicaInfo:
             'is_spot': self.is_spot,
             'launched_at': (cluster_record['launched_at']
                             if cluster_record is not None else None),
+            'ready_at': ready_at,
+            'time_to_ready_seconds': time_to_ready_seconds,
         }
         # Always populate the small derived strings — new clients read
         # these instead of touching the handle, and the cost is just a

@@ -31,6 +31,7 @@ import dashboardCache from '@/lib/cache';
 import {
   CustomTooltip as Tooltip,
   NonCapitalizedTooltip,
+  formatDuration,
   formatFullTimestamp,
 } from '@/components/utils';
 import { EndpointCell, formatUptime } from '@/components/services';
@@ -667,6 +668,7 @@ const REPLICA_SORT_VALUE = {
   hourlyCost: (replica) => replica.hourlyCost,
   region: (replica) => replica.region,
   endpoint: (replica) => replica.endpoint,
+  timeToReadySeconds: (replica) => replica.timeToReadySeconds,
   launched_at: (replica) => replica.launched_at,
 };
 
@@ -766,6 +768,7 @@ export function ReplicasCard({ replicas, loading }) {
                 {sortableHeader('Est. $/hr', 'hourlyCost')}
                 {sortableHeader('Region', 'region')}
                 {sortableHeader('Endpoint', 'endpoint')}
+                {sortableHeader('Ready in', 'timeToReadySeconds')}
                 {sortableHeader('Launched', 'launched_at')}
               </TableRow>
             </TableHeader>
@@ -807,6 +810,21 @@ export function ReplicasCard({ replicas, loading }) {
                       <EndpointCell endpoint={replica.endpoint} />
                     </TableCell>
                     <TableCell>
+                      {replica.timeToReadySeconds != null ? (
+                        <NonCapitalizedTooltip
+                          content={`Ready at ${formatFullTimestamp(
+                            new Date(replica.ready_at * 1000)
+                          )}`}
+                        >
+                          <span className="border-b border-dotted border-gray-400 cursor-help">
+                            {formatDuration(replica.timeToReadySeconds)}
+                          </span>
+                        </NonCapitalizedTooltip>
+                      ) : (
+                        '-'
+                      )}
+                    </TableCell>
+                    <TableCell>
                       {replica.launched_at
                         ? formatFullTimestamp(
                             new Date(replica.launched_at * 1000)
@@ -818,7 +836,7 @@ export function ReplicasCard({ replicas, loading }) {
               ) : (
                 <TableRow>
                   <TableCell
-                    colSpan={8}
+                    colSpan={9}
                     className="text-center py-6 text-gray-500"
                   >
                     No replicas.
