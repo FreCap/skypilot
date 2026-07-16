@@ -150,6 +150,7 @@ def launch_cluster(replica_id: int,
                    retry_until_up: bool = True,
                    max_retry: int = _DEFAULT_LAUNCH_MAX_RETRY,
                    availability_max_retry: int | None = None,
+                   exact_resources_override: bool = False,
                    pre_launch_guard: Callable[[], bool] | None = None,
                    continue_guard: Callable[[], bool] | None = None,
                    launch_fence: dict[str, Any] | None = None) -> None:
@@ -183,10 +184,20 @@ def launch_cluster(replica_id: int,
         task = task_lib.Task.from_yaml_str(yaml_content)
         if resources_override is not None:
             resources = task.resources
-            overrided_resources = [
-                r.copy(**resources_override) for r in resources
-            ]
-            task.set_resources(type(resources)(overrided_resources))
+            if exact_resources_override:
+                # Spot placement has already selected the complete launch
+                # location and shape. All entries have the same non-location
+                # fields (validated by SpotPlacer), so one is sufficient.
+                # Keeping the whole any_of set here would turn N entries into
+                # N identical pinned candidates and make sky.launch retry the
+                # same unavailable zone N times before reporting failure.
+                resource = next(iter(resources)).copy(**resources_override)
+                task.set_resources(resource)
+            else:
+                overrided_resources = [
+                    r.copy(**resources_override) for r in resources
+                ]
+                task.set_resources(type(resources)(overrided_resources))
         task.update_envs({serve_constants.REPLICA_ID_ENV_VAR: str(replica_id)})
 
         logger.info(f'Launching replica (id: {replica_id}) cluster '
@@ -2184,6 +2195,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                   retry_until_up),
             kwargs={
                 'availability_max_retry': availability_max_retry,
+                'exact_resources_override': location is not None,
                 'pre_launch_guard': self._service_is_launch_authorized,
                 'continue_guard': self._launch_owner_watchdog_allows_continue,
                 'launch_fence': self._replica_launch_fence_context(),
