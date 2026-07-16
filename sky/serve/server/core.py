@@ -66,6 +66,13 @@ def update(task: Optional['sky.Task'],
 
 
 @usage_lib.entrypoint
+def elect_version(service_name: str, version: int,
+                  expected_service_hash: str) -> None:
+    """Roll out a new generation from an immutable stored version."""
+    return impl.elect_version(service_name, version, expected_service_hash)
+
+
+@usage_lib.entrypoint
 # pylint: disable=redefined-builtin
 def down(
     service_names: str | list[str] | None = None,
@@ -168,6 +175,8 @@ def status(
         {
             'name': (str) service name,
             'active_versions': (List[int]) a list of versions that are active,
+            'elected_version': (int) the latest durably selected version; it
+              can differ from active_versions while a rollout is converging,
             'controller_job_id': (int) the job id of the controller,
             'uptime': (int) uptime in seconds,
             'status': (sky.ServiceStatus) service status,

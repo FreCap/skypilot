@@ -956,6 +956,35 @@ def update(
                          lifecycle_lock=lifecycle_lock)
 
 
+def elect_version(service_name: str, version: int,
+                  expected_service_hash: str) -> None:
+    """Create a new rollout generation from an immutable stored version."""
+    with filelock.FileLock(serve_utils.get_service_filelock_path(service_name)):
+        lifecycle_lock = serve_utils.get_service_lifecycle_lock(service_name)
+        with lifecycle_lock:
+            record = serve_state.get_service_from_name(service_name)
+            if (record is None or record.get('hash') != expected_service_hash or
+                    record.get('pool')):
+                raise RuntimeError(
+                    f'Service {service_name!r} changed before version '
+                    f'{version} could be elected. Refresh and try again.')
+            if record.get('elected_version') == version:
+                raise ValueError(
+                    f'Service {service_name!r} already has version {version} '
+                    'elected.')
+            yaml_content = serve_state.get_yaml_content(service_name, version)
+            if yaml_content is None:
+                raise ValueError(
+                    f'Committed version {version} does not exist for service '
+                    f'{service_name!r}.')
+            task = task_lib.Task.from_yaml_str(yaml_content)
+            _update_impl(task,
+                         service_name,
+                         serve_utils.UpdateMode.ROLLING,
+                         pool=False,
+                         lifecycle_lock=lifecycle_lock)
+
+
 def _assert_service_update_fence(service_name: str, pool: bool,
                                  handle: 'backends.CloudVmRayResourceHandle',
                                  backend: 'backends.CloudVmRayBackend',

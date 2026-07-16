@@ -1649,8 +1649,6 @@ class ReplicaManager:
 
         # Newest version among the currently provisioned and launched replicas
         self.latest_version: int = version
-        # Oldest version among the currently provisioned and launched replicas
-        self.least_recent_version: int = version
 
     def update_lb_in_flight(self,
                             in_flight_by_url: dict[str, int] | None,
@@ -4951,46 +4949,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                         # re-scanning the DB on the next replica.
                         in_flight += 1.0 / controller_utils.SERVE_LAUNCH_RATIO
 
-        # Clean old version
+        # Reconcile provider cleanup, but retain immutable version metadata.
+        # Historical specs power admin comparison and rollback, while full
+        # service teardown remains responsible for deleting all version rows.
         replica_infos = serve_state.get_replica_infos(self._service_name)
         self._reconcile_failed_cleanup(replica_infos)
-        current_least_recent_version = min([
-            info.version for info in replica_infos
-        ]) if replica_infos else self.least_recent_version
-        if self.least_recent_version < current_least_recent_version:
-            for version in range(self.least_recent_version,
-                                 current_least_recent_version):
-                # Cleanup inventory is durable and generation-scoped outside
-                # version_specs. Retiring metadata must never delete storage:
-                # a newer version may intentionally reference the same bucket
-                # or subpath. Full service teardown consumes every intent only
-                # after all replicas are gone.
-                yaml_content = serve_state.get_yaml_content(
-                    self._service_name, version)
-                if yaml_content is not None:
-                    service_hash = getattr(self, '_service_hash', None)
-                    controller_owner = getattr(self, '_controller_owner', None)
-                    ensure_storage_intent = (
-                        serve_state.
-                        ensure_committed_ephemeral_storage_intent_for_version)
-                    if (service_hash is None or controller_owner is None or
-                            not ensure_storage_intent(
-                                self._service_name, yaml_content, service_hash,
-                                controller_owner)):
-                        logger.warning(
-                            f'Retaining version {version} metadata for service '
-                            f'{self._service_name!r}: no owner-fenced scoped '
-                            'storage cleanup intent could be proven.')
-                        continue
-                deleted = serve_state.delete_version(self._service_name,
-                                                     version,
-                                                     **self._db_fence_kwargs())
-                if deleted is False:
-                    raise RuntimeError(
-                        f'Service {self._service_name!r} incarnation changed '
-                        f'while deleting version {version}.')
-            # The newest version metadata is removed with the service row.
-            self.least_recent_version = current_least_recent_version
 
     def _thread_pool_refresher(self) -> None:
         """Periodically refresh the launch/down thread pool."""

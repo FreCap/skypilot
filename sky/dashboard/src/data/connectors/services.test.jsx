@@ -3,6 +3,7 @@
 jest.mock('@/data/connectors/client', () => ({
   __esModule: true,
   apiClient: {
+    fetch: jest.fn(),
     post: jest.fn(),
     get: jest.fn(),
   },
@@ -10,6 +11,8 @@ jest.mock('@/data/connectors/client', () => ({
 
 import { apiClient } from '@/data/connectors/client';
 import {
+  electServiceVersion,
+  getServiceVersions,
   getServices,
   normalizeReplicaHistory,
   normalizeService,
@@ -445,6 +448,35 @@ describe('getServices', () => {
     const result = await getServices();
 
     expect(result).toEqual({ services: [], controllerStopped: true });
+  });
+});
+
+describe('service version administration', () => {
+  it('fetches the immutable version history', async () => {
+    const history = {
+      service_name: 'boltz-l4-fleet',
+      elected_version: 3,
+      active_versions: [2, 3],
+      versions: [{ version: 3, elected: true, active: true }],
+    };
+    apiClient.get.mockResolvedValue({
+      ok: true,
+      json: async () => history,
+    });
+
+    await expect(getServiceVersions('boltz/l4')).resolves.toEqual(history);
+    expect(apiClient.get).toHaveBeenCalledWith('/serve/boltz%2Fl4/versions');
+  });
+
+  it('elects a stored version through the queued update path', async () => {
+    apiClient.fetch.mockResolvedValue([]);
+
+    await electServiceVersion('boltz-l4-fleet', 2);
+
+    expect(apiClient.fetch).toHaveBeenCalledWith(
+      '/serve/boltz-l4-fleet/versions/elect',
+      { version: 2 }
+    );
   });
 });
 

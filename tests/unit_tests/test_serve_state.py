@@ -514,6 +514,37 @@ def test_replica_json_migration_handles_fresh_database(tmp_path):
     assert 'demand_capacity_observations' in inspector.get_table_names()
 
 
+def test_elected_version_migration_backfills_latest_committed_version(
+        tmp_path, monkeypatch):
+    engine = create_engine(f'sqlite:///{tmp_path / "old-serve.db"}')
+    monkeypatch.setattr(migration_utils, 'SERVE_VERSION', '013')
+    serve_state.create_table(engine)
+    with engine.begin() as connection:
+        connection.execute(serve_state.services_table.insert().values(
+            name='svc', current_version=1))
+        connection.execute(serve_state.version_specs_table.insert(), [{
+            'service_name': 'svc',
+            'version': 1,
+            'spec': pickle.dumps(None),
+            'yaml_content': 'yaml: v1',
+        }, {
+            'service_name': 'svc',
+            'version': 2,
+            'spec': pickle.dumps(None),
+            'yaml_content': 'yaml: v2',
+        }, {
+            'service_name': 'svc',
+            'version': 3,
+            'spec': pickle.dumps(None),
+            'yaml_content': None,
+        }])
+
+    monkeypatch.setattr(migration_utils, 'SERVE_VERSION', '014')
+    serve_state.create_table(engine)
+
+    assert _read_row(engine, 'svc')['current_version'] == 2
+
+
 def test_get_specs_batches_requested_versions_in_one_query(_mock_serve_db):
     initial_spec = types.SimpleNamespace(graceful_drain_async_occupancy=False)
     assert _add_minimal_service('svc-specs', spec=initial_spec) is True
@@ -546,6 +577,11 @@ def test_committed_version_content_is_immutable_and_retryable(_mock_serve_db):
     result = serve_state.add_or_update_version('svc-immutable', 2,
                                                original_spec, 'value: original')
     assert result is serve_state.VersionCommitResult.COMMITTED
+    assert _read_row(_mock_serve_db, 'svc-immutable')['current_version'] == 2
+    assert serve_state.get_version_yaml_contents('svc-immutable') == {
+        1: 'yaml: v1',
+        2: 'value: original',
+    }
     original_row = _read_version_row(_mock_serve_db, 'svc-immutable', 2)
 
     # A lost-response retry is idempotent and does not rewrite either stored
@@ -1068,7 +1104,7 @@ class TestServiceLifecycleEpoch:
         assert replica is not None
         assert replica.cluster_name == 'replica-b'
 
-    def test_exact_owner_cleanup_is_idempotent_when_children_are_absent(
+    def test_exact_owner_replica_cleanup_is_idempotent_when_child_is_absent(
             self, _mock_serve_db):
         epoch = serve_state.claim_service_lifecycle_epoch('svc')
         assert _add_minimal_service('svc',
@@ -1080,32 +1116,6 @@ class TestServiceLifecycleEpoch:
                                           99,
                                           expected_service_hash='incarnation-a',
                                           expected_lifecycle_epoch=epoch)
-        assert serve_state.delete_version('svc',
-                                          99,
-                                          expected_service_hash='incarnation-a')
-
-    def test_stale_version_delete_cannot_touch_successor(self, _mock_serve_db):
-        epoch_a = serve_state.claim_service_lifecycle_epoch('svc')
-        assert _add_minimal_service('svc',
-                                    service_hash='incarnation-a',
-                                    lifecycle_epoch=epoch_a,
-                                    resource_scope='incarnation-a')
-
-        epoch_delete = serve_state.claim_service_lifecycle_epoch('svc')
-        assert serve_state.remove_service_completely(
-            'svc', 'incarnation-a', expected_lifecycle_epoch=epoch_delete)
-        epoch_b = serve_state.claim_service_lifecycle_epoch('svc')
-        assert _add_minimal_service('svc',
-                                    service_hash='incarnation-b',
-                                    lifecycle_epoch=epoch_b,
-                                    resource_scope='incarnation-b')
-
-        assert not serve_state.delete_version(
-            'svc',
-            serve_constants.INITIAL_VERSION,
-            expected_service_hash='incarnation-a')
-        assert serve_state.get_yaml_content(
-            'svc', serve_constants.INITIAL_VERSION) == 'yaml: v1'
 
     def test_stale_recovery_script_and_version_claims_fail(
             self, _mock_serve_db):

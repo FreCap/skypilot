@@ -1082,7 +1082,6 @@ class TestLaunchOwnershipFence:
     def _queued_manager(cls, replica_ids):
         mgr = _make_manager()
         mgr._is_pool = False
-        mgr.least_recent_version = 1
         mgr._spot_placer = None
         mgr._replica_to_request_id = thread_utils.ThreadSafeDict()
         mgr._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
@@ -1184,7 +1183,6 @@ class TestLaunchOwnershipFence:
     def test_transient_lookup_defers_queued_launch_instead_of_discarding(self):
         mgr = _make_manager()
         mgr._is_pool = False
-        mgr.least_recent_version = 1
         mgr._spot_placer = None
         mgr._replica_to_request_id = thread_utils.ThreadSafeDict()
         mgr._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
@@ -1239,7 +1237,6 @@ class TestLaunchOwnershipFence:
     def test_stale_queued_launch_is_discarded_without_deleting_row(self):
         mgr = _make_manager()
         mgr._is_pool = False
-        mgr.least_recent_version = 1
         mgr._spot_placer = None
         mgr._replica_to_request_id = thread_utils.ThreadSafeDict()
         mgr._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
@@ -1429,10 +1426,9 @@ class TestLaunchOwnershipFence:
         placer.set_active.assert_called_once_with(location, selected_at=123.0)
         placer.set_preemptive.assert_not_called()
 
-    def test_old_version_retirement_leaves_storage_to_durable_intents(self):
+    def test_old_version_metadata_is_retained(self):
         mgr = _make_manager()
         mgr._is_pool = False
-        mgr.least_recent_version = 1
         mgr._spot_placer = None
         mgr._replica_to_request_id = thread_utils.ThreadSafeDict()
         mgr._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
@@ -1443,69 +1439,10 @@ class TestLaunchOwnershipFence:
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
                                return_value=[info]), \
-             mock.patch.object(replica_managers.serve_state,
-                               'get_service_versions',
-                               return_value=[1, 2]), \
-             mock.patch.object(replica_managers.serve_utils,
-                               'get_yaml_content',
-                               ) as get_yaml_content, \
-             mock.patch.object(replica_managers.serve_state,
-                               'delete_version',
-                               return_value=True) as delete_version:
+             mock.patch.object(mgr, '_reconcile_failed_cleanup') as reconcile:
             mgr._refresh_thread_pool()
 
-        delete_version.assert_called_once_with('svc', 1)
-        get_yaml_content.assert_not_called()
-
-    def test_old_version_scoped_storage_is_not_deleted_during_retirement(self):
-        mgr = _make_manager()
-        mgr._is_pool = False
-        mgr._resource_scope = 'incarnation-a'
-        mgr.least_recent_version = 1
-        mgr._spot_placer = None
-        mgr._replica_to_request_id = thread_utils.ThreadSafeDict()
-        mgr._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
-        mgr._launch_thread_pool = thread_utils.ThreadSafeDict()
-        mgr._down_thread_pool = thread_utils.ThreadSafeDict()
-        info = mock.Mock(version=2)
-
-        with mock.patch.object(replica_managers.serve_state,
-                               'get_replica_infos', return_value=[info]), \
-             mock.patch.object(replica_managers.serve_state,
-                               'get_service_versions', return_value=[1, 2]), \
-             mock.patch.object(replica_managers.serve_utils,
-                               'get_yaml_content') as get_yaml_content, \
-             mock.patch.object(replica_managers.serve_state,
-                               'delete_version', return_value=True) as delete:
-            mgr._refresh_thread_pool()
-
-        get_yaml_content.assert_not_called()
-        delete.assert_called_once_with('svc', 1)
-        assert mgr.least_recent_version == 2
-
-    def test_old_version_metadata_delete_failure_keeps_retry_pointer(self):
-        mgr = _make_manager()
-        mgr._is_pool = False
-        mgr._resource_scope = 'incarnation-a'
-        mgr.least_recent_version = 1
-        mgr._spot_placer = None
-        mgr._replica_to_request_id = thread_utils.ThreadSafeDict()
-        mgr._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
-        mgr._launch_thread_pool = thread_utils.ThreadSafeDict()
-        mgr._down_thread_pool = thread_utils.ThreadSafeDict()
-        info = mock.Mock(version=2)
-
-        with mock.patch.object(replica_managers.serve_state,
-                               'get_replica_infos', return_value=[info]), \
-             mock.patch.object(replica_managers.serve_state,
-                               'get_service_versions', return_value=[1, 2]), \
-             mock.patch.object(replica_managers.serve_state,
-                               'delete_version', return_value=False) as delete, \
-             pytest.raises(RuntimeError, match='incarnation changed'):
-            mgr._refresh_thread_pool()
-
-        delete.assert_called_once_with('svc', 1)
-        assert mgr.least_recent_version == 1
+        reconcile.assert_called_once_with([info])
 
 
 class TestCloudInstanceLooksAlive:
@@ -2770,7 +2707,6 @@ class TestLogicalCapacityPlanning:
         mgr._down_thread_pool = thread_utils.ThreadSafeDict()
         mgr._replica_to_request_id = thread_utils.ThreadSafeDict()
         mgr._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
-        mgr.least_recent_version = 9
         down_thread = mock.Mock()
         down_thread.is_alive.return_value = False
         mgr._down_thread_pool[9] = down_thread
@@ -2823,7 +2759,6 @@ class TestLogicalCapacityPlanning:
         mgr._terminate_replica = types.MethodType(
             replica_managers.SkyPilotReplicaManager._terminate_replica, mgr)
         mgr._resource_scope = None
-        mgr.least_recent_version = retiring_version
         tracker = replica_managers._ReplicaDrainTracker(mgr,
                                                         'http://old-backend',
                                                         drain_started=90.0)
@@ -2936,7 +2871,6 @@ class TestLogicalCapacityPlanning:
         mgr._logical_controller_epoch = 'new-controller-epoch'
         mgr._logical_target = (10, 5, current_target)
         mgr._resource_scope = None
-        mgr.least_recent_version = 9
         status = retiring.status_property
         status.logical_retirement_controller_epoch = 'old-controller-epoch'
         status.wait_for_idle_before_termination = False
@@ -3126,7 +3060,6 @@ class TestLogicalCapacityPlanning:
             replica_managers.SkyPilotReplicaManager._terminate_replica, mgr)
         mgr._logical_controller_epoch = 'new-controller-epoch'
         mgr._resource_scope = None
-        mgr.least_recent_version = 9
         status = retiring.status_property
         status.logical_retirement_controller_epoch = 'old-controller-epoch'
         status.wait_for_idle_before_termination = False
@@ -3715,7 +3648,6 @@ class TestFailedCleanupReconciliation:
     def test_finished_down_worker_survives_completion_persist_error(self):
         manager = _make_manager()
         manager._is_pool = False
-        manager.least_recent_version = 1
         manager._replica_to_request_id = thread_utils.ThreadSafeDict()
         manager._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
         manager._launch_thread_pool = thread_utils.ThreadSafeDict()
@@ -3752,7 +3684,6 @@ class TestFailedCleanupReconciliation:
         manager._down_thread_pool = thread_utils.ThreadSafeDict()
         manager._replica_to_request_id = thread_utils.ThreadSafeDict()
         manager._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
-        manager.least_recent_version = 9
         retiring.status_property.wait_for_idle_before_termination = False
         retiring.status_property.logical_retirement_confirmed_generation = 5
         original_thread = mock.Mock()
@@ -3838,7 +3769,6 @@ class TestFailedCleanupReconciliation:
         manager._down_thread_pool = thread_utils.ThreadSafeDict()
         manager._replica_to_request_id = thread_utils.ThreadSafeDict()
         manager._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
-        manager.least_recent_version = 9
         retiring.status_property.wait_for_idle_before_termination = False
         retiring.status_property.logical_retirement_confirmed_generation = 5
         retiring.status_property.drain_cap_seconds = 600

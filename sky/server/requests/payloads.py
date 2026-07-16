@@ -765,6 +765,18 @@ class ServeUpdateBody(RequestBody):
         return kwargs
 
 
+class ServeVersionElectionBody(BasePayload):
+    """The public admin request for electing a stored service version."""
+    version: int
+
+
+class ServeElectVersionBody(RequestBody):
+    """Internal queued request for a fenced service version election."""
+    service_name: str
+    version: int
+    expected_service_hash: str
+
+
 class ServeDownBody(RequestBody):
     """The request body for the serve down endpoint."""
     service_names: str | list[str] | None

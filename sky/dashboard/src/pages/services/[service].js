@@ -36,6 +36,7 @@ import {
 } from '@/components/utils';
 import { EndpointCell, formatUptime } from '@/components/services';
 import { ServeHistorySection } from '@/components/serve-history';
+import { ServiceVersionHistory } from '@/components/service-version-history';
 import { useMobile } from '@/hooks/useMobile';
 import { formatYaml } from '@/lib/yamlUtils';
 import { YamlCodeBlock } from '@/components/ui/yaml-code-block';
@@ -338,6 +339,10 @@ function ServiceDetails() {
               requestHistory={replicaHistory}
               pricingLoading={replicasLoading && serviceData.summaryOnly}
             />
+            <ServiceVersionHistory
+              serviceName={serviceName}
+              onElectionComplete={refreshData}
+            />
             <ServeHistorySection
               key={serviceName}
               history={replicaHistory}
@@ -565,6 +570,14 @@ export function ServiceDetailCard({
               </div>
               <div className="text-xs text-gray-500 mt-1">
                 Current fleet cost at the recent request rate
+              </div>
+            </div>
+            <div>
+              <div className="text-gray-600 font-medium text-base">
+                Elected Version
+              </div>
+              <div className="text-base mt-1">
+                {serviceData.electedVersion ?? '-'}
               </div>
             </div>
             <div>

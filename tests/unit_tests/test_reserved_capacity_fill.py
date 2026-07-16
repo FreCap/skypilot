@@ -1979,9 +1979,7 @@ class TestReplicaManagerInitIntact(unittest.TestCase):
     """Real __init__ must fully run (fill fixtures bypass it via __new__).
 
     Pins the regression class where an addition spliced into the middle
-    of ReplicaManager.__init__ silently truncated it: the suite passed
-    while least_recent_version was never set and the version-cleanup
-    refresher AttributeError'd every cycle.
+    of ReplicaManager.__init__ silently truncated it.
     """
 
     def test_base_init_sets_version_fields_and_placer_accessor(self):
@@ -1993,7 +1991,6 @@ class TestReplicaManagerInitIntact(unittest.TestCase):
                                      post_data=None)
         manager = replica_managers.ReplicaManager('svc', spec, version=3)
         self.assertEqual(manager.latest_version, 3)
-        self.assertEqual(manager.least_recent_version, 3)
         self.assertIsNone(manager.spot_placer)
 
 
