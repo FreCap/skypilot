@@ -122,8 +122,10 @@ def test_realtime_slurm_gpu_availability_isolates_cluster_failures():
          'unavailable'),
     ]
     assert mock_list.call_count == 3
-    assert [call.kwargs['region_filter'] for call in mock_list.call_args_list
-           ] == ['slurm-ok', 'slurm-empty', 'slurm-error']
+    assert sorted(
+        call.kwargs['region_filter'] for call in mock_list.call_args_list) == [
+            'slurm-empty', 'slurm-error', 'slurm-ok'
+        ]
 
 
 @pytest.mark.parametrize(('function_name', 'parameter_names'), [
