@@ -19,7 +19,7 @@ jobs:
   dashboard:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     - name: Install dependencies and check
       run: |
         npm --prefix sky/dashboard install
@@ -38,6 +38,7 @@ jobs:
           src/components/elements/deployment-version.test.jsx \
           src/components/elements/operator-notification-bell.test.jsx \
           src/components/elements/request-activity-indicator.test.jsx \
+          src/components/elements/sidebar.test.jsx \
           src/components/operator-notifications.test.jsx \
           src/data/connectors/client.test.js \
           src/data/connectors/clusters.test.jsx \
