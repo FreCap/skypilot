@@ -144,7 +144,11 @@ const formatDuration = (durationSeconds) => {
   return result.trim() || '0s';
 };
 
-export function useClustersPageData({ showHistory, refreshDataRef }) {
+export function useClustersPageData({
+  showHistory,
+  historyDays,
+  refreshDataRef,
+}) {
   const [preloadingComplete, setPreloadingComplete] = useState(false);
   const [lastFetchedTime, setLastFetchedTime] = useState(null);
   const requestVersionRef = useRef(0);
@@ -190,10 +194,10 @@ export function useClustersPageData({ showHistory, refreshDataRef }) {
     dashboardCache.invalidate(getClusters);
     dashboardCache.invalidate(getWorkspaces);
     if (showHistory) {
-      dashboardCache.invalidate(getClusterHistory);
+      dashboardCache.invalidate(getClusterHistory, [null, historyDays]);
     }
     return runPreload({ force: true, refreshTable: true });
-  }, [runPreload, showHistory]);
+  }, [historyDays, runPreload, showHistory]);
 
   return { preloadingComplete, lastFetchedTime, handleRefresh };
 }
@@ -245,7 +249,7 @@ export function Clusters() {
     labels: [],
   }); /// Option values for properties
   const { preloadingComplete, lastFetchedTime, handleRefresh } =
-    useClustersPageData({ showHistory, refreshDataRef });
+    useClustersPageData({ showHistory, historyDays, refreshDataRef });
 
   // Handle URL query parameters for workspace and user filtering and show history
   useEffect(() => {

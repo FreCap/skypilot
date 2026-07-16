@@ -196,8 +196,8 @@ describe('Clusters preload lifecycle', () => {
     expect(screen.getByText(/Updated just now/)).toBeInTheDocument();
   });
 
-  it('invalidates history only when history is visible', async () => {
-    router.query = { history: 'true' };
+  it('invalidates the visible history cache key', async () => {
+    router.query = { history: 'true', historyDays: '5' };
     render(<Clusters />);
     await screen.findByText(/Updated just now/);
 
@@ -206,7 +206,10 @@ describe('Clusters preload lifecycle', () => {
       await Promise.resolve();
     });
 
-    expect(dashboardCache.invalidate).toHaveBeenCalledWith(getClusterHistory);
+    expect(dashboardCache.invalidate).toHaveBeenCalledWith(getClusterHistory, [
+      null,
+      5,
+    ]);
   });
 });
 
