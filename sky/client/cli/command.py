@@ -5457,19 +5457,21 @@ def jobs_pool_down(
 
                 max_wait_time = 300  # 5 minutes max wait
                 check_interval = 2  # Check every 2 seconds
-                start_time = time.time()
+                deadline = time.monotonic() + max_wait_time
                 remaining_pool_jobs = _get_nonterminal_jobs(pool_names, all)
-                while (remaining_pool_jobs and
-                       time.time() - start_time < max_wait_time):
+                while remaining_pool_jobs:
+                    remaining_wait = deadline - time.monotonic()
+                    if remaining_wait <= 0:
+                        break
                     # Check remaining jobs via API
-                    time.sleep(check_interval)
+                    time.sleep(min(check_interval, remaining_wait))
                     remaining_pool_jobs = _get_nonterminal_jobs(pool_names, all)
                     ux_utils.spinner_message(
                         f'Waiting for {len(remaining_pool_jobs)} '
                         'jobs to be cancelled...')
 
                 click.echo('\r' + ' ' * 80 + '\r', nl=False)
-                if time.time() - start_time >= max_wait_time:
+                if remaining_pool_jobs:
                     click.echo(
                         f'{colorama.Fore.YELLOW}Warning: Timeout waiting '
                         f'for jobs to finish. Proceeding with pool down '
