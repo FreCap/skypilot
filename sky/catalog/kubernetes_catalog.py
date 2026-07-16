@@ -324,7 +324,8 @@ def _list_accelerators(
                     if quantized_availability > 0:
                         # only increment when quantized availability is positive
                         # to avoid assertion errors checking keyset sizes in
-                        # core.py _realtime_kubernetes_gpu_availability_single
+                        # accelerator_availability.py
+                        # _realtime_kubernetes_gpu_availability_single
                         total_accelerators_available[accelerator_name] = (
                             total_accelerators_available.get(
                                 accelerator_name, 0) + quantized_availability)
