@@ -11,6 +11,7 @@ from sky.serve import replica_managers
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.utils import common_utils
+from sky.utils import operator_notifications
 
 
 class TestSelectNonterminalReplicasToScaleDown(unittest.TestCase):
@@ -244,6 +245,60 @@ class TestAutoscalerVersionInitialization(unittest.TestCase):
         # version is the 3rd positional arg (service_name, service_spec,
         # version).
         self.assertEqual(mock_from_spec.call_args.args[2], 7)
+
+
+class TestRolloutBlockedNotifications(unittest.TestCase):
+    """Rollout failures alert operators without replacing the old fleet."""
+
+    @staticmethod
+    def _autoscaler():
+        spec = types.SimpleNamespace(min_replicas=1,
+                                     max_replicas=1,
+                                     num_overprovision=None,
+                                     target_qps_per_replica=1.0,
+                                     upscale_delay_seconds=None,
+                                     downscale_delay_seconds=None)
+        return autoscalers.RequestRateAutoscaler('svc', spec, version=2)
+
+    @staticmethod
+    def _failed_replica(*, unrecoverable: bool):
+        info = mock.Mock()
+        info.replica_id = 2
+        info.version = 2
+        info.is_ready = False
+        info.is_terminal = True
+        info.status_property.unrecoverable_failure.return_value = unrecoverable
+        return info
+
+    def test_unrecoverable_update_notifies_and_keeps_previous_version(self):
+        autoscaler = self._autoscaler()
+        info = self._failed_replica(unrecoverable=True)
+
+        with mock.patch.object(autoscalers.operator_notifications,
+                               'record_notification') as record_notification:
+            decisions = autoscaler.generate_scaling_decisions([info], [1])
+
+        self.assertEqual(decisions, [])
+        record_notification.assert_called_once()
+        category, message = record_notification.call_args.args
+        self.assertEqual(
+            category, operator_notifications.OperatorNotificationCategory.
+            SERVE_ROLLOUT_BLOCKED)
+        self.assertIn("service 'svc'", message)
+        self.assertIn('Version 1 remains active', message)
+
+    def test_all_terminal_provisioning_attempts_notify_while_retrying(self):
+        autoscaler = self._autoscaler()
+        info = self._failed_replica(unrecoverable=False)
+
+        with mock.patch.object(autoscalers.operator_notifications,
+                               'record_notification') as record_notification:
+            decisions = autoscaler.generate_scaling_decisions([info], [1])
+
+        record_notification.assert_called_once()
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0].operator,
+                         autoscalers.AutoscalerDecisionOperator.SCALE_UP)
 
 
 class TestAutoscalerInfo(unittest.TestCase):

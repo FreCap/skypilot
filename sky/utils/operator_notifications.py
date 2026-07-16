@@ -10,12 +10,14 @@ logger = sky_logging.init_logger(__name__)
 
 MAX_MESSAGE_LENGTH = 4096
 INSUFFICIENT_QUOTA_DEDUPE_WINDOW_SECONDS = 60 * 60
+SERVE_ROLLOUT_BLOCKED_DEDUPE_WINDOW_SECONDS = 60 * 60
 
 
 class OperatorNotificationCategory(str, enum.Enum):
     """Explicit category registry that keeps the notification DB bounded."""
 
     INSUFFICIENT_QUOTA = 'insufficient_quota'
+    SERVE_ROLLOUT_BLOCKED = 'serve_rollout_blocked'
 
 
 _failure_lock = threading.Lock()
