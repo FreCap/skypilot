@@ -2,44 +2,47 @@ import { buildReplicaHistoryView } from './serve-replica-history';
 
 describe('buildReplicaHistoryView', () => {
   it('sums versions, preserves missing-minute gaps, and derives statistics', () => {
-    const view = buildReplicaHistoryView({
-      available: true,
-      bucketSeconds: 60,
-      windowStart: 120,
-      windowEnd: 240,
-      samples: [
-        {
-          timestamp: 120,
-          version: 1,
-          readyCount: 2,
-          provisioningCount: 1,
-          notReadyCount: 0,
-          erroredCount: 1,
-          preemptedCount: 0,
-          stoppingCount: 0,
-        },
-        {
-          timestamp: 120,
-          version: 2,
-          readyCount: 3,
-          provisioningCount: 0,
-          notReadyCount: 0,
-          erroredCount: 0,
-          preemptedCount: 0,
-          stoppingCount: 1,
-        },
-        {
-          timestamp: 240,
-          version: 2,
-          readyCount: 4,
-          provisioningCount: 0,
-          notReadyCount: 1,
-          erroredCount: 2,
-          preemptedCount: 1,
-          stoppingCount: 0,
-        },
-      ],
-    });
+    const view = buildReplicaHistoryView(
+      {
+        available: true,
+        bucketSeconds: 60,
+        windowStart: 120,
+        windowEnd: 240,
+        samples: [
+          {
+            timestamp: 120,
+            version: 1,
+            readyCount: 2,
+            provisioningCount: 1,
+            notReadyCount: 0,
+            erroredCount: 1,
+            preemptedCount: 0,
+            stoppingCount: 0,
+          },
+          {
+            timestamp: 120,
+            version: 2,
+            readyCount: 3,
+            provisioningCount: 0,
+            notReadyCount: 0,
+            erroredCount: 0,
+            preemptedCount: 0,
+            stoppingCount: 1,
+          },
+          {
+            timestamp: 240,
+            version: 2,
+            readyCount: 4,
+            provisioningCount: 0,
+            notReadyCount: 1,
+            erroredCount: 2,
+            preemptedCount: 1,
+            stoppingCount: 0,
+          },
+        ],
+      },
+      { start: 120, end: 240 }
+    );
 
     expect(view.timestamps).toEqual([120, 180, 240]);
     expect(view.datasets.find(({ key }) => key === 'readyCount').data).toEqual([
@@ -61,10 +64,13 @@ describe('buildReplicaHistoryView', () => {
   });
 
   it('returns an empty view when history is unavailable', () => {
-    const view = buildReplicaHistoryView({
-      available: false,
-      samples: [{ timestamp: 60, version: 1, readyCount: 1 }],
-    });
+    const view = buildReplicaHistoryView(
+      {
+        available: false,
+        samples: [{ timestamp: 60, version: 1, readyCount: 1 }],
+      },
+      { start: 60, end: 120 }
+    );
     expect(view.timestamps).toEqual([]);
     expect(view.stats).toBeNull();
   });

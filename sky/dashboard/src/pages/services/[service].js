@@ -35,7 +35,7 @@ import {
   formatFullTimestamp,
 } from '@/components/utils';
 import { EndpointCell, formatUptime } from '@/components/services';
-import { ReplicaHistoryCard } from '@/components/serve-replica-history';
+import { ServeHistorySection } from '@/components/serve-history';
 import { useMobile } from '@/hooks/useMobile';
 import { formatYaml } from '@/lib/yamlUtils';
 import { YamlCodeBlock } from '@/components/ui/yaml-code-block';
@@ -60,6 +60,8 @@ const REPLICA_ERROR_STATUSES = new Set([
   'FAILED_PROVISION',
   'UNKNOWN',
 ]);
+
+const SERVICE_HISTORY_HOURS = 24;
 
 function getReplicaPlacementStatusBucket(status) {
   if (REPLICA_ERROR_STATUSES.has(status)) return 'error';
@@ -154,7 +156,7 @@ export function useServiceDetails({ serviceName }) {
           serviceNames: [serviceName],
           summaryOnly: true,
           includeTargetReplicas: true,
-          historyHours: 12,
+          historyHours: SERVICE_HISTORY_HOURS,
         },
       ])
       .then(({ services }) => {
@@ -203,7 +205,7 @@ export function useServiceDetails({ serviceName }) {
         serviceNames: [serviceName],
         summaryOnly: true,
         includeTargetReplicas: false,
-        historyHours: 12,
+        historyHours: SERVICE_HISTORY_HOURS,
       },
     ];
     const refreshHistory = async () => {
@@ -336,7 +338,8 @@ function ServiceDetails() {
               requestHistory={replicaHistory}
               pricingLoading={replicasLoading && serviceData.summaryOnly}
             />
-            <ReplicaHistoryCard
+            <ServeHistorySection
+              key={serviceName}
               history={replicaHistory}
               loading={historyLoading}
             />

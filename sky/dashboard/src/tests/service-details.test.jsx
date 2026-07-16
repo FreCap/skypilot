@@ -63,6 +63,9 @@ describe('useServiceDetails stale-response fencing', () => {
     );
 
     await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(2));
+    expect(dashboardCache.get.mock.calls[0][1][0]).toMatchObject({
+      historyHours: 24,
+    });
 
     let refreshPromise;
     await act(async () => {

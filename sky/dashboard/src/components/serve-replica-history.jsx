@@ -2,29 +2,12 @@
 
 import React, { useMemo } from 'react';
 import { CircularProgress } from '@mui/material';
-import {
-  CategoryScale,
-  Chart as ChartJS,
-  Filler,
-  Legend,
-  LinearScale,
-  LineElement,
-  PointElement,
-  Tooltip,
-} from 'chart.js';
-import { Line } from 'react-chartjs-2';
 
 import { Card } from '@/components/ui/card';
-
-ChartJS.register(
-  CategoryScale,
-  LinearScale,
-  PointElement,
-  LineElement,
-  Filler,
-  Tooltip,
-  Legend
-);
+import {
+  SelectableHistoryLine,
+  historyLinearScale,
+} from '@/components/serve-history-range';
 
 const SERIES = [
   {
@@ -69,9 +52,9 @@ function emptyCounts() {
   return Object.fromEntries(SERIES.map(({ key }) => [key, 0]));
 }
 
-export function buildReplicaHistoryView(history) {
+export function buildReplicaHistoryView(history, range = null) {
   const samples = history?.available ? history.samples || [] : [];
-  if (!samples.length) {
+  if (!samples.length || !range) {
     return {
       timestamps: [],
       versionBreakdowns: [],
@@ -81,18 +64,11 @@ export function buildReplicaHistoryView(history) {
   }
 
   const bucketSeconds = history.bucketSeconds || 60;
-  const firstTimestamp = Math.min(...samples.map((sample) => sample.timestamp));
-  const lastTimestamp = Math.max(...samples.map((sample) => sample.timestamp));
-  const windowStart = Number.isFinite(history.windowStart)
-    ? Math.ceil(history.windowStart / bucketSeconds) * bucketSeconds
-    : firstTimestamp;
-  const windowEnd = Number.isFinite(history.windowEnd)
-    ? Math.floor(history.windowEnd / bucketSeconds) * bucketSeconds
-    : lastTimestamp;
   const aggregates = new Map();
   const versions = new Map();
   samples.forEach((sample) => {
     const timestamp = sample.timestamp;
+    if (timestamp < range.start || timestamp > range.end) return;
     const aggregate = aggregates.get(timestamp) || emptyCounts();
     SERIES.forEach(({ key }) => {
       aggregate[key] += sample[key] || 0;
@@ -107,8 +83,8 @@ export function buildReplicaHistoryView(history) {
   const versionBreakdowns = [];
   const observed = [];
   for (
-    let timestamp = windowStart;
-    timestamp <= windowEnd;
+    let timestamp = range.start;
+    timestamp <= range.end;
     timestamp += bucketSeconds
   ) {
     timestamps.push(timestamp);
@@ -161,15 +137,6 @@ export function buildReplicaHistoryView(history) {
   };
 }
 
-function timestampLabel(timestamp) {
-  return new Date(timestamp * 1000).toLocaleString(undefined, {
-    month: 'short',
-    day: 'numeric',
-    hour: 'numeric',
-    minute: '2-digit',
-  });
-}
-
 function versionFooter(versionRows) {
   return versionRows.map(
     (row) =>
@@ -177,28 +144,39 @@ function versionFooter(versionRows) {
   );
 }
 
-export function ReplicaHistoryCard({ history, loading = false }) {
-  const view = useMemo(() => buildReplicaHistoryView(history), [history]);
+export function ReplicaHistoryCard({
+  history,
+  range,
+  onRangeSelect,
+  loading = false,
+}) {
+  const view = useMemo(
+    () => buildReplicaHistoryView(history, range),
+    [history, range]
+  );
   if (!history) return null;
   if (history?.available === false) return null;
 
   const chartData = {
-    labels: view.timestamps.map(timestampLabel),
-    datasets: view.datasets,
+    datasets: view.datasets.map((dataset) => ({
+      ...dataset,
+      parsing: false,
+      data: view.timestamps.map((timestamp, index) => ({
+        x: timestamp,
+        y: dataset.data[index],
+      })),
+    })),
   };
   const options = {
     responsive: true,
     maintainAspectRatio: false,
     interaction: { mode: 'index', intersect: false },
-    scales: {
-      x: { stacked: true, ticks: { maxTicksLimit: 12 } },
-      y: {
-        stacked: true,
-        beginAtZero: true,
-        ticks: { precision: 0 },
-        title: { display: true, text: 'Physical machines' },
-      },
-    },
+    scales: historyLinearScale(range, {
+      stacked: true,
+      beginAtZero: true,
+      ticks: { precision: 0 },
+      title: { display: true, text: 'Physical machines' },
+    }),
     plugins: {
       legend: { position: 'bottom' },
       tooltip: {
@@ -213,6 +191,11 @@ export function ReplicaHistoryCard({ history, loading = false }) {
       },
     },
   };
+  options.scales.x.stacked = true;
+  options.scales.y = {
+    ...options.scales.y,
+    stacked: true,
+  };
 
   return (
     <div className="mb-6">
@@ -220,7 +203,7 @@ export function ReplicaHistoryCard({ history, loading = false }) {
         <div>
           <h3 className="text-lg font-semibold">Machine history</h3>
           <div className="text-sm text-gray-500">
-            Physical replica status over the last 12 hours
+            Physical replica status in the selected range
           </div>
         </div>
         {loading && <CircularProgress size={16} />}
@@ -232,38 +215,49 @@ export function ReplicaHistoryCard({ history, loading = false }) {
           </div>
         ) : (
           <div className="p-4">
-            <div className="grid grid-cols-2 md:grid-cols-5 gap-3 mb-4 text-sm">
-              <div>
-                <div className="text-gray-500">Current ready</div>
-                <div className="font-semibold">
-                  {view.stats.current.readyCount}
+            {view.stats ? (
+              <div className="grid grid-cols-2 md:grid-cols-5 gap-3 mb-4 text-sm">
+                <div>
+                  <div className="text-gray-500">Latest ready</div>
+                  <div className="font-semibold">
+                    {view.stats.current.readyCount}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-gray-500">Average ready</div>
+                  <div className="font-semibold">
+                    {view.stats.averageReady.toFixed(1)}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-gray-500">Minimum ready</div>
+                  <div className="font-semibold">{view.stats.minimumReady}</div>
+                </div>
+                <div>
+                  <div className="text-gray-500">Peak errored</div>
+                  <div className="font-semibold">{view.stats.peakErrored}</div>
+                </div>
+                <div>
+                  <div className="text-gray-500">Error / stopping minutes</div>
+                  <div className="font-semibold">
+                    {view.stats.erroredMachineMinutes} /{' '}
+                    {view.stats.stoppingMachineMinutes}
+                  </div>
                 </div>
               </div>
-              <div>
-                <div className="text-gray-500">Average ready</div>
-                <div className="font-semibold">
-                  {view.stats.averageReady.toFixed(1)}
-                </div>
+            ) : (
+              <div className="mb-4 text-sm text-gray-500">
+                No machine samples in the selected range.
               </div>
-              <div>
-                <div className="text-gray-500">Minimum ready</div>
-                <div className="font-semibold">{view.stats.minimumReady}</div>
-              </div>
-              <div>
-                <div className="text-gray-500">Peak errored</div>
-                <div className="font-semibold">{view.stats.peakErrored}</div>
-              </div>
-              <div>
-                <div className="text-gray-500">Error / stopping minutes</div>
-                <div className="font-semibold">
-                  {view.stats.erroredMachineMinutes} /{' '}
-                  {view.stats.stoppingMachineMinutes}
-                </div>
-              </div>
-            </div>
-            <div className="h-80">
-              <Line data={chartData} options={options} />
-            </div>
+            )}
+            <SelectableHistoryLine
+              data={chartData}
+              options={options}
+              range={range}
+              bucketSeconds={history.bucketSeconds || 60}
+              onRangeSelect={onRangeSelect}
+              ariaLabel="Machine history chart"
+            />
           </div>
         )}
       </Card>
