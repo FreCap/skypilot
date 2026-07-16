@@ -1807,7 +1807,7 @@ def _delete_lb_object_if_owned(read_fn, delete_fn, name: str, namespace: str,
     # Keep the service DB row (and therefore the same-name up guard) until the
     # exact UID is gone; otherwise a successor can 409 against a terminating
     # object and accidentally adopt or patch the old incarnation.
-    deadline = time.time() + deletion_timeout_seconds
+    deadline = time.monotonic() + deletion_timeout_seconds
     while True:
         try:
             remaining = read_fn(name, namespace)
@@ -1820,11 +1820,12 @@ def _delete_lb_object_if_owned(read_fn, delete_fn, name: str, namespace: str,
             raise RuntimeError(
                 f'LB {kind} {name!r} was replaced while waiting for exact '
                 f'UID {uid!r} to disappear (found {remaining_uid!r}).')
-        if time.time() >= deadline:
+        remaining_seconds = deadline - time.monotonic()
+        if remaining_seconds <= 0:
             raise TimeoutError(
                 f'Timed out waiting for LB {kind} {name!r} UID {uid!r} to '
                 'be deleted.')
-        time.sleep(0.2)
+        time.sleep(min(0.2, remaining_seconds))
 
 
 def delete_lb_objects(service_name: str,

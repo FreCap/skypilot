@@ -1566,6 +1566,39 @@ def test_delete_wait_rejects_replacement_uid(monkeypatch):
     core.delete_namespaced_service.assert_called_once()
 
 
+def test_delete_wait_timeout_uses_monotonic_deadline(monkeypatch):
+    apps = mock.MagicMock()
+    core = mock.MagicMock()
+    apps.read_namespaced_deployment.side_effect = _ApiException(404)
+    core.read_namespaced_service.return_value = _owned_object(
+        'incarnation-a', 'service-a', '9')
+    _install(monkeypatch, apps_api=apps, core_api=core)
+    monkeypatch.setattr(lb_k8s, '_lb_object_deletion_timeout_seconds',
+                        lambda obj, kind: 0.3)
+    wall_clock = mock.Mock(
+        side_effect=AssertionError('elapsed timeout consulted wall clock'))
+    monotonic_clock = [10.0]
+    sleeps = []
+    monotonic = mock.Mock(side_effect=lambda: monotonic_clock[0])
+
+    def _sleep(delay):
+        sleeps.append(delay)
+        monotonic_clock[0] += delay
+
+    monkeypatch.setattr(
+        lb_k8s, 'time',
+        SimpleNamespace(time=wall_clock, monotonic=monotonic, sleep=_sleep))
+
+    with pytest.raises(TimeoutError, match='Timed out waiting'):
+        lb_k8s.delete_lb_objects('svc', 'incarnation-a')
+
+    wall_clock.assert_not_called()
+    assert monotonic.call_count == 4
+    core.delete_namespaced_service.assert_called_once()
+    assert core.read_namespaced_service.call_count == 4
+    assert sleeps == pytest.approx([0.2, 0.1])
+
+
 def test_reaper_db_null_then_successor_appears_fails_closed(monkeypatch):
     apps = mock.MagicMock()
     core = mock.MagicMock()
