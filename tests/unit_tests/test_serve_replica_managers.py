@@ -363,6 +363,34 @@ class TestLaunchClusterRetry:
         assert raised is not None
         assert mock_sdk.launch.call_count == 3
 
+    def test_exact_override_collapses_any_of_to_one_resource(self, tmp_path):
+        task = mock.MagicMock()
+        resources = [mock.Mock(name='first'), mock.Mock(name='second')]
+        task.resources = resources
+        pinned = mock.Mock(name='pinned')
+        resources[0].copy.return_value = pinned
+
+        with mock.patch(
+                'sky.serve.replica_managers.task_lib.Task.from_yaml_str',
+                return_value=task), \
+             mock.patch('sky.serve.replica_managers.usage_lib'), \
+             mock.patch('sky.serve.replica_managers.sdk') as mock_sdk:
+            mock_sdk.launch.return_value = 'request-id'
+            replica_managers.launch_cluster(
+                replica_id=1,
+                yaml_content='dummy: yaml',
+                cluster_name='svc-1',
+                log_file=str(tmp_path / 'launch.log'),
+                replica_to_request_id=thread_utils.ThreadSafeDict(),
+                replica_to_launch_cancelled=thread_utils.ThreadSafeDict(),
+                resources_override={'region': 'us-east-1'},
+                exact_resources_override=True)
+
+        resources[0].copy.assert_called_once_with(region='us-east-1')
+        resources[1].copy.assert_not_called()
+        task.set_resources.assert_called_once_with(pinned)
+        mock_sdk.launch.assert_called_once()
+
     def test_authoritative_prelaunch_guard_rejects_cloud_mutation(
             self, tmp_path):
         mock_sdk, mock_terminate, raised = self._run_launch_cluster(
@@ -448,6 +476,7 @@ class TestLaunchReplicaAvailabilityMaxRetry:
     def test_spot_with_placer_fails_fast_on_availability(self):
         call = self._launch_replica(use_spot=True, with_placer=True)
         assert call.kwargs['kwargs']['availability_max_retry'] == 1
+        assert call.kwargs['kwargs']['exact_resources_override'] is True
         assert callable(call.kwargs['kwargs']['pre_launch_guard'])
         assert callable(call.kwargs['kwargs']['continue_guard'])
         # retry_until_up must be False: failover is owned by the placer.
