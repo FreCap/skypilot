@@ -1404,15 +1404,22 @@ class SkyServeLoadBalancer:
           never use it as a floor or clamp capacity down to it — sizing
           on target_replicas would idle exactly the free machines the
           fill feature exists to use.
-        - max_replicas is the configured autoscaler ceiling, not a clamp
-          on materialized capacity. Overprovisioning or a recent ceiling
-          reduction can leave ready_replicas above it temporarily, so
-          readers must floor derived headroom at zero.
+        - In logical mode max_replicas is the effective admission ceiling,
+          max(configured_max_replicas, ready_replicas). This preserves
+          indivisible-machine overhang and capacity above a recently reduced
+          policy bound. configured_max_replicas remains the demand clamp.
+          Legacy physical-backend services retain their historical fields.
         """
         del request  # Unused.
         with self._client_pool_lock:
             ready_set = set(self._load_balancing_policy.ready_replicas)
             ready_replicas = len(ready_set)
+            hint = self._capacity_hint or {}
+            replica_unit = hint.get('replica_unit', 'physical_backend')
+            logical_replicas = replica_unit == 'logical_slot'
+            planned_capacity_by_url = hint.get('planned_capacity_by_url', {})
+            logical_urls = ready_set & set(
+                hint.get('logical_replica_urls', planned_capacity_by_url))
             total_slots_by_url = getattr(self, '_replica_total_slots',
                                          None) or {}
             # [boltz fork] Occupancy aggregates, over probed AND ready
@@ -1427,9 +1434,26 @@ class SkyServeLoadBalancer:
                 self._effective_replica_free_slots_locked().items()
                 if url in ready_set and url in total_slots_by_url
             }
-            probed_replicas = len(probed)
+            probed_backend_count = len(probed)
+            probed_replicas = probed_backend_count
             busy_replicas = sum(1 for free in probed.values() if free <= 0)
-            total_slots = sum(total_slots_by_url[url] for url in probed)
+            logical_plan_is_usable = (not logical_replicas or all(
+                isinstance(planned_capacity_by_url.get(url), int) and
+                not isinstance(planned_capacity_by_url[url], bool) and
+                planned_capacity_by_url[url] > 0 for url in logical_urls))
+            if logical_replicas:
+                # The runtime may report a degraded or buggy capacity. Never
+                # expose more logical replicas than the immutable width the
+                # controller pinned for that backend. A missing plan is an
+                # incompatible mixed-version report and fails closed.
+                total_slots = sum(
+                    min(total_slots_by_url[url], planned_capacity_by_url[url])
+                    for url in probed
+                    if isinstance(planned_capacity_by_url.get(url), int) and
+                    not isinstance(planned_capacity_by_url[url], bool) and
+                    planned_capacity_by_url[url] > 0)
+            else:
+                total_slots = sum(total_slots_by_url[url] for url in probed)
             observed_occupancy = getattr(self, '_replica_occupancy', {}) or {}
             pending_reservations = self._occupancy_pending_reservations or {}
             # Reported work is meaningful only for the probed set, while an
@@ -1439,9 +1463,29 @@ class SkyServeLoadBalancer:
                 sum(observed_occupancy.get(url, 0) for url in probed) +
                 sum(pending_reservations.get(url, 0) for url in ready_set) +
                 self._occupancy_unassigned_reservations)
-            free_slots = max(
-                0,
-                sum(probed.values()) - self._occupancy_unassigned_reservations)
+            if logical_replicas:
+
+                def _bounded_logical_free(url: str) -> int:
+                    runtime_busy = max(
+                        0, total_slots_by_url[url] - probed.get(url, 0))
+                    planned_free = max(
+                        0, planned_capacity_by_url[url] - runtime_busy)
+                    return min(probed.get(url, 0), planned_free)
+
+                free_slots = max(
+                    0,
+                    sum(
+                        _bounded_logical_free(url)
+                        for url in logical_urls
+                        if isinstance(planned_capacity_by_url.get(url), int) and
+                        not isinstance(planned_capacity_by_url[url], bool) and
+                        planned_capacity_by_url[url] > 0) -
+                    self._occupancy_unassigned_reservations)
+            else:
+                free_slots = max(
+                    0,
+                    sum(probed.values()) -
+                    self._occupancy_unassigned_reservations)
         request_queue_capacity: int | None = None
         request_queue_dispatch_limit: int | None = None
         request_queue_uses_async_occupancy: bool | None = None
@@ -1468,12 +1512,17 @@ class SkyServeLoadBalancer:
         # Capacity hint fields stay null until a controller sync carries
         # one: an admission reader must see "unknown" (and fall back to
         # its conservative floor) rather than zeros it would act on.
-        hint = self._capacity_hint or {}
-        max_replicas = hint.get('max_replicas')
-        occupancy_is_usable = (probed_replicas == ready_replicas and
-                               occupancy_probe_age is not None and
-                               occupancy_probe_age
-                               <= constants.LB_OCCUPANCY_PROBE_MAX_AGE_SECONDS)
+        configured_max_replicas = hint.get('configured_max_replicas',
+                                           hint.get('max_replicas'))
+        expected_probed_replicas = (len(logical_urls)
+                                    if logical_replicas else ready_replicas)
+        observed_expected_replicas = (len(set(probed) &
+                                          logical_urls) if logical_replicas else
+                                      probed_backend_count)
+        occupancy_is_usable = (
+            observed_expected_replicas == expected_probed_replicas and
+            logical_plan_is_usable and occupancy_probe_age is not None and
+            occupancy_probe_age <= constants.LB_OCCUPANCY_PROBE_MAX_AGE_SECONDS)
         # Machine-agnostic admission contract. Consumers should not need to
         # know whether capacity comes from one worker per replica or several
         # local workers sharing a multi-GPU machine. Until every ready replica
@@ -1483,9 +1532,25 @@ class SkyServeLoadBalancer:
                             if occupancy_is_usable else ready_replicas)
         in_flight_capacity = (running_slots
                               if occupancy_is_usable else in_flight)
-        max_capacity = (max(max_replicas, current_capacity)
-                        if max_replicas is not None else None)
+        if logical_replicas:
+            # A physical backend is not a valid fallback unit. Logical
+            # readiness therefore fails closed until the complete ready set
+            # has a fresh capacity observation.
+            ready_replicas = total_slots if occupancy_is_usable else 0
+            in_flight = in_flight_capacity
+            max_replicas = (max(configured_max_replicas, ready_replicas)
+                            if configured_max_replicas is not None else None)
+            current_capacity = ready_replicas
+            max_capacity = max_replicas
+            in_flight_capacity = in_flight
+            probed_replicas = total_slots
+            busy_replicas = running_slots
+        else:
+            max_replicas = hint.get('max_replicas')
+            max_capacity = (max(max_replicas, current_capacity)
+                            if max_replicas is not None else None)
         return fastapi.responses.JSONResponse({
+            'replica_unit': replica_unit,
             'ready_replicas': ready_replicas,
             'in_flight': in_flight,
             'draining': self._draining,
@@ -1500,6 +1565,7 @@ class SkyServeLoadBalancer:
             'provisioning_replicas': hint.get('provisioning_replicas'),
             'target_replicas': hint.get('target_num_replicas'),
             'max_replicas': max_replicas,
+            'configured_max_replicas': configured_max_replicas,
             'current_capacity': current_capacity,
             'max_capacity': max_capacity,
             'in_flight_capacity': in_flight_capacity,
@@ -1575,6 +1641,12 @@ class SkyServeLoadBalancer:
         slots are naturally 0 without a special case.
         """
         if not isinstance(raw, dict):
+            return None
+        status = raw.get('status')
+        if status is not None and status not in ('READY', 'DRAINING'):
+            # The local router reports UNKNOWN when no child worker returned a
+            # trustworthy sample. Its numeric zero is not an idle proof and
+            # must not authorize logical scale-down.
             return None
         running = raw.get('running_count')
         concurrency = raw.get('predict_concurrency')
@@ -1885,6 +1957,19 @@ class SkyServeLoadBalancer:
         # Kubernetes-query failure both suppress early drain proofs.
         in_flight, routing_urls, unknown_urls, occupancy_sampled_urls = (
             self._in_flight_with_draining())
+        with self._client_pool_lock:
+            sampled_set = set(occupancy_sampled_urls)
+            total_slots_by_url = {
+                url: int(slots)
+                for url, slots in (self._replica_total_slots or {}).items()
+                if url in sampled_set
+            }
+            occupancy_sample_generation = {
+                url: int(generation)
+                for url, generation in (
+                    self._occupancy_sample_generation or {}).items()
+                if url in sampled_set
+            }
         session_id = self._get_lb_session_id()
         async with aiohttp.ClientSession() as session:
             # Remove exactly the batch being sent BEFORE awaiting the
@@ -1903,6 +1988,8 @@ class SkyServeLoadBalancer:
                 # empty list, so a new controller fails closed instead of
                 # mistaking an envelope zero for known-idle async occupancy.
                 'occupancy_sampled_urls': occupancy_sampled_urls,
+                'total_slots_by_url': total_slots_by_url,
+                'occupancy_sample_generation': occupancy_sample_generation,
                 'draining_urls': list(self._draining_clients or {}),
                 'lb_session_id': session_id,
                 'queue_depth': self._queue_depth,

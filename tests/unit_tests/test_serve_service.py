@@ -21,6 +21,7 @@ from unittest import mock
 
 import pytest
 
+from sky.serve import serve_state
 from sky.serve import service
 
 
@@ -480,6 +481,8 @@ class TestRunCleanupAndFinalizeDeletesLb:
              mock.patch('sky.serve.service.serve_state.'
                         'set_service_status_and_active_versions_if_owner',
                         return_value=True), \
+             mock.patch('sky.serve.service.serve_state.get_replica_infos',
+                        return_value=[]), \
              mock.patch('sky.serve.service.serve_state.'
                         'remove_ha_recovery_script_if_owner'), \
              mock.patch('sky.serve.service.serve_state.'
@@ -632,6 +635,114 @@ def test_delayed_legacy_recovery_cannot_recreate_absent_service():
         service._start('svc', '/does/not/exist', 1, 'sky serve up')
 
 
+_LEGACY_PER_GPU_YAML = """
+resources:
+  cpus: 1
+  ports: 8080
+  accelerators: A100:1
+  use_spot: true
+service:
+  readiness_probe: /health
+  replica_policy:
+    min_replicas: 1
+    max_replicas: 8
+    target_concurrency_per_replica: 2
+    spot_placer: dynamic_fallback_per_gpu
+run: echo hi
+"""
+
+_CURRENT_PER_GPU_YAML = """
+resources:
+  cpus: 1
+  ports: 8080
+  accelerators: A100:1
+  use_spot: true
+service:
+  readiness_probe: /health
+  graceful_drain_async_occupancy: true
+  replica_policy:
+    min_replicas: 1
+    max_replicas: 8
+    target_concurrency_per_replica: 1
+    spot_placer: dynamic_fallback_per_gpu
+run: echo hi
+"""
+
+
+@pytest.mark.parametrize('persisted_logical,yaml_content', [
+    (False, _LEGACY_PER_GPU_YAML),
+    (True, _CURRENT_PER_GPU_YAML),
+])
+def test_recovery_spawns_controller_with_persisted_semantics(
+        persisted_logical, yaml_content):
+    persisted = mock.MagicMock()
+    persisted.pool = True
+    persisted.uses_logical_replicas = persisted_logical
+    record = {
+        'hash': 'incarnation-a',
+        'controller_job_id': 1,
+        'controller_pid': 123,
+        'controller_ip': '10.0.0.2',
+        'resource_scope': 'incarnation-a',
+        'pool': True,
+        'status': serve_state.ServiceStatus.READY,
+        'yaml_content': yaml_content,
+    }
+    process = mock.MagicMock(pid=456)
+
+    with mock.patch.object(service.auth_utils, 'get_or_generate_keys'), \
+         mock.patch.object(service.serve_state,
+                           'get_service_from_name',
+                           return_value=record), \
+         mock.patch.object(service.serve_state,
+                           'get_latest_committed_version_spec',
+                           return_value=(3, persisted)), \
+         mock.patch.object(service.serve_state,
+                           'get_yaml_content',
+                           return_value=yaml_content), \
+         mock.patch.object(service.serve_utils,
+                           'generate_remote_service_dir_name',
+                           return_value='/tmp/legacy-service'), \
+         mock.patch.object(service.serve_state,
+                           'get_latest_version',
+                           return_value=3), \
+         mock.patch.object(service.serve_state,
+                           'update_service_controller_pid_if_owner',
+                           return_value=True), \
+         mock.patch.object(service.filelock, 'FileLock'), \
+         mock.patch.object(service,
+                           '_select_controller_port',
+                           return_value=20001), \
+         mock.patch.object(service,
+                           '_spawn_controller',
+                           return_value=process) as spawn, \
+         mock.patch.object(service, '_wait_for_controller_ready'), \
+         mock.patch.object(
+             service.serve_state,
+             'update_service_controller_pid_ip_and_port',
+             return_value=True), \
+         mock.patch.object(
+             service.serve_state,
+             'get_service_controller_owner',
+             return_value={
+                 'hash': 'incarnation-a',
+                 'controller_pid': service.os.getpid(),
+                 'controller_ip': None,
+                 'status': serve_state.ServiceStatus.SHUTTING_DOWN,
+             }), \
+         mock.patch.object(service.subprocess_utils,
+                           'kill_children_processes'), \
+         mock.patch.object(service, '_run_cleanup_and_finalize'):
+        service._start('svc',
+                       '/does/not/matter',
+                       1,
+                       'sky serve up',
+                       requested_incarnation='incarnation-a')
+
+    assert spawn.call_args.args[1] is persisted
+    assert spawn.call_args.args[2] == 3
+
+
 class TestCleanupAuditLog:
     """`_cleanup` logs a WARN with the current DB controller_pid / ip /
     status before terminating replica clusters. An audit trail is essential
@@ -748,6 +859,25 @@ class TestFailedStartupCleansOnlyScopedStorage:
                     patcher.stop()
         cleanup.assert_called_once_with('service: {}', 'incarnation-a')
 
+    def test_multi_node_logical_service_is_rejected_before_registration(self):
+        task = self._task()
+        task.service.uses_logical_replicas = True
+        task.num_nodes = 2
+        patches = self._common_patches(task)
+        with mock.patch.object(service.serve_state,
+                               'add_service') as add_service:
+            for patcher in patches:
+                patcher.start()
+            try:
+                with pytest.raises(ValueError,
+                                   match='only single-node services'):
+                    service._start('svc', '/tmp/task.yaml', 7, 'sky serve up',
+                                   'incarnation-a', 11)
+            finally:
+                for patcher in patches:
+                    patcher.stop()
+        add_service.assert_not_called()
+
     def test_lost_registration_cleans_only_losing_scope(self):
         task = self._task()
         patches = self._common_patches(task)
@@ -789,6 +919,24 @@ class TestCleanupStorageStaleBucket:
     ticked).
     """
 
+    def test_legacy_per_gpu_policy_does_not_block_cleanup(self):
+        # Storage cleanup only needs task metadata and mounts. A historical
+        # physical per-GPU version must remain cleanable even though its full
+        # service policy is invalid under today's implicit logical contract.
+        assert service.cleanup_storage(_LEGACY_PER_GPU_YAML,
+                                       'incarnation-a') is True
+
+        with mock.patch.object(
+                service.serve_state,
+                'get_ephemeral_storage_cleanup_intents',
+                return_value=[]), \
+             mock.patch.object(
+                 service.serve_state,
+                 'get_version_yaml_contents',
+                 return_value={7: _LEGACY_PER_GPU_YAML}):
+            assert service.cleanup_storage_intents('svc',
+                                                   'incarnation-a') is True
+
     def test_returns_success_when_bucket_already_gone(self):
         from sky import exceptions as sky_exc
 
@@ -828,7 +976,7 @@ class TestCleanupStorageStaleBucket:
 
         mock_backend = mock.MagicMock()
 
-        with mock.patch('sky.serve.service.task_lib.Task.from_yaml_str',
+        with mock.patch('sky.serve.service.load_task_for_storage_cleanup',
                         return_value=mock_task), \
              mock.patch(
                  'sky.serve.service.cloud_vm_ray_backend.CloudVmRayBackend',
@@ -873,7 +1021,7 @@ class TestCleanupStorageStaleBucket:
 
         mock_backend = mock.MagicMock()
 
-        with mock.patch('sky.serve.service.task_lib.Task.from_yaml_str',
+        with mock.patch('sky.serve.service.load_task_for_storage_cleanup',
                         return_value=mock_task), \
              mock.patch(
                  'sky.serve.service.cloud_vm_ray_backend.CloudVmRayBackend',

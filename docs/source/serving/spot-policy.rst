@@ -84,6 +84,7 @@ constraints still apply.
 .. code-block:: yaml
 
     service:
+      graceful_drain_async_occupancy: true
       replica_policy:
         min_replicas: 1
         max_replicas: 100
@@ -101,8 +102,11 @@ constraints still apply.
 
 ``dynamic_fallback`` continues to compare raw hourly machine prices. Use the
 per-GPU policy only when each configured GPU contributes one equivalent serving
-slot. Multiple accelerator models can be supplied as separate ``any_of``
-entries; supported widths are discovered independently for each model.
+slot. The policy automatically makes ``min_replicas``, ``max_replicas``, and
+the autoscaler target count those slots, while the selected physical backend
+shape stays internal to SkyServe. Multiple accelerator models can be supplied
+as separate ``any_of`` entries; supported widths are discovered independently
+for each model.
 Non-spot entries and cluster-backed clouds such as Kubernetes remain at their
 explicitly configured count. SkyPilot does not inspect those live cluster APIs
 to discover additional shapes.

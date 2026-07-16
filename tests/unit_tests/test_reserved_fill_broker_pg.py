@@ -16,7 +16,8 @@ only sqlite. This module:
 - races two threads through run_round_if_stale so the publish CAS and the
   PostgresLock advisory path are exercised for real.
 """
-# pylint: disable=protected-access,unused-import
+# pylint: disable=cell-var-from-loop,missing-class-docstring
+# pylint: disable=protected-access,redefined-outer-name,unused-import
 import shutil
 import threading
 import time
@@ -305,13 +306,17 @@ class TestMigrationChainPG:
                     'reserved_fill_rounds',
                     'reserved_fill_lease',
                     'service_lifecycle_fences',
+                    'demand_capacity_observations',
                 }.issubset(tables), tables
                 service_columns = {
                     column['name']
                     for column in inspector.get_columns('services')
                 }
-                assert {'lifecycle_epoch',
-                        'resource_scope'}.issubset(service_columns)
+                assert {
+                    'lifecycle_epoch',
+                    'resource_scope',
+                    'logical_replica_semantics',
+                }.issubset(service_columns)
                 cleanup_intent_columns = {
                     column['name'] for column in inspector.get_columns(
                         'ephemeral_storage_cleanup_intents')

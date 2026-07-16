@@ -40,6 +40,7 @@ from sky.utils import controller_utils
 from sky.utils import subprocess_utils
 from sky.utils import thread_utils
 from sky.utils import ux_utils
+from sky.utils import yaml_utils
 
 if TYPE_CHECKING:
     from sky.serve import service_spec as service_spec_lib
@@ -52,6 +53,16 @@ logger = sky_logging.init_logger('sky.serve.service')
 
 class ServiceOwnershipLostError(RuntimeError):
     """Raised when teardown no longer owns the exact service incarnation."""
+
+
+def load_task_for_storage_cleanup(yaml_content: str) -> task_lib.Task:
+    """Load storage metadata without revalidating historical Serve policy."""
+    config = yaml_utils.safe_load(yaml_content)
+    if not isinstance(config, dict):
+        raise ValueError('Service task YAML must contain a mapping.')
+    config.pop('service', None)
+    config.pop('pool', None)
+    return task_lib.Task.from_yaml_config(config)
 
 
 def _handle_signal(service_name: str,
@@ -164,7 +175,7 @@ def cleanup_storage(yaml_content: str,
     scope_id: str | None = None
 
     try:
-        task = task_lib.Task.from_yaml_str(yaml_content)
+        task = load_task_for_storage_cleanup(yaml_content)
         if not isinstance(resource_scope, str) or not resource_scope:
             logger.info('Retaining task storage without a durable resource '
                         'scope.')
@@ -308,7 +319,7 @@ def cleanup_storage_intents(
             raise ServiceOwnershipLostError(
                 'Lifecycle ownership lost before scoped storage cleanup.')
         try:
-            version_task = task_lib.Task.from_yaml_str(yaml_content)
+            version_task = load_task_for_storage_cleanup(yaml_content)
             scope_metadata = version_task.metadata.get(
                 constants.EPHEMERAL_STORAGE_SCOPE_METADATA_KEY)
             generation = (scope_metadata.get('storage_generation')
@@ -1211,8 +1222,11 @@ def _start(service_name: str,
     # booting the controller at it crash-loops forever (SkyPilotReplicaManager
     # asserts the yaml is not None). The interrupted update is unrecoverable
     # (its yaml was never persisted), so resume the last committed version.
-    recovery_version = (serve_state.get_latest_committed_version(service_name)
-                        if is_recovery else None)
+    recovery_snapshot = (
+        serve_state.get_latest_committed_version_spec(service_name)
+        if is_recovery else None)
+    recovery_version = (recovery_snapshot[0]
+                        if recovery_snapshot is not None else None)
 
     if is_recovery:
         assert service is not None
@@ -1231,9 +1245,15 @@ def _start(service_name: str,
         yaml_content = _read_yaml_content(tmp_task_yaml)
 
     # Initialize database record for the service.
-    task = task_lib.Task.from_yaml_str(yaml_content)
+    authoritative_service_spec = (recovery_snapshot[1]
+                                  if recovery_snapshot is not None else None)
+    task = replica_managers.load_task_with_service_spec(
+        yaml_content, authoritative_service_spec)
     # Already checked before submit to controller.
     assert task.service is not None, task
+    # The task YAML remains authoritative for resources and execution, but its
+    # service policy must not be reinterpreted under newer hidden defaults on
+    # recovery. The immutable pickled spec is the committed semantic record.
     service_spec = task.service
 
     service_dir = os.path.expanduser(
@@ -1281,6 +1301,11 @@ def _start(service_name: str,
             lb_k8s.lb_termination_grace_period_seconds(
                 service_spec.lb_stream_timeout_seconds,
                 service_spec.graceful_drain_seconds))
+
+    # Validate the task-aware logical topology immediately before the durable
+    # service/version write too. This protects direct/older API callers and
+    # admin-policy mutations that bypassed an earlier server-side validation.
+    serve_utils.validate_logical_replica_task(task, service_spec)
 
     if not is_recovery:
         with filelock.FileLock(controller_utils.get_resources_lock_path()):

@@ -1035,6 +1035,32 @@ class TestFillLaunchPath(unittest.TestCase):
         add_mock.assert_not_called()
 
 
+class TestDemandLaunchBudget(unittest.TestCase):
+    """Demand launches obey measured free-GPU capacity."""
+
+    def test_exhausted_zero_cost_only_budget_persists_no_replica(self):
+        location = _make_location('research-ctx', 'free')
+        placer = mock.Mock()
+        placer.zero_cost_locations.return_value = [location]
+        placer.select_next_location.return_value = location
+        manager = _make_manager(placer)
+        budget = replica_managers._ZeroCostDemandBudget(
+            {('research-ctx', 'a100'): 0}, {('research-ctx', 'a100'): 0})
+
+        with mock.patch.object(replica_managers,
+                               '_should_use_spot',
+                               return_value=True), \
+             mock.patch.object(reserved_capacity_broker,
+                               'get_cached_grant',
+                               return_value=None), \
+             mock.patch.object(manager, '_persist_replica') as persist:
+            launched = manager._scale_up_one_locked(
+                None, set(), [], zero_cost_demand_budget=budget)
+
+        self.assertFalse(launched)
+        persist.assert_not_called()
+
+
 class TestQueryFreeSlots(unittest.TestCase):
     """Poller free-slot math: slots are per-replica GPUs; unknown (-1)
     availability is a measurement blackout (the standalone sum reads it
@@ -1202,6 +1228,138 @@ class TestQueryFreeSlots(unittest.TestCase):
                 reserved_capacity.query_free_slots_by_context(locations),
                 {'research-ctx': 0})
 
+    def test_shared_demand_cache_returns_raw_gpus_per_accelerator(self):
+        locations = [
+            self._k8s_location(gpu='A100', count=8),
+            self._k8s_location(gpu='H100', count=8),
+        ]
+        row = {
+            'context': 'research-ctx',
+            'snapshot_time': 100.0,
+            # A slow query completed much later. Freshness must use completion
+            # while planner debits retain the query-start snapshot.
+            'completed_at': 200.0,
+            'availability': '{"a100": 223, "h100": 16}',
+        }
+        with mock.patch.object(reserved_capacity.time,
+                               'time',
+                               return_value=201.0), \
+             mock.patch.object(reserved_capacity.serve_state,
+                               'get_demand_capacity_observations',
+                               return_value={'research-ctx': row}), \
+             mock.patch.object(reserved_capacity,
+                               '_schedule_demand_capacity_refresh') as schedule:
+            observations = reserved_capacity.get_cached_free_gpus_by_pool(
+                locations)
+
+        self.assertEqual(observations[('research-ctx', 'a100')].free_gpus, 223)
+        self.assertEqual(observations[('research-ctx', 'h100')].free_gpus, 16)
+        self.assertEqual(observations[('research-ctx', 'a100')].snapshot_time,
+                         100.0)
+        schedule.assert_called_once_with(set())
+
+    def test_demand_cache_freshness_honors_configured_poll_interval(self):
+        location = self._k8s_location(gpu='A100', count=8)
+        row = {
+            'context': 'research-ctx',
+            'snapshot_time': 90.0,
+            'completed_at': 100.0,
+            'availability': '{"a100": 8}',
+        }
+        env_var = constants.RESERVED_CAPACITY_POLL_INTERVAL_ENV_VAR
+        with mock.patch.dict(reserved_capacity.os.environ, {env_var: '300'}), \
+             mock.patch.object(reserved_capacity.time,
+                               'time',
+                               return_value=220.0), \
+             mock.patch.object(reserved_capacity.serve_state,
+                               'get_demand_capacity_observations',
+                               return_value={'research-ctx': row}), \
+             mock.patch.object(reserved_capacity,
+                               '_schedule_demand_capacity_refresh') as schedule:
+            observations = reserved_capacity.get_cached_free_gpus_by_pool(
+                [location])
+
+        self.assertEqual(observations[('research-ctx', 'a100')].free_gpus, 8)
+        schedule.assert_called_once_with(set())
+
+    def test_stale_shared_demand_cache_schedules_without_querying_inline(self):
+        location = self._k8s_location(gpu='A100', count=8)
+        with mock.patch.object(reserved_capacity.serve_state,
+                               'get_demand_capacity_observations',
+                               return_value={}), \
+             mock.patch.object(reserved_capacity,
+                               '_schedule_demand_capacity_refresh') as schedule, \
+             mock.patch.object(
+                 reserved_capacity.kubernetes_catalog,
+                 'list_accelerators_realtime') as query:
+            observations = reserved_capacity.get_cached_free_gpus_by_pool(
+                [location])
+
+        self.assertIsNone(observations[('research-ctx', 'a100')].free_gpus)
+        schedule.assert_called_once_with({'research-ctx'})
+        query.assert_not_called()
+
+    def test_background_refresh_publishes_one_raw_context_observation(self):
+        lock = mock.MagicMock()
+        lock.acquire.return_value = mock.MagicMock()
+        with mock.patch.object(reserved_capacity.locks,
+                               'get_lock',
+                               return_value=lock), \
+             mock.patch.object(reserved_capacity.serve_state,
+                               'get_demand_capacity_observations',
+                               return_value={}), \
+             mock.patch.object(
+                 reserved_capacity.kubernetes_catalog,
+                 'list_accelerators_realtime',
+                 return_value=({}, {}, {
+                     'A100': 223,
+                     'H100': 16,
+                 })) as query, \
+             mock.patch.object(
+                 reserved_capacity.serve_state,
+                 'upsert_demand_capacity_observation') as publish:
+            reserved_capacity._refresh_demand_capacity_contexts(
+                {'research-ctx'})
+
+        query.assert_called_once_with(gpus_only=True,
+                                      name_filter=None,
+                                      region_filter='research-ctx',
+                                      quantity_filter=None,
+                                      case_sensitive=False,
+                                      require_price=False)
+        context, snapshot_time, completed_at, availability = publish.call_args.args
+        self.assertEqual(context, 'research-ctx')
+        self.assertIsInstance(snapshot_time, float)
+        self.assertIsInstance(completed_at, float)
+        self.assertGreaterEqual(completed_at, snapshot_time)
+        self.assertEqual(availability, {'a100': 223, 'h100': 16})
+
+    def test_background_refresh_caches_query_failure(self):
+        lock = mock.MagicMock()
+        lock.acquire.return_value = mock.MagicMock()
+        with mock.patch.object(reserved_capacity.locks,
+                               'get_lock',
+                               return_value=lock), \
+             mock.patch.object(reserved_capacity.serve_state,
+                               'get_demand_capacity_observations',
+                               return_value={}), \
+             mock.patch.object(
+                 reserved_capacity.kubernetes_catalog,
+                 'list_accelerators_realtime',
+                 side_effect=RuntimeError('API unavailable')), \
+             mock.patch.object(
+                 reserved_capacity.serve_state,
+                 'upsert_demand_capacity_observation') as publish:
+            reserved_capacity._refresh_demand_capacity_contexts(
+                {'research-ctx'})
+
+        context, snapshot_time, completed_at, availability = publish.call_args.args
+        self.assertEqual(context, 'research-ctx')
+        self.assertIsInstance(snapshot_time, float)
+        self.assertIsInstance(completed_at, float)
+        self.assertGreaterEqual(completed_at, snapshot_time)
+        self.assertIsNone(availability)
+
 
 class TestCostFeasibilityDegradation(unittest.TestCase):
     """Empty feasible list degrades to inf cost, never a boot crash."""
@@ -1222,6 +1380,21 @@ class TestCostFeasibilityDegradation(unittest.TestCase):
         self.assertEqual(cost, float('inf'))
         # Not memoized: a transient K8s API blip heals on the next call.
         self.assertEqual(placer.location2cost, {})
+
+    def test_kubernetes_zero_cost_seed_avoids_live_reclassification(self):
+        location = spot_placer.Location.from_pickleable(_K8S_KEY)
+        task = types.SimpleNamespace(resources=[mock.Mock()], num_nodes=1)
+        with mock.patch.object(spot_placer,
+                               '_get_possible_location_from_task',
+                               return_value=[location]):
+            placer = spot_placer.SpotPlacer(task)
+        placer.resources.copy = mock.Mock(
+            side_effect=AssertionError('must not query cluster feasibility'))
+
+        for _ in range(100):
+            self.assertEqual(placer.zero_cost_locations(), [location])
+
+        placer.resources.copy.assert_not_called()
 
     def test_missing_spot_price_does_not_block_zero_cost_enumeration(self):
         placer = spot_placer.DynamicFallbackSpotPlacer.__new__(

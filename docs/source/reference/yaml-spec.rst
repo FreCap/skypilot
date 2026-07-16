@@ -1625,12 +1625,40 @@ Describes how SkyServe autoscales your service based on the QPS (queries per sec
         max_replicas: 5
         target_qps_per_replica: 10
 
+For async multi-GPU services, the ``dynamic_fallback_per_gpu`` spot placer
+automatically changes these public replica counts to concurrent job slots. All
+other placement strategies keep the historical meaning of one replica per
+physical SkyServe backend. This unit is an internal consequence of the placer,
+not a separate user setting.
+
+The per-GPU placer currently supports the local async router's
+one-job-per-whole-GPU contract. It requires
+``target_concurrency_per_replica: 1`` (the integer),
+``graceful_drain_async_occupancy: true``, and a whole-GPU accelerator shape.
+SkyServe may provision a multi-GPU backend that contributes several replicas.
+Because a backend is indivisible, ready capacity can exceed ``max_replicas`` by
+the width of the final backend without causing scaling churn. This mode
+currently requires rolling updates and does not yet support blue-green updates
+or ``reserved_capacity_fill``.
+
+.. code-block:: yaml
+
+  service:
+    graceful_drain_async_occupancy: true
+    replica_policy:
+      min_replicas: 1
+      max_replicas: 1000
+      target_concurrency_per_replica: 1
+      spot_placer: dynamic_fallback_per_gpu
+
 .. _yaml-spec-service-replica-policy-min-replicas:
 
 ``service.replica_policy.min_replicas``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Minimum number of active replicas (required).
+Minimum number of active replicas (required). With
+``dynamic_fallback_per_gpu``, this is the minimum number of concurrent job
+slots, not physical backends.
 
 Service never scales below this count.
 
@@ -1646,7 +1674,9 @@ Service never scales below this count.
 ``service.replica_policy.max_replicas``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Maximum allowed replicas (optional).
+Maximum requested replicas (optional). With ``dynamic_fallback_per_gpu``, this
+clamps the demand target in job slots; an indivisible multi-GPU backend may
+create stable materialized capacity above it.
 
 If not specified, SkyServe will use a fixed number of replicas (the same as min_replicas) and ignore any QPS threshold specified below.
 

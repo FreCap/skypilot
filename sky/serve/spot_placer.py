@@ -486,7 +486,15 @@ class SpotPlacer:
         }
         # When each PREEMPTED mark was set; drives the TTL retry.
         self.location2preempted_at: dict[Location, float] = {}
-        self.location2cost: dict[Location, float] = {}
+        # Kubernetes is user-owned capacity and always has zero SkyPilot cost.
+        # Seed that classification from the enumerated location instead of
+        # re-running live feasibility against the cluster on every service
+        # scale tick during an API outage.
+        self.location2cost: dict[Location, float] = {
+            location: 0.0
+            for location in possible_locations
+            if str(location.cloud).lower() == 'kubernetes'
+        }
         # Already checked there is only one resource in the task.
         self.resources = list(task.resources)[0]
         self.num_nodes = task.num_nodes

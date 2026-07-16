@@ -342,6 +342,18 @@ RESERVED_FILL_BROKER_LOCK_ID = '~/.sky/serve_reserved_fill_broker_lock'
 # round-trips; generous so a slow cluster query makes peers wait for the
 # fresh round instead of timing out into a no-fill cycle.
 RESERVED_FILL_BROKER_LOCK_TIMEOUT_SECONDS = 120
+# Shared demand-placement observations and reservations use a separate lock
+# from fill arbitration. The refresh path never holds it while a planner is
+# waiting on the fill broker, avoiding lock-order coupling between features.
+DEMAND_CAPACITY_REFRESH_LOCK_ID = '~/.sky/serve_demand_capacity_refresh_lock'
+DEMAND_CAPACITY_RESERVATION_LOCK_ID = (
+    '~/.sky/serve_demand_capacity_reservation_lock')
+# If a ready logical backend cannot report usable slot capacity for this long,
+# launch one bounded replacement wave while keeping the uncertain backend
+# alive. Replacement rows are durably marked so a persistent telemetry outage
+# cannot create an unbounded sequence of overlap waves across restarts.
+LOGICAL_UNKNOWN_CAPACITY_REPLACEMENT_SECONDS = (
+    3 * LB_CONTROLLER_SYNC_INTERVAL_SECONDS)
 # A claim whose heartbeat is older than this is dead and drops out of
 # arbitration. Comfortably above the controller respawn+boot+recovery window
 # (the parent respawns children within seconds, but recovery of a large
@@ -477,7 +489,8 @@ POD_NAMESPACE_ENV_VAR = 'SKYPILOT_POD_NAMESPACE'
 #        summaries: replica_status_counts instead of full replica_info).
 # v7.0 - Added include_target_num_replicas override so summary-only callers
 #        can skip per-service autoscaler HTTP fetches unless they render it.
-SERVE_VERSION = 7
+# v8.0 - Added per-GPU logical replica semantics and logical capacity hints.
+SERVE_VERSION = 8
 
 TERMINATE_REPLICA_VERSION_MISMATCH_ERROR = (
     'The version of service is outdated and does not support manually '

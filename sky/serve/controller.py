@@ -22,6 +22,7 @@ import uvicorn
 from sky import global_user_state
 from sky import serve
 from sky import sky_logging
+from sky import task as task_lib
 from sky.serve import autoscalers
 from sky.serve import constants as serve_constants
 from sky.serve import lb_k8s
@@ -134,6 +135,13 @@ class SkyServeController:
                                    controller_ip) if service_hash is not None or
                                   controller_pid is not None or
                                   controller_ip is not None else None)
+        if (service_hash is not None and
+                serve_state.service_uses_logical_replica_semantics(service_name)
+                and getattr(service_spec, 'uses_logical_replicas',
+                            False) is not True):
+            raise RuntimeError(
+                'Refusing to recover a service whose durable logical-replica '
+                'activation fence disagrees with its latest specification.')
         # Serialize durable update commits. The live manager/autoscaler
         # transition happens on the reconciler below: a fleet-wide probe can
         # hold the replica-manager lock for minutes, but a second update must
@@ -219,6 +227,10 @@ class SkyServeController:
         # replica's running job stays attributed to it (see
         # _get_lb_replica_info / _translate_in_flight).
         self._lb_translation_cache: dict[int, tuple[str, str, int]] = {}
+        # Monotonic generation for complete LB demand/capacity reports. It is
+        # intentionally process-local: after restart logical scale-down stays
+        # disabled until the new controller consumes a fresh report.
+        self._reconcile_generation = 0
         # Immutable routing configuration shipped to the external load
         # balancer. Stored in-memory and updated only after the controller's
         # live autoscaler / replica-manager state transitions, so syncs never
@@ -476,6 +488,18 @@ class SkyServeController:
                 in_flight_by_replica_id[replica_id] = int(count)
         return in_flight_by_replica_id
 
+    def _translate_observed_slots(
+            self, slots_by_url: dict[str, int] | None) -> dict[int, int]:
+        """Translate a generation-valid LB slot map to durable replica IDs."""
+        if slots_by_url is None:
+            return {}
+        url_to_replica_id = self._url_to_replica_id_map()
+        return {
+            url_to_replica_id[url]: max(0, int(slots))
+            for url, slots in slots_by_url.items()
+            if url in url_to_replica_id
+        }
+
     def _unknown_async_replica_ids(
         self,
         replica_infos: list['replica_managers.ReplicaInfo'],
@@ -618,13 +642,36 @@ class SkyServeController:
                 request_data.get('occupancy_sampled_urls', []),
                 request_data.get('unknown_in_flight_urls', []),
                 force_all_live_unknown=not drain_authoritative)
+            observed_slots = self._translate_observed_slots(
+                request_data.get('total_slots_by_url'))
+            self._reconcile_generation = getattr(self, '_reconcile_generation',
+                                                 0) + 1
+            reconcile_generation = self._reconcile_generation
             self._autoscaler.collect_request_information({
                 'timestamps': timestamps,
                 'in_flight_by_replica_id': translated_in_flight,
                 'unknown_in_flight_replica_ids': list(unknown_replica_ids),
+                'observed_slots_by_replica_id': observed_slots,
+                # During maxSurge overlap, no LB can prove service-wide async
+                # occupancy. Keep those backends drain-busy, but do not age the
+                # degraded-capacity replacement timer: the old Pod may simply
+                # be finishing a long stream. Replacement becomes eligible
+                # only from a sole-live authoritative reporter's real probe
+                # miss.
+                'unknown_capacity_replica_ids':
+                    list(unknown_replica_ids if drain_authoritative else ()),
+                'reconcile_generation': reconcile_generation,
                 'queue_depth': request_data.get('queue_depth'),
                 'rejected_in_window': request_data.get('rejected_in_window'),
             })
+            if (translated_in_flight is not None and getattr(
+                    self._autoscaler, 'replica_unit', None) == 'logical'):
+                self._replica_manager.update_logical_reconcile_snapshot(
+                    version=self._autoscaler.latest_version,
+                    generation=reconcile_generation,
+                    observed_slots_by_replica_id=observed_slots,
+                    in_flight_by_replica_id=translated_in_flight,
+                    unknown_replica_ids=unknown_replica_ids)
 
         if drain_authoritative:
             drain_in_flight, drain_routing_urls = self._lb_drain_report_view(
@@ -666,8 +713,8 @@ class SkyServeController:
                 # membership in this service. Do not reveal replica URLs,
                 # capacity, or routing policy to another service's Pod.
                 return fastapi.Response(status_code=503)
-            (replica_infos,
-             async_occupancy_by_version) = (await loop.run_in_executor(
+            (replica_infos, async_occupancy_by_version,
+             logical_versions) = (await loop.run_in_executor(
                  None, self._snapshot_replica_occupancy))
             # Cold endpoint resolution is proportional to the READY fleet and
             # may take tens of seconds. Keep it off the FastAPI event loop so
@@ -691,7 +738,8 @@ class SkyServeController:
                 'replica_info': lb_replica_info,
                 'num_ready_replicas': num_ready,
                 'routing_spec': self._get_routing_spec(),
-                'capacity_hint': self._get_capacity_hint(replica_infos),
+                'capacity_hint': self._get_capacity_hint(
+                    replica_infos, logical_versions),
             },
                                           status_code=200)
 
@@ -709,7 +757,8 @@ class SkyServeController:
 
     def _snapshot_replica_occupancy(
         self
-    ) -> tuple[list['replica_managers.ReplicaInfo'], dict[int, bool | None]]:
+    ) -> tuple[list['replica_managers.ReplicaInfo'], dict[int, bool | None],
+               set[int]]:
         """Read the replica rows and per-version async-occupancy flags.
 
         Blocking DB reads; callers on the event loop must run this in an
@@ -726,11 +775,18 @@ class SkyServeController:
                                  'graceful_drain_async_occupancy',
                                  None) for replica_version in replica_versions
         }
-        return replica_infos, async_occupancy_by_version
+        logical_versions = {
+            replica_version for replica_version in replica_versions
+            if getattr(version_specs.get(replica_version),
+                       'uses_logical_replicas', False) is True
+        }
+        return replica_infos, async_occupancy_by_version, logical_versions
 
     def _get_capacity_hint(
-            self, replica_infos: list['replica_managers.ReplicaInfo']
-    ) -> dict[str, int]:
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+        logical_versions: set[int] | None = None,
+    ) -> dict[str, Any]:
         """Build the capacity_hint block of the sync response.
 
         [boltz fork] Computed from the replica_infos list the handler
@@ -756,20 +812,40 @@ class SkyServeController:
         latest_version = self._autoscaler.latest_version
         num_provisioning = 0
         num_latest_nonterminal = 0
+        logical = getattr(self._autoscaler, 'replica_unit', None) == 'logical'
+        if logical_versions is None:
+            logical_versions = {latest_version} if logical else set()
         for info in replica_infos:
             if info.version != latest_version or info.is_terminal:
                 continue
-            num_latest_nonterminal += 1
+            if (logical and getattr(getattr(info, 'status_property', None),
+                                    'is_scale_down', False) is True):
+                continue
+            width = int(getattr(info, 'planned_capacity', 1)) if logical else 1
+            num_latest_nonterminal += width
             if not info.is_ready:
-                num_provisioning += 1
+                num_provisioning += width
         target = self._autoscaler.get_final_target_num_replicas()
         if not self._autoscaler.has_recomputed_with_fresh_data():
             target = max(target, num_latest_nonterminal)
-        return {
+        hint: dict[str, Any] = {
+            'replica_unit': ('logical_slot' if logical else 'physical_backend'),
             'provisioning_replicas': num_provisioning,
             'target_num_replicas': target,
             'max_replicas': self._autoscaler.max_replicas,
+            'configured_max_replicas': self._autoscaler.max_replicas,
         }
+        if logical:
+            planned_capacity_by_url = {
+                cached[0]: int(getattr(info, 'planned_capacity', 1))
+                for info in replica_infos
+                if info.version in logical_versions and not info.is_terminal
+                for cached in [self._lb_translation_cache.get(info.replica_id)]
+                if cached is not None
+            }
+            hint['planned_capacity_by_url'] = planned_capacity_by_url
+            hint['logical_replica_urls'] = sorted(planned_capacity_by_url)
+        return hint
 
     @staticmethod
     def _build_routing_spec(service_spec: Any) -> dict[str, Any] | None:
@@ -816,12 +892,70 @@ class SkyServeController:
         """
         return getattr(self, '_routing_spec', None)
 
+    def _load_service_for_update(self, version: int, yaml_content: str) -> Any:
+        """Parse a new update or reuse an exact legacy committed spec.
+
+        An old dynamic_fallback_per_gpu YAML can be invalid under today's
+        automatically activated logical contract. A lost-response retry must
+        therefore be recognized before parsing. The transactional commit still
+        rechecks immutability and lifecycle ownership.
+        """
+        if serve_state.get_yaml_content(self._service_name,
+                                        version) == yaml_content:
+            persisted = serve_state.get_spec(self._service_name, version)
+            if persisted is None:
+                raise RuntimeError(
+                    f'Service version {version} has committed YAML but its '
+                    'authoritative specification is missing.')
+            return persisted
+        return serve.SkyServiceSpec.from_yaml_str(yaml_content)
+
     def _commit_service_update(self, version: int, service: Any,
                                yaml_content: str,
                                update_mode: serve_utils.UpdateMode,
                                requested_service_hash: str | None,
                                lifecycle_epoch: int | None) -> fastapi.Response:
         """Durably accept one immutable version and schedule its apply."""
+        authoritative_retry_service = None
+        persisted_yaml = serve_state.get_yaml_content(self._service_name,
+                                                      version)
+        if persisted_yaml == yaml_content:
+            authoritative_retry_service = serve_state.get_spec(
+                self._service_name, version)
+        validation_service = authoritative_retry_service or service
+        current_autoscaler = getattr(self, '_autoscaler', None)
+        if (authoritative_retry_service is None and getattr(
+                current_autoscaler, 'replica_unit', None) == 'logical' and
+                getattr(validation_service, 'replica_unit',
+                        'physical_backend') != 'logical'):
+            return responses.JSONResponse(content={
+                'message': 'An existing dynamic_fallback_per_gpu service '
+                           'cannot switch in place to physical-backend replica '
+                           'semantics. Create a new service for that migration.'
+            },
+                                          status_code=400)
+        if (getattr(validation_service, 'replica_unit',
+                    'physical_backend') == 'logical' and
+                update_mode == serve_utils.UpdateMode.BLUE_GREEN):
+            return responses.JSONResponse(content={
+                'message': 'dynamic_fallback_per_gpu services currently '
+                           'require rolling updates. Blue-green activation is '
+                           'based on physical backend counts and cannot '
+                           'preserve the per-GPU capacity target.'
+            },
+                                          status_code=400)
+        if (authoritative_retry_service is None and getattr(
+                validation_service, 'uses_logical_replicas', False) is True):
+            try:
+                update_task = task_lib.Task.from_yaml_str(yaml_content)
+                if update_task.num_nodes != 1:
+                    raise ValueError(
+                        'dynamic_fallback_per_gpu currently supports only '
+                        'single-node services. Multi-node replica routing '
+                        'does not yet define a safe logical capacity contract.')
+            except (ValueError, RuntimeError) as e:
+                return responses.JSONResponse(content={'message': str(e)},
+                                              status_code=400)
         result = serve_state.add_or_update_version(
             self._service_name,
             version,
@@ -837,6 +971,13 @@ class SkyServeController:
                            'terminal status before the update was committed.'
             },
                                           status_code=409)
+        if result is serve_state.VersionCommitResult.SEMANTIC_CONFLICT:
+            return responses.JSONResponse(content={
+                'message': 'An existing dynamic_fallback_per_gpu service '
+                           'cannot switch in place to physical-backend replica '
+                           'semantics. Create a new service for that migration.'
+            },
+                                          status_code=400)
         if result is serve_state.VersionCommitResult.CONTENT_CONFLICT:
             return responses.JSONResponse(content={
                 'message': f'Service version {version} was already committed '
@@ -844,6 +985,28 @@ class SkyServeController:
                            'allocate a new version.'
             },
                                           status_code=409)
+        if result is serve_state.VersionCommitResult.STALE_VERSION:
+            return responses.JSONResponse(content={
+                'message': f'Service version {version} was superseded by a '
+                           'newer committed version before it could commit. '
+                           'Re-run the update to allocate a new version.'
+            },
+                                          status_code=409)
+        if result is serve_state.VersionCommitResult.IDEMPOTENT_RETRY:
+            # The caller reconstructed this YAML with today's hidden defaults,
+            # which may differ from an older stored pickled spec (notably a
+            # pre-activation dynamic_fallback_per_gpu version). Apply only the
+            # immutable authoritative bytes already committed for this version.
+            persisted_service = (authoritative_retry_service or
+                                 serve_state.get_spec(self._service_name,
+                                                      version))
+            if persisted_service is None:
+                return responses.JSONResponse(content={
+                    'message': f'Service version {version} was committed but '
+                               'its authoritative specification is missing.'
+                },
+                                              status_code=409)
+            service = persisted_service
 
         logger.info(f'Committed update to version {version}: {service}')
         self._record_committed_update(version, service, update_mode)
@@ -968,6 +1131,11 @@ class SkyServeController:
     def _apply_service_update(self, version: int, service: Any,
                               update_mode: serve_utils.UpdateMode) -> None:
         """Apply a persisted update to the live controller state."""
+        if (getattr(self._autoscaler, 'replica_unit', None) == 'logical' and
+                getattr(service, 'uses_logical_replicas', False) is not True):
+            raise ValueError(
+                'Refusing to apply a physical-backend version after logical '
+                'replica semantics were activated.')
         # add_or_update_version commits before this method runs.  Announce the
         # new version without acquiring the replica-manager lock: a large
         # placer-backed scale-up batch may currently hold that lock while
@@ -1078,14 +1246,28 @@ class SkyServeController:
                 active_versions = runtime_snapshot['active_versions']
                 logger.info(f'All replica info for autoscaler: {replica_infos}')
 
-                self._autoscaler.set_spot_placer(
+                # Keep the exact autoscaler instance/version that produced
+                # this tick. A concurrent update may replace or mutate
+                # `self._autoscaler` before actuation; the manager's expected
+                # version fence must carry the producer's version, not the
+                # newly published one.
+                decision_autoscaler = self._autoscaler
+                decision_version = decision_autoscaler.latest_version
+                decision_autoscaler.set_spot_placer(
                     self._replica_manager.spot_placer)
 
                 # Autoscaler now extracts GPU type info directly from
                 # replica_infos in generate_scaling_decisions method
                 # for better decoupling.
-                scaling_options = self._autoscaler.generate_scaling_decisions(
+                scaling_options = decision_autoscaler.generate_scaling_decisions(
                     replica_infos, active_versions)
+                if (isinstance(decision_autoscaler,
+                               autoscalers.ConcurrencyAutoscaler) and
+                        decision_autoscaler.replica_unit == 'logical'):
+                    target_state = decision_autoscaler.logical_target_state
+                    if target_state is not None:
+                        self._replica_manager.publish_logical_target(
+                            *target_state)
                 # Batch consecutive SCALE_UP decisions into ONE
                 # replica-manager call: each scale_up acquires the manager
                 # lock, which the readiness-probe round holds for tens of
@@ -1102,28 +1284,55 @@ class SkyServeController:
                 # The closure is only called within the same outer-loop
                 # iteration that (re)binds pending_scale_up, so capturing the
                 # loop-scoped list is intentional (B023 false positive).
-                def _flush_scale_up() -> None:
+                def _flush_scale_up(
+                        expected_version: int = decision_version) -> None:
                     if pending_scale_up:  # noqa: B023
                         self._replica_manager.scale_up_batch(
-                            list(pending_scale_up))  # noqa: B023
+                            list(pending_scale_up),  # noqa: B023
+                            expected_version=expected_version)
                         pending_scale_up.clear()  # noqa: B023
 
                 for scaling_option in scaling_options:
                     logger.info(f'Scaling option received: {scaling_option}')
                     if (scaling_option.operator ==
                             autoscalers.AutoscalerDecisionOperator.SCALE_UP):
-                        assert (scaling_option.target is None or isinstance(
-                            scaling_option.target, dict)), scaling_option
-                        pending_scale_up.append(scaling_option.target)
+                        if isinstance(scaling_option.target,
+                                      autoscalers.LogicalScaleTarget):
+                            _flush_scale_up()
+                            logical_target = scaling_option.target
+                            replacement_kwargs: dict[str, Any] = {}
+                            if logical_target.replace_unknown_replica_ids:
+                                replacement_kwargs[
+                                    'replace_unknown_replica_ids'] = (
+                                        logical_target.
+                                        replace_unknown_replica_ids)
+                            self._replica_manager.scale_up_to_logical_capacity(
+                                logical_target.target_capacity,
+                                logical_target.version,
+                                logical_target.reconcile_generation,
+                                **replacement_kwargs)
+                        else:
+                            assert (scaling_option.target is None or isinstance(
+                                scaling_option.target, dict)), scaling_option
+                            pending_scale_up.append(scaling_option.target)
                     else:
-                        assert isinstance(scaling_option.target,
-                                          int), scaling_option
                         _flush_scale_up()
-                        self._replica_manager.scale_down(
-                            scaling_option.target,
-                            wait_for_idle=(
-                                scaling_option.reason == autoscalers.
-                                AutoscalerDecisionReason.COST_REBALANCE))
+                        if isinstance(scaling_option.target,
+                                      autoscalers.LogicalScaleDownTarget):
+                            self._replica_manager.scale_down_logically(
+                                scaling_option.target.replica_id,
+                                scaling_option.target.target_capacity,
+                                scaling_option.target.version,
+                                scaling_option.target.reconcile_generation)
+                        else:
+                            assert isinstance(scaling_option.target,
+                                              int), scaling_option
+                            self._replica_manager.scale_down(
+                                scaling_option.target,
+                                wait_for_idle=(
+                                    scaling_option.reason == autoscalers.
+                                    AutoscalerDecisionReason.COST_REBALANCE),
+                                expected_version=decision_version)
                 _flush_scale_up()
             except Exception as e:  # pylint: disable=broad-except
                 # No matter what error happens, we should keep the
@@ -1217,7 +1426,7 @@ class SkyServeController:
                     resource_scope=self._resource_scope)
                 with open(latest_task_yaml, encoding='utf-8') as f:
                     yaml_content = f.read()
-                service = serve.SkyServiceSpec.from_yaml_str(yaml_content)
+                service = self._load_service_for_update(version, yaml_content)
                 requested_service_hash = request_data.get('service_hash')
                 lifecycle_epoch = request_data.get('lifecycle_epoch')
                 if (requested_service_hash is not None and

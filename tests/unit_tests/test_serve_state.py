@@ -200,6 +200,8 @@ def test_launch_budget_counts_share_one_replica_scan(_mock_serve_db,
 
 def test_replica_json_storage_round_trip_preserves_lifecycle_state():
     info = _replica(7, version=3)
+    info.planned_capacity = 8
+    info.unknown_capacity_replacement = True
     info.created_at = 123.5
     info.first_not_ready_time = 124.5
     info.first_consecutive_failure_time = 125.5
@@ -212,11 +214,17 @@ def test_replica_json_storage_round_trip_preserves_lifecycle_state():
     info.status_property.is_scale_down = True
     info.status_property.drain_cap_seconds = 30
     info.status_property.wait_for_idle_before_termination = True
+    info.status_property.logical_retirement_version = 3
+    info.status_property.logical_retirement_controller_epoch = 'epoch-a'
+    info.status_property.logical_retirement_generation = 10
+    info.status_property.logical_retirement_target_capacity = 17
+    info.status_property.logical_retirement_confirmed_generation = 11
 
     restored = replica_managers.ReplicaInfo.from_storage_dict(
         info.to_storage_dict())
 
     assert restored.to_storage_dict() == info.to_storage_dict()
+    assert restored.unknown_capacity_replacement is True
     assert restored.status == info.status
 
 
@@ -272,6 +280,26 @@ def test_replica_json_storage_reads_legacy_null_image_id_key():
     assert restored.resources_override['image_id'] == {
         None: 'docker:example.invalid/boltz:model'
     }
+
+
+@pytest.mark.parametrize('planned_capacity', [0, -1, True, 1.5, '8'])
+def test_replica_rejects_invalid_planned_capacity(planned_capacity):
+    with pytest.raises(ValueError, match='positive integer'):
+        replica_managers.ReplicaInfo(replica_id=1,
+                                     cluster_name='svc-1',
+                                     replica_port='8080',
+                                     is_spot=True,
+                                     location=None,
+                                     version=1,
+                                     resources_override=None,
+                                     planned_capacity=planned_capacity)
+
+
+def test_replica_rejects_invalid_stored_planned_capacity():
+    state = _replica(1).to_storage_dict()
+    state['planned_capacity'] = 0
+    with pytest.raises(ValueError, match='Stored planned_capacity'):
+        replica_managers.ReplicaInfo.from_storage_dict(state)
 
 
 def test_replica_state_uses_jsonb_on_postgres():
@@ -370,11 +398,14 @@ def test_replica_json_migration_handles_fresh_database(tmp_path):
 
     serve_state.create_table(engine)
 
-    columns = {
-        column['name']
-        for column in sqlalchemy.inspect(engine).get_columns('replicas')
-    }
+    inspector = sqlalchemy.inspect(engine)
+    columns = {column['name'] for column in inspector.get_columns('replicas')}
     assert {'replica_state_version', 'status', 'replica_state'} <= columns
+    service_columns = {
+        column['name'] for column in inspector.get_columns('services')
+    }
+    assert 'logical_replica_semantics' in service_columns
+    assert 'demand_capacity_observations' in inspector.get_table_names()
 
 
 def test_get_specs_batches_requested_versions_in_one_query(_mock_serve_db):
@@ -416,7 +447,7 @@ def test_committed_version_content_is_immutable_and_retryable(_mock_serve_db):
     retry_result = serve_state.add_or_update_version(
         'svc-immutable', 2, types.SimpleNamespace(value='original'),
         'value: original')
-    assert retry_result is serve_state.VersionCommitResult.COMMITTED
+    assert retry_result is serve_state.VersionCommitResult.IDEMPOTENT_RETRY
     assert _read_version_row(_mock_serve_db, 'svc-immutable', 2) == original_row
 
     conflict_result = serve_state.add_or_update_version(
@@ -424,6 +455,86 @@ def test_committed_version_content_is_immutable_and_retryable(_mock_serve_db):
         'value: different')
     assert conflict_result is serve_state.VersionCommitResult.CONTENT_CONFLICT
     assert _read_version_row(_mock_serve_db, 'svc-immutable', 2) == original_row
+
+
+def test_logical_replica_activation_is_durable_and_one_way(_mock_serve_db):
+    physical = types.SimpleNamespace(uses_logical_replicas=False)
+    logical = types.SimpleNamespace(uses_logical_replicas=True)
+    assert _add_minimal_service('svc-logical', spec=physical) is True
+    assert not serve_state.service_uses_logical_replica_semantics('svc-logical')
+
+    assert serve_state.add_version('svc-logical') == 2
+    assert (serve_state.add_or_update_version('svc-logical', 2, logical,
+                                              'yaml: logical')
+            is serve_state.VersionCommitResult.COMMITTED)
+    assert serve_state.service_uses_logical_replica_semantics('svc-logical')
+
+    assert serve_state.add_version('svc-logical') == 3
+    assert (serve_state.add_or_update_version('svc-logical', 3, physical,
+                                              'yaml: physical')
+            is serve_state.VersionCommitResult.SEMANTIC_CONFLICT)
+    assert serve_state.get_spec('svc-logical', 3) is None
+
+    # A lost-response retry of a physical version committed before activation
+    # remains idempotent. The fence only rejects new physical commits.
+    assert (serve_state.add_or_update_version('svc-logical', 1, physical,
+                                              'yaml: v1')
+            is serve_state.VersionCommitResult.IDEMPOTENT_RETRY)
+
+
+def test_lower_logical_commit_cannot_flip_newer_physical_semantics(
+        _mock_serve_db):
+    physical = types.SimpleNamespace(uses_logical_replicas=False)
+    logical = types.SimpleNamespace(uses_logical_replicas=True)
+    assert _add_minimal_service('svc-out-of-order', spec=physical) is True
+    assert serve_state.add_version('svc-out-of-order') == 2
+    assert serve_state.add_version('svc-out-of-order') == 3
+
+    assert (serve_state.add_or_update_version('svc-out-of-order', 3, physical,
+                                              'yaml: physical-v3')
+            is serve_state.VersionCommitResult.COMMITTED)
+    assert (serve_state.add_or_update_version('svc-out-of-order', 2, logical,
+                                              'yaml: logical-v2')
+            is serve_state.VersionCommitResult.STALE_VERSION)
+    assert not serve_state.service_uses_logical_replica_semantics(
+        'svc-out-of-order')
+    assert serve_state.get_spec('svc-out-of-order', 2) is None
+    assert serve_state.get_spec('svc-out-of-order',
+                                3).uses_logical_replicas is False
+
+
+def test_initial_logical_service_sets_activation_fence(_mock_serve_db):
+    logical = types.SimpleNamespace(uses_logical_replicas=True)
+    assert _add_minimal_service('svc-initial-logical', spec=logical) is True
+    assert serve_state.service_uses_logical_replica_semantics(
+        'svc-initial-logical')
+
+
+def test_demand_capacity_observation_round_trip(_mock_serve_db):
+    serve_state.upsert_demand_capacity_observation('research', 123.0, 123.5, {
+        'a100': 223,
+        'l4': 12,
+    })
+
+    observations = serve_state.get_demand_capacity_observations(
+        ['research', 'missing'])
+    assert set(observations) == {'research'}
+    assert observations['research']['snapshot_time'] == 123.0
+    assert observations['research']['completed_at'] == 123.5
+    assert json.loads(observations['research']['availability']) == {
+        'a100': 223,
+        'l4': 12,
+    }
+
+    # Query failures are durable observations too. They rate-limit provider
+    # retries while remaining distinguishable from a successful empty result.
+    serve_state.upsert_demand_capacity_observation('research', 124.0, 125.0,
+                                                   None)
+    observation = serve_state.get_demand_capacity_observations(['research'
+                                                               ])['research']
+    assert observation['snapshot_time'] == 124.0
+    assert observation['completed_at'] == 125.0
+    assert observation['availability'] is None
 
 
 def test_get_replica_infos_from_ids_batches_in_one_query(_mock_serve_db):

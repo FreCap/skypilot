@@ -503,6 +503,13 @@ class TestMixedValidation:
         import textwrap
 
         import sky
+        per_gpu = spot_placer_value == 'dynamic_fallback_per_gpu'
+        logical_replica_policy = (
+            '                target_concurrency_per_replica: 1'
+            if per_gpu else '                target_qps_per_replica: 0.1')
+        logical_service_policy = (
+            '              graceful_drain_async_occupancy: true'
+            if per_gpu else '')
         yaml_str = textwrap.dedent(f"""
             resources:
               cpus: 2+
@@ -516,10 +523,11 @@ class TestMixedValidation:
                   use_spot: {str(k8s_spot).lower()}
             service:
               readiness_probe: /health
+{logical_service_policy}
               replica_policy:
                 min_replicas: 1
                 max_replicas: 2
-                target_qps_per_replica: 0.1
+{logical_replica_policy}
                 {'spot_placer: ' + spot_placer_value if spot_placer_value else ''}
             run: echo hi
             """)
@@ -536,6 +544,14 @@ class TestMixedValidation:
         serve_utils.validate_service_task(self._task('dynamic_fallback_per_gpu',
                                                      k8s_spot=False),
                                           pool=False)
+
+    def test_per_gpu_placer_rejects_multi_node_before_submission(self):
+        from sky.serve import serve_utils
+        task = self._task('dynamic_fallback_per_gpu', k8s_spot=False)
+        task.num_nodes = 2
+
+        with pytest.raises(ValueError, match='only single-node services'):
+            serve_utils.validate_service_task(task, pool=False)
 
     def test_mixed_without_placer_rejected(self):
         from sky.serve import serve_utils

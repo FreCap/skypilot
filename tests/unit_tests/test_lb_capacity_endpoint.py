@@ -203,6 +203,134 @@ class TestCapacityEndpoint(unittest.TestCase):
         self.assertEqual(body['in_flight_capacity'], 3)
         self.assertEqual(body['max_capacity'], 3)
 
+    def test_logical_mode_reuses_replica_names_for_slot_capacity(self):
+        policy = lb_policies.LeastLoadPolicy()
+        policy.set_ready_replicas(['http://four-gpu:8080'])
+        balancer = _make_balancer(policy)
+        balancer._capacity_hint = {
+            'replica_unit': 'logical_slot',
+            'provisioning_replicas': 8,
+            'target_num_replicas': 3,
+            'max_replicas': 3,
+            'configured_max_replicas': 3,
+            'planned_capacity_by_url': {
+                'http://four-gpu:8080': 4
+            },
+        }
+        balancer._replica_occupancy = {'http://four-gpu:8080': 2}
+        balancer._replica_total_slots = {'http://four-gpu:8080': 4}
+        balancer._replica_free_slots = {'http://four-gpu:8080': 2}
+        balancer._last_occupancy_probe_time = time.monotonic() - 1.0
+
+        body = json.loads(
+            asyncio.run(balancer._capacity(mock.MagicMock())).body)
+
+        self.assertEqual(body['replica_unit'], 'logical_slot')
+        self.assertEqual(body['ready_replicas'], 4)
+        self.assertEqual(body['provisioning_replicas'], 8)
+        self.assertEqual(body['target_replicas'], 3)
+        self.assertEqual(body['configured_max_replicas'], 3)
+        # Structural overhang is usable admission capacity.
+        self.assertEqual(body['max_replicas'], 4)
+        self.assertEqual(body['in_flight'], 2)
+        self.assertEqual(body['current_capacity'], body['ready_replicas'])
+        self.assertEqual(body['max_capacity'], body['max_replicas'])
+        self.assertEqual(body['in_flight_capacity'], body['in_flight'])
+        self.assertEqual(body['probed_replicas'], 4)
+        self.assertEqual(body['busy_replicas'], 2)
+
+    def test_logical_bridge_ignores_routed_physical_backend_capacity(self):
+        physical_url = 'http://physical:8080'
+        logical_url = 'http://logical:8080'
+        policy = lb_policies.LeastLoadPolicy()
+        policy.set_ready_replicas([physical_url, logical_url])
+        balancer = _make_balancer(policy)
+        balancer._capacity_hint = {
+            'replica_unit': 'logical_slot',
+            'max_replicas': 20,
+            'configured_max_replicas': 20,
+            'planned_capacity_by_url': {
+                logical_url: 8
+            },
+            'logical_replica_urls': [logical_url],
+        }
+        balancer._replica_occupancy = {
+            physical_url: 0,
+            logical_url: 0,
+        }
+        balancer._replica_total_slots = {
+            physical_url: 8,
+            logical_url: 8,
+        }
+        balancer._replica_free_slots = {
+            physical_url: 8,
+            logical_url: 8,
+        }
+        balancer._last_occupancy_probe_time = time.monotonic() - 1.0
+
+        body = json.loads(
+            asyncio.run(balancer._capacity(mock.MagicMock())).body)
+
+        self.assertEqual(body['ready_replicas'], 8)
+        self.assertEqual(body['probed_replicas'], 8)
+        self.assertEqual(body['total_slots'], 8)
+        self.assertEqual(body['free_slots'], 8)
+
+    def test_logical_mode_never_falls_back_to_physical_backend_count(self):
+        policy = lb_policies.LeastLoadPolicy()
+        policy.set_ready_replicas(['http://eight-gpu:8080'])
+        policy.load_map['http://eight-gpu:8080'] = 1
+        balancer = _make_balancer(policy)
+        balancer._capacity_hint = {
+            'replica_unit': 'logical_slot',
+            'max_replicas': 20,
+            'configured_max_replicas': 20,
+            'planned_capacity_by_url': {
+                'http://eight-gpu:8080': 8
+            },
+        }
+        balancer._replica_occupancy = {'http://eight-gpu:8080': 2}
+        balancer._replica_total_slots = {'http://eight-gpu:8080': 8}
+        balancer._replica_free_slots = {'http://eight-gpu:8080': 6}
+        balancer._last_occupancy_probe_time = (
+            time.monotonic() -
+            lb_module.constants.LB_OCCUPANCY_PROBE_MAX_AGE_SECONDS - 1)
+
+        body = json.loads(
+            asyncio.run(balancer._capacity(mock.MagicMock())).body)
+
+        self.assertEqual(body['ready_replicas'], 0)
+        self.assertEqual(body['current_capacity'], 0)
+        self.assertEqual(body['max_replicas'], 20)
+        # Demand remains conservative while capacity fails closed.
+        self.assertEqual(body['in_flight'], 3)
+
+    def test_logical_mode_caps_runtime_slots_at_pinned_width(self):
+        url = 'http://eight-gpu:8080'
+        policy = lb_policies.LeastLoadPolicy()
+        policy.set_ready_replicas([url])
+        balancer = _make_balancer(policy)
+        balancer._capacity_hint = {
+            'replica_unit': 'logical_slot',
+            'max_replicas': 20,
+            'configured_max_replicas': 20,
+            'planned_capacity_by_url': {
+                url: 8
+            },
+        }
+        balancer._replica_occupancy = {url: 2}
+        balancer._replica_total_slots = {url: 64}
+        balancer._replica_free_slots = {url: 62}
+        balancer._last_occupancy_probe_time = time.monotonic() - 1.0
+
+        body = json.loads(
+            asyncio.run(balancer._capacity(mock.MagicMock())).body)
+
+        self.assertEqual(body['ready_replicas'], 8)
+        self.assertEqual(body['total_slots'], 8)
+        self.assertEqual(body['free_slots'], 6)
+        self.assertEqual(body['busy_replicas'], 2)
+
     def test_occupancy_aggregates_debit_assigned_and_unassigned_slots(self):
         policy = lb_policies.LeastLoadPolicy()
         policy.set_ready_replicas(['http://four-gpu:8080'])

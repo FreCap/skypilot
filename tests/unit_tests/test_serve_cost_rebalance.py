@@ -1,5 +1,6 @@
 """Cost-aware SkyServe replica replacement safety tests."""
 # pylint: disable=protected-access
+import threading
 import types
 from unittest import mock
 
@@ -514,7 +515,10 @@ class TestPinnedReplacementLaunch:
                                return_value=True):
             assert not manager._launch_replica(
                 8, {'region': 'research'},
-                prior_cost_rebalance_for_replica_id=7)
+                prior_cost_rebalance_for_replica_id=7,
+                recovering_existing_replica=True,
+                prior_version=1,
+                prior_yaml_content='resources: {}')
 
         manager._terminate_replica.assert_called_once_with(
             8,
@@ -529,6 +533,8 @@ def _recovery_manager():
     manager = replica_managers.SkyPilotReplicaManager.__new__(
         replica_managers.SkyPilotReplicaManager)
     manager._service_name = 'svc'
+    manager.latest_version = 1
+    manager.yaml_content = 'resources: {}'
     manager._is_pool = False
     manager._lb_in_flight_report = None
     manager._spot_placer = None
@@ -843,6 +849,91 @@ class TestStrictDrain:
         assert manager._wait_for_idle_trackers == {1: tracked}
         manager._persist_replica.assert_not_called()
         manager._terminate_replica.assert_not_called()
+
+    def test_logical_idle_proof_timeout_aborts_instead_of_force_killing(
+            self, monkeypatch):
+        monkeypatch.setattr(replica_managers.time, 'monotonic', lambda: 100.0)
+        manager = replica_managers.SkyPilotReplicaManager.__new__(
+            replica_managers.SkyPilotReplicaManager)
+        manager._service_name = 'svc'
+        manager._logical_state_lock = threading.RLock()
+        manager._logical_controller_epoch = 'test-controller-epoch'
+        manager._logical_reconcile_snapshot = None
+        manager._logical_target = None
+        manager._wait_for_idle_trackers = {
+            1: (mock.Mock(return_value=False), 99.0)
+        }
+        manager._persist_replica = mock.Mock()
+        manager._terminate_replica = mock.Mock()
+        status = replica_managers.ReplicaStatusProperty(
+            sky_launch_status=common_utils.ProcessStatus.SUCCEEDED,
+            sky_down_status=common_utils.ProcessStatus.SCHEDULED,
+            is_scale_down=True,
+            wait_for_idle_before_termination=True,
+            logical_retirement_version=1,
+            logical_retirement_controller_epoch='test-controller-epoch',
+            logical_retirement_generation=4,
+            logical_retirement_target_capacity=8)
+        info = types.SimpleNamespace(replica_id=1,
+                                     cluster_name='cluster-1',
+                                     status_property=status)
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos_from_ids',
+                               return_value={1: info}), \
+             mock.patch.object(
+                 replica_managers.global_user_state,
+                 'get_cluster_status_fields',
+                 return_value={'cluster-1': ('UP', 1)}):
+            manager._refresh_wait_for_idle()
+
+        manager._terminate_replica.assert_not_called()
+        assert not status.wait_for_idle_before_termination
+        assert status.sky_down_status is None
+        assert status.logical_retirement_version is None
+        assert 1 not in manager._wait_for_idle_trackers
+
+    def test_stale_logical_retirement_aborts_before_idle(self, monkeypatch):
+        monkeypatch.setattr(replica_managers.time, 'monotonic', lambda: 100.0)
+        manager = replica_managers.SkyPilotReplicaManager.__new__(
+            replica_managers.SkyPilotReplicaManager)
+        manager._service_name = 'svc'
+        manager._logical_state_lock = threading.RLock()
+        manager._logical_controller_epoch = 'new-controller-epoch'
+        manager._logical_reconcile_snapshot = None
+        manager._logical_target = None
+        manager._wait_for_idle_trackers = {
+            1: (mock.Mock(return_value=False), 200.0)
+        }
+        manager._persist_replica = mock.Mock()
+        manager._terminate_replica = mock.Mock()
+        status = replica_managers.ReplicaStatusProperty(
+            sky_launch_status=common_utils.ProcessStatus.SUCCEEDED,
+            sky_down_status=common_utils.ProcessStatus.SCHEDULED,
+            is_scale_down=True,
+            wait_for_idle_before_termination=True,
+            logical_retirement_version=1,
+            logical_retirement_controller_epoch='old-controller-epoch',
+            logical_retirement_generation=4,
+            logical_retirement_target_capacity=8)
+        info = types.SimpleNamespace(replica_id=1,
+                                     cluster_name='cluster-1',
+                                     status_property=status)
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos_from_ids',
+                               return_value={1: info}), \
+             mock.patch.object(
+                 replica_managers.global_user_state,
+                 'get_cluster_status_fields',
+                 return_value={'cluster-1': ('UP', 1)}):
+            manager._refresh_wait_for_idle()
+
+        manager._terminate_replica.assert_not_called()
+        assert status.sky_down_status is None
+        assert not status.is_scale_down
+        assert status.logical_retirement_version is None
+        assert 1 not in manager._wait_for_idle_trackers
 
     def test_off_route_intent_precedes_zero_occupancy_termination(self):
         manager = replica_managers.SkyPilotReplicaManager.__new__(

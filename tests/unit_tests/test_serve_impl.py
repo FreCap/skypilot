@@ -228,12 +228,12 @@ class TestCleanupProvisionalStorageIntents:
                      2: 'yaml-v2',
                  }) as get_version_yamls, \
              mock.patch.object(
-                 impl.task_lib.Task,
-                 'from_yaml_str',
+                 impl.service_lib,
+                 'load_task_for_storage_cleanup',
                  side_effect=lambda yaml_content: {
                      'yaml-v1': self._task_with_scope('scope-a', 'gen-a'),
                      'yaml-v2': self._task_with_scope('scope-z', 'gen-z'),
-                 }[yaml_content]) as from_yaml_str, \
+                 }[yaml_content]) as load_cleanup_task, \
              mock.patch.object(impl.service_lib,
                                'cleanup_storage',
                                return_value=True) as cleanup_storage, \
@@ -246,7 +246,7 @@ class TestCleanupProvisionalStorageIntents:
 
         assert calls == ['advance', 'versions']
         assert get_version_yamls.call_count == 1
-        assert from_yaml_str.call_count == 2
+        assert load_cleanup_task.call_count == 2
         cleanup_storage.assert_has_calls([
             mock.call('yaml-b', 'scope-b'),
             mock.call('yaml-c', 'scope-c'),
@@ -274,8 +274,8 @@ class TestCleanupProvisionalStorageIntents:
              mock.patch.object(impl.serve_state,
                                'get_version_yaml_contents',
                                return_value={1: 'broken-yaml'}), \
-             mock.patch.object(impl.task_lib.Task,
-                               'from_yaml_str',
+             mock.patch.object(impl.service_lib,
+                               'load_task_for_storage_cleanup',
                                side_effect=ValueError('bad yaml')), \
              mock.patch.object(impl.service_lib,
                                'cleanup_storage') as cleanup_storage, \
@@ -288,6 +288,24 @@ class TestCleanupProvisionalStorageIntents:
 
         cleanup_storage.assert_not_called()
         remove_intents.assert_not_called()
+
+    def test_legacy_per_gpu_policy_is_readable_storage_metadata(self):
+        legacy_yaml = """
+resources:
+  accelerators: A100:1
+service:
+  readiness_probe: /health
+  replica_policy:
+    min_replicas: 1
+    max_replicas: 8
+    target_concurrency_per_replica: 2
+    spot_placer: dynamic_fallback_per_gpu
+run: echo hi
+"""
+        with mock.patch.object(impl.serve_state,
+                               'get_version_yaml_contents',
+                               return_value={7: legacy_yaml}):
+            assert impl._get_committed_storage_generations('svc') == set()
 
     def test_removal_is_grouped_by_resource_scope(self):
         intents = [

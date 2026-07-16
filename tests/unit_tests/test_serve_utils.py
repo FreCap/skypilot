@@ -1285,7 +1285,10 @@ class TestStreamReplicaLogsZeroByteFallback:
                  return_value=iter(['LAUNCH-CONTENT\n'])), \
              mock.patch(
                  'sky.serve.serve_utils._get_service_status',
-                 return_value={'status': 'READY'}):
+                 return_value={'status': 'READY'}), \
+             mock.patch(
+                 'sky.serve.serve_utils.serve_state.get_service_from_name',
+                 return_value=None):
             serve_utils.stream_replica_logs('svc',
                                             replica_id=1,
                                             follow=False,
@@ -1310,7 +1313,10 @@ class TestStreamReplicaLogsZeroByteFallback:
                  return_value=str(main_log)), \
              mock.patch(
                  'sky.serve.serve_utils.generate_replica_launch_log_file_name',
-                 return_value=str(launch_log)):
+                 return_value=str(launch_log)), \
+             mock.patch(
+                 'sky.serve.serve_utils.serve_state.get_service_from_name',
+                 return_value=None):
             serve_utils.stream_replica_logs('svc',
                                             replica_id=1,
                                             follow=False,

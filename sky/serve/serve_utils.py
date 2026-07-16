@@ -1030,6 +1030,22 @@ def validate_external_lb_service_spec(
                 'from the service specification.')
 
 
+def validate_logical_replica_task(
+        task: 'sky.Task',
+        service_spec: 'service_spec_lib.SkyServiceSpec | None' = None) -> None:
+    """Reject topologies without a defined logical-replica contract."""
+    if service_spec is None:
+        service_spec = task.service
+    if (service_spec is not None and
+            getattr(service_spec, 'uses_logical_replicas', False) is True and
+            task.num_nodes != 1):
+        with ux_utils.print_exception_no_traceback():
+            raise ValueError(
+                'dynamic_fallback_per_gpu currently supports only single-node '
+                'services. Multi-node replica routing does not yet define a '
+                'safe logical capacity contract.')
+
+
 def validate_service_task(task: 'sky.Task', pool: bool) -> None:
     """Validate the task for Sky Serve.
 
@@ -1069,6 +1085,8 @@ def validate_service_task(task: 'sky.Task', pool: bool) -> None:
             raise ValueError(f'{field_name.capitalize()} section in the YAML '
                              f'file does not match the pool argument. '
                              f'To fix, add a valid `{field_name}` field.')
+
+    validate_logical_replica_task(task)
 
     # Validate that pools do not use ordered resources
     if pool and isinstance(task.resources, list):

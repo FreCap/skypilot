@@ -702,10 +702,15 @@ def test_sync_payload_proves_valid_occupancy_sample():
     lb._load_balancing_policy.set_ready_replicas([url])
     lb._occupancy_capable = {url}
     lb._replica_occupancy = {url: 0}
+    lb._replica_total_slots = {url: 4}
+    lb._occupancy_dispatch_generation = {url: 7}
+    lb._occupancy_sample_generation = {url: 7}
 
     captured = _run_sync(lb, {'replica_info': {}})
     assert captured['json']['in_flight'] == {url: 0}
     assert captured['json']['occupancy_sampled_urls'] == [url]
+    assert captured['json']['total_slots_by_url'] == {url: 4}
+    assert captured['json']['occupancy_sample_generation'] == {url: 7}
 
 
 def test_old_controller_omission_preserves_async_declaration():
@@ -886,6 +891,19 @@ class _FakeDrainingClient:
 
     def __init__(self, inflight):
         setattr(self, lb_module._INFLIGHT_ATTR, inflight)
+
+
+def test_unknown_capacity_status_is_not_an_idle_sample():
+    assert lb_module.SkyServeLoadBalancer._parse_replica_occupancy({
+        'status': 'UNKNOWN',
+        'running_count': 0,
+        'predict_concurrency': 0,
+    }) is None
+    assert lb_module.SkyServeLoadBalancer._parse_replica_occupancy({
+        'status': 'DRAINING',
+        'running_count': 0,
+        'predict_concurrency': 0,
+    }) == (0, 0, 0)
 
 
 def test_in_flight_includes_pruned_but_draining_work():

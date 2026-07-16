@@ -11,6 +11,7 @@ from typing import Any, Dict
 import pytest
 
 from sky.serve import service_spec as service_spec_lib
+from sky.serve import spot_placer
 
 
 def _make_spec(**kwargs: Any) -> service_spec_lib.SkyServiceSpec:
@@ -167,3 +168,105 @@ def test_setstate_defaults_knob_for_old_rows():
         service_spec_lib.SkyServiceSpec)
     restored.__setstate__(old_state)
     assert restored.target_concurrency_per_replica is None
+
+
+def test_per_gpu_placer_enables_logical_replicas_without_yaml_unit():
+    spec = _make_spec(min_replicas=1,
+                      max_replicas=17,
+                      target_concurrency_per_replica=1,
+                      spot_placer=spot_placer.CAPACITY_AWARE_SPOT_PLACER,
+                      graceful_drain_async_occupancy=True)
+
+    config = spec.to_yaml_config()
+    assert 'replica_unit' not in config['replica_policy']
+    restored = service_spec_lib.SkyServiceSpec.from_yaml_config(config)
+    assert restored.replica_unit == 'logical'
+    assert restored.uses_logical_replicas
+    assert restored.copy().replica_unit == 'logical'
+
+
+def test_legacy_per_gpu_spec_stays_physical_until_explicit_update():
+    current = _make_spec(min_replicas=1,
+                         max_replicas=17,
+                         target_concurrency_per_replica=1,
+                         spot_placer=spot_placer.CAPACITY_AWARE_SPOT_PLACER,
+                         graceful_drain_async_occupancy=True)
+    legacy_state = dict(current.__dict__)
+    del legacy_state['_uses_logical_replicas']
+    legacy = service_spec_lib.SkyServiceSpec.__new__(
+        service_spec_lib.SkyServiceSpec)
+    legacy.__setstate__(legacy_state)
+
+    assert legacy.spot_placer == spot_placer.CAPACITY_AWARE_SPOT_PLACER
+    assert legacy.replica_unit == 'physical_backend'
+    assert not legacy.uses_logical_replicas
+    assert not legacy.copy().uses_logical_replicas
+
+    updated = service_spec_lib.SkyServiceSpec.from_yaml_config(
+        legacy.to_yaml_config())
+    assert updated.uses_logical_replicas
+
+
+def test_legacy_per_gpu_copy_does_not_apply_new_logical_validation():
+    legacy = _make_spec(min_replicas=1,
+                        max_replicas=17,
+                        target_concurrency_per_replica=2,
+                        spot_placer=spot_placer.SPOT_HEDGE_PLACER)
+    legacy.__dict__['_spot_placer'] = spot_placer.CAPACITY_AWARE_SPOT_PLACER
+    legacy.__dict__['_uses_logical_replicas'] = False
+
+    copied = legacy.copy(min_replicas=2)
+
+    assert copied.min_replicas == 2
+    assert copied.target_concurrency_per_replica == 2
+    assert copied.spot_placer == spot_placer.CAPACITY_AWARE_SPOT_PLACER
+    assert not copied.uses_logical_replicas
+
+
+def test_other_placer_keeps_legacy_physical_semantics():
+    spec = _make_spec(min_replicas=1,
+                      max_replicas=5,
+                      target_concurrency_per_replica=1.0,
+                      spot_placer=spot_placer.SPOT_HEDGE_PLACER)
+    assert spec.replica_unit == 'physical_backend'
+    assert not spec.uses_logical_replicas
+    assert 'replica_unit' not in spec.to_yaml_config()['replica_policy']
+
+
+@pytest.mark.parametrize('kwargs,match', [
+    ({
+        'target_concurrency_per_replica': 1.0,
+        'graceful_drain_async_occupancy': True,
+    }, 'target_concurrency_per_replica: 1'),
+    ({
+        'target_concurrency_per_replica': 2,
+        'graceful_drain_async_occupancy': True,
+    }, 'target_concurrency_per_replica: 1'),
+    ({
+        'target_concurrency_per_replica': 1,
+    }, 'graceful_drain_async_occupancy: true'),
+    ({
+        'target_concurrency_per_replica': 1,
+        'graceful_drain_async_occupancy': True,
+        'reserved_capacity_fill': True,
+    }, 'does not yet support reserved_capacity_fill'),
+])
+def test_per_gpu_placer_rejects_ambiguous_capacity_contract(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        _make_spec(min_replicas=1,
+                   max_replicas=5,
+                   spot_placer=spot_placer.CAPACITY_AWARE_SPOT_PLACER,
+                   **kwargs)
+
+
+def test_replica_unit_is_not_a_user_facing_yaml_field():
+    spec = _make_spec(min_replicas=1,
+                      max_replicas=5,
+                      target_concurrency_per_replica=1,
+                      spot_placer=spot_placer.CAPACITY_AWARE_SPOT_PLACER,
+                      graceful_drain_async_occupancy=True)
+    config = spec.to_yaml_config()
+    config['replica_policy']['replica_unit'] = 'logical'
+
+    with pytest.raises(ValueError, match='Invalid service YAML'):
+        service_spec_lib.SkyServiceSpec.from_yaml_config(config)

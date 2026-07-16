@@ -17,8 +17,11 @@ level. With a single live claim the broker's fast path reproduces the
 standalone behavior exactly.
 """
 from collections.abc import Callable
+import dataclasses
+import json
 import os
 import re
+import threading
 import time
 import typing
 from typing import Any, Optional
@@ -29,12 +32,26 @@ from sky.serve import constants
 from sky.serve import reserved_capacity_broker
 from sky.serve import serve_state
 from sky.utils import common_utils
+from sky.utils import locks
 
 if typing.TYPE_CHECKING:
     from sky.serve import autoscalers
     from sky.serve import spot_placer as spot_placer_lib
 
 logger = sky_logging.init_logger(__name__)
+
+
+@dataclasses.dataclass(frozen=True)
+class FreeGpuObservation:
+    """One cached raw free-GPU value and the query's start time."""
+
+    free_gpus: int | None
+    snapshot_time: float | None
+
+
+_DEMAND_REFRESH_STATE_LOCK = threading.Lock()
+_DEMAND_REFRESH_PENDING_CONTEXTS: set[str] = set()
+_DEMAND_REFRESH_RUNNING = False
 
 
 def poll_interval_seconds() -> float:
@@ -205,6 +222,119 @@ def query_free_slots_by_context(
             max(0, available_lower.get(gpu_name, 0)) // per_replica
             for gpu_name, per_replica in shapes.items())
     return result
+
+
+def _observation_is_fresh(row: dict[str, Any] | None, now: float) -> bool:
+    return (row is not None and
+            now - float(row['completed_at']) <= poll_interval_seconds())
+
+
+def _refresh_demand_capacity_contexts(contexts: set[str]) -> None:
+    """Refresh stale context rows under one cross-controller query lock."""
+    try:
+        lock = locks.get_lock(constants.DEMAND_CAPACITY_REFRESH_LOCK_ID)
+        with lock.acquire(blocking=False):
+            now = time.time()
+            rows = serve_state.get_demand_capacity_observations(contexts)
+            for context in sorted(contexts):
+                if _observation_is_fresh(rows.get(context), now):
+                    continue
+                # Capture before the expensive query. A replica row created
+                # during it is debited from the cached result by the planner.
+                snapshot_time = time.time()
+                availability: dict[str, int] | None
+                try:
+                    _, _, available = (
+                        kubernetes_catalog.list_accelerators_realtime(
+                            gpus_only=True,
+                            name_filter=None,
+                            region_filter=context,
+                            quantity_filter=None,
+                            case_sensitive=False,
+                            require_price=False))
+                    availability = {
+                        str(gpu_name).lower(): int(count)
+                        for gpu_name, count in available.items()
+                    }
+                except Exception as e:  # pylint: disable=broad-except
+                    logger.warning(
+                        'Shared demand-capacity query failed for context '
+                        f'{context!r}: {common_utils.format_exception(e)}')
+                    availability = None
+                serve_state.upsert_demand_capacity_observation(
+                    context, snapshot_time, time.time(), availability)
+    except locks.LockTimeout:
+        # Another controller is already producing the shared observation.
+        # The next reconciliation tick will consume its durable result.
+        return
+
+
+def _demand_capacity_refresh_worker() -> None:
+    global _DEMAND_REFRESH_RUNNING
+    while True:
+        with _DEMAND_REFRESH_STATE_LOCK:
+            contexts = set(_DEMAND_REFRESH_PENDING_CONTEXTS)
+            _DEMAND_REFRESH_PENDING_CONTEXTS.clear()
+            if not contexts:
+                _DEMAND_REFRESH_RUNNING = False
+                return
+        try:
+            _refresh_demand_capacity_contexts(contexts)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.error('Shared demand-capacity refresh failed: '
+                         f'{common_utils.format_exception(e)}')
+
+
+def _schedule_demand_capacity_refresh(contexts: set[str]) -> None:
+    """Coalesce refresh work without issuing provider calls on the caller."""
+    global _DEMAND_REFRESH_RUNNING
+    if not contexts:
+        return
+    with _DEMAND_REFRESH_STATE_LOCK:
+        _DEMAND_REFRESH_PENDING_CONTEXTS.update(contexts)
+        if _DEMAND_REFRESH_RUNNING:
+            return
+        _DEMAND_REFRESH_RUNNING = True
+    threading.Thread(target=_demand_capacity_refresh_worker,
+                     name='serve-demand-capacity-refresh',
+                     daemon=True).start()
+
+
+def get_cached_free_gpus_by_pool(
+    zero_cost_locations: list['spot_placer_lib.Location']
+) -> dict[tuple[str, str], FreeGpuObservation]:
+    """Read shared raw free GPUs and asynchronously refresh stale contexts.
+
+    This function performs only one batched database read on the reconciliation
+    path. Kubernetes/provider calls run in a coalesced daemon worker and are
+    serialized across controller processes by a distributed lock.
+    """
+    pool_keys = set(zero_cost_pool_shapes(zero_cost_locations))
+    contexts = {context for context, _ in pool_keys}
+    rows = serve_state.get_demand_capacity_observations(contexts)
+    now = time.time()
+    stale_contexts = {
+        context for context in contexts
+        if not _observation_is_fresh(rows.get(context), now)
+    }
+    _schedule_demand_capacity_refresh(stale_contexts)
+
+    observations: dict[tuple[str, str], FreeGpuObservation] = {}
+    for context, gpu_name in pool_keys:
+        row = rows.get(context)
+        if context in stale_contexts or row is None:
+            observations[(context, gpu_name)] = FreeGpuObservation(None, None)
+            continue
+        availability_json = row['availability']
+        if availability_json is None:
+            free_gpus = None
+        else:
+            availability = json.loads(availability_json)
+            count = int(availability.get(gpu_name, 0))
+            free_gpus = None if count < 0 else max(0, count)
+        observations[(context, gpu_name)] = FreeGpuObservation(
+            free_gpus, float(row['snapshot_time']))
+    return observations
 
 
 def _standalone_cycle(autoscaler: 'autoscalers.Autoscaler',

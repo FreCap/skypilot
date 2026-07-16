@@ -26,7 +26,8 @@ def _spec(knob=1.0,
           min_replicas=0,
           max_replicas=20,
           upscale_delay_seconds=None,
-          downscale_delay_seconds=None):
+          downscale_delay_seconds=None,
+          replica_unit='physical_backend'):
     # Default delays resolve to one decision interval -> hysteresis
     # thresholds of 1 tick, so most tests observe target changes on the
     # first post-snap recompute.
@@ -36,6 +37,7 @@ def _spec(knob=1.0,
         max_replicas=max_replicas,
         num_overprovision=None,
         target_concurrency_per_replica=knob,
+        replica_unit=replica_unit,
         upscale_delay_seconds=(upscale_delay_seconds if upscale_delay_seconds
                                is not None else interval),
         downscale_delay_seconds=(downscale_delay_seconds
@@ -52,7 +54,8 @@ def _make_autoscaler(**spec_kwargs):
 def _replica(replica_id,
              gpu_count=1,
              status=serve_state.ReplicaStatus.READY,
-             version=1):
+             version=1,
+             planned_capacity=None):
     info = mock.Mock()
     info.replica_id = replica_id
     info.version = version
@@ -60,8 +63,12 @@ def _replica(replica_id,
     info.is_terminal = status in serve_state.ReplicaStatus.terminal_statuses()
     info.is_ready = status == serve_state.ReplicaStatus.READY
     info.cluster_name = f'cluster-{replica_id}'
+    info.planned_capacity = (gpu_count
+                             if planned_capacity is None else planned_capacity)
+    info.unknown_capacity_replacement = False
     info.status_property.sky_launch_status = (
         common_utils.ProcessStatus.SUCCEEDED)
+    info.status_property.is_scale_down = False
     info.status_property.unrecoverable_failure.return_value = False
     info.handle.return_value.launched_resources.accelerators = {'L4': gpu_count}
     return info
@@ -72,13 +79,20 @@ def _report(autoscaler,
             queue_depth=0,
             rejected=0,
             timestamps=(),
-            unknown=()):
+            unknown=(),
+            unknown_capacity=None,
+            observed_slots=None,
+            generation=1):
     autoscaler.collect_request_information({
         'timestamps': list(timestamps),
         'in_flight_by_replica_id': in_flight,
         'queue_depth': queue_depth,
         'rejected_in_window': rejected,
         'unknown_in_flight_replica_ids': list(unknown),
+        'observed_slots_by_replica_id': dict(observed_slots or {}),
+        'unknown_capacity_replica_ids':
+            list(unknown if unknown_capacity is None else unknown_capacity),
+        'reconcile_generation': generation,
     })
 
 
@@ -378,6 +392,405 @@ class TestSignalGap(unittest.TestCase):
         self.assertFalse(autoscaler._snap_target_on_next_recompute)
         self.assertEqual(autoscaler.target_num_replicas, 1)
         self.assertEqual(len(_scale_downs(decisions)), 2)
+
+
+class TestLogicalReplicaSemantics(unittest.TestCase):
+    """Logical targets are job slots; physical shapes remain indivisible."""
+
+    def test_scale_from_zero_emits_one_capacity_target(self):
+        autoscaler = _make_autoscaler(knob=1,
+                                      max_replicas=30,
+                                      replica_unit='logical')
+        _report(autoscaler, in_flight={}, queue_depth=17, generation=4)
+        decisions = _decisions(autoscaler, [])
+
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0].operator, _SCALE_UP)
+        self.assertEqual(
+            decisions[0].target,
+            autoscalers.LogicalScaleTarget(version=1,
+                                           reconcile_generation=4,
+                                           target_capacity=17))
+
+    def test_published_target_keeps_the_generation_used_by_its_tick(self):
+        autoscaler = _make_autoscaler(knob=1,
+                                      max_replicas=30,
+                                      replica_unit='logical')
+        _report(autoscaler, in_flight={}, queue_depth=5, generation=4)
+        _decisions(autoscaler, [])
+        self.assertEqual(autoscaler.logical_target_state, (1, 4, 5))
+
+        # A newer sync must not relabel the already computed target. The next
+        # decision tick will publish a new target for generation 5.
+        _report(autoscaler, in_flight={}, queue_depth=9, generation=5)
+        self.assertEqual(autoscaler.logical_target_state, (1, 4, 5))
+        _decisions(autoscaler, [])
+        self.assertEqual(autoscaler.logical_target_state, (1, 5, 9))
+
+    def test_existing_eight_slot_backend_emits_one_capacity_target(self):
+        autoscaler = _make_autoscaler(knob=1,
+                                      max_replicas=30,
+                                      replica_unit='logical')
+        backend = _replica(1, gpu_count=8, planned_capacity=8)
+        _report(autoscaler,
+                in_flight={1: 8},
+                queue_depth=9,
+                observed_slots={1: 8},
+                generation=9)
+        decisions = _decisions(autoscaler, [backend])
+
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(
+            decisions[0].target,
+            autoscalers.LogicalScaleTarget(version=1,
+                                           reconcile_generation=9,
+                                           target_capacity=17))
+
+    def test_indivisible_eight_slot_overhang_is_stable_at_target_five(self):
+        autoscaler = _make_autoscaler(knob=1,
+                                      max_replicas=20,
+                                      replica_unit='logical')
+        backend = _replica(1, gpu_count=8, planned_capacity=8)
+        _report(autoscaler,
+                in_flight={1: 0},
+                queue_depth=5,
+                observed_slots={1: 8})
+
+        self.assertEqual(_decisions(autoscaler, [backend]), [])
+        self.assertEqual(autoscaler.target_num_replicas, 5)
+
+    def test_scale_down_removes_only_backend_with_safe_coverage(self):
+        autoscaler = _make_autoscaler(knob=1,
+                                      max_replicas=20,
+                                      replica_unit='logical')
+        eight = _replica(1, gpu_count=8, planned_capacity=8)
+        four = _replica(2, gpu_count=4, planned_capacity=4)
+        _report(autoscaler,
+                in_flight={
+                    1: 0,
+                    2: 0
+                },
+                queue_depth=8,
+                observed_slots={
+                    1: 8,
+                    2: 4
+                },
+                generation=6)
+        decisions = _decisions(autoscaler, [eight, four])
+
+        downs = [d for d in decisions if d.operator == _SCALE_DOWN]
+        self.assertEqual(len(downs), 1)
+        self.assertEqual(
+            downs[0].target,
+            autoscalers.LogicalScaleDownTarget(version=1,
+                                               reconcile_generation=6,
+                                               target_capacity=8,
+                                               replica_id=2))
+
+    def test_cost_rebalance_retirement_keeps_logical_capacity_fence(self):
+        autoscaler = _make_autoscaler(knob=1,
+                                      max_replicas=20,
+                                      replica_unit='logical')
+        autoscaler.cost_rebalance = True
+        victim = _replica(1, gpu_count=8, planned_capacity=8)
+        replacement = _replica(2, gpu_count=8, planned_capacity=8)
+        replacement.cost_rebalance_for_replica_id = 1
+        victim.status_property.sky_down_status = None
+        replacement.status_property.sky_down_status = None
+        _report(autoscaler,
+                in_flight={
+                    1: 8,
+                    2: 0
+                },
+                observed_slots={
+                    1: 8,
+                    2: 0
+                },
+                generation=7)
+
+        decisions = _decisions(autoscaler, [victim, replacement])
+        rebalance_downs = [
+            decision for decision in decisions if decision.reason ==
+            autoscalers.AutoscalerDecisionReason.COST_REBALANCE
+        ]
+        self.assertEqual(len(rebalance_downs), 1)
+        self.assertEqual(
+            rebalance_downs[0].target,
+            autoscalers.LogicalScaleDownTarget(version=1,
+                                               reconcile_generation=7,
+                                               target_capacity=8,
+                                               replica_id=1))
+
+    def test_capacities_eight_and_four_are_stable_at_target_nine(self):
+        autoscaler = _make_autoscaler(knob=1,
+                                      max_replicas=20,
+                                      replica_unit='logical')
+        backends = [
+            _replica(1, gpu_count=8, planned_capacity=8),
+            _replica(2, gpu_count=4, planned_capacity=4),
+        ]
+        _report(autoscaler,
+                in_flight={
+                    1: 0,
+                    2: 0
+                },
+                queue_depth=9,
+                observed_slots={
+                    1: 8,
+                    2: 4
+                })
+
+        self.assertEqual(_decisions(autoscaler, backends), [])
+
+    def test_unknown_capacity_uses_planned_width_for_launch_suppression(self):
+        autoscaler = _make_autoscaler(knob=1,
+                                      max_replicas=20,
+                                      replica_unit='logical')
+        backend = _replica(1, gpu_count=8, planned_capacity=8)
+        _report(autoscaler,
+                in_flight={1: 0},
+                unknown=(1,),
+                observed_slots={1: 0})
+
+        self.assertEqual(_decisions(autoscaler, [backend]), [])
+        self.assertEqual(autoscaler._ready_capacity(backend), 0)
+        self.assertEqual(autoscaler._committed_capacity(backend), 8)
+
+    def test_persistent_unknown_capacity_emits_one_bounded_replacement_wave(
+            self):
+        autoscaler = _make_autoscaler(knob=1,
+                                      max_replicas=8,
+                                      replica_unit='logical')
+        original = _replica(1, gpu_count=8, planned_capacity=8)
+        with mock.patch.object(autoscalers.time, 'time', return_value=100.0):
+            _report(autoscaler,
+                    in_flight={1: 0},
+                    unknown=(1,),
+                    observed_slots={1: 0},
+                    generation=1)
+            self.assertEqual(_decisions(autoscaler, [original]), [])
+
+        deadline = (100.0 +
+                    constants.LOGICAL_UNKNOWN_CAPACITY_REPLACEMENT_SECONDS + 1)
+        with mock.patch.object(autoscalers.time, 'time', return_value=deadline):
+            decisions = _decisions(autoscaler, [original])
+
+        self.assertEqual(decisions, [
+            autoscalers.AutoscalerDecision(
+                _SCALE_UP,
+                autoscalers.LogicalScaleTarget(
+                    version=1,
+                    reconcile_generation=1,
+                    target_capacity=8,
+                    replace_unknown_replica_ids=(1,)))
+        ])
+
+        replacement = _replica(2, gpu_count=8, planned_capacity=8)
+        replacement.unknown_capacity_replacement = True
+        with mock.patch.object(autoscalers.time,
+                               'time',
+                               return_value=deadline + 1):
+            _report(autoscaler,
+                    in_flight={
+                        1: 0,
+                        2: 0
+                    },
+                    unknown=(1, 2),
+                    observed_slots={
+                        1: 0,
+                        2: 0
+                    },
+                    generation=2)
+            # The replacement's unknown-work floor overlaps the original;
+            # it does not recursively raise the target or authorize a second
+            # replacement wave, including at max_replicas.
+            self.assertEqual(_decisions(autoscaler, [original, replacement]),
+                             [])
+
+    def test_unknown_replacement_stays_protected_when_original_recovers(self):
+        autoscaler = _make_autoscaler(knob=1,
+                                      max_replicas=8,
+                                      replica_unit='logical')
+        original = _replica(1, gpu_count=8, planned_capacity=8)
+        replacement = _replica(2, gpu_count=8, planned_capacity=8)
+        replacement.unknown_capacity_replacement = True
+        _report(autoscaler,
+                in_flight={
+                    1: 0,
+                    2: 0
+                },
+                unknown=(2,),
+                observed_slots={1: 8},
+                generation=3)
+
+        # Target remains 8 from the replacement's possible work and the only
+        # proven-ready backend cannot be retired underneath it.
+        self.assertEqual(_decisions(autoscaler, [original, replacement]), [])
+
+    def test_recovered_original_retires_idle_zero_capacity_replacement(self):
+        autoscaler = _make_autoscaler(knob=1,
+                                      max_replicas=8,
+                                      replica_unit='logical')
+        original = _replica(1, gpu_count=8, planned_capacity=8)
+        replacement = _replica(2, gpu_count=8, planned_capacity=8)
+        replacement.unknown_capacity_replacement = True
+        _report(autoscaler,
+                in_flight={
+                    1: 0,
+                    2: 0
+                },
+                queue_depth=8,
+                observed_slots={
+                    1: 8,
+                    2: 0
+                },
+                generation=4)
+
+        decisions = _decisions(autoscaler, [original, replacement])
+
+        self.assertEqual(
+            [target.replica_id for target in _scale_downs(decisions)], [2])
+
+    def test_positive_replacement_retires_timed_out_zero_capacity_original(
+            self):
+        autoscaler = _make_autoscaler(knob=1,
+                                      max_replicas=8,
+                                      replica_unit='logical')
+        original = _replica(1, gpu_count=8, planned_capacity=8)
+        replacement = _replica(2, gpu_count=8, planned_capacity=8)
+        replacement.unknown_capacity_replacement = True
+        timeout = constants.LOGICAL_UNKNOWN_CAPACITY_REPLACEMENT_SECONDS
+        with mock.patch.object(autoscalers.time, 'time', return_value=100.0):
+            _report(autoscaler,
+                    in_flight={1: 0},
+                    queue_depth=8,
+                    observed_slots={1: 0},
+                    generation=1)
+            self.assertEqual(_decisions(autoscaler, [original]), [])
+        with mock.patch.object(autoscalers.time,
+                               'time',
+                               return_value=100.0 + timeout + 1):
+            _report(autoscaler,
+                    in_flight={
+                        1: 0,
+                        2: 0
+                    },
+                    queue_depth=8,
+                    observed_slots={
+                        1: 0,
+                        2: 8
+                    },
+                    generation=2)
+            decisions = _decisions(autoscaler, [original, replacement])
+
+        self.assertEqual(
+            [target.replica_id for target in _scale_downs(decisions)], [1])
+
+    def test_valid_zero_capacity_emits_only_one_bounded_replacement_wave(self):
+        autoscaler = _make_autoscaler(knob=1,
+                                      max_replicas=8,
+                                      replica_unit='logical')
+        original = _replica(1, gpu_count=8, planned_capacity=8)
+        with mock.patch.object(autoscalers.time, 'time', return_value=100.0):
+            _report(autoscaler,
+                    in_flight={1: 0},
+                    queue_depth=8,
+                    observed_slots={1: 0},
+                    generation=1)
+            self.assertEqual(_decisions(autoscaler, [original]), [])
+
+        timeout = constants.LOGICAL_UNKNOWN_CAPACITY_REPLACEMENT_SECONDS
+        with mock.patch.object(autoscalers.time,
+                               'time',
+                               return_value=100.0 + timeout + 1):
+            _report(autoscaler,
+                    in_flight={1: 0},
+                    queue_depth=8,
+                    observed_slots={1: 0},
+                    generation=2)
+            decisions = _decisions(autoscaler, [original])
+        self.assertEqual(decisions[0].target.replace_unknown_replica_ids, (1,))
+
+        replacement = _replica(2, gpu_count=8, planned_capacity=8)
+        replacement.unknown_capacity_replacement = True
+        for generation in range(3, 7):
+            now = 100.0 + generation * (timeout + 1)
+            with mock.patch.object(autoscalers.time, 'time', return_value=now):
+                _report(autoscaler,
+                        in_flight={
+                            1: 0,
+                            2: 0
+                        },
+                        queue_depth=8,
+                        observed_slots={
+                            1: 0,
+                            2: 0
+                        },
+                        generation=generation)
+                self.assertEqual(
+                    _decisions(autoscaler, [original, replacement]), [])
+
+    def test_rollout_overlap_unknown_never_starts_replacement_timer(self):
+        autoscaler = _make_autoscaler(knob=1,
+                                      max_replicas=8,
+                                      replica_unit='logical')
+        backend = _replica(1, gpu_count=8, planned_capacity=8)
+        with mock.patch.object(autoscalers.time, 'time', return_value=100.0):
+            _report(autoscaler,
+                    in_flight={1: 0},
+                    unknown=(1,),
+                    unknown_capacity=(),
+                    observed_slots={1: 0},
+                    generation=1)
+
+        deadline = (100.0 +
+                    constants.LOGICAL_UNKNOWN_CAPACITY_REPLACEMENT_SECONDS + 1)
+        with mock.patch.object(autoscalers.time, 'time', return_value=deadline):
+            self.assertEqual(_decisions(autoscaler, [backend]), [])
+
+    def test_recovered_replacement_is_eligible_in_a_later_outage(self):
+        autoscaler = _make_autoscaler(knob=1,
+                                      max_replicas=8,
+                                      replica_unit='logical')
+        recovered = _replica(2, gpu_count=8, planned_capacity=8)
+        # ReplicaManager clears this incident marker after a known sample.
+        recovered.unknown_capacity_replacement = False
+        with mock.patch.object(autoscalers.time, 'time', return_value=200.0):
+            _report(autoscaler,
+                    in_flight={2: 0},
+                    unknown=(2,),
+                    observed_slots={2: 0},
+                    generation=4)
+            self.assertEqual(_decisions(autoscaler, [recovered]), [])
+        deadline = (200.0 +
+                    constants.LOGICAL_UNKNOWN_CAPACITY_REPLACEMENT_SECONDS + 1)
+        with mock.patch.object(autoscalers.time, 'time', return_value=deadline):
+            decisions = _decisions(autoscaler, [recovered])
+
+        self.assertEqual(decisions[0].target.replace_unknown_replica_ids, (2,))
+
+    def test_retiring_backend_does_not_suppress_replacement_capacity(self):
+        autoscaler = _make_autoscaler(knob=1,
+                                      max_replicas=20,
+                                      replica_unit='logical')
+        retiring = _replica(1,
+                            gpu_count=8,
+                            status=serve_state.ReplicaStatus.SHUTTING_DOWN,
+                            planned_capacity=8)
+        retiring.status_property.is_scale_down = True
+        live = _replica(2, gpu_count=4, planned_capacity=4)
+        _report(autoscaler,
+                in_flight={2: 0},
+                queue_depth=8,
+                observed_slots={2: 4},
+                generation=12)
+
+        self.assertEqual(_decisions(autoscaler, [retiring, live]), [
+            autoscalers.AutoscalerDecision(
+                _SCALE_UP,
+                autoscalers.LogicalScaleTarget(
+                    version=1, reconcile_generation=12, target_capacity=8))
+        ])
 
 
 class TestDrainAwareDownscale(unittest.TestCase):

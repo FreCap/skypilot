@@ -1,5 +1,6 @@
 """ReplicaManager: handles the creation and deletion of endpoint replicas."""
 from collections.abc import Callable
+from collections.abc import Mapping
 import contextlib
 import dataclasses
 import functools
@@ -11,6 +12,7 @@ import time
 import traceback
 import typing
 from typing import Any, Optional
+import uuid
 
 import colorama
 import filelock
@@ -38,6 +40,7 @@ from sky.utils import common_utils
 from sky.utils import context
 from sky.utils import controller_utils
 from sky.utils import env_options
+from sky.utils import locks
 from sky.utils import resources_utils
 from sky.utils import status_lib
 from sky.utils import thread_utils
@@ -75,14 +78,12 @@ _WAIT_LAUNCH_THREAD_TIMEOUT_SECONDS = 15
 # bounds only rate-limit provider calls while an outage persists.
 _FAILED_CLEANUP_RETRY_BASE_SECONDS = 60
 _FAILED_CLEANUP_RETRY_MAX_SECONDS = 15 * 60
-# A large autoscaler tick is placed synchronously before any sky.launch result
-# can bench an unavailable location.  Without a bound, a zero-cost-first
-# placer can pin the entire wave (hundreds of replicas) to one full Kubernetes
-# pool, so every launch fails before the next tick can spill to paid spot.
-# Large waves replace this fixed assumption with one measured free-capacity
-# snapshot.  Keep a few probes per ACTIVE zero-cost shape only for small waves
-# (where a cluster-wide query costs more than it saves) or a measurement
-# blackout. Four matches SkyServe's historical per-service launch parallelism.
+# An autoscaler tick can place a full wave before any sky.launch result benches
+# an unavailable location. Without a bound, a zero-cost-first placer can pin
+# hundreds of replicas to one full Kubernetes pool. Demand placement consumes
+# a shared, asynchronously refreshed free-GPU observation. During a startup or
+# measurement blackout, keep only a few probes per ACTIVE zero-cost shape.
+# Four matches SkyServe's historical per-service launch parallelism.
 _ZERO_COST_SPECULATIVE_LAUNCHES_PER_LOCATION = 4
 
 # Sentinel for to_info_dict's pre-fetched cluster_record
@@ -93,12 +94,47 @@ _ZERO_COST_SPECULATIVE_LAUNCHES_PER_LOCATION = 4
 _NOT_PROVIDED: Any = object()
 
 
+def load_task_with_service_spec(
+    yaml_content: str,
+    authoritative_service_spec: 'service_spec.SkyServiceSpec | None' = None,
+) -> task_lib.Task:
+    """Load task resources while preserving a committed service policy.
+
+    Service-policy validation evolves. Re-parsing an old committed YAML can
+    therefore reject it or silently activate new hidden defaults. When an
+    immutable pickled spec is available, parse the rest of the task without
+    the service/pool section and bind that authoritative spec afterwards.
+    """
+    if authoritative_service_spec is None:
+        return task_lib.Task.from_yaml_str(yaml_content)
+    config = yaml_utils.safe_load(yaml_content)
+    if not isinstance(config, dict):
+        raise ValueError('Service task YAML must contain a mapping.')
+    config.pop('service', None)
+    config.pop('pool', None)
+    task = task_lib.Task.from_yaml_config(config)
+    task.set_service(authoritative_service_spec)
+    return task
+
+
 @dataclasses.dataclass
 class _ZeroCostDemandBudget:
-    """One scale-up batch's measured placement budget by K8s context."""
+    """One scale-up batch's raw-GPU budget by (K8s context, accelerator)."""
 
-    remaining_by_context: dict[str, int]
-    measured_by_context: dict[str, int | None]
+    remaining_by_pool: dict[tuple[str, str], int]
+    measured_by_pool: dict[tuple[str, str], int | None]
+
+
+@dataclasses.dataclass(frozen=True)
+class LogicalReconcileSnapshot:
+    """One immutable LB capacity and occupancy generation."""
+
+    version: int
+    generation: int
+    observed_slots_by_replica_id: dict[int, int]
+    in_flight_by_replica_id: dict[int, int]
+    unknown_replica_ids: frozenset[int]
+    received_at: float
 
 
 def _remove_nonmaterial_empty_storage_scope_metadata(
@@ -139,21 +175,22 @@ class _ReplicaLaunchOwnershipLostError(RuntimeError):
 # sky/spot/recovery_strategy.py::StrategyExecutor::launch
 # Use context.contextual to enable per-launch output redirection.
 @context.contextual
-def launch_cluster(replica_id: int,
-                   yaml_content: str,
-                   cluster_name: str,
-                   log_file: str,
-                   replica_to_request_id: thread_utils.ThreadSafeDict[int, str],
-                   replica_to_launch_cancelled: thread_utils.ThreadSafeDict[
-                       int, bool],
-                   resources_override: dict[str, Any] | None = None,
-                   retry_until_up: bool = True,
-                   max_retry: int = _DEFAULT_LAUNCH_MAX_RETRY,
-                   availability_max_retry: int | None = None,
-                   exact_resources_override: bool = False,
-                   pre_launch_guard: Callable[[], bool] | None = None,
-                   continue_guard: Callable[[], bool] | None = None,
-                   launch_fence: dict[str, Any] | None = None) -> None:
+def launch_cluster(
+        replica_id: int,
+        yaml_content: str,
+        cluster_name: str,
+        log_file: str,
+        replica_to_request_id: thread_utils.ThreadSafeDict[int, str],
+        replica_to_launch_cancelled: thread_utils.ThreadSafeDict[int, bool],
+        resources_override: dict[str, Any] | None = None,
+        retry_until_up: bool = True,
+        max_retry: int = _DEFAULT_LAUNCH_MAX_RETRY,
+        availability_max_retry: int | None = None,
+        exact_resources_override: bool = False,
+        pre_launch_guard: Callable[[], bool] | None = None,
+        continue_guard: Callable[[], bool] | None = None,
+        launch_fence: dict[str, Any] | None = None,
+        service_spec: 'service_spec.SkyServiceSpec | None' = None) -> None:
     """Launch a sky serve replica cluster.
 
     This function will not wait for the job starts running. It will return
@@ -181,7 +218,7 @@ def launch_cluster(replica_id: int,
                     f'{cluster_name} with resources override: '
                     f'{resources_override}')
     try:
-        task = task_lib.Task.from_yaml_str(yaml_content)
+        task = load_task_with_service_spec(yaml_content, service_spec)
         if resources_override is not None:
             resources = task.resources
             if exact_resources_override:
@@ -558,9 +595,12 @@ def terminate_cluster(cluster_name: str,
             time.sleep(gap_seconds)
 
 
-def _get_resources_ports(yaml_content: str) -> str:
+def _get_resources_ports(
+    yaml_content: str,
+    service_spec: 'service_spec.SkyServiceSpec | None' = None,
+) -> str:
     """Get the resources ports used by the task."""
-    task = task_lib.Task.from_yaml_str(yaml_content)
+    task = load_task_with_service_spec(yaml_content, service_spec)
     # Already checked all ports are valid in sky.serve.core.up
     assert task.resources, task
     assert task.service is not None, task
@@ -570,15 +610,17 @@ def _get_resources_ports(yaml_content: str) -> str:
     return task.service.ports
 
 
-def _should_use_spot(yaml_content: str,
-                     resource_override: dict[str, Any] | None) -> bool:
+def _should_use_spot(
+        yaml_content: str,
+        resource_override: dict[str, Any] | None,
+        service_spec: 'service_spec.SkyServiceSpec | None' = None) -> bool:
     """Get whether the task should use spot."""
     if resource_override is not None:
         use_spot_override = resource_override.get('use_spot')
         if use_spot_override is not None:
             assert isinstance(use_spot_override, bool)
             return use_spot_override
-    task = task_lib.Task.from_yaml_str(yaml_content)
+    task = load_task_with_service_spec(yaml_content, service_spec)
     spot_use_resources = [
         resources for resources in task.resources if resources.use_spot
     ]
@@ -588,6 +630,63 @@ def _should_use_spot(yaml_content: str,
     # is spot; the placer then pins each launch's actual use_spot via
     # its location's resources_override.
     return len(spot_use_resources) > 0
+
+
+def _whole_gpu_capacity(
+        accelerators: Mapping[str, int | float] | None) -> int | None:
+    """Return the v1 logical slot width for one exact GPU shape."""
+    if accelerators is None or len(accelerators) != 1:
+        return None
+    count = next(iter(accelerators.values()))
+    if (isinstance(count, bool) or not isinstance(count, (int, float)) or
+            count < 1 or not float(count).is_integer()):
+        return None
+    return int(count)
+
+
+def _zero_cost_pool_key(
+        location: spot_placer.Location) -> tuple[str, str] | None:
+    """Return the shared demand pool identity for one exact GPU shape."""
+    if (str(location.cloud).lower() != 'kubernetes' or
+            _whole_gpu_capacity(location.accelerators) is None or
+            location.accelerators is None):
+        return None
+    gpu_name = next(iter(location.accelerators))
+    return location.region, gpu_name.lower()
+
+
+def _uniform_whole_gpu_capacity(resources: typing.Iterable[Any]) -> int | None:
+    """Return one shared width only when every resource is an exact GPU."""
+    capacities = [
+        _whole_gpu_capacity(resource.accelerators) for resource in resources
+    ]
+    if not capacities or any(capacity is None for capacity in capacities):
+        return None
+    unique_capacities = set(typing.cast(list[int], capacities))
+    return (next(iter(unique_capacities))
+            if len(unique_capacities) == 1 else None)
+
+
+def _validate_logical_capacity_sources(default_capacity: int | None,
+                                       placer: spot_placer.SpotPlacer | None,
+                                       num_nodes: int) -> None:
+    """Require every launch path to prove an integer logical width."""
+    if num_nodes != 1:
+        raise ValueError(
+            'dynamic_fallback_per_gpu currently supports only single-node '
+            'services. Multi-node replica routing does not yet define a safe '
+            'logical capacity contract.')
+    if placer is None and default_capacity is None:
+        raise ValueError(
+            'Logical replicas require every launch to have one exact '
+            'whole-GPU width, or a shape-aware spot placer that pins the '
+            'selected resources.')
+    if placer is not None and any(
+            _whole_gpu_capacity(location.accelerators) is None
+            for location in placer.active_locations()):
+        raise ValueError(
+            'Logical replicas require every eligible spot-placement '
+            'candidate to have one exact whole-GPU shape.')
 
 
 # Every function that calls serve_state.add_or_update_replica should acquire
@@ -648,6 +747,13 @@ class ReplicaStatusProperty:
     # intent, but do not admit sky.down until a fresh LB report proves zero
     # occupancy.  getattr is used for rows predating this field.
     wait_for_idle_before_termination: bool = False
+    # Logical autoscaling retirement fence. None on physical services and
+    # destructive purge/failure cleanup.
+    logical_retirement_version: int | None = None
+    logical_retirement_controller_epoch: str | None = None
+    logical_retirement_generation: int | None = None
+    logical_retirement_target_capacity: int | None = None
+    logical_retirement_confirmed_generation: int | None = None
 
     def unrecoverable_failure(self) -> bool:
         """Whether the replica fails and cannot be recovered.
@@ -834,12 +940,21 @@ class ReplicaInfo:
     # so an incompatible worker fails before dispatch rather than mid-run.
     # Version 7 replaces the consecutive_failure_times list with the single
     # first_consecutive_failure_time timestamp.
-    _VERSION = 7
+    # Version 8 persists the immutable logical slot width selected for this
+    # physical backend. Version 9 marks bounded unknown-capacity replacement
+    # rows so a persistent telemetry outage cannot recursively replace them.
+    _VERSION = 9
 
-    def __init__(self, replica_id: int, cluster_name: str, replica_port: str,
-                 is_spot: bool, location: spot_placer.Location | None,
+    def __init__(self,
+                 replica_id: int,
+                 cluster_name: str,
+                 replica_port: str,
+                 is_spot: bool,
+                 location: spot_placer.Location | None,
                  version: int,
-                 resources_override: dict[str, Any] | None) -> None:
+                 resources_override: dict[str, Any] | None,
+                 planned_capacity: int = 1,
+                 unknown_capacity_replacement: bool = False) -> None:
         self._version = self._VERSION
         self.replica_id: int = replica_id
         self.cluster_name: str = cluster_name
@@ -864,6 +979,12 @@ class ReplicaInfo:
         self.location: dict[str, str | None] | None = (
             location.to_pickleable() if location is not None else None)
         self.resources_override: dict[str, Any] | None = resources_override
+        if (isinstance(planned_capacity, bool) or
+                not isinstance(planned_capacity, int) or planned_capacity < 1):
+            raise ValueError('planned_capacity must be a positive integer. '
+                             f'Got: {planned_capacity!r}')
+        self.planned_capacity: int = planned_capacity
+        self.unknown_capacity_replacement = bool(unknown_capacity_replacement)
         # Launch-origin attribution: True only for sentinel (fill)
         # launches; set by _launch_replica before the row is persisted.
         # The broker's holdings split and the grant ceiling's demand
@@ -908,6 +1029,9 @@ class ReplicaInfo:
             'is_spot': self.is_spot,
             'location': location,
             'resources_override': resources_override,
+            'planned_capacity': int(getattr(self, 'planned_capacity', 1)),
+            'unknown_capacity_replacement': bool(
+                getattr(self, 'unknown_capacity_replacement', False)),
             'reserved_fill': bool(getattr(self, 'reserved_fill', False)),
             'cost_rebalance_for_replica_id': getattr(
                 self, 'cost_rebalance_for_replica_id', None),
@@ -929,6 +1053,19 @@ class ReplicaInfo:
                 'wait_for_idle_before_termination': bool(
                     getattr(status_property, 'wait_for_idle_before_termination',
                             False)),
+                'logical_retirement_version': getattr(
+                    status_property, 'logical_retirement_version', None),
+                'logical_retirement_controller_epoch': getattr(
+                    status_property, 'logical_retirement_controller_epoch',
+                    None),
+                'logical_retirement_generation': getattr(
+                    status_property, 'logical_retirement_generation', None),
+                'logical_retirement_target_capacity': getattr(
+                    status_property, 'logical_retirement_target_capacity',
+                    None),
+                'logical_retirement_confirmed_generation': getattr(
+                    status_property, 'logical_retirement_confirmed_generation',
+                    None),
             },
         }
 
@@ -956,6 +1093,14 @@ class ReplicaInfo:
         replica.location = _decode_replica_resource_state(state.get('location'))
         replica.resources_override = _decode_replica_resource_state(
             state.get('resources_override'))
+        planned_capacity = state.get('planned_capacity', 1)
+        if (isinstance(planned_capacity, bool) or
+                not isinstance(planned_capacity, int) or planned_capacity < 1):
+            raise ValueError('Stored planned_capacity must be a positive '
+                             f'integer. Got: {planned_capacity!r}')
+        replica.planned_capacity = planned_capacity
+        replica.unknown_capacity_replacement = bool(
+            state.get('unknown_capacity_replacement', False))
         replica.reserved_fill = bool(state.get('reserved_fill', False))
         replica.cost_rebalance_for_replica_id = state.get(
             'cost_rebalance_for_replica_id')
@@ -976,6 +1121,16 @@ class ReplicaInfo:
             drain_cap_seconds=status_state.get('drain_cap_seconds'),
             wait_for_idle_before_termination=bool(
                 status_state.get('wait_for_idle_before_termination', False)),
+            logical_retirement_version=status_state.get(
+                'logical_retirement_version'),
+            logical_retirement_controller_epoch=status_state.get(
+                'logical_retirement_controller_epoch'),
+            logical_retirement_generation=status_state.get(
+                'logical_retirement_generation'),
+            logical_retirement_target_capacity=status_state.get(
+                'logical_retirement_target_capacity'),
+            logical_retirement_confirmed_generation=status_state.get(
+                'logical_retirement_confirmed_generation'),
         )
         return replica
 
@@ -1299,6 +1454,12 @@ class ReplicaInfo:
             self.first_consecutive_failure_time = (failure_times[0]
                                                    if failure_times else None)
 
+        if version < 8:
+            # Historical rows represent one physical replica. They are never
+            # inferred into logical mode during activation; the rolling bridge
+            # launches a new logical service version instead.
+            self.planned_capacity = 1
+
         self.__dict__.update(state)
         self._version = version if version >= 0 else 0
 
@@ -1340,6 +1501,19 @@ class ReplicaManager:
         self._lb_in_flight_report: tuple[float, dict[str, int], set[str] | None,
                                          set[str], set[str],
                                          str | None] | None = None
+        self._logical_reconcile_snapshot: LogicalReconcileSnapshot | None = (
+            None)
+        self._logical_state_lock = threading.RLock()
+        self._logical_controller_epoch = uuid.uuid4().hex
+        # Degraded replacements are protected from recursively replacing one
+        # another only until they produce a real capacity sample. The durable
+        # marker and this recovered index survive controller restarts; the
+        # thread-pool refresher clears both after authoritative recovery.
+        self._unknown_capacity_replacement_ids: set[int] = set()
+        # Published by the autoscaler tick after it consumes a report. A newer
+        # LB generation without a matching target publication blocks logical
+        # retirement until the next tick, which is the safe direction.
+        self._logical_target: tuple[int, int, int] | None = None
         header_keys = None
         if spec.readiness_headers is not None:
             header_keys = list(spec.readiness_headers.keys())
@@ -1383,6 +1557,35 @@ class ReplicaManager:
                                          ()), set(draining_urls or
                                                   ()), lb_session_id)
 
+    def update_logical_reconcile_snapshot(
+        self,
+        version: int,
+        generation: int,
+        observed_slots_by_replica_id: dict[int, int],
+        in_flight_by_replica_id: dict[int, int],
+        unknown_replica_ids: set[int],
+    ) -> None:
+        """Atomically publish one complete logical-capacity observation."""
+        with self._logical_state_lock:
+            self._logical_reconcile_snapshot = LogicalReconcileSnapshot(
+                version=version,
+                generation=generation,
+                observed_slots_by_replica_id=dict(observed_slots_by_replica_id),
+                in_flight_by_replica_id=dict(in_flight_by_replica_id),
+                unknown_replica_ids=frozenset(unknown_replica_ids),
+                received_at=time.monotonic())
+
+    def publish_logical_target(self, version: int, generation: int,
+                               target_capacity: int) -> None:
+        """Publish the target computed from an exact reconcile generation."""
+        with self._logical_state_lock:
+            self._logical_target = (version, generation, target_capacity)
+
+    @staticmethod
+    def _logical_snapshot_is_fresh(snapshot: LogicalReconcileSnapshot) -> bool:
+        return (time.monotonic() - snapshot.received_at
+                <= 3 * serve_constants.LB_CONTROLLER_SYNC_INTERVAL_SECONDS)
+
     @property
     def spot_placer(self) -> Optional['spot_placer.SpotPlacer']:
         """The placer, if this manager kind carries one (else None).
@@ -1401,15 +1604,24 @@ class ReplicaManager:
         """
         raise NotImplementedError
 
-    def scale_up_batch(
-            self, resources_overrides: list[dict[str, Any] | None]) -> None:
+    def scale_up_batch(self,
+                       resources_overrides: list[dict[str, Any] | None],
+                       expected_version: int | None = None) -> None:
         """Scale up by len(resources_overrides) replicas in one batch.
 
         Subclasses may override to amortize per-call synchronization; the
         default just loops over `scale_up`.
         """
+        if (expected_version is not None and
+                expected_version != self.latest_version):
+            return
         for resources_override in resources_overrides:
             self.scale_up(resources_override)
+
+    def scale_up_to_logical_capacity(self, target_capacity: int, version: int,
+                                     reconcile_generation: int) -> None:
+        """Persist complete backend shapes until target capacity is covered."""
+        raise NotImplementedError
 
     def notify_version_pending(self, version: int) -> None:
         """Notify long manager operations that a newer version is waiting."""
@@ -1420,8 +1632,14 @@ class ReplicaManager:
     def scale_down(self,
                    replica_id: int,
                    purge: bool = False,
-                   wait_for_idle: bool = False) -> None:
+                   wait_for_idle: bool = False,
+                   expected_version: int | None = None) -> None:
         """Scale down replica with replica_id."""
+        raise NotImplementedError
+
+    def scale_down_logically(self, replica_id: int, target_capacity: int,
+                             version: int, reconcile_generation: int) -> None:
+        """Retire one backend only if the logical coverage fence still holds."""
         raise NotImplementedError
 
     def update_version(self, version: int, spec: 'service_spec.SkyServiceSpec',
@@ -1604,9 +1822,20 @@ class SkyPilotReplicaManager(ReplicaManager):
         assert yaml_content is not None, (
             f'yaml content not found for {service_name} version {version}')
         self.yaml_content: str = yaml_content
-        task = task_lib.Task.from_yaml_str(self.yaml_content)
+        task = load_task_with_service_spec(self.yaml_content, spec)
+        self._version_specs: dict[int, service_spec.SkyServiceSpec] = {
+            version: spec
+        }
+        self._uses_logical_replicas = (getattr(spec, 'uses_logical_replicas',
+                                               False) is True)
+        self._default_planned_capacity = _uniform_whole_gpu_capacity(
+            task.resources)
         self._spot_placer: spot_placer.SpotPlacer | None = (
             spot_placer.SpotPlacer.from_task(spec, task))
+        if self._uses_logical_replicas:
+            _validate_logical_capacity_sources(self._default_planned_capacity,
+                                               self._spot_placer,
+                                               task.num_nodes)
         self._fill_skip_last_log_time: float = 0.0
         # TODO(tian): Store launch/down request id in the replica table, to make
         # the manager more persistent.
@@ -1755,6 +1984,19 @@ class SkyPilotReplicaManager(ReplicaManager):
         # past every persisted id so new replicas always get a fresh id. On a
         # first run there are no replicas, so this stays at 1 (no-op).
         all_replica_infos = serve_state.get_replica_infos(self._service_name)
+        replacement_ids = getattr(self, '_unknown_capacity_replacement_ids',
+                                  None)
+        if replacement_ids is None:
+            replacement_ids = set()
+            self._unknown_capacity_replacement_ids = replacement_ids
+        logical_state_lock = getattr(self, '_logical_state_lock', None)
+        logical_state_guard = (logical_state_lock if logical_state_lock
+                               is not None else contextlib.nullcontext())
+        with logical_state_guard:
+            replacement_ids.update(
+                info.replica_id
+                for info in all_replica_infos
+                if getattr(info, 'unknown_capacity_replacement', False) is True)
         existing_replica_ids = [info.replica_id for info in all_replica_infos]
         self._next_replica_id = max(existing_replica_ids, default=0) + 1
 
@@ -1776,6 +2018,14 @@ class SkyPilotReplicaManager(ReplicaManager):
             info for info in all_replica_infos
             if info.status == serve_state.ReplicaStatus.PENDING)
 
+        recovery_versions = sorted({
+            info.version
+            for info in to_up_replicas
+            if info.version != self.latest_version
+        })
+        recovery_yaml_contents = serve_state.get_yaml_contents(
+            self._service_name, recovery_versions)
+
         for replica_info in to_up_replicas:
             pending_version = getattr(self, '_pending_version', None)
             if (pending_version is not None and
@@ -1793,6 +2043,23 @@ class SkyPilotReplicaManager(ReplicaManager):
             # Per-replica isolation: one bad row must not strand the rest
             # un-redriven.
             try:
+                prior_planned_capacity = getattr(replica_info,
+                                                 'planned_capacity', 1)
+                if (isinstance(prior_planned_capacity, bool) or
+                        not isinstance(prior_planned_capacity, int) or
+                        prior_planned_capacity < 1):
+                    prior_planned_capacity = 1
+                if replica_info.version == self.latest_version:
+                    prior_yaml_content = self.yaml_content
+                else:
+                    recovered_yaml_content = recovery_yaml_contents.get(
+                        replica_info.version)
+                    if recovered_yaml_content is None:
+                        raise ValueError(
+                            'yaml content not found for recovery of '
+                            f'{self._service_name} version '
+                            f'{replica_info.version}')
+                    prior_yaml_content = recovered_yaml_content
                 # Carry the prior row's launch-origin attribution: the fill
                 # sentinel was consumed at original emission, so without it
                 # the replacement row would flip a fill replica to
@@ -1803,6 +2070,12 @@ class SkyPilotReplicaManager(ReplicaManager):
                     'recovering_existing_replica': True,
                     'prior_reserved_fill': bool(
                         getattr(replica_info, 'reserved_fill', False)),
+                    'prior_planned_capacity': prior_planned_capacity,
+                    'prior_unknown_capacity_replacement': bool(
+                        getattr(replica_info, 'unknown_capacity_replacement',
+                                False)),
+                    'prior_version': replica_info.version,
+                    'prior_yaml_content': prior_yaml_content,
                 }
                 prior_rebalance_id = getattr(replica_info,
                                              'cost_rebalance_for_replica_id',
@@ -1945,8 +2218,13 @@ class SkyPilotReplicaManager(ReplicaManager):
         existing_replica_infos: list['ReplicaInfo'] | None = None,
         prior_reserved_fill: bool = False,
         prior_cost_rebalance_for_replica_id: int | None = None,
+        prior_planned_capacity: int | None = None,
+        prior_unknown_capacity_replacement: bool = False,
+        prior_version: int | None = None,
+        prior_yaml_content: str | None = None,
         zero_cost_demand_budget: _ZeroCostDemandBudget | None = None,
         recovering_existing_replica: bool = False,
+        logical_reconcile_fence: tuple[int, int, int] | None = None,
     ) -> bool:
         """Enqueue one replica launch.
 
@@ -1964,6 +2242,16 @@ class SkyPilotReplicaManager(ReplicaManager):
         recovering_existing_replica: the replica already has a durable row
         and cluster identity. Reuse an exact persisted placement instead of
         asking the spot placer to select a new location.
+
+        prior_planned_capacity: immutable logical width of a recovery row.
+
+        prior_unknown_capacity_replacement: preserve the bounded degradation
+        attribution of a recovery row.
+
+        prior_version: immutable service version of a recovery row.
+
+        prior_yaml_content: exact launch YAML of a recovery row. Recovery must
+        not relabel or relaunch an old-version backend with the latest config.
         """
         if replica_id in self._launch_thread_pool:
             logger.warning(f'Launch thread for replica {replica_id} '
@@ -2007,7 +2295,27 @@ class SkyPilotReplicaManager(ReplicaManager):
         log_file_name = serve_utils.generate_replica_launch_log_file_name(
             self._service_name, replica_id,
             getattr(self, '_resource_scope', None))
-        use_spot = _should_use_spot(self.yaml_content, resources_override)
+        if recovering_existing_replica:
+            if prior_version is None or prior_yaml_content is None:
+                raise ValueError('Recovery launch requires its persisted '
+                                 'version and exact launch YAML.')
+            launch_version = prior_version
+            launch_yaml_content = prior_yaml_content
+        else:
+            launch_version = self.latest_version
+            launch_yaml_content = self.yaml_content
+        version_specs = getattr(self, '_version_specs', None)
+        launch_spec = None
+        if version_specs is not None:
+            launch_spec = version_specs.get(launch_version)
+            if launch_spec is None:
+                launch_spec = serve_state.get_spec(self._service_name,
+                                                   launch_version)
+                if launch_spec is None:
+                    raise ValueError(f'Version {launch_version} not found.')
+                version_specs[launch_version] = launch_spec
+        use_spot = _should_use_spot(launch_yaml_content, resources_override,
+                                    launch_spec)
         retry_until_up = True
         location = None
         recovered_location = None
@@ -2134,12 +2442,31 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # zero-cost when no paid candidate exists.
                 location = self._spot_placer.select_next_location(
                     current_spot_locations, skip_zero_cost_preference=True)
+                if (zero_cost_demand_budget is not None and
+                        location in self._spot_placer.zero_cost_locations()):
+                    budgeted_location = self._select_budgeted_zero_cost_location(
+                        current_spot_locations, zero_cost_demand_budget)
+                    if budgeted_location is None:
+                        logger.info('Deferring demand launch because the '
+                                    'shared zero-cost GPU budget is exhausted '
+                                    'and no paid location is active.')
+                        return False
+                    location = budgeted_location
             elif zero_cost_demand_budget is not None:
                 location = self._select_budgeted_zero_cost_location(
                     current_spot_locations, zero_cost_demand_budget)
                 if location is None:
                     location = self._spot_placer.select_next_location(
                         current_spot_locations, skip_zero_cost_preference=True)
+                    if location in self._spot_placer.zero_cost_locations():
+                        # A successful zero (or an exhausted speculative
+                        # allowance) is authoritative. If no paid candidate is
+                        # active, defer instead of falling through into the
+                        # same saturated research pool.
+                        logger.info('Deferring demand launch because the '
+                                    'shared zero-cost GPU budget is exhausted '
+                                    'and no paid location is active.')
+                        return False
             elif self._demand_should_skip_saturated_zero_cost(
                     existing_replica_infos):
                 location = self._spot_placer.select_next_location(
@@ -2178,6 +2505,19 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # launches -- while availability_max_retry=1 (armed by
                 # this location below) never sees the error.
                 retry_until_up = False
+        if logical_reconcile_fence is not None:
+            fence_version, fence_generation, fence_target = (
+                logical_reconcile_fence)
+            current_snapshot = self._logical_reconcile_snapshot
+            if (current_snapshot is None or
+                    current_snapshot.version != fence_version or
+                    current_snapshot.generation != fence_generation or
+                    not self._logical_snapshot_is_fresh(current_snapshot) or
+                    self.latest_version != fence_version or self._logical_target
+                    != (fence_version, fence_generation, fence_target)):
+                logger.info('Logical launch selection was superseded before '
+                            'row persistence; dropping the unpersisted pin.')
+                return False
         # When the spot placer owns failover (use_spot + placer above sets
         # retry_until_up=False), the launch is pinned to ONE location, so a
         # capacity failure there must propagate immediately for the placer to
@@ -2189,7 +2529,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         availability_max_retry = (1 if location is not None else None)
         t = thread_utils.SafeThread(
             target=launch_cluster,
-            args=(replica_id, self.yaml_content, cluster_name, log_file_name,
+            args=(replica_id, launch_yaml_content, cluster_name, log_file_name,
                   self._replica_to_request_id,
                   self._replica_to_launch_cancelled, resources_override,
                   retry_until_up),
@@ -2199,50 +2539,94 @@ class SkyPilotReplicaManager(ReplicaManager):
                 'pre_launch_guard': self._service_is_launch_authorized,
                 'continue_guard': self._launch_owner_watchdog_allows_continue,
                 'launch_fence': self._replica_launch_fence_context(),
+                'service_spec': launch_spec,
             },
         )
-        replica_port = _get_resources_ports(self.yaml_content)
+        replica_port = _get_resources_ports(launch_yaml_content, launch_spec)
 
-        info = ReplicaInfo(replica_id, cluster_name, replica_port, use_spot,
-                           location, self.latest_version, resources_override)
+        planned_capacity = 1
+        if getattr(self, '_uses_logical_replicas', False):
+            resolved_capacity = (prior_planned_capacity
+                                 if recovering_existing_replica else None)
+            if resolved_capacity is None:
+                accelerators = (location.accelerators
+                                if location is not None else None)
+                if accelerators is None and resources_override is not None:
+                    accelerators = resources_override.get('accelerators')
+                resolved_capacity = _whole_gpu_capacity(accelerators)
+                if resolved_capacity is None:
+                    resolved_capacity = self._default_planned_capacity
+            if resolved_capacity is None:
+                raise RuntimeError(
+                    'Logical replica launch requires an exact whole-GPU '
+                    'shape before the replica row is persisted.')
+            planned_capacity = resolved_capacity
+        info = ReplicaInfo(
+            replica_id,
+            cluster_name,
+            replica_port,
+            use_spot,
+            location,
+            launch_version,
+            resources_override,
+            planned_capacity=planned_capacity,
+            unknown_capacity_replacement=prior_unknown_capacity_replacement)
         # Persisted launch-origin attribution: the broker's holdings split
         # and the ceiling's demand exemption key on this flag. OR in the
         # replaced row's attribution on recovery re-drives (the sentinel
         # only exists at original emission).
         info.reserved_fill = bool(zero_cost_only or prior_reserved_fill)
         info.cost_rebalance_for_replica_id = (cost_rebalance_for_replica_id)
-        if (zero_cost_only and fill_grant_epoch is not None and
-                fill_pool_key is not None):
-            # Broker epoch fence, authoritative leg: the pre-check above
-            # is TOCTOU (a round can publish a new epoch between it and
-            # this persist, after capacity was already fed to a peer), so
-            # the final recheck and the row upsert are ONE transaction,
-            # and the persist additionally takes the cross-process broker
-            # round lock (non-blocking): a row must land either before a
-            # round's debit scan (counted) or after its publish (fenced)
-            # -- never inside the scan->publish window where the epoch is
-            # still current but the completed scan missed the row (see
-            # reserved_capacity_broker.persist_fill_replica). Contention
-            # with an in-flight round reads as a fence-skip: retried next
-            # tick. The lock/transaction spans only this persist -- never
-            # the launch thread (built above, started later by
-            # _refresh_thread_pool).
-            if not reserved_capacity_broker.persist_fill_replica(
-                    self._service_name,
-                    replica_id,
-                    info,
-                    pool_key=fill_pool_key,
-                    expected_epoch=fill_grant_epoch,
-                    **self._db_fence_kwargs()):
-                # No row was written and the launch thread was never
-                # registered/started: same leak-nothing contract as the
-                # pre-check fence.
-                self._log_fill_skip(
-                    f'grant epoch {fill_grant_epoch} superseded or round '
-                    'in flight at persist')
-                return False
-        else:
-            self._persist_replica(replica_id, info)
+        logical_state_guard = (self._logical_state_lock
+                               if logical_reconcile_fence is not None else
+                               contextlib.nullcontext())
+        with logical_state_guard:
+            if logical_reconcile_fence is not None:
+                fence_version, fence_generation, fence_target = (
+                    logical_reconcile_fence)
+                current_snapshot = self._logical_reconcile_snapshot
+                pending_version = getattr(self, '_pending_version', None)
+                if (current_snapshot is None or
+                        current_snapshot.version != fence_version or
+                        current_snapshot.generation != fence_generation or
+                        not self._logical_snapshot_is_fresh(current_snapshot) or
+                        self.latest_version != fence_version or
+                    (pending_version is not None and
+                     pending_version > fence_version) or self._logical_target
+                        != (fence_version, fence_generation, fence_target)):
+                    logger.info('Logical launch was superseded at its final '
+                                'row-persistence fence.')
+                    return False
+            if (zero_cost_only and fill_grant_epoch is not None and
+                    fill_pool_key is not None):
+                # Broker epoch fence, authoritative leg: the pre-check above
+                # is TOCTOU (a round can publish a new epoch between it and
+                # this persist, after capacity was already fed to a peer), so
+                # the final recheck and the row upsert are ONE transaction.
+                if not reserved_capacity_broker.persist_fill_replica(
+                        self._service_name,
+                        replica_id,
+                        info,
+                        pool_key=fill_pool_key,
+                        expected_epoch=fill_grant_epoch,
+                        **self._db_fence_kwargs()):
+                    # No row was written and the launch thread was never
+                    # registered/started: same leak-nothing contract as the
+                    # pre-check fence.
+                    self._log_fill_skip(
+                        f'grant epoch {fill_grant_epoch} superseded or round '
+                        'in flight at persist')
+                    return False
+            else:
+                self._persist_replica(replica_id, info)
+            if info.unknown_capacity_replacement:
+                replacement_ids = getattr(self,
+                                          '_unknown_capacity_replacement_ids',
+                                          None)
+                if replacement_ids is None:
+                    replacement_ids = set()
+                    self._unknown_capacity_replacement_ids = replacement_ids
+                replacement_ids.add(replica_id)
         if existing_replica_infos is not None:
             # Bulk callers (recovery re-drive) reuse one snapshot across a
             # whole wave of launches. Append the replica we just placed so
@@ -2305,110 +2689,154 @@ class SkyPilotReplicaManager(ReplicaManager):
         """Reserve and select one location from a measured batch budget."""
         if self._spot_placer is None:
             return None
-        allowed = {
-            location for location in self._spot_placer.zero_cost_locations()
-            if budget.remaining_by_context.get(location.region, 0) > 0
-        }
+        allowed = set()
+        for location in self._spot_placer.zero_cost_locations():
+            pool_key = _zero_cost_pool_key(location)
+            if pool_key is None:
+                continue
+            remaining = budget.remaining_by_pool.get(pool_key, 0)
+            measured = budget.measured_by_pool.get(pool_key)
+            width = _whole_gpu_capacity(location.accelerators)
+            if remaining <= 0 or width is None:
+                continue
+            # A successful measurement is expressed in GPU slots. During a
+            # measurement blackout, the fallback is deliberately expressed
+            # in bounded speculative backend attempts instead.
+            if measured is None or width <= remaining:
+                allowed.add(location)
         if not allowed:
             return None
         location = self._spot_placer.select_next_zero_cost_location(
             current_locations, allowed_locations=allowed)
         if location is None:
             return None
-        remaining = budget.remaining_by_context[location.region]
+        pool_key = _zero_cost_pool_key(location)
+        assert pool_key is not None, location
+        remaining = budget.remaining_by_pool[pool_key]
         assert remaining > 0, (location, budget)
-        budget.remaining_by_context[location.region] = remaining - 1
+        width = _whole_gpu_capacity(location.accelerators)
+        assert width is not None, location
+        debit = (width
+                 if budget.measured_by_pool.get(pool_key) is not None else 1)
+        assert remaining >= debit, (location, budget)
+        budget.remaining_by_pool[pool_key] = remaining - debit
         return location
 
     def _build_zero_cost_demand_budget(
-        self, existing_replica_infos: list['ReplicaInfo'],
-        resources_overrides: list[dict[str, Any] | None]
+        self,
+        existing_replica_infos: list['ReplicaInfo'],
+        resources_overrides: list[dict[str, Any] | None],
+        demand_count_override: int | None = None,
+        capacity_replica_infos: list['ReplicaInfo'] | None = None,
     ) -> _ZeroCostDemandBudget | None:
-        """Snapshot free GPUs once for a large zero-cost-first demand wave.
+        """Build a nonblocking shared free-GPU budget for one demand wave.
 
-        Small waves retain the bounded speculative path: issuing an expensive
-        cluster-wide pod listing to place at most the existing probe allowance
-        would add API load without reducing it.  Large waves measure every
-        active Kubernetes context once and reserve no more than the observed
-        free slots.  PENDING rows are subtracted because they have not entered
-        ``sky.launch`` yet and therefore cannot appear in the Kubernetes pod
-        snapshot.
-
-        A failed measurement falls back to the fixed per-location probe
-        allowance.  A successful zero is authoritative for this batch and
-        sends demand directly to paid fallback.
+        The observation is a database-cached, background-refreshed raw GPU
+        count. Rows across every service that may not be represented in that
+        snapshot are debited under the cross-process reservation lock before
+        this budget is returned. A missing/failed observation falls back to a
+        bounded number of backend probes; a successful zero is authoritative.
         """
         if self._spot_placer is None:
             return None
-        demand_count = sum(
-            resources_override is None or serve_constants.
-            RESERVED_CAPACITY_FILL_OVERRIDE_KEY not in resources_override
-            for resources_override in resources_overrides)
-        if demand_count <= _ZERO_COST_SPECULATIVE_LAUNCHES_PER_LOCATION:
-            return None
+        demand_count = (
+            demand_count_override if demand_count_override is not None else sum(
+                resources_override is None or serve_constants.
+                RESERVED_CAPACITY_FILL_OVERRIDE_KEY not in resources_override
+                for resources_override in resources_overrides))
         active = set(self._spot_placer.active_locations())
         all_zero_cost = self._spot_placer.zero_cost_locations()
         zero_cost = [
             location for location in all_zero_cost if location in active and
             str(location.cloud).lower() == 'kubernetes'
         ]
-        paid = [
-            location for location in active if location not in all_zero_cost
-        ]
-        if not zero_cost or not paid:
+        if not zero_cost:
             return None
-        fallback_limit = (_ZERO_COST_SPECULATIVE_LAUNCHES_PER_LOCATION *
-                          len(zero_cost))
-        if demand_count <= fallback_limit:
-            return None
-
-        measured = reserved_capacity.query_free_slots_by_context(zero_cost)
-        active_count_by_context: dict[str, int] = {}
+        observations = reserved_capacity.get_cached_free_gpus_by_pool(zero_cost)
+        measured = {
+            key: observation.free_gpus
+            for key, observation in observations.items()
+        }
+        active_count_by_pool: dict[tuple[str, str], int] = {}
         for location in zero_cost:
-            active_count_by_context[location.region] = (
-                active_count_by_context.get(location.region, 0) + 1)
+            pool_key = _zero_cost_pool_key(location)
+            if pool_key is not None:
+                active_count_by_pool[pool_key] = (
+                    active_count_by_pool.get(pool_key, 0) + 1)
 
-        pending_by_context: dict[str, int] = {}
-        for info in existing_replica_infos:
-            if info.status != serve_state.ReplicaStatus.PENDING:
+        capacity_infos = (existing_replica_infos if capacity_replica_infos
+                          is None else capacity_replica_infos)
+        unobserved_gpus_by_pool: dict[tuple[str, str], int] = {}
+        unresolved_backends_by_pool: dict[tuple[str, str], int] = {}
+        for info in capacity_infos:
+            if info.is_terminal:
                 continue
             replica_location = info.get_spot_location()
             if replica_location is None:
                 continue
-            if any(
-                    spot_placer.locations_match_placement(
-                        replica_location, candidate)
-                    for candidate in zero_cost):
-                pending_by_context[replica_location.region] = (
-                    pending_by_context.get(replica_location.region, 0) + 1)
+            pool_key = _zero_cost_pool_key(replica_location)
+            if pool_key not in active_count_by_pool:
+                continue
+            observation = observations.get(pool_key)
+            snapshot_time = (None if observation is None else
+                             observation.snapshot_time)
+            created_at = getattr(info, 'created_at', None)
+            status_property = getattr(info, 'status_property', None)
+            if info.is_ready:
+                first_ready_time = getattr(status_property, 'first_ready_time',
+                                           None)
+                if not isinstance(first_ready_time, (int, float)):
+                    first_ready_time = None
+                # The query timestamp is captured before the Kubernetes pod
+                # list. A row that only became READY afterwards may represent
+                # a pod created during the query and must be debited once.
+                unobserved = (snapshot_time is not None and
+                              (first_ready_time is None or
+                               first_ready_time > snapshot_time))
+            else:
+                unresolved_backends_by_pool[pool_key] = (
+                    unresolved_backends_by_pool.get(pool_key, 0) + 1)
+                launch_status = getattr(status_property, 'sky_launch_status',
+                                        None)
+                unobserved = (
+                    info.status == serve_state.ReplicaStatus.PENDING or
+                    launch_status != common_utils.ProcessStatus.SUCCEEDED or
+                    (snapshot_time is not None and created_at is not None and
+                     created_at > snapshot_time))
+            if unobserved:
+                width = (_whole_gpu_capacity(replica_location.accelerators) or
+                         int(getattr(info, 'planned_capacity', 1)))
+                unobserved_gpus_by_pool[pool_key] = (
+                    unobserved_gpus_by_pool.get(pool_key, 0) + width)
 
-        remaining: dict[str, int] = {}
-        for context_name, location_count in active_count_by_context.items():
-            free_slots = measured.get(context_name)
-            if free_slots is None:
+        remaining: dict[tuple[str, str], int] = {}
+        for pool_key, location_count in active_count_by_pool.items():
+            free_gpus = measured.get(pool_key)
+            if free_gpus is None:
                 allowance = (_ZERO_COST_SPECULATIVE_LAUNCHES_PER_LOCATION *
                              location_count)
-                unresolved = 0
-                for info in existing_replica_infos:
-                    if info.is_terminal or info.is_ready:
-                        continue
-                    replica_location = info.get_spot_location()
-                    if (replica_location is None or
-                            replica_location.region != context_name):
-                        continue
-                    if any(
-                            spot_placer.locations_match_placement(
-                                replica_location, candidate)
-                            for candidate in zero_cost):
-                        unresolved += 1
-                remaining[context_name] = max(0, allowance - unresolved)
+                remaining[pool_key] = max(
+                    0, allowance - unresolved_backends_by_pool.get(pool_key, 0))
             else:
-                remaining[context_name] = max(
-                    0, free_slots - pending_by_context.get(context_name, 0))
+                remaining[pool_key] = max(
+                    0, free_gpus - unobserved_gpus_by_pool.get(pool_key, 0))
         logger.info('Zero-cost demand capacity snapshot: measured='
-                    f'{measured}, pending={pending_by_context}, '
+                    f'{measured}, unobserved_gpus='
+                    f'{unobserved_gpus_by_pool}, '
                     f'batch_budget={remaining}, demand={demand_count}.')
         return _ZeroCostDemandBudget(remaining, measured)
+
+    def _uses_shared_zero_cost_demand_budget(self) -> bool:
+        """Whether demand placement can consume a shared free GPU pool."""
+        if self._spot_placer is None:
+            return False
+        active = set(self._spot_placer.active_locations())
+        all_zero_cost = self._spot_placer.zero_cost_locations()
+        zero_cost = [
+            location for location in all_zero_cost
+            if location in active and _zero_cost_pool_key(location) is not None
+        ]
+        return bool(zero_cost)
 
     def _demand_should_skip_saturated_zero_cost(
             self, existing_replica_infos: list['ReplicaInfo'] | None) -> bool:
@@ -2475,12 +2903,14 @@ class SkyPilotReplicaManager(ReplicaManager):
             logger.debug(f'Reserved-capacity fill launch skipped: {reason}.')
 
     def _scale_up_one_locked(
-            self,
-            resources_override: dict[str, Any] | None,
-            used_replica_ids: set[int],
-            existing_replica_infos: list['ReplicaInfo'] | None = None,
-            zero_cost_demand_budget: _ZeroCostDemandBudget | None = None
-    ) -> None:
+        self,
+        resources_override: dict[str, Any] | None,
+        used_replica_ids: set[int],
+        existing_replica_infos: list['ReplicaInfo'] | None = None,
+        zero_cost_demand_budget: _ZeroCostDemandBudget | None = None,
+        logical_reconcile_fence: tuple[int, int, int] | None = None,
+        unknown_capacity_replacement: bool = False,
+    ) -> bool:
         """Allocate an id and enqueue one replica launch. Lock must be held.
 
         `used_replica_ids` is the set of ids with a durable replica row,
@@ -2513,10 +2943,16 @@ class SkyPilotReplicaManager(ReplicaManager):
             if zero_cost_demand_budget is not None:
                 launch_kwargs['zero_cost_demand_budget'] = (
                     zero_cost_demand_budget)
+            if logical_reconcile_fence is not None:
+                launch_kwargs['logical_reconcile_fence'] = (
+                    logical_reconcile_fence)
+            if unknown_capacity_replacement:
+                launch_kwargs['prior_unknown_capacity_replacement'] = True
             launched = self._launch_replica(self._next_replica_id,
                                             resources_override, **launch_kwargs)
         if launched:
             self._next_replica_id += 1
+        return launched
 
     @with_lock
     def scale_up(self,
@@ -2525,8 +2961,9 @@ class SkyPilotReplicaManager(ReplicaManager):
             resources_override, serve_state.get_replica_ids(self._service_name))
 
     @with_lock
-    def scale_up_batch(
-            self, resources_overrides: list[dict[str, Any] | None]) -> None:
+    def scale_up_batch(self,
+                       resources_overrides: list[dict[str, Any] | None],
+                       expected_version: int | None = None) -> None:
         """Enqueue a batch of replica launches under ONE lock acquisition.
 
         The manager lock is held by the readiness-probe round for tens of
@@ -2546,7 +2983,32 @@ class SkyPilotReplicaManager(ReplicaManager):
         snapshot, so later decisions preserve the existing in-wave spreading
         and reserved-capacity accounting semantics.
         """
+        needs_reservation = (
+            self._batch_needs_placement_snapshot(resources_overrides) and
+            self._uses_shared_zero_cost_demand_budget())
+        if not needs_reservation:
+            self._scale_up_batch_locked(resources_overrides, expected_version)
+            return
+        try:
+            lock = locks.get_lock(
+                serve_constants.DEMAND_CAPACITY_RESERVATION_LOCK_ID)
+            with lock.acquire(blocking=False):
+                self._scale_up_batch_locked(resources_overrides,
+                                            expected_version)
+        except locks.LockTimeout:
+            logger.info('Deferring demand scale-up because another service '
+                        'is reserving shared zero-cost capacity.')
+
+    def _scale_up_batch_locked(self,
+                               resources_overrides: list[dict[str, Any] | None],
+                               expected_version: int | None = None) -> None:
+        """Persist one physical batch while any shared demand lock is held."""
         batch_version = self.latest_version
+        if (expected_version is not None and expected_version != batch_version):
+            logger.info('Discarding stale physical scale-up batch for '
+                        f'version {expected_version}; manager is at version '
+                        f'{batch_version}.')
+            return
         existing_replica_infos = None
         if self._batch_needs_placement_snapshot(resources_overrides):
             existing_replica_infos = serve_state.get_replica_infos(
@@ -2562,9 +3024,17 @@ class SkyPilotReplicaManager(ReplicaManager):
         else:
             used_replica_ids = serve_state.get_replica_ids(self._service_name)
         zero_cost_demand_budget = None
-        if existing_replica_infos is not None:
+        if (existing_replica_infos is not None and
+                self._uses_shared_zero_cost_demand_budget()):
+            infos_by_service = serve_state.get_replica_infos_grouped()
+            infos_by_service[self._service_name] = existing_replica_infos
+            capacity_replica_infos = [
+                info for infos in infos_by_service.values() for info in infos
+            ]
             zero_cost_demand_budget = self._build_zero_cost_demand_budget(
-                existing_replica_infos, resources_overrides)
+                existing_replica_infos,
+                resources_overrides,
+                capacity_replica_infos=capacity_replica_infos)
         for resources_override in resources_overrides:
             pending_version = getattr(self, '_pending_version', None)
             if (pending_version is not None and
@@ -2577,14 +3047,152 @@ class SkyPilotReplicaManager(ReplicaManager):
                                       existing_replica_infos,
                                       zero_cost_demand_budget)
 
+    @with_lock
+    def scale_up_to_logical_capacity(
+        self,
+        target_capacity: int,
+        version: int,
+        reconcile_generation: int,
+        replace_unknown_replica_ids: tuple[int, ...] = ()
+    ) -> None:
+        """Plan and persist complete backend shapes up to a logical target.
+
+        Selection and row persistence share the manager lock and one mutable
+        fleet snapshot. Each persisted backend immediately participates in the
+        next placement decision, so a single 8-slot choice removes eight slots
+        from the shortfall instead of causing eight physical launches.
+        """
+        if not self._uses_logical_replicas:
+            raise RuntimeError('Logical scale target sent to a physical '
+                               'replica service.')
+        snapshot = self._logical_reconcile_snapshot
+        if (snapshot is None or snapshot.version != version or
+                snapshot.generation != reconcile_generation or
+                version != self.latest_version or
+                not self._logical_snapshot_is_fresh(snapshot)):
+            logger.info('Discarding stale logical scale-up intent for '
+                        f'version {version}, generation '
+                        f'{reconcile_generation}.')
+            return
+        if self._logical_target != (version, reconcile_generation,
+                                    target_capacity):
+            logger.info('Discarding logical scale-up intent whose target is '
+                        'not the manager\'s current published target.')
+            return
+
+        if not self._uses_shared_zero_cost_demand_budget():
+            self._scale_up_to_logical_capacity_locked(
+                target_capacity, version, reconcile_generation, snapshot,
+                replace_unknown_replica_ids)
+            return
+        try:
+            lock = locks.get_lock(
+                serve_constants.DEMAND_CAPACITY_RESERVATION_LOCK_ID)
+            with lock.acquire(blocking=False):
+                self._scale_up_to_logical_capacity_locked(
+                    target_capacity, version, reconcile_generation, snapshot,
+                    replace_unknown_replica_ids)
+        except locks.LockTimeout:
+            logger.info('Deferring logical scale-up because another service '
+                        'is reserving shared zero-cost capacity.')
+
+    def _scale_up_to_logical_capacity_locked(
+            self, target_capacity: int, version: int, reconcile_generation: int,
+            snapshot: LogicalReconcileSnapshot,
+            replace_unknown_replica_ids: tuple[int, ...]) -> None:
+        """Persist complete shapes while the global demand lock is held."""
+
+        existing_replica_infos = serve_state.get_replica_infos(
+            self._service_name)
+        used_replica_ids = {info.replica_id for info in existing_replica_infos}
+
+        def _committed_capacity() -> int:
+            committed = 0
+            for info in existing_replica_infos:
+                if info.is_terminal or info.version != version:
+                    continue
+                if (getattr(info.status_property, 'is_scale_down', False)
+                        is True):
+                    continue
+                planned = int(getattr(info, 'planned_capacity', 1))
+                if info.replica_id in replace_unknown_replica_ids:
+                    # A bounded degraded-recovery decision explicitly
+                    # overlaps this uncertain backend without terminating it.
+                    continue
+                observed = snapshot.observed_slots_by_replica_id.get(
+                    info.replica_id)
+                if (info.is_ready and observed is not None and
+                        info.replica_id not in snapshot.unknown_replica_ids):
+                    if (observed <= 0 and getattr(
+                            info, 'unknown_capacity_replacement', False)):
+                        # A durably attributed replacement is the one bounded
+                        # overlap wave for this degradation incident. Keep its
+                        # planned pin until it proves positive capacity; zero
+                        # must not recursively authorize another full wave.
+                        committed += planned
+                    else:
+                        committed += min(planned, max(0, observed))
+                else:
+                    # Pending and temporarily unknown rows keep their durable
+                    # pin for duplicate-launch suppression.
+                    committed += planned
+            return committed
+
+        committed = _committed_capacity()
+        zero_cost_demand_budget = None
+        if self._uses_shared_zero_cost_demand_budget():
+            infos_by_service = serve_state.get_replica_infos_grouped()
+            infos_by_service[self._service_name] = existing_replica_infos
+            capacity_replica_infos = [
+                info for infos in infos_by_service.values() for info in infos
+            ]
+            zero_cost_demand_budget = self._build_zero_cost_demand_budget(
+                existing_replica_infos, [None],
+                demand_count_override=target_capacity - committed,
+                capacity_replica_infos=capacity_replica_infos)
+        while committed < target_capacity:
+            current_snapshot = self._logical_reconcile_snapshot
+            pending_version = getattr(self, '_pending_version', None)
+            if (current_snapshot is None or
+                    current_snapshot.generation != reconcile_generation or
+                    current_snapshot.version != version or
+                    not self._logical_snapshot_is_fresh(current_snapshot) or
+                    self.latest_version != version or
+                (pending_version is not None and pending_version > version) or
+                    self._logical_target != (version, reconcile_generation,
+                                             target_capacity)):
+                logger.info('Stopping logical scale-up batch after its '
+                            'reconciliation fence advanced.')
+                break
+            before = len(existing_replica_infos)
+            launch_kwargs: dict[str, Any] = {}
+            if replace_unknown_replica_ids:
+                launch_kwargs['unknown_capacity_replacement'] = True
+            launched = self._scale_up_one_locked(
+                None,
+                used_replica_ids,
+                existing_replica_infos,
+                zero_cost_demand_budget,
+                logical_reconcile_fence=(version, reconcile_generation,
+                                         target_capacity),
+                **launch_kwargs)
+            if not launched or len(existing_replica_infos) == before:
+                logger.info('Logical scale-up made no placement progress; '
+                            'retrying on the next reconciliation tick.')
+                break
+            persisted = existing_replica_infos[-1]
+            committed += int(getattr(persisted, 'planned_capacity', 1))
+
     def notify_version_pending(self, version: int) -> None:
-        pending_version = getattr(self, '_pending_version', None)
-        if pending_version is None or version > pending_version:
-            self._pending_version = version
+        with self._logical_state_lock:
+            pending_version = getattr(self, '_pending_version', None)
+            if pending_version is None or version > pending_version:
+                self._pending_version = version
 
     def clear_pending_version(self, version: int) -> None:
-        if getattr(self, '_pending_version', None) == version:
-            self._pending_version = None
+        with self._logical_state_lock:
+            if getattr(self, '_pending_version', None) == version:
+                self._pending_version = None
 
     def _batch_needs_placement_snapshot(
             self, resources_overrides: list[dict[str, Any] | None]) -> bool:
@@ -2606,8 +3214,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                 uses_task_default = True
             elif use_spot_override:
                 return True
-        return (uses_task_default and
-                _should_use_spot(self.yaml_content, resource_override=None))
+        return (uses_task_default and _should_use_spot(
+            self.yaml_content,
+            resource_override=None,
+            service_spec=getattr(self, '_version_specs', {}).get(
+                self.latest_version)))
 
     def _handle_sky_down_finish(self, info: ReplicaInfo,
                                 format_exc: str | None) -> None:
@@ -2980,7 +3591,10 @@ class SkyPilotReplicaManager(ReplicaManager):
             tracker = _ReplicaDrainTracker(self, replica_url, drain_started)
         self._wait_for_idle_trackers[info.replica_id] = (tracker, deadline)
 
-    def _defer_scale_down_until_idle(self, replica_id: int) -> None:
+    def _defer_scale_down_until_idle(
+            self,
+            replica_id: int,
+            logical_retirement: tuple[int, int, int] | None = None) -> None:
         """Persist off-route state without admitting termination yet."""
         info = serve_state.get_replica_info_from_id(self._service_name,
                                                     replica_id)
@@ -3004,8 +3618,132 @@ class SkyPilotReplicaManager(ReplicaManager):
         info.status_property.drain_cap_seconds = (
             self._resolve_drain_cap_seconds(replica_id))
         info.status_property.wait_for_idle_before_termination = True
+        if logical_retirement is not None:
+            version, generation, target_capacity = logical_retirement
+            info.status_property.logical_retirement_version = version
+            info.status_property.logical_retirement_controller_epoch = (
+                self._logical_controller_epoch)
+            info.status_property.logical_retirement_generation = generation
+            info.status_property.logical_retirement_target_capacity = (
+                target_capacity)
+            info.status_property.logical_retirement_confirmed_generation = (
+                None)
         self._persist_replica(replica_id, info)
         self._register_wait_for_idle(info)
+
+    def _logical_retirement_state(self, info: ReplicaInfo) -> str:
+        """Return safe, wait, or abort for one off-route logical backend."""
+        status = info.status_property
+        version = getattr(status, 'logical_retirement_version', None)
+        controller_epoch = getattr(status,
+                                   'logical_retirement_controller_epoch', None)
+        selection_generation = getattr(status, 'logical_retirement_generation',
+                                       None)
+        selection_target = getattr(status, 'logical_retirement_target_capacity',
+                                   None)
+        if (version is None or controller_epoch is None or
+                selection_generation is None or selection_target is None):
+            return 'abort'
+        if controller_epoch != self._logical_controller_epoch:
+            return 'abort'
+        snapshot = self._logical_reconcile_snapshot
+        target_state = self._logical_target
+        if (snapshot is None or snapshot.generation < selection_generation or
+                target_state is None):
+            return 'wait'
+        if not self._logical_snapshot_is_fresh(snapshot):
+            return 'wait'
+        if (snapshot.version != version or self.latest_version != version):
+            return 'abort'
+        pending_version = getattr(self, '_pending_version', None)
+        if pending_version is not None and pending_version > version:
+            return 'abort'
+        target_version, target_generation, current_target = target_state
+        if target_version != version:
+            return 'abort'
+        if target_generation != snapshot.generation:
+            return 'wait'
+        if current_target > selection_target:
+            return 'abort'
+        if (info.replica_id in snapshot.unknown_replica_ids or
+                snapshot.in_flight_by_replica_id.get(info.replica_id) != 0):
+            return 'wait'
+
+        ready_capacity = 0
+        for candidate in serve_state.get_replica_infos(self._service_name):
+            if (candidate.replica_id == info.replica_id or
+                    candidate.is_terminal or candidate.version != version or
+                    not candidate.is_ready):
+                continue
+            observed = snapshot.observed_slots_by_replica_id.get(
+                candidate.replica_id)
+            if (observed is None or
+                    candidate.replica_id in snapshot.unknown_replica_ids):
+                continue
+            ready_capacity += min(
+                int(getattr(candidate, 'planned_capacity', 1)), observed)
+        return 'safe' if ready_capacity >= current_target else 'abort'
+
+    def _abort_logical_retirement(self, info: ReplicaInfo, reason: str) -> None:
+        """Cancel an optimization retirement and make a healthy backend live."""
+        logger.info(f'Aborting logical retirement of replica '
+                    f'{info.replica_id}: {reason}.')
+        status = info.status_property
+        status.sky_down_status = None
+        status.is_scale_down = False
+        status.purged = False
+        status.drain_cap_seconds = None
+        status.wait_for_idle_before_termination = False
+        status.logical_retirement_version = None
+        status.logical_retirement_controller_epoch = None
+        status.logical_retirement_generation = None
+        status.logical_retirement_target_capacity = None
+        status.logical_retirement_confirmed_generation = None
+        self._persist_replica(info.replica_id, info)
+        self._wait_for_idle_trackers.pop(info.replica_id, None)
+
+    def _finish_logical_retirement_after_idle(self, replica_id: int,
+                                              info: ReplicaInfo) -> None:
+        """Recheck and schedule one drained logical retirement atomically."""
+        with self._logical_state_lock:
+            retirement_state = self._logical_retirement_state(info)
+            if retirement_state == 'wait':
+                return
+            if retirement_state == 'abort':
+                self._abort_logical_retirement(
+                    info, 'the current target or coverage fence changed')
+                return
+            snapshot = self._logical_reconcile_snapshot
+            assert snapshot is not None
+            info.status_property.logical_retirement_confirmed_generation = (
+                snapshot.generation)
+            self._persist_replica(replica_id, info)
+            # The state lock prevents a later sync from invalidating the
+            # confirmation between this final proof and shutdown scheduling.
+            if self._logical_retirement_state(info) != 'safe':
+                return
+            # _terminate_replica atomically clears the durable idle-wait bit
+            # with its SCHEDULED down state before installing the worker. Keep
+            # both the bit and tracker until that succeeds, so a transient DB
+            # failure is retried on the next refresh instead of stranding an
+            # off-route SHUTTING_DOWN row until controller restart.
+            try:
+                self._terminate_replica(replica_id,
+                                        sync_down_logs=False,
+                                        replica_drain_delay_seconds=0,
+                                        is_scale_down=True,
+                                        in_flight_drain_cap_seconds=0)
+            except Exception:  # pylint: disable=broad-except
+                info.status_property.wait_for_idle_before_termination = True
+                try:
+                    self._persist_replica(replica_id, info)
+                except Exception as restore_error:  # pylint: disable=broad-except
+                    logger.warning(
+                        'Failed to restore logical retirement retry state for '
+                        f'replica {replica_id}: '
+                        f'{common_utils.format_exception(restore_error)}')
+                raise
+            self._wait_for_idle_trackers.pop(replica_id, None)
 
     def _refresh_wait_for_idle(self) -> None:
         """Admit strict drains only after fresh LB zero-occupancy proof."""
@@ -3049,6 +3787,26 @@ class SkyPilotReplicaManager(ReplicaManager):
                     tracker = retried[0] if retried is not None else None
                 drained = tracker is not None and tracker()
             deadline_expired = time.monotonic() >= deadline
+            logical_retirement = getattr(info.status_property,
+                                         'logical_retirement_version',
+                                         None) is not None
+            if logical_retirement:
+                with self._logical_state_lock:
+                    retirement_state = self._logical_retirement_state(info)
+                    if retirement_state == 'abort':
+                        self._abort_logical_retirement(
+                            info, 'the current target or controller fence '
+                            'changed')
+                        continue
+                if deadline_expired and not drained:
+                    with self._logical_state_lock:
+                        self._abort_logical_retirement(
+                            info, 'post-routing idle proof timed out')
+                    continue
+                if not drained:
+                    continue
+                self._finish_logical_retirement_after_idle(replica_id, info)
+                continue
             if not drained and not deadline_expired:
                 continue
             drain_cap: int | None = 0
@@ -3070,11 +3828,51 @@ class SkyPilotReplicaManager(ReplicaManager):
                                     is_scale_down=True,
                                     in_flight_drain_cap_seconds=drain_cap)
 
+    def _clear_known_unknown_capacity_replacements(self) -> None:
+        """End degraded-wave attribution after a real capacity sample.
+
+        Called under the manager lock. Holding the logical-state lock across
+        the small fenced persistence prevents a concurrent LB generation from
+        changing the backend back to unknown between proof and marker clear.
+        """
+        replacement_ids: set[int] = getattr(
+            self, '_unknown_capacity_replacement_ids', set())
+        if not replacement_ids:
+            return
+        with self._logical_state_lock:
+            snapshot = self._logical_reconcile_snapshot
+            if snapshot is None or not self._logical_snapshot_is_fresh(
+                    snapshot):
+                return
+            known_ids = {
+                replica_id for replica_id in replacement_ids
+                if replica_id not in snapshot.unknown_replica_ids and
+                snapshot.observed_slots_by_replica_id.get(replica_id, 0) > 0
+            }
+            if not known_ids:
+                return
+            infos = serve_state.get_replica_infos_from_ids(
+                self._service_name, sorted(known_ids))
+            for replica_id in sorted(known_ids):
+                info = infos.get(replica_id)
+                if info is not None and getattr(
+                        info, 'unknown_capacity_replacement', False) is True:
+                    info.unknown_capacity_replacement = False
+                    self._persist_replica(replica_id, info)
+                replacement_ids.discard(replica_id)
+
     @with_lock
     def scale_down(self,
                    replica_id: int,
                    purge: bool = False,
-                   wait_for_idle: bool = False) -> None:
+                   wait_for_idle: bool = False,
+                   expected_version: int | None = None) -> None:
+        if (expected_version is not None and
+                expected_version != self.latest_version):
+            logger.info('Discarding stale physical scale-down for replica '
+                        f'{replica_id} from version {expected_version}; '
+                        f'manager is at version {self.latest_version}.')
+            return
         # Retirement drain: bounded by the replica's version spec,
         # completing early once the LB provably stopped routing to the
         # replica and reports zero in-flight for it. A purge is a forceful
@@ -3091,6 +3889,84 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 is_scale_down=True,
                                 purge=purge,
                                 in_flight_drain_cap_seconds=drain_cap)
+
+    @with_lock
+    def scale_down_logically(self, replica_id: int, target_capacity: int,
+                             version: int, reconcile_generation: int) -> None:
+        with self._logical_state_lock:
+            self._scale_down_logically_locked(replica_id, target_capacity,
+                                              version, reconcile_generation)
+
+    def _scale_down_logically_locked(self, replica_id: int,
+                                     target_capacity: int, version: int,
+                                     reconcile_generation: int) -> None:
+        """Accept one logical retirement only against the current snapshot."""
+        if not self._uses_logical_replicas:
+            raise RuntimeError('Logical scale-down sent to a physical '
+                               'replica service.')
+        snapshot = self._logical_reconcile_snapshot
+        if (snapshot is None or snapshot.version != version or
+                snapshot.generation != reconcile_generation or
+                not self._logical_snapshot_is_fresh(snapshot) or
+                self.latest_version != version or self._logical_target
+                != (version, reconcile_generation, target_capacity)):
+            logger.info('Discarding stale logical scale-down intent for '
+                        f'replica {replica_id}.')
+            return
+        info = serve_state.get_replica_info_from_id(self._service_name,
+                                                    replica_id)
+        if info is None or info.is_terminal:
+            return
+
+        replica_infos = serve_state.get_replica_infos(self._service_name)
+        ready_capacity = 0
+        committed_capacity = 0
+        for candidate in replica_infos:
+            if candidate.is_terminal or candidate.version != version:
+                continue
+            if (candidate.replica_id != replica_id and getattr(
+                    candidate.status_property, 'is_scale_down', False) is True):
+                continue
+            planned = int(getattr(candidate, 'planned_capacity', 1))
+            observed = snapshot.observed_slots_by_replica_id.get(
+                candidate.replica_id)
+            if (candidate.is_ready and observed is not None and
+                    candidate.replica_id not in snapshot.unknown_replica_ids):
+                width = min(planned, observed)
+                committed_capacity += width
+                ready_capacity += width
+            else:
+                committed_capacity += planned
+
+        has_served = (info.status_property.first_ready_time is not None and
+                      info.status_property.first_ready_time >= 0)
+        if not has_served:
+            victim_width = (int(getattr(info, 'planned_capacity', 1))
+                            if info.version == version else 0)
+            if committed_capacity - victim_width < target_capacity:
+                return
+            self._terminate_replica(replica_id,
+                                    sync_down_logs=False,
+                                    replica_drain_delay_seconds=0,
+                                    is_scale_down=True,
+                                    in_flight_drain_cap_seconds=0)
+            return
+
+        if (replica_id in snapshot.unknown_replica_ids or
+                snapshot.in_flight_by_replica_id.get(replica_id) != 0):
+            return
+        victim_ready_width = 0
+        if info.version == version:
+            observed = snapshot.observed_slots_by_replica_id.get(replica_id)
+            if observed is None:
+                return
+            victim_ready_width = min(int(getattr(info, 'planned_capacity', 1)),
+                                     observed)
+        if ready_capacity - victim_ready_width < target_capacity:
+            return
+        self._defer_scale_down_until_idle(
+            replica_id,
+            logical_retirement=(version, reconcile_generation, target_capacity))
 
     # We don't need to add lock here since every caller of this function
     # will acquire the lock.
@@ -3202,6 +4078,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         # Economic retirements are persisted off-route first and enter the
         # normal termination pool only after the LB proves they are idle.
         self._refresh_wait_for_idle()
+        self._clear_known_unknown_capacity_replacements()
 
         # To avoid `dictionary changed size during iteration` error.
         launch_thread_pool_snapshot = list(self._launch_thread_pool.items())
@@ -3358,14 +4235,36 @@ class SkyPilotReplicaManager(ReplicaManager):
                     if not controller_utils.can_terminate(self._is_pool,
                                                           in_flight=in_flight):
                         continue
-                    t.start()
-                    # This replica is now terminating; reflect it locally
-                    # (weighted like in_flight_launch_count) instead of
-                    # re-scanning the DB on the next replica.
-                    in_flight += 1.0 / controller_utils.SERVE_LAUNCH_RATIO
-                    info.status_property.sky_down_status = (
-                        common_utils.ProcessStatus.RUNNING)
-                    self._persist_replica(replica_id, info)
+                    logical_retirement = getattr(info.status_property,
+                                                 'logical_retirement_version',
+                                                 None) is not None
+                    logical_state_guard = (self._logical_state_lock
+                                           if logical_retirement else
+                                           contextlib.nullcontext())
+                    with logical_state_guard:
+                        if logical_retirement:
+                            retirement_state = self._logical_retirement_state(
+                                info)
+                            if retirement_state == 'wait':
+                                continue
+                            if retirement_state == 'abort':
+                                self._down_thread_pool.pop(replica_id)
+                                self._abort_logical_retirement(
+                                    info, 'shutdown admission fence changed')
+                                continue
+                            snapshot = self._logical_reconcile_snapshot
+                            assert snapshot is not None
+                            info.status_property.logical_retirement_confirmed_generation = (
+                                snapshot.generation)
+                            self._persist_replica(replica_id, info)
+                        t.start()
+                        # This replica is now terminating; reflect it locally
+                        # (weighted like in_flight_launch_count) instead of
+                        # re-scanning the DB on the next replica.
+                        in_flight += 1.0 / controller_utils.SERVE_LAUNCH_RATIO
+                        info.status_property.sky_down_status = (
+                            common_utils.ProcessStatus.RUNNING)
+                        self._persist_replica(replica_id, info)
 
         # Clean old version
         replica_infos = serve_state.get_replica_infos(self._service_name)
@@ -3846,14 +4745,39 @@ class SkyPilotReplicaManager(ReplicaManager):
         assert new_yaml_content is not None, (
             f'yaml content not found for {self._service_name} version {version}'
         )
-        # The placer is derived from task resources, not the service-only spec.
-        # Rebuild it before publishing the new version so scale-ups use the
-        # update's clouds, regions, and accelerator shapes.
-        new_task = task_lib.Task.from_yaml_str(new_yaml_content)
-        new_spot_placer = spot_placer.SpotPlacer.from_task(spec, new_task)
+        new_uses_logical_replicas = (getattr(spec, 'uses_logical_replicas',
+                                             False) is True)
+        if self._uses_logical_replicas and not new_uses_logical_replicas:
+            raise ValueError(
+                'Cannot change a logical per-GPU service back to physical '
+                'backend replica semantics in place.')
+        new_task = load_task_with_service_spec(new_yaml_content, spec)
+        new_default_planned_capacity = _uniform_whole_gpu_capacity(
+            new_task.resources)
+        # A service update may change the placement policy or any_of shape
+        # set. Rebuild it before mutating manager version state so neither
+        # logical nor physical versions retain candidates from the prior spec.
+        new_placer_name = getattr(spec, 'spot_placer', None)
+        new_spot_placer = None
+        if new_uses_logical_replicas or isinstance(new_placer_name, str):
+            new_spot_placer = spot_placer.SpotPlacer.from_task(spec, new_task)
+        if new_uses_logical_replicas:
+            _validate_logical_capacity_sources(new_default_planned_capacity,
+                                               new_spot_placer,
+                                               new_task.num_nodes)
+
         self.latest_version = version
         self.yaml_content = new_yaml_content
         self._update_mode = update_mode
+        self._uses_logical_replicas = new_uses_logical_replicas
+        version_specs = getattr(self, '_version_specs', None)
+        if version_specs is None:
+            # Compatibility for embedders and legacy tests that construct a
+            # manager without running the current constructor.
+            version_specs = {}
+            self._version_specs = version_specs
+        version_specs[version] = spec
+        self._default_planned_capacity = new_default_planned_capacity
         self._spot_placer = new_spot_placer
 
         # Reuse all replicas that have the same config as the new version
@@ -3880,6 +4804,10 @@ class SkyPilotReplicaManager(ReplicaManager):
         })
         prior_yaml_contents = (serve_state.get_yaml_contents(
             self._service_name, prior_versions) if prior_versions else {})
+        prior_specs = (serve_state.get_specs(self._service_name, prior_versions)
+                       if prior_versions else {})
+        if not isinstance(prior_specs, dict):
+            prior_specs = {}
         prior_configs = {}
         prior_any_of = {}
         for prior_version in prior_versions:
@@ -3898,6 +4826,18 @@ class SkyPilotReplicaManager(ReplicaManager):
                     old_config.get('resources', {}).pop('any_of', [])))
         for info in replica_infos:
             if info.version < version and not info.is_terminal:
+                prior_spec = prior_specs.get(info.version)
+                prior_is_logical = (getattr(prior_spec, 'uses_logical_replicas',
+                                            False) is True)
+                if prior_is_logical != self._uses_logical_replicas:
+                    # A unit change is a one-way rolling bridge. Never relabel
+                    # an existing physical row as logical merely because the
+                    # model task itself is byte-for-byte identical.
+                    logger.info(
+                        f'Replica unit changed for replica {info.replica_id}; '
+                        'launching replacement capacity instead of reusing '
+                        'the backend row.')
+                    continue
                 old_config = prior_configs[info.version]
                 # Bump replica version if all fields except for service are
                 # the same.

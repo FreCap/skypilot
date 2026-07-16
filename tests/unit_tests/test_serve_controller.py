@@ -113,6 +113,26 @@ def _make_controller() -> controller.SkyServeController:
     return ctrl
 
 
+def test_recovery_rejects_physical_spec_after_durable_logical_activation():
+    physical = mock.MagicMock()
+    physical.uses_logical_replicas = False
+    with mock.patch.object(
+            controller.serve_state,
+            'service_uses_logical_replica_semantics',
+            return_value=True), \
+         mock.patch.object(controller.replica_managers,
+                           'SkyPilotReplicaManager') as manager, \
+         pytest.raises(RuntimeError, match='activation fence disagrees'):
+        controller.SkyServeController('svc',
+                                      physical,
+                                      version=3,
+                                      host='localhost',
+                                      port=8000,
+                                      controller_owner_fingerprint='owner-a',
+                                      service_hash='incarnation-a')
+    manager.assert_not_called()
+
+
 class _FakeSpec:
     """Minimal SkyServiceSpec stub exposing the routing-spec properties."""
 
@@ -270,6 +290,39 @@ def _make_update_controller() -> controller.SkyServeController:
 
 class TestServiceUpdateReconciler:
 
+    def test_per_gpu_service_rejects_update_to_physical_semantics(self):
+        ctrl = _make_update_controller()
+        ctrl._autoscaler = types.SimpleNamespace(  # pylint: disable=protected-access
+            replica_unit='logical')
+        legacy_spec = types.SimpleNamespace(replica_unit='physical_backend')
+
+        with mock.patch.object(controller.serve_state,
+                               'add_or_update_version') as commit:
+            response = ctrl._commit_service_update(  # pylint: disable=protected-access
+                2, legacy_spec, 'service: changed',
+                serve_utils.UpdateMode.ROLLING, 'incarnation-a', 7)
+
+        assert response.status_code == 400
+        assert 'dynamic_fallback_per_gpu' in json.loads(
+            response.body)['message']
+        commit.assert_not_called()
+
+    def test_logical_service_rejects_blue_green_update(self):
+        ctrl = _make_update_controller()
+        ctrl._autoscaler = types.SimpleNamespace(  # pylint: disable=protected-access
+            replica_unit='logical')
+        logical_spec = types.SimpleNamespace(replica_unit='logical')
+
+        with mock.patch.object(controller.serve_state,
+                               'add_or_update_version') as commit:
+            response = ctrl._commit_service_update(  # pylint: disable=protected-access
+                2, logical_spec, 'service: changed',
+                serve_utils.UpdateMode.BLUE_GREEN, 'incarnation-a', 7)
+
+        assert response.status_code == 400
+        assert 'rolling updates' in json.loads(response.body)['message']
+        commit.assert_not_called()
+
     def test_content_conflict_returns_409_without_scheduling(self):
         ctrl = _make_update_controller()
         ctrl._record_committed_update = mock.Mock()  # pylint: disable=protected-access
@@ -293,6 +346,191 @@ class TestServiceUpdateReconciler:
                                        expected_lifecycle_epoch=7,
                                        expected_controller_owner=(123,
                                                                   '10.0.0.1'))
+
+    def test_stale_version_returns_409_without_scheduling(self):
+        ctrl = _make_update_controller()
+        ctrl._record_committed_update = mock.Mock()  # pylint: disable=protected-access
+        with mock.patch.object(
+                controller.serve_state,
+                'add_or_update_version',
+                return_value=serve_state.VersionCommitResult.STALE_VERSION):
+            response = ctrl._commit_service_update(  # pylint: disable=protected-access
+                2, mock.sentinel.spec, 'service: stale',
+                serve_utils.UpdateMode.ROLLING, 'incarnation-a', 7)
+
+        assert response.status_code == 409
+        assert 'superseded' in json.loads(response.body)['message']
+        ctrl._record_committed_update.assert_not_called()  # pylint: disable=protected-access
+
+    def test_durable_activation_fence_rejects_racing_physical_commit(self):
+        ctrl = _make_update_controller()
+        # Runtime is still physical while a previously committed logical
+        # version is waiting for the manager lock. The durable parent-row
+        # fence, not the currently published autoscaler, must reject v3.
+        ctrl._autoscaler = types.SimpleNamespace(  # pylint: disable=protected-access
+            replica_unit='physical_backend')
+        physical = types.SimpleNamespace(replica_unit='physical_backend',
+                                         uses_logical_replicas=False)
+        ctrl._record_committed_update = mock.Mock()  # pylint: disable=protected-access
+        with mock.patch.object(controller.serve_state,
+                               'add_or_update_version',
+                               return_value=serve_state.VersionCommitResult.
+                               SEMANTIC_CONFLICT) as commit:
+            response = ctrl._commit_service_update(  # pylint: disable=protected-access
+                3, physical, 'service: physical',
+                serve_utils.UpdateMode.ROLLING, 'incarnation-a', 7)
+
+        assert response.status_code == 400
+        assert 'dynamic_fallback_per_gpu' in json.loads(
+            response.body)['message']
+        commit.assert_called_once()
+        ctrl._record_committed_update.assert_not_called()  # pylint: disable=protected-access
+
+    def test_apply_revalidates_logical_to_physical_transition(self):
+        ctrl = _make_update_controller()
+        ctrl._autoscaler = types.SimpleNamespace(  # pylint: disable=protected-access
+            replica_unit='logical')
+        physical = types.SimpleNamespace(uses_logical_replicas=False)
+
+        with pytest.raises(ValueError, match='Refusing to apply'):
+            ctrl._apply_service_update(  # pylint: disable=protected-access
+                3, physical, serve_utils.UpdateMode.ROLLING)
+
+        ctrl._replica_manager.update_version.assert_not_called()  # pylint: disable=protected-access
+
+    def test_multi_node_logical_update_is_rejected_before_db_commit(self):
+        ctrl = _make_update_controller()
+        ctrl._autoscaler = types.SimpleNamespace(  # pylint: disable=protected-access
+            replica_unit='physical_backend')
+        logical = types.SimpleNamespace(replica_unit='logical',
+                                        uses_logical_replicas=True)
+        update_task = types.SimpleNamespace(service=logical, num_nodes=2)
+
+        with mock.patch.object(controller.task_lib.Task,
+                               'from_yaml_str',
+                               return_value=update_task), \
+             mock.patch.object(controller.serve_state,
+                               'get_yaml_content',
+                               return_value=None), \
+             mock.patch.object(controller.serve_state,
+                               'add_or_update_version') as commit:
+            response = ctrl._commit_service_update(  # pylint: disable=protected-access
+                2, logical, 'service: logical', serve_utils.UpdateMode.ROLLING,
+                'incarnation-a', 7)
+
+        assert response.status_code == 400
+        assert 'only single-node services' in json.loads(
+            response.body)['message']
+        commit.assert_not_called()
+
+    def test_legacy_per_gpu_retry_applies_authoritative_physical_spec(self):
+        ctrl = _make_update_controller()
+        ctrl._autoscaler = types.SimpleNamespace(  # pylint: disable=protected-access
+            replica_unit='physical_backend')
+        caller = types.SimpleNamespace(replica_unit='logical',
+                                       uses_logical_replicas=True)
+        persisted = types.SimpleNamespace(replica_unit='physical_backend',
+                                          uses_logical_replicas=False)
+        ctrl._record_committed_update = mock.Mock()  # pylint: disable=protected-access
+
+        with mock.patch.object(controller.serve_state,
+                               'get_yaml_content',
+                               return_value='service: same-legacy-yaml'), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'add_or_update_version',
+                 return_value=serve_state.VersionCommitResult.
+                 IDEMPOTENT_RETRY), \
+             mock.patch.object(controller.serve_state,
+                               'get_spec',
+                               return_value=persisted) as get_spec:
+            response = ctrl._commit_service_update(  # pylint: disable=protected-access
+                1, caller, 'service: same-legacy-yaml',
+                serve_utils.UpdateMode.BLUE_GREEN, 'incarnation-a', 7)
+
+        assert response.status_code == 200
+        get_spec.assert_called_once_with('svc', 1)
+        ctrl._record_committed_update.assert_called_once_with(  # pylint: disable=protected-access
+            1, persisted, serve_utils.UpdateMode.BLUE_GREEN)
+
+    def test_exact_legacy_yaml_is_loaded_before_current_parser(self):
+        ctrl = _make_update_controller()
+        persisted = types.SimpleNamespace(replica_unit='physical_backend',
+                                          uses_logical_replicas=False)
+        with mock.patch.object(controller.serve_state,
+                               'get_yaml_content',
+                               return_value='old-invalid-yaml'), \
+             mock.patch.object(controller.serve_state,
+                               'get_spec',
+                               return_value=persisted), \
+             mock.patch.object(
+                 controller.serve.SkyServiceSpec,
+                 'from_yaml_str',
+                 side_effect=AssertionError('current parser must not run')):
+            loaded = ctrl._load_service_for_update(  # pylint: disable=protected-access
+                2, 'old-invalid-yaml')
+
+        assert loaded is persisted
+
+    def test_older_physical_retry_is_idempotent_after_logical_activation(self):
+        ctrl = _make_update_controller()
+        ctrl._autoscaler = types.SimpleNamespace(  # pylint: disable=protected-access
+            replica_unit='logical')
+        ctrl._committed_version = 3  # pylint: disable=protected-access
+        ctrl._applied_version = 3  # pylint: disable=protected-access
+        persisted = types.SimpleNamespace(replica_unit='physical_backend',
+                                          uses_logical_replicas=False)
+
+        with mock.patch.object(controller.serve_state,
+                               'get_yaml_content',
+                               return_value='service: physical-v2'), \
+             mock.patch.object(controller.serve_state,
+                               'get_spec',
+                               return_value=persisted), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'add_or_update_version',
+                 return_value=serve_state.VersionCommitResult.
+                 IDEMPOTENT_RETRY):
+            response = ctrl._commit_service_update(  # pylint: disable=protected-access
+                2, persisted, 'service: physical-v2',
+                serve_utils.UpdateMode.ROLLING, 'incarnation-a', 7)
+
+        assert response.status_code == 200
+        assert ctrl._pending_update is None  # pylint: disable=protected-access
+        assert ctrl._applied_version == 3  # pylint: disable=protected-access
+        ctrl._replica_manager.notify_version_pending.assert_not_called()  # pylint: disable=protected-access
+
+    def test_exact_logical_retry_skips_current_topology_parser(self):
+        ctrl = _make_update_controller()
+        ctrl._autoscaler = types.SimpleNamespace(  # pylint: disable=protected-access
+            replica_unit='logical')
+        persisted = types.SimpleNamespace(replica_unit='logical',
+                                          uses_logical_replicas=True)
+        ctrl._record_committed_update = mock.Mock()  # pylint: disable=protected-access
+
+        with mock.patch.object(controller.serve_state,
+                               'get_yaml_content',
+                               return_value='old-logical-yaml'), \
+             mock.patch.object(controller.serve_state,
+                               'get_spec',
+                               return_value=persisted), \
+             mock.patch.object(
+                 controller.task_lib.Task,
+                 'from_yaml_str',
+                 side_effect=AssertionError('current parser must not run')), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'add_or_update_version',
+                 return_value=serve_state.VersionCommitResult.
+                 IDEMPOTENT_RETRY):
+            response = ctrl._commit_service_update(  # pylint: disable=protected-access
+                2, persisted, 'old-logical-yaml',
+                serve_utils.UpdateMode.ROLLING, 'incarnation-a', 7)
+
+        assert response.status_code == 200
+        ctrl._record_committed_update.assert_called_once_with(  # pylint: disable=protected-access
+            2, persisted, serve_utils.UpdateMode.ROLLING)
 
     def test_second_commit_does_not_wait_for_first_apply(self):
         ctrl = _make_update_controller()
@@ -1075,15 +1313,19 @@ class _StatefulDemandAutoscaler:
     """Small stateful collector exposing every LB-controlled demand field."""
 
     def __init__(self) -> None:
+        self.replica_unit = 'physical_backend'
+        self.latest_version = 1
         self.request_timestamps = [101]
         self.in_flight_by_replica_id = {1: 9}
         self.unknown_in_flight_replica_ids = {1}
         self.queue_depth = 7
         self.rejected_in_window = 5
         self.collect_calls = 0
+        self.reports = []
 
     def collect_request_information(self, report) -> None:
         self.collect_calls += 1
+        self.reports.append(report)
         self.request_timestamps.extend(report['timestamps'])
         self.in_flight_by_replica_id = report['in_flight_by_replica_id']
         self.unknown_in_flight_replica_ids = set(
@@ -1107,6 +1349,7 @@ class _StatefulReplicaManager:
         }, ['http://trusted:8080'], ['http://trusted:8080'],
                        ['http://trusted:8080'], 'trusted-session')
         self.update_calls = 0
+        self.logical_snapshot = None
 
     def update_lb_in_flight(self, in_flight, routing_urls, unknown_urls,
                             draining_urls, lb_session_id) -> None:
@@ -1116,6 +1359,9 @@ class _StatefulReplicaManager:
 
     def snapshot(self):
         return self.report, self.update_calls
+
+    def update_logical_reconcile_snapshot(self, **kwargs) -> None:
+        self.logical_snapshot = kwargs
 
 
 class TestAuthoritativeLbReportIngestion:
@@ -1225,6 +1471,32 @@ class TestAuthoritativeLbReportIngestion:
                 self._URL: 2
             }, [self._URL], [self._URL], [self._URL], 'lb-a'), 1)
 
+    def test_logical_report_publishes_capacity_and_demand_as_one_generation(
+            self):
+        ctrl, info, report = self._controller_and_report()
+        ctrl._autoscaler.replica_unit = 'logical'  # pylint: disable=protected-access
+        report['total_slots_by_url'] = {self._URL: 8}
+        report['occupancy_sampled_urls'] = [self._URL]
+        report['unknown_in_flight_urls'] = []
+
+        accepted = asyncio.run(
+            ctrl._ingest_load_balancer_report(  # pylint: disable=protected-access
+                report, [info], {1: True},
+                authority=(True, True, True)))
+
+        assert accepted is True
+        assert ctrl._replica_manager.logical_snapshot == {  # pylint: disable=protected-access
+            'version': 1,
+            'generation': 1,
+            'observed_slots_by_replica_id': {
+                1: 8
+            },
+            'in_flight_by_replica_id': {
+                1: 2
+            },
+            'unknown_replica_ids': set(),
+        }
+
     def test_sole_ready_reporter_keeps_demand_during_terminating_overlap(self):
         ctrl, info, report = self._controller_and_report()
         with mock.patch.object(controller.lb_k8s,
@@ -1242,6 +1514,8 @@ class TestAuthoritativeLbReportIngestion:
             [101, 201, 202], {
                 1: 2
             }, {1}, 11, 13, 1)
+        assert ctrl._autoscaler.reports[-1][  # pylint: disable=protected-access
+            'unknown_capacity_replica_ids'] == []
         # The reporter's clean-looking drain fields are not copied. A blocking
         # view also invalidates any still-fresh proof from before the rollout.
         assert ctrl._replica_manager.snapshot() == (  # pylint: disable=protected-access
@@ -1305,9 +1579,12 @@ class TestAuthoritativeLbReportIngestion:
 
         ctrl._get_lb_replica_info = _capture_lb_replica_info  # pylint: disable=protected-access
         ctrl._ingest_load_balancer_report = _capture_ingest  # pylint: disable=protected-access
-        ctrl._get_capacity_hint = lambda replica_infos: {  # pylint: disable=protected-access
-            'n': len(replica_infos)
-        }
+
+        def _capture_capacity_hint(replica_infos, logical_versions):
+            observed['logical_versions'] = set(logical_versions)
+            return {'n': len(replica_infos)}
+
+        ctrl._get_capacity_hint = _capture_capacity_hint  # pylint: disable=protected-access
         ctrl._routing_spec = {'policy': 'round_robin'}  # pylint: disable=protected-access
 
         with mock.patch.object(controller.lb_k8s,
@@ -1324,7 +1601,8 @@ class TestAuthoritativeLbReportIngestion:
                      1: types.SimpleNamespace(
                          graceful_drain_async_occupancy=False),
                      3: types.SimpleNamespace(
-                         graceful_drain_async_occupancy=True),
+                         graceful_drain_async_occupancy=True,
+                         uses_logical_replicas=True),
                  }) as get_specs, \
              mock.patch.object(controller.serve_state,
                                'get_spec',
@@ -1338,17 +1616,23 @@ class TestAuthoritativeLbReportIngestion:
         get_specs.assert_called_once_with('svc', [1, 2, 3])
         assert observed['sync'] == {1: False, 2: None, 3: True}
         assert observed['ingest'] == {1: False, 2: None, 3: True}
+        assert observed['logical_versions'] == {3}
         assert observed['sync_thread'] != event_loop_thread
 
 
 class _FakeAutoscaler:
     """Autoscaler stub for the capacity-hint computation."""
 
-    def __init__(self, target, recomputed, latest_version=1) -> None:
+    def __init__(self,
+                 target,
+                 recomputed,
+                 latest_version=1,
+                 replica_unit='physical_backend') -> None:
         self._target = target
         self._recomputed = recomputed
         self.latest_version = latest_version
         self.max_replicas = 20
+        self.replica_unit = replica_unit
 
     def get_final_target_num_replicas(self) -> int:
         return self._target
@@ -1384,11 +1668,15 @@ class TestGetCapacityHint:
             target=5,
             recomputed=True,
             latest_version=2)
-        hint = ctrl._get_capacity_hint(self._replicas())  # pylint: disable=protected-access
+        hint = ctrl._get_capacity_hint(  # pylint: disable=protected-access
+            self._replicas(),
+            logical_versions=set())
         assert hint == {
+            'replica_unit': 'physical_backend',
             'provisioning_replicas': 2,
             'target_num_replicas': 5,
             'max_replicas': 20,
+            'configured_max_replicas': 20,
         }
 
     def test_stale_autoscaler_reports_at_least_live_fleet(self):
@@ -1401,11 +1689,15 @@ class TestGetCapacityHint:
             target=1,
             recomputed=False,
             latest_version=2)
-        hint = ctrl._get_capacity_hint(self._replicas())  # pylint: disable=protected-access
+        hint = ctrl._get_capacity_hint(  # pylint: disable=protected-access
+            self._replicas(),
+            logical_versions=set())
         assert hint == {
+            'replica_unit': 'physical_backend',
             'provisioning_replicas': 2,
             'target_num_replicas': 3,
             'max_replicas': 20,
+            'configured_max_replicas': 20,
         }
 
     def test_stale_max_rule_keeps_larger_target(self):
@@ -1414,9 +1706,77 @@ class TestGetCapacityHint:
             target=10,
             recomputed=False,
             latest_version=2)
-        hint = ctrl._get_capacity_hint(self._replicas())  # pylint: disable=protected-access
+        hint = ctrl._get_capacity_hint(  # pylint: disable=protected-access
+            self._replicas(),
+            logical_versions=set())
         assert hint['target_num_replicas'] == 10
         assert hint['max_replicas'] == 20
+
+    def test_logical_hint_sums_persisted_backend_widths(self):
+        ctrl = _make_controller()
+        ctrl._autoscaler = _FakeAutoscaler(  # pylint: disable=protected-access
+            target=9,
+            recomputed=False,
+            latest_version=2,
+            replica_unit='logical')
+        replicas = self._replicas()
+        replicas[0].planned_capacity = 8
+        replicas[1].planned_capacity = 4
+        replicas[2].planned_capacity = 1
+        ctrl._lb_translation_cache = {  # pylint: disable=protected-access
+            1: ('http://eight', 'A100', 8),
+            2: ('http://four', 'A100', 4),
+            3: ('http://one', 'A100', 1),
+        }
+
+        hint = ctrl._get_capacity_hint(  # pylint: disable=protected-access
+            replicas, logical_versions={2})
+
+        assert hint == {
+            'replica_unit': 'logical_slot',
+            'provisioning_replicas': 5,
+            # Before a fresh demand tick, never advertise a target below the
+            # persisted 8 + 4 + 1 logical slots.
+            'target_num_replicas': 13,
+            'max_replicas': 20,
+            'configured_max_replicas': 20,
+            'planned_capacity_by_url': {
+                'http://eight': 8,
+                'http://four': 4,
+                'http://one': 1,
+            },
+            'logical_replica_urls': [
+                'http://eight',
+                'http://four',
+                'http://one',
+            ],
+        }
+
+    def test_logical_hint_excludes_physical_bridge_backends(self):
+        ctrl = _make_controller()
+        ctrl._autoscaler = _FakeAutoscaler(  # pylint: disable=protected-access
+            target=8,
+            recomputed=True,
+            latest_version=2,
+            replica_unit='logical')
+        physical = _FakeReplicaInfo(1,
+                                    serve_state.ReplicaStatus.READY,
+                                    version=1)
+        logical = _FakeReplicaInfo(2,
+                                   serve_state.ReplicaStatus.READY,
+                                   version=2)
+        logical.planned_capacity = 8
+        ctrl._lb_translation_cache = {  # pylint: disable=protected-access
+            1: ('http://physical', 'A100', 8),
+            2: ('http://logical', 'A100', 8),
+        }
+
+        hint = ctrl._get_capacity_hint(  # pylint: disable=protected-access
+            [physical, logical],
+            logical_versions={2})
+
+        assert hint['planned_capacity_by_url'] == {'http://logical': 8}
+        assert hint['logical_replica_urls'] == ['http://logical']
 
 
 class TestReservedCapacityPollerStart:

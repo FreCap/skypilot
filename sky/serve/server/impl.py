@@ -155,7 +155,8 @@ def _get_committed_storage_generations(
     for yaml_content in serve_state.get_version_yaml_contents(
             service_name).values():
         try:
-            version_task = task_lib.Task.from_yaml_str(yaml_content)
+            version_task = service_lib.load_task_for_storage_cleanup(
+                yaml_content)
         except Exception:  # pylint: disable=broad-except
             return None
         metadata = version_task.metadata.get(
@@ -507,6 +508,7 @@ def _require_supported_service_topology(task: 'task_lib.Task',
         return
     service_spec = task.service
     assert service_spec is not None
+    serve_utils.validate_logical_replica_task(task)
     serve_utils.validate_external_lb_service_spec(service_spec)
     # Validate the platform (Kubernetes identity, stable proxy address, and
     # all three projected auth rings) before syncing mounts or launching a

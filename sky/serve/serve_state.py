@@ -86,6 +86,13 @@ services_table = sqlalchemy.Table(
     # Pod IP where the controller process is running.
     # Written by the sky.serve.service process at startup.
     sqlalchemy.Column('controller_ip', sqlalchemy.Text, server_default=None),
+    # Durable one-way activation fence. Logical per-GPU semantics may be
+    # enabled by an update, but cannot safely be changed back to physical
+    # backend counts in place. This parent-row bit makes that rule atomic with
+    # a version commit and survives controller restarts/version retirement.
+    sqlalchemy.Column('logical_replica_semantics',
+                      sqlalchemy.Integer,
+                      server_default='0'),
 )
 
 replicas_table = sqlalchemy.Table(
@@ -273,6 +280,23 @@ reserved_fill_lease_table = sqlalchemy.Table(
     sqlalchemy.Column('id', sqlalchemy.Integer, primary_key=True),
     sqlalchemy.Column('epoch', sqlalchemy.Integer),
     sqlalchemy.Column('expires_at', sqlalchemy.Float),
+)
+
+# Shared raw Kubernetes accelerator observations used by demand placement.
+# One row per context lets every service/controller reuse the same expensive
+# cluster-wide query. ``availability`` is JSON {gpu_name_lower: free_gpus};
+# NULL records a failed query and rate-limits retry storms while preserving
+# the important distinction from a successful empty/zero observation.
+# ``snapshot_time`` is the query start used to debit replicas that raced the
+# observation; ``completed_at`` is the freshness/rate-limit clock, so a slow
+# query does not publish a result that is immediately stale.
+demand_capacity_observations_table = sqlalchemy.Table(
+    'demand_capacity_observations',
+    Base.metadata,
+    sqlalchemy.Column('context', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('snapshot_time', sqlalchemy.Float, nullable=False),
+    sqlalchemy.Column('completed_at', sqlalchemy.Float, nullable=False),
+    sqlalchemy.Column('availability', sqlalchemy.Text, server_default=None),
 )
 
 
@@ -756,7 +780,9 @@ def add_service(name: str,
                           if service_hash is None else service_hash),
                     lifecycle_epoch=lifecycle_epoch,
                     resource_scope=resource_scope,
-                    entrypoint=entrypoint))
+                    entrypoint=entrypoint,
+                    logical_replica_semantics=int(
+                        getattr(spec, 'uses_logical_replicas', False) is True)))
             version_insert_stmt = insert_func(version_specs_table).values(
                 service_name=name,
                 version=constants.INITIAL_VERSION,
@@ -911,6 +937,16 @@ def service_owner_matches(
             sqlalchemy.select(
                 services_table.c.name).where(*predicates)).fetchone()
     return row is not None
+
+
+def service_uses_logical_replica_semantics(service_name: str) -> bool:
+    """Whether logical replica semantics were durably activated."""
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        row = session.execute(
+            sqlalchemy.select(services_table.c.logical_replica_semantics).where(
+                services_table.c.name == service_name)).fetchone()
+    return bool(row[0]) if row is not None else False
 
 
 def remove_service_completely(
@@ -2321,14 +2357,18 @@ class VersionCommitResult(enum.Enum):
     """Outcome of committing the immutable contents of a service version."""
 
     COMMITTED = 'committed'
+    IDEMPOTENT_RETRY = 'idempotent_retry'
     REJECTED = 'rejected'
     CONTENT_CONFLICT = 'content_conflict'
+    SEMANTIC_CONFLICT = 'semantic_conflict'
+    STALE_VERSION = 'stale_version'
 
     def __bool__(self) -> bool:
         # Preserve the historical bool contract for internal callers while
         # allowing the controller to distinguish a content conflict from an
         # ownership/terminal rejection.
-        return self is VersionCommitResult.COMMITTED
+        return self in (VersionCommitResult.COMMITTED,
+                        VersionCommitResult.IDEMPOTENT_RETRY)
 
 
 def _lock_service_for_version_mutation(session: orm.Session,
@@ -2464,6 +2504,35 @@ def add_or_update_version(
             sqlalchemy.select(version_specs_table.c.yaml_content).where(
                 version_specs_table.c.service_name == service_name,
                 version_specs_table.c.version == version)).fetchone()
+        identical_retry = existing is not None and existing[0] == yaml_content
+        if existing is not None and existing[
+                0] is not None and not identical_retry:
+            session.rollback()
+            return VersionCommitResult.CONTENT_CONFLICT
+        if not identical_retry:
+            higher_committed_version = session.execute(
+                sqlalchemy.select(
+                    sqlalchemy.func.max(version_specs_table.c.version)).where(
+                        version_specs_table.c.service_name == service_name,
+                        version_specs_table.c.version > version,
+                        version_specs_table.c.yaml_content.isnot(
+                            None))).scalar()
+            if higher_committed_version is not None:
+                session.rollback()
+                return VersionCommitResult.STALE_VERSION
+
+        uses_logical_replicas = (getattr(spec, 'uses_logical_replicas', False)
+                                 is True)
+        semantics_row = session.execute(
+            sqlalchemy.select(services_table.c.logical_replica_semantics).where(
+                services_table.c.name ==
+                service_name).with_for_update()).fetchone()
+        # The fence applies to new commits, not to lost-response retries of a
+        # version that was already committed before logical activation.
+        if (not identical_retry and semantics_row is not None and
+                bool(semantics_row[0]) and not uses_logical_replicas):
+            session.rollback()
+            return VersionCommitResult.SEMANTIC_CONFLICT
         if existing is None:
             session.execute(version_specs_table.insert().values(
                 service_name=service_name,
@@ -2479,9 +2548,12 @@ def add_or_update_version(
                     version_specs_table.c.version == version,
                     version_specs_table.c.yaml_content.is_(None)).values(
                         spec=pickle.dumps(spec), yaml_content=yaml_content))
-        elif existing[0] != yaml_content:
-            session.rollback()
-            return VersionCommitResult.CONTENT_CONFLICT
+        if (not identical_retry and semantics_row is not None and
+                uses_logical_replicas):
+            session.execute(
+                sqlalchemy.update(services_table).where(
+                    services_table.c.name == service_name).values(
+                        logical_replica_semantics=1))
         # An identical committed YAML is an idempotent retry. Keep both the
         # original YAML and pickled spec bytes untouched.
         if resource_scope is not None and storage_generation is not None:
@@ -2498,7 +2570,8 @@ def add_or_update_version(
                 ] if expected_lifecycle_epoch is not None else []),
             ).update({ephemeral_storage_cleanup_intents_table.c.provisional: 0})
         session.commit()
-    return VersionCommitResult.COMMITTED
+    return (VersionCommitResult.IDEMPOTENT_RETRY
+            if identical_retry else VersionCommitResult.COMMITTED)
 
 
 def get_spec(service_name: str,
@@ -2925,6 +2998,51 @@ def get_reserved_fill_round(pool_key: str) -> dict[str, Any] | None:
             sqlalchemy.select(reserved_fill_rounds_table).where(
                 reserved_fill_rounds_table.c.pool_key == pool_key)).fetchone()
     return None if row is None else dict(row._mapping)  # pylint: disable=protected-access
+
+
+def get_demand_capacity_observations(
+        contexts: typing.Iterable[str]) -> dict[str, dict[str, Any]]:
+    """Return the latest shared demand-capacity observation per context."""
+    context_names = sorted(set(contexts))
+    if not context_names:
+        return {}
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        rows = session.execute(
+            sqlalchemy.select(demand_capacity_observations_table).where(
+                demand_capacity_observations_table.c.context.in_(
+                    context_names))).fetchall()
+    result: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        mapping = row._mapping  # pylint: disable=protected-access
+        result[str(mapping['context'])] = dict(mapping)
+    return result
+
+
+def upsert_demand_capacity_observation(
+        context: str, snapshot_time: float, completed_at: float,
+        availability: dict[str, int] | None) -> None:
+    """Publish one raw free-GPU observation for cross-controller reuse."""
+    engine = _db_manager.get_engine()
+    values = {
+        'context': context,
+        'snapshot_time': snapshot_time,
+        'completed_at': completed_at,
+        'availability': (None if availability is None else json.dumps(
+            availability, sort_keys=True)),
+    }
+    with orm.Session(engine) as session:
+        insert_stmt = _upsert_insert_func(engine)(
+            demand_capacity_observations_table).values(**values)
+        insert_stmt = insert_stmt.on_conflict_do_update(
+            index_elements=['context'],
+            set_={
+                key: getattr(insert_stmt.excluded, key)
+                for key in values
+                if key != 'context'
+            })
+        session.execute(insert_stmt)
+        session.commit()
 
 
 def acquire_reserved_fill_lease_token(

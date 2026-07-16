@@ -18,6 +18,9 @@ from sky.utils import yaml_utils
 
 logger = sky_logging.init_logger(__name__)
 
+REPLICA_UNIT_PHYSICAL_BACKEND = 'physical_backend'
+REPLICA_UNIT_LOGICAL = 'logical'
+
 
 class SkyServiceSpec:
     """SkyServe service specification."""
@@ -236,6 +239,30 @@ class SkyServiceSpec:
                         'target_concurrency_per_replica must be > 0. '
                         f'Got: {target_concurrency_per_replica}')
 
+        uses_logical_replicas = (
+            spot_placer == spot_placer_lib.CAPACITY_AWARE_SPOT_PLACER)
+        if uses_logical_replicas:
+            if (not isinstance(target_concurrency_per_replica, int) or
+                    isinstance(target_concurrency_per_replica, bool) or
+                    target_concurrency_per_replica != 1):
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        'dynamic_fallback_per_gpu currently requires '
+                        'target_concurrency_per_replica: 1 so one logical '
+                        'replica is exactly one concurrent job slot.')
+            if graceful_drain_async_occupancy is not True:
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        'dynamic_fallback_per_gpu requires '
+                        'graceful_drain_async_occupancy: true so scale-down '
+                        'can prove that no asynchronous work is running.')
+            if reserved_fill_enabled:
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        'dynamic_fallback_per_gpu does not yet support '
+                        'reserved_capacity_fill. The reserved allocator '
+                        'must migrate from backend counts to GPU slots first.')
+
         if target_qps_per_replica is not None:
             if max_replicas is None:
                 with ux_utils.print_exception_no_traceback():
@@ -415,6 +442,11 @@ class SkyServiceSpec:
         # Per-GPU target concurrency: replica capacity = knob * gpu_count.
         self._target_concurrency_per_replica: float | None = (
             target_concurrency_per_replica)
+        # Internal compatibility marker. dynamic_fallback_per_gpu predates
+        # logical replica semantics, so old persisted specs must remain
+        # physical across controller restarts. New specs activate logical
+        # semantics automatically; the marker is deliberately not a YAML field.
+        self._uses_logical_replicas: bool = uses_logical_replicas
         # Opt-in: allow scaling up onto free reserved (zero-cost) capacity.
         # Absent/False means no behavior change. Bool form or object form
         # ({floor_replicas, weight}); object form implies enabled.
@@ -457,6 +489,10 @@ class SkyServiceSpec:
         state.setdefault('_consecutive_failure_threshold_timeout', None)
         # Added with the concurrency autoscaler; old DB rows predate it.
         state.setdefault('_target_concurrency_per_replica', None)
+        # dynamic_fallback_per_gpu existed before logical replica semantics.
+        # Missing means this service version still counts physical backends
+        # until an explicit update creates a newly marked version.
+        state.setdefault('_uses_logical_replicas', False)
         # Added with reserved-capacity fill; old DB rows predate it.
         state.setdefault('_reserved_capacity_fill', None)
         state.setdefault('_cost_rebalance', None)
@@ -1052,6 +1088,16 @@ class SkyServiceSpec:
         return self._target_concurrency_per_replica
 
     @property
+    def replica_unit(self) -> str:
+        if self.uses_logical_replicas:
+            return REPLICA_UNIT_LOGICAL
+        return REPLICA_UNIT_PHYSICAL_BACKEND
+
+    @property
+    def uses_logical_replicas(self) -> bool:
+        return getattr(self, '_uses_logical_replicas', False)
+
+    @property
     def reserved_capacity_fill(self) -> bool:
         # Opt-in flag; absent (None) collapses to False so callers never
         # need to distinguish unset from disabled. The object form implies
@@ -1159,7 +1205,20 @@ class SkyServiceSpec:
         return self._consecutive_failure_threshold_timeout
 
     def copy(self, **override) -> 'SkyServiceSpec':
-        return SkyServiceSpec(
+        spot_placer_overridden = 'spot_placer' in override
+        copied_spot_placer = override.pop('spot_placer', self._spot_placer)
+        preserve_legacy_semantics = (
+            not spot_placer_overridden and
+            copied_spot_placer == spot_placer_lib.CAPACITY_AWARE_SPOT_PLACER and
+            not self.uses_logical_replicas)
+        # Legacy pickles can carry the per-GPU placer while retaining the old
+        # physical-backend contract.  Reconstruct through the other physical
+        # placer so all ordinary field validation still runs, then restore the
+        # authoritative legacy placer and hidden semantic marker below.
+        constructor_spot_placer = (spot_placer_lib.SPOT_HEDGE_PLACER
+                                   if preserve_legacy_semantics else
+                                   copied_spot_placer)
+        copied = SkyServiceSpec(
             readiness_path=override.pop('readiness_path', self._readiness_path),
             initial_delay_seconds=override.pop('initial_delay_seconds',
                                                self._initial_delay_seconds),
@@ -1205,7 +1264,7 @@ class SkyServiceSpec:
             base_ondemand_fallback_replicas=override.pop(
                 'base_ondemand_fallback_replicas',
                 self._base_ondemand_fallback_replicas),
-            spot_placer=override.pop('spot_placer', self._spot_placer),
+            spot_placer=constructor_spot_placer,
             upscale_delay_seconds=override.pop('upscale_delay_seconds',
                                                self._upscale_delay_seconds),
             downscale_delay_seconds=override.pop('downscale_delay_seconds',
@@ -1219,3 +1278,10 @@ class SkyServiceSpec:
                 'consecutive_failure_threshold_timeout',
                 self._consecutive_failure_threshold_timeout),
         )
+        if preserve_legacy_semantics:
+            # Preserve a legacy per-GPU version's pre-activation semantics
+            # through internal copies.  An explicit placer override is a new
+            # policy choice and keeps the constructor-derived semantics.
+            copied._spot_placer = copied_spot_placer  # pylint: disable=protected-access
+            copied._uses_logical_replicas = False  # pylint: disable=protected-access
+        return copied
