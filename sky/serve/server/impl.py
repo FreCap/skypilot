@@ -956,8 +956,8 @@ def update(
                          lifecycle_lock=lifecycle_lock)
 
 
-def elect_version(service_name: str, version: int,
-                  expected_service_hash: str) -> None:
+def elect_version(service_name: str, version: int, expected_service_hash: str,
+                  expected_elected_version: int | None) -> None:
     """Create a new rollout generation from an immutable stored version."""
     with filelock.FileLock(serve_utils.get_service_filelock_path(service_name)):
         lifecycle_lock = serve_utils.get_service_lifecycle_lock(service_name)
@@ -969,6 +969,10 @@ def elect_version(service_name: str, version: int,
                     f'Service {service_name!r} changed before version '
                     f'{version} could be elected. Refresh and try again.')
             elected_version = record.get('elected_version')
+            if elected_version != expected_elected_version:
+                raise RuntimeError(
+                    f'Service {service_name!r} changed before version '
+                    f'{version} could be elected. Refresh and try again.')
             if elected_version == version:
                 raise ValueError(
                     f'Service {service_name!r} already has version {version} '
@@ -994,7 +998,8 @@ def elect_version(service_name: str, version: int,
                          service_name,
                          serve_utils.UpdateMode.ROLLING,
                          pool=False,
-                         lifecycle_lock=lifecycle_lock)
+                         lifecycle_lock=lifecycle_lock,
+                         reuse_task_storage_scope=True)
 
 
 def _assert_service_update_fence(service_name: str, pool: bool,
@@ -1027,6 +1032,7 @@ def _update_impl(
     pool: bool = False,
     workers: int | None = None,
     lifecycle_lock: Any | None = None,
+    reuse_task_storage_scope: bool = False,
 ) -> None:
     """Run update and eagerly clean only uncommitted storage generations."""
     if lifecycle_lock is None:
@@ -1034,7 +1040,7 @@ def _update_impl(
     lifecycle_epoch = serve_utils.get_service_lifecycle_epoch(lifecycle_lock)
     try:
         _update_impl_body(task, service_name, mode, pool, workers,
-                          lifecycle_lock)
+                          lifecycle_lock, reuse_task_storage_scope)
     except BaseException:
         if serve_utils.is_consolidation_mode(pool):
             _cleanup_provisional_storage_intents(service_name, lifecycle_epoch,
@@ -1049,6 +1055,7 @@ def _update_impl_body(
     pool: bool = False,
     workers: int | None = None,
     lifecycle_lock: Any | None = None,
+    reuse_task_storage_scope: bool = False,
 ) -> None:
     noun = 'pool' if pool else 'service'
     capnoun = noun.capitalize()
@@ -1086,7 +1093,7 @@ def _update_impl_body(
     lifecycle_epoch = serve_utils.get_service_lifecycle_epoch(lifecycle_lock)
     consolidation_mode = serve_utils.is_consolidation_mode(pool)
 
-    reuse_existing_storage_scope = task is None
+    reuse_existing_storage_scope = task is None or reuse_task_storage_scope
     # If task is None and workers is specified, load existing configuration
     # and update replica count.
     if task is None:

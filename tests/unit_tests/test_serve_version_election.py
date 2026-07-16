@@ -92,13 +92,14 @@ def test_elect_version_reuses_safe_update_path():
                            'from_yaml_str',
                            return_value=task), \
          mock.patch.object(impl, '_update_impl') as update:
-        impl.elect_version('svc', 1, 'service-hash')
+        impl.elect_version('svc', 1, 'service-hash', 3)
 
     update.assert_called_once_with(task,
                                    'svc',
                                    serve_utils.UpdateMode.ROLLING,
                                    pool=False,
-                                   lifecycle_lock=lifecycle_lock)
+                                   lifecycle_lock=lifecycle_lock,
+                                   reuse_task_storage_scope=True)
 
 
 def test_elect_version_rejects_configuration_that_is_already_elected():
@@ -125,7 +126,7 @@ def test_elect_version_rejects_configuration_that_is_already_elected():
                            }), \
          mock.patch.object(impl, '_update_impl') as update, \
          pytest.raises(ValueError, match='already has the configuration'):
-        impl.elect_version('svc', 1, 'service-hash')
+        impl.elect_version('svc', 1, 'service-hash', 3)
 
     update.assert_not_called()
 
@@ -144,4 +145,25 @@ def test_elect_version_rejects_stale_service_incarnation():
                                'pool': False,
                            }), \
          pytest.raises(RuntimeError, match='changed before'):
-        impl.elect_version('svc', 1, 'original')
+        impl.elect_version('svc', 1, 'original', None)
+
+
+def test_elect_version_rejects_stale_elected_version():
+    with mock.patch.object(impl.filelock,
+                           'FileLock',
+                           return_value=contextlib.nullcontext()), \
+         mock.patch.object(impl.serve_utils,
+                           'get_service_lifecycle_lock',
+                           return_value=contextlib.nullcontext()), \
+         mock.patch.object(impl.serve_state,
+                           'get_service_from_name',
+                           return_value={
+                               'hash': 'service-hash',
+                               'pool': False,
+                               'elected_version': 4,
+                           }), \
+         mock.patch.object(impl, '_update_impl') as update, \
+         pytest.raises(RuntimeError, match='changed before'):
+        impl.elect_version('svc', 1, 'service-hash', 3)
+
+    update.assert_not_called()

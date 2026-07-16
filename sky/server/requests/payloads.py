@@ -775,6 +775,7 @@ class ServeElectVersionBody(RequestBody):
     service_name: str
     version: int
     expected_service_hash: str
+    expected_elected_version: int | None
 
 
 class ServeDownBody(RequestBody):

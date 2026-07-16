@@ -128,7 +128,8 @@ async def elect_version(
         request_body=payloads.ServeElectVersionBody(
             service_name=service_name,
             version=election_body.version,
-            expected_service_hash=record['hash']),
+            expected_service_hash=record['hash'],
+            expected_elected_version=record.get('elected_version')),
         func=core.elect_version,
         schedule_type=api_requests.ScheduleType.SHORT,
         request_cluster_name=common.SKY_SERVE_CONTROLLER_NAME,

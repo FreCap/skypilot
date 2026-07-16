@@ -66,10 +66,11 @@ def update(task: Optional['sky.Task'],
 
 
 @usage_lib.entrypoint
-def elect_version(service_name: str, version: int,
-                  expected_service_hash: str) -> None:
+def elect_version(service_name: str, version: int, expected_service_hash: str,
+                  expected_elected_version: int | None) -> None:
     """Roll out a new generation from an immutable stored version."""
-    return impl.elect_version(service_name, version, expected_service_hash)
+    return impl.elect_version(service_name, version, expected_service_hash,
+                              expected_elected_version)
 
 
 @usage_lib.entrypoint
