@@ -55,7 +55,6 @@ def _build_manager(num_launching: int):
     mgr._service_name = 'svc'
     mgr._is_pool = False
     mgr._spot_placer = None
-    mgr.least_recent_version = 1
     mgr._launch_thread_pool = {
         rid: _NotStartedThread() for rid in range(num_launching)
     }

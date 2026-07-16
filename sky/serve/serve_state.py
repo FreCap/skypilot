@@ -125,10 +125,8 @@ version_specs_table = sqlalchemy.Table(
 )
 
 # Durable cleanup inventory is intentionally separate from ``version_specs``.
-# ReplicaManager retires old version rows while a service is live, and a fresh
-# up can upload storage before the controller has created the service row.  An
-# exact, incarnation/generation-scoped manifest must therefore exist before the
-# first external mutation and outlive version metadata until teardown succeeds.
+# Version rows are immutable deployment history, while cleanup intents track
+# external storage ownership and survive until full service teardown.
 ephemeral_storage_cleanup_intents_table = sqlalchemy.Table(
     'ephemeral_storage_cleanup_intents',
     Base.metadata,
@@ -1421,6 +1419,10 @@ def _get_service_from_row(r: 'row.RowMapping') -> dict[str, Any]:
         # than the active versions as the load balancer may not consider the
         # latest version to be active for serving traffic.
         'version': current_version,
+        # The version selected by the latest durable update. This is separate
+        # from active_versions because a safe rollout can take time to move
+        # traffic to the elected configuration.
+        'elected_version': r['current_version'],
         # The versions that is active for the load balancer. This is a list of
         # integers in json format. This is mainly for display purpose.
         'active_versions': json.loads(r['active_versions'])
@@ -1701,78 +1703,6 @@ def add_ephemeral_storage_cleanup_intent(service_name: str, resource_scope: str,
             # ownership on conflict: workers-only updates reuse a committed
             # generation created by an earlier operation.
             set_={'yaml_content': stmt.excluded.yaml_content})
-        session.execute(stmt)
-        session.commit()
-    return True
-
-
-def ensure_committed_ephemeral_storage_intent_for_version(
-        service_name: str, yaml_content: str, expected_service_hash: str,
-        expected_controller_owner: tuple[int | None, str | None]) -> bool:
-    """Backfill cleanup inventory before retiring its only version YAML."""
-    storage_generation = _ephemeral_storage_generation_from_yaml(yaml_content)
-    if storage_generation is None:
-        return False
-    try:
-        config = yaml_utils.safe_load(yaml_content)
-        metadata = config['metadata'][
-            constants.EPHEMERAL_STORAGE_SCOPE_METADATA_KEY]
-        yaml_resource_scope = metadata['resource_scope']
-    except (KeyError, TypeError):
-        return False
-    if not isinstance(yaml_resource_scope, str):
-        return False
-
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        _begin_immediate_if_sqlite(session, engine, True)
-        fence_stmt = sqlalchemy.select(
-            service_lifecycle_fences_table.c.epoch).where(
-                service_lifecycle_fences_table.c.name == service_name)
-        if engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value:
-            fence_stmt = fence_stmt.with_for_update()
-        fence_row = session.execute(fence_stmt).fetchone()
-        service_row = session.execute(
-            sqlalchemy.select(services_table.c.hash,
-                              services_table.c.controller_pid,
-                              services_table.c.controller_ip,
-                              services_table.c.resource_scope,
-                              services_table.c.lifecycle_epoch,
-                              services_table.c.pool).where(
-                                  services_table.c.name ==
-                                  service_name).with_for_update()).fetchone()
-        if (fence_row is None or service_row is None or
-                service_row.hash != expected_service_hash or
-            (service_row.controller_pid,
-             service_row.controller_ip) != expected_controller_owner or
-                service_row.resource_scope != yaml_resource_scope or
-                service_row.lifecycle_epoch != fence_row.epoch):
-            session.rollback()
-            return False
-        if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
-            insert_func = sqlite.insert
-        elif (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value
-             ):
-            insert_func = postgresql.insert
-        else:
-            raise ValueError('Unsupported database dialect')
-        stmt = insert_func(ephemeral_storage_cleanup_intents_table).values(
-            service_name=service_name,
-            resource_scope=yaml_resource_scope,
-            storage_generation=storage_generation,
-            yaml_content=yaml_content,
-            pool=int(bool(service_row.pool)),
-            lifecycle_epoch=int(fence_row.epoch),
-            provisional=0,
-            created_at=time.time())
-        stmt = stmt.on_conflict_do_update(
-            index_elements=[
-                'service_name', 'resource_scope', 'storage_generation'
-            ],
-            set_={
-                'yaml_content': stmt.excluded.yaml_content,
-                'provisional': 0,
-            })
         session.execute(stmt)
         session.commit()
     return True
@@ -2590,6 +2520,14 @@ def add_or_update_version(
                 sqlalchemy.update(services_table).where(
                     services_table.c.name == service_name).values(
                         logical_replica_semantics=1))
+        if not identical_retry:
+            # Elect the immutable version in the same transaction that commits
+            # its contents. A controller or dashboard must never observe an
+            # elected pointer whose spec is still a NULL-yaml placeholder.
+            session.execute(
+                sqlalchemy.update(services_table).where(
+                    services_table.c.name == service_name).values(
+                        current_version=version))
         # An identical committed YAML is an idempotent retry. Keep both the
         # original YAML and pickled spec bytes untouched.
         if resource_scope is not None and storage_generation is not None:
@@ -2688,41 +2626,6 @@ def get_yaml_content(service_name: str, version: int) -> str | None:
                     version_specs_table.c.service_name == service_name,
                     version_specs_table.c.version == version))).fetchone()
     return result[0] if result else None
-
-
-def delete_version(
-    service_name: str,
-    version: int,
-    expected_service_hash: str | None = None,
-    expected_controller_owner: tuple[int | None, str | None] | None = None
-) -> bool:
-    """Delete a version, optionally fenced to one service incarnation."""
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        _begin_immediate_if_sqlite(
-            session, engine, expected_service_hash is not None or
-            expected_controller_owner is not None)
-        if expected_service_hash is not None:
-            owner = session.execute(
-                sqlalchemy.select(
-                    services_table.c.hash, services_table.c.controller_pid,
-                    services_table.c.controller_ip).where(
-                        services_table.c.name ==
-                        service_name).with_for_update()).fetchone()
-            if (owner is None or owner[0] != expected_service_hash or
-                (expected_controller_owner is not None and
-                 (owner[1], owner[2]) != expected_controller_owner)):
-                session.rollback()
-                return False
-        result = session.execute(
-            sqlalchemy.delete(version_specs_table).where(
-                sqlalchemy.and_(
-                    version_specs_table.c.service_name == service_name,
-                    version_specs_table.c.version == version)))
-        session.commit()
-    # Exact owner validation above distinguishes staleness. Missing metadata
-    # is idempotent success so version retirement can continue.
-    return expected_service_hash is not None or result.rowcount > 0
 
 
 def delete_all_versions(service_name: str) -> None:

@@ -270,6 +270,7 @@ export function normalizeService(record) {
     requestedResources: record.requested_resources_str || null,
     activeVersions: record.active_versions || [],
     version: record.version ?? null,
+    electedVersion: record.elected_version ?? record.version ?? null,
     tlsEncrypted: Boolean(record.tls_encrypted),
     // User-facing task YAML, redacted server-side (`service_yaml` in
     // _get_service_status); absent on old servers and empty when the
@@ -370,4 +371,32 @@ export async function getServices(options = {}) {
     console.error('Error fetching services:', error);
     throw error;
   }
+}
+
+async function parseImmediateResponse(response, fallback) {
+  if (response.ok) return response.json();
+  let detail;
+  try {
+    const payload = await response.json();
+    detail = payload?.detail;
+  } catch (_) {
+    // Use the status-based fallback below.
+  }
+  const error = new Error(detail || `${fallback} (${response.status})`);
+  error.status = response.status;
+  throw error;
+}
+
+export async function getServiceVersions(serviceName) {
+  const response = await apiClient.get(
+    `/serve/${encodeURIComponent(serviceName)}/versions`
+  );
+  return parseImmediateResponse(response, 'Failed to fetch service versions');
+}
+
+export async function electServiceVersion(serviceName, version) {
+  return apiClient.fetch(
+    `/serve/${encodeURIComponent(serviceName)}/versions/elect`,
+    { version }
+  );
 }

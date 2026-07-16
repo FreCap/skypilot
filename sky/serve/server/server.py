@@ -1,10 +1,12 @@
 """Rest APIs for SkyServe."""
 
+import asyncio
 import pathlib
 
 import fastapi
 
 from sky import sky_logging
+from sky.serve import serve_state
 from sky.serve.server import core
 from sky.server import stream_utils
 from sky.server.blob import blob_storage as bs
@@ -13,10 +15,48 @@ from sky.server.requests import payloads
 from sky.server.requests import request_names
 from sky.server.requests import requests as api_requests
 from sky.skylet import constants
+from sky.users import permission
+from sky.users import rbac
 from sky.utils import common
+from sky.utils import debug_dump_helpers
 
 logger = sky_logging.init_logger(__name__)
 router = fastapi.APIRouter()
+
+
+def _require_admin(request: fastapi.Request) -> None:
+    """Reject non-admin callers while preserving local single-user mode."""
+    auth_user = request.state.auth_user
+    if auth_user is None:
+        return
+    roles = permission.permission_service.get_user_roles(auth_user.id)
+    if rbac.RoleName.ADMIN.value not in roles:
+        raise fastapi.HTTPException(
+            status_code=403,
+            detail='Only admins can view or elect service versions.')
+
+
+def _service_version_history(service_name: str) -> dict:
+    """Return redacted immutable versions and current rollout state."""
+    record = serve_state.get_service_from_name(service_name)
+    if record is None or record.get('pool'):
+        raise fastapi.HTTPException(status_code=404,
+                                    detail='Service not found.')
+    elected_version = record.get('elected_version')
+    active_versions = record.get('active_versions', [])
+    versions = [{
+        'version': version,
+        'yaml_content': debug_dump_helpers.redact_task_yaml(yaml_content),
+        'elected': version == elected_version,
+        'active': version in active_versions,
+    } for version, yaml_content in reversed(
+        serve_state.get_version_yaml_contents(service_name).items())]
+    return {
+        'service_name': service_name,
+        'elected_version': elected_version,
+        'active_versions': active_versions,
+        'versions': versions,
+    }
 
 
 @router.post('/up')
@@ -45,6 +85,52 @@ async def update(
         request_name=request_names.RequestName.SERVE_UPDATE,
         request_body=update_body,
         func=core.update,
+        schedule_type=api_requests.ScheduleType.SHORT,
+        request_cluster_name=common.SKY_SERVE_CONTROLLER_NAME,
+        auth_user=request.state.auth_user,
+    )
+
+
+@router.get('/{service_name}/versions')
+def version_history(request: fastapi.Request, service_name: str) -> dict:
+    """Return immutable version history to an administrator."""
+    _require_admin(request)
+    return _service_version_history(service_name)
+
+
+@router.post('/{service_name}/versions/elect')
+async def elect_version(
+    request: fastapi.Request,
+    service_name: str,
+    election_body: payloads.ServeVersionElectionBody,
+) -> None:
+    """Safely roll out a new generation from a stored version."""
+    await asyncio.to_thread(_require_admin, request)
+    record = await asyncio.to_thread(serve_state.get_service_from_name,
+                                     service_name)
+    if record is None or record.get('pool'):
+        raise fastapi.HTTPException(status_code=404,
+                                    detail='Service not found.')
+    if not record.get('hash'):
+        raise fastapi.HTTPException(
+            status_code=409,
+            detail='Service has no durable incarnation identity.')
+    if await asyncio.to_thread(serve_state.get_yaml_content, service_name,
+                               election_body.version) is None:
+        raise fastapi.HTTPException(status_code=404,
+                                    detail='Service version not found.')
+    if record.get('elected_version') == election_body.version:
+        raise fastapi.HTTPException(status_code=409,
+                                    detail='Version is already elected.')
+    await executor.schedule_request_async(
+        request_id=request.state.request_id,
+        request_name=request_names.RequestName.SERVE_UPDATE,
+        request_body=payloads.ServeElectVersionBody(
+            service_name=service_name,
+            version=election_body.version,
+            expected_service_hash=record['hash'],
+            expected_elected_version=record.get('elected_version')),
+        func=core.elect_version,
         schedule_type=api_requests.ScheduleType.SHORT,
         request_cluster_name=common.SKY_SERVE_CONTROLLER_NAME,
         auth_user=request.state.auth_user,
