@@ -37,7 +37,7 @@ def check_no_duplicate_keys(yaml_str: str) -> None:
     visited: set[int] = set()
     visiting: set[int] = set()
     edge_count = 0
-    stack: list[tuple['yaml.Node', bool]] = [
+    stack: list[tuple[yaml.Node, bool]] = [
         (node, False) for node in reversed(nodes) if node is not None
     ]
     while stack:
@@ -54,7 +54,7 @@ def check_no_duplicate_keys(yaml_str: str) -> None:
         visiting.add(node_id)
         stack.append((node, True))
 
-        children: list['yaml.Node'] = []
+        children: list[yaml.Node] = []
         if isinstance(node, yaml.MappingNode):
             seen: dict[Any, int] = {}
             for key_node, value_node in node.value:
