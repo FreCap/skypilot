@@ -3834,9 +3834,15 @@ class SkyPilotReplicaManager(ReplicaManager):
         assert new_yaml_content is not None, (
             f'yaml content not found for {self._service_name} version {version}'
         )
+        # The placer is derived from task resources, not the service-only spec.
+        # Rebuild it before publishing the new version so scale-ups use the
+        # update's clouds, regions, and accelerator shapes.
+        new_task = task_lib.Task.from_yaml_str(new_yaml_content)
+        new_spot_placer = spot_placer.SpotPlacer.from_task(spec, new_task)
         self.latest_version = version
         self.yaml_content = new_yaml_content
         self._update_mode = update_mode
+        self._spot_placer = new_spot_placer
 
         # Reuse all replicas that have the same config as the new version
         # (except for the `service` field) by directly setting the version to be

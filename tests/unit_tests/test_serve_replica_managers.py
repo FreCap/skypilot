@@ -503,6 +503,41 @@ class TestUpdateVersionHoldsManagerLock:
 class TestUpdateVersionBatchesPriorVersionYamls:
     """`update_version` should reuse old YAMLs per distinct version."""
 
+    def test_refreshes_spot_placer_from_new_task(self):
+        mgr = _make_manager()
+        old_placer = mock.Mock(name='old_placer')
+        new_placer = mock.Mock(name='new_placer')
+        mgr._spot_placer = old_placer
+        spec = mock.Mock(spot_placer='dynamic_fallback_per_gpu')
+        new_task = mock.Mock(name='new_task')
+        new_yaml = ('resources: {accelerators: L4:1}\n'
+                    'file_mounts: {}\n'
+                    'service: {readiness_probe: /}\n')
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_yaml_content',
+                return_value=new_yaml), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_replica_infos',
+                 return_value=[]), \
+             mock.patch.object(
+                 replica_managers.task_lib.Task,
+                 'from_yaml_str',
+                 return_value=new_task) as parse_task, \
+             mock.patch.object(
+                 replica_managers.spot_placer.SpotPlacer,
+                 'from_task',
+                 return_value=new_placer) as build_placer:
+            mgr.update_version(2,
+                               spec,
+                               update_mode=serve_utils.UpdateMode.ROLLING)
+
+        parse_task.assert_called_once_with(new_yaml)
+        build_placer.assert_called_once_with(spec, new_task)
+        assert mgr._spot_placer is new_placer
+
     def test_reuses_distinct_old_version_yamls(self):
         mgr = _make_manager()
         mgr.latest_version = 2
@@ -541,7 +576,7 @@ class TestUpdateVersionBatchesPriorVersionYamls:
                  'get_replica_infos',
                  return_value=replica_infos):
             mgr.update_version(3,
-                               mock.Mock(),
+                               mock.Mock(spot_placer=None),
                                update_mode=serve_utils.UpdateMode.ROLLING)
 
         get_new_yaml.assert_called_once_with('svc', 3)
@@ -587,7 +622,7 @@ class TestUpdateVersionBatchesPriorVersionYamls:
                     ValueError,
                     match='yaml content not found for svc version 2'):
                 mgr.update_version(3,
-                                   mock.Mock(),
+                                   mock.Mock(spot_placer=None),
                                    update_mode=serve_utils.UpdateMode.ROLLING)
 
         assert not persisted
@@ -617,7 +652,7 @@ class TestUpdateVersionBatchesPriorVersionYamls:
                      'get_replica_infos',
                      return_value=replica_infos):
                 mgr.update_version(2,
-                                   mock.Mock(),
+                                   mock.Mock(spot_placer=None),
                                    update_mode=serve_utils.UpdateMode.ROLLING)
 
             get_old_yamls.assert_not_called()
@@ -664,7 +699,7 @@ class TestUpdateVersionBatchesPriorVersionYamls:
                  'get_replica_infos',
                  return_value=[info]):
             mgr.update_version(2,
-                               mock.Mock(),
+                               mock.Mock(spot_placer=None),
                                update_mode=serve_utils.UpdateMode.ROLLING)
 
         assert persisted == [(1, 2)]
@@ -705,7 +740,7 @@ class TestUpdateVersionBatchesPriorVersionYamls:
                  'get_replica_infos',
                  return_value=[info]):
             mgr.update_version(2,
-                               mock.Mock(),
+                               mock.Mock(spot_placer=None),
                                update_mode=serve_utils.UpdateMode.ROLLING)
 
         assert not persisted
