@@ -4,6 +4,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from '@testing-library/react';
 
 import { Workspaces } from '@/components/workspaces';
@@ -17,8 +18,10 @@ import { apiClient } from '@/data/connectors/client';
 import cachePreloader from '@/lib/cache-preloader';
 import dashboardCache from '@/lib/cache';
 
+const mockRouterPush = jest.fn();
+
 jest.mock('next/router', () => ({
-  useRouter: () => ({ push: jest.fn() }),
+  useRouter: () => ({ push: mockRouterPush }),
 }));
 
 jest.mock('@/hooks/useMobile', () => ({
@@ -119,6 +122,80 @@ describe('Workspaces request lifecycle', () => {
     expect(callsFor(getEnabledCloudsBatch)).toHaveLength(1);
     expect(callsFor(getClusters)).toHaveLength(1);
     expect(callsFor(getManagedJobs)).toHaveLength(1);
+  });
+
+  it('preserves workspace table filtering, labels, and protected actions', async () => {
+    apiClient.get.mockResolvedValue({
+      ok: true,
+      json: async () => ({ role: 'admin', name: 'Admin' }),
+    });
+    dashboardCache.get.mockImplementation((fetcher) => {
+      if (fetcher === getWorkspaces) {
+        return Promise.resolve({ default: { private: true }, beta: {} });
+      }
+      if (fetcher === getEnabledCloudsBatch) {
+        return Promise.resolve({ default: ['kubernetes'], beta: ['aws'] });
+      }
+      if (fetcher === getClusters) {
+        return Promise.resolve([
+          { workspace: 'default', status: 'RUNNING' },
+          { workspace: 'beta', status: 'RUNNING' },
+        ]);
+      }
+      if (fetcher === getManagedJobs) {
+        return Promise.resolve({
+          jobs: [{ workspace: 'beta', status: 'RUNNING' }],
+        });
+      }
+      throw new Error('Unexpected cache fetcher');
+    });
+
+    render(<Workspaces />);
+
+    await screen.findByRole('button', { name: 'default' });
+    expect(screen.getByText('Private')).toBeInTheDocument();
+    expect(screen.getByText('Public')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Kubernetes' })).toHaveAttribute(
+      'href',
+      '/infra'
+    );
+    expect(screen.getByTitle('Cannot delete default workspace')).toBeDisabled();
+    expect(screen.getByTitle('Delete workspace')).toBeEnabled();
+
+    fireEvent.change(screen.getByPlaceholderText('Filter workspaces'), {
+      target: { value: 'kubernetes' },
+    });
+    expect(screen.getByRole('button', { name: 'default' })).toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: 'beta' })
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTitle('Clear search'));
+    const betaButton = screen.getByRole('button', { name: 'beta' });
+    const betaRow = betaButton.closest('tr');
+    expect(betaRow).not.toBeNull();
+    const betaActions = within(betaRow).getAllByRole('button');
+    fireEvent.click(betaActions[1]);
+    expect(mockRouterPush).toHaveBeenCalledWith({
+      pathname: '/clusters',
+      query: { workspace: 'beta' },
+    });
+    fireEvent.click(betaActions[2]);
+    expect(mockRouterPush).toHaveBeenCalledWith({
+      pathname: '/jobs',
+      query: { workspace: 'beta' },
+    });
+    fireEvent.click(betaButton);
+    await waitFor(() => {
+      expect(mockRouterPush).toHaveBeenCalledWith('/workspaces/beta');
+    });
+    fireEvent.click(screen.getByRole('columnheader', { name: 'Workspace ↑' }));
+    expect(
+      screen.getByRole('columnheader', { name: 'Workspace ↓' })
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTitle('Delete workspace'));
+    expect(await screen.findByText('Delete Workspace')).toBeInTheDocument();
   });
 
   it('does not start a request when preload finishes after unmount', async () => {
