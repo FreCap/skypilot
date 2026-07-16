@@ -218,6 +218,94 @@ def test_wait_registration_reads_scoped_log_before_row_exists():
     generate_log_path.assert_called_once_with('svc', 'incarnation-a')
 
 
+def test_wait_registration_setup_timeout_uses_monotonic_deadline():
+    """Wall clock rollback must not extend controller setup."""
+    clock = mock.MagicMock()
+    clock.time.side_effect = [1000.0, 999.0, 998.0]
+    clock.monotonic.side_effect = [100.0, 401.0]
+    with mock.patch.object(serve_utils,
+                           'is_consolidation_mode',
+                           return_value=False), \
+         mock.patch.object(serve_utils.job_lib,
+                           'get_status',
+                           return_value=None) as get_status, \
+         mock.patch.object(serve_utils,
+                           '_get_service_status') as get_service_status, \
+         mock.patch.object(serve_utils, 'time', clock), \
+         mock.patch.object(
+             clock,
+             'sleep',
+             side_effect=AssertionError('setup exceeded its deadline')) as sleep, \
+         pytest.raises(RuntimeError, match='controller process'):
+        serve_utils.wait_service_registration('svc', 7, pool=False)
+
+    get_status.assert_called_once_with(7)
+    get_service_status.assert_not_called()
+    sleep.assert_not_called()
+    clock.time.assert_not_called()
+    assert clock.monotonic.call_count == 2
+
+
+def test_wait_registration_service_timeout_uses_monotonic_deadline():
+    """Wall clock rollback must not extend service registration."""
+    clock = mock.MagicMock()
+    clock.time.side_effect = [1000.0, 999.0, 998.0]
+    clock.monotonic.side_effect = [100.0, 200.0, 621.0]
+    with mock.patch.object(serve_utils,
+                           'is_consolidation_mode',
+                           return_value=True), \
+         mock.patch.object(serve_utils,
+                           '_get_service_status',
+                           return_value=None) as get_service_status, \
+         mock.patch.object(serve_utils.os.path,
+                           'exists',
+                           return_value=False), \
+         mock.patch.object(serve_utils, 'time', clock), \
+         mock.patch.object(
+             clock,
+             'sleep',
+             side_effect=AssertionError(
+                 'registration exceeded its deadline')) as sleep, \
+         pytest.raises(ValueError, match='Failed to register service'):
+        serve_utils.wait_service_registration('svc', 7, pool=False)
+
+    get_service_status.assert_called_once_with('svc',
+                                               pool=False,
+                                               with_replica_info=False)
+    sleep.assert_not_called()
+    clock.time.assert_not_called()
+    assert clock.monotonic.call_count == 3
+
+
+def test_wait_registration_accepts_result_at_deadline_boundary():
+    """A result at the existing strict timeout boundary still succeeds."""
+    pending = None
+    registered = {
+        'controller_job_id': 7,
+        'status': serve_state.ServiceStatus.READY,
+        'load_balancer_port': 8080,
+    }
+    clock = mock.MagicMock()
+    clock.monotonic.side_effect = [100.0, 200.0, 620.0]
+    with mock.patch.object(serve_utils,
+                           'is_consolidation_mode',
+                           return_value=True), \
+         mock.patch.object(serve_utils,
+                           '_get_service_status',
+                           side_effect=[pending, registered]) as get_status, \
+         mock.patch.object(serve_utils.os.path,
+                           'exists',
+                           return_value=False), \
+         mock.patch.object(serve_utils, 'time', clock):
+        payload = serve_utils.wait_service_registration('svc', 7, pool=False)
+
+    assert serve_utils.load_service_initialization_result(payload) == 8080
+    assert get_status.call_count == 2
+    clock.sleep.assert_called_once_with(1)
+    clock.time.assert_not_called()
+    assert clock.monotonic.call_count == 3
+
+
 def test_external_lb_service_spec_rejects_task_tls():
     spec = mock.Mock(tls_credential=mock.Mock())
     with pytest.raises(ValueError, match='Terminate TLS at the'):

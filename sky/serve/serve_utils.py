@@ -3003,7 +3003,7 @@ def wait_service_registration(
             generate_remote_controller_log_file_name(service_name,
                                                      resource_scope))
 
-    start_time = time.time()
+    deadline = (time.monotonic() + constants.CONTROLLER_SETUP_TIMEOUT_SECONDS)
     setup_completed = False
     noun = 'pool' if pool else 'service'
     while True:
@@ -3014,8 +3014,7 @@ def wait_service_registration(
             if job_status is None or job_status < job_lib.JobStatus.RUNNING:
                 # Wait for the controller process to finish setting up. It
                 # can be slow if a lot cloud dependencies are being installed.
-                if (time.time() - start_time
-                        > constants.CONTROLLER_SETUP_TIMEOUT_SECONDS):
+                if time.monotonic() > deadline:
                     with ux_utils.print_exception_no_traceback():
                         raise RuntimeError(
                             f'Failed to start the controller process for '
@@ -3029,8 +3028,9 @@ def wait_service_registration(
 
         if not setup_completed:
             setup_completed = True
-            # Reset the start time to wait for the service to be registered.
-            start_time = time.time()
+            # Give service registration its own full timeout budget.
+            deadline = (time.monotonic() +
+                        constants.SERVICE_REGISTER_TIMEOUT_SECONDS)
 
         record = _get_service_status(service_name,
                                      pool=pool,
@@ -3075,8 +3075,7 @@ def wait_service_registration(
                         raise RuntimeError(
                             controller_utils.get_max_services_error_message(
                                 pool))
-        elapsed = time.time() - start_time
-        if elapsed > constants.SERVICE_REGISTER_TIMEOUT_SECONDS:
+        if time.monotonic() > deadline:
             # Print the controller log to help user debug.
             controller_log_path = _controller_log_path(record)
             try:
