@@ -340,6 +340,24 @@ def test_replica_status_counts_are_grouped_in_sql(_mock_serve_db):
     assert status_counts == {'PENDING': 1, 'READY': 1}
 
 
+def test_replica_status_and_capacity_counts_use_compact_json(_mock_serve_db):
+    ready = _replica(1)
+    ready.planned_capacity = 8
+    ready.status_property.sky_launch_status = common_utils.ProcessStatus.SUCCEEDED
+    ready.status_property.service_ready_now = True
+    pending = _replica(2)
+    pending.planned_capacity = 4
+    serve_state.add_or_update_replicas('svc', [(1, ready), (2, pending)])
+
+    with _count_sql_statements(_mock_serve_db) as counts:
+        status_counts, capacity_counts = (
+            serve_state.get_replica_status_and_capacity_counts('svc'))
+
+    assert counts['n'] == 1
+    assert status_counts == {'PENDING': 1, 'READY': 1}
+    assert capacity_counts == {'PENDING': 4, 'READY': 8}
+
+
 def test_replica_json_migration_backfills_legacy_pickle(tmp_path, monkeypatch):
     engine = create_engine(f'sqlite:///{tmp_path / "legacy-serve.db"}')
     legacy_metadata = sqlalchemy.MetaData()

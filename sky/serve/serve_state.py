@@ -1429,6 +1429,7 @@ def _get_service_from_row(r: 'row.RowMapping') -> dict[str, Any]:
         'lifecycle_epoch': r['lifecycle_epoch'],
         'resource_scope': r['resource_scope'],
         'entrypoint': r['entrypoint'],
+        'logical_replica_semantics': bool(r['logical_replica_semantics']),
         'yaml_content': r.get('yaml_content'),
     }
     latest_spec = pickle.loads(r['spec']) if r.get('spec') is not None else None
@@ -2315,6 +2316,35 @@ def get_replica_status_counts(service_name: str) -> dict[str, int]:
             ).where(replicas_table.c.service_name == service_name).group_by(
                 replicas_table.c.status)).fetchall()
     return {status: count for status, count in rows}
+
+
+def get_replica_status_and_capacity_counts(
+        service_name: str) -> tuple[dict[str, int], dict[str, int]]:
+    """Return physical row and planned-capacity counts grouped by status.
+
+    This reads only the compact JSON state used for replica recovery. It avoids
+    unpickling ReplicaInfo objects, resolving cluster handles, or contacting
+    any cloud/cluster API on dashboard summary requests.
+    """
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        rows = session.execute(
+            sqlalchemy.select(
+                replicas_table.c.status, replicas_table.c.replica_state).where(
+                    replicas_table.c.service_name == service_name)).fetchall()
+    status_counts: collections.defaultdict[str,
+                                           int] = (collections.defaultdict(int))
+    capacity_counts: collections.defaultdict[str, int] = (
+        collections.defaultdict(int))
+    for status, replica_state in rows:
+        status_counts[status] += 1
+        planned_capacity = (replica_state.get('planned_capacity', 1)
+                            if isinstance(replica_state, dict) else 1)
+        if (not isinstance(planned_capacity, int) or
+                isinstance(planned_capacity, bool) or planned_capacity < 1):
+            planned_capacity = 1
+        capacity_counts[status] += planned_capacity
+    return dict(status_counts), dict(capacity_counts)
 
 
 def total_number_provisioning_replicas() -> int:

@@ -777,6 +777,11 @@ class Autoscaler:
             })
         return info
 
+    def get_ready_replica_capacity(self,
+                                   info: 'replica_managers.ReplicaInfo') -> int:
+        """Return the public replica units currently ready on one backend."""
+        return 1 if info.is_ready else 0
+
     def _generate_scaling_decisions(
         self,
         replica_infos: list['replica_managers.ReplicaInfo'],
@@ -2482,6 +2487,12 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         if info.is_ready and observed is not None:
             return min(planned, observed)
         return planned
+
+    def get_ready_replica_capacity(self,
+                                   info: 'replica_managers.ReplicaInfo') -> int:
+        if self.replica_unit == 'logical':
+            return self._ready_capacity(info)
+        return super().get_ready_replica_capacity(info)
 
     def _cost_rebalance_replica_capacity(
             self, info: 'replica_managers.ReplicaInfo') -> float:

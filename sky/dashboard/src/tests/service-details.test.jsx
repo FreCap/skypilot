@@ -203,6 +203,47 @@ describe('ServiceDetailCard cost and request estimates', () => {
     ).toBeTruthy();
     expect(screen.getByText('$3.0556')).toBeTruthy();
   });
+
+  it('labels logical replicas separately from physical backends', () => {
+    render(
+      <ServiceDetailCard
+        serviceData={{
+          name: 'svc',
+          status: 'READY',
+          uptime: null,
+          replicaUnit: 'logical',
+          replicasReady: 8,
+          replicasTotal: 12,
+          replicasFailed: 4,
+          physicalReplicasReady: 1,
+          physicalReplicasTotal: 2,
+          physicalReplicasFailed: 1,
+          targetReplicas: 1,
+          endpoint: null,
+          policy: 'autoscaling',
+          loadBalancingPolicy: 'instance_aware_least_load',
+          requestedResources: 'L4:1',
+          activeVersions: [2],
+          estimatedHourlyCost: null,
+          spotHourlyCost: 0,
+          onDemandHourlyCost: 0,
+          hourlyCostExcludedReplicaCount: 0,
+          requestRate: null,
+          recentRequestCount: null,
+          requestWindowSeconds: null,
+          inFlightRequests: null,
+          requestQueueDepth: null,
+          rejectedRequests: null,
+          requestStatsAgeSeconds: null,
+          costPerThousandRequests: null,
+        }}
+      />
+    );
+
+    expect(screen.getByText('Logical replicas (ready/total)')).toBeTruthy();
+    expect(screen.getByText(/1\/2 physical backends ready/)).toBeTruthy();
+    expect(screen.queryByText('Replicas (ready/total)')).toBeNull();
+  });
 });
 
 describe('service replica placement breakdown', () => {

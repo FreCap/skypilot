@@ -1262,6 +1262,9 @@ class ReplicaInfo:
             'status': self.status,
             'version': self.version,
             'replica_info_version': self._version,
+            # Immutable logical width selected when this physical backend was
+            # placed. It is one for ordinary and legacy physical replicas.
+            'planned_capacity': int(getattr(self, 'planned_capacity', 1)),
             'endpoint':
                 (self._resolve_url(cluster_record=cluster_record, handle=handle)
                  if with_url else None),

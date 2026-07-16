@@ -1677,6 +1677,12 @@ class TestGetCapacityHint:
             'target_num_replicas': 5,
             'max_replicas': 20,
             'configured_max_replicas': 20,
+            'ready_replicas': 2,
+            'total_replicas': 5,
+            'failed_replicas': 0,
+            'physical_ready_replicas': 2,
+            'physical_total_replicas': 5,
+            'physical_failed_replicas': 0,
         }
 
     def test_stale_autoscaler_reports_at_least_live_fleet(self):
@@ -1698,6 +1704,12 @@ class TestGetCapacityHint:
             'target_num_replicas': 3,
             'max_replicas': 20,
             'configured_max_replicas': 20,
+            'ready_replicas': 2,
+            'total_replicas': 5,
+            'failed_replicas': 0,
+            'physical_ready_replicas': 2,
+            'physical_total_replicas': 5,
+            'physical_failed_replicas': 0,
         }
 
     def test_stale_max_rule_keeps_larger_target(self):
@@ -1740,6 +1752,13 @@ class TestGetCapacityHint:
             'target_num_replicas': 13,
             'max_replicas': 20,
             'configured_max_replicas': 20,
+            # One READY x8 logical backend plus the old physical bridge row.
+            'ready_replicas': 9,
+            'total_replicas': 15,
+            'failed_replicas': 0,
+            'physical_ready_replicas': 2,
+            'physical_total_replicas': 5,
+            'physical_failed_replicas': 0,
             'planned_capacity_by_url': {
                 'http://eight': 8,
                 'http://four': 4,
@@ -1777,6 +1796,58 @@ class TestGetCapacityHint:
 
         assert hint['planned_capacity_by_url'] == {'http://logical': 8}
         assert hint['logical_replica_urls'] == ['http://logical']
+        assert hint['ready_replicas'] == 9
+        assert hint['physical_ready_replicas'] == 2
+
+    def test_logical_counts_preserve_capacity_and_physical_failures(self):
+        ctrl = _make_controller()
+        ctrl._autoscaler = _FakeAutoscaler(  # pylint: disable=protected-access
+            target=4,
+            recomputed=True,
+            latest_version=2,
+            replica_unit='logical')
+        ready = _FakeReplicaInfo(1, serve_state.ReplicaStatus.READY, version=2)
+        ready.planned_capacity = 4
+        failed = _FakeReplicaInfo(2,
+                                  serve_state.ReplicaStatus.FAILED_PROVISION,
+                                  version=2)
+        failed.planned_capacity = 8
+        bridge = _FakeReplicaInfo(3, serve_state.ReplicaStatus.READY, version=1)
+
+        counts = ctrl._get_replica_counts(  # pylint: disable=protected-access
+            [ready, failed, bridge])
+
+        assert counts == {
+            'replica_unit': 'logical_slot',
+            'ready_replicas': 5,
+            'total_replicas': 5,
+            'failed_replicas': 8,
+            'physical_ready_replicas': 2,
+            'physical_total_replicas': 2,
+            'physical_failed_replicas': 1,
+        }
+
+    def test_logical_ready_count_uses_observed_router_capacity(self):
+        ctrl = _make_controller()
+        autoscaler = _FakeAutoscaler(target=8,
+                                     recomputed=True,
+                                     latest_version=2,
+                                     replica_unit='logical')
+        autoscaler.get_ready_replica_capacity = lambda info: (
+            7 if info.replica_id == 1 else 1)
+        ctrl._autoscaler = autoscaler  # pylint: disable=protected-access
+        logical = _FakeReplicaInfo(1,
+                                   serve_state.ReplicaStatus.READY,
+                                   version=2)
+        logical.planned_capacity = 8
+        bridge = _FakeReplicaInfo(2, serve_state.ReplicaStatus.READY, version=1)
+
+        counts = ctrl._get_replica_counts(  # pylint: disable=protected-access
+            [logical, bridge])
+
+        assert counts['ready_replicas'] == 8
+        assert counts['total_replicas'] == 9
+        assert counts['physical_ready_replicas'] == 2
 
 
 class TestReservedCapacityPollerStart:

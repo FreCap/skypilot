@@ -129,6 +129,7 @@ describe('getServices', () => {
       region: 'us-east-1',
       resources_str: '1x(gpus=L4:1)',
       resources_str_full: '1x(gpus=L4:1, cpus=4, mem=16)',
+      plannedCapacity: 1,
       hourlyCost: 1.25,
     });
     // The pickled handle blob must not leak into the normalized replica.
@@ -187,6 +188,63 @@ describe('getServices', () => {
     expect(services[0].replicasReady).toBe(2);
     expect(services[0].replicasTotal).toBe(3);
     expect(services[0].replicasFailed).toBe(1);
+  });
+
+  it('uses authoritative logical capacity while retaining physical backend counts', async () => {
+    const record = rawServiceRecord({
+      replica_unit: 'logical_slot',
+      ready_replicas: 8,
+      total_replicas: 12,
+      failed_replicas: 4,
+      physical_ready_replicas: 1,
+      physical_total_replicas: 2,
+      physical_failed_replicas: 1,
+      replica_info: [
+        { replica_id: 1, status: 'READY', planned_capacity: 8 },
+        { replica_id: 2, status: 'PROVISIONING', planned_capacity: 4 },
+        { replica_id: 3, status: 'FAILED_PROVISION', planned_capacity: 4 },
+      ],
+    });
+    apiClient.post.mockResolvedValue(mockDispatchResponse());
+    apiClient.get.mockResolvedValue(mockResultResponse([record]));
+
+    const { services } = await getServices();
+
+    expect(services[0]).toMatchObject({
+      replicaUnit: 'logical',
+      replicasReady: 8,
+      replicasTotal: 12,
+      replicasFailed: 4,
+      physicalReplicasReady: 1,
+      physicalReplicasTotal: 2,
+      physicalReplicasFailed: 1,
+    });
+    expect(
+      services[0].replicas.map((replica) => replica.plannedCapacity)
+    ).toEqual([8, 4, 4]);
+  });
+
+  it('sums per-backend widths for a logical full response without aggregates', () => {
+    const service = normalizeService(
+      rawServiceRecord({
+        replica_unit: 'logical',
+        replica_info: [
+          { replica_id: 1, status: 'READY', planned_capacity: 8 },
+          { replica_id: 2, status: 'PROVISIONING', planned_capacity: 4 },
+          { replica_id: 3, status: 'FAILED_PROBING', planned_capacity: 2 },
+        ],
+      })
+    );
+
+    expect(service).toMatchObject({
+      replicaUnit: 'logical',
+      replicasReady: 8,
+      replicasTotal: 12,
+      replicasFailed: 2,
+      physicalReplicasReady: 1,
+      physicalReplicasTotal: 2,
+      physicalReplicasFailed: 1,
+    });
   });
 
   it('excludes every failed-class replica status from the total', async () => {
@@ -249,6 +307,38 @@ describe('getServices', () => {
     // replica_info-based computation.
     expect(services[0].replicasTotal).toBe(5);
     expect(services[0].replicasFailed).toBe(1);
+  });
+
+  it('keeps logical summary aggregates distinct from the physical status histogram', async () => {
+    const record = rawServiceRecord({
+      replica_unit: 'logical_slot',
+      ready_replicas: 8,
+      total_replicas: 12,
+      failed_replicas: 4,
+      physical_ready_replicas: 1,
+      physical_total_replicas: 2,
+      physical_failed_replicas: 1,
+      replica_info: undefined,
+      replica_status_counts: {
+        READY: 1,
+        PROVISIONING: 1,
+        FAILED_PROBING: 1,
+      },
+    });
+    apiClient.post.mockResolvedValue(mockDispatchResponse());
+    apiClient.get.mockResolvedValue(mockResultResponse([record]));
+
+    const { services } = await getServices({ summaryOnly: true });
+
+    expect(services[0]).toMatchObject({
+      summaryOnly: true,
+      replicasReady: 8,
+      replicasTotal: 12,
+      replicasFailed: 4,
+      physicalReplicasReady: 1,
+      physicalReplicasTotal: 2,
+      physicalReplicasFailed: 1,
+    });
   });
 
   it('passes include_target_num_replicas through when requested', async () => {

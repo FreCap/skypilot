@@ -1582,6 +1582,32 @@ def get_yaml_content(service_name: str,
         return f.read()
 
 
+def _set_replica_status_aggregates(record: dict[str, Any],
+                                   status_counts: dict[str, int],
+                                   capacity_counts: dict[str, int]) -> None:
+    """Attach public replica capacity and physical backend aggregates."""
+    failed_statuses = {
+        status.value for status in serve_state.ReplicaStatus.failed_statuses()
+    }
+    physical_failed = sum(count for status, count in status_counts.items()
+                          if status in failed_statuses)
+    capacity_failed = sum(count for status, count in capacity_counts.items()
+                          if status in failed_statuses)
+    logical = bool(record.get('logical_replica_semantics'))
+    record.update({
+        'replica_unit': ('logical_slot' if logical else 'physical_backend'),
+        'ready_replicas': capacity_counts.get(
+            serve_state.ReplicaStatus.READY.value, 0),
+        'total_replicas': sum(capacity_counts.values()) - capacity_failed,
+        'failed_replicas': capacity_failed,
+        'physical_ready_replicas': status_counts.get(
+            serve_state.ReplicaStatus.READY.value, 0),
+        'physical_total_replicas': sum(status_counts.values()) -
+                                   physical_failed,
+        'physical_failed_replicas': physical_failed,
+    })
+
+
 def _get_service_status(
         service_name: str,
         pool: bool,
@@ -1689,6 +1715,7 @@ def _get_service_status(
                 'recent_request_count': 'recent_request_count',
                 'request_window_seconds': 'request_window_seconds',
                 'requests_per_second': 'requests_per_second',
+                'observed_ready_replicas': 'ready_replicas',
                 'in_flight_requests': 'in_flight_total',
                 'request_queue_depth': 'queue_depth',
                 'rejected_requests': 'rejected_in_window',
@@ -1714,14 +1741,38 @@ def _get_service_status(
     if with_replica_counts and not with_replica_info:
         # Summary mode: give callers (the dashboard header, list views)
         # enough to render without the expensive per-replica
-        # `to_info_dict` serialization below. The status histogram is one
-        # indexed GROUP BY, with no JSON decoding, cluster-record joins, or
-        # URL resolution.
-        record['replica_status_counts'] = serve_state.get_replica_status_counts(
-            service_name)
+        # `to_info_dict` serialization below. Physical services use one
+        # indexed GROUP BY. Logical services scan only the compact JSON state
+        # needed for persisted widths; neither path resolves cluster records,
+        # endpoints, handles, or cloud/cluster APIs.
+        logical = bool(record.get('logical_replica_semantics'))
+        if logical:
+            status_counts, capacity_counts = (
+                serve_state.get_replica_status_and_capacity_counts(service_name)
+            )
+        else:
+            status_counts = serve_state.get_replica_status_counts(service_name)
+            capacity_counts = status_counts
+        record['replica_status_counts'] = status_counts
+        _set_replica_status_aggregates(record, status_counts, capacity_counts)
 
     if with_replica_info:
         replica_infos = serve_state.get_replica_infos(service_name)
+        full_status_counts: collections.defaultdict[str, int] = (
+            collections.defaultdict(int))
+        full_capacity_counts: collections.defaultdict[str, int] = (
+            collections.defaultdict(int))
+        logical = bool(record.get('logical_replica_semantics'))
+        for info in replica_infos:
+            status = info.status.value
+            full_status_counts[status] += 1
+            planned_capacity = getattr(info, 'planned_capacity', 1)
+            if (not isinstance(planned_capacity, int) or
+                    isinstance(planned_capacity, bool) or planned_capacity < 1):
+                planned_capacity = 1
+            full_capacity_counts[status] += planned_capacity if logical else 1
+        _set_replica_status_aggregates(record, dict(full_status_counts),
+                                       dict(full_capacity_counts))
         # Pre-fetch cluster records in one batched DB query instead of
         # letting each to_info_dict() do its own. With a long failure
         # history this was an N+1.
@@ -1762,6 +1813,10 @@ def _get_service_status(
                         serve_state.ReplicaStatus.READY):
                     job_ids = list(dict.fromkeys(pool_level_job_ids + job_ids))
                 replica_info['used_by'] = job_ids
+    observed_ready = record.get('observed_ready_replicas')
+    if ('ready_replicas' in record and isinstance(observed_ready, int) and
+            not isinstance(observed_ready, bool) and observed_ready >= 0):
+        record['ready_replicas'] = observed_ready
     return record
 
 
@@ -3315,6 +3370,12 @@ def stream_serve_process_logs(service_name: str, stream_controller: bool,
 
 
 def _get_replicas(service_record: dict[str, Any]) -> str:
+    ready = service_record.get('ready_replicas')
+    total = service_record.get('total_replicas')
+    if (isinstance(ready, int) and not isinstance(ready, bool) and
+            ready >= 0 and isinstance(total, int) and
+            not isinstance(total, bool) and total >= 0):
+        return f'{ready}/{total}'
     ready_replica_num, total_replica_num = 0, 0
     for info in service_record['replica_info']:
         if info['status'] == serve_state.ReplicaStatus.READY:

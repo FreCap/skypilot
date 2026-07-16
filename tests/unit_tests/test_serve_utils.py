@@ -1172,6 +1172,58 @@ class TestServiceStatusEndpointSnapshot:
         info.handle = mock.Mock(return_value=handle)
         return info, handle
 
+    def test_summary_reports_logical_and_physical_capacity_counts(self):
+        service_record = {
+            'name': 'svc-a',
+            'pool': False,
+            'hash': 'incarnation-a',
+            'logical_replica_semantics': True,
+        }
+        expected = {
+            'replica_unit': 'logical_slot',
+            # The controller's observed router capacity wins over persisted
+            # planned capacity for the live ready count.
+            'ready_replicas': 7,
+            'total_replicas': 12,
+            'failed_replicas': 4,
+            'physical_ready_replicas': 1,
+            'physical_total_replicas': 2,
+            'physical_failed_replicas': 1,
+        }
+        response = mock.Mock()
+        response.json.return_value = {
+            'target_num_replicas': 1,
+            'ready_replicas': 7,
+        }
+        with mock.patch(
+                'sky.serve.serve_utils.serve_state.get_service_from_name',
+                return_value=service_record), \
+             mock.patch('sky.serve.serve_utils.serve_state.'
+                        'get_replica_status_and_capacity_counts',
+                        return_value=({
+                            'READY': 1,
+                            'PROVISIONING': 1,
+                            'FAILED_PROVISION': 1,
+                        }, {
+                            'READY': 8,
+                            'PROVISIONING': 4,
+                            'FAILED_PROVISION': 4,
+                        })), \
+             mock.patch('sky.serve.serve_utils.'
+                        '_get_to_controller_with_retry',
+                        return_value=response):
+            status = serve_utils._get_service_status(
+                'svc-a',
+                pool=False,
+                with_replica_info=False,
+                with_replica_counts=True,
+                with_yaml=False,
+                with_target_num_replicas=True)
+
+        assert status is not None
+        for key, value in expected.items():
+            assert status[key] == value
+
     def test_service_status_reuses_batched_cluster_snapshot_for_endpoints(self):
         replicas_and_handles = [self._replica(f'r-{i}') for i in (1, 2)]
         replicas = [info for info, _ in replicas_and_handles]
@@ -1210,6 +1262,9 @@ class TestServiceStatusEndpointSnapshot:
         mock_clusters.assert_called_once_with(['r-1', 'r-2'])
         assert [replica['endpoint'] for replica in status['replica_info']
                ] == ['http://r-1.svc:8080', 'http://r-2.svc:8080']
+        assert [
+            replica['planned_capacity'] for replica in status['replica_info']
+        ] == [1, 1]
         assert endpoint_calls == [
             ('r-1', 8080, {
                 'cluster_record': cluster_records['r-1']
@@ -1237,6 +1292,30 @@ class TestTerminalStatuses:
         # to update healthy pools.
         assert serve_state.ServiceStatus.READY not in statuses
         assert serve_state.ServiceStatus.CONTROLLER_INIT not in statuses
+
+
+class TestServiceReplicaSummary:
+    """Service headers prefer public capacity but support old servers."""
+
+    def test_prefers_authoritative_logical_capacity(self):
+        assert serve_utils._get_replicas({
+            'ready_replicas': 8,
+            'total_replicas': 12,
+            'replica_info': [{
+                'status': serve_state.ReplicaStatus.READY,
+            }],
+        }) == '8/12'
+
+    def test_old_server_falls_back_to_physical_rows(self):
+        assert serve_utils._get_replicas({
+            'replica_info': [{
+                'status': serve_state.ReplicaStatus.READY,
+            }, {
+                'status': serve_state.ReplicaStatus.PROVISIONING,
+            }, {
+                'status': serve_state.ReplicaStatus.FAILED_PROVISION,
+            }],
+        }) == '1/2'
 
 
 class TestStreamReplicaLogsZeroByteFallback:

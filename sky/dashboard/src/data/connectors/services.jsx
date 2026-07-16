@@ -11,6 +11,11 @@ export function normalizeReplica(replica) {
     rawHourlyCost === null || rawHourlyCost === undefined
       ? null
       : Number(rawHourlyCost);
+  const rawPlannedCapacity = Number(replica.planned_capacity);
+  const plannedCapacity =
+    Number.isInteger(rawPlannedCapacity) && rawPlannedCapacity > 0
+      ? rawPlannedCapacity
+      : 1;
   return {
     id: replica.replica_id,
     status: replica.status,
@@ -24,6 +29,7 @@ export function normalizeReplica(replica) {
     resources_str: replica.resources_str || null,
     resources_str_full:
       replica.resources_str_full || replica.resources_str || null,
+    plannedCapacity,
     hourlyCost: Number.isFinite(hourlyCost) ? hourlyCost : null,
     hourlyCostExclusionReason: replica.hourly_cost_exclusion_reason || null,
   };
@@ -57,22 +63,70 @@ export function normalizeService(record) {
     !replicaInfo.length && record.replica_status_counts
       ? record.replica_status_counts
       : null;
-  let replicasReady;
-  let replicasFailed;
-  let replicasTotalRaw;
+  let physicalReplicasReady;
+  let physicalReplicasFailed;
+  let physicalReplicasTotalRaw;
   if (counts) {
-    replicasReady = counts['READY'] || 0;
-    replicasFailed = Object.entries(counts)
+    physicalReplicasReady = counts['READY'] || 0;
+    physicalReplicasFailed = Object.entries(counts)
       .filter(([status]) => FAILED_REPLICA_STATUSES.has(status))
       .reduce((acc, [, n]) => acc + n, 0);
-    replicasTotalRaw = Object.values(counts).reduce((acc, n) => acc + n, 0);
+    physicalReplicasTotalRaw = Object.values(counts).reduce(
+      (acc, n) => acc + n,
+      0
+    );
   } else {
-    replicasReady = replicas.filter((r) => r.status === 'READY').length;
-    replicasFailed = replicas.filter((r) =>
+    physicalReplicasReady = replicas.filter((r) => r.status === 'READY').length;
+    physicalReplicasFailed = replicas.filter((r) =>
       FAILED_REPLICA_STATUSES.has(r.status)
     ).length;
-    replicasTotalRaw = replicas.length;
+    physicalReplicasTotalRaw = replicas.length;
   }
+  const physicalReplicasTotal =
+    physicalReplicasTotalRaw - physicalReplicasFailed;
+
+  const usesLogicalReplicas = ['logical', 'logical_slot'].includes(
+    record.replica_unit
+  );
+  const capacityFor = (replica) =>
+    usesLogicalReplicas ? replica.plannedCapacity : 1;
+  const computedReplicasReady = replicas
+    .filter((replica) => replica.status === 'READY')
+    .reduce((total, replica) => total + capacityFor(replica), 0);
+  const computedReplicasFailed = replicas
+    .filter((replica) => FAILED_REPLICA_STATUSES.has(replica.status))
+    .reduce((total, replica) => total + capacityFor(replica), 0);
+  const computedReplicasTotal =
+    replicas.reduce((total, replica) => total + capacityFor(replica), 0) -
+    computedReplicasFailed;
+  const hasAuthoritativeCapacityCounts = [
+    record.ready_replicas,
+    record.total_replicas,
+    record.failed_replicas,
+  ].every((value) => Number.isInteger(value) && value >= 0);
+  const replicasReady = hasAuthoritativeCapacityCounts
+    ? record.ready_replicas
+    : replicas.length
+      ? computedReplicasReady
+      : physicalReplicasReady;
+  const replicasTotal = hasAuthoritativeCapacityCounts
+    ? record.total_replicas
+    : replicas.length
+      ? computedReplicasTotal
+      : physicalReplicasTotal;
+  const replicasFailed = hasAuthoritativeCapacityCounts
+    ? record.failed_replicas
+    : replicas.length
+      ? computedReplicasFailed
+      : physicalReplicasFailed;
+  const physicalCountFields = [
+    record.physical_ready_replicas,
+    record.physical_total_replicas,
+    record.physical_failed_replicas,
+  ];
+  const hasAuthoritativePhysicalCounts = physicalCountFields.every(
+    (value) => Number.isInteger(value) && value >= 0
+  );
 
   const pricedReplicas = replicas.filter(
     (replica) => replica.hourlyCost !== null
@@ -112,10 +166,18 @@ export function normalizeService(record) {
     uptime: record.uptime ?? null,
     endpoint: record.endpoint || null,
     replicasReady,
-    // Match `sky serve status`: failed replicas are excluded from the
-    // total (see _get_replicas in sky/serve/serve_utils.py).
-    replicasTotal: replicasTotalRaw - replicasFailed,
+    replicasTotal,
     replicasFailed,
+    replicaUnit: usesLogicalReplicas ? 'logical' : 'physical',
+    physicalReplicasReady: hasAuthoritativePhysicalCounts
+      ? record.physical_ready_replicas
+      : physicalReplicasReady,
+    physicalReplicasTotal: hasAuthoritativePhysicalCounts
+      ? record.physical_total_replicas
+      : physicalReplicasTotal,
+    physicalReplicasFailed: hasAuthoritativePhysicalCounts
+      ? record.physical_failed_replicas
+      : physicalReplicasFailed,
     // True when this record came from a summary_only response: the
     // per-replica list is intentionally absent, not empty.
     summaryOnly: Boolean(counts),

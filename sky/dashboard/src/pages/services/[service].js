@@ -340,6 +340,7 @@ export function ServiceDetailCard({ serviceData, pricingLoading = false }) {
   }
 
   const requestDetails = [];
+  const usesLogicalReplicas = serviceData.replicaUnit === 'logical';
   if (
     serviceData.recentRequestCount != null &&
     serviceData.requestWindowSeconds != null
@@ -389,7 +390,9 @@ export function ServiceDetailCard({ serviceData, pricingLoading = false }) {
             </div>
             <div>
               <div className="text-gray-600 font-medium text-base">
-                Replicas (ready/total)
+                {usesLogicalReplicas
+                  ? 'Logical replicas (ready/total)'
+                  : 'Replicas (ready/total)'}
               </div>
               <div className="text-base mt-1">
                 {serviceData.replicasReady}/{serviceData.replicasTotal}
@@ -406,6 +409,18 @@ export function ServiceDetailCard({ serviceData, pricingLoading = false }) {
                   </span>
                 )}
               </div>
+              {usesLogicalReplicas && (
+                <div className="text-sm text-gray-500 mt-1">
+                  {serviceData.physicalReplicasReady}/
+                  {serviceData.physicalReplicasTotal} physical backends ready
+                  {serviceData.physicalReplicasFailed > 0 && (
+                    <span className="text-red-700">
+                      {' '}
+                      (+{serviceData.physicalReplicasFailed} failed)
+                    </span>
+                  )}
+                </div>
+              )}
             </div>
             <div>
               <div className="text-gray-600 font-medium text-base">
@@ -570,7 +585,8 @@ export function ReplicaPlacementCard({ replicas, loading }) {
         <div>
           <h3 className="text-lg font-semibold">Machines by region</h3>
           <p className="text-sm text-gray-500">
-            Kubernetes contexts and cloud regions, grouped by lifecycle state.
+            Physical backends by Kubernetes context or cloud region, grouped by
+            lifecycle state.
           </p>
         </div>
         {loading && (

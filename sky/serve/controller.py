@@ -237,6 +237,9 @@ class SkyServeController:
         # advertise a newer routing policy than the runtime has actually
         # applied.
         self._routing_spec = self._build_routing_spec(service_spec)
+        # Refreshed only by autoscaler/LB-sync paths that already hold a full
+        # replica snapshot. Status polling reads this without new DB/API work.
+        self._replica_counts_snapshot: dict[str, int | str] | None = None
         self._app = fastapi.FastAPI(lifespan=self.lifespan)
 
     @contextlib.asynccontextmanager
@@ -734,6 +737,8 @@ class SkyServeController:
                                                     replica_infos,
                                                     async_occupancy_by_version,
                                                     authority=authority)
+            self._replica_counts_snapshot = self._get_replica_counts(
+                replica_infos)
             return responses.JSONResponse(content={
                 'replica_info': lb_replica_info,
                 'num_ready_replicas': num_ready,
@@ -835,6 +840,7 @@ class SkyServeController:
             'max_replicas': self._autoscaler.max_replicas,
             'configured_max_replicas': self._autoscaler.max_replicas,
         }
+        hint.update(self._get_replica_counts(replica_infos, include_unit=False))
         if logical:
             planned_capacity_by_url = {
                 cached[0]: int(getattr(info, 'planned_capacity', 1))
@@ -846,6 +852,55 @@ class SkyServeController:
             hint['planned_capacity_by_url'] = planned_capacity_by_url
             hint['logical_replica_urls'] = sorted(planned_capacity_by_url)
         return hint
+
+    def _get_replica_counts(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+        include_unit: bool = True,
+    ) -> dict[str, int | str]:
+        """Return logical capacity and physical backend status aggregates."""
+        autoscaler = getattr(self, '_autoscaler', None)
+        logical = getattr(autoscaler, 'replica_unit', None) == 'logical'
+
+        ready = total = failed = 0
+        physical_ready = physical_total = physical_failed = 0
+        failed_statuses = serve_state.ReplicaStatus.failed_statuses()
+        for info in replica_infos:
+            status = info.status
+            # Pre-activation bridge rows deserialize with planned_capacity=1;
+            # every logical version keeps its selected width. This lets a
+            # rolling activation count both generations without spec queries.
+            planned_capacity = getattr(info, 'planned_capacity', 1)
+            width = (planned_capacity
+                     if logical and isinstance(planned_capacity, int) and
+                     not isinstance(planned_capacity, bool) and
+                     planned_capacity > 0 else 1)
+            if status == serve_state.ReplicaStatus.READY:
+                capacity_getter = getattr(autoscaler,
+                                          'get_ready_replica_capacity', None)
+                observed_ready = (capacity_getter(info) if logical and
+                                  callable(capacity_getter) else width)
+                ready += max(0, int(observed_ready))
+                physical_ready += 1
+            if status in failed_statuses:
+                failed += width
+                physical_failed += 1
+            else:
+                total += width
+                physical_total += 1
+
+        counts: dict[str, int | str] = {
+            'ready_replicas': ready,
+            'total_replicas': total,
+            'failed_replicas': failed,
+            'physical_ready_replicas': physical_ready,
+            'physical_total_replicas': physical_total,
+            'physical_failed_replicas': physical_failed,
+        }
+        if include_unit:
+            counts['replica_unit'] = ('logical_slot'
+                                      if logical else 'physical_backend')
+        return counts
 
     @staticmethod
     def _build_routing_spec(service_spec: Any) -> dict[str, Any] | None:
@@ -1235,6 +1290,8 @@ class SkyServeController:
             try:
                 replica_infos = serve_state.get_replica_infos(
                     self._service_name)
+                self._replica_counts_snapshot = self._get_replica_counts(
+                    replica_infos)
                 # Use the active versions set by replica manager to make
                 # sure we only scale down the outdated replicas that are
                 # not used by the load balancer.
@@ -1376,6 +1433,9 @@ class SkyServeController:
             dependencies=[admin_auth_dependency, controller_owner_dependency])
         async def get_autoscaler_info() -> fastapi.Response:
             info = self._autoscaler.info()
+            counts = self._replica_counts_snapshot
+            if counts is not None:
+                info.update(counts)
             info.update(self._get_update_status())
             return responses.JSONResponse(content=info, status_code=200)
 
