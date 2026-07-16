@@ -25,6 +25,7 @@ jobs:
         npm --prefix sky/dashboard install
         npm --prefix sky/dashboard test -- --runInBand \
           src/components/services.test.jsx \
+          src/components/recipe-hub.test.jsx \
           src/components/recipe-detail.test.jsx \
           src/components/clusters.test.jsx \
           src/components/volumes.test.jsx \
