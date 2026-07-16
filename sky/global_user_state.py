@@ -3777,11 +3777,17 @@ def record_operator_notification(category: str,
         current = operator_notification_table.c
         starts_new_incident = (current.last_seen_at
                                <= emitted_at - dedupe_window_seconds)
+        is_earliest_occurrence = current.first_seen_at > emitted_at
         advances_last_seen = current.last_seen_at < emitted_at
+        is_latest_occurrence = current.last_seen_at <= emitted_at
         upsert_stmnt = insert_stmnt.on_conflict_do_update(
             index_elements=[current.category],
             set_={
-                current.message: message,
+                current.message: sqlalchemy.case(
+                    (is_latest_occurrence, message), else_=current.message),
+                current.first_seen_at: sqlalchemy.case(
+                    (is_earliest_occurrence, emitted_at),
+                    else_=current.first_seen_at),
                 current.last_seen_at: sqlalchemy.case(
                     (advances_last_seen, emitted_at),
                     else_=current.last_seen_at),

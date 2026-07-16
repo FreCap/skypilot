@@ -109,6 +109,25 @@ def test_notification_lookback_filters_by_latest_occurrence(
     assert [item['message'] for item in recent['notifications']] == ['recent']
 
 
+def test_stale_occurrence_does_not_replace_latest_message(
+        tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    global_user_state.record_operator_notification('insufficient_quota',
+                                                   'newer actionable text',
+                                                   3600,
+                                                   emitted_at=200)
+    global_user_state.record_operator_notification('insufficient_quota',
+                                                   'stale actionable text',
+                                                   3600,
+                                                   emitted_at=150)
+
+    notification = global_user_state.get_operator_notifications(
+        'operator', 0)['notifications'][0]
+    assert notification['first_seen_at'] == 150
+    assert notification['last_seen_at'] == 200
+    assert notification['message'] == 'newer actionable text'
+
+
 def test_concurrent_occurrences_keep_one_category_row(tmp_path, monkeypatch):
     _fresh_db(tmp_path, monkeypatch)
 
