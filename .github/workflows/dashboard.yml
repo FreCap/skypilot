@@ -30,6 +30,7 @@ jobs:
           src/components/volumes.test.jsx \
           src/components/estimated-spend.test.jsx \
           src/components/infra.test.jsx \
+          src/data/connectors/infra-slurm.test.jsx \
           src/components/job-detail-logs.test.jsx \
           src/components/jobs.test.jsx \
           src/components/users.test.jsx \
