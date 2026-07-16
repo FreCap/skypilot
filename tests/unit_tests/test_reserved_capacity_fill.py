@@ -1118,6 +1118,23 @@ class TestQueryFreeSlots(unittest.TestCase):
                 reserved_capacity.query_free_slots(
                     [self._k8s_location(count=2)]), 2)
 
+    def test_pool_shapes_preserve_exact_whole_gpu_counts(self):
+        shapes = reserved_capacity.zero_cost_pool_shapes([
+            self._k8s_location(gpu='A100', count=2.0),
+            self._k8s_location(gpu='H100', count=1),
+        ])
+        self.assertEqual(shapes, {
+            ('research-ctx', 'a100'): 2,
+            ('research-ctx', 'h100'): 1,
+        })
+
+    def test_pool_shapes_reject_fractional_and_non_finite_counts(self):
+        for count in (0.5, 1.5, float('nan'), float('inf')):
+            with self.subTest(count=count):
+                self.assertEqual(
+                    reserved_capacity.zero_cost_pool_shapes(
+                        [self._k8s_location(count=count)]), {})
+
     def test_unknown_availability_counts_zero(self):
         with mock.patch.object(reserved_capacity.kubernetes_catalog,
                                'list_accelerators_realtime',
@@ -1933,6 +1950,29 @@ class TestBrokerPollerCycle(unittest.TestCase):
         # The location set is still seeded: existing holdings keep their
         # scale-down shelter even while fill is inactive.
         self.assertIsNotNone(autoscaler._fill_snapshot_time)
+
+    def test_logical_multi_gpu_shape_withdraws_claim_and_feeds_zero(self):
+        autoscaler = _make_autoscaler(min_replicas=1)
+        logical_placer = (
+            spot_placer.CapacityAwareDynamicFallbackSpotPlacer.__new__(
+                spot_placer.CapacityAwareDynamicFallbackSpotPlacer))
+        location_data = dict(_K8S_KEY, accelerators={'A100': 2})
+        zero_cost = [spot_placer.Location.from_pickleable(location_data)]
+        keys = [location.to_pickleable() for location in zero_cost]
+
+        with mock.patch.object(reserved_capacity.reserved_capacity_broker,
+                               'remove_claim') as remove_mock, \
+             mock.patch.object(reserved_capacity.reserved_capacity_broker,
+                               'upsert_claim') as upsert_mock, \
+             mock.patch.object(reserved_capacity.reserved_capacity_broker,
+                               'run_round_if_stale') as round_mock:
+            reserved_capacity._broker_cycle(autoscaler, logical_placer, 'svc',
+                                            zero_cost, keys)
+
+        remove_mock.assert_called_once_with('svc')
+        upsert_mock.assert_not_called()
+        round_mock.assert_not_called()
+        self.assertEqual(autoscaler.info()['fill_free_slots'], 0)
 
 
 class TestReplicaManagerInitIntact(unittest.TestCase):
