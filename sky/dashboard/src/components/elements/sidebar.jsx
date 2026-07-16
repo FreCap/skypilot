@@ -44,7 +44,8 @@ const ICON_MAP = {
   piechart: PieChartIcon,
   activity: Activity,
 };
-import { BASE_PATH, ENDPOINT } from '@/data/connectors/constants';
+import { getCurrentUserRole } from '@/data/connectors/client';
+import { BASE_PATH } from '@/data/connectors/constants';
 import { CustomTooltip } from '@/components/utils';
 import { useMobile } from '@/hooks/useMobile';
 import { ThemeToggle } from '@/components/elements/ThemeToggle';
@@ -71,42 +72,21 @@ export function SidebarProvider({ children }) {
     setIsMobileSidebarOpen((prev) => !prev);
   };
 
-  const baseUrl = window.location.origin;
-  const fullEndpoint = `${baseUrl}${ENDPOINT}`;
   useEffect(() => {
-    // Fetch user info from health endpoint
-    fetch(`${fullEndpoint}/api/health`)
-      .then((res) => res.json())
-      .then((data) => {
-        if (data.user && data.user.name) {
-          setUserEmail(data.user.name);
-
-          // Get role from direct API endpoint to avoid cache interference
-          // Using cache would cause race condition, which leads to unexpected
-          // behavior in workspaces and users page.
-          const getUserRole = async () => {
-            try {
-              const response = await fetch(`${fullEndpoint}/users/role`);
-              if (response.ok) {
-                const roleData = await response.json();
-                if (roleData.role) {
-                  setUserRole(roleData.role);
-                }
-              }
-            } catch (error) {
-              // If role data is not available or there's an error,
-              // we just don't show the role - it's not critical
-              console.log('Could not fetch user role:', error);
-            }
-          };
-
-          getUserRole();
-        }
+    let isCurrent = true;
+    getCurrentUserRole()
+      .then((currentUser) => {
+        if (!isCurrent || currentUser.roleFetchFailed) return;
+        if (currentUser.name) setUserEmail(currentUser.name);
+        if (currentUser.role) setUserRole(currentUser.role);
       })
       .catch((error) => {
         console.error('Error fetching user data:', error);
       });
-  }, [fullEndpoint]);
+    return () => {
+      isCurrent = false;
+    };
+  }, []);
 
   return (
     <SidebarContext.Provider
