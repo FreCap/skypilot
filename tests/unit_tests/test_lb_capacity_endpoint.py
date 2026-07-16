@@ -305,6 +305,28 @@ class TestCapacityEndpoint(unittest.TestCase):
         # Demand remains conservative while capacity fails closed.
         self.assertEqual(body['in_flight'], 3)
 
+    def test_logical_mode_unprobed_ready_url_fails_closed(self):
+        url = 'http://unprobed-eight-gpu:8080'
+        policy = lb_policies.LeastLoadPolicy()
+        policy.set_ready_replicas([url])
+        balancer = _make_balancer(policy)
+        balancer._capacity_hint = {
+            'replica_unit': 'logical_slot',
+            'max_replicas': 20,
+            'configured_max_replicas': 20,
+            'planned_capacity_by_url': {
+                url: 8
+            },
+        }
+
+        body = json.loads(
+            asyncio.run(balancer._capacity(mock.MagicMock())).body)
+
+        self.assertEqual(body['ready_replicas'], 0)
+        self.assertEqual(body['total_slots'], 0)
+        self.assertEqual(body['free_slots'], 0)
+        self.assertEqual(body['current_capacity'], 0)
+
     def test_logical_mode_caps_runtime_slots_at_pinned_width(self):
         url = 'http://eight-gpu:8080'
         policy = lb_policies.LeastLoadPolicy()

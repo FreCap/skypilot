@@ -1466,8 +1466,14 @@ class SkyServeLoadBalancer:
             if logical_replicas:
 
                 def _bounded_logical_free(url: str) -> int:
-                    runtime_busy = max(
-                        0, total_slots_by_url[url] - probed.get(url, 0))
+                    runtime_total = total_slots_by_url.get(url)
+                    if runtime_total is None:
+                        # A ready backend can disappear from an occupancy
+                        # snapshot after a probe miss. Unknown capacity is not
+                        # free capacity, so fail closed instead of indexing a
+                        # partial snapshot.
+                        return 0
+                    runtime_busy = max(0, runtime_total - probed.get(url, 0))
                     planned_free = max(
                         0, planned_capacity_by_url[url] - runtime_busy)
                     return min(probed.get(url, 0), planned_free)
