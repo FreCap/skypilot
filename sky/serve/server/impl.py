@@ -977,22 +977,11 @@ def elect_version(service_name: str, version: int, expected_service_hash: str,
                 raise ValueError(
                     f'Service {service_name!r} already has version {version} '
                     'elected.')
-            versions = [version]
-            if isinstance(elected_version, int):
-                versions.append(elected_version)
-            yaml_contents = serve_state.get_yaml_contents(
-                service_name, versions)
-            yaml_content = yaml_contents.get(version)
+            yaml_content = serve_state.get_yaml_content(service_name, version)
             if yaml_content is None:
                 raise ValueError(
                     f'Committed version {version} does not exist for service '
                     f'{service_name!r}.')
-            if (isinstance(elected_version, int) and
-                    yaml_contents.get(elected_version) == yaml_content):
-                raise ValueError(
-                    f'Service {service_name!r} already has the configuration '
-                    f'from version {version} elected as version '
-                    f'{elected_version}.')
             task = task_lib.Task.from_yaml_str(yaml_content)
             _update_impl(task,
                          service_name,
