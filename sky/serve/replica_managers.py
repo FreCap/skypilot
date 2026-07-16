@@ -2219,7 +2219,6 @@ class SkyPilotReplicaManager(ReplicaManager):
         replica_id: int,
         resources_override: dict[str, Any] | None = None,
         existing_replica_infos: list['ReplicaInfo'] | None = None,
-        current_spot_locations: list[spot_placer.Location] | None = None,
         prior_reserved_fill: bool = False,
         prior_cost_rebalance_for_replica_id: int | None = None,
         prior_planned_capacity: int | None = None,
@@ -2256,10 +2255,6 @@ class SkyPilotReplicaManager(ReplicaManager):
 
         prior_yaml_content: exact launch YAML of a recovery row. Recovery must
         not relabel or relaunch an old-version backend with the latest config.
-
-        current_spot_locations: mutable batch-local placement load. A
-        successful launch appends its selected location so later launches in
-        the same wave preserve spreading without rescanning replica rows.
         """
         if replica_id in self._launch_thread_pool:
             logger.warning(f'Launch thread for replica {replica_id} '
@@ -2387,9 +2382,6 @@ class SkyPilotReplicaManager(ReplicaManager):
             if existing_replica_infos is None:
                 existing_replica_infos = serve_state.get_replica_infos(
                     self._service_name)
-            if current_spot_locations is None:
-                current_spot_locations = self._get_spot_locations(
-                    existing_replica_infos)
             if zero_cost_only:
                 # Broker epoch fence: a fill decision computed from a
                 # superseded allocation round (the pool's epoch moved
@@ -2429,8 +2421,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # aborted fill launch leaks nothing and the autoscaler
                 # simply retries on a later tick as capacity frees.
                 zero_cost_location = (
-                    self._spot_placer.select_next_zero_cost_location(
-                        current_spot_locations))
+                    self._spot_placer.select_next_zero_cost_location())
                 if zero_cost_location is None:
                     self._log_fill_skip(
                         'no ACTIVE zero-cost location available')
@@ -2442,11 +2433,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # preferring the zero-cost tier.  The placer falls back to
                 # zero-cost when no paid candidate exists.
                 location = self._spot_placer.select_next_location(
-                    current_spot_locations, skip_zero_cost_preference=True)
+                    skip_zero_cost_preference=True)
                 if (zero_cost_demand_budget is not None and
                         location in self._spot_placer.zero_cost_locations()):
                     budgeted_location = self._select_budgeted_zero_cost_location(
-                        current_spot_locations, zero_cost_demand_budget)
+                        zero_cost_demand_budget)
                     if budgeted_location is None:
                         logger.info('Deferring demand launch because the '
                                     'shared zero-cost GPU budget is exhausted '
@@ -2455,10 +2446,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                     location = budgeted_location
             elif zero_cost_demand_budget is not None:
                 location = self._select_budgeted_zero_cost_location(
-                    current_spot_locations, zero_cost_demand_budget)
+                    zero_cost_demand_budget)
                 if location is None:
                     location = self._spot_placer.select_next_location(
-                        current_spot_locations, skip_zero_cost_preference=True)
+                        skip_zero_cost_preference=True)
                     if location in self._spot_placer.zero_cost_locations():
                         # A successful zero (or an exhausted speculative
                         # allowance) is authoritative. If no paid candidate is
@@ -2471,10 +2462,9 @@ class SkyPilotReplicaManager(ReplicaManager):
             elif self._demand_should_skip_saturated_zero_cost(
                     existing_replica_infos):
                 location = self._spot_placer.select_next_location(
-                    current_spot_locations, skip_zero_cost_preference=True)
+                    skip_zero_cost_preference=True)
             else:
-                location = self._spot_placer.select_next_location(
-                    current_spot_locations)
+                location = self._spot_placer.select_next_location()
             resources_override.update(location.to_dict())
             # The location dictates the actual spot-ness of THIS launch
             # (a zero-cost reserved location is non-spot even though the
@@ -2487,9 +2477,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             # use_spot gate after its fill sentinel was consumed at original
             # emission. Recover the location from the override so the
             # upserted replica row keeps it -- location=None would permanently
-            # drop the replica from the placer's load counting and from
-            # zero-cost fill accounting (no scale-down shelter, undercounted
-            # fill baseline).
+            # drop the replica from zero-cost fill accounting (no scale-down
+            # shelter, undercounted fill baseline).
             location = recovered_location
             if location is None:
                 location = spot_placer.Location.from_resources_override(
@@ -2628,32 +2617,15 @@ class SkyPilotReplicaManager(ReplicaManager):
                     replacement_ids = set()
                     self._unknown_capacity_replacement_ids = replacement_ids
                 replacement_ids.add(replica_id)
-        if current_spot_locations is not None and location is not None:
-            current_spot_locations.append(location)
         if existing_replica_infos is not None:
             # Bulk callers (recovery re-drive) reuse one snapshot across a
-            # whole wave of launches. Append the replica we just placed so
-            # the spot placer sees in-wave assignments and spreads the wave
-            # across locations instead of pinning every launch to the
-            # least-loaded location of the frozen snapshot.
+            # whole wave of launches. Append each accepted replica so shared
+            # zero-cost capacity accounting sees the in-wave reservations.
             existing_replica_infos.append(info)
         # Don't start right now; we will start it later in _refresh_thread_pool
         # to avoid too many sky.launch running at the same time.
         self._launch_thread_pool[replica_id] = t
         return True
-
-    @staticmethod
-    def _get_spot_locations(
-            replica_infos: list['ReplicaInfo']) -> list[spot_placer.Location]:
-        """Extract placer locations once for a mutable replica snapshot."""
-        locations = []
-        for info in replica_infos:
-            # Every placer-placed replica counts toward location load,
-            # including non-spot reserved-capacity ones.
-            location = info.get_spot_location()
-            if location is not None:
-                locations.append(location)
-        return locations
 
     def _demand_should_skip_zero_cost(
             self, existing_replica_infos: list['ReplicaInfo'] | None) -> bool:
@@ -2661,11 +2633,10 @@ class SkyPilotReplicaManager(ReplicaManager):
 
         When this service already holds at least its broker grant on the
         zero-cost tier, its DEMAND launches stop preferring that tier and
-        compete normally (in practice: go to paid capacity, since the
-        grant-full tier carries more load). Reads ONLY the poller's
-        in-process grant cache -- no DB on the launch path, and with no
-        broker grant (single service, broker disabled, or unit tests)
-        the gate is inert and behavior is exactly pre-broker.
+        select paid capacity when it is available. Reads ONLY the poller's
+        in-process grant cache -- no DB on the launch path, and with no broker
+        grant (single service, broker disabled, or unit tests) the gate is
+        inert and behavior is exactly pre-broker.
         Demand replicas already ON the pool are untouched: the gate
         prevents new squatting only; existing rows are demand-protected
         until their traffic recedes (v1 semantics per the design doc).
@@ -2700,8 +2671,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         return holdings >= grant
 
     def _select_budgeted_zero_cost_location(
-            self, current_locations: list[spot_placer.Location],
-            budget: _ZeroCostDemandBudget) -> spot_placer.Location | None:
+            self, budget: _ZeroCostDemandBudget) -> spot_placer.Location | None:
         """Reserve and select one location from a measured batch budget."""
         if self._spot_placer is None:
             return None
@@ -2723,7 +2693,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         if not allowed:
             return None
         location = self._spot_placer.select_next_zero_cost_location(
-            current_locations, allowed_locations=allowed)
+            allowed_locations=allowed)
         if location is None:
             return None
         pool_key = _zero_cost_pool_key(location)
@@ -2926,7 +2896,6 @@ class SkyPilotReplicaManager(ReplicaManager):
         zero_cost_demand_budget: _ZeroCostDemandBudget | None = None,
         logical_reconcile_fence: tuple[int, int, int] | None = None,
         unknown_capacity_replacement: bool = False,
-        current_spot_locations: list[spot_placer.Location] | None = None,
     ) -> bool:
         """Allocate an id and enqueue one replica launch. Lock must be held.
 
@@ -2957,9 +2926,6 @@ class SkyPilotReplicaManager(ReplicaManager):
             launch_kwargs: dict[str, Any] = {
                 'existing_replica_infos': existing_replica_infos
             }
-            if current_spot_locations is not None:
-                launch_kwargs['current_spot_locations'] = (
-                    current_spot_locations)
             if zero_cost_demand_budget is not None:
                 launch_kwargs['zero_cost_demand_budget'] = (
                     zero_cost_demand_budget)
@@ -2996,13 +2962,10 @@ class SkyPilotReplicaManager(ReplicaManager):
         waits per tick; the launch budget in `_refresh_thread_pool` then
         paces actual `sky.launch` concurrency as intended.
 
-        Placement also shares replica and location snapshots across the wave.
-        Without them, every placer-managed replica calls `get_replica_infos`
-        and extracts the locations of all N existing rows K times for a
-        K-replica wave. The launch path appends each successfully enqueued
-        replica and selected location to these snapshots, so later decisions
-        preserve the existing in-wave spreading and reserved-capacity
-        accounting semantics.
+        Shared zero-cost placement also reuses one replica snapshot across the
+        wave. The launch path appends each successfully enqueued replica so
+        later decisions observe in-wave reservations without querying and
+        unpickling all existing rows once per launch.
         """
         needs_reservation = (
             self._batch_needs_placement_snapshot(resources_overrides) and
@@ -3044,17 +3007,6 @@ class SkyPilotReplicaManager(ReplicaManager):
             }
         else:
             used_replica_ids = serve_state.get_replica_ids(self._service_name)
-        current_spot_locations = None
-        cost_rebalance_key = (
-            serve_constants.COST_REBALANCE_FOR_REPLICA_OVERRIDE_KEY)
-        placement_load_overrides = [
-            override for override in resources_overrides
-            if override is None or cost_rebalance_key not in override
-        ]
-        if (existing_replica_infos is not None and
-                self._batch_needs_placement_snapshot(placement_load_overrides)):
-            current_spot_locations = self._get_spot_locations(
-                existing_replica_infos)
         zero_cost_demand_budget = None
         if (existing_replica_infos is not None and
                 self._uses_shared_zero_cost_demand_budget()):
@@ -3075,12 +3027,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                             f'{batch_version} scale-up batch because version '
                             f'{pending_version} is waiting to be applied.')
                 break
-            self._scale_up_one_locked(
-                resources_override,
-                used_replica_ids,
-                existing_replica_infos,
-                zero_cost_demand_budget,
-                current_spot_locations=current_spot_locations)
+            self._scale_up_one_locked(resources_override, used_replica_ids,
+                                      existing_replica_infos,
+                                      zero_cost_demand_budget)
 
     @with_lock
     def scale_up_to_logical_capacity(
@@ -3140,10 +3089,6 @@ class SkyPilotReplicaManager(ReplicaManager):
         existing_replica_infos = serve_state.get_replica_infos(
             self._service_name)
         used_replica_ids = {info.replica_id for info in existing_replica_infos}
-        current_spot_locations = None
-        if self._spot_placer is not None:
-            current_spot_locations = self._get_spot_locations(
-                existing_replica_infos)
 
         def _committed_capacity() -> int:
             committed = 0
@@ -3207,9 +3152,6 @@ class SkyPilotReplicaManager(ReplicaManager):
             launch_kwargs: dict[str, Any] = {}
             if replace_unknown_replica_ids:
                 launch_kwargs['unknown_capacity_replacement'] = True
-            if current_spot_locations is not None:
-                launch_kwargs['current_spot_locations'] = (
-                    current_spot_locations)
             launched = self._scale_up_one_locked(
                 None,
                 used_replica_ids,
@@ -4134,6 +4076,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                                     ReplicaInfo]] = []
         pending_launches: list[tuple[int, thread_utils.SafeThread,
                                      ReplicaInfo]] = []
+        successful_spot_locations: dict[spot_placer.Location, float] = {}
+        failed_spot_locations: set[spot_placer.Location] = set()
         # One query for every finished launch thread; walking the pool with
         # per-replica reads makes queued PENDING launches re-hit the DB every
         # tick until they are admitted.
@@ -4182,11 +4126,19 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # availability of the location later.
                 location = info.get_spot_location()
                 assert location is not None
+                resolved_location = self._spot_placer.resolve_location(location)
+                if resolved_location is not None:
+                    location = resolved_location
                 if t.format_exc is not None:
-                    self._spot_placer.set_preemptive(location)
+                    failed_spot_locations.add(location)
                     info.status_property.failed_spot_availability = True
                 else:
-                    self._spot_placer.set_active(location)
+                    selected_at = getattr(info, 'created_at', None)
+                    if selected_at is not None:
+                        successful_spot_locations[location] = max(
+                            selected_at,
+                            successful_spot_locations.get(
+                                location, selected_at))
             self._persist_replica(replica_id, info)
             if error_in_sky_launch:
                 # Teardown after update replica info since
@@ -4194,6 +4146,18 @@ class SkyPilotReplicaManager(ReplicaManager):
                 self._terminate_replica(replica_id,
                                         sync_down_logs=True,
                                         replica_drain_delay_seconds=0)
+
+        if self._spot_placer is not None:
+            # A mixed wave can consume the last available capacity while
+            # sibling launches fail. Make any failure authoritative for this
+            # refresh regardless of replica iteration order; a later TTL probe
+            # is the bounded path back to the cheaper location.
+            for location, selected_at in successful_spot_locations.items():
+                if location not in failed_spot_locations:
+                    self._spot_placer.set_active(location,
+                                                 selected_at=selected_at)
+            for location in failed_spot_locations:
+                self._spot_placer.set_preemptive(location)
 
         if pending_launches:
             # Queued launches for one service share the same controller-owner
@@ -4218,6 +4182,28 @@ class SkyPilotReplicaManager(ReplicaManager):
                     self._replica_to_request_id.pop(replica_id)
                     self._replica_to_launch_cancelled.pop(replica_id)
                     continue
+                if self._spot_placer is not None:
+                    location = info.get_spot_location()
+                    resolved_location = (
+                        self._spot_placer.resolve_location(location)
+                        if location is not None else None)
+                    if resolved_location is not None:
+                        location = resolved_location
+                    if (location is not None and
+                        (location in failed_spot_locations or
+                         not self._spot_placer.is_active_location(location))):
+                        # This exact placement failed after the batch was
+                        # queued but before this thread was admitted. Drop the
+                        # never-started row so the autoscaler replans it on the
+                        # next tick against the next-cheapest active location.
+                        logger.info(
+                            f'Discarding queued launch for replica '
+                            f'{replica_id}: placement {location} is benched.')
+                        self._remove_replica(replica_id)
+                        self._launch_thread_pool.pop(replica_id)
+                        self._replica_to_request_id.pop(replica_id)
+                        self._replica_to_launch_cancelled.pop(replica_id)
+                        continue
                 # sky.launch not started yet; admitted below under the
                 # resources lock.
                 launch_to_admit.append((replica_id, t, info))

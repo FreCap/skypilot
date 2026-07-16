@@ -49,19 +49,16 @@ def _make_per_gpu_placer(costs):
 class TestZeroCostTierFirst:
     """Free capacity fills completely before any paid launch."""
 
-    def test_zero_cost_wins_even_when_loaded(self, hybrid_placer):
+    def test_zero_cost_wins(self, hybrid_placer):
         placer, k8s, cheap_spot, pricey_spot = hybrid_placer
-        # k8s already hosts 50 replicas, spot none: k8s STILL wins —
-        # only a launch failure (bench) moves load to paid tier.
-        current = [k8s] * 50
-        assert placer.select_next_location(current) == k8s
+        assert placer.select_next_location() == k8s
 
     def test_benched_zero_cost_falls_back_to_cheapest_spot(
             self, hybrid_placer, monkeypatch):
         placer, k8s, cheap_spot, pricey_spot = hybrid_placer
         monkeypatch.setattr(spot_placer.time, 'time', lambda: 1000.0)
         placer.set_preemptive(k8s)  # cluster full -> launch failed
-        assert placer.select_next_location([]) == cheap_spot
+        assert placer.select_next_location() == cheap_spot
 
     def test_ttl_retry_pulls_back_to_zero_cost(self, hybrid_placer,
                                                monkeypatch):
@@ -69,11 +66,11 @@ class TestZeroCostTierFirst:
         now = [1000.0]
         monkeypatch.setattr(spot_placer.time, 'time', lambda: now[0])
         placer.set_preemptive(k8s)
-        assert placer.select_next_location([]) == cheap_spot
+        assert placer.select_next_location() == cheap_spot
         # Capacity frees; after the TTL the zero-cost tier is probed
         # again and immediately preferred.
         now[0] += spot_placer._PREEMPTION_RETRY_SECONDS_DEFAULT + 1
-        assert placer.select_next_location([cheap_spot] * 10) == k8s
+        assert placer.select_next_location() == k8s
 
 
 class TestCapacityAwareCost:
@@ -228,26 +225,27 @@ run: echo hi
                                  cloud_name='AWS')
         costs = {one_gpu: 0.2, four_gpu: 0.6}
 
-        assert make_placer(costs).select_next_location([]) == one_gpu
-        assert _make_per_gpu_placer(costs).select_next_location([]) == four_gpu
+        assert make_placer(costs).select_next_location() == one_gpu
+        assert _make_per_gpu_placer(costs).select_next_location() == four_gpu
 
     def test_fractional_gpu_shape_uses_exact_configured_count(self):
         half_gpu = make_location('half', accelerators={'L4': 0.5})
         one_gpu = make_location('one', accelerators={'L4': 1})
         placer = _make_per_gpu_placer({half_gpu: 0.4, one_gpu: 0.6})
 
-        assert placer.select_next_location([]) == one_gpu
+        assert placer.select_next_location() == one_gpu
 
-    def test_gpu_load_spreads_across_physical_locations(self):
+    def test_cheapest_per_gpu_shape_is_reused(self):
         one_gpu = make_location('one', accelerators={'L4': 1}, cloud_name='AWS')
         four_gpu = make_location('four',
                                  accelerators={'L4': 4},
                                  cloud_name='AWS')
         placer = _make_per_gpu_placer({one_gpu: 0.2, four_gpu: 0.6})
 
-        assert placer.select_next_location([four_gpu]) == one_gpu
+        assert placer.select_next_location() == four_gpu
+        assert placer.select_next_location() == four_gpu
 
-    def test_shapes_do_not_create_fake_diversity_locations(self):
+    def test_cheapest_per_gpu_wins_across_regions(self):
         one_gpu = make_location('east',
                                 accelerators={'L4': 1},
                                 cloud_name='AWS')
@@ -263,8 +261,8 @@ run: echo hi
             other_region: 0.25,
         })
 
-        assert placer.select_next_location([]) == four_gpu
-        assert placer.select_next_location([four_gpu]) == other_region
+        assert placer.select_next_location() == four_gpu
+        assert placer.select_next_location() == four_gpu
 
     def test_multiple_accelerator_models_share_per_gpu_optimization(self):
         l4 = make_location('same-zone',
@@ -275,14 +273,14 @@ run: echo hi
                              cloud_name='AWS')
         placer = _make_per_gpu_placer({l4: 0.8, a10g: 0.25})
 
-        assert placer.select_next_location([]) == l4
+        assert placer.select_next_location() == l4
 
     def test_zero_cost_tier_still_wins(self):
         reserved = make_location('reserved', accelerators={'A100': 1})
         paid = make_location('paid', accelerators={'L4': 8})
         placer = _make_per_gpu_placer({reserved: 0.0, paid: 0.4})
 
-        assert placer.select_next_location([reserved] * 20) == reserved
+        assert placer.select_next_location() == reserved
 
 
 class TestProvisionTimeoutWarning:
@@ -483,17 +481,6 @@ class TestLegacyLocationResolution:
         placer.set_preemptive(stranger)
         placer.set_active(stranger)
         assert keyed in placer.active_locations()
-
-    def test_load_counting_resolves_legacy_rows(self):
-        keyed = make_location('us-east-1', accelerators={'L4': 1})
-        other = make_location('us-east-2', accelerators={'L4': 1})
-        placer = make_placer({keyed: 0.2, other: 0.2})
-        legacy = spot_placer.Location(cloud=keyed.cloud,
-                                      region='us-east-1',
-                                      zone=None)
-        # One legacy replica in us-east-1: the next launch must go to
-        # the (unloaded) other region, proving the legacy row counted.
-        assert placer.select_next_location([legacy]) == other
 
 
 class TestMixedValidation:

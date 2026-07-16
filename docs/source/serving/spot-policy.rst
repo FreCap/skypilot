@@ -72,14 +72,15 @@ Cost-aware multi-GPU placement
 ------------------------------
 
 For a heterogeneous ``resources.any_of`` fleet, set ``spot_placer`` to
-``dynamic_fallback_per_gpu`` to spread capacity across physical locations and
-compare their active machine shapes by hourly price divided by accelerator
-count. SkyPilot expands each paid spot entry across the whole-GPU machine
-widths supported by its provider catalog, so the service does not need to
-duplicate instance-shape lists. A 1-GPU and a 4-GPU machine in the same zone
-are alternatives, not separate diversity locations; the 4-GPU machine wins
-when its cost per serving slot is lower. Configured cloud and region
-constraints still apply.
+``dynamic_fallback_per_gpu`` to fill the lowest-cost active machine shape by
+hourly price divided by accelerator count. SkyPilot keeps selecting that shape
+until a launch failure temporarily benches its exact location, then falls
+through to the next-cheapest active candidate. Benched locations become
+eligible for a bounded probe after the retry window, so recovered cheap
+capacity is filled again without pinning retries to an unavailable location.
+SkyPilot expands each paid spot entry across the whole-GPU machine widths
+supported by its provider catalog, so the service does not need to duplicate
+instance-shape lists. Configured cloud and region constraints still apply.
 
 .. code-block:: yaml
 

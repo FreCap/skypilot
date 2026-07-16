@@ -914,28 +914,27 @@ class TestZeroCostSelection(unittest.TestCase):
         self.placer = _make_placer({self.k8s: 0.0, self.paid: 0.2})
 
     def test_returns_active_zero_cost(self):
-        self.assertEqual(self.placer.select_next_zero_cost_location([]),
-                         self.k8s)
+        self.assertEqual(self.placer.select_next_zero_cost_location(), self.k8s)
 
     def test_benched_zero_cost_returns_none_never_paid(self):
         with mock.patch.object(spot_placer.time, 'time', return_value=1000.0):
             self.placer.set_preemptive(self.k8s)
-            self.assertIsNone(self.placer.select_next_zero_cost_location([]))
+            self.assertIsNone(self.placer.select_next_zero_cost_location())
 
     def test_no_zero_cost_at_all_returns_none(self):
         placer = _make_placer({self.paid: 0.2})
-        self.assertIsNone(placer.select_next_zero_cost_location([]))
+        self.assertIsNone(placer.select_next_zero_cost_location())
 
     def test_enumeration_includes_benched(self):
         with mock.patch.object(spot_placer.time, 'time', return_value=1000.0):
             self.placer.set_preemptive(self.k8s)
             self.assertIn(self.k8s, self.placer.zero_cost_locations())
 
-    def test_least_loaded_zero_cost_wins(self):
+    def test_equal_cost_reuses_first_candidate(self):
         other = _make_location('research-ctx-2', 'free')
         placer = _make_placer({self.k8s: 0.0, other: 0.0, self.paid: 0.2})
-        selected = placer.select_next_zero_cost_location([self.k8s, self.k8s])
-        self.assertEqual(selected, other)
+        selected = placer.select_next_zero_cost_location()
+        self.assertEqual(selected, self.k8s)
 
 
 class TestFillLaunchPath(unittest.TestCase):
@@ -1000,7 +999,7 @@ class TestFillLaunchPath(unittest.TestCase):
         # stripped, use_spot=False). The placer selection path is
         # skipped, but the upserted row must keep the pinned location --
         # location=None would permanently drop the replica from fill
-        # accounting and the placer's load counter.
+        # accounting.
         location = spot_placer.Location.from_pickleable(_K8S_KEY)
         placer = mock.Mock()
         manager = _make_manager(placer)
@@ -1764,26 +1763,17 @@ class TestPlacerSkipZeroCostPreference(unittest.TestCase):
         self.paid = _make_location('us-east-1', 'paid', use_spot=True)
         self.placer = _make_placer({self.k8s: 0.0, self.paid: 0.2})
 
-    def test_default_prefers_loaded_zero_cost(self):
-        selected = self.placer.select_next_location([self.k8s, self.k8s])
+    def test_default_prefers_zero_cost(self):
+        selected = self.placer.select_next_location()
         self.assertEqual(selected, self.k8s)
 
-    def test_skip_lets_load_steer_to_paid(self):
+    def test_skip_selects_paid(self):
         selected = self.placer.select_next_location(
-            [self.k8s, self.k8s], skip_zero_cost_preference=True)
+            skip_zero_cost_preference=True)
         self.assertEqual(selected, self.paid)
 
-    def test_skip_excludes_zero_cost_on_load_tie(self):
-        # Fleetless service: every candidate ties at load 0, and the
-        # min-cost tiebreak would pick the free tier — the gate must
-        # exclude it, not merely stop preferring it, or tied demand
-        # launches squat a peer's entitlement one by one.
+    def test_skip_excludes_zero_cost(self):
         selected = self.placer.select_next_location(
-            [], skip_zero_cost_preference=True)
-        self.assertEqual(selected, self.paid)
-        # Equal nonzero load on both tiers: same rule.
-        selected = self.placer.select_next_location(
-            [self.k8s, self.k8s, self.paid, self.paid],
             skip_zero_cost_preference=True)
         self.assertEqual(selected, self.paid)
 
@@ -1791,8 +1781,7 @@ class TestPlacerSkipZeroCostPreference(unittest.TestCase):
         # The gate throttles placement preference, never availability: a
         # zero-cost-only candidate set must still yield a location.
         placer = _make_placer({self.k8s: 0.0})
-        selected = placer.select_next_location([],
-                                               skip_zero_cost_preference=True)
+        selected = placer.select_next_location(skip_zero_cost_preference=True)
         self.assertEqual(selected, self.k8s)
 
 

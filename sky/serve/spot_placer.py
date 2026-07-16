@@ -221,9 +221,8 @@ class Location:
         re-entering the selection path, so the location must be
         recovered from the override itself -- otherwise the replica row
         is upserted with location=None and permanently drops out of
-        placer load counting and zero-cost fill accounting. Returns None
-        unless the override carries the placer's pin signature
-        (cloud + region).
+        zero-cost fill accounting. Returns None unless the override carries
+        the placer's pin signature (cloud + region).
         """
         if not override:
             return None
@@ -507,10 +506,10 @@ class SpotPlacer:
                 'Only one policy can be default.')
             DEFAULT_SPOT_PLACER = name
 
-    def select_next_location(
-            self,
-            current_locations: list[Location],
-            skip_zero_cost_preference: bool = False) -> Location:
+    def select_next_location(self,
+                             *,
+                             skip_zero_cost_preference: bool = False
+                            ) -> Location:
         """Select next location to place spot instance.
 
         skip_zero_cost_preference disables the fill-the-free-tier-first
@@ -540,11 +539,22 @@ class SpotPlacer:
             return matches[0]
         return None
 
-    def set_active(self, location: Location) -> None:
+    def set_active(self,
+                   location: Location,
+                   *,
+                   selected_at: float | None = None) -> None:
         resolved = self.resolve_location(location)
         if resolved is None:
             logger.warning(f'set_active: unknown location {location}; '
                            'ignoring (likely a pre-upgrade replica row).')
+            return
+        preempted_at = self.location2preempted_at.get(resolved)
+        if (selected_at is not None and preempted_at is not None and
+                preempted_at > selected_at):
+            # A slower sibling selected before a newer capacity failure must
+            # not clear that failure when it eventually succeeds. A TTL probe
+            # is selected after the current bench timestamp, so its success
+            # still reactivates the location immediately.
             return
         self.location2status[resolved] = LocationStatus.ACTIVE
         self.location2preempted_at.pop(resolved, None)
@@ -644,10 +654,10 @@ class SpotPlacer:
         the retry must be consumed the moment it is selected — not when the
         probe launch later fails. Otherwise a burst of scale-ups inside one
         window would all pile onto the benched location (it looks like the
-        least-loaded ACTIVE candidate) before the first failure re-benches
-        it. Refreshing the timestamp here caps it to one probe launch per
-        TTL window regardless of batch size; a successful launch clears the
-        mark via set_active.
+        cheapest ACTIVE candidate) before the first failure re-benches it.
+        Refreshing the timestamp here caps it to one probe launch per TTL
+        window regardless of batch size; a successful launch clears the mark
+        via set_active.
         """
         if self.location2status.get(location) == LocationStatus.PREEMPTED:
             self.location2preempted_at[location] = time.time()
@@ -671,36 +681,6 @@ class SpotPlacer:
     def preemptive_locations(self) -> list[Location]:
         return self._location_with_status(LocationStatus.PREEMPTED)
 
-    def _select_least_loaded_min_cost(
-            self, candidate_locations: list[Location],
-            current_locations: list[Location]) -> Location:
-        """Least-loaded candidate, cheapest on ties (shared selection core).
-
-        Prioritize the least-loaded locations (unused ones have load 0, so
-        this preserves the prefer-unused behavior while any location is
-        still free). Without the load tiebreak, once every location hosts
-        at least one replica the min-cost rule pins EVERY subsequent launch
-        to the single cheapest active location: at fleet scale this
-        serially hammers one spot-exhausted zone (observed live: >1000
-        consecutive failed attempts in one zone while other zones and
-        clouds sat idle) instead of spreading. Pre-upgrade replica rows
-        carry shape-less locations; resolve them onto the current key set
-        so they still count as load.
-        """
-        location_load = collections.Counter(resolved for resolved in (
-            self.resolve_location(loc) for loc in current_locations)
-                                            if resolved is not None)
-        min_load = min(
-            (location_load[location] for location in candidate_locations),
-            default=0)
-        least_loaded: list[Location] = [
-            location for location in candidate_locations
-            if location_load[location] == min_load
-        ]
-        if not least_loaded:
-            least_loaded = candidate_locations
-        return self._min_cost_location(least_loaded)
-
     def zero_cost_locations(self) -> list[Location]:
         """All zero-cost locations, regardless of bench status.
 
@@ -716,7 +696,6 @@ class SpotPlacer:
 
     def select_next_zero_cost_location(
             self,
-            current_locations: list[Location],
             allowed_locations: set[Location] | None = None) -> Location | None:
         """Select among zero-cost ACTIVE locations only; None when none is.
 
@@ -736,7 +715,7 @@ class SpotPlacer:
         ]
         if not candidates:
             return None
-        res = self._select_least_loaded_min_cost(candidates, current_locations)
+        res = self._min_cost_location(candidates)
         self._consume_retry_if_benched(res)
         return res
 
@@ -795,10 +774,10 @@ class DynamicFallbackSpotPlacer(SpotPlacer,
                     f'{_PREEMPTION_RETRY_SECONDS_ENV_VAR} (or raise the '
                     'TTL).')
 
-    def select_next_location(
-            self,
-            current_locations: list[Location],
-            skip_zero_cost_preference: bool = False) -> Location:
+    def select_next_location(self,
+                             *,
+                             skip_zero_cost_preference: bool = False
+                            ) -> Location:
         active_locations = self.active_locations()
         # Zero-cost tier first: locations that cost nothing (reserved /
         # already-paid capacity, e.g. a Kubernetes pool) are filled
@@ -809,11 +788,9 @@ class DynamicFallbackSpotPlacer(SpotPlacer,
         # skip_zero_cost_preference (the broker's demand-placement gate:
         # this service already holds its zero-cost grant) EXCLUDES the
         # free tier from the candidate set — merely demoting it to
-        # normal competition is not enough, because selection breaks
-        # load ties by cost and a zero-cost location wins every tie, so
-        # tied demand launches would still land on a peer's entitlement
-        # one by one. Excluded only while a paid candidate exists: a
-        # zero-cost-only set must still serve (the gate throttles
+        # normal competition is not enough because cost-first selection
+        # always prefers a free location. Excluded only while a paid candidate
+        # exists: a zero-cost-only set must still serve (the gate throttles
         # placement preference, never availability).
         zero_cost = [
             location for location in active_locations
@@ -828,11 +805,12 @@ class DynamicFallbackSpotPlacer(SpotPlacer,
             ]
             if paid:
                 active_locations = paid
-        res = self._select_least_loaded_min_cost(active_locations,
-                                                 current_locations)
+        # Keep filling the cheapest usable location. A failed launch benches
+        # that exact location, so the next selection falls through to the
+        # next-cheapest ACTIVE candidate instead of getting stuck retrying it.
+        res = self._min_cost_location(active_locations)
         self._consume_retry_if_benched(res)
         logger.info(f'Active locations: {active_locations}\n'
-                    f'Current locations: {current_locations}\n'
                     f'Selected location: {res}\n')
         return res
 
@@ -852,11 +830,8 @@ class CapacityAwareDynamicFallbackSpotPlacer(DynamicFallbackSpotPlacer,
                                              name=CAPACITY_AWARE_SPOT_PLACER):
     """Dynamic fallback that discovers and prices whole-GPU spot shapes.
 
-    Availability spreading is by physical placement, not machine width.  A
-    1-GPU and an 8-GPU candidate in the same zone are alternative shapes at
-    one location; treating them as separate locations would deliberately
-    launch every width before reusing the cheapest one.  Within the least
-    GPU-loaded physical placements, choose the cheapest active shape per GPU.
+    Fill the cheapest active shape per GPU until a failed launch benches it,
+    then fall through to the next-cheapest active candidate.
     """
 
     _expand_accelerator_counts = True
@@ -866,33 +841,9 @@ class CapacityAwareDynamicFallbackSpotPlacer(DynamicFallbackSpotPlacer,
         slots = sum((location.accelerators or {}).values())
         return float(slots) if slots > 0 else 1.0
 
-    @staticmethod
-    def _placement_key(location: Location) -> tuple[str, str, str | None]:
-        return (str(location.cloud).lower(), location.region, location.zone)
-
     def _min_cost_location(self, locations: list[Location]) -> Location:
         # TODO(fran): Rank heterogeneous accelerators by measured workload
         # throughput per dollar once services can publish benchmark weights.
         return min(locations,
                    key=lambda location: self._get_cost_per_hour_cached(location)
                    / self._accelerator_slots(location))
-
-    def _select_least_loaded_min_cost(
-            self, candidate_locations: list[Location],
-            current_locations: list[Location]) -> Location:
-        """Spread GPU slots across placements, then pick their best shape."""
-        placement_load: collections.defaultdict[tuple[
-            str, str, str | None], float] = collections.defaultdict(float)
-        for location in current_locations:
-            resolved = self.resolve_location(location)
-            if resolved is not None:
-                placement_load[self._placement_key(
-                    resolved)] += self._accelerator_slots(resolved)
-        min_load = min((placement_load[self._placement_key(location)]
-                        for location in candidate_locations),
-                       default=0)
-        least_loaded = [
-            location for location in candidate_locations
-            if placement_load[self._placement_key(location)] == min_load
-        ]
-        return self._min_cost_location(least_loaded or candidate_locations)

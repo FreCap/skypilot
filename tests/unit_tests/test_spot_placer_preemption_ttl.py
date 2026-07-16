@@ -49,8 +49,8 @@ class TestPreemptionTtlRetry:
         now[0] += spot_placer._PREEMPTION_RETRY_SECONDS_DEFAULT + 1
         assert cheap in placer.active_locations()
         assert cheap not in placer.preemptive_locations()
-        # And it is selectable again (cheapest of the equally-unloaded).
-        assert placer.select_next_location([]) == cheap
+        # And it is selectable again as the cheapest active location.
+        assert placer.select_next_location() == cheap
 
     def test_failed_retry_rebenches_for_full_ttl(self, placer_and_locations,
                                                  monkeypatch):
@@ -78,6 +78,29 @@ class TestPreemptionTtlRetry:
         assert cheap in placer.active_locations()
         assert cheap not in placer.location2preempted_at
 
+    def test_older_success_cannot_clear_newer_failure(self,
+                                                      placer_and_locations,
+                                                      monkeypatch):
+        placer, cheap, other, third = placer_and_locations
+        now = [1000.0]
+        monkeypatch.setattr(spot_placer.time, 'time', lambda: now[0])
+
+        # The successful launch was selected before this newer failure.
+        selected_at = now[0]
+        now[0] += 1
+        placer.set_preemptive(cheap)
+        placer.set_active(cheap, selected_at=selected_at)
+
+        assert cheap not in placer.active_locations()
+        assert cheap in placer.preemptive_locations()
+
+        # A later retry was selected after the bench, so its success is fresh
+        # evidence that the location can be reactivated immediately.
+        now[0] += 1
+        placer.set_active(cheap, selected_at=now[0])
+        assert cheap in placer.active_locations()
+        assert cheap not in placer.preemptive_locations()
+
     def test_total_exhaustion_reset(self, placer_and_locations, monkeypatch):
         """The global reset fires only when NOTHING is selectable —
         a single remaining active location must stay the fallback
@@ -104,15 +127,15 @@ class TestPreemptionTtlRetry:
         placer.set_preemptive(cheap)
         now[0] += spot_placer._PREEMPTION_RETRY_SECONDS_DEFAULT + 1
         # First selection picks the expired-benched cheapest location...
-        assert placer.select_next_location([]) == cheap
+        assert placer.select_next_location() == cheap
         # ...and consumes its retry: subsequent selections in the same
         # burst must go elsewhere until the next window.
         assert cheap not in placer.active_locations()
-        assert placer.select_next_location([]) == other
-        assert placer.select_next_location([]) == other
+        assert placer.select_next_location() == other
+        assert placer.select_next_location() == other
         # Next window: retryable again.
         now[0] += spot_placer._PREEMPTION_RETRY_SECONDS_DEFAULT + 1
-        assert placer.select_next_location([]) == cheap
+        assert placer.select_next_location() == cheap
 
     def test_env_override_ttl(self, placer_and_locations, monkeypatch):
         placer, cheap, other, third = placer_and_locations
