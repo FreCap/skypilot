@@ -260,6 +260,8 @@ export function RecipeDetail() {
   const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
 
   const fetchTemplate = useCallback(async () => {
+    setIsEditModalOpen(false);
+    setIsDeleteModalOpen(false);
     // Wait for router to be ready before accessing query params
     // (required for Next.js static export where query params are populated client-side)
     if (!router.isReady || !slug) {
@@ -311,28 +313,44 @@ export function RecipeDetail() {
   }, [fetchTemplate]);
 
   const handleEdit = async (data) => {
-    const updated = await updateRecipe(template.name, data);
-    if (updated) {
-      setTemplate(updated);
-      showToast('Recipe updated successfully!', 'success');
-    } else {
-      throw new Error('Failed to update recipe');
+    const requestVersion = requestVersionRef.current;
+    try {
+      const updated = await updateRecipe(template.name, data);
+      if (requestVersionRef.current !== requestVersion) return;
+      if (updated) {
+        setTemplate(updated);
+        showToast('Recipe updated successfully!', 'success');
+      } else {
+        throw new Error('Failed to update recipe');
+      }
+    } catch (error) {
+      if (requestVersionRef.current !== requestVersion) return;
+      throw error;
     }
   };
 
   const handleDelete = async () => {
-    const deleted = await deleteRecipe(template.name);
-    if (deleted) {
-      showToast('Recipe deleted successfully!', 'success');
-      router.push('/recipes');
-    } else {
-      throw new Error('Failed to delete recipe');
+    const requestVersion = requestVersionRef.current;
+    try {
+      const deleted = await deleteRecipe(template.name);
+      if (requestVersionRef.current !== requestVersion) return;
+      if (deleted) {
+        showToast('Recipe deleted successfully!', 'success');
+        router.push('/recipes');
+      } else {
+        throw new Error('Failed to delete recipe');
+      }
+    } catch (error) {
+      if (requestVersionRef.current !== requestVersion) return;
+      throw error;
     }
   };
 
   const handleTogglePin = async () => {
+    const requestVersion = requestVersionRef.current;
     try {
       const updated = await togglePinRecipe(template.name, !template.pinned);
+      if (requestVersionRef.current !== requestVersion) return;
       if (updated) {
         setTemplate(updated);
         showToast(
@@ -341,6 +359,7 @@ export function RecipeDetail() {
         );
       }
     } catch (error) {
+      if (requestVersionRef.current !== requestVersion) return;
       showToast(`Recipe pin operation failed: ${error.message}`, 'error');
     }
   };
