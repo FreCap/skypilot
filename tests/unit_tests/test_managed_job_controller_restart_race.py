@@ -72,8 +72,7 @@ def _wire_dead_controller(monkeypatch,
     monkeypatch.setattr(managed_job_state, 'get_job_status_check_state',
                         lambda job_id: fresh_state)
     monkeypatch.setattr(utils, 'controller_process_alive', lambda record: False)
-    monkeypatch.setattr(utils.global_user_state, 'get_handle_from_cluster_name',
-                        lambda name: None)
+    monkeypatch.setattr(utils, 'terminate_cluster', lambda name: None)
     monkeypatch.setattr(managed_job_state, 'set_failed',
                         lambda *a, **k: set_failed_calls.append((a, k)))
     monkeypatch.setattr(utils.scheduler, 'job_done',
@@ -133,8 +132,9 @@ def test_cleanup_reports_every_failed_cluster_termination(monkeypatch):
                         lambda job_id=None: info)
     monkeypatch.setattr(utils, 'generate_managed_job_cluster_name',
                         lambda task_name, job_id: f'{task_name}-{job_id}')
+    handle_prechecks = []
     monkeypatch.setattr(utils.global_user_state, 'get_handle_from_cluster_name',
-                        lambda name: object())
+                        lambda name: handle_prechecks.append(name) or object())
     attempted = []
 
     def _terminate(cluster_name):
@@ -148,6 +148,8 @@ def test_cleanup_reports_every_failed_cluster_termination(monkeypatch):
 
     # A failure on one cluster must not stop teardown of the others.
     assert attempted == ['task-a-1', 'task-b-1', 'task-c-1']
+    assert not handle_prechecks, (
+        'terminate_cluster owns the authoritative cluster-row lookup')
     assert len(set_failed_calls) == 1
     failure_reason = set_failed_calls[0][1]['failure_reason']
     assert 'task-a-1' in failure_reason
@@ -187,8 +189,6 @@ def test_terminal_job_preserves_status_when_controller_dies_during_cleanup(
     def _record_termination(cluster_name):
         terminated_clusters.append(cluster_name)
 
-    monkeypatch.setattr(utils.global_user_state, 'get_handle_from_cluster_name',
-                        lambda name: object())
     monkeypatch.setattr(utils, 'terminate_cluster', _record_termination)
 
     utils.update_managed_jobs_statuses(job_id=1)
@@ -356,8 +356,6 @@ def test_cleanup_uses_task_name_identity_for_multi_task_jobs(monkeypatch):
     monkeypatch.setattr(
         utils, 'generate_managed_job_cluster_name', lambda task_name, job_id:
         seen_task_names.append(task_name) or f'{task_name}-{job_id}')
-    monkeypatch.setattr(utils.global_user_state, 'get_handle_from_cluster_name',
-                        lambda name: object())
     monkeypatch.setattr(utils, 'terminate_cluster', lambda cluster_name: None)
     monkeypatch.setattr(managed_job_state, 'set_failed',
                         lambda *a, **k: set_failed_calls.append((a, k)))

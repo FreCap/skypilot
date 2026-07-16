@@ -17,6 +17,10 @@ from sky.utils import controller_utils
 # mock.patch needs the dotted path to the attribute being patched.
 _SIGNAL_FILE_CONST = (
     'sky.jobs.constants.JOBS_CONSOLIDATION_RELOADED_SIGNAL_FILE')
+_DEFAULT_CLUSTER_RECORD = {
+    'name': 'test-cluster',
+    'workspace': 'default',
+}
 
 
 @pytest.fixture(autouse=True)
@@ -32,10 +36,13 @@ def _clear_consolidation_mode_caches():
     controller_utils._effective_jobs_consolidation_with_warnings.cache_clear()
 
 
+@mock.patch('sky.jobs.utils.global_user_state.get_cluster_from_name',
+            return_value=_DEFAULT_CLUSTER_RECORD)
 @mock.patch('sky.core.down')
 @mock.patch('sky.usage.usage_lib.messages.usage.set_internal')
 def test_terminate_cluster_retry_on_value_error(mock_set_internal,
-                                                mock_sky_down) -> None:
+                                                mock_sky_down,
+                                                mock_get_cluster) -> None:
     # Set up mock to fail twice with ValueError, then succeed
     mock_sky_down.side_effect = [
         ValueError('Mock error 1'),
@@ -56,13 +63,18 @@ def test_terminate_cluster_retry_on_value_error(mock_set_internal,
 
     # Verify usage.set_internal was called before each sky.down
     assert mock_set_internal.call_count == 3
+    mock_get_cluster.assert_called_once_with('test-cluster',
+                                             include_user_info=False,
+                                             summary_response=True)
 
 
+@mock.patch('sky.jobs.utils.global_user_state.get_cluster_from_name',
+            return_value=_DEFAULT_CLUSTER_RECORD)
 @mock.patch('sky.core.down')
 @mock.patch('sky.usage.usage_lib.messages.usage.set_internal')
-def test_terminate_cluster_handles_nonexistent_cluster(mock_set_internal,
-                                                       mock_sky_down) -> None:
-    # Set up mock to raise ClusterDoesNotExist
+def test_terminate_cluster_handles_concurrent_cluster_removal(
+        mock_set_internal, mock_sky_down, mock_get_cluster) -> None:
+    """A cluster removed after the row snapshot remains an idempotent no-op."""
     mock_sky_down.side_effect = ClusterDoesNotExist('test-cluster')
 
     # Call should succeed silently
@@ -76,6 +88,9 @@ def test_terminate_cluster_handles_nonexistent_cluster(mock_set_internal,
 
     # Verify usage.set_internal was called once
     assert mock_set_internal.call_count == 1
+    mock_get_cluster.assert_called_once_with('test-cluster',
+                                             include_user_info=False,
+                                             summary_response=True)
 
 
 @pytest.mark.asyncio
@@ -217,9 +232,12 @@ def test_job_recovery_skips_autostopping():
 # ======== Graceful cancel tests ========
 
 
+@mock.patch('sky.jobs.utils.global_user_state.get_cluster_from_name',
+            return_value=_DEFAULT_CLUSTER_RECORD)
 @mock.patch('sky.core.down')
 @mock.patch('sky.usage.usage_lib.messages.usage.set_internal')
-def test_terminate_cluster_graceful(mock_set_internal, mock_sky_down) -> None:
+def test_terminate_cluster_graceful(mock_set_internal, mock_sky_down,
+                                    mock_get_cluster) -> None:
     """Test terminate_cluster passes graceful params to core.down."""
     utils.terminate_cluster('test-cluster', graceful=True, graceful_timeout=120)
 
@@ -227,18 +245,26 @@ def test_terminate_cluster_graceful(mock_set_internal, mock_sky_down) -> None:
                                           graceful=True,
                                           graceful_timeout=120)
     assert mock_set_internal.call_count == 1
+    mock_get_cluster.assert_called_once_with('test-cluster',
+                                             include_user_info=False,
+                                             summary_response=True)
 
 
+@mock.patch('sky.jobs.utils.global_user_state.get_cluster_from_name',
+            return_value=_DEFAULT_CLUSTER_RECORD)
 @mock.patch('sky.core.down')
 @mock.patch('sky.usage.usage_lib.messages.usage.set_internal')
-def test_terminate_cluster_graceful_no_timeout(mock_set_internal,
-                                               mock_sky_down) -> None:
+def test_terminate_cluster_graceful_no_timeout(mock_set_internal, mock_sky_down,
+                                               mock_get_cluster) -> None:
     """Test terminate_cluster with graceful=True but no timeout."""
     utils.terminate_cluster('test-cluster', graceful=True)
 
     mock_sky_down.assert_called_once_with('test-cluster',
                                           graceful=True,
                                           graceful_timeout=None)
+    mock_get_cluster.assert_called_once_with('test-cluster',
+                                             include_user_info=False,
+                                             summary_response=True)
 
 
 @mock.patch('sky.jobs.utils.global_user_state.get_cluster_from_name')
@@ -270,7 +296,9 @@ def test_terminate_cluster_pins_active_workspace_from_cluster_record(
 
     utils.terminate_cluster('test-cluster')
 
-    mock_get_cluster.assert_called_once_with('test-cluster')
+    mock_get_cluster.assert_called_once_with('test-cluster',
+                                             include_user_info=False,
+                                             summary_response=True)
     assert observed_workspace == [
         'team-a'
     ], (f'Expected active workspace to be pinned to the cluster row '
@@ -280,21 +308,20 @@ def test_terminate_cluster_pins_active_workspace_from_cluster_record(
 @mock.patch('sky.jobs.utils.global_user_state.get_cluster_from_name')
 @mock.patch('sky.core.down')
 @mock.patch('sky.usage.usage_lib.messages.usage.set_internal')
-def test_terminate_cluster_no_record_skips_workspace_pin(
-        mock_set_internal, mock_sky_down, mock_get_cluster) -> None:
-    """If the cluster row is already gone, there is no workspace to pin
-    — `core.down` will raise `ClusterDoesNotExist` and we return. The
-    function must NOT crash trying to enter
-    `local_active_workspace_ctx(None)`.
-    """
+def test_terminate_cluster_no_record_skips_down(mock_set_internal,
+                                                mock_sky_down,
+                                                mock_get_cluster) -> None:
+    """An already-removed cluster returns before usage or down work."""
     mock_get_cluster.return_value = None
-    mock_sky_down.side_effect = ClusterDoesNotExist('test-cluster')
 
     # Must not raise.
     utils.terminate_cluster('test-cluster')
 
-    mock_get_cluster.assert_called_once_with('test-cluster')
-    mock_sky_down.assert_called_once()
+    mock_get_cluster.assert_called_once_with('test-cluster',
+                                             include_user_info=False,
+                                             summary_response=True)
+    mock_sky_down.assert_not_called()
+    mock_set_internal.assert_not_called()
 
 
 @mock.patch('sky.jobs.utils.global_user_state.get_cluster_from_name')
@@ -348,7 +375,9 @@ def test_terminate_cluster_retry_reenters_workspace_ctx(
     assert observed == ['team-a', 'team-a', 'team-a'], observed
     # Single DB lookup outside the loop is sufficient — cluster
     # workspace is immutable.
-    mock_get_cluster.assert_called_once_with('test-cluster')
+    mock_get_cluster.assert_called_once_with('test-cluster',
+                                             include_user_info=False,
+                                             summary_response=True)
 
 
 def test_cancel_signal_file_no_graceful():

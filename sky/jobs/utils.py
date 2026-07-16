@@ -185,12 +185,16 @@ def terminate_cluster(
     # workspace and the owner-identity check at
     # `backend_utils._check_owner_identity_with_record` fails for any
     # cluster whose recorded workspace is not 'default'.
-    # DB lookup once outside the loop — cluster workspace is immutable.
-    # `None` when the cluster row is already gone: `core.down` will then
-    # raise `ClusterDoesNotExist` immediately and we return — no
-    # workspace to pin in that case.
-    record = global_user_state.get_cluster_from_name(cluster_name)
-    cluster_workspace = record.get('workspace') if record else None
+    # DB lookup once outside the loop — cluster workspace is immutable. This
+    # is also the authoritative existence check: callers do not need a
+    # separate handle lookup before teardown.
+    record = global_user_state.get_cluster_from_name(cluster_name,
+                                                     include_user_info=False,
+                                                     summary_response=True)
+    if record is None:
+        logger.debug(f'The cluster {cluster_name} is already down.')
+        return
+    cluster_workspace = record.get('workspace')
 
     retry_cnt = 0
     # In some cases, e.g. botocore.exceptions.NoCredentialsError due to AWS
@@ -613,17 +617,14 @@ def update_managed_jobs_statuses(job_id: int | None = None):
                 task['task_name'], job_id)
             if cluster_name is None:
                 continue
-            handle = global_user_state.get_handle_from_cluster_name(
-                cluster_name)
-            if handle is not None:
-                try:
-                    terminate_cluster(cluster_name)
-                except Exception as e:  # pylint: disable=broad-except
-                    error_msg = (
-                        f'Failed to terminate cluster {cluster_name}: '
-                        f'{common_utils.format_exception(e, use_bracket=True)}')
-                    logger.exception(error_msg, exc_info=e)
-                    error_msgs.append(error_msg)
+            try:
+                terminate_cluster(cluster_name)
+            except Exception as e:  # pylint: disable=broad-except
+                error_msg = (
+                    f'Failed to terminate cluster {cluster_name}: '
+                    f'{common_utils.format_exception(e, use_bracket=True)}')
+                logger.exception(error_msg, exc_info=e)
+                error_msgs.append(error_msg)
         if not error_msgs:
             return None
         return '; '.join(error_msgs)
