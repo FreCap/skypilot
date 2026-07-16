@@ -3523,6 +3523,141 @@ class TestFailedCleanupReconciliation:
             assert durable[9].status_property.logical_retirement_version == 10
             assert not durable[9].status_property.logical_retirement_committed
 
+    @pytest.mark.parametrize('failed_state_persist_raises', [False, True])
+    def test_down_worker_start_failure_retries_committed_cleanup(
+            self, tmp_path, failed_state_persist_raises):
+        manager, retiring, survivor = (
+            TestLogicalCapacityPlanning()._pending_logical_retirement())
+        manager._terminate_replica = types.MethodType(
+            replica_managers.SkyPilotReplicaManager._terminate_replica, manager)
+        manager._resource_scope = None
+        manager._launch_thread_pool = thread_utils.ThreadSafeDict()
+        manager._down_thread_pool = thread_utils.ThreadSafeDict()
+        manager._replica_to_request_id = thread_utils.ThreadSafeDict()
+        manager._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
+        manager.least_recent_version = 9
+        retiring.status_property.wait_for_idle_before_termination = False
+        retiring.status_property.logical_retirement_confirmed_generation = 5
+        original_thread = mock.Mock()
+        original_thread.is_alive.return_value = False
+        original_thread.format_exc = None
+        original_thread.start.side_effect = RuntimeError('thread start failed')
+        fresh_thread = mock.Mock()
+        fresh_thread.is_alive.return_value = False
+        fresh_thread.format_exc = None
+        manager._down_thread_pool[9] = original_thread
+        manager._wait_for_idle_trackers[9] = (None, 999)
+        durable = {
+            9: replica_managers.ReplicaInfo.from_storage_dict(
+                retiring.to_storage_dict())
+        }
+        clock = [100]
+        failed_persist_attempted = [False]
+
+        def _clone(info):
+            return replica_managers.ReplicaInfo.from_storage_dict(
+                info.to_storage_dict())
+
+        def _persist(replica_id, info):
+            if (failed_state_persist_raises and
+                    not failed_persist_attempted[0] and
+                    info.status_property.sky_down_status
+                    == common_utils.ProcessStatus.FAILED):
+                failed_persist_attempted[0] = True
+                raise RuntimeError('failed-state database write')
+            durable[replica_id] = _clone(info)
+
+        def _read_many(_service, replica_ids):
+            return {
+                replica_id: _clone(durable[replica_id])
+                for replica_id in replica_ids
+                if replica_id in durable
+            }
+
+        def _read_all(_service):
+            return [_clone(durable[9]), _clone(survivor)]
+
+        with mock.patch.object(
+                manager, '_reconcile_legacy_uncertain_logical_retirements'), \
+             mock.patch.object(manager, '_refresh_wait_for_idle'), \
+             mock.patch.object(
+                 manager, '_clear_known_unknown_capacity_replacements'), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos_from_ids',
+                               side_effect=_read_many), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_info_from_id',
+                               side_effect=lambda _service, replica_id:
+                               _clone(durable[replica_id])), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               side_effect=_read_all), \
+             mock.patch.object(replica_managers.global_user_state,
+                               'cluster_with_name_exists',
+                               return_value=True), \
+             mock.patch.object(replica_managers.serve_utils,
+                               'generate_replica_log_file_name',
+                               return_value=str(tmp_path / 'replica.log')), \
+             mock.patch.object(replica_managers.thread_utils,
+                               'SafeThread',
+                               return_value=fresh_thread), \
+             mock.patch.object(controller_utils, 'get_resources_lock_path',
+                               return_value=str(tmp_path / 'resources.lock')), \
+             mock.patch.object(controller_utils,
+                               'in_flight_launch_count',
+                               return_value=0), \
+             mock.patch.object(controller_utils,
+                               'can_terminate',
+                               return_value=True), \
+             mock.patch.object(manager,
+                               '_persist_replica',
+                               side_effect=_persist), \
+             mock.patch.object(manager, '_remove_replica') as remove, \
+             mock.patch('sky.serve.replica_managers.time.monotonic',
+                        side_effect=lambda: clock[0]):
+            if failed_state_persist_raises:
+                with pytest.raises(RuntimeError,
+                                   match='failed-state database write'):
+                    manager._refresh_thread_pool()
+            else:
+                manager._refresh_thread_pool()
+
+            original_thread.start.assert_called_once_with()
+            assert 9 not in manager._down_thread_pool
+            assert 9 not in manager._wait_for_idle_trackers
+            assert manager._failed_cleanup_retry_attempts == {9: 1}
+            assert manager._failed_cleanup_retry_at == {9: 160}
+            expected_durable_status = (common_utils.ProcessStatus.RUNNING
+                                       if failed_state_persist_raises else
+                                       common_utils.ProcessStatus.FAILED)
+            assert (durable[9].status_property.sky_down_status ==
+                    expected_durable_status)
+            assert durable[9].status_property.logical_retirement_committed
+            assert not durable[9].is_ready
+            remove.assert_not_called()
+
+            # Once the retry deadline arrives, the durable commitment is
+            # detached from the obsolete selection epoch and a new,
+            # idempotent cleanup worker is installed. It is admitted on the
+            # next tick without ever making the backend READY again.
+            clock[0] = 160
+            manager._refresh_thread_pool()
+            assert manager._down_thread_pool[9] is fresh_thread
+            assert (durable[9].status_property.sky_down_status ==
+                    common_utils.ProcessStatus.SCHEDULED)
+            assert (durable[9].status_property.logical_retirement_version
+                    is None)
+            assert not durable[9].is_ready
+
+            manager._refresh_thread_pool()
+
+        fresh_thread.start.assert_called_once_with()
+        assert (durable[9].status_property.sky_down_status ==
+                common_utils.ProcessStatus.RUNNING)
+        assert not durable[9].is_ready
+        assert manager._down_thread_pool[9] is fresh_thread
+        remove.assert_not_called()
+
     def test_log_sync_failure_does_not_block_cleanup(self):
         manager = _make_manager()
         manager._is_pool = False
