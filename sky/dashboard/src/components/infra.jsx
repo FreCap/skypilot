@@ -85,6 +85,24 @@ const REFRESH_INTERVAL = REFRESH_INTERVALS.REFRESH_INTERVAL;
 const NAME_TRUNCATE_LENGTH = UI_CONFIG.NAME_TRUNCATE_LENGTH;
 const TABLE_MAX_ROWS_BEFORE_SCROLL = 5;
 
+export async function loadContextGPUDataInParallel(
+  contexts,
+  loadContext,
+  onSuccess,
+  onError
+) {
+  await Promise.all(
+    contexts.map(async (context) => {
+      try {
+        const gpuData = await loadContext(context);
+        onSuccess(context, gpuData);
+      } catch (error) {
+        onError(context, error);
+      }
+    })
+  );
+}
+
 const SkeletonBadge = () => (
   <span className="px-2 py-0.5 bg-muted rounded text-xs font-medium inline-flex items-center">
     <span
@@ -675,8 +693,7 @@ export function GPUs() {
 
   // State and refs for tracking ALL in-flight fetches (including background refresh)
   const [isFetching, setIsFetching] = useState(false);
-  const pendingContextCountRef = React.useRef(0);
-  const mainFetchDoneRef = React.useRef(false);
+  const activeFetchCountRef = React.useRef(0);
 
   // Selected context for subpage view
   const [selectedContext, setSelectedContext] = useState(null);
@@ -686,8 +703,8 @@ export function GPUs() {
       const { showLoadingIndicators = true, forceRefresh = false } = options;
 
       // Track fetch cycle for top-right spinner (works for both foreground and background refresh)
+      activeFetchCountRef.current += 1;
       setIsFetching(true);
-      mainFetchDoneRef.current = false;
 
       if (showLoadingIndicators) {
         setKubeLoading(true);
@@ -722,13 +739,6 @@ export function GPUs() {
           fetchClusterStatsData(),
           fetchSlurmData(),
         ]);
-
-        // Mark main fetch as done, check if we can set isFetching = false
-        mainFetchDoneRef.current = true;
-        if (pendingContextCountRef.current === 0) {
-          setIsFetching(false); // No pending K8s contexts, all done
-        }
-        // If pendingContextCountRef > 0, isFetching stays true until contexts finish
       } catch (error) {
         console.error('Error in fetchData:', error);
         // On error, we should still mark data as loaded but with empty values
@@ -757,13 +767,12 @@ export function GPUs() {
         setPerNodeSlurmGPUs([]);
         setSshAndKubeJobsData({});
         setSshAndKubeJobsDataLoading(false);
-
-        // On error, still mark main fetch as done
-        mainFetchDoneRef.current = true;
-        if (pendingContextCountRef.current === 0) {
+      } finally {
+        activeFetchCountRef.current -= 1;
+        if (activeFetchCountRef.current === 0) {
           setIsFetching(false);
         }
-      } finally {
+
         // Always clear loading states when showLoadingIndicators is true
         // This prevents infinite loading state
         if (showLoadingIndicators) {
@@ -854,63 +863,51 @@ export function GPUs() {
         setContextErrors({}); // Clear errors for fresh fetch
       }
 
-      // Set pending count to track in-flight K8s context fetches (for top-right spinner)
-      pendingContextCountRef.current = validContexts.length;
-
       // Fetch GPU data for all contexts in parallel, updating state as each completes
       // For manual refresh (forceRefresh), fetch fresh data directly
       // For interval refresh (!forceRefresh), use cache for quick response
-      validContexts.forEach((context) => {
-        const gpuDataPromise = forceRefresh
-          ? getContextGPUData(context)
-          : dashboardCache.get(getContextGPUData, [context]);
-        gpuDataPromise
-          .then((gpuData) => {
-            // Mark this context as loaded (even if it has no GPUs)
-            setLoadedContexts((prev) => new Set([...prev, context]));
+      await loadContextGPUDataInParallel(
+        validContexts,
+        (context) =>
+          forceRefresh
+            ? getContextGPUData(context)
+            : dashboardCache.get(getContextGPUData, [context]),
+        (context, gpuData) => {
+          // Mark this context as loaded (even if it has no GPUs)
+          setLoadedContexts((prev) => new Set([...prev, context]));
 
-            // Update perContextGPUs - merge in data for this context
-            setPerContextGPUs((prev) => {
-              // Remove any existing entries for this context, then add new ones
-              const filtered = prev.filter((gpu) => gpu.context !== context);
-              return [...filtered, ...gpuData.perContextGPUs];
-            });
+          // Update perContextGPUs - merge in data for this context
+          setPerContextGPUs((prev) => {
+            // Remove any existing entries for this context, then add new ones
+            const filtered = prev.filter((gpu) => gpu.context !== context);
+            return [...filtered, ...gpuData.perContextGPUs];
+          });
 
-            // Update perNodeGPUs - merge in data for this context
-            setPerNodeGPUs((prev) => {
-              const filtered = prev.filter((node) => node.context !== context);
-              return [...filtered, ...gpuData.perNodeGPUs];
-            });
+          // Update perNodeGPUs - merge in data for this context
+          setPerNodeGPUs((prev) => {
+            const filtered = prev.filter((node) => node.context !== context);
+            return [...filtered, ...gpuData.perNodeGPUs];
+          });
 
-            // Note: allGPUs is computed via useEffect when perContextGPUs changes
+          // Note: allGPUs is computed via useEffect when perContextGPUs changes
 
-            // Update context errors if there was an error
-            if (gpuData.error) {
-              setContextErrors((prev) => ({
-                ...prev,
-                [context]: gpuData.error,
-              }));
-            }
-          })
-          .catch((error) => {
-            // Mark context as loaded even on error to prevent infinite spinner
-            setLoadedContexts((prev) => new Set([...prev, context]));
+          // Update context errors if there was an error
+          if (gpuData.error) {
             setContextErrors((prev) => ({
               ...prev,
-              [context]: error.message || 'Failed to load GPU data',
+              [context]: gpuData.error,
             }));
-          })
-          .finally(() => {
-            // Decrement pending count and check if ALL fetches are complete
-            pendingContextCountRef.current--;
-            if (
-              pendingContextCountRef.current === 0 &&
-              mainFetchDoneRef.current
-            ) {
-              setIsFetching(false); // Everything done, stop spinner
-            }
-          });
-      });
+          }
+        },
+        (context, error) => {
+          // Mark context as loaded even on error to prevent infinite spinner
+          setLoadedContexts((prev) => new Set([...prev, context]));
+          setContextErrors((prev) => ({
+            ...prev,
+            [context]: error.message || 'Failed to load GPU data',
+          }));
+        }
+      );
     } catch (error) {
       console.error('Error in fetchKubernetesData:', error);
       setWorkspaceInfrastructure({});

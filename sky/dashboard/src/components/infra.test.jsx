@@ -7,7 +7,10 @@ import {
   within,
 } from '@testing-library/react';
 
-import { ContextDetails } from '@/components/infra';
+import {
+  ContextDetails,
+  loadContextGPUDataInParallel,
+} from '@/components/infra';
 import { ContextDetails as ExtractedContextDetails } from '@/components/infra-context-details';
 import { SSHNodePoolDetails } from '@/components/ssh-node-pool-details';
 import {
@@ -80,6 +83,58 @@ function deferred() {
   });
   return { promise, resolve, reject };
 }
+
+describe('loadContextGPUDataInParallel', () => {
+  it('starts every context once and settles after successes and failures', async () => {
+    const loads = {
+      alpha: deferred(),
+      beta: deferred(),
+      gamma: deferred(),
+    };
+    const loadContext = jest.fn((context) => loads[context].promise);
+    const onSuccess = jest.fn();
+    const onError = jest.fn();
+    let settled = false;
+
+    const completion = loadContextGPUDataInParallel(
+      Object.keys(loads),
+      loadContext,
+      onSuccess,
+      onError
+    ).finally(() => {
+      settled = true;
+    });
+
+    expect(loadContext.mock.calls.map(([context]) => context)).toEqual([
+      'alpha',
+      'beta',
+      'gamma',
+    ]);
+    expect(settled).toBe(false);
+
+    loads.alpha.resolve({ perContextGPUs: ['a'] });
+    loads.beta.reject(new Error('beta unavailable'));
+    await Promise.resolve();
+    expect(onSuccess).toHaveBeenCalledWith('alpha', {
+      perContextGPUs: ['a'],
+    });
+    expect(onError).toHaveBeenCalledWith('beta', expect.any(Error));
+    expect(settled).toBe(false);
+
+    loads.gamma.resolve({ perContextGPUs: ['g'] });
+    await completion;
+    expect(settled).toBe(true);
+    expect(loadContext).toHaveBeenCalledTimes(3);
+  });
+
+  it('settles an empty context set without loading', async () => {
+    const loadContext = jest.fn();
+
+    await loadContextGPUDataInParallel([], loadContext, jest.fn(), jest.fn());
+
+    expect(loadContext).not.toHaveBeenCalled();
+  });
+});
 
 function sshNodePoolDetails({
   poolName = 'gpu-pool',
