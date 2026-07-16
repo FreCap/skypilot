@@ -114,7 +114,7 @@ export function OperatorNotificationBell({ role, compact = false }) {
     setIsOpen(opening);
     if (!opening) return;
 
-    const unread = data.notifications.filter((item) => item.unread).slice(0, 5);
+    const unread = data.notifications.filter((item) => item.unread);
     setOpenNotifications(unread);
     if (data.latest_sequence > data.last_seen_sequence) {
       acknowledge(data.latest_sequence);

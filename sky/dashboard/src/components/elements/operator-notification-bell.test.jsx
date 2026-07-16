@@ -62,6 +62,38 @@ describe('OperatorNotificationBell', () => {
     });
   });
 
+  it('shows every unread category before acknowledging the global cursor', async () => {
+    getOperatorNotifications.mockResolvedValue({
+      notifications: Array.from({ length: 6 }, (_, index) => ({
+        category: `category_${index + 1}`,
+        message: `Actionable message ${index + 1}`,
+        first_seen_at: 100 + index,
+        last_seen_at: 200 + index,
+        occurrence_count: 1,
+        sequence: index + 1,
+        unread: true,
+      })),
+      unread_count: 6,
+      latest_sequence: 6,
+      last_seen_sequence: 0,
+    });
+    acknowledgeOperatorNotifications.mockResolvedValue({
+      last_seen_sequence: 6,
+    });
+
+    render(<OperatorNotificationBell role="admin" />);
+    fireEvent.click(
+      await screen.findByRole('button', {
+        name: 'Operator notifications: 6 unread',
+      })
+    );
+
+    expect(screen.getByText('Actionable message 6')).toBeInTheDocument();
+    await waitFor(() =>
+      expect(acknowledgeOperatorNotifications).toHaveBeenCalledWith(6)
+    );
+  });
+
   it('is hidden from non-admin users', () => {
     render(<OperatorNotificationBell role="user" />);
     expect(
