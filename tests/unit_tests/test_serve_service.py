@@ -94,6 +94,28 @@ class TestWaitForControllerReady:
         with pytest.raises(RuntimeError, match='did not become ready'):
             service._wait_for_controller_ready('127.0.0.1', port, timeout=1)
 
+    def test_timeout_bounds_probe_and_sleep_with_monotonic_deadline(self):
+        """A short timeout must not inherit fixed probe or sleep budgets."""
+        with mock.patch.object(
+                service.time,
+                'monotonic',
+                side_effect=[10.0, 10.0, 10.04, 10.1]), \
+             mock.patch.object(service.time, 'time') as wall_clock, \
+             mock.patch.object(service.time, 'sleep') as sleep, \
+             mock.patch.object(
+                 service.socket,
+                 'create_connection',
+                 side_effect=ConnectionRefusedError) as create_connection:
+            with pytest.raises(RuntimeError, match='did not become ready'):
+                service._wait_for_controller_ready('127.0.0.1',
+                                                   12345,
+                                                   timeout=0.1)
+
+        wall_clock.assert_not_called()
+        create_connection.assert_called_once_with(('127.0.0.1', 12345),
+                                                  timeout=pytest.approx(0.1))
+        sleep.assert_called_once_with(pytest.approx(0.06))
+
     def test_treats_zero_zero_as_loopback(self):
         """Controller may be configured to bind 0.0.0.0 (k8s mode); we must
         probe via 127.0.0.1, not literally connect to 0.0.0.0 (which is not

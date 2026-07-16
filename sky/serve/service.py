@@ -546,17 +546,23 @@ def _wait_for_controller_ready(
     """
     # When binding 0.0.0.0, probe via loopback.
     probe_host = '127.0.0.1' if host == '0.0.0.0' else host
-    start = time.time()
-    while time.time() - start < timeout:
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         if process is not None and not process.is_alive():
             raise RuntimeError(
                 f'Controller process exited (exitcode={process.exitcode}) '
                 f'before becoming ready on {probe_host}:{port}')
         try:
-            with socket.create_connection((probe_host, port), timeout=0.5):
+            with socket.create_connection((probe_host, port),
+                                          timeout=min(0.5, remaining)):
                 return
-        except (ConnectionRefusedError, OSError):
-            time.sleep(0.2)
+        except OSError:
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(0.2, remaining))
     raise RuntimeError(f'Controller did not become ready on '
                        f'{probe_host}:{port} within {timeout}s')
 
