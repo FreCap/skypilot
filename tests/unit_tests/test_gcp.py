@@ -1,4 +1,7 @@
+import inspect
 import pathlib
+import pickle
+import subprocess
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
@@ -15,6 +18,8 @@ from sky.clouds.utils import gcp_utils
 from sky.provision import common
 from sky.provision.gcp import config as gcp_config
 from sky.provision.gcp import constants as gcp_constants
+from sky.provision.gcp import instance_utils
+from sky.provision.gcp import tpu_node
 from sky.utils import common_utils
 from sky.utils import config_utils
 
@@ -558,3 +563,101 @@ class TestIsReservationBound:
             zone='us-central1-a',
             filter='name=my-dense-res',
         )
+
+
+class TestTPUNodeGateway:
+    """Characterizes the legacy gcloud TPU node lifecycle gateway."""
+
+    def test_instance_utils_facade_identity(self):
+        assert instance_utils.delete_tpu_node is tpu_node.delete_tpu_node
+        assert instance_utils.create_tpu_node.__module__ == (
+            'sky.provision.gcp.instance_utils')
+        assert instance_utils.delete_tpu_node.__module__ == (
+            'sky.provision.gcp.instance_utils')
+        assert pickle.loads(pickle.dumps(
+            instance_utils.create_tpu_node)) is (instance_utils.create_tpu_node)
+        assert pickle.loads(pickle.dumps(
+            instance_utils.delete_tpu_node)) is (instance_utils.delete_tpu_node)
+        create_signature = inspect.signature(instance_utils.create_tpu_node)
+        assert list(create_signature.parameters) == [
+            'project_id', 'zone', 'tpu_node_config', 'vpc_name'
+        ]
+        assert create_signature.return_annotation is inspect.Signature.empty
+        delete_signature = inspect.signature(instance_utils.delete_tpu_node)
+        assert list(delete_signature.parameters) == [
+            'project_id', 'zone', 'tpu_node_config'
+        ]
+        assert delete_signature.return_annotation is inspect.Signature.empty
+
+    @patch('subprocess.run')
+    def test_create_tpu_node_command(self, mock_run):
+        mock_run.return_value.stdout = b'created\n'
+
+        instance_utils.create_tpu_node(
+            'project-1', 'us-central1-b', {
+                'name': 'tpu-1',
+                'acceleratorType': 'v3-8',
+                'runtimeVersion': 'tpu-vm-base',
+            }, 'default')
+
+        mock_run.assert_called_once_with(
+            'yes | gcloud compute tpus create tpu-1 '
+            '--project=project-1 --zone=us-central1-b '
+            '--version=tpu-vm-base --accelerator-type=v3-8 '
+            '--network=default',
+            capture_output=True,
+            shell=True,
+            check=True,
+        )
+
+    @patch('subprocess.run')
+    def test_create_tpu_node_maps_quota_error(self, mock_run):
+        mock_run.side_effect = subprocess.CalledProcessError(
+            returncode=1,
+            cmd='gcloud compute tpus create',
+            stderr=b'RESOURCE_EXHAUSTED',
+        )
+
+        with pytest.raises(common.ProvisionerError) as exc_info:
+            instance_utils.create_tpu_node(
+                'project-1', 'us-central1-b', {
+                    'name': 'tpu-1',
+                    'acceleratorType': 'v3-8',
+                    'runtimeVersion': 'tpu-vm-base',
+                }, 'default')
+
+        assert exc_info.value.errors == [{
+            'code': 'RESOURCE_EXHAUSTED',
+            'domain': 'tpu',
+            'message': 'TPU tpu-1 creation failed due to quota exhaustion. '
+                       'Please visit '
+                       'https://console.cloud.google.com/iam-admin/quotas '
+                       'for more information.'
+        }]
+
+    @patch('subprocess.run')
+    def test_delete_tpu_node_command(self, mock_run):
+        mock_run.return_value.stdout = b'deleted\n'
+
+        instance_utils.delete_tpu_node('project-1', 'us-central1-b',
+                                       {'name': 'tpu-1'})
+
+        mock_run.assert_called_once_with(
+            'yes | gcloud compute tpus delete tpu-1 '
+            '--project=project-1 --zone=us-central1-b',
+            capture_output=True,
+            shell=True,
+            check=True,
+        )
+
+    @patch('subprocess.run')
+    def test_delete_tpu_node_ignores_not_found(self, mock_run):
+        mock_run.side_effect = subprocess.CalledProcessError(
+            returncode=1,
+            cmd='gcloud compute tpus delete',
+            output=b'',
+            stderr=b'ERROR: (gcloud.compute.tpus.delete) NOT_FOUND',
+        )
+
+        instance_utils.delete_tpu_node('project-1', 'us-central1-b',
+                                       {'name': 'tpu-1'})
