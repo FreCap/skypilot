@@ -1794,7 +1794,7 @@ def wait_until_ray_cluster_ready(
 
     ssh_credentials = ssh_credential_from_yaml(cluster_config_file, docker_user)
     last_nodes_so_far = 0
-    start = time.time()
+    last_progress_at = time.monotonic()
     runner = command_runner.SSHCommandRunner(node=(head_ip, 22),
                                              **ssh_credentials)
     with rich_utils.safe_status(
@@ -1841,14 +1841,16 @@ def wait_until_ray_cluster_ready(
             # nodes fetched in a while (nodes_launching_progress_timeout),
             # though number of nodes_so_far is still not as expected.
             if nodes_so_far > last_nodes_so_far:
-                # Reset the start time if the number of launching nodes
+                # Reset the progress timeout if the number of launching nodes
                 # changes, i.e. new nodes are launched.
-                logger.debug('Reset start time, as new nodes are launched. '
+                logger.debug('Reset progress timeout, as new nodes are '
+                             'launched. '
                              f'({last_nodes_so_far} -> {nodes_so_far})')
-                start = time.time()
+                last_progress_at = time.monotonic()
                 last_nodes_so_far = nodes_so_far
             elif (nodes_launching_progress_timeout is not None and
-                  time.time() - start > nodes_launching_progress_timeout and
+                  time.monotonic() - last_progress_at
+                  > nodes_launching_progress_timeout and
                   nodes_so_far != num_nodes):
                 logger.error(
                     'Timed out: waited for more than '
