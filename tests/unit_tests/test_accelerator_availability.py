@@ -13,6 +13,22 @@ from sky import models
 
 
 def test_realtime_kubernetes_gpu_availability_normalizes_catalog_results():
+
+    def query_catalog(**kwargs):
+        context = kwargs['region_filter']
+        if context == 'context-a':
+            return ({
+                'A100': [1, 2]
+            }, {
+                'A100': 8,
+                'H100': 4
+            }, {
+                'A100': 6,
+                'H100': 3
+            })
+        assert context == 'context-b'
+        return ({'L4': [1]}, {'L4': 4}, {'L4': 2})
+
     with mock.patch.object(
             clouds.Kubernetes,
             'existing_allowed_contexts',
@@ -21,26 +37,8 @@ def test_realtime_kubernetes_gpu_availability_normalizes_catalog_results():
                            'existing_allowed_contexts',
                            return_value=['ssh-a']), \
          mock.patch.object(catalog,
-                           'list_accelerator_realtime') as mock_list:
-        mock_list.side_effect = [
-            ({
-                'A100': [1, 2]
-            }, {
-                'A100': 8,
-                'H100': 4
-            }, {
-                'A100': 6,
-                'H100': 3
-            }),
-            ({
-                'L4': [1]
-            }, {
-                'L4': 4
-            }, {
-                'L4': 2
-            }),
-        ]
-
+                           'list_accelerator_realtime',
+                           side_effect=query_catalog) as mock_list:
         result = core.realtime_kubernetes_gpu_availability(name_filter='gpu',
                                                            quantity_filter=2,
                                                            is_ssh=False)
@@ -54,20 +52,21 @@ def test_realtime_kubernetes_gpu_availability_normalizes_catalog_results():
             models.RealtimeGpuAvailability('L4', [1], 4, 2),
         ]),
     ]
-    assert mock_list.call_args_list == [
-        mock.call(gpus_only=True,
-                  clouds='kubernetes',
-                  name_filter='gpu',
-                  region_filter='context-a',
-                  quantity_filter=2,
-                  case_sensitive=False),
-        mock.call(gpus_only=True,
-                  clouds='kubernetes',
-                  name_filter='gpu',
-                  region_filter='context-b',
-                  quantity_filter=2,
-                  case_sensitive=False),
-    ]
+    assert sorted(mock_list.call_args_list,
+                  key=lambda call: call.kwargs['region_filter']) == [
+                      mock.call(gpus_only=True,
+                                clouds='kubernetes',
+                                name_filter='gpu',
+                                region_filter='context-a',
+                                quantity_filter=2,
+                                case_sensitive=False),
+                      mock.call(gpus_only=True,
+                                clouds='kubernetes',
+                                name_filter='gpu',
+                                region_filter='context-b',
+                                quantity_filter=2,
+                                case_sensitive=False),
+                  ]
 
 
 def test_realtime_kubernetes_gpu_availability_preserves_no_gpu_error():
