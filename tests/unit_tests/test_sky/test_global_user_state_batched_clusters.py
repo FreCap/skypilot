@@ -4,6 +4,7 @@ These helpers exist so pool dashboard (and any future caller iterating many
 replicas) can avoid the per-name DB round-trip that would otherwise show up
 as a double N+1 inside ReplicaInfo.to_info_dict.
 """
+# pylint: disable=protected-access
 from sqlalchemy import event
 
 from sky import global_user_state
@@ -32,12 +33,13 @@ class _MinimalHandle:
     launched_resources = None
 
 
-def _add_cluster(name: str) -> None:
+def _add_cluster(name: str, *, is_managed: bool = False) -> None:
     global_user_state.add_or_update_cluster(
         cluster_name=name,
         cluster_handle=_MinimalHandle(),
         requested_resources=set(),
         ready=False,
+        is_managed=is_managed,
     )
 
 
@@ -156,6 +158,33 @@ def test_get_cluster_status_fields_has_chunk_bounded_query_count(
     assert set(result) == set(names)
     assert all(status == 'INIT' for status, _ in result.values())
     assert len(select_statements) == 3
+
+
+def test_get_cluster_status_fields_all_unmanaged_uses_one_select(
+        tmp_path, monkeypatch):
+    """The refresh sweep can select and order unmanaged clusters from one
+    plain-column snapshot instead of reading names first."""
+    _fresh_db(tmp_path, monkeypatch)
+    _add_cluster('user-a')
+    _add_cluster('managed-a', is_managed=True)
+    _add_cluster('user-b')
+
+    engine = global_user_state._db_manager.get_engine()
+    select_statements = []
+
+    @event.listens_for(engine, 'before_cursor_execute')
+    def _count_selects(_conn, _cursor, statement, *_args):
+        if statement.lstrip().upper().startswith('SELECT'):
+            select_statements.append(statement)
+
+    try:
+        result = global_user_state.get_cluster_status_fields(
+            None, exclude_managed_clusters=True)
+    finally:
+        event.remove(engine, 'before_cursor_execute', _count_selects)
+
+    assert set(result) == {'user-a', 'user-b'}
+    assert len(select_statements) == 1
 
 
 def test_get_clusters_from_names_matches_single_helper(tmp_path, monkeypatch):

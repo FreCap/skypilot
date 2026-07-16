@@ -4051,7 +4051,10 @@ def _get_cluster_refresh_parallelism() -> int:
     return subprocess_utils.get_parallel_threads()
 
 
-def _sort_clusters_for_refresh(cluster_names: list[str]) -> list[str]:
+def _sort_clusters_for_refresh(
+    cluster_names: list[str],
+    status_fields: dict[str, tuple[str | None, int | None]] | None = None,
+) -> list[str]:
     """Orders clusters so those most in need of reconciliation go first.
 
     INIT clusters (e.g. half-provisioned clusters orphaned by an API server
@@ -4067,8 +4070,9 @@ def _sort_clusters_for_refresh(cluster_names: list[str]) -> list[str]:
         # Reads only plain columns (no handle unpickling or metadata
         # parsing), so one corrupt row cannot fail the lookup for every
         # cluster.
-        status_fields = global_user_state.get_cluster_status_fields(
-            cluster_names)
+        if status_fields is None:
+            status_fields = global_user_state.get_cluster_status_fields(
+                cluster_names)
 
         def _priority(cluster_name: str) -> tuple[int, float]:
             status, status_updated_at = status_fields.get(
@@ -4103,8 +4107,19 @@ def refresh_cluster_records() -> None:
     # We force to exclude managed clusters to avoid multiple sources
     # manipulating them. For example, SkyServe assumes the replica manager
     # is the only source of truth for the cluster status.
-    cluster_names = list(
-        global_user_state.get_cluster_names(exclude_managed_clusters=True))
+    try:
+        status_fields = global_user_state.get_cluster_status_fields(
+            None, exclude_managed_clusters=True)
+        cluster_names = list(status_fields)
+    except Exception as e:  # pylint: disable=broad-except
+        # Ordering is an optimization, not a liveness requirement. Preserve
+        # the old names-only sweep if the richer snapshot cannot be read.
+        logger.debug('Failed to snapshot clusters for refresh; refreshing in '
+                     'the original order: '
+                     f'{common_utils.format_exception(e, use_bracket=True)}')
+        cluster_names = list(
+            global_user_state.get_cluster_names(exclude_managed_clusters=True))
+        status_fields = {}
 
     # TODO(syang): we should try not to leak
     # request info in backend_utils.py.
@@ -4133,7 +4148,8 @@ def refresh_cluster_records() -> None:
         # Do not refresh the clusters that have an active launch request.
         subprocess_utils.run_in_parallel(
             _refresh_cluster_record,
-            _sort_clusters_for_refresh(cluster_names_without_launch_request),
+            _sort_clusters_for_refresh(cluster_names_without_launch_request,
+                                       status_fields),
             num_threads=_get_cluster_refresh_parallelism())
 
 

@@ -49,13 +49,17 @@ class TestRefreshFaultIsolation:
 
         monkeypatch.setattr(backend_utils, 'refresh_cluster_record',
                             _fake_refresh_cluster_record)
+
+        def _snapshot(names=None, *, exclude_managed_clusters=False):
+            del exclude_managed_clusters
+            selected_names = cluster_names if names is None else names
+            return {
+                name: (status_lib.ClusterStatus.UP.value, 1)
+                for name in selected_names
+            }
+
         monkeypatch.setattr(backend_utils.global_user_state,
-                            'get_cluster_names',
-                            lambda exclude_managed_clusters: cluster_names)
-        monkeypatch.setattr(
-            backend_utils.global_user_state, 'get_cluster_status_fields',
-            lambda names:
-            {name: (status_lib.ClusterStatus.UP.value, 1) for name in names})
+                            'get_cluster_status_fields', _snapshot)
         monkeypatch.setattr(backend_utils.requests_lib, 'get_request_tasks',
                             lambda req_filter: [])
 
@@ -63,9 +67,51 @@ class TestRefreshFaultIsolation:
         backend_utils.refresh_cluster_records()
         assert sorted(attempted) == sorted(cluster_names)
 
-    def test_sweep_covers_all_clusters_when_ordering_fails(self, monkeypatch):
-        """A failure in the best-effort ordering step must not abort the
-        sweep: all clusters are still refreshed, in some order."""
+    def test_sweep_reuses_status_snapshot_for_names_and_ordering(
+            self, monkeypatch):
+        """The normal sweep path reads one consistent unmanaged snapshot."""
+        attempted = []
+        snapshot_calls = []
+
+        class _Request:
+
+            cluster_name = 'launching'
+
+        def _snapshot(cluster_names=None, *, exclude_managed_clusters=False):
+            snapshot_calls.append((cluster_names, exclude_managed_clusters))
+            return {
+                'up-stale': (status_lib.ClusterStatus.UP.value, 1),
+                'init-fresh': (status_lib.ClusterStatus.INIT.value, 2),
+                'launching': (status_lib.ClusterStatus.INIT.value, 0),
+            }
+
+        def _unexpected_names_read(*args, **kwargs):
+            del args, kwargs
+            raise AssertionError('normal path must not reread cluster names')
+
+        def _fake_refresh_cluster_record(cluster_name, **kwargs):
+            del kwargs
+            attempted.append(cluster_name)
+            return _record(status_lib.ClusterStatus.UP, 1)
+
+        monkeypatch.setattr(backend_utils.global_user_state,
+                            'get_cluster_status_fields', _snapshot)
+        monkeypatch.setattr(backend_utils.global_user_state,
+                            'get_cluster_names', _unexpected_names_read)
+        monkeypatch.setattr(backend_utils.requests_lib, 'get_request_tasks',
+                            lambda req_filter: [_Request()])
+        monkeypatch.setattr(backend_utils, 'refresh_cluster_record',
+                            _fake_refresh_cluster_record)
+        monkeypatch.setattr(backend_utils, '_get_cluster_refresh_parallelism',
+                            lambda: 1)
+
+        backend_utils.refresh_cluster_records()
+
+        assert snapshot_calls == [(None, True)]
+        assert attempted == ['init-fresh', 'up-stale']
+
+    def test_sweep_covers_all_clusters_when_snapshot_fails(self, monkeypatch):
+        """A status-snapshot failure falls back to the names-only sweep."""
         cluster_names = ['c-1', 'c-2', 'c-3']
         attempted = []
         attempted_lock = threading.Lock()
@@ -76,8 +122,8 @@ class TestRefreshFaultIsolation:
                 attempted.append(cluster_name)
             return _record(status_lib.ClusterStatus.UP, 1)
 
-        def _raise(names):
-            del names
+        def _raise(names=None, *, exclude_managed_clusters=False):
+            del names, exclude_managed_clusters
             raise RuntimeError('corrupt row')
 
         monkeypatch.setattr(backend_utils, 'refresh_cluster_record',
@@ -111,8 +157,8 @@ class TestRefreshFaultIsolation:
                 attempted.append(cluster_name)
             return _record(status_lib.ClusterStatus.UP, 1)
 
-        def _raise(names):
-            del names
+        def _raise(names=None, *, exclude_managed_clusters=False):
+            del names, exclude_managed_clusters
             raise RuntimeError('corrupt row')
 
         monkeypatch.setattr(backend_utils, 'refresh_cluster_record',

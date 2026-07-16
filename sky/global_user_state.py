@@ -2333,25 +2333,36 @@ def get_clusters_from_names(
 
 @metrics_lib.time_me
 def get_cluster_status_fields(
-    cluster_names: list[str],) -> dict[str, tuple[str | None, int | None]]:
+    cluster_names: list[str] | None,
+    *,
+    exclude_managed_clusters: bool = False,
+) -> dict[str, tuple[str | None, int | None]]:
     """Returns the raw (status, status_updated_at) columns for clusters.
 
     Unlike ``get_clusters_from_names``, this reads only plain columns and
     does no per-row deserialization (no handle unpickling, metadata parsing,
-    or enum conversion), so a corrupt row cannot make the lookup raise.
-    Names not present in the cluster table are omitted from the result.
+    or enum conversion), so a corrupt row cannot make the lookup raise. If
+    ``cluster_names`` is None, all matching clusters are returned. Names not
+    present in the cluster table are omitted from the result.
     """
     result: dict[str, tuple[str | None, int | None]] = {}
-    if not cluster_names:
+    if cluster_names == []:
         return result
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
+        query = session.query(cluster_table.c.name, cluster_table.c.status,
+                              cluster_table.c.status_updated_at)
+        if exclude_managed_clusters:
+            query = query.filter(cluster_table.c.is_managed == int(False))
+        if cluster_names is None:
+            rows = query.all()
+            return {
+                row.name: (row.status, row.status_updated_at) for row in rows
+            }
         for offset in range(0, len(cluster_names),
                             _CLUSTER_IN_QUERY_CHUNK_SIZE):
             batch = cluster_names[offset:offset + _CLUSTER_IN_QUERY_CHUNK_SIZE]
-            rows = session.query(cluster_table.c.name, cluster_table.c.status,
-                                 cluster_table.c.status_updated_at).filter(
-                                     cluster_table.c.name.in_(batch)).all()
+            rows = query.filter(cluster_table.c.name.in_(batch)).all()
             for row in rows:
                 result[row.name] = (row.status, row.status_updated_at)
     return result
