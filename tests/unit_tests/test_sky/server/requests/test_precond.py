@@ -40,6 +40,73 @@ class TestPrecondition(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(mock_set_failed.call_args[0][1],
                               exceptions.RequestCancelled)
 
+    async def test_precondition_timeout_uses_monotonic_deadline(self):
+        """Wall clock rollback must not extend the precondition timeout."""
+        check_calls = 0
+
+        class Pending(preconditions.Precondition):
+
+            async def check(self):
+                nonlocal check_calls
+                check_calls += 1
+                return False, 'Still checking'
+
+        mock_get_request = mock.AsyncMock(return_value=mock.MagicMock(
+            status=api_requests.RequestStatus.PENDING))
+        mock_set_failed = mock.AsyncMock()
+        mock_update_status = mock.AsyncMock()
+        mock_sleep = mock.AsyncMock(side_effect=[
+            None,
+            AssertionError('wait exceeded its monotonic deadline'),
+        ])
+        mock_clock = mock.MagicMock()
+        mock_clock.time.side_effect = [1000.0, 999.0, 998.0]
+        mock_clock.monotonic.side_effect = [100.0, 100.5, 101.1]
+        with mock.patch.object(api_requests, 'get_request_async',
+                               mock_get_request), \
+             mock.patch.object(api_requests, 'set_request_failed_async',
+                               mock_set_failed), \
+             mock.patch.object(api_requests, 'update_status_msg_async',
+                               mock_update_status), \
+             mock.patch.object(preconditions, 'time', mock_clock), \
+             mock.patch.object(preconditions.asyncio, 'sleep', mock_sleep):
+            result = await Pending(self.request_id, check_interval=1, timeout=1)
+
+        self.assertFalse(result)
+        mock_set_failed.assert_awaited_once()
+        mock_get_request.assert_awaited_once()
+        self.assertEqual(check_calls, 1)
+        mock_sleep.assert_awaited_once_with(1)
+        mock_clock.time.assert_not_called()
+        self.assertEqual(mock_clock.monotonic.call_count, 3)
+
+    @mock.patch('sky.server.requests.requests.get_request_async')
+    async def test_precondition_without_timeout_skips_clock(
+            self, mock_get_request):
+        """An unlimited immediate wait should not read the deadline clock."""
+        check_calls = 0
+
+        class Ready(preconditions.Precondition):
+
+            async def check(self):
+                nonlocal check_calls
+                check_calls += 1
+                return True, None
+
+        mock_get_request.return_value = mock.MagicMock(
+            status=api_requests.RequestStatus.PENDING)
+        mock_clock = mock.MagicMock()
+        with mock.patch.object(preconditions, 'time', mock_clock), \
+             mock.patch.object(preconditions.asyncio, 'sleep',
+                               new_callable=mock.AsyncMock) as mock_sleep:
+            result = await Ready(self.request_id, timeout=0)
+
+        self.assertTrue(result)
+        mock_get_request.assert_awaited_once()
+        self.assertEqual(check_calls, 1)
+        mock_sleep.assert_not_awaited()
+        mock_clock.monotonic.assert_not_called()
+
     @mock.patch('sky.server.requests.requests.get_request_async')
     async def test_precondition_cancelled(self, mock_get_request):
         """Test Precondition cancellation behavior."""

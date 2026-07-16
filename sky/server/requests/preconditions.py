@@ -97,10 +97,11 @@ class Precondition(abc.ABC):
         Args:
             on_condition_met: Callback to execute when the precondition is met.
         """
-        start_time = time.time()
+        deadline = (time.monotonic() +
+                    self.timeout if self.timeout > 0 else None)
         last_status_msg = ''
         while True:
-            if self.timeout > 0 and time.time() - start_time > self.timeout:
+            if deadline is not None and time.monotonic() > deadline:
                 # Cancel the request on timeout.
                 await api_requests.set_request_failed_async(
                     self.request_id,
