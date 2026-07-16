@@ -7,9 +7,11 @@ session silently dies (RDS failover, idle timeout, pg_terminate_backend).
 session probe two pods can both believe they are the leader (split-brain HA
 recovery), mirroring `_lock_still_held` in the managed-jobs refresh thread.
 """
+# pylint: disable=protected-access
 from unittest import mock
 
 from sky.server import daemons
+from sky.skylet import events
 from sky.utils import locks
 
 
@@ -72,3 +74,24 @@ def test_non_postgres_lock_skips_session_probe():
     get_lock.assert_not_called()
     lock.acquire.assert_not_called()
     assert result is lock
+
+
+def test_serve_history_event_uses_wall_clock_minutes_and_retries(monkeypatch):
+    record = mock.Mock(return_value=2)
+    monkeypatch.setattr(events.serve_history, 'record_status_snapshot', record)
+    timestamps = iter([120.1, 140.1, 180.1, 240.1, 240.2])
+    event = events.ServiceStatusHistoryEvent(time_fn=lambda: next(timestamps))
+
+    event.run()
+    event.run()
+    event.run()
+    assert record.call_args_list == [
+        mock.call(timestamp=120.1),
+        mock.call(timestamp=180.1),
+    ]
+
+    record.side_effect = RuntimeError('transient database failure')
+    event.run()
+    record.side_effect = None
+    event.run()
+    assert record.call_args_list[-1] == mock.call(timestamp=240.2)

@@ -206,6 +206,7 @@ _serve_consolidation_mode_lock = None
 # not on this module.)
 _pool_status_update_event = None
 _serve_status_update_event = None
+_serve_status_history_event = None
 
 
 # Attempt to gracefully release the lock when the process exits.
@@ -345,6 +346,7 @@ def _serve_status_refresh_event(pool: bool):
     # declarations).
     from sky.skylet import events
     global _pool_status_update_event, _serve_status_update_event
+    global _serve_status_history_event
     if pool:
         if _pool_status_update_event is None:
             _pool_status_update_event = events.ServiceUpdateEvent(pool=True)
@@ -355,6 +357,10 @@ def _serve_status_refresh_event(pool: bool):
         event = _serve_status_update_event
     noun = 'pool' if pool else 'serve'
     logger.info(f'=== Running {noun} status refresh event ===')
+    if not pool:
+        if _serve_status_history_event is None:
+            _serve_status_history_event = events.ServiceStatusHistoryEvent()
+        _serve_status_history_event.run()
     event.run()
     time.sleep(events.EVENT_CHECKING_INTERVAL_SECONDS)
 

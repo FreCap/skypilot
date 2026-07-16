@@ -11,6 +11,7 @@ jest.mock('@/data/connectors/client', () => ({
 import { apiClient } from '@/data/connectors/client';
 import {
   getServices,
+  normalizeReplicaHistory,
   normalizeService,
   normalizeReplica,
 } from '@/data/connectors/services';
@@ -313,6 +314,62 @@ describe('getServices', () => {
     expect(services[0].replicasFailed).toBe(1);
   });
 
+  it('requests and normalizes aggregate replica history', async () => {
+    const record = rawServiceRecord({
+      replica_status_history: {
+        available: true,
+        bucket_seconds: 60,
+        retention_hours: 72,
+        window_start: 1751590000,
+        window_end: 1751633200,
+        samples: [
+          {
+            timestamp: 1751633160,
+            observed_at: 1751633170,
+            version: 2,
+            ready_count: 3,
+            provisioning_count: 1,
+            not_ready_count: 0,
+            errored_count: 2,
+            preempted_count: 0,
+            stopping_count: 1,
+            total_count: 7,
+          },
+        ],
+      },
+    });
+    apiClient.post.mockResolvedValue(mockDispatchResponse());
+    apiClient.get.mockResolvedValue(mockResultResponse([record]));
+
+    const { services } = await getServices({
+      serviceNames: ['boltz-l4-fleet'],
+      summaryOnly: true,
+      historyHours: 12,
+    });
+
+    expect(apiClient.post).toHaveBeenCalledWith('/serve/status', {
+      service_names: ['boltz-l4-fleet'],
+      summary_only: true,
+      history_hours: 12,
+    });
+    expect(services[0].replicaHistory).toMatchObject({
+      available: true,
+      bucketSeconds: 60,
+      retentionHours: 72,
+      samples: [
+        {
+          timestamp: 1751633160,
+          version: 2,
+          readyCount: 3,
+          provisioningCount: 1,
+          erroredCount: 2,
+          stoppingCount: 1,
+          totalCount: 7,
+        },
+      ],
+    });
+  });
+
   it('keeps logical summary aggregates distinct from the physical status histogram', async () => {
     const record = rawServiceRecord({
       replica_unit: 'logical_slot',
@@ -388,6 +445,28 @@ describe('getServices', () => {
     const result = await getServices();
 
     expect(result).toEqual({ services: [], controllerStopped: true });
+  });
+});
+
+describe('normalizeReplicaHistory', () => {
+  it('drops malformed samples and defaults invalid counts to zero', () => {
+    expect(
+      normalizeReplicaHistory({
+        available: true,
+        samples: [
+          { timestamp: '100', version: 1, ready_count: '2' },
+          { timestamp: 'bad', version: 2, ready_count: 3 },
+        ],
+      }).samples
+    ).toEqual([
+      expect.objectContaining({
+        timestamp: 100,
+        version: 1,
+        readyCount: 2,
+        erroredCount: 0,
+        totalCount: 0,
+      }),
+    ]);
   });
 });
 
