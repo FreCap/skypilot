@@ -91,6 +91,13 @@ def _decisions(scaler, replicas):
     return scaler.generate_scaling_decisions(replicas, [1])
 
 
+def _status_property(
+        wait_for_idle: bool) -> replica_managers.ReplicaStatusProperty:
+    status_property = replica_managers.ReplicaStatusProperty()
+    status_property.wait_for_idle_before_termination = wait_for_idle
+    return status_property
+
+
 class TestCostRebalanceSpec:
     """Configuration validation and serialization remain compatible."""
 
@@ -362,17 +369,27 @@ class TestEconomicDecisions:
                      cost_rebalance_max_parallel_replacements=2)
         scaler = _autoscaler(spec)
         paid = make_location('paid', accelerators={'L4': 1}, use_spot=True)
-        cheap = make_location('research',
-                              accelerators={'A100': 1},
-                              use_spot=False)
-        scaler.set_spot_placer(make_placer({paid: 1.0, cheap: 0.0}))
+        cheap_a = make_location('research-a',
+                                accelerators={'A100': 1},
+                                use_spot=False)
+        cheap_b = make_location('research-b',
+                                accelerators={'A100': 1},
+                                use_spot=False)
+        scaler.set_spot_placer(
+            make_placer({
+                paid: 1.0,
+                cheap_a: 0.0,
+                cheap_b: 0.0,
+            }))
         replicas = [_Replica(i, paid, 1.0) for i in (1, 2, 3)]
         _report(scaler, replicas)
         launches = [
             d for d in _decisions(scaler, replicas)
             if d.operator == autoscalers.AutoscalerDecisionOperator.SCALE_UP
         ]
-        assert len(launches) == 2
+        assert sorted(launch.target['region'] for launch in launches) == [
+            'research-a', 'research-b'
+        ]
 
     def test_location_load_is_computed_once_per_tick(self):
         replica_count = 50
@@ -748,8 +765,7 @@ class TestStrictDrain:
             replica_id: types.SimpleNamespace(
                 replica_id=replica_id,
                 cluster_name=f'cluster-{replica_id}',
-                status_property=replica_managers.ReplicaStatusProperty(
-                    wait_for_idle_before_termination=True))
+                status_property=_status_property(True))
             for replica_id in range(51)
         }
         # Row 50 disappeared. Row 51 still exists but its durable drain intent
@@ -758,8 +774,7 @@ class TestStrictDrain:
         infos[51] = types.SimpleNamespace(
             replica_id=51,
             cluster_name='cluster-51',
-            status_property=replica_managers.ReplicaStatusProperty(
-                wait_for_idle_before_termination=False))
+            status_property=_status_property(False))
         live_clusters = {
             f'cluster-{replica_id}': ('UP', 1)
             for replica_id in range(50)
@@ -804,11 +819,9 @@ class TestStrictDrain:
         manager._wait_for_idle_trackers = {1: tracked}
         manager._persist_replica = mock.Mock()
         manager._terminate_replica = mock.Mock()
-        info = types.SimpleNamespace(
-            replica_id=1,
-            cluster_name='cluster-1',
-            status_property=replica_managers.ReplicaStatusProperty(
-                wait_for_idle_before_termination=True))
+        info = types.SimpleNamespace(replica_id=1,
+                                     cluster_name='cluster-1',
+                                     status_property=_status_property(True))
 
         with mock.patch.object(
                 replica_managers.serve_state,
