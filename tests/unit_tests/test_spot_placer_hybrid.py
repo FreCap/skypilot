@@ -580,12 +580,25 @@ class TestReservedFillPoolValidation:
     zero-cost-ness is not knowable client-side.
     """
 
-    def _task(self, k8s_entries):
+    def _task(self, k8s_entries, *, logical=False):
         # pylint: disable=import-outside-toplevel
         import sky
+        normalized_entries = [(ctx, gpu, count)
+                              for ctx, gpu, *counts in k8s_entries
+                              for count in [counts[0] if counts else 1]]
         entries = '\n'.join(f'    - infra: k8s/{ctx}\n'
-                            f'      accelerators: {gpu}:1'
-                            for ctx, gpu in k8s_entries)
+                            f'      accelerators: {gpu}:{count}'
+                            for ctx, gpu, count in normalized_entries)
+        if logical:
+            entries += ('\n    - infra: aws/us-east-1\n'
+                        '      accelerators: L4:1\n'
+                        '      use_spot: true')
+        target = ('target_concurrency_per_replica: 1'
+                  if logical else 'target_qps_per_replica: 0.1')
+        logical_policy = ('''\n  graceful_drain_async_occupancy: true'''
+                          if logical else '')
+        placer = ('\n    spot_placer: dynamic_fallback_per_gpu'
+                  if logical else '')
         yaml_str = f"""
 resources:
   cpus: 2+
@@ -593,12 +606,12 @@ resources:
   any_of:
 {entries}
 service:
-  readiness_probe: /health
+  readiness_probe: /health{logical_policy}
   replica_policy:
     min_replicas: 1
     max_replicas: 4
-    target_qps_per_replica: 0.1
-    reserved_capacity_fill: true
+    {target}
+    reserved_capacity_fill: true{placer}
 run: echo hi
 """
         return sky.Task.from_yaml_str(yaml_str)
@@ -622,6 +635,33 @@ run: echo hi
         serve_utils.validate_service_task(self._task([('ctx-a', 'A100'),
                                                       ('ctx-a', 'a100')]),
                                           pool=False)
+
+    def test_logical_single_pool_exact_one_gpu_accepted(self):
+        # pylint: disable=import-outside-toplevel
+        from sky.serve import serve_utils
+        task = self._task([('ctx-a', 'A100', 1), ('ctx-a', 'H100', 1.0)],
+                          logical=True)
+        serve_utils.validate_service_task(task, pool=False)
+
+    @pytest.mark.parametrize(
+        'gpu_count',
+        [0.5, 1.5, 2, float('nan'), float('inf')])
+    def test_logical_pool_rejects_every_non_exact_one_gpu_count(
+            self, gpu_count):
+        # pylint: disable=import-outside-toplevel
+        from sky.serve import serve_utils
+        task = self._task([('ctx-a', 'A100', 1)], logical=True)
+        k8s_resource = next(resource for resource in task.resources
+                            if str(resource.cloud).lower() == 'kubernetes')
+        # Resources currently permits non-finite positive-looking floats.
+        # Mutating the parsed object exercises validation at the Serve trust
+        # boundary without depending on a YAML parser's NaN/Inf spelling.
+        k8s_resource._accelerators = {  # pylint: disable=protected-access
+            'A100': gpu_count
+        }
+
+        with pytest.raises(ValueError, match='one-GPU Kubernetes fill shapes'):
+            serve_utils.validate_service_task(task, pool=False)
 
 
 class TestImageIdNormalizationEndToEnd:

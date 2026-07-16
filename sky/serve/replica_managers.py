@@ -776,7 +776,8 @@ class ReplicaStatusProperty:
     sky_down_status: common_utils.ProcessStatus | None = None
     # Whether the termination is caused by autoscaler's decision
     is_scale_down: bool = False
-    # The replica's spot instance was preempted.
+    # The replica's underlying capacity was interrupted. This includes spot
+    # preemption and reclamation of low-priority zero-cost Kubernetes pods.
     preempted: bool = False
     # Whether the replica is purged.
     purged: bool = False
@@ -895,7 +896,7 @@ class ReplicaStatusProperty:
             return serve_state.ReplicaStatus.SHUTTING_DOWN
         if self.sky_down_status is not None:
             if self.preempted:
-                # Replica (spot) is preempted
+                # The replica's underlying capacity was interrupted.
                 return serve_state.ReplicaStatus.PREEMPTED
             if self.sky_down_status == common_utils.ProcessStatus.SCHEDULED:
                 # sky.down is scheduled to run, but not started yet.
@@ -2280,33 +2281,34 @@ class SkyPilotReplicaManager(ReplicaManager):
                              f'{replica_info.replica_id}: '
                              f'{common_utils.format_exception(e)}')
 
-        # A forced status refresh can remove a preempted spot cluster from
-        # global state before the replica row is marked preempted. If the
+        # A forced status refresh can remove an interrupted cluster from global
+        # state before the replica row records the interruption. If the
         # controller crashes between those writes, the next prober cannot
-        # classify the replica (its handle is already gone). Detect that
+        # classify the replica because its handle is already gone. Detect that
         # earliest crash window in one bulk lookup. Only active, successfully
-        # launched spot rows qualify; pending launches and retained failure
-        # records can legitimately lack a handle and must keep their existing
-        # recovery semantics.
+        # launched interruptible rows qualify; pending launches and retained
+        # failure records can legitimately lack a handle and keep their
+        # existing recovery semantics.
         active_statuses = {
             serve_state.ReplicaStatus.STARTING,
             serve_state.ReplicaStatus.READY,
             serve_state.ReplicaStatus.NOT_READY,
         }
-        active_spot_replicas = [
+        active_interruptible_replicas = [
             info for info in all_replica_infos
-            if (info.is_spot and not info.status_property.preempted and
-                info.status in active_statuses)
+            if (self._is_interruptible_replica(info) and not info.
+                status_property.preempted and info.status in active_statuses)
         ]
-        active_spot_cluster_names = [
-            info.cluster_name for info in active_spot_replicas
+        active_interruptible_cluster_names = [
+            info.cluster_name for info in active_interruptible_replicas
         ]
-        active_spot_status_fields = global_user_state.get_cluster_status_fields(
-            active_spot_cluster_names)
-        orphaned_spot_clusters = {
+        active_interruptible_status_fields = (
+            global_user_state.get_cluster_status_fields(
+                active_interruptible_cluster_names))
+        orphaned_interruptible_clusters = {
             info.cluster_name
-            for info in active_spot_replicas
-            if info.cluster_name not in active_spot_status_fields
+            for info in active_interruptible_replicas
+            if info.cluster_name not in active_interruptible_status_fields
         }
 
         # Inspect the raw durable rows instead of querying only the derived
@@ -2321,7 +2323,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             info for info in all_replica_infos
             if (info.status == serve_state.ReplicaStatus.SHUTTING_DOWN or
                 info.status_property.preempted or
-                info.cluster_name in orphaned_spot_clusters)
+                info.cluster_name in orphaned_interruptible_clusters)
         ]
         legacy_uncertain_ids = getattr(
             self, '_legacy_uncertain_logical_retirement_ids', None)
@@ -2354,22 +2356,23 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # is_scale_down write.
                 drain_cap: int | None = None
                 status_property = replica_info.status_property
-                if replica_info.cluster_name in orphaned_spot_clusters:
+                if replica_info.cluster_name in orphaned_interruptible_clusters:
                     logger.warning(
-                        f'Recovering preempted replica '
+                        f'Recovering interrupted replica '
                         f'{replica_info.replica_id}: cluster '
                         f'{replica_info.cluster_name!r} was removed before '
-                        'the preemption intent was persisted.')
+                        'the interruption intent was persisted.')
                     status_property.preempted = True
                     # Persist the recovered intent before scheduling cleanup;
                     # another crash is then caught by the raw preempted scan.
                     self._persist_replica(replica_info.replica_id, replica_info)
                 is_preempted = status_property.preempted
                 # SpotPlacer is reconstructed with every location ACTIVE on a
-                # controller restart. Rebuild the preemption bench before the
-                # durable replica row (and its location evidence) is removed,
-                # including when the preempted intent was already persisted.
-                if is_preempted and self._spot_placer is not None:
+                # controller restart. Rebuild only real spot capacity benches.
+                # A reclaimed research pod proves that pod was evicted, not
+                # that the zero-cost pool is unavailable.
+                if (is_preempted and replica_info.is_spot and
+                        self._spot_placer is not None):
                     spot_location = replica_info.get_spot_location()
                     if spot_location is not None:
                         self._spot_placer.set_preemptive(spot_location)
@@ -4550,13 +4553,32 @@ class SkyPilotReplicaManager(ReplicaManager):
                          f'as alive: {common_utils.format_exception(e)}')
             return True
 
+    def _is_reclaimable_zero_cost_kubernetes(self, info: ReplicaInfo) -> bool:
+        """Whether a non-spot replica runs as reclaimable research capacity."""
+        placer = getattr(self, '_spot_placer', None)
+        if info.is_spot or placer is None:
+            return False
+        replica_location = info.get_spot_location()
+        if (replica_location is None or
+                str(replica_location.cloud).lower() != 'kubernetes'):
+            return False
+        return any(
+            not location.use_spot and
+            str(location.cloud).lower() == 'kubernetes' and
+            spot_placer.locations_match_placement(replica_location, location)
+            for location in placer.zero_cost_locations())
+
+    def _is_interruptible_replica(self, info: ReplicaInfo) -> bool:
+        """Whether infrastructure loss should enter replacement lifecycle."""
+        return (info.is_spot or self._is_reclaimable_zero_cost_kubernetes(info))
+
     def _handle_preemption(self, info: ReplicaInfo) -> bool:
-        """Handle preemption of the replica if any error happened.
+        """Handle an infrastructure interruption after a replica error.
 
         Returns:
-            bool: Whether the replica is preempted.
+            bool: Whether the replica's capacity was interrupted.
         """
-        if not info.is_spot:
+        if not self._is_interruptible_replica(info):
             return False
 
         # Get cluster handle first for zone information. The following
@@ -4570,8 +4592,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                          'Skipping preemption handling.')
             return False
         assert isinstance(handle, backends.CloudVmRayResourceHandle)
-        # Pull the actual cluster status from the cloud provider to
-        # determine whether the cluster is preempted.
+        # Pull the actual cluster status from the provider to distinguish an
+        # infrastructure interruption from an application readiness failure.
         cluster_status, _ = backend_utils.refresh_cluster_status_handle(
             info.cluster_name,
             force_refresh_statuses=set(status_lib.ClusterStatus))
@@ -4579,14 +4601,17 @@ class SkyPilotReplicaManager(ReplicaManager):
         if cluster_status in (status_lib.ClusterStatus.UP,
                               status_lib.ClusterStatus.AUTOSTOPPING):
             return False
-        # The cluster is (partially) preempted. It can be down, INIT or STOPPED,
-        # based on the interruption behavior of the cloud.
+        # The cluster is partially or fully interrupted. It can be down, INIT
+        # or STOPPED, based on the provider's interruption behavior.
         cluster_status_str = ('' if cluster_status is None else
                               f' (status: {cluster_status.value})')
-        logger.info(
-            f'Replica {info.replica_id} is preempted{cluster_status_str}.')
+        interruption = ('spot-preempted'
+                        if info.is_spot else 'reclaimed from zero-cost '
+                        'Kubernetes capacity')
+        logger.info(f'Replica {info.replica_id} was {interruption}'
+                    f'{cluster_status_str}.')
         info.status_property.preempted = True
-        if self._spot_placer is not None:
+        if info.is_spot and self._spot_placer is not None:
             spot_location = info.get_spot_location()
             assert spot_location is not None
             self._spot_placer.set_preemptive(spot_location)
@@ -5214,7 +5239,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 future.get() for future in probe_futures
             ]
 
-            # Parallel cloud-only pre-filter for preemption handling. The
+            # Parallel cloud-only pre-filter for interruption handling. The
             # full _handle_preemption does a forced cluster refresh (cloud
             # API + an SSH ray-status probe) serially under the manager
             # lock; running it for every failed probe made cold-start probe
@@ -5222,25 +5247,28 @@ class SkyPilotReplicaManager(ReplicaManager):
             # 129-replica spot fleet (starving scale-up on the same lock
             # and leaving the LB's ready-set stale -> 503s with READY
             # replicas). Instead, confirm instance liveness with one cheap
-            # provider call per failed spot replica, in parallel; only
+            # provider call per failed interruptible replica, in parallel;
+            # only
             # cloud-confirmed-dead (or handle-less) replicas take the full
             # preemption path, which is rare and worth its cost. Detection
             # latency is unchanged: every failed probe is still checked
             # against the cloud every round.
-            failed_spot_infos = [
+            failed_interruptible_infos = [
                 info for info, probe_succeeded, _ in probe_results
-                if not probe_succeeded and info.is_spot
+                if (not probe_succeeded and self._is_interruptible_replica(info)
+                   )
             ]
             possibly_preempted_ids: set[int] = set()
-            if failed_spot_infos:
+            if failed_interruptible_infos:
                 num_workers = min(self._PREEMPTION_PREFILTER_PARALLELISM,
-                                  len(failed_spot_infos))
+                                  len(failed_interruptible_infos))
                 with mp_pool.ThreadPool(num_workers) as prefilter_pool:
                     alive_flags = prefilter_pool.map(
-                        self._cloud_instance_looks_alive, failed_spot_infos)
+                        self._cloud_instance_looks_alive,
+                        failed_interruptible_infos)
                 possibly_preempted_ids = {
                     failed_info.replica_id for failed_info, alive in zip(
-                        failed_spot_infos, alive_flags) if not alive
+                        failed_interruptible_infos, alive_flags) if not alive
                 }
 
             pending_writes: list[tuple[int, ReplicaInfo]] = []

@@ -1535,6 +1535,204 @@ class TestCloudInstanceLooksAlive:
         query.assert_not_called()
 
 
+class TestInfrastructureInterruptionRecovery:
+    """Research Kubernetes pods use the recoverable spot lifecycle.
+
+    Every service pod on a configured zero-cost research location is
+    low-priority and reclaimable, including ordinary demand pods. Reclamation
+    must replace the backend without benching the still-healthy research pool.
+    """
+
+    @staticmethod
+    def _location(*, cloud='Kubernetes', region='research-ctx', use_spot=False):
+        return replica_managers.spot_placer.Location.from_pickleable({
+            'cloud': cloud,
+            'region': region,
+            'zone': None,
+            'accelerators': {
+                'A100' if cloud == 'Kubernetes' else 'L4': 1
+            },
+            'use_spot': use_spot,
+        })
+
+    @staticmethod
+    def _info(location, *, is_spot=False, ready=False):
+        info = replica_managers.ReplicaInfo(replica_id=1,
+                                            cluster_name='svc-1',
+                                            replica_port='8080',
+                                            is_spot=is_spot,
+                                            location=location,
+                                            version=1,
+                                            resources_override=None)
+        info.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.SUCCEEDED)
+        info.reserved_fill = False
+        if ready:
+            info.status_property.first_ready_time = 1.0
+            info.status_property.service_ready_now = True
+        return info
+
+    @staticmethod
+    def _handle():
+        return mock.Mock(
+            spec=replica_managers.backends.CloudVmRayResourceHandle)
+
+    def _manager(self, zero_cost):
+        manager = _make_manager()
+        manager._spot_placer = mock.Mock()
+        manager._spot_placer.zero_cost_locations.return_value = [zero_cost]
+        return manager
+
+    def test_non_fill_research_replica_is_interruptible(self):
+        research = self._location()
+        manager = self._manager(research)
+        info = self._info(research)
+
+        assert info.reserved_fill is False
+        assert manager._is_interruptible_replica(info) is True
+
+    def test_unrelated_nonspot_replica_is_not_interruptible(self):
+        research = self._location()
+        unrelated = self._location(cloud='AWS', region='us-east-1')
+        manager = self._manager(research)
+
+        assert manager._is_interruptible_replica(self._info(unrelated)) is False
+
+    def test_reclaimed_research_replica_reuses_recoverable_lifecycle(self):
+        research = self._location()
+        manager = self._manager(research)
+        info = self._info(research)
+
+        with mock.patch.object(
+                replica_managers.global_user_state,
+                'get_handle_from_cluster_name',
+                return_value=self._handle()), \
+             mock.patch.object(
+                 replica_managers.backend_utils,
+                 'refresh_cluster_status_handle',
+                 return_value=(None, None)), \
+             mock.patch.object(manager, '_persist_replica') as persist, \
+             mock.patch.object(manager, '_terminate_replica') as terminate:
+            assert manager._handle_preemption(info) is True
+
+        assert info.status_property.preempted is True
+        persist.assert_called_once_with(1, info)
+        terminate.assert_called_once_with(1,
+                                          sync_down_logs=False,
+                                          replica_drain_delay_seconds=0,
+                                          is_scale_down=True)
+        manager._spot_placer.set_preemptive.assert_not_called()
+
+        # A reclaimed backend before first readiness must not brick the
+        # version as an unrecoverable application failure.
+        info.status_property.sky_down_status = (
+            common_utils.ProcessStatus.SCHEDULED)
+        assert info.status_property.unrecoverable_failure() is False
+
+    def test_running_research_replica_is_not_reclaimed(self):
+        research = self._location()
+        manager = self._manager(research)
+        info = self._info(research)
+        from sky.utils import status_lib
+
+        with mock.patch.object(
+                replica_managers.global_user_state,
+                'get_handle_from_cluster_name',
+                return_value=self._handle()), \
+             mock.patch.object(
+                 replica_managers.backend_utils,
+                 'refresh_cluster_status_handle',
+                 return_value=(status_lib.ClusterStatus.UP, None)), \
+             mock.patch.object(manager, '_persist_replica') as persist, \
+             mock.patch.object(manager, '_terminate_replica') as terminate:
+            assert manager._handle_preemption(info) is False
+
+        persist.assert_not_called()
+        terminate.assert_not_called()
+
+    def test_spot_interruption_still_benches_location(self):
+        research = self._location()
+        spot = self._location(cloud='AWS', region='us-east-1', use_spot=True)
+        manager = self._manager(research)
+        info = self._info(spot, is_spot=True)
+
+        with mock.patch.object(
+                replica_managers.global_user_state,
+                'get_handle_from_cluster_name',
+                return_value=self._handle()), \
+             mock.patch.object(
+                 replica_managers.backend_utils,
+                 'refresh_cluster_status_handle',
+                 return_value=(None, None)), \
+             mock.patch.object(manager, '_persist_replica'), \
+             mock.patch.object(manager, '_terminate_replica'):
+            assert manager._handle_preemption(info) is True
+
+        manager._spot_placer.set_preemptive.assert_called_once_with(spot)
+
+    def test_failed_research_probe_enters_interruption_prefilter(self):
+        research = self._location()
+        manager = self._manager(research)
+        info = self._info(research)
+        info.probe = mock.Mock(return_value=(info, False, 100.0))
+        manager._is_pool = False
+        manager._uptime = 1.0
+        manager._tick_version_spec_cache = {}
+        manager._resolve_probe_urls = mock.Mock(
+            return_value={1: 'http://10.0.0.1:8080'})
+        manager._get_readiness_path = mock.Mock(return_value='/health')
+        manager._get_post_data = mock.Mock(return_value=None)
+        manager._get_readiness_timeout_seconds = mock.Mock(return_value=15)
+        manager._get_readiness_headers = mock.Mock(return_value=None)
+        manager._cloud_instance_looks_alive = mock.Mock(return_value=False)
+        manager._handle_preemption = mock.Mock(return_value=True)
+        manager._persist_replicas = mock.Mock()
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[info]), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_specs',
+                               return_value={1: mock.Mock()}):
+            manager._probe_all_replicas()
+
+        manager._cloud_instance_looks_alive.assert_called_once_with(info)
+        manager._handle_preemption.assert_called_once_with(info)
+        manager._persist_replicas.assert_called_once_with([])
+
+    @pytest.mark.parametrize('persisted_intent', [False, True])
+    def test_recovery_redrives_reclaimed_research_replica_without_bench(
+            self, persisted_intent):
+        research = self._location()
+        manager = self._manager(research)
+        info = self._info(research, ready=True)
+        info.status_property.preempted = persisted_intent
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos',
+                return_value=[info]), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_yaml_contents',
+                 return_value={}), \
+             mock.patch.object(
+                 replica_managers.global_user_state,
+                 'get_cluster_status_fields',
+                 return_value={}), \
+             mock.patch.object(manager, '_persist_replica') as persist, \
+             mock.patch.object(manager, '_terminate_replica') as terminate:
+            manager._recover_replica_operations()
+
+        assert info.status_property.preempted is True
+        if persisted_intent:
+            persist.assert_not_called()
+        else:
+            persist.assert_called_once_with(1, info)
+        terminate.assert_called_once()
+        manager._spot_placer.set_preemptive.assert_not_called()
+
+
 class TestScaleUpBatch:
     """A batch of scale-ups must run under ONE manager-lock acquisition:
     the probe round holds the lock for tens of seconds per round on large

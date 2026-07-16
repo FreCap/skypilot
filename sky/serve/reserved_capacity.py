@@ -19,6 +19,7 @@ standalone behavior exactly.
 from collections.abc import Callable
 import dataclasses
 import json
+import math
 import os
 import re
 import threading
@@ -31,12 +32,12 @@ from sky.catalog import kubernetes_catalog
 from sky.serve import constants
 from sky.serve import reserved_capacity_broker
 from sky.serve import serve_state
+from sky.serve import spot_placer as spot_placer_lib
 from sky.utils import common_utils
 from sky.utils import locks
 
 if typing.TYPE_CHECKING:
     from sky.serve import autoscalers
-    from sky.serve import spot_placer as spot_placer_lib
 
 logger = sky_logging.init_logger(__name__)
 
@@ -92,13 +93,20 @@ def zero_cost_pool_shapes(
         if not location.accelerators:
             continue
         gpu_name, per_replica = next(iter(location.accelerators.items()))
-        try:
-            per_replica = max(1, int(per_replica))
-        except (TypeError, ValueError):
-            per_replica = 1
+        is_numeric = (not isinstance(per_replica, bool) and
+                      isinstance(per_replica, (int, float)))
+        is_finite = is_numeric and math.isfinite(float(per_replica))
+        if (not is_finite or not float(per_replica).is_integer() or
+                float(per_replica) < 1):
+            logger.error('Reserved-fill capacity has an invalid Kubernetes '
+                         f'GPU shape {gpu_name}:{per_replica!r}; each count '
+                         'must be a positive whole number. Fill is inactive '
+                         'for this service.')
+            return {}
+        exact_per_replica = int(per_replica)
         key = (location.region, gpu_name.lower())
         per_key_replica_size[key] = max(per_key_replica_size.get(key, 1),
-                                        per_replica)
+                                        exact_per_replica)
     return per_key_replica_size
 
 
@@ -414,11 +422,16 @@ def _broker_cycle(
     shapes = zero_cost_pool_shapes(zero_cost)
     contexts = {context for context, _ in shapes}
     per_replica_counts = set(shapes.values())
-    if len(contexts) != 1 or len(per_replica_counts) != 1:
+    logical_slot_mismatch = (isinstance(
+        placer, spot_placer_lib.CapacityAwareDynamicFallbackSpotPlacer) and
+                             per_replica_counts != {1})
+    if (len(contexts) != 1 or len(per_replica_counts) != 1 or
+            logical_slot_mismatch):
         logger.error(
             'Reserved-fill broker: zero-cost shapes must share one context '
-            f'and GPU count per backend; got {sorted(shapes.items())}. Fill '
-            'is inactive for this service.')
+            'and GPU count per backend, and logical services require exact '
+            f'one-GPU shapes; got {sorted(shapes.items())}. Fill is inactive '
+            'for this service.')
         reserved_capacity_broker.remove_claim(service_name, **fence_kwargs)
         autoscaler.collect_reserved_capacity(0, keys, time.time())
         return

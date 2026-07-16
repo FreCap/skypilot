@@ -11,6 +11,7 @@ import enum
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import pathlib
 import pickle
@@ -1182,10 +1183,6 @@ def validate_service_task(task: 'sky.Task', pool: bool) -> None:
                                  f'{sys_name} will replenish preempted spot '
                                  f'with {policy_description} instances.')
 
-    # Try to create a spot placer from the task yaml. Check if the task yaml
-    # is valid for spot placer.
-    spot_placer.SpotPlacer.from_task(task.service, task)
-
     # Reserved fill supports one Kubernetes context per service. Multiple
     # accelerator names in that context form one brokered capacity group,
     # provided they use the same GPU count per backend. Zero-cost-ness is not
@@ -1200,6 +1197,24 @@ def validate_service_task(task: 'sky.Task', pool: bool) -> None:
             if not accelerators:
                 continue
             gpu_name, gpu_count = next(iter(accelerators.items()))
+            is_numeric = (not isinstance(gpu_count, bool) and
+                          isinstance(gpu_count, (int, float)))
+            is_finite = is_numeric and math.isfinite(float(gpu_count))
+            is_whole = is_finite and float(gpu_count).is_integer()
+            if (task.service.uses_logical_replicas and
+                (not is_whole or float(gpu_count) != 1.0)):
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        'dynamic_fallback_per_gpu with '
+                        'reserved_capacity_fill requires one-GPU Kubernetes '
+                        'fill shapes so broker slots equal logical slots. '
+                        f'Got {gpu_name}:{gpu_count!r}.')
+            if not is_whole or float(gpu_count) < 1:
+                with ux_utils.print_exception_no_traceback():
+                    raise ValueError(
+                        'reserved_capacity_fill requires each Kubernetes GPU '
+                        'count to be a positive whole number. '
+                        f'Got {gpu_name}:{gpu_count!r}.')
             key = (requested_resources.region, gpu_name.lower())
             pool_shapes[key] = max(pool_shapes.get(key, 1), int(gpu_count))
         contexts = {context for context, _ in pool_shapes}
@@ -1217,6 +1232,12 @@ def validate_service_task(task: 'sky.Task', pool: bool) -> None:
                     'dynamic_fallback_per_gpu with reserved_capacity_fill '
                     'requires one-GPU Kubernetes fill shapes so broker slots '
                     'equal logical slots.')
+
+    # Try to create a spot placer from the task yaml. Check if the task yaml
+    # is valid for spot placer. Reserved-fill shape validation stays before
+    # construction so malformed counts fail at the Serve trust boundary,
+    # rather than leaking NaN/Inf into cloud feasibility code.
+    spot_placer.SpotPlacer.from_task(task.service, task)
 
     replica_ingress_port: int | None = int(
         task.service.ports) if (task.service.ports is not None) else None
