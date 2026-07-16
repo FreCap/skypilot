@@ -5001,6 +5001,14 @@ class SkyPilotReplicaManager(ReplicaManager):
         refresh or a log sync while holding it.
         """
         infos = serve_state.get_replica_infos(self._service_name)
+        # A setup error in a new version is commonly version-wide. Sample one
+        # trackable latest-version replica before the serial full-fleet walk so
+        # a bad rollout is stopped without waiting behind every old replica.
+        for index, info in enumerate(infos):
+            if (info.version == self.latest_version and
+                    info.status_property.should_track_service_status()):
+                infos.insert(0, infos.pop(index))
+                break
         for info in infos:
             if not info.status_property.should_track_service_status():
                 continue

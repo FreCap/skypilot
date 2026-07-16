@@ -22,13 +22,14 @@ from sky.skylet import job_lib
 from sky.utils import common_utils
 
 
-def _tracked_replica(replica_id: int) -> replica_managers.ReplicaInfo:
+def _tracked_replica(replica_id: int,
+                     version: int = 1) -> replica_managers.ReplicaInfo:
     info = replica_managers.ReplicaInfo(replica_id=replica_id,
                                         cluster_name=f'c{replica_id}',
                                         replica_port='8080',
                                         is_spot=True,
                                         location=None,
-                                        version=1,
+                                        version=version,
                                         resources_override=None)
     # SUCCEEDED + no down -> should_track_service_status() is True.
     info.status_property.sky_launch_status = common_utils.ProcessStatus.SUCCEEDED
@@ -40,7 +41,34 @@ def _build_manager():
     mgr.lock = threading.Lock()
     mgr._service_name = 'svc'
     mgr._is_pool = False
+    mgr.latest_version = 1
     return mgr
+
+
+def test_fetch_job_status_samples_latest_version_first(monkeypatch):
+    old = [_tracked_replica(1), _tracked_replica(2)]
+    latest = _tracked_replica(3, version=2)
+    replicas = old + [latest]
+    monkeypatch.setattr(serve_state, 'get_replica_infos',
+                        lambda svc: list(replicas))
+    monkeypatch.setattr(replica_managers.ReplicaInfo,
+                        'handle',
+                        lambda self, cluster_record=None: self.replica_id)
+
+    probed = []
+
+    def _get_job_status(self, handle, job_ids, stream_logs=False):
+        probed.append(handle)
+        return {1: job_lib.JobStatus.RUNNING}
+
+    monkeypatch.setattr(replica_managers.backends.CloudVmRayBackend,
+                        'get_job_status', _get_job_status)
+
+    mgr = _build_manager()
+    mgr.latest_version = 2
+    mgr._fetch_job_status()
+
+    assert probed == [3, 1, 2]
 
 
 def test_fetch_job_status_releases_lock_during_ssh(monkeypatch):

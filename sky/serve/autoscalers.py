@@ -18,6 +18,7 @@ from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve import spot_placer
 from sky.utils import common_utils
+from sky.utils import operator_notifications
 
 if typing.TYPE_CHECKING:
     from sky.serve import replica_managers
@@ -1169,6 +1170,17 @@ class Autoscaler:
                 del self._cost_rebalance_candidate_since[key]
         return decisions
 
+    def _notify_rollout_blocked(self, previous_version: int) -> None:
+        operator_notifications.record_notification(
+            operator_notifications.OperatorNotificationCategory.
+            SERVE_ROLLOUT_BLOCKED,
+            f'SkyServe rollout blocked for service {self._service_name!r}: '
+            f'version {self.latest_version} failed before any replica became '
+            f'ready. Version {previous_version} remains active. Inspect the '
+            'new replica provisioning and setup logs.',
+            dedupe_window_seconds=operator_notifications.
+            SERVE_ROLLOUT_BLOCKED_DEDUPE_WINDOW_SECONDS)
+
     def generate_scaling_decisions(
         self,
         replica_infos: list['replica_managers.ReplicaInfo'],
@@ -1192,14 +1204,23 @@ class Autoscaler:
                 latest_replicas.append(info)
                 if info.is_ready:
                     self.latest_version_ever_ready = self.latest_version
+        previous_versions = [
+            version for version in active_versions
+            if version < self.latest_version
+        ]
         if self.latest_version_ever_ready < self.latest_version:
             for info in latest_replicas:
                 if info.status_property.unrecoverable_failure():
+                    if previous_versions:
+                        self._notify_rollout_blocked(max(previous_versions))
                     # Stop scaling if one of replica of the latest version
                     # failed, it is likely that a fatal error happens to the
                     # user application and may lead to a infinte termination
                     # and restart.
                     return []
+            if (previous_versions and latest_replicas and
+                    all(info.is_terminal for info in latest_replicas)):
+                self._notify_rollout_blocked(max(previous_versions))
 
         scaling_decisions = []
 
