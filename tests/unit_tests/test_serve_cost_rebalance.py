@@ -876,6 +876,7 @@ class TestStrictDrain:
             logical_retirement_target_capacity=8)
         info = types.SimpleNamespace(replica_id=1,
                                      cluster_name='cluster-1',
+                                     version=1,
                                      status_property=status)
 
         with mock.patch.object(replica_managers.serve_state,
