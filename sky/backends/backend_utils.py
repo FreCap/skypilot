@@ -3495,7 +3495,8 @@ def refresh_cluster_record(
         # The loop logic allows us to notice if the status was updated in the
         # global_user_state by another process and stop trying to get the lock.
         lock = locks.get_lock(cluster_status_lock_id(cluster_name))
-        start_time = time.perf_counter()
+        lock_deadline = (None if cluster_status_lock_timeout < 0 else
+                         time.perf_counter() + cluster_status_lock_timeout)
 
         # Loop until we have an up-to-date status or until we acquire the lock.
         while True:
@@ -3534,18 +3535,19 @@ def refresh_cluster_record(
                 # available and we have blocking=False.
                 pass
 
-            # Logic adapted from FileLock.acquire().
-            # If cluster_status_lock_time is <0, we will never hit this. No timeout.
-            # Otherwise, if we have timed out, return the cached status. This has
-            # the potential to cause correctness issues, but if so it is the
-            # caller's responsibility to set the timeout to -1.
-            if 0 <= cluster_status_lock_timeout < time.perf_counter(
-            ) - start_time:
-                logger.debug(
-                    'Refreshing status: Failed get the lock for cluster '
-                    f'{cluster_name!r}. Using the cached status.')
-                return record
-            time.sleep(lock.poll_interval)
+            # Logic adapted from FileLock.acquire(). A negative timeout waits
+            # indefinitely. Finite waits clamp the final poll so callers do
+            # not sleep past their lock budget.
+            sleep_seconds = lock.poll_interval
+            if lock_deadline is not None:
+                remaining_wait = lock_deadline - time.perf_counter()
+                if remaining_wait <= 0:
+                    logger.debug(
+                        'Refreshing status: Failed get the lock for cluster '
+                        f'{cluster_name!r}. Using the cached status.')
+                    return record
+                sleep_seconds = min(sleep_seconds, remaining_wait)
+            time.sleep(sleep_seconds)
 
             # Refresh for next loop iteration.
             record = _reload_record_if_refresh_fields_changed(

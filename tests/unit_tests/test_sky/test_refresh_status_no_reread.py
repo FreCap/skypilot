@@ -314,6 +314,89 @@ def test_refresh_reloads_record_when_autostop_changes_before_lock():
                                    False)
 
 
+def test_refresh_lock_wait_clamps_final_sleep_to_deadline():
+    """A finite lock wait must not sleep past its remaining budget."""
+    handle = _make_handle()
+    handle.launched_resources.use_spot = True
+    record = _make_refreshable_record(handle)
+    refresh_fields = ('UP', record['status_updated_at'], record['autostop'],
+                      record['to_down'])
+
+    blocked = mock.MagicMock()
+    blocked.__enter__.side_effect = backend_utils.locks.LockTimeout
+    lock = mock.MagicMock(poll_interval=1.0)
+    lock.acquire.return_value = blocked
+
+    with mock.patch.object(backend_utils.global_user_state,
+                           'get_cluster_from_name',
+                           return_value=record) as full_read, \
+         mock.patch.object(backend_utils.global_user_state,
+                           'get_cluster_refresh_fields',
+                           return_value=refresh_fields) as cheap_read, \
+         mock.patch.object(backend_utils,
+                           '_check_owner_identity_with_record'), \
+         mock.patch.object(backend_utils.locks, 'get_lock',
+                           return_value=lock), \
+         mock.patch.object(
+             backend_utils.time,
+             'perf_counter',
+             side_effect=[100.0, 100.75, 101.001]) as perf_counter, \
+         mock.patch.object(backend_utils.time, 'sleep') as sleep, \
+         mock.patch.object(backend_utils, '_update_cluster_status') as update:
+        result = backend_utils.refresh_cluster_record(
+            'test-cluster', cluster_status_lock_timeout=1)
+
+    assert result is record
+    full_read.assert_called_once()
+    cheap_read.assert_called_once_with('test-cluster')
+    assert lock.acquire.call_count == 2
+    sleep.assert_called_once_with(pytest.approx(0.25))
+    assert perf_counter.call_count == 3
+    update.assert_not_called()
+
+
+def test_refresh_lock_wait_returns_concurrent_update_at_deadline():
+    """The final bounded sleep still reloads a concurrent status update."""
+    handle = _make_handle()
+    handle.launched_resources.use_spot = True
+    record = _make_refreshable_record(handle)
+    fresh_record = dict(record,
+                        status=status_lib.ClusterStatus.STOPPED,
+                        status_updated_at=int(time.time()))
+    refresh_fields = ('STOPPED', fresh_record['status_updated_at'],
+                      fresh_record['autostop'], fresh_record['to_down'])
+
+    blocked = mock.MagicMock()
+    blocked.__enter__.side_effect = backend_utils.locks.LockTimeout
+    lock = mock.MagicMock(poll_interval=1.0)
+    lock.acquire.return_value = blocked
+
+    with mock.patch.object(backend_utils.global_user_state,
+                           'get_cluster_from_name',
+                           side_effect=[record, fresh_record]) as full_read, \
+         mock.patch.object(backend_utils.global_user_state,
+                           'get_cluster_refresh_fields',
+                           return_value=refresh_fields) as cheap_read, \
+         mock.patch.object(backend_utils,
+                           '_check_owner_identity_with_record'), \
+         mock.patch.object(backend_utils.locks, 'get_lock',
+                           return_value=lock), \
+         mock.patch.object(backend_utils.time,
+                           'perf_counter',
+                           side_effect=[100.0, 100.75]), \
+         mock.patch.object(backend_utils.time, 'sleep') as sleep, \
+         mock.patch.object(backend_utils, '_update_cluster_status') as update:
+        result = backend_utils.refresh_cluster_record(
+            'test-cluster', cluster_status_lock_timeout=1)
+
+    assert result is fresh_record
+    assert full_read.call_count == 2
+    cheap_read.assert_called_once_with('test-cluster')
+    lock.acquire.assert_called_once_with(blocking=False)
+    sleep.assert_called_once_with(pytest.approx(0.25))
+    update.assert_not_called()
+
+
 def test_external_failures_return_record_without_reread():
     handle = _make_handle()
     record = _make_record(handle)
