@@ -228,11 +228,9 @@ def get_status_history(service_name: str,
                 services.c.pool == 0)).scalar_one_or_none()
         if service_hash is None:
             return {
-                'available': True,
+                'available': False,
                 'bucket_seconds': BUCKET_SECONDS,
                 'retention_hours': RETENTION_HOURS,
-                'window_start': window_start.timestamp(),
-                'window_end': observed_at.timestamp(),
                 'samples': [],
             }
         predicates = [

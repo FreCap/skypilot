@@ -76,14 +76,22 @@ def test_non_postgres_lock_skips_session_probe():
     assert result is lock
 
 
-def test_serve_history_event_records_once_per_minute(monkeypatch):
+def test_serve_history_event_uses_wall_clock_minutes_and_retries(monkeypatch):
     record = mock.Mock(return_value=2)
     monkeypatch.setattr(events.serve_history, 'record_status_snapshot', record)
-    event = events.ServiceStatusHistoryEvent()
+    timestamps = iter([120.1, 140.1, 180.1, 240.1, 240.2])
+    event = events.ServiceStatusHistoryEvent(time_fn=lambda: next(timestamps))
 
     event.run()
     event.run()
-    record.assert_not_called()
     event.run()
+    assert record.call_args_list == [
+        mock.call(timestamp=120.1),
+        mock.call(timestamp=180.1),
+    ]
 
-    record.assert_called_once_with()
+    record.side_effect = RuntimeError('transient database failure')
+    event.run()
+    record.side_effect = None
+    event.run()
+    assert record.call_args_list[-1] == mock.call(timestamp=240.2)

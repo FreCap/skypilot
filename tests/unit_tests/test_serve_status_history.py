@@ -2,6 +2,7 @@
 # pylint: disable=protected-access
 
 import datetime
+from unittest import mock
 
 import pytest
 from sqlalchemy.dialects import postgresql
@@ -73,3 +74,23 @@ def test_snapshot_query_uses_normalized_columns_only():
 def test_history_hours_are_bounded_before_database_access(hours):
     with pytest.raises(ValueError, match='hours must be an integer'):
         serve_history.get_status_history('svc', hours=hours)
+
+
+def test_missing_central_service_is_unavailable(monkeypatch):
+    engine = mock_engine = mock.MagicMock()
+    engine.dialect.name = 'postgresql'
+    monkeypatch.setattr(serve_history, '_postgres_engine', lambda: mock_engine)
+    session = mock.MagicMock()
+    session.__enter__.return_value = session
+    session.execute.return_value.scalar_one_or_none.return_value = None
+    monkeypatch.setattr(serve_history.orm, 'Session',
+                        lambda unused_engine: session)
+
+    history = serve_history.get_status_history('missing', timestamp=120)
+
+    assert history == {
+        'available': False,
+        'bucket_seconds': 60,
+        'retention_hours': 72,
+        'samples': [],
+    }

@@ -1,4 +1,5 @@
 """skylet events"""
+from collections.abc import Callable
 import math
 import os
 import re
@@ -154,10 +155,22 @@ class ServiceUpdateEvent(SkyletEvent):
 
 class ServiceStatusHistoryEvent(SkyletEvent):
     """Persist one aggregate physical-machine snapshot per minute."""
-    EVENT_INTERVAL_SECONDS = 60
+    EVENT_INTERVAL_SECONDS = EVENT_CHECKING_INTERVAL_SECONDS
+
+    def __init__(self, time_fn: Callable[[], float] = time.time) -> None:
+        super().__init__()
+        self._last_bucket: int | None = None
+        self._time_fn = time_fn
 
     def _run(self):
-        written = serve_history.record_status_snapshot()
+        timestamp = self._time_fn()
+        bucket = int(timestamp // serve_history.BUCKET_SECONDS)
+        if bucket == self._last_bucket:
+            return
+        written = serve_history.record_status_snapshot(timestamp=timestamp)
+        # Advance only after a successful write so a transient failure is
+        # retried on the next daemon iteration within the same minute.
+        self._last_bucket = bucket
         logger.debug(f'Persisted {written} Serve status history rows.')
 
 
