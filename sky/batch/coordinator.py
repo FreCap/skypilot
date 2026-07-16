@@ -1152,13 +1152,25 @@ class BatchCoordinator:
     def _cancel_worker_job_by_id(self, cluster_name: str, worker_job_id: int,
                                  worker_token: str) -> None:
         """Cancel exactly one worker ID and retire its durable record."""
-        cancel_request_id = sdk.cancel(cluster_name, job_ids=[worker_job_id])
-        sdk.get(cancel_request_id)
-        managed_job_state.remove_batch_worker_record(
-            self._managed_job_id,
-            worker_token,
-            cluster_name,
-            worker_job_id=worker_job_id)
+        cancel_request_id = None
+        for attempt in range(2):
+            try:
+                if cancel_request_id is None:
+                    cancel_request_id = sdk.cancel(cluster_name,
+                                                   job_ids=[worker_job_id])
+                sdk.get(cancel_request_id)
+                managed_job_state.remove_batch_worker_record(
+                    self._managed_job_id,
+                    worker_token,
+                    cluster_name,
+                    worker_job_id=worker_job_id)
+                return
+            except Exception as e:  # pylint: disable=broad-except
+                if attempt == 1:
+                    raise
+                logger.warning(
+                    'Retrying exact Batch worker cancellation for '
+                    '%s on %s after: %s', worker_job_id, cluster_name, e)
 
     def _shutdown_worker(self,
                          cluster_name: str,

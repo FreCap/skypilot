@@ -743,6 +743,68 @@ def test_cancel_claims_worker_cleanup_once(monkeypatch):
     assert not batch_coordinator._active_workers
 
 
+def test_cancel_retries_unresolved_worker_cleanup_once(monkeypatch):
+    batch_coordinator = _make_coordinator()
+    entered = threading.Event()
+    release = threading.Event()
+    monkeypatch.setattr(batch_coordinator, '_launch_worker_service',
+                        mock.Mock(return_value=17))
+
+    def _pop_ready_batch():
+        entered.set()
+        release.wait(timeout=5)
+        return None, None
+
+    monkeypatch.setattr(batch_coordinator, '_pop_ready_batch', _pop_ready_batch)
+    shutdown_request = mock.Mock(
+        side_effect=RuntimeError('transient exec failure'))
+    cancel_request = mock.Mock(
+        side_effect=[RuntimeError('transient cancel failure'), 'cancel'])
+    remove_record = mock.Mock(return_value=True)
+    monkeypatch.setattr(coordinator.sdk, 'exec', shutdown_request)
+    monkeypatch.setattr(coordinator.sdk, 'get', mock.Mock())
+    monkeypatch.setattr(coordinator.sdk, 'cancel', cancel_request)
+    monkeypatch.setattr(coordinator.time, 'sleep', mock.Mock())
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'remove_batch_worker_record', remove_record)
+    dispatch = threading.Thread(target=batch_coordinator._worker_dispatch_loop,
+                                args=('worker-a',))
+    dispatch.start()
+    assert entered.wait(timeout=5)
+
+    batch_coordinator.cancel()
+    release.set()
+    dispatch.join(timeout=5)
+
+    assert not dispatch.is_alive()
+    shutdown_request.assert_called_once()
+    assert cancel_request.call_count == 2
+    remove_record.assert_called_once_with(1,
+                                          batch_coordinator._worker_token,
+                                          'worker-a',
+                                          worker_job_id=17)
+
+
+def test_worker_cancel_reuses_request_after_transient_wait_failure(monkeypatch):
+    batch_coordinator = _make_coordinator()
+    cancel_request = mock.Mock(return_value='cancel')
+    wait = mock.Mock(side_effect=[RuntimeError('transient wait failure'), None])
+    remove_record = mock.Mock(return_value=True)
+    monkeypatch.setattr(coordinator.sdk, 'cancel', cancel_request)
+    monkeypatch.setattr(coordinator.sdk, 'get', wait)
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'remove_batch_worker_record', remove_record)
+
+    batch_coordinator._cancel_worker_job_by_id('worker-a', 17, 'token')
+
+    cancel_request.assert_called_once_with('worker-a', job_ids=[17])
+    assert wait.call_args_list == [mock.call('cancel'), mock.call('cancel')]
+    remove_record.assert_called_once_with(1,
+                                          'token',
+                                          'worker-a',
+                                          worker_job_id=17)
+
+
 def test_worker_finalization_claims_cleanup_before_late_cancel(monkeypatch):
     batch_coordinator = _make_coordinator()
     monkeypatch.setattr(batch_coordinator, '_launch_worker_service',
