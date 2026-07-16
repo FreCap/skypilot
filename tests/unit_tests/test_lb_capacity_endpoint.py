@@ -165,7 +165,7 @@ class TestCapacityEndpoint(unittest.TestCase):
         self.assertEqual(body['in_flight_capacity'], 1)
         self.assertGreaterEqual(body['occupancy_probe_age_seconds'], 1.0)
 
-    def test_generic_capacity_uses_complete_fresh_slot_snapshot(self):
+    def test_generic_capacity_does_not_mix_replica_and_slot_units(self):
         policy = lb_policies.LeastLoadPolicy()
         policy.set_ready_replicas(['http://four-gpu:8080'])
         balancer = _make_balancer(policy)
@@ -178,9 +178,10 @@ class TestCapacityEndpoint(unittest.TestCase):
             asyncio.run(balancer._capacity(mock.MagicMock())).body)
         self.assertEqual(body['current_capacity'], 4)
         self.assertEqual(body['in_flight_capacity'], 2)
-        # A configured replica ceiling must never understate already
-        # materialized multi-worker capacity.
-        self.assertEqual(body['max_capacity'], 4)
+        # max_replicas is a physical-backend count. Without an authoritative
+        # slot-width plan, presenting it as a slot ceiling would erase valid
+        # multi-worker headroom or overstate a rolling version's capacity.
+        self.assertIsNone(body['max_capacity'])
 
     def test_generic_capacity_falls_back_when_slot_snapshot_is_stale(self):
         policy = lb_policies.LeastLoadPolicy()

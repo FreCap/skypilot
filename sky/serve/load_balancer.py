@@ -1553,8 +1553,18 @@ class SkyServeLoadBalancer:
             busy_replicas = running_slots
         else:
             max_replicas = hint.get('max_replicas')
+            # max_replicas is a physical-backend ceiling. It is a valid
+            # capacity ceiling only while this response is also expressed in
+            # physical backends. A fresh multi-worker snapshot switches
+            # current_capacity to slot units, but legacy controller hints do
+            # not carry an authoritative future slot width. Report unknown
+            # instead of mixing units; logical mode above has the planned
+            # slot-unit ceiling needed to publish an exact value.
+            max_capacity_is_usable = (not occupancy_is_usable or all(
+                total_slots_by_url[url] == 1 for url in probed))
             max_capacity = (max(max_replicas, current_capacity)
-                            if max_replicas is not None else None)
+                            if max_replicas is not None and
+                            max_capacity_is_usable else None)
         return fastapi.responses.JSONResponse({
             'replica_unit': replica_unit,
             'ready_replicas': ready_replicas,
