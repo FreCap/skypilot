@@ -2309,7 +2309,7 @@ class TestTerminateFailedServices:
                                'get_latest_committed_version',
                                return_value=1), \
              mock.patch.object(serve_utils.time,
-                               'time',
+                               'monotonic',
                                side_effect=[0, 11]), \
              mock.patch.object(serve_utils.time, 'sleep'), \
              mock.patch.object(serve_state,
@@ -2323,6 +2323,52 @@ class TestTerminateFailedServices:
         assert 'has not yet acknowledged' in message
         get_replicas.assert_not_called()
         remove_service.assert_not_called()
+
+    def test_controller_ack_wait_uses_monotonic_bounded_sleep(self):
+        """Clock changes cannot extend the wait or oversleep its deadline."""
+        lifecycle_lock = mock.MagicMock(epoch=17)
+        owner = {
+            'hash': 'incarnation-a',
+            'controller_pid': 101,
+            'controller_ip': '10.0.0.1',
+            'controller_port': None,
+        }
+        with mock.patch.object(serve_utils,
+                               'lifecycle_lock_is_valid',
+                               return_value=True), \
+             mock.patch.object(serve_state,
+                               'service_owner_matches',
+                               return_value=True), \
+             mock.patch.object(
+                 serve_state,
+                 'set_service_status_and_active_versions_if_hash',
+                 return_value=True), \
+             mock.patch.object(serve_state,
+                               'get_service_controller_owner',
+                               return_value=owner), \
+             mock.patch.object(serve_state,
+                               'get_ha_recovery_script',
+                               return_value='recovery command'), \
+             mock.patch.object(serve_state,
+                               'get_latest_committed_version',
+                               return_value=1), \
+             mock.patch.object(serve_utils.time,
+                               'time',
+                               side_effect=AssertionError(
+                                   'wall clock must not drive the deadline')), \
+             mock.patch.object(serve_utils.time,
+                               'monotonic',
+                               side_effect=[0, 9.9, 10]), \
+             mock.patch.object(serve_utils.time, 'sleep') as sleep, \
+             mock.patch.object(serve_state,
+                               'get_replica_infos') as get_replicas:
+            message = serve_utils._terminate_failed_services_locked(
+                'svc', 'incarnation-a', False, lifecycle_lock)
+
+        assert message is not None
+        assert 'has not yet acknowledged' in message
+        sleep.assert_called_once_with(pytest.approx(0.1))
+        get_replicas.assert_not_called()
 
     def test_orphan_without_recovery_script_can_claim_teardown(self):
         # Legacy FAILED_CLEANUP rows have no live/recoverable controller to
