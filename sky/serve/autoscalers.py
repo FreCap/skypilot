@@ -498,6 +498,11 @@ class Autoscaler:
             self._fill_location_matches(location, zero_cost)
             for zero_cost in self._fill_zero_cost_locations)
 
+    def _fill_capacity_units(self, info: 'replica_managers.ReplicaInfo') -> int:
+        """Autoscaling units represented by one row for fill accounting."""
+        del info
+        return 1
+
     def _apply_reserved_capacity_fill(
         self,
         replica_infos: list['replica_managers.ReplicaInfo'],
@@ -570,15 +575,16 @@ class Autoscaler:
         for info in replica_infos:
             if info.is_terminal:
                 continue
+            capacity_units = self._fill_capacity_units(info)
             is_latest = info.version == self.latest_version
             if is_latest:
-                num_latest_nonterminal += 1
+                num_latest_nonterminal += capacity_units
             if self._replica_on_zero_cost_location(info):
-                zero_cost_count += 1
+                zero_cost_count += capacity_units
                 if is_latest:
-                    zero_cost_latest += 1
+                    zero_cost_latest += capacity_units
                 if self._fill_row_occupies_free_slot(info):
-                    zero_cost_occupying += 1
+                    zero_cost_occupying += capacity_units
                 # reserved_fill is the persisted launch-origin flag: only
                 # sentinel (fill) launches carry it. Demand-placed
                 # zero-cost rows are demand-protected, not broker
@@ -589,9 +595,9 @@ class Autoscaler:
                 # shelter but stay ceiling-exempt until natural churn
                 # replaces them with flagged rows.
                 if not getattr(info, 'reserved_fill', False):
-                    zero_cost_demand_placed += 1
+                    zero_cost_demand_placed += capacity_units
                     if is_latest:
-                        zero_cost_demand_placed_latest += 1
+                        zero_cost_demand_placed_latest += capacity_units
         # Three defense layers keep fill launches within physical free
         # capacity:
         # 1. Emission-time spend (below): free-slot memory is deducted
@@ -2451,6 +2457,11 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             return float(getattr(info, 'planned_capacity', 1))
         _, gpu_count = self._get_gpu_shape_from_replica_info(info)
         return self._get_knob_for_version(info.version) * gpu_count
+
+    def _fill_capacity_units(self, info: 'replica_managers.ReplicaInfo') -> int:
+        if self.replica_unit == 'logical':
+            return max(1, int(self._replica_capacity(info)))
+        return super()._fill_capacity_units(info)
 
     def _ready_capacity(self, info: 'replica_managers.ReplicaInfo') -> int:
         """Observed ready logical slots, or zero when not proven fresh."""

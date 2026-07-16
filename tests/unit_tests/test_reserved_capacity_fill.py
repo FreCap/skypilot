@@ -22,6 +22,7 @@ from sky.serve import replica_managers
 from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_broker
 from sky.serve import serve_state
+from sky.serve import service_spec
 from sky.serve import spot_placer
 
 _SCALE_UP = autoscalers.AutoscalerDecisionOperator.SCALE_UP
@@ -172,6 +173,37 @@ class TestSentinelScaleUps(unittest.TestCase):
             _FILL_KEY: True
         }]), 3)
         self.assertEqual(autoscaler.info()['fill_target'], 4)
+
+
+class TestLogicalReplicaFill(unittest.TestCase):
+    """Logical fleets account one-GPU fill candidates in slot units."""
+
+    def test_paid_backend_width_is_counted_in_logical_units(self):
+        spec = service_spec.SkyServiceSpec(
+            readiness_path='/health',
+            initial_delay_seconds=60,
+            readiness_timeout_seconds=30,
+            endpoint_probe_interval_seconds=10,
+            lb_stream_timeout_seconds=60,
+            min_replicas=1,
+            max_replicas=10,
+            target_concurrency_per_replica=1,
+            graceful_drain_async_occupancy=True,
+            spot_placer=spot_placer.CAPACITY_AWARE_SPOT_PLACER,
+            reserved_capacity_fill=True)
+        autoscaler = autoscalers.ConcurrencyAutoscaler('svc', spec)
+        autoscaler.seed_zero_cost_locations([_K8S_KEY])
+        _feed(autoscaler, 5)
+        paid_location = make_location('us-east-1',
+                                      accelerators={'L4': 4},
+                                      cloud_name='AWS')
+        paid = _replica(1, paid_location.to_pickleable())
+        paid.planned_capacity = 4
+
+        fill_ups = _ups(autoscaler._apply_reserved_capacity_fill([paid], []))
+
+        self.assertEqual(len(fill_ups), 1)
+        self.assertTrue(fill_ups[0].target[_FILL_KEY])
 
 
 class TestScaleDownSuppression(unittest.TestCase):
@@ -1128,6 +1160,23 @@ class TestQueryFreeSlots(unittest.TestCase):
         self.assertIsNone(observation.free_slots)
         self.assertEqual(set(observation.gpu_names), {'A100', 'A100-80GB'})
 
+    def test_group_observation_sums_requested_accelerators_once(self):
+        with mock.patch.object(reserved_capacity.kubernetes_catalog,
+                               'list_accelerators_realtime',
+                               return_value=({}, {}, {
+                                   'A100': 3,
+                                   'A100-80GB': 4,
+                                   'H100': 9,
+                               })) as query:
+            observation = reserved_capacity.query_pool_group_observation(
+                'research-ctx', {
+                    'a100': 1,
+                    'a100-80gb': 2,
+                })
+        self.assertEqual(observation.free_slots, 5)
+        self.assertEqual(set(observation.gpu_names), {'A100', 'A100-80GB'})
+        query.assert_called_once()
+
     def test_same_shape_different_counts_use_largest_deterministically(self):
         # A100:1 and A100:8 entries over one pool draw from the same
         # free GPUs: the LARGEST per-replica size wins regardless of
@@ -1852,8 +1901,25 @@ class TestBrokerPollerCycle(unittest.TestCase):
         self.assertIsNotNone(autoscaler._fill_snapshot_time)
         self.assertEqual(autoscaler.info()['fill_free_slots'], 0)
 
-    def test_multi_pool_service_withdraws_claim_and_feeds_zero(self):
+    def test_same_context_accelerators_share_one_broker_group(self):
         other = dict(_K8S_KEY, accelerators={'H100': 1})
+        zero_cost = [
+            spot_placer.Location.from_pickleable(_K8S_KEY),
+            spot_placer.Location.from_pickleable(other),
+        ]
+        autoscaler, upsert_mock, remove_mock, round_mock = self._run_cycle(
+            allocation=None, zero_cost=zero_cost)
+        upsert_mock.assert_called_once()
+        self.assertEqual(
+            upsert_mock.call_args.kwargs['pool_key'],
+            reserved_capacity_broker.make_pool_key('research-ctx',
+                                                   ('a100', 'h100')))
+        remove_mock.assert_not_called()
+        round_mock.assert_called_once()
+        self.assertIsNone(autoscaler._fill_grant)
+
+    def test_multiple_contexts_withdraw_claim_and_feed_zero(self):
+        other = dict(_K8S_KEY, region='other-ctx', accelerators={'H100': 1})
         zero_cost = [
             spot_placer.Location.from_pickleable(_K8S_KEY),
             spot_placer.Location.from_pickleable(other),

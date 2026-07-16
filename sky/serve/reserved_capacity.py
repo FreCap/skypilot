@@ -150,6 +150,42 @@ def query_pool_observation(
         gpu_names=tuple(available.keys()))
 
 
+def query_pool_group_observation(
+    context: str,
+    shapes: dict[str, int],
+) -> reserved_capacity_broker.PoolObservation:
+    """Measure several accelerator names in one Kubernetes context query."""
+    try:
+        _, _, available = kubernetes_catalog.list_accelerators_realtime(
+            gpus_only=True,
+            name_filter=None,
+            region_filter=context,
+            quantity_filter=None,
+            case_sensitive=False,
+            require_price=False)
+    except Exception as e:  # pylint: disable=broad-except
+        logger.warning('Reserved-capacity group poll failed for context '
+                       f'{context!r}: {common_utils.format_exception(e)}')
+        return reserved_capacity_broker.PoolObservation(free_slots=None)
+    available_lower = {
+        str(gpu_name).lower(): count for gpu_name, count in available.items()
+    }
+    requested_counts = [available_lower.get(name, 0) for name in shapes]
+    if any(count < 0 for count in requested_counts):
+        logger.warning('Reserved-capacity group availability is unknown for '
+                       f'context {context!r} ({available}).')
+        return reserved_capacity_broker.PoolObservation(free_slots=None,
+                                                        gpu_names=tuple(
+                                                            available.keys()))
+    free_slots = sum(
+        max(0, available_lower.get(name, 0)) // per_replica
+        for name, per_replica in shapes.items())
+    matched_names = tuple(
+        name for name in available if str(name).lower() in shapes)
+    return reserved_capacity_broker.PoolObservation(free_slots=free_slots,
+                                                    gpu_names=matched_names)
+
+
 def query_free_slots(
         zero_cost_locations: list['spot_placer_lib.Location']) -> int:
     """Free replica slots across the zero-cost locations, summed per shape.
@@ -376,22 +412,25 @@ def _broker_cycle(
     if expected_controller_owner is not None:
         fence_kwargs['expected_controller_owner'] = expected_controller_owner
     shapes = zero_cost_pool_shapes(zero_cost)
-    if len(shapes) != 1:
-        # v1 restriction: all zero-cost shapes must resolve into ONE pool
-        # group (multi-pool claims/feeds/pinned launches are v2). Withdraw
-        # the claim (peers must not arbitrate around a ghost) and feed
-        # zero: existing holdings keep their shelter via zero_cost_count,
-        # but no new fill happens on an un-arbitrated pool set. Re-logged
-        # every interval by design -- this is a misconfiguration.
+    contexts = {context for context, _ in shapes}
+    per_replica_counts = set(shapes.values())
+    if len(contexts) != 1 or len(per_replica_counts) != 1:
         logger.error(
-            'Reserved-fill broker: service zero-cost shapes resolve to '
-            f'{len(shapes)} pools ({sorted(shapes)}); v1 supports exactly '
-            'one. Fill is inactive for this service.')
+            'Reserved-fill broker: zero-cost shapes must share one context '
+            f'and GPU count per backend; got {sorted(shapes.items())}. Fill '
+            'is inactive for this service.')
         reserved_capacity_broker.remove_claim(service_name, **fence_kwargs)
         autoscaler.collect_reserved_capacity(0, keys, time.time())
         return
-    (context, gpu_name), per_replica = next(iter(shapes.items()))
-    pool_key = reserved_capacity_broker.make_pool_key(context, gpu_name)
+    context = next(iter(contexts))
+    per_replica = next(iter(per_replica_counts))
+    grouped_shapes = {
+        gpu_name: count
+        for (shape_context, gpu_name), count in shapes.items()
+        if shape_context == context
+    }
+    pool_key = reserved_capacity_broker.make_pool_key(context,
+                                                      tuple(grouped_shapes))
     replica_infos = serve_state.get_replica_infos(service_name)
     # Seed before counting (idempotent no-op when already seeded): after a
     # respawn whose best-effort boot seed failed, an unseeded autoscaler
@@ -423,12 +462,12 @@ def _broker_cycle(
         **fence_kwargs)
     if claim_persisted is False:
         autoscaler.collect_reserved_capacity(0, keys, time.time())
-        logger.info(f'Reserved-fill broker: stale controller for '
-                    f'{service_name!r}; skipping claim and feeding 0 slots.')
+        logger.info('Reserved-fill broker: claim rejected or controller '
+                    f'stale for {service_name!r}; feeding 0 slots.')
         return
     allocation = reserved_capacity_broker.run_round_if_stale(
         service_name, pool_key,
-        lambda: query_pool_observation(context, gpu_name, per_replica),
+        lambda: query_pool_group_observation(context, grouped_shapes),
         poll_interval_seconds())
     if allocation is None:
         # No allocation this cycle (claim rejected/expired, round lock

@@ -686,6 +686,32 @@ class TestBlackout:
 @pytest.mark.usefixtures('_broker_db')
 class TestClaimLifecycle:
 
+    def test_overlapping_accelerator_groups_are_rejected(self):
+        _upsert('svc-a', pool_key=broker.make_pool_key('research-ctx', 'A100'))
+        accepted = broker.upsert_claim('svc-b',
+                                       pool_key=broker.make_pool_key(
+                                           'research-ctx',
+                                           ('A100', 'A100-80GB')),
+                                       weight=1,
+                                       floor_replicas=0,
+                                       gpus_per_replica=1,
+                                       holdings_fill=0,
+                                       launchable=True)
+        assert accepted is False
+        assert {
+            row['service_name']
+            for row in serve_state.get_reserved_fill_claims()
+        } == {'svc-a'}
+
+    def test_identical_accelerator_groups_share_broker_round(self):
+        pool = broker.make_pool_key('research-ctx', ('A100', 'A100-80GB'))
+        _upsert('svc-a', pool_key=pool)
+        _upsert('svc-b', pool_key=pool)
+        assert {
+            row['service_name']
+            for row in serve_state.get_reserved_fill_claims(pool_key=pool)
+        } == {'svc-a', 'svc-b'}
+
     def test_expired_claim_pruned_fast_respawn_readopts(self, clock):
         _upsert('svc-a')
         _upsert('svc-b')
