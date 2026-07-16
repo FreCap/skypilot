@@ -1468,8 +1468,10 @@ class TestScaleUpBatch:
 
         def _launch(replica_id,
                     _resources_override,
-                    existing_replica_infos=None):
+                    existing_replica_infos=None,
+                    current_spot_locations=None):
             assert existing_replica_infos is not None
+            assert current_spot_locations is not None
             snapshots.append(
                 (existing_replica_infos, len(existing_replica_infos)))
             existing_replica_infos.append(_fake_replica_info(replica_id))
@@ -1496,6 +1498,98 @@ class TestScaleUpBatch:
         id_scan.assert_not_called()
         assert [size for _, size in snapshots] == [2, 3, 4]
         assert all(snapshot is snapshots[0][0] for snapshot, _ in snapshots)
+
+    def test_spot_batch_reuses_one_location_snapshot(self):
+        """K placements must extract the N existing locations once.
+
+        The mutable location snapshot must also accumulate each successful
+        in-wave placement in order, matching the existing replica snapshot.
+        """
+        mgr = _make_manager(next_replica_id=1)
+        mgr.lock = self._CountingLock()
+        mgr._replica_to_request_id = thread_utils.ThreadSafeDict()
+        mgr._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
+        mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=False)
+
+        def _location(zone):
+            return replica_managers.spot_placer.Location.from_pickleable({
+                'cloud': 'AWS',
+                'region': 'us-east-1',
+                'zone': zone,
+                'accelerators': {
+                    'L4': 1
+                },
+                'use_spot': True,
+            })
+
+        initial_locations = [_location('us-east-1a'), _location('us-east-1b')]
+        initial_infos = [_fake_replica_info(40), _fake_replica_info(41)]
+        for info, location in zip(initial_infos, initial_locations):
+            info.get_spot_location.return_value = location
+
+        selected_locations = [
+            _location('us-east-1c'),
+            _location('us-east-1d'),
+            _location('us-east-1e'),
+        ]
+        seen_locations = []
+
+        def _select(current_locations):
+            seen_locations.append(list(current_locations))
+            return selected_locations[len(seen_locations) - 1]
+
+        placer = mock.Mock()
+        placer.select_next_location.side_effect = _select
+        placer.zero_cost_locations.return_value = []
+        placer.active_locations.return_value = []
+        mgr._spot_placer = placer
+
+        with mock.patch(
+                'sky.serve.replica_managers.serve_state.get_replica_infos',
+                return_value=initial_infos), \
+             mock.patch.object(replica_managers.reserved_capacity_broker,
+                               'get_cached_grant', return_value=None), \
+             mock.patch('sky.serve.replica_managers._should_use_spot',
+                        return_value=True), \
+             mock.patch.object(mgr, '_persist_replica'), \
+             mock.patch(
+                 'sky.serve.replica_managers.serve_utils.'
+                 'generate_replica_launch_log_file_name',
+                 return_value='/tmp/launch.log'), \
+             mock.patch('sky.serve.replica_managers._get_resources_ports',
+                        return_value='8080'), \
+             mock.patch('sky.serve.replica_managers.thread_utils.SafeThread'):
+            mgr.scale_up_batch([{'use_spot': True}] * 3)
+
+        assert seen_locations == [
+            initial_locations,
+            initial_locations + selected_locations[:1],
+            initial_locations + selected_locations[:2],
+        ]
+        assert [
+            info.get_spot_location.call_count for info in initial_infos[:2]
+        ] == [1, 1]
+
+    def test_cost_rebalance_batch_does_not_extract_placement_load(self):
+        """Pinned rebalance launches do not need the fleet load snapshot."""
+        mgr = _make_manager(next_replica_id=1)
+        mgr.lock = self._CountingLock()
+        mgr._spot_placer = mock.Mock()
+        mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=False)
+        info = _fake_replica_info(40)
+        override = {
+            replica_managers.serve_constants.COST_REBALANCE_FOR_REPLICA_OVERRIDE_KEY: 40
+        }
+
+        with mock.patch(
+                'sky.serve.replica_managers.serve_state.get_replica_infos',
+                return_value=[info]), \
+             mock.patch.object(mgr, '_launch_replica', return_value=True) \
+                     as launch:
+            mgr.scale_up_batch([override])
+
+        info.get_spot_location.assert_not_called()
+        assert 'current_spot_locations' not in launch.call_args.kwargs
 
     def test_spot_batch_defers_when_shared_reservation_lock_is_busy(self):
         mgr = _make_manager(next_replica_id=1)
@@ -1726,12 +1820,20 @@ class TestLogicalCapacityPlanning:
                 received_at=replica_managers.time.monotonic()))
         mgr._logical_target = (1, 7, 9)
         mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=True)
+        mgr._spot_placer = mock.Mock()
         widths = iter([8, 4])
         planned = []
+        location_snapshots = []
 
-        def _append_shape(_override, _used_ids, existing, _budget,
-                          logical_reconcile_fence):
+        def _append_shape(_override,
+                          _used_ids,
+                          existing,
+                          _budget,
+                          logical_reconcile_fence,
+                          current_spot_locations=None):
             assert logical_reconcile_fence == (1, 7, 9)
+            assert current_spot_locations is not None
+            location_snapshots.append(current_spot_locations)
             width = next(widths)
             info = mock.Mock(replica_id=len(existing) + 1,
                              is_terminal=False,
@@ -1740,6 +1842,7 @@ class TestLogicalCapacityPlanning:
                              planned_capacity=width)
             existing.append(info)
             planned.append(width)
+            current_spot_locations.append(mock.Mock())
             return True
 
         with mock.patch.object(replica_managers.serve_state,
@@ -1759,6 +1862,8 @@ class TestLogicalCapacityPlanning:
                                              reconcile_generation=7)
 
         assert planned == [8, 4]
+        assert location_snapshots[0] is location_snapshots[1]
+        assert len(location_snapshots[0]) == 2
         assert build_zero_cost_budget.call_args.kwargs[
             'demand_count_override'] == 9
 
@@ -2342,6 +2447,39 @@ class TestLaunchReplicaSnapshotAccumulation:
             manager._launch_replica(replica_id=1)
         # Without a caller-provided snapshot each launch scans fresh state.
         assert mock_scan.call_count == 1
+
+    def test_superseded_launch_does_not_advance_shared_snapshots(self):
+        placer = mock.Mock()
+        location = replica_managers.spot_placer.Location.from_pickleable({
+            'cloud': 'AWS',
+            'region': 'us-east-1',
+            'zone': 'us-east-1a',
+            'accelerators': {
+                'L4': 1
+            },
+            'use_spot': True,
+        })
+        placer.select_next_location.return_value = location
+        manager = self._make_manager(placer)
+        manager._logical_state_lock = threading.RLock()
+        manager._logical_reconcile_snapshot = None
+        manager._logical_target = (1, 7, 1)
+        shared_infos = []
+        shared_locations = []
+
+        with mock.patch('sky.serve.replica_managers._should_use_spot',
+                        return_value=True), \
+             mock.patch.object(manager, '_persist_replica') as persist:
+            launched = manager._launch_replica(
+                replica_id=1,
+                existing_replica_infos=shared_infos,
+                current_spot_locations=shared_locations,
+                logical_reconcile_fence=(1, 7, 1))
+
+        assert launched is False
+        assert not shared_infos
+        assert not shared_locations
+        persist.assert_not_called()
 
     def test_recovery_preserves_exact_spot_location(self):
         # A recovered spot row already owns its cluster name. Selecting a new
