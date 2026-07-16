@@ -10,7 +10,7 @@ import { ClusterJobs } from '@/components/jobs';
 import { useRouter } from 'next/router';
 import { Layout } from '@/components/elements/layout';
 import Link from 'next/link';
-import { Status2Actions } from '@/components/clusters';
+import { Status2Actions } from '@/components/cluster-actions';
 import { StatusBadge } from '@/components/elements/StatusBadge';
 import { Card } from '@/components/ui/card';
 import {
