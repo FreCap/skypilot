@@ -478,6 +478,19 @@ describe('normalizeReplicaHistory', () => {
     expect(history.requestWindowSeconds).toBe(3600);
     expect(history.requestsLastHour).toBe(7);
   });
+
+  it('does not fabricate zero requests when history is unavailable', () => {
+    const history = normalizeReplicaHistory({
+      available: false,
+      request_window_seconds: 3600,
+      requests_last_hour: 0,
+      samples: [],
+      request_samples: [],
+    });
+
+    expect(history.available).toBe(false);
+    expect(history.requestsLastHour).toBeNull();
+  });
 });
 
 describe('normalizeService / normalizeReplica', () => {

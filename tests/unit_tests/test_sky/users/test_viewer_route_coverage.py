@@ -89,6 +89,8 @@ _KNOWN_VIEWER_DENIED: set = {
     # capacity state and is never a viewer API.
     ('/api/internal/serve/{service_name}/controller/load_balancer_sync', 'POST'
     ),
+    ('/api/internal/serve/{service_name}/controller/'
+     'load_balancer_request_history_sync', 'POST'),
     # --- Volumes writes ---
     ('/volumes/apply', 'POST'),
     ('/volumes/delete', 'POST'),

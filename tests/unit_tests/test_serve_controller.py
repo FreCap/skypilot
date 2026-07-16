@@ -1666,6 +1666,138 @@ class TestAuthoritativeLbReportIngestion:
         assert accepted is True
         assert ctrl._replica_manager.confirmed_bridge_capacities == [{1: 8}]  # pylint: disable=protected-access
 
+    def test_sync_confirms_empty_logical_version_bridge_with_hardware_cap(self):
+        ctrl, info, report = self._controller_and_report()
+        ctrl._autoscaler.replica_unit = 'logical'  # pylint: disable=protected-access
+        ctrl._autoscaler.latest_version = 2  # pylint: disable=protected-access
+        ctrl._lb_translation_cache = {  # pylint: disable=protected-access
+            1: (self._URL, 'L4', 8)
+        }
+        report['total_slots_by_url'] = {self._URL: 64}
+        report['occupancy_sampled_urls'] = [self._URL]
+        report['unknown_in_flight_urls'] = []
+
+        with mock.patch.object(
+                ctrl, '_owns_current_service', return_value=True), \
+             mock.patch.object(
+                 ctrl,
+                 '_lb_report_authority',
+                 return_value=(True, True, True)), \
+             mock.patch.object(
+                 ctrl,
+                 '_snapshot_replica_occupancy',
+                 return_value=([info], {
+                     1: True
+                 }, set())), \
+             mock.patch.object(
+                 ctrl, '_get_lb_replica_info', return_value=({}, 1)), \
+             mock.patch.object(
+                 ctrl,
+                 '_persist_request_history',
+                 new=mock.AsyncMock(return_value=True)), \
+             mock.patch.object(
+                 ctrl, '_get_capacity_hint', return_value={}):
+            response = asyncio.run(
+                ctrl._handle_load_balancer_sync(  # pylint: disable=protected-access
+                    report))
+
+        assert response.status_code == 200
+        assert ctrl._replica_manager.confirmed_bridge_capacities == [{1: 8}]  # pylint: disable=protected-access
+        assert info.planned_capacity == 8
+        assert info.logical_bridge_capacity_verified is True
+        assert ctrl._autoscaler.reports[-1][  # pylint: disable=protected-access
+            'observed_slots_by_replica_id'] == {
+                1: 8
+            }
+
+    @pytest.mark.parametrize('cached', [
+        None,
+        ('http://1.1.1.1:8080', 'unknown', 8),
+        ('http://1.1.1.1:8080', 'L4', 0),
+    ])
+    def test_unresolved_bridge_hardware_clamps_to_durable_width(self, cached):
+        ctrl, info, _ = self._controller_and_report()
+        ctrl._autoscaler.replica_unit = 'logical'  # pylint: disable=protected-access
+        ctrl._lb_translation_cache = ({  # pylint: disable=protected-access
+            1: cached
+        } if cached is not None else {})
+        observed_slots = {1: 64}
+
+        candidates = ctrl._logical_bridge_capacity_candidates(  # pylint: disable=protected-access
+            [info], set(), observed_slots)
+
+        assert not candidates
+        assert observed_slots == {1: 1}
+
+    @pytest.mark.parametrize(('reported', 'expected'), [(64, 4), (2, 2)])
+    def test_unresolved_bridge_hardware_caps_at_verified_durable_width(
+            self, reported, expected):
+        ctrl, info, _ = self._controller_and_report()
+        ctrl._autoscaler.replica_unit = 'logical'  # pylint: disable=protected-access
+        ctrl._lb_translation_cache = {  # pylint: disable=protected-access
+            1: (self._URL, 'unknown', 8)
+        }
+        info.planned_capacity = 4
+        info.logical_bridge_capacity_verified = True
+        observed_slots = {1: reported}
+
+        candidates = ctrl._logical_bridge_capacity_candidates(  # pylint: disable=protected-access
+            [info], set(), observed_slots)
+
+        assert not candidates
+        assert observed_slots == {1: expected}
+
+    @pytest.mark.parametrize(
+        ('planned', 'verified', 'reported', 'expected'),
+        [(1, False, 64, 1), (4, True, 64, 4), (4, True, 2, 2)],
+    )
+    def test_sync_bounds_unknown_bridge_hardware_before_autoscaling(
+            self, planned, verified, reported, expected):
+        ctrl, info, report = self._controller_and_report()
+        ctrl._autoscaler.replica_unit = 'logical'  # pylint: disable=protected-access
+        ctrl._autoscaler.latest_version = 2  # pylint: disable=protected-access
+        ctrl._lb_translation_cache = {  # pylint: disable=protected-access
+            1: (self._URL, 'unknown', 8)
+        }
+        info.planned_capacity = planned
+        info.logical_bridge_capacity_verified = verified
+        report['total_slots_by_url'] = {self._URL: reported}
+        report['occupancy_sampled_urls'] = [self._URL]
+        report['unknown_in_flight_urls'] = []
+
+        with mock.patch.object(
+                ctrl, '_owns_current_service', return_value=True), \
+             mock.patch.object(
+                 ctrl,
+                 '_lb_report_authority',
+                 return_value=(True, True, True)), \
+             mock.patch.object(
+                 ctrl,
+                 '_snapshot_replica_occupancy',
+                 return_value=([info], {
+                     1: True
+                 }, set())), \
+             mock.patch.object(
+                 ctrl, '_get_lb_replica_info', return_value=({}, 1)), \
+             mock.patch.object(
+                 ctrl,
+                 '_persist_request_history',
+                 new=mock.AsyncMock(return_value=True)), \
+             mock.patch.object(
+                 ctrl, '_get_capacity_hint', return_value={}):
+            response = asyncio.run(
+                ctrl._handle_load_balancer_sync(  # pylint: disable=protected-access
+                    report))
+
+        assert response.status_code == 200
+        assert ctrl._replica_manager.confirmed_bridge_capacities == []  # pylint: disable=protected-access
+        assert info.planned_capacity == planned
+        assert info.logical_bridge_capacity_verified is verified
+        assert ctrl._autoscaler.reports[-1][  # pylint: disable=protected-access
+            'observed_slots_by_replica_id'] == {
+                1: expected
+            }
+
     def test_sole_ready_reporter_keeps_demand_during_terminating_overlap(self):
         ctrl, info, report = self._controller_and_report()
         with mock.patch.object(controller.lb_k8s,
@@ -1738,18 +1870,21 @@ class TestAuthoritativeLbReportIngestion:
             observed['sync'] = dict(async_occupancy_by_version)
             return ({}, 0)
 
-        async def _capture_ingest(request_data,
-                                  replica_infos,
-                                  async_occupancy_by_version,
-                                  authority=None,
-                                  logical_versions=None):
-            del request_data, replica_infos, authority
+        async def _capture_confirm(replica_infos, logical_versions,
+                                   observed_slots):
+            del replica_infos, observed_slots
+            observed['ingest_logical_versions'] = set(logical_versions)
+
+        def _capture_ingest(request_data, replica_infos,
+                            async_occupancy_by_version, authority,
+                            observed_slots):
+            del request_data, replica_infos, authority, observed_slots
             observed['ingest'] = dict(async_occupancy_by_version)
-            observed['ingest_logical_versions'] = set(logical_versions or ())
             return True
 
         ctrl._get_lb_replica_info = _capture_lb_replica_info  # pylint: disable=protected-access
-        ctrl._ingest_load_balancer_report = _capture_ingest  # pylint: disable=protected-access
+        ctrl._confirm_logical_bridge_capacities = _capture_confirm  # pylint: disable=protected-access
+        ctrl._apply_load_balancer_report = _capture_ingest  # pylint: disable=protected-access
 
         def _capture_capacity_hint(replica_infos, logical_versions):
             observed['logical_versions'] = set(logical_versions)
@@ -2112,6 +2247,7 @@ class TestLbSyncBlockingReadsOffLoop:
 
     def _run_sync(self):
         ctrl = _make_controller()
+        ctrl._autoscaler = mock.Mock(replica_unit='physical')  # pylint: disable=protected-access
         # Arm the ownership fence so _owns_current_service reads the DB.
         ctrl._service_hash = 'incarnation-a'  # pylint: disable=protected-access
         ctrl._controller_owner = (101, '10.0.0.1')  # pylint: disable=protected-access
@@ -2132,7 +2268,7 @@ class TestLbSyncBlockingReadsOffLoop:
             'controller_ip': '10.0.0.1',
         }
 
-        async def _ingest(*_args, **_kwargs):
+        def _ingest(*_args, **_kwargs):
             return True
 
         loop_thread = []
@@ -2153,7 +2289,7 @@ class TestLbSyncBlockingReadsOffLoop:
                                return_value=(True, True, True)), \
              mock.patch.object(ctrl, '_get_lb_replica_info',
                                return_value=([], 0)), \
-             mock.patch.object(ctrl, '_ingest_load_balancer_report',
+             mock.patch.object(ctrl, '_apply_load_balancer_report',
                                side_effect=_ingest), \
              mock.patch.object(ctrl, '_get_capacity_hint',
                                return_value={}):
@@ -2191,16 +2327,22 @@ class TestLbSyncOwnershipFences:
 
     def _make_fenced_controller(self):
         ctrl = _make_controller()
+        ctrl._autoscaler = mock.Mock(replica_unit='physical')  # pylint: disable=protected-access
         ctrl._service_hash = 'incarnation-a'  # pylint: disable=protected-access
         ctrl._controller_owner = (101, '10.0.0.1')  # pylint: disable=protected-access
         return ctrl
 
-    def _sync(self, ctrl, owner_rows):
+    def _sync(self, ctrl, owner_rows, request_data=None):
         """Drive one sync; each fence read pops the next owner row."""
         ingest_calls = []
+        history_calls = []
 
-        async def _ingest(*args, **kwargs):
+        def _ingest(*args, **kwargs):
             ingest_calls.append((args, kwargs))
+            return True
+
+        def _record_history(data):
+            history_calls.append(data)
             return True
 
         with mock.patch.object(controller.serve_state,
@@ -2214,14 +2356,16 @@ class TestLbSyncOwnershipFences:
                                return_value=(True, True, True)), \
              mock.patch.object(ctrl, '_get_lb_replica_info',
                                return_value=([], 0)), \
-             mock.patch.object(ctrl, '_ingest_load_balancer_report',
+             mock.patch.object(ctrl, '_apply_load_balancer_report',
                                side_effect=_ingest), \
+             mock.patch.object(ctrl, '_record_request_history',
+                               side_effect=_record_history), \
              mock.patch.object(ctrl, '_get_capacity_hint',
                                return_value={}):
             response = asyncio.run(
                 ctrl._handle_load_balancer_sync(  # pylint: disable=protected-access
-                    {'lb_session_id': 'lb-a'}))
-        return response, ingest_calls
+                    request_data or {'lb_session_id': 'lb-a'}))
+        return response, ingest_calls, history_calls
 
     def test_non_owner_rejected_at_entry(self):
         ctrl = self._make_fenced_controller()
@@ -2230,7 +2374,7 @@ class TestLbSyncOwnershipFences:
             'controller_pid': 202,
             'controller_ip': '10.0.0.2',
         }
-        response, ingest_calls = self._sync(ctrl, owner_rows=[stolen])
+        response, ingest_calls, _ = self._sync(ctrl, owner_rows=[stolen])
         assert response.status_code == 503
         assert not ingest_calls
 
@@ -2249,23 +2393,180 @@ class TestLbSyncOwnershipFences:
             'controller_pid': 202,
             'controller_ip': '10.0.0.2',
         }
-        response, ingest_calls = self._sync(ctrl, owner_rows=[owned, stolen])
+        response, ingest_calls, _ = self._sync(ctrl, owner_rows=[owned, stolen])
         assert response.status_code == 503
         assert not ingest_calls
 
-    def test_ingest_never_awaits_with_authority_provided(self):
-        # The fence consolidation relies on this: with `authority` passed,
-        # _ingest_load_balancer_report must run to completion without
-        # yielding, so nothing can interleave between the fence, the
-        # mutation, and the disclosure.
+    def test_ownership_lost_during_history_write_blocks_disclosure(self):
+        ctrl = self._make_fenced_controller()
+        owned = {
+            'hash': 'incarnation-a',
+            'controller_pid': 101,
+            'controller_ip': '10.0.0.1',
+        }
+        stolen = {
+            'hash': 'incarnation-b',
+            'controller_pid': 202,
+            'controller_ip': '10.0.0.2',
+        }
+        request_data = {
+            'lb_session_id': 'lb-a',
+            'request_history_session_id': 'a' * 32,
+            'request_history': {
+                'bucket_seconds': 60,
+                'buckets': [],
+            },
+        }
+
+        response, ingest_calls, history_calls = self._sync(
+            ctrl, owner_rows=[owned, stolen], request_data=request_data)
+
+        assert response.status_code == 503
+        assert response.body == b''
+        assert history_calls == [request_data]
+        assert not ingest_calls
+
+    def test_ownership_lost_during_bridge_confirmation_blocks_side_effects(
+            self):
+        ctrl = self._make_fenced_controller()
+        autoscaler = _StatefulDemandAutoscaler()
+        autoscaler.replica_unit = 'logical'
+        autoscaler.latest_version = 2
+        replica_manager = _StatefulReplicaManager()
+        ctrl._autoscaler = autoscaler  # pylint: disable=protected-access
+        ctrl._replica_manager = replica_manager  # pylint: disable=protected-access
+        url = 'http://1.1.1.1:8080'
+        ctrl._lb_translation_cache = {  # pylint: disable=protected-access
+            1: (url, 'L4', 8)
+        }
+        info = _FakeReplicaInfo(1,
+                                serve_state.ReplicaStatus.READY,
+                                version=1,
+                                url=url,
+                                accelerators={'L4': 8})
+        report = {
+            'lb_session_id': 'lb-a',
+            'total_slots_by_url': {
+                url: 8
+            },
+        }
+        owns_service = [True]
+        confirm_started = threading.Event()
+        release_confirm = threading.Event()
+        confirmed = []
+
+        def _confirm(capacities):
+            confirmed.append(dict(capacities))
+            confirm_started.set()
+            assert release_confirm.wait(timeout=5)
+            return dict(capacities)
+
+        replica_manager.confirm_logical_bridge_capacities = _confirm
+        autoscaler_before = autoscaler.snapshot()
+        drain_before = replica_manager.snapshot()
+
+        async def _drive():
+            task = asyncio.create_task(
+                ctrl._handle_load_balancer_sync(  # pylint: disable=protected-access
+                    report))
+            for _ in range(500):
+                if confirm_started.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert confirm_started.is_set()
+            owns_service[0] = False
+            release_confirm.set()
+            return await task
+
+        with mock.patch.object(
+                ctrl,
+                '_owns_current_service',
+                side_effect=lambda: owns_service[0]), \
+             mock.patch.object(
+                 ctrl,
+                 '_lb_report_authority',
+                 return_value=(True, True, True)), \
+             mock.patch.object(
+                 ctrl,
+                 '_snapshot_replica_occupancy',
+                 return_value=([info], {
+                     1: True
+                 }, {2})), \
+             mock.patch.object(
+                 ctrl, '_get_lb_replica_info', return_value=({
+                     'secret': {}
+                 }, 1)), \
+             mock.patch.object(
+                 ctrl,
+                 '_persist_request_history',
+                 new=mock.AsyncMock(return_value=True)):
+            response = asyncio.run(_drive())
+
+        assert response.status_code == 503
+        assert response.body == b''
+        assert confirmed == [{1: 8}]
+        assert autoscaler.snapshot() == autoscaler_before
+        assert replica_manager.snapshot() == drain_before
+
+    def test_history_only_sync_never_ingests_demand_or_discloses_routes(self):
+        ctrl = self._make_fenced_controller()
+        request_data = {
+            'lb_session_id': 'lb-a',
+            'request_history_session_id': 'a' * 32,
+            'request_history': {
+                'bucket_seconds': 60,
+                'buckets': [],
+            },
+        }
+        ctrl._ingest_load_balancer_report = mock.AsyncMock()  # pylint: disable=protected-access
+
+        with mock.patch.object(ctrl,
+                               '_owns_current_service',
+                               return_value=True), \
+             mock.patch.object(ctrl,
+                               '_lb_report_authority',
+                               return_value=(True, False, False)), \
+             mock.patch.object(
+                 ctrl,
+                 '_persist_request_history',
+                 new=mock.AsyncMock(return_value=True)) as persist:
+            response = asyncio.run(
+                ctrl._handle_load_balancer_request_history_sync(  # pylint: disable=protected-access
+                    request_data))
+
+        assert response.status_code == 200
+        assert json.loads(response.body) == {'request_history_accepted': True}
+        persist.assert_awaited_once_with(request_data)
+        ctrl._ingest_load_balancer_report.assert_not_awaited()  # pylint: disable=protected-access
+
+    def test_history_only_sync_rejects_nonmember_before_persistence(self):
+        ctrl = self._make_fenced_controller()
+        persist = mock.AsyncMock(return_value=True)
+
+        with mock.patch.object(ctrl,
+                               '_owns_current_service',
+                               return_value=True), \
+             mock.patch.object(ctrl,
+                               '_lb_report_authority',
+                               return_value=(False, False, False)), \
+             mock.patch.object(
+                 ctrl, '_persist_request_history', new=persist):
+            response = asyncio.run(
+                ctrl._handle_load_balancer_request_history_sync(  # pylint: disable=protected-access
+                    {'lb_session_id': 'other-service-pod'}))
+
+        assert response.status_code == 503
+        assert response.body == b''
+        persist.assert_not_awaited()
+
+    def test_apply_load_balancer_report_is_synchronous(self):
+        # The final ownership fence relies on runtime mutation and routing
+        # disclosure having no await between them.
         ctrl = _make_controller()
         ctrl._replica_manager = mock.Mock()
         ctrl._autoscaler = mock.Mock()
-        coro = ctrl._ingest_load_balancer_report(  # pylint: disable=protected-access
+        accepted = ctrl._apply_load_balancer_report(  # pylint: disable=protected-access
             {'lb_session_id': 'lb-a'}, [], {},
-            authority=(True, True, True))
-        # Driving the coroutine by hand: a bare send(None) must finish it
-        # in one step (StopIteration) -- any await would suspend instead.
-        with pytest.raises(StopIteration) as stop:
-            coro.send(None)
-        assert stop.value.value is True
+            authority=(True, True, True),
+            observed_slots={})
+        assert accepted is True

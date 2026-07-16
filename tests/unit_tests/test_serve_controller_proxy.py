@@ -156,6 +156,27 @@ def test_proxy_forwards_raw_body_once_and_preserves_response(monkeypatch):
         constants.LB_CONTROLLER_PROXY_TIMEOUT_SECONDS)
 
 
+def test_proxy_forwards_history_only_sync_to_distinct_controller_path(
+        monkeypatch):
+    owner = _owner()
+    _patch_owner_reads(monkeypatch, [owner, owner])
+    calls = []
+    monkeypatch.setattr(controller_proxy.aiohttp, 'ClientSession',
+                        lambda: _FakeClientSession(calls))
+    path = ('/api/internal/serve/svc/controller/'
+            'load_balancer_request_history_sync')
+
+    response = asyncio.run(
+        controller_proxy.proxy_load_balancer_request_history_sync(
+            'svc', _request(path, body=b'{"request_history": {}}')))
+
+    assert response.status_code == 200
+    assert len(calls) == 1
+    assert calls[0]['url'] == ('http://10.2.3.4:20001/controller/'
+                               'load_balancer_request_history_sync')
+    assert calls[0]['data'] == b'{"request_history": {}}'
+
+
 def test_proxy_rejects_response_if_owner_changes(monkeypatch):
     _patch_owner_reads(monkeypatch, [
         _owner(),
@@ -284,7 +305,11 @@ def test_proxy_connection_failure_is_503_without_retry(monkeypatch):
 
 @pytest.mark.parametrize('path,expected', [
     ('/api/internal/serve/svc/controller/load_balancer_sync', True),
+    ('/api/internal/serve/svc/controller/'
+     'load_balancer_request_history_sync', True),
     ('/api/internal/serve//controller/load_balancer_sync', False),
+    ('/api/internal/serve//controller/'
+     'load_balancer_request_history_sync', False),
     ('/api/internal/serve/a/b/controller/load_balancer_sync', False),
     ('/api/internal/serve/svc/controller/load_balancer_sync/more', False),
     ('/api/internal/serve/svc/controller/update_service', False),
@@ -298,6 +323,8 @@ def test_internal_route_is_hidden_from_openapi():
     app.include_router(controller_proxy.router)
     assert controller_proxy.CONTROLLER_SYNC_ROUTE_PATH not in app.openapi(
     )['paths']
+    assert (controller_proxy.CONTROLLER_HISTORY_SYNC_ROUTE_PATH
+            not in app.openapi()['paths'])
 
 
 def test_api_server_route_authenticates_and_proxies(monkeypatch):
@@ -328,6 +355,40 @@ def test_api_server_route_authenticates_and_proxies(monkeypatch):
 
     assert response.status_code == 200
     assert response.json() == {'replica_info': {}}
+    assert len(calls) == 1
+
+
+def test_api_server_history_route_uses_sync_auth(monkeypatch):
+    monkeypatch.setattr(server.serve_utils,
+                        'get_lb_sync_auth_tokens',
+                        lambda required=False: ('sync-token',))
+    owner = _owner()
+    _patch_owner_reads(monkeypatch, [owner, owner])
+    calls = []
+    upstream = _FakeControllerResponse(
+        body=b'{"request_history_accepted": true}')
+    monkeypatch.setattr(controller_proxy.aiohttp, 'ClientSession',
+                        lambda: _FakeClientSession(calls, response=upstream))
+    path = ('/api/internal/serve/svc/controller/'
+            'load_balancer_request_history_sync')
+    client = testclient.TestClient(server.app)
+
+    rejected = client.post(path,
+                           headers={'Authorization': 'Bearer wrong'},
+                           json={'request_history': {}})
+    assert rejected.status_code == 401
+    assert not calls
+
+    response = client.post(
+        path,
+        headers={
+            'Authorization': 'Bearer sync-token',
+            constants.SERVICE_HASH_HEADER: 'service-incarnation-a',
+        },
+        json={'request_history': {}})
+
+    assert response.status_code == 200
+    assert response.json() == {'request_history_accepted': True}
     assert len(calls) == 1
 
 

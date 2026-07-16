@@ -248,6 +248,45 @@ describe('ServiceDetailCard cost and request estimates', () => {
     expect(screen.getByText(/1\/2 physical backends ready/)).toBeTruthy();
     expect(screen.queryByText('Replicas (ready/total)')).toBeNull();
   });
+
+  it('does not show a request total when durable history is unavailable', () => {
+    render(
+      <ServiceDetailCard
+        requestHistory={{
+          available: false,
+          requestsLastHour: 0,
+        }}
+        serviceData={{
+          name: 'svc',
+          status: 'READY',
+          uptime: null,
+          replicasReady: 1,
+          replicasTotal: 1,
+          replicasFailed: 0,
+          targetReplicas: 1,
+          endpoint: null,
+          policy: 'fixed',
+          loadBalancingPolicy: 'round_robin',
+          requestedResources: 'L4:1',
+          activeVersions: [1],
+          estimatedHourlyCost: null,
+          spotHourlyCost: 0,
+          onDemandHourlyCost: 0,
+          hourlyCostExcludedReplicaCount: 0,
+          requestRate: null,
+          recentRequestCount: null,
+          requestWindowSeconds: null,
+          inFlightRequests: null,
+          requestQueueDepth: null,
+          rejectedRequests: null,
+          requestStatsAgeSeconds: null,
+          costPerThousandRequests: null,
+        }}
+      />
+    );
+
+    expect(screen.queryByText('0 requests in last hour')).toBeNull();
+  });
 });
 
 describe('service replica placement breakdown', () => {

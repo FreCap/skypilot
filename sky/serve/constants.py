@@ -296,6 +296,9 @@ LB_JOB_ID_HEADER = 'X-SkyServe-Job-Id'
 # pulls it from the Service endpoints), then waits this long for in-flight
 # requests to drain before letting the server exit.
 LB_DRAIN_GRACE_SECONDS = 15
+# Keep the best-effort history-only shutdown flush comfortably inside the
+# pod's drain grace. It must never extend termination or re-register demand.
+LB_DRAIN_HISTORY_FLUSH_TIMEOUT_SECONDS = 5
 
 # [boltz fork] Reserved-capacity fill (opt-in via
 # replica_policy.reserved_capacity_fill): the controller runs a poller that

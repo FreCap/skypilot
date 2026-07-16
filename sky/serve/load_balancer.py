@@ -862,10 +862,27 @@ class SkyServeLoadBalancer:
 
     def _begin_draining(self) -> None:
         """Start draining (idempotent): fail readiness + stop syncing."""
-        if not self._draining:
-            logger.info('Draining load balancer: failing readiness and '
-                        'deregistering from the controller sync.')
+        if self._draining:
+            return
+        logger.info('Draining load balancer: failing readiness and '
+                    'deregistering from the controller sync.')
         self._draining = True
+        if self._request_aggregator.request_history_snapshot() is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # Direct synchronous tests and unsupported runtimes have no loop.
+            # Production SIGTERM is delivered on uvicorn's running loop.
+            return
+        task = loop.create_task(self._flush_request_history_on_drain())
+        self._background_tasks.append(task)
+
+        def _discard(done: asyncio.Task) -> None:
+            with contextlib.suppress(ValueError):
+                self._background_tasks.remove(done)
+
+        task.add_done_callback(_discard)
 
     def _get_lb_session_id(self) -> str:
         """Return the durable external LB identity, failing closed if absent."""
@@ -2161,6 +2178,56 @@ class SkyServeLoadBalancer:
                 # controller creates a CPU/network/log hot loop.
                 await asyncio.sleep(retry_delay)
 
+    async def _flush_request_history_on_drain(self) -> None:
+        """Best-effort bounded history flush that cannot report demand."""
+        request_history = self._request_aggregator.request_history_snapshot()
+        if request_history is None:
+            return
+        try:
+            sync_tokens = serve_utils.get_lb_sync_auth_tokens(required=True)
+            session_id = self._get_lb_session_id()
+            payload = {
+                'request_history': request_history,
+                'request_history_session_id': self._request_history_session_id,
+                'lb_session_id': session_id,
+            }
+            async with aiohttp.ClientSession() as session:
+                token_attempts: tuple[str | None,
+                                      ...] = (sync_tokens if sync_tokens else
+                                              (None,))
+                for token_index, controller_token in enumerate(token_attempts):
+                    headers = {}
+                    if controller_token is not None:
+                        headers['Authorization'] = (
+                            f'Bearer {controller_token}')
+                    if self._service_hash is not None:
+                        headers[constants.SERVICE_HASH_HEADER] = (
+                            self._service_hash)
+                    async with session.post(
+                            self._controller_url + '/controller/'
+                            'load_balancer_request_history_sync',
+                            json=payload,
+                            headers=headers or None,
+                            timeout=aiohttp.ClientTimeout(
+                                constants.LB_DRAIN_HISTORY_FLUSH_TIMEOUT_SECONDS
+                            ),
+                    ) as response:
+                        if (getattr(response, 'status', None) == 401 and
+                                token_index + 1 < len(token_attempts)):
+                            continue
+                        response.raise_for_status()
+                        response_json = await response.json()
+                        if response_json.get(
+                                'request_history_accepted') is True:
+                            self._request_aggregator.mark_request_history_accepted(
+                                request_history)
+                        return
+        except Exception as e:  # pylint: disable=broad-except
+            # Shutdown must remain bounded even when the controller, token
+            # projection, or central database is unavailable.
+            logger.warning('Failed to flush request history while draining: '
+                           f'{common_utils.format_exception(e)}')
+
     async def _proxy_request_to(
             self, url: str,
             request: fastapi.Request) -> fastapi.responses.Response | Exception:
@@ -2332,6 +2399,12 @@ class SkyServeLoadBalancer:
             if acquired_slot:
                 # The configured active-concurrency budget owns the body now.
                 self._release_waiting_body_budget(request)
+            # Draining may begin while admission awaits. Recheck immediately
+            # before the inner handler records this arrival; there is no await
+            # between this fence and RequestTimestamp.add(), so the shutdown
+            # snapshot cannot miss a request that starts after draining.
+            if self._draining:
+                raise self._draining_request_error()
             response = await self._proxy_with_retries_inner(request)
             if (acquired_slot and
                     isinstance(response, _ReleasingStreamingResponse)):
