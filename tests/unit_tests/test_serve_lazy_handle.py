@@ -124,6 +124,36 @@ class TestToInfoDictPreComputedFields:
         assert result['resources_str'] == simple
         assert result['resources_str_full'] == full
 
+    def test_exposes_first_ready_time_and_end_to_end_latency(self):
+        info = _make_replica_info()
+        info.created_at = 100.0
+        info.status_property.first_ready_time = 166.5
+        # Exercise the persisted replica JSON contract, not just the live
+        # in-memory object.
+        info = replica_managers.ReplicaInfo.from_storage_dict(
+            info.to_storage_dict())
+
+        result = info.to_info_dict(with_handle=False,
+                                   with_url=False,
+                                   cluster_record=None)
+
+        assert result['ready_at'] == 166.5
+        assert result['time_to_ready_seconds'] == 66.5
+
+    @pytest.mark.parametrize('first_ready_time', [None, -1.0])
+    def test_does_not_expose_missing_or_failed_readiness(
+            self, first_ready_time):
+        info = _make_replica_info()
+        info.created_at = 100.0
+        info.status_property.first_ready_time = first_ready_time
+
+        result = info.to_info_dict(with_handle=False,
+                                   with_url=False,
+                                   cluster_record=None)
+
+        assert result['ready_at'] is None
+        assert result['time_to_ready_seconds'] is None
+
     def test_resources_str_full_falls_back_to_simple_when_none(self):
         """``get_readable_resources_repr`` returns ``(simple, None)`` if no
         full form is meaningful. Implementation must coerce to ``simple``."""
