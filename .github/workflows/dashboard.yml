@@ -53,7 +53,8 @@ jobs:
           src/lib/cache.test.js \
           src/lib/jobs-cache-manager.test.js \
           src/lib/request-activity.test.js \
-          src/lib/request-activity.persistence.test.js
+          src/lib/request-activity.persistence.test.js \
+          src/hooks/useTour.test.jsx
         npm --prefix sky/dashboard run lint
         npm --prefix sky/dashboard run format:check
         npm --prefix sky/dashboard run build
