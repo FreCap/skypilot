@@ -754,6 +754,16 @@ class ReplicaStatusProperty:
     logical_retirement_generation: int | None = None
     logical_retirement_target_capacity: int | None = None
     logical_retirement_confirmed_generation: int | None = None
+    # True only after an outdated backend consumed the full configured drain
+    # deadline without an explicit idle proof and replacement capacity was
+    # revalidated.  Persisted so down-thread admission can distinguish that
+    # bounded rolling-update completion from an ordinary idle confirmation.
+    logical_retirement_bounded_deadline: bool = False
+    # Persisted at down admission immediately before the worker starts. A
+    # SCHEDULED row without this bit is queued but unadmitted and may still be
+    # safely aborted after a controller restart. RUNNING/FAILED rows predate
+    # the bit but are already unambiguously committed cleanup.
+    logical_retirement_committed: bool | None = False
 
     def unrecoverable_failure(self) -> bool:
         """Whether the replica fails and cannot be recovered.
@@ -1009,6 +1019,14 @@ class ReplicaInfo:
     def to_storage_dict(self) -> dict[str, Any]:
         """Serialize control-plane state into the versioned JSON contract."""
         status_property = self.status_property
+        # getattr() is insufficient for old pickles. If a pre-field dataclass
+        # instance lacks this key, attribute lookup falls through to the new
+        # class-level default False and destroys the missing-vs-uncommitted
+        # distinction needed to recover an ambiguous SCHEDULED teardown.
+        logical_retirement_committed = vars(status_property).get(
+            'logical_retirement_committed')
+        if type(logical_retirement_committed) is not bool:
+            logical_retirement_committed = None
         location = _encode_replica_resource_state(self.location)
         resources_override = _encode_replica_resource_state(
             self.resources_override)
@@ -1075,6 +1093,11 @@ class ReplicaInfo:
                 'logical_retirement_confirmed_generation': getattr(
                     status_property, 'logical_retirement_confirmed_generation',
                     None),
+                'logical_retirement_bounded_deadline':
+                    (getattr(status_property,
+                             'logical_retirement_bounded_deadline', False)
+                     is True),
+                'logical_retirement_committed': logical_retirement_committed,
             },
         }
 
@@ -1142,6 +1165,12 @@ class ReplicaInfo:
                 'logical_retirement_target_capacity'),
             logical_retirement_confirmed_generation=status_state.get(
                 'logical_retirement_confirmed_generation'),
+            logical_retirement_bounded_deadline=(status_state.get(
+                'logical_retirement_bounded_deadline', False) is True),
+            logical_retirement_committed=(
+                status_state.get('logical_retirement_committed') if type(
+                    status_state.get('logical_retirement_committed')) is bool
+                else None),
         )
         return replica
 
@@ -1834,21 +1863,44 @@ class SkyPilotReplicaManager(ReplicaManager):
                 f'Service {self._service_name!r} incarnation changed while '
                 f'removing replica {replica_id}.')
 
+    def _failed_cleanup_retry_state(
+            self) -> tuple[dict[int, int], dict[int, float]]:
+        """Return retry maps, tolerating managers built before these fields.
+
+        Normal construction initializes both maps in ``__init__``.  Keeping
+        this accessor backward-compatible also protects lightweight embedders,
+        tests, and upgrade/recovery paths that reconstruct a manager without
+        replaying the newest initializer in full.
+        """
+        attempts: dict[int, int] | None = getattr(
+            self, '_failed_cleanup_retry_attempts', None)
+        retry_at: dict[int, float] | None = getattr(self,
+                                                    '_failed_cleanup_retry_at',
+                                                    None)
+        if attempts is None:
+            attempts = {}
+            self._failed_cleanup_retry_attempts = attempts
+        if retry_at is None:
+            retry_at = {}
+            self._failed_cleanup_retry_at = retry_at
+        return attempts, retry_at
+
     def _clear_failed_cleanup_retry(self, replica_id: int) -> None:
         """Forget in-memory cleanup rate limiting after confirmed success."""
-        self._failed_cleanup_retry_attempts.pop(replica_id, None)
-        self._failed_cleanup_retry_at.pop(replica_id, None)
+        attempts, retry_at = self._failed_cleanup_retry_state()
+        attempts.pop(replica_id, None)
+        retry_at.pop(replica_id, None)
 
     def _schedule_failed_cleanup_retry(self, replica_id: int) -> None:
         """Rate-limit, but never give up on, a durable cleanup failure."""
-        attempt = self._failed_cleanup_retry_attempts.get(replica_id, 0) + 1
-        self._failed_cleanup_retry_attempts[replica_id] = attempt
+        attempts, retry_at = self._failed_cleanup_retry_state()
+        attempt = attempts.get(replica_id, 0) + 1
+        attempts[replica_id] = attempt
         exponential_step = min(attempt - 1, 30)
         delay_seconds = min(
             _FAILED_CLEANUP_RETRY_BASE_SECONDS * 2**exponential_step,
             _FAILED_CLEANUP_RETRY_MAX_SECONDS)
-        self._failed_cleanup_retry_at[replica_id] = (time.monotonic() +
-                                                     delay_seconds)
+        retry_at[replica_id] = time.monotonic() + delay_seconds
         logger.warning(f'Replica {replica_id} cleanup will retry in '
                        f'{delay_seconds}s (attempt {attempt}).')
 
@@ -1914,11 +1966,16 @@ class SkyPilotReplicaManager(ReplicaManager):
         self._ownership_lost = threading.Event()
         self._down_thread_pool: thread_utils.ThreadSafeDict[
             int, thread_utils.SafeThread] = thread_utils.ThreadSafeDict()
-        self._failed_cleanup_retry_attempts: dict[int, int] = {}
-        self._failed_cleanup_retry_at: dict[int, float] = {}
+        self._failed_cleanup_retry_attempts = {}
+        self._failed_cleanup_retry_at = {}
         self._wait_for_idle_trackers: dict[int,
                                            tuple[_ReplicaDrainTracker | None,
                                                  float]] = {}
+        # A pre-commit-bit SCHEDULED row is ambiguous across an upgrade: the
+        # old controller may have started sky.down before persisting RUNNING.
+        # Keep it off-route until a fresh current-generation replacement proof
+        # lets us safely re-drive the idempotent teardown.
+        self._legacy_uncertain_logical_retirement_ids: set[int] = set()
 
         # Tick-scoped memo of per-version specs, reset at the start of every
         # probe round (see _probe_all_replicas). Within a single readiness probe
@@ -2190,8 +2247,21 @@ class SkyPilotReplicaManager(ReplicaManager):
                 info.status_property.preempted or
                 info.cluster_name in orphaned_spot_clusters)
         ]
+        legacy_uncertain_ids = getattr(
+            self, '_legacy_uncertain_logical_retirement_ids', None)
+        if legacy_uncertain_ids is None:
+            legacy_uncertain_ids = set()
+            self._legacy_uncertain_logical_retirement_ids = (
+                legacy_uncertain_ids)
         for replica_info in to_down_replicas:
             try:
+                if self._is_legacy_uncertain_logical_retirement(replica_info):
+                    logger.warning(
+                        f'Keeping legacy logical retirement for replica '
+                        f'{replica_info.replica_id} off-route until fresh '
+                        'replacement capacity is confirmed.')
+                    legacy_uncertain_ids.add(replica_info.replica_id)
+                    continue
                 if (getattr(replica_info.status_property,
                             'wait_for_idle_before_termination', False) is True):
                     self._register_wait_for_idle(replica_info)
@@ -3451,6 +3521,19 @@ class SkyPilotReplicaManager(ReplicaManager):
                                                     replica_id)
         assert info is not None
 
+        # A controller restart loses the in-memory down worker.  Once a
+        # logical retirement crossed the durable teardown boundary, its
+        # prior worker may already have started even if the last persisted
+        # process status is only SCHEDULED.  Re-evaluating the old selection
+        # epoch would then be unsafe: aborting could re-advertise a backend
+        # whose cloud resources are disappearing.  Detach the obsolete
+        # optimization fence; the SCHEDULED write below persists that
+        # detachment atomically before installing the idempotent cleanup
+        # worker.  The strict pre-commit shape (wait_for_idle=True) does not
+        # qualify and keeps the normal epoch/target/coverage abort behavior.
+        if self._is_committed_logical_retirement(info):
+            self._detach_committed_logical_retirement(info)
+
         if sync_down_logs:
             try:
                 _download_and_stream_logs(info)
@@ -3525,17 +3608,19 @@ class SkyPilotReplicaManager(ReplicaManager):
                                   replica_infos: list[ReplicaInfo]) -> None:
         """Re-drive every durable cleanup failure until absence is proven."""
         now = time.monotonic()
+        _, retry_at_by_replica = self._failed_cleanup_retry_state()
         for info in replica_infos:
             down_failed = (info.status_property.sky_down_status ==
                            common_utils.ProcessStatus.FAILED)
+            retry_pending = info.replica_id in retry_at_by_replica
             if (info.status != serve_state.ReplicaStatus.FAILED_CLEANUP and
-                    not down_failed):
+                    not down_failed and not retry_pending):
                 continue
             replica_id = info.replica_id
             if (replica_id in self._down_thread_pool or
                     replica_id in self._launch_thread_pool):
                 continue
-            retry_at = self._failed_cleanup_retry_at.get(replica_id, 0)
+            retry_at = retry_at_by_replica.get(replica_id, 0)
             if now < retry_at:
                 continue
 
@@ -3546,7 +3631,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             # Once an attempt is admitted, its durable SCHEDULED/RUNNING state
             # prevents duplicate reconciliation.  Remove the old deadline;
             # a failure records the next one in _handle_sky_down_finish.
-            self._failed_cleanup_retry_at.pop(replica_id, None)
+            retry_at_by_replica.pop(replica_id, None)
             try:
                 self._terminate_replica(
                     replica_id,
@@ -3661,13 +3746,24 @@ class SkyPilotReplicaManager(ReplicaManager):
             info.status_property.logical_retirement_generation = generation
             info.status_property.logical_retirement_target_capacity = (
                 target_capacity)
-            info.status_property.logical_retirement_confirmed_generation = (
-                None)
+        info.status_property.logical_retirement_confirmed_generation = (None)
+        info.status_property.logical_retirement_bounded_deadline = False
+        info.status_property.logical_retirement_committed = False
         self._persist_replica(replica_id, info)
         self._register_wait_for_idle(info)
 
-    def _logical_retirement_state(self, info: ReplicaInfo) -> str:
-        """Return safe, wait, or abort for one off-route logical backend."""
+    def _logical_retirement_state(self,
+                                  info: ReplicaInfo,
+                                  *,
+                                  require_victim_idle: bool = True) -> str:
+        """Return safe, wait, or abort for one off-route logical backend.
+
+        ``require_victim_idle=False`` is reserved for an outdated backend
+        that has already consumed its full configured drain window.  It still
+        requires a fresh current-epoch/current-target replacement-capacity
+        proof; only the retiring backend's otherwise-unprovable idle state is
+        omitted from that bounded rolling-update completion check.
+        """
         status = info.status_property
         version = getattr(status, 'logical_retirement_version', None)
         controller_epoch = getattr(status,
@@ -3676,8 +3772,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                                        None)
         selection_target = getattr(status, 'logical_retirement_target_capacity',
                                    None)
-        if (version is None or controller_epoch is None or
-                selection_generation is None or selection_target is None):
+        if (type(version) is not int or not isinstance(controller_epoch, str) or
+                not controller_epoch or type(selection_generation) is not int or
+                selection_generation < 0 or type(selection_target) is not int or
+                selection_target < 0):
             return 'abort'
         if controller_epoch != self._logical_controller_epoch:
             return 'abort'
@@ -3700,8 +3798,9 @@ class SkyPilotReplicaManager(ReplicaManager):
             return 'wait'
         if current_target > selection_target:
             return 'abort'
-        if (info.replica_id in snapshot.unknown_replica_ids or
-                snapshot.in_flight_by_replica_id.get(info.replica_id) != 0):
+        if (require_victim_idle and
+            (info.replica_id in snapshot.unknown_replica_ids or
+             snapshot.in_flight_by_replica_id.get(info.replica_id) != 0)):
             return 'wait'
 
         ready_capacity = 0
@@ -3719,10 +3818,216 @@ class SkyPilotReplicaManager(ReplicaManager):
                 int(getattr(candidate, 'planned_capacity', 1)), observed)
         return 'safe' if ready_capacity >= current_target else 'abort'
 
+    @staticmethod
+    def _is_committed_logical_retirement(info: ReplicaInfo) -> bool:
+        """Whether a persisted logical retirement must finish cleanup.
+
+        Down admission persists ``logical_retirement_committed`` immediately
+        before starting the worker. That disambiguates a budget-delayed
+        SCHEDULED row from the crash window in which ``sky.down`` may already
+        have started before RUNNING is persisted. Legacy RUNNING/FAILED rows
+        are intrinsically committed. Exact type/value checks keep malformed
+        state fail-closed.
+        """
+        status = info.status_property
+        retirement_version = getattr(status, 'logical_retirement_version', None)
+        controller_epoch = getattr(status,
+                                   'logical_retirement_controller_epoch', None)
+        selection_generation = getattr(status, 'logical_retirement_generation',
+                                       None)
+        selection_target = getattr(status, 'logical_retirement_target_capacity',
+                                   None)
+        confirmed_generation = getattr(
+            status, 'logical_retirement_confirmed_generation', None)
+        bounded_deadline = getattr(status,
+                                   'logical_retirement_bounded_deadline', False)
+        committed = getattr(status, 'logical_retirement_committed', None)
+        info_version = getattr(info, 'version', None)
+        committed_statuses = (
+            common_utils.ProcessStatus.SCHEDULED,
+            common_utils.ProcessStatus.RUNNING,
+            common_utils.ProcessStatus.FAILED,
+        )
+        return (status.is_scale_down is True and
+                status.wait_for_idle_before_termination is False and
+                status.sky_down_status in committed_statuses and
+                (committed is None or type(committed) is bool) and
+                (committed is True or
+                 (status.sky_down_status
+                  in (common_utils.ProcessStatus.RUNNING,
+                      common_utils.ProcessStatus.FAILED))) and
+                type(info_version) is int and
+                type(retirement_version) is int and
+                info_version <= retirement_version and
+                isinstance(controller_epoch, str) and bool(controller_epoch) and
+                type(selection_generation) is int and
+                selection_generation >= 0 and type(selection_target) is int and
+                selection_target >= 0 and type(confirmed_generation) is int and
+                confirmed_generation >= selection_generation and
+                type(bounded_deadline) is bool)
+
+    @staticmethod
+    def _is_legacy_uncertain_logical_retirement(info: ReplicaInfo) -> bool:
+        """Whether a pre-commit-bit SCHEDULED retirement is ambiguous."""
+        status = info.status_property
+        retirement_version = getattr(status, 'logical_retirement_version', None)
+        controller_epoch = getattr(status,
+                                   'logical_retirement_controller_epoch', None)
+        selection_generation = getattr(status, 'logical_retirement_generation',
+                                       None)
+        selection_target = getattr(status, 'logical_retirement_target_capacity',
+                                   None)
+        confirmed_generation = getattr(
+            status, 'logical_retirement_confirmed_generation', None)
+        bounded_deadline = getattr(status,
+                                   'logical_retirement_bounded_deadline', False)
+        committed = getattr(status, 'logical_retirement_committed', None)
+        info_version = getattr(info, 'version', None)
+        return (status.is_scale_down is True and
+                status.wait_for_idle_before_termination is False and
+                status.sky_down_status == common_utils.ProcessStatus.SCHEDULED
+                and committed is None and type(info_version) is int and
+                type(retirement_version) is int and
+                info_version <= retirement_version and
+                isinstance(controller_epoch, str) and bool(controller_epoch) and
+                type(selection_generation) is int and
+                selection_generation >= 0 and type(selection_target) is int and
+                selection_target >= 0 and type(confirmed_generation) is int and
+                confirmed_generation >= selection_generation and
+                type(bounded_deadline) is bool)
+
+    def _reconcile_legacy_uncertain_logical_retirements(self) -> None:
+        """Safely adopt and re-drive ambiguous pre-commit-bit retirements."""
+        uncertain_ids = getattr(self,
+                                '_legacy_uncertain_logical_retirement_ids',
+                                None)
+        if uncertain_ids is None:
+            uncertain_ids = set()
+            self._legacy_uncertain_logical_retirement_ids = uncertain_ids
+        if not uncertain_ids:
+            return
+
+        infos = serve_state.get_replica_infos_from_ids(self._service_name,
+                                                       sorted(uncertain_ids))
+        for replica_id in list(uncertain_ids):
+            info = infos.get(replica_id)
+            if info is None:
+                uncertain_ids.discard(replica_id)
+                continue
+            if self._is_committed_logical_retirement(info):
+                try:
+                    self._terminate_replica(replica_id,
+                                            sync_down_logs=False,
+                                            replica_drain_delay_seconds=0,
+                                            is_scale_down=True,
+                                            in_flight_drain_cap_seconds=0)
+                except Exception as e:  # pylint: disable=broad-except
+                    logger.warning(f'Failed to re-drive adopted legacy logical '
+                                   f'retirement for replica {replica_id}: '
+                                   f'{common_utils.format_exception(e)}')
+                    continue
+                uncertain_ids.discard(replica_id)
+                continue
+            if not self._is_legacy_uncertain_logical_retirement(info):
+                # Once classified as ambiguous, never reactivate the backend
+                # merely because its durable state becomes malformed. Keep the
+                # safe off-route state for operator inspection.
+                continue
+
+            with self._logical_state_lock:
+                snapshot = self._logical_reconcile_snapshot
+                target_state = self._logical_target
+                if (snapshot is None or target_state is None or
+                        not self._logical_snapshot_is_fresh(snapshot) or
+                        snapshot.version != self.latest_version):
+                    continue
+                target_version, target_generation, current_target = target_state
+                if (target_version != self.latest_version or
+                        target_generation != snapshot.generation):
+                    continue
+                pending_version = getattr(self, '_pending_version', None)
+                if (pending_version is not None and
+                        pending_version > self.latest_version):
+                    continue
+
+                status = info.status_property
+                old_selection = (
+                    status.logical_retirement_version,
+                    status.logical_retirement_controller_epoch,
+                    status.logical_retirement_generation,
+                    status.logical_retirement_target_capacity,
+                    status.logical_retirement_confirmed_generation,
+                    status.logical_retirement_bounded_deadline,
+                )
+                status.logical_retirement_version = self.latest_version
+                status.logical_retirement_controller_epoch = (
+                    self._logical_controller_epoch)
+                status.logical_retirement_generation = snapshot.generation
+                status.logical_retirement_target_capacity = current_target
+                status.logical_retirement_confirmed_generation = (
+                    snapshot.generation)
+                status.logical_retirement_bounded_deadline = False
+                if self._logical_retirement_state(
+                        info, require_victim_idle=False) != 'safe':
+                    (status.logical_retirement_version,
+                     status.logical_retirement_controller_epoch,
+                     status.logical_retirement_generation,
+                     status.logical_retirement_target_capacity,
+                     status.logical_retirement_confirmed_generation,
+                     status.logical_retirement_bounded_deadline) = old_selection
+                    continue
+
+                status.logical_retirement_committed = True
+                try:
+                    self._persist_replica(replica_id, info)
+                except Exception as e:  # pylint: disable=broad-except
+                    # The write may have committed server-side. A fresh read on
+                    # the next tick distinguishes committed from still-legacy
+                    # state without ever advertising the backend again.
+                    logger.warning(
+                        f'Failed to confirm adoption of legacy logical '
+                        f'retirement for replica {replica_id}: '
+                        f'{common_utils.format_exception(e)}')
+                    continue
+                try:
+                    self._terminate_replica(replica_id,
+                                            sync_down_logs=False,
+                                            replica_drain_delay_seconds=0,
+                                            is_scale_down=True,
+                                            in_flight_drain_cap_seconds=0)
+                except Exception as e:  # pylint: disable=broad-except
+                    logger.warning(f'Failed to schedule adopted legacy logical '
+                                   f'retirement for replica {replica_id}: '
+                                   f'{common_utils.format_exception(e)}')
+                    continue
+                uncertain_ids.discard(replica_id)
+
+    def _detach_committed_logical_retirement(self, info: ReplicaInfo) -> None:
+        """Make an irreversible teardown independent of its selection."""
+        assert self._is_committed_logical_retirement(info)
+        status = info.status_property
+        logger.info(
+            f'Recovering committed logical retirement of replica '
+            f'{info.replica_id}; continuing teardown independently of its '
+            'obsolete controller selection epoch.')
+        status.logical_retirement_version = None
+        status.logical_retirement_controller_epoch = None
+        status.logical_retirement_generation = None
+        status.logical_retirement_target_capacity = None
+        status.logical_retirement_confirmed_generation = None
+        status.logical_retirement_bounded_deadline = False
+        status.logical_retirement_committed = False
+
     def _abort_logical_retirement(self, info: ReplicaInfo, reason: str) -> None:
         """Cancel an optimization retirement and make a healthy backend live."""
         logger.info(f'Aborting logical retirement of replica '
                     f'{info.replica_id}: {reason}.')
+        down_thread_pool = getattr(self, '_down_thread_pool', {})
+        queued_down = down_thread_pool.get(info.replica_id)
+        if (queued_down is not None and not queued_down.is_alive() and
+                info.status_property.sky_down_status
+                == common_utils.ProcessStatus.SCHEDULED):
+            down_thread_pool.pop(info.replica_id)
         status = info.status_property
         status.sky_down_status = None
         status.is_scale_down = False
@@ -3734,14 +4039,20 @@ class SkyPilotReplicaManager(ReplicaManager):
         status.logical_retirement_generation = None
         status.logical_retirement_target_capacity = None
         status.logical_retirement_confirmed_generation = None
+        status.logical_retirement_bounded_deadline = False
+        status.logical_retirement_committed = False
         self._persist_replica(info.replica_id, info)
         self._wait_for_idle_trackers.pop(info.replica_id, None)
 
-    def _finish_logical_retirement_after_idle(self, replica_id: int,
-                                              info: ReplicaInfo) -> None:
-        """Recheck and schedule one drained logical retirement atomically."""
+    def _finish_logical_retirement(self,
+                                   replica_id: int,
+                                   info: ReplicaInfo,
+                                   *,
+                                   require_victim_idle: bool = True) -> None:
+        """Recheck and schedule one fenced logical retirement atomically."""
         with self._logical_state_lock:
-            retirement_state = self._logical_retirement_state(info)
+            retirement_state = self._logical_retirement_state(
+                info, require_victim_idle=require_victim_idle)
             if retirement_state == 'wait':
                 return
             if retirement_state == 'abort':
@@ -3752,10 +4063,13 @@ class SkyPilotReplicaManager(ReplicaManager):
             assert snapshot is not None
             info.status_property.logical_retirement_confirmed_generation = (
                 snapshot.generation)
+            info.status_property.logical_retirement_bounded_deadline = (
+                not require_victim_idle)
             self._persist_replica(replica_id, info)
             # The state lock prevents a later sync from invalidating the
             # confirmation between this final proof and shutdown scheduling.
-            if self._logical_retirement_state(info) != 'safe':
+            if self._logical_retirement_state(
+                    info, require_victim_idle=require_victim_idle) != 'safe':
                 return
             # _terminate_replica atomically clears the durable idle-wait bit
             # with its SCHEDULED down state before installing the worker. Keep
@@ -3778,7 +4092,12 @@ class SkyPilotReplicaManager(ReplicaManager):
                         f'replica {replica_id}: '
                         f'{common_utils.format_exception(restore_error)}')
                 raise
-            self._wait_for_idle_trackers.pop(replica_id, None)
+            if not require_victim_idle:
+                # Bounded completion no longer needs victim-idle evidence.
+                # Ordinary completion retains the original deadline until
+                # the queued down worker actually starts, so late occupancy
+                # cannot strand a budget-delayed retirement forever.
+                self._wait_for_idle_trackers.pop(replica_id, None)
 
     def _refresh_wait_for_idle(self) -> None:
         """Admit strict drains only after fresh LB zero-occupancy proof."""
@@ -3786,6 +4105,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         # instantiate the manager without running the current constructor.
         if not hasattr(self, '_wait_for_idle_trackers'):
             self._wait_for_idle_trackers = {}
+        down_thread_pool = getattr(self, '_down_thread_pool', {})
         tracker_items = list(self._wait_for_idle_trackers.items())
         if not tracker_items:
             return
@@ -3793,13 +4113,29 @@ class SkyPilotReplicaManager(ReplicaManager):
         replica_infos = serve_state.get_replica_infos_from_ids(
             self._service_name, [replica_id for replica_id, _ in tracker_items])
         tracked_infos: dict[int, ReplicaInfo] = {}
+        queued_logical_ids: set[int] = set()
         for replica_id, _ in tracker_items:
             info = replica_infos.get(replica_id)
-            if (info is None or getattr(info.status_property,
-                                        'wait_for_idle_before_termination',
-                                        False) is not True):
+            if info is None:
                 self._wait_for_idle_trackers.pop(replica_id, None)
                 continue
+            status = info.status_property
+            waiting_for_idle = getattr(status,
+                                       'wait_for_idle_before_termination',
+                                       False) is True
+            down_thread = down_thread_pool.get(replica_id)
+            queued_logical = (getattr(status, 'logical_retirement_version',
+                                      None) is not None and
+                              status.is_scale_down is True and
+                              status.sky_down_status
+                              == common_utils.ProcessStatus.SCHEDULED and
+                              down_thread is not None and
+                              not down_thread.is_alive())
+            if not waiting_for_idle and not queued_logical:
+                self._wait_for_idle_trackers.pop(replica_id, None)
+                continue
+            if queued_logical:
+                queued_logical_ids.add(replica_id)
             tracked_infos[replica_id] = info
 
         cluster_names = list(
@@ -3834,13 +4170,44 @@ class SkyPilotReplicaManager(ReplicaManager):
                             'changed')
                         continue
                 if deadline_expired and not drained:
+                    retirement_version = getattr(info.status_property,
+                                                 'logical_retirement_version',
+                                                 None)
+                    info_version = getattr(info, 'version', None)
+                    outdated_backend = (type(retirement_version) is int and
+                                        type(info_version) is int and
+                                        info_version < retirement_version)
+                    if outdated_backend:
+                        with self._logical_state_lock:
+                            bounded_state = self._logical_retirement_state(
+                                info, require_victim_idle=False)
+                            if bounded_state == 'abort':
+                                self._abort_logical_retirement(
+                                    info, 'the bounded rolling-update '
+                                    'coverage fence changed')
+                                continue
+                        if bounded_state == 'wait':
+                            continue
+                        logger.warning(
+                            f'Outdated replica {replica_id} reached its '
+                            'post-routing idle-proof deadline; replacement '
+                            'capacity still covers the target, so completing '
+                            'the bounded rolling-update retirement.')
+                        self._finish_logical_retirement(
+                            replica_id, info, require_victim_idle=False)
+                        continue
                     with self._logical_state_lock:
                         self._abort_logical_retirement(
                             info, 'post-routing idle proof timed out')
                     continue
                 if not drained:
                     continue
-                self._finish_logical_retirement_after_idle(replica_id, info)
+                if replica_id in queued_logical_ids:
+                    # Keep revalidating the original deadline until the
+                    # resource budget admits this already-scheduled worker.
+                    # Admission below performs the final strict state proof.
+                    continue
+                self._finish_logical_retirement(replica_id, info)
                 continue
             if not drained and not deadline_expired:
                 continue
@@ -4116,6 +4483,9 @@ class SkyPilotReplicaManager(ReplicaManager):
         the fly. If any of them finished, it will update the status of the
         corresponding replica.
         """
+        # A pre-field SCHEDULED retirement stays off-route across an upgrade
+        # until current replacement capacity proves it can be re-driven.
+        self._reconcile_legacy_uncertain_logical_retirements()
         # Economic retirements are persisted off-route first and enter the
         # normal termination pool only after the LB proves they are idle.
         self._refresh_wait_for_idle()
@@ -4328,12 +4698,29 @@ class SkyPilotReplicaManager(ReplicaManager):
                                            contextlib.nullcontext())
                     with logical_state_guard:
                         if logical_retirement:
+                            status = info.status_property
+                            retirement_version = getattr(
+                                status, 'logical_retirement_version', None)
+                            confirmed_generation = getattr(
+                                status,
+                                'logical_retirement_confirmed_generation', None)
+                            bounded_deadline = getattr(
+                                status, 'logical_retirement_bounded_deadline',
+                                False)
+                            info_version = getattr(info, 'version', None)
+                            bounded_outdated_retirement = (
+                                type(retirement_version) is int and
+                                type(info_version) is int and
+                                info_version < retirement_version and
+                                type(confirmed_generation) is int and
+                                bounded_deadline is True)
                             retirement_state = self._logical_retirement_state(
-                                info)
+                                info,
+                                require_victim_idle=
+                                not bounded_outdated_retirement)
                             if retirement_state == 'wait':
                                 continue
                             if retirement_state == 'abort':
-                                self._down_thread_pool.pop(replica_id)
                                 self._abort_logical_retirement(
                                     info, 'shutdown admission fence changed')
                                 continue
@@ -4341,15 +4728,71 @@ class SkyPilotReplicaManager(ReplicaManager):
                             assert snapshot is not None
                             info.status_property.logical_retirement_confirmed_generation = (
                                 snapshot.generation)
+                            # The RUNNING write below is the durable admission
+                            # boundary. After it, a crash may happen before
+                            # t.start(), so recovery must finish cleanup.
+                            # Before it, a budget-delayed SCHEDULED retirement
+                            # remains safe to abort and reselect.
+                            info.status_property.logical_retirement_committed = (
+                                True)
+                        info.status_property.sky_down_status = (
+                            common_utils.ProcessStatus.RUNNING)
+                        try:
                             self._persist_replica(replica_id, info)
-                        t.start()
+                        except Exception:
+                            # The database may have committed RUNNING even if
+                            # the client observed an error. Remove the never-
+                            # started worker and immediately re-read/re-drive:
+                            # committed readback detaches into ordinary cleanup;
+                            # uncommitted readback recreates the fenced worker.
+                            self._down_thread_pool.pop(replica_id)
+                            status = info.status_property
+                            is_scale_down = (status.is_scale_down or
+                                             status.preempted)
+                            purge = status.purged
+                            try:
+                                self._terminate_replica(
+                                    replica_id,
+                                    sync_down_logs=not (is_scale_down or purge),
+                                    replica_drain_delay_seconds=0,
+                                    is_scale_down=is_scale_down,
+                                    purge=purge,
+                                    in_flight_drain_cap_seconds=getattr(
+                                        status, 'drain_cap_seconds', None))
+                            except Exception as redrive_error:  # pylint: disable=broad-except
+                                logger.warning(
+                                    f'Failed to re-drive replica {replica_id} '
+                                    'after ambiguous down-admission write: '
+                                    f'{common_utils.format_exception(redrive_error)}'
+                                )
+                                self._schedule_failed_cleanup_retry(replica_id)
+                            raise
+                        try:
+                            t.start()
+                        except Exception as e:  # pylint: disable=broad-except
+                            # RUNNING and (for logical retirement) the
+                            # commitment bit were persisted before start, so
+                            # a crash here is safely recoverable. In-process,
+                            # convert failed admission into the ordinary
+                            # failed-cleanup retry loop with a fresh worker.
+                            logger.error(
+                                f'Failed to start terminate worker for '
+                                f'replica {replica_id}: '
+                                f'{common_utils.format_exception(e)}')
+                            self._down_thread_pool.pop(replica_id)
+                            self._wait_for_idle_trackers.pop(replica_id, None)
+                            info.status_property.sky_down_status = (
+                                common_utils.ProcessStatus.FAILED)
+                            try:
+                                self._persist_replica(replica_id, info)
+                            finally:
+                                self._schedule_failed_cleanup_retry(replica_id)
+                            continue
+                        self._wait_for_idle_trackers.pop(replica_id, None)
                         # This replica is now terminating; reflect it locally
                         # (weighted like in_flight_launch_count) instead of
                         # re-scanning the DB on the next replica.
                         in_flight += 1.0 / controller_utils.SERVE_LAUNCH_RATIO
-                        info.status_property.sky_down_status = (
-                            common_utils.ProcessStatus.RUNNING)
-                        self._persist_replica(replica_id, info)
 
         # Clean old version
         replica_infos = serve_state.get_replica_infos(self._service_name)

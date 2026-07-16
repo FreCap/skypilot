@@ -13,6 +13,7 @@ Covers:
 # pylint: disable=protected-access,import-outside-toplevel,reimported
 # pylint: disable=unused-argument,invalid-name,line-too-long
 # pylint: disable=missing-class-docstring,unnecessary-dunder-call
+import dataclasses
 import threading
 import types
 from unittest import mock
@@ -2104,6 +2105,42 @@ class TestLogicalCapacityPlanning:
         info.status_property.first_ready_time = 1.0
         return info
 
+    def _pending_logical_retirement(self, retiring_version=9):
+        mgr = _make_manager()
+        mgr.latest_version = 10
+        mgr._uses_logical_replicas = True
+        mgr._is_pool = False
+        mgr._wait_for_idle_trackers = {}
+        mgr._lb_in_flight_report = None
+        retiring = self._ready_backend(9, 1)
+        retiring.version = retiring_version
+        survivor = self._ready_backend(10, 1)
+        survivor.version = 10
+        status = retiring.status_property
+        status.is_scale_down = True
+        status.sky_down_status = common_utils.ProcessStatus.SCHEDULED
+        status.wait_for_idle_before_termination = True
+        status.logical_retirement_version = 10
+        status.logical_retirement_controller_epoch = 'test-controller-epoch'
+        status.logical_retirement_generation = 4
+        status.logical_retirement_target_capacity = 1
+        status.logical_retirement_confirmed_generation = None
+        mgr._logical_reconcile_snapshot = (
+            replica_managers.LogicalReconcileSnapshot(
+                version=10,
+                generation=5,
+                observed_slots_by_replica_id={10: 1},
+                in_flight_by_replica_id={
+                    9: 0,
+                    10: 0
+                },
+                unknown_replica_ids=frozenset(),
+                received_at=replica_managers.time.monotonic()))
+        mgr._logical_target = (10, 5, 1)
+        mgr._persist_replica = mock.Mock()
+        mgr._terminate_replica = mock.Mock()
+        return mgr, retiring, survivor
+
     def test_manager_rechecks_ready_coverage_before_accepting_retirement(self):
         mgr = _make_manager()
         mgr._uses_logical_replicas = True
@@ -2288,7 +2325,606 @@ class TestLogicalCapacityPlanning:
             replica_drain_delay_seconds=0,
             is_scale_down=True,
             in_flight_drain_cap_seconds=0)
-        assert 1 not in mgr._wait_for_idle_trackers
+        assert 1 in mgr._wait_for_idle_trackers
+
+    @pytest.mark.parametrize('retiring_version,should_terminate', [(9, True),
+                                                                   (10, False)])
+    def test_unknown_then_absent_logical_retirement_deadline_is_bounded_only_for_outdated_backend(
+            self, monkeypatch, retiring_version, should_terminate):
+        now = [100.0]
+        monkeypatch.setattr(replica_managers.time, 'monotonic', lambda: now[0])
+        mgr, retiring, survivor = self._pending_logical_retirement(
+            retiring_version=retiring_version)
+        tracker = replica_managers._ReplicaDrainTracker(mgr,
+                                                        'http://old-backend',
+                                                        drain_started=now[0])
+        mgr._wait_for_idle_trackers = {9: (tracker, 160.0)}
+
+        def _refresh():
+            with mock.patch.object(replica_managers.serve_state,
+                                   'get_replica_infos_from_ids',
+                                   return_value={9: retiring}), \
+                 mock.patch.object(replica_managers.serve_state,
+                                   'get_replica_infos',
+                                   return_value=[retiring, survivor]), \
+                 mock.patch.object(
+                     replica_managers.global_user_state,
+                     'get_cluster_status_fields',
+                     return_value={'svc-9': ('UP', 1)}):
+                mgr._refresh_wait_for_idle()
+
+        # Reproduce the production migration: the old nginx backend is first
+        # occupancy-UNKNOWN, then disappears from every LB overlay. Absence
+        # cannot clear the tracker's UNKNOWN taint before the deadline.
+        now[0] = 110.0
+        mgr._logical_reconcile_snapshot = dataclasses.replace(
+            mgr._logical_reconcile_snapshot, received_at=now[0])
+        mgr._lb_in_flight_report = (now[0], {
+            'http://old-backend': 0
+        }, set(), {'http://old-backend'}, set(), 'lb-session')
+        _refresh()
+        mgr._terminate_replica.assert_not_called()
+
+        now[0] = 120.0
+        mgr._logical_reconcile_snapshot = dataclasses.replace(
+            mgr._logical_reconcile_snapshot, received_at=now[0])
+        mgr._lb_in_flight_report = (now[0], {}, set(), set(), set(),
+                                    'lb-session')
+        _refresh()
+        mgr._terminate_replica.assert_not_called()
+
+        now[0] = 160.0
+        mgr._logical_reconcile_snapshot = dataclasses.replace(
+            mgr._logical_reconcile_snapshot, received_at=now[0])
+        mgr._lb_in_flight_report = (now[0], {}, set(), set(), set(),
+                                    'lb-session')
+        _refresh()
+
+        if should_terminate:
+            mgr._terminate_replica.assert_called_once_with(
+                9,
+                sync_down_logs=False,
+                replica_drain_delay_seconds=0,
+                is_scale_down=True,
+                in_flight_drain_cap_seconds=0)
+            assert retiring.status_property.is_scale_down
+        else:
+            mgr._terminate_replica.assert_not_called()
+            assert not retiring.status_property.is_scale_down
+        assert (retiring.status_property.logical_retirement_bounded_deadline
+                is should_terminate)
+        assert 9 not in mgr._wait_for_idle_trackers
+
+    @pytest.mark.parametrize('guard', [
+        'stale_snapshot',
+        'pending_update',
+        'target_growth',
+        'unknown_replacement',
+        'insufficient_replacement',
+    ])
+    def test_outdated_deadline_never_bypasses_logical_coverage_fences(
+            self, monkeypatch, guard):
+        now = [200.0]
+        monkeypatch.setattr(replica_managers.time, 'monotonic', lambda: now[0])
+        mgr, retiring, survivor = self._pending_logical_retirement()
+        snapshot = mgr._logical_reconcile_snapshot
+        if guard == 'stale_snapshot':
+            snapshot = dataclasses.replace(snapshot, received_at=0.0)
+        elif guard == 'pending_update':
+            mgr._pending_version = 11
+        elif guard == 'target_growth':
+            mgr._logical_target = (10, 5, 2)
+        elif guard == 'unknown_replacement':
+            snapshot = dataclasses.replace(snapshot,
+                                           unknown_replica_ids=frozenset({10}))
+        elif guard == 'insufficient_replacement':
+            snapshot.observed_slots_by_replica_id[10] = 0
+        mgr._logical_reconcile_snapshot = snapshot
+        mgr._lb_in_flight_report = (now[0], {}, set(), set(), set(),
+                                    'lb-session')
+        mgr._wait_for_idle_trackers = {
+            9: (mock.Mock(return_value=False), now[0])
+        }
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos_from_ids',
+                               return_value={9: retiring}), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[retiring, survivor]), \
+             mock.patch.object(
+                 replica_managers.global_user_state,
+                 'get_cluster_status_fields',
+                 return_value={'svc-9': ('UP', 1)}):
+            mgr._refresh_wait_for_idle()
+
+        mgr._terminate_replica.assert_not_called()
+        if guard == 'stale_snapshot':
+            assert retiring.status_property.wait_for_idle_before_termination
+            assert 9 in mgr._wait_for_idle_trackers
+        else:
+            assert not retiring.status_property.is_scale_down
+            assert 9 not in mgr._wait_for_idle_trackers
+
+    def test_outdated_bounded_retirement_retries_scheduling_failure(
+            self, monkeypatch):
+        now = [200.0]
+        monkeypatch.setattr(replica_managers.time, 'monotonic', lambda: now[0])
+        mgr, retiring, survivor = self._pending_logical_retirement()
+        tracker = mock.Mock(return_value=False)
+        mgr._wait_for_idle_trackers = {9: (tracker, now[0])}
+        mgr._terminate_replica = mock.Mock(
+            side_effect=[RuntimeError('database unavailable'), None])
+
+        def _refresh():
+            with mock.patch.object(replica_managers.serve_state,
+                                   'get_replica_infos_from_ids',
+                                   return_value={9: retiring}), \
+                 mock.patch.object(replica_managers.serve_state,
+                                   'get_replica_infos',
+                                   return_value=[retiring, survivor]), \
+                 mock.patch.object(
+                     replica_managers.global_user_state,
+                     'get_cluster_status_fields',
+                     return_value={'svc-9': ('UP', 1)}):
+                mgr._refresh_wait_for_idle()
+
+        with pytest.raises(RuntimeError, match='database unavailable'):
+            _refresh()
+        assert retiring.status_property.wait_for_idle_before_termination
+        assert retiring.status_property.logical_retirement_bounded_deadline
+        assert 9 in mgr._wait_for_idle_trackers
+
+        _refresh()
+        assert mgr._terminate_replica.call_count == 2
+        assert 9 not in mgr._wait_for_idle_trackers
+
+    @pytest.mark.parametrize(
+        'bounded_deadline,confirmed_generation,should_start', [
+            (False, 5, False),
+            (True, 5, True),
+            (True, None, False),
+            (True, True, False),
+            (True, '5', False),
+        ])
+    def test_only_bounded_outdated_confirmation_bypasses_late_victim_occupancy(
+            self, monkeypatch, tmp_path, bounded_deadline, confirmed_generation,
+            should_start):
+        now = [200.0]
+        monkeypatch.setattr(replica_managers.time, 'monotonic', lambda: now[0])
+        mgr, retiring, survivor = self._pending_logical_retirement()
+        retiring.status_property.wait_for_idle_before_termination = False
+        retiring.status_property.logical_retirement_confirmed_generation = (
+            confirmed_generation)
+        retiring.status_property.logical_retirement_bounded_deadline = (
+            bounded_deadline)
+        mgr._logical_reconcile_snapshot = dataclasses.replace(
+            mgr._logical_reconcile_snapshot,
+            generation=6,
+            in_flight_by_replica_id={
+                9: 1,
+                10: 0
+            },
+            received_at=now[0])
+        mgr._logical_target = (10, 6, 1)
+        mgr._launch_thread_pool = thread_utils.ThreadSafeDict()
+        mgr._down_thread_pool = thread_utils.ThreadSafeDict()
+        mgr._replica_to_request_id = thread_utils.ThreadSafeDict()
+        mgr._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
+        mgr.least_recent_version = 9
+        down_thread = mock.Mock()
+        down_thread.is_alive.return_value = False
+        mgr._down_thread_pool[9] = down_thread
+
+        with mock.patch.object(mgr, '_refresh_wait_for_idle'), \
+             mock.patch.object(
+                 mgr, '_clear_known_unknown_capacity_replacements'), \
+             mock.patch.object(mgr, '_reconcile_failed_cleanup'), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos_from_ids',
+                               side_effect=lambda _svc, ids:
+                               ({9: retiring} if ids else {})), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[retiring, survivor]), \
+             mock.patch.object(controller_utils, 'get_resources_lock_path',
+                               return_value=str(tmp_path / 'resources.lock')), \
+             mock.patch.object(controller_utils, 'in_flight_launch_count',
+                               return_value=0), \
+             mock.patch.object(controller_utils,
+                               'can_terminate',
+                               return_value=True), \
+             mock.patch.object(mgr, '_persist_replica') as persist:
+            mgr._refresh_thread_pool()
+
+        if should_start:
+            down_thread.start.assert_called_once_with()
+            assert (retiring.status_property.sky_down_status ==
+                    common_utils.ProcessStatus.RUNNING)
+            assert retiring.status_property.logical_retirement_committed
+            persist.assert_called_once_with(9, retiring)
+        else:
+            down_thread.start.assert_not_called()
+            assert (retiring.status_property.sky_down_status ==
+                    common_utils.ProcessStatus.SCHEDULED)
+            persist.assert_not_called()
+
+    @pytest.mark.parametrize('scenario', [
+        'outdated_bounded_start',
+        'same_version_abort',
+        'target_growth_abort',
+    ])
+    def test_budget_delayed_logical_admission_retains_original_deadline(
+            self, monkeypatch, tmp_path, scenario):
+        now = [100.0]
+        monkeypatch.setattr(replica_managers.time, 'monotonic', lambda: now[0])
+        retiring_version = 10 if scenario == 'same_version_abort' else 9
+        mgr, retiring, survivor = self._pending_logical_retirement(
+            retiring_version=retiring_version)
+        mgr._terminate_replica = types.MethodType(
+            replica_managers.SkyPilotReplicaManager._terminate_replica, mgr)
+        mgr._resource_scope = None
+        mgr.least_recent_version = retiring_version
+        tracker = replica_managers._ReplicaDrainTracker(mgr,
+                                                        'http://old-backend',
+                                                        drain_started=90.0)
+        mgr._wait_for_idle_trackers = {9: (tracker, 160.0)}
+        down_thread = mock.Mock()
+        down_thread.is_alive.return_value = False
+        down_thread.format_exc = None
+        mgr._persist_replica = mock.Mock()
+
+        def _infos_from_ids(_service_name, replica_ids):
+            infos = {9: retiring, 10: survivor}
+            return {
+                replica_id: infos[replica_id]
+                for replica_id in replica_ids
+                if replica_id in infos
+            }
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[retiring, survivor]), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_info_from_id',
+                               return_value=retiring), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos_from_ids',
+                               side_effect=_infos_from_ids), \
+             mock.patch.object(
+                 replica_managers.global_user_state,
+                 'get_cluster_status_fields',
+                 return_value={
+                     retiring.cluster_name: ('UP', 1),
+                     survivor.cluster_name: ('UP', 1)
+                 }), \
+             mock.patch.object(
+                 replica_managers.global_user_state,
+                 'cluster_with_name_exists',
+                 return_value=True), \
+             mock.patch.object(replica_managers.serve_utils,
+                               'generate_replica_log_file_name',
+                               return_value=str(tmp_path / 'replica.log')), \
+             mock.patch.object(replica_managers.thread_utils,
+                               'SafeThread',
+                               return_value=down_thread), \
+             mock.patch.object(
+                 mgr, '_clear_known_unknown_capacity_replacements'), \
+             mock.patch.object(controller_utils, 'get_resources_lock_path',
+                               return_value=str(tmp_path / 'resources.lock')), \
+             mock.patch.object(controller_utils, 'in_flight_launch_count',
+                               return_value=0), \
+             mock.patch.object(
+                 controller_utils,
+                 'can_terminate',
+                 side_effect=lambda *_args, **_kwargs: now[0] >= 200.0):
+            # Explicit idle proves the victim drained, but the global
+            # terminate budget cannot admit its already-scheduled worker.
+            mgr._lb_in_flight_report = (now[0], {
+                'http://old-backend': 0
+            }, set(), set(), {'http://old-backend'}, 'lb-session')
+            mgr._refresh_thread_pool()
+            down_thread.start.assert_not_called()
+            assert 9 in mgr._down_thread_pool
+            assert 9 in mgr._wait_for_idle_trackers
+            assert not retiring.status_property.wait_for_idle_before_termination
+            assert not (
+                retiring.status_property.logical_retirement_bounded_deadline)
+            assert not retiring.status_property.logical_retirement_committed
+
+            # A late busy report invalidates the ordinary idle proof. The
+            # original deadline must still promote only an outdated backend;
+            # same-version or grown-target retirement is cancelled.
+            now[0] = 200.0
+            mgr._logical_reconcile_snapshot = dataclasses.replace(
+                mgr._logical_reconcile_snapshot,
+                in_flight_by_replica_id={
+                    9: 1,
+                    10: 0
+                },
+                received_at=now[0])
+            mgr._lb_in_flight_report = (now[0], {
+                'http://old-backend': 1
+            }, set(), set(), {'http://old-backend'}, 'lb-session')
+            if scenario == 'target_growth_abort':
+                mgr._logical_target = (10, 5, 2)
+            mgr._refresh_thread_pool()
+
+        if scenario == 'outdated_bounded_start':
+            down_thread.start.assert_called_once_with()
+            assert retiring.status_property.is_scale_down
+            assert (retiring.status_property.sky_down_status ==
+                    common_utils.ProcessStatus.RUNNING)
+            assert (
+                retiring.status_property.logical_retirement_bounded_deadline)
+            assert retiring.status_property.logical_retirement_committed
+        else:
+            down_thread.start.assert_not_called()
+            assert not retiring.status_property.is_scale_down
+            assert retiring.status_property.sky_down_status is None
+            assert 9 not in mgr._down_thread_pool
+        assert 9 not in mgr._wait_for_idle_trackers
+
+    def _recover_logical_teardown(self,
+                                  tmp_path,
+                                  down_status,
+                                  bounded_deadline,
+                                  committed=True,
+                                  current_target=1):
+        mgr, retiring, survivor = self._pending_logical_retirement()
+        mgr._terminate_replica = types.MethodType(
+            replica_managers.SkyPilotReplicaManager._terminate_replica, mgr)
+        mgr._logical_controller_epoch = 'new-controller-epoch'
+        mgr._logical_target = (10, 5, current_target)
+        mgr._resource_scope = None
+        mgr.least_recent_version = 9
+        status = retiring.status_property
+        status.logical_retirement_controller_epoch = 'old-controller-epoch'
+        status.wait_for_idle_before_termination = False
+        status.logical_retirement_confirmed_generation = 5
+        status.logical_retirement_bounded_deadline = bounded_deadline
+        status.logical_retirement_committed = committed
+        status.sky_down_status = down_status
+        down_thread = mock.Mock()
+        down_thread.is_alive.return_value = False
+        down_thread.format_exc = None
+        mgr._persist_replica = mock.Mock()
+
+        def _infos_from_ids(_service_name, replica_ids):
+            infos = {9: retiring, 10: survivor}
+            return {
+                replica_id: infos[replica_id]
+                for replica_id in replica_ids
+                if replica_id in infos
+            }
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[retiring, survivor]), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_info_from_id',
+                               return_value=retiring), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos_from_ids',
+                               side_effect=_infos_from_ids), \
+             mock.patch.object(
+                 replica_managers.global_user_state,
+                 'get_cluster_status_fields',
+                 return_value={
+                     retiring.cluster_name: ('UP', 1),
+                     survivor.cluster_name: ('UP', 1)
+                 }), \
+             mock.patch.object(
+                 replica_managers.global_user_state,
+                 'cluster_with_name_exists',
+                 return_value=True), \
+             mock.patch.object(replica_managers.serve_utils,
+                               'generate_replica_log_file_name',
+                               return_value=str(tmp_path / 'replica.log')), \
+             mock.patch.object(replica_managers.thread_utils,
+                               'SafeThread',
+                               return_value=down_thread), \
+             mock.patch.object(mgr, '_refresh_wait_for_idle'), \
+             mock.patch.object(
+                 mgr, '_clear_known_unknown_capacity_replacements'), \
+             mock.patch.object(controller_utils, 'get_resources_lock_path',
+                               return_value=str(tmp_path / 'resources.lock')), \
+             mock.patch.object(controller_utils, 'in_flight_launch_count',
+                               return_value=0), \
+             mock.patch.object(controller_utils,
+                               'can_terminate',
+                               return_value=True):
+            mgr._recover_replica_operations()
+            # FAILED cleanup is reconciled at the end of the first refresh
+            # and admitted on the next one. SCHEDULED/RUNNING recovery has a
+            # worker ready for admission immediately.
+            if down_status == common_utils.ProcessStatus.FAILED:
+                mgr._refresh_thread_pool()
+            mgr._refresh_thread_pool()
+
+        return mgr, retiring, down_thread
+
+    @pytest.mark.parametrize('bounded_deadline', [False, True])
+    @pytest.mark.parametrize('down_status', [
+        common_utils.ProcessStatus.SCHEDULED,
+        common_utils.ProcessStatus.RUNNING,
+        common_utils.ProcessStatus.FAILED,
+    ])
+    def test_recovery_never_reactivates_committed_logical_teardown(
+            self, tmp_path, bounded_deadline, down_status):
+        mgr, retiring, down_thread = self._recover_logical_teardown(
+            tmp_path, down_status, bounded_deadline)
+
+        down_thread.start.assert_called_once_with()
+        assert retiring.status_property.is_scale_down
+        assert (retiring.status_property.sky_down_status ==
+                common_utils.ProcessStatus.RUNNING)
+        assert retiring.status_property.logical_retirement_version is None
+        assert (retiring.status_property.logical_retirement_controller_epoch
+                is None)
+        assert (retiring.status_property.logical_retirement_generation is None)
+        assert (retiring.status_property.logical_retirement_target_capacity
+                is None)
+        assert (retiring.status_property.logical_retirement_confirmed_generation
+                is None)
+        assert not retiring.status_property.logical_retirement_bounded_deadline
+        assert not retiring.status_property.logical_retirement_committed
+        assert 9 in mgr._down_thread_pool
+
+    def test_recovery_aborts_valid_unadmitted_scheduled_logical_retirement(
+            self, tmp_path):
+        mgr, retiring, down_thread = self._recover_logical_teardown(
+            tmp_path,
+            common_utils.ProcessStatus.SCHEDULED,
+            bounded_deadline=False,
+            committed=False)
+
+        down_thread.start.assert_not_called()
+        assert not retiring.status_property.is_scale_down
+        assert retiring.status_property.sky_down_status is None
+        assert retiring.status_property.logical_retirement_version is None
+        assert not retiring.status_property.logical_retirement_committed
+        assert 9 not in mgr._down_thread_pool
+
+    def test_recovery_adopts_legacy_ambiguous_scheduled_retirement(
+            self, tmp_path):
+        mgr, retiring, down_thread = self._recover_logical_teardown(
+            tmp_path,
+            common_utils.ProcessStatus.SCHEDULED,
+            bounded_deadline=False,
+            committed=None)
+
+        down_thread.start.assert_called_once_with()
+        assert retiring.status_property.is_scale_down
+        assert (retiring.status_property.sky_down_status ==
+                common_utils.ProcessStatus.RUNNING)
+        assert retiring.status_property.logical_retirement_version is None
+        assert 9 not in mgr._legacy_uncertain_logical_retirement_ids
+        assert 9 in mgr._down_thread_pool
+
+    @pytest.mark.parametrize('down_status', [
+        common_utils.ProcessStatus.RUNNING,
+        common_utils.ProcessStatus.FAILED,
+    ])
+    def test_recovery_finishes_intrinsically_committed_legacy_teardown(
+            self, tmp_path, down_status):
+        mgr, retiring, down_thread = self._recover_logical_teardown(
+            tmp_path, down_status, bounded_deadline=False, committed=None)
+
+        down_thread.start.assert_called_once_with()
+        assert retiring.status_property.is_scale_down
+        assert (retiring.status_property.sky_down_status ==
+                common_utils.ProcessStatus.RUNNING)
+        assert retiring.status_property.logical_retirement_version is None
+        assert 9 in mgr._down_thread_pool
+
+    def test_recovery_keeps_legacy_ambiguous_retirement_off_route_until_covered(
+            self, tmp_path):
+        mgr, retiring, down_thread = self._recover_logical_teardown(
+            tmp_path,
+            common_utils.ProcessStatus.SCHEDULED,
+            bounded_deadline=False,
+            committed=None,
+            current_target=2)
+
+        down_thread.start.assert_not_called()
+        assert retiring.status_property.is_scale_down
+        assert (retiring.status_property.sky_down_status ==
+                common_utils.ProcessStatus.SCHEDULED)
+        assert (retiring.status_property.logical_retirement_committed is None)
+        assert 9 in mgr._legacy_uncertain_logical_retirement_ids
+        assert 9 not in mgr._down_thread_pool
+
+    def test_recovery_revalidates_unadmitted_bounded_retirement_after_growth(
+            self, tmp_path):
+        mgr, retiring, down_thread = self._recover_logical_teardown(
+            tmp_path,
+            common_utils.ProcessStatus.SCHEDULED,
+            bounded_deadline=True,
+            committed=False,
+            current_target=2)
+
+        down_thread.start.assert_not_called()
+        assert not retiring.status_property.is_scale_down
+        assert retiring.status_property.sky_down_status is None
+        assert retiring.status_property.logical_retirement_version is None
+        assert not retiring.status_property.logical_retirement_committed
+        assert 9 not in mgr._down_thread_pool
+
+    @pytest.mark.parametrize('malformed_field,malformed_value', [
+        ('logical_retirement_confirmed_generation', None),
+        ('logical_retirement_confirmed_generation', True),
+        ('logical_retirement_confirmed_generation', '5'),
+        ('logical_retirement_bounded_deadline', 'true'),
+        ('logical_retirement_committed', 'true'),
+        ('logical_retirement_version', True),
+        ('logical_retirement_controller_epoch', ''),
+    ])
+    def test_recovery_keeps_unconfirmed_or_malformed_teardown_fail_closed(
+            self, tmp_path, malformed_field, malformed_value):
+        mgr, retiring, survivor = self._pending_logical_retirement()
+        mgr._terminate_replica = types.MethodType(
+            replica_managers.SkyPilotReplicaManager._terminate_replica, mgr)
+        mgr._logical_controller_epoch = 'new-controller-epoch'
+        mgr._resource_scope = None
+        mgr.least_recent_version = 9
+        status = retiring.status_property
+        status.logical_retirement_controller_epoch = 'old-controller-epoch'
+        status.wait_for_idle_before_termination = False
+        status.logical_retirement_confirmed_generation = 5
+        status.logical_retirement_bounded_deadline = False
+        status.logical_retirement_committed = True
+        status.sky_down_status = common_utils.ProcessStatus.SCHEDULED
+        setattr(status, malformed_field, malformed_value)
+        down_thread = mock.Mock()
+        down_thread.is_alive.return_value = False
+        down_thread.format_exc = None
+        mgr._persist_replica = mock.Mock()
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[retiring, survivor]), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_info_from_id',
+                               return_value=retiring), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos_from_ids',
+                               return_value={9: retiring}), \
+             mock.patch.object(
+                 replica_managers.global_user_state,
+                 'get_cluster_status_fields',
+                 return_value={
+                     retiring.cluster_name: ('UP', 1),
+                     survivor.cluster_name: ('UP', 1)
+                 }), \
+             mock.patch.object(
+                 replica_managers.global_user_state,
+                 'cluster_with_name_exists',
+                 return_value=True), \
+             mock.patch.object(replica_managers.serve_utils,
+                               'generate_replica_log_file_name',
+                               return_value=str(tmp_path / 'replica.log')), \
+             mock.patch.object(replica_managers.thread_utils,
+                               'SafeThread',
+                               return_value=down_thread), \
+             mock.patch.object(mgr, '_refresh_wait_for_idle'), \
+             mock.patch.object(
+                 mgr, '_clear_known_unknown_capacity_replacements'), \
+             mock.patch.object(mgr, '_reconcile_failed_cleanup'), \
+             mock.patch.object(controller_utils, 'get_resources_lock_path',
+                               return_value=str(tmp_path / 'resources.lock')), \
+             mock.patch.object(controller_utils, 'in_flight_launch_count',
+                               return_value=0), \
+             mock.patch.object(controller_utils,
+                               'can_terminate',
+                               return_value=True):
+            mgr._recover_replica_operations()
+            mgr._refresh_thread_pool()
+
+        down_thread.start.assert_not_called()
+        assert not retiring.status_property.is_scale_down
+        assert retiring.status_property.sky_down_status is None
+        assert 9 not in mgr._down_thread_pool
 
     def test_logical_retirement_retries_termination_scheduling_failure(self):
         mgr = _make_manager()
@@ -2347,7 +2983,7 @@ class TestLogicalCapacityPlanning:
         assert 1 in mgr._wait_for_idle_trackers
         _refresh()
         assert mgr._terminate_replica.call_count == 2
-        assert 1 not in mgr._wait_for_idle_trackers
+        assert 1 in mgr._wait_for_idle_trackers
 
     @pytest.mark.parametrize('confirmed_generation', [None, 5])
     def test_restart_before_or_after_confirmation_never_terminates_stale_intent(
@@ -2800,6 +3436,227 @@ class TestFailedCleanupReconciliation:
             manager._refresh_thread_pool()
 
         assert manager._down_thread_pool[1] is down_thread
+
+    @pytest.mark.parametrize('server_committed', [False, True])
+    def test_ambiguous_down_admission_write_replaces_unstarted_worker(
+            self, tmp_path, server_committed):
+        manager, retiring, survivor = (
+            TestLogicalCapacityPlanning()._pending_logical_retirement())
+        manager._terminate_replica = types.MethodType(
+            replica_managers.SkyPilotReplicaManager._terminate_replica, manager)
+        manager._resource_scope = None
+        manager._launch_thread_pool = thread_utils.ThreadSafeDict()
+        manager._down_thread_pool = thread_utils.ThreadSafeDict()
+        manager._replica_to_request_id = thread_utils.ThreadSafeDict()
+        manager._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
+        manager.least_recent_version = 9
+        retiring.status_property.wait_for_idle_before_termination = False
+        retiring.status_property.logical_retirement_confirmed_generation = 5
+        original_thread = mock.Mock()
+        original_thread.is_alive.return_value = False
+        original_thread.format_exc = None
+        fresh_thread = mock.Mock()
+        fresh_thread.is_alive.return_value = False
+        fresh_thread.format_exc = None
+        manager._down_thread_pool[9] = original_thread
+        durable = {
+            9: replica_managers.ReplicaInfo.from_storage_dict(
+                retiring.to_storage_dict())
+        }
+        persist_calls = [0]
+
+        def _persist(replica_id, info):
+            persist_calls[0] += 1
+            if persist_calls[0] == 1:
+                if server_committed:
+                    durable[replica_id] = (
+                        replica_managers.ReplicaInfo.from_storage_dict(
+                            info.to_storage_dict()))
+                raise RuntimeError('ambiguous database write')
+            durable[replica_id] = (
+                replica_managers.ReplicaInfo.from_storage_dict(
+                    info.to_storage_dict()))
+
+        with mock.patch.object(manager, '_refresh_wait_for_idle'), \
+             mock.patch.object(
+                 manager, '_clear_known_unknown_capacity_replacements'), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos_from_ids',
+                               side_effect=lambda _service, ids:
+                               ({9: retiring} if ids else {})), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_info_from_id',
+                               side_effect=lambda _service, replica_id:
+                               durable.get(replica_id)), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[retiring, survivor]), \
+             mock.patch.object(replica_managers.global_user_state,
+                               'cluster_with_name_exists',
+                               return_value=True), \
+             mock.patch.object(replica_managers.serve_utils,
+                               'generate_replica_log_file_name',
+                               return_value=str(tmp_path / 'replica.log')), \
+             mock.patch.object(replica_managers.thread_utils,
+                               'SafeThread',
+                               return_value=fresh_thread), \
+             mock.patch.object(controller_utils, 'get_resources_lock_path',
+                               return_value=str(tmp_path / 'resources.lock')), \
+             mock.patch.object(controller_utils, 'in_flight_launch_count',
+                               return_value=0), \
+             mock.patch.object(controller_utils,
+                               'can_terminate',
+                               return_value=True), \
+             mock.patch.object(manager,
+                               '_persist_replica',
+                               side_effect=_persist), \
+             pytest.raises(RuntimeError, match='ambiguous database write'):
+            manager._refresh_thread_pool()
+
+        original_thread.start.assert_not_called()
+        assert manager._down_thread_pool[9] is fresh_thread
+        assert (durable[9].status_property.sky_down_status ==
+                common_utils.ProcessStatus.SCHEDULED)
+        if server_committed:
+            assert durable[9].status_property.logical_retirement_version is None
+        else:
+            assert durable[9].status_property.logical_retirement_version == 10
+            assert not durable[9].status_property.logical_retirement_committed
+
+    @pytest.mark.parametrize('failed_state_persist_raises', [False, True])
+    def test_down_worker_start_failure_retries_committed_cleanup(
+            self, tmp_path, failed_state_persist_raises):
+        manager, retiring, survivor = (
+            TestLogicalCapacityPlanning()._pending_logical_retirement())
+        manager._terminate_replica = types.MethodType(
+            replica_managers.SkyPilotReplicaManager._terminate_replica, manager)
+        manager._resource_scope = None
+        manager._launch_thread_pool = thread_utils.ThreadSafeDict()
+        manager._down_thread_pool = thread_utils.ThreadSafeDict()
+        manager._replica_to_request_id = thread_utils.ThreadSafeDict()
+        manager._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
+        manager.least_recent_version = 9
+        retiring.status_property.wait_for_idle_before_termination = False
+        retiring.status_property.logical_retirement_confirmed_generation = 5
+        original_thread = mock.Mock()
+        original_thread.is_alive.return_value = False
+        original_thread.format_exc = None
+        original_thread.start.side_effect = RuntimeError('thread start failed')
+        fresh_thread = mock.Mock()
+        fresh_thread.is_alive.return_value = False
+        fresh_thread.format_exc = None
+        manager._down_thread_pool[9] = original_thread
+        manager._wait_for_idle_trackers[9] = (None, 999)
+        durable = {
+            9: replica_managers.ReplicaInfo.from_storage_dict(
+                retiring.to_storage_dict())
+        }
+        clock = [100]
+        failed_persist_attempted = [False]
+
+        def _clone(info):
+            return replica_managers.ReplicaInfo.from_storage_dict(
+                info.to_storage_dict())
+
+        def _persist(replica_id, info):
+            if (failed_state_persist_raises and
+                    not failed_persist_attempted[0] and
+                    info.status_property.sky_down_status
+                    == common_utils.ProcessStatus.FAILED):
+                failed_persist_attempted[0] = True
+                raise RuntimeError('failed-state database write')
+            durable[replica_id] = _clone(info)
+
+        def _read_many(_service, replica_ids):
+            return {
+                replica_id: _clone(durable[replica_id])
+                for replica_id in replica_ids
+                if replica_id in durable
+            }
+
+        def _read_all(_service):
+            return [_clone(durable[9]), _clone(survivor)]
+
+        with mock.patch.object(
+                manager, '_reconcile_legacy_uncertain_logical_retirements'), \
+             mock.patch.object(manager, '_refresh_wait_for_idle'), \
+             mock.patch.object(
+                 manager, '_clear_known_unknown_capacity_replacements'), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos_from_ids',
+                               side_effect=_read_many), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_info_from_id',
+                               side_effect=lambda _service, replica_id:
+                               _clone(durable[replica_id])), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               side_effect=_read_all), \
+             mock.patch.object(replica_managers.global_user_state,
+                               'cluster_with_name_exists',
+                               return_value=True), \
+             mock.patch.object(replica_managers.serve_utils,
+                               'generate_replica_log_file_name',
+                               return_value=str(tmp_path / 'replica.log')), \
+             mock.patch.object(replica_managers.thread_utils,
+                               'SafeThread',
+                               return_value=fresh_thread), \
+             mock.patch.object(controller_utils, 'get_resources_lock_path',
+                               return_value=str(tmp_path / 'resources.lock')), \
+             mock.patch.object(controller_utils,
+                               'in_flight_launch_count',
+                               return_value=0), \
+             mock.patch.object(controller_utils,
+                               'can_terminate',
+                               return_value=True), \
+             mock.patch.object(manager,
+                               '_persist_replica',
+                               side_effect=_persist), \
+             mock.patch.object(manager, '_remove_replica') as remove, \
+             mock.patch('sky.serve.replica_managers.time.monotonic',
+                        side_effect=lambda: clock[0]):
+            if failed_state_persist_raises:
+                with pytest.raises(RuntimeError,
+                                   match='failed-state database write'):
+                    manager._refresh_thread_pool()
+            else:
+                manager._refresh_thread_pool()
+
+            original_thread.start.assert_called_once_with()
+            assert 9 not in manager._down_thread_pool
+            assert 9 not in manager._wait_for_idle_trackers
+            assert manager._failed_cleanup_retry_attempts == {9: 1}
+            assert manager._failed_cleanup_retry_at == {9: 160}
+            expected_durable_status = (common_utils.ProcessStatus.RUNNING
+                                       if failed_state_persist_raises else
+                                       common_utils.ProcessStatus.FAILED)
+            assert (durable[9].status_property.sky_down_status ==
+                    expected_durable_status)
+            assert durable[9].status_property.logical_retirement_committed
+            assert not durable[9].is_ready
+            remove.assert_not_called()
+
+            # Once the retry deadline arrives, the durable commitment is
+            # detached from the obsolete selection epoch and a new,
+            # idempotent cleanup worker is installed. It is admitted on the
+            # next tick without ever making the backend READY again.
+            clock[0] = 160
+            manager._refresh_thread_pool()
+            assert manager._down_thread_pool[9] is fresh_thread
+            assert (durable[9].status_property.sky_down_status ==
+                    common_utils.ProcessStatus.SCHEDULED)
+            assert (durable[9].status_property.logical_retirement_version
+                    is None)
+            assert not durable[9].is_ready
+
+            manager._refresh_thread_pool()
+
+        fresh_thread.start.assert_called_once_with()
+        assert (durable[9].status_property.sky_down_status ==
+                common_utils.ProcessStatus.RUNNING)
+        assert not durable[9].is_ready
+        assert manager._down_thread_pool[9] is fresh_thread
+        remove.assert_not_called()
 
     def test_log_sync_failure_does_not_block_cleanup(self):
         manager = _make_manager()

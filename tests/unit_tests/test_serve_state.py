@@ -220,6 +220,8 @@ def test_replica_json_storage_round_trip_preserves_lifecycle_state():
     info.status_property.logical_retirement_generation = 10
     info.status_property.logical_retirement_target_capacity = 17
     info.status_property.logical_retirement_confirmed_generation = 11
+    info.status_property.logical_retirement_bounded_deadline = True
+    info.status_property.logical_retirement_committed = True
 
     restored = replica_managers.ReplicaInfo.from_storage_dict(
         info.to_storage_dict())
@@ -228,6 +230,35 @@ def test_replica_json_storage_round_trip_preserves_lifecycle_state():
     assert restored.unknown_capacity_replacement is True
     assert restored.logical_bridge_capacity_verified is True
     assert restored.status == info.status
+
+    legacy_state = info.to_storage_dict()
+    legacy_state['status_property'].pop('logical_retirement_bounded_deadline')
+    legacy_restored = replica_managers.ReplicaInfo.from_storage_dict(
+        legacy_state)
+    assert not legacy_restored.status_property.logical_retirement_bounded_deadline
+
+    malformed_state = info.to_storage_dict()
+    malformed_state['status_property'][
+        'logical_retirement_bounded_deadline'] = 'true'
+    malformed_restored = replica_managers.ReplicaInfo.from_storage_dict(
+        malformed_state)
+    assert not malformed_restored.status_property.logical_retirement_bounded_deadline
+
+    legacy_commit_state = info.to_storage_dict()
+    legacy_commit_state['status_property'].pop('logical_retirement_committed')
+    legacy_commit_restored = replica_managers.ReplicaInfo.from_storage_dict(
+        legacy_commit_state)
+    assert (legacy_commit_restored.status_property.logical_retirement_committed
+            is None)
+
+    malformed_commit_state = info.to_storage_dict()
+    malformed_commit_state['status_property'][
+        'logical_retirement_committed'] = 'true'
+    malformed_commit_restored = replica_managers.ReplicaInfo.from_storage_dict(
+        malformed_commit_state)
+    assert (
+        malformed_commit_restored.status_property.logical_retirement_committed
+        is None)
 
 
 def test_replica_json_storage_preserves_region_independent_image_id():
@@ -397,9 +428,40 @@ def test_replica_json_migration_backfills_legacy_pickle(tmp_path, monkeypatch):
     info.status_property.service_ready_now = True
     legacy_blob = pickle.dumps(info)
     expected_state = pickle.loads(legacy_blob).to_storage_dict()
+    uncertain = _replica(4, cluster_name='legacy-uncertain-cluster', version=1)
+    uncertain.status_property.sky_launch_status = (
+        common_utils.ProcessStatus.SUCCEEDED)
+    uncertain.status_property.service_ready_now = True
+    uncertain_status = uncertain.status_property
+    uncertain_status.sky_down_status = common_utils.ProcessStatus.SCHEDULED
+    uncertain_status.is_scale_down = True
+    uncertain_status.wait_for_idle_before_termination = False
+    uncertain_status.logical_retirement_version = 2
+    uncertain_status.logical_retirement_controller_epoch = 'legacy-epoch'
+    uncertain_status.logical_retirement_generation = 3
+    uncertain_status.logical_retirement_target_capacity = 1
+    uncertain_status.logical_retirement_confirmed_generation = 4
+    # Model a real pre-field pickle: deleting the instance key still makes
+    # getattr() see the new dataclass class default False after unpickling.
+    vars(uncertain_status).pop('logical_retirement_committed')
+    uncertain_blob = pickle.dumps(uncertain)
+    loaded_uncertain = pickle.loads(uncertain_blob)
+    assert ('logical_retirement_committed'
+            not in vars(loaded_uncertain.status_property))
+    assert getattr(loaded_uncertain.status_property,
+                   'logical_retirement_committed') is False
+    assert (loaded_uncertain.to_storage_dict()['status_property']
+            ['logical_retirement_committed'] is None)
     with engine.begin() as connection:
-        connection.execute(legacy_replicas.insert().values(
-            service_name='svc', replica_id=3, replica_info=legacy_blob))
+        connection.execute(legacy_replicas.insert(), [{
+            'service_name': 'svc',
+            'replica_id': 3,
+            'replica_info': legacy_blob,
+        }, {
+            'service_name': 'svc',
+            'replica_id': 4,
+            'replica_info': uncertain_blob,
+        }])
         connection.execute(version_table.insert().values(version_num='009'))
 
     migration_utils.safe_alembic_upgrade(engine, migration_utils.SERVE_DB_NAME,
@@ -410,7 +472,16 @@ def test_replica_json_migration_backfills_legacy_pickle(tmp_path, monkeypatch):
     assert restored is not None
     assert restored.to_storage_dict() == expected_state
     assert restored.first_consecutive_failure_time == 42.0
-    assert serve_state.get_replica_status_counts('svc') == {'READY': 1}
+    restored_uncertain = serve_state.get_replica_info_from_id('svc', 4)
+    assert restored_uncertain is not None
+    assert (restored_uncertain.status_property.logical_retirement_committed
+            is None)
+    assert (replica_managers.SkyPilotReplicaManager.
+            _is_legacy_uncertain_logical_retirement(restored_uncertain))
+    assert serve_state.get_replica_status_counts('svc') == {
+        'READY': 1,
+        'SHUTTING_DOWN': 1,
+    }
 
 
 def test_replica_json_migration_handles_fresh_database(tmp_path):
