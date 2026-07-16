@@ -17,7 +17,10 @@ The async route accepts these actions:
 * ``async_capacity`` returns nonnegative integer ``running_count`` and
   ``predict_concurrency`` fields.
 * ``async_predict`` accepts a request and returns its ``request_id``.
-* ``async_status`` and ``async_cancel`` address a request by ``request_id``.
+* ``async_status`` and ``async_cancel`` address a request by ``request_id`` and
+  echo that ID with a recognized status: ``QUEUED``, ``PENDING``,
+  ``IN_PROGRESS``, ``RUNNING``, ``SUCCEEDED``, ``FAILED``, ``EXPIRED``,
+  ``CANCELED``, ``CANCELLED``, or ``NOT_FOUND``.
 
 A worker must include newly accepted work in ``running_count`` before it
 acknowledges ``async_predict``.  This lets the router reconcile its temporary
@@ -55,11 +58,23 @@ The router:
 
 * sums worker capacities for ``async_capacity`` responses;
 * reserves a free worker slot atomically before forwarding ``async_predict``;
+* serializes and deduplicates predictions with the same stable
+  ``request_id``, including retries after the router restarts;
 * retries a different worker only after explicit rejection (429 by default,
   configurable with ``--retriable-status-code``);
 * never replays a timeout, connection loss, or other ambiguous response;
 * remembers request ownership for status and cancellation; and
 * reports the replica ready when at least one worker is ready.
+
+If any worker's occupancy probe is unknown, the aggregate capacity response is
+marked ``UNKNOWN`` even when other workers remain usable. This prevents a
+transient worker or router restart from being mistaken for proof that the
+machine is idle while local work may still be running.
+
+Ambiguous ownership claims are never evicted to make room for ordinary cached
+owners. If the configured ``--max-sticky-requests`` safety budget is exhausted
+by ambiguous requests, new IDs are rejected before dispatch until an existing
+claim is reconciled.
 
 Concurrent capacity requests share one probe wave. Readiness and ownership
 recovery return as soon as a worker gives a definitive answer instead of

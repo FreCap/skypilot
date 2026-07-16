@@ -41,6 +41,12 @@ _KNOWN_ACTIONS = {
     _ACTION_STATUS,
     _ACTION_CANCEL,
 }
+_ACTIVE_REQUEST_STATUSES = frozenset(
+    ('QUEUED', 'PENDING', 'IN_PROGRESS', 'RUNNING'))
+_TERMINAL_REQUEST_STATUSES = frozenset(
+    ('SUCCEEDED', 'FAILED', 'EXPIRED', 'CANCELED', 'CANCELLED'))
+_KNOWN_REQUEST_STATUSES = (_ACTIVE_REQUEST_STATUSES |
+                           _TERMINAL_REQUEST_STATUSES | {'NOT_FOUND'})
 _HOP_BY_HOP_HEADERS = {
     'connection',
     'content-length',
@@ -86,6 +92,20 @@ class _ChildResponse:
     status: int
     body: bytes
     headers: Sequence[tuple[str, str]]
+
+
+@dataclasses.dataclass
+class _RequestGate:
+    """Serializes predictions that carry the same stable request ID."""
+
+    lock: asyncio.Lock = dataclasses.field(default_factory=asyncio.Lock)
+    users: int = 0
+
+
+@dataclasses.dataclass(frozen=True)
+class _Owner:
+    child_index: int
+    ambiguous: bool
 
 
 class LocalAsyncRouter:
@@ -149,8 +169,10 @@ class LocalAsyncRouter:
         self._last_probe_finished_at = 0.0
         self._next_child = 0
         self._next_reservation = 0
-        self._owners: collections.OrderedDict[str,
-                                              int] = (collections.OrderedDict())
+        self._owners: collections.OrderedDict[
+            str, _Owner] = collections.OrderedDict()
+        self._ambiguous_owner_count = 0
+        self._request_gates: dict[str, _RequestGate] = {}
         self._session: aiohttp.ClientSession | None = None
 
     def create_app(self) -> web.Application:
@@ -217,9 +239,44 @@ class LocalAsyncRouter:
 
     async def _handle_predict(self, request: web.Request, body: bytes,
                               payload: Mapping[str, Any]) -> web.StreamResponse:
+        request_id = payload.get('request_id')
+        if not isinstance(request_id, str):
+            return await self._dispatch_predict(request, body, payload)
+
+        gate = await self._retain_request_gate(request_id)
+        acquired = False
+        try:
+            await gate.lock.acquire()
+            acquired = True
+            owner = await self._owner_record(request_id)
+            if owner is not None:
+                return await self._handle_duplicate_predict(
+                    request, request_id, owner)
+
+            discovered_owner, existing, absence_confirmed = (
+                await self._discover_request_owner(request, request_id))
+            if discovered_owner is not None and existing is not None:
+                await self._remember_owner(request_id,
+                                           discovered_owner,
+                                           ambiguous=False)
+                return _relay(existing)
+            if not absence_confirmed:
+                return _json_error(
+                    502, 'Could not prove that this request ID is absent '
+                    'from every local worker; request was not dispatched.')
+            return await self._dispatch_predict(request, body, payload)
+        finally:
+            if acquired:
+                gate.lock.release()
+            await asyncio.shield(self._release_request_gate(request_id, gate))
+
+    async def _dispatch_predict(
+            self, request: web.Request, body: bytes,
+            payload: Mapping[str, Any]) -> web.StreamResponse:
         await self._refresh_capacity()
         attempted: set[int] = set()
         last_rejection: _ChildResponse | None = None
+        submitted_id = payload.get('request_id')
         while len(attempted) < len(self._children):
             reservation = await self._reserve(attempted)
             if reservation is None:
@@ -228,12 +285,28 @@ class LocalAsyncRouter:
             attempted.add(child_index)
             reservation_finalized = False
             try:
+                if isinstance(submitted_id, str):
+                    # Claim before dispatch. An ambiguous timeout must retain
+                    # this owner so a caller retry cannot escape to another
+                    # GPU.
+                    claimed = await self._remember_owner(submitted_id,
+                                                         child_index,
+                                                         ambiguous=True)
+                    if not claimed:
+                        await self._release(child_index, token)
+                        reservation_finalized = True
+                        return _json_error(
+                            429,
+                            'Local request-ownership safety budget is full; '
+                            'request was not dispatched.')
                 response = await self._request_child(
                     child_index, request.method, request.rel_url.raw_path_qs,
                     body, request.headers, self._request_timeout_seconds)
                 if (response is not None and
                         response.status in self._retriable_status_codes):
                     await self._release(child_index, token)
+                    if isinstance(submitted_id, str):
+                        await self._forget_owner_if(submitted_id, child_index)
                     reservation_finalized = True
                     last_rejection = response
                     continue
@@ -251,7 +324,15 @@ class LocalAsyncRouter:
                     await asyncio.shield(self._settle(child_index, token))
             request_id = _request_id(payload, response)
             if request_id is not None:
-                await self._remember_owner(request_id, child_index)
+                response_payload = (None if response is None else
+                                    _response_json(response))
+                confirmed = (response is not None and
+                             200 <= response.status < 300 and
+                             response_payload is not None and
+                             response_payload.get('request_id') == request_id)
+                await self._remember_owner(request_id,
+                                           child_index,
+                                           ambiguous=not confirmed)
             if response is None:
                 return _json_error(502, 'Local worker request failed.')
             return _relay(response)
@@ -260,22 +341,113 @@ class LocalAsyncRouter:
             return _relay(last_rejection)
         return _json_error(429, 'All local worker slots are busy.')
 
+    async def _handle_duplicate_predict(self, request: web.Request,
+                                        request_id: str,
+                                        owner: _Owner) -> web.StreamResponse:
+        response = await self._request_status_child(request, request_id,
+                                                    owner.child_index)
+        if response is None:
+            return _json_error(
+                502, 'Owning local worker is unreachable; duplicate '
+                'request was not dispatched.')
+        status = _status_response_status(response, request_id)
+        if not 200 <= response.status < 300 or status is None:
+            return _json_error(
+                502, 'Owning local worker returned an inconclusive status; '
+                'duplicate request was not dispatched.')
+        if status == 'NOT_FOUND' and owner.ambiguous:
+            # The original dispatch may still be completing after an
+            # ambiguous transport outcome. Replaying elsewhere is unsafe.
+            return _json_error(
+                502, 'Owning local worker has not confirmed this request ID; '
+                'duplicate request was not dispatched.')
+        if status != 'NOT_FOUND':
+            await self._remember_owner(request_id,
+                                       owner.child_index,
+                                       ambiguous=False)
+        return _relay(response)
+
+    async def _discover_request_owner(
+            self, request: web.Request,
+            request_id: str) -> tuple[int | None, _ChildResponse | None, bool]:
+        """Find a pre-restart request, or prove that all workers lack it."""
+
+        async def _request_indexed(
+                index: int) -> tuple[int, _ChildResponse | None]:
+            return index, await self._request_status_child(
+                request, request_id, index)
+
+        tasks = [
+            asyncio.create_task(_request_indexed(index))
+            for index in range(len(self._children))
+        ]
+        absence_confirmed = True
+        try:
+            for completed in asyncio.as_completed(tasks):
+                index, response = await completed
+                if response is None or not 200 <= response.status < 300:
+                    absence_confirmed = False
+                    continue
+                status = _status_response_status(response, request_id)
+                if status is None:
+                    absence_confirmed = False
+                    continue
+                if status != 'NOT_FOUND':
+                    return index, response, True
+            return None, None, absence_confirmed
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _request_status_child(self, request: web.Request, request_id: str,
+                                    child_index: int) -> _ChildResponse | None:
+        body = json.dumps({
+            'action': _ACTION_STATUS,
+            'request_id': request_id,
+        }).encode()
+        headers = _end_to_end_headers(request.headers.items())
+        for name in ('Content-Encoding', 'Content-Type'):
+            if name in headers:
+                del headers[name]
+        headers['Content-Type'] = 'application/json'
+        return await self._request_child(child_index, request.method,
+                                         request.rel_url.raw_path_qs, body,
+                                         headers, self._status_timeout_seconds)
+
     async def _handle_owned_request(
             self, request: web.Request, body: bytes,
             payload: Mapping[str, Any]) -> web.StreamResponse:
         request_id = payload.get('request_id')
-        owner = await self._owner(request_id)
+        owner = await self._owner_record(request_id)
         if owner is not None:
-            response = await self._request_child(owner, request.method,
+            assert isinstance(request_id, str)
+            response = await self._request_child(owner.child_index,
+                                                 request.method,
                                                  request.rel_url.raw_path_qs,
                                                  body, request.headers,
                                                  self._status_timeout_seconds)
             if response is None:
                 return _json_error(502, 'Owning local worker is unreachable.')
-            if (_is_terminal(response) or
-                (payload['action'] == _ACTION_CANCEL and
-                 200 <= response.status < 300)):
+            status = _status_response_status(response, request_id)
+            definitive_cancel = (payload['action'] == _ACTION_CANCEL and
+                                 _is_definitive_cancellation(
+                                     response, request_id))
+            contradictory_cancel = (payload['action'] == _ACTION_CANCEL and
+                                    status in ('CANCELED', 'CANCELLED') and
+                                    not definitive_cancel)
+            terminal_statuses = _TERMINAL_REQUEST_STATUSES
+            if payload['action'] == _ACTION_CANCEL:
+                terminal_statuses -= {'CANCELED', 'CANCELLED'}
+            terminal = status in terminal_statuses
+            safe_absence = status == 'NOT_FOUND' and not owner.ambiguous
+            if definitive_cancel or terminal or safe_absence:
                 await self._forget_owner(request_id)
+            elif (status is not None and status != 'NOT_FOUND' and
+                  not contradictory_cancel):
+                await self._remember_owner(request_id,
+                                           owner.child_index,
+                                           ambiguous=False)
             return _relay(response)
 
         # Ownership can be lost if this router restarts while workers survive.
@@ -293,32 +465,56 @@ class LocalAsyncRouter:
             asyncio.create_task(_request_indexed(index))
             for index in range(len(self._children))
         ]
-        fallbacks: dict[int, _ChildResponse] = {}
+        not_found_fallbacks: dict[int, _ChildResponse] = {}
+        error_fallbacks: dict[int, _ChildResponse] = {}
+        inconclusive = False
         try:
             for completed in asyncio.as_completed(tasks):
                 index, response = await completed
                 if response is None:
+                    inconclusive = True
                     continue
-                if (200 <= response.status < 300 and
-                        not _is_not_found(response)):
-                    terminal = (_is_terminal(response) or
-                                payload['action'] == _ACTION_CANCEL)
-                    if isinstance(request_id, str) and not terminal:
-                        await self._remember_owner(request_id, index)
-                    return _relay(response)
-                fallbacks[index] = response
+                if not 200 <= response.status < 300:
+                    error_fallbacks[index] = response
+                    continue
+                status = _status_response_status(response, request_id)
+                if status is None:
+                    inconclusive = True
+                    continue
+                if status == 'NOT_FOUND':
+                    not_found_fallbacks[index] = response
+                    continue
+                definitive_cancel = (payload['action'] == _ACTION_CANCEL and
+                                     _is_definitive_cancellation(
+                                         response, request_id))
+                contradictory_cancel = (payload['action'] == _ACTION_CANCEL and
+                                        status in ('CANCELED', 'CANCELLED') and
+                                        not definitive_cancel)
+                if contradictory_cancel:
+                    inconclusive = True
+                    continue
+                terminal_statuses = _TERMINAL_REQUEST_STATUSES
+                if payload['action'] == _ACTION_CANCEL:
+                    terminal_statuses -= {'CANCELED', 'CANCELLED'}
+                terminal = status in terminal_statuses
+                if not definitive_cancel and not terminal:
+                    assert isinstance(request_id, str)
+                    await self._remember_owner(request_id,
+                                               index,
+                                               ambiguous=False)
+                return _relay(response)
         finally:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
-        ordered_fallbacks = [fallbacks[index] for index in sorted(fallbacks)]
-        error_fallback = next((response for response in ordered_fallbacks
-                               if not _is_not_found(response)), None)
-        if error_fallback is not None:
-            return _relay(error_fallback)
-        if ordered_fallbacks:
-            return _relay(ordered_fallbacks[0])
+        if error_fallbacks:
+            return _relay(error_fallbacks[min(error_fallbacks)])
+        if inconclusive:
+            return _json_error(
+                502, 'Local workers returned inconclusive request status.')
+        if not_found_fallbacks:
+            return _relay(not_found_fallbacks[min(not_found_fallbacks)])
         return _json_error(502, 'All local workers are unreachable.')
 
     async def _refresh_capacity(self, *, force: bool = False) -> None:
@@ -385,6 +581,8 @@ class LocalAsyncRouter:
 
     async def _capacity_response(self) -> web.Response:
         async with self._state_lock:
+            admission_blocked = (self._ambiguous_owner_count
+                                 >= self._max_sticky_requests)
             known_children = 0
             running = 0
             total = 0
@@ -394,13 +592,32 @@ class LocalAsyncRouter:
                     known_children += 1
                     total += child.capacity
                     if child.capacity > 0:
-                        running += min(child.capacity, child.running + reserved)
+                        running += max(
+                            child.running,
+                            min(child.capacity, child.running + reserved))
                     else:
                         running += child.running + reserved
                 else:
-                    running += reserved
-        status = ('READY' if total > 0 else
-                  'DRAINING' if known_children > 0 else 'UNKNOWN')
+                    # Preserve the last confirmed occupancy across transient
+                    # misses. With no prior sample, one conservative busy slot
+                    # prevents a fresh router from proving false idleness while
+                    # surviving workers may still own requests.
+                    running += max(1, child.running, reserved)
+            if admission_blocked:
+                # The router rejects every new stable request ID while the
+                # ambiguity budget is exhausted.  Advertise zero free slots
+                # too, otherwise the outer load balancer repeatedly selects
+                # an admission-disabled machine and may scale up against
+                # capacity that cannot accept work.  Retain the logical width
+                # so dashboards and capacity consumers keep machine topology
+                # accurate while treating every slot as conservatively busy.
+                total = max(
+                    total,
+                    sum(max(1, child.capacity) for child in self._children))
+                running = max(running, total)
+        all_children_known = known_children == len(self._children)
+        status = ('UNKNOWN' if not all_children_known else
+                  'READY' if total > 0 else 'DRAINING')
         return web.json_response({
             'status': status,
             'pod_name': socket.gethostname(),
@@ -436,14 +653,39 @@ class LocalAsyncRouter:
             if reservation is not None:
                 reservation.settled_at = time.monotonic()
 
-    async def _remember_owner(self, request_id: str, child_index: int) -> None:
+    async def _remember_owner(self,
+                              request_id: str,
+                              child_index: int,
+                              *,
+                              ambiguous: bool = False) -> bool:
         async with self._state_lock:
-            self._owners[request_id] = child_index
+            previous = self._owners.get(request_id)
+            becomes_ambiguous = (ambiguous and
+                                 (previous is None or not previous.ambiguous))
+            if (becomes_ambiguous and
+                    self._ambiguous_owner_count >= self._max_sticky_requests):
+                return False
+            if becomes_ambiguous:
+                self._ambiguous_owner_count += 1
+            elif (not ambiguous and previous is not None and
+                  previous.ambiguous):
+                self._ambiguous_owner_count -= 1
+            self._owners[request_id] = _Owner(child_index, ambiguous)
             self._owners.move_to_end(request_id)
             while len(self._owners) > self._max_sticky_requests:
-                self._owners.popitem(last=False)
+                confirmed_id = next(
+                    (owner_id for owner_id, owner in self._owners.items()
+                     if not owner.ambiguous), None)
+                if confirmed_id is None:
+                    break
+                self._owners.pop(confirmed_id)
+            return True
 
     async def _owner(self, request_id: Any) -> int | None:
+        owner = await self._owner_record(request_id)
+        return None if owner is None else owner.child_index
+
+    async def _owner_record(self, request_id: Any) -> _Owner | None:
         if not isinstance(request_id, str):
             return None
         async with self._state_lock:
@@ -455,7 +697,34 @@ class LocalAsyncRouter:
     async def _forget_owner(self, request_id: Any) -> None:
         if isinstance(request_id, str):
             async with self._state_lock:
-                self._owners.pop(request_id, None)
+                self._pop_owner(request_id)
+
+    async def _forget_owner_if(self, request_id: str, child_index: int) -> None:
+        async with self._state_lock:
+            owner = self._owners.get(request_id)
+            if owner is not None and owner.child_index == child_index:
+                self._pop_owner(request_id)
+
+    def _pop_owner(self, request_id: str) -> None:
+        owner = self._owners.pop(request_id, None)
+        if owner is not None and owner.ambiguous:
+            self._ambiguous_owner_count -= 1
+
+    async def _retain_request_gate(self, request_id: str) -> _RequestGate:
+        async with self._state_lock:
+            gate = self._request_gates.get(request_id)
+            if gate is None:
+                gate = _RequestGate()
+                self._request_gates[request_id] = gate
+            gate.users += 1
+            return gate
+
+    async def _release_request_gate(self, request_id: str,
+                                    gate: _RequestGate) -> None:
+        async with self._state_lock:
+            gate.users -= 1
+            if gate.users == 0 and self._request_gates.get(request_id) is gate:
+                del self._request_gates[request_id]
 
     async def _request_child(self, child_index: int, method: str, path: str,
                              body: bytes, headers: Mapping[str, str],
@@ -566,15 +835,26 @@ def _request_id(payload: Mapping[str, Any],
     return submitted_id if isinstance(submitted_id, str) else None
 
 
-def _is_not_found(response: _ChildResponse) -> bool:
+def _status_response_status(response: _ChildResponse,
+                            request_id: Any) -> str | None:
+    if not isinstance(request_id, str):
+        return None
     payload = _response_json(response)
-    return payload is not None and payload.get('status') == 'NOT_FOUND'
+    if payload is None or payload.get('request_id') != request_id:
+        return None
+    status = payload.get('status')
+    return status if status in _KNOWN_REQUEST_STATUSES else None
 
 
-def _is_terminal(response: _ChildResponse) -> bool:
+def _is_definitive_cancellation(response: _ChildResponse,
+                                request_id: Any) -> bool:
+    if _status_response_status(response,
+                               request_id) not in ('CANCELED', 'CANCELLED'):
+        return False
     payload = _response_json(response)
-    return (payload is not None and payload.get('status')
-            in ('SUCCEEDED', 'FAILED', 'CANCELED', 'CANCELLED', 'NOT_FOUND'))
+    assert payload is not None
+    canceled = payload.get('canceled')
+    return canceled is not False
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -604,7 +884,13 @@ def _parser() -> argparse.ArgumentParser:
         action='append',
         type=int,
         help='Explicit pre-dispatch rejection status. Defaults to 429.')
-    parser.add_argument('--max-sticky-requests', type=int, default=10000)
+    parser.add_argument(
+        '--max-sticky-requests',
+        type=int,
+        default=10000,
+        help=('Maximum confirmed owner cache size and ambiguous ownership '
+              'safety budget.'),
+    )
     parser.add_argument('--client-max-size-mib', type=int, default=1)
     return parser
 

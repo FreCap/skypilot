@@ -13,6 +13,7 @@ from aiohttp import test_utils
 from aiohttp import web
 import pytest
 
+from sky.serve import load_balancer
 from sky.serve import local_async_router
 
 _ASYNC_PATH = '/async'
@@ -60,6 +61,11 @@ class _RejectingWorker:
             return web.json_response({
                 'request_id': payload['request_id'],
                 'status': 'IN_PROGRESS',
+            })
+        if action == 'async_status':
+            return web.json_response({
+                'request_id': payload['request_id'],
+                'status': 'NOT_FOUND',
             })
         raise AssertionError(action)
 
@@ -157,7 +163,7 @@ async def test_dead_worker_reservation_is_conservative_until_recovery(
     }
     body = json.dumps(payload).encode()
 
-    response = await router._handle_predict(request, body, payload)
+    response = await router._dispatch_predict(request, body, payload)
     assert response.status == 502
     reservation = next(iter(router._children[0].reservations.values()))
     assert reservation.settled_at is not None
@@ -247,6 +253,59 @@ async def test_capacity_status_tracks_unknown_draining_and_ready() -> None:
     assert ready['status'] == 'READY'
     assert ready['running_count'] == 1
     assert ready['predict_concurrency'] == 2
+
+
+@pytest.mark.asyncio
+async def test_partial_probe_failure_cannot_prove_machine_idle() -> None:
+    router = local_async_router.LocalAsyncRouter(
+        ['http://127.0.0.1:8081', 'http://127.0.0.1:8082'],
+        _ASYNC_PATH,
+        _READINESS_PATH,
+    )
+    router._apply_probe(
+        0, local_async_router._ProbeSample(1.0, capacity=2, running=1))
+    router._apply_probe(
+        1, local_async_router._ProbeSample(1.0, capacity=1, running=0))
+    router._apply_probe(
+        0, local_async_router._ProbeSample(2.0, capacity=None, running=None))
+
+    partial = json.loads((await router._capacity_response()).body)
+    assert partial == {
+        'status': 'UNKNOWN',
+        'pod_name': local_async_router.socket.gethostname(),
+        'running_count': 1,
+        'predict_concurrency': 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_first_partial_probe_after_restart_is_conservatively_busy(
+) -> None:
+    router = local_async_router.LocalAsyncRouter(
+        ['http://127.0.0.1:8081', 'http://127.0.0.1:8082'],
+        _ASYNC_PATH,
+        _READINESS_PATH,
+    )
+    router._apply_probe(
+        1, local_async_router._ProbeSample(1.0, capacity=1, running=0))
+
+    partial = json.loads((await router._capacity_response()).body)
+    assert partial['status'] == 'UNKNOWN'
+    assert partial['running_count'] == 1
+    assert partial['predict_concurrency'] == 1
+
+
+@pytest.mark.asyncio
+async def test_reported_running_count_is_never_clipped_to_capacity() -> None:
+    router = local_async_router.LocalAsyncRouter(['http://127.0.0.1:8081'],
+                                                 _ASYNC_PATH, _READINESS_PATH)
+    router._apply_probe(
+        0, local_async_router._ProbeSample(1.0, capacity=1, running=2))
+
+    response = json.loads((await router._capacity_response()).body)
+    assert response['status'] == 'READY'
+    assert response['running_count'] == 2
+    assert response['predict_concurrency'] == 1
 
 
 def test_stale_probe_cannot_overwrite_recovered_worker() -> None:
@@ -387,6 +446,42 @@ async def test_cancelled_refresh_releases_lock_and_next_refresh_recovers(
 
 
 @pytest.mark.asyncio
+async def test_synthetic_status_probe_rewrites_entity_headers(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    router = local_async_router.LocalAsyncRouter(['http://127.0.0.1:8081'],
+                                                 _ASYNC_PATH, _READINESS_PATH)
+    captured: dict[str, Any] = {}
+
+    async def _capture_request(
+            *args: Any, **_kwargs: Any) -> local_async_router._ChildResponse:
+        captured['body'] = args[3]
+        captured['headers'] = args[4]
+        return local_async_router._ChildResponse(200, b'{}', ())
+
+    monkeypatch.setattr(router, '_request_child', _capture_request)
+    request = test_utils.make_mocked_request(
+        'POST',
+        _ASYNC_PATH,
+        headers={
+            'Authorization': 'Bearer internal',
+            'Content-Encoding': 'gzip',
+            'Content-Type': 'application/octet-stream',
+        },
+    )
+
+    await router._request_status_child(request, 'job-1', 0)
+
+    assert json.loads(captured['body']) == {
+        'action': 'async_status',
+        'request_id': 'job-1',
+    }
+    headers = captured['headers']
+    assert headers['Authorization'] == 'Bearer internal'
+    assert headers['Content-Type'] == 'application/json'
+    assert 'Content-Encoding' not in headers
+
+
+@pytest.mark.asyncio
 async def test_sticky_owner_lru_is_bounded_for_long_lived_router() -> None:
     router = local_async_router.LocalAsyncRouter(
         ['http://127.0.0.1:8081'],
@@ -403,3 +498,252 @@ async def test_sticky_owner_lru_is_bounded_for_long_lived_router() -> None:
     assert await router._owner('least-recently-used') is None
     assert await router._owner('old-but-recently-read') == 0
     assert await router._owner('new') == 0
+
+
+@pytest.mark.asyncio
+async def test_confirmed_owner_lru_cannot_evict_ambiguous_claim(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    router = local_async_router.LocalAsyncRouter(
+        ['http://127.0.0.1:8081'],
+        _ASYNC_PATH,
+        _READINESS_PATH,
+        max_sticky_requests=1,
+    )
+    assert await router._remember_owner('ambiguous-original', 0, ambiguous=True)
+    assert await router._remember_owner('newer-confirmed', 0)
+    assert await router._owner('ambiguous-original') == 0
+    assert await router._owner('newer-confirmed') is None
+
+    async def _not_found(*_args: Any,
+                         **_kwargs: Any) -> local_async_router._ChildResponse:
+        return local_async_router._ChildResponse(
+            200,
+            json.dumps({
+                'request_id': 'ambiguous-original',
+                'status': 'NOT_FOUND',
+            }).encode(),
+            (),
+        )
+
+    dispatched = False
+
+    async def _must_not_dispatch(*_args: Any, **_kwargs: Any) -> web.Response:
+        nonlocal dispatched
+        dispatched = True
+        return web.json_response({'status': 'unexpected'})
+
+    monkeypatch.setattr(router, '_request_status_child', _not_found)
+    monkeypatch.setattr(router, '_dispatch_predict', _must_not_dispatch)
+    request = test_utils.make_mocked_request('POST', _ASYNC_PATH)
+    payload = {
+        'action': 'async_predict',
+        'request_id': 'ambiguous-original',
+    }
+
+    response = await router._handle_predict(request,
+                                            json.dumps(payload).encode(),
+                                            payload)
+
+    assert response.status == 502
+    assert not dispatched
+
+
+@pytest.mark.asyncio
+async def test_full_ambiguity_budget_rejects_before_dispatch(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    router = local_async_router.LocalAsyncRouter(
+        ['http://127.0.0.1:8081'],
+        _ASYNC_PATH,
+        _READINESS_PATH,
+        max_sticky_requests=1,
+    )
+    router._apply_probe(
+        0, local_async_router._ProbeSample(1.0, capacity=1, running=0))
+    router._last_probe_finished_at = float('inf')
+    assert await router._remember_owner('unresolved', 0, ambiguous=True)
+
+    async def _must_not_reach_worker(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError('request reached a worker')
+
+    monkeypatch.setattr(router, '_request_child', _must_not_reach_worker)
+    request = test_utils.make_mocked_request('POST', _ASYNC_PATH)
+    payload = {
+        'action': 'async_predict',
+        'request_id': 'new-request',
+    }
+
+    response = await router._dispatch_predict(request,
+                                              json.dumps(payload).encode(),
+                                              payload)
+
+    assert response.status == 429
+    assert router._children[0].reservations == {}
+    assert await router._owner('new-request') is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('worker_count', [1, 4, 8])
+async def test_full_ambiguity_budget_advertises_zero_free_slots_and_recovers(
+        worker_count: int) -> None:
+    router = local_async_router.LocalAsyncRouter(
+        [f'http://127.0.0.1:{8081 + index}' for index in range(worker_count)],
+        _ASYNC_PATH,
+        _READINESS_PATH,
+        max_sticky_requests=1,
+    )
+    for index in range(worker_count):
+        router._apply_probe(
+            index, local_async_router._ProbeSample(1.0, capacity=1, running=0))
+    assert await router._remember_owner('unresolved', 0, ambiguous=True)
+
+    blocked = json.loads((await router._capacity_response()).body)
+    assert blocked == {
+        'status': 'READY',
+        'pod_name': blocked['pod_name'],
+        'running_count': worker_count,
+        'predict_concurrency': worker_count,
+    }
+    assert load_balancer.SkyServeLoadBalancer._parse_replica_occupancy(
+        blocked) == (worker_count, 0, worker_count)
+
+    await router._forget_owner('unresolved')
+    recovered = json.loads((await router._capacity_response()).body)
+    assert recovered == {
+        'status': 'READY',
+        'pod_name': recovered['pod_name'],
+        'running_count': 0,
+        'predict_concurrency': worker_count,
+    }
+    assert load_balancer.SkyServeLoadBalancer._parse_replica_occupancy(
+        recovered) == (0, worker_count, worker_count)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('worker_count', [1, 4, 8])
+async def test_full_ambiguity_budget_preserves_unknown_worker_status(
+        worker_count: int) -> None:
+    router = local_async_router.LocalAsyncRouter(
+        [f'http://127.0.0.1:{8081 + index}' for index in range(worker_count)],
+        _ASYNC_PATH,
+        _READINESS_PATH,
+        max_sticky_requests=1,
+    )
+    for index in range(worker_count):
+        router._apply_probe(
+            index, local_async_router._ProbeSample(1.0, capacity=1, running=0))
+    assert await router._remember_owner('unresolved', 0, ambiguous=True)
+    router._apply_probe(
+        worker_count - 1,
+        local_async_router._ProbeSample(2.0, capacity=None, running=None))
+
+    blocked = json.loads((await router._capacity_response()).body)
+    assert blocked['status'] == 'UNKNOWN'
+    assert blocked['running_count'] == worker_count
+    assert blocked['predict_concurrency'] == worker_count
+    assert load_balancer.SkyServeLoadBalancer._parse_replica_occupancy(
+        blocked) is None
+
+    await router._forget_owner('unresolved')
+    budget_recovered = json.loads((await router._capacity_response()).body)
+    assert budget_recovered['status'] == 'UNKNOWN'
+    assert load_balancer.SkyServeLoadBalancer._parse_replica_occupancy(
+        budget_recovered) is None
+
+    router._apply_probe(
+        worker_count - 1,
+        local_async_router._ProbeSample(3.0, capacity=1, running=0))
+    worker_recovered = json.loads((await router._capacity_response()).body)
+    assert worker_recovered['status'] == 'READY'
+    assert load_balancer.SkyServeLoadBalancer._parse_replica_occupancy(
+        worker_recovered) == (0, worker_count, worker_count)
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_owner_preclaim_leaves_reconcilable_slot(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    router = local_async_router.LocalAsyncRouter(
+        ['http://127.0.0.1:8081'],
+        _ASYNC_PATH,
+        _READINESS_PATH,
+        reservation_grace_seconds=0,
+    )
+    router._apply_probe(
+        0, local_async_router._ProbeSample(1.0, capacity=1, running=0))
+    router._last_probe_finished_at = float('inf')
+    preclaim_started = asyncio.Event()
+
+    async def _blocked_preclaim(*_args: Any, **_kwargs: Any) -> bool:
+        preclaim_started.set()
+        await asyncio.Event().wait()
+        return True
+
+    monkeypatch.setattr(router, '_remember_owner', _blocked_preclaim)
+    request = test_utils.make_mocked_request('POST', _ASYNC_PATH)
+    payload = {
+        'action': 'async_predict',
+        'request_id': 'cancel-during-preclaim',
+    }
+    task = asyncio.create_task(
+        router._dispatch_predict(request,
+                                 json.dumps(payload).encode(), payload))
+    await preclaim_started.wait()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    reservation = next(iter(router._children[0].reservations.values()))
+    assert reservation.settled_at is not None
+    router._apply_probe(
+        0,
+        local_async_router._ProbeSample(reservation.settled_at + 1,
+                                        capacity=1,
+                                        running=0))
+    assert router._children[0].reservations == {}
+    assert await router._reserve(()) is not None
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_budget_release_leaves_reconcilable_slot(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    router = local_async_router.LocalAsyncRouter(
+        ['http://127.0.0.1:8081'],
+        _ASYNC_PATH,
+        _READINESS_PATH,
+        max_sticky_requests=1,
+        reservation_grace_seconds=0,
+    )
+    router._apply_probe(
+        0, local_async_router._ProbeSample(1.0, capacity=1, running=0))
+    router._last_probe_finished_at = float('inf')
+    assert await router._remember_owner('unresolved', 0, ambiguous=True)
+    release_started = asyncio.Event()
+
+    async def _blocked_release(*_args: Any, **_kwargs: Any) -> None:
+        release_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(router, '_release', _blocked_release)
+    request = test_utils.make_mocked_request('POST', _ASYNC_PATH)
+    payload = {
+        'action': 'async_predict',
+        'request_id': 'cancel-during-budget-release',
+    }
+    task = asyncio.create_task(
+        router._dispatch_predict(request,
+                                 json.dumps(payload).encode(), payload))
+    await release_started.wait()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    reservation = next(iter(router._children[0].reservations.values()))
+    assert reservation.settled_at is not None
+    router._apply_probe(
+        0,
+        local_async_router._ProbeSample(reservation.settled_at + 1,
+                                        capacity=1,
+                                        running=0))
+    assert router._children[0].reservations == {}
+    assert await router._reserve(()) is not None

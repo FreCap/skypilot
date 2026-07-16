@@ -37,6 +37,8 @@ class _FakeWorker:
     predict_response_headers: list[tuple[str, str]] = dataclasses.field(
         default_factory=list)
     status_http_status: int | None = None
+    status_payload: Any | None = None
+    cancel_payload: Any | None = None
     predicts: int = 0
     capacity_probes: int = 0
     statuses: int = 0
@@ -97,12 +99,16 @@ class _FakeWorker:
                 return web.json_response({'status': 'error'},
                                          status=self.status_http_status)
             request_id = payload['request_id']
+            if self.status_payload is not None:
+                return web.json_response(self.status_payload)
             return web.json_response({
                 'request_id': request_id,
                 'status': self.jobs.get(request_id, 'NOT_FOUND'),
             })
         if action == 'async_cancel':
             request_id = payload['request_id']
+            if self.cancel_payload is not None:
+                return web.json_response(self.cancel_payload)
             found = request_id in self.jobs
             if found:
                 self.jobs[request_id] = 'CANCELED'
@@ -238,6 +244,151 @@ async def test_retries_only_explicit_capacity_rejections() -> None:
 
 
 @pytest.mark.asyncio
+async def test_concurrent_duplicate_prediction_is_dispatched_once() -> None:
+    workers = [_FakeWorker(predict_delay=0.05), _FakeWorker()]
+    worker_servers = [await _start_worker(worker) for worker in workers]
+    router_server = await _start_router(worker_servers)
+    try:
+        async with aiohttp.ClientSession() as session:
+            payload = {
+                'action': 'async_predict',
+                'request_id': 'same-logical-job',
+            }
+            first, second = await asyncio.gather(
+                _post(session, router_server, payload),
+                _post(session, router_server, payload),
+            )
+            assert first.status == 200
+            assert second.status == 200
+            assert (await first.json())['status'] == 'IN_PROGRESS'
+            assert (await second.json())['status'] == 'IN_PROGRESS'
+            assert sum(worker.predicts for worker in workers) == 1
+            assert sum(worker.running for worker in workers) == 1
+    finally:
+        await router_server.close()
+        await asyncio.gather(*(server.close() for server in worker_servers))
+
+
+@pytest.mark.asyncio
+async def test_predict_retry_after_router_restart_recovers_worker_owner(
+) -> None:
+    workers = [
+        _FakeWorker(running=1,
+                    jobs={'accepted-before-router-restart': 'IN_PROGRESS'}),
+        _FakeWorker(),
+    ]
+    worker_servers = [await _start_worker(worker) for worker in workers]
+    router_server = await _start_router(worker_servers)
+    try:
+        async with aiohttp.ClientSession() as session:
+            response = await _post(
+                session, router_server, {
+                    'action': 'async_predict',
+                    'request_id': 'accepted-before-router-restart',
+                })
+            assert response.status == 200
+            assert (await response.json())['status'] == 'IN_PROGRESS'
+            assert [worker.predicts for worker in workers] == [0, 0]
+
+            status = await _post(
+                session, router_server, {
+                    'action': 'async_status',
+                    'request_id': 'accepted-before-router-restart',
+                })
+            assert (await status.json())['status'] == 'IN_PROGRESS'
+            assert workers[0].statuses == 2
+            assert workers[1].statuses == 1
+    finally:
+        await router_server.close()
+        await asyncio.gather(*(server.close() for server in worker_servers))
+
+
+@pytest.mark.asyncio
+async def test_predict_waits_when_restart_discovery_is_inconclusive() -> None:
+    workers = [_FakeWorker(status_http_status=500), _FakeWorker()]
+    worker_servers = [await _start_worker(worker) for worker in workers]
+    router_server = await _start_router(worker_servers)
+    try:
+        async with aiohttp.ClientSession() as session:
+            payload = {
+                'action': 'async_predict',
+                'request_id': 'not-proven-absent',
+            }
+            inconclusive = await _post(session, router_server, payload)
+            assert inconclusive.status == 502
+            assert [worker.predicts for worker in workers] == [0, 0]
+
+            workers[0].status_http_status = None
+            accepted = await _post(session, router_server, payload)
+            assert accepted.status == 200
+            assert sum(worker.predicts for worker in workers) == 1
+    finally:
+        await router_server.close()
+        await asyncio.gather(*(server.close() for server in worker_servers))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('invalid_status', [
+    {},
+    {
+        'request_id': 'different-job',
+        'status': 'IN_PROGRESS',
+    },
+    {
+        'request_id': 'malformed-status',
+        'status': 'UNRECOGNIZED',
+    },
+])
+async def test_malformed_restart_status_cannot_claim_request(
+        invalid_status: dict[str, Any]) -> None:
+    workers = [_FakeWorker(status_payload=invalid_status), _FakeWorker()]
+    worker_servers = [await _start_worker(worker) for worker in workers]
+    router_server = await _start_router(worker_servers)
+    try:
+        async with aiohttp.ClientSession() as session:
+            response = await _post(session, router_server, {
+                'action': 'async_predict',
+                'request_id': 'malformed-status',
+            })
+            assert response.status == 502
+            assert [worker.predicts for worker in workers] == [0, 0]
+    finally:
+        await router_server.close()
+        await asyncio.gather(*(server.close() for server in worker_servers))
+
+
+@pytest.mark.asyncio
+async def test_restart_owner_discovery_returns_before_unrelated_slow_worker(
+) -> None:
+    never_respond = asyncio.Event()
+    workers = [
+        _FakeWorker(running=1,
+                    jobs={'accepted-before-router-restart': 'IN_PROGRESS'}),
+        _FakeWorker(status_gate=never_respond),
+    ]
+    worker_servers = [await _start_worker(worker) for worker in workers]
+    router_server = await _start_router(worker_servers,
+                                        status_timeout_seconds=1)
+    try:
+        async with aiohttp.ClientSession() as session:
+            response = await asyncio.wait_for(
+                _post(
+                    session, router_server, {
+                        'action': 'async_predict',
+                        'request_id': 'accepted-before-router-restart',
+                    }),
+                timeout=0.2,
+            )
+            assert response.status == 200
+            assert (await response.json())['status'] == 'IN_PROGRESS'
+            assert [worker.predicts for worker in workers] == [0, 0]
+    finally:
+        never_respond.set()
+        await router_server.close()
+        await asyncio.gather(*(server.close() for server in worker_servers))
+
+
+@pytest.mark.asyncio
 async def test_does_not_replay_ambiguous_worker_failure() -> None:
     workers = [_FakeWorker(predict_statuses=[503]), _FakeWorker()]
     worker_servers = [await _start_worker(worker) for worker in workers]
@@ -322,7 +473,17 @@ async def test_preserves_duplicate_headers_and_strips_connection_options(
 
 
 @pytest.mark.asyncio
-async def test_does_not_replay_worker_timeout() -> None:
+@pytest.mark.parametrize('cancel_payload, expected_cancel_status', [
+    (None, 'NOT_FOUND'),
+    ({
+        'request_id': 'job-timeout',
+        'status': 'CANCELED',
+        'canceled': False,
+    }, 'CANCELED'),
+])
+async def test_does_not_replay_worker_timeout(
+        cancel_payload: dict[str, Any] | None,
+        expected_cancel_status: str) -> None:
     workers = [_FakeWorker(predict_delay=0.05), _FakeWorker()]
     worker_servers = [await _start_worker(worker) for worker in workers]
     router_server = await _start_router(worker_servers,
@@ -335,6 +496,61 @@ async def test_does_not_replay_worker_timeout() -> None:
             })
             assert response.status == 502
             assert [worker.predicts for worker in workers] == [1, 0]
+
+            workers[0].cancel_payload = cancel_payload
+            canceled = await _post(session, router_server, {
+                'action': 'async_cancel',
+                'request_id': 'job-timeout',
+            })
+            assert canceled.status == 200
+            assert (await canceled.json())['status'] == expected_cancel_status
+
+            retry = await _post(session, router_server, {
+                'action': 'async_predict',
+                'request_id': 'job-timeout',
+            })
+            assert retry.status == 502
+            assert [worker.predicts for worker in workers] == [1, 0]
+    finally:
+        await router_server.close()
+        await asyncio.gather(*(server.close() for server in worker_servers))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('action, response_field, invalid_response', [
+    ('async_status', 'status_payload', {
+        'request_id': 'different-job',
+        'status': 'IN_PROGRESS',
+    }),
+    ('async_status', 'status_payload', {
+        'request_id': 'restart-query',
+        'status': 'UNRECOGNIZED',
+    }),
+    ('async_cancel', 'cancel_payload', {
+        'request_id': 'different-job',
+        'status': 'CANCELED',
+        'canceled': True,
+    }),
+    ('async_cancel', 'cancel_payload', {
+        'request_id': 'restart-query',
+        'status': 'UNRECOGNIZED',
+    }),
+])
+async def test_restart_fanout_rejects_inconclusive_responses(
+        action: str, response_field: str, invalid_response: dict[str,
+                                                                 Any]) -> None:
+    workers = [_FakeWorker(), _FakeWorker()]
+    setattr(workers[0], response_field, invalid_response)
+    worker_servers = [await _start_worker(worker) for worker in workers]
+    router_server = await _start_router(worker_servers)
+    try:
+        async with aiohttp.ClientSession() as session:
+            response = await _post(session, router_server, {
+                'action': action,
+                'request_id': 'restart-query',
+            })
+            assert response.status == 502
+            assert (await response.json())['status'] == 'error'
     finally:
         await router_server.close()
         await asyncio.gather(*(server.close() for server in worker_servers))
@@ -365,7 +581,7 @@ async def test_cancelled_handler_leaves_reconcilable_reservation(
         'request_id': 'job-cancelled-client',
     }).encode()
     task = asyncio.create_task(
-        router._handle_predict(request, body, json.loads(body)))
+        router._dispatch_predict(request, body, json.loads(body)))
     await request_started.wait()
 
     task.cancel()
@@ -524,7 +740,7 @@ async def test_status_is_sticky_and_recovers_missing_ownership() -> None:
                 'request_id': 'sticky',
             })
             assert (await sticky.json())['status'] == 'IN_PROGRESS'
-            assert [worker.statuses for worker in workers] == [1, 0]
+            assert [worker.statuses for worker in workers] == [2, 1]
 
             workers[0].status_http_status = 500
 
@@ -533,7 +749,7 @@ async def test_status_is_sticky_and_recovers_missing_ownership() -> None:
                 'request_id': 'preexisting',
             })
             assert (await recovered.json())['status'] == 'SUCCEEDED'
-            assert [worker.statuses for worker in workers] == [2, 1]
+            assert [worker.statuses for worker in workers] == [3, 2]
     finally:
         await router_server.close()
         await asyncio.gather(*(server.close() for server in worker_servers))
