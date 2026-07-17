@@ -103,7 +103,8 @@ def test_get_next_cluster_name_uses_grouped_pool_counts_in_fallback():
     get_status.assert_called_once_with('pool-a',
                                        pool=True,
                                        with_replica_info=False,
-                                       with_yaml=False)
+                                       with_yaml=False,
+                                       status_snapshot_only=True)
     grouped_counts.assert_called_once_with('pool-a')
     assert selected == 'replica-idle'
     set_cluster.assert_called_once_with(17, 'replica-idle')

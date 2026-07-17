@@ -297,10 +297,43 @@ class TestGetServiceStatusSummary:
             pool=False,
             with_replica_info=False,
             with_yaml=False,
-            with_target_num_replicas=False)
+            with_target_num_replicas=False,
+            status_snapshot_only=True)
 
         get_snapshot.assert_called_once_with('svc', require_version=True)
         assert record == snapshot
+
+    def test_status_snapshot_rejects_enrichment(self):
+        with pytest.raises(ValueError, match='cannot include service'):
+            serve_utils._get_service_status(  # pylint: disable=protected-access
+                'svc',
+                pool=False,
+                status_snapshot_only=True)
+
+    def test_yaml_free_status_keeps_latest_spec_by_default(self, monkeypatch):
+        full_record = {
+            'name': 'svc',
+            'pool': False,
+            'hash': 'incarnation-a',
+            'yaml_content': None,
+        }
+        get_full_record = mock.Mock(return_value=dict(full_record))
+        get_snapshot = mock.Mock(
+            side_effect=AssertionError('slim snapshots must be explicit'))
+        monkeypatch.setattr(serve_state, 'get_service_from_name',
+                            get_full_record)
+        monkeypatch.setattr(serve_state, 'get_service_status_snapshot',
+                            get_snapshot)
+
+        record = serve_utils._get_service_status(  # pylint: disable=protected-access
+            'svc',
+            pool=False,
+            with_replica_info=False,
+            with_yaml=False)
+
+        assert record == full_record
+        get_full_record.assert_called_once_with('svc')
+        get_snapshot.assert_not_called()
 
     def test_full_status_unaffected(self, patched_state, monkeypatch):
         # with_replica_info=True keeps the original full contract.

@@ -1735,7 +1735,8 @@ def _get_service_status(
         with_replica_info: bool = True,
         with_replica_counts: bool = False,
         with_yaml: bool = True,
-        with_target_num_replicas: bool = False) -> dict[str, Any] | None:
+        with_target_num_replicas: bool = False,
+        status_snapshot_only: bool = False) -> dict[str, Any] | None:
     """Get the status dict of the service.
 
     Args:
@@ -1757,14 +1758,19 @@ def _get_service_status(
             registration polling) must never block on a possibly-dead
             controller's connect timeout for fields they do not read. Only
             user-facing status rendering should pass True.
+        status_snapshot_only: Whether to read only lifecycle fields from the
+            services table. Callers must opt in explicitly because some
+            YAML-free lifecycle paths still inspect latest-version metadata.
 
     Returns:
         A dictionary describing the status of the service if the service exists.
         Otherwise, return None.
     """
-    minimal_status_only = (not with_replica_info and not with_replica_counts and
-                           not with_yaml and not with_target_num_replicas)
-    if minimal_status_only:
+    if status_snapshot_only:
+        if (with_replica_info or with_replica_counts or with_yaml or
+                with_target_num_replicas):
+            raise ValueError('A status-only snapshot cannot include service '
+                             'enrichment.')
         record = serve_state.get_service_status_snapshot(service_name,
                                                          require_version=True)
     else:
@@ -2199,7 +2205,8 @@ def get_next_cluster_name(
     service_status = _get_service_status(service_name,
                                          pool=True,
                                          with_replica_info=False,
-                                         with_yaml=False)
+                                         with_yaml=False,
+                                         status_snapshot_only=True)
     if service_status is None:
         logger.error(f'Service {service_name!r} does not exist.')
         return None
@@ -3068,7 +3075,8 @@ def wait_service_registration(
         record = _get_service_status(service_name,
                                      pool=pool,
                                      with_replica_info=False,
-                                     with_yaml=False)
+                                     with_yaml=False,
+                                     status_snapshot_only=True)
         if record is not None:
             if (expected_resource_scope is not None and
                     record.get('resource_scope') != expected_resource_scope):

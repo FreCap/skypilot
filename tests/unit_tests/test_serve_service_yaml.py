@@ -89,7 +89,7 @@ def test_service_yaml_skipped_when_not_requested(monkeypatch):
     get_yaml = mock.Mock()
     monkeypatch.setattr(serve_utils, 'get_yaml_content', get_yaml)
 
-    record = _get_status(with_yaml=False)
+    record = _get_status(with_yaml=False, status_snapshot_only=True)
 
     assert record is not None
     assert 'service_yaml' not in record
