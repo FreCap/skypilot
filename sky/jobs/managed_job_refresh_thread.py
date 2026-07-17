@@ -52,11 +52,11 @@ class ManagedJobRefreshDaemonThread(threading.Thread):
         self._lock: locks.DistributedLock | None = None
 
     def run(self) -> None:
-        self._lock = locks.get_lock(
-            managed_job_constants.CONSOLIDATION_MODE_LOCK_ID)
-
         while True:
             try:
+                if self._lock is None:
+                    self._lock = locks.get_lock(
+                        managed_job_constants.CONSOLIDATION_MODE_LOCK_ID)
                 self._become_leader_and_run()
                 # _become_leader_and_run only returns normally after
                 # _suicide_on_lock_loss sent SIGTERM. Re-entering would
@@ -77,7 +77,8 @@ class ManagedJobRefreshDaemonThread(threading.Thread):
                 # (local `_acquired` flag still True, server-side lock
                 # released, another replica can grab it).  Hand off via
                 # SIGTERM, same as the steady-state probe path.
-                if self._lock.is_locked() and not self._lock_still_held():
+                if (self._lock is not None and self._lock.is_locked() and
+                        not self._lock_still_held()):
                     self._suicide_on_lock_loss()
                     return
                 time.sleep(_ACQUIRE_RETRY_INTERVAL_SECONDS)
