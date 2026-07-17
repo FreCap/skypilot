@@ -87,6 +87,7 @@ class InternalRequestDaemon:
         # pylint: disable=import-outside-toplevel
         import logging
 
+        level_str = self.default_log_level
         try:
             # Refresh config within the while loop.
             # Since this is a long running daemon,

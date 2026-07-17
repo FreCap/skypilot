@@ -163,6 +163,7 @@ def encode_jobs_queue_v2(
         jobs_or_tuple) -> list[dict[str, Any]] | dict[str, Any]:
     # Support returning either a plain jobs list or a (jobs, total) tuple
     status_counts: dict[str, int] = {}
+    total_no_filter = None
     if isinstance(jobs_or_tuple, tuple):
         if len(jobs_or_tuple) == 2:
             jobs, total = jobs_or_tuple
