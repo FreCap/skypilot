@@ -1731,6 +1731,57 @@ class TestCancelSignalScan:
         assert (signal_dir / '9.lock').exists()
 
 
+class TestControllerManagerMonitorLoop:
+    """The controller monitor reacts to capacity changes without polling."""
+
+    @pytest.mark.asyncio
+    async def test_saturated_launch_slot_wakes_on_notification(self):
+        manager = ControllerManager('test-uuid')
+        manager.starting.add(1)
+        wait_started = asyncio.Event()
+        job_started = asyncio.Event()
+
+        class TrackingCondition(asyncio.Condition):
+
+            async def wait_for(self, predicate):
+                wait_started.set()
+                return await super().wait_for(predicate)
+
+        manager._starting_signal = TrackingCondition(manager._job_tasks_lock)
+
+        async def start_job(job_id, pool=None):
+            assert job_id == 2
+            assert pool is None
+            job_started.set()
+            raise asyncio.CancelledError
+
+        manager.start_job = AsyncMock(side_effect=start_job)
+
+        with patch('sky.jobs.controller.controller_utils.'
+                   'LAUNCHES_PER_WORKER', 1), \
+                patch('sky.jobs.controller.managed_job_state.'
+                      'get_waiting_job_async',
+                      new=AsyncMock(return_value={'job_id': 2})), \
+                patch('sky.jobs.controller.os.listdir', return_value=[]), \
+                patch('sky.jobs.controller.asyncio.sleep',
+                      new=AsyncMock(side_effect=AssertionError(
+                          'launch capacity must not use polling sleeps'))
+                     ) as sleep:
+            monitor = asyncio.create_task(manager.monitor_loop())
+            try:
+                await asyncio.wait_for(wait_started.wait(), timeout=1)
+                async with manager._starting_signal:
+                    manager.starting.remove(1)
+                    manager._starting_signal.notify()
+                await asyncio.wait_for(job_started.wait(), timeout=1)
+            finally:
+                monitor.cancel()
+                await asyncio.gather(monitor, return_exceptions=True)
+
+        sleep.assert_not_awaited()
+        manager.start_job.assert_awaited_once_with(2, None)
+
+
 class TestRunJobLoopCancelInfoCleanup:
     """run_job_loop must drop stale cancel info even on the success path.
 
