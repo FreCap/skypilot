@@ -1141,17 +1141,18 @@ def write_cluster_config(
         if auto_mounts_config:
             home_dir = kubernetes_utils.DEFAULT_HOME_DIRECTORY
             attached_auto_mount_volumes: set[str] = set()
+            volume_configs = global_user_state.get_volume_configs_by_names(
+                [entry['volume_name'] for entry in auto_mounts_config])
             for entry in auto_mounts_config:
                 volume_name = entry['volume_name']
                 mount_paths = entry.get('mount_paths', [])
-                record = global_user_state.get_volume_by_name(volume_name)
-                if record is None:
+                volume_config = volume_configs.get(volume_name)
+                if volume_config is None:
                     logger.warning(
                         f'Auto-mount volume {volume_name!r} not found in '
                         f'SkyPilot volume DB. Skipping. '
                         f'Create it with: sky volumes apply')
                     continue
-                volume_config = record['handle']
                 # Only hostPath and ReadWriteMany PVC volumes support
                 # concurrent multi-pod access required by auto_mounts.
                 if (volume_config.type == volume_utils.VolumeType.PVC.value and

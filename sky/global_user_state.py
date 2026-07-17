@@ -3166,6 +3166,20 @@ def get_volumes(is_ephemeral: bool | None = None) -> list[dict[str, Any]]:
 
 
 @metrics_lib.time_me
+def get_volume_configs_by_names(
+        names: list[str]) -> dict[str, models.VolumeConfig]:
+    """Returns one snapshot of the requested volume configs, keyed by name."""
+    unique_names = tuple(dict.fromkeys(names))
+    if not unique_names:
+        return {}
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        rows = session.query(volume_table.c.name, volume_table.c.handle).filter(
+            volume_table.c.name.in_(unique_names)).all()
+    return {row.name: pickle.loads(row.handle) for row in rows}
+
+
+@metrics_lib.time_me
 def get_volume_by_name(name: str) -> dict[str, Any] | None:
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:

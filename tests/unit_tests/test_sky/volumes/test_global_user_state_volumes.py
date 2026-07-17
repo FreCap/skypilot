@@ -1,8 +1,4 @@
-"""Unit tests for volume database operations in global_user_state.py.
-
-These tests specifically cover the is_ephemeral boolean/integer conversion
-that is necessary for PostgreSQL compatibility. See issue #8178 and PR #8179.
-"""
+"""Unit tests for volume database operations in global_user_state.py."""
 
 import pickle
 from unittest import mock
@@ -14,8 +10,8 @@ from sky import models
 from sky.utils import status_lib
 
 
-class TestVolumeIsEphemeralHandling:
-    """Test is_ephemeral boolean/integer handling in volume operations.
+class TestVolumeDatabaseOperations:
+    """Test volume reads and is_ephemeral boolean/integer handling.
 
     PostgreSQL stores boolean values as integers (0/1), while SQLite
     handles Python booleans transparently. These tests verify that
@@ -154,6 +150,35 @@ class TestVolumeIsEphemeralHandling:
         # Verify query.all() was called (not filter_by)
         mock_session.query.return_value.all.assert_called_once()
         mock_session.query.return_value.filter_by.assert_not_called()
+
+    def test_get_volume_configs_by_names_is_one_exact_query(
+            self,
+            mock_engine,  # pylint: disable=unused-argument
+            mock_session,
+            mock_volume_config):
+        row = mock.Mock()
+        row.name = 'test-volume'
+        row.handle = pickle.dumps(mock_volume_config)
+        query = mock_session.query.return_value
+        query.filter.return_value.all.return_value = [row]
+
+        result = global_user_state.get_volume_configs_by_names(
+            ['test-volume', 'missing', 'test-volume'])
+
+        assert result == {'test-volume': mock_volume_config}
+        mock_session.query.assert_called_once_with(
+            global_user_state.volume_table.c.name,
+            global_user_state.volume_table.c.handle)
+        query.filter.assert_called_once()
+        criterion = query.filter.call_args.args[0]
+        assert set(criterion.right.value) == {'test-volume', 'missing'}
+
+    def test_get_volume_configs_by_names_empty_is_query_free(
+            self,
+            mock_engine,  # pylint: disable=unused-argument
+            mock_session):
+        assert global_user_state.get_volume_configs_by_names([]) == {}
+        mock_session.query.assert_not_called()
 
     @pytest.mark.parametrize('db_value,expected_bool,last_attached', [
         (1, True, 1234567890),

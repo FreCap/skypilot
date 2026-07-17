@@ -4,6 +4,7 @@
 
 import os
 import pathlib
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -215,6 +216,74 @@ def test_write_cluster_config_w_post_provision_runcmd_kubernetes(
         0] == cluster_config_template, 'config template incorrect'
     assert mock_fill_template.call_args[0][1][
         'runcmd'] == expected_runcmd, 'runcmd not passed correctly'
+
+
+@mock.patch.object(skypilot_config, '_global_config_context',
+                   skypilot_config.ConfigContext())
+@mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+            return_value=[])
+@mock.patch('sky.utils.common_utils.fill_template',
+            wraps=common_utils.fill_template)
+def test_write_cluster_config_snapshots_auto_mount_volumes_once(
+        mock_fill_template, _mock_nodes, monkeypatch):
+    auto_mounts = [{
+        'volume_name': 'shared',
+        'mount_paths': ['/data'],
+    }, {
+        'volume_name': 'shared',
+        'mount_paths': ['~/cache'],
+    }, {
+        'volume_name': 'missing',
+        'mount_paths': ['/missing'],
+    }]
+
+    def _get_config(cloud=None,
+                    keys=(),
+                    region=None,
+                    default_value=None,
+                    override_configs=None,
+                    merge_dicts=False,
+                    **_kwargs):
+        del cloud, region, override_configs, merge_dicts
+        if keys == ('auto_mounts',):
+            return auto_mounts
+        return default_value
+
+    volume_config = SimpleNamespace(type='k8s-hostpath',
+                                    config={'host_path': '/host/shared'},
+                                    name_on_cloud=None,
+                                    id_on_cloud=None)
+    get_configs = mock.Mock(return_value={'shared': volume_config})
+    monkeypatch.setattr(skypilot_config, 'get_effective_region_config',
+                        _get_config)
+    monkeypatch.setattr('sky.global_user_state.get_volume_configs_by_names',
+                        get_configs)
+    point_read = mock.Mock(side_effect=AssertionError('point read used'))
+    monkeypatch.setattr('sky.global_user_state.get_volume_by_name', point_read)
+
+    cloud = clouds.Kubernetes()
+    region = clouds.Region(name='fake-context')
+    resource = Resources(cloud=cloud, instance_type='4CPU--16GB')
+    backend_utils.write_cluster_config(
+        to_provision=resource,
+        num_nodes=2,
+        cluster_config_template='kubernetes-ray.yml.j2',
+        cluster_name='display',
+        local_wheel_path=pathlib.Path('/tmp/fake'),
+        wheel_hash='b1bd84059bc0342f7843fcbe04ab563e',
+        region=region,
+        dryrun=True,
+        keep_launch_fields_in_existing_config=True)
+
+    get_configs.assert_called_once_with(['shared', 'shared', 'missing'])
+    point_read.assert_not_called()
+    rendered_mounts = mock_fill_template.call_args.args[1]['volume_mounts']
+    assert [
+        (mount.name, mount.path, mount.host_path) for mount in rendered_mounts
+    ] == [
+        ('shared', '/data', '/host/shared'),
+        ('shared', '/home/sky/cache', '/host/shared'),
+    ]
 
 
 def test_get_clusters_launch_refresh(monkeypatch):
