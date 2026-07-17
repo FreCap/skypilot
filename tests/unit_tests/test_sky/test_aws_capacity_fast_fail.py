@@ -1,5 +1,6 @@
 """Tests for terminal AWS RunInstances fast-fail behavior."""
 # pylint: disable=protected-access
+import pickle
 from types import SimpleNamespace
 from typing import Dict, List
 
@@ -7,7 +8,9 @@ import botocore.exceptions
 import pytest
 
 from sky.provision import common as provision_common
+from sky.provision import constants as provision_constants
 from sky.provision.aws import instance as aws_instance
+from sky.provision.aws import instance_requests
 
 
 def _client_error(code: str) -> botocore.exceptions.ClientError:
@@ -32,6 +35,97 @@ def _node_config(subnets: List[str], *, spot: bool) -> Dict:
 def _create(fake_ec2, node_config, *, single_zone: bool):
     return aws_instance._create_instances(fake_ec2, 'cluster', node_config, {},
                                           1, True, 0, single_zone)
+
+
+def test_create_instances_projects_request_without_mutating_node_config():
+    launched = [object()]
+    observed = []
+
+    class _FakeEC2:
+
+        def create_instances(self, **kwargs):
+            observed.append(kwargs)
+            return launched
+
+    node_config = {
+        'SubnetIds': ['subnet-a'],
+        'SecurityGroupIds': ['sg-1'],
+        'InstanceType': 'g6.4xlarge',
+        'TagSpecifications': [{
+            'ResourceType': 'instance',
+            'Tags': [{
+                'Key': 'Name',
+                'Value': 'custom-name',
+            }, {
+                'Key': 'purpose',
+                'Value': 'test',
+            }],
+        }, {
+            'ResourceType': 'volume',
+            'Tags': [{
+                'Key': 'storage',
+                'Value': 'scratch',
+            }],
+        }],
+    }
+
+    result = aws_instance._create_instances(  # pylint: disable=protected-access
+        _FakeEC2(), 'cluster', node_config, {'owner': 'sky'}, 1, True, 0)
+
+    assert result is launched
+    assert node_config['SubnetIds'] == ['subnet-a']
+    assert node_config['SecurityGroupIds'] == ['sg-1']
+    assert observed == [{
+        'InstanceType': 'g6.4xlarge',
+        'TagSpecifications': [{
+            'ResourceType': 'instance',
+            'Tags': [{
+                'Key': 'Name',
+                'Value': 'custom-name',
+            }, {
+                'Key': provision_constants.TAG_RAY_CLUSTER_NAME,
+                'Value': 'cluster',
+            }, {
+                'Key': provision_constants.TAG_SKYPILOT_CLUSTER_NAME,
+                'Value': 'cluster',
+            }, {
+                'Key': 'owner',
+                'Value': 'sky',
+            }, {
+                'Key': 'purpose',
+                'Value': 'test',
+            }],
+        }, {
+            'ResourceType': 'volume',
+            'Tags': [{
+                'Key': 'storage',
+                'Value': 'scratch',
+            }],
+        }],
+        'MinCount': 1,
+        'MaxCount': 1,
+        'NetworkInterfaces': [{
+            'SubnetId': 'subnet-a',
+            'DeviceIndex': 0,
+            'AssociatePublicIpAddress': True,
+            'Groups': ['sg-1'],
+            'InterfaceType': 'interface',
+        }],
+    }]
+
+
+def test_instance_request_helpers_keep_instance_facade():
+    assert (aws_instance._create_instances
+            is not instance_requests.create_instances)
+    assert (aws_instance._is_single_zone_request
+            is instance_requests._is_single_zone_request)
+
+
+@pytest.mark.parametrize('name',
+                         ['_create_instances', '_is_single_zone_request'])
+def test_instance_request_helpers_load_from_legacy_pickle_paths(name):
+    payload = f'csky.provision.aws.instance\n{name}\n.'.encode()
+    assert pickle.loads(payload) is getattr(aws_instance, name)
 
 
 @pytest.mark.parametrize(('availability_zone', 'expected'), [
