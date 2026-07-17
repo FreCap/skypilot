@@ -2526,6 +2526,9 @@ class TestLogicalCapacityPlanning:
         mgr._defer_scale_down_until_idle = defer
 
         with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_info_from_id',
+                               return_value=four), \
+             mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
                                return_value=[eight, four]):
             mgr._logical_target = (1, 3, 9)
@@ -2577,9 +2580,39 @@ class TestLogicalCapacityPlanning:
                                              [peer])) as scan:
             mgr.scale_down_logically(1, 4, 1, 3)
 
-        point_read.assert_not_called()
+        point_read.assert_called_once_with('svc', 1)
         scan.assert_called_once_with('svc')
         defer.assert_not_called()
+
+    @pytest.mark.parametrize('victim_missing', [True, False])
+    def test_terminal_or_missing_retirement_skips_fleet_scan(
+            self, victim_missing):
+        mgr = _make_manager()
+        mgr._uses_logical_replicas = True
+        terminal_victim = self._ready_backend(1, 4)
+        terminal_victim.status_property.sky_down_status = (
+            common_utils.ProcessStatus.SCHEDULED)
+        mgr._logical_reconcile_snapshot = (
+            replica_managers.LogicalReconcileSnapshot(
+                version=1,
+                generation=3,
+                observed_slots_by_replica_id={1: 4},
+                in_flight_by_replica_id={1: 0},
+                unknown_replica_ids=frozenset(),
+                received_at=replica_managers.time.monotonic()))
+        mgr._logical_target = (1, 3, 0)
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_info_from_id',
+                return_value=(None if victim_missing else terminal_victim
+                             )) as point_read, mock.patch.object(
+                                 replica_managers.serve_state,
+                                 'get_replica_infos') as scan:
+            mgr.scale_down_logically(1, 0, 1, 3)
+
+        point_read.assert_called_once_with('svc', 1)
+        scan.assert_not_called()
 
     def test_zero_capacity_rebalance_replacement_cannot_retire_incumbent(self):
         mgr = _make_manager()
@@ -2605,6 +2638,9 @@ class TestLogicalCapacityPlanning:
         mgr._defer_scale_down_until_idle = defer
 
         with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_info_from_id',
+                               return_value=victim), \
+             mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
                                return_value=[victim, replacement]):
             mgr.scale_down_logically(1, 8, 1, 3)
@@ -3410,7 +3446,12 @@ class TestLogicalCapacityPlanning:
             info.status_property.sky_down_status = (
                 common_utils.ProcessStatus.SCHEDULED)
 
-        with mock.patch.object(replica_managers.serve_state,
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_info_from_id',
+                side_effect=lambda _service, replica_id: backends[
+                    replica_id - 1]), \
+             mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
                                return_value=backends), \
              mock.patch.object(mgr,
