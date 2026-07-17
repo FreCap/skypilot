@@ -1441,6 +1441,7 @@ class TestGetServiceControllerOwner:
             'controller_ip',
             'controller_port',
             'lifecycle_epoch',
+            'pool',
             'resource_scope',
         }
         assert record['hash']
@@ -1448,6 +1449,7 @@ class TestGetServiceControllerOwner:
         assert record['controller_pid'] == 12345
         assert record['controller_ip'] == '10.4.10.8'
         assert record['controller_port'] == 20007
+        assert record['pool'] is False
 
     def test_missing_row_returns_none(self, _mock_serve_db):
         assert serve_state.get_service_controller_owner('missing') is None

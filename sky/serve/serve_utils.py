@@ -3121,10 +3121,22 @@ def load_service_initialization_result(payload: str) -> int:
     return message_utils.decode_payload(payload)
 
 
+def _get_service_log_owner_record(service_name: str,
+                                  pool: bool) -> dict[str, Any] | None:
+    """Read the slim service row used by log/liveness helpers.
+
+    These paths only need status and resource-scope metadata, so they must
+    stay off the joined latest-spec read and never parse YAML.
+    """
+    record = serve_state.get_service_controller_owner(service_name,
+                                                      require_version=True)
+    if record is None or record.get('pool') != pool:
+        return None
+    return record
+
+
 def _check_service_status_healthy(service_name: str, pool: bool) -> str | None:
-    service_record = _get_service_status(service_name,
-                                         pool,
-                                         with_replica_info=False)
+    service_record = _get_service_log_owner_record(service_name, pool)
     capnoun = 'Service' if not pool else 'Pool'
     if service_record is None:
         return f'{capnoun} {service_name!r} does not exist.'
@@ -3314,7 +3326,7 @@ def stream_replica_logs(service_name: str, replica_id: int, follow: bool,
     caprepnoun = repnoun.capitalize()
     print(f'{colorama.Fore.YELLOW}Start streaming logs for launching process '
           f'of {repnoun} {replica_id}.{colorama.Style.RESET_ALL}')
-    record = serve_state.get_service_from_name(service_name)
+    record = _get_service_log_owner_record(service_name, pool)
     resource_scope = record.get('resource_scope') if record else None
     log_file_name = generate_replica_log_file_name(service_name, replica_id,
                                                    resource_scope)
@@ -3460,15 +3472,13 @@ def stream_serve_process_logs(service_name: str, stream_controller: bool,
         # legacy controller-local load_balancer.log file.
         from sky.serve import lb_k8s  # pylint: disable=import-outside-toplevel
         return lb_k8s.stream_lb_logs(service_name, follow, tail)
-    record = serve_state.get_service_from_name(service_name)
+    record = _get_service_log_owner_record(service_name, pool)
     resource_scope = record.get('resource_scope') if record else None
     log_file = generate_remote_controller_log_file_name(service_name,
                                                         resource_scope)
 
     def _service_is_terminal() -> bool:
-        record = _get_service_status(service_name,
-                                     pool,
-                                     with_replica_info=False)
+        record = _get_service_log_owner_record(service_name, pool)
         if record is None:
             return True
         return record['status'] in serve_state.ServiceStatus.failed_statuses()

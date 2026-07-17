@@ -28,10 +28,17 @@ def patched_env(monkeypatch, tmp_path):
     """Route service logs to tmp_path and stub the service-level checks."""
     monkeypatch.setattr(serve_utils, '_check_service_status_healthy',
                         lambda name, pool: None)
-    monkeypatch.setattr(serve_state, 'get_service_from_name', lambda name: {
-        'name': name,
-        'resource_scope': None
-    })
+    monkeypatch.setattr(serve_state,
+                        'get_service_controller_owner',
+                        lambda name, require_version=False: {
+                            'pool': False,
+                            'resource_scope': None,
+                        })
+    monkeypatch.setattr(
+        serve_state, 'get_service_from_name', lambda name:
+        (_ for _ in ()).throw(
+            AssertionError('stream_replica_logs should not '
+                           'load the full service row')))
     monkeypatch.setattr(serve_utils,
                         'generate_remote_service_dir_name',
                         lambda name, scope=None: str(tmp_path))
@@ -100,3 +107,26 @@ class TestStreamReplicaLogsStatusLookup:
                                             follow=False,
                                             tail=None,
                                             pool=False)
+
+    def test_resource_scope_comes_from_owner_lookup(self, monkeypatch,
+                                                    patched_env):
+        monkeypatch.setattr(
+            serve_state, 'get_replica_info_from_id', lambda service_name,
+            replica_id: _fake_replica(serve_state.ReplicaStatus.PROVISIONING))
+        monkeypatch.setattr(
+            serve_utils, '_follow_logs_with_provision_expanding',
+            lambda f, cluster_name, should_stop, stop_on_eof: iter(()))
+        owner_lookup = mock.Mock(return_value={
+            'pool': False,
+            'resource_scope': 'team-a',
+        })
+        monkeypatch.setattr(serve_state, 'get_service_controller_owner',
+                            owner_lookup)
+
+        serve_utils.stream_replica_logs('svc',
+                                        replica_id=1,
+                                        follow=False,
+                                        tail=None,
+                                        pool=False)
+
+        owner_lookup.assert_called_once_with('svc', require_version=True)

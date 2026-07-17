@@ -1671,6 +1671,7 @@ def get_service_controller_owner(
             services_table.c.controller_ip,
             services_table.c.controller_port,
             services_table.c.lifecycle_epoch,
+            services_table.c.pool,
             services_table.c.resource_scope,
             services_table.c.lb_ha_enabled,
             services_table.c.lb_active_slot,
@@ -1692,6 +1693,7 @@ def get_service_controller_owner(
         'controller_ip': mapping['controller_ip'],
         'controller_port': mapping['controller_port'],
         'lifecycle_epoch': mapping['lifecycle_epoch'],
+        'pool': bool(mapping['pool']),
         'resource_scope': mapping['resource_scope'],
     }
     if include_lb_state:
