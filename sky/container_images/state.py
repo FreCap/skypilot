@@ -13,10 +13,10 @@ import sqlalchemy
 from sqlalchemy import exc as sqlalchemy_exc
 from sqlalchemy import orm
 from sqlalchemy.dialects import postgresql
-from sqlalchemy.dialects import sqlite
 
 from sky import global_user_state
 from sky.container_images import models
+from sky.utils.db import db_utils
 from sky.utils.db import retries as db_retries
 
 _FINGERPRINT_PATTERN = re.compile(r'^[0-9a-f]{64}$')
@@ -234,7 +234,12 @@ class ImageLocationIntent:
 
 
 def _engine() -> sqlalchemy.engine.Engine:
-    return global_user_state.initialize_and_get_db()
+    engine = global_user_state.initialize_and_get_db()
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        raise RuntimeError(
+            'Managed container image state requires the central PostgreSQL '
+            'database.')
+    return engine
 
 
 def _validate_catalog_quota(value: int, subject: str, maximum: int) -> int:
@@ -247,17 +252,14 @@ def _validate_catalog_quota(value: int, subject: str, maximum: int) -> int:
 
 def _lock_workspace_catalog(
     session: orm.Session,
-    engine: sqlalchemy.engine.Engine,
     workspace: str,
     now: int,
 ) -> sqlalchemy.engine.RowMapping:
     """Locks the per-workspace quota row and initializes legacy counts."""
-    insert_func = (sqlite.insert
-                   if engine.dialect.name == 'sqlite' else postgresql.insert)
     workspace_table = (
         global_user_state.container_image_workspace_catalog_table)
     workspace_insert = session.execute(
-        insert_func(workspace_table).values(
+        postgresql.insert(workspace_table).values(
             workspace=workspace, artifact_count=0,
             updated_at=now).on_conflict_do_nothing())
     if workspace_insert.rowcount == 1:
@@ -278,9 +280,8 @@ def _lock_workspace_catalog(
 def _insert_do_nothing(table: sqlalchemy.Table, values: dict[str, Any]) -> bool:
     """Inserts without turning expected first-use races into exceptions."""
     engine = _engine()
-    insert_func = (sqlite.insert
-                   if engine.dialect.name == 'sqlite' else postgresql.insert)
-    statement = insert_func(table).values(**values).on_conflict_do_nothing()
+    statement = postgresql.insert(table).values(
+        **values).on_conflict_do_nothing()
     with orm.Session(engine) as session:
         result = session.execute(statement)
         session.commit()
@@ -566,23 +567,18 @@ def _location_publication_sort_key(
 
 def _ensure_publication_artifact_in_session(
     session: orm.Session,
-    engine: sqlalchemy.engine.Engine,
     publication: ImagePublication,
     now: int,
 ) -> ImageRecord:
     """Ensures and locks one publication artifact without committing."""
-    insert_func = (sqlite.insert
-                   if engine.dialect.name == 'sqlite' else postgresql.insert)
     image_table = global_user_state.container_image_table
     workspace_table = (
         global_user_state.container_image_workspace_catalog_table)
-    workspace_row = _lock_workspace_catalog(session, engine,
-                                            publication.workspace, now)
+    workspace_row = _lock_workspace_catalog(session, publication.workspace, now)
     image_statement = image_table.select().where(
         image_table.c.workspace == publication.workspace,
         image_table.c.source_digest == publication.source_digest)
-    if engine.dialect.name == 'postgresql':
-        image_statement = image_statement.with_for_update()
+    image_statement = image_statement.with_for_update()
     image_row = session.execute(image_statement).mappings().first()
     if image_row is None:
         if int(workspace_row['artifact_count']) >= publication.max_artifacts:
@@ -591,7 +587,7 @@ def _ensure_publication_artifact_in_session(
                 f'container image artifact quota of '
                 f'{publication.max_artifacts}.')
         session.execute(
-            insert_func(image_table).values(
+            postgresql.insert(image_table).values(
                 id=str(uuid.uuid4()),
                 workspace=publication.workspace,
                 creator_user_hash=publication.creator_user_hash,
@@ -615,21 +611,17 @@ def _ensure_publication_artifact_in_session(
 
 def _ensure_publication_source_in_session(
     session: orm.Session,
-    engine: sqlalchemy.engine.Engine,
     publication: ImagePublication,
     image: ImageRecord,
     now: int,
 ) -> str:
     """Ensures and locks one immutable source alias without committing."""
-    insert_func = (sqlite.insert
-                   if engine.dialect.name == 'sqlite' else postgresql.insert)
     source_table = global_user_state.container_image_source_table
 
     source_statement = source_table.select().where(
         source_table.c.workspace == publication.workspace,
         source_table.c.source_ref == publication.source_ref)
-    if engine.dialect.name == 'postgresql':
-        source_statement = source_statement.with_for_update()
+    source_statement = source_statement.with_for_update()
     source_row = session.execute(source_statement).mappings().first()
     if source_row is None:
         source_count = session.execute(
@@ -642,7 +634,7 @@ def _ensure_publication_source_in_session(
                 f'Container image artifact {image.id!r} reached its source '
                 f'alias quota of {publication.max_sources_per_artifact}.')
         session.execute(
-            insert_func(source_table).values(
+            postgresql.insert(source_table).values(
                 id=str(uuid.uuid4()),
                 workspace=publication.workspace,
                 image_id=image.id,
@@ -661,7 +653,6 @@ def _ensure_publication_source_in_session(
 
 def _ensure_publication_release_in_session(
     session: orm.Session,
-    engine: sqlalchemy.engine.Engine,
     publication: ImagePublication,
     image: ImageRecord,
     now: int,
@@ -669,15 +660,12 @@ def _ensure_publication_release_in_session(
     """Ensures and locks one immutable release alias without committing."""
     if publication.release is None:
         return
-    insert_func = (sqlite.insert
-                   if engine.dialect.name == 'sqlite' else postgresql.insert)
     image_table = global_user_state.container_image_table
     release_table = global_user_state.container_image_release_table
     release_statement = release_table.select().where(
         release_table.c.workspace == publication.workspace,
         release_table.c.name == publication.release)
-    if engine.dialect.name == 'postgresql':
-        release_statement = release_statement.with_for_update()
+    release_statement = release_statement.with_for_update()
     release_row = session.execute(release_statement).mappings().first()
     if release_row is None:
         release_count = session.execute(
@@ -690,7 +678,7 @@ def _ensure_publication_release_in_session(
                 f'Container image artifact {image.id!r} reached its release '
                 f'alias quota of {publication.max_releases_per_artifact}.')
         session.execute(
-            insert_func(release_table).values(
+            postgresql.insert(release_table).values(
                 workspace=publication.workspace,
                 name=publication.release,
                 image_id=image.id,
@@ -709,7 +697,6 @@ def _ensure_publication_release_in_session(
 
 def _ensure_publication_location_in_session(
     session: orm.Session,
-    engine: sqlalchemy.engine.Engine,
     publication: ImagePublication,
     image: ImageRecord,
     source_id: str,
@@ -718,7 +705,6 @@ def _ensure_publication_location_in_session(
     """Ensures one canonical intent after every alias lock is held."""
     _ensure_location_in_session(
         session,
-        engine,
         image.id,
         publication.profile,
         publication.target_id,
@@ -787,27 +773,27 @@ def publish_images_atomically(
             image = artifacts.get(artifact_key)
             if image is None:
                 image = _ensure_publication_artifact_in_session(
-                    session, engine, publication, now)
+                    session, publication, now)
                 artifacts[artifact_key] = image
             records[index] = image
 
         for index, publication in sorted(indexed_publications,
                                          key=_source_publication_sort_key):
             source_ids[index] = _ensure_publication_source_in_session(
-                session, engine, publication, records[index], now)
+                session, publication, records[index], now)
 
         release_publications = [
             item for item in indexed_publications if item[1].release is not None
         ]
         for index, publication in sorted(release_publications,
                                          key=_release_publication_sort_key):
-            _ensure_publication_release_in_session(session, engine, publication,
+            _ensure_publication_release_in_session(session, publication,
                                                    records[index], now)
 
         for index, publication in sorted(indexed_publications,
                                          key=_location_publication_sort_key):
-            _ensure_publication_location_in_session(session, engine,
-                                                    publication, records[index],
+            _ensure_publication_location_in_session(session, publication,
+                                                    records[index],
                                                     source_ids[index], now)
         session.commit()
     return [records[index] for index in range(len(publications))]
@@ -938,10 +924,10 @@ def prepare_image_atomically(
         source_id = None
         if normalized_publication is not None:
             record = _ensure_publication_artifact_in_session(
-                session, engine, normalized_publication, now)
+                session, normalized_publication, now)
             source_id = _ensure_publication_source_in_session(
-                session, engine, normalized_publication, record, now)
-            _ensure_publication_release_in_session(session, engine,
+                session, normalized_publication, record, now)
+            _ensure_publication_release_in_session(session,
                                                    normalized_publication,
                                                    record, now)
         else:
@@ -950,8 +936,7 @@ def prepare_image_atomically(
             statement = image_table.select().where(
                 image_table.c.id == existing_image_id,
                 image_table.c.workspace == workspace)
-            if engine.dialect.name == 'postgresql':
-                statement = statement.with_for_update()
+            statement = statement.with_for_update()
             row = session.execute(statement).mappings().first()
             if row is None:
                 raise ValueError('Container image artifact was not found in '
@@ -963,7 +948,6 @@ def prepare_image_atomically(
         canonical_intent = canonical_intents[0]
         canonical_location = _ensure_location_in_session(
             session,
-            engine,
             record.id,
             profile,
             canonical_intent.target_id,
@@ -982,7 +966,6 @@ def prepare_image_atomically(
                 key=lambda item: (item.target_fingerprint, item.target_id)):
             _ensure_location_in_session(
                 session,
-                engine,
                 record.id,
                 profile,
                 intent.target_id,
@@ -1061,12 +1044,11 @@ def register_image(
     workspace_table = (
         global_user_state.container_image_workspace_catalog_table)
     with orm.Session(engine) as session:
-        workspace_row = _lock_workspace_catalog(session, engine, workspace, now)
+        workspace_row = _lock_workspace_catalog(session, workspace, now)
         statement = image_table.select().where(
             image_table.c.workspace == workspace,
             image_table.c.source_digest == source_digest)
-        if engine.dialect.name == 'postgresql':
-            statement = statement.with_for_update()
+        statement = statement.with_for_update()
         image_row = session.execute(statement).mappings().first()
         if image_row is None:
             if int(workspace_row['artifact_count']) >= max_artifacts:
@@ -1121,13 +1103,10 @@ def bind_source(image_id: str,
     table = global_user_state.container_image_source_table
     image_table = global_user_state.container_image_table
     engine = _engine()
-    insert_func = (sqlite.insert
-                   if engine.dialect.name == 'sqlite' else postgresql.insert)
     with orm.Session(engine) as session:
         image_statement = image_table.select().where(
             image_table.c.id == image_id, image_table.c.workspace == workspace)
-        if engine.dialect.name == 'postgresql':
-            image_statement = image_statement.with_for_update()
+        image_statement = image_statement.with_for_update()
         image_row = session.execute(image_statement).mappings().first()
         if image_row is None:
             raise ValueError(f'Container image {image_id!r} does not exist in '
@@ -1137,8 +1116,7 @@ def bind_source(image_id: str,
                 'Source alias must resolve to the artifact digest.')
         existing_statement = table.select().where(
             table.c.workspace == workspace, table.c.source_ref == source_ref)
-        if engine.dialect.name == 'postgresql':
-            existing_statement = existing_statement.with_for_update()
+        existing_statement = existing_statement.with_for_update()
         existing_row = session.execute(existing_statement).mappings().first()
         if existing_row is None:
             count = session.execute(
@@ -1151,7 +1129,8 @@ def bind_source(image_id: str,
                     f'Container image artifact {image_id!r} reached its '
                     f'source alias quota of {max_sources_per_artifact}.')
             session.execute(
-                insert_func(table).values(**values).on_conflict_do_nothing())
+                postgresql.insert(table).values(
+                    **values).on_conflict_do_nothing())
             existing_row = session.execute(existing_statement).mappings().one()
         if (existing_row['image_id'] != image_id or
                 existing_row['resolved_source_ref'] != resolved_source_ref):
@@ -1217,21 +1196,17 @@ def bind_release(image_id: str,
     table = global_user_state.container_image_release_table
     image_table = global_user_state.container_image_table
     engine = _engine()
-    insert_func = (sqlite.insert
-                   if engine.dialect.name == 'sqlite' else postgresql.insert)
     with orm.Session(engine) as session:
         image_statement = image_table.select().where(
             image_table.c.id == image_id, image_table.c.workspace == workspace)
-        if engine.dialect.name == 'postgresql':
-            image_statement = image_statement.with_for_update()
+        image_statement = image_statement.with_for_update()
         image_row = session.execute(image_statement).mappings().first()
         if image_row is None:
             raise ValueError(f'Container image {image_id!r} does not exist in '
                              f'workspace {workspace!r}.')
         release_statement = table.select().where(table.c.workspace == workspace,
                                                  table.c.name == release)
-        if engine.dialect.name == 'postgresql':
-            release_statement = release_statement.with_for_update()
+        release_statement = release_statement.with_for_update()
         release_row = session.execute(release_statement).mappings().first()
         if release_row is None:
             count = session.execute(
@@ -1244,7 +1219,8 @@ def bind_release(image_id: str,
                     f'Container image artifact {image_id!r} reached its '
                     f'release alias quota of {max_releases_per_artifact}.')
             session.execute(
-                insert_func(table).values(**values).on_conflict_do_nothing())
+                postgresql.insert(table).values(
+                    **values).on_conflict_do_nothing())
             release_row = session.execute(release_statement).mappings().one()
         if release_row['image_id'] != image_id:
             bound_digest = session.execute(
@@ -1452,11 +1428,9 @@ def _lock_profile_revision(
                          'SHA-256 hex digest.')
     engine = session.get_bind()
     assert engine is not None
-    insert_func = (sqlite.insert
-                   if engine.dialect.name == 'sqlite' else postgresql.insert)
     table = global_user_state.container_image_profile_revision_table
     session.execute(
-        insert_func(table).values(
+        postgresql.insert(table).values(
             workspace=workspace,
             profile=profile,
             revision=revision,
@@ -1491,9 +1465,9 @@ def _lock_profile_revision(
     # Activation is O(1) in the dominant PENDING/READY population.  Old rows
     # are generation-fenced by the profile authority and transferred lazily,
     # one locked physical location at a time, when the new policy touches it.
-    # Keep each state in a separate LIMIT 1 probe so SQLite and PostgreSQL can
-    # use the matching state-specific partial index without evaluating an OR
-    # across the full profile population.
+    # Keep each state in a separate LIMIT 1 probe so PostgreSQL can use the
+    # matching state-specific partial index without evaluating an OR across
+    # the full profile population.
     blocking_work = None
     for lease_state, verification in (
         (models.ImageLocationState.COPYING.value, False),
@@ -1655,7 +1629,6 @@ def _repair_locked_location(
 
 def _ensure_location_in_session(
     session: orm.Session,
-    engine: sqlalchemy.engine.Engine,
     image_id: str,
     profile: str,
     target_id: str,
@@ -1675,8 +1648,6 @@ def _ensure_location_in_session(
     location_table = global_user_state.container_image_location_table
     image_table = global_user_state.container_image_table
     source_table = global_user_state.container_image_source_table
-    insert_func = (sqlite.insert
-                   if engine.dialect.name == 'sqlite' else postgresql.insert)
     image_row = session.execute(image_table.select().where(
         image_table.c.id == image_id)).mappings().first()
     if image_row is None:
@@ -1720,8 +1691,7 @@ def _ensure_location_in_session(
             location_table.c.canonical.is_(True),
             location_table.c.profile_revision == profile_revision,
         )
-        if engine.dialect.name == 'postgresql':
-            canonical_statement = canonical_statement.with_for_update(read=True)
+        canonical_statement = canonical_statement.with_for_update(read=True)
         canonical_row = session.execute(canonical_statement).mappings().first()
         if canonical_row is None:
             raise ValueError('Regional materialization must bind to the '
@@ -1750,7 +1720,8 @@ def _ensure_location_in_session(
         'updated_at': now,
     }
     insert_result = session.execute(
-        insert_func(location_table).values(**values).on_conflict_do_nothing())
+        postgresql.insert(location_table).values(
+            **values).on_conflict_do_nothing())
     inserted = insert_result.rowcount == 1
     row = session.execute(location_table.select().where(
         location_table.c.image_id == image_id,
@@ -1883,7 +1854,6 @@ def ensure_location(
     with orm.Session(engine) as session:
         location = _ensure_location_in_session(
             session,
-            engine,
             image_id,
             profile,
             target_id,
@@ -2032,10 +2002,7 @@ def _lock_image_for_update(
     """Locks artifact metadata before a canonical location transition."""
     table = global_user_state.container_image_table
     statement = table.select().where(table.c.id == image_id)
-    bind = session.get_bind()
-    assert bind is not None
-    if bind.dialect.name == 'postgresql':
-        statement = statement.with_for_update()
+    statement = statement.with_for_update()
     return session.execute(statement).mappings().first()
 
 
@@ -2043,10 +2010,7 @@ def _lock_location_for_update(session: orm.Session, location_id: str) -> bool:
     """Locks one physical location before reading the lease clock."""
     table = global_user_state.container_image_location_table
     statement = sqlalchemy.select(table.c.id).where(table.c.id == location_id)
-    bind = session.get_bind()
-    assert bind is not None
-    if bind.dialect.name == 'postgresql':
-        statement = statement.with_for_update()
+    statement = statement.with_for_update()
     return session.execute(statement).first() is not None
 
 
@@ -2080,7 +2044,6 @@ def _exact_canonical_ready_join(
 
 def _regional_candidate_select(
     table: sqlalchemy.Table,
-    engine: sqlalchemy.engine.Engine,
     *,
     workspace: str,
     profile: str,
@@ -2101,7 +2064,6 @@ def _regional_candidate_select(
     The claimant still locks and rechecks the exact canonical row before
     mutation, so this denormalized bit is an index key, never the final fence.
     """
-    del engine
     after_condition = None
     if after is not None:
         if ordering_column is None:
@@ -2150,7 +2112,6 @@ def _regional_candidate_select(
 def _eviction_candidate_page(
     session: orm.Session,
     table: sqlalchemy.Table,
-    engine: sqlalchemy.engine.Engine,
     *,
     cursor_name: str,
     workspace: str,
@@ -2172,7 +2133,6 @@ def _eviction_candidate_page(
     def _query(boundary: tuple[int, str] | None) -> list[Any]:
         statement = _regional_candidate_select(
             table,
-            engine,
             workspace=workspace,
             profile=profile,
             profile_revision=profile_revision,
@@ -2248,9 +2208,9 @@ def _reconciliation_queue_specs(
     failed_retry = sqlalchemy.and_(
         attempt_available,
         table.c.state.in_([
-            # SQLite matches a partial-index predicate textually. These fixed
-            # enum literals must compile as literals, rather than bind
-            # parameters, so FAILED/MISSING due probes use the retry indexes.
+            # These fixed enum literals must compile as literals, rather than
+            # bind parameters, so PostgreSQL can prove the partial-index
+            # predicate for FAILED/MISSING due probes.
             sqlalchemy.literal_column("'FAILED'"),
             sqlalchemy.literal_column("'MISSING'"),
         ]),
@@ -2437,7 +2397,6 @@ def claim_next_reconciliation_candidate(
                         else:
                             claim_select = _regional_candidate_select(
                                 table,
-                                engine,
                                 workspace=workspace,
                                 profile=candidate_profile,
                                 profile_revision=candidate_revision,
@@ -2460,9 +2419,8 @@ def claim_next_reconciliation_candidate(
                             continue
                         lock_select = sqlalchemy.select(
                             table.c.id).where(table.c.id == location_id)
-                        if engine.dialect.name == 'postgresql':
-                            lock_select = lock_select.with_for_update(
-                                of=table, skip_locked=True)
+                        lock_select = lock_select.with_for_update(
+                            of=table, skip_locked=True)
                         if session.execute(lock_select).first() is None:
                             attempt.rollback()
                             continue
@@ -3072,12 +3030,8 @@ def acquire_reference(location_id: str,
             raise ValueError('Image materialization is no longer READY, is '
                              'being verified, or does not match the pinned '
                              'reference.')
-        bind = session.get_bind()
-        assert bind is not None
-        insert_func = (sqlite.insert
-                       if bind.dialect.name == 'sqlite' else postgresql.insert)
         reference_id = str(uuid.uuid4())
-        reference_insert = insert_func(reference_table).values(
+        reference_insert = postgresql.insert(reference_table).values(
             id=reference_id,
             workspace=workspace,
             location_id=location_id,
@@ -3208,7 +3162,6 @@ def list_eviction_candidates(workspace: str, unused_before: int,
                 rows = _eviction_candidate_page(
                     session,
                     table,
-                    engine,
                     cursor_name='eviction-list-candidate',
                     workspace=workspace,
                     profile=str(profile_row['profile']),
@@ -3332,7 +3285,6 @@ def claim_next_eviction_candidate(
                 rows = _eviction_candidate_page(
                     session,
                     table,
-                    engine,
                     cursor_name='eviction-claim-candidate',
                     workspace=workspace,
                     profile=candidate_profile,
@@ -3353,9 +3305,8 @@ def claim_next_eviction_candidate(
                         continue
                     lock_select = sqlalchemy.select(
                         table.c.id).where(table.c.id == location_id)
-                    if engine.dialect.name == 'postgresql':
-                        lock_select = lock_select.with_for_update(
-                            of=table, skip_locked=True)
+                    lock_select = lock_select.with_for_update(of=table,
+                                                              skip_locked=True)
                     if session.execute(lock_select).first() is None:
                         attempt.rollback()
                         continue

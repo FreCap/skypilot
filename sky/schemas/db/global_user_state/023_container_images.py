@@ -10,7 +10,7 @@ from collections.abc import Sequence
 
 from alembic import op
 
-from sky.global_user_state import Base
+from sky import global_user_state
 from sky.utils.db import db_utils
 
 # revision identifiers, used by Alembic.
@@ -32,11 +32,16 @@ _CONTAINER_IMAGE_TABLE_NAMES = (
 
 
 def upgrade():
-    """Create the image catalog and per-target preparation tables."""
+    """Create the PostgreSQL image catalog and preparation tables."""
+    bind = op.get_bind()
+    if bind.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        # Local SkyPilot state can still use SQLite. Managed image state is a
+        # central service feature, so do not install its tables there.
+        return
     with op.get_context().autocommit_block():
         db_utils.add_all_tables_to_db_sqlalchemy(
-            Base.metadata,
-            op.get_bind(),
+            global_user_state.container_image_metadata,
+            bind,
             reconcile_indexes_for=_CONTAINER_IMAGE_TABLE_NAMES)
 
 

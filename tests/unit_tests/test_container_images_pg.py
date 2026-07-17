@@ -156,18 +156,13 @@ def postgres_engine():
     engine = sqlalchemy.create_engine(
         container.get_connection_url(),
         connect_args={'options': '-c statement_timeout=10000'})
-    tables = [
-        global_user_state.container_image_workspace_catalog_table,
-        global_user_state.container_image_table,
-        global_user_state.container_image_source_table,
-        global_user_state.container_image_release_table,
-        global_user_state.container_image_profile_revision_table,
-        global_user_state.container_image_location_table,
-        global_user_state.container_image_reference_table,
-        global_user_state.cluster_table,
-        global_user_state.cluster_history_table,
-    ]
-    global_user_state.Base.metadata.create_all(engine, tables=tables)
+    global_user_state.Base.metadata.create_all(
+        engine,
+        tables=[
+            global_user_state.cluster_table,
+            global_user_state.cluster_history_table,
+        ])
+    global_user_state.container_image_metadata.create_all(engine)
     try:
         yield engine
     finally:
@@ -184,6 +179,7 @@ def image_pg_engine(postgres_engine, monkeypatch):
                 'container_image_locations, '
                 'container_image_profile_revisions, '
                 'container_image_releases, container_image_sources, '
+                'container_image_workspace_catalogs, container_image_catalog, '
                 'container_images, clusters, cluster_history CASCADE'))
     monkeypatch.setattr(state, '_engine', lambda: postgres_engine)
     monkeypatch.setattr(global_user_state._db_manager, '_engine',

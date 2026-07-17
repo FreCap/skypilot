@@ -13,12 +13,9 @@ import types
 from unittest import mock
 import uuid
 
-from alembic import migration
-from alembic import operations
 import pytest
 import sqlalchemy
 from sqlalchemy.dialects import postgresql as sqlalchemy_postgresql
-from sqlalchemy.pool import StaticPool
 
 from sky import clouds
 from sky import dag as dag_lib
@@ -49,7 +46,11 @@ from sky.utils import debug_dump_helpers
 from sky.utils import schemas
 from sky.utils import yaml_utils
 from sky.utils.db import db_utils
-from sky.utils.db import migration_utils
+
+try:
+    testcontainers_postgres = importlib.import_module('testcontainers.postgres')
+except ImportError:
+    testcontainers_postgres = None
 
 _DIGEST = 'sha256:' + 'a' * 64
 _OTHER_DIGEST = 'sha256:' + 'b' * 64
@@ -280,50 +281,61 @@ def _allow_manifest_deletion(monkeypatch):
     return adapter
 
 
-@pytest.fixture
-def image_state_engine(monkeypatch):
-    with state._PROFILE_CURSOR_LOCK:
-        state._PROFILE_CURSORS.clear()
-        state._EVICTION_CANDIDATE_CURSORS.clear()
-    engine = sqlalchemy.create_engine(
-        'sqlite://',
-        connect_args={'check_same_thread': False},
-        poolclass=StaticPool,
-    )
-    global_user_state.Base.metadata.create_all(engine)
-    monkeypatch.setattr(state, '_engine', lambda: engine)
-    monkeypatch.setattr(global_user_state._db_manager, '_engine', engine)
-    yield engine
-    with state._PROFILE_CURSOR_LOCK:
-        state._PROFILE_CURSORS.clear()
-        state._EVICTION_CANDIDATE_CURSORS.clear()
-
-
-def _sqlite_vm_steps(engine, operation) -> int:
-    """Returns a 1000-instruction-granularity SQLite VM step count."""
-    progress_calls = 0
-
-    def progress() -> int:
-        nonlocal progress_calls
-        progress_calls += 1
-        return 0
-
-    with engine.connect() as connection:
-        raw_connection = connection.connection.driver_connection
-        raw_connection.set_progress_handler(progress, 1000)
+@pytest.fixture(scope='module')
+def postgres_engine():
+    if testcontainers_postgres is None:
+        pytest.skip('testcontainers[postgres] is not installed')
+    pytest.importorskip('psycopg2')
+    container = testcontainers_postgres.PostgresContainer('postgres:16')
     try:
-        operation()
+        container.start()
+    except Exception as e:  # pylint: disable=broad-except
+        pytest.skip(f'could not start postgres container: {e}')
+    engine = sqlalchemy.create_engine(
+        container.get_connection_url(),
+        connect_args={'options': '-c statement_timeout=30000'})
+    global_user_state.Base.metadata.create_all(engine)
+    global_user_state.container_image_metadata.create_all(engine)
+    try:
+        yield engine
     finally:
-        with engine.connect() as connection:
-            connection.connection.driver_connection.set_progress_handler(
-                None, 0)
-    return progress_calls * 1000
+        engine.dispose()
+        container.stop()
 
 
-def _sqlite_result_and_vm_steps(engine, operation):
-    result = []
-    steps = _sqlite_vm_steps(engine, lambda: result.append(operation()))
-    return result[0], steps
+@pytest.fixture
+def image_state_engine(postgres_engine, monkeypatch):
+    with state._PROFILE_CURSOR_LOCK:
+        state._PROFILE_CURSORS.clear()
+        state._EVICTION_CANDIDATE_CURSORS.clear()
+    with postgres_engine.begin() as connection:
+        table_names = ', '.join(
+            connection.dialect.identifier_preparer.format_table(table)
+            for metadata in (global_user_state.Base.metadata,
+                             global_user_state.container_image_metadata)
+            for table in metadata.sorted_tables)
+        connection.execute(
+            sqlalchemy.text(f'TRUNCATE TABLE {table_names} '
+                            'RESTART IDENTITY CASCADE'))
+    monkeypatch.setattr(state, '_engine', lambda: postgres_engine)
+    monkeypatch.setattr(global_user_state._db_manager, '_engine',
+                        postgres_engine)
+    try:
+        yield postgres_engine
+    finally:
+        with state._PROFILE_CURSOR_LOCK:
+            state._PROFILE_CURSORS.clear()
+            state._EVICTION_CANDIDATE_CURSORS.clear()
+
+
+def test_managed_image_state_requires_postgresql(monkeypatch):
+    engine = mock.Mock()
+    engine.dialect.name = db_utils.SQLAlchemyDialect.SQLITE.value
+    monkeypatch.setattr(global_user_state, 'initialize_and_get_db',
+                        lambda: engine)
+
+    with pytest.raises(RuntimeError, match='central PostgreSQL'):
+        state.get_catalog_authority_id(create=False)
 
 
 def _ready_regional_location(
@@ -374,38 +386,29 @@ def _seed_referenced_eviction_queue(
     location_table = global_user_state.container_image_location_table
     prefix = f'referenced-{count}-'
     seed_locations = sqlalchemy.text("""
-        WITH RECURSIVE synthetic(n) AS (
-          VALUES(1)
-          UNION ALL
-          SELECT n + 1 FROM synthetic WHERE n < :row_count
-        )
         INSERT INTO container_image_locations (
           id, workspace, image_id, profile, target_id, target_fingerprint,
           policy_fingerprint, profile_revision, canonical,
           canonical_location_id, canonical_ready, target_ref, expected_digest,
           state, attempt_count, last_used_at, auto_evict, updated_at
         )
-        SELECT :prefix || printf('%06d', n), 'research', :image_id, 'managed',
-               'referenced-target-' || n, printf('%064x', n),
-               :policy_fingerprint, 1, 0, :canonical_id, 1,
-               'registry.example.com/referenced-' || n || '@' || :digest,
-               :digest, 'READY', 0, 1, 1, 1
-        FROM synthetic
+        SELECT :prefix || lpad(n::text, 6, '0'), 'research', :image_id,
+               'managed', 'referenced-target-' || n::text,
+               lpad(to_hex(n), 64, '0'), :policy_fingerprint, 1, FALSE,
+               :canonical_id, TRUE,
+               'registry.example.com/referenced-' || n::text || '@' ||
+               :digest, :digest, 'READY', 0, 1, TRUE, 1
+        FROM generate_series(1, :row_count) AS synthetic(n)
     """)
     seed_references = sqlalchemy.text("""
-        WITH RECURSIVE synthetic(n) AS (
-          VALUES(1)
-          UNION ALL
-          SELECT n + 1 FROM synthetic WHERE n < :row_count
-        )
         INSERT INTO container_image_references (
           id, workspace, location_id, consumer_type, consumer_id, expires_at,
           created_at, updated_at
         )
-        SELECT 'reference-' || :prefix || n, 'research',
-               :prefix || printf('%06d', n), 'serve',
-               'consumer-' || :prefix || n, NULL, 1, 1
-        FROM synthetic
+        SELECT 'reference-' || :prefix || n::text, 'research',
+               :prefix || lpad(n::text, 6, '0'), 'serve',
+               'consumer-' || :prefix || n::text, NULL, 1, 1
+        FROM generate_series(1, :row_count) AS synthetic(n)
     """)
     parameters = {
         'row_count': count,
@@ -441,134 +444,6 @@ def _seed_referenced_eviction_queue(
             updated_at=2,
         ))
     return eventual_id
-
-
-def test_schema_023_upgrades_existing_sqlite_database(tmp_path):
-    engine = sqlalchemy.create_engine(f'sqlite:///{tmp_path / "old.db"}')
-    old_metadata = sqlalchemy.MetaData()
-    sqlalchemy.Table(
-        'clusters', old_metadata,
-        sqlalchemy.Column('name', sqlalchemy.Text, primary_key=True))
-    old_metadata.create_all(engine)
-
-    schema_023 = importlib.import_module(
-        'sky.schemas.db.global_user_state.023_container_images')
-    with engine.connect() as connection:
-        context = migration.MigrationContext.configure(connection)
-        with operations.Operations.context(context):
-            schema_023.upgrade()
-
-    inspector = sqlalchemy.inspect(engine)
-    assert migration_utils.GLOBAL_USER_STATE_VERSION == '023'
-    assert {
-        'container_image_catalog', 'container_images',
-        'container_image_sources', 'container_image_releases',
-        'container_image_profile_revisions', 'container_image_locations',
-        'container_image_references', 'container_image_workspace_catalogs'
-    } <= set(inspector.get_table_names())
-    image_columns = {
-        column['name'] for column in inspector.get_columns('container_images')
-    }
-    assert {
-        'workspace', 'source_digest', 'resolved_source_ref', 'producer_kind',
-        'producer_spec_hash', 'builder_version'
-    } <= image_columns
-    compressed_size_type = (
-        global_user_state.container_image_table.c.compressed_size_bytes.type)
-    assert compressed_size_type.compile(
-        dialect=sqlalchemy_postgresql.dialect()) == 'BIGINT'
-    location_columns = {
-        column['name']
-        for column in inspector.get_columns('container_image_locations')
-    }
-    assert {
-        'id', 'workspace', 'image_id', 'profile', 'target_id',
-        'target_fingerprint', 'policy_fingerprint', 'profile_revision',
-        'canonical', 'canonical_location_id', 'expected_digest', 'state',
-        'source_id', 'lease_owner', 'last_used_at', 'auto_evict',
-        'verification_requested_at', 'canonical_ready'
-    } <= location_columns
-    image_indexes = {
-        index['name'] for index in inspector.get_indexes('container_images')
-    }
-    assert 'ix_container_images_scope_source_ref' in image_indexes
-    assert 'ix_container_images_scope_created' in image_indexes
-    source_indexes = {
-        index['name']
-        for index in inspector.get_indexes('container_image_sources')
-    }
-    assert 'ix_container_image_sources_resolved' in source_indexes
-    unique_constraints = {
-        constraint['name']
-        for constraint in inspector.get_unique_constraints('container_images')
-    }
-    assert {'uq_container_images_scope_digest'} <= unique_constraints
-    location_indexes = {
-        index['name']
-        for index in inspector.get_indexes('container_image_locations')
-    }
-    assert {
-        'ix_container_image_locations_eviction_ready',
-        'ix_container_image_locations_eviction_lease',
-        'ix_container_image_locations_profile_eviction_ready',
-        'ix_container_image_locations_profile_eviction_retry',
-        'ix_container_image_locations_profile_eviction_lease',
-        'ix_container_image_locations_profile_eviction_incomplete_lease',
-        'ix_container_image_locations_materialize_queue',
-        'ix_container_image_locations_profile_pending_queue',
-        'ix_container_image_locations_regional_pending_queue',
-        'ix_container_image_locations_profile_pending_retry',
-        'ix_container_image_locations_regional_pending_retry',
-        'ix_container_image_locations_profile_copying_queue',
-        'ix_container_image_locations_regional_copying_queue',
-        'ix_container_image_locations_profile_copying_incomplete_lease',
-        'ix_container_image_locations_regional_copying_incomplete_lease',
-        'ix_container_image_locations_profile_retry_queue',
-        'ix_container_image_locations_regional_retry_queue',
-        'ix_container_image_locations_verify_queue',
-        'ix_container_image_locations_profile_verification_queue',
-        'ix_container_image_locations_regional_verify_queue',
-        'ix_container_image_locations_profile_verification_retry',
-        'ix_container_image_locations_regional_verification_retry',
-        'ix_container_image_locations_profile_copying_active_lease',
-        'ix_container_image_locations_profile_evicting_active_lease',
-        'ix_container_image_locations_profile_verification_active_lease',
-        'ix_container_image_locations_canonical_source',
-        'ix_container_image_locations_ready_canonical_dependency',
-        'ix_container_image_locations_import_source',
-    } <= location_indexes
-    reference_indexes = {
-        index['name']
-        for index in inspector.get_indexes('container_image_references')
-    }
-    assert 'ix_container_image_references_consumer' in reference_indexes
-
-
-def test_schema_023_restart_recreates_missing_index(tmp_path):
-    engine = sqlalchemy.create_engine(f'sqlite:///{tmp_path / "partial.db"}')
-    schema_023 = importlib.import_module(
-        'sky.schemas.db.global_user_state.023_container_images')
-
-    def _upgrade() -> None:
-        with engine.connect() as connection:
-            context = migration.MigrationContext.configure(connection)
-            with operations.Operations.context(context):
-                schema_023.upgrade()
-
-    _upgrade()
-    missing_index = 'ix_container_image_locations_regional_pending_queue'
-    with engine.begin() as connection:
-        connection.exec_driver_sql(f'DROP INDEX {missing_index}')
-    assert missing_index not in {
-        index['name'] for index in sqlalchemy.inspect(engine).get_indexes(
-            'container_image_locations')
-    }
-
-    _upgrade()
-    assert missing_index in {
-        index['name'] for index in sqlalchemy.inspect(engine).get_indexes(
-            'container_image_locations')
-    }
 
 
 def test_container_image_scalar_object_and_digest_validation():
@@ -4131,79 +4006,43 @@ def test_registry_default_preserves_legacy_docker_tasks(image_state_engine,
             'research')
 
 
-def test_catalog_authority_identifies_the_exact_database(monkeypatch):
-    first_engine = sqlalchemy.create_engine('sqlite://')
-    second_engine = sqlalchemy.create_engine('sqlite://')
-    global_user_state.Base.metadata.create_all(first_engine)
-    global_user_state.Base.metadata.create_all(second_engine)
-    current_engine = [first_engine]
-    monkeypatch.setattr(state, '_engine', lambda: current_engine[0])
-    first_authority = state.get_catalog_authority_id()
-    assert first_authority is not None
-    assert state.catalog_authority_matches(first_authority)
+def test_catalog_authority_identifies_the_exact_database(
+        postgres_engine, monkeypatch):
+    schemas = [
+        f'catalog_authority_{uuid.uuid4().hex}_{suffix}'
+        for suffix in ('first', 'second')
+    ]
+    with postgres_engine.begin() as connection:
+        for schema in schemas:
+            connection.execute(sqlalchemy.text(f'CREATE SCHEMA {schema}'))
+    engines = [
+        sqlalchemy.create_engine(postgres_engine.url,
+                                 connect_args={
+                                     'options': (f'-c search_path={schema} '
+                                                 '-c statement_timeout=30000')
+                                 }) for schema in schemas
+    ]
+    try:
+        for engine in engines:
+            global_user_state.container_image_metadata.create_all(engine)
+        current_engine = [engines[0]]
+        monkeypatch.setattr(state, '_engine', lambda: current_engine[0])
+        first_authority = state.get_catalog_authority_id()
+        assert first_authority is not None
+        assert state.catalog_authority_matches(first_authority)
 
-    current_engine[0] = second_engine
-    second_authority = state.get_catalog_authority_id()
-    assert second_authority is not None
-    assert second_authority != first_authority
-    assert not state.catalog_authority_matches(first_authority)
-
-
-def test_sqlite_concurrent_identical_publications_retry_and_converge(
-        tmp_path, monkeypatch):
-    engine = sqlalchemy.create_engine(
-        f'sqlite:///{tmp_path / "concurrent-publication.db"}',
-        connect_args={
-            'check_same_thread': False,
-            'timeout': 0.01,
-        })
-    global_user_state.Base.metadata.create_all(engine)
-    monkeypatch.setattr(state, '_engine', lambda: engine)
-
-    blocker = engine.connect()
-    blocker.exec_driver_sql('BEGIN IMMEDIATE')
-    retry_count = 0
-    retry_lock = threading.Lock()
-    both_retried = threading.Event()
-    resume_retries = threading.Event()
-
-    def _controlled_retry_sleep(_delay):
-        nonlocal retry_count
-        with retry_lock:
-            retry_count += 1
-            if retry_count >= 2:
-                both_retried.set()
-        assert resume_retries.wait(timeout=10)
-
-    monkeypatch.setattr(state.db_retries.time, 'sleep', _controlled_retry_sleep)
-    start = threading.Barrier(2)
-    results = []
-    errors = []
-
-    def _publish():
-        try:
-            start.wait(timeout=10)
-            results.append(_publish_state_image(_SOURCE, _DIGEST))
-        except Exception as error:  # pylint: disable=broad-except
-            errors.append(error)
-
-    threads = [threading.Thread(target=_publish) for _ in range(2)]
-    for thread in threads:
-        thread.start()
-    assert both_retried.wait(timeout=10)
-    blocker.rollback()
-    blocker.close()
-    resume_retries.set()
-    for thread in threads:
-        thread.join(timeout=20)
-
-    assert all(not thread.is_alive() for thread in threads)
-    assert not errors
-    assert len(results) == 2
-    assert results[0].id == results[1].id
-    assert len(state.list_images('research')) == 1
-    assert len(state.list_sources(results[0].id, 'research')) == 1
-    assert len(state.list_locations(results[0].id, 'managed')) == 1
+        current_engine[0] = engines[1]
+        second_authority = state.get_catalog_authority_id()
+        assert second_authority is not None
+        assert second_authority != first_authority
+        assert not state.catalog_authority_matches(first_authority)
+    finally:
+        for engine in engines:
+            engine.dispose()
+        with postgres_engine.begin() as connection:
+            for schema in schemas:
+                connection.execute(
+                    sqlalchemy.text(f'DROP SCHEMA {schema} CASCADE'))
 
 
 def test_auth_rotation_does_not_change_materialization_identity():
@@ -4484,64 +4323,6 @@ def test_profile_activation_does_not_rewrite_dominant_location_population(
     assert untouched == (1, 1)
 
 
-def test_profile_activation_active_lease_probes_are_population_independent(
-        image_state_engine):
-    revision_one = _profile()
-    revision_two = models.RegistryProfile(
-        **{
-            **revision_one.__dict__,
-            'ownership': models.RegistryOwnership.EXTERNAL,
-            'revision': 2,
-        })
-    image = _publish_state_image(_SOURCE,
-                                 _DIGEST,
-                                 release='activation-scale',
-                                 profile=revision_one)
-    canonical = next(location for location in state.list_locations(image.id)
-                     if location.canonical)
-    insert_sql = sqlalchemy.text("""
-        WITH RECURSIVE synthetic(n) AS (
-          VALUES(1)
-          UNION ALL
-          SELECT n + 1 FROM synthetic WHERE n < :row_count
-        )
-        INSERT INTO container_image_locations (
-          id, workspace, image_id, profile, target_id, target_fingerprint,
-          policy_fingerprint, profile_revision, canonical,
-          canonical_location_id, canonical_ready, expected_digest, state,
-          attempt_count, auto_evict, updated_at
-        )
-        SELECT 'activation-bulk-' || n, 'research', :image_id, 'managed',
-               'target-' || n, 'activation-fingerprint-' || n,
-               :policy_fingerprint, 1, 0, :canonical_id, 0, :digest,
-               'PENDING', 0, 1, 1
-        FROM synthetic
-    """)
-    with image_state_engine.begin() as connection:
-        connection.execute(
-            insert_sql, {
-                'row_count': 200_000,
-                'image_id': image.id,
-                'policy_fingerprint': _POLICY_FINGERPRINT,
-                'canonical_id': canonical.id,
-                'digest': _DIGEST,
-            })
-
-    activated = None
-
-    def activate() -> None:
-        nonlocal activated
-        activated = _ensure_profile_location(image,
-                                             revision_two,
-                                             revision_two.canonical,
-                                             canonical=True)
-
-    steps = _sqlite_vm_steps(image_state_engine, activate)
-    assert activated is not None
-    assert activated.profile_revision == 2
-    assert steps < 100_000
-
-
 def test_profile_revision_settles_expired_copy_after_canonical_loss(
         image_state_engine, monkeypatch):
     del image_state_engine
@@ -4648,132 +4429,6 @@ def test_profile_revision_settles_expired_eviction_after_canonical_loss(
     assert transferred.next_retry_at == 2031
     assert not state.complete_location_eviction(regional.id,
                                                 eviction.lease_owner)
-
-
-def test_profile_activation_fences_exact_expiry_and_malformed_copy(
-        image_state_engine, monkeypatch):
-    now = [1000]
-    monkeypatch.setattr(state.time, 'time', lambda: now[0])
-    revision_one = _profile()
-    revision_two = models.RegistryProfile(
-        **{
-            **revision_one.__dict__,
-            'ownership': models.RegistryOwnership.EXTERNAL,
-            'revision': 2,
-        })
-    image = state.register_image(_SOURCE, _SOURCE, _DIGEST, 'research',
-                                 'user-1')
-    canonical = _ensure_profile_location(image,
-                                         revision_one,
-                                         revision_one.canonical,
-                                         canonical=True)
-    claim = state.claim_location(canonical.id, 'importer', 30)
-    assert claim is not None
-    assert claim.lease_owner is not None
-    canonical_ref = references.managed_reference(revision_one,
-                                                 revision_one.canonical,
-                                                 'research', _SOURCE, _DIGEST)
-    assert _complete_location(canonical.id, claim.lease_owner, canonical_ref,
-                              _DIGEST)
-    regional = _ensure_profile_location(image,
-                                        revision_one,
-                                        revision_one.target('aws-us-west-2'),
-                                        auto_evict=True)
-    inactive_image = state.register_image(_OTHER_SOURCE, _OTHER_SOURCE,
-                                          _OTHER_DIGEST, 'research', 'user-1')
-    _ensure_profile_location(inactive_image,
-                             revision_one,
-                             revision_one.canonical,
-                             canonical=True)
-    inactive_failed = _ensure_profile_location(
-        inactive_image,
-        revision_one,
-        revision_one.target('aws-us-west-2'),
-        auto_evict=True)
-    assert state.retry_location(canonical.id)
-    old_verification = state.claim_location_verification(
-        canonical.id, 'revision-one-verifier', 30)
-    assert old_verification is not None
-    assert old_verification.lease_owner is not None
-    table = global_user_state.container_image_location_table
-    with image_state_engine.begin() as connection:
-        connection.exec_driver_sql('PRAGMA ignore_check_constraints = ON')
-        connection.execute(
-            table.update().where(table.c.id == regional.id).values(
-                state=models.ImageLocationState.COPYING.value,
-                lease_owner=None,
-                lease_expires_at=9999,
-                heartbeat_at=1000))
-        connection.execute(
-            table.update().where(table.c.id == inactive_failed.id).values(
-                state=models.ImageLocationState.FAILED.value,
-                lease_owner='impossible-future-token',
-                lease_expires_at=9999,
-                heartbeat_at=1000))
-        connection.exec_driver_sql('PRAGMA ignore_check_constraints = OFF')
-
-    now[0] = 1030
-    advanced = _ensure_profile_location(image,
-                                        revision_two,
-                                        revision_two.canonical,
-                                        canonical=True)
-    transferred = _ensure_profile_location(image, revision_two,
-                                           revision_two.target('aws-us-west-2'))
-    assert advanced.profile_revision == 2
-    assert advanced.state == models.ImageLocationState.READY
-    assert advanced.lease_owner is None
-    assert transferred.profile_revision == 2
-    assert transferred.state == models.ImageLocationState.FAILED
-    assert transferred.lease_owner is None
-    fenced_inactive = state.get_location_by_id(inactive_failed.id)
-    assert fenced_inactive is not None
-    assert fenced_inactive.state == models.ImageLocationState.FAILED
-    assert fenced_inactive.profile_revision == 1
-    # Activation no longer rewrites every historical row. The old generation
-    # is fenced immediately and an exact row is repaired only if revision two
-    # later touches that physical destination.
-    assert fenced_inactive.lease_owner == 'impossible-future-token'
-    assert state.claim_location(inactive_failed.id, 'stale-worker', 30) is None
-    assert not state.complete_location_verification(
-        canonical.id, old_verification.lease_owner, _OTHER_DIGEST)
-    unchanged = state.get_location_by_id(canonical.id)
-    assert unchanged is not None
-    assert unchanged.state == models.ImageLocationState.READY
-    new_verification = state.claim_location_verification(
-        canonical.id, 'revision-two-verifier', 30)
-    assert new_verification is not None
-    assert new_verification.lease_owner is not None
-    assert state.complete_location_verification(canonical.id,
-                                                new_verification.lease_owner,
-                                                _DIGEST)
-
-
-def test_unchanged_generation_reclaims_structurally_incomplete_lease(
-        image_state_engine, monkeypatch):
-    now = [1000]
-    monkeypatch.setattr(state.time, 'time', lambda: now[0])
-    profile = _profile()
-    image = _publish_state_image(_SOURCE, _DIGEST, profile=profile)
-    canonical = state.list_locations(image.id, profile.name)[0]
-    first = state.claim_location(canonical.id, 'crashed-worker', 30)
-    assert first is not None
-    assert first.lease_owner is not None
-
-    table = global_user_state.container_image_location_table
-    with image_state_engine.begin() as connection:
-        connection.exec_driver_sql('PRAGMA ignore_check_constraints = ON')
-        connection.execute(table.update().where(
-            table.c.id == canonical.id).values(lease_owner=None,
-                                               lease_expires_at=9999,
-                                               heartbeat_at=1000))
-        connection.exec_driver_sql('PRAGMA ignore_check_constraints = OFF')
-
-    reclaimed = state.claim_location(canonical.id, 'repair-worker', 30)
-    assert reclaimed is not None
-    assert reclaimed.lease_owner is not None
-    assert reclaimed.lease_owner != first.lease_owner
-    assert reclaimed.lease_expires_at == 1030
-    assert reclaimed.heartbeat_at == 1000
 
 
 @pytest.mark.parametrize('transition', [
@@ -4911,70 +4566,6 @@ def test_location_claims_start_lease_after_all_row_locks(
     assert claim is not None
     assert claim.heartbeat_at == lock_time
     assert claim.lease_expires_at == lock_time + 10
-
-
-def test_unchanged_generation_repairs_impossible_ready_ownership(
-        image_state_engine, monkeypatch):
-    now = [1000]
-    monkeypatch.setattr(state.time, 'time', lambda: now[0])
-    profile = _profile()
-    image = _publish_state_image(_SOURCE, _DIGEST, profile=profile)
-    canonical = next(location for location in state.list_locations(image.id)
-                     if location.canonical)
-    claim = state.claim_location(canonical.id, 'ready-owner-fixture', 30)
-    assert claim is not None
-    assert claim.lease_owner is not None
-    canonical_ref = references.managed_reference(profile, profile.canonical,
-                                                 'research', _SOURCE, _DIGEST)
-    assert _complete_location(canonical.id, claim.lease_owner, canonical_ref,
-                              _DIGEST)
-    table = global_user_state.container_image_location_table
-    with sqlalchemy.orm.Session(image_state_engine) as session:
-        with pytest.raises(sqlalchemy.exc.IntegrityError):
-            session.execute(
-                table.update().where(table.c.id == canonical.id).values(
-                    lease_owner='schema-rejected-owner',
-                    lease_expires_at=9999,
-                    heartbeat_at=1000,
-                    verification_requested_at=None))
-            session.commit()
-        session.rollback()
-    with image_state_engine.begin() as connection:
-        connection.exec_driver_sql('PRAGMA ignore_check_constraints = ON')
-        connection.execute(
-            table.update().where(table.c.id == canonical.id).values(
-                lease_owner='impossible-ready-owner',
-                lease_expires_at=9999,
-                heartbeat_at=1000,
-                verification_requested_at=None))
-        connection.exec_driver_sql('PRAGMA ignore_check_constraints = OFF')
-
-    repaired = _ensure_profile_location(image,
-                                        profile,
-                                        profile.canonical,
-                                        canonical=True)
-    assert repaired.state == models.ImageLocationState.READY
-    assert repaired.lease_owner is None
-    assert repaired.lease_expires_at is None
-    assert repaired.heartbeat_at is None
-    reference = state.acquire_reference(repaired.id, 'research', 'serve',
-                                        'impossible-ready-repair')
-    assert reference.location_id == repaired.id
-
-    with image_state_engine.begin() as connection:
-        connection.exec_driver_sql('PRAGMA ignore_check_constraints = ON')
-        connection.execute(
-            table.update().where(table.c.id == canonical.id).values(
-                lease_owner='second-impossible-ready-owner',
-                lease_expires_at=9999,
-                heartbeat_at=1000,
-                verification_requested_at=None))
-        connection.exec_driver_sql('PRAGMA ignore_check_constraints = OFF')
-    assert state.retry_location(canonical.id)
-    verification = state.claim_location_verification(canonical.id, 'verifier',
-                                                     30)
-    assert verification is not None
-    assert verification.lease_owner is not None
 
 
 def test_untyped_operational_selector_rejects_namespace_ambiguity(
@@ -8826,100 +8417,6 @@ def test_direct_claims_recover_missing_transition_leases(
     assert eviction.attempt_count == 1
 
 
-@pytest.mark.parametrize('partial_lease', [
-    {
-        'lease_owner': 'historical-owner',
-        'lease_expires_at': None,
-        'heartbeat_at': 900,
-    },
-    {
-        'lease_owner': None,
-        'lease_expires_at': 900,
-        'heartbeat_at': 900,
-    },
-    {
-        'lease_owner': '',
-        'lease_expires_at': 900,
-        'heartbeat_at': 900,
-    },
-])
-def test_indexed_reconciliation_repairs_partial_historical_lease(
-        image_state_engine, monkeypatch, partial_lease):
-    now = [1000]
-    monkeypatch.setattr(state.time, 'time', lambda: now[0])
-    image = _publish_state_image(_SOURCE, _DIGEST, release='partial-copy-lease')
-    canonical = next(location for location in state.list_locations(image.id)
-                     if location.canonical)
-    table = global_user_state.container_image_location_table
-    with image_state_engine.connect() as connection:
-        connection.exec_driver_sql('PRAGMA ignore_check_constraints = ON')
-        connection.execute(
-            table.update().where(table.c.id == canonical.id).values(
-                state=models.ImageLocationState.COPYING.value, **partial_lease))
-        connection.commit()
-        connection.exec_driver_sql('PRAGMA ignore_check_constraints = OFF')
-
-    assert [
-        candidate.id for candidate in state.list_reconciliation_candidates(
-            'research', now=now[0], limit=10)
-    ] == [canonical.id]
-    claimed = state.claim_next_reconciliation_candidate(
-        'research',
-        'repair-partial-copy',
-        materialization_lease_seconds=30,
-        verification_lease_seconds=30,
-        now=now[0])
-    assert claimed is not None
-    assert claimed.id == canonical.id
-    assert claimed.lease_owner is not None
-    assert claimed.lease_expires_at == 1030
-
-
-@pytest.mark.parametrize('partial_lease', [
-    {
-        'lease_owner': 'historical-owner',
-        'lease_expires_at': None,
-        'heartbeat_at': 900,
-    },
-    {
-        'lease_owner': None,
-        'lease_expires_at': 900,
-        'heartbeat_at': 900,
-    },
-])
-def test_indexed_eviction_repairs_partial_historical_lease(
-        image_state_engine, monkeypatch, partial_lease):
-    now = [1000]
-    monkeypatch.setattr(state.time, 'time', lambda: now[0])
-    image, _ = _ready_regional_location()
-    regional = next(location for location in state.list_locations(image.id)
-                    if not location.canonical)
-    now[0] += 8 * _WEEK_SECONDS + 1
-    cutoff = now[0] - 8 * _WEEK_SECONDS
-    table = global_user_state.container_image_location_table
-    with image_state_engine.connect() as connection:
-        connection.exec_driver_sql('PRAGMA ignore_check_constraints = ON')
-        connection.execute(
-            table.update().where(table.c.id == regional.id).values(
-                state=models.ImageLocationState.EVICTING.value,
-                **partial_lease))
-        connection.commit()
-        connection.exec_driver_sql('PRAGMA ignore_check_constraints = OFF')
-
-    assert [
-        candidate.id
-        for candidate in state.list_eviction_candidates('research', cutoff, 10)
-    ] == [regional.id]
-    claimed = state.claim_next_eviction_candidate('research',
-                                                  'repair-partial-eviction',
-                                                  lease_seconds=30,
-                                                  unused_before=cutoff,
-                                                  now=now[0])
-    assert claimed is not None
-    assert claimed.id == regional.id
-    assert claimed.lease_owner is not None
-
-
 def test_eviction_retries_stop_at_automatic_attempt_limit(
         image_state_engine, monkeypatch):
     del image_state_engine
@@ -8952,121 +8449,6 @@ def test_eviction_retries_stop_at_automatic_attempt_limit(
                                                unused_before=cutoff,
                                                now=now[0]) is None
     assert state.list_eviction_candidates('research', cutoff, 10) == []
-
-
-def test_future_retry_queues_are_due_indexed_at_large_cardinality(
-        image_state_engine):
-    image, _ = _ready_regional_location()
-    canonical = next(location for location in state.list_locations(image.id)
-                     if location.canonical)
-    seed_verification = sqlalchemy.text("""
-        WITH RECURSIVE synthetic(n) AS (
-          VALUES(1)
-          UNION ALL
-          SELECT n + 1 FROM synthetic WHERE n < :row_count
-        )
-        INSERT INTO container_image_locations (
-          id, workspace, image_id, profile, target_id, target_fingerprint,
-          policy_fingerprint, profile_revision, canonical, canonical_ready,
-          target_ref, expected_digest, state, attempt_count, next_retry_at,
-          verification_requested_at, auto_evict, updated_at
-        )
-        SELECT 'verify-future-' || n, 'research', :image_id, 'managed',
-               'verify-target-' || n, 'verify-fingerprint-' || n,
-               :policy_fingerprint, 1, 1, 0,
-               'verify.example/repo-' || n || '@' || :digest, :digest,
-               'READY', 1, 4000000000, 1, 0, 1
-        FROM synthetic
-    """)
-    seed_eviction = sqlalchemy.text("""
-        WITH RECURSIVE synthetic(n) AS (
-          VALUES(1)
-          UNION ALL
-          SELECT n + 1 FROM synthetic WHERE n < :row_count
-        )
-        INSERT INTO container_image_locations (
-          id, workspace, image_id, profile, target_id, target_fingerprint,
-          policy_fingerprint, profile_revision, canonical,
-          canonical_location_id, canonical_ready, target_ref, expected_digest,
-          state, attempt_count, next_retry_at, last_used_at, auto_evict,
-          updated_at
-        )
-        SELECT 'evict-future-' || n, 'research', :image_id, 'managed',
-               'evict-target-' || n, 'evict-fingerprint-' || n,
-               :policy_fingerprint, 1, 0, :canonical_id, 1,
-               'evict.example/repo-' || n || '@' || :digest, :digest,
-               'READY', 1, 4000000000, 1, 1, 1
-        FROM synthetic
-    """)
-    parameters = {
-        'row_count': 100_000,
-        'image_id': image.id,
-        'policy_fingerprint': _POLICY_FINGERPRINT,
-        'canonical_id': canonical.id,
-        'digest': _DIGEST,
-    }
-    with image_state_engine.begin() as connection:
-        connection.execute(seed_verification, parameters)
-        connection.execute(seed_eviction, parameters)
-
-    operations = (
-        ('list reconciliation', lambda: state.list_reconciliation_candidates(
-            'research', now=1000, limit=10)),
-        ('claim reconciliation', lambda: state.
-         claim_next_reconciliation_candidate('research',
-                                             'scale-reconciler',
-                                             materialization_lease_seconds=30,
-                                             verification_lease_seconds=30,
-                                             now=1000)),
-        ('list eviction',
-         lambda: state.list_eviction_candidates('research', 100, 10)),
-        ('claim eviction',
-         lambda: state.claim_next_eviction_candidate('research',
-                                                     'scale-evictor',
-                                                     lease_seconds=30,
-                                                     unused_before=100,
-                                                     now=1000)),
-    )
-    for label, operation in operations:
-        result, steps = _sqlite_result_and_vm_steps(image_state_engine,
-                                                    operation)
-        assert not result
-        assert steps < 100_000, f'{label} used {steps} SQLite VM steps'
-
-
-def test_referenced_eviction_backlog_has_constant_bounded_probe_cost(
-        image_state_engine, monkeypatch):
-    monkeypatch.setattr(state.time, 'time', lambda: 1000)
-    profile = _profile()
-    image = _publish_state_image(_SOURCE, _DIGEST, profile=profile)
-    canonical = state.list_locations(image.id, profile.name)[0]
-    claim = state.claim_location(canonical.id, 'canonical-worker', 30)
-    assert claim is not None and claim.lease_owner is not None
-    canonical_ref = references.managed_reference(profile, profile.canonical,
-                                                 'research', _SOURCE, _DIGEST)
-    assert _complete_location(canonical.id, claim.lease_owner, canonical_ref,
-                              _DIGEST)
-    _seed_referenced_eviction_queue(image_state_engine, image, canonical,
-                                    100_000)
-    with state._PROFILE_CURSOR_LOCK:
-        state._PROFILE_CURSORS.clear()
-        state._EVICTION_CANDIDATE_CURSORS.clear()
-
-    listed, list_steps = _sqlite_result_and_vm_steps(
-        image_state_engine,
-        lambda: state.list_eviction_candidates('research', 100, 1))
-    claimed, claim_steps = _sqlite_result_and_vm_steps(
-        image_state_engine,
-        lambda: state.claim_next_eviction_candidate('research',
-                                                    'bounded-evictor',
-                                                    lease_seconds=30,
-                                                    unused_before=100,
-                                                    now=1000))
-
-    assert listed == []
-    assert claimed is None
-    assert list_steps < 200_000
-    assert claim_steps < 1_000_000
 
 
 def test_eviction_reference_pages_eventually_reach_later_unreferenced_work(
@@ -9105,113 +8487,17 @@ def test_eviction_reference_pages_eventually_reach_later_unreferenced_work(
     assert claimed.id == eventual_id
 
 
-def test_failed_retry_probe_uses_sqlite_partial_queue_index(
-        image_state_engine, monkeypatch):
-    monkeypatch.setattr(state.time, 'time', lambda: 1000)
-    profile = _profile()
-    image = _publish_state_image(_SOURCE, _DIGEST, profile=profile)
-    canonical = state.list_locations(image.id, profile.name)[0]
-    claim = state.claim_location(canonical.id, 'failed-retry-fixture', 30)
-    assert claim is not None and claim.lease_owner is not None
-    assert state.fail_location(
-        canonical.id,
-        claim.lease_owner,
-        models.ImageLocationErrorCode.MATERIALIZATION_FAILED,
-        retry_at=1000)
-    with state._PROFILE_CURSOR_LOCK:
-        state._PROFILE_CURSORS.clear()
-
-    executed = []
-
-    def _capture(_connection, _cursor, statement, parameters, _context,
-                 _executemany):
-        if "IN ('FAILED', 'MISSING')" in statement:
-            executed.append((statement, parameters))
-
-    sqlalchemy.event.listen(image_state_engine, 'before_cursor_execute',
-                            _capture)
-    try:
-        candidates = state.list_reconciliation_candidates('research',
-                                                          now=1000,
-                                                          limit=1)
-    finally:
-        sqlalchemy.event.remove(image_state_engine, 'before_cursor_execute',
-                                _capture)
-    assert [candidate.id for candidate in candidates] == [canonical.id]
-    assert len(executed) == 1
-    statement, parameters = executed[0]
-    with image_state_engine.connect() as connection:
-        plan = connection.connection.driver_connection.execute(
-            f'EXPLAIN QUERY PLAN {statement}', parameters).fetchall()
-    plan_text = ' '.join(str(row) for row in plan)
-    assert 'ix_container_image_locations_profile_retry_queue' in plan_text
-
-
-def test_queue_profile_discovery_is_bounded_at_large_cardinality(
-        image_state_engine):
-    seed_profiles = sqlalchemy.text("""
-        WITH RECURSIVE synthetic(n) AS (
-          VALUES(1)
-          UNION ALL
-          SELECT n + 1 FROM synthetic WHERE n < :row_count
-        )
-        INSERT INTO container_image_profile_revisions (
-          workspace, profile, revision, revision_fingerprint, created_at,
-          updated_at
-        )
-        SELECT 'research', 'empty-' || printf('%06d', n), 1,
-               :revision_fingerprint, 1, 1
-        FROM synthetic
-    """)
-    with image_state_engine.begin() as connection:
-        connection.execute(seed_profiles, {
-            'row_count': 200_000,
-            'revision_fingerprint': _POLICY_FINGERPRINT,
-        })
-    with state._PROFILE_CURSOR_LOCK:
-        state._PROFILE_CURSORS.clear()
-
-    operations = (
-        ('list reconciliation', lambda: state.list_reconciliation_candidates(
-            'research', now=1000, limit=1)),
-        ('claim reconciliation', lambda: state.
-         claim_next_reconciliation_candidate('research',
-                                             'profile-page-reconciler',
-                                             materialization_lease_seconds=30,
-                                             verification_lease_seconds=30,
-                                             now=1000)),
-        ('list eviction',
-         lambda: state.list_eviction_candidates('research', 100, 1)),
-        ('claim eviction',
-         lambda: state.claim_next_eviction_candidate('research',
-                                                     'profile-page-evictor',
-                                                     lease_seconds=30,
-                                                     unused_before=100,
-                                                     now=1000)),
-    )
-    for label, operation in operations:
-        result, steps = _sqlite_result_and_vm_steps(image_state_engine,
-                                                    operation)
-        assert not result
-        assert steps < 100_000, f'{label} used {steps} SQLite VM steps'
-
-
 def test_bounded_profile_pages_eventually_revisit_due_work(image_state_engine):
     image = state.register_image(_SOURCE, _SOURCE, _DIGEST, 'research',
                                  'user-1')
     seed_profiles = sqlalchemy.text("""
-        WITH RECURSIVE synthetic(n) AS (
-          VALUES(0)
-          UNION ALL
-          SELECT n + 1 FROM synthetic WHERE n < 129
-        )
         INSERT INTO container_image_profile_revisions (
           workspace, profile, revision, revision_fingerprint, created_at,
           updated_at
         )
-        SELECT 'research', 'page-' || printf('%03d', n), 1,
+        SELECT 'research', 'page-' || lpad(n::text, 3, '0'), 1,
                :revision_fingerprint, 1, 1
-        FROM synthetic
+        FROM generate_series(0, 129) AS synthetic(n)
     """)
     with image_state_engine.begin() as connection:
         connection.execute(seed_profiles,
@@ -9257,18 +8543,13 @@ def test_bounded_eviction_profile_pages_eventually_revisit_due_work(
     image = state.register_image(_SOURCE, _SOURCE, _DIGEST, 'research',
                                  'user-1')
     seed_profiles = sqlalchemy.text("""
-        WITH RECURSIVE synthetic(n) AS (
-          VALUES(0)
-          UNION ALL
-          SELECT n + 1 FROM synthetic WHERE n < 129
-        )
         INSERT INTO container_image_profile_revisions (
           workspace, profile, revision, revision_fingerprint, created_at,
           updated_at
         )
-        SELECT 'research', 'evict-page-' || printf('%03d', n), 1,
+        SELECT 'research', 'evict-page-' || lpad(n::text, 3, '0'), 1,
                :revision_fingerprint, 1, 1
-        FROM synthetic
+        FROM generate_series(0, 129) AS synthetic(n)
     """)
     with image_state_engine.begin() as connection:
         connection.execute(seed_profiles,
@@ -9334,51 +8615,6 @@ def test_bounded_eviction_profile_pages_eventually_revisit_due_work(
             break
     assert claimed is not None
     assert claimed.id == regional.id
-
-
-def test_partial_work_queue_indexes_exclude_exhausted_attempts(
-        image_state_engine):
-    queue_indexes = {
-        'ix_container_image_locations_profile_eviction_ready',
-        'ix_container_image_locations_profile_eviction_retry',
-        'ix_container_image_locations_profile_eviction_lease',
-        'ix_container_image_locations_profile_eviction_incomplete_lease',
-        'ix_container_image_locations_profile_pending_queue',
-        'ix_container_image_locations_regional_pending_queue',
-        'ix_container_image_locations_profile_pending_retry',
-        'ix_container_image_locations_regional_pending_retry',
-        'ix_container_image_locations_profile_copying_queue',
-        'ix_container_image_locations_regional_copying_queue',
-        'ix_container_image_locations_profile_copying_incomplete_lease',
-        'ix_container_image_locations_regional_copying_incomplete_lease',
-        'ix_container_image_locations_profile_retry_queue',
-        'ix_container_image_locations_regional_retry_queue',
-        'ix_container_image_locations_profile_verification_queue',
-        'ix_container_image_locations_regional_verify_queue',
-        'ix_container_image_locations_profile_verification_retry',
-        'ix_container_image_locations_regional_verification_retry',
-    }
-    active_indexes = {
-        'ix_container_image_locations_profile_copying_active_lease',
-        'ix_container_image_locations_profile_evicting_active_lease',
-        'ix_container_image_locations_profile_verification_active_lease',
-    }
-    placeholders = ', '.join('?' for _ in queue_indexes)
-    with image_state_engine.connect() as connection:
-        rows = connection.exec_driver_sql(
-            'SELECT name, sql FROM sqlite_master WHERE type = \'index\' '
-            f'AND name IN ({placeholders})',
-            tuple(sorted(queue_indexes))).all()
-        active_rows = connection.exec_driver_sql(
-            "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND "
-            f"name IN ({', '.join('?' for _ in active_indexes)})",
-            tuple(sorted(active_indexes))).all()
-    assert {name for name, _ in rows} == queue_indexes
-    for _, sql in rows:
-        assert 'attempt_count < 20' in sql
-    assert {name for name, _ in active_rows} == active_indexes
-    for _, sql in active_rows:
-        assert 'lease_owner IS NOT NULL' in sql
 
 
 def test_table_and_index_races_do_not_skip_later_index_repairs():

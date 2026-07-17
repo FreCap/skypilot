@@ -65,13 +65,6 @@ def _bounded_container_image_queue(predicate: str) -> sqlalchemy.TextClause:
         f'{predicate} AND {_CONTAINER_IMAGE_QUEUE_ATTEMPT_BOUND}')
 
 
-def _bounded_container_image_sqlite_queue(
-        predicate: str) -> sqlalchemy.TextClause:
-    """Uses the Boolean spelling emitted by SQLAlchemy's SQLite compiler."""
-    predicate = predicate.replace('IS TRUE', 'IS 1').replace('IS FALSE', 'IS 0')
-    return _bounded_container_image_queue(predicate)
-
-
 _UNIQUE_CONSTRAINT_FAILED_ERROR_MSGS = [
     # sqlite
     'UNIQUE constraint failed',
@@ -198,9 +191,11 @@ volume_table = sqlalchemy.Table(
 # Workspace-scoped immutable OCI artifacts. These tables intentionally store
 # identity and orchestration state only. Registry credentials are minted for a
 # bounded operation and must never be persisted here.
+container_image_metadata = sqlalchemy.MetaData()
+
 container_image_catalog_table = sqlalchemy.Table(
     'container_image_catalog',
-    Base.metadata,
+    container_image_metadata,
     sqlalchemy.Column('id', sqlalchemy.Text, primary_key=True),
     sqlalchemy.Column('authority_id', sqlalchemy.Text, nullable=False),
     sqlalchemy.Column('created_at', sqlalchemy.Integer, nullable=False),
@@ -211,7 +206,7 @@ container_image_catalog_table = sqlalchemy.Table(
 # identity is immutable and v0 deliberately has no artifact deletion path.
 container_image_workspace_catalog_table = sqlalchemy.Table(
     'container_image_workspace_catalogs',
-    Base.metadata,
+    container_image_metadata,
     sqlalchemy.Column('workspace', sqlalchemy.Text, primary_key=True),
     sqlalchemy.Column('artifact_count',
                       sqlalchemy.Integer,
@@ -222,7 +217,7 @@ container_image_workspace_catalog_table = sqlalchemy.Table(
 
 container_image_profile_revision_table = sqlalchemy.Table(
     'container_image_profile_revisions',
-    Base.metadata,
+    container_image_metadata,
     sqlalchemy.Column('workspace', sqlalchemy.Text, primary_key=True),
     sqlalchemy.Column('profile', sqlalchemy.Text, primary_key=True),
     sqlalchemy.Column('revision', sqlalchemy.Integer, nullable=False),
@@ -233,7 +228,7 @@ container_image_profile_revision_table = sqlalchemy.Table(
 
 container_image_table = sqlalchemy.Table(
     'container_images',
-    Base.metadata,
+    container_image_metadata,
     sqlalchemy.Column('id', sqlalchemy.Text, primary_key=True),
     sqlalchemy.Column('workspace', sqlalchemy.Text, nullable=False),
     sqlalchemy.Column('creator_user_hash', sqlalchemy.Text, nullable=False),
@@ -266,7 +261,7 @@ container_image_table = sqlalchemy.Table(
 
 container_image_release_table = sqlalchemy.Table(
     'container_image_releases',
-    Base.metadata,
+    container_image_metadata,
     sqlalchemy.Column('workspace', sqlalchemy.Text, primary_key=True),
     sqlalchemy.Column('name', sqlalchemy.Text, primary_key=True),
     sqlalchemy.Column('image_id',
@@ -279,7 +274,7 @@ container_image_release_table = sqlalchemy.Table(
 
 container_image_source_table = sqlalchemy.Table(
     'container_image_sources',
-    Base.metadata,
+    container_image_metadata,
     sqlalchemy.Column('id', sqlalchemy.Text, primary_key=True),
     sqlalchemy.Column('workspace', sqlalchemy.Text, nullable=False),
     sqlalchemy.Column('image_id',
@@ -299,7 +294,7 @@ container_image_source_table = sqlalchemy.Table(
 
 container_image_location_table = sqlalchemy.Table(
     'container_image_locations',
-    Base.metadata,
+    container_image_metadata,
     sqlalchemy.Column('id', sqlalchemy.Text, primary_key=True),
     # Denormalize workspace onto the queue row so million-row claim paths can
     # use one ordered index probe instead of joining through artifact identity.
@@ -389,9 +384,8 @@ container_image_location_table = sqlalchemy.Table(
         'id',
         'image_id',
         postgresql_where=sqlalchemy.text(
-            "canonical IS TRUE AND state = 'READY' AND target_ref IS NOT NULL"),
-        sqlite_where=sqlalchemy.text(
-            "canonical IS 1 AND state = 'READY' AND target_ref IS NOT NULL")),
+            "canonical IS TRUE AND state = 'READY' AND target_ref IS NOT NULL")
+    ),
     sqlalchemy.Index('ix_container_image_locations_import_source', 'source_id'),
     sqlalchemy.Index('ix_container_image_locations_eviction_ready', 'workspace',
                      'auto_evict', 'state', 'last_used_at', 'next_retry_at'),
@@ -404,10 +398,6 @@ container_image_location_table = sqlalchemy.Table(
                      postgresql_where=_bounded_container_image_queue(
                          "canonical IS FALSE AND auto_evict IS TRUE AND "
                          "canonical_ready IS TRUE AND state = 'READY' AND "
-                         "next_retry_at IS NULL"),
-                     sqlite_where=_bounded_container_image_sqlite_queue(
-                         "canonical IS FALSE AND auto_evict IS TRUE AND "
-                         "canonical_ready IS TRUE AND state = 'READY' AND "
                          "next_retry_at IS NULL")),
     sqlalchemy.Index('ix_container_image_locations_profile_eviction_retry',
                      'workspace',
@@ -416,10 +406,6 @@ container_image_location_table = sqlalchemy.Table(
                      'next_retry_at',
                      'id',
                      postgresql_where=_bounded_container_image_queue(
-                         "canonical IS FALSE AND auto_evict IS TRUE AND "
-                         "canonical_ready IS TRUE AND state = 'READY' AND "
-                         "next_retry_at IS NOT NULL"),
-                     sqlite_where=_bounded_container_image_sqlite_queue(
                          "canonical IS FALSE AND auto_evict IS TRUE AND "
                          "canonical_ready IS TRUE AND state = 'READY' AND "
                          "next_retry_at IS NOT NULL")),
@@ -436,12 +422,6 @@ container_image_location_table = sqlalchemy.Table(
                          "canonical_ready IS TRUE AND state = 'EVICTING' AND "
                          "lease_owner IS NOT NULL AND lease_owner <> '' AND "
                          "lease_expires_at IS NOT NULL AND "
-                         "heartbeat_at IS NOT NULL"),
-                     sqlite_where=_bounded_container_image_sqlite_queue(
-                         "canonical IS FALSE AND auto_evict IS TRUE AND "
-                         "canonical_ready IS TRUE AND state = 'EVICTING' AND "
-                         "lease_owner IS NOT NULL AND lease_owner <> '' AND "
-                         "lease_expires_at IS NOT NULL AND "
                          "heartbeat_at IS NOT NULL")),
     sqlalchemy.Index(
         'ix_container_image_locations_profile_eviction_incomplete_lease',
@@ -450,11 +430,6 @@ container_image_location_table = sqlalchemy.Table(
         'profile_revision',
         'id',
         postgresql_where=_bounded_container_image_queue(
-            "canonical IS FALSE AND auto_evict IS TRUE AND "
-            "canonical_ready IS TRUE AND state = 'EVICTING' AND "
-            "(lease_owner IS NULL OR lease_owner = '' OR "
-            "lease_expires_at IS NULL OR heartbeat_at IS NULL)"),
-        sqlite_where=_bounded_container_image_sqlite_queue(
             "canonical IS FALSE AND auto_evict IS TRUE AND "
             "canonical_ready IS TRUE AND state = 'EVICTING' AND "
             "(lease_owner IS NULL OR lease_owner = '' OR "
@@ -470,9 +445,6 @@ container_image_location_table = sqlalchemy.Table(
                      'id',
                      postgresql_where=_bounded_container_image_queue(
                          "canonical IS TRUE AND state = 'PENDING' AND "
-                         "next_retry_at IS NULL"),
-                     sqlite_where=_bounded_container_image_sqlite_queue(
-                         "canonical IS TRUE AND state = 'PENDING' AND "
                          "next_retry_at IS NULL")),
     sqlalchemy.Index('ix_container_image_locations_regional_pending_queue',
                      'workspace',
@@ -481,9 +453,6 @@ container_image_location_table = sqlalchemy.Table(
                      'updated_at',
                      'id',
                      postgresql_where=_bounded_container_image_queue(
-                         "canonical IS FALSE AND canonical_ready IS TRUE AND "
-                         "state = 'PENDING' AND next_retry_at IS NULL"),
-                     sqlite_where=_bounded_container_image_sqlite_queue(
                          "canonical IS FALSE AND canonical_ready IS TRUE AND "
                          "state = 'PENDING' AND next_retry_at IS NULL")),
     sqlalchemy.Index('ix_container_image_locations_profile_pending_retry',
@@ -494,9 +463,6 @@ container_image_location_table = sqlalchemy.Table(
                      'id',
                      postgresql_where=_bounded_container_image_queue(
                          "canonical IS TRUE AND state = 'PENDING' AND "
-                         "next_retry_at IS NOT NULL"),
-                     sqlite_where=_bounded_container_image_sqlite_queue(
-                         "canonical IS TRUE AND state = 'PENDING' AND "
                          "next_retry_at IS NOT NULL")),
     sqlalchemy.Index('ix_container_image_locations_regional_pending_retry',
                      'workspace',
@@ -506,9 +472,6 @@ container_image_location_table = sqlalchemy.Table(
                      'id',
                      postgresql_where=_bounded_container_image_queue(
                          "canonical IS FALSE AND canonical_ready IS TRUE AND "
-                         "state = 'PENDING' AND next_retry_at IS NOT NULL"),
-                     sqlite_where=_bounded_container_image_sqlite_queue(
-                         "canonical IS FALSE AND canonical_ready IS TRUE AND "
                          "state = 'PENDING' AND next_retry_at IS NOT NULL")),
     sqlalchemy.Index('ix_container_image_locations_profile_copying_queue',
                      'workspace',
@@ -517,11 +480,6 @@ container_image_location_table = sqlalchemy.Table(
                      'lease_expires_at',
                      'id',
                      postgresql_where=_bounded_container_image_queue(
-                         "canonical IS TRUE AND state = 'COPYING' AND "
-                         "lease_owner IS NOT NULL AND lease_owner <> '' AND "
-                         "lease_expires_at IS NOT NULL AND "
-                         "heartbeat_at IS NOT NULL"),
-                     sqlite_where=_bounded_container_image_sqlite_queue(
                          "canonical IS TRUE AND state = 'COPYING' AND "
                          "lease_owner IS NOT NULL AND lease_owner <> '' AND "
                          "lease_expires_at IS NOT NULL AND "
@@ -536,11 +494,6 @@ container_image_location_table = sqlalchemy.Table(
                          "canonical IS FALSE AND canonical_ready IS TRUE AND "
                          "state = 'COPYING' AND lease_owner IS NOT NULL AND "
                          "lease_owner <> '' AND lease_expires_at IS NOT NULL "
-                         "AND heartbeat_at IS NOT NULL"),
-                     sqlite_where=_bounded_container_image_sqlite_queue(
-                         "canonical IS FALSE AND canonical_ready IS TRUE AND "
-                         "state = 'COPYING' AND lease_owner IS NOT NULL AND "
-                         "lease_owner <> '' AND lease_expires_at IS NOT NULL "
                          "AND heartbeat_at IS NOT NULL")),
     sqlalchemy.Index(
         'ix_container_image_locations_profile_copying_incomplete_lease',
@@ -549,10 +502,6 @@ container_image_location_table = sqlalchemy.Table(
         'profile_revision',
         'id',
         postgresql_where=_bounded_container_image_queue(
-            "canonical IS TRUE AND state = 'COPYING' AND "
-            "(lease_owner IS NULL OR lease_owner = '' OR "
-            "lease_expires_at IS NULL OR heartbeat_at IS NULL)"),
-        sqlite_where=_bounded_container_image_sqlite_queue(
             "canonical IS TRUE AND state = 'COPYING' AND "
             "(lease_owner IS NULL OR lease_owner = '' OR "
             "lease_expires_at IS NULL OR heartbeat_at IS NULL)")),
@@ -566,11 +515,6 @@ container_image_location_table = sqlalchemy.Table(
             "canonical IS FALSE AND canonical_ready IS TRUE AND "
             "state = 'COPYING' AND (lease_owner IS NULL OR "
             "lease_owner = '' OR lease_expires_at IS NULL OR "
-            "heartbeat_at IS NULL)"),
-        sqlite_where=_bounded_container_image_sqlite_queue(
-            "canonical IS FALSE AND canonical_ready IS TRUE AND "
-            "state = 'COPYING' AND (lease_owner IS NULL OR "
-            "lease_owner = '' OR lease_expires_at IS NULL OR "
             "heartbeat_at IS NULL)")),
     sqlalchemy.Index(
         'ix_container_image_locations_profile_retry_queue',
@@ -580,8 +524,6 @@ container_image_location_table = sqlalchemy.Table(
         'next_retry_at',
         'id',
         postgresql_where=_bounded_container_image_queue(
-            "canonical IS TRUE AND state IN ('FAILED', 'MISSING')"),
-        sqlite_where=_bounded_container_image_sqlite_queue(
             "canonical IS TRUE AND state IN ('FAILED', 'MISSING')")),
     sqlalchemy.Index('ix_container_image_locations_regional_retry_queue',
                      'workspace',
@@ -590,9 +532,6 @@ container_image_location_table = sqlalchemy.Table(
                      'next_retry_at',
                      'id',
                      postgresql_where=_bounded_container_image_queue(
-                         "canonical IS FALSE AND canonical_ready IS TRUE AND "
-                         "state IN ('FAILED', 'MISSING')"),
-                     sqlite_where=_bounded_container_image_sqlite_queue(
                          "canonical IS FALSE AND canonical_ready IS TRUE AND "
                          "state IN ('FAILED', 'MISSING')")),
     sqlalchemy.Index('ix_container_image_locations_verify_queue', 'workspace',
@@ -607,10 +546,6 @@ container_image_location_table = sqlalchemy.Table(
                      postgresql_where=_bounded_container_image_queue(
                          "canonical IS TRUE AND state = 'READY' AND "
                          "verification_requested_at IS NOT NULL AND "
-                         "next_retry_at IS NULL"),
-                     sqlite_where=_bounded_container_image_sqlite_queue(
-                         "canonical IS TRUE AND state = 'READY' AND "
-                         "verification_requested_at IS NOT NULL AND "
                          "next_retry_at IS NULL")),
     sqlalchemy.Index('ix_container_image_locations_regional_verify_queue',
                      'workspace',
@@ -619,11 +554,6 @@ container_image_location_table = sqlalchemy.Table(
                      'verification_requested_at',
                      'id',
                      postgresql_where=_bounded_container_image_queue(
-                         "canonical IS FALSE AND canonical_ready IS TRUE AND "
-                         "state = 'READY' AND "
-                         "verification_requested_at IS NOT NULL AND "
-                         "next_retry_at IS NULL"),
-                     sqlite_where=_bounded_container_image_sqlite_queue(
                          "canonical IS FALSE AND canonical_ready IS TRUE AND "
                          "state = 'READY' AND "
                          "verification_requested_at IS NOT NULL AND "
@@ -637,10 +567,6 @@ container_image_location_table = sqlalchemy.Table(
                      postgresql_where=_bounded_container_image_queue(
                          "canonical IS TRUE AND state = 'READY' AND "
                          "verification_requested_at IS NOT NULL AND "
-                         "next_retry_at IS NOT NULL"),
-                     sqlite_where=_bounded_container_image_sqlite_queue(
-                         "canonical IS TRUE AND state = 'READY' AND "
-                         "verification_requested_at IS NOT NULL AND "
                          "next_retry_at IS NOT NULL")),
     sqlalchemy.Index(
         'ix_container_image_locations_regional_verification_retry',
@@ -650,10 +576,6 @@ container_image_location_table = sqlalchemy.Table(
         'next_retry_at',
         'id',
         postgresql_where=_bounded_container_image_queue(
-            "canonical IS FALSE AND canonical_ready IS TRUE AND "
-            "state = 'READY' AND verification_requested_at IS NOT NULL AND "
-            "next_retry_at IS NOT NULL"),
-        sqlite_where=_bounded_container_image_sqlite_queue(
             "canonical IS FALSE AND canonical_ready IS TRUE AND "
             "state = 'READY' AND verification_requested_at IS NOT NULL AND "
             "next_retry_at IS NOT NULL")),
@@ -666,10 +588,6 @@ container_image_location_table = sqlalchemy.Table(
         postgresql_where=sqlalchemy.text(
             "state = 'COPYING' AND lease_owner IS NOT NULL AND "
             "lease_owner <> '' AND lease_expires_at IS NOT NULL AND "
-            "heartbeat_at IS NOT NULL"),
-        sqlite_where=sqlalchemy.text(
-            "state = 'COPYING' AND lease_owner IS NOT NULL AND "
-            "lease_owner <> '' AND lease_expires_at IS NOT NULL AND "
             "heartbeat_at IS NOT NULL")),
     sqlalchemy.Index(
         'ix_container_image_locations_profile_evicting_active_lease',
@@ -678,10 +596,6 @@ container_image_location_table = sqlalchemy.Table(
         'lease_expires_at',
         'id',
         postgresql_where=sqlalchemy.text(
-            "state = 'EVICTING' AND lease_owner IS NOT NULL AND "
-            "lease_owner <> '' AND lease_expires_at IS NOT NULL AND "
-            "heartbeat_at IS NOT NULL"),
-        sqlite_where=sqlalchemy.text(
             "state = 'EVICTING' AND lease_owner IS NOT NULL AND "
             "lease_owner <> '' AND lease_expires_at IS NOT NULL AND "
             "heartbeat_at IS NOT NULL")),
@@ -694,16 +608,12 @@ container_image_location_table = sqlalchemy.Table(
         postgresql_where=sqlalchemy.text(
             "state = 'READY' AND verification_requested_at IS NOT NULL AND "
             "lease_owner IS NOT NULL AND lease_owner <> '' AND "
-            "lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL"),
-        sqlite_where=sqlalchemy.text(
-            "state = 'READY' AND verification_requested_at IS NOT NULL AND "
-            "lease_owner IS NOT NULL AND lease_owner <> '' AND "
             "lease_expires_at IS NOT NULL AND heartbeat_at IS NOT NULL")),
 )
 
 container_image_reference_table = sqlalchemy.Table(
     'container_image_references',
-    Base.metadata,
+    container_image_metadata,
     sqlalchemy.Column('id', sqlalchemy.Text, primary_key=True),
     sqlalchemy.Column('workspace', sqlalchemy.Text, nullable=False),
     sqlalchemy.Column('location_id',
@@ -744,6 +654,15 @@ def container_image_exact_canonical_ready(location: sqlalchemy.Table,
     )
 
 
+def _require_container_image_postgres(session: orm.Session) -> None:
+    bind = session.get_bind()
+    if (bind is None or
+            bind.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value):
+        raise RuntimeError(
+            'Managed container image state requires the central PostgreSQL '
+            'database.')
+
+
 def lock_container_image_exact_canonical_for_work(
     session: orm.Session,
     location_id: str,
@@ -757,6 +676,7 @@ def lock_container_image_exact_canonical_for_work(
     snapshot predicate.  Canonical locations return immediately because the
     caller's subsequent update locks that same row.
     """
+    _require_container_image_postgres(session)
     location = container_image_location_table
     row = session.execute(
         sqlalchemy.select(
@@ -781,11 +701,7 @@ def lock_container_image_exact_canonical_for_work(
         location.c.canonical.is_(True),
         location.c.state == 'READY',
         location.c.target_ref.isnot(None),
-    )
-    bind = session.get_bind()
-    assert bind is not None
-    if bind.dialect.name == 'postgresql':
-        statement = statement.with_for_update(read=True)
+    ).with_for_update(read=True)
     return session.execute(statement).first() is not None
 
 
@@ -806,6 +722,7 @@ def lock_container_image_profile_revision_for_work(
     activation, so the stale revision no longer matches. Callers must acquire
     this lock before locking or updating a location row.
     """
+    _require_container_image_postgres(session)
     statement = sqlalchemy.select(
         container_image_profile_revision_table.c.revision).where(
             container_image_profile_revision_table.c.workspace == workspace,
@@ -815,12 +732,9 @@ def lock_container_image_profile_revision_for_work(
         statement = statement.where(
             container_image_profile_revision_table.c.revision_fingerprint ==
             revision_fingerprint)
-    bind = session.get_bind()
-    assert bind is not None
-    if bind.dialect.name == 'postgresql':
-        statement = statement.with_for_update(read=True,
-                                              key_share=True,
-                                              skip_locked=skip_locked)
+    statement = statement.with_for_update(read=True,
+                                          key_share=True,
+                                          skip_locked=skip_locked)
     return session.execute(statement).first() is not None
 
 
@@ -1873,6 +1787,13 @@ def add_or_update_cluster(cluster_name: str,
                 image_policy_fingerprint = resolved_image.policy_fingerprint
                 image_digest = resolved_image.digest
 
+    container_image_state_available = (
+        engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value)
+    if resolved_image is not None and not container_image_state_available:
+        raise RuntimeError(
+            'Managed container image state requires the central PostgreSQL '
+            'database.')
+
     # Extract node_names from cached_cluster_info and merge with lineage.
     # Also opportunistically compute cloud-provider instance console URLs for
     # the dashboard's External Links section (mirrors the managed-job flow in
@@ -2323,7 +2244,7 @@ def add_or_update_cluster(cluster_name: str,
                         'Image materialization changed while the cluster '
                         'reference was being acquired.')
                 reference_id = str(uuid.uuid4())
-                reference_insert = insert_func(
+                reference_insert = postgresql.insert(
                     container_image_reference_table).values(
                         id=reference_id,
                         workspace=image_row['workspace'],
@@ -2345,7 +2266,7 @@ def add_or_update_cluster(cluster_name: str,
                             container_image_reference_table.c.expires_at: None,
                             container_image_reference_table.c.updated_at: status_updated_at,
                         }))
-        else:
+        elif container_image_state_available:
             # Updating a cluster away from a managed image must release its
             # old eviction fence in the same transaction as the new handle.
             session.execute(container_image_reference_table.delete().where(
@@ -2990,9 +2911,12 @@ def remove_cluster(cluster_name: str, terminate: bool) -> None:
             session.query(cluster_table).filter_by(name=cluster_name).delete()
             # Container image references deliberately survive stop/start but
             # are released with the retained cluster record on termination.
-            session.execute(container_image_reference_table.delete().where(
-                container_image_reference_table.c.consumer_type == 'cluster',
-                container_image_reference_table.c.consumer_id == cluster_name))
+            if (engine.dialect.name ==
+                    db_utils.SQLAlchemyDialect.POSTGRESQL.value):
+                session.execute(container_image_reference_table.delete().where(
+                    container_image_reference_table.c.consumer_type ==
+                    'cluster', container_image_reference_table.c.consumer_id ==
+                    cluster_name))
         else:
             if row is None or row.handle is None:
                 return
