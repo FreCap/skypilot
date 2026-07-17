@@ -181,6 +181,7 @@ def setup_gcp_authentication(config: dict[str, Any]) -> dict[str, Any]:
             # within their google workspace after the os-login credentials
             # were established.
             config_path = os.path.expanduser(clouds.gcp.GCP_CONFIG_PATH)
+            account = None
             with open(config_path, encoding='utf-8') as infile:
                 for line in infile:
                     if line.startswith('account'):
@@ -192,6 +193,8 @@ def setup_gcp_authentication(config: dict[str, Any]) -> dict[str, Any]:
                             'GCP authentication failed, as the oslogin is '
                             f'enabled but the file {config_path} does not '
                             'contain the account information.')
+            if account is None:
+                raise RuntimeError('GCP authentication account is missing.')
             os_login_username = account.replace('@', '_').replace('.', '_')
         config['auth']['ssh_user'] = os_login_username
 
@@ -264,6 +267,7 @@ def setup_ibm_authentication(config: dict[str, Any]) -> dict[str, Any]:
               encoding='utf-8') as file:
         ssh_key_data = file.read().strip()
     # pylint: disable=E1136
+    vpc_key_id = None
     try:
         res = client.create_key(public_key=ssh_key_data,
                                 name=_get_unique_key_name(),
@@ -288,6 +292,9 @@ def setup_ibm_authentication(config: dict[str, Any]) -> dict[str, Any]:
                 already registered in the specified region""") from e
         else:
             raise Exception('Failed to register a key') from e
+
+    if vpc_key_id is None:
+        raise RuntimeError('Failed to resolve the IBM VPC SSH key.')
 
     config['auth']['ssh_private_key'] = private_key_path
 
