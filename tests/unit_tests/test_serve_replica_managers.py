@@ -163,6 +163,10 @@ run: echo hi
         persisted_spec.pool = False
         persisted_spec.uses_logical_replicas = False
         with mock.patch(
+                'sky.serve.replica_managers.serve_state.'
+                'get_service_from_name',
+                return_value={'workspace': 'default'}), \
+             mock.patch(
                 'sky.serve.replica_managers.serve_state.get_yaml_content',
                 return_value=legacy_yaml), \
              mock.patch(
