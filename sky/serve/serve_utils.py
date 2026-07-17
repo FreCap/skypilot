@@ -1762,7 +1762,13 @@ def _get_service_status(
         A dictionary describing the status of the service if the service exists.
         Otherwise, return None.
     """
-    record = serve_state.get_service_from_name(service_name)
+    minimal_status_only = (not with_replica_info and not with_replica_counts and
+                           not with_yaml and not with_target_num_replicas)
+    if minimal_status_only:
+        record = serve_state.get_service_status_snapshot(service_name,
+                                                         require_version=True)
+    else:
+        record = serve_state.get_service_from_name(service_name)
     if record is None:
         return None
     if record['pool'] != pool:
@@ -2192,7 +2198,8 @@ def get_next_cluster_name(
     # Check if service exists
     service_status = _get_service_status(service_name,
                                          pool=True,
-                                         with_replica_info=False)
+                                         with_replica_info=False,
+                                         with_yaml=False)
     if service_status is None:
         logger.error(f'Service {service_name!r} does not exist.')
         return None
@@ -3060,7 +3067,8 @@ def wait_service_registration(
 
         record = _get_service_status(service_name,
                                      pool=pool,
-                                     with_replica_info=False)
+                                     with_replica_info=False,
+                                     with_yaml=False)
         if record is not None:
             if (expected_resource_scope is not None and
                     record.get('resource_scope') != expected_resource_scope):

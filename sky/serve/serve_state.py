@@ -1646,6 +1646,53 @@ def get_service_runtime_snapshot(
     }
 
 
+def get_service_status_snapshot(
+        service_name: str,
+        require_version: bool = False) -> dict[str, Any] | None:
+    """Read the slim status fields used by control and liveness helpers.
+
+    Unlike :func:`get_service_from_name`, this helper stays on the
+    ``services`` table: no ``version_specs`` join and no latest-spec
+    deserialization. ``require_version`` preserves callers whose old joined
+    read treated an orphan/versionless service row as missing.
+    """
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        query = sqlalchemy.select(
+            services_table.c.name,
+            services_table.c.controller_job_id,
+            services_table.c.controller_port,
+            services_table.c.load_balancer_port,
+            services_table.c.status,
+            services_table.c.pool,
+            services_table.c.controller_pid,
+            services_table.c.controller_ip,
+            services_table.c.hash,
+            services_table.c.lifecycle_epoch,
+            services_table.c.resource_scope,
+        ).where(services_table.c.name == service_name)
+        if require_version:
+            query = query.where(sqlalchemy.exists().where(
+                version_specs_table.c.service_name == services_table.c.name))
+        row = session.execute(query).fetchone()
+    if row is None:
+        return None
+    mapping = row._mapping  # pylint: disable=protected-access
+    return {
+        'name': mapping['name'],
+        'controller_job_id': mapping['controller_job_id'],
+        'controller_port': mapping['controller_port'],
+        'load_balancer_port': mapping['load_balancer_port'],
+        'status': ServiceStatus[mapping['status']],
+        'pool': bool(mapping['pool']),
+        'controller_pid': mapping['controller_pid'],
+        'controller_ip': mapping['controller_ip'],
+        'hash': mapping['hash'],
+        'lifecycle_epoch': mapping['lifecycle_epoch'],
+        'resource_scope': mapping['resource_scope'],
+    }
+
+
 def get_service_controller_owner(
         service_name: str,
         require_version: bool = False,

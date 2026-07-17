@@ -65,7 +65,7 @@ def test_get_next_cluster_name_uses_grouped_pool_counts_in_fallback():
                            '_get_service_status',
                            return_value={
                                'pool': True,
-                           }), \
+                           }) as get_status, \
          mock.patch.object(serve_utils,
                            'get_service_filelock_path',
                            return_value='/tmp/pool.lock'), \
@@ -100,6 +100,10 @@ def test_get_next_cluster_name_uses_grouped_pool_counts_in_fallback():
                                                      job_id=17,
                                                      task_resources=None)
 
+    get_status.assert_called_once_with('pool-a',
+                                       pool=True,
+                                       with_replica_info=False,
+                                       with_yaml=False)
     grouped_counts.assert_called_once_with('pool-a')
     assert selected == 'replica-idle'
     set_cluster.assert_called_once_with(17, 'replica-idle')
