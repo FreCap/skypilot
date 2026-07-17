@@ -157,6 +157,80 @@ describe('useServiceDetails stale-response fencing', () => {
     expect(result.current.serviceData.name).toBe('svc-b');
     expect(result.current.serviceData.status).toBe('svc-b-full');
   });
+
+  it('does not overlap history refreshes at the fixed polling cadence', async () => {
+    jest.useFakeTimers();
+    const historyRefresh = deferred();
+    dashboardCache.get
+      .mockResolvedValueOnce({
+        services: [{ name: 'svc', status: 'READY' }],
+      })
+      .mockResolvedValueOnce({
+        services: [{ name: 'svc', status: 'READY', replicas: [] }],
+      })
+      .mockImplementation(() => historyRefresh.promise);
+
+    const { unmount } = renderHook(() =>
+      useServiceDetails({ serviceName: 'svc' })
+    );
+    let mounted = true;
+
+    try {
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+
+      await act(async () => {
+        jest.advanceTimersByTime(60 * 1000);
+        await Promise.resolve();
+      });
+      expect(dashboardCache.get).toHaveBeenCalledTimes(3);
+
+      await act(async () => {
+        jest.advanceTimersByTime(2 * 60 * 1000 + 30 * 1000);
+        await Promise.resolve();
+      });
+
+      // A slow history query must not accumulate one new request per timer
+      // boundary. Apart from the initial summary and full fetches, only one
+      // automatic history request may be pending.
+      expect(dashboardCache.get).toHaveBeenCalledTimes(3);
+
+      await act(async () => {
+        historyRefresh.resolve({
+          services: [
+            { name: 'svc', replicaHistory: { currentReadyReplicas: 1 } },
+          ],
+        });
+        await Promise.resolve();
+      });
+
+      await act(async () => {
+        jest.advanceTimersByTime(30 * 1000 - 1);
+      });
+      expect(dashboardCache.get).toHaveBeenCalledTimes(3);
+
+      await act(async () => {
+        jest.advanceTimersByTime(1);
+        await Promise.resolve();
+      });
+      expect(dashboardCache.get).toHaveBeenCalledTimes(4);
+
+      unmount();
+      mounted = false;
+      await act(async () => {
+        jest.advanceTimersByTime(2 * 60 * 1000);
+        await Promise.resolve();
+      });
+      expect(dashboardCache.get).toHaveBeenCalledTimes(4);
+    } finally {
+      if (mounted) {
+        unmount();
+      }
+      jest.useRealTimers();
+    }
+  });
 });
 
 describe('ServiceDetailCard cost and request estimates', () => {
