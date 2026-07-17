@@ -95,7 +95,7 @@ function deferred() {
 }
 
 describe('infrastructure refresh lifecycle', () => {
-  it('keeps loading active until every overlapping refresh settles', async () => {
+  it('coalesces overlapping manual refreshes before the context fanout duplicates', async () => {
     const gpuData = {
       perContextGPUs: [],
       perNodeGPUs: [],
@@ -124,19 +124,15 @@ describe('infrastructure refresh lifecycle', () => {
       window.dispatchEvent(new Event('skydashboard:infra:refresh'));
     });
     await waitFor(() => {
-      expect(getContextGPUData).toHaveBeenCalledTimes(3);
+      expect(getContextGPUData).toHaveBeenCalledTimes(2);
       expect(screen.getByText('Loading...')).toBeVisible();
     });
 
     await act(async () => {
-      second.resolve(gpuData);
-      await second.promise;
-    });
-    expect(screen.getByText('Loading...')).toBeVisible();
-
-    await act(async () => {
       first.resolve(gpuData);
+      second.resolve(gpuData);
       await first.promise;
+      await second.promise;
     });
     await waitFor(() => {
       expect(screen.queryByText('Loading...')).not.toBeInTheDocument();

@@ -238,20 +238,22 @@ export function GPUs() {
   // Ref to track previous loading state for detecting when loading completes
   const wasLoadingRef = React.useRef(true);
 
-  // State and refs for tracking ALL in-flight fetches (including background refresh)
+  // Only the newest refresh generation may publish state. Background polls
+  // reuse the active refresh instead of starting overlapping duplicate work.
+  const refreshStateRef = React.useRef({ generation: 0, active: null });
+
+  // State and refs for tracking the current visible refresh.
   const [isFetching, setIsFetching] = useState(false);
-  const activeFetchCountRef = React.useRef(0);
 
   // Selected context for subpage view
   const [selectedContext, setSelectedContext] = useState(null);
 
   const fetchData = React.useCallback(
-    async (options = { showLoadingIndicators: true }) => {
+    async (options = { showLoadingIndicators: true }, owner) => {
       const { showLoadingIndicators = true, forceRefresh = false } = options;
-
-      // Track fetch cycle for top-right spinner (works for both foreground and background refresh)
-      activeFetchCountRef.current += 1;
-      setIsFetching(true);
+      const ownsRefresh = () =>
+        refreshStateRef.current.active === owner &&
+        refreshStateRef.current.generation === owner.generation;
 
       if (showLoadingIndicators) {
         setKubeLoading(true);
@@ -279,14 +281,17 @@ export function GPUs() {
         // The SSH GPU info comes from getWorkspaceInfrastructure() which handles both K8s and SSH contexts.
         await Promise.all([
           skyCheckPromise,
-          fetchKubernetesData(forceRefresh, showLoadingIndicators),
-          fetchSSHNodePools(forceRefresh),
-          fetchCloudData(forceRefresh),
-          fetchManagedJobsData(),
-          fetchClusterStatsData(),
-          fetchSlurmData(),
+          fetchKubernetesData(forceRefresh, showLoadingIndicators, ownsRefresh),
+          fetchSSHNodePools(forceRefresh, ownsRefresh),
+          fetchCloudData(forceRefresh, ownsRefresh),
+          fetchManagedJobsData(ownsRefresh),
+          fetchClusterStatsData(ownsRefresh),
+          fetchSlurmData(ownsRefresh),
         ]);
       } catch (error) {
+        if (!ownsRefresh()) {
+          return;
+        }
         console.error('Error in fetchData:', error);
         // On error, we should still mark data as loaded but with empty values
         setWorkspaceInfrastructure({});
@@ -315,9 +320,8 @@ export function GPUs() {
         setSshAndKubeJobsData({});
         setSshAndKubeJobsDataLoading(false);
       } finally {
-        activeFetchCountRef.current -= 1;
-        if (activeFetchCountRef.current === 0) {
-          setIsFetching(false);
+        if (!ownsRefresh()) {
+          return;
         }
 
         // Always clear loading states when showLoadingIndicators is true
@@ -342,7 +346,8 @@ export function GPUs() {
 
   const fetchKubernetesData = async (
     forceRefresh,
-    showLoadingIndicators = true
+    showLoadingIndicators = true,
+    ownsRefresh = () => true
   ) => {
     try {
       // Phase 1: Get context names quickly (without GPU data)
@@ -350,6 +355,9 @@ export function GPUs() {
       const contextsData = forceRefresh
         ? await getWorkspaceContexts()
         : await dashboardCache.get(getWorkspaceContexts);
+      if (!ownsRefresh()) {
+        return;
+      }
 
       if (!contextsData) {
         setWorkspaceInfrastructure({});
@@ -420,6 +428,9 @@ export function GPUs() {
             ? getContextGPUData(context)
             : dashboardCache.get(getContextGPUData, [context]),
         (context, gpuData) => {
+          if (!ownsRefresh()) {
+            return;
+          }
           // Mark this context as loaded (even if it has no GPUs)
           setLoadedContexts((prev) => new Set([...prev, context]));
 
@@ -447,6 +458,9 @@ export function GPUs() {
           }
         },
         (context, error) => {
+          if (!ownsRefresh()) {
+            return;
+          }
           // Mark context as loaded even on error to prevent infinite spinner
           setLoadedContexts((prev) => new Set([...prev, context]));
           setContextErrors((prev) => ({
@@ -456,6 +470,9 @@ export function GPUs() {
         }
       );
     } catch (error) {
+      if (!ownsRefresh()) {
+        return;
+      }
       console.error('Error in fetchKubernetesData:', error);
       setWorkspaceInfrastructure({});
       setAllKubeContextNames([]);
@@ -470,7 +487,7 @@ export function GPUs() {
     }
   };
 
-  const fetchManagedJobsData = async () => {
+  const fetchManagedJobsData = async (ownsRefresh = () => true) => {
     try {
       // Always use cache - it's already invalidated if refreshing
       // Jobs data doesn't depend on sky check, so no need to bypass cache
@@ -478,8 +495,14 @@ export function GPUs() {
       const jobsData = await dashboardCache.get(getManagedJobs, [
         { allUsers: true, skipFinished: true },
       ]);
+      if (!ownsRefresh()) {
+        return;
+      }
       const jobs = jobsData?.jobs || [];
       setSshAndKubeJobsData(await getContextJobs(jobs));
+      if (!ownsRefresh()) {
+        return;
+      }
 
       // Also compute cloud job counts for the Cloud panel (progressive loading)
       const cloudCounts = {};
@@ -492,6 +515,9 @@ export function GPUs() {
 
       setSshAndKubeJobsDataLoading(false);
     } catch (error) {
+      if (!ownsRefresh()) {
+        return;
+      }
       console.error('Error in fetchManagedJobsData:', error);
       setSshAndKubeJobsData({});
       setCloudJobCounts({});
@@ -500,13 +526,19 @@ export function GPUs() {
   };
 
   // Fetch cluster stats separately for fast loading (similar to jobs)
-  const fetchClusterStatsData = async () => {
+  const fetchClusterStatsData = async (ownsRefresh = () => true) => {
     try {
       // Get clusters from cache (fast - already cached)
       const clustersData = await dashboardCache.get(getClusters);
+      if (!ownsRefresh()) {
+        return;
+      }
       const clusters = clustersData || [];
       // Compute cluster stats per context (fast - local computation)
       const clusterStats = await getContextClusters(clusters);
+      if (!ownsRefresh()) {
+        return;
+      }
       setContextStats(clusterStats);
 
       // Also compute cloud cluster counts for the Cloud panel (progressive loading)
@@ -520,6 +552,9 @@ export function GPUs() {
 
       setClusterDataLoading(false);
     } catch (error) {
+      if (!ownsRefresh()) {
+        return;
+      }
       console.error('Error in fetchClusterStatsData:', error);
       setContextStats({});
       setCloudClusterCounts({});
@@ -528,9 +563,12 @@ export function GPUs() {
   };
 
   // Fetch Slurm data separately for parallel loading with Kubernetes/SSH
-  const fetchSlurmData = async () => {
+  const fetchSlurmData = async (ownsRefresh = () => true) => {
     try {
       const slurmData = await dashboardCache.get(getSlurmInfrastructure);
+      if (!ownsRefresh()) {
+        return;
+      }
       if (slurmData) {
         setAllSlurmGPUs(slurmData.allSlurmGPUs || []);
         setPerClusterSlurmGPUs(slurmData.perClusterSlurmGPUs || []);
@@ -539,6 +577,9 @@ export function GPUs() {
       setSlurmDataLoaded(true);
       setSlurmLoading(false);
     } catch (error) {
+      if (!ownsRefresh()) {
+        return;
+      }
       console.error('Error in fetchSlurmData:', error);
       setAllSlurmGPUs([]);
       setPerClusterSlurmGPUs([]);
@@ -550,12 +591,15 @@ export function GPUs() {
 
   // Fetch enabled clouds list fast (without counts) for progressive loading
   // Counts come from cloudClusterCounts and cloudJobCounts (computed separately)
-  const fetchCloudData = async (forceRefresh) => {
+  const fetchCloudData = async (forceRefresh, ownsRefresh = () => true) => {
     try {
       // Use fast function that only gets enabled cloud names (no counts)
       const cloudData = forceRefresh
         ? await getEnabledCloudsList()
         : await dashboardCache.get(getEnabledCloudsList);
+      if (!ownsRefresh()) {
+        return;
+      }
 
       // Set cloud data with defensive checks
       if (cloudData) {
@@ -571,6 +615,9 @@ export function GPUs() {
       // Clear loading state as soon as Cloud list is ready
       setCloudLoading(false);
     } catch (error) {
+      if (!ownsRefresh()) {
+        return;
+      }
       console.error('Error in fetchCloudData:', error);
       setCloudInfraData([]);
       setTotalClouds(0);
@@ -580,19 +627,50 @@ export function GPUs() {
   };
 
   // SSH Node Pool data fetching
-  const fetchSSHNodePools = async (forceRefresh) => {
+  const fetchSSHNodePools = async (forceRefresh, ownsRefresh = () => true) => {
     try {
       const pools = forceRefresh
         ? await getSSHNodePools()
         : await dashboardCache.get(getSSHNodePools);
+      if (!ownsRefresh()) {
+        return;
+      }
       setSshNodePools(pools);
       setSshLoading(false);
     } catch (error) {
+      if (!ownsRefresh()) {
+        return;
+      }
       console.error('Failed to fetch SSH Node Pools:', error);
       setSshNodePools({});
       setSshLoading(false);
     }
   };
+
+  const startRefresh = React.useCallback(
+    (options = { showLoadingIndicators: true }) => {
+      const { showLoadingIndicators = true } = options;
+      const state = refreshStateRef.current;
+      if (state.active !== null && !showLoadingIndicators) {
+        return state.active.promise;
+      }
+
+      const owner = {
+        generation: ++state.generation,
+        promise: null,
+      };
+      state.active = owner;
+      setIsFetching(true);
+      owner.promise = fetchData(options, owner).finally(() => {
+        if (state.active === owner && state.generation === owner.generation) {
+          state.active = null;
+          setIsFetching(false);
+        }
+      });
+      return owner.promise;
+    },
+    [fetchData]
+  );
 
   // SSH Node Pool handlers
   const handleAddSSHPool = () => {
@@ -649,10 +727,15 @@ export function GPUs() {
     }
   };
 
-  // Effect for assigning fetchData to refreshDataRef, stable after isInitialLoad becomes false.
+  // Effect for assigning the latest refresh entrypoint to refreshDataRef.
   useEffect(() => {
-    refreshDataRef.current = fetchData;
-  }, [fetchData]);
+    refreshDataRef.current = startRefresh;
+    return () => {
+      if (refreshDataRef.current === startRefresh) {
+        refreshDataRef.current = null;
+      }
+    };
+  }, [startRefresh]);
 
   // Compute allGPUs (aggregated totals) whenever perContextGPUs changes
   useEffect(() => {
@@ -683,7 +766,7 @@ export function GPUs() {
       // Trigger cache preloading for infra page and background preload other pages
       await cachePreloader.preloadForPage('infra');
 
-      await fetchData({ showLoadingIndicators: true });
+      await startRefresh({ showLoadingIndicators: true });
     };
 
     initializeData();
@@ -712,6 +795,7 @@ export function GPUs() {
 
   // Reset states when component unmounts
   useEffect(() => {
+    const refreshState = refreshStateRef.current;
     return () => {
       // Don't invalidate cache on unmount - this was causing premature cache invalidation
       // Cache should only be invalidated on manual refresh or TTL expiration
@@ -724,6 +808,9 @@ export function GPUs() {
       setIsInitialLoad(true);
       setSshAndKubeJobsDataLoading(false);
       setClusterDataLoading(false);
+      refreshState.generation += 1;
+      refreshState.active = null;
+      setIsFetching(false);
     };
   }, []);
 
