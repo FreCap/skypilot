@@ -127,10 +127,19 @@ def add_column_to_table(
 
 
 def add_all_tables_to_db_sqlalchemy(
-    metadata: sqlalchemy.MetaData,
-    engine: sqlalchemy.Engine | sqlalchemy.engine.Connection,
+        metadata: sqlalchemy.MetaData,
+        engine: sqlalchemy.Engine | sqlalchemy.engine.Connection,
+        *,
+        reconcile_indexes_for: Iterable[str] = (),
 ):
-    """Add tables to the database."""
+    """Add tables to the database and repair selected tables' indexes.
+
+    Index reconciliation is opt-in because migration modules import the
+    current SQLAlchemy metadata.  An older migration may run against a table
+    that intentionally lacks columns introduced by later migrations, so
+    blindly creating every current index would make historical upgrades fail.
+    """
+    reconcile_indexes = frozenset(reconcile_indexes_for)
     for table in metadata.tables.values():
         try:
             table.create(bind=engine, checkfirst=True)
@@ -138,9 +147,11 @@ def add_all_tables_to_db_sqlalchemy(
                 sqlalchemy_exc.ProgrammingError) as e:
             if 'already exists' not in str(e):
                 raise
+        if table.name not in reconcile_indexes:
+            continue
         # `Table.create(checkfirst=True)` skips the complete table object when
         # a prior autocommit attempt created the table but crashed between
-        # index statements. Reconcile every index independently. In a
+        # index statements. Reconcile selected indexes independently. In a
         # multi-host race, one duplicate must not prevent later missing
         # indexes from being attempted before the migration is stamped.
         for index in table.indexes:

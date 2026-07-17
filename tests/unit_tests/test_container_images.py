@@ -9385,6 +9385,7 @@ def test_table_and_index_races_do_not_skip_later_index_repairs():
     already_exists = sqlalchemy.exc.OperationalError(
         'CREATE', {}, RuntimeError('already exists'))
     table = mock.Mock()
+    table.name = 'locations'
     table.create.side_effect = already_exists
     first_index = mock.Mock()
     first_index.create.side_effect = already_exists
@@ -9394,7 +9395,8 @@ def test_table_and_index_races_do_not_skip_later_index_repairs():
     metadata.tables = {'locations': table}
     engine = mock.sentinel.engine
 
-    db_utils.add_all_tables_to_db_sqlalchemy(metadata, engine)
+    db_utils.add_all_tables_to_db_sqlalchemy(
+        metadata, engine, reconcile_indexes_for={'locations'})
 
     table.create.assert_called_once_with(bind=engine, checkfirst=True)
     first_index.create.assert_called_once_with(bind=engine, checkfirst=True)

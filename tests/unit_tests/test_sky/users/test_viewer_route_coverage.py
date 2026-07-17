@@ -87,6 +87,11 @@ _KNOWN_VIEWER_DENIED: set = {
     ('/serve/terminate-replica', 'POST'),
     ('/serve/{service_name}/versions', 'GET'),
     ('/serve/{service_name}/versions/elect', 'POST'),
+    # --- Managed container image writes ---
+    ('/images/publish', 'POST'),
+    ('/images/register', 'POST'),
+    ('/images/prepare', 'POST'),
+    ('/images/retry', 'POST'),
     # Authenticated LB-to-controller sync proxy; exposes internal routing and
     # capacity state and is never a viewer API.
     ('/api/internal/serve/{service_name}/controller/load_balancer_sync', 'POST'
