@@ -2889,14 +2889,15 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
                          f'{self.cluster_name!r} on port {tunnel.port}')
 
         lock_id = backend_utils.cluster_tunnel_lock_id(self.cluster_name)
-        remaining_timeout = backend_utils.CLUSTER_TUNNEL_LOCK_TIMEOUT_SECONDS
         start_time = time.perf_counter()
+        deadline = (start_time +
+                    backend_utils.CLUSTER_TUNNEL_LOCK_TIMEOUT_SECONDS)
         attempt = 1
 
         def _get_remaining_timeout() -> float:
-            return max(0.0,
-                       remaining_timeout - (time.perf_counter() - start_time))
+            return max(0.0, deadline - time.perf_counter())
 
+        remaining_timeout = _get_remaining_timeout()
         while remaining_timeout > 0:
             logger.debug(
                 'Attempting to acquire exclusive lock for %s (attempt %d)',
@@ -2951,7 +2952,7 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
 
             # Add small jitter before probing to smoothen the effects
             # of many readers waking up simultaneously.
-            jitter = random.uniform(0.01, 0.05)
+            jitter = min(random.uniform(0.01, 0.05), _get_remaining_timeout())
             time.sleep(jitter)
 
             # Re-read the tunnel metadata and verify it's healthy.
