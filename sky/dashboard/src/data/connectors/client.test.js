@@ -30,6 +30,7 @@ describe('current user cache', () => {
   afterEach(() => {
     resetRequestActivityForTests();
     global.TextDecoder = originalTextDecoder;
+    window.history.pushState({}, '', '/');
     jest.restoreAllMocks();
   });
 
@@ -435,5 +436,32 @@ describe('current user cache', () => {
       role: 'admin',
     });
     expect(global.fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('routes current-user lookups through the dashboard base path', async () => {
+    window.history.pushState({}, '', '/tenant/dashboard/clusters');
+    jest.resetModules();
+    const {
+      getCurrentUserRole: getPrefixedCurrentUserRole,
+      resetCurrentUserCacheForTests: resetPrefixedCurrentUserCache,
+    } = require('@/data/connectors/client');
+    resetPrefixedCurrentUserCache();
+    global.fetch.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        id: 'alice-id',
+        name: 'alice@example.com',
+        role: 'admin',
+      }),
+    });
+
+    await expect(getPrefixedCurrentUserRole()).resolves.toEqual({
+      id: 'alice-id',
+      name: 'alice@example.com',
+      role: 'admin',
+    });
+    expect(global.fetch.mock.calls[0][0]).toBe(
+      'http://localhost/tenant/internal/dashboard/users/role'
+    );
   });
 });
