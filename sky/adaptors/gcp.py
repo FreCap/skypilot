@@ -112,4 +112,6 @@ def get_credentials(cred_type: str, credentials_field: str):
     elif cred_type == 'credentials_token':
         # Otherwise the credentials type must be credentials_token.
         credentials = OAuthCredentials(credentials_field)
+    else:
+        raise ValueError(f'Unsupported GCP credential type: {cred_type!r}')
     return credentials

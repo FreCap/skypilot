@@ -23,6 +23,7 @@ def get_verda_configuration(
     """Checks known config file exists and is valid.
     Also supports using env vars instead.
     """
+    config_file_path = os.path.expanduser('~/.verda/config.json')
     try:
         if ('VERDA_CLIENT_ID' in os.environ and
                 'VERDA_CLIENT_SECRET' in os.environ):
@@ -56,8 +57,6 @@ def get_verda_configuration(
                 ),
             )
 
-        filename = '~/.verda/config.json'
-        config_file_path = os.path.expanduser(filename)
         if not os.path.exists(config_file_path):
             return (
                 False,
