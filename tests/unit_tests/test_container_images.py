@@ -443,7 +443,7 @@ def _seed_referenced_eviction_queue(
     return eventual_id
 
 
-def test_schema_022_upgrades_existing_sqlite_database(tmp_path):
+def test_schema_023_upgrades_existing_sqlite_database(tmp_path):
     engine = sqlalchemy.create_engine(f'sqlite:///{tmp_path / "old.db"}')
     old_metadata = sqlalchemy.MetaData()
     sqlalchemy.Table(
@@ -451,15 +451,15 @@ def test_schema_022_upgrades_existing_sqlite_database(tmp_path):
         sqlalchemy.Column('name', sqlalchemy.Text, primary_key=True))
     old_metadata.create_all(engine)
 
-    schema_022 = importlib.import_module(
+    schema_023 = importlib.import_module(
         'sky.schemas.db.global_user_state.023_container_images')
     with engine.connect() as connection:
         context = migration.MigrationContext.configure(connection)
         with operations.Operations.context(context):
-            schema_022.upgrade()
+            schema_023.upgrade()
 
     inspector = sqlalchemy.inspect(engine)
-    assert migration_utils.GLOBAL_USER_STATE_VERSION == '022'
+    assert migration_utils.GLOBAL_USER_STATE_VERSION == '023'
     assert {
         'container_image_catalog', 'container_images',
         'container_image_sources', 'container_image_releases',
@@ -544,16 +544,16 @@ def test_schema_022_upgrades_existing_sqlite_database(tmp_path):
     assert 'ix_container_image_references_consumer' in reference_indexes
 
 
-def test_schema_022_restart_recreates_missing_index(tmp_path):
+def test_schema_023_restart_recreates_missing_index(tmp_path):
     engine = sqlalchemy.create_engine(f'sqlite:///{tmp_path / "partial.db"}')
-    schema_022 = importlib.import_module(
+    schema_023 = importlib.import_module(
         'sky.schemas.db.global_user_state.023_container_images')
 
     def _upgrade() -> None:
         with engine.connect() as connection:
             context = migration.MigrationContext.configure(connection)
             with operations.Operations.context(context):
-                schema_022.upgrade()
+                schema_023.upgrade()
 
     _upgrade()
     missing_index = 'ix_container_image_locations_regional_pending_queue'

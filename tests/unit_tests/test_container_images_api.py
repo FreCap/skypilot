@@ -1344,7 +1344,7 @@ def test_structured_image_unknown_fields_are_rejected_value_free(body_factory):
     assert 'unsupported fields' in str(error.value)
 
 
-def test_container_image_launch_requires_api_v60():
+def test_container_image_launch_requires_api_v62():
     dag = types.SimpleNamespace(tasks=[
         types.SimpleNamespace(resources=[
             types.SimpleNamespace(container_image=mock.sentinel.image)
@@ -1352,14 +1352,14 @@ def test_container_image_launch_requires_api_v60():
     ])
     with mock.patch.object(sky_sdk.versions,
                            'get_remote_api_version',
-                           return_value=59), \
+                           return_value=61), \
          pytest.raises(exceptions.APINotSupportedError,
-                       match='requires API server version 60'):
+                       match='requires API server version 62'):
         sky_sdk._check_container_image_api_support(dag)
 
     with mock.patch.object(sky_sdk.versions,
                            'get_remote_api_version',
-                           return_value=60):
+                           return_value=62):
         sky_sdk._check_container_image_api_support(dag)
 
     legacy_resources = __import__('sky').Resources(image_id='docker:ubuntu')

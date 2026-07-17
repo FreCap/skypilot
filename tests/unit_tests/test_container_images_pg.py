@@ -191,7 +191,7 @@ def image_pg_engine(postgres_engine, monkeypatch):
     return postgres_engine
 
 
-def test_schema_022_upgrades_and_repairs_postgresql(postgres_engine):
+def test_schema_023_upgrades_and_repairs_postgresql(postgres_engine):
     schema_name = f'container_image_migration_{uuid.uuid4().hex}'
     with postgres_engine.begin() as connection:
         connection.execute(sqlalchemy.text(f'CREATE SCHEMA {schema_name}'))
@@ -206,14 +206,14 @@ def test_schema_022_upgrades_and_repairs_postgresql(postgres_engine):
         'clusters', old_metadata,
         sqlalchemy.Column('name', sqlalchemy.Text, primary_key=True))
     old_metadata.create_all(migration_engine)
-    schema_022 = importlib.import_module(
+    schema_023 = importlib.import_module(
         'sky.schemas.db.global_user_state.023_container_images')
 
     def _upgrade() -> None:
         with migration_engine.connect() as connection:
             context = migration.MigrationContext.configure(connection)
             with operations.Operations.context(context):
-                schema_022.upgrade()
+                schema_023.upgrade()
 
     try:
         _upgrade()
